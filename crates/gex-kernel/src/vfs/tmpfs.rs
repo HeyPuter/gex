@@ -44,6 +44,13 @@ pub struct FileNode {
     /// Whether anything has opened the file ([`TmpFs::opened`]): what a run
     /// needed of its bundle, which gex-eject's split keeps in the bundle.
     opened: core::sync::atomic::AtomicBool,
+    /// Whether the program has made or changed the file since the root was
+    /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
+    /// rename. Not a time set (`utimensat`, which a program can aim at any
+    /// file), not a lazy file's contents arriving, not the seeding itself.
+    /// What a page's persist store snapshots (web/src/persist-worker.js),
+    /// so a snapshot never reads a file the program did not touch.
+    written: core::sync::atomic::AtomicBool,
 }
 
 impl FileNode {
@@ -55,10 +62,17 @@ impl FileNode {
             mtime: AtomicI64::new(now()),
             times: Mutex::new(Default::default()),
             opened: core::sync::atomic::AtomicBool::new(false),
+            written: core::sync::atomic::AtomicBool::new(false),
         }
     }
     fn touch(&self) {
+        self.mark_written();
         self.stamp(now());
+    }
+    fn mark_written(&self) {
+        if !self.written.load(Ordering::Relaxed) {
+            self.written.store(true, Ordering::Relaxed);
+        }
     }
     /// Modified at `secs`: the change time with it, once the times are kept.
     fn stamp(&self, secs: i64) {
@@ -530,6 +544,11 @@ impl TmpFs {
         }
         let node = inner.nodes.remove(from).unwrap();
         let ino = inner.inos.remove(from).unwrap_or(1);
+        // A file under a new name is a change to keep; a directory's files
+        // are marked one by one, since each now has a new path.
+        if let Node::File(f) = &node {
+            f.mark_written();
+        }
         // The mode travels with the name. `dpkg` unpacks a program to
         // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
         // mode behind here means every binary a package installs arrives
@@ -545,6 +564,13 @@ impl TmpFs {
         inner.inos.insert(to.to_string(), ino);
         if is_dir {
             inner.move_under(from, to);
+            let lo = format!("{to}/");
+            let hi = format!("{to}0");
+            for (_, n) in inner.nodes.range::<String, _>(lo..hi) {
+                if let Node::File(f) = n {
+                    f.mark_written();
+                }
+            }
             // It and every directory under it are somewhere else now.
             let lo = format!("{to}/");
             let hi = format!("{to}0");
@@ -604,6 +630,20 @@ impl TmpFs {
         let f = FileNode::new(Vec::new(), ino);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
+    }
+
+    /// Every file the program has made or changed since the root was seeded
+    /// (`FileNode::written`), by path with its leading `/`, sorted.
+    pub fn written(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .nodes
+            .iter()
+            .filter_map(|(p, n)| match n {
+                Node::File(f) if f.written.load(Ordering::Relaxed) => Some(format!("/{p}")),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every file something has opened, by path (with its leading `/`; a
@@ -1110,6 +1150,7 @@ impl FileSystem for TmpFs {
                     inner.next_ino += 1;
                     inner.set_ino(path.clone(), ino);
                     let f = Arc::new(FileNode::new(Vec::new(), ino));
+                    f.mark_written();
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
                     Some(f)
                 }
@@ -1809,6 +1850,35 @@ mod lazy_tests {
         fs.open("a/dir", 0, 0).unwrap();
         assert!(fs.open("a/missing", 0, 0).is_err());
         assert_eq!(fs.opened(), vec!["/a/lazy".to_string(), "/a/read".to_string()]);
+    }
+
+    /// `written` lists what the program made or changed -- a create, a
+    /// write, a truncation, a rename, a directory's files moved with it --
+    /// and not the seeded files, a read (a lazy one's contents arriving
+    /// included), or a time set: what a page's persist store snapshots.
+    #[test]
+    fn written_lists_what_the_program_changed() {
+        set_lazy_fetch(counting);
+        let fs = TmpFs::new();
+        for f in ["a/kept", "a/wrote", "a/cut", "a/moved", "a/timed", "d/in"] {
+            fs.add_file(f, b"seed".to_vec());
+        }
+        fs.add_lazy("/a/lazy", 5, "/l");
+        assert!(fs.written().is_empty());
+        let mut buf = [0u8; 4];
+        fs.open("a/kept", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        fs.open("a/lazy", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        FileSystem::set_mtime(&fs, "a/timed", 1).unwrap();
+        assert!(fs.written().is_empty(), "{:?}", fs.written());
+        fs.open("a/wrote", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
+        fs.open("a/cut", oflags::O_RDWR, 0).unwrap().truncate(1).unwrap();
+        fs.open("a/new", oflags::O_CREAT | oflags::O_RDWR, 0o644).unwrap();
+        FileSystem::rename(&fs, "a/moved", "a/there").unwrap();
+        FileSystem::rename(&fs, "d", "e").unwrap();
+        assert_eq!(
+            fs.written(),
+            ["/a/cut", "/a/new", "/a/there", "/a/wrote", "/e/in"].map(String::from).to_vec()
+        );
     }
 
     /// Requests of `/data/r`, each `(offset, len)`.

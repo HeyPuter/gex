@@ -1,5 +1,5 @@
-// The persist worker (see persist.js): walks a directory of the global
-// kernel's filesystem and copies what changed into IndexedDB. A Worker, not
+// The persist worker (see persist.js): copies what the program changed under
+// a directory of the global kernel's filesystem into IndexedDB. A Worker, not
 // the page, because the kernel's locks may wait (memory.atomic.wait), which
 // the main thread may not.
 //
@@ -8,6 +8,7 @@
 // Message out: { synced: id, wrote, removed, files, bytes } or { error }.
 
 import { openDb, txDone } from './persist-db.js';
+import { pick } from './persist-pick.js';
 import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 
 const SCRATCH = 0x1000; // where paths and buffers go in this worker's process memory
@@ -18,9 +19,9 @@ let mem = null;
 let root = '';
 let dbName = '';
 let db = null;
-// What IndexedDB holds: path -> "size:hash". Every file is reread on each
-// snapshot (a save directory is small, and a write need not move mtime: the
-// global kernel has no clock of its own), and only changed ones are stored.
+// What IndexedDB holds: path -> "size:hash". Each snapshot rereads the files
+// the kernel says the program wrote (not by mtime: a write need not move it,
+// and the program can set it) and stores the ones that changed.
 let known = null;
 
 function bytes() {
@@ -127,6 +128,28 @@ function walk(dir, out) {
   return out;
 }
 
+/** The kernel's list of files the program has made or changed since the
+ *  root was seeded (`k_fs_written`), or null from a kernel without it. */
+function writtenPaths() {
+  if (!k.k_fs_written) return null;
+  for (let cap = 1 << 16; ; cap *= 4) {
+    ensure(cap);
+    const n = k.k_fs_written(BigInt(SCRATCH), cap);
+    if (n === -34) continue;
+    if (n < 0) return null;
+    return new TextDecoder().decode(bytes().slice(SCRATCH, SCRATCH + n)).split('\n').filter(Boolean);
+  }
+}
+
+/** What a snapshot looks at, as path -> meta (see `pick`). A walk of `root`
+ *  only from a kernel without `k_fs_written`: it reads every file under the
+ *  root, which for a root over the lazy part of a bundle (FL Studio's /pfx,
+ *  3.3 GB) faults all of it in. */
+function candidates() {
+  const written = writtenPaths();
+  return written ? pick(root, written, known.keys(), meta) : walk(root, new Map());
+}
+
 async function sync() {
   if (!known) {
     known = new Map();
@@ -147,11 +170,18 @@ async function sync() {
   if ((k.k_fs_populated && !k.k_fs_populated()) || !meta(root)?.dir) {
     return { wrote: 0, removed: 0, files: 0, bytes: 0, skipped: true };
   }
-  const now = walk(root, new Map());
+  const now = candidates();
   const writes = [];
   let bytesOut = 0;
   for (const [p, m] of now) {
-    const data = read(p, m.size);
+    if (m.keep) continue;
+    let data;
+    try {
+      data = read(p, m.size);
+    } catch (e) {
+      // A trap in the kernel leaves it unusable for this snapshot: say which file.
+      throw new Error(`reading ${p} (${m.size} bytes): ${e?.message ?? e}`);
+    }
     if (!data) continue;
     const stamp = `${data.length}:${hash(data)}`;
     if (known.get(p) === stamp) continue;

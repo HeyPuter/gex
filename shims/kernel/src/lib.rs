@@ -2855,6 +2855,26 @@ pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
     b.len() as i32
 }
 
+/// The files the program has made or changed since the root was seeded
+/// (`TmpFs::written`), one path per line, at `at`; their length, or `-ERANGE`
+/// with nothing written when `cap` will not hold them. A page's persist store
+/// (web/src/persist-worker.js) snapshots these and no others, so a snapshot
+/// never reads, or fetches, a file the program left alone.
+#[no_mangle]
+pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let mut b = rootfs().written().join("\n");
+    if !b.is_empty() {
+        b.push('\n');
+    }
+    if b.len() as u32 > cap {
+        return -34; // ERANGE
+    }
+    if !b.is_empty() {
+        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    }
+    b.len() as i32
+}
+
 /// A path's metadata, without opening it -- which matters for a symlink and
 /// for anything an open would refuse.
 #[no_mangle]
