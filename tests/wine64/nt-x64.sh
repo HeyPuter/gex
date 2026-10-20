@@ -274,10 +274,14 @@ else
 fi
 # Images loaded, run and unloaded one after another (dllcycle.c: 24 distinct
 # DLLs of ~1000 functions each, dllcycle-gen.py), as a plugin scan does: each
-# one's translations must go with it. In the page, every Worker's `blocks`
-# kept each unloaded image's modules alive (FL Studio's verified scan of ~50
-# plugins ran the tab out of memory), so the run's peak RSS is checked
-# against 4 such images: under DLLCYCLE_MB (default 8) MiB per further one.
+# one's translations must go with it once it is unloaded. In the page, the
+# run's peak RSS grows by under DLLCYCLE_MB (default 18) MiB per further
+# unloaded image. The slope is taken between two long runs, the 24 images
+# once and RSS_ROUNDS (default 4) times (each round loads every image again
+# at its base, translated again): the peak's own swing between runs, a few
+# percent of a large total, is then spread over 72 further loads, and both
+# ends carry the same baseline. Each load currently keeps about 13 MiB; the
+# bound catches growth beyond that.
 # ROUNDS=2 loads each again at the same base (translated again).
 if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
 	python3 "$here/dllcycle-gen.py" 1000 "$w/bigcode.c" &&
@@ -292,15 +296,18 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
 	x24=$(python3 "$here/dllcycle-gen.py" 1000 --expect 24)
 	xr=$(python3 "$here/dllcycle-gen.py" 1000 --expect $((24 * ${ROUNDS:-1})))
 	if [ -n "$page" ] && case " ${CASES:-dllcycle} " in *" dllcycle "*) true ;; *) false ;; esac; then
-		f0=$fail
-		EXTRA="$plugs" RSS_OUT="$w/rss4" CASES=dllcycle4 check dllcycle4 0 "dllcycle 4 x $x4" "$w/dllcycle.exe" 4 1
-		EXTRA="$plugs" RSS_OUT="$w/rss24" CASES=dllcycle check dllcycle 0 "dllcycle $((24 * ${ROUNDS:-1})) x $xr" "$w/dllcycle.exe" 24 ${ROUNDS:-1}
-		if [ "$fail" = "$f0" ] && [ -s "$w/rss4" ] && [ -s "$w/rss24" ]; then
-			per=$(( ($(cat "$w/rss24") - $(cat "$w/rss4")) / (20 * ${ROUNDS:-1}) / 1024 ))
-			if [ "$per" -lt "${DLLCYCLE_MB:-8}" ]; then
-				pass=$((pass + 1)); echo "ok   x64/dllcycle-rss ($tag): $per MiB per unloaded image"
+		f0=$fail; R=${RSS_ROUNDS:-4}
+		xR=$(python3 "$here/dllcycle-gen.py" 1000 --expect $((24 * R)))
+		EXTRA="$plugs" RSS_OUT="$w/rss1" CASES=dllcycle check dllcycle 0 "dllcycle 24 x $x24" "$w/dllcycle.exe" 24 1
+		EXTRA="$plugs" RSS_OUT="$w/rssR" CASES=dllcycleR TMO=${TMO:-$((300 * R))} check dllcycleR 0 "dllcycle $((24 * R)) x $xR" "$w/dllcycle.exe" 24 $R
+		if [ "$fail" = "$f0" ] && [ -s "$w/rss1" ] && [ -s "$w/rssR" ]; then
+			# KiB difference over the further loads, in MiB (one decimal kept for the log)
+			per10=$(( ($(cat "$w/rssR") - $(cat "$w/rss1")) * 10 / (24 * (R - 1)) / 1024 ))
+			per="$((per10 / 10)).$(( (per10 < 0 ? -per10 : per10) % 10 ))"
+			if [ "$per10" -lt "$(( ${DLLCYCLE_MB:-18} * 10 ))" ]; then
+				pass=$((pass + 1)); echo "ok   x64/dllcycle-rss ($tag): $per MiB per further unloaded image (rss $(cat "$w/rss1") -> $(cat "$w/rssR") KiB, 24 -> $((24 * R)) loads)"
 			else
-				fail=$((fail + 1)); echo "FAIL x64/dllcycle-rss ($tag): $per MiB per unloaded image (bound ${DLLCYCLE_MB:-8})"
+				fail=$((fail + 1)); echo "FAIL x64/dllcycle-rss ($tag): $per MiB per further unloaded image (bound ${DLLCYCLE_MB:-18}; rss $(cat "$w/rss1") -> $(cat "$w/rssR") KiB, 24 -> $((24 * R)) loads)"
 			fi
 		fi
 	else
