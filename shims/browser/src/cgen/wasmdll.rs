@@ -526,8 +526,13 @@ pub extern "C" fn gex_wasmdll_installed() {
     let base = ftab(|m| m.install(install).base);
     let read = |off: u32| -> Vec<(u64, u32)> {
         let at = data + off as u64;
-        // (an LLP64 module's pointers are 8 bytes, their values below 4 GiB)
-        let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + w).unwrap_or(0) as u64);
+        // An LLP64 module's pointers are 8 bytes. A lowered one's values are
+        // below 4 GiB; the memory64 core's data window is at the top of 16
+        // GiB (`w64_pe_data`), so the whole pointer is read -- its low half
+        // pointed elsewhere, no thunk was bound, and a fiber's start
+        // (`start_fiber`'s table index as its Rip) faulted as a guest pc.
+        let ptr = |a: u64| if w == 8 { gm.read_u64(a).unwrap_or(0) } else { gm.read_u32(a).unwrap_or(0) as u64 };
+        let (start, stop) = (ptr(at), ptr(at + w));
         let mut out = Vec::new();
         let mut a = start;
         while start != 0 && a + 2 * w <= stop {
