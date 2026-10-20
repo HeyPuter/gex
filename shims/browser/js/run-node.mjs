@@ -399,6 +399,9 @@ const host = new ProcessHost({
     w3Split: !!process.env.GEX_W3_SPLIT,
     // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
     nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
+    // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
+    // its start (tests/browser-stack-tripwire.sh).
+    testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
