@@ -131,6 +131,8 @@ function xcacheName() {
   const switches = ['tso', 'coherentloads', 'arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&')
+    // `tso=arm` names one switch value for two flavours: the host's is named too.
+    + (flag('tso') === 'arm' && tso() ? '&tsohost=1' : '')
     // Named only when on: the cache of a page without it keeps its name.
     + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
@@ -167,12 +169,38 @@ export function runtimeUrls() {
  * makes `ldar`/`stlr`; plain ones there reorder, and x86 code relies on them
  * not doing so. Translated code only: tier 1 and the function JIT. Function-
  * tier units and closures, compiled ahead with plain accesses, are not used
- * (the shim refuses units too). Off by default, and never wanted on x86,
- * where an atomic store is an `xchg`.
+ * (the shim refuses units too). Off by default. `tso=arm` turns it on only
+ * when the host is arm64 ([`detectTso`]): a page whose program needs x86
+ * ordering sets that (FL Studio's demo does), since on x86 an atomic store
+ * is an `xchg` and the flavour costs every program that does not need it.
  */
 function tso() {
   const v = flag('tso') ?? flag('coherentloads');
+  if (v === 'arm') return tsoHost;
   return !!v && v !== '0';
+}
+
+/** Whether the host is arm64 (the browser's own word for it), for `tso=arm`.
+ *  Set once by [`detectTso`]. */
+let tsoHost = false;
+
+/**
+ * With `tso=arm`: ask the browser what CPU it runs on (`navigator.userAgentData`'s
+ * high-entropy `architecture`, Chromium only; a Worker has it too) before the
+ * first program starts. "arm" turns the TSO flavour on; no answer leaves it off.
+ * Other values never ask. Returns the effective setting, for a page to report.
+ */
+export async function detectTso() {
+  if (flag('tso') === 'arm') {
+    try {
+      const ua = globalThis.navigator?.userAgentData;
+      const h = ua?.getHighEntropyValues ? await ua.getHighEntropyValues(['architecture']) : null;
+      tsoHost = h?.architecture === 'arm';
+    } catch {
+      tsoHost = false;
+    }
+  }
+  return tso();
 }
 
 /**
@@ -712,6 +740,9 @@ async function runProgramHere(
     glSource = null,
   },
 ) {
+  // `tso=arm`: the TSO flavour if the host is arm64. What was chosen is
+  // `__gexTso`, for a page or a recorder to read.
+  globalThis.__gexTso = await detectTso();
   // A closure's code was translated ahead with plain accesses (`tso`).
   if (tso() && closure) {
     console.warn('[gex] tso: the closure is translated with plain accesses; translating instead');
