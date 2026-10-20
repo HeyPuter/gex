@@ -420,10 +420,10 @@ struct Jit {
     shared: Arc<Mutex<JitShared>>,
     engine: Engine,
     linker: Linker<HostState>,
-    /// Every dispatch table, in index order; `tables[0]` holds the miss span
-    /// and everything a program this size needs. Several exist only because V8
-    /// caps a table at 10M entries and the code `br_table`s between them;
-    /// natively tables 1+ stay empty but must exist because the code names them.
+    /// Every dispatch table, in index order; `tables[0]` holds the miss span.
+    /// Several exist because V8 caps a table at 10M entries and the code
+    /// `br_table`s between them; pages numbered once the first is full have
+    /// their slots in the later ones.
     tables: Vec<Table>,
     /// Where compiled runtime translations are kept, and the build they
     /// belong to. `None` when the cache is off or this build cannot name
