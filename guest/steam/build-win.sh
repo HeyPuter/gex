@@ -6,8 +6,8 @@
 #   guest/steam/build-win.sh OUT_DIR
 #
 # STEAM_SDK_HEADERS: interface headers of every version (the current SDK's
-# isteam*.h plus isteamuser018.h and the like; the Goldberg emulator's
-# sdk/steam has them). STEAM_API_JSON: the current SDK's steam_api.json.
+# isteam*.h plus older ones such as isteamuser018.h). STEAM_API_JSON: the
+# current SDK's steam_api.json.
 # Neither is part of this tree. Needs clang (MSVC targets), lld, and
 # MinGW-w64's kernel32 import libraries.
 set -eu

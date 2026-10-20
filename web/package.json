@@ -1,8 +1,7 @@
 {
-  "name": "web",
+  "name": "gex-web",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "The gex browser runtime and its pages",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -11,7 +10,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "devDependencies": {
     "vite": "^8.2.0"
@@ -21,5 +20,6 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0"
-  }
+  },
+  "private": true
 }

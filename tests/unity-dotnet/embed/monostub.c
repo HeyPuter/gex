@@ -1,6 +1,5 @@
-/* libmonobdwgc-2.0.so for tests: Unity's Mono library's exports (the 313 names
- * UnityPlayer looks up, tools/unity-dotnet/mono-imports.txt), none of which may
- * run: under gex the Mono provider replaces every one (docs/unity-dotnet.md). */
+/* libmonobdwgc-2.0.so for tests: stubs for the Mono embedding API's exports,
+ * none of which may run: under gex the Mono provider replaces every one. */
 #include <stdio.h>
 #include <stdlib.h>
 static void stub (const char *n) { fprintf (stderr, "x86 Mono stub %s called\n", n); abort (); }

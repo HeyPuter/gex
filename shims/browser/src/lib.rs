@@ -14055,8 +14055,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // come, or never did). Every translation of the block checks the
         // page table's base, so retranslating alone never converges; write
         // the entry (its slots not filled here yet only miss and catch up).
-        // Paint's startup stall: uiribbon's function at 0x604eefff,
-        // translated about 155 times a second for minutes.
+        // Without it one function was translated over a hundred times a
+        // second for minutes at a program's start-up.
         heal_dirs(start);
         let again = with_jit_only(|j| {
             // Dispatch at `start` no longer reaches the stale block: its slot
@@ -14064,9 +14064,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             // the stale block was entered by a direct jump from a sibling in
             // its own module (a loop whose head is on a retired page and whose
             // body is on one that is not), and the sibling will jump to it
-            // again, however often `start` is translated: FL Studio's page
-            // startup translated one such head about 100 times a second, 34k
-            // translations in 290 s, until the renderer ran out of memory.
+            // again, however often `start` is translated: one such head was
+            // translated about 100 times a second, tens of thousands of
+            // times, until the renderer ran out of memory.
             // Resuming from JavaScript (below) reaches the slot's block; only
             // a stale block dispatch itself comes back to needs translating
             // again (the `repeat` case).
@@ -14103,9 +14103,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             // again for it, and resumes from JavaScript (below), correct and
             // only slower -- unless it is the same block asking again
             // (`repeat`): then resuming came straight back to it, and only a
-            // translation moves this Worker on. Bounded that too, FL Studio's
-            // loader thread ran one ACM codec's stale block for ever, the
-            // loader lock held.
+            // translation moves this Worker on. Unbounded, a loader thread
+            // could run one stale block for ever with the loader lock held.
             if again && !repeat {
                 let n = j.stale_again.entry(start).or_insert(0);
                 *n += 1;
@@ -14488,8 +14487,7 @@ fn remiss(pc: u64) {
     // Every miss that reaches translation counts, whether or not `translated`
     // still has the pc: a stale page check (`PAGE_STALE`) and the bridge's
     // hand-over (`FTAB_TIER1`) clear it before they come here, and a pc
-    // translated again and again that way was never counted (Paint's
-    // startup stall at 0x604eefff, scratch/P/stall85).
+    // translated again and again that way was never counted.
     let said = with_jit_only(|j| {
         let n = j.remiss.entry(pc).or_insert(0);
         *n += 1;
@@ -14565,9 +14563,8 @@ fn pwatch_say(page: u64, what: impl FnOnce() -> String) {
 /// Misses at one pc this many times within [`LIVELOCK_WINDOW`] misses of a
 /// Worker: a dispatch that does not converge. Said loudly, once per pc, with
 /// what dispatch sees there and how the miss path last dealt with it (a
-/// diagnostic: nothing here changes what the miss does). A Paint startup
-/// spun for minutes re-translating one AOT entry (0x604eefff, uiribbon;
-/// scratch/P/stall85), and no line said so.
+/// diagnostic: nothing here changes what the miss does): a start-up once
+/// spun for minutes re-translating one AOT entry, and no line said so.
 const LIVELOCK_MISSES: u32 = 256;
 const LIVELOCK_WINDOW: u32 = 8192;
 
@@ -16144,8 +16141,8 @@ fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u6
 }
 
 /// Times each page with translations was retired (a page retired again and
-/// again is translated again and again: FL Studio's page startup came to
-/// 34k translations in 290 s on a few pages). Said once a page reaches each
+/// again is translated again and again: tens of thousands of translations
+/// in a few minutes on a few pages). Said once a page reaches each
 /// of a few counts, with the call and the module of the page and of the
 /// caller, so a storm names its writer. A diagnostic: nothing here changes
 /// what is retired.

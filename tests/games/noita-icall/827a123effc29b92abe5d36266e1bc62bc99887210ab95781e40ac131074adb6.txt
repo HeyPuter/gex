@@ -1,4 +1,0 @@
-# /w3/lib/wine/i386-windows/advapi32.dll at 0x7ba00000: (return address, target, calls) at table calls, counted by gex (icallcount units)
-icall 0x7ba10d14 0x7bfa1338 1
-icall 0x7ba10de8 0x7ba1d580 1
-icall 0x7ba13ee4 0x7bd915f0 17

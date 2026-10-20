@@ -722,10 +722,10 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     pe.parse_relocs()?;
     pe.imports = pe.parse_imports()?;
     // Only a hint (the loader rebinds every import from its name table), and
-    // Windows ignores one that does not hold: Windows 7's mspaint.exe and
-    // others name a directory in the headers that is not one (no terminator
-    // within the image), and Windows runs them. Refusing the whole image
-    // left every such program on tier-1 (no function-tier unit, W3).
+    // Windows ignores one that does not hold: some programs name a
+    // directory in the headers that is not one (no terminator within the
+    // image), and Windows runs them. Refusing the whole image would leave
+    // every such program without a function-tier unit.
     pe.bound_imports = pe.parse_bound_imports().unwrap_or_default();
     pe.delay_imports = pe.parse_delay_imports()?;
     pe.exports = pe.parse_exports()?;

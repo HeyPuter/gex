@@ -3421,8 +3421,7 @@ impl gex_kernel::net::Transport for HostStream {
         // that a page does not. Every address it gives, IPv4 first (the
         // guest's network is IPv4): the first is often IPv6, which a host
         // without an IPv6 route refuses at once, and taking only that one
-        // made every dual-stack name unreachable there (FL Studio's news
-        // server on gooner). Each try is bounded, so an address that drops
+        // made every dual-stack name unreachable there. Each try is bounded, so an address that drops
         // the SYN costs seconds, not the two minutes of the host's retries.
         let mut addrs: Vec<std::net::SocketAddr> = (host, port)
             .to_socket_addrs()

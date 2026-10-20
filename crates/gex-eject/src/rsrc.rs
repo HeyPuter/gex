@@ -24,8 +24,8 @@
 //!   or table that could load it by number), goes.
 //! * **Bytes no directory reaches.** Whatever of a resource section the
 //!   (rewritten) tree does not point at: entries dropped above, and copies
-//!   left behind by a resource editor (Paint's merged MUI moved its whole
-//!   directory into `.rsrcmui`, leaving `.rsrc` unread).
+//!   left behind by a resource editor (a merged MUI can move the whole
+//!   directory into another section, leaving `.rsrc` unread).
 //!
 //! An image is left whole when anything else points into what would be
 //! zeroed: a relocated word, another data directory. Without base

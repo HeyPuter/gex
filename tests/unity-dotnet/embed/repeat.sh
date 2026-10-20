@@ -3,7 +3,7 @@
 # at thresholds 1, 2 and 10, 4 at a time; a run fails on any missing pattern or invalid module.
 # Env: OUT, PROV as jitknob.sh. Writes repeat.log in OUT/embed; keeps the output of failed runs.
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${OUT:-/home/claude/gex-sandbox/scratch/unity/dnc-gc}; export OUT HERE
+OUT=${OUT:?set OUT to a tools/unity-dotnet/mono build directory}; export OUT HERE
 one() { thr=$1; i=$2; r=$(THR=$thr bash "$HERE/jitknob.sh" r${thr}_$i MONO_WASM_JIT_VERBOSE=1 | head -1)
   f=$OUT/embed/kn-r${thr}_$i.txt; inv=$(grep -a -c '^WASM_JIT_INVALID' "$f")
   echo "$r inv=$inv"; case "$r" in *PASS) [ "$inv" = 0 ] && rm -f "$f";; esac; }

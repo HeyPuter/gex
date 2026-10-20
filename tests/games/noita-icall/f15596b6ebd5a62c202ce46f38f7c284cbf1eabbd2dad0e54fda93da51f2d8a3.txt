@@ -1,4 +1,0 @@
-# /w3/lib/wine/i386-windows/oleaut32.dll at 0x7a420000: (return address, target, calls) at table calls, counted by gex (icallcount units)
-icall 0x7a426f23 0x7bfa16d8 1
-icall 0x7a427008 0x7a478920 1
-icall 0x7a4437c4 0x7bfa1338 1

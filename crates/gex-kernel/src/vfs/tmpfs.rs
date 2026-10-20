@@ -953,8 +953,8 @@ impl FileHandle for TmpHandle {
         ];
         // The immediate children only, each child's own subtree passed in one
         // seek (as `dir_nlink`). A scan of every node in the filesystem was
-        // each listing's cost: FL Studio's page start, its tree lazily
-        // mounted (29,292 files), spent 43 of 60 profiled seconds here, in
+        // each listing's cost: a page start with a lazily mounted tree of
+        // ~29,000 files spent 43 of 60 profiled seconds here, in
         // Wine's case-insensitive lookups (each a directory read) and its
         // directory scans, with the loader lock held. Otherwise one pass over
         // the names in order, the inode numbers (same keys) walked beside

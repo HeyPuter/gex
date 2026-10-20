@@ -2,6 +2,7 @@
 name = "gex-mem"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 wasmtime = { version = "49", default-features = false, features = ["runtime", "std", "threads", "gc", "gc-null", "anyhow"] }

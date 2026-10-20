@@ -4,7 +4,7 @@
 # Checks every pattern of run.sh.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${OUT:-/home/claude/gex-sandbox/scratch/unity/dnc-gc}; T=$OUT/embed; N=$1; shift; PROV=${PROV:-$OUT/provider/mono.wasm}
+OUT=${OUT:?set OUT to a tools/unity-dotnet/mono build directory}; T=$OUT/embed; N=$1; shift; PROV=${PROV:-$OUT/provider/mono.wasm}
 GEXC=${GEXC:-$HERE/../../../target/x86/release/gexc}
 E=(); for kv in "$@"; do E+=(--env "$kv"); done
 cd $T

@@ -1163,13 +1163,12 @@ pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds),
     // something takes: a function, a jump-table case, a handler -- unless
     // what it points at is a pointer itself. The operand of `call [slot]`
     // is relocated as well, and Microsoft's linker keeps such slots in
-    // `.text` (the IAT, and shell32.dll's lazily bound wrappers: `[slot]
-    // [nops][stub]`). An address holding a relocated word, or inside an
-    // import slot, is data: taken for a start, the slot's bytes decoded
-    // straight into the stub after it and made that an interior block of a
-    // function at the slot, so the stub had no function of its own and
-    // every call through the slot left the unit (the Win7 shell's hottest
-    // call-outs).
+    // `.text` (the IAT, and lazily bound wrappers laid out `[slot][nops]
+    // [stub]`). An address holding a relocated word, or inside an import
+    // slot, is data: taken for a start, the slot's bytes decoded straight
+    // into the stub after it and made that an interior block of a function
+    // at the slot, so the stub had no function of its own and every call
+    // through the slot left the unit.
     let held: std::collections::HashSet<u64> = pe
         .relocs
         .iter()
@@ -1636,13 +1635,13 @@ fn guessed_cases(functions: &BTreeMap<u64, Function>) -> HashSet<u64> {
 /// tail (`mov eax, [obj]; jmp [eax + 16]` with `obj` in `.data`) resolved
 /// from the initial bytes, not a jump table. Its case is the callee, a
 /// function of its own; it does not stop that start from being promoted
-/// (Win7's uiribbon.dll: the vtable functions such tails reach were blocks
-/// of the tail and nobody's entry, called a few thousand times at start-up
-/// through the function table's fallback). Read-only memory too: a `jmp
-/// [slot]` with no index through a pointer kept in `.text` is a tail call
-/// all the same (shell32.dll's lazily bound wrappers: the stub the slot
-/// holds was a block of every function that tail-jumps through it, and
-/// every call through the slot left the unit).
+/// (otherwise the vtable functions such tails reach are blocks of the tail
+/// and nobody's entry, and every call to them goes through the function
+/// table's fallback). Read-only memory too: a `jmp [slot]` with no index
+/// through a pointer kept in `.text` is a tail call all the same (a lazily
+/// bound wrapper: the stub the slot holds would be a block of every
+/// function that tail-jumps through it, and every call through the slot
+/// would leave the unit).
 fn one_case_guess(t: &gex_ir::func::JumpTable) -> bool {
     t.count == 1 && t.entry_bytes == 0
 }

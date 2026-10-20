@@ -25,8 +25,8 @@ pub fn threads() -> usize {
 
 /// Helper threads running now, across every caller in the process. One
 /// budget of [`threads`] for them all: each translating guest thread asked
-/// for `threads()` of its own, so FL Studio's 125 threads could ask for some
-/// 3000 at once, and a spawn refused under a task limit (`TasksMax`)
+/// for `threads()` of its own, so a program with 125 threads could ask for
+/// some 3000 at once, and a spawn refused under a task limit (`TasksMax`)
 /// panicked the guest thread that asked (`scope.spawn`).
 #[cfg(feature = "parallel")]
 static HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

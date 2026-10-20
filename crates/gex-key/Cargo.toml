@@ -2,6 +2,7 @@
 name = "gex-key"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Content keys every host computes alike: SHA-256, an image's identity, a function-tier unit's key"
 
 [dependencies]

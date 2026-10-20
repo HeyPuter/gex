@@ -1,6 +1,5 @@
 /* ptext32.exe: a function pointer kept in .text, its target right after it,
- * as Win7's shell32.dll lays out its lazily bound wrappers (`[slot][nops]
- * [stub]`, the stub `mov edi,edi; push ebp; mov ebp,esp; ...; pop ebp;
+ * laid out as a lazily bound wrapper (`[slot][nops][stub]`, the stub `mov edi,edi; push ebp; mov ebp,esp; ...; pop ebp;
  * jmp eax`), and callers that call through it (`call *_slot`). The call's
  * operand is a relocated address too, but of data: recovery must not take
  * the slot for a function, which swallowed the stub as an interior block

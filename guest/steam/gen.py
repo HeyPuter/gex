@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate gex-steam's interface classes from the Steamworks SDK's
-steam_api.json (docs/games.md).
+steam_api.json.
 
     gen.py STEAM_API_JSON OUT.inc
 
@@ -9,8 +9,8 @@ order, so its vtable is the one a game compiled against that SDK indexes.
 A method ignores its arguments (the callers clean the stack on both i386
 and x86-64) and returns zero of its return type; what matters for the ABI
 is the return: an aggregate is returned through a hidden pointer, so each
-one gets a struct of its size. The methods with an answer worth giving
-(logged on, owns the app, the language) are in OVERRIDES.
+one gets a struct of its size. The methods with a fixed answer (the session's
+user, the language, ...) are in OVERRIDES.
 """
 import json
 import os

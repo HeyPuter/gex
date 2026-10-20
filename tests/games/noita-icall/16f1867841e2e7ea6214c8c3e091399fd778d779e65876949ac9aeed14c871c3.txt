@@ -1,3 +1,0 @@
-# /w3/lib/wine/i386-windows/version.dll at 0x79550000: (return address, target, calls) at table calls, counted by gex (icallcount units)
-icall 0x795512f4 0x7bfa1338 1
-icall 0x795513c8 0x79552190 1

@@ -9,13 +9,13 @@
 #
 # Environment:
 #   GEX_TOOLCHAIN  aarch64 musl cross toolchain bin directory
-#   GEX_QEMU       qemu-aarch64 binary
+#   GEX_QEMU       qemu-aarch64 binary (default: the one on PATH)
 #   GEXC           the gexc binary under test
 
 set -eu
 
-TOOLCHAIN="${GEX_TOOLCHAIN:-/home/claude/toolchains/aarch64-linux-musl-cross/bin}"
-QEMU="${GEX_QEMU:-/home/claude/toolchains/qemu-aarch64}"
+TOOLCHAIN="${GEX_TOOLCHAIN:?set GEX_TOOLCHAIN to an aarch64 musl cross toolchain bin directory}"
+QEMU="${GEX_QEMU:-$(command -v qemu-aarch64 || echo qemu-aarch64)}"
 GEXC="${GEXC:-target/release/gexc}"
 # V8 is the target of record; the cross-engine stage is skipped rather than
 # failed when Node is absent, so the suite still runs on a bare machine.

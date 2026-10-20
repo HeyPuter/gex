@@ -2,7 +2,7 @@
 # The function-tier units of a frozen set of images, for one gexc: prints the
 # cache directory (GEX_CGEN_CACHE) that holds them, building it first when no
 # set exists for that gexc's unit-key inputs. Gate legs that run frozen Wine
-# and game bundles on units (tests/games/noita-page-leg.sh) call it, so a gex
+# and game bundles on units (a game repo's page leg) call it, so a gex
 # change that moves every unit key (gex-cgen's sources, gex-ld's through the
 # recovery inputs, the ABI) costs one rebuild inside the leg, not a hand step.
 #
@@ -14,7 +14,7 @@
 #               A hard-linked copy under DIR/images keeps them frozen.
 #   icall/      optional: an indirect-call profile per image identity (the
 #               same image at the same base, whatever the gexc), as
-#               tests/games/noita-icall/place.py places it. Each set is built
+#               a game's own tooling places it. Each set is built
 #               with it (devirtualised hot table calls: the "second pass").
 # and the sets, DIR/ukeys/ID (ID: `gexc cgen-image --inputs`, a hash of
 # everything a unit key takes besides its image), each with its build log at

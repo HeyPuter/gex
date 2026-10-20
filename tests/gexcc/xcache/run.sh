@@ -12,7 +12,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-TC=${TOOLCHAIN:-/home/claude/toolchains/aarch64-linux-musl-cross}
+TC=${TOOLCHAIN:?set TOOLCHAIN to an aarch64 musl cross toolchain directory}
 CC=$TC/bin/aarch64-linux-musl-gcc
 WEB=${WEB:-$ROOT/web/public/gex}
 W=$(mktemp -d)

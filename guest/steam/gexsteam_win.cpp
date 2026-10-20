@@ -1,10 +1,9 @@
-/* gex-steam for Windows games: steam_api.dll / steam_api64.dll with no
- * Steam client (docs/games.md, "gex-steam").
+/* gex-steam for Windows games: steam_api.dll / steam_api64.dll for a
+ * process that has no Steam client beside it.
  *
- * The game's own steam_api.dll fails without a running Steam ("Steam must be
- * running to play this game"), and many games then quit or ask Steam to
- * restart them. This one answers instead: the user is logged on, owns the
- * app and its DLC, the language is English; callbacks never fire.
+ * It implements the Steamworks API's interfaces with fixed answers for now
+ * (an offline session with one user, English, no callbacks); a later version
+ * connects them to a real Steam client.
  *
  * Interface objects come in every version the SDK has had
  * (gen_versions.py), because a game asks for the versions its SDK knew:
