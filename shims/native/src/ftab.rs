@@ -596,13 +596,14 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
                 b
             }
         };
-        if gex_abi::dispatch_entry_table(base) != 0 {
-            continue;
-        }
+        // Every page numbered here gets its directory entry, whichever
+        // table its slots are in: a numbered page whose entry stays zero
+        // misses for good, since a translation there finds it numbered and
+        // writes no entry either.
         if !dirs.iter().any(|&(p, _)| p == page) {
             dirs.push((page, base));
         }
-        slots.push(gex_abi::dispatch_index(a, base) as u32);
+        slots.push(gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32));
     }
     s.translated.extend(entries.iter().copied());
     let unit = Arc::new(CompiledUnit {
@@ -1078,13 +1079,16 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
     call_out(caller, ctx, target, ret, sp + delta)
 }
 
-/// Write the bridge into this store's dispatch table at `slots`.
+/// Write the bridge into this store's dispatch tables at `slots`, each a
+/// table and slot packed as a directory entry (`gex_abi::dispatch_entry`).
 pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots: &[u32]) -> Result<()> {
     ensure(cx.as_context_mut())?;
     let jit = cx.as_context().data().jit.as_ref().unwrap();
-    let (t0, bridge) = (jit.tables[0], jit.ftab.as_ref().unwrap().bridge.clone());
-    for &s in slots {
-        t0.set(cx.as_context_mut(), s as u64, wasmtime::Ref::Func(Some(bridge.clone())))?;
+    let (tables, bridge) = (jit.tables.clone(), jit.ftab.as_ref().unwrap().bridge.clone());
+    for &packed in slots {
+        let s = crate::Slot::of_entry(packed);
+        let table = tables.get(s.table).ok_or_else(|| anyhow!("a bridge in dispatch table {}, past the last", s.table))?;
+        table.set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(bridge.clone())))?;
     }
     Ok(())
 }

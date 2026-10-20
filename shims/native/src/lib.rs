@@ -452,8 +452,9 @@ struct CompiledUnit {
     exported_blocks: Vec<(u64, String)>,
     dir_entries: Vec<(u64, u32)>,
     table_slots: u64,
-    /// Table-0 slots to point at the function table's bridge (`ftab`):
-    /// addresses a function body serves.
+    /// Slots to point at the function table's bridge (`ftab`), each a table
+    /// and slot packed as a directory entry: addresses a function body
+    /// serves.
     bridges: Vec<u32>,
 }
 
@@ -4469,6 +4470,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 });
                 return Err(StopExecution.into());
             }
+            // The return pad's filler: a guest return to native Wine that no
+            // call-out caught. Its native caller is gone, so no handler can
+            // make sense of it; say so instead of raising a breakpoint at an
+            // address no code has.
+            if pc as u64 == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD {
+                let sp = caller.data().memory.clone().and_then(|m| GuestMem::new(m.bytes()).read_u64(caller.data().thread.ctx_addr + ctx::x(sp_index()) as u64).ok()).unwrap_or(0);
+                let open: Vec<String> = caller.data().callouts.iter().map(|co| format!("{:#x} sp {:#x} slot {:?} live {}", co.ret, co.sp_want, co.slot.as_ref().map(|s| s.0), co.live)).collect();
+                let detail = format!("BUG: a guest return reached native Wine's return pad {pc:#x} (sp {sp:#x}) with no call-out catching it; call-outs open: {open:?}");
+                eprintln!("gex: {detail}");
+                caller.data_mut().exit = Some(Exit::Signal { signal: signal::SIGTRAP, pc: pc as u64, detail, internal: true });
+                return Err(StopExecution.into());
+            }
             // int3: the hook sees the address after it, as hardware leaves it.
             if deliver_guest_fault(&mut caller, fault_code::BREAKPOINT, pc as u64 + 1, pc as u64)? {
                 return Err(StopExecution.into());
@@ -5299,8 +5312,8 @@ fn install_unit(
     };
     // Slots are allocated in one space that spans every table, so the figure
     // the unit carries is a running total and each table's share is that
-    // total clamped to its own window. Natively only the first ever has any.
-    let per = gex_xlate::PageTable::SLOTS_PER_TABLE as u64;
+    // total clamped to its own window.
+    let per = gex_xlate::PageTable::slots_per_table();
     let miss = tables[0]
         .get(cx.as_context_mut(), 0)
         .ok_or_else(|| anyhow!("dispatch table is empty"))?;
@@ -5310,6 +5323,13 @@ fn install_unit(
             .min(per);
         let have = t.size(cx.as_context_mut());
         if want > have {
+            if have == 0 && i > 0 && per < gex_xlate::PageTable::SLOTS_PER_TABLE {
+                // (GEX_DISPATCH_TABLE_SLOTS: what a test of the later tables checks for)
+                static SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if SAID.fetch_max(i, std::sync::atomic::Ordering::Relaxed) < i {
+                    eprintln!("gex: dispatch table {i} in use");
+                }
+            }
             jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
             t.grow(cx.as_context_mut(), want - have, miss.clone())
                 .with_context(|| format!("growing dispatch table {i}"))?;
@@ -5351,7 +5371,7 @@ fn install_unit(
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cx.as_context().data().callouts.is_empty() {
-        let slots: std::collections::HashSet<u64> =
+        let slots: std::collections::HashSet<Slot> =
             unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
@@ -5426,7 +5446,7 @@ struct Callout {
     /// guest call from native Wine.
     unwound: u64,
     /// `(slot, what the slot held)` while watched.
-    slot: Option<(u64, wasmtime::Ref)>,
+    slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
     live: bool,
 }
@@ -5479,17 +5499,37 @@ pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) 
 /// nested inside them.
 const NATIVE_UNWOUND: u64 = 512;
 
-/// The table-0 slot dispatch reaches `pc` through, as the directory says now.
-fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<u64> {
+/// A dispatch slot: the table it is in and its index there. Pages are
+/// numbered in one slot space that spans every table, so a page numbered
+/// once the first table is full has its slots in a later one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Slot {
+    pub(crate) table: usize,
+    pub(crate) index: u64,
+}
+
+impl Slot {
+    /// The slot a packed directory entry names (`gex_abi::dispatch_entry`).
+    pub(crate) fn of_entry(packed: u32) -> Slot {
+        Slot { table: gex_abi::dispatch_entry_table(packed), index: gex_abi::dispatch_entry_base(packed) as u64 }
+    }
+
+    /// One of the miss stub's own slots, which every page with no directory
+    /// entry shares.
+    fn is_miss(self) -> bool {
+        self.table == 0 && self.index < gex_abi::MISS_SLOTS
+    }
+}
+
+/// The slot dispatch reaches `pc` through, as the directory says now: in
+/// the miss span when its page has no entry.
+fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<Slot> {
     let page = pc / gex_abi::DISPATCH_PAGE;
     if page >= gex_abi::dispatch_max_pages() {
         return None;
     }
     let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).ok()?;
-    if gex_abi::dispatch_entry_table(entry) != 0 {
-        return None;
-    }
-    Some(gex_abi::dispatch_index(pc, entry))
+    Some(Slot { table: gex_abi::dispatch_entry_table(entry), index: gex_abi::dispatch_index(pc, entry) })
 }
 
 /// The per-store stub a watched slot holds (`call_out`), made once.
@@ -5544,7 +5584,7 @@ fn sp_index() -> u8 {
 /// An install wrote dispatch slots `written`: a watched one no longer holds
 /// the stub, and what it now holds is what the return should run when it is
 /// not the awaited one.
-fn note_overwritten(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, written: &dyn Fn(u64) -> bool) {
+fn note_overwritten(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, written: &dyn Fn(Slot) -> bool) {
     for co in cx.as_context_mut().data_mut().callouts.iter_mut() {
         if let Some((s, _)) = &co.slot {
             if written(*s) {
@@ -5562,14 +5602,14 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
         return Ok(());
     }
     let Some(memory) = cx.as_context().data().memory.clone() else { return Ok(()) };
-    let Some(table) = cx.as_context().data().jit.as_ref().map(|j| j.tables[0]) else { return Ok(()) };
+    let Some(tables) = cx.as_context().data().jit.as_ref().map(|j| j.tables.clone()) else { return Ok(()) };
     let stub = watch_stub(cx);
-    let size = table.size(cx.as_context_mut());
+    let sizes: Vec<u64> = tables.iter().map(|t| t.size(cx.as_context_mut())).collect();
     let n = cx.as_context().data().callouts.len();
     for i in 0..n {
         let ret = cx.as_context().data().callouts[i].ret;
         // (only a page with an entry of its own: the miss slots are shared)
-        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size && s >= gex_abi::MISS_SLOTS);
+        let want = dispatch_slot_of(&memory, ret).filter(|s| !s.is_miss() && sizes.get(s.table).is_some_and(|&n| s.index < n));
         let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
         if have.is_some() && have != want {
             // The return moved: put the old slot back, unless another
@@ -5582,7 +5622,7 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
             };
             let shared = cx.as_context().data().callouts.iter().any(|c| matches!(&c.slot, Some((os, _)) if *os == s));
             if live && !shared {
-                table.set(cx.as_context_mut(), s, old)?;
+                tables[s.table].set(cx.as_context_mut(), s.index, old)?;
             }
         }
         let Some(s) = want else { continue };
@@ -5598,14 +5638,14 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
         }
         // The slot holds real content: save it for every call-out watching
         // it, and arm the stub.
-        let cur = table.get(cx.as_context_mut(), s).ok_or_else(|| anyhow!("dispatch slot {s} out of range"))?;
+        let cur = tables[s.table].get(cx.as_context_mut(), s.index).ok_or_else(|| anyhow!("dispatch slot {s:?} out of range"))?;
         for (k, co) in cx.as_context_mut().data_mut().callouts.iter_mut().enumerate() {
             if k == i || matches!(&co.slot, Some((os, _)) if *os == s) {
                 co.slot = Some((s, cur.clone()));
                 co.live = true;
             }
         }
-        table.set(cx.as_context_mut(), s, wasmtime::Ref::Func(Some(stub.clone())))?;
+        tables[s.table].set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(stub.clone())))?;
     }
     Ok(())
 }
@@ -5978,10 +6018,11 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     };
     // Unwatch: put the slot back unless an install has written over it.
     if let Some(co) = caller.data_mut().callouts.pop() {
-        if let (Some((s, old)), Some(table)) = (co.slot, caller.data().jit.as_ref().map(|j| j.tables[0])) {
+        if let Some((s, old)) = co.slot {
+            let table = caller.data().jit.as_ref().and_then(|j| j.tables.get(s.table).copied());
             let outer_watches = caller.data().callouts.iter().any(|c| matches!(&c.slot, Some((os, _)) if *os == s));
-            if co.live && !outer_watches {
-                table.set(&mut *caller, s, old)?;
+            if let (Some(table), true, false) = (table, co.live, outer_watches) {
+                table.set(&mut *caller, s.index, old)?;
             }
         }
     }
@@ -6040,13 +6081,21 @@ fn dispatch_tables(
     store: &mut Store<HostState>,
     instance: &wasmtime::Instance,
 ) -> Result<Vec<Table>> {
+    // `GEX_DISPATCH_TABLE_SLOTS=N` (debugging): each dispatch table full
+    // after N slots, so a small program numbers pages in the later tables.
+    static TABLE_SLOTS: std::sync::Once = std::sync::Once::new();
+    TABLE_SLOTS.call_once(|| {
+        if let Some(n) = std::env::var("GEX_DISPATCH_TABLE_SLOTS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            gex_xlate::PageTable::set_slots_per_table(n);
+            eprintln!("gex: dispatch tables of {} slots (GEX_DISPATCH_TABLE_SLOTS)", gex_xlate::PageTable::slots_per_table());
+        }
+    });
     let mut out = Vec::new();
     for i in 0..gex_abi::DISPATCH_TABLES {
         match instance.get_export(&mut *store, exports::dispatch_table(i)) {
             Some(Extern::Table(t)) => out.push(t),
             // A module from before there were several exports only the first.
-            // That is fine as long as nothing dispatches past it, which
-            // natively nothing does.
+            // That is fine as long as no page is numbered past it.
             _ if i > 0 => break,
             _ => bail!("translated module does not export its dispatch table"),
         }
