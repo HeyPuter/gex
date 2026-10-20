@@ -33,4 +33,18 @@ for bits in 32 64; do
         fail=1
     fi
 done
+# glibc's own if_nameindex, getifaddrs and getaddrinfo(AI_ADDRCONFIG) over the
+# route socket (../netlink-ifaces.c), 64-bit: what apt's http method resolves with.
+bin="$WORK/netlink-ifaces64"
+if gcc -O1 -o "$bin" "$HERE/../netlink-ifaces.c" 2>/dev/null; then
+    native=$("$bin"); ns=$?
+    gex=$("$GEXC" run "$bin" 2>&1); gs=$?
+    if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
+        echo "ok   glibc-netlink-ifaces"
+    else
+        echo "FAIL glibc-netlink-ifaces: native exit $ns, gex exit $gs"
+        printf '  native: %s\n  gex:    %s\n' "$native" "$gex" | head -12
+        fail=1
+    fi
+fi
 exit $fail
