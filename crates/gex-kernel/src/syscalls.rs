@@ -9,7 +9,6 @@
 //! implementation serves a host passthrough, an in-memory root and the
 //! synthetic `/proc` without the syscall layer knowing which is which.
 
-use gex_abi::GuestEndian;
 use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
@@ -211,16 +210,9 @@ pub mod nr {
 }
 
 /// Hand a system call's result back to the guest: `x0`, or `rax` (both
-/// `x(0)`), or on PowerPC r3 with an error as a positive errno and CR0.SO
-/// set (docs/ppc.md §6). `ret` is the kernel's own convention, `-errno` for
-/// a failure. Every place a result is written goes through here.
+/// `x(0)`). `ret` is the kernel's own convention, `-errno` for a failure.
+/// Every place a result is written goes through here.
 pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
-    if gex_abi::PPC {
-        let err = (-4095..0).contains(&(ret as i64));
-        let v = if err { (ret as i64).wrapping_neg() as u64 } else { ret & 0xffff_ffff };
-        m.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, v)?;
-        return m.write(ctx_addr + (ctx::PPC_CR + 3) as u64, &[err as u8]);
-    }
     m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(ret))
 }
 
@@ -997,14 +989,7 @@ pub fn clock_call(
     clock: ClockFn,
     started: u128,
 ) -> bool {
-    // A ppc32 process's clock calls are i386's but for their numbers, and
-    // in its 32-bit layouts whatever `compat` says.
-    let compat = compat || gex_abi::PPC;
-    let (raw, a0, a1) = if gex_abi::PPC {
-        let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
-        let Some(raw) = crate::ppc::i386_number(r(ctx::SYSCALL_NR)) else { return false };
-        (raw, r(ctx::SYSCALL_ARGS[0]), r(ctx::SYSCALL_ARGS[1]))
-    } else if compat {
+    let (raw, a0, a1) = if compat {
         let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
         (
             r(ctx::x(0)),
@@ -3124,10 +3109,10 @@ impl PathIo<'_> {
         // `struct statx` is 256 bytes and mostly reserved.
         let mut out = [0u8; 256];
         let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
-            o[at..at + 4].copy_from_slice(&v.to_ge_bytes())
+            o[at..at + 4].copy_from_slice(&v.to_le_bytes())
         };
         let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_ge_bytes())
+            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
         };
         // What is filled in. The caller asks for a mask and the kernel says
         // which parts it actually answered; claiming everything but the
@@ -3138,7 +3123,7 @@ impl PathIo<'_> {
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.creds.uid());
         put32(&mut out, 24, self.creds.gid());
-        out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
+        out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
         put64(&mut out, 48, st.blocks as u64);
@@ -5069,7 +5054,7 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
             | nr::SETGROUPS
             | nr::GETPPID
     ) || (n == nr::ARCH_PRCTL && gex_abi::X86)
-        || (n == nr::NOOP_OK && (gex_abi::X86 || gex_abi::PPC || compat))
+        || (n == nr::NOOP_OK && (gex_abi::X86 || compat))
 }
 
 /// The calls that make a descriptor's object or work one, needing the
@@ -5262,7 +5247,7 @@ fn clone3_args(m: &GuestMem<'_>, c: u64, compat: bool) -> Result<[u64; 6], Errno
     // tls@56 (aligned u64s).
     let w = |o: u64| m.read_u64(c + o).map_err(|_| Errno::EFAULT);
     let (flags, child_tid, parent_tid, stack, stack_size, tls) = (w(0)?, w(16)?, w(24)?, w(40)?, w(48)?, w(56)?);
-    let tls = if compat && !gex_abi::PPC && flags & clone_flags::SETTLS != 0 && tls != 0 {
+    let tls = if compat && flags & clone_flags::SETTLS != 0 && tls != 0 {
         m.read_u32(tls + 4).map(|b| b as u64).unwrap_or(0)
     } else {
         tls
@@ -5325,14 +5310,7 @@ impl ThreadMaker<'_> {
         if flags & clone_flags::SETTLS != 0 {
             // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
             // one's base into %fs.
-            // PowerPC's thread pointer is r2.
-            let slot = if gex_abi::PPC {
-                ctx::x(2)
-            } else if self.compat {
-                ctx::TPIDRRO
-            } else {
-                ctx::TPIDR
-            };
+            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
             m.write_u64(child + slot as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
@@ -5486,7 +5464,7 @@ pub fn is_signal_call(n: u64) -> bool {
 pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u64; 6]) -> SysResult {
     let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
     // The timeout is read and checked before anything is taken, as Linux
-    // does (the time64 layout: i386's and ppc's arrive widened).
+    // does (the time64 layout: i386's arrives widened).
     if a[2] != 0 {
         sigwait_timeout(m, a[2])?;
     }
@@ -5498,7 +5476,7 @@ pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u
         m.write_u32(a[1], signal)?;
         match source {
             Some(src) => {
-                let fields = a[1] + if compat || gex_abi::PPC { 12 } else { 16 };
+                let fields = a[1] + if compat { 12 } else { 16 };
                 m.write_u32(a[1] + 8, src.code as u32)?;
                 m.write_u32(fields, src.pid as u32)?;
                 m.write_u32(fields + 4, src.uid)?;
@@ -6002,7 +5980,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
 #[derive(Clone, Copy, Debug)]
 pub struct CallRegs {
     /// The number in the ABI's own numbering (an i386 process's from `x(0)`,
-    /// 32 bits; a ppc32 process's 32 bits of `SYSCALL_NR`).
+    /// 32 bits).
     pub raw: u64,
     /// The six arguments (an i386 process's 32 bits each, unextended).
     pub a: [u64; 6],
@@ -6011,9 +5989,7 @@ pub struct CallRegs {
 impl CallRegs {
     /// The canonical number (the kernel's own, AArch64's).
     pub fn canonical(&self, compat: bool) -> u64 {
-        if gex_abi::PPC {
-            crate::ppc::canonical_number(self.raw)
-        } else if compat {
+        if compat {
             crate::i386::canonical_number(self.raw)
         } else if gex_abi::X86 {
             crate::x86::canonical_number(self.raw)
@@ -6026,11 +6002,8 @@ impl CallRegs {
 /// The call in the context at `ctx_addr`: its number and arguments, where
 /// [`free_class`] and the full call read them.
 pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
-    let compat = compat && !gex_abi::PPC;
     let raw = if compat {
         m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
-    } else if gex_abi::PPC {
-        m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff
     } else {
         m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     };
@@ -6048,9 +6021,6 @@ pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
 /// [`free_class`] of a call already read ([`call_regs`] of the same
 /// context and ABI).
 pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<FreeCall> {
-    if gex_abi::PPC {
-        return free_class_ppc(m, regs);
-    }
     let CallRegs { raw, mut a } = regs;
     let Some(n) = free_number(raw, compat) else { return nosys_call(raw, compat) };
     // A `clone` that makes a process (no `CLONE_THREAD`) is the host's, and
@@ -6079,42 +6049,13 @@ pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<F
     Some(FreeCall { n, raw, a })
 }
 
-/// [`free_class`] for a ppc32 process: the number and arguments where the
-/// full call reads them (`SYSCALL_NR`, `SYSCALL_ARGS`), the class decided on
-/// the canonical number [`crate::ppc::translate`] gives, and the arguments
-/// left raw, for [`free_call`] to translate as the full call does.
-fn free_class_ppc(m: &GuestMem<'_>, regs: CallRegs) -> Option<FreeCall> {
-    let CallRegs { raw, a } = regs;
-    let n = crate::ppc::canonical_number(raw);
-    let admitted = match n {
-        crate::ppc::UNKNOWN => false,
-        // ppc32 has `alarm` and `dup2`, which the canonical (AArch64)
-        // numbering leaves out of its classes.
-        nr::ALARM | nr::DUP2 => true,
-        n => free_number(n, false) == Some(n) || is_quiet(n, true),
-    };
-    if !admitted {
-        return nosys_call(raw, false);
-    }
-    // As for the other ABIs: only a thread's `clone` is the free path's.
-    if is_thread_clone(n) {
-        use crate::ppc::raw as p;
-        if (raw != p::CLONE && raw != p::CLONE3) || thread_clone_flags(m, n, &a).is_none() {
-            return None;
-        }
-    }
-    Some(FreeCall { n, raw, a })
-}
-
 /// A call in none of the free path's classes: one that makes or replaces
 /// a process (`execve`, and `clone`, `clone3`, `fork` and `vfork` making a
 /// process), which is the host's (`None`), or one the kernel does not make,
 /// which [`free_call`] answers `ENOSYS` (its number [`NOSYS`]). Which is
 /// which is `only_the_process_calls_take_the_locked_path`'s census.
 fn nosys_call(raw: u64, compat: bool) -> Option<FreeCall> {
-    let n = if gex_abi::PPC {
-        crate::ppc::canonical_number(raw)
-    } else if compat {
+    let n = if compat {
         crate::i386::canonical_number(raw)
     } else if gex_abi::X86 {
         crate::x86::canonical_number(raw)
@@ -6164,16 +6105,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
     let mut post = crate::i386::Post::None;
-    let mut ppc_post = crate::ppc::PpcPost::None;
     if n == NOSYS || n == CLOCK_OR_ID {
         // Nothing to translate: the answer is ENOSYS, or the clock's or
         // the id's, which read the call as the guest made it.
-    } else if gex_abi::PPC {
-        // Every ppc32 call is translated, as the full call translates it.
-        let (t, p, pp) = crate::ppc::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, ctx_addr);
-        post = p;
-        ppc_post = pp;
-        debug_assert_eq!(t, n);
     } else if is_poll(n)
         || (compat
             && (matches!(
@@ -6320,7 +6254,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             // Returning from a handler restores a whole context, so it
             // does not go through "write the result and continue".
             nr::RT_SIGRETURN => {
-                let legacy = compat && !gex_abi::PPC && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
+                let legacy = compat && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
                 return match signal::sigreturn(f.signals, m, ctx_addr, compat, legacy) {
                     // The restored context is in ctx: a wasm32 program goes
                     // on there, or makes the call its handler interrupted.
@@ -6444,7 +6378,6 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
         Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, v))),
-        Ok(v) if ppc_post != crate::ppc::PpcPost::None => encode(Ok(crate::ppc::finish(ppc_post, v))),
         r => encode(r),
     };
     let _ = set_result(m, ctx_addr, ret);
@@ -7087,17 +7020,12 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
     if ids.tid == 0 {
         return false;
     }
-    // A ppc32 process's: i386's but for their numbers.
-    let raw = if gex_abi::PPC {
-        let raw = m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff;
-        let Some(raw) = crate::ppc::i386_number(raw) else { return false };
-        raw
-    } else if compat {
+    let raw = if compat {
         m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
     } else {
         m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     };
-    let v = if compat || gex_abi::PPC {
+    let v = if compat {
         use crate::i386::raw as x;
         match raw {
             x::GETPID => ids.pid,
@@ -8388,11 +8316,11 @@ impl Kernel {
         self.syscall_pc = pc;
         // An i386-ABI process has its number in eax (`x(0)`) in every build:
         // on an AArch64 build that is a native wasm32 program.
-        let nr_slot = if self.compat && !gex_abi::PPC { ctx::x(0) } else { ctx::SYSCALL_NR };
+        let nr_slot = if self.compat { ctx::x(0) } else { ctx::SYSCALL_NR };
         let raw = m
             .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = if self.compat && !gex_abi::PPC {
+        let mut a: [u64; 6] = if self.compat {
             let mut a = [0u64; 6];
             for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
                 a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
@@ -8416,19 +8344,7 @@ impl Kernel {
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
         let mut post = crate::i386::Post::None;
-        let mut ppc_post = crate::ppc::PpcPost::None;
-        let n = if gex_abi::PPC {
-            let (n, p, pp) = crate::ppc::translate(
-                raw & 0xffff_ffff,
-                &mut a,
-                m,
-                self.ctx_addr + ctx::SCRATCH as u64,
-                self.ctx_addr,
-            );
-            post = p;
-            ppc_post = pp;
-            n
-        } else if self.compat {
+        let n = if self.compat {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,
@@ -8677,7 +8593,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if (gex_abi::X86 || gex_abi::PPC || self.compat) && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || self.compat) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -8725,9 +8641,6 @@ impl Kernel {
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
-                Ok(v) if ppc_post != crate::ppc::PpcPost::None => {
-                    encode(Ok(crate::ppc::finish(ppc_post, *v)))
-                }
                 _ => encode(*r),
             },
             Err(exit) => {
@@ -9067,9 +8980,9 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
-            nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(a[0]),
+            nr::DUP2 if gex_abi::X86 || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME if gex_abi::X86 || self.compat => self.sys_time(m, a[0]),
+            nr::ALARM if gex_abi::X86 || self.compat => self.sys_alarm(a[0]),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -9919,10 +9832,10 @@ impl FdIo<'_> {
             TIOCGWINSZ => {
                 let (rows, cols, x, y) = tty.winsize();
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&rows.to_ge_bytes());
-                ws[2..4].copy_from_slice(&cols.to_ge_bytes());
-                ws[4..6].copy_from_slice(&x.to_ge_bytes());
-                ws[6..8].copy_from_slice(&y.to_ge_bytes());
+                ws[0..2].copy_from_slice(&rows.to_le_bytes());
+                ws[2..4].copy_from_slice(&cols.to_le_bytes());
+                ws[4..6].copy_from_slice(&x.to_le_bytes());
+                ws[6..8].copy_from_slice(&y.to_le_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
@@ -9931,7 +9844,7 @@ impl FdIo<'_> {
             // pane is. Everyone in the foreground group hears about it.
             TIOCSWINSZ => {
                 let ws = m.read(arg, 8)?.to_vec();
-                let g = |n: usize| u16::from_ge_bytes([ws[n], ws[n + 1]]);
+                let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
                 if tty.set_winsize((g(0), g(2), g(4), g(6))) {
                     signal_foreground(procs, tty, self.pid, crate::signal::sig::SIGWINCH);
                 }
@@ -10321,7 +10234,7 @@ impl Kernel {
         let abstract_name = path.starts_with('\0');
         if addr != 0 {
             let mut buf = vec![0u8; 110];
-            buf[..2].copy_from_slice(&AF_UNIX.to_ge_bytes());
+            buf[..2].copy_from_slice(&AF_UNIX.to_le_bytes());
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
@@ -10606,14 +10519,14 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
         m.write_u32(buf, 1000)?; // uptime
         m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
         m.write_u32(buf + 20, 1 << 19)?; // freeram
-        m.write(buf + 40, &1u16.to_ge_bytes())?; // procs
+        m.write(buf + 40, &1u16.to_le_bytes())?; // procs
         m.write_u32(buf + 52, 4096)?; // mem_unit
     } else {
         m.zero(buf, 112)?;
         m.write_u64(buf, 1000)?; // uptime
         m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
         m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write(buf + 80, &1u16.to_ge_bytes())?; // procs
+        m.write(buf + 80, &1u16.to_le_bytes())?; // procs
         m.write_u32(buf + 104, 1)?; // mem_unit
     }
     Ok(0)
@@ -10969,7 +10882,7 @@ mod tests {
     /// what it was not given.
     #[test]
     fn ident_call_answers_as_the_kernel_does() {
-        if gex_abi::PPC || gex_abi::X86 {
+        if gex_abi::X86 {
             return;
         }
         let (mut mem, mut k) = setup();
@@ -11000,9 +10913,6 @@ mod tests {
     fn clock_call_answers_as_the_kernel_does() {
         fn fixed() -> (u64, u32) {
             (1_700_000_000, 123_456_789)
-        }
-        if gex_abi::PPC {
-            return;
         }
         // The monotonic clocks' base is one per host process, set by the
         // first monotonic reading. Set it from the real clock before `fixed`
@@ -11361,13 +11271,6 @@ mod tests {
     fn set_args(m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, args: &[u64]) {
         let raw = if gex_abi::X86 {
             (0..512).rev().find(|&r| crate::x86::canonical_number(r) == n).unwrap_or(n)
-        } else if gex_abi::PPC {
-            // `_llseek` (140) also reaches LSEEK, with its own arguments.
-            if n == nr::LSEEK {
-                crate::ppc::raw::LSEEK
-            } else {
-                (0..512).rev().find(|&r| crate::ppc::canonical_number(r) == n).unwrap_or(n)
-            }
         } else {
             n
         };
@@ -11379,12 +11282,7 @@ mod tests {
     }
 
     fn ret(m: &GuestMem<'_>, ctx_addr: u64) -> i64 {
-        let v = m.read_u64(ctx_addr + ctx::SYSCALL_RET as u64).unwrap() as i64;
-        // PowerPC: a positive errno, flagged by CR0.SO (`set_result`).
-        if gex_abi::PPC && m.read(ctx_addr + (ctx::PPC_CR + 3) as u64, 1).unwrap()[0] != 0 {
-            return -v;
-        }
-        v
+        m.read_u64(ctx_addr + ctx::SYSCALL_RET as u64).unwrap() as i64
     }
 
     fn put_str(m: &mut GuestMem<'_>, addr: u64, s: &str) {
@@ -11613,8 +11511,6 @@ mod tests {
             // not one of its calls.
             let spelled = if gex_abi::X86 {
                 (0..512).any(|r| crate::x86::canonical_number(r) == n)
-            } else if gex_abi::PPC {
-                (0..512).any(|r| crate::ppc::canonical_number(r) == n)
             } else {
                 true
             };
@@ -11678,104 +11574,9 @@ mod tests {
         assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::CLONE3], "{locked:?}");
     }
 
-    /// A ppc32 process's calls (L25e): each made by the full call in one
-    /// kernel and by the free path in a twin, from the same memory, answer
-    /// alike: the same result and the same memory after. Raw ppc32 numbers
-    /// and layouts, so the translation is the one under test.
-    #[test]
-    fn ppc_calls_answer_on_the_free_path_as_the_kernel_does() {
-        if !gex_abi::PPC {
-            return;
-        }
-        use crate::ppc::raw as p;
-        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
-            let call = free_class(m, at, true)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
-            Some(free_call(&f, m, at, call))
-        }
-        let twin = || {
-            let (buf, mut k) = setup();
-            k.compat = true;
-            (buf, k)
-        };
-        let (mut ba, mut ka) = twin();
-        let (mut bb, mut kb) = twin();
-        let at = ka.ctx_addr;
-        let (path, data, buf, aux) = (0x20000u64, 0x20100u64, 0x21000u64, 0x22000u64);
-        for b in [&mut ba, &mut bb] {
-            let mut m = GuestMem::new(b);
-            put_str(&mut m, path, "/f");
-            m.write(data, b"hello").unwrap();
-            put_str(&mut m, data + 0x40, "/d");
-            // A signal set (sigset_t, 8 bytes) and a sigaction.
-            m.write_u64(aux, 1 << 9).unwrap();
-            m.write_u32(aux + 0x100, 1).unwrap();
-        }
-        let calls: Vec<(u64, [u64; 6])> = vec![
-            (p::OPEN, [path, 0o102, 0o644, 0, 0, 0]),
-            (p::WRITE, [3, data, 5, 0, 0, 0]),
-            (p::LSEEK, [3, 1, 0, 0, 0, 0]),
-            (p::READ, [3, buf, 16, 0, 0, 0]),
-            (p::_LLSEEK, [3, 0, 2, buf + 0x40, 0, 0]),
-            (p::PREAD64, [3, buf + 0x80, 4, 0, 0, 1]),
-            (p::FCNTL64, [3, 3, 0, 0, 0, 0]),
-            (p::FCNTL, [3, 1, 0, 0, 0, 0]),
-            (p::FSTAT64, [3, buf + 0x100, 0, 0, 0, 0]),
-            (p::STAT64, [path, buf + 0x200, 0, 0, 0, 0]),
-            (p::STAT64, [data + 0x40, buf + 0x300, 0, 0, 0, 0]),
-            (p::MKDIR, [data + 0x40, 0o755, 0, 0, 0, 0]),
-            (p::CHDIR, [data + 0x40, 0, 0, 0, 0, 0]),
-            (p::GETCWD, [buf + 0x400, 64, 0, 0, 0, 0]),
-            (p::DUP, [3, 0, 0, 0, 0, 0]),
-            (p::CLOSE, [4, 0, 0, 0, 0, 0]),
-            (p::DUP2, [3, 9, 0, 0, 0, 0]),
-            (p::DUP2, [3, 3, 0, 0, 0, 0]),
-            (p::DUP2, [77, 9, 0, 0, 0, 0]),
-            (p::ALARM, [0, 0, 0, 0, 0, 0]),
-            (p::CLOSE, [99, 0, 0, 0, 0, 0]),
-            (p::PIPE2, [buf + 0x500, 0, 0, 0, 0, 0]),
-            (p::EVENTFD2, [3, 0, 0, 0, 0, 0]),
-            (p::GETPPID, [0; 6]),
-            (p::GETUID, [0; 6]),
-            (p::UNAME, [buf + 0x600, 0, 0, 0, 0, 0]),
-            (p::RT_SIGPROCMASK, [0, aux, buf + 0x800, 8, 0, 0]),
-            (p::RT_SIGPROCMASK, [2, 0, buf + 0x808, 8, 0, 0]),
-            (p::RT_SIGACTION, [10, aux + 0x100, buf + 0x900, 8, 0, 0]),
-            (p::SIGALTSTACK, [0, buf + 0xa00, 0, 0, 0, 0]),
-            (p::SCHED_GETAFFINITY, [0, 128, buf + 0xb00, 0, 0, 0]),
-            (p::SET_TID_ADDRESS, [aux + 0x200, 0, 0, 0, 0, 0]),
-            (p::FUTEX, [aux + 0x300, 1, 1, 0, 0, 0]),
-            (p::UNSHARE, [0x400, 0, 0, 0, 0, 0]),
-            (p::UNSHARE, [0, 0, 0, 0, 0, 0]),
-            (p::KILL, [ka.pid as u64, 0, 0, 0, 0, 0]),
-            (p::MMAP, [0, 0x1000, 3, 0x22, !0u32 as u64, 0]),
-            (p::IOCTL, [3, 0x4004_667f, buf + 0xc00, 0, 0, 0]),
-        ];
-        for (n, a) in calls {
-            let mut ma = GuestMem::new(&mut ba);
-            let mut mb = GuestMem::new(&mut bb);
-            for m in [&mut ma, &mut mb] {
-                m.write_u64(at + ctx::SYSCALL_NR as u64, n).unwrap();
-                for (i, v) in a.iter().enumerate() {
-                    m.write_u64(at + ctx::SYSCALL_ARGS[i] as u64, *v).unwrap();
-                }
-            }
-            ka.syscall(&mut ma, 0);
-            let o = free(&kb, &mut mb, at);
-            assert!(matches!(o, Some(FreeOutcome::Done(Delivery::None))), "ppc call {n} on the free path");
-            assert_eq!(ret(&mb, at), ret(&ma, at), "ppc call {n} {a:x?}: result");
-            assert!(ma.read(0x20000, 0x20000).unwrap() == mb.read(0x20000, 0x20000).unwrap(), "ppc call {n} {a:x?}: memory");
-        }
-    }
 
     #[test]
     fn free_quiet_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11844,11 +11645,6 @@ mod tests {
     /// (a stat's owner), and a fork's ids are its own.
     #[test]
     fn free_cred_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12031,11 +11827,6 @@ mod tests {
     /// own. `unshare(CLONE_FS)` gives the caller a fs_struct of its own.
     #[test]
     fn thread_own_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
         k.enter_thread(&main);
@@ -12188,11 +11979,6 @@ mod tests {
     /// is EINVAL both ways.
     #[test]
     fn thread_clone_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         use std::sync::atomic::Ordering::SeqCst;
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
@@ -12429,7 +12215,7 @@ mod tests {
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, at), SIGUSR1 as i64);
         assert_eq!(m.read_u32(info_at + 8).unwrap() as i32, signal::SI_TKILL);
-        assert_eq!(m.read_u32(info_at + if gex_abi::PPC { 12 } else { 16 }).unwrap(), k.pid as u32);
+        assert_eq!(m.read_u32(info_at + 16).unwrap(), k.pid as u32);
 
         // Pending already: answered at once, no park. A bad timeout: EINVAL.
         set_args(&mut m, at, nr::KILL, &[pid, SIGUSR1]);
@@ -12542,11 +12328,6 @@ mod tests {
 
     #[test]
     fn free_fd_object_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12652,11 +12433,6 @@ mod tests {
 
     #[test]
     fn free_fd_misc_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12777,11 +12553,6 @@ mod tests {
 
     #[test]
     fn free_own_state_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12873,11 +12644,6 @@ mod tests {
 
     #[test]
     fn free_call_answers_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -13061,11 +12827,6 @@ mod tests {
     /// or answer as the full call (docs/kernel-locking.md §5.2 step 5).
     #[test]
     fn free_sleep_answers_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -13436,11 +13197,6 @@ mod tests {
     /// `MSG_PEEK` leaves the bytes for the next read.
     #[test]
     fn recvmsg_flags() {
-        // A 32-bit guest's msghdr is not read yet (i386's gap too), so the
-        // call is ENOSYS there.
-        if gex_abi::PPC {
-            return;
-        }
         const MSG_PEEK: u64 = 0x2;
         const MSG_DONTWAIT: u64 = 0x40;
         let (mut buf, mut k) = setup();
@@ -13489,9 +13245,6 @@ mod tests {
     /// iovecs fills them in order rather than peeking the same bytes twice.
     #[test]
     fn recvmsg_iovecs() {
-        if gex_abi::PPC {
-            return;
-        }
         const MSG_PEEK: u64 = 0x2;
         const MSG_DONTWAIT: u64 = 0x40;
         let (mut buf, mut k) = setup();
@@ -13698,9 +13451,6 @@ mod tests {
     /// `ugetrlimit`'s 32-bit struct and the narrow `sysinfo`.
     #[test]
     fn free_i386_fd_misc_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -13776,9 +13526,6 @@ mod tests {
 
     #[test]
     fn free_i386_positioned_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -13944,9 +13691,6 @@ mod tests {
     fn a_tmpfile_name_goes_with_its_last_descriptor() {
         // Closed through the lock-free path, which has no kernel: the name
         // goes with the description (`OpenFile`'s `Drop`).
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -14044,9 +13788,6 @@ mod tests {
     /// `ELOOP`. And `fcntl(F_GETFL)` answers in that spelling too.
     #[test]
     fn open_flags_are_the_guests_spelling() {
-        if gex_abi::PPC {
-            return;
-        }
         let g = |f: u64| oflags::to_guest(f, false);
         for lock_free in [true, false] {
             let (_, mut k) = setup();
@@ -14286,9 +14027,6 @@ mod tests {
     /// removed `getcwd` and relative lookups say `ENOENT`, as on Linux.
     #[test]
     fn a_working_directory_follows_its_renames() {
-        if gex_abi::PPC {
-            return;
-        }
         let mut seen = Vec::new();
         for lock_free in [true, false] {
             let (_, mut k) = setup();
@@ -14357,9 +14095,6 @@ mod tests {
     /// `AT_FDCWD` sign-extended.
     #[test]
     fn free_i386_path_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         use crate::i386::raw;
         let mut seen = Vec::new();
         for lock_free in [true, false] {
@@ -14467,9 +14202,6 @@ mod tests {
     /// the file as it was before the writes.
     #[test]
     fn a_new_mapping_reads_what_a_shared_one_wrote() {
-        if gex_abi::PPC {
-            return;
-        }
         use crate::mem::{flags as mf, prot};
         let (_, mut k) = setup();
         let mut buf = vec![0u8; 0x0708_0000];
@@ -14497,11 +14229,6 @@ mod tests {
     /// kernels, the same calls, one through each path.
     #[test]
     fn free_mapping_calls_answer_as_the_kernel_does() {
-        // Its data is in the AArch64 layouts, little-endian; ppc32's free
-        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
-        if gex_abi::PPC {
-            return;
-        }
         use crate::mem::{flags as mf, prot};
         let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
         let mut seen = Vec::new();
@@ -14575,9 +14302,6 @@ mod tests {
     /// addresses above 2 GiB not sign-extended.
     #[test]
     fn free_i386_mapping_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         use crate::i386::raw;
         use crate::mem::{flags as mf, prot};
         let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
@@ -14624,9 +14348,6 @@ mod tests {
 
     #[test]
     fn free_i386_fd_table_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);

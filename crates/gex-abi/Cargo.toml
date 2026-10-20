@@ -12,6 +12,3 @@ description = "Shared layout contract between gex's compiler, kernel and runtime
 # choice because the instruction alignment (dispatch slot granularity) and the
 # syscall register convention are constants the emitter, kernel and shims bake in.
 x86 = []
-# `ppc` selects 32-bit big-endian PowerPC (docs/ppc.md). Mutually exclusive
-# with `x86`.
-ppc = []

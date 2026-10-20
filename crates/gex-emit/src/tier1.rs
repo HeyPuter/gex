@@ -334,15 +334,6 @@ fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64) -> Vec<(u64, u
 }
 
 
-/// `GEX_BSWAP_BALLAST`: extra byte-swap pairs per swap, for pricing the
-/// swaps of a big-endian guest (see `Emitter::emit_bswap`). Zero normally.
-fn bswap_ballast() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("GEX_BSWAP_BALLAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
-    })
-}
-
 /// What a misaligned locked access does (`Emitter::emit_misaligned_atomic`),
 /// with the locals holding its operands.
 #[derive(Clone, Copy)]
@@ -1245,18 +1236,6 @@ impl<'a> Emitter<'a> {
             GuestReg::X87Tags => ctx::X87_TAGS,
             // Not a slot: read as the context's own address. Never stored.
             GuestReg::CtxAddr => 0,
-            // PowerPC: a GPR is the low word of the 64-bit slot (the context
-            // is little-endian), an FPR the low eight bytes of a vector slot.
-            GuestReg::R(n) => ctx::x(n),
-            GuestReg::F(n) => ctx::f(n),
-            GuestReg::Lr => ctx::PPC_LR,
-            GuestReg::Ctr => ctx::PPC_CTR,
-            GuestReg::Cr(n) => ctx::PPC_CR + n as usize,
-            GuestReg::So => ctx::PPC_SO,
-            GuestReg::Ov => ctx::PPC_OV,
-            GuestReg::Ca => ctx::PPC_CA,
-            GuestReg::XerBc => ctx::PPC_XER_BC,
-            GuestReg::Fpscr => ctx::PPC_FPSCR,
         }) as u32
     }
 
@@ -1526,24 +1505,6 @@ impl<'a> Emitter<'a> {
         // nothing, and the engine traps any bulk address past the end.
         let on = null_guard_on();
         let null_guard = on && biased && !self.is_ctx(addr);
-        // A 32-bit guest's effective address (PowerPC): already wrapped by the
-        // guest's own arithmetic, and below 2^32, so it needs no guard -- an
-        // address at or past `GUEST_LIMIT` is past the end of memory and traps
-        // there. A small non-negative displacement rides as the static offset
-        // (docs/ppc.md §2.4); anything else is added first, wrapping.
-        if gex_abi::PPC && self.type_of(addr) == Ty::I32 {
-            if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
-                self.f.i32_const((c as u32).wrapping_add(offset as u32) as i32);
-                return 0;
-            }
-            self.push(addr);
-            if (0..=0xffff).contains(&offset) {
-                return offset as u32;
-            }
-            self.f.i32_const(offset as i32);
-            self.f.byte(0x6a); // i32.add
-            return 0;
-        }
         // A memory64 guest memory (docs/mem64.md) takes the guest address
         // as it stands: past the end of the memory, the engine's own check
         // traps, which is the SIGSEGV the guard below exists to produce. The
@@ -3155,23 +3116,11 @@ impl<'a> Emitter<'a> {
     }
 
     /// Reinterpret the integer bit pattern on top of the stack as a float.
-    /// Reverse the bytes of the value on the stack (docs/ppc.md §2.2). Wasm
+    /// Reverse the bytes of the value on the stack. Wasm
     /// has no byte swap: 32 bits is two rotates, two masks and an or; 16 bits
     /// two shifts, two masks and an or; 64 bits a `pshufb`-shaped swizzle,
     /// which beats the eleven-op scalar sequence and its two 64-bit masks.
     fn emit_bswap(&mut self, op: UnOp, ty: Ty) {
-        // Measurement only: `GEX_BSWAP_BALLAST=N` emits every swap 2N more
-        // times, which leaves the value right (an even number of extra
-        // swaps) and prices one swap as half the time each N adds. A guest
-        // without swaps cannot run at all -- its argv and every initialised
-        // word would read backwards -- so a no-swap build is no baseline.
-        for _ in 0..2 * bswap_ballast() {
-            self.emit_bswap_once(op, ty);
-        }
-        self.emit_bswap_once(op, ty);
-    }
-
-    fn emit_bswap_once(&mut self, op: UnOp, ty: Ty) {
         const I32_AND: u8 = 0x71;
         const I32_OR: u8 = 0x72;
         const I32_SHL: u8 = 0x74;
@@ -3219,7 +3168,7 @@ impl<'a> Emitter<'a> {
             }
             (UnOp::Bswap16, Ty::I64) => {
                 self.f.byte(code::I32_WRAP_I64);
-                self.emit_bswap_once(UnOp::Bswap16, Ty::I32);
+                self.emit_bswap(UnOp::Bswap16, Ty::I32);
                 self.f.byte(code::I64_EXTEND_I32_U);
             }
             _ => unreachable!("byte swap of a {ty:?}"),

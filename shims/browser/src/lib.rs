@@ -7653,7 +7653,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let regs = gex_kernel::syscalls::call_regs(&gm, base, compat);
         // The number slot itself, which `LAST_SYSCALL` and the stub entry's
         // check read raw: an i386-ABI process's number is in `x(0)`.
-        let slot = if compat || gex_abi::PPC {
+        let slot = if compat {
             gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX)
         } else {
             regs.raw
@@ -7694,13 +7694,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // the number canonicalised so the names below match on x86-64 too.
         let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
-        let n = if gex_abi::X86 {
-            gex_kernel::x86::canonical_number(n)
-        } else if gex_abi::PPC {
-            gex_kernel::ppc::canonical_number(n)
-        } else {
-            n
-        };
+        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `openat`'s path is arg 1, the rest
@@ -7740,8 +7734,6 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let ret = if gex_abi::X86 {
             gm.read_u64(gm.read_u64(base + ctx::SP as u64).unwrap_or(0))
                 .unwrap_or(0)
-        } else if gex_abi::PPC {
-            gm.read_u32(base + ctx::PPC_LR as u64).unwrap_or(0) as u64
         } else {
             gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
         };
@@ -7857,13 +7849,11 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // question wants the canonical one.
         // An i386-ABI process (W3's Wine) numbers its calls the i386 way, with
         // the number in `x(0)` in every build.
-        let canonical = if h.kernel.compat && !gex_abi::PPC {
+        let canonical = if h.kernel.compat {
             let raw = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(!0);
             gex_kernel::i386::canonical_number(raw)
         } else if gex_abi::X86 {
             gex_kernel::x86::canonical_number(nr)
-        } else if gex_abi::PPC {
-            gex_kernel::ppc::canonical_number(nr)
         } else {
             nr
         };
@@ -10006,9 +9996,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
             let _ = gm.write_u64(ctx_addr + ctx::SP as u64, sp as u64);
         }
         if tls != 0 {
-            // PowerPC's thread pointer is r2.
-            let slot = if gex_abi::PPC { ctx::x(2) } else { ctx::TPIDR };
-            let _ = gm.write_u64(ctx_addr + slot as u64, tls as u64);
+            let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls as u64);
         }
         // A monitor is per-thread and the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
@@ -10880,9 +10868,6 @@ const SNAP_SYSCALL: u64 = 0x6765_7801;
 /// takes `_dl_fini` in `rdx`; `rax` is free.)
 const SNAP_STUB_CODE: &[u8] = if gex_abi::X86 {
     &[0xb8, 0x01, 0x78, 0x65, 0x67, 0x0f, 0x05]
-} else if gex_abi::PPC {
-    // lis 0, 0x6765 ; ori 0, 0, 0x7801 ; sc
-    &[0x3c, 0x00, 0x67, 0x65, 0x60, 0x00, 0x78, 0x01, 0x44, 0x00, 0x00, 0x02]
 } else {
     &[0x28, 0x00, 0x8f, 0xd2, 0xa8, 0xec, 0xac, 0xf2, 0x01, 0x00, 0x00, 0xd4]
 };
@@ -13673,7 +13658,7 @@ pub extern "C" fn gex_set_compat(on: i32) {
     // `ctx::SP`; an i386-ABI process's is `esp` (`ctx::sp_slot`), which on
     // an AArch64 build is another slot (its i386-ABI processes are wasm32
     // programs: posix_spawn's child starts on that stack).
-    if on != 0 && !gex_abi::X86 && !gex_abi::PPC {
+    if on != 0 && !gex_abi::X86 {
         compat_stack(my_ctx());
     }
     gex_xlate::set_compat(on != 0);
@@ -13932,20 +13917,6 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
              run the ejected project natively",
             pc as u64
         );
-    }
-    // PowerPC: a non-default FPSCR rounding mode, which wasm arithmetic cannot
-    // honour, and mffs under GEX_FP_STRICT=1 (docs/ppc.md §8). Both fail
-    // loudly, as an illegal instruction would.
-    if gex_abi::PPC
-        && ((reg == gex_kernel::ppc::SYSREG_FPSCR_RN && val != 0)
-            || reg == gex_kernel::ppc::SYSREG_MFFS_STRICT)
-    {
-        trace_line(&format!(
-            "gex: {} at pc={pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
-            if reg == gex_kernel::ppc::SYSREG_MFFS_STRICT { "mffs under GEX_FP_STRICT" } else { "non-default FP rounding mode" },
-        ));
-        set_exit(128 + 4);
-        trap();
     }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.

@@ -66,7 +66,6 @@ pub mod unix;
 pub use gex_f80 as f80;
 pub mod x86;
 pub mod i386;
-pub mod ppc;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
@@ -208,57 +207,33 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
-    // The typed accessors read and write guest memory in the guest's byte
-    // order, and the runtime's own structures below
-    // `gex_abi::GUEST_ORDER_FROM` (thread contexts, the kernel's scratch, the
-    // dispatch directory) in the host's: see `gex_abi::is_guest_be`. With a
-    // little-endian guest both are little-endian and these are the plain
-    // conversions.
+    // The typed accessors: guest memory is little-endian.
 
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
         let b: [u8; 8] = self.read(addr, 8)?.try_into().unwrap();
-        Ok(if gex_abi::is_guest_be(addr) { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) })
+        Ok(u64::from_le_bytes(b))
     }
 
     pub fn write_u64(&mut self, addr: u64, v: u64) -> Result<(), Errno> {
-        if gex_abi::is_guest_be(addr) {
-            self.write(addr, &v.to_be_bytes())
-        } else {
-            self.write(addr, &v.to_le_bytes())
-        }
+        self.write(addr, &v.to_le_bytes())
     }
 
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
         let b: [u8; 4] = self.read(addr, 4)?.try_into().unwrap();
-        Ok(if gex_abi::is_guest_be(addr) { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
+        Ok(u32::from_le_bytes(b))
     }
 
     pub fn write_u32(&mut self, addr: u64, v: u32) -> Result<(), Errno> {
-        if gex_abi::is_guest_be(addr) {
-            self.write(addr, &v.to_be_bytes())
-        } else {
-            self.write(addr, &v.to_le_bytes())
-        }
+        self.write(addr, &v.to_le_bytes())
     }
 
     /// 64 bits of a guest bitmap made of C `long`s: a `sigset_t`, an
-    /// `fd_set` word. Bit `n` is signal `n + 1` or descriptor `n`. On a
-    /// 64-bit or little-endian guest that is one `u64`; a 32-bit big-endian
-    /// guest stores two words, the one holding bits 0-31 first.
+    /// `fd_set` word. Bit `n` is signal `n + 1` or descriptor `n`.
     pub fn read_bits64(&self, addr: u64) -> Result<u64, Errno> {
-        if gex_abi::BIG_ENDIAN {
-            let lo = self.read_u32(addr)? as u64;
-            let hi = self.read_u32(addr + 4)? as u64;
-            return Ok(lo | (hi << 32));
-        }
         self.read_u64(addr)
     }
 
     pub fn write_bits64(&mut self, addr: u64, v: u64) -> Result<(), Errno> {
-        if gex_abi::BIG_ENDIAN {
-            self.write_u32(addr, v as u32)?;
-            return self.write_u32(addr + 4, (v >> 32) as u32);
-        }
         self.write_u64(addr, v)
     }
 
@@ -306,29 +281,11 @@ impl<'a> GuestMem<'a> {
 mod tests {
     use super::*;
 
-    /// The byte-order rule (docs/ppc.md §3): the runtime's own structures
-    /// below `GUEST_ORDER_FROM` are little-endian on every guest, guest
-    /// memory above it is in the guest's order.
+    /// No guest mapping is ever placed in the runtime's low region (thread
+    /// contexts, the kernel's scratch, the dispatch directory).
     #[test]
-    fn typed_accessors_follow_the_guest_order_line() {
-        let line = gex_abi::GUEST_ORDER_FROM;
-        let mut buf = vec![0u8; line as usize + 0x100];
-        let mut m = GuestMem::new(&mut buf);
-        m.write_u32(0x1000, 0x1122_3344).unwrap();
-        m.write_u32(line, 0x1122_3344).unwrap();
-        assert_eq!(m.read(0x1000, 4).unwrap(), &[0x44, 0x33, 0x22, 0x11]);
-        let above = if gex_abi::BIG_ENDIAN { [0x11, 0x22, 0x33, 0x44] } else { [0x44, 0x33, 0x22, 0x11] };
-        assert_eq!(m.read(line, 4).unwrap(), &above);
-        assert_eq!(m.read_u32(line).unwrap(), 0x1122_3344);
-        m.write_u64(line + 8, 0x0102_0304_0506_0708).unwrap();
-        assert_eq!(m.read_u64(line + 8).unwrap(), 0x0102_0304_0506_0708);
-    }
-
-    /// No guest mapping is ever placed below the line, so no guest-visible
-    /// structure can be read with the runtime's byte order.
-    #[test]
-    fn nothing_guest_visible_lives_below_the_order_line() {
-        let line = gex_abi::GUEST_ORDER_FROM;
+    fn nothing_guest_visible_lives_in_the_runtime_region() {
+        let line = gex_abi::DISPATCH_DIR_END;
         assert!(mem::hits_runtime(0x1000, 0x2000));
         assert!(mem::hits_runtime(line - 0x1000, line));
         assert!(!mem::hits_runtime(line, line + 0x1000));

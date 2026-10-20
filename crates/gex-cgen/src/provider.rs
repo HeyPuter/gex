@@ -110,14 +110,13 @@ pub enum Arch {
 
 /// The provider architecture for an image of this build's guest: i386 or
 /// x86-64 on an x86 build, aarch64's 64-bit images on an aarch64 build
-/// (its 32-bit ones are wasm32 programs, which have no providers); none on
-/// a PPC build.
+/// (its 32-bit ones are wasm32 programs, which have no providers).
 pub fn guest_arch(class32: bool) -> Option<Arch> {
-    match (gex_abi::X86, gex_abi::PPC, class32) {
-        (true, _, true) => Some(Arch::I386),
-        (true, _, false) => Some(Arch::X86_64),
-        (false, false, false) => Some(Arch::Aarch64),
-        _ => None,
+    match (gex_abi::X86, class32) {
+        (true, true) => Some(Arch::I386),
+        (true, false) => Some(Arch::X86_64),
+        (false, false) => Some(Arch::Aarch64),
+        (false, true) => None,
     }
 }
 

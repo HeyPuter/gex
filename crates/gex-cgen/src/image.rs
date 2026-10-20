@@ -156,7 +156,6 @@ pub fn abi_fingerprint() -> String {
     let mut s = crate::header::header();
     let named: &[(&str, u64)] = &[
         ("X86", gex_abi::X86 as u64),
-        ("PPC", gex_abi::PPC as u64),
         ("DISPATCH_SHIFT", gex_abi::DISPATCH_SHIFT as u64),
         ("INST_ALIGN_SHIFT", gex_abi::INST_ALIGN_SHIFT as u64),
         ("INST_ALIGN", gex_abi::INST_ALIGN),
@@ -196,20 +195,12 @@ pub fn abi_fingerprint() -> String {
         ("ctx::X87_CW", ctx::X87_CW as u64),
         ("ctx::X87_SW", ctx::X87_SW as u64),
         ("ctx::X87_TAGS", ctx::X87_TAGS as u64),
-        ("ctx::PPC_CR", ctx::PPC_CR as u64),
-        ("ctx::PPC_LR", ctx::PPC_LR as u64),
-        ("ctx::PPC_CTR", ctx::PPC_CTR as u64),
-        ("ctx::PPC_SO", ctx::PPC_SO as u64),
-        ("ctx::PPC_OV", ctx::PPC_OV as u64),
-        ("ctx::PPC_CA", ctx::PPC_CA as u64),
-        ("ctx::PPC_XER_BC", ctx::PPC_XER_BC as u64),
-        ("ctx::PPC_FPSCR", ctx::PPC_FPSCR as u64),
     ];
     for (n, v) in named {
         s.push_str(&format!("{n}={v}\n"));
     }
     for i in 0..32u8 {
-        s.push_str(&format!("ctx::x({i})={} ctx::v({i})={} ctx::f({i})={}\n", ctx::x(i), ctx::v(i), ctx::f(i)));
+        s.push_str(&format!("ctx::x({i})={} ctx::v({i})={}\n", ctx::x(i), ctx::v(i)));
     }
     s
 }

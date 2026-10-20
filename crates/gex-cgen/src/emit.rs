@@ -122,19 +122,6 @@ pub(crate) fn reg_name(r: GuestReg) -> String {
         GuestReg::X87Sw => "r_x87sw".into(),
         GuestReg::X87Tags => "r_x87tags".into(),
         GuestReg::CtxAddr => "r_ctxaddr".into(),
-        // PowerPC (docs/ppc.md §4). Function recovery refuses 32-bit images,
-        // so no PowerPC function reaches the C tier yet; the names and slots
-        // are here so it can.
-        GuestReg::R(n) => format!("r_r{n}"),
-        GuestReg::Lr => "r_lr".into(),
-        GuestReg::Ctr => "r_ctr".into(),
-        GuestReg::Cr(n) => format!("f_cr{n}"),
-        GuestReg::So => "f_so".into(),
-        GuestReg::Ov => "f_ov".into(),
-        GuestReg::Ca => "f_ca".into(),
-        GuestReg::XerBc => "r_xerbc".into(),
-        GuestReg::Fpscr => "r_fpscr".into(),
-        GuestReg::F(n) => format!("r_f{n}"),
     }
 }
 
@@ -163,16 +150,6 @@ pub(crate) fn reg_offset(r: GuestReg) -> usize {
         GuestReg::X87Sw => ctx::X87_SW,
         GuestReg::X87Tags => ctx::X87_TAGS,
         GuestReg::CtxAddr => 0,
-        GuestReg::R(n) => ctx::x(n),
-        GuestReg::F(n) => ctx::f(n),
-        GuestReg::Lr => ctx::PPC_LR,
-        GuestReg::Ctr => ctx::PPC_CTR,
-        GuestReg::Cr(n) => ctx::PPC_CR + n as usize,
-        GuestReg::So => ctx::PPC_SO,
-        GuestReg::Ov => ctx::PPC_OV,
-        GuestReg::Ca => ctx::PPC_CA,
-        GuestReg::XerBc => ctx::PPC_XER_BC,
-        GuestReg::Fpscr => ctx::PPC_FPSCR,
     }
 }
 

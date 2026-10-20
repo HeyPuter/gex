@@ -151,9 +151,6 @@ mod tests {
     /// `execve`'s plan places what `load_program` places, from the files.
     #[test]
     fn a_plan_is_the_program_without_its_bytes() {
-        if gex_abi::PPC {
-            return;
-        }
         let exe = minimal_elf(3, Some("/interp"));
         let interp = minimal_elf(3, None);
         let file = |path: &str| match path {
@@ -192,10 +189,6 @@ mod tests {
 
     #[test]
     fn a_static_program_needs_no_interpreter() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         // A minimal ET_EXEC header with one PT_LOAD.
         let img = minimal_elf(2, None);
         let p = load_program(&img, 0x2000_0000, 0x3000_0000, &|_| None).unwrap();
@@ -206,10 +199,6 @@ mod tests {
 
     #[test]
     fn a_missing_interpreter_is_reported_by_name() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         let img = minimal_elf(3, Some("/lib/ld-musl-aarch64.so.1"));
         let err = load_program(&img, 0x2000_0000, 0x3000_0000, &|_| None).unwrap_err();
         assert_eq!(
@@ -220,10 +209,6 @@ mod tests {
 
     #[test]
     fn the_interpreter_is_entered_not_the_program() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         let exe = minimal_elf(3, Some("/interp"));
         let interp = minimal_elf(3, None);
         let p = load_program(&exe, 0x2000_0000, 0x3000_0000, &|path| {

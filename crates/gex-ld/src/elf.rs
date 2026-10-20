@@ -8,9 +8,6 @@ const ELFCLASS64: u8 = 2;
 /// `e_machine` of an i386 executable: the 32-bit program an x86-64 guest
 /// kernel runs in compatibility mode.
 const EM_386: u16 = 3;
-const ELFDATA2MSB: u8 = 2;
-/// 32-bit PowerPC, the only image the `ppc` build loads.
-const EM_PPC: u16 = 20;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -404,8 +401,6 @@ pub struct Image {
 
 struct Reader<'a> {
     data: &'a [u8],
-    /// A big-endian (`ELFDATA2MSB`) image: PowerPC's.
-    be: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -415,17 +410,17 @@ impl<'a> Reader<'a> {
     fn u16(&self, off: usize) -> Result<u16, LoadError> {
         let b = self.data.get(off..off + 2).ok_or(LoadError::TooShort)?;
         let b = [b[0], b[1]];
-        Ok(if self.be { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) })
+        Ok(u16::from_le_bytes(b))
     }
     fn u32(&self, off: usize) -> Result<u32, LoadError> {
         let b = self.data.get(off..off + 4).ok_or(LoadError::TooShort)?;
         let b = [b[0], b[1], b[2], b[3]];
-        Ok(if self.be { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
+        Ok(u32::from_le_bytes(b))
     }
     fn u64(&self, off: usize) -> Result<u64, LoadError> {
         let b = self.data.get(off..off + 8).ok_or(LoadError::TooShort)?;
         let b = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-        Ok(if self.be { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) })
+        Ok(u64::from_le_bytes(b))
     }
     fn slice(&self, off: usize, len: usize) -> Result<&'a [u8], LoadError> {
         self.data.get(off..off + len).ok_or(LoadError::TooShort)
@@ -476,25 +471,22 @@ fn headers(r: &Reader, pie_base: u64) -> Result<Headers, LoadError> {
     if &data[0..4] != b"\x7fELF" {
         return Err(LoadError::NotElf);
     }
-    let order = if gex_abi::BIG_ENDIAN { ELFDATA2MSB } else { ELFDATA2LSB };
-    if r.u8(5)? != order {
+    if r.u8(5)? != ELFDATA2LSB {
         return Err(LoadError::NotElf64Le);
     }
     // A 32-bit i386 image runs in the same process model as everything
     // else, on the i386 ABI: on the x86-64 guest any i386 program, in
     // compatibility mode; on the AArch64 guest only a native wasm32 program
     // (an i386 container around a wasm module, checked by the caller), which
-    // has no i386 code to translate. The PowerPC guest is 32-bit only.
+    // has no i386 code to translate.
     let class32 = match r.u8(4)? {
-        ELFCLASS64 if !gex_abi::PPC => false,
+        ELFCLASS64 => false,
         ELFCLASS32 => true,
         _ => return Err(LoadError::NotElf64Le),
     };
     let e_type = r.u16(16)?;
     let machine = r.u16(18)?;
-    let want = if gex_abi::PPC {
-        EM_PPC
-    } else if class32 {
+    let want = if class32 {
         EM_386
     } else {
         EM_GUEST
@@ -700,7 +692,7 @@ pub fn plan(
     // headers lie further in is read again, that far.
     let mut head = read(0, 4096)?;
     let need = {
-        let r = Reader { data: &head, be: gex_abi::BIG_ENDIAN };
+        let r = Reader { data: &head };
         let class32 = r.u8(4)? == ELFCLASS32;
         let (phoff, phentsize, phnum) = if class32 {
             (r.u32(28)? as usize, r.u16(42)? as usize, r.u16(44)? as usize)
@@ -712,7 +704,7 @@ pub fn plan(
     if need > head.len() && need <= 1 << 20 {
         head = read(0, need)?;
     }
-    let r = Reader { data: &head, be: gex_abi::BIG_ENDIAN };
+    let r = Reader { data: &head };
     let h = headers(&r, pie_base)?;
     let interp = match h.interp {
         Some((off, len)) => {
@@ -726,7 +718,7 @@ pub fn plan(
     let image = h.image(h.loads.iter().map(|(s, _)| s.clone()).collect(), interp);
     // An i386 image on a guest that runs no i386 code is only acceptable as
     // a native wasm32 program's container: its magic, 0x40 below the entry.
-    if image.class32 && !gex_abi::X86 && !gex_abi::PPC {
+    if image.class32 && !gex_abi::X86 {
         let at = image.entry.wrapping_sub(0x40);
         let magic = image.segments.iter().zip(&ranges).find_map(|(s, (o, l))| {
             (at >= s.vaddr && at + 8 <= s.vaddr + l).then(|| read(o + (at - s.vaddr), 8).ok())?
@@ -743,11 +735,7 @@ pub fn plan(
 /// `pie_base` is the load bias used for `ET_DYN` images; `ET_EXEC` images are
 /// placed at their own `p_vaddr`s.
 pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
-    // The PowerPC guest is big-endian throughout; every other one is little.
-    let r = Reader {
-        data,
-        be: gex_abi::BIG_ENDIAN,
-    };
+    let r = Reader { data };
     let h = headers(&r, pie_base)?;
     let interp = h.interp.map(|(off, _)| r.cstr(off));
     let mut segments = Vec::with_capacity(h.loads.len());
@@ -760,7 +748,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     let (e_shoff, e_shentsize, e_shnum) = (h.e_shoff, h.e_shentsize, h.e_shnum);
     let mut image = h.image(segments, interp);
 
-    if class32 && !gex_abi::X86 && !gex_abi::PPC && !image.is_wasm32() {
+    if class32 && !gex_abi::X86 && !image.is_wasm32() {
         return Err(LoadError::NotAarch64);
     }
 
@@ -783,9 +771,6 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if !class32 {
         image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
         image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
-    } else if gex_abi::PPC {
-        image.symbols = read_symbols32(&r, e_shoff, e_shentsize, e_shnum, bias);
-        image.code = read_code_sections32(&r, e_shoff, e_shentsize, e_shnum, bias);
     } else {
         // i386: the function symbols, for function recovery (the function
         // tier) and names. The code sections stay unread, so what tier-1
@@ -1291,42 +1276,6 @@ fn read_code_sections(
     merged
 }
 
-/// [`read_code_sections`] for an `ELFCLASS32` image (`Elf32_Shdr`).
-fn read_code_sections32(
-    r: &Reader<'_>,
-    e_shoff: usize,
-    e_shentsize: usize,
-    e_shnum: usize,
-    bias: u64,
-) -> Vec<(u64, u64)> {
-    const SHF_EXECINSTR: u32 = 0x4;
-    const SHT_NOBITS: u32 = 8;
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    if e_shoff == 0 || e_shnum == 0 {
-        return out;
-    }
-    for i in 0..e_shnum {
-        let off = e_shoff + i * e_shentsize;
-        let (Ok(sh_type), Ok(sh_flags), Ok(sh_addr), Ok(sh_size)) =
-            (r.u32(off + 4), r.u32(off + 8), r.u32(off + 12), r.u32(off + 20))
-        else {
-            continue;
-        };
-        if sh_flags & SHF_EXECINSTR == 0 || sh_type == SHT_NOBITS || sh_size == 0 || sh_addr == 0 {
-            continue;
-        }
-        out.push((sh_addr as u64 + bias, (sh_addr + sh_size) as u64 + bias));
-    }
-    out.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in out {
-        match merged.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
-    }
-    merged
-}
 
 /// [`read_symbols`] for an `ELFCLASS32` image (`Elf32_Shdr`, `Elf32_Sym`).
 fn read_symbols32(
@@ -1480,10 +1429,6 @@ mod tests {
     /// be loaded at zero to measure it: nothing is placed there.
     #[test]
     fn a_relocatable_image_loads_at_any_base() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         let so = test_image(ET_DYN, 0);
         assert_eq!(load(&so, 0).unwrap().brk, 0x1000);
         assert_eq!(load(&so, gex_abi::MMAP_BOTTOM).unwrap().bias, gex_abi::MMAP_BOTTOM);
@@ -1493,10 +1438,6 @@ mod tests {
     /// the contexts and dispatch directory: refused, not loaded over them.
     #[test]
     fn a_fixed_image_in_the_runtime_region_is_refused() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         assert_eq!(
             load(&exec_at(0x10000), 0).unwrap_err(),
             LoadError::InRuntimeRegion { vaddr: 0x10000, size: 0x1000 }

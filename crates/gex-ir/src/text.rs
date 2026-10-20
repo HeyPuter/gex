@@ -52,16 +52,6 @@ pub fn reg_name(r: GuestReg) -> String {
         GuestReg::X87Sw => "x87.sw".into(),
         GuestReg::X87Tags => "x87.tags".into(),
         GuestReg::CtxAddr => "ctx".into(),
-        GuestReg::R(n) => format!("r{n}"),
-        GuestReg::Lr => "lr".into(),
-        GuestReg::Ctr => "ctr".into(),
-        GuestReg::Cr(n) => format!("cr.{n}"),
-        GuestReg::So => "so".into(),
-        GuestReg::Ov => "ov".into(),
-        GuestReg::Ca => "ca".into(),
-        GuestReg::XerBc => "xer.bc".into(),
-        GuestReg::Fpscr => "fpscr".into(),
-        GuestReg::F(n) => format!("f{n}"),
     }
 }
 

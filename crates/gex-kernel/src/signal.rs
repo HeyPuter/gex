@@ -1027,9 +1027,6 @@ fn build_frame(
     compat: bool,
     taken: Taken,
 ) -> Result<u64, Errno> {
-    if gex_abi::PPC {
-        return setup_frame_ppc(signals, m, ctx_addr, signal, fault_address, taken);
-    }
     if compat {
         return setup_frame_i386(signals, m, ctx_addr, signal, fault_address, taken);
     }
@@ -1569,9 +1566,6 @@ pub fn sigreturn(
     compat: bool,
     legacy: bool,
 ) -> Result<u64, Errno> {
-    if gex_abi::PPC {
-        return sigreturn_ppc(signals, m, ctx_addr);
-    }
     if compat {
         // The frame's own kind decides; the entry number is a cross-check.
         let _ = legacy;
@@ -1731,190 +1725,7 @@ fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// PowerPC (32-bit): `arch/powerpc/kernel/signal_32.c`'s rt_sigframe
-// ---------------------------------------------------------------------------
-
-/// Offsets of the ppc32 `rt_sigframe`, relative to the frame (docs/ppc.md §7).
-mod pframe {
-    /// `struct siginfo`, then `struct ucontext`.
-    pub const INFO: u64 = 0;
-    pub const UC: u64 = 128;
-    pub const UC_STACK: u64 = 8;
-    /// `uc_regs`: points at `uc_mcontext`.
-    pub const UC_REGS: u64 = 48;
-    pub const UC_SIGMASK: u64 = 52;
-    pub const UC_MCONTEXT: u64 = 192;
-    /// Within `mcontext`: 48 gregs, then 33 doubles (f0–f31, FPSCR).
-    pub const MC_FREGS: u64 = 48 * 4;
-    /// The whole frame: siginfo, ucontext (with the AltiVec area gex never
-    /// fills) and the 224-byte ABI gap, rounded to 16.
-    pub const SIZE: u64 = 128 + 192 + 1024 + 224;
-    /// The caller frame the kernel leaves below it: `__SIGNAL_FRAMESIZE` + 16.
-    pub const CALLER: u64 = 64 + 16;
-    /// `mc_gregs` indices beyond the GPRs.
-    pub const PT_NIP: u64 = 32;
-    pub const PT_MSR: u64 = 33;
-    pub const PT_ORIG_R3: u64 = 34;
-    pub const PT_CTR: u64 = 35;
-    pub const PT_LNK: u64 = 36;
-    pub const PT_XER: u64 = 37;
-    pub const PT_CCR: u64 = 38;
-    pub const PT_TRAP: u64 = 40;
-    pub const PT_DAR: u64 = 41;
-    /// A user-mode MSR: EE, PR, FP, ME, IR, DR, RI.
-    pub const USER_MSR: u32 = 0xd032;
-}
-
-/// The CR, from its 32 context bytes.
-fn read_cr_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u32, Errno> {
-    let b = m.read(ctx_addr + ctx::PPC_CR as u64, 32)?;
-    Ok(b.iter().enumerate().fold(0u32, |acc, (i, v)| acc | (((*v & 1) as u32) << (31 - i))))
-}
-
-fn write_cr_ppc(m: &mut GuestMem<'_>, ctx_addr: u64, cr: u32) -> Result<(), Errno> {
-    let b: Vec<u8> = (0..32).map(|i| ((cr >> (31 - i)) & 1) as u8).collect();
-    m.write(ctx_addr + ctx::PPC_CR as u64, &b)
-}
-
-fn read_xer_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u32, Errno> {
-    let b = m.read(ctx_addr + ctx::PPC_SO as u64, 4)?;
-    Ok(((b[0] as u32 & 1) << 31) | ((b[1] as u32 & 1) << 30) | ((b[2] as u32 & 1) << 29) | (b[3] as u32 & 0x7f))
-}
-
-fn write_xer_ppc(m: &mut GuestMem<'_>, ctx_addr: u64, x: u32) -> Result<(), Errno> {
-    let b = [(x >> 31) as u8 & 1, (x >> 30) as u8 & 1, (x >> 29) as u8 & 1, (x & 0x7f) as u8];
-    m.write(ctx_addr + ctx::PPC_SO as u64, &b)
-}
-
-fn setup_frame_ppc(
-    signals: &Signals,
-    m: &mut GuestMem<'_>,
-    ctx_addr: u64,
-    signal: u32,
-    fault_address: u64,
-    taken: Taken,
-) -> Result<u64, Errno> {
-    use pframe::*;
-    let action = signals.action(signal);
-    let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
-    let mut own = signals.own();
-    let base = if action.flags & sa::ONSTACK != 0 && own.alt_stack.size > 0 {
-        let alt = &own.alt_stack;
-        let top = alt.sp + alt.size;
-        if sp > alt.sp && sp <= top {
-            sp
-        } else {
-            top
-        }
-    } else {
-        sp
-    };
-    let frame = (base - SIZE) & !0xf;
-    let newsp = frame - CALLER;
-    m.zero(newsp, (SIZE + CALLER) as usize)?;
-
-    let info = frame + INFO;
-    write_siginfo(signals, m, info, signal, fault_address, false, taken)?;
-    let uc = frame + UC;
-    m.write_u32(uc + UC_STACK, own.alt_stack.sp as u32)?;
-    m.write_u32(uc + UC_STACK + 4, own.alt_stack.flags)?;
-    m.write_u32(uc + UC_STACK + 8, own.alt_stack.size as u32)?;
-    let mc = uc + UC_MCONTEXT;
-    m.write_u32(uc + UC_REGS, mc as u32)?;
-    m.write_bits64(uc + UC_SIGMASK, own.suspend_restore.take().unwrap_or(own.blocked))?;
-
-    let g = |i: u64| mc + i * 4;
-    for n in 0..32u8 {
-        let v = m.read_u64(ctx_addr + ctx::x(n) as u64)? as u32;
-        m.write_u32(g(n as u64), v)?;
-    }
-    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
-    m.write_u32(g(PT_NIP), pc as u32)?;
-    m.write_u32(g(PT_MSR), USER_MSR)?;
-    m.write_u32(g(PT_ORIG_R3), m.read_u32(ctx_addr + ctx::x(3) as u64)?)?;
-    m.write_u32(g(PT_CTR), m.read_u32(ctx_addr + ctx::PPC_CTR as u64)?)?;
-    m.write_u32(g(PT_LNK), m.read_u32(ctx_addr + ctx::PPC_LR as u64)?)?;
-    m.write_u32(g(PT_XER), read_xer_ppc(m, ctx_addr)?)?;
-    m.write_u32(g(PT_CCR), read_cr_ppc(m, ctx_addr)?)?;
-    // 0x300 is a data storage interrupt, 0x700 a program check.
-    let trap = match signal {
-        sig::SIGSEGV | sig::SIGBUS => 0x300,
-        sig::SIGILL | sig::SIGTRAP | sig::SIGFPE => 0x700,
-        _ => 0,
-    };
-    m.write_u32(g(PT_TRAP), trap)?;
-    m.write_u32(g(PT_DAR), fault_address as u32)?;
-    for n in 0..32u8 {
-        let v = m.read_u64(ctx_addr + ctx::f(n) as u64)?;
-        m.write_u64(mc + MC_FREGS + n as u64 * 8, v)?;
-    }
-    let fpscr = m.read_u32(ctx_addr + ctx::PPC_FPSCR as u64)? as u64;
-    m.write_u64(mc + MC_FREGS + 32 * 8, fpscr)?;
-    // The back chain of the handler's caller frame.
-    m.write_u32(newsp, sp as u32)?;
-
-    own.blocked |= action.mask;
-    if action.flags & sa::NODEFER == 0 {
-        own.blocked |= bit(signal);
-    }
-    if let Taken::Fault = taken {
-        signals.clear_pending(signal);
-    }
-    own.in_handler = true;
-    if action.flags & sa::RESETHAND != 0 {
-        let _ = signals.set_action(signal, SigAction::default());
-    }
-    if std::env::var_os("GEX_SIGTRACE").is_some() {
-        eprintln!(
-            "[sig] ppc frame for {signal}: frame=0x{frame:x} sp=0x{newsp:x} handler=0x{:x} interrupted pc=0x{pc:x}",
-            action.handler
-        );
-    }
-    // r1 = the caller frame, r3 = signo, r4 = &info, r5 = &uc, r6 = the
-    // frame; the handler returns through LR to the host's trampoline.
-    for (n, v) in [(1u8, newsp), (3, signal as u64), (4, info), (5, uc), (6, frame)] {
-        m.write_u64(ctx_addr + ctx::x(n) as u64, v & 0xffff_ffff)?;
-    }
-    m.write_u32(ctx_addr + ctx::PPC_LR as u64, SIGRETURN_TRAMPOLINE as u32)?;
-    m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
-    Ok(action.handler)
-}
-
-/// `rt_sigreturn`: the frame is above the handler's r1 by the caller frame
-/// the kernel left, and its `uc_regs` names the registers to restore (a
-/// handler may point it elsewhere, as `swapcontext`-style code does).
-fn sigreturn_ppc(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
-    use pframe::*;
-    let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
-    let frame = sp + CALLER;
-    let uc = frame + UC;
-    let mask = m.read_bits64(uc + UC_SIGMASK)?;
-    let mc = m.read_u32(uc + UC_REGS)? as u64;
-    let g = |i: u64| mc + i * 4;
-    for n in 0..32u8 {
-        let v = m.read_u32(g(n as u64))? as u64;
-        m.write_u64(ctx_addr + ctx::x(n) as u64, v)?;
-    }
-    let pc = m.read_u32(g(PT_NIP))? as u64;
-    m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
-    m.write_u32(ctx_addr + ctx::PPC_CTR as u64, m.read_u32(g(PT_CTR))?)?;
-    m.write_u32(ctx_addr + ctx::PPC_LR as u64, m.read_u32(g(PT_LNK))?)?;
-    write_xer_ppc(m, ctx_addr, m.read_u32(g(PT_XER))?)?;
-    write_cr_ppc(m, ctx_addr, m.read_u32(g(PT_CCR))?)?;
-    for n in 0..32u8 {
-        let v = m.read_u64(mc + MC_FREGS + n as u64 * 8)?;
-        m.write_u64(ctx_addr + ctx::f(n) as u64, v)?;
-    }
-    let fpscr = m.read_u64(mc + MC_FREGS + 32 * 8)? as u32;
-    m.write_u32(ctx_addr + ctx::PPC_FPSCR as u64, fpscr)?;
-    let mut own = signals.own();
-    own.blocked = mask;
-    own.in_handler = false;
-    Ok(pc)
-}
-
-#[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
+#[cfg(all(test, not(feature = "x86")))]
 mod tests {
     use super::*;
 

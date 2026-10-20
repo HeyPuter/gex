@@ -141,10 +141,6 @@ fn program() -> (Image, [u64; 3], [u64; 4], GuestReg) {
 
 #[test]
 fn recovers_functions_a_complete_table_and_a_noreturn_call() {
-    // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-    if gex_abi::PPC {
-        return;
-    }
     let (img, [f, g, die], cases, _) = program();
     let prog = recover(&img, None, &RecoverOptions::default());
     let found: Vec<u64> = prog.functions.keys().copied().collect();
@@ -189,10 +185,6 @@ fn recovers_functions_a_complete_table_and_a_noreturn_call() {
 
 #[test]
 fn summaries_prove_what_the_program_does() {
-    // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-    if gex_abi::PPC {
-        return;
-    }
     let (img, [f, g, die], _, saved) = program();
     let prog = recover(&img, None, &RecoverOptions::default());
     let sums = gex_xlate::summary::analyze(&prog);
@@ -224,10 +216,6 @@ fn summaries_prove_what_the_program_does() {
 
 #[test]
 fn every_function_runs_the_same_in_both_forms_and_keeps_its_summary() {
-    // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-    if gex_abi::PPC {
-        return;
-    }
     let (img, _, _, _) = program();
     let prog = recover(&img, None, &RecoverOptions::default());
     let sums = gex_xlate::summary::analyze(&prog);

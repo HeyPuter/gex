@@ -1,8 +1,0 @@
-[package]
-name = "gex-isa-ppc"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "32-bit PowerPC instruction decoder and disassembler for gex"
-
-[dependencies]

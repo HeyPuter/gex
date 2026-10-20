@@ -17,7 +17,6 @@
 //! `ONLCR`) and go straight to the master. The single [`Tty`] holds the shared
 //! termios, window size, foreground process group and session for the pair.
 
-use gex_abi::GuestEndian;
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 
@@ -570,16 +569,16 @@ impl RemotePty {
             ioc::TIOCGWINSZ => {
                 let (row, col, x, y) = crate::tty::unpack_ws((r.winsize)(id));
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&row.to_ge_bytes());
-                ws[2..4].copy_from_slice(&col.to_ge_bytes());
-                ws[4..6].copy_from_slice(&x.to_ge_bytes());
-                ws[6..8].copy_from_slice(&y.to_ge_bytes());
+                ws[0..2].copy_from_slice(&row.to_le_bytes());
+                ws[2..4].copy_from_slice(&col.to_le_bytes());
+                ws[4..6].copy_from_slice(&x.to_le_bytes());
+                ws[6..8].copy_from_slice(&y.to_le_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
             ioc::TIOCSWINSZ => {
                 let ws = m.read(arg, 8)?.to_vec();
-                let g = |n: usize| u16::from_ge_bytes([ws[n], ws[n + 1]]);
+                let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
                 (r.set_winsize)(id, crate::tty::pack_ws((g(0), g(2), g(4), g(6))));
                 Ok(0)
             }
