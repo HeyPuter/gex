@@ -1212,7 +1212,8 @@ impl Namespace {
     }
 
     pub fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        let mut current = normalize(path, &self.cwd);
+        // Borrowed when already normal, the usual case: no allocation.
+        let mut current = normalize_cow(path, &self.cwd);
         // In the root, all links followed (`resolve_final`, then the
         // metadata there): one step.
         if let Some(root) = self.mounts.get("/") {
@@ -1224,11 +1225,11 @@ impl Namespace {
             let (fs, rel) = self.resolve(&current)?;
             match fs.read_link(&rel) {
                 Ok(target) => {
-                    current = if target.starts_with('/') {
+                    current = std::borrow::Cow::Owned(if target.starts_with('/') {
                         normalize(&target, "/")
                     } else {
                         normalize(&target, &parent_of(&current))
-                    };
+                    });
                 }
                 Err(_) => return fs.metadata(&rel),
             }
@@ -1548,6 +1549,15 @@ pub fn normalize(path: &str, cwd: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", parts.join("/"))
+    }
+}
+
+/// [`normalize`], borrowing `path` when it is already normal.
+pub fn normalize_cow<'a>(path: &'a str, cwd: &str) -> std::borrow::Cow<'a, str> {
+    if is_normal(path) {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(normalize(path, cwd))
     }
 }
 

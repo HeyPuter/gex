@@ -115,6 +115,33 @@ pub struct Stat {
     pub ctime_ns: u32,
 }
 
+/// A guest `struct stat` as bytes, on the stack: every flavour fits in 144,
+/// and `stat`/`fstat` then write it without an allocation (each one took
+/// the process allocator's lock, which a threaded `stat` loop queues on).
+pub struct StatBytes {
+    b: [u8; 144],
+    n: usize,
+}
+
+impl StatBytes {
+    fn zeroed(n: usize) -> StatBytes {
+        StatBytes { b: [0; 144], n }
+    }
+}
+
+impl std::ops::Deref for StatBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.b[..self.n]
+    }
+}
+
+impl std::ops::DerefMut for StatBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.b[..self.n]
+    }
+}
+
 impl Stat {
     /// (seconds, nanoseconds) of atime, mtime, ctime, in `struct stat`'s
     /// order.
@@ -124,9 +151,9 @@ impl Stat {
 
     /// PowerPC's 32-bit `struct stat64` (104 bytes, big-endian): no padding
     /// after `st_dev`, a 64-bit `st_ino` second, 32-bit times.
-    fn encode_ppc(&self) -> Vec<u8> {
+    fn encode_ppc(&self) -> StatBytes {
         use gex_abi::GuestEndian;
-        let mut b = vec![0u8; 104];
+        let mut b = StatBytes::zeroed(104);
         b[0..8].copy_from_slice(&self.dev.to_ge_bytes());
         b[8..16].copy_from_slice(&self.ino.to_ge_bytes());
         b[16..20].copy_from_slice(&self.mode.to_ge_bytes());
@@ -148,17 +175,17 @@ impl Stat {
     /// 144 on x86-64, where `st_nlink` widens to 64 bits and precedes
     /// `st_mode` and `st_blksize` is 64 bits.
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_for(false)
+        self.encode_for(false).to_vec()
     }
 
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
-    pub fn encode_for(&self, compat: bool) -> Vec<u8> {
+    pub fn encode_for(&self, compat: bool) -> StatBytes {
         if gex_abi::PPC {
             return self.encode_ppc();
         }
         if compat {
-            let mut b = vec![0u8; 96];
+            let mut b = StatBytes::zeroed(96);
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());
             b[12..16].copy_from_slice(&(self.ino as u32).to_le_bytes());
             b[16..20].copy_from_slice(&self.mode.to_le_bytes());
@@ -177,7 +204,7 @@ impl Stat {
             return b;
         }
         if gex_abi::X86 {
-            let mut b = vec![0u8; 144];
+            let mut b = StatBytes::zeroed(144);
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());
             b[8..16].copy_from_slice(&self.ino.to_le_bytes());
             b[16..24].copy_from_slice(&(self.nlink as u64).to_le_bytes());
@@ -194,7 +221,7 @@ impl Stat {
             }
             return b;
         }
-        let mut b = vec![0u8; 128];
+        let mut b = StatBytes::zeroed(128);
         b[0..8].copy_from_slice(&self.dev.to_le_bytes());
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());

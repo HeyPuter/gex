@@ -3110,12 +3110,24 @@ impl PathIo<'_> {
         flags: u64,
     ) -> SysResult {
         crate::phase::mark(5);
-        let raw = m.read_cstr(path, 4096)?;
+        // A path that fits is read onto the stack, and a normal absolute one
+        // is used as it stands: no allocation on the common path (each took
+        // the process allocator's one lock, which threads stat-ing at once
+        // queued on).
+        let mut small = [0u8; 256];
+        let long;
+        let raw: &[u8] = match m.read_cstr_into(path, &mut small)? {
+            Some(n) => &small[..n],
+            None => {
+                long = m.read_cstr(path, 4096)?;
+                &long
+            }
+        };
         if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.fstat(m, dirfd, buf);
         }
         // The path as read: not read again (`at_path`).
-        let p = self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)?;
+        let p = self.at_path_cow(dirfd, std::str::from_utf8(raw).map_err(|_| Errno::EINVAL)?)?;
         crate::phase::mark(6);
         let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             self.ns.metadata_nofollow(&p)
@@ -3555,6 +3567,16 @@ impl PathIo<'_> {
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)
+    }
+
+    /// [`Self::at_path_str`], borrowing `p` when it is absolute and already
+    /// normal: what that would return, since a normal path has no trailing
+    /// slash to check and is not relative to any directory.
+    pub fn at_path_cow<'a>(&self, dirfd: i32, p: &'a str) -> Result<std::borrow::Cow<'a, str>, Errno> {
+        if crate::vfs::is_normal(p) {
+            return Ok(std::borrow::Cow::Borrowed(p));
+        }
+        self.at_path_str(dirfd, p).map(std::borrow::Cow::Owned)
     }
 
     pub fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
