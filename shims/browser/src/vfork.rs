@@ -448,7 +448,7 @@ fn exec_memory(path: &str) -> Need {
 
 /// Whether `wasm`'s imported memory is a 64-bit one; `None` when its
 /// import section is not in `wasm` or it imports no memory.
-fn wasm_memory64(wasm: &[u8]) -> Option<bool> {
+pub(crate) fn wasm_memory64(wasm: &[u8]) -> Option<bool> {
     fn leb(b: &[u8], i: &mut usize) -> Option<u64> {
         let (mut r, mut s) = (0u64, 0);
         loop {

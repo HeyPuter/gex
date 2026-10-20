@@ -37,6 +37,8 @@
 #               the display driver's PE side, W64.4) made in b64-K-S and
 #               linked as one module behind their skeletons
 #               (stage-native64.sh)
+#   pen64-K-N-twin  with W64_TWIN=1, that core plus the memory64 build's
+#               module as winepe.wasm.m64 (W64_NATIVE then names it)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
 # S those, gex's link tools, gex-gl's guest library and the OSSv4 header
@@ -205,12 +207,8 @@ ntdll_native() {
 	( cd "$C/b64-$K-$S" && nice -n 10 make -j"$J" dlls/ntdll/wasm64-windows/ntdll.dll )
 	cp -p "$C/b64-$K-$S"/dlls/ntdll/wasm64-windows/ntdll.dll .
 }
-if [ "$M64" != 0 ]; then
-	# the native PE side's memory64 link is still to come
-	echo "W64_DIST=$C/dist64-$K-$S"; echo "W64_PREFIX=$C/pfx64-$P/pfx"; echo "W64_TOOLS=$T"; echo "W64_SRC=$W"
-	exit 0
-fi
-log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native
+# (W64.2's lone PE ntdll: the lowered flavour's only)
+[ "$M64" != 0 ] || { log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native; }
 
 D=${W64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
 NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
@@ -225,16 +223,33 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 DIST=$C/dist64-$K-$S
+NATIVE=$C/pen64-$K-$NK/native
+if [ "$M64" != 0 ]; then
+	# The memory64 flavour: its loader; with W64_M64_NATIVE=1 (the twin's
+	# half) its PE core too, a module for a 64-bit memory (pelink.py sees
+	# the tree's -mgex-memory64). Otherwise nothing more than before.
+	if [ "${W64_M64_NATIVE:-0}" != 0 ]; then
+		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
+	fi
+	echo "W64_DIST=$DIST"; echo "W64_PREFIX=$C/pfx64-$P/pfx"; echo "W64_TOOLS=$T"; echo "W64_SRC=$W"
+	[ "${W64_M64_NATIVE:-0}" = 0 ] || echo "W64_NATIVE=$NATIVE"
+	exit 0
+fi
+log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 # W64_TWIN=1: a twin install (docs/mem64.md §5, per program): the default
 # install with the memory64 loader beside the lowered one, as
 # x86_64-unix/wine.m64 (the W64_MEM64=1 build's wine; one PE side, one
 # prefix). An exec of the loader that asks for a 64-bit memory (GEX_MEM64=1)
 # runs the twin (shim vfork.rs `exec_route`); every other exec, the default.
+# The native PE core likewise: the memory64 build's module beside the
+# default's, as winepe.wasm.m64, which a process with a 64-bit memory loads
+# in its place (one set of skeletons: the same DLLs and exports).
 # Off by default: the default install and its downloads do not grow.
 if [ "${W64_TWIN:-0}" != 0 ]; then
-	MD=$(W64_TWIN=0 W64_MEM64=1 "$0" "$W" "$C" | sed -n 's/^W64_DIST=//p') && [ -n "$MD" ] || { log "the memory64 build for the twin failed"; exit 1; }
+	MO=$(W64_TWIN=0 W64_MEM64=1 W64_M64_NATIVE=1 "$0" "$W" "$C") || { log "the memory64 build for the twin failed"; exit 1; }
+	MD=$(sed -n 's/^W64_DIST=//p' <<< "$MO"); MN=$(sed -n 's/^W64_NATIVE=//p' <<< "$MO")
+	[ -n "$MD" ] && [ -f "$MN/winepe.wasm" ] || { log "the memory64 build for the twin made no loader or PE core"; exit 1; }
 	twin_make() {
 		cp -a "$DIST/." .
 		rm -f .done
@@ -242,10 +257,17 @@ if [ "${W64_TWIN:-0}" != 0 ]; then
 	}
 	log "twin install ($K, $S)"; step dist64-$K-$S-twin twin_make
 	DIST=$C/dist64-$K-$S-twin
+	twin_native() {
+		cp -a "$NATIVE/." .
+		rm -f .done
+		cp -p "$MN/winepe.wasm" winepe.wasm.m64
+	}
+	log "twin native PE core ($K, $NK)"; step pen64-$K-$NK-twin twin_native
+	NATIVE=$C/pen64-$K-$NK-twin
 fi
 echo "W64_DIST=$DIST"
 echo "W64_PREFIX=$C/pfs64-$P-$R/pfx"
 echo "W64_TOOLS=$T"
 echo "W64_SRC=$W"
 echo "W64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
-echo "W64_NATIVE=$C/pen64-$K-$NK/native"
+echo "W64_NATIVE=$NATIVE"

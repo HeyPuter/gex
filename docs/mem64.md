@@ -491,6 +491,15 @@ browser shim; the coordinator sequences them.
   PAGE=mp (the loader exec'd by a launcher with GEX_MEM64=1): the W64 cases,
   highdata's 5 GiB, and `childtwin` (the program's CreateProcess child is
   32-bit: highdata's 5 GiB fail in it).
+  The native PE core likewise (W64.2, the skeletons over one wasm module):
+  the twin install's W64_NATIVE dir holds the memory64 build's module as
+  `winepe.wasm.m64` beside `winepe.wasm` (pelink.py, for a tree built with
+  `wcc64 -mgex-memory64`: linked for 16 GiB, not lowered), and a process
+  with a 64-bit memory loads it in place of the other (cgen/wasmdll.rs; the
+  same skeletons, so the same DLLs and exports). Without it a 64-bit
+  process ends at its first skeleton, saying the module is for the other
+  memory (it was a LinkError, "cannot import i64 memory as i32"). Built
+  only with W64_TWIN=1 (W64_MEM64=1 W64_M64_NATIVE=1 for the half alone).
 - The record for a Windows program: Wine's exec of the loader names only
   the loader, so Wine names the program as well. Under `__wasm__`,
   `prepare_wineloader_exec` (ntdll unix loader.c, called by `spawn_process`
@@ -503,6 +512,13 @@ browser shim; the coordinator sequences them.
   tests/wine64/nt-x64.sh TWIN=1 `image`, the Hades case. A 32-bit parent
   (siblings.exe) starts hades.exe, whose `.exe` carries the record and
   which gets 5 GiB. Its own child is 32-bit, and so is its sibling.
+  A game started directly (game.json exe=wine, argv the .exe) runs in the
+  relaunch of the process that started the server (Wine loader.c
+  `wineserver_relaunch`), not a new Windows process: that relaunch names
+  argv[1] as WINEGEX_IMAGE when it is a Unix path (mw `kc/wine-image`
+  3f490c7fbc3). Tests: nt-x64.sh TWIN=1 `direct-image` (the record, `wine
+  /pfx/drive_c/hades.exe`) and `direct-env` (GEX_MEM64=1 in the loader's
+  own environment).
   Rejected: (b1) the shim resolving the command line's first word through
   `$WINEPREFIX/dosdevices` (a second copy of Wine's search: PATH, App
   Paths, quoting, drive overrides); (b3) the process asking for the

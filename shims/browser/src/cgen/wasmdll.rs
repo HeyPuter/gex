@@ -116,10 +116,34 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             Some((dir, _)) => format!("{dir}/{module_name}"),
             None => module_name.clone(),
         };
-        let wasm = gex_kernel::nt::file::read_guest_file(&crate::sigs::proc_home().ns(), &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+        // A twin install (w64-dist.sh W64_TWIN=1, docs/mem64.md §5): a
+        // process with a 64-bit memory loads the memory64 build's module,
+        // beside the other as `<module>.m64`, under the same skeletons.
+        let ns = crate::sigs::proc_home().ns();
+        let twin = format!("{file}.m64");
+        let (file, wasm) = match gex_abi::mem64().then(|| gex_kernel::nt::file::read_guest_file(&ns, &twin).ok()).flatten() {
+            Some(w) => (twin, w),
+            None => {
+                let w = gex_kernel::nt::file::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+                (file, w)
+            }
+        };
+        // The module's memory must be this process's: a wasm32 one in a
+        // 64-bit memory fails to instantiate (a LinkError, deep in the
+        // runtime), so it is said here, with what is missing.
+        if let Some(m64) = crate::vfork::wasm_memory64(&wasm[..wasm.len().min(4 << 20)]) {
+            if m64 != gex_abi::mem64() {
+                return Err(format!(
+                    "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
+                    if m64 { 64 } else { 32 },
+                    if m64 { 32 } else { 64 },
+                    if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: w64-dist.sh W64_TWIN=1)" }
+                ));
+            }
+        }
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
-        // (an LLP64 module's above the images: see `crate::W64_PE_DATA`)
+        // (an LLP64 module's above the images: see `crate::w64_pe_data`)
         let data = if pe.is64 {
             alloc_pe_data_window((size as u64).max(16) + a, "[wine PE data]")?
         } else {
@@ -214,7 +238,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         wp.install = ftab(|m| m.publish(len, PROVIDER | wp.number, Tier::Unit, &pairs));
         clear(&addrs);
         let (regs, dirs, slots) = bridges(&addrs);
-        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data as u32 });
+        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data });
         Ok(wp.number as i32)
     } else {
         let install = wp.install;
@@ -408,11 +432,11 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
-/// A PE32+ core's data, at the top of [`crate::W64_PE_DATA`] (reserved at
+/// A PE32+ core's data, at the top of [`crate::w64_pe_data`] (reserved at
 /// the x86-64 split), zeroed.
 fn alloc_pe_data_window(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
-    let (lo, hi) = crate::W64_PE_DATA;
+    let (lo, hi) = crate::w64_pe_data();
     let len = (size + 0xffff) & !0xffff;
     if len > hi - lo {
         return Err(format!("{name}: {len:#x} bytes do not fit the W64 PE data window"));
@@ -502,8 +526,13 @@ pub extern "C" fn gex_wasmdll_installed() {
     let base = ftab(|m| m.install(install).base);
     let read = |off: u32| -> Vec<(u64, u32)> {
         let at = data + off as u64;
-        // (an LLP64 module's pointers are 8 bytes, their values below 4 GiB)
-        let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + w).unwrap_or(0) as u64);
+        // An LLP64 module's pointers are 8 bytes. A lowered one's values are
+        // below 4 GiB; the memory64 core's data window is at the top of 16
+        // GiB (`w64_pe_data`), so the whole pointer is read -- its low half
+        // pointed elsewhere, no thunk was bound, and a fiber's start
+        // (`start_fiber`'s table index as its Rip) faulted as a guest pc.
+        let ptr = |a: u64| if w == 8 { gm.read_u64(a).unwrap_or(0) } else { gm.read_u32(a).unwrap_or(0) as u64 };
+        let (start, stop) = (ptr(at), ptr(at + w));
         let mut out = Vec::new();
         let mut a = start;
         while start != 0 && a + 2 * w <= stop {

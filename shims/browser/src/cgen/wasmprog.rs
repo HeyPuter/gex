@@ -248,7 +248,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let (regs, dirs, slots) = entry_bridges(&[entry, thread_entry]);
     let path = exe_path();
     super::dylink::static_published(number, info, &path, base, mem_base as u32);
-    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
+    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     let path = path.clone();
     let lowered = is_lowered(&wasm);
     lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path, lowered });

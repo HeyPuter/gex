@@ -142,7 +142,9 @@ struct ProviderModule {
     dirs: Vec<(u64, u32)>,
     slots: u64,
     /// A stateful provider's data (`__memory_base`), 0 for a stateless one.
-    memory_base: u32,
+    /// Above 4 GiB only for Wine's PE module in a 64-bit memory (its data
+    /// window is the top of the 16 GiB: `crate::w64_pe_data`).
+    memory_base: u64,
 }
 
 static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
@@ -1184,14 +1186,14 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
             return -1;
         }
     };
-    let mut memory_base = 0u32;
+    let mut memory_base = 0u64;
     let pairs: Vec<(u64, u32)> = match &stateful {
         None => {
             if data {
                 // A built-in stateful provider's data, top down as natively
                 // (`nt_cgen::install_providers`).
                 match builtin_data(&file, wasm) {
-                    Ok(b) => memory_base = b,
+                    Ok(b) => memory_base = b as u64,
                     Err(e) => {
                         crate::warn_line(&format!("gex-nt: provider {file}: {e}\n"));
                         return -1;
@@ -1206,7 +1208,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         Some((exports, entry)) => {
             match stateful_pairs(&file, wasm, &names, exports, *entry) {
                 Ok((pairs, base)) => {
-                    memory_base = base;
+                    memory_base = base as u64;
                     pairs
                 }
                 Err(e) => {
@@ -1399,7 +1401,14 @@ pub extern "C" fn gex_nt_qpc() -> i64 {
 /// Provider module `number`'s data (`__memory_base`), 0 when stateless.
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_memory_base(number: u32) -> u32 {
-    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.memory_base)
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.memory_base as u32)
+}
+
+/// [`gex_cgen_pmod_memory_base`]'s upper half: 0 but for Wine's PE module
+/// in a 64-bit memory, whose data is above 4 GiB.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_memory_base_hi(number: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| (p.memory_base >> 32) as u32)
 }
 
 /// `gex.provider_alloc(size)`: fresh read-write guest pages, or 0.

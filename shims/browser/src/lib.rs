@@ -9185,15 +9185,32 @@ fn rebuild_carried(
 /// data goes above 2 GiB; the page's guest ends below that.
 pub(crate) const W64_PE_DATA: (u64, u64) = (0x7fde_0000, 0x7ffe_0000);
 
-/// Reserve [`W64_PE_DATA`] (no access until the core's data is placed in
-/// it) and keep mmap below it.
+/// In a 64-bit memory (a twin install's 64-bit process, docs/mem64.md §5)
+/// Wine places its images top down from the top of the 16 GiB, far above
+/// [`W64_PE_DATA`]: the window is the top of that space instead (below a
+/// 64 KiB guard), above every image and within 4 GiB of the first ones.
+const W64_PE_DATA_M64: (u64, u64) = (gex_abi::LIMIT64 - 0x21_0000, gex_abi::LIMIT64 - 0x1_0000);
+
+/// The W64 PE data window of this process's memory.
+pub(crate) fn w64_pe_data() -> (u64, u64) {
+    if gex_abi::mem64() {
+        W64_PE_DATA_M64
+    } else {
+        W64_PE_DATA
+    }
+}
+
+/// Reserve [`w64_pe_data`] (no access until the core's data is placed in
+/// it) and, in a 32-bit memory, keep mmap below it.
 pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     use gex_kernel::mem::{flags, prot};
-    let (lo, hi) = W64_PE_DATA;
+    let (lo, hi) = w64_pe_data();
     if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {
         warn_line(&format!("gex: W64: reserving the PE data window {lo:#x}..{hi:#x}: errno {}\n", e.0));
     }
-    mem.set_mmap_top(lo);
+    if !gex_abi::mem64() {
+        mem.set_mmap_top(lo);
+    }
 }
 
 /// The kernel's half of a W3 process's address space: no mapping above
