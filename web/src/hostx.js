@@ -27,7 +27,7 @@
 // turn left to do it in.
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
-import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
@@ -241,7 +241,8 @@ export class HostX {
         ? (inst.exports.k_stack_area() >>> 0)
           + (inst.exports.k_stack_size() >>> 0) * ((inst.exports.k_stack_count() >>> 0) - 1)
         : 0);
-      if (top) inst.exports.__stack_pointer.value = top | 0;
+      // And thread-locals of its own at the top of it (`kernelThread`).
+      if (top) kernelThread(inst.exports, top);
       this.#k = inst.exports;
       this.#kmem = msg.kernel.memory;
     }
