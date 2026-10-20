@@ -56,5 +56,21 @@ check "  a restored stale block whose id one of the run's own has is not sent el
 # so the next run has the old libt.so again, which the cache (saved with the
 # new one) must not serve either.
 f=$(run); check "and the next run, back on the old one, is not served the new" "$(expect 2)" 'libt.so changed since the save' "$f"
+# A lazy file (a site's lazy.json files) has the same time on every load, so
+# its keys are restored rather than dropped as a changed file: a library read
+# lazily comes from the cache on the next run.
+mkdir -p "$W/lroot/lib" "$W/lroot/bin" "$W/lz" "$W/xcl"
+cp "$W/root/lib/ld-musl-aarch64.so.1" "$W/lroot/lib/"
+cp "$W/root/bin/t" "$W/lroot/bin/"
+lib 4 ../lz.so; mv "$W/root/lz.so" "$W/lz/libt.so"
+runl() {
+  GEX_XCACHE=gate GEX_XCACHE_DIR="$W/xcl" GEX_XCACHE_MIN=0 GEX_WEB_DIR="$WEB" GEX_SHARED=1 \
+    timeout 300 node "$ROOT/shims/browser/js/run-node.mjs" --dir /="$W/lroot" --lazy /lib/libt.so="$W/lz/libt.so" \
+    --argv0 /bin/t "$WEB/seed.shared.wasm" "$W/lroot/bin/t" 2>&1
+}
+g=$(runl); check "a cold run with a lazy library saves" "$(expect 4)" 'xcache gate: saved' "$g"
+sleep 1.1
+h=$(runl); check "the next run restores it" "$(expect 4)" 'restored [1-9][0-9]* modules' "$h"
+if grep -aq 'changed since the save' <<<"$h"; then echo "FAIL the lazy library counted as changed: $(grep -a 'changed since' <<<"$h" | head -1)"; fail=1; else echo "ok   the lazy library is not counted as changed"; fi
 [ $fail = 0 ] && echo "xcache: PASS" || echo "xcache: FAIL"
 exit $fail
