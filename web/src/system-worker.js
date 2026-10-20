@@ -125,6 +125,7 @@ self.onmessage = async (ev) => {
             url: q.get('glurl') || assetUrl('/gex/st/gex-wgpu-replay.js'),
             ...(q.get('mesaenv') ? { mesaEnv: q.get('mesaenv') } : {}),
             ...(q.get('wgslcache') ? { wgslCache: q.get('wgslcache') } : {}),
+            ...(q.get('gltrace') === '1' ? { glTrace: true } : {}),
           });
         }
       } else delete opts.gl;

@@ -53,6 +53,7 @@ extern "C" WGPUDevice emscripten_webgpu_get_device(void);
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1433,10 +1434,19 @@ bool display_backend() {
          * against how many were declined. A frame presents either way, so this
          * is what distinguishes "drawing nothing" from "not started". */
         static unsigned frames;
+        /* GEX_WGPU_FRAME_REPORT=N (`?mesaenv=GEX_WGPU_FRAME_REPORT=1`): the
+         * report every N frames instead, for a program that presents a
+         * handful of frames and whose second one is the question (which
+         * texture its draws and blits went to, against the one shown). */
+        static unsigned every;
+        if (!every) {
+            const char *value = getenv("GEX_WGPU_FRAME_REPORT");
+            every = value && atoi(value) > 0 ? (unsigned)atoi(value) : 600;
+        }
         /* Braced: the report below was once outside the `if` by mistake, so
          * its ten formatted stderr lines (and the page's console plumbing
          * for each) ran on every displayed frame. */
-        if ((frames++ % 600) == 0) {
+        if ((frames++ % every) == 0) {
             fprintf(stderr,
                     "gex-wgpu: frame %u -- issued %u, declined %u "
                     "(constant %u, texture %u, vertex %u; last: %s)\n",

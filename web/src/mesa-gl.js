@@ -189,7 +189,8 @@ function countWebGpu() {
  *  their first words; everything else as it comes. Each console line is a
  *  message to whatever is listening (DevTools, a harness over CDP), on the
  *  thread that runs Mesa: two thousand batches in a seven-minute Noita run.
- *  `?gltrace=1` keeps them all. */
+ *  `?gltrace=1` keeps them all: the `glTrace` option, which a Worker gets
+ *  from its page (a Worker's own `location` has none of the page's query). */
 /** A page's `?NAME=1`. In a Worker `location` is the worker script's, so
  *  the compositor passes its page's switches in as options instead. */
 function pageFlag(name) {
@@ -200,11 +201,7 @@ function pageFlag(name) {
   }
 }
 
-function quietReports(out) {
-  let all = false;
-  try {
-    all = pageParams().get('gltrace') === '1';
-  } catch {}
+function quietReports(out, all) {
   if (all) return out;
   const last = new Map();
   return (line) => {
@@ -358,7 +355,7 @@ export class MesaGlDevice {
         locateFile: (file) => new URL(file, new URL(url, location.href)).href,
         // Mesa's stdout is its chatter; its stderr (below) stays.
         print: (line) => logOn('debug') && console.log('[mesa-gl]', line),
-        printErr: quietReports((line) => console.warn('[mesa-gl]', line)),
+        printErr: quietReports((line) => console.warn('[mesa-gl]', line), options.glTrace ?? pageFlag('gltrace')),
         ...fromSource?.extra,
       });
       out.#module = await (fromSource ? Promise.race([made, fromSource.failed]) : made);
