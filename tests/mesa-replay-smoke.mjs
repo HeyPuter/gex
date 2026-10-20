@@ -164,6 +164,42 @@ const [legacyVersion, coreVersion] = contextVersions([1, 0, 1], [3, 2, 0]);
 if (glVersion(coreVersion) < 32)
   throw new Error(`a 3.2 core request after a legacy context got ${coreVersion} (legacy: ${legacyVersion})`);
 
+// A shader deleted while attached stays usable until it is detached: GL
+// programs may attach, delete, and only then compile and link. The decoder
+// must keep the guest name's mapping across DELETE_SHADER for that link to
+// succeed.
+function deletedWhileAttachedLinks() {
+  const GL_VERTEX_SHADER = 0x8b31, GL_FRAGMENT_SHADER = 0x8b30;
+  const GL_LINK_STATUS = 0x8b82;
+  const text = (s) => new TextEncoder().encode(s);
+  const vs = "#version 150\nin vec4 pos;\nvoid main() { gl_Position = pos; }\n";
+  const fs = "#version 150\nout vec4 c;\nvoid main() { c = vec4(1.0); }\n";
+  const status = submitPacket(join([
+    command(51, new Words().u32(301)),
+    command(48, new Words().u32(302).u32(GL_VERTEX_SHADER)),
+    command(49, new Words().u32(302).blob(text(vs))),
+    command(52, new Words().u32(301).u32(302)),
+    command(56, new Words().u32(302)),
+    command(48, new Words().u32(303).u32(GL_FRAGMENT_SHADER)),
+    command(49, new Words().u32(303).blob(text(fs))),
+    command(52, new Words().u32(301).u32(303)),
+    command(56, new Words().u32(303)),
+    command(50, new Words().u32(302)),
+    command(50, new Words().u32(303)),
+    command(54, new Words().u32(301)),
+    command(61, new Words().u32(301).u32(GL_LINK_STATUS)),
+    command(131),
+  ]));
+  if (status !== 0) throw new Error(`deleted-while-attached replay failed: ${status}`);
+  const at = mesa._gex_gl_reply_data();
+  const dv = new DataView(mesa.HEAPU8.buffer, at, mesa._gex_gl_reply_len());
+  return { linked: dv.getUint32(0, true), error: dv.getUint32(4, true) };
+}
+const attached = deletedWhileAttachedLinks();
+if (attached.linked !== 1 || attached.error !== 0)
+  throw new Error(`a shader deleted while attached: link status ${attached.linked}, ` +
+                  `GL error 0x${attached.error.toString(16)}`);
+
 // Decoder failure poisons the graphics connection: execution and decoding are
 // intentionally not resumed afterward.  A caller must discard the worker GL
 // context on either negative status, because an operation may have consumed a
@@ -178,3 +214,4 @@ console.log(`PASS gex-mesa-replay vendor=${vendor} renderer=${renderer}`);
 console.log(`PASS gex-mesa-replay malformed=${malformed.length}`);
 console.log(`PASS gex-mesa-replay version=${version} pixel=${pixel.join(",")}`);
 console.log(`PASS gex-mesa-replay legacy-then-core=${coreVersion}`);
+console.log(`PASS gex-mesa-replay deleted-while-attached links`);

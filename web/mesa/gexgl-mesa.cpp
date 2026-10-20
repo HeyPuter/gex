@@ -2269,7 +2269,14 @@ bool one(uint32_t op, Reader& a) {
         glShaderSource(s, 1, &p, nullptr); break;
     }
     case COMPILE_SHADER: glCompileShader(lookup(shaders, a.u32())); break;
-    case DELETE_SHADER: { uint32_t g = a.u32(); glDeleteShader(lookup(shaders, g)); shaders.erase(g); break; }
+    case DELETE_SHADER: {
+        /* GL keeps a deleted shader that is still attached to a program,
+         * and its name stays valid until it is detached: a program may
+         * attach, delete, and only then compile and link. So the guest name
+         * keeps its mapping; CREATE_SHADER given the same name replaces it. */
+        glDeleteShader(lookup(shaders, a.u32()));
+        break;
+    }
     case CREATE_PROGRAM: { uint32_t g = a.u32(); programs[g] = glCreateProgram(); break; }
     case ATTACH_SHADER: { GLuint p = lookup(programs, a.u32()); glAttachShader(p, lookup(shaders, a.u32())); break; }
     case DETACH_SHADER: { GLuint p = lookup(programs, a.u32()); glDetachShader(p, lookup(shaders, a.u32())); break; }
