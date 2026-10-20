@@ -16666,16 +16666,25 @@ pub extern "C" fn gex_loader_done_ms() -> u64 {
 /// When this process began, for the measurement above.
 static PROCESS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The path of the most recent `openat`, for the crash report: its own
-/// lock, since `openat` takes no other (L14b).
-static LAST_OPEN: gex_kernel::sync::Mutex<String> = gex_kernel::sync::Mutex::new(String::new());
+/// The longest prefix of a path [`LAST_OPEN`] keeps.
+const LAST_OPEN_MAX: usize = 256;
+
+thread_local! {
+    /// The path of this thread's most recent `openat` (its first
+    /// [`LAST_OPEN_MAX`] bytes, and how many), for the crash report. The
+    /// thread's own: written by its `openat`, read by the report its Worker
+    /// makes (`gex_last_open`, on the same thread). No lock, and nothing
+    /// allocated per open: a global under its own lock was taken by every
+    /// Worker's every `openat`.
+    static LAST_OPEN: (Cell<[u8; LAST_OPEN_MAX]>, Cell<usize>) = const { (Cell::new([0; LAST_OPEN_MAX]), Cell::new(0)) };
+}
 
 /// How many bytes of it there are, written into the shim's own buffer.
 #[no_mangle]
 pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
-    let s = LAST_OPEN.lock();
-    let n = s.len().min(max as usize);
-    shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
+    let (bytes, len) = LAST_OPEN.with(|(b, l)| (b.get(), l.get()));
+    let n = len.min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&bytes[..n]);
     n as u32
 }
 
@@ -16696,12 +16705,26 @@ fn note_process_syscall(base: u64, pc: i64) {
     // inside `openat` says nothing about which file, one bounded string read
     // away.
     if n == nr::OPENAT {
-        if let Ok(b) = gm.read_cstr(g(1), 256) {
-            // Its own lock: every Worker's openat writes it, and two at once
-            // through a bare cell was a wild store (the browser's stack
-            // smash).
-            let path = String::from_utf8_lossy(&b).into_owned();
-            *LAST_OPEN.lock() = path;
+        // This thread's own copy (`LAST_OPEN`): no other Worker writes it,
+        // so no lock. Up to the NUL, or the first `LAST_OPEN_MAX` bytes.
+        // (A path within `LAST_OPEN_MAX` of memory's end: the bounded
+        // string read, which copies.)
+        let keep = |b: &[u8]| {
+            let len = b.iter().position(|&c| c == 0).unwrap_or(b.len()).min(LAST_OPEN_MAX);
+            let mut buf = [0u8; LAST_OPEN_MAX];
+            buf[..len].copy_from_slice(&b[..len]);
+            LAST_OPEN.with(|(p, l)| {
+                p.set(buf);
+                l.set(len);
+            });
+        };
+        match gm.read(g(1), LAST_OPEN_MAX) {
+            Ok(b) => keep(b),
+            Err(_) => {
+                if let Ok(b) = gm.read_cstr(g(1), LAST_OPEN_MAX) {
+                    keep(&b);
+                }
+            }
         }
     }
     if n != nr::CLONE && n != nr::EXECVE {
