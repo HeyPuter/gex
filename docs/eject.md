@@ -425,7 +425,7 @@ and when a fetch of the running program starts or ends), and the handle's
 | `p.` | What |
 | --- | --- |
 | `phase` | `'download'`, `'compile'`, `'boot'`, `'first-frame'`, `'ready'`, in that order and never back; then `'exited'` or `'failed'` |
-| `download` | `{done, total}` bytes as sent (compressed), `{filesDone, files}` |
+| `download` | `{done, total}` bytes as sent (compressed), `{filesDone, files}`; `cached`, the bytes of `done` the page already had (pieces kept from an earlier visit) |
 | `compile` | `{done, total}` units compiled ahead (they compile as they arrive) |
 | `at` | each phase's start, ms since `start()` |
 | `elapsed` | ms since `start()`, at this call |
@@ -447,7 +447,10 @@ the page decides: a program whose first window is a splash, or Windows'
 desktop, which paints its wallpaper long before its taskbar, calls
 `handle.ready()` when what it waits for is there (`describe()` says what
 the windows are). The example page's loading screen (user/index.html) is
-one way to draw it.
+one way to draw it: a bar for the download (with what came from the cache),
+then the download's time and a bar of the build's images loaded during the
+start-up (`boot`), the latest program and image, the last eight lines of
+`log`, and after `'ready'` a line in a corner for each fetch.
 
 The library never reads the page's URL: the runtime's switches come from
 these options (`GEX_PAGE_SEARCH`, web/src/page-env.js), and its files from
@@ -599,14 +602,17 @@ Ejecting one makes it the app library (above), built with the features the
 user keeps, and a standalone site around the project's page:
 
 ```sh
-# 1. record: run the page to its window (headless Chromium)
-node tools/eject/record-w3.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle mspaint.tar
+# 1. record: run the page to its window (headless Chromium); --boot-units-out
+#    also lists the images whose units it used by 15 s after the window
+node tools/eject/record-w3.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle mspaint.tar \
+  --boot-units-out rec/boot-units.txt
 # 2. eject: the bundle, the units it used, the runtime, a build step
 gexc eject rec --out mspaint-project --web-src web --unit-cache UNITS --features -compositor
 # 3. build: the page with those features, the site's inputs in build/web
 mspaint-project/build.sh
 # 4. the static site
-node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
+node web/eject-site.mjs mspaint-project site --strip --prune --dedupe \
+  --pieces --boot-units rec/boot-units.txt
 node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
 node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks its windows
 node tests/eject/w3-page.mjs site --shell tests/eject/w3-shell-min.html   # a hand-written page

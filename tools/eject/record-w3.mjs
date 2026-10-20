@@ -20,6 +20,12 @@
 // machine (its URL is all the page knows); the eject reads it from there.
 // --title: a regular expression a toplevel's title must match (default
 // "Untitled - Paint"); --settle: seconds to keep recording after it (5).
+// --boot-units-out FILE: also write the images whose units the run used by
+// --boot-after S seconds after the title (default 15; the recording settles
+// at least that long), one guest path a line: web/eject-site.mjs's
+// --boot-units list, whose units ship in the boot's download and the rest in
+// the background fill. Union several runs' lists for a program whose start
+// varies (sort -u).
 
 import { spawn } from 'node:child_process';
 import { createReadStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -30,15 +36,17 @@ import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
-const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into'];
+const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into', '--boot-units-out', '--boot-after'];
 const [url, out] = av.filter((a, i) => !a.startsWith('--') && !named.includes(av[i - 1]));
 if (!url || !out) {
-  console.error('usage: node tools/eject/record-w3.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION]');
+  console.error('usage: node tools/eject/record-w3.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION] [--boot-units-out FILE] [--boot-after S]');
   process.exit(2);
 }
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
 const timeout = Number(opt('--timeout', '400')) * 1000;
-const settle = Number(opt('--settle', '5')) * 1000;
+const bootOut = opt('--boot-units-out', null);
+const bootAfter = Number(opt('--boot-after', '15'));
+const settle = Math.max(Number(opt('--settle', '5')), bootOut ? bootAfter : 0) * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 mkdirSync(out, { recursive: true });
 
@@ -212,6 +220,12 @@ const session = {
   ...(coverage.size ? { coverage: Object.fromEntries([...coverage].map(([k, set]) => [k, runs([...set].sort((x, y) => x - y))])) } : {}),
 };
 writeFileSync(join(out, 'w3-session.json'), `${JSON.stringify(session, null, 2)}\n`);
+if (bootOut) {
+  const boot = [...new Set(session.units.filter((u) => u.at <= atTitle + bootAfter).map((u) => u.path))].sort();
+  writeFileSync(bootOut, `# The images whose units ${url} used by ${bootAfter} s after "${title}" (${atTitle.toFixed(1)} s):\n`
+    + `# web/eject-site.mjs --boot-units. Written by tools/eject/record-w3.mjs --boot-units-out.\n${boot.join('\n')}\n`);
+  console.log(`${bootOut}: ${boot.length} of ${session.units.length} units' images by ${bootAfter} s after the title`);
+}
 console.log(`${out}/w3-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
   + `${session.units.length} units (${session.unit_misses.length} images without one), ${session.modules.length} wasm modules`
   + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
