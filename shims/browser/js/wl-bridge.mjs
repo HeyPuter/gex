@@ -283,6 +283,17 @@ export function readScene(channel, { onlyChanged = false } = {}) {
 }
 
 /**
+ * Whether a surface takes the pointer anywhere: false only when its client
+ * set an empty input region (`wl_surface.set_input_region` with nothing in
+ * it), and the pointer then goes to what is under it. A client's subsurface
+ * for a window's GL picture is one such surface, laid over its parent.
+ */
+export function takesPointer(record) {
+  const r = record.input;
+  return !r || (r.w > 0 && r.h > 0);
+}
+
+/**
  * A process has exited: its block's surfaces go, and the block is free.
  *
  * A process that ends normally gives its block back (`release`), but one that

@@ -65,6 +65,7 @@ import {
   ROLE_POPUP,
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
+  takesPointer,
 } from '@gex/wl-bridge.mjs';
 import { pageParams } from './page-env.js';
 
@@ -633,6 +634,16 @@ export class DomDesktop {
       win.canvas.width = Math.max(1, s.width);
       win.canvas.height = Math.max(1, s.height);
       win.onresized?.(s.width, s.height);
+    }
+    // A surface whose input region is empty takes no pointer: the pointer
+    // goes to what is under it, as in the scene compositor's hit test. A
+    // client's subsurface for a window's GL picture is one, laid over its
+    // parent, and its parent must get the pointer. A region that is not
+    // empty is taken as the whole surface here.
+    const noInput = !takesPointer(s);
+    if (noInput !== win.noInput) {
+      win.noInput = noInput;
+      win.canvas.style.pointerEvents = noInput ? 'none' : '';
     }
     // A popup, a subsurface or an X menu is placed by its client, not by the
     // page: say where it asked to be.
