@@ -9,7 +9,7 @@
 
 import { openDb, txDone } from './persist-db.js';
 import { pick } from './persist-pick.js';
-import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 
 const SCRATCH = 0x1000; // where paths and buffers go in this worker's process memory
 const CHUNK = 1 << 20;
@@ -228,10 +228,10 @@ self.onmessage = (e) => {
         }
       }
       k = inst.exports;
-      // The stack slot above every Worker's (PageTty's, which an ejected
-      // program's page does not use: it has no terminal).
+      // A kernel stack slot of its own (`HELPER_STACKS`; it shared the
+      // terminal's and fs-opened's before), thread-locals at the top of it.
       if (k.k_stack_area && k.__stack_pointer) {
-        k.__stack_pointer.value = (k.k_stack_area() + k.k_stack_count() * k.k_stack_size()) | 0;
+        kernelThread(k, helperStackTop(k, 'persist'));
       }
       db = await openDb(dbName);
     }).catch((err) => self.postMessage({ error: String(err?.stack ?? err) }));

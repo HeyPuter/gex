@@ -1,10 +1,11 @@
 // fs-opened.js's Worker: one `k_fs_opened` call against the global kernel.
 // Message in: { module, memory }; out: { paths } or { error }.
 //
-// It runs on the stack slot persist-worker.js uses (above every Worker's), so
-// it is not for a page that persists while it asks: a recording run.
+// It runs on a kernel stack slot of its own (lazy-fetch.mjs `HELPER_STACKS`):
+// it may ask while the page persists and has a terminal. fs-opened.js asks
+// one at a time, so two of these never share it.
 
-import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 
 const SCRATCH = 0x1000;
 
@@ -24,7 +25,8 @@ self.onmessage = async (e) => {
     const k = inst.exports;
     if (!k.k_fs_opened) throw new Error('this kernel has no k_fs_opened');
     if (k.k_stack_area && k.__stack_pointer) {
-      k.__stack_pointer.value = (k.k_stack_area() + k.k_stack_count() * k.k_stack_size()) | 0;
+      // Its own slot (`HELPER_STACKS`), thread-locals at the top of it.
+      kernelThread(k, helperStackTop(k, 'fsOpened'));
     }
     for (let cap = 1 << 20; ; cap *= 4) {
       const need = Math.ceil((SCRATCH + cap) / 65536) - mem.buffer.byteLength / 65536;

@@ -11,7 +11,7 @@ const GUEST_BYTES = 0xffff0000;
 // memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
-import { lazyFetch, processMemories } from "./lazy-fetch.mjs";
+import { kernelThread, lazyFetch, processMemories } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logOn, logQuiet } from "./log.mjs";
@@ -2523,7 +2523,8 @@ export class Gex {
     // memory, so two Workers in the kernel would overwrite each other's locals.
     // `stackTop` is a per-Worker slice the kernel reserves; the first Worker
     // has none and keeps the linked stack.
-    if (stackTop) inst.exports.__stack_pointer.value = stackTop | 0;
+    // Its thread-locals too (`kernelThread`), at the top of that slice.
+    if (stackTop) kernelThread(inst.exports, stackTop);
     this.#kernel = inst.exports;
     // `?timescale=N&fixedtime=S`: the benchmark clocks (gex-kernel
     // `set_guest_clock`, as pewasm's PEWASM_TIME_SCALE and FIXED_TIME). The
