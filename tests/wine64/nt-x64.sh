@@ -383,10 +383,20 @@ fi
 # calling back (tests/wasm64/dll)
 if [ -n "${W64_TOOLS:-}" ] && [ -n "${W64_SRC:-}" ]; then
 	case " ${CASES:-dll} " in *" dll "*)
-		if "$root/tests/wasm64/dll/build.sh" "$w/dll" "$W64_SRC" "$W64_TOOLS" > "$w/dll.build" 2>&1; then
+		# wcc64 needs the sysroot (build-sysroot64.sh) as well as the tools.
+		# Not beside the native PE core: a process has one Wine PE module
+		# (wasmdll.rs WINE_PE), so abi.dll's skeleton would be bound into
+		# winepe.wasm's slots, and LoadLibrary runs its ud2 stubs (c000001d).
+		if [ -n "${NATIVE:-}" ]; then
+			echo "skip x64/dll ($tag): abi.dll's own module cannot load beside the native PE core (one Wine PE module a process)"
+		elif [ -z "${GEX_WASM64_SYSROOT:-}" ]; then
+			fail=$((fail + 1)); echo "FAIL x64/dll (W64): build: GEX_WASM64_SYSROOT is not set (W64_TOOLS and W64_SRC are)"
+		elif "$root/tests/wasm64/dll/build.sh" "$w/dll" "$W64_SRC" "$W64_TOOLS" > "$w/dll.build" 2>&1; then
 			EXTRA="$w/dll/abi.dll" check dll 0 "(ok [^$nl]*$nl)+PASS" "$w/dll/abi_test.exe"
 		else
-			fail=$((fail + 1)); echo "FAIL x64/dll (W64): build"; tail -5 "$w/dll.build" | sed 's/^/  /'
+			# The last line on the FAIL line itself: a caller keeping only
+			# ok/FAIL lines still sees why.
+			fail=$((fail + 1)); echo "FAIL x64/dll (W64): build: $(tail -1 "$w/dll.build")"; tail -5 "$w/dll.build" | sed 's/^/  /'
 		fi ;;
 	esac
 fi
