@@ -9,7 +9,10 @@
 // Checks: (1) with no window focused, a key goes to A, the topmost toplevel
 // that is mapped and on the output, not OFF; (2) once the program activates
 // B and raises A over it without activation, the next key goes to B (the
-// focused window keeps the keyboard; the fallback never takes it). Prints
+// focused window keeps the keyboard; the fallback never takes it); (3) after
+// C to B, with A, B and OFF gone and N shown without activation (inactive in
+// Win32, nothing active), a key reaches N, which Wine activates on the
+// keyboard's enter (winewayland, needs the W3 dist to carry it). Prints
 // PASS/FAIL lines and "ok eject-keyfocus" or "FAIL eject-keyfocus".
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -112,12 +115,12 @@ const key = async (k, code, vk) => {
   }
 };
 await key('a', 'KeyA', 65);
-const first = await wait('the first key', 30, async () => (/^kf: (A|OFF|B|\?) key 0x41$/m.exec(out) ?? [])[1]);
+const first = await wait('the first key', 30, async () => (/^kf: (A|OFF|B|N|\?) key 0x41$/m.exec(out) ?? [])[1]);
 check(first === 'A', `with no window focused the key reached A, the topmost window on the output (it reached ${first ?? 'no window'})`);
 // The compositor's own note of where the keyboard went.
 const d1 = await describe();
 const gave = d1?.log?.map((l) => /no window has the keyboard; it goes to the top one, (\S+)/.exec(l)?.[1]).filter(Boolean) ?? [];
-check(gave.length === 1 && gave[0] === up.a, `the keyboard went to A (${up.a}) once, not OFF (${up.off}), which is above it but off the output (given to: ${gave.join(', ') || 'none'})`);
+check(gave[0] === up.a && !gave.includes(up.off), `the keyboard went to A (${up.a}) once, not OFF (${up.off}), which is above it but off the output (given to: ${gave.join(', ') || 'none'})`);
 // B activated by the program, A raised over it without activation.
 const b = await wait('B', 60, async () => {
   if (!/^kf: B up/m.test(out)) return null;
@@ -128,8 +131,23 @@ const b = await wait('B', 60, async () => {
 if (!check(!!b, 'B is up and has the keyboard (its client activated it)')) done();
 await sleep(1000);
 await key('b', 'KeyB', 66);
-const second = await wait('the second key', 30, async () => (/^kf: (A|OFF|B|\?) key 0x42$/m.exec(out) ?? [])[1]);
+const second = await wait('the second key', 30, async () => (/^kf: (A|OFF|B|N|\?) key 0x42$/m.exec(out) ?? [])[1]);
 check(second === 'B', `the next key reached B, which has the keyboard, not A above it (it reached ${second ?? 'no window'})`);
 const d2 = await describe();
 check(d2?.focus === b, `B keeps the keyboard (${d2?.focus})`);
+// C to B: keyfocus.exe closes A, B and OFF and brings up N.
+await key('c', 'KeyC', 67);
+// N: inactive in Win32, nothing active, no window with the keyboard.
+const nk = await wait('N', 60, async () => {
+  if (!/^kf: N up/m.test(out)) return null;
+  const d = await describe();
+  const k = keyOf(d, 'kf-n');
+  return k && !keyOf(d, 'kf-a') && !keyOf(d, 'kf-b') && !keyOf(d, 'kf-off') ? { k, d } : null;
+});
+if (!check(!!nk, 'A, B and OFF are gone and N is up')) done();
+check(nk.d.focus === null, `no window has the keyboard with N up (focus ${nk.d.focus})`);
+await key('n', 'KeyN', 78);
+const third = await wait('the third key', 30, async () => (/^kf: (A|OFF|B|N|\?) key 0x4e$/m.exec(out) ?? [])[1]);
+check(third === 'N', `a window inactive in Win32 that is given the keyboard gets the key (it reached ${third ?? 'no window'})`);
+check(/^kf: N activated$/m.test(out), 'N was activated (winewayland, on the keyboard while nothing is active)');
 done();
