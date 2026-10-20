@@ -24,15 +24,6 @@ use std::path::{Path, PathBuf};
 pub const PROVIDER_H: &str = include_str!("../../gex-cgen/providers/provider.h");
 
 #[cfg(feature = "build")]
-/// Whether the PE file at `path` is LuaJIT's lua51.dll (it exports
-/// `luaJIT_setmode`): its trace compiler writes x86 at run time, which an
-/// ejected project cannot run, so it gets the Lua provider.
-pub fn is_luajit(path: &Path) -> Result<bool> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    Ok(pe.exports.entries.iter().any(|e| e.names.iter().any(|n| n == "luaJIT_setmode")))
-}
-
 /// Where a configured provider's module goes.
 fn provider_wasm(dir: &Path, p: &crate::config::Provider) -> PathBuf {
     dir.join("build/providers").join(p.library.to_ascii_lowercase().replace(".dll", ".wasm"))

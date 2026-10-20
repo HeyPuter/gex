@@ -37,10 +37,6 @@ pub mod decompile;
 pub mod eject;
 pub mod json;
 pub mod pe;
-/// The stateful providers an eject can set up (`libs/`, embedded).
-pub mod libs {
-    include!(concat!(env!("OUT_DIR"), "/libs.rs"));
-}
 #[cfg(feature = "build")]
 pub mod plt;
 pub mod project;
