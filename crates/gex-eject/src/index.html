@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gex-eject</title>
+<style>
+  :root { --bg: #111; --fg: #ddd; --dim: #8a8f98; --track: #2a2d33; --bar: #4a90e2; --err: #f88; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; }
+  #error { position: fixed; left: 1em; right: 1em; bottom: 1em; margin: 0; color: var(--err); white-space: pre-wrap; z-index: 2147483647; }
+  /* The loading screen: over the whole page (above the windows' own z-index)
+     until the program's first frame. */
+  #loading { position: fixed; inset: 0; z-index: 2147483646; display: flex; align-items: center; justify-content: center;
+             background: var(--bg); transition: opacity 0.6s ease; }
+  #loading.done { opacity: 0; pointer-events: none; }
+  #loading .box { width: min(360px, calc(100vw - 32px)); }
+  #loading .row { display: flex; justify-content: space-between; gap: 1em; margin-bottom: 8px; }
+  #loading .phase { font-weight: 600; }
+  #loading .time, #loading .detail { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #loading .track { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+  #loading .fill { height: 100%; width: 0; background: var(--bar); transition: width 0.2s linear; }
+  /* No count to show (the program is starting): a bar that moves. */
+  #loading .track.busy .fill { width: 30%; animation: busy 1.2s ease-in-out infinite; }
+  @keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  #loading .detail { margin-top: 8px; min-height: 1.2em; }
+  /* What the start-up has reached (start()'s progress log): the latest lines. */
+  #loading .log { margin: 10px 0 0; padding: 0; list-style: none; height: calc(8 * 1.35em); overflow: hidden;
+                  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.35em; color: var(--dim);
+                  display: flex; flex-direction: column; justify-content: flex-end; }
+  #loading .log li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #loading .log .t { display: inline-block; width: 5.5em; text-align: right; margin-right: 1em; opacity: 0.7; }
+  /* The phases already over (the download, with its time). */
+  #loading .past { margin-top: 4px; min-height: 1.2em; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  /* What the running program is fetching (a lazy file, translated code). */
+  #fetching { position: fixed; right: 8px; bottom: 48px; z-index: 2147483645; max-width: calc(100vw - 32px);
+              padding: 3px 10px; border-radius: 4px; background: rgba(0, 0, 0, 0.72); color: #eee;
+              font: 12px system-ui, sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; pointer-events: none; opacity: 0; transition: opacity 0.2s; }
+  #fetching.on { opacity: 1; }
+</style>
+</head>
+<body>
+<pre id="error"></pre>
+<div id="fetching" aria-live="polite"></div>
+<div id="loading" role="progressbar" aria-live="polite">
+  <div class="box">
+    <div class="row"><span class="phase">Loading</span><span class="time">0 s</span></div>
+    <div class="track"><div class="fill"></div></div>
+    <div class="detail"></div>
+    <div class="past"></div>
+    <ul class="log"></ul>
+  </div>
+</div>
+<script type="module">
+  // Your page: gexc eject wrote it once (user/index.html) and never rewrites
+  // it. The program is app.mjs's: start() takes an element to fill and,
+  // optionally, args, env, size ('fit' or {w, h}), onLog, onExit, onProgress
+  // and more (docs/eject.md, "The web build"); it gives back { exited, kill(),
+  // resize(), state }. The loading screen below is this page's: start()
+  // only says how far along it is (onProgress).
+  import { start } from './app.mjs';
+  const error = document.getElementById('error');
+  const show = (e) => { error.textContent = String(e?.message ?? e); };
+
+  const loading = document.getElementById('loading');
+  const $ = (c) => loading.querySelector(c);
+  // The clock counts the download, then starts again at 0 for the start-up,
+  // so each shows its own time; the download's stays on the screen.
+  const t0 = performance.now();
+  let since = t0;
+  let downloaded = false;
+  const secs = (ms) => (ms < 10000 ? (ms / 1000).toFixed(1) : String(Math.round(ms / 1000)));
+  const clock = setInterval(() => { $('.time').textContent = `${Math.floor((performance.now() - since) / 1000)} s`; }, 250);
+  const downloadDone = (p) => {
+    if (downloaded || !['compile', 'boot', 'first-frame', 'ready'].includes(p.phase)) return;
+    downloaded = true;
+    // When the download ended: the next phase's start (start()'s own clock).
+    const end = p.at.compile ?? p.at.boot ?? p.at['first-frame'] ?? p.elapsed;
+    since = t0 + end;
+    const d = p.download;
+    $('.past').textContent = `Downloaded${d.total ? ` ${mb(d.total)} MB` : ''} in ${secs(end)} s`;
+  };
+  const mb = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0);
+  const bar = (frac) => {
+    $('.track').classList.toggle('busy', frac === null);
+    $('.fill').style.width = frac === null ? '' : `${Math.min(100, frac * 100).toFixed(1)}%`;
+  };
+  const hide = () => {
+    clearInterval(clock);
+    loading.classList.add('done');
+    setTimeout(() => loading.remove(), 700);
+  };
+  // After the start: what the program is fetching, in a corner, while it is.
+  const line = document.getElementById('fetching');
+  let off = 0;
+  const fetching = (f) => {
+    clearTimeout(off);
+    if (!f) {
+      off = setTimeout(() => line.classList.remove('on'), 400);
+      return;
+    }
+    const more = f.inflight > 1 ? ` (+${f.inflight - 1})` : '';
+    const of = f.total >= 1e6 ? `${mb(f.done)} of ${mb(f.total)} MB`
+      : `${Math.round(f.done / 1e3)} of ${Math.max(1, Math.round(f.total / 1e3))} KB`;
+    const code = f.name && f.owner && f.name.toLowerCase() !== f.owner.toLowerCase() ? `${f.name} (${f.owner})` : f.name || f.owner || 'the program';
+    const what = f.kind === 'code' ? `code for ${code}` : f.name;
+    line.textContent = `Loading ${what}${f.total ? ` \u2014 ${of}` : ''}${more}`;
+    line.classList.add('on');
+  };
+  // The latest lines of start()'s log (structured events: phases, programs
+  // started, images loaded, files fetched), each with its time on the clock
+  // that was running then.
+  const logList = $('.log');
+  let logged = '';
+  const showLog = (p) => {
+    const lines = p.log ?? [];
+    const l0 = lines[lines.length - 1];
+    const last = l0 ? `${lines.length}:${l0.t}:${l0.text}` : '';
+    if (last === logged) return;
+    logged = last;
+    const end = p.at?.compile ?? p.at?.boot;
+    logList.replaceChildren(...lines.slice(-8).map((l) => {
+      const li = document.createElement('li');
+      const t = document.createElement('span');
+      t.className = 't';
+      t.textContent = `${secs(end !== undefined && l.t >= end ? l.t - end : l.t)} s`;
+      li.append(t, l.text);
+      return li;
+    }));
+  };
+  const progress = (p) => {
+    downloadDone(p);
+    showLog(p);
+    const d = p.download;
+    const c = p.compile;
+    if (p.phase === 'download') {
+      $('.phase').textContent = 'Downloading';
+      // Pieces the page kept from an earlier visit count as done: say so.
+      const kept = d.cached ? ` (${mb(d.cached)} MB from cache)` : '';
+      $('.detail').textContent = (d.total ? `${mb(d.done)} of ${mb(d.total)} MB` : `${d.filesDone} of ${d.files} files`) + kept;
+      bar(d.total ? d.done / d.total : d.files ? d.filesDone / d.files : null);
+    } else if (p.phase === 'compile') {
+      $('.phase').textContent = 'Compiling';
+      $('.detail').textContent = `${c.done} of ${c.total}`;
+      bar(c.total ? c.done / c.total : null);
+    } else if (p.phase === 'boot' || p.phase === 'first-frame') {
+      // What the program has reached: the latest program and image, and the
+      // build's images loaded so far of all it ships (the bar).
+      const b = p.boot;
+      $('.phase').textContent = b?.program ? `Starting ${b.program}` : 'Starting';
+      const of = b?.units.total ? `${b.units.done} of ${b.units.total} images` : '';
+      $('.detail').textContent = [b?.image, of].filter(Boolean).join(' \u2014 ');
+      bar(b?.units.total ? b.units.done / b.units.total : null);
+    } else if (p.phase === 'ready') {
+      hide();
+      fetching(p.fetch);
+    } else if (p.phase === 'failed' || p.phase === 'exited') {
+      clearInterval(clock);
+      $('.phase').textContent = p.phase === 'failed' ? 'Failed' : 'The program exited';
+      bar(0);
+    }
+  };
+
+  try {
+    // The guest's network over a Wisp proxy: gex's default (as its desktop
+    // page), or ?wisp=wss://…/; an empty ?wisp= leaves the guest offline.
+    const q = new URLSearchParams(location.search);
+    const wisp = q.has('wisp') ? q.get('wisp') : 'wss://anura.pro/';
+    const app = await start({ container: document.body, onProgress: progress, ...(wisp ? { wisp } : {}) });
+    // A library that says nothing of its progress: no loading screen to keep.
+    if (!app.state?.progress) hide();
+    // The desktop follows the window (a resize, a zoom): 'fit' again,
+    // once the window has settled.
+    let resizing = 0;
+    addEventListener('resize', () => {
+      clearTimeout(resizing);
+      resizing = setTimeout(() => app.resize?.('fit'), 250);
+    });
+    app.exited.then((status) => { if (status) show(`The program exited (${status}).`); }, show);
+  } catch (e) {
+    progress({ phase: 'failed' });
+    show(e);
+  }
+</script>
+</body>
+</html>
