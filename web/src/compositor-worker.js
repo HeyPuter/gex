@@ -1642,7 +1642,14 @@ class Compositor {
       // appear twice rather than infer it from a screenshot.
       list: [...this.#windows.values()].map((w) =>
         `${w.key} role=${w.role} ${w.width}x${w.height}@${w.x},${w.y}`
-        + ` serial=${w.info?.serial ?? 0} scale=${w.bs ?? 1}/${w.cs ?? 1} "${w.title}"`),
+        + ` serial=${w.info?.serial ?? 0} scale=${w.bs ?? 1}/${w.cs ?? 1}`
+        // How the pointer finds it (`#hit`): placed by its client, drawn whole
+        // by it (no frame), maximized, its input region's bounds if it set one,
+        // and its parent. Before the title, which tests match at the end.
+        + `${w.placed ? ' placed' : ''}${w.unmanaged ? ' unmanaged' : ''}${w.maximized ? ' maximized' : ''}`
+        + (w.info?.input ? ` input=${w.info.input.w}x${w.info.input.h}@${w.info.input.x},${w.info.input.y}` : '')
+        + (w.parent ? ` parent=${w.parent} rel=${w.relX},${w.relY}` : '')
+        + ` "${w.title}"`),
       log: this.#log.slice(-24),
       staging: this.#stagingOk === false,
       titles: wins.map((w) => w.title || '(untitled)'),
