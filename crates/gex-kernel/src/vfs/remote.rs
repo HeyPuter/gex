@@ -50,6 +50,10 @@ pub struct Remote {
     /// length, with [`WALK_AT_MOUNT`] set if it stopped at a mount), or a
     /// negated errno. `mounts` is the other mount points, NUL-separated.
     pub walk: extern "C" fn(path: crate::PAddr, path_len: u32, mounts: crate::PAddr, mounts_len: u32, follow: u32, at: crate::PAddr, cap: u32) -> i32,
+    /// [`crate::vfs::FileSystem::walk_metadata`] there: the metadata
+    /// ([`META_BYTES`]) into `at` and 0, a negated errno, or
+    /// [`WALK_META_AT_MOUNT`] with nothing written.
+    pub walk_meta: extern "C" fn(path: crate::PAddr, path_len: u32, mounts: crate::PAddr, mounts_len: u32, at: crate::PAddr) -> i32,
     pub unlink: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
@@ -133,6 +137,9 @@ pub const OMIT: u32 = u32::MAX;
 
 /// Set in `walk`'s answer when the walk stopped at another mount.
 pub const WALK_AT_MOUNT: i32 = 1 << 30;
+
+/// `walk_meta`'s answer when the walk stopped at another mount.
+pub const WALK_META_AT_MOUNT: i32 = 1;
 
 /// A time for `Remote::set_times`.
 pub fn time_arg(t: Option<(i64, u32)>) -> (i64, u32) {
@@ -325,6 +332,16 @@ impl FileSystem for RemoteFs {
             buf.len() as u32,
         ))? as usize;
         Ok(String::from_utf8_lossy(&buf[..got]).into_owned())
+    }
+
+    fn walk_metadata(&self, abs: &str, mounts: &str) -> Result<Option<Metadata>, Errno> {
+        let (a, n) = at(abs.as_bytes());
+        let (ma, mn) = at(mounts.as_bytes());
+        let mut buf = [0u8; META_BYTES];
+        match ok((self.remote.walk_meta)(a, n, ma, mn, buf.as_mut_ptr() as crate::PAddr))? {
+            WALK_META_AT_MOUNT => Ok(None),
+            _ => Ok(Some(decode_meta(&buf))),
+        }
     }
 
     fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {

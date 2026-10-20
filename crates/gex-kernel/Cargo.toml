@@ -25,3 +25,5 @@ ppc = ["gex-abi/ppc"]
 # (core's own checks reject its guest-memory slices), so its order check is
 # this switch (shims/browser/build.sh: GEX_LOCK_RANKS=1).
 lock-ranks = []
+# A system call's time by phase (`phase`): a measuring build.
+phases = []

@@ -47,6 +47,7 @@ pub mod mem;
 pub mod net;
 pub mod nt;
 pub mod pipe;
+pub mod phase;
 pub mod proc;
 pub mod pty;
 pub mod signal;

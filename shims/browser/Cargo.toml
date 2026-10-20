@@ -42,6 +42,9 @@ heap-counters = ["talc/counters"]
 # The lock-order check (docs/kernel-locking.md §4.3) in this release build:
 # a panic naming the ranks held when a lock is taken out of order.
 lock-ranks = ["gex-kernel/lock-ranks"]
+# The phase marks (`gex_kernel::phase`, read with `GEX_PHASES=1`): a
+# measuring build (build.sh: GEX_PHASE_MARKS=1).
+phases = ["gex-kernel/phases"]
 # Host an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).

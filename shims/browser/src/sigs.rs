@@ -489,6 +489,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         },
         thread_fs: &home.thread_fs,
     };
+    gex_kernel::phase::mark(4);
     syscalls::free_call(&f, gm, ctx_addr, call)
 }
 

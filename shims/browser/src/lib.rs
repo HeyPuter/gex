@@ -353,6 +353,7 @@ extern "C" {
     fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -839,91 +840,184 @@ extern "C" fn rpty_queue(id: i32) -> u32 {
 }
 
 extern "C" fn rf_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
-    unsafe { k_fs_open_now(path, path_len, flags, mode, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_open_now(path, path_len, flags, mode, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_close(handle: i32) {
-    unsafe { k_fs_close(handle) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_close(handle) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_dup(handle: i32) -> i32 {
-    unsafe { k_fs_dup(handle) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_dup(handle) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_fs_read(handle, offset, at, len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read(handle, offset, at, len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32 {
-    unsafe { k_fs_write_now(handle, offset, at, len, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_write_now(handle, offset, at, len, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_meta(handle: i32, at: gex_kernel::PAddr) -> i32 {
-    unsafe { k_fs_meta(handle, at) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_meta(handle, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
-    unsafe { k_fs_truncate(handle, len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_truncate(handle, len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
-    unsafe { k_fs_advise(handle, offset, len, advice) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_advise(handle, offset, len, advice) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_read_dir(handle, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read_dir(handle, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32 {
-    unsafe { k_fs_path_meta(path, path_len, at) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_path_meta(path, path_len, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_read_link(path, path_len, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read_link(path, path_len, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_walk(path, path_len, mounts, mounts_len, follow, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_walk(path, path_len, mounts, mounts_len, follow, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
+}
+extern "C" fn rf_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32 {
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_walk_meta(path, path_len, mounts, mounts_len, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_unlink(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_unlink(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_mkdir(path, path_len, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_mkdir(path, path_len, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_rmdir(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rmdir(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32 {
-    unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_moved(handle, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_moved(handle, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rename_epoch() -> i32 {
-    unsafe { k_fs_rename_epoch() }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rename_epoch() };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_hold_renames(handle: i32, owner: i32, on: u32) -> i32 {
-    unsafe { k_fs_hold_renames(handle, owner, on) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_hold_renames(handle, owner, on) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_fchmod(handle: i32, mode: u32) -> i32 {
-    unsafe { k_fs_fchmod(handle, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_fchmod(handle, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32 {
-    unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
-    unsafe { k_fs_touch(handle, secs) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_touch(handle, secs) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
-    unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
-    unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32 {
-    unsafe { k_fs_xattr(handle, path, path_len, op, name, name_len, buf, len, flags) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_xattr(handle, path, path_len, op, name, name_len, buf, len, flags) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_symlink(target, target_len, path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_symlink(target, target_len, path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
-    unsafe { k_fs_link(from, from_len, to, to_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_link(from, from_len, to, to_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_mksocket(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_mksocket(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 
 extern "C" fn rp_new(pid: i32) -> i32 {
@@ -1488,6 +1582,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             path_meta: rf_path_meta,
             read_link: rf_read_link,
             walk: rf_walk,
+            walk_meta: rf_walk_meta,
             unlink: rf_unlink,
             mkdir: rf_mkdir,
             rmdir: rf_rmdir,
@@ -7240,11 +7335,102 @@ fn count_syscall(nr: u64, ctx: u64) {
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    gex_kernel::phase::begin();
     syscall_entry(ctx, pc);
     cgen::ftab_resume();
     if gex_kernel::unix::take_host_sent() {
         pump_compositor();
     }
+    phases_end();
+}
+
+/// `GEX_PHASES` (a debug switch): a stat's time by phase, from the shim's
+/// entry to its return ([`gex_kernel::phase`]).
+#[no_mangle]
+pub extern "C" fn gex_set_phases(on: i32) {
+    if on != 0 {
+        if !cfg!(feature = "phases") {
+            warn_line("[gex] GEX_PHASES: this shim has no phase marks (build it with GEX_PHASE_MARKS=1)\n");
+        }
+        gex_kernel::phase::set_clock(now_ns);
+    }
+}
+
+/// The phases' names (`gex_kernel::phase` slots), in call order.
+const PHASES: [(usize, &str); 13] = [
+    (0, "entry checks"),
+    (1, "number, trace"),
+    (2, "preamble"),
+    (3, "free_class"),
+    (4, "free_call setup"),
+    (5, "kernel dispatch"),
+    (6, "path read, at_path"),
+    (7, "vfs (kernel)"),
+    (8, "global kernel calls"),
+    (9, "stat encode, write"),
+    (10, "back to free_syscall"),
+    (11, "free_syscall after"),
+    (12, "exit to guest"),
+];
+
+/// A call's end: every 20,000 stats measured, their mean by phase.
+fn phases_end() {
+    if !gex_kernel::phase::enabled() {
+        return;
+    }
+    let calls = gex_kernel::phase::end(12);
+    if calls == 0 || calls % 20_000 != 0 {
+        return;
+    }
+    let (v, calls) = gex_kernel::phase::take();
+    // What a mark costs (a clock read), to read the phases against.
+    let t0 = now_ns();
+    for _ in 0..999 {
+        now_ns();
+    }
+    let clock = (now_ns() - t0) / 1000;
+    // What a call into the global kernel costs by itself (one atomic load
+    // there), and a root path's metadata and walk (the stat of `/tmp`).
+    let probe = |f: &dyn Fn()| {
+        let t0 = now_ns();
+        for _ in 0..2000 {
+            f();
+        }
+        (now_ns() - t0) as f64 / 2000.0
+    };
+    let p = b"/tmp";
+    let mut out = [0u8; 256];
+    let k_epoch = probe(&|| {
+        unsafe { k_fs_rename_epoch() };
+    });
+    let k_meta = probe(&|| {
+        unsafe { k_fs_path_meta(p.as_ptr() as gex_kernel::PAddr, 4, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let k_walk = probe(&|| {
+        unsafe { k_fs_walk(p.as_ptr() as gex_kernel::PAddr, 4, out.as_ptr() as gex_kernel::PAddr, 0, 1, out.as_ptr() as gex_kernel::PAddr, 128) };
+    });
+    let q = b"/nonexistent-name";
+    let k_miss = probe(&|| {
+        unsafe { k_fs_path_meta(q.as_ptr() as gex_kernel::PAddr, q.len() as u32, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let r = b"/tmp/missing.txt";
+    let k_wm = probe(&|| {
+        unsafe { k_fs_walk_meta(r.as_ptr() as gex_kernel::PAddr, r.len() as u32, out.as_ptr() as gex_kernel::PAddr, 0, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let line0 = format!("[gex] global kernel calls: rename_epoch {k_epoch:.0} ns, path_meta /tmp {k_meta:.0} ns, walk /tmp {k_walk:.0} ns, path_meta_miss {k_miss:.0} ns, walk_meta_miss {k_wm:.0} ns each\n");
+    warn_line(&line0);
+    let total: u64 = v.iter().map(|p| p.0).sum();
+    let mut line = format!("[gex] phases of {calls} stats: total {:.2} us, clock read {clock} ns:", total as f64 / calls as f64 / 1e3);
+    for (i, name) in PHASES {
+        let (ns, marks) = v[i];
+        line.push_str(&format!(" {name} {:.2} us", ns as f64 / calls as f64 / 1e3));
+        if marks != calls {
+            line.push_str(&format!(" ({:.1}/call)", marks as f64 / calls as f64));
+        }
+        line.push(';');
+    }
+    line.push('\n');
+    warn_line(&line);
 }
 
 fn syscall_entry(ctx: i32, pc: i64) {
@@ -7284,6 +7470,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
             }
         }
     }
+    gex_kernel::phase::mark(0);
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
         // A wasm32 program has no safepoints of its own: its loops reach
@@ -7363,6 +7550,10 @@ fn syscall_entry(ctx: i32, pc: i64) {
         }
         n
     };
+    if this_nr == gex_kernel::syscalls::nr::NEWFSTATAT {
+        gex_kernel::phase::keep();
+    }
+    gex_kernel::phase::mark(1);
     // posix_spawn's child running in its parent's Worker: not the calls
     // that would change the memory map it shares (vfork.rs).
     if vfork::active() {
@@ -7498,6 +7689,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if gone_now {
         stop_gone();
     }
+    gex_kernel::phase::mark(2);
     let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped) } {
     Some(stop) => stop,
     None => with_exec_lock(|h| {
@@ -12273,7 +12465,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             o
         })
     } else {
-        sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64)
+        gex_kernel::phase::mark(3);
+        let o = sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64);
+        gex_kernel::phase::mark(10);
+        o
     };
     if n == nr::FUTEX || n == nr::EXIT {
         // Every futex this call woke (an `exit` wakes its thread's joiner),
@@ -12341,6 +12536,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         // the lock if it is a class call, as any other).
         FreeOutcome::Again => return free_syscall(ctx, pc, mapped),
     })
+    .inspect(|_| gex_kernel::phase::mark(11))
 }
 
 /// Park a class call ([`free_syscall`]) on its stream, without the kernel:

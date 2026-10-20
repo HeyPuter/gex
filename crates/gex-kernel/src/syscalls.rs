@@ -3087,18 +3087,23 @@ impl PathIo<'_> {
         buf: u64,
         flags: u64,
     ) -> SysResult {
+        crate::phase::mark(5);
         let raw = m.read_cstr(path, 4096)?;
         if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.fstat(m, dirfd, buf);
         }
-        let p = self.at_path(m, dirfd, path)?;
+        // The path as read: not read again (`at_path`).
+        let p = self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)?;
+        crate::phase::mark(6);
         let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             self.ns.metadata_nofollow(&p)
         } else {
             self.ns.metadata(&p)
         };
+        crate::phase::mark(7);
         let md = md?;
         m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        crate::phase::mark(9);
         Ok(0)
     }
 
@@ -3527,12 +3532,10 @@ impl PathIo<'_> {
 
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
-        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
-        self.at_path_str(dirfd, &p)
+        self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)
     }
 
     pub fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        let p = p.to_string();
         // An empty path names nothing (the AT_EMPTY_PATH forms check for it
         // before they get here), as on Linux.
         if p.is_empty() {
