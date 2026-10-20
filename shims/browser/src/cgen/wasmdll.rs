@@ -143,7 +143,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
-        // (an LLP64 module's above the images: see `crate::W64_PE_DATA`)
+        // (an LLP64 module's above the images: see `crate::w64_pe_data`)
         let data = if pe.is64 {
             alloc_pe_data_window((size as u64).max(16) + a, "[wine PE data]")?
         } else {
@@ -238,7 +238,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         wp.install = ftab(|m| m.publish(len, PROVIDER | wp.number, Tier::Unit, &pairs));
         clear(&addrs);
         let (regs, dirs, slots) = bridges(&addrs);
-        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data as u32 });
+        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data });
         Ok(wp.number as i32)
     } else {
         let install = wp.install;
@@ -432,11 +432,11 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
-/// A PE32+ core's data, at the top of [`crate::W64_PE_DATA`] (reserved at
+/// A PE32+ core's data, at the top of [`crate::w64_pe_data`] (reserved at
 /// the x86-64 split), zeroed.
 fn alloc_pe_data_window(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
-    let (lo, hi) = crate::W64_PE_DATA;
+    let (lo, hi) = crate::w64_pe_data();
     let len = (size + 0xffff) & !0xffff;
     if len > hi - lo {
         return Err(format!("{name}: {len:#x} bytes do not fit the W64 PE data window"));

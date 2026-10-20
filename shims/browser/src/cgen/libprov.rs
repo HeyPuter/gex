@@ -398,7 +398,7 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
         gex_kernel::ftab::fcache_clear(mem, a);
     }
     let (regs, dirs, slots) = bridges(&addrs);
-    lock(&PROVIDERS).push(ProviderModule { file: format!("libprov:{}", l.path), regs, dirs, slots, memory_base: l.data as u32 });
+    lock(&PROVIDERS).push(ProviderModule { file: format!("libprov:{}", l.path), regs, dirs, slots, memory_base: l.data as u32 as u64 });
     l.number = Some(number);
     number as i32
 }

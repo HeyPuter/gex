@@ -4071,7 +4071,8 @@ export class Gex {
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
     // A stateful provider (docs/eject-pe.md §5.1): its data in the guest's
     // memory, this Worker's provider stack, and the provider_* imports.
-    const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) : 0;
+    // (above 4 GiB for Wine's PE module in a 64-bit memory: the upper half)
+    const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) + (e.gex_cgen_pmod_memory_base_hi?.(prov) >>> 0) * 2 ** 32 : 0;
     const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c)
       : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
       : (b, c) => e.gex_cgen_regs(u, b, c);
@@ -4091,7 +4092,9 @@ export class Gex {
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
         // and its shared libraries share it (one per thread, as natively).
-        __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered ? this.#providerStack64() : this.#providerStack())
+        // (Wine's PE module of a twin install in a 64-bit memory's process,
+        // winepe.wasm.m64: built for wasm64 and not lowered, so i64 too.)
+        __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered || (wasmdll && m64()) ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
         // clang's three names for a C main: Wine's crt_main references all
@@ -4100,7 +4103,9 @@ export class Gex {
         // static link leaves them, and a trap behind the null check.
         ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
-      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, m64()
+        ? new WebAssembly.Global({ value: 'i64', mutable: true }, 0n)
+        : new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
         // Built-in providers' host functions (gex-cgen/providers): nt_qpc's

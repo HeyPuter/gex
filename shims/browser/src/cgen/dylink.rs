@@ -144,7 +144,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
         }
         let number = {
             let mut provs = lock(&PROVIDERS);
-            provs.push(ProviderModule { file: format!("wasmprog:{}", m.path), regs, dirs, slots, memory_base: m.memory_base });
+            provs.push(ProviderModule { file: format!("wasmprog:{}", m.path), regs, dirs, slots, memory_base: m.memory_base as u64 });
             provs.len() as u32 - 1
         };
         p.module_of[i] = number;
