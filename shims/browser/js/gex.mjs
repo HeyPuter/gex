@@ -1531,24 +1531,25 @@ export class Gex {
         // own and another process hands out the same ones.
         // In the single build a promise (the compositor's Mesa runs in this
         // realm), so the import suspends; never from a nested call-out.
+        // `ring` is an f64, whole in a 64-bit memory (gl.rs).
         gl_submit: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
-            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
+            ? this.#gl.submit(this.#memory, ring, this.wlToken(), false, this.#glWaitNote)
             : -1))
           : (ring) =>
             (this.#gl
-              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
+              ? this.#gl.submit(this.#memory, ring, this.wlToken(), false, this.#glWaitNote)
               : -1),
         // The same, not waited for (a frame's last batch): the copy is taken
         // and the guest draws on; the next submit waits for this one, and
         // says how long through `gex_gl_note_wait_ns`.
         gl_submit_async: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
-            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
+            ? this.#gl.submit(this.#memory, ring, this.wlToken(), true, this.#glWaitNote)
             : -1))
           : (ring) =>
             (this.#gl
-              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
+              ? this.#gl.submit(this.#memory, ring, this.wlToken(), true, this.#glWaitNote)
               : -1),
         // This pump's scene: `count` surface records at `ptr` in this memory,
         // saying where each surface's pixels are rather than carrying them. The

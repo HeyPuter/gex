@@ -15,12 +15,17 @@ extern "C" {
     /// Run the batch whose header is at `ring` (an address in this module's
     /// memory). Returns zero, or negative when the page has no WebGL. The reply
     /// is written back into the buffer, not through the return value.
-    fn gl_submit(ring: u32) -> i32;
+    ///
+    /// The address is an `f64` (exact below 2^53): in a 64-bit memory the
+    /// guest's ring is commonly above 4 GiB (the high arena takes a
+    /// non-executable mapping), and a `u32` sent the page to the wrong bytes
+    /// -- Hades' GL in its M64 process got status 0 and no version string.
+    fn gl_submit(ring: f64) -> i32;
     /// `gl_submit` without waiting for the batch to run: the page copies the
     /// ring and returns; the next submit waits for this one first. Returns
     /// the frames shown as of this process's previous unwaited batch's
     /// PRESENT (0 when not known), or negative when that batch failed.
-    fn gl_submit_async(ring: u32) -> i32;
+    fn gl_submit_async(ring: f64) -> i32;
 }
 
 /// Set when the page said it has a canvas with WebGL on it. Off by default, so
@@ -78,7 +83,7 @@ thread_local! {
     /// A submit the ioctl took but left for after the kernel's lock
     /// (`submit_pending`): (ring address, unwaited, a present whose frames
     /// shown are the call's result).
-    static PENDING: std::cell::Cell<Option<(u32, bool, bool)>> = const { std::cell::Cell::new(None) };
+    static PENDING: std::cell::Cell<Option<(u64, bool, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -87,8 +92,9 @@ thread_local! {
     pub(crate) static DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn submit_now(ring: u32, unwaited: bool) -> i32 {
+fn submit_now(ring: u64, unwaited: bool) -> i32 {
     let t0 = crate::now_ns();
+    let ring = ring as f64;
     let r = if unwaited { unsafe { gl_submit_async(ring) } } else { unsafe { gl_submit(ring) } };
     GL_NS.with(|g| g.set(g.get() + crate::now_ns().saturating_sub(t0)));
     r
@@ -174,10 +180,10 @@ impl FileHandle for GlDevice {
                     submit_now(ring, u);
                 }
                 if DEFER.with(|d| d.get()) {
-                    PENDING.with(|p| p.set(Some((arg as u32, unwaited, present))));
+                    PENDING.with(|p| p.set(Some((arg, unwaited, present))));
                     return Some(Ok(0));
                 }
-                let r = submit_now(arg as u32, unwaited);
+                let r = submit_now(arg, unwaited);
                 Some(if r < 0 {
                     Err(Errno::EIO)
                 } else if present {
