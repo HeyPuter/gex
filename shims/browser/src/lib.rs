@@ -3726,7 +3726,24 @@ fn install_panic_hook() {
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
         std::panic::set_hook(Box::new(|info| {
-            let text = format!("gex: panic in the shim: {info}\n");
+            // A panic while this Worker reports one (the `write` below can
+            // re-enter the shim): said on the console only, after the first,
+            // which is already there.
+            thread_local! {
+                static REPORTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            let nested = REPORTING.with(|r| r.replace(true));
+            let text = format!("gex: panic in the shim{}: {info}\n", if nested { " (while reporting a panic)" } else { "" });
+            // A long message (a diagnostic's dump) first as its head, alone,
+            // so a log that drops or cuts long lines still has the panic.
+            const HEAD: usize = 1024;
+            if text.len() > 2 * HEAD {
+                let mut cut = HEAD;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                warn_line(&format!("{} ... ({} bytes; the whole message follows)\n", &text[..cut], text.len()));
+            }
             // Straight to the host's console, not through fd 2.
             //
             // `write` is a *syscall*: it takes the kernel. Almost every panic
@@ -3743,6 +3760,13 @@ fn install_panic_hook() {
             // `warn` is a direct import to `console.error` and touches no
             // kernel, so it cannot re-enter. Nothing here may take a borrow.
             warn_line(&text);
+            // Not through the kernel again from inside a panic it caused, nor
+            // in the middle of this Worker's own translation, where the
+            // syscall path asks for the JIT state the translation holds
+            // (`jit_in`) and its panic would end the report.
+            if nested || jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
+                return;
+            }
             // And fd 2 as well, so a run whose output is the terminal still
             // shows it -- but only after the console has it, because this is
             // the call that can die.
