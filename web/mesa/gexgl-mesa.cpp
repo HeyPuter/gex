@@ -1074,12 +1074,8 @@ void report_version_gap() {
 
 /* The depth/stencil format the driver under us will actually take.
  *
- * This used to name one -- Z24_UNORM_S8_UINT -- which softpipe and gex_wgpu
- * both accept and virglrenderer does not: its format table only carries the
- * other byte order, so every drawable failed to allocate and every command
- * buffer after it was refused. Which of the two a driver has is a driver's
- * business, so ask rather than assume; the order here is preference, and the
- * fallback is what the code said before.
+ * Which byte order of Z24S8 a driver has is a driver's business, so ask
+ * rather than assume; the order here is preference.
  */
 static enum pipe_format depth_stencil_for(struct pipe_screen *screen)
 {
@@ -1100,14 +1096,8 @@ static enum pipe_format depth_stencil_for(struct pipe_screen *screen)
 
 /* This client's Gallium screen, made if it has none yet.
  *
- * One screen per client, not one per device. virglrenderer sees a *connection*
- * per screen and a vtest connection carries a single context, so two clients
- * on one screen shared a virgl context -- and their GL state with it. What
- * that looks like from outside is one client's viewport with the other's
- * drawable bound, two windows the wrong size, and both of them black.
- *
- * The other backends have no such constraint, but a screen each is right for
- * them too: it is where a driver keeps its per-client caches.
+ * One screen per client, not one per device: the screen is where a driver
+ * keeps its per-client caches.
  */
 int ensure_screen() {
     if (mesa_frontend_screen.screen) return 0;
@@ -1402,7 +1392,7 @@ void configure_present_surface() {
     cfg.format = WGPUTextureFormat_RGBA8Unorm;
     /* Read as well as written. The frame is presented into this canvas and
      * then *taken* from it: the compositor with a scene uploads the canvas
-     * into a WebGL texture, and the one that puts each window in an element
+     * into a texture, and the one that puts each window in an element
      * copies it into the window's own canvas. Both are ordinary image-source
      * reads of a canvas, and a WebGPU canvas configured without CopySrc
      * cannot be one -- which did not fail the read so much as take the device

@@ -1,7 +1,7 @@
 #!/bin/bash
 # The demo build: the desktop page (docs/gexcc.md §9) into web/dist-demo,
 # always stripped, runtime modules shipped as .wasm.zst. No test runs on this
-# build; tests/demo/smoke.sh checks the desktop comes up with both windows.
+# build.
 #
 #   web/build-demo.sh [--no-runtime] [--no-x] [--no-rootfs] [--no-pkgs]
 #

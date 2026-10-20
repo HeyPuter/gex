@@ -36,8 +36,8 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 grep "GL capture:" "$WORK/drive.log" | sed 's/^ *//;s/^/     /'
 [ -s "$TRACE" ] || { echo "FAIL gl-capture-browser: nothing was recorded"; exit 1; }
 
-# Executed, not merely decoded: a stream the page's WebGL accepted and Mesa
-# only parses would prove nothing about the backend that has to run it.
+# Executed, not merely decoded: a stream the page accepted and Mesa only
+# parses would prove nothing about the backend that has to run it.
 node "$ROOT/tests/gl-replay.mjs" "$TRACE" "$REPLAY" --readback >"$WORK/replay.log" 2>&1 || {
     echo "FAIL gl-capture-browser: what the browser recorded, Mesa could not run"
     grep -v "Heap resize" "$WORK/replay.log" | tail -20 | sed 's/^/     /'

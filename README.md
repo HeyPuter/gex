@@ -42,7 +42,7 @@ landed. What runs today:
   windows it draws the frames for (`xdg-decoration`, so Qt and KDE stop drawing
   their own), with popups placed by their positioners, subsurfaces, client
   cursors, per-surface input hit-testing, drag-to-move and click-to-raise. The
-  output is one WebGL context, and a software client's pixels are uploaded
+  output is one WebGPU canvas, and a software client's pixels are uploaded
   straight out of the guest's memory -- damage-tracked, no copy of a frame
   anywhere. It is also the **X window manager**: rootless Xwayland hands a
   window to Wayland only once something has taken `SubstructureRedirect`,

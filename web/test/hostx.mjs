@@ -5,7 +5,7 @@
 // The same `HostX` the page's Worker runs (web/src/hostx.js), with the same
 // global kernel and the same scene arena -- so everything that can go wrong in
 // the transport goes wrong here too, in a terminal, in two seconds, with a
-// stack trace. What it cannot do is draw: there is no WebGL in Node, so the
+// stack trace. What it cannot do is draw: there is no WebGPU in Node, so the
 // scene is reported as records rather than pixels.
 //
 // It says what it saw: the server's own log, the compositor's protocol trace,

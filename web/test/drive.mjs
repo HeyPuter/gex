@@ -56,7 +56,7 @@ mkdirSync(CHROME_STATE, { recursive: true });
 const DEMOS = {
   busybox: { want: /~ \$/ },
   debian: { want: /[#$]/ },
-  // The API-split WebGL path (guest links libGLESv2/libEGL marshallers): its
+  // The API-split GL path (guest links libGLESv2/libEGL marshallers): its
   // own glReadPixels coverage, so a black frame that exits 0 does not pass.
   gears: { want: /covered ([1-9]\d*)%/, fail: /covered 0%/, settle: 'finished' },
   // A session: several clients, each its own process, in one output. The bar
@@ -101,7 +101,7 @@ const INJECT_JS = `(() => {
 })()`;
 
 // What the compositor says it has drawn: mapped windows, frames, and a readback
-// of its own output (`lit`). The output is a WebGL canvas owned by a worker, so
+// of its own output (`lit`). The output is a WebGPU canvas owned by a worker, so
 // the page cannot sample it directly -- `describe()` asks the worker, which
 // reads its own framebuffer. A run that maps a window and shows black is the
 // failure this measures, and it has happened at every layer of this pipeline.
@@ -241,7 +241,7 @@ async function ensureServer() {
 // ---------------------------------------------------------------------------
 // The persistent browser: one headless chromium with remote debugging, a fixed
 // profile so a second launch refuses (singleton) and a fixed port so we find
-// it again. WebGL via swiftshader (the demos need a real GL context headless).
+// it again.
 // ---------------------------------------------------------------------------
 async function ensureChrome(restart) {
   if (restart) {
@@ -276,8 +276,7 @@ async function ensureChrome(restart) {
     ...(!headed ? ['--headless'] : []),
     '--no-sandbox',
     '--disable-gpu-sandbox',
-    // A real, if software, WebGL2 context in headless -- the graphics demos
-    // negotiate a GL context before drawing a byte.
+    // SwiftShader in headless, for a software WebGPU adapter.
     ...(!headed ? ['--enable-unsafe-swiftshader'] : []),
     // Mesa on gex_wgpu targets WebGPU. Chromium's Linux/headless
     // build exposes navigator.gpu without offering an adapter unless this
@@ -292,8 +291,7 @@ async function ensureChrome(restart) {
     // process -- "Could not find SharedImageBackingFactory with params: usage:
     // Gles2Read|...|WebgpuSwapChainTexture|..." -- and Chromium destroyed the
     // device two milliseconds later. Nothing surfaced that as an error: draws
-    // kept being "issued" into a dead device and the canvas stayed blank,
-    // which is what made SuperTuxKart look like a renderer bug for days.
+    // kept being "issued" into a dead device and the canvas stayed blank.
     // Demos that never present (gears) never hit it.
     //
     // GEX_WEBGPU_SOFTWARE=1 moves *both* to SwiftShader instead. Correctness

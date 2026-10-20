@@ -1579,7 +1579,7 @@ export class Gex {
         // Another holder of a stream (a socket passed to another process).
         net_dup: (id) => (this.#netShared && this.#net?.dup ? this.#net.dup(id) : 0),
         // Graphics: the guest's GL library batched commands in its own memory;
-        // this hands over the address and the page runs them on WebGL.
+        // this hands over the address and the page runs them on Mesa.
         // The token as well as the ring: the host keeps a GL context per
         // process, because the object names in the stream are this process's
         // own and another process hands out the same ones.

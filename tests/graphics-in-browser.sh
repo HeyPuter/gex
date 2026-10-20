@@ -5,7 +5,7 @@
 #
 # The browser runtime under Node: the same `gex.mjs` a page loads, the same
 # shim, the same runtime translator. What it cannot do is draw -- there is no
-# WebGL here.
+# WebGPU here.
 #
 # What this is for is the part that has nothing to do with graphics: an X
 # server, its `xkbcomp`, a shell and a client, all as separate processes in one

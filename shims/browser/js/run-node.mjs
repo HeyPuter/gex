@@ -531,7 +531,7 @@ const host = new ProcessHost({
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
           // Why misses translated rather than being filled, and where: a
           // Worker whose table lacks an install it should have shows here
-          // as nofill (tests/gexcc/exec-reuse.sh).
+          // as nofill.
           (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
           (m.byObject ? ` [${m.byObject}]` : '') +
           (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +

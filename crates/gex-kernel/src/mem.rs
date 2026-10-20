@@ -949,12 +949,11 @@ impl MemoryMap {
             return Ok(start - tail);
         }
         // Record the span and hand back its start. A single `take` is one
-        // contiguous claim whatever the cursor does; a `29f6e7f` change added a
-        // SECOND `take` here to "top up" the tail `want` was shortened by, but
-        // the arena cursor is shared between a process's threads, so a racing
-        // claim from another thread landed between the two takes and the span
-        // recorded here then covered memory that claim owned -- multithreaded
-        // Xvfb corrupted into an OOB/SIGABRT, which was the virgl regression.
+        // contiguous claim whatever the cursor does. Never add a second `take`
+        // to top up the tail `want` was shortened by: the arena cursor is
+        // shared between a process's threads, so another thread's claim can
+        // land between the two takes, and the span recorded here would then
+        // cover memory that claim owns.
         // The common mapping (a pthread stack is 8 MiB == CHUNK, so `want` is
         // floored to CHUNK >= need) is fully backed by the one take above; the
         // only under-backed case is a mapping larger than a CHUNK that followed

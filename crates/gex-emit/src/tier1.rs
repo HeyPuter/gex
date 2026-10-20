@@ -305,14 +305,14 @@ fn region_at(block: &Block, cx: &Context<'_>) -> Option<crate::region::Region> {
 }
 
 /// `GEX_NO_PAGE_CHECK=1`: blocks do not check their page's directory entry
-/// on entry (pricing, and the mutation tests/nt/detour.c catches).
+/// on entry (for pricing, and as a mutation the page-check tests must catch).
 fn page_check() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     !*OFF.get_or_init(|| std::env::var_os("GEX_NO_PAGE_CHECK").is_some())
 }
 
 /// `GEX_PAGE_CHECK_NO_RETRANSLATE=1`: a block failing its page check only
-/// dispatches (the mutation tests/nt/pagespan.c catches).
+/// dispatches (a mutation the page-span tests must catch).
 fn page_check_no_retranslate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_PAGE_CHECK_NO_RETRANSLATE").is_some())

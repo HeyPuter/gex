@@ -2436,8 +2436,8 @@ unsigned glGetError(void) {
  * message is late: it arrives at the next submit that waits, which may be
  * several calls after the one that failed. GL allows that unless
  * GL_DEBUG_OUTPUT_SYNCHRONOUS is enabled; with it enabled the message is
- * still delivered at the next waiting submit (a deviation, said in
- * docs/gl.md), not at the call.
+ * still delivered at the next waiting submit, not at the call (a deviation
+ * from the spec).
  *
  * Why it exists: wined3d checks every GL call with glGetError
  * (checkGLcall) whenever Wine's d3d ERR channel is on, which is the
@@ -4065,9 +4065,8 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     struct gexgl_egl_surface *s = egl_surface_of(surface);
     if (s) egl_surface_use(s);
     else s = egl_surface;
-    /* Preserve the swap boundary in the wire stream. WebGL displays its
-       default framebuffer automatically, while explicit APIs such as WebGPU
-       must acquire and submit a surface image here. */
+    /* Preserve the swap boundary in the wire stream: the host's WebGPU
+       surface acquires and submits a surface image here. */
     // What a real EGL does here as well as presenting: notice a resize, and
     // commit -- the commit is what carries the frame callback this client is
     // waiting for.

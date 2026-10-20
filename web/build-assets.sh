@@ -136,9 +136,9 @@ fi
 
 # -- the graphics rootfs, for the Mesa demo --------------------------------
 #
-# Debian's own glxgears and Xvfb, and the Mesa they link against. Built from
-# the same tree `tests/opengl-in-guest.sh` uses, which is not fetched by
-# default -- so this is skipped rather than failed when it is absent.
+# Debian's own glxgears and Xvfb, and the Mesa they link against. The tree
+# it is built from is not fetched by default, so this is skipped rather than
+# failed when it is absent.
 if [ -x "$HERE/build-graphics-rootfs.sh" ]; then
     "$HERE/build-graphics-rootfs.sh" "$PUB/rootfs/graphics.tar"
 fi

@@ -737,7 +737,7 @@ async function runProgramHere(
     // embedder needs to act on the running system from outside the guest:
     // the process host (kernel stack slices), the global kernel, the shared
     // terminal and the compositor. The demo desktop's launcher adds files
-    // with it (web/src/overlay.js) and types commands to pid 1.
+    // with it (web/src/overlay-worker.js) and types commands to pid 1.
     onSystem = null,
     // With `gl: 'compositor'`: start the host's Mesa only when `startGl`
     // (handed to `onSystem`) is called -- a desktop whose first windows
