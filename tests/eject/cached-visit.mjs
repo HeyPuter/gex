@@ -4,15 +4,13 @@
 // the compositor's Mesa) comes from the page's Cache Storage the second time.
 // The server sends every response `no-store`, so the browser's HTTP cache keeps
 // nothing (as with a self-signed certificate, which Chromium never caches
-// for): what the second visit does not fetch, the page kept itself.
-// (FL's demo, 10-19: Mesa, 20 MB, and the lazy list, 5.8 MB, came again on
-// every visit: the scene compositor loaded Mesa as files, and the list was
-// fetched plain.)
+// for): what the second visit does not fetch, the page kept itself. Mesa
+// for the scene compositor and the lazy files' list are among what it keeps.
 //
 //   node tests/eject/cached-visit.mjs SITE [--secs S (default 90)] [--chrome PATH]
 //
-// SITE: a directory with index.html and pack.json (web/eject-site.mjs, or
-// FL's tools/fl-demo.py). Each visit runs S seconds. Prints
+// SITE: a directory with index.html and pack.json (web/eject-site.mjs).
+// Each visit runs S seconds. Prints
 // "ok   cached visit: ..." or FAIL lines naming what visit 2 fetched again.
 import http from 'node:http';
 import { spawn } from 'node:child_process';

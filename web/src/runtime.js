@@ -171,7 +171,7 @@ export function runtimeUrls() {
  * tier units and closures, compiled ahead with plain accesses, are not used
  * (the shim refuses units too). Off by default. `tso=arm` turns it on only
  * when the host is arm64 ([`detectTso`]): a page whose program needs x86
- * ordering sets that (FL Studio's demo does), since on x86 an atomic store
+ * ordering sets that, since on x86 an atomic store
  * is an `xchg` and the flavour costs every program that does not need it.
  */
 function tso() {
