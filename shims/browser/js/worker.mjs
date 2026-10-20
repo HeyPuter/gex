@@ -1057,7 +1057,10 @@ async function handle(msg) {
       const stacks = gex.kernelStacks?.();
       if (stacks) port.post({ kind: 'kernelStacks', ...stacks });
     }
-    winsize = (rows, cols) => gex.shim.exports.gex_set_winsize?.(rows, cols);
+    // The host sends a resize to every Worker it has, an exited one too until
+    // it hears of the exit: none after this one's slot went back
+    // (`Gex#releaseWorker`), whose next holder runs on its stack.
+    winsize = (rows, cols) => { if (!gex.released) gex.shim.exports.gex_set_winsize?.(rows, cols); };
     // The line discipline is the guest's choice, read from its termios; the page
     // does the echoing so it has to be told, and it is sent with every write
     // because that is when it changes (a shell sets up then prints a prompt).

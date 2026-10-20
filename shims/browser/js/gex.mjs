@@ -1255,6 +1255,9 @@ export class Gex {
 
   get shim() { return this.#shim; }
 
+  /** The slot went back (`releaseWorker`): call nothing in this instance. */
+  get released() { return this.#released; }
+
   /**
    * Give this instance's stack and thread-local slot back to the process
    * (`gex_worker_release`). The last call into this instance: the slot's next
@@ -1299,10 +1302,11 @@ export class Gex {
   releaseWorker() {
     if (this.#stackTop === null) return;
     // The census first: its timer calls into this instance every 3 s
-    // (gex_alloc, gex_wait_census) and only `close` stopped it, so an exited
-    // thread's Worker, alive until the host ends it, could tick on the stack
-    // and thread-locals the slot's next holder -- the process's next thread --
-    // already runs on. Pairs with the slot claim in `gex_worker_init`.
+    // (gex_alloc, gex_wait_census). An ordinary exit has `close` stop it
+    // first, but a run that threw (worker.mjs) goes straight here, and its
+    // Worker, alive until the host ends it, would tick on the stack and
+    // thread-locals the slot's next holder already runs on. Pairs with the
+    // slot claim in `gex_worker_init`.
     if (this.#census) {
       clearInterval(this.#census);
       this.#census = null;
