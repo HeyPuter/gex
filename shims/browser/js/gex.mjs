@@ -7086,9 +7086,19 @@ export class Gex {
     // frame does, with room for the exception frame it builds there.
     const spG = this.#wasmprogStack();
     const cur = spG.value;
-    const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
-    const low = Math.min(Number(cur) >>> 0, esp);
-    spG.value = typeof cur === 'bigint' ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
+    // An i64 stack pointer (a 64-bit memory, or a lowered LP64 program)
+    // takes the guest's whole 64-bit one: a thread stack above 4 GiB cut to
+    // its low 32 bits put the hook's frames, and the exception record it
+    // writes, over whatever lives there, the runtime's own heap included.
+    if (typeof cur === 'bigint') {
+      const rsp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+      const low = cur !== 0n && cur < rsp ? cur : rsp;
+      spG.value = (low - 4096n) & ~15n;
+    } else {
+      const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
+      const low = Math.min(Number(cur) >>> 0, esp);
+      spG.value = ((low - 4096) & ~15) | 0;
+    }
     // W64's hook (signal_wasm64.c) takes the address as a 64-bit integer
     // (above 4 GiB in a 64-bit memory), W3's (signal_wasm32.c) as 32 bits.
     const wide = e.gex_guest_x86_64?.() === 1;

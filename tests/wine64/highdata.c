@@ -6,7 +6,8 @@
  *
  * `highdata mem64`: the memory64 flavour (W64.7, §0.1), which has neither
  * limit: 5 GiB of data, some of it above 4 GiB, executable memory runs
- * wherever it lands, and a high data page made executable runs.
+ * wherever it lands, a high data page made executable runs, and system
+ * calls made on a stack above 4 GiB write nothing at its low 32 bits.
  *
  * `highdata where`: only which flavour this process is ("flavour 64" when
  * a top-down allocation lands above 4 GiB, else "flavour 32"), exit 0.
@@ -21,6 +22,24 @@
 #include <stdio.h>
 
 static int failures;
+
+/* `fn` called with the stack pointer at `top`, then the stack put back. */
+static void on_stack(char *top, void (*fn)(void))
+{
+    __asm__ volatile("mov %%rsp, %%rbx\n\t"
+                     "mov %0, %%rsp\n\t"
+                     "sub $32, %%rsp\n\t"
+                     "call *%1\n\t"
+                     "mov %%rbx, %%rsp"
+                     : : "r"(top), "r"(fn)
+                     : "rbx", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+                       "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory", "cc");
+}
+
+static void system_calls(void)
+{
+    for (int i = 0; i < 8; i++) SwitchToThread();
+}
 static void check(int ok, const char *what)
 {
     printf("%s %s\n", ok ? "ok" : "FAIL", what);
@@ -111,6 +130,30 @@ int main(int argc, char **argv)
     check(io, mem64 ? "a file written from and read into a top-down buffer above 4 GiB"
                     : "a file written from and read into a top-down buffer above 2 GiB");
     if (top) VirtualFree(top, 0, MEM_RELEASE);
+
+    /* system calls made on a stack above 4 GiB: memory of ours at the same
+     * low 32 bits, patterned, is left alone */
+    if (mem64)
+    {
+        int tried = 0, kept = 0;
+        for (int i = 0; i < n && !tried; i++)
+        {
+            if ((ULONG_PTR)blocks[i] < LIMIT32) continue;
+            for (ULONG_PTR off = 0x100000; off < BLOCK && !tried; off += 0x1000000)
+            {
+                ULONG_PTR top = (ULONG_PTR)blocks[i] + off, low = top & 0xffffffffull;
+                unsigned char *win = VirtualAlloc((void *)(low - 0x20000), 0x30000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if (!win) continue;
+                for (int k = 0; k < 0x30000; k++) win[k] = 0x5a;
+                on_stack((char *)top, system_calls);
+                kept = 1;
+                for (int k = 0; k < 0x30000; k++) if (((volatile unsigned char *)win)[k] != 0x5a) kept = 0;
+                VirtualFree(win, 0, MEM_RELEASE);
+                tried = 1;
+            }
+        }
+        check(tried && kept, "system calls on a stack above 4 GiB leave the memory at its low 32 bits alone");
+    }
 
     /* a JIT's way: write data, then make it code */
     void *hi = NULL;
