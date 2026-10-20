@@ -164,6 +164,9 @@ impl std::fmt::Debug for Refill {
 /// times as many of them did not show up in the timings at all.
 const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 8;
 
+/// [`PageTable::slots_per_table`].
+static TABLE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(PageTable::SLOTS_PER_TABLE);
+
 /// Above this many blocks, a module's element segments are passive and it
 /// carries the fill helpers; below it, they are active and it carries none.
 ///
@@ -193,6 +196,22 @@ impl PageTable {
     pub const SLOTS_PER_TABLE: u64 = (gex_abi::DISPATCH_TABLE_MAX_SLOTS / SLOTS_PER_PAGE)
         * SLOTS_PER_PAGE;
 
+    /// Slots one table holds in this process: [`Self::SLOTS_PER_TABLE`]
+    /// unless [`Self::set_slots_per_table`] lowered it.
+    #[inline]
+    pub fn slots_per_table() -> u64 {
+        TABLE_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Debugging: fill each table after `slots` (whole pages, at least two
+    /// past the miss span, at most [`Self::SLOTS_PER_TABLE`]), so a small
+    /// program numbers pages in the later tables. Set before any page is
+    /// numbered; every table of the process must agree on it.
+    pub fn set_slots_per_table(slots: u64) {
+        let n = (slots / SLOTS_PER_PAGE * SLOTS_PER_PAGE).clamp(MISS_SLOTS + 2 * SLOTS_PER_PAGE, Self::SLOTS_PER_TABLE);
+        TABLE_SLOTS.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The directory entry for a page, allocating slots if it has none.
     ///
     /// Allocation is linear in one *virtual* slot space spanning every table;
@@ -215,8 +234,8 @@ impl PageTable {
         }
         let v = self.take_slots();
         let entry = gex_abi::dispatch_entry(
-            (v / Self::SLOTS_PER_TABLE) as usize,
-            (v % Self::SLOTS_PER_TABLE) as u32,
+            (v / Self::slots_per_table()) as usize,
+            (v % Self::slots_per_table()) as u32,
         );
         self.pages.insert(page, entry);
         self.high.fetch_max(
@@ -238,8 +257,8 @@ impl PageTable {
     /// Record that virtual slot `v` and the page above it are wanted, so the
     /// table holding them knows how long it has to be.
     fn note_virtual(&self, v: u64) {
-        let t = (v / Self::SLOTS_PER_TABLE) as usize;
-        let within = v % Self::SLOTS_PER_TABLE + SLOTS_PER_PAGE;
+        let t = (v / Self::slots_per_table()) as usize;
+        let within = v % Self::slots_per_table() + SLOTS_PER_PAGE;
         if let Some(h) = self.highs.get(t) {
             h.fetch_max(within, std::sync::atomic::Ordering::SeqCst);
         }
@@ -259,7 +278,7 @@ impl PageTable {
         // The entries stay: a page published at the build's base really does
         // need its table to reach it. Only the mark goes.
         for e in self.pages.values() {
-            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::SLOTS_PER_TABLE
+            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::slots_per_table()
                 + gex_abi::dispatch_entry_base(*e) as u64;
             self.note_virtual(v);
         }
@@ -286,8 +305,8 @@ impl PageTable {
             let end = self.chunk_end.load(std::sync::atomic::Ordering::SeqCst);
             // A page's slots are written as a unit and indexed off one base,
             // so a page must not straddle two tables either.
-            let straddles = v / Self::SLOTS_PER_TABLE
-                != (v + SLOTS_PER_PAGE - 1) / Self::SLOTS_PER_TABLE;
+            let straddles = v / Self::slots_per_table()
+                != (v + SLOTS_PER_PAGE - 1) / Self::slots_per_table();
             if v + SLOTS_PER_PAGE <= end && !straddles {
                 if self
                     .next_slot
@@ -336,7 +355,7 @@ impl PageTable {
         // Grow `high` (what the host grows its tables to) past the adopted
         // slots, or the directory names slots the table has not got and the
         // next indirect branch into the page traps out of bounds.
-        let end = gex_abi::dispatch_entry_table(entry) as u64 * Self::SLOTS_PER_TABLE
+        let end = gex_abi::dispatch_entry_table(entry) as u64 * Self::slots_per_table()
             + gex_abi::dispatch_entry_base(entry) as u64
             + SLOTS_PER_PAGE;
         self.high.fetch_max(end, std::sync::atomic::Ordering::SeqCst);
@@ -451,7 +470,7 @@ impl PageTable {
         // has to be long enough for the page it will hand out next.
         t.note_virtual(next_slot.saturating_sub(SLOTS_PER_PAGE.min(next_slot)));
         for (_, e) in entries {
-            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::SLOTS_PER_TABLE
+            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::slots_per_table()
                 + gex_abi::dispatch_entry_base(*e) as u64;
             t.note_virtual(v);
         }
