@@ -228,7 +228,12 @@ export class Compositor {
       post({ kind: 'pointer-move', x, y, time: now() });
     };
     const onDown = (e) => {
-      target.focus?.();
+      // Without preventScroll, focusing scrolls the canvas into view when the
+      // page is shorter than the canvas and whatever sits above it (the eject
+      // page's 34 px bar), and #at below then measures the canvas where it is
+      // *after* the scroll: the press lands 34 px below where it was made.
+      // FL's menu row and 5D Chess's buttons both missed this way.
+      target.focus?.({ preventScroll: true });
       // `?pointerlock=1` and direct present: the first click locks the pointer.
       if (this.#direct && this.#pointerLock && document.pointerLockElement !== target) target.requestPointerLock?.();
       const button = BTN[e.button];
