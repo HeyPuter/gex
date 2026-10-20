@@ -17992,6 +17992,9 @@ pub extern "C" fn gex_set_copy_loop(on: i32) {
 #[no_mangle]
 pub extern "C" fn gex_set_coherent_loads(on: i32) {
     gex_xlate::set_coherent_loads(on != 0);
+    if on != 0 {
+        crate::cgen::set_tso();
+    }
 }
 
 /// Diagnostic: at each safepoint, check the running thread's SP against the

@@ -398,6 +398,29 @@ pub(crate) fn providers_on() -> bool {
 /// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
 /// the browser the guarded flavor guards only at the memory's end, as the
 /// unguarded one traps there by itself (docs/browser-units-plan.md).
+/// The TSO flavour (`?tso=1`, for weakly ordered hosts): guest loads and stores are
+/// atomic where aligned, which tier 1 and the function JIT emit and a
+/// function-tier unit, compiled ahead with plain accesses, does not. So units
+/// are off in it, whichever of the two switches comes first; export
+/// providers (C, not translated guest code) stay.
+pub(crate) static TSO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the TSO flavour on: units off from here.
+pub(crate) fn set_tso() {
+    TSO.store(true, Ordering::Relaxed);
+    if MODE.swap(0, Ordering::Relaxed) != 0 {
+        tso_refuses_units();
+    }
+}
+
+#[cold]
+fn tso_refuses_units() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::warn_line("[gex-note] tso: function-tier units are compiled with plain accesses; translating instead\n");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 4 != 0 {
@@ -411,7 +434,11 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 16 != 0 {
         gex_cgen::image::set_icall_count(true);
     }
-    let mode = mode & 3;
+    let mut mode = mode & 3;
+    if mode != 0 && TSO.load(Ordering::Relaxed) {
+        tso_refuses_units();
+        mode = 0;
+    }
     MODE.store(mode.min(2), Ordering::Relaxed);
     if mode == 0 {
         return;

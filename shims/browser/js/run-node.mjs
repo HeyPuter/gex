@@ -470,7 +470,7 @@ const host = new ProcessHost({
     // so shared reads stay coherent under true parallelism (V8 can't hoist a
     // plain wasm load across a guest fence). Tests whether the GTK startup race
     // is plain-load coherence at the PLAN 5.8 boundary. Default off.
-    coherentLoads: !!process.env.GEX_COHERENT_LOADS,
+    coherentLoads: !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
     // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
     // into the MAIN thread's stack (it would smash a canary the main thread only
     // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
