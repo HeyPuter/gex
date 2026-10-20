@@ -12,10 +12,6 @@ third_party/wasmtime-49.0.2/
     Wasmtime, by the Bytecode Alliance and its contributors, with local
     changes. Apache-2.0 WITH LLVM-exception (third_party/wasmtime-49.0.2/LICENSE).
 
-crates/gex-eject/libs/lua51/lua/
-    Lua 5.1, Copyright (C) 1994-2012 Lua.org, PUC-Rio. MIT licence
-    (crates/gex-eject/libs/lua51/lua/COPYRIGHT).
-
 crates/gex-cgen/providers/glibc_printf.c
     Formatting core taken from musl libc (src/stdio/vfprintf.c),
     Copyright (C) 2005-2020 Rich Felker et al. MIT licence.
