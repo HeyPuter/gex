@@ -126,27 +126,6 @@ pub enum GuestReg {
     /// how the x87 register stack (a computed slot of the context) is reached
     /// through ordinary loads and stores.
     CtxAddr,
-
-    // -- PowerPC (32-bit) only -------------------------------------------------
-    /// `r0`–`r31`, 32 bits: the low word of the `x(n)` context slot.
-    R(u8),
-    /// The link register.
-    Lr,
-    /// The count register.
-    Ctr,
-    /// Condition-register bit 0..=31, one byte each: bit `4f + k` is CR
-    /// field `f`'s LT, GT, EQ, SO for `k` = 0..3. A flag.
-    Cr(u8),
-    /// XER's summary overflow, overflow and carry bits. Flags.
-    So,
-    Ov,
-    Ca,
-    /// XER's byte count (bits 25–31), for `lswx`/`stswx`.
-    XerBc,
-    /// The FPSCR.
-    Fpscr,
-    /// FPR `n`, an f64 bit pattern.
-    F(u8),
 }
 
 impl GuestReg {
@@ -164,23 +143,14 @@ impl GuestReg {
             | GuestReg::X87Cw
             | GuestReg::X87Sw
             | GuestReg::X87Tags
-            | GuestReg::R(_)
-            | GuestReg::Lr
-            | GuestReg::Ctr
-            | GuestReg::Cr(_)
-            | GuestReg::So
-            | GuestReg::Ov
-            | GuestReg::Ca
-            | GuestReg::XerBc
-            | GuestReg::Fpscr => Ty::I32,
+            => Ty::I32,
             GuestReg::V128(_) => Ty::V128,
             _ => Ty::I64,
         }
     }
 
     /// True for the condition flags: AArch64's four, x86-64's parity,
-    /// auxiliary-carry and direction flags, and PowerPC's CR bits and XER
-    /// SO/OV/CA. Each lives in one byte of the context and holds 0 or 1.
+    /// auxiliary-carry and direction flags. Each lives in one byte of the context and holds 0 or 1.
     pub fn is_flag(self) -> bool {
         matches!(
             self,
@@ -191,10 +161,6 @@ impl GuestReg {
                 | GuestReg::P
                 | GuestReg::A
                 | GuestReg::D
-                | GuestReg::Cr(_)
-                | GuestReg::So
-                | GuestReg::Ov
-                | GuestReg::Ca
         )
     }
 }
@@ -238,8 +204,7 @@ pub enum UnOp {
     Not,
     /// Two's-complement negation.
     Neg,
-    /// Reverse the bytes of the whole value: a big-endian guest's loads and
-    /// stores (docs/ppc.md §2).
+    /// Reverse the bytes of the whole value.
     Bswap,
     /// Swap the low two bytes; the result is zero-extended (the bits above
     /// the low sixteen of the operand are ignored).
@@ -350,9 +315,7 @@ pub enum Expr {
         signed: bool,
     },
     /// Read guest memory at `addr + offset`, where `addr` is a full 64-bit
-    /// guest address -- or, from a 32-bit guest (PowerPC), an `I32` effective
-    /// address that has already wrapped as the guest's arithmetic does. The
-    /// same holds for every other memory access.
+    /// guest address. The same holds for every other memory access.
     Load {
         addr: Value,
         offset: i64,

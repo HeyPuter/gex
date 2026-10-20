@@ -358,9 +358,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .map(|(i, b)| (b.start, i))
         .collect();
     let effects: Vec<(u64, u64)> = blocks.iter().map(pass::flag_effects).collect();
-    // The guest's own flags; the masks carry every guest's, and a block of
-    // one guest never names another's.
-    let all = if gex_abi::PPC { pass::PPC_FLAGS } else { pass::ALL_FLAGS };
+    let all = pass::ALL_FLAGS;
 
     // Successors as block indices in one flat array, resolved once: the
     // fixpoint walks them every round, so a fresh `Vec` and hash lookup per
@@ -1561,7 +1559,7 @@ fn lift_one(
             _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
         })
     };
-    if !gex_abi::X86 && !gex_abi::PPC {
+    if !gex_abi::X86 {
         // A64: folded through memory before the ordinary passes, so a PLT's
         // GOT load becomes a constant and its `br` becomes a target discovery
         // can follow.
@@ -1590,9 +1588,7 @@ fn lift_one(
             block.guard = Some(snap[..n].to_vec());
         }
     }
-    // x86-64 and PowerPC: folded on a scratch copy only, never in the
-    // emitted block (32-bit PowerPC code addresses its globals absolutely,
-    // `lis`/`lwz`, so a folded load would bake in a variable's value) --
+    // x86-64: folded on a scratch copy only, never in the emitted block --
     // memory read at translation time is a guess about the future (a GOT slot
     // bound later), and code that bakes it in is wrong once it changes.
     let folded = match block.term {
@@ -1606,7 +1602,7 @@ fn lift_one(
     (block, folded)
 }
 
-#[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
+#[cfg(all(test, not(feature = "x86")))]
 mod tests {
     #[test]
     fn cgen_refuses_profiling() {

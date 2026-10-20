@@ -79,8 +79,8 @@ mod tests {
     use super::*;
 
     /// An exactly-zero result keeps IEEE's sign: -0 when the product and the
-    /// addend are both -0, +0 when they cancel. Found by the PowerPC
-    /// differential fuzzer (`fmsub` with a -0 product).
+    /// addend are both -0, +0 when they cancel (a fused multiply-subtract
+    /// with a -0 product).
     #[test]
     fn zero_results_have_the_right_sign() {
         for (a, b, c) in [

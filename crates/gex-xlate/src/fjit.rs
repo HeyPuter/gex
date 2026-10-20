@@ -242,7 +242,7 @@ impl Jit {
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
-        if gex_abi::PPC || (class32 && !gex_abi::X86) {
+        if class32 && !gex_abi::X86 {
             return None;
         }
         if class32 != crate::arch::compat() {

@@ -28,7 +28,6 @@
 
 use crate::errno::{Errno, SysResult};
 use crate::vfs::{FileHandle, FileType, Metadata};
-use gex_abi::GuestEndian;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -131,11 +130,11 @@ impl Default for NetlinkRoute {
 /// Appends a `struct nlmsghdr` and `body`, padded to 4 bytes.
 fn message(out: &mut Vec<u8>, kind: u16, flags: u16, seq: u32, body: &[u8]) {
     let len = 16 + body.len();
-    out.extend_from_slice(&(len as u32).to_ge_bytes());
-    out.extend_from_slice(&kind.to_ge_bytes());
-    out.extend_from_slice(&flags.to_ge_bytes());
-    out.extend_from_slice(&seq.to_ge_bytes());
-    out.extend_from_slice(&0u32.to_ge_bytes()); // from the kernel
+    out.extend_from_slice(&(len as u32).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // from the kernel
     out.extend_from_slice(body);
     while out.len() % 4 != 0 {
         out.push(0);
@@ -144,8 +143,8 @@ fn message(out: &mut Vec<u8>, kind: u16, flags: u16, seq: u32, body: &[u8]) {
 
 /// Appends a `struct rtattr` holding `data`, padded to 4 bytes.
 fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
-    out.extend_from_slice(&((4 + data.len()) as u16).to_ge_bytes());
-    out.extend_from_slice(&kind.to_ge_bytes());
+    out.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(data);
     while out.len() % 4 != 0 {
         out.push(0);
@@ -162,12 +161,12 @@ fn cstr(s: &str) -> Vec<u8> {
 fn links(out: &mut Vec<u8>, seq: u32) {
     for i in &IFACES {
         let mut b = vec![AF_UNSPEC, 0];
-        b.extend_from_slice(&i.kind.to_ge_bytes());
-        b.extend_from_slice(&(i.index as i32).to_ge_bytes());
-        b.extend_from_slice(&i.flags.to_ge_bytes());
-        b.extend_from_slice(&0xffff_ffffu32.to_ge_bytes()); // ifi_change
+        b.extend_from_slice(&i.kind.to_le_bytes());
+        b.extend_from_slice(&(i.index as i32).to_le_bytes());
+        b.extend_from_slice(&i.flags.to_le_bytes());
+        b.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // ifi_change
         attr(&mut b, IFLA_IFNAME, &cstr(i.name));
-        attr(&mut b, IFLA_MTU, &i.mtu.to_ge_bytes());
+        attr(&mut b, IFLA_MTU, &i.mtu.to_le_bytes());
         attr(&mut b, IFLA_ADDRESS, &i.mac);
         let bcast = if i.kind == ARPHRD_ETHER { [0xff; 6] } else { [0; 6] };
         attr(&mut b, IFLA_BROADCAST, &bcast);
@@ -181,7 +180,7 @@ fn addrs(out: &mut Vec<u8>, seq: u32) {
     for i in &IFACES {
         let scope = if i.flags & IFF_LOOPBACK != 0 { RT_SCOPE_HOST } else { RT_SCOPE_UNIVERSE };
         let mut b = vec![AF_INET, i.prefix, IFA_F_PERMANENT, scope];
-        b.extend_from_slice(&i.index.to_ge_bytes());
+        b.extend_from_slice(&i.index.to_le_bytes());
         attr(&mut b, IFA_ADDRESS, &i.addr);
         attr(&mut b, IFA_LOCAL, &i.addr);
         if i.flags & IFF_BROADCAST != 0 {
@@ -201,9 +200,9 @@ impl NetlinkRoute {
 
     /// The reply to one request (`nlmsghdr` + body), if it is owed one.
     fn answer(req: &[u8]) -> Option<Vec<u8>> {
-        let kind = u16::from_ge_bytes(req[4..6].try_into().unwrap());
-        let flags = u16::from_ge_bytes(req[6..8].try_into().unwrap());
-        let seq = u32::from_ge_bytes(req[8..12].try_into().unwrap());
+        let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
+        let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
+        let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
         // rtgenmsg / ifinfomsg / ifaddrmsg all start with the family.
         let family = req.get(16).copied().unwrap_or(AF_UNSPEC);
         let mut out = Vec::new();
@@ -217,13 +216,13 @@ impl NetlinkRoute {
                 if flags & (NLM_F_ACK | NLM_F_DUMP) == 0 {
                     return None;
                 }
-                let mut b = (-(Errno::EOPNOTSUPP.0 as i32)).to_ge_bytes().to_vec();
+                let mut b = (-(Errno::EOPNOTSUPP.0 as i32)).to_le_bytes().to_vec();
                 b.extend_from_slice(&req[..16]);
                 message(&mut out, NLMSG_ERROR, 0, seq, &b);
                 return Some(out);
             }
         }
-        message(&mut out, NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ge_bytes());
+        message(&mut out, NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_le_bytes());
         Some(out)
     }
 }
@@ -245,11 +244,11 @@ impl FileHandle for NetlinkRoute {
         let mut at = 0;
         let mut out = Vec::new();
         while at + 16 <= buf.len() {
-            let len = u32::from_ge_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
             if len < 16 || at + len > buf.len() {
                 return Err(Errno::EINVAL);
             }
-            let flags = u16::from_ge_bytes(buf[at + 6..at + 8].try_into().unwrap());
+            let flags = u16::from_le_bytes(buf[at + 6..at + 8].try_into().unwrap());
             if flags & NLM_F_REQUEST != 0 {
                 if let Some(r) = Self::answer(&buf[at..at + len]) {
                     out.extend_from_slice(&r);
@@ -326,7 +325,7 @@ pub fn is_iface_ioctl(req: u64) -> bool {
 pub fn iface_ioctl(req: u64, ifr: &mut [u8; 32]) -> Result<(), Errno> {
     use ioctl::*;
     let iface = if req == SIOCGIFNAME {
-        let index = i32::from_ge_bytes(ifr[16..20].try_into().unwrap());
+        let index = i32::from_le_bytes(ifr[16..20].try_into().unwrap());
         IFACES.iter().find(|i| i.index as i32 == index)
     } else {
         let name = ifr[..16].split(|&b| b == 0).next().unwrap_or(&[]);
@@ -335,7 +334,7 @@ pub fn iface_ioctl(req: u64, ifr: &mut [u8; 32]) -> Result<(), Errno> {
     let i = iface.ok_or(Errno::ENODEV)?;
     let inet = |ifr: &mut [u8; 32], a: [u8; 4]| {
         ifr[16..32].fill(0);
-        ifr[16..18].copy_from_slice(&(AF_INET as u16).to_ge_bytes());
+        ifr[16..18].copy_from_slice(&(AF_INET as u16).to_le_bytes());
         ifr[20..24].copy_from_slice(&a);
     };
     let mask = (u32::MAX << (32 - i.prefix as u32)).to_be_bytes();
@@ -344,13 +343,13 @@ pub fn iface_ioctl(req: u64, ifr: &mut [u8; 32]) -> Result<(), Errno> {
             ifr[..16].fill(0);
             ifr[..i.name.len()].copy_from_slice(i.name.as_bytes());
         }
-        SIOCGIFINDEX => ifr[16..20].copy_from_slice(&(i.index as i32).to_ge_bytes()),
+        SIOCGIFINDEX => ifr[16..20].copy_from_slice(&(i.index as i32).to_le_bytes()),
         // ifr_flags is a short: the low 16 bits (IFF_LOWER_UP is not among them).
-        SIOCGIFFLAGS => ifr[16..18].copy_from_slice(&(i.flags as u16).to_ge_bytes()),
-        SIOCGIFMTU => ifr[16..20].copy_from_slice(&(i.mtu as i32).to_ge_bytes()),
+        SIOCGIFFLAGS => ifr[16..18].copy_from_slice(&(i.flags as u16).to_le_bytes()),
+        SIOCGIFMTU => ifr[16..20].copy_from_slice(&(i.mtu as i32).to_le_bytes()),
         SIOCGIFHWADDR => {
             ifr[16..32].fill(0);
-            ifr[16..18].copy_from_slice(&i.kind.to_ge_bytes());
+            ifr[16..18].copy_from_slice(&i.kind.to_le_bytes());
             ifr[18..24].copy_from_slice(&i.mac);
         }
         SIOCGIFADDR => inet(ifr, i.addr),
@@ -382,9 +381,9 @@ mod tests {
         let mut out = Vec::new();
         let mut at = 0;
         while at + 16 <= d.len() {
-            let len = u32::from_ge_bytes(d[at..at + 4].try_into().unwrap()) as usize;
-            let kind = u16::from_ge_bytes(d[at + 4..at + 6].try_into().unwrap());
-            let seq = u32::from_ge_bytes(d[at + 8..at + 12].try_into().unwrap());
+            let len = u32::from_le_bytes(d[at..at + 4].try_into().unwrap()) as usize;
+            let kind = u16::from_le_bytes(d[at + 4..at + 6].try_into().unwrap());
+            let seq = u32::from_le_bytes(d[at + 8..at + 12].try_into().unwrap());
             out.push((kind, seq, d[at + 16..at + len].to_vec()));
             at += (len + 3) & !3;
         }
@@ -396,8 +395,8 @@ mod tests {
         let mut out = Vec::new();
         let mut at = skip;
         while at + 4 <= body.len() {
-            let len = u16::from_ge_bytes(body[at..at + 2].try_into().unwrap()) as usize;
-            let kind = u16::from_ge_bytes(body[at + 2..at + 4].try_into().unwrap());
+            let len = u16::from_le_bytes(body[at..at + 2].try_into().unwrap()) as usize;
+            let kind = u16::from_le_bytes(body[at + 2..at + 4].try_into().unwrap());
             out.push((kind, body[at + 4..at + len].to_vec()));
             at += (len + 3) & !3;
         }
@@ -428,7 +427,7 @@ mod tests {
             .iter()
             .map(|(k, _, b)| {
                 assert_eq!(*k, RTM_NEWLINK);
-                let index = i32::from_ge_bytes(b[4..8].try_into().unwrap());
+                let index = i32::from_le_bytes(b[4..8].try_into().unwrap());
                 let name = attrs(b, 16).into_iter().find(|a| a.0 == IFLA_IFNAME).unwrap().1;
                 (index, name)
             })
@@ -449,7 +448,7 @@ mod tests {
             .map(|(k, _, b)| {
                 assert_eq!(*k, RTM_NEWADDR);
                 let local = attrs(b, 8).into_iter().find(|a| a.0 == IFA_LOCAL).unwrap().1;
-                (b[0], b[1], u32::from_ge_bytes(b[4..8].try_into().unwrap()), local)
+                (b[0], b[1], u32::from_le_bytes(b[4..8].try_into().unwrap()), local)
             })
             .collect();
         assert_eq!(got, vec![(AF_INET, 8, 1, vec![127, 0, 0, 1]), (AF_INET, 24, 2, vec![10, 0, 2, 15])]);
@@ -465,7 +464,7 @@ mod tests {
         let msgs = parse(&reply(&s));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, NLMSG_ERROR);
-        assert_eq!(i32::from_ge_bytes(msgs[0].2[..4].try_into().unwrap()), -(Errno::EOPNOTSUPP.0 as i32));
+        assert_eq!(i32::from_le_bytes(msgs[0].2[..4].try_into().unwrap()), -(Errno::EOPNOTSUPP.0 as i32));
         s.write_at(0, &request(24, NLM_F_REQUEST, 10, AF_INET)).unwrap();
         assert!(!s.poll_readable());
     }
@@ -480,14 +479,14 @@ mod tests {
     fn interface_ioctls_answer_by_name_and_index() {
         let mut r = ifr("eth0");
         iface_ioctl(ioctl::SIOCGIFINDEX, &mut r).unwrap();
-        assert_eq!(i32::from_ge_bytes(r[16..20].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(r[16..20].try_into().unwrap()), 2);
         let mut r = [0u8; 32];
-        r[16..20].copy_from_slice(&1i32.to_ge_bytes());
+        r[16..20].copy_from_slice(&1i32.to_le_bytes());
         iface_ioctl(ioctl::SIOCGIFNAME, &mut r).unwrap();
         assert_eq!(&r[..3], b"lo\0");
         let mut r = ifr("lo");
         iface_ioctl(ioctl::SIOCGIFFLAGS, &mut r).unwrap();
-        assert_ne!(u16::from_ge_bytes(r[16..18].try_into().unwrap()) as u32 & IFF_LOOPBACK, 0);
+        assert_ne!(u16::from_le_bytes(r[16..18].try_into().unwrap()) as u32 & IFF_LOOPBACK, 0);
         let mut r = ifr("eth0");
         iface_ioctl(ioctl::SIOCGIFADDR, &mut r).unwrap();
         assert_eq!(&r[20..24], &[10, 0, 2, 15]);
@@ -497,11 +496,11 @@ mod tests {
         assert_eq!(&r[20..24], &[10, 0, 2, 255]);
         let mut r = ifr("eth0");
         iface_ioctl(ioctl::SIOCGIFHWADDR, &mut r).unwrap();
-        assert_eq!(u16::from_ge_bytes(r[16..18].try_into().unwrap()), ARPHRD_ETHER);
+        assert_eq!(u16::from_le_bytes(r[16..18].try_into().unwrap()), ARPHRD_ETHER);
         assert_eq!(&r[18..24], &[2, 0, 0, 0, 0, 1]);
         let mut r = ifr("lo");
         iface_ioctl(ioctl::SIOCGIFMTU, &mut r).unwrap();
-        assert_eq!(i32::from_ge_bytes(r[16..20].try_into().unwrap()), 65536);
+        assert_eq!(i32::from_le_bytes(r[16..20].try_into().unwrap()), 65536);
         assert_eq!(iface_ioctl(ioctl::SIOCGIFINDEX, &mut ifr("wlan0")).err(), Some(Errno::ENODEV));
     }
 

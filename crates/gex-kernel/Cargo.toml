@@ -18,8 +18,6 @@ gex-gl.workspace = true
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.
 x86 = ["gex-abi/x86"]
-# Serve a 32-bit big-endian PowerPC guest (docs/ppc.md).
-ppc = ["gex-abi/ppc"]
 # Check the lock order (`sync::rank`) in a release build, as a debug build
 # always does: the page shim cannot be built with debug assertions whole
 # (core's own checks reject its guest-memory slices), so its order check is

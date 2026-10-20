@@ -8,12 +8,10 @@ members = [
     "crates/gex-mem",
     "crates/gex-isa",
     "crates/gex-isa-x86",
-    "crates/gex-isa-ppc",
     "crates/gex-ir",
     "crates/gex-f80",
     "crates/gex-lift",
     "crates/gex-lift-x86",
-    "crates/gex-lift-ppc",
     "crates/gex-emit",
     "crates/gex-cgen",
     "crates/gex-split",
@@ -36,7 +34,6 @@ members = [
     "shims/native",
     "tests/diff-fuzz",
     "tests/diff-fuzz-x86",
-    "tests/diff-fuzz-ppc",
 ]
 
 [workspace.package]
@@ -58,13 +55,11 @@ gex-gpu = { path = "crates/gex-gpu" }
 gex-gl = { path = "crates/gex-gl", default-features = false }
 gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
-gex-isa-ppc = { path = "crates/gex-isa-ppc" }
 gex-ir = { path = "crates/gex-ir" }
 gex-dylink = { path = "crates/gex-dylink" }
 gex-f80 = { path = "crates/gex-f80" }
 gex-lift = { path = "crates/gex-lift" }
 gex-lift-x86 = { path = "crates/gex-lift-x86" }
-gex-lift-ppc = { path = "crates/gex-lift-ppc" }
 gex-emit = { path = "crates/gex-emit" }
 gex-cgen = { path = "crates/gex-cgen" }
 gex-split = { path = "crates/gex-split" }

@@ -8,8 +8,7 @@
 /// wasm32 programs use on every build. The four bits Linux spells
 /// differently per architecture (`O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT`,
 /// `O_LARGEFILE`) arrive from an AArch64 program in the asm-generic spelling
-/// and are turned into this one at the guest's door ([`from_guest`]); a ppc
-/// program's go through `ppc::open_flags`.
+/// and are turned into this one at the guest's door ([`from_guest`]).
 pub mod oflags {
     pub const O_RDONLY: u64 = 0o0;
     pub const O_WRONLY: u64 = 0o1;
@@ -36,8 +35,7 @@ pub mod oflags {
     pub const O_LARGEFILE: u64 = 0o100000;
     pub const ACCMODE: u64 = 0o3;
 
-    /// The asm-generic spelling (AArch64's, and ppc's but for `O_DIRECT` and
-    /// `O_LARGEFILE`, which ppc swaps).
+    /// The asm-generic spelling (AArch64's).
     pub mod generic {
         pub const O_DIRECTORY: u64 = 0o40000;
         pub const O_NOFOLLOW: u64 = 0o100000;
@@ -69,9 +67,9 @@ pub mod oflags {
 
     /// Whether this process spells its open flags the generic way: an
     /// AArch64 program. Not an i386 or wasm32 one (`compat`, which use x86's
-    /// on every build), and not a ppc one, which its own layer translates.
+    /// on every build).
     pub fn generic_guest(compat: bool) -> bool {
-        !gex_abi::X86 && !gex_abi::PPC && !compat
+        !gex_abi::X86 && !compat
     }
 
     /// Flags as this process passed them, in the kernel's spelling.
@@ -149,28 +147,6 @@ impl Stat {
         [(self.atime, self.atime_ns), (self.mtime, self.mtime_ns), (self.ctime, self.ctime_ns)]
     }
 
-    /// PowerPC's 32-bit `struct stat64` (104 bytes, big-endian): no padding
-    /// after `st_dev`, a 64-bit `st_ino` second, 32-bit times.
-    fn encode_ppc(&self) -> StatBytes {
-        use gex_abi::GuestEndian;
-        let mut b = StatBytes::zeroed(104);
-        b[0..8].copy_from_slice(&self.dev.to_ge_bytes());
-        b[8..16].copy_from_slice(&self.ino.to_ge_bytes());
-        b[16..20].copy_from_slice(&self.mode.to_ge_bytes());
-        b[20..24].copy_from_slice(&self.nlink.to_ge_bytes());
-        b[24..28].copy_from_slice(&self.uid.to_ge_bytes());
-        b[28..32].copy_from_slice(&self.gid.to_ge_bytes());
-        b[32..40].copy_from_slice(&self.rdev.to_ge_bytes());
-        b[48..56].copy_from_slice(&self.size.to_ge_bytes());
-        b[56..60].copy_from_slice(&self.blksize.to_ge_bytes());
-        b[64..72].copy_from_slice(&self.blocks.to_ge_bytes());
-        for (off, (t, ns)) in [72usize, 80, 88].into_iter().zip(self.times()) {
-            b[off..off + 4].copy_from_slice(&(t as u32).to_ge_bytes());
-            b[off + 4..off + 8].copy_from_slice(&ns.to_ge_bytes());
-        }
-        b
-    }
-
     /// Serialise into the guest kernel's `struct stat`: 128 bytes on aarch64,
     /// 144 on x86-64, where `st_nlink` widens to 64 bits and precedes
     /// `st_mode` and `st_blksize` is 64 bits.
@@ -181,9 +157,6 @@ impl Stat {
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
     pub fn encode_for(&self, compat: bool) -> StatBytes {
-        if gex_abi::PPC {
-            return self.encode_ppc();
-        }
         if compat {
             let mut b = StatBytes::zeroed(96);
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());

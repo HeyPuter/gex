@@ -219,10 +219,6 @@ mod tests {
     /// refused as "in the runtime's region": nothing is placed at zero.
     #[test]
     fn a_library_linked_at_zero_is_measured_and_placed() {
-        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
-        if gex_abi::PPC {
-            return;
-        }
         let mut exe = crate::elf::load(&crate::elf::test_image(2, gex_abi::EXEC_BASE), 0).unwrap();
         exe.needed = vec!["libzero.so".to_string()];
         let so = crate::elf::test_image(3, 0);

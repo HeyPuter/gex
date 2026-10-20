@@ -220,7 +220,7 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
         // As `gex_set_compat` does for an adopted child: on an AArch64
         // build an i386-ABI process's stack is `esp`, where `__clone`'s
         // child stack has to be.
-        if h.kernel.compat && !gex_abi::X86 && !gex_abi::PPC {
+        if h.kernel.compat && !gex_abi::X86 {
             crate::compat_stack(h.kernel.ctx_addr);
         }
         publish_vfork_child(h);

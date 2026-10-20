@@ -53,7 +53,7 @@ fn main() {
         v
     };
     let mut rec = Vec::new();
-    for c in ["gex-ir", "gex-lift", "gex-lift-x86", "gex-lift-ppc", "gex-isa", "gex-isa-x86", "gex-isa-ppc", "gex-abi", "gex-ld"] {
+    for c in ["gex-ir", "gex-lift", "gex-lift-x86", "gex-isa", "gex-isa-x86", "gex-abi", "gex-ld"] {
         rec.extend(src(c));
     }
     rec.extend(src("gex-xlate").into_iter().filter(|p| {
