@@ -1169,13 +1169,17 @@ pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::Path
     Ok(unit)
 }
 
-static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();
-
-/// Build (once per gex build: cached) and install the trampoline page's
-/// unit, at boot.
-fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()> {
-    if TRAMPOLINES_DONE.set(()).is_err() {
-        return Ok(());
+/// Build (once per gex build: cached) and publish the trampoline page's
+/// unit and its providers, once per address space. Whether it did.
+fn publish_trampolines(data: &HostState, class32: bool) -> Result<bool> {
+    let jit = data.jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+    let (shared, engine, cache) = (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone());
+    {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if sh.trampolines {
+            return Ok(false);
+        }
+        sh.trampolines = true;
     }
     let (image, seeds) = trampoline_input(class32);
     let t0 = std::time::Instant::now();
@@ -1184,18 +1188,14 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
         prepare_image(&image, &seeds, 2, false)?
     };
     let cwasm = std::fs::read(&path)?;
-    let memory = store.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let memory = data.memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     for seg in &image.segments {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
         if memory.bytes().get(lo..lo + n) != Some(&seg.bytes[..]) {
-            bail!("the NT trampoline page in guest memory is not the one its unit was built from");
+            bail!("the trampoline page in guest memory is not the one its unit was built from");
         }
     }
     let entries = gex_cgen::image::read_entries(&path)?;
-    let (shared, engine, cache) = {
-        let jit = store.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
-        (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
-    };
     let module = compile(&engine, cache.as_ref(), &path, &cwasm)?;
     crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
     // Its providers (gex-cgen/providers/nt_unixcall.c), after the unit, at
@@ -1215,13 +1215,41 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
             let module = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| gex_cache::compile(&engine, &b)).with_context(|| format!("compiling provider {}", prov.name))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
             crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
-            eprintln!("gex-nt: provider {} for the NT trampolines: {} entries", prov.name, pairs.len());
+            if trace() {
+                eprintln!("gex-cgen: provider {} for the trampolines: {} entries", prov.name, pairs.len());
+            }
         }
     }
-    crate::ftab::catch_up(&mut *store)?;
-    catch_up_table(store)?;
     if trace() {
-        eprintln!("gex-nt: function tier for the NT trampolines: {} entries, {:.1}s", entries.len(), t0.elapsed().as_secs_f64());
+        eprintln!("gex-cgen: function tier for the trampolines: {} entries, {:.1}s", entries.len(), t0.elapsed().as_secs_f64());
+    }
+    Ok(true)
+}
+
+/// [`publish_trampolines`] at boot, from the store.
+fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()> {
+    if publish_trampolines(store.data(), class32)? {
+        crate::ftab::catch_up(&mut *store)?;
+        catch_up_table(store)?;
+    }
+    Ok(())
+}
+
+/// [`publish_trampolines`] for a wine32 or wine64 process, with its first
+/// image: the page is in memory from the start (`run_program_with`), and
+/// Wine's unix calls and syscalls all go through it.
+fn w3_trampolines(caller: &mut Caller<'_, HostState>, class32: bool) -> Result<()> {
+    if caller.data().jit.is_none() {
+        return Ok(());
+    }
+    // Without it the page runs on tier-1, as before it had a unit here.
+    match publish_trampolines(caller.data(), class32) {
+        Ok(true) => {
+            crate::ftab::catch_up(&mut *caller)?;
+            replay_registry(caller)?;
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("gex-w3: the trampoline page's unit: {e:#}; it runs on tier-1"),
     }
     Ok(())
 }
@@ -1919,7 +1947,11 @@ pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64
         Ok("all") => 2,
         _ => 1,
     });
-    if which == 0 || (which == 1 && !path.contains("/lib/wine/")) || mode() == Mode::Off || is_wasm_skeleton(&pe) {
+    if which == 0 || mode() == Mode::Off {
+        return Ok(());
+    }
+    w3_trampolines(caller, !pe.is64)?;
+    if (which == 1 && !path.contains("/lib/wine/")) || is_wasm_skeleton(&pe) {
         return Ok(());
     }
     // `GEX_W3_UNITS_SKIP=a.dll,b.dll`: those stay on tier-1 (bisecting).

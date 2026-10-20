@@ -494,6 +494,9 @@ struct JitShared {
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
     relocated: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// The trampoline page's unit is published (`pe_units`): once per
+    /// address space, with its first Windows image.
+    trampolines: bool,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -1239,6 +1242,7 @@ fn run_program_with(
                 wasm_program: false,
                 wine_pe: None,
                 relocated: Default::default(),
+                trampolines: false,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
