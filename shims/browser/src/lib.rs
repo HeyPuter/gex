@@ -7337,6 +7337,7 @@ fn count_syscall(nr: u64, ctx: u64) {
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     gex_kernel::phase::begin();
     syscall_entry(ctx, pc);
+    gex_kernel::phase::mark(16);
     cgen::ftab_resume();
     if gex_kernel::unix::take_host_sent() {
         pump_compositor();
@@ -7344,10 +7345,17 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     phases_end();
 }
 
-/// `GEX_PHASES` (a debug switch): a stat's time by phase, from the shim's
-/// entry to its return ([`gex_kernel::phase`]).
+/// Which call [`gex_set_phases`] measures: its canonical number.
+static PHASES_NR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(gex_kernel::syscalls::nr::NEWFSTATAT);
+
+/// `GEX_PHASES` (a debug switch): a call's time by phase, from the shim's
+/// entry to its return ([`gex_kernel::phase`]). `1` measures `newfstatat`;
+/// a larger value is the canonical number of the call to measure.
 #[no_mangle]
 pub extern "C" fn gex_set_phases(on: i32) {
+    if on > 1 {
+        PHASES_NR.store(on as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     if on != 0 {
         if !cfg!(feature = "phases") {
             warn_line("[gex] GEX_PHASES: this shim has no phase marks (build it with GEX_PHASE_MARKS=1)\n");
@@ -7357,9 +7365,11 @@ pub extern "C" fn gex_set_phases(on: i32) {
 }
 
 /// The phases' names (`gex_kernel::phase` slots), in call order.
-const PHASES: [(usize, &str); 13] = [
+const PHASES: [(usize, &str); 17] = [
     (0, "entry checks"),
     (1, "number, trace"),
+    (13, "census, watch"),
+    (14, "last syscall, process note"),
     (2, "preamble"),
     (3, "free_class"),
     (4, "free_call setup"),
@@ -7370,6 +7380,8 @@ const PHASES: [(usize, &str); 13] = [
     (9, "stat encode, write"),
     (10, "back to free_syscall"),
     (11, "free_syscall after"),
+    (15, "gl, mapped code"),
+    (16, "syscall_entry tail"),
     (12, "exit to guest"),
 ];
 
@@ -7420,7 +7432,8 @@ fn phases_end() {
     let line0 = format!("[gex] global kernel calls: rename_epoch {k_epoch:.0} ns, path_meta /tmp {k_meta:.0} ns, walk /tmp {k_walk:.0} ns, path_meta_miss {k_miss:.0} ns, walk_meta_miss {k_wm:.0} ns each\n");
     warn_line(&line0);
     let total: u64 = v.iter().map(|p| p.0).sum();
-    let mut line = format!("[gex] phases of {calls} stats: total {:.2} us, clock read {clock} ns:", total as f64 / calls as f64 / 1e3);
+    let mut line = format!("[gex] phases of {calls} calls ({}):", gex_kernel::syscalls::syscall_name(PHASES_NR.load(std::sync::atomic::Ordering::Relaxed)));
+    line.push_str(&format!(" total {:.2} us, clock read {clock} ns:", total as f64 / calls as f64 / 1e3));
     for (i, name) in PHASES {
         let (ns, marks) = v[i];
         line.push_str(&format!(" {name} {:.2} us", ns as f64 / calls as f64 / 1e3));
@@ -7550,7 +7563,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         }
         n
     };
-    if this_nr == gex_kernel::syscalls::nr::NEWFSTATAT {
+    if gex_kernel::phase::enabled() && this_nr == PHASES_NR.load(std::sync::atomic::Ordering::Relaxed) {
         gex_kernel::phase::keep();
     }
     gex_kernel::phase::mark(1);
@@ -7649,6 +7662,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     }
     count_syscall(this_nr, ctx as u32 as u64);
     watch_mem("syscall");
+    gex_kernel::phase::mark(13);
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
     // what survives to narrow a crash to a single handler.
@@ -7666,6 +7680,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if !tracing() {
         note_process_syscall(ctx as u32 as u64, pc);
     }
+    gex_kernel::phase::mark(14);
     // The host's integrity check, the process's pid and the pin report are
     // done inside the locked section below: each took the host lock on its
     // own, and with a W3 game's ~25 Wine Workers contending for it every take
@@ -8172,6 +8187,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         stop
     };
     recompile_objects(mapped);
+    gex_kernel::phase::mark(15);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
     let stop = if stop == 3 && frames_stay() {

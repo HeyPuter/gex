@@ -435,7 +435,7 @@ const host = new ProcessHost({
     // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,
     // GEX_PHASES=1: a stat's time by phase, from entry to return (gex_kernel::phase).
-    phases: process.env.GEX_PHASES ? 1 : undefined,
+    phases: process.env.GEX_PHASES ? (Number(process.env.GEX_PHASES) || 1) : undefined,
     // GEX_RECOMPILE_OBJECTS statically recompiles each shared object once it
     // proves hot -- the feature this project exists for. The value is a cap in
     // KiB of mapped text; 8 MB is the largest that works (Mesa's rasteriser
