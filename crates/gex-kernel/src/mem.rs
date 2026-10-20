@@ -250,6 +250,10 @@ pub struct MemoryMap {
     /// Where the top-down allocator starts over when the cursor runs out:
     /// the holes `munmap` left above it (MMAP_TOP, or `set_mmap_top`).
     mmap_ceiling: u64,
+    /// Place by address-ordered first fit in two bands instead of the
+    /// cursor (a process hosting Windows code, [`Self::set_mmap_top`]):
+    /// see [`Self::place_banded`].
+    banded: bool,
     /// How far up the arena has been claimed, and who to ask for more.
     ///
     /// A guest in a browser lives in a `WebAssembly.Memory` allocated up to its
@@ -431,6 +435,14 @@ fn say(s: &str) {
 /// probes the top of its x86-64 user space with a 1 MiB one in every process).
 const SHORT_REPORT_MIN: u64 = 4 << 20;
 
+/// [`MemoryMap::place_banded`]: mappings from this size up are placed from
+/// the top, smaller ones from the bottom.
+const BAND_LARGE: u64 = 1 << 20;
+
+/// [`MemoryMap::place_banded`]'s alignment for anonymous mappings of this
+/// size or more: Windows' allocation granularity.
+const BAND_ALIGN: u64 = 64 << 10;
+
 pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Note that an M32 process ran out of address space asking for `len` bytes.
@@ -474,6 +486,7 @@ impl MemoryMap {
             brk_cur: page_align_up(brk_start),
             mmap_next: MMAP_TOP,
             mmap_ceiling: MMAP_TOP,
+            banded: false,
             arena: Vec::new(),
             take: None,
             back: None,
@@ -1143,9 +1156,12 @@ impl MemoryMap {
     /// Hand out no mapping above `top` unless asked for there (a process
     /// hosting Windows code, W3: Windows keeps 0x7ffe0000 for
     /// KUSER_SHARED_DATA and the top of user space for itself).
+    /// Such a process's mappings are also placed in bands
+    /// ([`Self::place_banded`]).
     pub fn set_mmap_top(&mut self, top: u64) {
         self.mmap_next = self.mmap_next.min(page_align_down(top));
         self.mmap_ceiling = self.mmap_ceiling.min(page_align_down(top));
+        self.banded = true;
     }
 
     /// Find and reserve a free range of `len` bytes. Top-down from [`MMAP_TOP`],
@@ -1257,6 +1273,17 @@ impl MemoryMap {
                 return Ok(candidate);
             }
             let start = self.extend_arena(len)?;
+            self.insert_from(start, start + len, prot, name, origin);
+            return Ok(start);
+        }
+
+        if self.banded {
+            let Some(start) = self.place_banded(len, origin.is_none()) else {
+                if self.high.is_none() {
+                    note_address_space_short(len);
+                }
+                return Err(Errno::ENOMEM);
+            };
             self.insert_from(start, start + len, prot, name, origin);
             return Ok(start);
         }
@@ -1376,7 +1403,13 @@ impl MemoryMap {
     /// mappings, which a Wine process has thousands of, under the kernel
     /// lock, on every anonymous `mmap`).
     fn first_fit(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
-        let mut candidate = page_align_up(lo);
+        self.first_fit_aligned(lo, hi, len, PAGE_SIZE)
+    }
+
+    /// [`Self::first_fit`] at a power-of-two `align` (a multiple of the page).
+    fn first_fit_aligned(&self, lo: u64, hi: u64, len: u64, align: u64) -> Option<u64> {
+        let up = |v: u64| (v + align - 1) & !(align - 1);
+        let mut candidate = up(lo);
         let mut i = self.vmas.partition_point(|v| v.end <= candidate);
         loop {
             let end = candidate.checked_add(len)?;
@@ -1384,17 +1417,62 @@ impl MemoryMap {
                 return None;
             }
             if let Some(&(_, b)) = self.fixed_only.iter().find(|&&(a, b)| candidate < b && a < end) {
-                candidate = page_align_up(b);
+                candidate = up(b);
                 i = self.vmas.partition_point(|v| v.end <= candidate);
                 continue;
             }
             match self.vmas.get(i) {
                 Some(v) if v.start < end => {
-                    candidate = candidate.max(page_align_up(v.end));
+                    candidate = candidate.max(up(v.end));
                     i += 1;
                 }
                 _ => return Some(candidate),
             }
+        }
+    }
+
+    /// The highest `align`-aligned `len`-byte hole in `[lo, hi)`: first fit
+    /// from the top, in one pass down the sorted mappings.
+    fn last_fit_aligned(&self, lo: u64, hi: u64, len: u64, align: u64) -> Option<u64> {
+        let mut top = hi;
+        loop {
+            let start = top.checked_sub(len)? & !(align - 1);
+            if start < lo {
+                return None;
+            }
+            let end = start + len;
+            if let Some(&(a, _)) = self.fixed_only.iter().rev().find(|&&(a, b)| start < b && a < end) {
+                top = a;
+                continue;
+            }
+            // The highest mapping starting below `end` is the only one that
+            // can overlap from above `start`'s side; one ending above
+            // `start` gets in the way.
+            let i = self.vmas.partition_point(|v| v.start < end);
+            match i.checked_sub(1).map(|i| &self.vmas[i]) {
+                Some(v) if v.end > start => top = v.start,
+                _ => return Some(start),
+            }
+        }
+    }
+
+    /// Where a mapping that names no address goes in a process hosting
+    /// Windows code: address-ordered first fit in two bands. Below
+    /// [`BAND_LARGE`], bottom-up from MMAP_BOTTOM; from it up, top-down from
+    /// the ceiling. Such a process makes thousands of small short-lived
+    /// mappings; packing them at the bottom, where a freed hole is reused at
+    /// once, keeps the middle of the space whole for large ones, as first fit
+    /// does on Windows and Linux.
+    ///
+    /// Anonymous mappings of 64 KiB or more are 64 KiB-aligned: a caller that
+    /// asks for a view plus 60 KiB and trims to 64 KiB granularity then has
+    /// only the tail to trim, not a sliver below too.
+    fn place_banded(&self, len: u64, anon: bool) -> Option<u64> {
+        let align = if anon && len >= BAND_ALIGN { BAND_ALIGN } else { PAGE_SIZE };
+        if len < BAND_LARGE {
+            self.first_fit_aligned(MMAP_BOTTOM, self.mmap_ceiling, len, align)
+        } else {
+            self.last_fit_aligned(MMAP_BOTTOM, self.mmap_ceiling, len, align)
         }
     }
 
@@ -2002,6 +2080,49 @@ mod tests {
         assert!(b < a, "expected top-down allocation, got {a:x} then {b:x}");
         assert!(a + 0x1000 <= MMAP_TOP);
         assert_eq!(a % PAGE_SIZE, 0);
+    }
+
+    /// A process hosting Windows code (set_mmap_top): small mappings
+    /// bottom-up, large ones top-down, 64 KiB ones aligned to 64 KiB.
+    #[test]
+    fn banded_placement_splits_small_and_large() {
+        let mut m = MemoryMap::new(0x40_1000);
+        m.set_mmap_top(0x7ffe_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS;
+        let small = m.mmap(0, 0x1f000, prot::READ | prot::WRITE, anon, "view").unwrap();
+        assert_eq!(small, MMAP_BOTTOM, "a small mapping at the bottom");
+        let page = m.mmap(0, 0x1000, prot::READ, anon, "page").unwrap();
+        assert_eq!(page, MMAP_BOTTOM + 0x1f000, "a page right above it, not 64 KiB-aligned");
+        let next = m.mmap(0, 0x10000, prot::READ, anon, "64k").unwrap();
+        assert_eq!(next % 0x10000, 0, "a 64 KiB mapping at {next:#x}, 64 KiB-aligned");
+        let big = m.mmap(0, 64 << 20, prot::READ | prot::WRITE, anon, "chunk").unwrap();
+        assert_eq!(big + (64 << 20), 0x7ffe_0000, "a large mapping at the top");
+        // A freed small hole is used again at once.
+        m.unmap(small, 0x1f000).unwrap();
+        assert_eq!(m.mmap(0, 0x10000, prot::READ, anon, "again").unwrap(), MMAP_BOTTOM);
+    }
+
+    /// Thousands of small mappings that come and go leave room for a large
+    /// one: the small ones reuse the holes at the bottom.
+    #[test]
+    fn banded_churn_keeps_a_large_hole() {
+        let mut m = MemoryMap::new(0x40_1000);
+        m.set_mmap_top(0x7ffe_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS;
+        let mut live: Vec<u64> = Vec::new();
+        let mut seed = 1u64;
+        for _ in 0..40_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if live.len() > 3000 || (seed >> 62) == 0 && !live.is_empty() {
+                let i = (seed >> 20) as usize % live.len();
+                m.unmap(live.swap_remove(i), 0x20000).unwrap();
+            } else {
+                live.push(m.mmap(0, 0x20000, prot::READ | prot::WRITE, anon, "view").unwrap());
+            }
+        }
+        // 3000 live 128 KiB views are 375 MiB: a 64 MiB request still fits.
+        assert!(m.mmap(0, 64 << 20, prot::READ | prot::WRITE, anon, "chunk").is_ok());
+        assert!(m.mmap(0, 512 << 20, prot::READ | prot::WRITE, anon, "heap").is_ok());
     }
 
     #[test]
