@@ -9,7 +9,7 @@ use crate::errno::{Errno, SysResult};
 use crate::fs::oflags;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Bytes tmpfs is holding, summed as `Vec` capacity rather than length: a
 /// buffer that grew geometrically keeps the larger allocation whatever its
@@ -438,17 +438,23 @@ impl Inner {
 }
 
 /// The tree, and its rename lock ([`super::RenameGate`]), taken before the
-/// tree's.
+/// tree's. A reader-writer lock: lookups (`stat`, the walks, `readlink`)
+/// share it, so threads asking at once no longer queue behind each other
+/// (the global kernel's root is one of these, for every process).
 #[derive(Debug)]
 struct Shared {
-    m: Mutex<Inner>,
+    m: RwLock<Inner>,
     gate: super::RenameGate,
 }
 
-impl std::ops::Deref for Shared {
-    type Target = Mutex<Inner>;
-    fn deref(&self) -> &Mutex<Inner> {
-        &self.m
+impl Shared {
+    /// The tree to change.
+    fn lock(&self) -> LockResult<RwLockWriteGuard<'_, Inner>> {
+        self.m.write()
+    }
+    /// The tree to look at.
+    fn read(&self) -> LockResult<RwLockReadGuard<'_, Inner>> {
+        self.m.read()
     }
 }
 
@@ -481,7 +487,7 @@ impl TmpFs {
     /// [`super::walk_plain`] here: the walk's answer for `abs` with no link
     /// on it, `None` for [`FileSystem::walk`] to follow them.
     pub fn walk_plain(&self, abs: &str, follow_final: bool, mounts: &str) -> Option<bool> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         super::walk_plain(abs, follow_final, mounts, &|rel| matches!(inner.nodes.get(rel), Some(Node::Symlink(_))))
     }
 
@@ -499,7 +505,7 @@ impl TmpFs {
     /// `rename_locked` is "it changed meanwhile".
     pub fn rename2_as(&self, from: &str, to: &str, noreplace: bool, own: u32) -> Result<(), Errno> {
         loop {
-            let dir = matches!(self.inner.lock().unwrap().nodes.get(from), Some(Node::Dir));
+            let dir = matches!(self.inner.read().unwrap().nodes.get(from), Some(Node::Dir));
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
                 Err(Errno::EAGAIN) => continue,
                 r => return r,
@@ -596,7 +602,7 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Shared { m: Mutex::new(inner), gate: Default::default() }),
+            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default() }),
         }
     }
 
@@ -651,7 +657,7 @@ impl TmpFs {
     /// read set: gex-eject's bundle split keeps these in the bundle and
     /// serves the rest as lazy files.
     pub fn opened(&self) -> Vec<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         inner
             .nodes
             .iter()
@@ -912,7 +918,7 @@ impl FileHandle for TmpHandle {
                 times: file.times(),
             });
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let Some(path) = self.here(&inner) else {
             // A directory removed while open: still a directory, with no
             // names left, as `fstat` of one says on Linux.
@@ -922,7 +928,7 @@ impl FileHandle for TmpHandle {
     }
 
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         // A directory removed while open lists nothing, not even `.`.
         let Some(path) = self.here(&inner) else { return Ok(Vec::new()) };
         if !matches!(inner.nodes.get(&path), Some(Node::Dir)) {
@@ -999,7 +1005,7 @@ impl FileHandle for TmpHandle {
                 Ok(())
             }
             None => {
-                let path = self.here(&self.inner.lock().unwrap()).ok_or(Errno::ENOENT)?;
+                let path = self.here(&self.inner.read().unwrap()).ok_or(Errno::ENOENT)?;
                 FileSystem::set_mtime(&TmpFs { inner: Arc::clone(&self.inner) }, &path, secs)
             }
         }
@@ -1016,7 +1022,7 @@ impl FileHandle for TmpHandle {
                 Ok(())
             }
             None => {
-                let path = self.here(&self.inner.lock().unwrap()).ok_or(Errno::ENOENT)?;
+                let path = self.here(&self.inner.read().unwrap()).ok_or(Errno::ENOENT)?;
                 TmpFs { inner: Arc::clone(&self.inner) }.set_times_now(&path, atime, mtime, now)
             }
         }
@@ -1078,7 +1084,7 @@ impl FileHandle for TmpHandle {
 
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {
         let ino = self.dir?;
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         Some(
             inner
                 .dir_now(&self.path, ino)
@@ -1167,7 +1173,7 @@ impl FileSystem for TmpFs {
     /// From the tree, under one lock: no handle made (with its own copy of
     /// the path) for one question.
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        TmpFs::meta_at(&self.inner.lock().unwrap(), path)
+        TmpFs::meta_at(&self.inner.read().unwrap(), path)
     }
 
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
@@ -1208,7 +1214,7 @@ impl FileSystem for TmpFs {
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         match inner.nodes.get(path) {
             Some(Node::Symlink(t)) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
@@ -1217,7 +1223,7 @@ impl FileSystem for TmpFs {
 
     /// The walk and the metadata under one lock.
     fn walk_metadata(&self, abs: &str, mounts: &str) -> Result<Option<Metadata>, Errno> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let is_link = |rel: &str| matches!(inner.nodes.get(rel), Some(Node::Symlink(_)));
         // The directories without a link (or a mount) on them: the last
         // name's node is then looked up once, for its link and its metadata.
@@ -1245,7 +1251,7 @@ impl FileSystem for TmpFs {
 
     /// One lock for the whole walk, not one per component.
     fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         super::walk_links(abs.to_string(), follow_final, mounts, &|rel| match inner.nodes.get(rel) {
             Some(Node::Symlink(t)) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
@@ -1428,7 +1434,7 @@ mod tests {
     /// (what `read_dir` did before it skipped subtrees).
     fn check_listings(fs: &TmpFs) {
         let (dirs, all): (Vec<String>, Vec<String>) = {
-            let inner = fs.inner.m.lock().unwrap();
+            let inner = fs.inner.read().unwrap();
             let dirs = inner.nodes.iter().filter(|(_, n)| matches!(n, Node::Dir)).map(|(p, _)| p.clone());
             (std::iter::once(String::new()).chain(dirs).collect(), inner.nodes.keys().cloned().collect())
         };
