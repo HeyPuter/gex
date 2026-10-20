@@ -1851,7 +1851,11 @@ impl FdIo<'_> {
         if control != 0 && controllen >= self.cmsg_hdr() {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
-                sock.stage_send(files);
+                if !self.fds.get(fd)?.writable {
+                    return Err(Errno::EBADF);
+                }
+                // The bytes and their descriptors in one step (`send_with`).
+                return sock.send_with(&data, files);
             } else if let Ok(sock) = self.remote_unix_of(fd) {
                 // The far end is in another memory, where an `OpenFile` means
                 // nothing: each descriptor goes as a description the host
@@ -1982,12 +1986,18 @@ impl FdIo<'_> {
                 want += len;
             }
         }
+        let mut received = Vec::new();
         let total = if want == 0 {
             0
         } else {
             let mut tmp = vec![0u8; want];
             let n = match &unix_sock {
-                Some(sock) => sock.recv(&mut tmp, room, peek)?,
+                // The bytes and their descriptors in one step (`recv_with`).
+                Some(sock) => {
+                    let (n, fds) = sock.recv_with(&mut tmp, room, peek)?;
+                    received = fds;
+                    n
+                }
                 None if peek => match self.socket_of(fd) {
                     Ok(sock) => sock.peek(&mut tmp)?,
                     Err(_) => self.fds.get(fd)?.read(&mut tmp)?,
@@ -2018,7 +2028,6 @@ impl FdIo<'_> {
                 self.write_sockaddr(m, ip, port, name, namelen_at)?;
             }
         }
-        let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
         // msg_flags (int): nothing truncated
