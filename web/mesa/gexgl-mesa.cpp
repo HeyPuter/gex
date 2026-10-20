@@ -655,6 +655,26 @@ static void gl_count_line(const char *what) {
             sur ? sur->produced : 0u, sur ? sur->displayed : 0u);
 }
 
+/* GEX_GL_ERRORS=1 (`?mesaenv=GEX_GL_ERRORS=1`): glGetError after every
+ * command, and each opcode/error pair reported the first few times it
+ * happens, with the client. It takes the error the program would have read
+ * itself, so it is a diagnostic only. */
+static void gl_error_check(uint32_t op) {
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("GEX_GL_ERRORS");
+        on = value && *value && *value != '0';
+    }
+    if (!on) return;
+    const GLenum e = glGetError();
+    if (e == GL_NO_ERROR) return;
+    static std::map<std::pair<uint32_t, uint32_t>, uint32_t> seen;
+    const uint32_t n = ++seen[{op, (uint32_t)e}];
+    if (n <= 3 || (n & (n - 1)) == 0)
+        fprintf(stderr, "gexgl: opcode %u -> GL error 0x%x (%u times, client %u)\n",
+                op, (unsigned)e, n, current_client);
+}
+
 /* Run what follows as this client. */
 void use_client(uint32_t client) {
     if (client == current_client) return;
@@ -2977,6 +2997,7 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len,
             }
             return -2;
         }
+        gl_error_check(op);
         at += size;
     }
     return 0;
