@@ -15965,6 +15965,16 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() {
         return 0;
     }
+    // Nor while this Worker translates with the JIT state out (`jitout`):
+    // the lock is given back for the lift, so `jit_holds` is false, but the
+    // trap is the translator's. Made the guest's, its SIGSEGV went to Wine's
+    // handler, whose KiUserExceptionDispatcher miss asked for the JIT state
+    // still out with this Worker (Hades on the twin: "the JIT state was
+    // asked for in the middle of this Worker's own translation"). Pairs with
+    // the `jitout::OUT` stores in the miss and object paths.
+    if jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
+        return 0;
+    }
     let c = match my_ctx() {
         0 => ctx_addr as u64,
         m => m,
