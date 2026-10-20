@@ -51,6 +51,9 @@ RUSTFLAGS="-C link-arg=--import-memory \
   -C link-arg=--max-memory=4294967296 \
   -C link-arg=--export-table \
   -C link-arg=--export=__stack_pointer \
+  -C link-arg=--export=__wasm_init_tls \
+  -C link-arg=--export=__tls_size \
+  -C link-arg=--export=__tls_align \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
     --release -Z build-std=std,panic_abort --target-dir $TDIR $ARCH_FEATURES

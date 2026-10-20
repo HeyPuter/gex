@@ -6,7 +6,7 @@
 //
 // It holds a process memory of its own only because the kernel imports one and
 // `k_pipe_write` reads bytes from there; it is a staging buffer, nothing more.
-import { lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { single, sched } from './single.mjs';
 let k = null;
 let stage = null; // Uint8Array over this Worker's dummy process memory
@@ -34,7 +34,8 @@ self.onmessage = async (e) => {
     k = inst.exports;
     // A stack of this Worker's own: each instance's `__stack_pointer` starts at
     // the same address in the shared memory.
-    if (msg.kernelStack) k.__stack_pointer.value = msg.kernelStack | 0;
+    // And thread-locals of its own (`kernelThread`).
+    if (msg.kernelStack) kernelThread(k, msg.kernelStack);
     stage = new Uint8Array(process.buffer);
     post({ kind: 'ready' });
     return;

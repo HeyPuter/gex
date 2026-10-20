@@ -12,7 +12,7 @@
 //
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
-import { lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { single, sched } from './single.mjs';
 
 /** The single-thread build's fibers park on the scheduler, not on their
@@ -94,7 +94,8 @@ export class PageTty {
       const area = k.k_stack_area() >>> 0;
       const size = k.k_stack_size() >>> 0;
       const count = k.k_stack_count() >>> 0;
-      inst.exports.__stack_pointer.value = (area + count * size) | 0;
+      // Its thread-locals at the top of it (`kernelThread`).
+      kernelThread(inst.exports, area + count * size);
     }
     return new PageTty(k, scratch);
   }

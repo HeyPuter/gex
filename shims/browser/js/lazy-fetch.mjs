@@ -117,6 +117,31 @@ export function processMemories(mem, is64 = false, spare = null) {
   return is64 ? { process: empty, process64: mem } : { process: mem, process64: empty };
 }
 
+/**
+ * Give a global kernel instance its own stack, and its own thread-local block
+ * at the top of it, before anything is called. Every instance's
+ * `__stack_pointer` starts at the same address in the shared memory, and so
+ * does `__tls_base`: wasm-ld's start function points it at the static block
+ * only in the instance that initialises the memory, and leaves it 0 in every
+ * other, so every later Worker's thread-locals (std's panic count and
+ * `thread::current`, HashMap's keys) were the same bytes at address 0.
+ * `__wasm_init_tls` copies the module's `.tdata` into the block and sets the
+ * instance's base. A module that predates the export keeps the shared block.
+ * Returns the stack pointer it set.
+ */
+export function kernelThread(k, top) {
+  let sp = top >>> 0;
+  const size = k.__tls_size ? k.__tls_size.value >>> 0 : 0;
+  if (size && typeof k.__wasm_init_tls === 'function') {
+    const align = Math.max(16, k.__tls_align ? k.__tls_align.value >>> 0 : 16);
+    const tls = (sp - size) & -align;
+    k.__wasm_init_tls(tls);
+    sp = tls;
+  }
+  k.__stack_pointer.value = sp | 0;
+  return sp;
+}
+
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
   return (url, urlLen, offset, dst, len) => {
