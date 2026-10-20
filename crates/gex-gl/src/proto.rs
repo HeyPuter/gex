@@ -1,6 +1,6 @@
 //! The command stream between a guest's GL driver and the host's.
 //!
-//! The split is at the API, not at a virtual GPU. virtio-gpu/VirGL would run
+//! The split is at the API, not at a virtual GPU. A virtio-gpu driver would run
 //! Mesa's state tracker as translated aarch64 (tens of thousands of
 //! instructions per draw) and compile each shader twice. Instead the guest's
 //! `libGLESv2.so.2` is a pure marshaller: a call becomes a few dozen bytes

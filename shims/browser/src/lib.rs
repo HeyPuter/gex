@@ -10441,7 +10441,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             // (a 107 MiB libLLVM span among it), and zeroing those never-reused
             // pages stalled the exec indefinitely -- a bulk fill over this shared
             // memory commits every page and crawls, where the live low layout
-            // clears in a blink. This was the long-standing glxgears/virgl "hang".
+            // clears in a blink.
             if start >= gex_abi::ARENA_BOTTOM {
                 continue;
             }
