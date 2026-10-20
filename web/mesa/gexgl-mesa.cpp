@@ -627,6 +627,30 @@ void swap_client_state(client_state& other) {
     std::swap(current_surface, other.current_surface);
 }
 
+/* GEX_GL_COUNTS=1 (`?mesaenv=GEX_GL_COUNTS=1`): a line per PRESENT decoded,
+ * and one per 256 batches, with the client's batches and presents so far and
+ * the surface's frames produced and displayed. For a guest that swaps many
+ * times and a window that shows one frame: which of "never arrived", "arrived
+ * and was not presented" and "presented and not displayed" it is. */
+static bool gl_counts() {
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("GEX_GL_COUNTS");
+        on = value && *value && *value != '0';
+    }
+    return on != 0;
+}
+static std::map<uint32_t, std::pair<uint64_t, uint64_t>> gl_client_counts;
+static void gl_count_line(const char *what) {
+    const auto &c = gl_client_counts[current_client];
+    fprintf(stderr,
+            "gexgl: counts %s -- client %u: %llu batches, %llu presents; "
+            "surface %u produced %u displayed %u\n",
+            what, current_client, (unsigned long long)c.first,
+            (unsigned long long)c.second, sur ? sur->uid : 0u,
+            sur ? sur->produced : 0u, sur ? sur->displayed : 0u);
+}
+
 /* Run what follows as this client. */
 void use_client(uint32_t client) {
     if (client == current_client) return;
@@ -1912,6 +1936,10 @@ bool one(uint32_t op, Reader& a) {
      * released by another window's frame reaching the screen. */
     case PRESENT:
         present_backend();
+        if (gl_counts()) {
+            ++gl_client_counts[current_client].second;
+            gl_count_line("present");
+        }
         put_u32(sur ? sur->displayed : displayed);
         break;
     case CLEAR_COLOR: {
@@ -2767,6 +2795,8 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_init(int width, int height) {
 EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len,
                                        uint32_t client) {
     use_client(client);
+    if (gl_counts() && (++gl_client_counts[current_client].first % 256) == 0)
+        gl_count_line("batch");
     reply.clear(); uint32_t at = 0;
     while (at < len) {
         if (len - at < 8) return -1;
