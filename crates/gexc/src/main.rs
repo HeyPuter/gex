@@ -162,7 +162,7 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64] [--w3-kuser]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64] [--w3-kuser] [--entries FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
@@ -170,7 +170,10 @@ usage:
                                    with a memory cap: recovery of a large image
                                    is the peak. --w3-kuser: a W3 unit (Wine as
                                    wasm32): KUSER_SHARED_DATA's constant
-                                   addresses folded to W3's page
+                                   addresses folded to W3's page. --entries:
+                                   region entries too, at the hex addresses
+                                   in FILE (resumes a run without translation
+                                   makes inside the image's functions)
   gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
@@ -2510,6 +2513,7 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base) = (None, None);
     let mut elf = false;
     let mut jobs = 4usize;
+    let mut entries: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2524,6 +2528,14 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             "--jobs" => {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
+            }
+            // `--entries FILE`: hex addresses, one per line, the unit has no
+            // entry for and a run without translation resumes at (a call's
+            // continuation reached from outside the unit's own frames): the
+            // unit's region entries, `<cache>/regions/<key>/`.
+            "--entries" => {
+                i += 1;
+                entries = Some(args.get(i).context("--entries needs a file")?.clone());
             }
             // A unit for a 64-bit guest memory (docs/mem64.md): another
             // key, other code.
@@ -2578,6 +2590,18 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let _lock = gex_native::pe_units::build_lock()?;
     let t0 = std::time::Instant::now();
     let out = gex_native::pe_units::prepare_pe(&pe, base, jobs, true)?;
+    if let Some(f) = &entries {
+        let text = std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?;
+        let pcs = text
+            .split_whitespace()
+            .map(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).with_context(|| format!("{f}: {w}: not a hex address")))
+            .collect::<Result<Vec<u64>>>()?;
+        let failed = gex_native::pe_units::prepare_regions(&pe, base, &out, &pcs, jobs)?;
+        if !failed.is_empty() {
+            bail!("{path} at {base:#x}: no region entry for {failed:x?}");
+        }
+        eprintln!("{path} at {base:#x}: region entries for {} addresses", pcs.len());
+    }
     if gex_abi::kuser_fold() {
         // Zero for a unit the cache already held (nothing was lifted).
         eprintln!("{path}: KUSER_SHARED_DATA accesses folded: {}", gex_ir::kuser_folds_total());

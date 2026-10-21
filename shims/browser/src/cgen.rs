@@ -949,6 +949,40 @@ pub extern "C" fn gex_cgen_key(u: u32, buf: u32, cap: u32) -> u32 {
     units.get(u as usize).map_or(0, |x| put_str(&x.key, buf, cap))
 }
 
+/// Whether code a published unit's image runs translated is reported
+/// (`gex_cgen_set_record`): gex-eject's W3 recorder, whose AOT-only project
+/// would have no code there.
+static RECORD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_set_record(on: i32) {
+    RECORD.store(on != 0, Ordering::Relaxed);
+}
+
+/// A miss at `pc`, which no function holds: when it is on a code page of an
+/// image whose unit is published, `[gex-record] uncovered PC KEY PATH`, once
+/// per address. A run without translation needs a region entry there.
+pub(crate) fn record_uncovered(pc: u64) {
+    if !RECORD.load(Ordering::Relaxed) || knows(pc) {
+        return;
+    }
+    static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    let page = pc / gex_abi::DISPATCH_PAGE;
+    let published = lock(&PUBLISHED).clone();
+    let units = lock(&UNITS);
+    let Some(u) = published.iter().filter_map(|&i| units.get(i)).find(|u| u.pages.iter().any(|&(p, _)| p == page)) else { return };
+    if !lock(&SEEN).get_or_insert_with(std::collections::HashSet::new).insert(pc) {
+        return;
+    }
+    crate::warn_line(&format!("[gex-record] uncovered {pc:#x} {} {}\n", u.key, u.path));
+}
+
+/// The address unit `u`'s image is at (its key's base).
+#[no_mangle]
+pub extern "C" fn gex_cgen_base(u: u32) -> u64 {
+    lock(&UNITS).get(u as usize).map_or(0, |x| x.base)
+}
+
 /// The path of the image unit `u` is for, for messages.
 #[no_mangle]
 pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {

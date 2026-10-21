@@ -14920,6 +14920,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if cgen::entry_log() && !cgen::knows(pc) {
         crate::cgen::note_web_entry(pc);
     }
+    // A recording: the same pcs, named with their unit, before the function
+    // JIT or tier-1 takes them.
+    cgen::record_uncovered(pc);
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if fjit::serve(pc) {
