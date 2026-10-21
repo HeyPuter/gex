@@ -113,6 +113,16 @@ impl Stream {
         self.rate as u64 * self.frame_bytes()
     }
 
+    /// The room a write of `len` bytes waits for: a fragment, or all of a
+    /// shorter write, and never more than the buffer.
+    fn wanted(&self, len: u64) -> u64 {
+        len.min(self.fragsize).min(self.bufsize()).max(1)
+    }
+
+    fn room(&self) -> u64 {
+        self.bufsize() - self.queued.min(self.bufsize())
+    }
+
     /// Play what the player has played since the last look, or (no player
     /// taking this stream's frames) what the time since then has.
     fn drain(&mut self) {
@@ -395,7 +405,11 @@ impl FileHandle for OssHandle {
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
         let room = s.bufsize() - s.queued.min(s.bufsize());
-        if room == 0 {
+        // Nothing until a fragment's room (or room for all of a shorter
+        // write): a writer offering more than fits would otherwise be given
+        // the few frames the clock freed since its last write, again and
+        // again, and spend the buffer's time in calls for a frame each.
+        if room < s.wanted(buf.len() as u64) {
             return Err(Errno::EAGAIN);
         }
         // Whole frames when not all of it fits: what is played next starts
@@ -435,7 +449,8 @@ impl FileHandle for OssHandle {
     fn poll_writable(&self) -> bool {
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
-        s.queued < s.bufsize()
+        // A fragment free, as OSS reports a device writable.
+        s.room() >= s.wanted(u64::MAX)
     }
 
     fn poll_readable(&self) -> bool {
@@ -461,16 +476,18 @@ impl FileHandle for OssHandle {
             // A reader of the loopback: looked at again each quantum.
             return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
         }
-        if s.queued < s.bufsize() {
-            // Room now: a writer is ready.
+        let (room, want) = (s.room(), s.wanted(u64::MAX));
+        if room >= want {
+            // A fragment's room now: a writer is ready.
             return None;
         }
         if s.played_by_player {
             // The player takes a quantum at a time.
             return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
         }
+        // When the clock has played the rest of a fragment.
         let bps = s.bytes_per_second().max(1);
-        Some((1_000_000_000 / bps).max(1))
+        Some(((want - room) * 1_000_000_000 / bps).max(1))
     }
 
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
@@ -637,6 +654,9 @@ mod tests {
         let start = Instant::now();
         assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
+        // Not a fragment's room yet (2048 bytes play in 10.7 ms): nothing,
+        // and a waiter looks again when one will have played.
+        assert!(h.ready_in_ns().is_some_and(|ns| ns <= 10_700_000));
         std::thread::sleep(std::time::Duration::from_millis(60));
         let n = h.write_at(0, &vec![0u8; 100_000]).unwrap();
         // Against the clock as it actually ran (a loaded machine sleeps
@@ -662,9 +682,17 @@ mod tests {
         assert_eq!(h.write_at(0, &vec![0u8; BUFSIZE as usize - 6]).unwrap(), BUFSIZE - 6);
         // The clock stopped: nothing plays from here on.
         h.stream.lock().unwrap().at = u64::MAX;
-        // 6 bytes of room: one 4-byte frame of the 8 offered, then none.
-        assert_eq!(h.write_at(0, &[0u8; 8]).unwrap(), 4);
+        // 6 bytes of room: not the 8 offered, nor a fragment, so nothing;
+        // a write of 4 fits whole.
         assert_eq!(h.write_at(0, &[0u8; 8]), Err(Errno::EAGAIN));
+        assert_eq!(h.write_at(0, &[0u8; 4]).unwrap(), 4);
+        assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
+        // With a fragment's room, a longer write takes the whole frames that fit.
+        {
+            let mut s = h.stream.lock().unwrap();
+            s.queued = BUFSIZE - FRAGSIZE - 2;
+        }
+        assert_eq!(h.write_at(0, &vec![0u8; 3 * FRAGSIZE as usize]).unwrap(), FRAGSIZE);
     }
 
     /// The test player: what it has not played, by stream (absent: not
@@ -693,9 +721,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
         assert_eq!(h.ready_in_ns(), Some(128 * 1_000_000_000 / 48000));
-        // It played 100 frames: 400 bytes of room, exactly.
+        // It played 100 frames: 400 bytes of room, exactly; less than a
+        // write of 1000 wants, enough for one of 400.
         PLAYER.lock().unwrap()[0].1 = (BUFSIZE / 4) as u32 - 100;
-        assert_eq!(h.write_at(0, &vec![0u8; 1000]).unwrap(), 400);
+        assert_eq!(h.write_at(0, &vec![0u8; 1000]), Err(Errno::EAGAIN));
+        assert_eq!(h.write_at(0, &[0u8; 400]).unwrap(), 400);
         // It lets the stream go (another took the device, or it stopped):
         // back on the clock, which drains it.
         PLAYER.lock().unwrap().clear();
