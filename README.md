@@ -111,7 +111,8 @@ Mesa for the page also needs Emscripten. Running AArch64 tests needs an
 
 ```console
 $ cargo build --release -p gexc                      # AArch64 guests
-$ cargo build --release -p gexc --features x86       # x86-64 and i386 guests
+$ cargo build --release -p gexc --features x86 --target-dir target/x86
+                                                     # x86-64 and i386 guests
 
 $ gexc run <elf> [args...]          # translate and run
 $ gexc run --wayland SOCKET <elf>   # with the compositor, at SOCKET
@@ -135,7 +136,8 @@ memory. It needs SharedArrayBuffer, so the page must be served with
 COOP/COEP headers. The single-thread build runs every thread as a fiber in
 one Worker, and works on any static host. See `web/README.md`.
 
-Wine:
+Wine needs the x86 `gexc` at `target/x86/release/gexc`, as built above
+(or `GEXC=` naming another):
 
 ```console
 $ make -C tools/wine-wasm           # the Wine dist and a prefix
