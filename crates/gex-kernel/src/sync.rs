@@ -67,7 +67,7 @@ pub fn rank_take(r: u8) {
         let held = RANKS.with(|c| c.get());
         if held >> r != 0 {
             panic!(
-                "gex: lock order: taking rank {r} while holding ranks {:?} (docs/kernel-locking.md §4.3)",
+                "gex: lock order: taking rank {r} while holding ranks {:?}",
                 (1..32).filter(|i| held & (1 << i) != 0).collect::<Vec<_>>()
             );
         }
