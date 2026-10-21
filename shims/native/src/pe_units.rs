@@ -2090,7 +2090,8 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     Ok(())
 }
 
-#[cfg(all(test, feature = "translate"))]
+// The test decodes i386 code: only an x86 guest build has that decoder.
+#[cfg(all(test, feature = "translate", feature = "x86"))]
 mod region_tests {
     #[test]
     fn a_32_bit_region_reads_an_absolute_slot() {
