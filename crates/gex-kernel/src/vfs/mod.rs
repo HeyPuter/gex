@@ -148,7 +148,7 @@ pub const FADV_WILLNEED: u32 = 3;
 /// export name, the version resource, the CLR and load-config headers, the
 /// shared sections: server/mapping.c `get_image_params`), so that its read
 /// inside a door call never waits on the network (`offset`, `len` unused).
-/// A W3 client advises this before `create_mapping` (ntdll's `NtCreateSection`).
+/// A Wine client advises this before `create_mapping` (ntdll's `NtCreateSection`).
 pub const FADV_GEX_IMAGE: u32 = 0x4745_0001;
 
 /// One extended-attribute call (`getxattr` and its kin), path or handle.
@@ -821,7 +821,7 @@ fn within(abs: &str, at: &str) -> bool {
 
 /// A process's mount table and working directory, and its published
 /// [`Namespace`]: what a caller without the kernel lock reads
-/// ([`Vfs::view`], docs/kernel-locking.md §3.4). Every lookup is the
+/// ([`Vfs::view`]). Every lookup is the
 /// namespace's (`Deref`); the three changes -- a mount, an unmount, a
 /// `chdir` -- are this type's, and publish.
 pub struct Vfs {
@@ -1422,9 +1422,8 @@ pub struct Walked {
 /// relative to the root. At most 40 links, as Linux.
 ///
 /// The one walk both the per-process [`Vfs`] and the browser's global kernel
-/// run, so a whole lookup there is one call (it was one round trip per
-/// directory per lookup: an `openat` of a file five directories down made a
-/// dozen).
+/// run, so a whole lookup there is one call rather than a round trip per
+/// directory.
 pub fn walk_links(
     mut abs: String,
     follow_final: bool,

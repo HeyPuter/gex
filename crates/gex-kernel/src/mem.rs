@@ -1,11 +1,11 @@
 //! The guest's virtual memory bookkeeping.
 //!
-//! gex *is* the allocator for the guest address space (PLAN §2.3), so `mmap`,
+//! gex *is* the allocator for the guest address space, so `mmap`,
 //! `brk` and `munmap` are ordinary data-structure operations over a list of
 //! mappings — there is no host `mmap` involved and no page table to program.
 //!
 //! Protection bits are recorded, not enforced: wasm has no way to fault on a
-//! stray load or store (PLAN §7.2). They still matter, because `/proc/self/maps`
+//! stray load or store. They still matter, because `/proc/self/maps`
 //! reports them, translation invalidation keys off `PROT_EXEC`, and any access
 //! the *kernel* performs on the guest's behalf does check them.
 
@@ -96,8 +96,7 @@ impl Vma {
 }
 
 /// What a reader that does not own the map sees of it: each mapping's
-/// range and protection, published after every change
-/// (docs/kernel-locking.md §3.5). A futex's "is the word mapped" asks this,
+/// range and protection, published after every change. A futex's "is the word mapped" asks this,
 /// from any thread, with no lock shared with the map's writers.
 ///
 /// A reader on a view one change old can see a mapping a concurrent
@@ -169,8 +168,8 @@ impl std::fmt::Debug for ViewCell {
     }
 }
 
-/// A process's memory map behind its own lock, the process's mm lock
-/// (docs/kernel-locking.md §3.5): what a mapping call changes and every
+/// A process's memory map behind its own lock, the process's mm lock: what a
+/// mapping call changes and every
 /// reader that needs more than the published view ([`MapView`]) looks at.
 /// Held for a leaf computation only, never across a trap back to JS.
 ///
@@ -273,7 +272,7 @@ pub struct MemoryMap {
     /// `end` are this map's alone, and are recorded as arena for later
     /// mappings to use. A host may instead leave the cursor where it is and
     /// answer [`BACKED_ISLAND`], keeping the range as an island its cursor
-    /// steps over (W3 in the browser): backed, the guest's for mappings placed
+    /// steps over (32-bit Wine in the browser): backed, the guest's for mappings placed
     /// there, and never arena.
     back: Option<fn(u64, u64) -> Option<u64>>,
     /// Bumped by every change to the map. `/proc/self/maps` is derived from the
@@ -281,8 +280,8 @@ pub struct MemoryMap {
     /// reformatting on every read (measured half of an X server's time in
     /// `core::fmt` before this).
     generation: u64,
-    /// An M64 process's high arena, `[HIGH_ARENA_BASE, LIMIT64)`
-    /// (docs/mem64.md §3): non-executable mappings without a fixed address go
+    /// An M64 process's high arena, `[HIGH_ARENA_BASE, LIMIT64)`:
+    /// non-executable mappings without a fixed address go
     /// there. `None` for every M32 process, whose map behaves exactly as it
     /// always has.
     high: Option<(u64, u64)>,
@@ -292,10 +291,10 @@ pub struct MemoryMap {
     /// is known, which is always safe.
     ///
     /// Lets an anonymous `mmap` skip zeroing what is zero already, and a
-    /// `fork` skip copying it. Wine under W3 reserves ~3 GiB of PROT_NONE
+    /// `fork` skip copying it. 32-bit Wine reserves ~3 GiB of PROT_NONE
     /// address space at each process start and forks twice per child
-    /// process: scanning and copying those reservations was 2-3 s of every
-    /// Windows process start.
+    /// process: scanning and copying those reservations would cost seconds
+    /// of every Windows process start.
     ///
     /// Trusts the protection: a page that is never writable is never written.
     /// gex does not fault every store to a non-writable page (a wasm32
@@ -318,8 +317,8 @@ pub struct MemoryMap {
     pub log: MapLog,
 }
 
-/// What a process's mapping calls note beside its map (docs/kernel-locking.md
-/// §3.5, L12b): kept with the map, under the mm lock, so a mapping call needs
+/// What a process's mapping calls note beside its map: kept with the map,
+/// under the mm lock, so a mapping call needs
 /// nothing else of its kernel and is made without the kernel lock.
 ///
 /// A copy (a fork's, a vfork child's) starts empty: the parent's notes are
@@ -376,9 +375,9 @@ pub struct MapLog {
     /// `.text` to fill an import table and put it back, `cgen::on_retire`).
     /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
     /// could have changed the code was retired when the page became writable,
-    /// and forgetting the dispatch pages here dropped the bridges of the units
-    /// and native modules on them for good (a native Wine DLL's `ud2` stub
-    /// then ran as code: SIGILL in Undertale's GL start).
+    /// and forgetting the dispatch pages here would drop the bridges of the
+    /// units and native modules on them for good (a native Wine DLL's `ud2`
+    /// stub would then run as code: SIGILL).
     pub recheck_code: Vec<(u64, u64)>,
 }
 
@@ -415,7 +414,7 @@ pub fn dirty_parts(clean: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64)
 
 /// Bytes an M32 process asked for and could not be given for lack of address
 /// space (not of memory): the run that sees it records the program for a
-/// 64-bit memory next time (docs/mem64.md §5). Zero until it happens.
+/// 64-bit memory next time. Zero until it happens.
 /// Where this module's rare diagnostics go: stderr unless the host says
 /// otherwise (a browser has none; its shim points this at the console).
 static SAY: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
@@ -461,7 +460,7 @@ pub fn note_address_space_short(len: u64) {
 ///   own stack and data there. Natively it is only unused, and refusing it
 ///   moves a guest's mapping elsewhere, which is harmless.
 /// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
-///   directory and patched-page bits (docs/mem64.md §3).
+///   directory and patched-page bits.
 pub fn hits_runtime(start: u64, end: u64) -> bool {
     start < gex_abi::DISPATCH_DIR_END
         || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
@@ -491,7 +490,7 @@ impl MemoryMap {
             take: None,
             back: None,
             // Every process of a host with a 64-bit guest memory has the
-            // high arena (docs/mem64.md §3).
+            // high arena.
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
             clean: Vec::new(),
             fresh: None,
@@ -562,7 +561,7 @@ impl MemoryMap {
         &self.clean
     }
 
-    /// Give this process a 64-bit memory's high arena (docs/mem64.md §3).
+    /// Give this process a 64-bit memory's high arena.
     pub fn set_high_arena(&mut self, lo: u64, hi: u64) {
         self.high = Some((lo, hi));
     }
@@ -630,7 +629,7 @@ impl MemoryMap {
     }
 
     /// Take `[lo, hi)` as this map's own arena: the host has backed it and
-    /// handed it to the process (the browser's Windows address space, W3),
+    /// handed it to the process (the browser's Windows address space),
     /// so mappings land in it, fixed or not, without asking the host again.
     pub fn adopt_arena(&mut self, lo: u64, hi: u64) {
         if lo >= hi {
@@ -649,11 +648,9 @@ impl MemoryMap {
     }
 
     /// Never place a mapping that names no address in `[lo, hi)`: it is
-    /// for mappings placed there (W3's and W64's exe slot and pinned-DLL
-    /// band, `shims/browser/src/nt.rs` `keep_exe_slot`). Once a fixed
-    /// mapping there made it arena, its holes took anonymous mappings
-    /// bottom-up (64 MiB from 0x19711000, just above lime.ndll, in W64
-    /// Dicey's game), and a DLL mapped later found its pin taken.
+    /// for mappings placed there (Wine's exe slot and pinned-DLL band). If
+    /// a fixed mapping there made it arena, its holes would take anonymous
+    /// mappings bottom-up, and a DLL mapped later would find its pin taken.
     pub fn keep_fixed_only(&mut self, lo: u64, hi: u64) {
         if lo >= hi || self.fixed_only.iter().any(|&(a, b)| a <= lo && hi <= b) {
             return;
@@ -774,10 +771,11 @@ impl MemoryMap {
         let Some(prev) = back(start, end) else {
             return Err(Errno::ENOMEM);
         };
-        // An island's range (W3's pinned DLL band, in the browser): backed and
-        // the guest's, but never this map's arena. Adopted, an image's slot
-        // went to the next bottom-up mapping once the image was unmapped, and
-        // the image, loaded again, relocated and missed its unit.
+        // An island's range (Wine's pinned DLL band, in the browser): backed
+        // and the guest's, but never this map's arena. Adopted, an image's
+        // slot would go to the next bottom-up mapping once the image was
+        // unmapped, and the image, loaded again, would relocate and miss its
+        // unit.
         if prev == BACKED_ISLAND {
             return Ok(());
         }
@@ -802,8 +800,8 @@ impl MemoryMap {
     /// large mapping is refused for want of space (Wine's x86-64 user space
     /// is 4 GiB to it, and it asks above 2 GiB only once nothing below
     /// fits). Totals by kind, the biggest mappings and names, the free holes
-    /// and the arena, so "the game's working set" and "our leak" can be told
-    /// apart from the log.
+    /// and the arena, so the program's own working set and a leak in gex can
+    /// be told apart from the log.
     fn report_short(&self, addr: u64, len: u64) {
         use std::sync::atomic::{AtomicBool, Ordering};
         static DONE: AtomicBool = AtomicBool::new(false);
@@ -949,12 +947,11 @@ impl MemoryMap {
             return Ok(start - tail);
         }
         // Record the span and hand back its start. A single `take` is one
-        // contiguous claim whatever the cursor does; a `29f6e7f` change added a
-        // SECOND `take` here to "top up" the tail `want` was shortened by, but
-        // the arena cursor is shared between a process's threads, so a racing
-        // claim from another thread landed between the two takes and the span
-        // recorded here then covered memory that claim owned -- multithreaded
-        // Xvfb corrupted into an OOB/SIGABRT, which was the virgl regression.
+        // contiguous claim whatever the cursor does. Never a second `take` to
+        // "top up" the tail `want` was shortened by: the arena cursor is
+        // shared between a process's threads, so a claim from another thread
+        // can land between the two takes, and the span recorded here would
+        // then cover memory that claim owns.
         // The common mapping (a pthread stack is 8 MiB == CHUNK, so `want` is
         // floored to CHUNK >= need) is fully backed by the one take above; the
         // only under-backed case is a mapping larger than a CHUNK that followed
@@ -1153,7 +1150,7 @@ impl MemoryMap {
     }
 
     /// Hand out no mapping above `top` unless asked for there (a process
-    /// hosting Windows code, W3: Windows keeps 0x7ffe0000 for
+    /// hosting Windows code: Windows keeps 0x7ffe0000 for
     /// KUSER_SHARED_DATA and the top of user space for itself).
     /// Such a process's mappings are also placed in bands
     /// ([`Self::place_banded`]).
@@ -1770,7 +1767,7 @@ mod tests {
         }
     }
 
-    /// A range kept for fixed mappings (W3's exe slot and pinned-DLL band)
+    /// A range kept for fixed mappings (Wine's exe slot and pinned-DLL band)
     /// takes no anonymous mapping once it is arena, bottom-up or top-down;
     /// a fixed mapping or a free hint still goes there.
     #[test]
@@ -1919,7 +1916,7 @@ mod tests {
         assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
     }
 
-    /// A host's island (W3's pinned DLL band): a fixed mapping there is
+    /// A host's island (Wine's pinned DLL band): a fixed mapping there is
     /// backed but never becomes arena, so once it is unmapped the next
     /// bottom-up mapping does not take its slot, and the image mapped there
     /// again gets its address back.
@@ -1998,7 +1995,7 @@ mod tests {
     /// The arena is shared with the shim's heap through one cursor. A hint,
     /// MAP_FIXED or in-place mremap into a span the heap took must not put a
     /// guest mapping over it: musl (as zig builds it) passes mmap hints, and
-    /// a benchmark's hundredth large malloc trapped inside the browser shim.
+    /// a large malloc placed there traps inside the browser shim.
     #[test]
     fn a_placed_mapping_never_lands_in_the_runtimes_heap() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2222,14 +2219,14 @@ mod tests {
         assert!(!m.check_access(0x1000_1800, 0x1000, prot::READ));
     }
 
-    /// docs/mem64.md §3: in an M64 process, data goes above 4 GiB and code
+    /// In an M64 process, data goes above 4 GiB and code
     /// stays below MMAP_TOP, but a high page may become code (a W^X JIT's
     /// flip): the M64 dispatch directory covers the whole memory.
     #[test]
     fn a_64_bit_memory_puts_data_in_the_high_arena() {
         let mut m = MemoryMap::new(0x40_0000);
         m.set_high_arena(gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64);
-        // Unity's reservations: 512 MiB - 4 KiB with no access, twenty of them.
+        // A runtime's reservations: 512 MiB - 4 KiB with no access, twenty of them.
         let mut last = 0;
         for _ in 0..20 {
             let a = m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").unwrap();
@@ -2276,7 +2273,7 @@ mod tests {
     }
 
     /// An M32 map is unchanged, and running out of address space is recorded
-    /// for the next start (docs/mem64.md §5).
+    /// for the next start.
     #[test]
     fn a_32_bit_memory_records_running_out_of_address_space() {
         let mut m = MemoryMap::new(0x40_0000);

@@ -1,4 +1,4 @@
-//! Syscall entry and the T0-T2 implementations (PLAN §8).
+//! Syscall entry and the syscall implementations.
 //!
 //! `svc #0` arrives here with the guest context still in linear memory: the
 //! number in `x8`, arguments in `x0`-`x5`. The kernel reads them from the
@@ -231,7 +231,7 @@ pub enum SyscallOutcome {
     ///
     /// Produced by `rt_sigreturn` and by signal delivery. Redirecting is safe
     /// at any host call because the guest's registers are already flushed to
-    /// the context, so there is no wasm stack to unwind (PLAN §2.4).
+    /// the context, so there is no wasm stack to unwind.
     Resume(u64),
     /// The process is over.
     Exit(i32),
@@ -518,7 +518,7 @@ pub struct Kernel {
     pub tid: i32,
     /// Guest path of the running program.
     pub exe_path: String,
-    /// The memory flavour the last `execve` asked for (docs/mem64.md §5):
+    /// The memory flavour the last `execve` asked for:
     /// `Some(true)` a 64-bit memory, `Some(false)` a 32-bit one, `None`
     /// the page's own. From the call's `GEX_MEM64` entry, which the kernel
     /// takes out of the new program's environment so that it applies to
@@ -532,7 +532,7 @@ pub struct Kernel {
     /// Its user and group ids, which its threads share and a fork copies
     /// ([`Creds`]).
     pub creds: Arc<Creds>,
-    /// Trace every syscall to stderr (PLAN §11's strace mode).
+    /// Trace every syscall to stderr (`gexc run --strace`).
     pub trace: bool,
     /// Signal dispositions, masks and pending set.
     pub signals: Signals,
@@ -540,8 +540,7 @@ pub struct Kernel {
     /// locks take the futex path whenever a lock is contended, and `EAGAIN`
     /// from an already-changed word is the answer it needs.
     pub futexes: Arc<FutexTable>,
-    /// Syscalls seen but not implemented, for the ENOSYS telemetry in
-    /// PLAN §14.
+    /// Syscalls seen but not implemented, for ENOSYS telemetry.
     pub unimplemented: Vec<u64>,
     /// Next free register-context slot. Slot 0 is the initial thread's.
     /// Shared with the free path (`Free::slots`), which makes threads there.
@@ -561,7 +560,7 @@ pub struct Kernel {
     /// address spaces. `None` keeps the local `UnixSocket`, which is right
     /// whenever every process really is one process.
     ///
-    /// It matters for exactly the case the switcher used to hide: an X server
+    /// It matters when processes are in separate Workers: an X server
     /// binds a name in its own Worker and its client, another Worker, looks
     /// in a name table that has never heard of it. See [`crate::unix::Remote`].
     pub unix_remote: Option<crate::unix::Remote>,
@@ -610,7 +609,7 @@ pub struct Kernel {
     /// a signal); the host takes it after the call and wakes threads parked
     /// on descriptors ([`Kernel::take_fd_activity`]).
     pub fd_activity: bool,
-    /// The wasm32 personality (docs/wine-native.md §3.11): a native wasm32
+    /// The wasm32 personality: a native wasm32
     /// program on the i386 ABI. Everything is i386's except how control
     /// moves: a signal frame or a `sigreturn` is left in the thread context
     /// and the syscall returns normally ([`SyscallOutcome::Continue`]), for
@@ -686,8 +685,8 @@ pub struct Kernel {
     /// its mask to the next thread that finishes a futex wait (Mono's GC
     /// left the main thread with SIGPWR blocked that way).
     pub thread_calls: std::collections::HashMap<i32, PendingCall>,
-    /// The pc of the syscall being handled (docs/mem64.md: a mapping the
-    /// dynamic loader asks for stays below 4 GiB, since it will hold code).
+    /// The pc of the syscall being handled (a mapping the dynamic loader
+    /// asks for stays below 4 GiB, since it will hold code).
     pub syscall_pc: u64,
     /// The restart class of the call that last parked
     /// ([`BlockOp::restart`]) and its syscall's return pc, for
@@ -745,7 +744,7 @@ pub const RLIMIT_MSGQUEUE: usize = 12;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
 /// A process's resource limits, behind their own lock: `prlimit64` sets
-/// them without the kernel lock (docs/kernel-locking.md, L17).
+/// them without the kernel lock.
 pub struct Rlimits(std::sync::Mutex<[[u64; 2]; RLIM_NLIMITS]>);
 
 impl Default for Rlimits {
@@ -854,14 +853,13 @@ static CLOCK_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// the guest reads it: 0, or now less a fixed starting instant.
 static WALL_SHIFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// The benchmark clocks, as pewasm's PEWASM_TIME_SCALE and PEWASM_FIXED_TIME
-/// make them (its src/x86/host.c): the monotonic clocks -- which Wine's
+/// The benchmark clocks: the monotonic clocks -- which Wine's
 /// QueryPerformanceCounter, GetTickCount and timeGetTime all come from --
 /// run `scale` times faster than real time, so a program that caps its own
 /// frame rate against them stops sleeping and runs as fast as it can; the
 /// wall clock runs at real time but `wall_shift` seconds behind, so it
-/// starts at a fixed date (pewasm: the fixed date plus the real time since
-/// start). Sleeps and timeouts stay real time, as in pewasm: Wine's
+/// starts at a fixed date (the fixed date plus the real time since start).
+/// Sleeps and timeouts stay real time: Wine's
 /// NtDelayExecution counts on the wall clock, and a relative wait on the
 /// monotonic one waits its length in real time. Every process of a host
 /// must be given the same values (the browser's kernel hands them out).
@@ -881,15 +879,15 @@ fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// A monotonic clock reading made from a wall clock reading: seconds since
 /// a shared boot instant, not since the epoch. Programs truncate monotonic
 /// milliseconds to 32 bits and compare them across processes -- X server
-/// event times are `(CARD32)` CLOCK_MONOTONIC milliseconds, and Unity
-/// compares them with its own clock -- which only works while the uptime
+/// event times are `(CARD32)` CLOCK_MONOTONIC milliseconds, and toolkits
+/// compare them with their own clock -- which only works while the uptime
 /// is under 49.7 days, as it is on real machines; an epoch-based value
 /// (1.8e12 ms) never agrees with its own truncation.
 /// `clock_gettime(clk)` in nanoseconds from `clock`, as [`Kernel`]'s
 /// `sys_clock_gettime` answers it for every clock but the two CPU-time ones
 /// (0 for those): no kernel, no lock. For a host import that reads the
-/// guest's clock directly (`gex.clock_ns`, W3's PE ntdll
-/// NtQueryPerformanceCounter, docs/wine-overhead.md F2), so the value is the
+/// guest's clock directly (`gex.clock_ns`, Wine's PE ntdll
+/// NtQueryPerformanceCounter), so the value is the
 /// one a system call would give.
 pub fn clock_ns(clock: ClockFn, clk: u64) -> u64 {
     let (secs, nanos) = match clk {
@@ -967,17 +965,17 @@ fn time_answer(m: &mut GuestMem<'_>, compat: bool, clock: ClockFn, tloc: u64) ->
 /// `ctx_addr`, without a [`Kernel`], and say whether it was one.
 ///
 /// A host takes its kernel lock for every syscall, and Wine asks the time
-/// several times per sleep: Undertale's game thread made ~2,000 of these
-/// calls a second in the page and spent about 25 ms of each 87 ms frame
-/// queueing for the lock behind the process's other Workers. None of them
+/// several times per sleep: a game's main thread can make thousands of
+/// these calls a second, each one queueing for the lock behind the
+/// process's other Workers. None of them
 /// needs the kernel: the answer is the clock, and `started` (the process's
 /// [`Kernel::started`], which the processor-time clocks count from).
 ///
 /// Returns false, writing nothing, for any other call. A clock call is
 /// always answered here, `EFAULT` included (a buffer the guest cannot be
 /// written at, as the kernel's own calls answer), so a host that routes these
-/// numbers here never takes its kernel for them (docs/kernel-locking.md §5.2
-/// step 1). `compat` is [`Kernel::compat`] (the i386 numbering, number in
+/// numbers here never takes its kernel for them. `compat` is
+/// [`Kernel::compat`] (the i386 numbering, number in
 /// `eax`, 32-bit layouts); `started` the process's start, which the
 /// processor-time clocks count from. The result goes where [`set_result`]
 /// puts it. Signal delivery, which the kernel does at every syscall
@@ -1129,7 +1127,7 @@ pub fn clock_call(
 // `read`, `write`, their vectored and positioned forms and `lseek` need the
 // descriptor table and nothing else of a kernel, blocking included: the
 // full call and a host calling without the kernel lock ([`free_call`]) run
-// the same code (docs/kernel-locking.md step 9).
+// the same code.
 
 /// The descriptor table, and the ABI its `iovec`s are in.
 #[derive(Clone, Copy)]
@@ -2029,8 +2027,8 @@ impl FdIo<'_> {
         // read fail EAGAIN and the call return that error -- the bytes of the
         // first were taken from the socket and never reported. libwayland
         // reads its ring buffer as two iovecs whenever it wraps, so a Wayland
-        // client lost whole events now and then (a placement origin, and
-        // Paint's window stepped back a pixel during a caption drag). A peek
+        // client would lose whole events now and then (a window stepping
+        // back a pixel during a caption drag). A peek
         // per iovec also peeked the same bytes into each.
         let mut parts = Vec::new();
         let mut want = 0usize;
@@ -2713,7 +2711,7 @@ impl ThreadFs {
     }
 }
 
-/// The path lookups and opens (docs/kernel-locking.md, L14b): what they
+/// The path lookups and opens: what they
 /// read is the namespace (the kernel's own, or its published view), the
 /// working directory of the calling thread's fs_struct, the descriptor
 /// table and the mapping log (an object's pin or placement, armed by its
@@ -3315,7 +3313,7 @@ impl PathIo<'_> {
         // `/proc/self/fd/N` is a symlink to the temp's real path, so following it
         // here turns a would-be cross-mount link (/proc vs the target's fs, an
         // EXDEV) into the same-fs link it really is. QSaveFile (Qt, hence every
-        // KDE app) relies on it -- without it dolphin cannot save its bookmarks.
+        // KDE app) relies on it to save a file.
         let from = if a[4] & AT_SYMLINK_FOLLOW != 0 {
             let mut cur = from;
             for _ in 0..40 {
@@ -3701,7 +3699,7 @@ impl PathIo<'_> {
 }
 
 /// The memory map and what a mapping call needs beside it, none of it behind
-/// the kernel lock (docs/kernel-locking.md §3.5, L12b): `mmap`, `munmap`,
+/// the kernel lock: `mmap`, `munmap`,
 /// `mprotect`, `brk`, `mremap`, `madvise` and `msync`, the same code for the
 /// full call and [`free_call`]. What they note for the host (code mapped and
 /// retired, pins, shared file mappings) is the map's own ([`MapLog`]).
@@ -3716,7 +3714,7 @@ pub struct MapIo<'a> {
     pub pins: &'a std::collections::HashMap<String, u64>,
     pub place: Option<&'a Arc<dyn ObjectPlace>>,
     /// The call's pc: a mapping the dynamic loader asks for stays below
-    /// 4 GiB, since it will hold code (docs/mem64.md).
+    /// 4 GiB, since it will hold code.
     pub pc: u64,
 }
 
@@ -3879,7 +3877,7 @@ impl MapIo<'_> {
         }
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
-            // correct and needs no page faults (PLAN §7.4).
+            // correct and needs no page faults.
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
@@ -3945,7 +3943,7 @@ impl MapIo<'_> {
             )?;
             if let Some((path, base)) = pinned {
                 // Said as it happens: the end-of-run report is lost when the
-                // process is killed (a game run ends at its timeout).
+                // process is killed (a run ended by its timeout).
                 if base != start {
                     eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
                 }
@@ -4034,7 +4032,7 @@ impl MapIo<'_> {
         // The dynamic loader's reservation for an object (glibc maps an
         // over-aligned library into anonymous PROT_NONE memory) will hold
         // code, so in a 64-bit memory it stays below 4 GiB with the code; the
-        // loader runs at INTERP_BASE (docs/mem64.md §3).
+        // loader runs at INTERP_BASE.
         // What was known to be zero before the mapping (which forgets it).
         let clean_before = self.mem.lock().clean_ranges().to_vec();
         // Only what this mapping claims (another caller's claim may since
@@ -4048,7 +4046,7 @@ impl MapIo<'_> {
         };
         if let Some((path, base)) = pinned {
             // Said as it happens: the end-of-run report is lost when the
-            // process is killed (a game run ends at its timeout).
+            // process is killed (a run ended by its timeout).
             if base != start {
                 eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
             }
@@ -4186,7 +4184,7 @@ impl MapIo<'_> {
     }
 }
 
-/// The socket calls (L18): `socket`, `socketpair`, `bind`, `listen`,
+/// The socket calls: `socket`, `socketpair`, `bind`, `listen`,
 /// `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmmsg`,
 /// `recvmmsg`, the names (`getsockname`, `getpeername`), the options and
 /// `shutdown` (canonical numbers). `sendmsg` and `recvmsg` are [`FdIo`]'s.
@@ -4213,8 +4211,8 @@ pub fn is_socket_call(n: u64) -> bool {
 }
 
 /// What the socket calls need of their process beside its descriptor table
-/// ([`FdIo`]), none of it behind the kernel lock (docs/kernel-locking.md
-/// step 9, L18): the network and the name tables are shared and lock
+/// ([`FdIo`]), none of it behind the kernel lock: the network and the name
+/// tables are shared and lock
 /// themselves, the global kernel's sockets are another module's.
 #[derive(Clone, Copy)]
 pub struct NetIo<'a> {
@@ -4398,8 +4396,8 @@ impl NetIo<'_> {
             return install_unix(io, sock, flags, ty & SOCK_CLOEXEC != 0);
         }
         // AF_NETLINK, which libudev's device monitor opens (SDL's joystick
-        // and haptic start-up through it; a failure there made SDL_Init undo
-        // its video subsystem too, and Unity 6 then saw no display). There
+        // and haptic start-up through it; a failure there makes SDL_Init undo
+        // its video subsystem too, and the program sees no display). There
         // are no devices to announce, so the socket binds, takes its options
         // and never has a message: an empty eventfd behind the descriptor.
         // NETLINK_ROUTE answers its interface and address dumps
@@ -5013,7 +5011,7 @@ pub fn is_own_state(n: u64) -> bool {
 /// descriptor table, the global kernel's pipes, the resource limits'
 /// own lock or nothing at all: `epoll_ctl`, `pipe2`, `ftruncate`, `fadvise64`,
 /// `statfs`/`fstatfs`, `getpriority`/`setpriority`, `sysinfo` and
-/// `prlimit64` (L17). Canonical.
+/// `prlimit64`. Canonical.
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
@@ -5027,7 +5025,7 @@ pub fn is_fd_misc(n: u64) -> bool {
 /// nothing at all: `uname`, `prctl`, `sync`, the robust list and `rseq`,
 /// the scheduling policy calls, `sched_getaffinity`, `getcpu`,
 /// `membarrier`, the supplementary groups, and the calls that are
-/// accepted and do nothing here (L22). Canonical, for this process's ABI
+/// accepted and do nothing here. Canonical, for this process's ABI
 /// (`compat`): `arch_prctl` is x86's, and the do-nothing number is made
 /// only by a translation from x86-64 or i386.
 pub fn is_quiet(n: u64, compat: bool) -> bool {
@@ -5061,7 +5059,7 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
 /// descriptor table and nothing else of a kernel (and the clock for a
 /// timer): `eventfd2`, `epoll_create1`, `memfd_create`, the timerfd calls,
 /// `fallocate`, and the transfers `sendfile`, `splice` and
-/// `copy_file_range` (L22b). Canonical.
+/// `copy_file_range`. Canonical.
 pub fn is_fd_object(n: u64) -> bool {
     matches!(
         n,
@@ -5100,8 +5098,7 @@ pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u6
 /// and an `exec` keeps it. Read at each use (the owner a stat reports, the
 /// sender a signal names, `getuid`), so a change is seen by every thread's
 /// next call, with or without a kernel lock. Each set call changes one
-/// word, so two atomics are the whole of it (docs/kernel-locking.md §3.12
-/// A, L22c).
+/// word, so two atomics are the whole of it.
 #[derive(Debug)]
 pub struct Creds {
     uid: std::sync::atomic::AtomicU32,
@@ -5132,13 +5129,13 @@ impl Creds {
 }
 
 /// The credential, session and process group calls: `get[e]uid`,
-/// `mount` and `umount2` (L22e): the namespace's mount table, which its
+/// `mount` and `umount2`: the namespace's mount table, which its
 /// published view ([`crate::vfs::VfsView`]) writes. Canonical.
 pub fn is_mount(n: u64) -> bool {
     matches!(n, nr::MOUNT | nr::UMOUNT2)
 }
 
-/// The calls on the calling thread's own state alone (L22e):
+/// The calls on the calling thread's own state alone:
 /// `set_tid_address`, the word in its [`crate::signal::ThreadSig`] its exit
 /// clears, and `unshare(CLONE_FS)`, a fs_struct of its own in the
 /// process's [`ThreadFs`]. Canonical.
@@ -5146,7 +5143,7 @@ pub fn is_thread_own(n: u64) -> bool {
     matches!(n, nr::SET_TID_ADDRESS | nr::UNSHARE)
 }
 
-/// The calls that end a thread or the process, or wait for a child (L25a):
+/// The calls that end a thread or the process, or wait for a child:
 /// `exit`, `exit_group`, `wait4` and `reboot`. What they touch locks
 /// itself: the live thread count (an atomic), the thread's own signal
 /// state and fs_struct, the futexes and the process table. Canonical.
@@ -5220,7 +5217,7 @@ fn reboot_halts(cmd: u64) -> Option<&'static str> {
 /// a list this process owns, so a child reparented here when its own parent
 /// died is one this `wait4` can collect. That is what makes pid 1 able to do
 /// its job.
-/// `clone` and `clone3` that make a thread (`CLONE_THREAD`), L25b: what
+/// `clone` and `clone3` that make a thread (`CLONE_THREAD`): what
 /// they touch locks itself (the context slots and live count are atomics,
 /// the thread ids the process table's, the fs_structs and signal states
 /// their tables'). Canonical. A `clone` that makes a process is the host's
@@ -5255,7 +5252,7 @@ fn clone3_args(m: &GuestMem<'_>, c: u64, compat: bool) -> Result<[u64; 6], Errno
     Ok([flags, stack.wrapping_add(stack_size), parent_tid, tls, child_tid, 0])
 }
 
-/// What making a thread needs of its process (L25b), the same for the
+/// What making a thread needs of its process, the same for the
 /// kernel's `clone` and the free path's.
 pub struct ThreadMaker<'a> {
     pub procs: &'a ProcTable,
@@ -5382,7 +5379,7 @@ pub fn thread_own_call(
 
 /// `get[e]gid`, the `set*id` family, `getres[ug]id`, `setsid`, `getsid`,
 /// `getpgid` (and i386's and x86-64's `getpgrp`, translated to it) and
-/// `setpgid` (L22c). They need the process's [`Creds`] and the process
+/// `setpgid`. They need the process's [`Creds`] and the process
 /// table, which locks itself. Canonical.
 pub fn is_cred(n: u64) -> bool {
     matches!(
@@ -5447,7 +5444,7 @@ pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_
     }
 }
 
-/// The signal calls (L22d): those that send one, `kill` to a process, a
+/// The signal calls: those that send one, `kill` to a process, a
 /// group or every process and `tkill` and `tgkill` to a thread; and the
 /// calling thread's own `rt_sigtimedwait`, `rt_sigsuspend` and
 /// `rt_sigreturn`. They need the process table, which locks itself, the
@@ -6094,7 +6091,7 @@ impl FreeCall {
 }
 
 /// The call [`free_class`] found, whole, for a host that makes it without a
-/// kernel lock (docs/kernel-locking.md step 9): the same code as the full
+/// kernel lock: the same code as the full
 /// call ([`FdIo`], [`sigprocmask`]), the park included, and the signal that
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
@@ -6415,7 +6412,7 @@ pub fn clock_nanos_at(clock: ClockFn, started: u128, clk: u64) -> u128 {
 /// The park of a `nanosleep` or `clock_nanosleep`; `None` leaves the call to
 /// [`nanosleep_answer`], which answers at once: EINVAL for a malformed
 /// request, 0 for one with nothing left to wait for. The same code in the
-/// kernel and in a host that makes the call without it (§5.2 step 5).
+/// kernel and in a host that makes the call without it.
 pub fn sleep_block(m: &GuestMem<'_>, n: u64, a: [u64; 6], clock: ClockFn, started: u128) -> Option<BlockOp> {
     // `clock_nanosleep` puts the request in a[2]; `nanosleep` in a[0].
     let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
@@ -6455,7 +6452,7 @@ pub fn nanosleep_answer(m: &GuestMem<'_>, req: u64) -> SysResult {
     Ok(0)
 }
 
-/// What a process's futex calls need of it (docs/kernel-locking.md §3.2):
+/// What a process's futex calls need of it:
 /// its futex table, its memory map's published view (whether a word is
 /// mapped), the calling thread's id (a PI lock's owner) and the clock. No
 /// kernel lock: the table and the view synchronise themselves.
@@ -6474,7 +6471,7 @@ impl FutexCx<'_> {
     /// Whether the futex word at `addr` is inside the process's memory map.
     /// Checked against the map, not by reading: a guest address is a
     /// linear-memory offset, so reading address zero succeeds and proves
-    /// nothing (#113).
+    /// nothing.
     fn mapped(&self, addr: u64) -> bool {
         match (self.map, self.mapped_by) {
             (Some(v), _) => v.mapped(addr, 4),
@@ -6512,8 +6509,7 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
     // not a wait: the wake would have to come from an address
     // nothing can write. Checked against the map, not with
     // `GuestMem::read` -- a guest address is a linear-memory
-    // offset, so reading address zero succeeds and proves nothing
-    // (#113).
+    // offset, so reading address zero succeeds and proves nothing.
     if !cx.mapped(a[0]) {
         return None;
     }
@@ -6602,7 +6598,7 @@ pub fn futex_pi_park(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<
 
 /// `futex`'s answer, every operation but the waiting half of `FUTEX_WAIT`
 /// (which [`futex_block`] parks): the same code in the kernel and in a host
-/// that makes the call without the kernel (docs/kernel-locking.md §3.2).
+/// that makes the call without the kernel.
 pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
     let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
     // The private and clock bits change nothing here: the timeout is
@@ -6617,7 +6613,7 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // has: glibc aborts on a futex error it does not recognise,
             // and `EAGAIN` (word changed, so re-read and loop) is on its
             // recognised list while `EINVAL` is not. An address the
-            // process lacks is still `EFAULT` (#113).
+            // process lacks is still `EFAULT`.
             Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
         }
         futex::op::WAKE | futex::op::WAKE_BITSET => Ok(cx.table.wake(uaddr, val)),
@@ -6764,7 +6760,7 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
 // they need the descriptor table and nothing else of the kernel, so the full
 // call and any caller holding only the table run the same code.
 
-// -- coherence with shared file mappings (scratch/KC/map-shared.md, A) -------
+// -- coherence with shared file mappings ------------------------------------
 //
 // A `MAP_SHARED` mapping is an eager copy of the file, written back at
 // `msync` and `munmap`. Within the process the two must still agree: a
@@ -7010,8 +7006,8 @@ pub struct Idents {
 }
 
 /// `getpid`, `getppid`, `gettid` answered from `ids`, and the 32-bit
-/// `get[e]uid`/`get[e]gid` from the process's `creds`, with no lock
-/// (docs/kernel-locking.md §3.1), as [`clock_call`] answers the clocks: a
+/// `get[e]uid`/`get[e]gid` from the process's `creds`, with no lock,
+/// as [`clock_call`] answers the clocks: a
 /// host that knows the calling thread's ids calls this before anything
 /// else, and the full syscall runs whenever it returns false. `ids.tid ==
 /// 0` means the host has none yet, and `ids.ppid == 0` leaves `getppid` to
@@ -7404,7 +7400,7 @@ pub struct SharedMap {
     /// A hash of each page as the file last had it (read at `mmap`, written
     /// back since): a write-back writes only the pages that differ, so two
     /// processes' mappings of one file, each written back whole before,
-    /// stop undoing each other's pages (scratch/KC/map-shared.md, B).
+    /// stop undoing each other's pages.
     pub pages: Arc<[std::sync::atomic::AtomicU64]>,
 }
 
@@ -7440,8 +7436,8 @@ pub fn page_hashes(bytes: &[u8]) -> Arc<[std::sync::atomic::AtomicU64]> {
 
 /// A process's shared file mappings ([`SharedMap`]), and their published
 /// copy ([`SharedMaps::view`]): what a caller without the kernel lock reads
-/// (the page's compositor, finding a client's pool; docs/kernel-locking.md
-/// §3.10). Read as a slice (`Deref`); the two changes, a mapping added and
+/// (the page's compositor, finding a client's pool). Read as a slice
+/// (`Deref`); the two changes, a mapping added and
 /// mappings dropped, are this type's, and publish.
 #[derive(Debug)]
 pub struct SharedMaps {
@@ -7971,8 +7967,8 @@ impl Kernel {
         let (mut path, argv, envp) = self.read_exec_args(m, a)?;
         // The program as `/proc/self/exe` will name it: absolute, from the
         // caller's working directory, as Linux records it. ld.so asserts that
-        // the link starts with `/` when it works out `$ORIGIN` (Warfork's
-        // launcher execs `./wf_steam.x86_64`).
+        // the link starts with `/` when it works out `$ORIGIN` (a launcher
+        // that execs `./game.x86_64`).
         if !path.starts_with('/') {
             path = crate::vfs::normalize(&path, &self.caller_cwd());
         }
@@ -9010,7 +9006,7 @@ impl Kernel {
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(m, a[0] as i32, a[1]),
             nr::FADVISE64 => self.fd_io().fadvise(a[0] as i32, a[1], a[2], a[3]),
-            // `set_tid_address` and `unshare` (L22e).
+            // `set_tid_address` and `unshare`.
             n if is_thread_own(n) => {
                 let fs = self.fs_of(self.ctx_addr);
                 thread_own_call(self.signals.thread(), &self.thread_fs, &fs, self.ctx_addr, self.tid, n, a)
@@ -9025,7 +9021,7 @@ impl Kernel {
                 let Some(r) = self.map_io().call(m, n, a) else { unreachable!() };
                 r
             }
-            // The path lookups and opens (L14b), the free path's code.
+            // The path lookups and opens, the free path's code.
             n if is_path(n) => {
                 let Some(r) = self.path_io().call(m, n, a) else { unreachable!() };
                 r
@@ -9034,10 +9030,10 @@ impl Kernel {
             // -- process and time --------------------------------------------
             nr::GETPID => Ok(self.pid as u64),
             nr::GETTID => Ok(self.tid as u64),
-            // -- credentials, sessions and process groups (L22c) ------------
+            // -- credentials, sessions and process groups --------------------
             n if is_cred(n) => cred_call(&self.creds, &self.procs, self.pid, m, n, a),
 
-            // -- mounts (L22e) ----------------------------------------------
+            // -- mounts ------------------------------------------------------
             n if is_mount(n) => self.path_io().mount_call(m, n, a),
 
             // -- sockets -----------------------------------------------------
@@ -9087,7 +9083,7 @@ impl Kernel {
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // `kill`, `tkill` and `tgkill` (L22d), as the free path makes
+            // `kill`, `tkill` and `tgkill`, as the free path makes
             // them.
             nr::KILL | nr::TKILL | nr::TGKILL => {
                 if self.trace && n == nr::KILL {
@@ -9411,8 +9407,8 @@ impl Kernel {
 }
 
 /// The descriptor table's own calls: `close`, `close_range`, the `dup`
-/// family, `fcntl` and `flock`. No kernel lock (docs/kernel-locking.md,
-/// L10): the table publishes itself, `flock`'s locks and a memfd's seals
+/// family, `fcntl` and `flock`. No kernel lock: the table publishes itself,
+/// `flock`'s locks and a memfd's seals
 /// lock themselves, and an `O_TMPFILE`'s name is dropped through the
 /// process's published namespace.
 impl FdIo<'_> {
@@ -9592,7 +9588,7 @@ impl FdIo<'_> {
 impl FdIo<'_> {
     /// `ioctl`: the device's own requests, the descriptor's, and the
     /// terminal's. No kernel lock: the table, the process table, the
-    /// terminal and every device synchronise themselves (§5.2 step 6).
+    /// terminal and every device synchronise themselves.
     pub fn ioctl(
         &self,
         m: &mut GuestMem<'_>,
@@ -10107,10 +10103,11 @@ impl Kernel {
     /// (see [`wakes_fd_waiters`]). Its descriptor must be a stream -- a read
     /// or write of a file, `/proc` or a device never ends a wait -- and a
     /// read must be able to make room (`FileHandle::read_frees_nothing`).
-    /// Each "no" spares every parked Worker in the page a wake: Undertale's
-    /// reads of the wineserver's replies were half of all global wakes, every
-    /// one of them going round every idle Worker of every process
-    /// (docs/kernel-locking.md, step 3). Anything else is "yes".
+    /// Each "no" spares every parked Worker in the page a wake: a Wine
+    /// process's reads of the wineserver's replies can be half of all global
+    /// wakes, every one of them going round every idle Worker of every
+    /// process.
+    /// Anything else is "yes".
     fn io_may_wake(&self, n: u64, a: &[u64; 6]) -> bool {
         let read = matches!(n, nr::READ | nr::READV | nr::PREAD64);
         if !read && !matches!(n, nr::WRITE | nr::WRITEV | nr::PWRITE64) {
@@ -11385,11 +11382,11 @@ mod tests {
     /// the same results and bytes, the same park on an empty pipe, the same
     /// mask, the same `SIGPIPE`; and it declines every other call by number.
     /// The calls on a process's and thread's own signal state, and
-    /// `getrandom`, made lock-free (L15): what one path sets the other
+    /// `getrandom`, made lock-free: what one path sets the other
     /// reads back.
-    /// The small descriptor and process calls (L17), lock-free and in the
+    /// The small descriptor and process calls, lock-free and in the
     /// kernel, give the same answers and change the same state.
-    /// The socket calls (L18) answer on the free path as the kernel does:
+    /// The socket calls answer on the free path as the kernel does:
     /// a pair carries bytes, a named listener takes a connection and hands
     /// it out, the names and options are the same, a blocking `accept` with
     /// nothing waiting parks, and the errors are the kernel's.
@@ -11499,8 +11496,8 @@ mod tests {
         }
     }
 
-    /// What a page still makes under the kernel lock (docs/kernel-locking.md
-    /// §3.12): every call but `execve` and a process's `clone` is in one of
+    /// What a page still makes under the kernel lock: every call but `execve`
+    /// and a process's `clone` is in one of
     /// the free path's classes, and one it answers `ENOSYS` the kernel does
     /// not make either. Each canonical number, with zero arguments.
     #[test]
@@ -11540,7 +11537,7 @@ mod tests {
     }
 
     /// [`only_the_process_calls_take_the_locked_path`] for an i386 process
-    /// (W3's Wine), in its own numbering: each raw number with zero
+    /// (32-bit Wine), in its own numbering: each raw number with zero
     /// arguments.
     #[test]
     fn only_the_i386_process_calls_take_the_locked_path() {
@@ -11640,7 +11637,7 @@ mod tests {
         assert!(free_class(&m, at, false).is_none());
     }
 
-    /// The credential calls (L22c) answer and change the ids as the
+    /// The credential calls answer and change the ids as the
     /// kernel's arms do, the change is what the rest of the process reads
     /// (a stat's owner), and a fork's ids are its own.
     #[test]
@@ -11725,7 +11722,7 @@ mod tests {
         assert_eq!(k.creds.uid(), 4321);
     }
 
-    /// `kill`, `tkill` and `tgkill` (L22d) answer as the kernel's arms do,
+    /// `kill`, `tkill` and `tgkill` answer as the kernel's arms do,
     /// and one for another thread of the process is raised on that
     /// thread's own state, found through the shared table.
     #[test]
@@ -11819,7 +11816,7 @@ mod tests {
         assert_eq!(ret(&m, at), -(Errno::EFAULT.0 as i64));
     }
 
-    /// `set_tid_address` and `unshare` (L22e) answer the same with and
+    /// `set_tid_address` and `unshare` answer the same with and
     /// without the kernel, on the calling thread's own state: the word its
     /// exit clears is in its `ThreadSig` (`CLONE_CHILD_CLEARTID`'s from its
     /// start), so a thread that names one without the lock has it cleared
@@ -11897,7 +11894,7 @@ mod tests {
         assert_eq!(k.signals.thread().clear_child_tid(), 0);
     }
 
-    /// `exit`, `exit_group`, `wait4` and `reboot` (L25a) answer the same
+    /// `exit`, `exit_group`, `wait4` and `reboot` answer the same
     /// with and without the kernel: an exit of one of several threads ends
     /// only it (its joiner's word cleared, its signal state and id gone,
     /// the count down by one); the last thread's exit and `exit_group` end
@@ -11971,7 +11968,7 @@ mod tests {
         assert_eq!(k.procs.halt_code(), Some(0));
     }
 
-    /// `clone` and `clone3` that make a thread (L25b) answer the same with
+    /// `clone` and `clone3` that make a thread answer the same with
     /// and without the kernel: the creator gets the tid, the child a copy of
     /// its context answering 0 on its own stack, its own slot, id and signal
     /// state (with the word its exit clears), and the count goes up. A
@@ -12060,7 +12057,7 @@ mod tests {
         assert!(free_class(&m, main.ctx_addr, false).is_none());
     }
 
-    /// `mount` and `umount2` (L22e) answer the same with and without the
+    /// `mount` and `umount2` answer the same with and without the
     /// kernel. The mount table's one writer is its published view: a mount
     /// made without the lock is the kernel's at its next call, and mounts
     /// made from several threads at once, beside the kernel's own and its
@@ -12824,7 +12821,7 @@ mod tests {
 
 
     /// `nanosleep` and `clock_nanosleep` without the kernel: the same park
-    /// or answer as the full call (docs/kernel-locking.md §5.2 step 5).
+    /// or answer as the full call.
     #[test]
     fn free_sleep_answers_as_the_kernel_does() {
         let (mut buf, mut k) = setup();
@@ -12878,7 +12875,7 @@ mod tests {
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::Sleep(_), None)));
     }
 
-    /// `futex` in the lock-free class (docs/kernel-locking.md §5.2 step 4)
+    /// `futex` in the lock-free class
     /// answers as the full call does: a wait on a changed word, on an
     /// unmapped word, a wait that parks, a wake, and a PI lock taken, found
     /// held (waiters bit set, then a park) and released. The map is asked
@@ -13281,8 +13278,8 @@ mod tests {
         assert_eq!(m.read(0x22100, 4).unwrap(), b"efgh");
     }
 
-    /// `sendmsg` and `recvmsg` in the lock-free class (docs/kernel-locking.md
-    /// §5.2, L5): bytes and a descriptor over a socketpair, a blocking
+    /// `sendmsg` and `recvmsg` in the lock-free class: bytes and a descriptor
+    /// over a socketpair, a blocking
     /// socket's park, and `MSG_DONTWAIT`'s EAGAIN, as the full call answers.
     #[test]
     fn free_socket_messages_answer_as_the_kernel_does() {
@@ -13348,7 +13345,7 @@ mod tests {
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::AcceptWait { .. }, None)));
     }
 
-    /// `ioctl` in the lock-free class (docs/kernel-locking.md §5.2, L6)
+    /// `ioctl` in the lock-free class
     /// answers as the full call does: a pipe's bytes waiting, close-on-exec
     /// and non-blocking set from either path, a terminal request on a pipe,
     /// the terminal's own (whatever stdin is here) and a bad descriptor.
@@ -13419,8 +13416,8 @@ mod tests {
         assert_ne!(k.fds.get(pr as i32).unwrap().flags() & oflags::O_NONBLOCK, 0);
     }
 
-    /// The shared mappings' published view (docs/kernel-locking.md §3.10,
-    /// L8) follows the list: what the page's compositor reads without the
+    /// The shared mappings' published view follows the list: what the page's
+    /// compositor reads without the
     /// kernel to find a client's pool. A mapping added is seen, one dropped
     /// is gone, a reader's copy stays whole, and a forked copy's view is
     /// its own.
@@ -13444,9 +13441,9 @@ mod tests {
     }
 
     /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class
-    /// (docs/kernel-locking.md §5.2, L9) answer as the full call does: the
+    /// answer as the full call does: the
     /// 64-bit offset from two registers, `_llseek`'s result through memory.
-    /// The small descriptor and process calls in their i386 forms (L17):
+    /// The small descriptor and process calls in their i386 forms:
     /// `pipe`, `ftruncate64`'s two-word length, `fstatfs64`'s size argument,
     /// `ugetrlimit`'s 32-bit struct and the narrow `sysinfo`.
     #[test]
@@ -13910,7 +13907,7 @@ mod tests {
         assert_eq!(seen[0], want);
     }
 
-    /// The path writers through the lock-free path ([`PathIo`], L14c)
+    /// The path writers through the lock-free path ([`PathIo`])
     /// answer as the full call does. A directory renamed takes what is under
     /// it, a descriptor on a directory below follows it there (Linux
     /// resolves it by the directory, not its name), `RENAME_NOREPLACE`
@@ -14144,7 +14141,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::READLINK, [0x20100, 0x24000, 64, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::READLINKAT, [cwd32, 0x20100, 0x24000, 64, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::GETCWD, [0x25000, 64, 0, 0, 0, 0]));
-            // The writers' older forms (L14c).
+            // The writers' older forms.
             for (p, t) in [(0x20400u64, &b"/dd\0"[..]), (0x20500, b"/dd/f\0"), (0x20600, b"/ee\0"), (0x20700, b"/ee/f\0"), (0x20800, b"/ee/h\0"), (0x20900, b"/ee/s\0")] {
                 m.write(p, t).unwrap();
             }
@@ -14165,7 +14162,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::UNLINK, [0x20700, 0, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::RMDIR, [0x20600, 0, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::OPENAT, [cwd32, 0x20200, 0, 0, 0, 0]));
-            // The own-state calls (L15) in their 32-bit layouts: a handler
+            // The own-state calls in their 32-bit layouts: a handler
             // set and read back, an interval timer armed and its old value
             // narrowed back (musl's `alarm`), `getitimer`, `alarm`.
             for (o, v) in [(0u64, 0x1234u32), (4, 0), (8, 0)] {

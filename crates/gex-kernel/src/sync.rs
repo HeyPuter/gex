@@ -1,4 +1,4 @@
-//! The locks that replace the one kernel lock (docs/kernel-locking.md §4).
+//! The locks that replace the one kernel lock.
 //!
 //! One type per kind, the same source in all three builds:
 //!
@@ -7,7 +7,7 @@
 //!   on wasm32 with atomics is a CAS word parked with
 //!   `memory.atomic.wait32/notify`, as `ExecLock` is;
 //! - **the SP page build** (no atomics): `std::sync`'s single-thread form, a
-//!   flag that panics on re-entry. That is the no-op cell §4.0 asks for, with
+//!   flag that panics on re-entry: a cell that costs nothing, with
 //!   its re-entry check.
 //!
 //! The kernel already keeps pipes, sockets and ptys behind `std::sync::Mutex`
@@ -18,7 +18,7 @@
 //!   host sets with [`set_thread_id`]: the Worker number in the page), for a
 //!   deadlock report;
 //! - **a held count** per thread, which the page shim checks every time it
-//!   traps back to JS ([`check_trap_out`], §4.1). A trap does not unwind, so a
+//!   traps back to JS ([`check_trap_out`]). A trap does not unwind, so a
 //!   guard held across one never drops and the lock stays taken for good;
 //! - **no poisoning:** a native panic in one thread does not make the state
 //!   unreadable to the rest. The page aborts on panic anyway.
@@ -29,7 +29,7 @@
 //!   a change that would deadlock two Workers in the page fails at once on
 //!   one.
 //!
-//! [`Epochs`] is the reclamation scheme of §4.2: readers announce an epoch,
+//! [`Epochs`] is epoch-based reclamation: readers announce an epoch,
 //! and a writer frees what it retired once every reader has moved past it.
 
 use std::cell::Cell;
@@ -47,7 +47,7 @@ thread_local! {
 /// Whether the order is checked: a debug build, or the `lock-ranks` feature.
 const RANKED: bool = cfg!(any(debug_assertions, feature = "lock-ranks"));
 
-/// The order the nesting locks are taken in (docs/kernel-locking.md §4.3):
+/// The order the nesting locks are taken in:
 /// a lower rank first. The page shim's exec lock (`ExecLock`, what is left
 /// of its kernel lock: `execve` and a process's `clone` take it) is
 /// outermost; the JIT state's lock may be taken under it; the memory map's
@@ -95,7 +95,7 @@ pub fn held() -> u32 {
 
 /// Called where the page shim leaves Rust by trapping back to JS. `Err(n)`
 /// when this thread still holds `n` guards: a bug, since those locks stay
-/// taken for good (§4.1). The count is reset so one bug is reported once.
+/// taken for good. The count is reset so one bug is reported once.
 pub fn check_trap_out() -> Result<(), u32> {
     let n = held();
     if n == 0 {
@@ -288,8 +288,7 @@ impl<T> std::ops::DerefMut for WriteGuard<'_, T> {
     }
 }
 
-/// Epoch-based reclamation for snapshots published to lock-free readers
-/// (§4.2).
+/// Epoch-based reclamation for snapshots published to lock-free readers.
 ///
 /// The page has no quiescent point every thread passes through, so readers
 /// say where they are: each thread has a slot, holding the global epoch
@@ -425,7 +424,7 @@ mod tests {
 
     #[test]
     // The order is checked only where `RANKED` is on: a release build without
-    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    // `lock-ranks` (a plain `cargo test --release`) would fail the first and hang the second.
     #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
     #[should_panic(expected = "lock order")]
     fn a_ranked_lock_under_a_higher_one_panics() {
@@ -437,7 +436,7 @@ mod tests {
 
     #[test]
     // The order is checked only where `RANKED` is on: a release build without
-    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    // `lock-ranks` (a plain `cargo test --release`) would fail the first and hang the second.
     #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
     #[should_panic(expected = "lock order")]
     fn a_ranked_lock_taken_again_panics_rather_than_hangs() {
@@ -477,7 +476,7 @@ mod tests {
         assert_eq!(held(), 0);
     }
 
-    /// The trap-out check (§4.1): a guard alive at a trap is reported, once.
+    /// The trap-out check: a guard alive at a trap is reported, once.
     #[test]
     fn a_guard_held_at_a_trap_out_is_reported() {
         let m = Mutex::new(1);

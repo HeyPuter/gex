@@ -439,7 +439,7 @@ impl Inner {
 
 /// The tree, and its rename lock ([`super::RenameGate`]), taken before the
 /// tree's. A reader-writer lock: lookups (`stat`, the walks, `readlink`)
-/// share it, so threads asking at once no longer queue behind each other
+/// share it, so threads asking at once do not queue behind each other
 /// (the global kernel's root is one of these, for every process).
 #[derive(Debug)]
 struct Shared {

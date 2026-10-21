@@ -1,6 +1,6 @@
 //! Futexes.
 //!
-//! PLAN §8 maps these onto the host's blocking primitives, which is what
+//! These map onto the host's blocking primitives, which is what
 //! makes them near-native: a guest thread is a real host thread, so waiting
 //! is a real wait rather than a scheduler simulation.
 //!
@@ -85,7 +85,7 @@ impl Parked {
 }
 
 /// How many shards a table's queues are split over: a wait and a wake on
-/// different words rarely meet on one lock (docs/kernel-locking.md §3.2).
+/// different words rarely meet on one lock.
 const SHARDS: usize = 256;
 
 /// The shard of `addr`'s queue: the word's index, mixed so that neighbouring

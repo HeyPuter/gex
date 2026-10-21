@@ -4,7 +4,7 @@
 //! because that is what makes them true. `self/maps` in particular has to
 //! reflect the VMA tree exactly: glibc, OpenSSL and every JVM read it, and
 //! C++ exception unwinding locates `.eh_frame` through the same picture of
-//! the address space (PLAN §6.4, §8).
+//! the address space.
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
