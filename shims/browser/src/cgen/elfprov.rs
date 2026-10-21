@@ -221,7 +221,7 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
 pub(crate) fn on_exec() {
     lock(&BOUND).clear();
     queue(|q| q.clear());
-    lock(&REBRIDGE).clear();
+    REBRIDGE.with(|v| v.borrow_mut().clear());
     lock(&REBRIDGED).clear();
 }
 
@@ -241,9 +241,17 @@ pub extern "C" fn gex_elfprov_wanted() -> i32 {
     queue(|q| q.pop_front()).map_or(-1, |u| u as i32)
 }
 
-/// Dispatch slots (table, slot pairs, as `bridges` gives them) JS must point
-/// at the bridge again (`gex_elfprov_rebridge`).
-static REBRIDGE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+thread_local! {
+    /// Dispatch slots (table, slot pairs, as `bridges` gives them) JS must
+    /// point at the bridge again (`gex_elfprov_rebridge`). Per Worker: each
+    /// Worker has tables of its own, and the bridge must land in the tables
+    /// of the Worker whose dispatch missed, before it dispatches again. A
+    /// list any Worker of the process could take, at its next trap, would
+    /// write the bridge into that Worker's tables instead, and the one that
+    /// missed would miss again.
+    static REBRIDGE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Each re-bridged address: how many times in a row it lost the bridge
 /// again at once, and the dispatch-miss count when it last did (a loop
 /// guard).
@@ -315,7 +323,7 @@ pub(crate) fn rebridge(pc: u64) -> bool {
     if let Some(base) = crate::with_jit_only(|j| j.page_table.lookup(page)) {
         super::write_dirs(vec![(page, base)]);
     }
-    lock(&REBRIDGE).extend(regs);
+    REBRIDGE.with(|v| v.borrow_mut().extend(regs));
     NEED.fetch_max(slots.min(u32::MAX as u64) as u32, Ordering::Relaxed);
     true
 }
@@ -331,15 +339,17 @@ pub extern "C" fn gex_elfprov_rebridge_need() -> u32 {
 /// How many u32s of re-bridge pairs wait (`gex_elfprov_rebridge`).
 #[no_mangle]
 pub extern "C" fn gex_elfprov_rebridge_len() -> u32 {
-    lock(&REBRIDGE).len() as u32
+    REBRIDGE.with(|v| v.borrow().len() as u32)
 }
 
 /// The re-bridge pairs into `buf` (at most `cap` u32s), taken.
 #[no_mangle]
 pub extern "C" fn gex_elfprov_rebridge(buf: u32, cap: u32) -> u32 {
-    let mut v = lock(&REBRIDGE);
-    let k = v.len().min(cap as usize) & !1;
-    super::put_u32s(&v[..k], buf);
-    v.drain(..k);
-    k as u32
+    REBRIDGE.with(|v| {
+        let mut v = v.borrow_mut();
+        let k = v.len().min(cap as usize) & !1;
+        super::put_u32s(&v[..k], buf);
+        v.drain(..k);
+        k as u32
+    })
 }
