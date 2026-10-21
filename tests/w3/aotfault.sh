@@ -5,7 +5,9 @@
 # - a call into a page that is not executable reaches the program's own
 #   handler as an access violation, executing ("aotfault dep ok");
 # - a call into code made at run time stops the run, naming it as code
-#   outside every image.
+#   outside every image;
+# - a call through a window-procedure thunk made at run time, of either
+#   documented shape, runs; one of another shape stops as above.
 # A first, ordinary run of each case names the images it ran without a
 # unit; those are built (minutes: Wine's own DLLs) and, with the exe's,
 # are all an AOT-only run has.
@@ -40,7 +42,7 @@ verdict() { # NAME LOG WANT
 	if grep -aq "$3" "$2"; then pass=$((pass + 1)); echo "ok   $1"
 	else fail=$((fail + 1)); echo "FAIL $1"; grep -av '^\[host\]' "$2" | tail -8 | sed 's/^/  /'; fi
 }
-for c in hello dep gen; do
+for c in hello dep gen thunk; do
 	a=$c; [ $c = hello ] && a=
 	run "$w/warm-$c.log" "$a" GEX_W3_TRACE=1
 done
@@ -61,5 +63,9 @@ run "$w/dep.log" dep GEX_AOT_ONLY=1
 verdict "aot-only: a non-executable page is the program's access violation" "$w/dep.log" '^aotfault dep ok'
 run "$w/gen.log" gen GEX_AOT_ONLY=1
 verdict "aot-only: code made at run time stops the run" "$w/gen.log" 'outside every image: code generated at run time'
+run "$w/thunk.log" thunk GEX_AOT_ONLY=1
+verdict "aot-only: window-procedure thunks made at run time run" "$w/thunk.log" '^aotfault thunk ok'
+run "$w/near.log" near GEX_AOT_ONLY=1
+verdict "aot-only: a thunk of another shape stops the run" "$w/near.log" 'outside every image: code generated at run time'
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

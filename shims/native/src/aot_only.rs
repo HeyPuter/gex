@@ -137,7 +137,7 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
 
 /// Index 1 of an AOT-only process's function table: the call that reached
 /// it named an address no installed function serves.
-pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i32> {
+pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, depth: i32, need: i32, ret: u64) -> Result<i32> {
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let target = GuestMem::new(memory.bytes()).read_u64(ctx as u32 as u64 + ctx::LAST_TARGET as u64).unwrap_or(0);
     // The awaited return itself, reached with the stack moved: leave, and
@@ -167,6 +167,18 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -
             return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
         }
         return crate::branch_not_executable(caller, target);
+    }
+    // A window-procedure thunk made at run time (gex_kernel::win::thunk):
+    // its store done here, then the call goes on to where it jumps.
+    if gex_kernel::compat32() {
+        let next = gex_kernel::win::thunk::run(&mut GuestMem::new(memory.bytes()), ctx as u32 as u64, target);
+        if let Some(next) = next {
+            let _ = GuestMem::new(memory.bytes()).write_u64(ctx as u32 as u64 + ctx::LAST_TARGET as u64, next);
+            let idx = crate::ftab::lookup(caller, next)?;
+            let f = crate::ftab::table_func(caller, idx as u32)?;
+            let f = f.typed::<(i32, i32, i32, i64), i32>(&*caller).context("a function table entry of another type")?;
+            return Ok(f.call(&mut *caller, (ctx, depth, need, ret as i64))?);
+        }
     }
     Err(missing(caller, target, "a call or jump"))
 }
