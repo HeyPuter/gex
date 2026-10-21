@@ -959,6 +959,10 @@ export class Gex {
   #stackTop = null;
   /** The slot went back (`releaseWorker`): nothing may call in again. */
   #released = false;
+  /** A thread's Worker whose `clone` promised it a slot it has not claimed. */
+  #promise = false;
+  /** `gex_worker_init` found no slot: the instance has no thread-locals. */
+  #noSlot = false;
   /** This instance is a forked child's first: its slot bits are its parent's. */
   #forkChild = false;
   /** A forked child's inherited regions' ends, for its first arena claim. */
@@ -1112,11 +1116,16 @@ export class Gex {
         this.#inheritedEnds = [];
       }
       const at = this.#shim.exports.gex_worker_init?.(); 
-      // No slot: every one of the process's 64 is held by a live instance.
-      // Running on would put this instance's thread-locals at address zero
-      // (`__tls_base` unset), over the guest's memory.
+      // A thread's slot was promised by its `clone`: claimed now, or lost.
+      this.keepPromise();
+      // No slot (every one held by a live instance, or no arena for its
+      // stack). Running on, or calling into this instance at all, would
+      // put its thread-locals at address zero (`__tls_base` unset), over
+      // the thread contexts at the bottom of the memory: the instance is
+      // done (`noSlot`) and nothing calls in again.
       if (at === 0 && (isShared(this.#memory.buffer) || single.on)) {
-        throw new Error('gex: no shim stack slot left for this Worker (64 instances of this process are live)');
+        this.#noSlot = true;
+        throw new Error('gex: no shim stack slot left for this Worker (every slot of this process is held)');
       }
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
       // A test's: this Worker's stack guard broken, as an overrun leaves it,
@@ -1265,6 +1274,18 @@ export class Gex {
 
   /** The slot went back (`releaseWorker`): call nothing in this instance. */
   get released() { return this.#released; }
+  /** No slot was had (`#workerStack`): call nothing in this instance. */
+  get noSlot() { return this.#noSlot; }
+  /**
+   * A promised slot claimed, or never to be: told once, so the process's
+   * next `clone` can count on it. Pairs with `thread_runner_take` (the
+   * shim's), which promised it.
+   */
+  keepPromise() {
+    if (!this.#promise) return;
+    this.#promise = false;
+    try { this.#shim?.exports?.gex_worker_promise_done?.(); } catch {}
+  }
 
   /**
    * Give this instance's stack and thread-local slot back to the process
@@ -3263,13 +3284,19 @@ export class Gex {
    */
   #startThread(who = 'gex') {
     let thread;
+    // A thread that will not start gives back the slot its `clone` was
+    // promised (`gex_worker_promise_done`).
+    const lost = (err) => {
+      threadNotStarted(who, err);
+      try { this.#shim?.exports?.gex_worker_promise_done?.(); } catch {}
+    };
     try {
       thread = this.#takeThread();
     } catch (err) {
-      threadNotStarted(who, err);
+      lost(err);
       return;
     }
-    if (thread) this.#postThread(thread).catch((err) => threadNotStarted(who, err));
+    if (thread) this.#postThread(thread).catch(lost);
   }
 
   /** The thread `clone` left for the host, claimed: null with none. */
@@ -3339,6 +3366,7 @@ export class Gex {
   async adoptThread(shimWasm, guestWasm, thread) {
     this.#threaded();
     this.#threadTid = thread.tid;
+    this.#promise = true;
     await this.attach(shimWasm, guestWasm, { devices: false });
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');

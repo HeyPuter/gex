@@ -4418,7 +4418,12 @@ mod slots {
     pub const STACK: usize = 1 << 20;
     /// And room for the thread-locals, which are a handful of words today.
     pub const TLS: usize = 1 << 16;
-    pub const COUNT: usize = 64;
+    /// A process's live Workers at most. A slot's span of arena is taken
+    /// the first time the slot is, and kept for its next holder, so the
+    /// count costs nothing until that many threads are live at once.
+    pub const COUNT: usize = 256;
+    /// Words of the used-slot bitmap.
+    pub const WORDS: usize = COUNT / 64;
     /// Bytes of guard pattern at the bottom of each stack.
     pub const GUARD: usize = 4096;
 }
@@ -4430,10 +4435,15 @@ extern "C" {
     fn __wasm_init_tls(ptr: *mut u8);
 }
 
-/// Which slots a live instance holds (bit `i`), and where each slot's span
-/// of arena is once one was taken for it (0: never).
+/// Which slots a live instance holds (bit `i % 64` of word `i / 64`), and
+/// where each slot's span of arena is once one was taken for it (0: never).
 #[cfg(feature = "shared-memory")]
-static SLOT_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SLOT_USED: [std::sync::atomic::AtomicU64; slots::WORDS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; slots::WORDS];
+/// Threads `clone` has made whose Workers have not claimed a slot yet: each
+/// was promised one (`thread_runner_take`), so a slot is kept for it.
+#[cfg(feature = "shared-memory")]
+static PROMISED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "shared-memory")]
 static SLOT_BASE: [std::sync::atomic::AtomicU64; slots::COUNT] =
     [const { std::sync::atomic::AtomicU64::new(0) }; slots::COUNT];
@@ -4453,16 +4463,11 @@ static SLOT_BASE: [std::sync::atomic::AtomicU64; slots::COUNT] =
 pub extern "C" fn gex_worker_init() -> u32 {
     use std::sync::atomic::Ordering;
     note_content_names();
-    let i = loop {
-        let used = SLOT_USED.load(Ordering::Acquire);
-        let i = (!used).trailing_zeros() as usize;
-        if i >= slots::COUNT {
-            return 0;
-        }
-        if SLOT_USED.compare_exchange(used, used | 1 << i, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            break i;
-        }
-    };
+    gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners {
+        take: thread_runner_take,
+        give: || gex_worker_promise_done(),
+    });
+    let Some(i) = slot_claim() else { return 0 };
     let mut base = SLOT_BASE[i].load(Ordering::Acquire);
     if base == 0 {
         // This slot's own span of arena. The cursor is atomic and the bytes
@@ -4470,7 +4475,7 @@ pub extern "C" fn gex_worker_init() -> u32 {
         // spans without a lock between them.
         arena_note(2, (slots::STACK + slots::TLS) as u64);
         let Some(b) = arena_take((slots::STACK + slots::TLS) as u64) else {
-            SLOT_USED.fetch_and(!(1 << i), Ordering::AcqRel);
+            slot_free(i);
             return 0;
         };
         base = b;
@@ -4486,7 +4491,7 @@ pub extern "C" fn gex_worker_init() -> u32 {
         // dispatch, so the memory covers it from the start (V8 commits
         // lazily: untouched pages of it cost nothing).
         if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
-            SLOT_USED.fetch_and(!(1 << i), Ordering::AcqRel);
+            slot_free(i);
             return 0;
         }
         memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
@@ -4519,6 +4524,62 @@ pub extern "C" fn gex_worker_init() -> u32 {
     }
 }
 
+/// The first free slot, claimed.
+#[cfg(feature = "shared-memory")]
+fn slot_claim() -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    for (w, word) in SLOT_USED.iter().enumerate() {
+        loop {
+            let used = word.load(Ordering::Acquire);
+            let b = (!used).trailing_zeros() as usize;
+            if b >= 64 {
+                break;
+            }
+            if word.compare_exchange(used, used | 1 << b, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return Some(w * 64 + b);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "shared-memory")]
+fn slot_free(i: usize) {
+    SLOT_USED[i / 64].fetch_and(!(1u64 << (i % 64)), std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Promise a slot to a thread `clone` is making, or refuse: every slot is
+/// held or already promised. A thread made without one would get no stack
+/// when its Worker starts and never run. Counting held and promised slots
+/// apart can count a thread twice while its Worker claims (its bit is set
+/// before `gex_worker_promise_done`), which errs towards refusing; it never
+/// promises a slot that is not there.
+#[cfg(feature = "shared-memory")]
+fn thread_runner_take() -> bool {
+    use std::sync::atomic::Ordering;
+    loop {
+        let promised = PROMISED.load(Ordering::Acquire);
+        let held: u32 = SLOT_USED.iter().map(|w| w.load(Ordering::Acquire).count_ones()).sum();
+        if (held + promised) as usize >= slots::COUNT {
+            return false;
+        }
+        if PROMISED.compare_exchange(promised, promised + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return true;
+        }
+    }
+}
+
+/// A promised slot's thread has claimed it, or will never run (its Worker
+/// did not start, or `clone` failed after the promise). Touches no
+/// thread-local and nothing on the stack: a thread's Worker calls it
+/// whether or not its claim succeeded.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_promise_done() {
+    use std::sync::atomic::Ordering;
+    let _ = PROMISED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| p.checked_sub(1));
+}
+
 #[cfg(feature = "shared-memory")]
 const STACK_GUARD: u32 = 0x5747_5d0d;
 /// A forked child's first instance, before it claims: the memory it was
@@ -4529,7 +4590,10 @@ const STACK_GUARD: u32 = 0x5747_5d0d;
 #[cfg(feature = "shared-memory")]
 #[no_mangle]
 pub extern "C" fn gex_worker_slots_reset() {
-    SLOT_USED.store(0, std::sync::atomic::Ordering::Release);
+    for w in &SLOT_USED {
+        w.store(0, std::sync::atomic::Ordering::Release);
+    }
+    PROMISED.store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// A forked child's inherited region ending at `end`, told before its first
@@ -4578,8 +4642,7 @@ pub extern "C" fn gex_worker_release() {
     if !CLAIMED.with(|c| c.replace(false)) {
         return;
     }
-    let i = worker_id() as usize;
-    SLOT_USED.fetch_and(!(1u64 << i), std::sync::atomic::Ordering::AcqRel);
+    slot_free(worker_id() as usize);
 }
 
 
