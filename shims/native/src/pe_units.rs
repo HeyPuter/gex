@@ -384,7 +384,7 @@ fn regions_from(
     want.sort_unstable();
     want.dedup();
     // v3: call continuations of the enclosing functions, and direct callees.
-    let list = String::from("v3\n") + &want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
+    let list = String::from("v4\n") + &want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
     if want.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
         return Ok(Vec::new());
@@ -395,7 +395,7 @@ fn regions_from(
     }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let code = Code::with_elf(image, None);
+    let code = region_code(image);
     let (mut starts, _) = func::seeds(&code, None, false);
     for &(a, src) in seed_starts {
         if code.is_code(a) {
@@ -496,6 +496,16 @@ fn regions_from(
     let more: Vec<u64> = want.iter().copied().filter(|a| recorded.contains(a) && !got.contains(a) && !failed.contains(a)).collect();
     failed.extend(more);
     Ok(failed)
+}
+
+/// `image`'s code, decoded in the image's own mode: in a 32-bit image
+/// `[disp32]` is absolute, not relative to the next instruction.
+#[cfg(feature = "translate")]
+fn region_code(image: &gex_ld::Image) -> gex_xlate::func::Code<'_> {
+    if image.class32 != gex_xlate::arch::compat() {
+        gex_xlate::set_compat(image.class32);
+    }
+    gex_xlate::func::Code::with_elf(image, None)
 }
 
 /// The region module beside the unit at `unit`, if one was built.
@@ -2078,4 +2088,26 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     crate::ftab::catch_up(&mut *caller)?;
     replay_registry(caller)?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "translate"))]
+mod region_tests {
+    #[test]
+    fn a_32_bit_region_reads_an_absolute_slot() {
+        let (mut image, _) = gex_kernel::win::trampoline_input(true);
+        let at = image.segments[0].vaddr;
+        let slot = (at + 0x100) as u32;
+        let bytes = &mut image.segments[0].bytes;
+        bytes[..6].copy_from_slice(&[0xff, 0x15, 0, 0, 0, 0]);
+        bytes[2..6].copy_from_slice(&slot.to_le_bytes());
+        bytes[6] = 0xc3;
+        gex_xlate::set_compat(false);
+        let code = super::region_code(&image);
+        let mut starts = std::collections::BTreeMap::new();
+        let f = gex_xlate::func::recover_one(&code, at, &mut starts, &Default::default(), &Default::default());
+        let ir = format!("{:?}", f.blocks);
+        let wrong = slot as u64 + at + 6;
+        assert!(ir.contains(&format!("({slot})")), "no load of {slot:#x}: {ir}");
+        assert!(!ir.contains(&format!("({wrong})")), "the slot was read relative to the next instruction");
+    }
 }
