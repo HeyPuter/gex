@@ -1,6 +1,6 @@
 //! Standalone C for a set of functions: what `gexc eject decompile` writes.
 //!
-//! The same Phase B C as `build_functions` emits (`func::FnUnit`), as one
+//! The same C as `build_functions` emits (`func::FnUnit`), as one
 //! self-contained translation unit that does not need the splice:
 //!
 //! * every body, loop function and `gex_call_known` is `static`, so several
@@ -25,7 +25,7 @@ use std::fmt::Write;
 /// One translation unit holding `funcs` (C bodies for each, calls between
 /// them staying in C) and an exported entry for each of `roots`, as
 /// `(function entry, export name)`. `funcs` are what [`crate::select`] kept,
-/// so the C is the function tier's own; `sums` are S2's summaries, by entry;
+/// so the C is the function tier's own; `sums` are gex-xlate's summaries, by entry;
 /// `class32` says the guest is a 32-bit image (i386), as for the tier's units;
 /// `read` gives a guest code byte (for `func::ret_pops`).
 pub fn standalone(

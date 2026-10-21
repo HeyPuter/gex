@@ -1,9 +1,10 @@
 //! The function tier: GIR → C → clang → wasm, spliced into tier-1 modules.
 //!
-//! See `docs/function-tier.md`. Phase A (this crate today) emits every tier-1
-//! block as a C function with the uniform `(ctx)` signature, compiles the
-//! lot with clang, and splices the result into the tier-1 module built from
-//! the same blocks, so both hosts install it unchanged.
+//! It takes over either every tier-1 block or whole functions. Blocks: each
+//! is a C function with the uniform `(ctx)` signature. Functions: each
+//! recovered guest function is one C function. Either way the lot is
+//! compiled with clang and spliced into the tier-1 module built from the
+//! same blocks, so both hosts install it unchanged.
 
 pub mod emit;
 pub mod func;
@@ -27,8 +28,8 @@ pub use splice::SpliceStats;
 /// Blocks per translation unit, before it is worth another clang process.
 const MIN_UNIT: usize = 256;
 
-/// Which code the C side takes over: `GEX_CGEN_TIER=blocks` (Phase A, every
-/// block) or `functions` (Phase B, whole functions; the default).
+/// Which code the C side takes over: `GEX_CGEN_TIER=blocks` (every block)
+/// or `functions` (whole functions; the default).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tier {
     Blocks,
@@ -43,16 +44,16 @@ pub fn tier() -> Result<Tier> {
     }
 }
 
-/// Where Phase B's functions come from.
+/// Where whole functions come from.
 pub enum Functions {
-    /// S2's recovery (`gex_xlate::func::recover`), in memory form.
+    /// gex-xlate's recovery (`gex_xlate::func::recover`), in memory form.
     /// `intrinsics` are the entries tier-1 serves with a host builtin
     /// (`gex_xlate::intrinsic`): those functions are re-formed from their
     /// tier-1 block, so C callers get the builtin rather than the lifted loop.
     Recovered {
         functions: Vec<Function>,
         intrinsics: Vec<u64>,
-        /// S2's call-graph summaries, by entry.
+        /// gex-xlate's call-graph summaries, by entry.
         summaries: HashMap<u64, Summary>,
     },
     /// The stand-in in `recover.rs`, from the tier-1 blocks and the symbol
@@ -60,8 +61,8 @@ pub enum Functions {
     StandIn { symbols: Vec<u64> },
 }
 
-/// `GEX_CGEN_RECOVER=standin` selects [`Functions::StandIn`]; S2's recovery
-/// is the default.
+/// `GEX_CGEN_RECOVER=standin` selects [`Functions::StandIn`]; gex-xlate's
+/// recovery (`s2`) is the default.
 pub fn use_standin() -> Result<bool> {
     match std::env::var("GEX_CGEN_RECOVER").as_deref() {
         Ok("standin") => Ok(true),
@@ -165,7 +166,7 @@ fn compile_and_link(units: Vec<(String, String)>, exports: &[String]) -> Result<
     Ok((std::fs::read(&linked)?, dir))
 }
 
-/// Phase B: whole functions (`func.rs`).
+/// Whole functions (`func.rs`).
 fn build_functions(
     tier1: &[u8],
     blocks: &[(&Block, u32)],
@@ -196,7 +197,7 @@ fn build_functions(
         }
     };
     // Emit, compile and link; a function clang compiled to use its shadow
-    // stack (which the splice cannot give it, docs/function-tier.md §4) is
+    // stack (which the splice cannot give it) is
     // dropped -- it stays tier-1 -- and the rest are built again.
     let mut dropped: HashSet<u64> = HashSet::new();
     let (cwasm, dir, entries) = loop {
@@ -284,12 +285,12 @@ fn build_functions(
     Ok((wasm, stats))
 }
 
-/// Phase A: every block as its own C function.
+/// Every block as its own C function.
 fn build_blocks(tier1: &[u8], blocks: &[(&Block, u32)]) -> Result<(Vec<u8>, SpliceStats)> {
     let timing = std::env::var_os("GEX_TIMING").is_some();
     let started = std::time::Instant::now();
 
-    // A block with a self-modification guard stays tier-1 (§9 of the note).
+    // A block with a self-modification guard stays tier-1.
     let owned: Vec<(&Block, u32)> = blocks
         .iter()
         .filter(|(b, _)| b.guard.is_none())

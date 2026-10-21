@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// clang's flags for generated C. See `docs/function-tier.md` §3 and §8.
+/// clang's flags for generated C.
 pub const CFLAGS: &[&str] = &[
     "--target=wasm32",
     "-O2",
@@ -36,7 +36,7 @@ pub const CFLAGS: &[&str] = &[
 ];
 
 /// [`CFLAGS`] for this process's guest memory: `--target=wasm64` for a
-/// memory64 one (docs/mem64.md), the flags as they are otherwise.
+/// memory64 one, the flags as they are otherwise.
 pub fn cflags() -> Vec<&'static str> {
     CFLAGS
         .iter()
@@ -54,7 +54,7 @@ fn ld_memory_flags() -> Vec<String> {
     }
 }
 
-/// What a whole-image unit adds (docs/merge-plan.md §9.8.1): it is linked
+/// What a whole-image unit adds: it is linked
 /// position-independent, so its function pointers are indices into the
 /// process's function table from `__table_base`, and calls between its
 /// functions stay direct (hidden visibility).
@@ -211,7 +211,7 @@ pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Res
     link_with_table(dir, objs, exports, out, false)
 }
 
-/// Link a whole-image unit (docs/merge-plan.md §9.8.1): position-
+/// Link a whole-image unit: position-
 /// independent, importing the process's function table and filling its
 /// slots from `__table_base` with one element segment.
 pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
@@ -280,8 +280,8 @@ fn extra_cflags() -> Vec<String> {
     v
 }
 
-/// ThinLTO for what this process builds next (a link group's module,
-/// docs/eject-pe.md §6a G3): objects are bitcode (another object key, through
+/// ThinLTO for what this process builds next (a link group's module):
+/// objects are bitcode (another object key, through
 /// [`cflags_key`]), and [`link_image`] optimises and generates code across
 /// them.
 static LTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
