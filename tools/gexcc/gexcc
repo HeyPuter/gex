@@ -583,7 +583,12 @@ def link_shared(cmd):
         for name, params, ret, _, so in found:
             c = os.path.join(tmp, 'mismatch-%d.c' % len(stubs))
             args = ', '.join('%s a%d' % (WASM_C[t.strip()], i) for i, t in enumerate(params.split(',')) if t.strip())
-            open(c, 'w').write('%s %s(%s) { __builtin_trap(); }\n' % (WASM_C.get(ret, 'void'), name, args or 'void'))
+            # (says so on stderr when reached: a call that gets here is a
+            # miscompile the build let through)
+            msg = 'gexcc: %s called through a declaration of the wrong type (stub)\n' % name
+            open(c, 'w').write('long write(int, const void *, unsigned long);\n'
+                               '%s %s(%s) { write(2, "%s", %d); __builtin_trap(); }\n'
+                               % (WASM_C.get(ret, 'void'), name, args or 'void', msg.replace('\n', '\\n'), len(msg)))
             o = c[:-2] + '.o'
             if subprocess.call(['clang', '--target=' + TRIPLE, '-fPIC', '-c', '-w', '-fno-builtin', '-o', o, c]
                                + [a for a in BASE if a.startswith('-m') and a != '-mllvm']):
