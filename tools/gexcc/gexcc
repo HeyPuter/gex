@@ -168,6 +168,11 @@ def sysroot_dirs(argv):
 
 
 args = sysroot_dirs(args)
+# -pthread defines _REENTRANT, as GCC's and clang's Linux drivers do (not
+# clang's wasm one); configure scripts check it (unbound's AX_PTHREAD)
+if '-pthread' in args or '-pthreads' in args:
+    BASE += ['-D_REENTRANT']
+    CLANG += ['-D_REENTRANT']
 
 # --- queries -------------------------------------------------------------
 if args == ['--print-sysroot'] or args == ['-print-sysroot']:

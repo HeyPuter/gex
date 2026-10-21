@@ -101,4 +101,8 @@ printf 'int fa(void){return 1;}\n' > "$W/da/m.c"; printf 'int fb(void){return 2;
 GEXCC_SHARED=1 gexcc -fPIC -c "$W/da/m.c" -o "$W/da/la-m.o" && GEXCC_SHARED=1 gexcc -fPIC -c "$W/db/m.c" -o "$W/db/la-m.o" &&
     GEXCC_SHARED=1 gexcc -shared -o "$W/libd.so" "$W/da/la-m.o" "$W/db/la-m.o" 2> "$W/log"
 check $? "a shared library of two objects with the same file name"
+# -pthread defines _REENTRANT (AX_PTHREAD), compiling and linking at once
+printf '#ifndef _REENTRANT\n#error no _REENTRANT\n#endif\nint main(void){return 0;}\n' > "$W/re.c"
+gexcc -pthread -c -o "$W/re.o" "$W/re.c" 2> "$W/log" && gexcc -pthread -o "$W/re" "$W/re.c" 2>> "$W/log"
+check $? "-pthread defines _REENTRANT"
 exit $fail
