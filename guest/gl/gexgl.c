@@ -4068,14 +4068,16 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     /* Preserve the swap boundary in the wire stream. WebGL displays its
        default framebuffer automatically, while explicit APIs such as WebGPU
        must acquire and submit a surface image here. */
-    // What a real EGL does here as well as presenting: notice a resize, and
-    // commit -- the commit is what carries the frame callback this client is
-    // waiting for.
-    gexgl_wl_follow_size(s);
-    gexgl_x11_follow_size(s);
+    // What a real EGL does here as well as presenting: commit -- the commit
+    // is what carries the frame callback this client is waiting for -- and
+    // notice a resize. The frame being swapped was drawn at the old size, so
+    // it is presented first and the drawable resized for the next one; a
+    // resize before the present showed the new drawable, never drawn into.
     gexgl_wl_commit(s);
     persistent_publish(0, PUBLISH_SWAP);
     CMD0(GEXGL_PRESENT);
+    gexgl_wl_follow_size(s);
+    gexgl_x11_follow_size(s);
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */
     if (egl_swap_interval == 0) {
