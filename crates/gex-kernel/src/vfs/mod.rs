@@ -246,6 +246,26 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         Err(Errno::EBADF)
     }
     fn metadata(&self) -> Result<Metadata, Errno>;
+    /// How many times the file's contents have changed, as the filesystem
+    /// holding them counts, or 0 where it keeps no count. Two equal nonzero
+    /// counts are the same contents: every change is counted before anyone
+    /// can read what it wrote.
+    fn changes(&self) -> u64 {
+        0
+    }
+    /// [`FileHandle::metadata`] and [`FileHandle::changes`] together, which
+    /// a filesystem in another module answers in one call.
+    fn metadata_changes(&self) -> Result<(Metadata, u64), Errno> {
+        Ok((self.metadata()?, self.changes()))
+    }
+    /// [`FileHandle::read_at`] handing `f` the bytes where they are, for a
+    /// caller that copies them on (the global kernel into a process's
+    /// memory) rather than into a buffer of its own first. `None` where the
+    /// filesystem has them nowhere to hand over.
+    fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
+        let _ = (offset, len, f);
+        None
+    }
     /// The id this handle has in the global kernel, when it has one. `fork`
     /// hands the child an id rather than a path, because a file the parent
     /// created and unlinked (as dpkg-deb does) has no name left to reopen.

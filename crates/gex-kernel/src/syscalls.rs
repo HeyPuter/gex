@@ -3741,7 +3741,17 @@ impl MapIo<'_> {
                     Unalias::Plain => {}
                 }
                 let flushed = self.flush_shared(m, a[0], a[1]);
-                self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                {
+                    let mut mm = self.mem.lock();
+                    let maps = &mut mm.log.shared_maps;
+                    let gone: Vec<SharedMap> = maps.iter().filter(|s| s.start >= a[0] && s.start + s.len <= a[0] + a[1]).cloned().collect();
+                    if flushed.is_ok() {
+                        for s in &gone {
+                            maps.remember(s);
+                        }
+                    }
+                    maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                }
                 self.retire_code_why(a[0], a[1], "munmap", 0);
                 flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
             }
@@ -3982,6 +3992,12 @@ impl MapIo<'_> {
             for (at, n) in behind {
                 self.flush_shared(m, at, n)?;
             }
+            // The file's change count either side of the read: the same
+            // nonzero count is the contents it was before (a change is
+            // counted before it can be read), and the hashes kept of them
+            // stand (`SharedMaps::recall`).
+            let shared = flags & crate::mem::flags::SHARED != 0;
+            let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
             let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
@@ -3997,8 +4013,13 @@ impl MapIo<'_> {
                     offset,
                 });
             }
-            if flags & crate::mem::flags::SHARED != 0 {
-                let pages = page_hashes(m.read(start, len_aligned as usize)?);
+            if shared {
+                let changes = if before != 0 && file.handle.changes() == before { before } else { 0 };
+                let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
+                let pages = match kept {
+                    Some(p) => p,
+                    None => page_hashes(m.read(start, len_aligned as usize)?),
+                };
                 self.mem.lock().log.shared_maps.push(SharedMap {
                     start,
                     len: len_aligned,
@@ -4006,6 +4027,7 @@ impl MapIo<'_> {
                     offset,
                     holders: vec![(start, len_aligned)],
                     pages,
+                    changes: Arc::new(std::sync::atomic::AtomicU64::new(changes)),
                 });
             }
             return Ok(start);
@@ -4104,8 +4126,19 @@ impl MapIo<'_> {
             let to = (map.start + map.len).min(hi);
             // Only what the file holds: a shared mapping's page past the
             // end of the file is not the file's (Linux never extends it).
-            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
+            let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
+            let (size, at_start) = match map.file.handle.metadata_changes() {
+                Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
+                Err(_) => (u64::MAX, 0),
+            };
             let to = to.min(map.start + size.saturating_sub(map.offset));
+            // Whether `pages` stay the file's at a count (`SharedMap::changes`):
+            // only if nothing else changed the file since they were (the count
+            // has not moved), and after the writes below only if those were
+            // the only changes and every page written had its hash kept.
+            use std::sync::atomic::Ordering::AcqRel;
+            let mut writes = 0u64;
+            let mut exact = known != 0 && at_start == known;
             // Only the pages that changed since the file last had them, in
             // runs: another process's writes to the other pages stand.
             const P: u64 = crate::mem::PAGE_SIZE;
@@ -4121,9 +4154,13 @@ impl MapIo<'_> {
                     let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
                     // A partial range writes back only its part, so the page's
                     // hash is the file's only when the whole page went.
-                    if was != Some(h) && ps == whole && pe == (whole + P).min(map.start + map.len) {
-                        if let Some(s) = slot {
-                            s.store(h, std::sync::atomic::Ordering::Relaxed);
+                    if was != Some(h) {
+                        if ps == whole && pe == (whole + P).min(map.start + map.len) {
+                            if let Some(s) = slot {
+                                s.store(h, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else {
+                            exact = false;
                         }
                     }
                     was != Some(h)
@@ -4133,6 +4170,7 @@ impl MapIo<'_> {
                     (false, Some(rs)) => {
                         let at = map.offset + (rs - map.start);
                         map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
+                        writes += 1;
                         run = None;
                     }
                     _ => {}
@@ -4141,6 +4179,10 @@ impl MapIo<'_> {
                     break;
                 }
                 page += 1;
+            }
+            if known != 0 {
+                let now = if exact && writes > 0 { map.file.handle.changes() } else { at_start };
+                let _ = map.changes.compare_exchange(known, if exact && now == at_start + writes { now } else { 0 }, AcqRel, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(())
@@ -7393,7 +7435,37 @@ pub struct SharedMap {
     /// processes' mappings of one file, each written back whole before,
     /// stop undoing each other's pages.
     pub pages: Arc<[std::sync::atomic::AtomicU64]>,
+    /// The file's [`crate::vfs::FileHandle::changes`] at which `pages` are
+    /// its pages, or 0 when that is not known (it keeps no count, or
+    /// something else changed it since). What lets the next mapping of the
+    /// same range take `pages` rather than hash it again
+    /// ([`SharedMaps::recall`]).
+    pub changes: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Page hashes of a file range a shared mapping held, kept past its
+/// `munmap` with the file's change count then ([`SharedMaps::remember`]).
+#[derive(Debug)]
+struct Recent {
+    /// The file as [`OpenFile::same_file`] knows it, by path and inode, not
+    /// the description: holding that would keep a closed (or unlinked) file.
+    path: String,
+    ino: u64,
+    offset: u64,
+    len: u64,
+    changes: u64,
+    pages: Arc<[std::sync::atomic::AtomicU64]>,
+}
+
+/// Unmapped ranges whose page hashes a process keeps: a program that maps a
+/// file, unmaps it and maps it again (Wine's views of an index file, a lock
+/// at a time) gets the hashes back when the file has not changed.
+const RECENT_MAX: usize = 16;
+
+/// The smallest mapping worth asking the file's change count for: two
+/// asks (one either side of the read) cost about what hashing a few pages
+/// does.
+pub const RECALL_MIN: u64 = 8 * crate::mem::PAGE_SIZE;
 
 /// [`SharedMaps::unalias`]'s answer.
 #[derive(Debug, PartialEq, Eq)]
@@ -7429,15 +7501,23 @@ pub fn content_id(bytes: &[u8]) -> String {
 
 /// The hash a [`SharedMap`] keeps of a page.
 pub fn page_hash(bytes: &[u8]) -> u64 {
-    // FNV-style over 8-byte words, then a final mix: fast, and only ever
-    // compared with itself.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut words = bytes.chunks_exact(8);
-    for w in &mut words {
-        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x100_0000_01b3);
+    // FNV-style over 8-byte words in four lanes, then a final mix: only ever
+    // compared with itself, so any build agrees with itself. Four chains
+    // rather than one, because each step waits on the multiply before it
+    // and a page is hashed whole at every mapping and every write-back.
+    const K: u64 = 0x100_0000_01b3;
+    let w = |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap());
+    let (mut a, mut b, mut c, mut d) = (0xcbf2_9ce4_8422_2325u64, 0x6c62_272e_07bb_0142u64, 0x9e37_79b9_7f4a_7c15u64, 0xff51_afd7_ed55_8ccdu64);
+    let mut quads = bytes.chunks_exact(32);
+    for q in &mut quads {
+        a = (a ^ w(&q[0..8])).wrapping_mul(K);
+        b = (b ^ w(&q[8..16])).wrapping_mul(K);
+        c = (c ^ w(&q[16..24])).wrapping_mul(K);
+        d = (d ^ w(&q[24..32])).wrapping_mul(K);
     }
-    for &b in words.remainder() {
-        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    let mut h = a ^ b.rotate_left(16) ^ c.rotate_left(32) ^ d.rotate_left(48);
+    for &x in quads.remainder() {
+        h = (h ^ x as u64).wrapping_mul(K);
     }
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -7458,6 +7538,7 @@ pub fn page_hashes(bytes: &[u8]) -> Arc<[std::sync::atomic::AtomicU64]> {
 pub struct SharedMaps {
     list: Vec<SharedMap>,
     view: Arc<SharedMapView>,
+    recent: Vec<Recent>,
 }
 
 /// A [`SharedMaps`]'s list as other threads read it: replaced whole on every
@@ -7490,7 +7571,7 @@ impl SharedMapView {
 
 impl SharedMaps {
     pub fn new() -> SharedMaps {
-        SharedMaps { list: Vec::new(), view: Arc::new(SharedMapView::new(&[])) }
+        SharedMaps { list: Vec::new(), view: Arc::new(SharedMapView::new(&[])), recent: Vec::new() }
     }
 
     /// The published list, the same view for this process's whole life.
@@ -7515,10 +7596,14 @@ impl SharedMaps {
         let list: Vec<SharedMap> = self
             .list
             .iter()
-            .map(|s| SharedMap { pages: s.pages.iter().map(|h| AtomicU64::new(h.load(Ordering::Relaxed))).collect(), ..s.clone() })
+            .map(|s| SharedMap {
+                pages: s.pages.iter().map(|h| AtomicU64::new(h.load(Ordering::Relaxed))).collect(),
+                changes: Arc::new(AtomicU64::new(s.changes.load(Ordering::Relaxed))),
+                ..s.clone()
+            })
             .collect();
         let view = Arc::new(SharedMapView::new(&list));
-        SharedMaps { list, view }
+        SharedMaps { list, view, recent: Vec::new() }
     }
 
     /// Mapping `s` as text, all but its file, for a fork's child in another
@@ -7552,8 +7637,36 @@ impl SharedMaps {
             .filter(|h| !h.is_empty())
             .map(|h| u64::from_str_radix(h, 16).ok().map(std::sync::atomic::AtomicU64::new))
             .collect::<Option<Arc<[std::sync::atomic::AtomicU64]>>>()?;
-        self.push(SharedMap { start, len, file, offset, holders, pages });
+        // The count is not carried: the child's hashes are taken as unknown
+        // against the file's count, and its next mapping hashes afresh.
+        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default() });
         Some(())
+    }
+
+    /// Keep mapping `s`'s page hashes past its unmap, when its count says
+    /// they are the file's pages ([`SharedMap::changes`]); the oldest kept
+    /// goes first.
+    pub fn remember(&mut self, s: &SharedMap) {
+        let changes = s.changes.load(std::sync::atomic::Ordering::Acquire);
+        let ino = s.file.ino();
+        if changes == 0 || s.len < RECALL_MIN || ino == 0 {
+            return;
+        }
+        self.recent.retain(|r| !(r.path == s.file.path && r.ino == ino && r.offset == s.offset && r.len == s.len));
+        if self.recent.len() == RECENT_MAX {
+            self.recent.remove(0);
+        }
+        self.recent.push(Recent { path: s.file.path.clone(), ino, offset: s.offset, len: s.len, changes, pages: Arc::clone(&s.pages) });
+    }
+
+    /// The page hashes [`SharedMaps::remember`] kept of `file`'s
+    /// `[offset, offset + len)`, if the file's count is still `changes`
+    /// (nonzero): its pages are then the ones they were hashed from.
+    pub fn recall(&mut self, file: &OpenFile, offset: u64, len: u64, changes: u64) -> Option<Arc<[std::sync::atomic::AtomicU64]>> {
+        let ino = file.ino();
+        let i = self.recent.iter().position(|r| ino != 0 && r.path == file.path && r.ino == ino && r.offset == offset && r.len == len)?;
+        let r = self.recent.remove(i);
+        (changes != 0 && r.changes == changes).then_some(r.pages)
     }
 
     /// One more holder of mapping `i`'s pages (an aliasing `mmap` of
@@ -13443,8 +13556,8 @@ mod tests {
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         assert!(view.of(&a).is_none());
-        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]) });
-        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]) });
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default() });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default() });
         let held = view.get();
         assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
         assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
@@ -14234,6 +14347,51 @@ mod tests {
         assert_eq!(m.read(0x07021004, 3).unwrap(), b"new", "the private copy has the shared mapping's writes");
         m.write(0x07021004, b"own").unwrap();
         assert_eq!(m.read(0x07011004, 3).unwrap(), b"new", "and its own writes stay its own");
+    }
+
+    /// A shared mapping unmapped and mapped again: the file unchanged, the
+    /// page hashes come back rather than being taken again; changed by a
+    /// write through another descriptor while unmapped, they do not, and a
+    /// store that puts a page back as it was before that write still
+    /// reaches the file (kept hashes would call it clean).
+    #[test]
+    fn a_remapped_file_takes_its_kept_hashes_only_while_unchanged() {
+        use crate::mem::{flags as mf, prot};
+        let (_, mut k) = setup();
+        let mut buf = vec![0u8; 0x0708_0000];
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let rw = (prot::READ | prot::WRITE) as u64;
+        let len = RECALL_MIN;
+        m.write(0x20000, b"/r\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        let other = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_RDWR as u64, 0]);
+        m.write(0x21000, &vec![b'A'; len as usize]).unwrap();
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PWRITE64, &[fd, 0x21000, len, 0]), len);
+        let map = |m: &mut GuestMem<'_>, k: &mut Kernel| sys_locked(m, k, at, nr::MMAP, &[0x07010000, len, rw, mf::SHARED | mf::FIXED, fd, 0]);
+        let unmap = |m: &mut GuestMem<'_>, k: &mut Kernel| sys_locked(m, k, at, nr::MUNMAP, &[0x07010000, len]);
+        let at_file = |m: &mut GuestMem<'_>, k: &mut Kernel, off: u64| {
+            assert_eq!(sys_locked(m, k, at, nr::PREAD64, &[fd, 0x22000, 1, off]), 1);
+            m.read(0x22000, 1).unwrap()[0]
+        };
+        assert_eq!(map(&mut m, &mut k), 0x07010000);
+        m.write(0x07010000, b"P").unwrap();
+        assert_eq!(unmap(&mut m, &mut k), 0);
+        assert_eq!(at_file(&mut m, &mut k, 0), b'P');
+        assert_eq!(k.mem.lock().log.shared_maps.recent.len(), 1, "the unmapped range's hashes are kept");
+        assert_eq!(map(&mut m, &mut k), 0x07010000);
+        assert!(k.mem.lock().log.shared_maps.recent.is_empty(), "and taken back by the next mapping");
+        assert_ne!(k.mem.lock().log.shared_maps[0].changes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        m.write(0x07011000, b"Q").unwrap();
+        assert_eq!(unmap(&mut m, &mut k), 0);
+        assert_eq!(at_file(&mut m, &mut k, 0x1000), b'Q', "a store after taking them back is written back");
+        m.write(0x23000, b"B").unwrap();
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PWRITE64, &[other, 0x23000, 1, 0x2000]), 1);
+        assert_eq!(map(&mut m, &mut k), 0x07010000);
+        assert_eq!(m.read(0x07012000, 1).unwrap(), b"B", "the other descriptor's write is seen");
+        m.write(0x07012000, b"A").unwrap();
+        assert_eq!(unmap(&mut m, &mut k), 0);
+        assert_eq!(at_file(&mut m, &mut k, 0x2000), b'A', "the page put back as it was is written back");
     }
 
     /// The mapping calls through the lock-free path ([`MapIo`]) answer as

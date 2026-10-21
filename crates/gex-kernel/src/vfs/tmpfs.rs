@@ -54,6 +54,10 @@ pub struct FileNode {
     /// What a page's persist store snapshots (web/src/persist-worker.js),
     /// so a snapshot never reads a file the program did not touch.
     written: core::sync::atomic::AtomicBool,
+    /// [`FileHandle::changes`]: bumped with the contents' lock held, so a
+    /// reader that saw the same count before and after its read read
+    /// contents no change was halfway through. From 1, as 0 is no count.
+    changes: core::sync::atomic::AtomicU64,
 }
 
 impl FileNode {
@@ -66,7 +70,13 @@ impl FileNode {
             times: Mutex::new(Default::default()),
             opened: core::sync::atomic::AtomicBool::new(false),
             written: core::sync::atomic::AtomicBool::new(false),
+            changes: core::sync::atomic::AtomicU64::new(1),
         }
+    }
+    /// One more change of the contents; called with `data` locked (the
+    /// count's reader pairs with this through that lock: [`FileNode::changes`]).
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
     }
     fn touch(&self) {
         self.mark_written();
@@ -886,6 +896,22 @@ impl FileHandle for TmpHandle {
         Ok(n as u64)
     }
 
+    fn changes(&self) -> u64 {
+        self.file.as_ref().map_or(0, |f| f.changes.load(Ordering::Acquire))
+    }
+
+    fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
+        let file = self.file.as_ref()?;
+        if file.lazy.lock().unwrap().is_some() {
+            return None;
+        }
+        let data = file.data.lock().unwrap();
+        let start = (offset as usize).min(data.len());
+        let n = len.min(data.len() - start);
+        f(&data[start..start + n]);
+        Some(Ok(n as u64))
+    }
+
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         let Some(file) = &self.file else { return Ok(()) };
         match file.lazy.lock().unwrap().as_mut() {
@@ -908,6 +934,8 @@ impl FileHandle for TmpHandle {
             note_capacity(was, data.capacity());
         }
         data[start..start + buf.len()].copy_from_slice(buf);
+        file.changed();
+        drop(data);
         file.touch();
         Ok(buf.len() as u64)
     }
@@ -1048,6 +1076,7 @@ impl FileHandle for TmpHandle {
             reserve(&mut data, len as usize)?;
             data.resize(len as usize, 0);
             note_capacity(was, data.capacity());
+            file.changed();
         }
         file.touch();
         Ok(())
@@ -1133,6 +1162,7 @@ impl FileSystem for TmpFs {
                                 data.clear();
                                 data.shrink_to_fit();
                                 note_capacity(was, data.capacity());
+                                f.changed();
                             }
                             f.touch();
                         }
@@ -1415,6 +1445,28 @@ mod tests {
     /// A lazy file's time does not come from the clock: two loads of the same
     /// site, a second apart, see the same time for it, and a recorded time
     /// replaces it.
+    #[test]
+    fn a_change_of_the_contents_moves_the_count_and_a_read_does_not() {
+        use crate::fs::oflags::{O_CREAT, O_RDWR, O_TRUNC};
+        let fs = TmpFs::new();
+        let h = fs.open("f", O_RDWR | O_CREAT, 0o644).unwrap();
+        let c0 = h.changes();
+        assert_ne!(c0, 0);
+        h.write_at(0, b"abc").unwrap();
+        let c1 = h.changes();
+        assert!(c1 > c0);
+        let mut b = [0u8; 3];
+        h.read_at(0, &mut b).unwrap();
+        h.set_mtime(1_700_000_000).unwrap();
+        assert_eq!(h.changes(), c1, "a read or a time set is no change");
+        h.truncate(1).unwrap();
+        let c2 = h.changes();
+        assert!(c2 > c1);
+        let again = fs.open("f", O_RDWR | O_TRUNC, 0o644).unwrap();
+        assert!(again.changes() > c2, "O_TRUNC is a change, seen through every handle");
+        assert_eq!(h.changes(), again.changes());
+    }
+
     #[test]
     fn a_lazy_file_has_the_same_time_on_every_load() {
         let load = || {
