@@ -7,8 +7,8 @@ Runs `gexc run --no-cache --no-jit <A flags> <elf>` and the same with the
 <B flags> (default: tier-1 against `--cgen`), each with GEX_SYSCALL_LOG and
 GEX_FAKE_CLOCK set (shims/native/src/lockstep.rs), and compares the logs
 thread by thread: every syscall's number and arguments, the architectural
-registers at its entry, and its result. Tier-1 is the reference (merge plan
-§5.2). Prints the first divergence with the fields that differ, or "same".
+registers at its entry, and its result. Tier-1 is the reference. Prints
+the first divergence with the fields that differ, or "same".
 Exit status 0 when the runs agree, 1 when they diverge, 2 on usage errors.
 
 --ignore-flags leaves the condition flags out of the comparison. Both
