@@ -161,16 +161,76 @@ for a in args:
         print('.'); sys.exit(0)
 
 # --- compile only -----------------------------------------------------------
+SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
+# `.symver` (ELF symbol versions, in top-level asm) is a directive the wasm
+# assembler does not know, and a wasm module has no symbol versions. A
+# compile that fails on one is run again on the preprocessed source with
+# those asm statements taken out: the symbol itself is still defined, only
+# its versioned alias is not made.
+SYMVER_ASM = re.compile(r'\b(?:__asm__|__asm|asm)\s*(?:volatile\s*|__volatile__\s*)?\(\s*'
+                        r'"(?:\\t|\s)*\.symver\b(?:[^"\\]|\\.)*"(?:\s*"(?:[^"\\]|\\.)*")*\s*\)\s*;?')
+DEP_FLAGS = {'-MD', '-MMD', '-MP'}
+DEP_ARG = {'-MF', '-MT', '-MQ'}
+
+
+def compile_cmd(cmd):
+    """Run a compile, with the `.symver` retry above. Returns its exit code."""
+    r = subprocess.run(cmd, stderr=subprocess.PIPE)
+    err = r.stderr
+    srcs = [a for a in cmd[1:] if a.endswith(SRC_EXT) and not a.endswith(('.s', '.S')) and os.path.isfile(a)]
+    if r.returncode == 0 or b'.symver' not in err or b'unknown directive' not in err or len(srcs) != 1:
+        sys.stderr.buffer.write(err)
+        return r.returncode
+    src = srcs[0]
+    tmpd = tempfile.mkdtemp(prefix='gexcc-symver-')
+    try:
+        ii = os.path.join(tmpd, os.path.basename(src) + ('.ii' if CXX or src.endswith(('.cc', '.cpp', '.cxx', '.c++', '.C', '.ii')) else '.i'))
+        pre, skip = [], False
+        for a in cmd:
+            if skip:
+                skip = False; continue
+            if a == '-o':
+                skip = True; continue
+            if a in ('-c', '-S') or (a.startswith('-o') and len(a) > 2):
+                continue
+            pre.append(a)
+        obj = next((cmd[k + 1] for k, a in enumerate(cmd[:-1]) if a == '-o'), None)
+        if obj and any(a in DEP_FLAGS for a in cmd) and not any(a.startswith(('-MT', '-MQ')) for a in cmd):
+            pre += ['-MT', obj]
+        if run(pre + ['-E', '-o', ii]):
+            sys.stderr.buffer.write(err)
+            return r.returncode
+        text = open(ii, encoding='utf-8', errors='surrogateescape').read()
+        n = len(SYMVER_ASM.findall(text))
+        open(ii, 'w', encoding='utf-8', errors='surrogateescape').write(SYMVER_ASM.sub('', text))
+        sys.stderr.write('gexcc: %s: %d .symver directive(s) left out (wasm has no symbol versions)\n' % (src, n))
+        out, skip = [], False
+        for a in cmd:
+            if skip:
+                skip = False; continue
+            if a in DEP_FLAGS:
+                continue
+            if a in DEP_ARG:
+                skip = True; continue
+            if a.startswith(('-MF', '-MT', '-MQ')) and len(a) > 3:
+                continue
+            out.append(ii if a == src else a)
+        return run(out + ['-Wno-unused-command-line-argument'])
+    finally:
+        shutil.rmtree(tmpd, True)
+
+
 NOLINK = ('-c', '-S', '-E', '-M', '-MM', '-fsyntax-only', '--version', '-v', '-###', '--help')
 if not args or any(a in NOLINK or a.startswith(('-print-', '-dump')) for a in args):
     if args == ['-v'] or args == ['--version'] or not args:
         os.execvp(CLANG[0], [CLANG[0], '--target=' + TRIPLE] + args)
+    if '-c' in args and '-E' not in args:
+        sys.exit(compile_cmd(CLANG + args + CLANG_TAIL))
     os.execvp(CLANG[0], CLANG + args + CLANG_TAIL)
 
 # --- link -----------------------------------------------------------------
 LIBC_NAMES = {'c', 'm', 'pthread', 'dl', 'rt', 'util', 'crypt', 'xnet', 'resolv', 'gcc', 'gcc_s', 'gcc_eh',
               'atomic', 'ssp', 'ssp_nonshared', 'unwind'}
-SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
 # Linker options with no meaning for a static wasm module, dropped quietly.
 LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--?version-script|-z|--as-needed|--no-as-needed|'
                      r'--no-undefined|-O\d|--hash-style|--build-id|--enable-new-dtags|--disable-new-dtags|'
@@ -259,6 +319,8 @@ while i < len(args):
     elif a in ('-I', '-D', '-U', '-include', '-imacros', '-isystem', '-idirafter', '-iquote', '-MF', '-MT', '-MQ',
                '-target', '--target', '-arch', '-Xclang', '-mllvm', '-iprefix', '-iwithprefix', '-isysroot'):
         cflags += [a, nxt]; i += 2; continue
+    elif a == '-' and xlang and xlang != 'none':
+        srcs.append((a, xlang))  # the source on stdin (-x LANG -)
     elif not a.startswith('-') and (a.endswith(SRC_EXT) or (xlang and xlang != 'none')):
         srcs.append((a, xlang))
     elif not a.startswith('-'):
@@ -288,7 +350,7 @@ for k, (s, lang) in enumerate(srcs):
         if cflags[j] == '-x':
             j += 2; continue
         cf.append(cflags[j]); j += 1
-    r = run(CLANG + cf + pre + ['-c', s, '-o', o] + CLANG_TAIL)
+    r = compile_cmd(CLANG + cf + pre + ['-c', s, '-o', o] + CLANG_TAIL)
     if r:
         sys.exit(r)
     objs.append(o)
@@ -299,6 +361,10 @@ if not objs and not inputs:
     die('no input files')
 if out is None:
     out = 'a.out'
+if out == '/dev/null':
+    # a configure-style check that only wants to know the link works: the
+    # module is made (and post-processed) in the scratch directory instead
+    out = os.path.join(tmp, 'discarded.out')
 
 LIB = SYSROOT + '/lib'
 SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib/' + MULTIARCH, SYSROOT + '/usr/lib',
