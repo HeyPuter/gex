@@ -1,22 +1,17 @@
 #!/bin/sh
-# Rebuilds the PE fixtures in bin/ from src/ and pewasm's examples. The
-# binaries are committed, so `cargo test` needs no MinGW; run this only after
-# changing a source. Needs i686-w64-mingw32-gcc, x86_64-w64-mingw32-gcc and
-# (for the MSVC-style image) clang-cl, lld-link and llvm-dlltool.
+# Rebuilds the PE fixtures in bin/ from src/. The binaries are committed, so
+# `cargo test` needs no MinGW; run this only after changing a source. Needs
+# i686-w64-mingw32-gcc, x86_64-w64-mingw32-gcc and (for the MSVC-style
+# image) clang-cl, lld-link and llvm-dlltool.
+#
+#   build.sh [OUT]    (default: bin/ beside this script)
+#
+# The committed ones were built with MinGW-w64 GCC 15.2. Binutils 2.40's
+# dlltool leaves uses.exe without its delay import, which tests/pe.rs checks.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 src=$here/src
-# pewasm's checkout sits beside gex's (or beside the worktree's parent).
-pewasm=${PEWASM:-}
-if [ -z "$pewasm" ]; then
-    d=$here
-    while [ "$d" != / ]; do
-        d=$(dirname "$d")
-        if [ -f "$d/pewasm/pewasm.py" ]; then pewasm=$d/pewasm; break; fi
-    done
-fi
-[ -n "$pewasm" ] || { echo "pewasm checkout not found; set PEWASM" >&2; exit 1; }
-out=$here/bin
+out=${1:-$here/bin}
 rm -rf "$out"
 mkdir -p "$out/x86" "$out/x64"
 tmp=$(mktemp -d)
@@ -31,7 +26,7 @@ for arch in x86 x64; do
         res=x86_64-w64-mingw32-windres
     fi
     o=$out/$arch
-    flags="-O1 -s -fno-stack-protector -fno-asynchronous-unwind-tables"
+    flags="-O1 -s -ffile-prefix-map=$here=. -fno-stack-protector -fno-asynchronous-unwind-tables"
     # The DLLs: no CRT, their own entry point, exports from .def files.
     $cc $flags -shared -nostdlib -Wl,--entry,$dllentry "$src/libb.c" "$src/libb.def" -lkernel32 -o "$o/libb.dll"
     $tool -d "$src/libb.def" -D libb.dll -l "$tmp/libb-$arch.a"
@@ -42,14 +37,16 @@ for arch in x86 x64; do
     # The application: the MinGW CRT, TLS callbacks, delay imports, resources.
     $res "$src/uses.rc" -O coff -o "$tmp/uses-res-$arch.o"
     $cc $flags "$src/uses.c" "$tmp/uses-res-$arch.o" "$tmp/liba-$arch.a" "$tmp/delayed-$arch.a" -o "$o/uses.exe"
-    # pewasm's own examples, each built for the width its name implies.
-    for f in "$pewasm"/examples/*.c; do
+    # The program fixtures, each built for the width its name implies.
+    for f in "$src"/*.c; do
         n=$(basename "$f" .c)
+        case $n in liba|libb|delayed|uses|tiny|msvc) continue ;; esac
         case $n in *32) [ $arch = x86 ] || continue ;; *) [ $arch = x64 ] || continue ;; esac
-        case $n in mesa_wink_smoke|wined3d_probe|export_registry32) continue ;; esac
-        $cc $flags -nostdlib -Wl,--entry,$entry "$f" -lkernel32 -luser32 -lgdi32 -lmsvcrt \
-            -ld3d11 -ldxgi -ldsound -ldinput8 -ldxguid -lopengl32 -lwinmm -lole32 -o "$o/$n.exe" \
-            || echo "skipped example $n (does not build with MinGW)" >&2
+        # threads32 prints through the UCRT (api-ms-win-crt-stdio), the rest
+        # import msvcrt.
+        crt="-lmsvcrt"; [ $n = threads32 ] && crt="-D__MSVCRT_VERSION__=0xE00 -D_UCRT -lucrt"
+        $cc $flags -nostdlib -Wl,--entry,$entry "$f" -lkernel32 -luser32 -lgdi32 $crt \
+            -ld3d11 -ldxgi -ldsound -ldinput8 -ldxguid -lopengl32 -lwinmm -lole32 -o "$o/$n.exe"
     done
 done
 
