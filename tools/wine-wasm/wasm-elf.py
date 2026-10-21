@@ -172,6 +172,21 @@ def main():
         ph += phdr(0x6474e551, 0, 0, 0, 0, 0, 6, 16)
     out = (eh + ph).ljust(wasm_off, b'\0') + w
     out = out.ljust(text_off, b'\0') + text + b'\xf4' * PAGE
+    # Section headers: the null section and the names' table, nothing
+    # else. A file with none is valid ELF, but build tools that edit an
+    # installed program (Meson's rpath fixer) index the names' table
+    # without checking that there is one.
+    names = b'\0.shstrtab\0'
+    names_off = len(out)
+    out += names
+    out = out.ljust(up(len(out), 8), b'\0')
+    shoff = len(out)
+    if elf64:
+        out += bytes(64) + struct.pack('<IIQQQQIIQQ', 1, 3, 0, 0, names_off, len(names), 0, 0, 1, 0)
+        out = out[:40] + struct.pack('<Q', shoff) + out[48:58] + struct.pack('<HHH', 64, 2, 1) + out[64:]
+    else:
+        out += bytes(40) + struct.pack('<10I', 1, 3, 0, 0, names_off, len(names), 0, 0, 1, 0)
+        out = out[:32] + struct.pack('<I', shoff) + out[36:46] + struct.pack('<HHH', 40, 2, 1) + out[52:]
     open(dst, 'wb').write(out)
     import os
     os.chmod(dst, 0o755)

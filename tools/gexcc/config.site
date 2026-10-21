@@ -24,6 +24,9 @@ fi
 # __ELF__) asks whether -shared -Wl,-soname builds a shared library: on
 # gexcc it does (a wasm side module), though the object format is not ELF
 itz_cv_sys_elf=${itz_cv_sys_elf=yes}
+# X.Org's XORG_CHECK_MALLOC_ZERO (libX11, libXt and the rest): musl's
+# malloc(0) returns a unique pointer
+xorg_cv_malloc0_returns_null=${xorg_cv_malloc0_returns_null=no}
 ac_cv_func_chown_works=${ac_cv_func_chown_works=yes}
 ac_cv_func_getgroups_works=${ac_cv_func_getgroups_works=yes}
 ac_cv_func_malloc_0_nonnull=${ac_cv_func_malloc_0_nonnull=yes}

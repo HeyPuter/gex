@@ -2,7 +2,8 @@
 # gexcc's driver on what configure scripts and Debian sources hand it, with
 # nothing run: a source on stdin, a link to /dev/null (pass and fail), and
 # top-level `.symver` asm (left out, the symbol still defined, the
-# dependency file still naming the object).
+# dependency file still naming the object), and a program's container
+# carrying section headers (Meson's rpath fixer reads them at install).
 #
 #   tests/gexcc/driver.sh        (gexcc on PATH: tools/gexcc/install.sh)
 set -u
@@ -37,4 +38,8 @@ ln -s "$(command -v gexcc)" "$W/wasm32-linux-musl-cpp"
 check $? "cpp -undef reads standard input"
 printf '#define A 7\nA\n' > "$W/a.h"; "$W/wasm32-linux-musl-cpp" "$W/a.h" "$W/a.out" 2>/dev/null
 [ "$(tail -1 "$W/a.out")" = 7 ]; check $? "cpp IN OUT"
+printf 'int main(void){return 0;}\n' | gexcc -x c -o "$W/prog" - 2> "$W/log"
+[ "$(readelf -h "$W/prog" | awk '/Section header string table index/{print $NF}')" = 1 ] && \
+    readelf -S "$W/prog" | grep -q '\.shstrtab'
+check $? "a program has a section names' table"
 exit $fail

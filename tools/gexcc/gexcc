@@ -94,9 +94,11 @@ if not CXX:
 if CXX:
     BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
 # Where cross-built libraries install (--prefix=/usr DESTDIR=SYSROOT); the
-# libc's include/ is clang's own sysroot default.
+# libc's include/ is clang's own sysroot default. Debian's packages put
+# per-architecture headers (ffi.h, opensslconf.h) in usr/include/TRIPLET,
+# which its GCC searches before usr/include.
 INCS = []
-for d in ('include/gexcc', 'usr/local/include', 'usr/include'):
+for d in ('include/gexcc', 'usr/local/include', 'usr/include/wasm32-linux-musl', 'usr/include'):
     if os.path.isdir(os.path.join(SYSROOT, d)):
         INCS += ['-isystem', os.path.join(SYSROOT, d)]
 # libc++'s headers come before the C library's (its <math.h> wraps musl's),
