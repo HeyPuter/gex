@@ -576,7 +576,7 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 
 /// [`cache_key`], remembered for this host process: every Wine process under
 /// W3 execs the same 5.7 MB program, and its SHA-256 was 0.36-0.58 s of each
-/// child's start on edger (with the other processes' threads busy). The memo
+/// child's start (with the other processes' threads busy). The memo
 /// is keyed by a 128-bit SipHash of the same fields, a few ms.
 fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -1562,7 +1562,7 @@ fn store_limits() -> wasmtime::StoreLimits {
 /// `start.elapsed() >= d` and then computing `d - start.elapsed()` reads it
 /// twice, and a thread descheduled between the two (a loaded machine) got a
 /// second reading past the deadline and panicked subtracting durations,
-/// taking the guest thread with it (Baba Is You's, on gooner).
+/// taking the guest thread with it.
 fn time_left(deadline: std::time::Duration, elapsed: std::time::Duration) -> Option<std::time::Duration> {
     deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
 }

@@ -11,10 +11,11 @@
 # thunk the shell binds at its table index. Variadic exports and va_list
 # arguments go through gexva.h.
 #
-#   build-sqlite.sh OUT   (GEXCC_PREFIX; A64_SYSROOT, required)
+#   build-sqlite.sh OUT   (SQLITE_SRC: Debian's sqlite3 source, unpacked;
+#                          GEXCC_PREFIX; A64_SYSROOT; all required)
 set -eu
 H=$(cd "$(dirname "$0")" && pwd); O=$(realpath -m "$1"); mkdir -p "$O/sqlite"
-S=${SQLITE_SRC:-$HOME/gex-sandbox/scratch/CC/debian/src/sqlite3-3.46.1-7+deb13u2}
+S=${SQLITE_SRC:?the Debian sqlite3 source (3.46.1), unpacked}
 OPT=${GEXCC_PREFIX:?}/sysroot/binaryen/bin/wasm-opt
 : "${A64_SYSROOT:?the LP64 libc (sysroot.sh)}"
 . "$H/lib.sh"

@@ -557,8 +557,7 @@ export class ProcessHost {
   /// Worker after another: called on a take alone, a take removed one and
   /// added one, and the pool never held more than one Worker. The second
   /// and third processes of a pipeline (`echo a | cat | cat`) then each
-  /// waited about 20 ms for a Worker made at their fork (worldmachine,
-  /// demo page).
+  /// waited about 20 ms for a Worker made at their fork (demo page).
   #topUp() {
     if (this.#warm.length >= this.#warmWanted) return;
     try {

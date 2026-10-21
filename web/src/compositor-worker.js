@@ -1729,7 +1729,7 @@ function loop() {
 /**
  * Draw when a guest publishes, not at the next animation frame: a frame drawn
  * now reaches the screen a frame tick sooner than one drawn at the next tick
- * (publish to draw was 3-15 ms of a click's 55-70 ms on mspaint, worldmachine).
+ * (publish to draw was 3-15 ms of a click's 55-70 ms in a paint program).
  * At most once between animation frames, so a guest publishing on every
  * scheduler turn still costs one extra draw a frame at most; the rest waits
  * for `loop`, which draws whatever is newest.

@@ -7,12 +7,12 @@
 # is IEEE quad, as on aarch64). The libraries are then lowered to the
 # guest's 32-bit memory (build.sh).
 #
-#   sysroot.sh OUT [MUSL_SRC]
+#   sysroot.sh OUT [MUSL_SRC]   (MUSL_SRC, argument or environment: required)
 #
 # OUT/sysroot gets include/, lib/libc.a and lib/libclang_rt.builtins-wasm64.a.
 set -eu
 OUT=$(realpath -m "$1")
-MUSL=$(realpath "${2:-$HOME/gex-sandbox/scratch/CC/musl-a64}")
+MUSL=$(realpath "${2:-${MUSL_SRC:?musl, branch gex-wasm64-a64}}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-8}
 . "$(dirname "$0")/flags.sh"

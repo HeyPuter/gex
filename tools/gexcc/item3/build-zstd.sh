@@ -8,10 +8,11 @@
 # threads) and the dictionary builder; without it, single-threaded
 # (ZSTD_c_nbWorkers > 0 is refused) and ZDICT_* are bound to gexp__missing.
 #
-#   build-zstd.sh OUT   (GEXCC_PREFIX; A64_SYSROOT; DEBIAN_ROOT for zstt)
+#   build-zstd.sh OUT   (ZSTD_SRC: Debian's libzstd source, unpacked;
+#                        GEXCC_PREFIX; A64_SYSROOT; DEBIAN_ROOT for zstt)
 set -eu
 H=$(cd "$(dirname "$0")" && pwd); O=$(realpath -m "$1"); mkdir -p "$O/zstd"
-S=${ZSTD_SRC:-$HOME/gex-sandbox/scratch/CC/debian/src/libzstd-1.5.7+dfsg-1}/lib
+S=${ZSTD_SRC:?the Debian libzstd source (1.5.7), unpacked}/lib
 OPT=${GEXCC_PREFIX:?}/sysroot/binaryen/bin/wasm-opt
 . "$H/lib.sh"
 lib_setup "$H" "$O/zstd"

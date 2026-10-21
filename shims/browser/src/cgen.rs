@@ -566,7 +566,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
 /// never runs is then never read, hashed or placed: a resource DLL (22 MB
 /// of ehres.dll mapped three times by the shell for icons, 20 tzres.dll
 /// maps for time zone names), each KnownDll wineboot maps for its imports
-/// (40 of them, 3.8 s of W64 Dicey's start, edger), the game's exe in the
+/// (40 of them, 3.8 s of a W64 game's start), the game's exe in the
 /// first process, which only hands it to start.exe (its 261 MiB unit
 /// fetched, compiled and placed for nothing). One that runs is placed at
 /// its first miss, as a relocated image's is.
