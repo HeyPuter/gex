@@ -105,4 +105,15 @@ check $? "a shared library of two objects with the same file name"
 printf '#ifndef _REENTRANT\n#error no _REENTRANT\n#endif\nint main(void){return 0;}\n' > "$W/re.c"
 gexcc -pthread -c -o "$W/re.o" "$W/re.c" 2> "$W/log" && gexcc -pthread -o "$W/re" "$W/re.c" 2>> "$W/log"
 check $? "-pthread defines _REENTRANT"
+# an empty shared link (libbsd's output-format probe), and a GNU ld script
+# in a library's place (libbsd.so: GROUP(libbsd.so.0 AS_NEEDED(...)))
+GEXCC_SHARED=1 gexcc -shared -nostdlib -nostartfiles -x assembler /dev/null -o "$W/empty.so" 2> "$W/log"
+check $? "an empty shared link"
+mkdir -p "$W/ls"
+printf 'int ls_get(void){return 7;}\n' > "$W/ls/l.c"
+GEXCC_SHARED=1 gexcc -shared -fPIC -Wl,-soname,libls.so.0 -o "$W/ls/libls.so.0" "$W/ls/l.c" &&
+    printf '/* GNU ld script */\nOUTPUT_FORMAT(elf32-i386)\nGROUP(%s/ls/libls.so.0 AS_NEEDED(-lm))\n' "$W" > "$W/ls/libls.so" &&
+    printf 'int ls_get(void);\nint main(void){return ls_get() != 7;}\n' > "$W/ls/m.c" &&
+    GEXCC_SHARED=1 gexcc -o "$W/ls/m" "$W/ls/m.c" -L"$W/ls" -lls 2> "$W/log"
+check $? "a GNU ld script in a library's place"
 exit $fail

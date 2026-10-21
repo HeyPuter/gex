@@ -492,7 +492,8 @@ def resolve(lib):
     for d in SEARCH:
         for ext in ('.so', '.a'):
             p = os.path.join(d, 'lib' + lib + ext)
-            if os.path.exists(p) and (ext == '.a' or is_archive(p) or (shared_ok and open(p, 'rb').read(4) == b'\0asm')):
+            if os.path.exists(p) and (ext == '.a' or is_archive(p) or (shared_ok and open(p, 'rb').read(4) == b'\0asm')
+                                      or ld_script_inputs(p) is not None):
                 return os.path.abspath(p)
     return None
 
@@ -510,6 +511,32 @@ def archive_deps(path):
         return []
     b = data.find(b'\nGEXCC-END', a)
     return data[a + 11:b].decode().split('\n') if b > 0 else []
+
+
+def ld_script_inputs(path):
+    """A GNU ld script in a library's place (libbsd.so: GROUP(libbsd.so.0
+    AS_NEEDED(-lmd))): the inputs it names, a target path the build machine
+    lacks being the sysroot's. None for anything else."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if b'\0' in head or not re.search(rb'\b(GROUP|INPUT)\s*\(', head):
+        return None
+    text = re.sub(r'/\*.*?\*/', ' ', open(path, errors='replace').read(), flags=re.S)
+    out = []
+    for m in re.finditer(r'\b(?:GROUP|INPUT)\s*\(((?:[^()]|\([^()]*\))*)\)', text):
+        for tok in re.split(r'[\s,()]+', m.group(1)):
+            if not tok or tok == 'AS_NEEDED':
+                continue
+            if tok.startswith('-l'):
+                out.append(tok)
+            elif tok.startswith('/'):
+                out.append(in_sysroot(tok))
+            else:
+                out.append(os.path.join(os.path.dirname(path), tok))
+    return out
 
 
 def expand(items, seen):
@@ -537,6 +564,12 @@ def expand(items, seen):
         if it in seen:
             continue
         seen.add(it)
+        script = ld_script_inputs(it) if not it.startswith('-') else None
+        if script is not None:
+            sub, miss = expand(script, seen)
+            res += sub
+            missing += miss
+            continue
         res.append(it)
         if is_archive(it):
             sub, miss = expand(archive_deps(it), seen)
@@ -781,7 +814,11 @@ def link_shared(cmd):
     return 1
 
 
-LDC_SHARED = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296']
+# The features shared memory needs, said outright: an empty link (libbsd's
+# `-shared -x assembler /dev/null`, to learn the output format) has no
+# object to infer them from.
+LDC_SHARED = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296',
+              '--extra-features=atomics,bulk-memory']
 
 
 def shared_undef():
