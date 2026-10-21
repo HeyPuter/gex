@@ -39,6 +39,31 @@ pub mod flags {
     pub const STACK: u64 = 0x20000;
 }
 
+/// The prefix of a code identity named by the bytes rather than a file
+/// ([`MemoryMap::name_by_content`]).
+pub const CONTENT_ID: &str = "content:";
+
+/// How many times one address's code is named by its bytes: a loader makes a
+/// section executable once or twice (after reading it, after relocating it);
+/// a code generator flips its buffers between writable and executable without
+/// end, and hashing them on every flip would be its cost alone.
+pub const CONTENT_NAMINGS: u32 = 4;
+
+/// Whether code is named by its bytes at all: only something that keeps
+/// translations by name (a translation cache across loads) needs it, so with
+/// none it costs nothing. The host sets it; off until it does.
+static CONTENT_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Name code by its bytes from now on ([`MemoryMap::name_by_content`]).
+pub fn set_content_names(on: bool) {
+    CONTENT_NAMES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether code is named by its bytes ([`set_content_names`]).
+pub fn content_names() -> bool {
+    CONTENT_NAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One contiguous mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vma {
@@ -61,6 +86,9 @@ pub struct Vma {
     /// has touched it), which is a different question from whether the code is
     /// the same code.
     pub code: Option<(String, u64)>,
+    /// How many times this mapping's code has been named by its bytes
+    /// ([`MemoryMap::name_by_content`]); a new mapping starts from none.
+    pub namings: u32,
 }
 
 impl Vma {
@@ -91,6 +119,7 @@ impl Vma {
                 .code
                 .as_ref()
                 .map(|(id, off)| (id.clone(), off + (start - self.start))),
+            namings: self.namings,
         }
     }
 }
@@ -1006,6 +1035,7 @@ impl MemoryMap {
             name: name.to_string(),
             origin: None,
             code,
+            namings: 0,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1066,6 +1096,7 @@ impl MemoryMap {
             name: name.to_string(),
             code,
             origin,
+            namings: 0,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -1506,6 +1537,66 @@ impl MemoryMap {
         out.sort_by_key(|v| v.start);
         self.vmas = out;
         Ok(())
+    }
+
+    /// Name the code of the anonymous mappings over `[start, end)` that are
+    /// executable and not writable by their bytes: `name(lo, hi)` gives the
+    /// identity of the bytes in `[lo, hi)` ([`CONTENT_ID`] and a hash), or
+    /// `None` to leave the mapping unnamed. A mapping named this way before
+    /// is named again, since its bytes may have changed while it was
+    /// writable. Mappings from a file keep their file identity. A
+    /// mapping named [`CONTENT_NAMINGS`] times already stays unnamed.
+    ///
+    /// This is how code that was read into memory rather than mapped from a
+    /// file gets an identity: a loader that `pread`s an image whose sections
+    /// are not page-aligned in its file, then relocates and protects them.
+    /// The bytes are the relocated ones, so the identity holds only for the
+    /// address they were relocated for, and the key that uses it pairs it with
+    /// the address anyway.
+    pub fn name_by_content(&mut self, start: u64, end: u64, mut name: impl FnMut(u64, u64) -> Option<String>) {
+        let mut changed = false;
+        for v in self.vmas.iter_mut() {
+            if v.end <= start || v.start >= end || v.origin.is_some() {
+                continue;
+            }
+            if v.prot & prot::EXEC == 0 || v.prot & prot::WRITE != 0 {
+                continue;
+            }
+            if v.code.as_ref().is_some_and(|(id, _)| !id.starts_with(CONTENT_ID)) {
+                continue;
+            }
+            v.namings = v.namings.saturating_add(1);
+            let fresh = if v.namings <= CONTENT_NAMINGS { name(v.start, v.end) } else { None };
+            if fresh.is_none() && v.code.is_none() {
+                continue;
+            }
+            v.code = fresh.map(|id| (id, 0));
+            changed = true;
+        }
+        if changed {
+            self.generation += 1;
+            self.publish();
+        }
+    }
+
+    /// Drop the content identities ([`Self::name_by_content`]) over
+    /// `[start, end)`: the range is writable now, so what it will hold is
+    /// not what was named.
+    pub fn forget_content(&mut self, start: u64, end: u64) {
+        let mut changed = false;
+        for v in self.vmas.iter_mut() {
+            if v.end <= start || v.start >= end {
+                continue;
+            }
+            if v.code.as_ref().is_some_and(|(id, _)| id.starts_with(CONTENT_ID)) {
+                v.code = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation += 1;
+            self.publish();
+        }
     }
 
     /// Change protection over a range, splitting mappings as needed.
@@ -2198,6 +2289,51 @@ mod tests {
         let b = m.mmap(0, 0x2000, rw, flags::ANONYMOUS, "y").unwrap();
         m.protect(b, 0x1000, prot::READ).unwrap();
         assert_eq!(m.vmas().iter().filter(|v| v.start >= b && v.end <= b + 0x2000).count(), 2);
+    }
+
+    /// Code read into anonymous memory is named by its bytes once it is
+    /// executable and not writable, named again when it comes back from
+    /// being writable, and never in place of a file's identity.
+    #[test]
+    fn anonymous_code_is_named_by_its_bytes() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let rw = prot::READ | prot::WRITE;
+        let rx = prot::READ | prot::EXEC;
+        let a = m.mmap(0, 0x2000, rw, flags::ANONYMOUS, "").unwrap();
+        let lib = m.mmap_from(0, 0x1000, rx, 0, "libx.so", Some(("libx.so".into(), 0))).unwrap();
+        let code = |m: &MemoryMap, at: u64| m.vmas().iter().find(|v| v.start <= at && at < v.end).and_then(|v| v.code.clone());
+        let mut n = 0;
+        let mut name = |lo: u64, hi: u64| {
+            n += 1;
+            Some(format!("{CONTENT_ID}{lo:x}-{hi:x}-{n}"))
+        };
+        // Still writable: not named.
+        m.name_by_content(a, a + 0x2000, &mut name);
+        assert_eq!(code(&m, a), None);
+        m.protect(a, 0x2000, rx).unwrap();
+        m.name_by_content(a, a + 0x2000, &mut name);
+        let first = code(&m, a).expect("named");
+        assert!(first.0.starts_with(CONTENT_ID));
+        // A file's mapping keeps its file.
+        m.name_by_content(lib, lib + 0x1000, &mut name);
+        assert_eq!(code(&m, lib), Some(("libx.so".into(), 0)));
+        // Writable again, then executable: named afresh.
+        m.protect(a, 0x2000, rw).unwrap();
+        m.forget_content(a, a + 0x2000);
+        assert_eq!(code(&m, a), None);
+        m.protect(a, 0x2000, rx).unwrap();
+        m.name_by_content(a, a + 0x2000, &mut name);
+        let second = code(&m, a).expect("named again");
+        assert_ne!(first, second);
+        // Flipped on and on, as generated code is: named no more.
+        for _ in 0..CONTENT_NAMINGS {
+            m.protect(a, 0x2000, rw).unwrap();
+            m.forget_content(a, a + 0x2000);
+            m.protect(a, 0x2000, rx).unwrap();
+            m.name_by_content(a, a + 0x2000, &mut name);
+        }
+        assert_eq!(code(&m, a), None);
+        assert_eq!(n, CONTENT_NAMINGS as usize, "a range past the cap is not read");
     }
 
     #[test]

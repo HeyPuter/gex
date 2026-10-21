@@ -4440,6 +4440,7 @@ static SLOT_BASE: [std::sync::atomic::AtomicU64; slots::COUNT] =
 #[no_mangle]
 pub extern "C" fn gex_worker_init() -> u32 {
     use std::sync::atomic::Ordering;
+    note_content_names();
     let i = loop {
         let used = SLOT_USED.load(Ordering::Acquire);
         let i = (!used).trailing_zeros() as usize;
@@ -11757,9 +11758,15 @@ fn note_key(p: &Px<'_>, key: u64, path: &str) {
         if !x.0.insert(key) {
             return;
         }
-        let (size, mtime) = *x.1.entry(path.to_string()).or_insert_with(|| match p.ns.metadata(path) {
-            Ok(m) => (m.size, m.mtime),
-            Err(_) => (u64::MAX, 0),
+        // Code named by its bytes has no file to check: the name is the check.
+        let (size, mtime) = *x.1.entry(path.to_string()).or_insert_with(|| {
+            if path.starts_with(gex_kernel::mem::CONTENT_ID) {
+                return (0, 0);
+            }
+            match p.ns.metadata(path) {
+                Ok(m) => (m.size, m.mtime),
+                Err(_) => (u64::MAX, 0),
+            }
         });
         if unsafe { k_key_path(key, path.as_ptr() as gex_kernel::PAddr, path.len() as u32, size, mtime) } < 0 {
             warn_line(&format!("[gex] xcache: {path} changed since the save; its translations are dropped\n"));
@@ -11775,7 +11782,16 @@ pub extern "C" fn gex_xcache_restore() -> i32 {
     if unsafe { k_present() } == 0 {
         return -1;
     }
+    note_content_names();
     unsafe { k_store_restore() }
+}
+
+/// Name code read into memory by its bytes only in a load that keeps a cache
+/// of translations by name (`k_xcache_on`): the hashing is that cache's cost.
+fn note_content_names() {
+    // SAFETY: scalars out of the kernel, no borrow.
+    let on = unsafe { k_present() != 0 && k_xcache_on() != 0 };
+    gex_kernel::mem::set_content_names(on);
 }
 
 fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
@@ -11819,6 +11835,22 @@ fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
     let key = hasher.finish();
     note_key(p, key, id);
     Some(key)
+}
+
+/// Whether `page`'s code is named by its bytes ([`gex_kernel::mem::CONTENT_ID`])
+/// and the base the system gave that name's page is `base`.
+fn content_base_agrees(p: &Px<'_>, page: u64, base: u32) -> bool {
+    let at = page * gex_abi::DISPATCH_PAGE;
+    let named = {
+        let mm = p.mm.lock();
+        mm.vmas()
+            .iter()
+            .find(|v| at >= v.start && at < v.end)
+            .and_then(|v| v.code.as_ref())
+            .is_some_and(|(id, _)| id.starts_with(gex_kernel::mem::CONTENT_ID))
+    };
+    // SAFETY: a lookup in the kernel's memory, borrowing nothing here.
+    named && page_identity(p, at).is_some_and(|k| unsafe { k_slot_get(page, k) } == base)
 }
 
 /// Nanoseconds on the host clock.
@@ -15418,7 +15450,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                             // second `node -e 0` its libc (4,979 blocks lifted
                             // became 15,975).
                             Some(have) => have == *b || LIVE_BASE.0.borrow().get(p) != Some(&have),
-                            None => !gex_abi::X86 || !j.retired_pages.contains(p),
+                            // A retired page whose code is named by its bytes
+                            // was named after its last change, so a module
+                            // stored for that name at this base was built
+                            // from what is there now.
+                            None => !gex_abi::X86 || !j.retired_pages.contains(p) || content_base_agrees(px, *p, *b),
                         })
                     })
                     .collect();
