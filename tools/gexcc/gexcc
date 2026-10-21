@@ -144,6 +144,31 @@ def expand_rsp(args):
 FPCAST = os.environ.get('GEXCC_FPCAST', '0') != '0' or '-fgex-fpcast-emu' in sys.argv[1:]
 args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu')]
 
+
+def in_sysroot(path):
+    """A target library's directory as a build machine with it installed
+    would name it (tclConfig.sh's -I/usr/include/tcl8.6): the sysroot's when
+    the build machine has none there."""
+    if path.startswith('/usr/') and not os.path.exists(path) and os.path.exists(SYSROOT + path):
+        return SYSROOT + path
+    return path
+
+
+def sysroot_dirs(argv):
+    out, k = [], 0
+    while k < len(argv):
+        a = argv[k]
+        if a in ('-I', '-isystem', '-idirafter', '-L') and k + 1 < len(argv):
+            out += [a, in_sysroot(argv[k + 1])]; k += 2; continue
+        for opt in ('-isystem', '-I', '-L'):
+            if a.startswith(opt + '/'):
+                a = opt + in_sysroot(a[len(opt):]); break
+        out.append(a); k += 1
+    return out
+
+
+args = sysroot_dirs(args)
+
 # --- queries -------------------------------------------------------------
 if args == ['--print-sysroot'] or args == ['-print-sysroot']:
     print(SYSROOT); sys.exit(0)
@@ -392,6 +417,12 @@ while i < len(args):
         srcs.append((a, xlang))  # the source on stdin (-x LANG -)
     elif not a.startswith('-') and (a.endswith(SRC_EXT) or (xlang and xlang != 'none')):
         srcs.append((a, xlang))
+    elif not a.startswith('-') and ld_skip:
+        # -Wl,--version-script FILE: GCC hands the linker its arguments in
+        # order, so the file is the option's argument, not an input
+        ld_skip -= 1
+        if ld_want:
+            ld_opts[ld_want].append(a); ld_want = None
     elif not a.startswith('-'):
         inputs.append(a)
     elif a in ('-rdynamic', '-export-dynamic'):

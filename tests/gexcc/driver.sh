@@ -73,4 +73,20 @@ check $? "an unused static inline function under -Werror"
 printf 'int main(void){return 0;}\n' > "$W/v.c"
 gexcc -c -o "$W/v.o" "$W/v.c" && gexcc -v -Wl,-v "$W/v.o" -o "$W/v" 2> "$W/log" && [ -s "$W/v" ]
 check $? "-v -Wl,-v on a link still links"
+# -Wl,--version-script FILE (kmod): the file is the option's, not an input
+printf 'LIB_1 { global: used; local: *; };\n' > "$W/lib.sym"
+GEXCC_SHARED=1 gexcc -shared -fPIC -Wl,--version-script "$W/lib.sym" -o "$W/libu.so" "$W/u.c" 2> "$W/log"
+check $? "-Wl,--version-script FILE with the file as its own argument"
+# a target library's -I/usr/include/DIR (tclConfig.sh) is the sysroot's
+# when the build machine has no such directory
+SR=$(gexcc -print-sysroot)
+if [ ! -e /usr/include/gexcc-driver-test ] && [ -w "$SR/usr/include" ]; then
+    mkdir -p "$SR/usr/include/gexcc-driver-test"
+    echo '#define DRIVER_TEST 3' > "$SR/usr/include/gexcc-driver-test/dt.h"
+    printf '#include <dt.h>\nint t(void){return DRIVER_TEST;}\n' > "$W/dt.c"
+    gexcc -I/usr/include/gexcc-driver-test -c -o "$W/dt.o" "$W/dt.c" 2> "$W/log"
+    r=$?
+    rm -r "$SR/usr/include/gexcc-driver-test"
+    check $r "-I/usr/include/DIR is found in the sysroot"
+fi
 exit $fail
