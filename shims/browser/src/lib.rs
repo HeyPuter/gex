@@ -5396,13 +5396,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         Some(_) => install_bundle_remote(),
         None => install_bundle(&root),
     }
+    // The interpreter's name goes through symlinks (Debian's is
+    // /lib/ld-linux-aarch64.so.1: /lib is a link, and so is the file).
     let read_file = |path: &str| -> Option<Vec<u8>> {
         use gex_kernel::vfs::FileSystem;
-        let p = path.trim_start_matches('/');
-        let f = match &shared_root {
-            Some(r) => r.open(p, 0, 0).ok()?,
-            None => root.open(p, 0, 0).ok()?,
+        let fs: &dyn FileSystem = match &shared_root {
+            Some(r) => &**r,
+            None => &*root,
         };
+        let abs = format!("/{}", path.trim_start_matches('/'));
+        let walked = fs.walk(&abs, true, "").ok()?;
+        let f = fs.open(walked.path.trim_start_matches('/'), 0, 0).ok()?;
         let len = f.metadata().ok()?.size as usize;
         let mut buf = vec![0u8; len];
         f.read_at(0, &mut buf).ok()?;

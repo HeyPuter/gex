@@ -3025,13 +3025,22 @@ impl PathIo<'_> {
             };
             Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
         } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
-            let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-            let h = self.ns.open(
-                &tmp,
-                oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
-                if mode == 0 { 0o600 } else { mode },
-            )?;
+            // A name can be taken already: one left by a gex that was
+            // killed with the descriptor open, from a process that had this
+            // pid (pids repeat from run to run). The next number, then.
+            let mut tries = 0;
+            let (tmp, h) = loop {
+                let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
+                match self.ns.open(
+                    &tmp,
+                    oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
+                    if mode == 0 { 0o600 } else { mode },
+                ) {
+                    Err(Errno::EEXIST) if tries < 256 => tries += 1,
+                    r => break (tmp, r?),
+                }
+            };
             // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
             // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
             // into place; the name is removed when the descriptor closes (see
@@ -10571,7 +10580,9 @@ impl Kernel {
 }
 
 /// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
-/// magic, a 4 GiB volume half free).
+/// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
+/// always does: glibc's `statvfs` otherwise looks the mount flags up in
+/// /proc/mounts.
 pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
@@ -10587,8 +10598,10 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     put(&mut out, 32, 1 << 19); // f_bavail
     put(&mut out, 40, 1 << 18); // f_files
     put(&mut out, 48, 1 << 17); // f_ffree
-    put(&mut out, 72, 255); // f_namelen
-    put(&mut out, 80, 4096); // f_frsize
+    // f_fsid (8 bytes) at 56
+    put(&mut out, 64, 255); // f_namelen
+    put(&mut out, 72, 4096); // f_frsize
+    put(&mut out, 80, ST_VALID); // f_flags
     if compat {
         // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
         // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
@@ -10599,12 +10612,16 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
         c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
         w32(&mut c, 56, 255);
         w32(&mut c, 60, 4096);
+        w32(&mut c, 64, ST_VALID as u32);
         m.write(buf, &c)?;
         return Ok(0);
     }
     m.write(buf, &out)?;
     Ok(0)
 }
+
+/// `struct statfs`'s `f_flags` bit saying the flags are filled in.
+const ST_VALID: u64 = 0x20;
 
 /// `sysinfo`: a constant machine (4 GiB, half free, one process).
 pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
@@ -10912,6 +10929,26 @@ fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
 mod tests {
     use super::*;
     use crate::vfs::TmpFs;
+
+    /// Linux's 64-bit `struct statfs`: seven 8-byte counts and sizes, the
+    /// 8-byte fsid, then f_namelen, f_frsize, f_flags. The name length was
+    /// one field late (in f_frsize's place), so programs saw a 4096-byte
+    /// name limit and a fragment size of 0.
+    #[test]
+    fn statfs_fields_are_where_linux_puts_them() {
+        let mut buf = vec![0u8; 0x1000];
+        statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
+        let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
+        assert_eq!(q(8), 4096, "f_bsize");
+        assert_eq!(q(56), 0, "f_fsid");
+        assert_eq!(q(64), 255, "f_namelen");
+        assert_eq!(q(72), 4096, "f_frsize");
+        assert_eq!(q(80) & ST_VALID, ST_VALID, "f_flags");
+        let mut buf = vec![0u8; 0x1000];
+        statfs(&mut GuestMem::new(&mut buf), true, 0x100).unwrap();
+        let d = |at: usize| u32::from_le_bytes(buf[0x100 + at..0x104 + at].try_into().unwrap());
+        assert_eq!((d(56), d(60), d(64) & 0x20), (255, 4096, 0x20), "i386 statfs64: f_namelen, f_frsize, f_flags");
+    }
 
     #[test]
     fn poll_skips_negative_descriptors() {
@@ -13875,6 +13912,26 @@ mod tests {
         assert!(k.vfs.metadata(&name).is_ok(), "a copy is still open");
         assert_eq!(close(&mut m, &k, copy), 0);
         assert!(k.vfs.metadata(&name).is_err(), "{name} outlived its last descriptor");
+    }
+
+    /// A leftover `.gex-tmpfile-PID-N` (a gex killed with the descriptor
+    /// open; pids repeat) does not make the next `O_TMPFILE` fail with
+    /// EEXIST: QTemporaryFile then gave up, and ksmserver with it.
+    #[test]
+    fn a_tmpfile_skips_a_name_left_behind() {
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        for n in 0..3 {
+            let left = format!("/.gex-tmpfile-{}-{}\0", k.pid, n);
+            m.write(0x20100, left.as_bytes()).unwrap();
+            let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20100, oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR, 0o600]);
+            assert!((fd as i64) >= 0, "the leftover {left}");
+        }
+        m.write(0x20000, b"/\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_TMPFILE | oflags::O_RDWR, 0o600]);
+        assert!((fd as i64) >= 0, "O_TMPFILE over leftovers: {}", fd as i64);
+        assert!(k.fds.get(fd as i32).unwrap().path.ends_with("-3"), "the first free number");
     }
 
     /// A call made through the kernel, its result.
