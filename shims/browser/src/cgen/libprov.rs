@@ -180,9 +180,11 @@ pub(crate) fn note_stray(pc: u64) {
 /// Guest pages below 4 GiB: a provider's data and code page (its data base
 /// and the guest addresses it binds are 32-bit numbers to the page).
 fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
-    use gex_kernel::mem::flags;
     let len = (size + 0xfff) & !0xfff;
-    crate::sigs::proc_home().mm().lock().mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    // Zeroed, as a guest's anonymous mapping is: a Windows space places by
+    // first fit, so the range may be one Wine's own mappings used.
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    crate::sigs::proc_home().mm().mmap_anon(&mut gm, 0, len, prot, 0, true, name).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// A forked child's copy of the mapping [`alloc_low`] made in its parent

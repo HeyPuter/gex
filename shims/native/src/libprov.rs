@@ -191,9 +191,16 @@ pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64>
 fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     use gex_kernel::mem::prot;
     let len = (size + 0xfff) & !0xfff;
-    state
-        .with_kernel(|k| k.mem.lock().mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
-        .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
+    map_anon(state, 0, len, prot::READ | prot::WRITE, 0, false, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
+}
+
+/// An anonymous mapping for the host's own use, zeroed as a guest's is
+/// (`Mm::mmap_anon`): a wine32 process places by first fit, so the range
+/// may be one Wine's own mappings used and unmapped.
+fn map_anon(state: &mut HostState, addr: u64, len: u64, prot_bits: u32, extra: u64, low: bool, name: &str) -> std::result::Result<u64, gex_kernel::Errno> {
+    let memory = state.memory.clone().ok_or(gex_kernel::Errno::EFAULT)?;
+    let mut gm = GuestMem::new(memory.bytes());
+    state.with_kernel(|k| k.mem.mmap_anon(&mut gm, addr, len, prot_bits, extra, low, name))
 }
 
 /// Data a 64-bit skeleton's export table points at (W64, Wine's PE module:
@@ -208,9 +215,7 @@ pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> 
     let len = (size + 0xffff) & !0xffff;
     let mut at = (0x1_0000_0000u64.saturating_sub(len + STEP)) & !0xffff;
     while at >= FLOOR {
-        let r = state.with_kernel(|k| {
-            k.mem.lock().mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, name)
-        });
+        let r = map_anon(state, at, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name);
         if let Ok(a) = r {
             return Ok(a);
         }
@@ -233,9 +238,7 @@ fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
         return alloc(state, CODE_PAGE, name);
     }
     use gex_kernel::mem::prot;
-    state
-        .with_kernel(|k| k.mem.lock().mmap_low(0, CODE_PAGE, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
-        .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
+    map_anon(state, 0, CODE_PAGE, prot::READ, 0, true, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
 /// [`alloc`] from the top down (`boot::alloc_private_top`): a built-in

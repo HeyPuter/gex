@@ -4054,30 +4054,8 @@ impl MapIo<'_> {
             }
             self.mem.lock().log.pin_landed.push((path, base, start));
         }
-        // Anonymous memory is defined to read as zero. Pages that already
-        // are stay untouched, so a large reservation costs no memory, and
-        // ranges known to be zero (`MemoryMap::clean`) are not even read.
-        let end = start + crate::mem::page_align_up(len);
-        // Arena the mapping had to claim is zero already: reading it to make
-        // sure faulted in every page of it (the guest's own first write then
-        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
-        // the claim took past the mapping is free arena, still zero, and
-        // known clean for the next mapping into it.
-        let mut clean_before = clean_before;
-        let fresh = self.mem.lock().take_fresh();
-        if let Some((fs, fe)) = fresh {
-            let at = clean_before.partition_point(|&(s, _)| s < fs);
-            clean_before.insert(at, (fs, fe));
-            if end < fe {
-                self.mem.lock().mark_clean(end.max(fs), fe);
-            }
-        }
-        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
-        }
-        if prot_bits & crate::mem::prot::WRITE == 0 {
-            self.mem.lock().mark_clean(start, end);
-        }
+        // Anonymous memory is defined to read as zero.
+        self.mem.zero_new(m, start, len, prot_bits, clean_before)?;
         Ok(start)
     }
 

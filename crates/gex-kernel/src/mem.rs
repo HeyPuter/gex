@@ -214,6 +214,51 @@ impl Mm {
         &self.view
     }
 
+    /// An anonymous private mapping the host makes in the guest's space for
+    /// itself (a provider's data, stack or code page), placed as a guest's
+    /// `mmap(addr, ..)` with `extra` flags would be (`low`: as
+    /// [`MemoryMap::mmap_low`]), and reading as zero, as a guest's does.
+    /// Placement can hand back addresses an earlier mapping used (a Windows
+    /// space's first fit, [`MemoryMap::set_mmap_top`]), whose bytes are
+    /// still there.
+    pub fn mmap_anon(&self, m: &mut crate::GuestMem<'_>, addr: u64, len: u64, prot_bits: u32, extra: u64, low: bool, name: &str) -> SysResult {
+        let clean_before = self.lock().clean_ranges().to_vec();
+        let _ = self.lock().take_fresh();
+        let fl = flags::PRIVATE | flags::ANONYMOUS | extra;
+        let start = if low { self.lock().mmap_low(addr, len, prot_bits, fl, name)? } else { self.lock().mmap(addr, len, prot_bits, fl, name)? };
+        self.zero_new(m, start, len, prot_bits, clean_before)?;
+        Ok(start)
+    }
+
+    /// Make the anonymous mapping just placed at `[start, start+len)` read
+    /// as zero. Pages that already are stay untouched, so a large
+    /// reservation costs no memory, and ranges known to be zero
+    /// ([`MemoryMap::clean_ranges`] before the mapping, `clean_before`) are
+    /// not even read.
+    pub(crate) fn zero_new(&self, m: &mut crate::GuestMem<'_>, start: u64, len: u64, prot_bits: u32, mut clean_before: Vec<(u64, u64)>) -> Result<(), Errno> {
+        let end = start + page_align_up(len);
+        // Arena the mapping had to claim is zero already: reading it to make
+        // sure faulted in every page of it (the guest's own first write then
+        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
+        // the claim took past the mapping is free arena, still zero, and
+        // known clean for the next mapping into it.
+        let fresh = self.lock().take_fresh();
+        if let Some((fs, fe)) = fresh {
+            let at = clean_before.partition_point(|&(s, _)| s < fs);
+            clean_before.insert(at, (fs, fe));
+            if end < fe {
+                self.lock().mark_clean(end.max(fs), fe);
+            }
+        }
+        for (a, b) in dirty_parts(&clean_before, start, end) {
+            m.zero_dirty(a, (b - a) as usize)?;
+        }
+        if prot_bits & prot::WRITE == 0 {
+            self.lock().mark_clean(start, end);
+        }
+        Ok(())
+    }
+
     /// Whether `other` is this same map (one [`Mm::shared`] the other).
     pub fn same(&self, other: &Mm) -> bool {
         std::sync::Arc::ptr_eq(&self.map, &other.map)
