@@ -1,5 +1,5 @@
 // A guest directory that outlives the page (an ejected program's saves and
-// settings), as pewasm's page keeps C:\app\locallow in IndexedDB (IDBFS).
+// settings), kept in IndexedDB.
 //
 // - `restore(db, root)`, before the program starts: the files stored last
 //   time, to lay over the bundle's.
@@ -9,7 +9,7 @@
 //
 // What a snapshot sees is whatever the program has written so far; a save
 // half-written at the instant of a snapshot is stored half-written, and the
-// next snapshot fixes it (pewasm's syncfs has the same window).
+// next snapshot fixes it (IDBFS's syncfs has the same window).
 
 import { openDb, readAll } from './persist-db.js';
 import { logOn } from '@gex/log.mjs';

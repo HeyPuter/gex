@@ -5,9 +5,7 @@
  * implementation has to survive: it creates a window and a context purely to
  * read the GL strings, destroys both, and only then creates the ones the
  * application will use -- with different attributes. Toolkits generally do
- * some version of this, and SuperTuxKart (the SDL application in these
- * images) needed a preloaded interposer for years because this library could
- * not take it.
+ * some version of this, SDL among them.
  *
  * So this program is that sequence, step by step, each step reporting what it
  * got. Everything is reached through dlopen, exactly as SDL reaches libGL:

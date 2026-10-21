@@ -48,7 +48,7 @@ EM_JS(void, gexjs_tick, (void), { Module.gexos.tick(); });
  * place the Worker blocks, and it blocks the way a guest process does: on the
  * global kernel's wake word. */
 #ifdef GEX_XWL_JSPI
-/* The single-thread build's (docs/single-thread.md): nothing may block, so the
+/* The single-thread build's: nothing may block, so the
  * wait is a promise and the server's stack suspends on it (JSPI) while the
  * guests run. */
 EM_ASYNC_JS(int, gexjs_wait, (int ms), { return await Module.gexos.wait(ms); });

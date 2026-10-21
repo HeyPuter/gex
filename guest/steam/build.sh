@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build gex-steam's libsteam_api.so (docs/games.md) for a guest.
+# Build gex-steam's libsteam_api.so for a guest.
 #
 #   guest/steam/build.sh OUT_DIR [CXX...]
 #

@@ -4,7 +4,7 @@
 //
 // The global kernel module serves a process with a 32-bit memory and one
 // with a memory64 (gex-kmem's memories 1 and 2, lazy-fetch.mjs
-// `processMemories`): a page whose processes differ -- W64's wasm32 server
+// `processMemories`): a page whose processes differ -- 64-bit Wine's wasm32 server
 // beside a 64-bit memory's loader, the X server under `?mem64=1` -- has one
 // kernel and one layout of its state. Two kernel builds, one per flavour,
 // put their statics 16 bytes apart, and whichever started second read the

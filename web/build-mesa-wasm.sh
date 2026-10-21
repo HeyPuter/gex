@@ -7,7 +7,7 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 MESA=$ROOT/third_party/mesa
 SANITIZE=${GEX_MESA_SANITIZE:-0}
-# GEX_MESA_THREADS=0: the single-thread build's Mesa (docs/single-thread.md),
+# GEX_MESA_THREADS=0: the single-thread build's Mesa,
 # without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
 # Built in its own directory and published under web/public/gex/st/, beside
 # the threaded one.
@@ -160,7 +160,7 @@ fi
 # instrumented module and never shipped, and .wasm.orig is the plain one,
 # which web/mesa-split.py splits by web/mesa-hot.txt into what the page loads
 # and a cold part (gex-wgpu-replay.deferred.wasm) it fetches the first time a
-# function there runs (docs/mesa-wasm-size.md). GEX_MESA_HOT=none ships it
+# function there runs. GEX_MESA_HOT=none ships it
 # whole; GEX_MESA_HOT=FILE splits by another list. GEX_MESA_PROFILE=1 ships
 # it whole and instrumented instead, to measure which functions a workload
 # runs (wasm-split --instrument --in-memory: a byte per function at address

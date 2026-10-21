@@ -21,7 +21,7 @@ export default defineConfig({
     fs: { allow: [fileURLToPath(new URL('..', import.meta.url))] },
   },
   preview: { headers: ISOLATED },
-  // gex-eject's feature selection (docs/eject.md, "Features"):
+  // gex-eject's feature selection (crates/gex-eject/README.md):
   // GEX_FEATURES_OFF=compositor,... builds the page without them, the code
   // behind each constant dropped from the bundle.
   define: {
