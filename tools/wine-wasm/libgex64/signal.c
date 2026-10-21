@@ -1,6 +1,6 @@
-/* libgex (wasm64, W64): running the signal frames gex-kernel leaves at a
- * syscall's return, for a program built LP64 and lowered to wasm32
- * (docs/wine-native-x64.md §1.1). The wasm32 form is ../libgex/signal.c.
+/* libgex (wasm64, 64-bit Wine): running the signal frames gex-kernel leaves at a
+ * syscall's return, for a program built LP64 and lowered to wasm32. The
+ * wasm32 form is ../libgex/signal.c.
  *
  * musl's wasm64 syscall stub calls this when the context's PC changed across
  * the syscall. The frame is x86-64's: RSP points at it (its first word is

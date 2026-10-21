@@ -33,7 +33,7 @@ const [
   shared = '1',
   maxPages = GUEST_MAX_PAGES,
   // `64`: a memory64 (limits flag 0x04), for processes with a 64-bit guest
-  // memory (docs/mem64.md step 6).
+  // memory.
   index = '32',
 ] = process.argv.slice(2);
 if (!inPath || !outPath) {

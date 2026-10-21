@@ -1,4 +1,4 @@
-# W3: Wine's own Unix side as wasm32 on gex (docs/wine-native.md), built
+# 32-bit Wine: Wine's own Unix side as wasm32 on gex, built
 # reproducibly from the pins in w3.pins.
 #
 #   make -C tools/wine-wasm            the dist and the game-ready prefix
@@ -7,7 +7,7 @@
 #   make -C tools/wine-wasm prefix-null  the same with the null driver (tests)
 #   make -C tools/wine-wasm paths      print where they are (KEY=path lines)
 #   make -C tools/wine-wasm build      the configured wasm32 build tree alone
-#                                      (W3_BUILD: W64's wineserver, w64-dist.sh)
+#                                      (W3_BUILD: 64-bit Wine's wineserver, w64-dist.sh)
 #   tools/wine-wasm/run.sh EXE [args]  run a Windows program on them (run.sh -h)
 #
 # Every output lives in W3_CACHE under a directory named by what it is built
@@ -83,7 +83,7 @@ BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
 TOOLS_KEY := $(call h,$(filter-out %/local.mk %/w3.pins %/run.sh %/w3/units.sh,$(wildcard $(W3)/*.py $(W3)/*.sh $(W3)/*.txt $(W3)/*.reg $(W3)/wcc $(W3)/w3/*.sh)),8)
 # W3_TLS=0: the loader without GnuTLS (crypt32's and schannel's dlopen of it
 # then fails, as on a host without it), 1.8 MB less wasm, for a site that
-# never speaks https (Paint). The Wine build is the same either way.
+# never speaks https. The Wine build is the same either way.
 W3_TLS ?= 1
 export W3_TLS
 # W3_MONO=0: no Wine Mono in the dist (.NET programs then fail to start,

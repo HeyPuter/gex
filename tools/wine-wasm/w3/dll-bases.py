@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Pinned DLL addresses for a W3 bundle: its prefix's dll-bases file, which
+"""Pinned DLL addresses for a 32-bit Wine bundle: its prefix's dll-bases file, which
 Wine's server reads (server/mapping.c, "ADDRESS UNIXPATH" lines) to place
 each named image, relocated if need be, at that address.
 
-In the browser a W3 process's memory grows only as high as it is used (the
-compact space, docs/wine-native.md §3.19), and gex keeps
+In the browser a 32-bit Wine process's memory grows only as high as it is used (the
+compact space), and gex keeps
 [0x11000000, 0x20000000) as an island for these pins. An image left at its
 own base (w3-bases.txt puts the dist's DLLs at 0x20000000-0x7b000000) is
 mapped wherever the shim's heap may already sit once the arena's cursor has

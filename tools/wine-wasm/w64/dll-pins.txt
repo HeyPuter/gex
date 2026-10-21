@@ -1,11 +1,11 @@
-# W64's pinned builtins (tools/wine-wasm/w64/dll-bases.py), in the order
+# 64-bit Wine's pinned builtins (tools/wine-wasm/w64/dll-bases.py), in the order
 # their band addresses are handed out. APPEND ONLY: an entry's address is
 # the sum of the sizes before it, and a function-tier unit is keyed by it.
 # Left out: the native PE core (ntdll, kernel32, kernelbase, msvcrt,
 # ucrtbase, winewayland.drv: compiled, not translated), programs, and
 # resource-only DLLs (tzres, normaliz: no relocations, no code).
-# The first list is what Dicey Dungeons, Geometry Dash and Hyper Light
-# Drifter load (page runs, 2026-10-18), in the order they first load it.
+# The first list is what three games' page runs load, in the order they
+# first load it.
 advapi32.dll
 sechost.dll
 rpcrt4.dll

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the LLP64 plugin and its macro header (docs/wine-native-x64.md §1.2).
+# Build the LLP64 plugin and its macro header.
 #   tools/wine-wasm/llp64/build.sh OUT_DIR  -> OUT_DIR/GexLLP64.so, OUT_DIR/llp64.h
 # clang's C++ headers (libclang-NN-dev) are not installed on our hosts: with no
 # CLANG_DEV_INCLUDE, the matching Debian package is fetched once (apt-get

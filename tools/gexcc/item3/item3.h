@@ -1,4 +1,4 @@
-/* An LP64 wasm library under an aarch64 guest program (docs/gexcc.md §7.8):
+/* An LP64 wasm library under an aarch64 guest program:
  * the guest's registers, read and written by an export's adapter, a gex
  * F_body bound at the arm64 export's address (shim cgen/libprov.rs). */
 #ifndef ITEM3_H

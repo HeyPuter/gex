@@ -1,5 +1,5 @@
 /* The C runtime an LP64 wasm library needs in place of an aarch64
- * program's (zlib, zstd; docs/gexcc.md §7.8): malloc and friends over the provider heap
+ * program's (zlib, zstd): malloc and friends over the provider heap
  * (gex.provider_alloc: fresh guest pages), the mem* functions, and the
  * adapters every replaced library has (missing exports, constructors). */
 #include "item3.h"

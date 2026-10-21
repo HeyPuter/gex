@@ -1,11 +1,10 @@
 # config.site for gexcc (CONFIG_SITE): configure in cross mode (--build
 # given) runs none of the programs it builds, so it guesses what they would
 # have found. These are the answers gnulib's and autoconf's run-time checks
-# gave on gex itself (measured 2026-10-07, natively, gex at merge/gexcc
-# 24be3714, musl gex-wasm32-slim). A "no" makes gnulib use its own
+# gave on gex itself (natively, musl gex-wasm32-slim). A "no" makes gnulib use its own
 # replacement, which is always safe; several are gex gaps being fixed
-# (trailing slashes, select's EBADF, getgroups, sigaltstack), see
-# docs/gexcc.md. Regenerate: tests/gexcc/corpus/config-site.sh.
+# (trailing slashes, select's EBADF, getgroups, sigaltstack). Regenerate:
+# tests/gexcc/corpus/config-site.sh.
 ac_cv_func_chown_works=${ac_cv_func_chown_works=yes}
 ac_cv_func_getgroups_works=${ac_cv_func_getgroups_works=yes}
 ac_cv_func_malloc_0_nonnull=${ac_cv_func_malloc_0_nonnull=yes}

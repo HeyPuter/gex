@@ -6,7 +6,7 @@
 
 PLAIN.wasm is the profiling build's module before instrumentation; each LOG
 holds the `[gex-wgpu] mesa-profile N HITS BASE64` lines the instrumented one
-printed while a workload ran (docs/mesa-wasm-size.md, "Measuring"). A
+printed while a workload ran ("Measuring"). A
 function is hot if any LOG saw it run. The margin adds what a hot function
 calls directly when it is at most --callee-max bytes (default 1024): the
 error and edge paths a hot function reaches on another workload's input.

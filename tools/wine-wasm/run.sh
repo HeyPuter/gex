@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run a Windows program on W3 (Wine's own Unix side as wasm32 on gex) with the
+# Run a Windows program on 32-bit Wine (Wine's own Unix side as wasm32 on gex) with the
 # dist and prefix `make -C tools/wine-wasm` builds, natively under gexc.
 #
 #   tools/wine-wasm/run.sh [options] EXE [ARGS...]
@@ -21,7 +21,7 @@
 # prints the program's output, "unitless:" lines and an "== w3 page:" result
 # (w3/page-run.mjs). With --build-units the unitless images' units are built
 # afterwards (w3/units.sh) for the next run: the page builds none itself.
-# W3_PAGE_DIR defaults to W3_CACHE/page; for BENCH_HOST=worldmachine it and the
+# W3_PAGE_DIR defaults to W3_CACHE/page; for a remote BENCH_HOST it and the
 # unit cache must be under ~/gex-sandbox (bench.sh maps only those paths).
 #
 # Options:

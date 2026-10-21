@@ -1,4 +1,4 @@
-// A Windows program on W3 in the page (web/nt.html, x86 shim, gl=1 on Mesa's
+// A Windows program on 32-bit Wine in the page (web/nt.html, x86 shim, gl=1 on Mesa's
 // gex_wgpu driver), the bench-box half of `tools/wine-wasm/run.sh --page`.
 //
 //   node tools/wine-wasm/w3/page-run.mjs TREE SECS EXE [ARGS...]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gexcc / gexc++: a C/C++ compiler for gex's wasm32 Linux target (docs/gexcc.md).
+"""gexcc / gexc++: a C/C++ compiler for gex's wasm32 Linux target.
 
 Used like gcc or clang. Compiles with clang --target=wasm32-unknown-linux-musl
 against the gexcc sysroot (musl with gex's wasm32 arch, libgex, compiler-rt).
@@ -76,7 +76,7 @@ BASE = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a
 BASE += ['-mllvm', '-wasm-enable-eh']
 # Default visibility, as on ELF (clang's wasm default is hidden): a library
 # built shared exports what it would on Linux, and a static build is the
-# same code (docs/gexcc.md 7.3, pie-dv). A later -fvisibility= wins.
+# same code. A later -fvisibility= wins.
 BASE += ['-fvisibility=default']
 if CXX:
     BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
@@ -397,7 +397,7 @@ opt = os.path.join(SYSROOT, 'binaryen', 'bin', 'wasm-opt')
 feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
          '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
 
-# --- shared libraries (GEXCC_SHARED=1, docs/gexcc.md §7) -------------------
+# --- shared libraries (GEXCC_SHARED=1) -------------------
 # -shared writes a wasm side module (dylink.0) and a program links against
 # them; gex's loader binds them at run time. -static, or GEXCC_SHARED unset,
 # keeps the static way above.

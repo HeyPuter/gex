@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Pinned DLL addresses for a W64 prefix: its dll-bases file, which W64
+"""Pinned DLL addresses for a 64-bit Wine prefix: its dll-bases file, which 64-bit Wine
 Wine's server reads (server/mapping.c, pinned_map_address: "ADDRESS
 UNIXPATH" lines) to give each named image that address in every process.
 
-W64 runs x86-64 code lowered to wasm32 (docs/wine-native-x64.md), in a 4 GiB
+64-bit Wine runs x86-64 code lowered to wasm32, in a 4 GiB
 space whose code half ends at 0x7fff0000. The x86_64 builtins' own bases
 (0x170000000, 0x180000000) are beyond it, so without pins each process put
 each builtin top-down in the order it loaded them: an image's address
 differed between the processes of one run and between runs, and a
 function-tier unit, keyed by the image and its base, missed. The DLLs go
 in [0x11000000, 0x20000000), the island gex's browser shim keeps clear of
-its own heap in every Wine process (nt.rs, keep_exe_slot: W3's band too;
+its own heap in every Wine process (nt.rs, keep_exe_slot: 32-bit Wine's band too;
 at 0x60000000 the shim's heap had reached them in a game's process),
 bottom-up, each at its size rounded to 64 KiB plus a 64 KiB gap, in the
 order given. Keep the list's order stable and only append to it

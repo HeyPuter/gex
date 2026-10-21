@@ -5,8 +5,8 @@
 #
 # Machine-wide slots: every program started from the host is a whole gexc
 # (wasmtime, large reservations, ~27 threads). A configure script or a
-# `make check` on the host starts thousands; many at once took a 24-thread
-# machine down (2026-10-07). So at most GEXCC_SLOTS (default 4) run at
+# `make check` on the host starts thousands, and many at once can take a
+# machine down. So at most GEXCC_SLOTS (default 4) run at
 # once, per user: each holds an flock on one slot file for its lifetime and
 # the rest wait. Programs a gexc's guest execs stay inside that gexc and
 # take no slot. GEXCC_SLOTS=0 turns the limit off.
