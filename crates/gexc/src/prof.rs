@@ -1,5 +1,5 @@
 //! `GEX_PROF=<file>`: a flat CPU profile of the whole process, for
-//! attributing time without `perf` (docs/noita-perf.md).
+//! attributing time without `perf`.
 //!
 //! `ITIMER_PROF` delivers SIGPROF to whichever thread is burning CPU, every
 //! millisecond of process CPU time; the handler records the interrupted PC
