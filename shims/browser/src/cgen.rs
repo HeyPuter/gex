@@ -550,6 +550,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
     if !on() {
         return false;
     }
+    w3_trampolines(!pe.is64);
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
     if !w3_matches(&image, base, pe, true) {
         w3_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())) });
@@ -618,6 +619,23 @@ fn w3_forget(base: u64, size: u64) {
     }
 }
 
+/// The trampoline page's unit (and, for i386, its unix-call provider:
+/// [`place`]) for a W3 process, with the first image it places: the page is
+/// in memory from the start, and Wine's unix calls and syscalls all go
+/// through it. Once per address space; a page that is not the one the unit
+/// was built from keeps to the other tiers ([`place`] says so).
+fn w3_trampolines(class32: bool) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
+    place(&image, "[the trampolines]", image.bias, true, None);
+    if crate::tracing() {
+        crate::stderr_line(&format!("gex-cgen: the trampolines' unit wanted ({}-bit)\n", if class32 { 32 } else { 64 }));
+    }
+}
+
 /// Whether the mapped code is `image`'s.
 /// At the mapping (`at_map`) every byte counts, the import slots too: until
 /// the loader has filled them (and put back the protection it lifts to do
@@ -660,6 +678,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
             }
         },
     };
+    w3_trampolines(!pe.is64);
     let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
     if !w3_matches(&image, d.base, &pe, false) {
         crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
@@ -1788,15 +1807,27 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
         }
-        // Published by another Worker and not yet installed here: catch up,
-        // then call it, as the lookup would have (leaving would lose the
-        // frames that called here).
+        // The first call into a W3 image left unplaced at its mapping
+        // (`w3_miss`; native Wine calls a DLL's entry point straight after
+        // mapping it): its unit is placed now and served below.
+        let placed = w3_miss(t);
+        // Published by another Worker and not yet installed here (or just
+        // placed): catch up, then call it, as the lookup would have (leaving
+        // would lose the frames that called here).
+        if placed {
+            crate::nt::serve_now();
+        }
         if let Some(idx) = ftab(|m| m.get(t).map(|f| f.idx)) {
             crate::nt::serve_now();
             CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
             // SAFETY: a host import taking scalars; nothing here holds a lock.
             return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
         }
+    }
+    // The awaited return itself, reached with the stack moved (below): leave
+    // before an AOT-only run would stop at it.
+    if !crate::jit_on() && t == ret as u64 {
+        return gex_abi::ftab::RET_LEFT;
     }
     if !crate::jit_on() {
         let path = lock(&UNITS)

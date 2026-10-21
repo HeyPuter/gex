@@ -7345,7 +7345,7 @@ pub extern "C" fn gex_set_trace(on: i32) {
     unsafe { TRACE = on != 0 };
 }
 
-fn tracing() -> bool {
+pub(crate) fn tracing() -> bool {
     unsafe { TRACE }
 }
 
@@ -14854,6 +14854,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
+    }
+    // AOT-only: native Wine's return pad with no call-out waiting for it, a
+    // function body native Wine called directly returning there with its
+    // stack moved. The bodies leave, and the native caller goes on from the
+    // pad (gexrt's `run_until`), as after any body that leaves.
+    if aot() && pc == gex_kernel::win::tramp::NATIVE_RETURN_PAD && !no_leave {
+        miss_way(pc, 3);
+        return gex_emit::module::DISPATCH_MISS_LEAVE;
     }
     // A block this process has (the slot names it in `blocks`) that this
     // Worker has not instantiated: JavaScript catches up, then the dispatch
