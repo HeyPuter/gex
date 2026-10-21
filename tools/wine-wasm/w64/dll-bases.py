@@ -100,7 +100,8 @@ def check(path):
     bad = []
     prev = None
     for n, line in enumerate(open(path), 1):
-        f = line.split()
+        # the path is the rest of the line (a unix path may hold spaces)
+        f = line.rstrip().split(None, 1)
         if len(f) != 2:
             continue
         a = int(f[0], 16)
