@@ -2744,6 +2744,20 @@ pub extern "C" fn k_fs_close(handle: i32) {
 #[no_mangle]
 pub extern "C" fn k_fs_read(handle: i32, offset: u64, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
+    // Straight from the file's bytes where the filesystem has them: a
+    // buffer here was an allocation, a zeroing and a copy more per read
+    // (a shared mapping reads its whole range at every `mmap`).
+    let mut push = |b: &[u8]| {
+        if !b.is_empty() {
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+        }
+    };
+    if let Some(r) = h.read_with(offset, len as usize, &mut push) {
+        return match r {
+            Ok(n) => n as i32,
+            Err(e) => -e.0,
+        };
+    }
     let mut buf = vec![0u8; len as usize];
     match h.read_at(offset, &mut buf) {
         Ok(n) => {
@@ -2789,7 +2803,7 @@ pub extern "C" fn k_fs_meta(handle: i32, at: gex_kmem::PAddr) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     match h.metadata() {
         Ok(m) => {
-            let b = remote::encode_meta(&m);
+            let b = remote::encode_meta(&m, h.changes());
             unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             0
         }
@@ -2881,7 +2895,7 @@ pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
 pub extern "C" fn k_fs_path_meta(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr) -> i32 {
     match with_path(path, path_len, true, |p| rootfs().metadata(p)) {
         Ok(m) => {
-            let b = remote::encode_meta(&m);
+            let b = remote::encode_meta(&m, 0);
             unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             0
         }
@@ -2947,7 +2961,7 @@ pub extern "C" fn k_fs_walk_meta(path: gex_kmem::PAddr, path_len: u32, mounts: g
     let r = with_path(path, path_len, false, |abs| with_path(mounts, mounts_len, false, |mounts| rootfs().walk_metadata(abs, mounts)));
     match r {
         Ok(Some(m)) => {
-            let b = remote::encode_meta(&m);
+            let b = remote::encode_meta(&m, 0);
             unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             0
         }

@@ -153,11 +153,13 @@ pub fn time_of(s: i64, ns: u32) -> Option<(i64, u32)> {
 
 /// Serialised [`Metadata`] size. Both modules compile this file so they agree,
 /// but they are separate wasm artefacts -- a change here means rebuilding both.
-pub const META_BYTES: usize = 64;
+pub const META_BYTES: usize = 72;
 
-/// `Metadata` as bytes, in the one layout both modules read.
-pub fn encode_meta(m: &Metadata) -> [u8; META_BYTES] {
+/// `Metadata` as bytes, in the one layout both modules read, and the
+/// handle's [`FileHandle::changes`] (0 for a path's metadata).
+pub fn encode_meta(m: &Metadata, changes: u64) -> [u8; META_BYTES] {
     let mut out = [0u8; META_BYTES];
+    out[64..72].copy_from_slice(&changes.to_le_bytes());
     out[0..4].copy_from_slice(&(file_type_code(m.file_type)).to_le_bytes());
     out[4..8].copy_from_slice(&m.mode.to_le_bytes());
     out[8..16].copy_from_slice(&m.size.to_le_bytes());
@@ -491,6 +493,16 @@ impl FileHandle for RemoteHandle {
         let mut buf = [0u8; META_BYTES];
         ok((self.remote.meta)(self.id, buf.as_mut_ptr() as crate::PAddr))?;
         Ok(decode_meta(&buf))
+    }
+
+    fn changes(&self) -> u64 {
+        self.metadata_changes().map_or(0, |(_, c)| c)
+    }
+
+    fn metadata_changes(&self) -> Result<(Metadata, u64), Errno> {
+        let mut buf = [0u8; META_BYTES];
+        ok((self.remote.meta)(self.id, buf.as_mut_ptr() as crate::PAddr))?;
+        Ok((decode_meta(&buf), u64::from_le_bytes(buf[64..72].try_into().unwrap())))
     }
 
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
