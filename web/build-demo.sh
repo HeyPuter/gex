@@ -67,8 +67,7 @@ fi
 # -- 2b. the guest's GL marshallers (glibc, arm64) ------------------------------
 # For the gears item: libGL/libEGL/libGLESv2 that marshal to the page's Mesa
 # (guest/gl). A cross gcc when there is one, else zig cc for aarch64 glibc.
-# The tracked ones in web/public/fs/glibc are used as they are; they are built
-# only when missing (rebuild them with guest/gl/build.sh when the protocol moves).
+# web/build-assets.sh makes them; they are built here only when missing.
 if ! [ -f "$PUB/fs/glibc/libGL.so.1" -a -f "$PUB/fs/glibc/libEGL.so.1" -a -f "$PUB/fs/glibc/libGLESv2.so.2" ]; then
     GL_CC=${GEX_GL_CC:-$(command -v aarch64-linux-gnu-gcc || true)}
     if [ -z "$GL_CC" ] && [ -x "$HOME/toolchains/zig/zig" ]; then
