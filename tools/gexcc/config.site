@@ -20,6 +20,10 @@ if test -z "$host_alias" && test -n "$DEB_HOST_GNU_TYPE" && test "$DEB_HOST_GNU_
     test -n "$build_alias" || build_alias=$DEB_BUILD_GNU_TYPE ;;
   esac
 fi
+# "whether system is ELF" (gpm and other old configure scripts, testing
+# __ELF__) asks whether -shared -Wl,-soname builds a shared library: on
+# gexcc it does (a wasm side module), though the object format is not ELF
+itz_cv_sys_elf=${itz_cv_sys_elf=yes}
 ac_cv_func_chown_works=${ac_cv_func_chown_works=yes}
 ac_cv_func_getgroups_works=${ac_cv_func_getgroups_works=yes}
 ac_cv_func_malloc_0_nonnull=${ac_cv_func_malloc_0_nonnull=yes}

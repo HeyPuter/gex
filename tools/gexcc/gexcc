@@ -29,6 +29,12 @@ import atexit, os, re, shutil, subprocess, sys, tempfile
 
 TRIPLE = 'wasm32-unknown-linux-musl'
 me = os.path.realpath(__file__)
+# The compiler, linker and binaryen are build-machine programs: a build that
+# points LD_LIBRARY_PATH (or LD_PRELOAD) at the target libraries it just made
+# (ncurses' tests, libtool's wrappers) must not hand them to the host's
+# loader, which stops at a wasm file ("invalid ELF header")
+for v in ('LD_LIBRARY_PATH', 'LD_PRELOAD'):
+    os.environ.pop(v, None)
 PREFIX = os.path.dirname(os.path.dirname(me))
 LIBDIR = os.path.join(PREFIX, 'lib', 'gexcc')
 SYSROOT = os.environ.get('GEXCC_SYSROOT') or os.path.join(PREFIX, 'sysroot')
@@ -173,7 +179,8 @@ LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--version-script|
                      r'--copy-dt-needed-entries|-Bdynamic|-Bstatic|--eh-frame-hdr|--icf|-x|-X|--discard-all|'
                      r'--discard-locals|--fatal-warnings|--warn-shared-textrel|--no-relax|--relax|--push-state|'
                      r'--pop-state|-dynamic-linker|--dynamic-linker|--allow-shlib-undefined|--exclude-libs|'
-                     r'--undefined-version|--no-undefined-version|-nostdlib)(=.*)?$')
+                     r'--undefined-version|--no-undefined-version|-nostdlib|-stats|--stats|--no-keep-memory|'
+                     r'--reduce-memory-overheads)(=.*)?$')
 LD_ARG = {'-rpath', '-rpath-link', '-soname', '-h', '--version-script', '-z', '--sort-section', '--dynamic-list',
           '-dynamic-linker', '--dynamic-linker', '--exclude-libs'}
 
@@ -231,6 +238,10 @@ while i < len(args):
                 k += 1; continue
             if p in ('-E', '--export-dynamic'):
                 export_dynamic = True
+            # a library named to the linker (-Wl,-lc) is an input like any
+            # other, found the same way
+            if p.startswith('-l') and len(p) > 2:
+                inputs.append(p); k += 1; continue
             if LD_DROP.match(p):
                 k += 1; continue
             ld_flags.append(p); k += 1
@@ -546,6 +557,44 @@ def finish_shared(wasm, sos, lib):
             die('gex-dylink section failed')
 
 
+WASM_C = {'i32': 'int', 'i64': 'long long', 'f32': 'float', 'f64': 'double'}
+
+
+def link_shared(cmd):
+    """wasm-ld for a shared-mode link. A function an object declares with
+    one type and a side module defines with another stops wasm-ld, where an
+    ELF link (which knows no types) goes through: configure's link tests
+    declare `char f(void)` for every function they look for. As wasm-ld
+    does for a static library's function of the wrong type, the link gets
+    a stub of the object's type that traps when called, with a warning."""
+    stubs = []
+    for _ in range(64):
+        # (first: a definition the side module's then meets defined)
+        p = subprocess.run(cmd[:1] + stubs + cmd[1:], capture_output=True, text=True)
+        if p.returncode == 0:
+            sys.stderr.write(p.stderr)
+            return 0
+        found = re.findall(r'function signature mismatch: (\S+)\n>>> defined as \(([^)]*)\) -> (\S+) in (\S+)\n'
+                           r'>>> defined as \([^)]*\) -> \S+ in (\S+)', p.stderr)
+        found = [f for f in found if '/sonames/' in f[4] or is_wasm_so(f[4])]
+        if not found:
+            sys.stderr.write(p.stderr)
+            return p.returncode
+        for name, params, ret, _, so in found:
+            c = os.path.join(tmp, 'mismatch-%d.c' % len(stubs))
+            args = ', '.join('%s a%d' % (WASM_C[t.strip()], i) for i, t in enumerate(params.split(',')) if t.strip())
+            open(c, 'w').write('%s %s(%s) { __builtin_trap(); }\n' % (WASM_C.get(ret, 'void'), name, args or 'void'))
+            o = c[:-2] + '.o'
+            if subprocess.call(['clang', '--target=' + TRIPLE, '-fPIC', '-c', '-w', '-fno-builtin', '-o', o, c]
+                               + [a for a in BASE if a.startswith('-m') and a != '-mllvm']):
+                sys.stderr.write(p.stderr)
+                return p.returncode
+            sys.stderr.write('gexcc: warning: %s is declared (%s) -> %s but %s defines another type: '
+                             'calls to it trap\n' % (name, params, ret, os.path.basename(so)))
+            stubs.append(o)
+    return 1
+
+
 LDC_SHARED = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296']
 
 
@@ -572,7 +621,7 @@ if shared and SHARED:
         pre += shared_undef()
     wasm = os.path.join(tmp, 'out.so')
     sos = by_soname(ins + tail)
-    r = run(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm]
+    r = link_shared(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm]
             + ['--rpath=' + x for x in ld_opts['rpath']] + objs + pre + sos + ld_flags)
     if r:
         sys.exit(r)
@@ -663,7 +712,7 @@ if SHARED:
         exp.append('--export-dynamic')
     cmd = LDC_SHARED + ['-pie', '--no-entry', '-o', wasm] + exp + ['--rpath=' + x for x in ld_opts['rpath']] \
         + crt + objs + [os.path.join(LIBDIR, 'dso.o')] + sos + ld_flags + shared_undef()
-    r = run(cmd)
+    r = link_shared(cmd)
     if r:
         sys.exit(r)
     finish_shared(wasm, sos, False)
