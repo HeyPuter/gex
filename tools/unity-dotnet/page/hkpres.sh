@@ -1,3 +1,0 @@
-#!/bin/bash
-# presents/s over the 602-692 s window of each run log: hkpres.sh eruns/hgNN.out...
-for f; do awk -v f="$f" '/\[nt-browser\] 602 s: presents/{a=$5+0} /\[nt-browser\] 692 s: presents/{b=$5+0} END{if(a&&b) printf "%s: presents %d -> %d, %.2f/s over 602-692 s\n",f,a,b,(b-a)/90; else print f": window missing"}' "$f"; done

@@ -144,58 +144,58 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
     mkdir -p "$PUB/fs" "$WORK/glinc"
     "$ROOT/guest/gl/build.sh" "$WORK/gldriver" >/dev/null
     cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
-    "$CC" -O2 -o "$PUB/fs/gles-gears" "$ROOT/tests/integration/programs/gles-gears.c" \
+    "$CC" -O2 -o "$PUB/fs/gles-gears" "$ROOT/guest/gl/probes/gles-gears.c" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-uniform-probe" \
-        "$ROOT/tests/integration/programs/gl44-uniform-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-uniform-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-state-probe" \
-        "$ROOT/tests/integration/programs/gl44-state-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-state-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-clear-probe" \
-        "$ROOT/tests/integration/programs/gl44-clear-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-clear-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-msaa-blit-probe" \
-        "$ROOT/tests/integration/programs/gl44-msaa-blit-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-msaa-blit-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-msaa-depth-blit-probe" \
-        "$ROOT/tests/integration/programs/gl44-msaa-depth-blit-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-msaa-depth-blit-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-indirect-probe" \
-        "$ROOT/tests/integration/programs/gl44-indirect-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-indirect-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-reflection-probe" \
-        "$ROOT/tests/integration/programs/gl44-reflection-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-reflection-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-indexed-probe" \
-        "$ROOT/tests/integration/programs/gl44-indexed-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-indexed-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-compute-probe" \
-        "$ROOT/tests/integration/programs/gl44-compute-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-compute-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl43-msvo-probe" \
-        "$ROOT/tests/integration/programs/gl43-msvo-probe.c" \
+        "$ROOT/guest/gl/probes/gl43-msvo-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-persistent-probe" \
-        "$ROOT/tests/integration/programs/gl44-persistent-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-persistent-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-texture-sampler-probe" \
-        "$ROOT/tests/integration/programs/gl44-texture-sampler-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-texture-sampler-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-integer-texture-probe" \
-        "$ROOT/tests/integration/programs/gl44-integer-texture-probe.c" \
+        "$ROOT/guest/gl/probes/gl44-integer-texture-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     cp "$WORK/gldriver/libGLESv2.so.2" "$WORK/gldriver/libEGL.so.1" "$PUB/fs/"
@@ -251,7 +251,7 @@ if [ -x "$X86_CC" ] && [ -d /usr/include/GLES2 ]; then
     mkdir -p "$PUB/fs/x86" "$WORK/glinc"
     GEX_CC="$X86_CC" "$ROOT/guest/gl/build.sh" "$WORK/gldriver-x86" >/dev/null
     cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
-    "$X86_CC" -O2 -o "$PUB/fs/x86/gles-gears" "$ROOT/tests/integration/programs/gles-gears.c" \
+    "$X86_CC" -O2 -o "$PUB/fs/x86/gles-gears" "$ROOT/guest/gl/probes/gles-gears.c" \
         -I "$WORK/glinc" -L "$WORK/gldriver-x86" -lEGL -lGLESv2 -lm
     cp "$WORK/gldriver-x86/libGLESv2.so.2" "$WORK/gldriver-x86/libEGL.so.1" "$PUB/fs/x86/"
     cp "$X86_TOOLCHAIN/x86_64-linux-musl/lib/libc.so" "$PUB/fs/x86/ld-musl-x86_64.so.1"

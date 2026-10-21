@@ -53,7 +53,7 @@ cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/include/" 2>/d
 
 echo "== building the gears for aarch64"
 "$CC" -O2 -o "$WORK/root/gears" \
-    "$ROOT/tests/integration/programs/gles-gears.c" \
+    "$ROOT/guest/gl/probes/gles-gears.c" \
     -I "$WORK/include" -L "$WORK/driver" -lEGL -lGLESv2 -lm
 
 echo "== running under gex"

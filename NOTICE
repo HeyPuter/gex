@@ -24,9 +24,6 @@ tools/wine-wasm/w3/oss/sys/soundcard.h
     FreeBSD's sys/soundcard.h (OSSv4 API), Copyright Hannu Savolainen,
     4Front Technologies, Luigi Rizzo and others. BSD-2-Clause (in the file).
 
-tools/gexcc/bench-codegen/src/a64/memcpy.S, memset.S
-    Arm Optimized Routines, Copyright (c) 2012-2020 Arm Limited. MIT licence.
-
 web/eject-site/vendor/zstddec-stream.mjs
     zstddec, Copyright (c) 2020 Don McCurdy. MIT licence
     (web/eject-site/vendor/zstddec-LICENSE).

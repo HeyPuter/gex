@@ -170,7 +170,8 @@ step_em-native() {
 }
 
 step_em-smoke() {
-	exec "$UD/../../tests/unity-dotnet/smoke/run.sh" "$OUT"
+	# The smoke test lives in gexdev (GEXDEV: a gexdev checkout).
+	exec "${GEXDEV:?set GEXDEV to a gexdev checkout}/tests/unity-dotnet/smoke/run.sh" "$OUT"
 }
 
 for s in $STEPS; do

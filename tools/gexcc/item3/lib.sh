@@ -13,7 +13,7 @@ lib_setup() {
     RT_SRCS="a64call.c rtmusl.c"
     LIBS="$A64_SYSROOT/lib/libc.a $A64_SYSROOT/lib/libclang_rt.builtins-wasm64.a"
   else
-    CF="$A64W_CFLAGS -ffreestanding -nostdinc -isystem $res -isystem $h/../bench-codegen/src/inc -w"
+    CF="$A64W_CFLAGS -ffreestanding -nostdinc -isystem $res -isystem $h/inc -w"
     RT_SRCS="a64call.c rt.c"
     LIBS=
   fi

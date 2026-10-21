@@ -1,1 +1,0 @@
-../x86-programs/sig-pause.c

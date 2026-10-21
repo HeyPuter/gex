@@ -1,4 +1,0 @@
-HOME_SEED for tests/games/muck-dotnet.sh with Hollow Knight: Unity PlayerPrefs that say the
-language was chosen (GameLangSet=1, M2H_lastLanguage=EN), so the first-run language screen
-is skipped. Unity's graphics start-up opens PlayerPrefs before it knows the company and
-product names (unity3d/unknown/unknown) and keeps that file, so the prefs are in both places.

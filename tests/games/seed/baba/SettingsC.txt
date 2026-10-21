@@ -1,7 +1,0 @@
-[settings]
-grid=0
-delay=10
-fullscreen=0
-sound=100
-music=70
-init=1

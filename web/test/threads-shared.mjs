@@ -37,7 +37,7 @@ for (const p of [SHIM, SEED]) {
 // joins it (`Jit::ever_threaded`), then runs code it has not run before.
 const [elfPath] = process.argv.slice(2);
 if (!elfPath || !existsSync(elfPath)) {
-  console.log('skip threads-shared: give it tests/integration/programs/threads-shared.c, built static for aarch64');
+  console.log('skip threads-shared: give it gexdev tests/integration/programs/threads-shared.c, built static for aarch64');
   process.exit(0);
 }
 
