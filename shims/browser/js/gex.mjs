@@ -19,9 +19,14 @@ import { logOn, logQuiet } from "./log.mjs";
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
 /** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
- *  process with one Worker, and for one with threads. */
+ *  process with one Worker, and for one with threads. Room is only how soon
+ *  a Worker must grow again: an index past a running Worker's table never
+ *  enters the probe cache (cgen.rs `fcache_publish`), so a short table costs
+ *  a `lookup`, never a trap. Every entry is held per Worker in the
+ *  renderer's trusted range, which all its isolates share (1 GiB), so the
+ *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
-const FTAB_SPARE_THREADED = 65536;
+const FTAB_SPARE_THREADED = 8192;
 /** Tests only (tests/w3/ftabstale.sh): both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
@@ -4072,7 +4077,10 @@ export class Gex {
     for (;;) {
       const want = size + this.#ftabSpare;
       const have = Number(st.ftab.length);
-      if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
+      if (have < want) {
+        st.ftab.grow(tIdx(want - have), st.resolve);
+        this.#tallyTables('ftab grew');
+      }
       // Counted for the probe cache's indices at this length (cgen.rs
       // `gex_ftab_enter`); again if another Worker allocated meanwhile.
       if (!e.gex_ftab_enter) return;
@@ -6505,6 +6513,7 @@ export class Gex {
           `dispatch table ${i} would not grow from ${tables[i].length} to ${want}: ${err.message}`,
         );
       }
+      this.#tallyTables(`dispatch${i} grew`);
     }
     return tables;
   }
@@ -6530,6 +6539,7 @@ export class Gex {
       try {
         growTable(tables[i], need - tables[i].length, stub, i);
         grew = true;
+        this.#tallyTables(`dispatch${i} grew to the claimed`);
       } catch {
         /* a table that will not grow is reported by the caller's retry cap */
       }
@@ -7904,6 +7914,7 @@ export class Gex {
     if (delta <= 0) return;
     const g0 = performance.now();
     growTable(tables[t], delta, stub, t);
+    this.#tallyTables(`dispatch${t} grew`);
     this.#pubGrewSlots += delta;
     this.#pubGrowMs += performance.now() - g0;
   }
@@ -8472,11 +8483,56 @@ export class Gex {
     const need = this.#shim.exports.gex_dense_size() >>> 0;
     const len = b.length;
     if (len >= need) return false;
-    const want = Math.max(need, Math.min(len * 2, len + (1 << 18)));
+    // An eighth over what is numbered (4096 entries at least), not double:
+    // each entry is per Worker in the renderer's trusted range, shared by
+    // all its isolates, and a doubled `blocks` was mostly never filled.
+    const want = need + Math.max(need >>> 3, 4096);
     growTable(b, want - len, b.get(0), 'blocks');
+    this.#tallyTables('blocks grew');
     return true;
   }
 
+  /**
+   * `GEX_LOG=tables`: this Worker's funcref tables, each as length/entries
+   * used (an entry other than the table's fill)/entries the process has
+   * numbered (where it says), one line, said when one of
+   * them grows -- a Worker parked in a wait says
+   * nothing later, so its last line is what it holds. V8 keeps each entry
+   * in the renderer's trusted range, which all its isolates share. Off: one
+   * call and a compare.
+   */
+  #tallyTables(why) {
+    if (!logOn('tables')) return;
+    const used = (t, fill) => {
+      let n = 0;
+      const len = Number(t.length);
+      for (let j = 0; j < len; j++) if (t.get(typeof t.length === 'bigint' ? BigInt(j) : j) !== fill) n++;
+      return `${len}/${n}`;
+    };
+    const seen = new Set();
+    const out = [];
+    // `need`: the entries the process has numbered, which the table must cover.
+    const note = (name, t, fill, need) => {
+      if (!t || seen.has(t)) return;
+      seen.add(t);
+      out.push(`${name}=${used(t, fill)}${need === undefined ? '' : `/${need >>> 0}`}`);
+    };
+    try {
+      const tables = this.#guest ? this.#dispatchTables() : [];
+      const stub = tables[0]?.get(0);
+      tables.forEach((t, i) => note(`dispatch${i}`, t, stub));
+      const b = this.#guest?.exports?.blocks;
+      const e = this.#shim.exports;
+      if (b) note('blocks', b, b.get(0), e.gex_dense_size?.());
+      if (this.#cgen) note('ftab', this.#cgen.ftab, this.#cgen.resolve, e.gex_ftab_size?.());
+      for (const [where, ex] of [['guest', this.#guest?.exports], ['shim', this.#shim?.exports]]) {
+        for (const [k, v] of Object.entries(ex ?? {})) if (v instanceof WebAssembly.Table) note(`${where}.${k}`, v, null);
+      }
+    } catch (err) {
+      out.push(`(tally failed: ${err?.message ?? err})`);
+    }
+    console.error(`[tables] ${this.#whoFills()} ${why}: ${out.join(' ')}`);
+  }
   /** Every dispatch table the guest module exports, in index order. */
   #dispatchTables() {
     const out = [];
