@@ -3361,6 +3361,14 @@ fn push_pending(j: &mut Jit, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8
     if let (Some(d), true) = (&dense, id != 0) {
         j.dense_base.insert(id, d.base);
     }
+    // Every module this process numbers has its `blocks` range known, a
+    // served one as much as its own translations: a stale page check in a
+    // served module reached by a direct jump from a sibling is then seen to
+    // be elsewhere (`PAGE_STALE`) and resumes at the newer block, where
+    // translating it again would never move the sibling off its own copy.
+    if let Some(d) = &dense {
+        j.module_dense.insert(d.base, d.entries.len() as u32);
+    }
     j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
@@ -3372,14 +3380,11 @@ static STALE_FOREIGN_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// (`Jit::stale_again`).
 const STALE_AGAIN_MAX: u32 = 64;
 
-/// Remember the `blocks` range the module just queued was numbered
-/// (`Jit::module_dense`).
+/// `GEX_JIT_DIAG`: the id of this process's own module just queued
+/// (`Jit::own_ids`); its `blocks` range is noted when it is queued.
 fn note_module_dense(j: &mut Jit, module_id: u64) {
-    if let Some(d) = j.pending.back().and_then(|p| p.dense.as_ref()) {
-        j.module_dense.insert(d.base, d.entries.len() as u32);
-        if jit_diag() {
-            j.own_ids.insert(module_id as u32);
-        }
+    if j.pending.back().is_some_and(|p| p.dense.is_some()) && jit_diag() {
+        j.own_ids.insert(module_id as u32);
     }
 }
 
