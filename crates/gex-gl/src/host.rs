@@ -784,8 +784,8 @@ impl Gl {
             // version. The guest names its own objects (the wire protocol lets
             // it), and a core profile refuses to bind a buffer, texture or
             // vertex array name glGen* did not return: every glBindBuffer of
-            // Muck's (a GL 4.x core client) failed with INVALID_OPERATION,
-            // and nothing drew. A compatibility profile is a superset of core
+            // a GL 4.x core client that names its own objects failed with
+            // INVALID_OPERATION, and nothing drew. A compatibility profile is a superset of core
             // for what a core client calls; the guest library answers
             // GL_CONTEXT_PROFILE_MASK with what the client asked for.
             let attrs_for = |core: bool| {
@@ -1584,7 +1584,7 @@ impl Gl {
                 // Framebuffers and renderbuffers are named by the host: unlike
                 // buffers and textures, ARB_framebuffer_object refuses a name
                 // GenFramebuffers did not return (NVIDIA does, with
-                // INVALID_OPERATION, and every FBO bind failed: Hollow Knight
+                // INVALID_OPERATION, and every FBO bind failed, so the frame
                 // drew black there; Mesa takes them). The decoder keeps the
                 // map (`gexgl_native_object`), so the generated cases and the
                 // binding queries see the guest's names.
@@ -1815,7 +1815,7 @@ impl Gl {
 /// Make `name` a texture name the host's GL generated and has not bound, as
 /// glTextureView requires of its new texture (the guest picks texture names
 /// and GL otherwise meets them first at bind time, so a view's name was never
-/// valid and wined3d's views came out empty: Rain World drew nothing).
+/// valid and wined3d's views came out empty, so nothing drew).
 /// Generated names are the lowest free ones, so generate until it comes up and
 /// give back the rest.
 unsafe fn reserve_texture_name(name: GLuint) {

@@ -1,4 +1,4 @@
-/* A wasm64 stateful provider in an x86-64 guest process (docs/unity-dotnet.md):
+/* A wasm64 stateful provider in an x86-64 guest process:
  * the register view of the calling guest thread, entering and returning, and
  * the host imports. Built against the wasm64 musl sysroot
  * (tools/unity-dotnet/sysroot), linked into a position-independent module

@@ -1,4 +1,4 @@
-# stackRestore for the runtime wasm JIT (docs/unity-dotnet.md P5): emscripten's
+# stackRestore for the runtime wasm JIT: emscripten's
 # compiler-rt helper that sets __stack_pointer, which interp.c calls to drop
 # the C-stack frames of JIT code an exception abandoned. wasm64.
 	.globaltype	__stack_pointer, i64

@@ -3,8 +3,8 @@ wasm jit: direct calls to the runtime's own InternalCalls, handles included; str
 0009 called guest InternalCalls and P/Invokes straight from the residual's scratch. The runtime's
 own InternalCalls (functions of this wasm module: GCHandle.InternalGet, RuntimeType.GetName,
 Array.GetLowerBoundInternal, FastAllocateString, Monitor, Enum, reflection handles) still went
-through interp_entry and the managed-to-native wrapper (Hollow Knight hg10: 3.8M "icall-handles"
-and part of 13.2M "icall" interpreter legs a run). mono_wasm_jit_gex_native_site now builds a
+through interp_entry and the managed-to-native wrapper (3.8M "icall-handles" and part of 13.2M
+"icall" interpreter legs in one run). mono_wasm_jit_gex_native_site now builds a
 `mono` site for them: the wrapper's work is redone in C (null check of `this`; for a handles icall
 each reference argument becomes a pointer to a local of the C frame, out/in-out references go
 through a local and back with a write barrier; the GC-safe transition for a foreign icall; the
@@ -79,8 +79,8 @@ index 64edfe400..6dbdf8197 100644
 + *
 + * An InternalCall implemented by the runtime itself -- GCHandle.InternalGet, RuntimeType.GetName,
 + * Array.GetLowerBoundInternal, string.FastAllocateString -- is a function in this wasm module. The residual
-+ * reached it through interp_entry and the managed-to-native wrapper's IL (3.8M "icall-handles" legs a run in
-+ * Hollow Knight, hg10). Here the wrapper (marshal-lightweight.c emit_native_icall_wrapper_ilgen) is redone
++ * reached it through interp_entry and the managed-to-native wrapper's IL (3.8M "icall-handles" legs in one
++ * run). Here the wrapper (marshal-lightweight.c emit_native_icall_wrapper_ilgen) is redone
 + * in C: the null check of `this`; for a handles icall every reference argument becomes a handle, i.e. a
 + * pointer to a local of this frame (the C stack is scanned), and an out / in-out reference argument goes
 + * through a local and back through a write barrier; the call itself goes through the interpreter's own m2n

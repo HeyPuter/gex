@@ -2,9 +2,9 @@ wasm jit: direct calls from JIT code to guest InternalCalls and P/Invokes (gex)
 
 A wasm-JIT body reached an InternalCall or P/Invoke only through the residual
 (call_interp -> interp_entry -> the managed-to-native wrapper in the
-interpreter), ~490 ns a crossing in the browser. Hollow Knight makes ~220k
-such calls a second into UnityPlayer (13.2M interpreter-routed icall
-residuals a minute in hg10). mono_wasm_jit_gex_native_site resolves the
+interpreter), ~490 ns a crossing in the browser, and an embedder's
+scripting API can take ~220k such calls a second (13.2M interpreter-routed
+icall residuals a minute in one profile). mono_wasm_jit_gex_native_site resolves the
 guest target at compile time for identity-marshalled signatures, and the
 residual site calls mono_wasm_jit_gex_native_call on the same scratch
 layout instead: null check of this, GC-safe transition for foreign
@@ -31,12 +31,12 @@ index f4746f8a4..7b657f37d 100644
   * without it the JITted caller would read the stale scratch slot as a garbage object -> OOB.
   */
 +/*
-+ * gex: DIRECT NATIVE CALLS from wasm-JIT code to guest code (UnityPlayer's InternalCalls and P/Invokes).
++ * gex: DIRECT NATIVE CALLS from wasm-JIT code to guest code (the embedder's InternalCalls and P/Invokes).
 + *
 + * A wasm-JIT body reaches an InternalCall or P/Invoke only through the residual (call_interp -> interp_entry ->
 + * the managed-to-native wrapper's IL -> ves_pinvoke_method -> gex_interp_call_guest): ~490 ns a call in the
-+ * browser, against ~60 ns for the interpreter's own call, and Hollow Knight makes ~220k such calls a second
-+ * (Component.get_gameObject_Injected, Transform.get_position_Injected, ...). mono_wasm_jit_gex_native_site
++ * browser, against ~60 ns for the interpreter's own call, and an embedder's scripting API can take ~220k such
++ * calls a second. mono_wasm_jit_gex_native_site
 + * decides at compile time whether a callee can instead be called straight from the residual's scratch: the
 + * target is resolved once (it is a guest function), and the wrapper's work is redone here with no interpreter
 + * frame -- the null check of `this`, the GC-safe transition (foreign InternalCalls and P/Invokes, as

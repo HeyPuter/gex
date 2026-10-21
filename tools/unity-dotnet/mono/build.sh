@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build upstream Mono as a gex stateful provider (docs/unity-dotnet.md).
+# Build upstream Mono as a gex stateful provider.
 #
 # The runtime is r58Playz/dotnet-runtime, branch wasm-jspi-jit-10.0.3 (dotnet/runtime v10.0.3 plus
 # a runtime wasm JIT for Mono), at the commit below, with patches/ applied. Its CoreLib differs
@@ -16,15 +16,15 @@
 #   corelib   System.Private.CoreLib (linux-x64 Mono flavour) -> OUT/lib
 #   formatters the out-of-band System.Runtime.Serialization.Formatters (NuGet, FORMATTERS_VERSION,
 #             default 10.0.*): BinaryFormatter, which the shared framework only stubs since .NET 9 and
-#             Unity games still use for saves -> OUT/lib-extra (tests/games/muck-dotnet.sh puts it in
-#             the BCL directory, over the framework's stub)
+#             older programs still use -> OUT/lib-extra (a runner puts it in the BCL directory, over
+#             the framework's stub)
 #   provider  OUT/provider/mono.wasm: the runtime, System.Native, the adapters for every
 #             public mono_* function it defines (host/gen-adapters.py, SysV x86-64) and the glue
 #             (host/gexmono-provider.c), linked as a position-independent wasm64 module
-#   em-runtime em-native em-smoke   P1's emscripten build and its node smoke test
+#   em-runtime em-native em-smoke   an emscripten build and its node smoke test
 #
 # Needs clang/wasm-ld (22), llvm-ar, dotnet, git, ninja, cmake; /usr/lib/emsdk only for em-*.
-# Builds at nice 19 with JOBS (default 12) jobs (stream rules).
+# Builds at nice 19 with JOBS (default 12) jobs.
 set -euo pipefail
 
 FORK=https://github.com/r58Playz/dotnet-runtime.git
@@ -37,7 +37,7 @@ OUT=$(realpath -m "$1"); shift
 STEPS=${*:-src sysroot runtime native corelib formatters provider}
 MUSL_SRC=${MUSL_SRC:-$(realpath -m "$UD/../../../musl-wasm64")}
 RUN="nice -n 19"
-JOBS=${JOBS:-12}  # gooner rules: a heavy nice-19 build may use 12 jobs
+JOBS=${JOBS:-12}
 # CMake for dotnet/runtime wants llvm-strings, llvm-readelf, llvm-link: from the versioned LLVM if not on PATH.
 command -v llvm-strings >/dev/null || PATH=$PATH:/usr/lib/llvm-22/bin
 SR=$OUT/sysroot/sysroot
@@ -137,7 +137,7 @@ step_provider() {
 	echo "provider: $W/mono.wasm; $(tail -1 adapters.log | cut -d, -f1)"
 }
 
-# ---- P1: the emscripten build and its node smoke test ----
+# ---- the emscripten build and its node smoke test ----
 
 step_em-runtime() {
 	source /usr/lib/emsdk/emsdk_env.sh >/dev/null 2>&1

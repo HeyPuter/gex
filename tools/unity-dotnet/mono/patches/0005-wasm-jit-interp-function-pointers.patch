@@ -11,7 +11,7 @@ index 2f18c3115..2c782536b 100644
 +	 * the wasm JIT's. A function pointer it loads goes to the interpreter (a delegate .ctor the JIT calls through
 +	 * interp_entry, ves_icall_mono_delegate_ctor_interp; the JIT bails on raw calli), which takes function
 +	 * pointers as InterpMethod* (its MINT_LDFTN). create_method_pointer's native entry read as an InterpMethod
-+	 * gave a NULL method there (Hollow Knight, tk2dSpriteAnimator.Start). */
++	 * gave a NULL method there. */
 +	if (mono_use_interpreter && method->wrapper_type != MONO_WRAPPER_NATIVE_TO_MANAGED)
 +		return mini_get_interp_callbacks ()->get_interp_method (method);
 +#endif

@@ -1,4 +1,4 @@
-/* Runtime support every wasm64 provider links (docs/unity-dotnet.md):
+/* Runtime support every wasm64 provider links:
  * calls into guest code, and abandoning guest frames on a raise. */
 #include "gexprov64.h"
 

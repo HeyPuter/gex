@@ -1,14 +1,14 @@
 #!/bin/sh
-# A diagnostic assembly for a Unity Mono game under gex (docs/unity-dotnet.md):
-# Probe.cs logs every first-chance exception and, every 5 s of real time, the
-# clock, the "StartManager" object's animator and components, and the cameras.
-# Unity runs it through RuntimeInitializeOnLoads.json; no scene changes.
+# A diagnostic assembly for a Unity Mono program under gex: Probe.cs logs
+# every first-chance exception and, every 5 s of real time, the clock, a named
+# object's animator and components, and the cameras. The engine runs it
+# through RuntimeInitializeOnLoads.json; no scene changes.
 #
 #   build.sh GAME_DATA_DIR OVERLAY_DIR
 #
-# GAME_DATA_DIR: the game's <name>_Data. Writes OVERLAY_DIR/<name>_Data/{Managed/
-# GexProbe.dll,ScriptingAssemblies.json,RuntimeInitializeOnLoads.json} for
-# tests/games/muck-dotnet.sh's OVERLAY= (the game's own files stay untouched).
+# GAME_DATA_DIR: the program's <name>_Data. Writes OVERLAY_DIR/<name>_Data/{Managed/
+# GexProbe.dll,ScriptingAssemblies.json,RuntimeInitializeOnLoads.json} for a
+# runner's OVERLAY= (the program's own files stay untouched).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 D=$(realpath "$1"); O=$(realpath -m "$2"); N=$(basename "$D")

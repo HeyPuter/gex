@@ -2,8 +2,8 @@ wasm jit: checked arithmetic and unsigned-to-double conversions (gex)
 
 Methods using checked add/sub/mul or uint/ulong-to-double were refused whole
 ("unsupported opcode" int_addcc 662, int_conv_to_r_un 627, int_mul_ovf 636):
-List<T>.AddRange (707k interpreter legs a minute in Hollow Knight) and
-InputStateBlock.ReadFloat (571k). ADDCC/SUBCC fuse with the COND_EXC_[I]OV /
+List<T>.AddRange (707k interpreter legs a minute in one program's profile)
+among them. ADDCC/SUBCC fuse with the COND_EXC_[I]OV /
 [I]C that follows them (wasm has no flags); IMUL_OVF[_UN] goes through the
 64-bit product; [I|L]CONV_TO_R_UN are f64.convert_i32_u / _i64_u.
 Tests: tests/unity-dotnet T.Checked.

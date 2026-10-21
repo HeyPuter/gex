@@ -1,7 +1,7 @@
-// Diagnostics for Hollow Knight under gex's .NET Mono (docs/unity-dotnet.md):
-// loaded by Unity through RuntimeInitializeOnLoads.json; logs every
-// first-chance exception and, every few seconds of real time, the clock and
-// the intro's state, from a player-loop system (no MonoBehaviour needed).
+// Diagnostics for a Unity program under gex's .NET Mono: loaded through
+// RuntimeInitializeOnLoads.json; logs every first-chance exception and,
+// every few seconds of real time, the clock and the scene's state, from a
+// player-loop system (no MonoBehaviour needed).
 using System;
 using UnityEngine;
 using UnityEngine.LowLevel;

@@ -3,7 +3,7 @@ wasm jit: a lazy stub's interpreter leg derives nothing per call (gex)
 A call through a lazy f-slot whose callee is not compiled ran
 mono_wasm_get_call_info on every call (lazy_interp) and looked the callee's
 InterpMethod up by method hash (lazy_bind -> pretransform): 0.13 s and 0.30 s
-of a 20 s Hollow Knight profile (hg13). The slot caches its signature shape,
+of a 20 s profile. The slot caches its signature shape,
 and the bind pretransforms with the slot's own InterpMethod.
 
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
@@ -61,7 +61,7 @@ index 869344d97..4f8897c95 100644
 -	/* The residual's discipline: transform (and run any cctor) BEFORE the arguments go into GC-invisible scratch. */
 -	mono_wasm_jit_pretransform (ls->method);
 +	/* The residual's discipline: transform (and run any cctor) BEFORE the arguments go into GC-invisible scratch.
-+	 * gex: with the slot's own InterpMethod, not a hash lookup by method on every call (0.30 s of hg13's 20 s). */
++	 * gex: with the slot's own InterpMethod, not a hash lookup by method on every call (0.30 s of a 20 s profile). */
 +	{
 +		extern void mono_wasm_jit_pretransform_im (MonoMethod *method, gpointer imethod);
 +		mono_wasm_jit_pretransform_im (ls->method, ls->imethod);
@@ -81,7 +81,7 @@ index 869344d97..4f8897c95 100644
 -		mono_wasm_jit_counters [WJC_LAZY_DEAD]++;
 -		g_error ("wasm-jit lazy: f-slot %d's owner no longer has the stub's functype", slot);
 +	/* gex: the signature-derived shape once per slot, not mono_wasm_get_call_info on every call (0.13 s of a 20 s
-+	 * Hollow Knight profile, hg13). A slot's owner is fixed for its life (a freed owner is caught above). */
++	 * profile). A slot's owner is fixed for its life (a freed owner is caught above). */
 +	gint32 shape = ls->interp_shape;
 +	if (G_UNLIKELY (!shape)) {
 +		int norm = 0;

@@ -1,8 +1,8 @@
 sgen: cache the major heap used size between collections (gex)
 
 mono_gc_get_used_size walked every object in the major heap on each call.
-Hollow Knight asks every frame (GCManager.Update -> GetMonoHeapUsage), which
-cost 3-4.5% of its main thread in the browser on either tier. Recompute only
+A program that asks every frame spent 3-4.5% of its main thread there in the
+browser on either tier. Recompute only
 after a collection or when the major section count changes;
 MONO_GC_USED_SIZE_EXACT=1 restores the walk on every call.
 
@@ -16,7 +16,7 @@ index aec2a0422..d52ccb872 100644
  
 +/*
 + * The major heap's used size, recomputed only when it can have changed (gex). get_used_size walks every
-+ * object in the major heap, and a game that asks every frame (Hollow Knight's GCManager, through
++ * object in the major heap, and a program that asks every frame (through
 + * mono_gc_get_used_size) spent 3-4.5% of its main thread there. Between collections the major heap
 + * changes by blocks allocated or freed (num_major_sections, which also follows a sweep that frees
 + * blocks) and by pinned objects placed in existing blocks; those are left for the next collection, as

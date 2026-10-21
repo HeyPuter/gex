@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate gex F_body adapters for Mono's embedding API (docs/unity-dotnet.md).
+"""Generate gex F_body adapters for Mono's embedding API.
 
 Reads the MONO_API_FUNCTION(ret, name, (args)) declarations of upstream Mono's
 public headers (src/native/public/mono/*/details/*-functions.h) and writes, for

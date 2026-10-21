@@ -1,10 +1,9 @@
 /*
  * gexmono-unity.c: the parts of Unity's Mono embedding API that upstream Mono
- * lacks or has without a callback the guest can give it (docs/unity-dotnet.md
- * §2): the mono_unity_* functions of Unity's fork, the legacy names Unity
- * still looks up, and the functions taking guest callbacks. Semantics follow
- * Unity-Technologies/mono (unity-utils.c and friends); what only serves
- * Unity's memory profiler reports nothing.
+ * lacks or has without a callback the guest can give it: the mono_unity_*
+ * functions of Unity's fork, the legacy names an embedder still looks up, and the functions taking guest callbacks. Semantics follow
+ * Unity-Technologies/mono (unity-utils.c and friends); what only serves a
+ * memory profiler reports nothing.
  *
  * Each is a gex F_body adapter (gexprov64.h), listed in gexmono_unity_adapters.
  */
@@ -104,9 +103,9 @@ U(mono_unity_type_get_name_full_chunked)
 	RETV;
 }
 
-/* Unity's mscorlib is .NET Framework's reference source, whose private
- * fields are m_name; .NET's CoreLib names most of the same fields _name.
- * UnityPlayer reads a few of them by name (AttributeUsageAttribute's
+/* .NET Framework's reference source names private fields m_name; .NET's
+ * CoreLib names most of the same fields _name. An embedder written against
+ * the former may look a few of them up by name (AttributeUsageAttribute's
  * m_attributeTarget, m_inherited, m_allowMultiple). A miss on m_x retries
  * _x, then the table; a final miss is logged. */
 static const char *const field_alias [][3] = {
@@ -132,7 +131,7 @@ U(mono_class_get_field_from_name)
 }
 
 /* mono_class_is_subclass_of (klass, klassc, check_interfaces). GEXMONO_TRACE_SUBCLASS=NAME logs
- * every test against a class called NAME (Unity's FindObjectOfType walks every object this way) with
+ * every test against a class called NAME (a walk over every object by type tests each one) with
  * both classes' images, so a type loaded twice (two MonoClass for one name) shows. */
 U(mono_class_is_subclass_of)
 {
@@ -150,7 +149,7 @@ U(mono_class_is_subclass_of)
 
 /* mono_class_get_methods (klass, iter): with GEXMONO_TRACE_METHODS=1, a line for each
  * finished pass over a class (its name, how many methods, how many passes so far):
- * which class Unity scans over and over. */
+ * which class the embedder scans over and over. */
 U(mono_class_get_methods)
 {
 	ENTER;
@@ -185,7 +184,7 @@ U(mono_class_get_methods)
 
 /* GEXMONO_TRACE_ARRAYS=1: each mono_array_new with its class, length and result, and any
  * mono_gc_wbarrier_set_field after which the slot does not hold the value (diagnostics for
- * the Instantiate crash, docs/unity-dotnet.md §12). */
+ * a crash in object instantiation). */
 static int trace_arrays = -1;
 static int
 arrays_on (void)
@@ -203,10 +202,10 @@ U(mono_array_new)
 			P (1) ? m_class_get_name ((MonoClass *)P (1)) : "?", (unsigned long long)A (2), a);
 	RET (a);
 }
-/* mono_gc_get_used_size: Unity asks every frame. SGen's answer walks every object of the major
- * heap (major_iterate_objects with a full sweep), and under gex every object lives there (the
- * Boehm-like mode): it was half of Hollow Knight's main thread in its menu. Boehm's answer, which
- * Unity was written against, is O(1). Here the walk runs again only after a collection, or when the
+/* mono_gc_get_used_size: an embedder may ask every frame. SGen's answer walks every object of
+ * the major heap (major_iterate_objects with a full sweep), and under gex every object lives
+ * there (the Boehm-like mode), so it can be half a main thread's time. Boehm's answer, which
+ * Unity's Mono gives, is O(1). Here the walk runs again only after a collection, or when the
  * last answer is older than 500 ms; GEXMONO_USED_SIZE_EXACT=1 walks on every call. */
 static int64_t used_size_cached;
 static int used_size_gcs = -1;
@@ -252,9 +251,9 @@ U(mono_gc_wbarrier_set_field)
 
 /* mono_custom_attrs_from_field (klass, field): Mono finds the field's
  * metadata row from its index in klass's field array, so klass must be the
- * class that defines the field. UnityPlayer's serializer passes the class it
- * is serializing, which for an inherited field is a subclass; use the
- * field's own parent. */
+ * class that defines the field. A caller may pass the class it is working
+ * on, which for an inherited field is a subclass; use the field's own
+ * parent. */
 U(mono_custom_attrs_from_field)
 {
 	ENTER;
@@ -345,10 +344,10 @@ U(mono_thread_pop_appdomain_ref) { ENTER; RETV; }
 U(mono_thread_has_sufficient_execution_stack) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain_v2) { ENTER; RET (1); }
-/* Unity 6 uses the v2 handle API with Unity's Mono encoding: a v2 handle is the GC's own handle value
- * (slot << 3 | type + 1), which Unity's libmonobdwgc also returns from the v1 calls. Its scripting layer
- * tests bit 0: set (normal and weak handles), a GC handle; clear, a pointer to an object reference; and its
- * managed code takes the same values (GCHandle.FromIntPtr). This tree's runtime and CoreLib use that raw
+/* Unity's Mono encodes v2 handles as the GC's own handle value (slot << 3 | type + 1), and returns
+ * the same from the v1 calls. In that encoding bit 0 set (normal and weak handles) is a GC handle and
+ * clear is a pointer to an object reference, and managed code takes the same values
+ * (GCHandle.FromIntPtr). This tree's runtime and CoreLib use that raw
  * value as the handle (gc-internals.h, GCHandle.cs), so v1 and v2 calls are the same functions here. */
 MonoGCHandle mono_gchandle_new_internal (MonoObject *obj, gboolean pinned);
 MonoGCHandle mono_gchandle_new_weakref_internal (MonoObject *obj, gboolean track_resurrection);
@@ -356,8 +355,8 @@ MonoObject *mono_gchandle_get_target_internal (MonoGCHandle gchandle);
 void mono_gchandle_free_internal (MonoGCHandle gchandle);
 #define UNITY_H(h) ((uintptr_t)(h))
 #define GC_H(u) ((MonoGCHandle)(uintptr_t)(u))
-/* Unity reads handles after freeing them (Hollow Knight: get_target on a freed handle), which Unity's
- * Boehm-backed Mono answers with NULL and SGen asserts on. So the handles given out are remembered, and a
+/* A handle may be read after it is freed (get_target on a freed handle), which Unity's Boehm-backed
+ * Mono answers with NULL and SGen asserts on. So the handles given out are remembered, and a
  * read or free of one that is not live is NULL / nothing. */
 static GHashTable *live_handles;
 static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -388,7 +387,7 @@ U(mono_gchandle_new_v2) { ENTER; RET (handle_out (mono_gchandle_new_internal ((M
 U(mono_gchandle_new_weakref_v2) { ENTER; RET (handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
 U(mono_gchandle_get_target_v2) { ENTER; RET (handle_live (A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H (A (0))) : 0); }
 U(mono_gchandle_free_v2) { ENTER; if (handle_live (A (0), TRUE)) mono_gchandle_free_internal (GC_H (A (0))); RETV; }
-/* The v1 calls too, in the same encoding: Unity mixes them (a handle from one, freed or read by the other). */
+/* The v1 calls too, in the same encoding: callers may mix them (a handle from one, freed or read by the other). */
 U(mono_gchandle_new) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
 U(mono_gchandle_new_weakref) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
 U(mono_gchandle_get_target) { ENTER; RET (handle_live ((uint32_t)A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H ((uint32_t)A (0))) : 0); }
@@ -411,7 +410,7 @@ U(mono_gc_set_max_time_slice_ns) { ENTER; RETV; }
 U(mono_gc_start_incremental_collection) { ENTER; RETV; }
 U(mono_gc_set_heap_validate_frequency) { ENTER; RETV; }
 U(mono_gc_set_heap_verifier_callback) { ENTER; RETV; }
-/* Unity stops the world around its liveness walk (below): the GC lock keeps any
+/* The embedder stops the world around its liveness walk (below): the GC lock keeps any
  * collection, and so any object move, from starting until it restarts it. */
 static int gc_world_stopped;
 void sgen_gc_lock (void);
@@ -440,7 +439,7 @@ U(mono_unity_stop_gc_world) { ENTER; lv_watch ("stop"); lv_pass_reset (); if (!g
 U(mono_unity_start_gc_world) { ENTER; lv_watch ("start"); if (gc_world_stopped) { gc_world_stopped = 0; sgen_gc_unlock (); } RETV; }
 U(mono_unity_heap_validation_from_statics) { ENTER; RETV; }
 
-/* ---- Unity's memory profiler: reports nothing ---- */
+/* ---- the memory profiler calls: report nothing ---- */
 
 U(mono_unity_assembly_mempool_chunk_foreach) { ENTER; RETV; }
 U(mono_unity_domain_mempool_chunk_foreach) { ENTER; RETV; }
@@ -452,13 +451,11 @@ U(mono_unity_class_for_each) { ENTER; RETV; }
 U(mono_unity_capture_memory_snapshot) { ENTER; RET (0); }
 U(mono_unity_free_captured_memory_snapshot) { ENTER; RETV; }
 /* ---- liveness: which UnityEngine.Objects managed code still reaches ----
- * Unity's UnloadUnusedAssets keeps an asset only if a managed object reachable
- * from a root (Unity's GC handles, the statics) refers to it: it asks for every
- * object of class `filter` reachable from each root and marks what comes back.
- * Reporting nothing (as the stubs did) let it unload every asset only managed
- * code referred to: Hollow Knight's StartManager lost its loading-spinner
- * prefab at the first scene and its intro never ended. Semantics after Unity's
- * unity-liveness.c: a depth-first walk over reference fields, array elements
+ * The embedder keeps an asset only if a managed object reachable from a root
+ * (its GC handles, the statics) refers to it: it asks for every object of
+ * class `filter` reachable from each root and marks what comes back.
+ * Reporting nothing would let it unload every asset only managed code refers
+ * to. Semantics after Unity's unity-liveness.c: a depth-first walk over reference fields, array elements
  * and value-type fields with references; objects of `filter` are reported to
  * the callback (gpointer *objects, int count, void *userdata) in batches of up
  * to max_count, and the rest at finalize. The walk holds no world stopped: the
@@ -490,7 +487,7 @@ lv_new (MonoClass *filter, guint32 max, uint64_t cb, uint64_t data)
 
 static int lv_env (const char *name);
 /* The walk is on by default; GEXMONO_LIVENESS=0 turns it off (the provider then reports
- * nothing: Unity unloads every asset only script data holds). GEXMONO_LV_OFF=1 walks but
+ * nothing: the embedder unloads every asset only script data holds). GEXMONO_LV_OFF=1 walks but
  * reports nothing. */
 static int
 lv_on (void)
@@ -502,8 +499,7 @@ lv_on (void)
 	}
 	return on;
 }
-/* GEXMONO_LV_TRACE=1: each reported object and each root, as class and Unity instance ID
- * (the int at +8 of the native object m_CachedPtr points to). */
+/* GEXMONO_LV_TRACE=1: each reported object and each root, as class and instance ID. */
 static int
 lv_trace (void)
 {
@@ -515,8 +511,8 @@ lv_trace (void)
 static int
 lv_iid (MonoObject *o)
 {
-	/* UnityEngine.Object's first field, m_CachedPtr, right after the header: no metadata
-	 * lookups here (the walk runs on Unity job threads Mono does not know). */
+	/* The object's first field, right after the header: no metadata lookups here (the walk
+	 * runs on the embedder's job threads, which Mono does not know). */
 	uint8_t *native = *(uint8_t **)((char *)o + MONO_ABI_SIZEOF (MonoObject));
 	return (uintptr_t)native > 0x10000 && (uintptr_t)native < ((uintptr_t)1 << 34) ? *(int *)(native + 8) : 0;
 }
@@ -546,15 +542,15 @@ lv_free (Liveness *s)
 	g_free (s);
 }
 
-/* Objects already visited in this collection, by any state: Unity's own walk
+/* Objects already visited in this collection, by any state: unity-liveness.c
  * marks objects in their header for the whole pass, so each object reaches the
- * callbacks once however many roots and states reach it (Unity sizes its
- * buffers by the number of objects). Reset when Unity stops the world for the
+ * callbacks once however many roots and states reach it (a caller may size its
+ * buffers by the number of objects). Reset when the world is stopped for the
  * next pass. */
 static int lv_env (const char *name);
 /* The pass's visited set is an open-addressing table of 64-bit words, each the
  * object pointer (below 2^40) tagged with the pass's generation in the top 24
- * bits, filled with compare-and-swap: Unity's mark jobs walk from several
+ * bits, filled with compare-and-swap: the embedder's mark jobs walk from several
  * threads at once, and the old mutex-guarded GHashTable cost a lock and a
  * hash insert per reference. A reset is a generation bump, not a clear. An
  * object whose probe run is full goes to the locked overflow set (every thread
@@ -908,12 +904,10 @@ void sgen_gc_unlock (void);
 static int lv_world_stopped;
 
 /* Report what a from_root / from_statics call found before returning, as Unity's Mono does
- * (unity-liveness.c filters and calls back at the end of each calculation): Unity marks the
- * reported objects into its queue and drains it (their native dependencies: a Font's atlas
- * texture and material, a component's GameObject...) before it calls liveness_finalize, so
- * objects first reported from finalize were marked with none of their dependencies, which
- * Unity then unloaded under them (Hollow Knight's menu labels drew from a font whose atlas
- * texture had been unloaded and reloaded empty). GEXMONO_LV_LATE=1 restores the old
+ * (unity-liveness.c filters and calls back at the end of each calculation): the caller may
+ * process what each call reports, native dependencies included, before it calls
+ * liveness_finalize, so objects first reported from finalize would be marked with none of
+ * their dependencies, which could then be unloaded under them. GEXMONO_LV_LATE=1 restores the old
  * flush-at-finalize behaviour, for comparison. */
 static void
 lv_flush_now (Liveness *s)
@@ -939,9 +933,8 @@ U(mono_unity_liveness_calculation_from_root)
 	if (s && lv_on () && P (0)) {
 		/* As Unity's from_root: the root's references are walked, the root itself is
 		 * neither marked nor reported (it is reported if another path reaches it). The
-		 * roots are the managed wrappers Unity holds GC handles to; reporting them kept
-		 * every component alive whatever its GameObject's fate (a MonoBehaviour outlived
-		 * its unloaded GameObject and Object.name followed the dangling pointer). */
+		 * roots are the managed wrappers the embedder holds GC handles to; reporting them
+		 * would keep every one alive whatever happened to its native object. */
 		if (lv_trace ())
 			fprintf (stderr, "[gexmono] lv-root %p state %p %s.%s id %d\n", P (0), s, m_class_get_name_space (mono_object_class (P (0))),
 				m_class_get_name (mono_object_class (P (0))), lv_iid (P (0)));
@@ -1029,7 +1022,7 @@ U(mono_trace_set_log_handler) { ENTER; log_cb.fn = A (0); log_cb.data = A (1); m
 /* ---- where assemblies and native plugins come from ----
  * Unity's own BCL (mscorlib and the rest of its Mono profile) does not run
  * on upstream Mono: .NET's CoreLib and Framework facades (GEXMONO_ASSEMBLIES)
- * stand in for it. Unity's game assemblies come from where it says. */
+ * stand in for it. The program's own assemblies come from where it says. */
 
 char *gexmono_unity_managed_dir;
 

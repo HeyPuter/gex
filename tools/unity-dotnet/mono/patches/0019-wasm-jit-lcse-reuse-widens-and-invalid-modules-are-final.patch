@@ -10,7 +10,7 @@ the miss path does.
 The instantiate error buffer grows from 192 to 1024 bytes so the validation message survives, and
 wasmtime's "validating the module" counts as permanent like V8's CompileError: emission is
 deterministic, so a retry rebuilds the same bytes. In the embed suite FillName had been
-re-emitted 106 times. Hollow Knight's hg17 reported invalid=1322.
+re-emitted 106 times; one program's profile reported invalid=1322.
 
 Test: T.LcseWide (VerKey is invalid before, compiles after), checked against CoreCLR.
 

@@ -3,8 +3,7 @@ wasm jit: one continuation block per finally on a multi-finally leave (gex)
 A leave that exits several try-finally blocks emitted CALL_HANDLER; CALL_HANDLER; BR
 in one block. The wasm emitter runs a finally as "finally_ind = the next OP_BR target,
 goto handler", so the first handler had nowhere to return and the method was refused
-("finally: complex call_handler continuation", tk2dSprite.UpdateMaterial and
-GUILayoutGroup.CalcHeight in Hollow Knight). Under COMPILE_WASM each CALL_HANDLER
+("finally: complex call_handler continuation"). Under COMPILE_WASM each CALL_HANDLER
 but the last now ends its block with a BR to a fresh block, the shape the non-wasm
 path already makes for its abort check. Test: T.NestedFinally.
 

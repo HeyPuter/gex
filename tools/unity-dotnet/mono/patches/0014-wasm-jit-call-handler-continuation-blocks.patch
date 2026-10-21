@@ -3,8 +3,7 @@ wasm jit: a continuation block for every CALL_HANDLER; bail reasons by gate (gex
 The emitter runs a finally as "finally_ind = continuation block; goto handler", so the
 continuation must start a block. Out-of-SSA puts phi moves between a CALL_HANDLER and the
 leave's OP_BR, and branch optimization deletes a BR to the fallthrough block; both were refused
-as "finally: complex call_handler continuation" (tk2dSprite.UpdateMaterial and
-GUILayoutGroup.CalcHeight in Hollow Knight; UnmanagedMemoryStream.ReadByte,
+as "finally: complex call_handler continuation" (UnmanagedMemoryStream.ReadByte,
 SR.InternalGetResourceString, the resource readers in the BCL). wj_split_call_handler_blocks
 moves the instructions after a CALL_HANDLER into a new block reached by an OP_BR, with the
 non-handler CFG edges, before any analysis; a CALL_HANDLER that ends its block continues at
@@ -54,7 +53,7 @@ index 660e37fce..f8d248eeb 100644
 + * code between a CALL_HANDLER and the leave's OP_BR -- out-of-SSA parks phi moves there (copies that, on a
 + * native target, run after the handler call returns) -- and branch optimization deletes the BR when its
 + * target is the next block. Those methods were refused as "finally: complex call_handler continuation"
-+ * (tk2dSprite.UpdateMaterial and GUILayoutGroup.CalcHeight in Hollow Knight, UnmanagedMemoryStream.ReadByte
++ * (UnmanagedMemoryStream.ReadByte and the resource readers
 + * in the BCL). Here the instructions after a CALL_HANDLER move to a new block that follows it, reached by
 + * an OP_BR, so they run after the finally exactly as they would natively; the CFG edges other than the
 + * handler's move with them. Runs before any analysis, so every later pass sees the split blocks. */

@@ -1,6 +1,6 @@
 # CMake toolchain for code that runs as a gex stateful provider in an x86-64
-# guest (docs/unity-dotnet.md): clang for wasm64 against the musl wasm64
-# sysroot (tools/unity-dotnet/sysroot). Linux as far as the code can tell:
+# guest: clang for wasm64 against the musl wasm64 sysroot
+# (tools/unity-dotnet/sysroot). Linux as far as the code can tell:
 # its syscalls are x86-64 Linux's, served by gex-kernel.
 #   -DGEX_SYSROOT=<OUT>/sysroot
 set(CMAKE_SYSTEM_NAME Linux)

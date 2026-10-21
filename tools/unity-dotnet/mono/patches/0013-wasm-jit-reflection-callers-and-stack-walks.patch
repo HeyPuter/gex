@@ -1,7 +1,7 @@
 wasm jit: compile callers of System.Reflection; keep stack walkers right (gex)
 
 The "residual reflection" refusal kept every method with a residual call into
-System.Reflection in the interpreter (PlayMaker LoadActionField in Hollow Knight). It
+System.Reflection in the interpreter. It
 guards a re-entry into a dynamic type mid-Finish, so it now applies only once a
 Reflection.Emit image exists (mono_dynamic_images_exist).
 
@@ -103,8 +103,8 @@ index 69f04eabb..660e37fce 100644
 -					{ const char *_ns = m_class_get_name_space (call->method->klass);
 -					  if (_ns && !strncmp (_ns, "System.Reflection", 17)) { fail = "residual reflection"; goto done; } }
 +					/* gex: only once a Reflection.Emit image exists. That re-entry needs a dynamic type to
-+					 * be mid-Finish, so a process that never made one (Unity games: PlayMaker's
-+					 * LoadActionField calls FieldInfo through here 145k times a minute in Hollow Knight)
++					 * be mid-Finish, so a process that never made one (a program calling FieldInfo
++					 * through here 145k times a minute)
 +					 * kept the interpreter for every such caller for nothing. A method compiled before the
 +					 * first dynamic image keeps its residual; IKVM, the workload the refusal was written
 +					 * for, creates its dynamic assembly at startup, before anything is hot. */

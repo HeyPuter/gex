@@ -1,8 +1,7 @@
 #!/bin/sh
-# The wasm64 sysroot the Mono provider builds against (docs/unity-dotnet.md):
-# musl with the gex `wasm64` arch (fork: wt/musl-wasm64, branch gex-wasm64,
-# from stream W's gex-wasm32) and compiler-rt's builtins, with the system
-# clang. Syscalls are the x86-64 Linux ABI through gex.syscall(ctx).
+# The wasm64 sysroot the Mono provider builds against:
+# musl with the gex `wasm64` arch (the musl fork's branch gex-wasm64, from
+# its gex-wasm32) and compiler-rt's builtins, with the system clang. Syscalls are the x86-64 Linux ABI through gex.syscall(ctx).
 #
 #   tools/unity-dotnet/sysroot/build.sh OUT [MUSL_SRC]
 #

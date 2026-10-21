@@ -1,7 +1,7 @@
 /*
  * gexmono-provider.c: upstream Mono (the r58Playz fork, wasm64, interpreter)
  * as a gex stateful provider in place of a guest's Mono library
- * (libmonobdwgc-2.0.so, mono-2.0-bdwgc.dll; docs/unity-dotnet.md).
+ * (libmonobdwgc-2.0.so, mono-2.0-bdwgc.dll).
  *
  * The guest calls the library's exports; gex binds each to `gexp_<name>`
  * (generated adapters, gen-adapters.py, plus the ones here). This file does
@@ -326,8 +326,8 @@ preinit (void)
 	if (done)
 		return;
 	done = 1;
-	/* The fork's runtime wasm JIT (docs/unity-dotnet.md P5): on by default (user, 2026-10-07: normal runs
-	 * use the JIT, ejected builds .NET AOT); GEXMONO_WASM_JIT=0 runs the interpreter only. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
+	/* The fork's runtime wasm JIT: on by default (normal runs use the JIT, ejected builds .NET
+	 * AOT); GEXMONO_WASM_JIT=0 runs the interpreter only. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
 	 * fills; here the host reserves the range in the process's function table (gex.provider_jit_reserve). The
 	 * rest of the jiterpreter (traces, interp_entry and jit_call wrappers) stays off. Inline TLAB
 	 * allocation (INLINE_ALLOC) is emitted only where mono_gc_wasm_inline_alloc_size accepts the clear policy. */
@@ -338,12 +338,11 @@ preinit (void)
 		 * (INLINE_ALLOC, T2, GUARDED_INLINE, DELEGATE_DEVIRT, IC_MID, PRED_MID, LAZY_COLD, FAST_TLS,
 		 * INLINE_COLD_THROW, EH_REC, VCALL_AOT_WAYS, LAZY_NOGC, DIRECT_DEPS, PROF_ORIGIN, PROF_INLINEE). They
 		 * are ported (mono patch 0020: the inline TLAB bump, the fast thread read, the EH record and the
-		 * tier-2 poll are pointer-width) and run at the runtime's own defaults; docs/unity-dotnet.md records
-		 * the per-knob results. Any of them can still be set to 0 from the environment. */
+		 * tier-2 poll are pointer-width) and run at the runtime's own defaults. Any of them can still be set to 0 from the environment. */
 		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
-		/* An address-taken scalar argument (ldarga; Unity's Unmarshal.FromIntPtrUnsafe, 3.0M interpreter legs a
-		 * minute in Hollow Knight's King's Pass) is homed in the frame instead of refusing the method. Upstream
-		 * ships it off only because Minecraft did not need it (bd265537e); T.ArgAddr tests it. */
+		/* An address-taken scalar argument (ldarga, common in marshalling helpers, which otherwise run on the
+		 * interpreter) is homed in the frame instead of refusing the method. Upstream ships it off only
+		 * because its first user did not need it (bd265537e); T.ArgAddr tests it. */
 		setenv ("MONO_WASM_JIT_LDADDR_ARG", "1", 0);
 		/* the 64-bit worker-local vcall PIC (way loop unrolled): four receivers per site */
 		setenv ("MONO_WASM_JIT_VCALL_WAYS", "4", 0);
