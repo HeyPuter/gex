@@ -636,7 +636,13 @@ mod tests {
         // about 171 ms.
         let start = Instant::now();
         assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
+        // Full, with the clock held (a loaded machine may let the 21 us a
+        // frame plays in pass between two calls): no room, and a waiter
+        // looks again as soon as any will have played.
+        let at = std::mem::replace(&mut h.stream.lock().unwrap().at, u64::MAX);
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
+        assert!(h.ready_in_ns().is_some_and(|ns| ns <= 1_000_000));
+        h.stream.lock().unwrap().at = at;
         std::thread::sleep(std::time::Duration::from_millis(60));
         let n = h.write_at(0, &vec![0u8; 100_000]).unwrap();
         // Against the clock as it actually ran (a loaded machine sleeps
@@ -698,7 +704,7 @@ mod tests {
         assert_eq!(h.write_at(0, &vec![0u8; 1000]).unwrap(), 400);
         // It lets the stream go (another took the device, or it stopped):
         // back on the clock, which drains it.
-        PLAYER.lock().unwrap().clear();
+        PLAYER.lock().unwrap().retain(|e| e.0 != h.id);
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
     }
@@ -717,9 +723,10 @@ mod tests {
             s.format = AFMT_S16_LE;
             s.channels = 2;
             (s.fragsize, s.fragments) = frag_layout(0x0002_0009);
-            s.at = u64::MAX;
         }
         assert_eq!(h.write_at(0, &vec![0u8; 4096]).unwrap(), 1024);
+        // The clock stopped (the first write set it going): full.
+        h.stream.lock().unwrap().at = u64::MAX;
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
     }
 
