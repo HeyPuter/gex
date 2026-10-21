@@ -1188,6 +1188,9 @@ async function runProgramHere(
       // dispatch waited for took longer than any before it. In `extra` for
       // every Worker.
       fillTime: flag('filltime') ? 1 : undefined,
+      // `?relayall=1` (debugging): every module a Worker compiles is handed to
+      // its siblings compiled, small ones too. In `extra` for every Worker.
+      relayAll: flag('relayall') ? 1 : undefined,
       // `?claimpages=0`: publish closure dir entries at the build's slot numbers
       // instead of per-process demand numbering — a diagnostic for the
       // many-object-closure wrong-dispatch crash. In `extra` for every Worker.

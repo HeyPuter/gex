@@ -138,6 +138,10 @@ const UNIT_MODULE_BYTES = 256 << 20;
  *  it the oldest are dropped from the cache (Workers that installed them
  *  keep theirs; a thread started later compiles what it needs). */
 const PROCESS_MODULE_BYTES = 256 << 20;
+/** And the most modules it, or the page's unit cache, keeps: each module the
+ *  main thread holds lengthens every collection there, and those hold up
+ *  compiles on every Worker of the page. Not with `?relayall=1`. */
+const RELAY_MODULES = 512;
 /** A registry key's module size: `LENGTH:HASH:HASH` (or `u:LENGTH:...`). */
 const regKeyBytes = (k) => Number(String(k).replace(/^u:/, '').split(':')[0]) || 0;
 /** A `wasm:` key's module size: the key is `wasm:LENGTH:HASH:HASH`. */
@@ -199,6 +203,22 @@ export class ProcessHost {
   // same bytes again. Most recent first out, to UNIT_MODULE_BYTES of wasm.
   #unitModules = new Map();
   #unitBytes = 0;
+  /** `?filltime=1`: at most once a minute, how many modules the relay
+   *  holds on this thread, and how many it has been handed. */
+  #relayCensus() {
+    this.#relayed++;
+    const now = performance.now();
+    if (now < this.#relayCensusAt) return;
+    this.#relayCensusAt = now + 60000;
+    let n = 0, bytes = 0;
+    for (const c of this.#moduleCache.values()) { n += c.size; bytes += c.bytes ?? 0; }
+    console.warn(`[host] relay holds ${n} process modules (${(bytes / 1048576).toFixed(0)} MiB), ${this.#pageModules.size} programs, `
+      + `${this.#unitModules.size} units (${(this.#unitBytes / 1048576).toFixed(0)} MiB); ${this.#relayed} handed to it so far`);
+  }
+  #relayed = 0;
+  #relayCensusAt = 0;
+  get #relayModules() { return this.#extra?.relayAll ? Infinity : RELAY_MODULES; }
+
   /** What a starting Worker gets: its process's modules and the page's. */
   #sharedFor(pid, withProcess, w = null) {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
@@ -933,6 +953,7 @@ export class ProcessHost {
         const proc = String(pid).split(':')[0];
         let cache = this.#moduleCache.get(proc);
         if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
+        if (this.#extra?.fillTime) this.#relayCensus();
         if (typeof m.key === 'string' && m.key.startsWith('wasm:')) {
           this.#pageModules.delete(m.key);
           this.#pageModules.set(m.key, m.mod);
@@ -953,7 +974,7 @@ export class ProcessHost {
             this.#unitModules.set(m.key, m.mod);
             this.#poolModule(m.key, m.mod);
             this.#unitBytes += Number(m.key.split(':')[1]);
-            while (this.#unitBytes > UNIT_MODULE_BYTES && this.#unitModules.size > 1) {
+            while ((this.#unitBytes > UNIT_MODULE_BYTES || this.#unitModules.size > this.#relayModules) && this.#unitModules.size > 1) {
               const oldest = this.#unitModules.keys().next().value;
               this.#unitBytes -= Number(oldest.split(':')[1]);
               this.#unitModules.delete(oldest);
@@ -964,7 +985,7 @@ export class ProcessHost {
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
           cache.bytes = (cache.bytes ?? 0) + regKeyBytes(m.key);
-          while (cache.bytes > PROCESS_MODULE_BYTES && cache.size > 1) {
+          while ((cache.bytes > PROCESS_MODULE_BYTES || cache.size > this.#relayModules) && cache.size > 1) {
             const oldest = cache.keys().next().value;
             cache.bytes -= regKeyBytes(oldest);
             cache.delete(oldest);
