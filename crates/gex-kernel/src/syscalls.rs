@@ -3793,8 +3793,7 @@ impl MapIo<'_> {
             }
         }
         if r.is_ok() && (a[2] as u32) & crate::mem::prot::WRITE != 0 {
-            let start = crate::mem::page_align_down(a[0]);
-            mm.forget_content(start, crate::mem::page_align_up(a[0].saturating_add(a[1])));
+            mm.forget_code(crate::mem::page_align_down(a[0]), crate::mem::page_align_up(a[0].saturating_add(a[1])));
         }
         r
     }
