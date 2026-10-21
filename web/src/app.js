@@ -335,7 +335,7 @@ async function begin(opts, base, at, state, meter) {
     mem64: !!b.mem64,
   };
   for (const k of Object.keys(PIECES)) {
-    if (opts[k] === true && !has[k]) {
+    if ((opts[k] === true || (k === 'hostx' && opts[k] === 'rootful')) && !has[k]) {
       throw new Error(`start({ ${k}: true }): this build has no ${k === 'gl' ? 'OpenGL' : k}; it needs ${PIECES[k]} in user/eject.json, and a rebuild`);
     }
   }
@@ -758,7 +758,10 @@ async function begin(opts, base, at, state, meter) {
     wlInput: desk ?? canvas,
     onDesktop: desk ? (d) => { desktop = d; globalThis.__gexCompositor = bareDesktop(d, desk); } : null,
     onSystem: (s) => { sys = s; },
-    hostX: !!b.hostx && opts.hostx !== false,
+    // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,
+    // under the X session's own window manager (see hostx.js).
+    hostX: !!b.hostx && opts.hostx !== false
+      && ((opts.hostx === 'rootful' || (b.hostxRootful && opts.hostx === undefined)) ? 'rootful' : true),
     preModules,
     fill,
     lazyCache,
@@ -873,6 +876,9 @@ function withStart(b, st) {
   if (st.trapstack) out.switches.trapstack = '1';
   if (st.persist !== undefined) out.persist = st.persist || null;
   if (st.ready) out.ready = st.ready;
+  // "rootful": the X server is one fullscreen window the X session's own
+  // window manager runs in, rather than a window per X window.
+  if (st.hostx === 'rootful') out.hostxRootful = true;
   return out;
 }
 

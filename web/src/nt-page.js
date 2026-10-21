@@ -71,7 +71,9 @@ async function main() {
       jitFallback: true,
       gl: q.get('gl') === '1',
       glBackend: q.get('glbackend') || 'wgpu',
-      hostx: q.get('hostx') === '1',
+      hostx: q.get('hostx') === '1' || q.get('hostx') === 'rootful',
+      // `hostx=rootful`: one fullscreen X screen under the session's own window manager
+      hostxRootful: q.get('hostx') === 'rootful',
       mem64: q.get('mem64') === '1',
       pack: q.get('pack'),
       zstd: q.get('zstd') || '/vendor/zstddec-stream.mjs',

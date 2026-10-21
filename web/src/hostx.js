@@ -302,7 +302,10 @@ export class HostX {
     // The Wayland connection and the window manager's, both queues into the
     // module next door. libwayland takes the first from WAYLAND_SOCKET.
     const wl = this.#reserve({ kind: 'wl' });
-    const wm = this.#reserve({ kind: 'wm' });
+    // Rootful: no window manager connection. The X screen is one window, and
+    // the session in it runs its own window manager (KWin, ...), which draws
+    // the frames; the compositor shows the screen fullscreen and frameless.
+    const wm = msg.rootful ? -1 : this.#reserve({ kind: 'wm' });
     // Through `setenv` rather than emscripten's ENV object: ENV is what the
     // runtime *starts* with, and by the time this runs the environment has
     // already been materialised for the C side. libwayland reads
@@ -315,7 +318,12 @@ export class HostX {
       + `WAYLAND_SOCKET=${this.#getenv('WAYLAND_SOCKET')}`);
     const argv = [
       msg.display ?? ':0',
-      '-rootless',
+      // Rootful: one toplevel for the whole screen that asks to be fullscreen,
+      // which the compositor shows frameless over the whole output.
+      // The screen is the output's size, so nothing scales it.
+      ...(msg.rootful
+        ? ['-fullscreen', '-geometry', `${Math.max(1, this.#out?.w | 0)}x${Math.max(1, this.#out?.h | 0)}`]
+        : ['-rootless']),
       // No lock file: `link()` on emscripten's in-memory filesystem cannot
       // make one, and there is no second X server in this tab to lock against.
       '-nolock',
@@ -327,7 +335,7 @@ export class HostX {
       // server compiles keymaps by forking xkbcomp, and there is no fork here.
       '-nokeymap',
       '-shm',
-      '-wm', String(wm),
+      ...(msg.rootful ? [] : ['-wm', String(wm)]),
     ];
     for (const fd of listen) argv.push('-listenfd', String(fd));
     if (msg.verbose) argv.push('-verbose', String(msg.verbose));

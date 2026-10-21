@@ -484,6 +484,14 @@ impl Wayland {
                 }
             }
             routed.retain(|r| r.0 != s.id);
+            // A window that asked to be fullscreen (a rootful Xwayland, a
+            // nested compositor) is given the whole output, and one that took
+            // it back is left to choose its size again.
+            for (surface, on) in s.client.take_fullscreen_changes() {
+                let (w, h) = if on { *self.inner.size.lock().unwrap() } else { (0, 0) };
+                let states = gex_wayland::STATE_ACTIVATED | if on { gex_wayland::STATE_FULLSCREEN } else { 0 };
+                s.client.configure(surface, w, h, states);
+            }
             let frames = s.client.take_frames();
             self.inner.screen.lock().unwrap().update(s.id, &mut s.client, &frames);
             produced.extend(frames);

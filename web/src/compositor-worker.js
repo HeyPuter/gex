@@ -27,6 +27,7 @@ import {
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
   F_CONFIGURE_PENDING,
+  F_FULLSCREEN,
   EV_MOTION,
   EV_BUTTON,
   EV_AXIS,
@@ -64,7 +65,7 @@ const RESIZE_CURSORS = {
   [EDGE_TOP | EDGE_RIGHT]: 'nesw-resize', [EDGE_BOTTOM | EDGE_LEFT]: 'nesw-resize',
 };
 /** A configure's states (`gex_wayland::STATE_*`). */
-const STATE_ACTIVATED = 1, STATE_MAXIMIZED = 2, STATE_RESIZING = 4;
+const STATE_ACTIVATED = 1, STATE_MAXIMIZED = 2, STATE_RESIZING = 4, STATE_FULLSCREEN = 8;
 let BUTTON = 18;
 let BUTTON_GAP = 6;
 function setUiScale(u) {
@@ -534,6 +535,7 @@ class Compositor {
     // read at twice its size, and sending that size back made the client
     // adopt it. foot then opened at 1391x988 surface units, twice the size of
     // the output.
+    if (win.fullscreen) return { w: this.#outW, h: this.#outH };
     if (!win.want) return { w: 0, h: 0 };
     return { w: Math.min(win.want.w, maxW), h: Math.min(win.want.h, maxH) };
   }
@@ -543,6 +545,7 @@ class Compositor {
     const kind = code & 7;
     const held = (this.#pointer.buttons & 1) !== 0;
     this.#note(`request ${k} ${['none', 'move', 'resize', 'maximize', 'unmaximize'][kind] ?? kind}`);
+    if (win.fullscreen) return;
     if (kind === 1 && held && !win.maximized) {
       this.#drag = { key: k, dx: this.#pointer.x - win.x, dy: this.#pointer.y - win.y };
     } else if (kind === 2 && held && !win.maximized) {
@@ -592,6 +595,28 @@ class Compositor {
     if (!final && win.configurePending && now - r.sentAt < 250) return;
     r.sentAt = now;
     this.#configure(win, this.#focus === r.key, final ? 0 : STATE_RESIZING);
+  }
+
+  /** A window that asked to be fullscreen: no frame, at the output's origin,
+   *  the output's size, on top and with the keyboard; or back where it was
+   *  once it takes that back. */
+  #fullscreen(k, win, on) {
+    if (on) {
+      win.restoreFs = { x: win.x, y: win.y };
+      win.x = 0;
+      win.y = 0;
+      win.fullscreen = true;
+      this.#raise(k);
+      this.#focusWindow(k);
+    } else {
+      const r = win.restoreFs ?? { x: BORDER, y: TITLE_H };
+      win.x = r.x;
+      win.y = r.y;
+      win.fullscreen = false;
+    }
+    this.#note(`${on ? 'fullscreen' : 'unfullscreen'} ${k}`);
+    this.#reportPosition(win);
+    this.#configure(win, this.#focus === k);
   }
 
   /** Maximize a window into the work area (the output less its frame), or
@@ -712,6 +737,8 @@ class Compositor {
         win.requestSeq = seq;
         this.#clientRequest(k, win, (s.flags >>> 24) & 0x7f);
       }
+      const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;
+      if (fs !== !!win.fullscreen) this.#fullscreen(k, win, fs);
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
       win.layer = s.layer;
@@ -841,7 +868,7 @@ class Compositor {
   /** Whether the compositor draws a window's frame: a toplevel's, unless its
    *  client places it and draws the whole window itself. */
   #decorated(win) {
-    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged);
+    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged) && !win.fullscreen;
   }
 
   /** Absolute position of a surface: popups and subsurfaces follow a parent. */
@@ -1392,7 +1419,8 @@ class Compositor {
     // client said which window is active, and a configure would only echo it.
     if (win.placed) return;
     const fit = this.#fit(win);
-    const states = (activated ? STATE_ACTIVATED : 0) | (win.maximized ? STATE_MAXIMIZED : 0) | extra;
+    const states = (activated ? STATE_ACTIVATED : 0) | (win.maximized ? STATE_MAXIMIZED : 0)
+      | (win.fullscreen ? STATE_FULLSCREEN : 0) | extra;
     const want = `${fit.w}x${fit.h}:${states}`;
     if (win.configuredAs === want) return;
     win.configuredAs = want;

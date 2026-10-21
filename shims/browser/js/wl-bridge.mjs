@@ -94,6 +94,9 @@ export const ROLE_CURSOR = 4;
  *  request, a flag nobody cleared; a request is now its kind, edges and
  *  number (bits 3..6 the number, 24..30 the request). */
 export const F_CONFIGURE_PENDING = 4;
+/** The client asked to be fullscreen (`xdg_toplevel.set_fullscreen`): no
+ *  frame, the whole output. A state, held until `unset_fullscreen`. */
+export const F_FULLSCREEN = 1;
 /** The pixels are not at `addr`: the host has them. A client that renders
  *  through the host's OpenGL attaches no buffer -- its frames never come back
  *  to the guest -- so the record says how big the surface is and the

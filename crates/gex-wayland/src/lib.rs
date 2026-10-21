@@ -271,6 +271,12 @@ pub struct SurfaceInfo {
     pub request: Request,
     /// Bumped with every request; the host remembers the last it acted on.
     pub request_seq: u8,
+    /// The client asked to be fullscreen (`xdg_toplevel.set_fullscreen`) and
+    /// has not taken it back: a state, not a numbered request, because a
+    /// client asks before its first commit (a rootful Xwayland, a nested
+    /// compositor) and a host takes the first request number it sees as
+    /// already handled. A fullscreen window has no frame and fills the output.
+    pub fullscreen: bool,
     /// A configure has gone out that the client has not acked yet: a host
     /// resizing interactively sends the next size once this clears, so a
     /// client that redraws slowly is not buried in configures.
@@ -344,12 +350,13 @@ impl Placement {
 }
 
 impl SurfaceInfo {
-    /// `R_FLAGS`, as `wl-bridge.mjs` reads it: external (bit 1), a configure
+    /// `R_FLAGS`, as `wl-bridge.mjs` reads it: fullscreen (bit 0), external (bit 1), a configure
     /// not yet acked (bit 2), the request's number (bits 3..6), the buffer
     /// and client scales (bits 8 and 16), and the request itself
     /// ([`Request::code`], bits 24..30).
     pub fn flags(&self) -> i32 {
-        (i32::from(self.external) << 1)
+        i32::from(self.fullscreen)
+            | (i32::from(self.external) << 1)
             | (i32::from(self.configure_pending) << 2)
             | ((i32::from(self.request_seq) & 0xf) << 3)
             | ((self.buffer_scale & 0xff) << 8)
@@ -441,6 +448,7 @@ fn trace_out(s: &str) {
 pub const STATE_ACTIVATED: u32 = 1;
 pub const STATE_MAXIMIZED: u32 = 2;
 pub const STATE_RESIZING: u32 = 4;
+pub const STATE_FULLSCREEN: u32 = 8;
 
 /// What the host's frame takes from the output, in surface units: a border
 /// on each side, and the title bar over a border at the bottom
@@ -641,6 +649,8 @@ struct SurfaceState {
     /// [`SurfaceInfo::request`]).
     request: Request,
     request_seq: u8,
+    /// See [`SurfaceInfo::fullscreen`].
+    fullscreen: bool,
     /// The serial of the last configure sent for this surface's role, and of
     /// the last one the client acked.
     configure_sent: u32,
@@ -719,6 +729,9 @@ pub struct Client {
     next_serial: u32,
     /// The size a toplevel is told it is, in device pixels.
     default_size: (i32, i32),
+    /// Surfaces whose fullscreen state the client changed and the host has
+    /// not taken yet ([`Client::take_fullscreen_changes`]), one entry each.
+    fullscreen_changes: Vec<(u32, bool)>,
     /// Device pixels per surface unit: what `wl_output.scale` says. A
     /// toplevel's configure is in surface units, so `default_size / scale`.
     scale: i32,
@@ -803,6 +816,7 @@ impl Client {
             frames: Vec::new(),
             next_serial: 1,
             default_size: (640, 480),
+            fullscreen_changes: Vec::new(),
             scale: 1,
             wm_base_version: 0,
             placement_version: 0,
@@ -838,6 +852,13 @@ impl Client {
         let (w, h) = self.default_size;
         let k = self.scale.max(1);
         ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
+    }
+
+    /// The surfaces whose fullscreen state changed since the last call, and
+    /// the state each is in now: for a host that configures on the change
+    /// rather than reading every scene (the native one).
+    pub fn take_fullscreen_changes(&mut self) -> Vec<(u32, bool)> {
+        std::mem::take(&mut self.fullscreen_changes)
     }
 
     /// The output scale this client is told (`wl_output.scale`), for a host
@@ -1952,9 +1973,23 @@ impl Client {
                 self.request(xdg_surface, Request::Unmaximize);
                 true
             }
-            // set_max_size, set_min_size, set_fullscreen, unset_fullscreen,
-            // set_minimized -- acknowledged and not acted on.
-            7 | 8 | 11..=13 => true,
+            // set_fullscreen(output), unset_fullscreen: a state the host reads
+            // (`SurfaceInfo::fullscreen`). The output is ignored: there is one.
+            11 | 12 => {
+                let on = opcode == 11;
+                if let Some(k) = self.surface_of_xdg(xdg_surface) {
+                    if let Some(s) = self.surfaces.get_mut(&k) {
+                        s.fullscreen = on;
+                    }
+                    self.fullscreen_changes.retain(|c| c.0 != k);
+                    self.fullscreen_changes.push((k, on));
+                }
+                self.dirty = true;
+                true
+            }
+            // set_max_size, set_min_size, set_minimized -- acknowledged and
+            // not acted on.
+            7 | 8 | 13 => true,
             _ => false,
         }
     }
@@ -2036,7 +2071,7 @@ impl Client {
         // draws itself as inactive, which is why an app that never gets
         // `activated` looks greyed out and takes no keyboard focus of its own.
         let mut states = Vec::new();
-        for (bit, state) in [(STATE_MAXIMIZED, 1u32), (STATE_RESIZING, 3), (STATE_ACTIVATED, 4)] {
+        for (bit, state) in [(STATE_MAXIMIZED, 1u32), (STATE_FULLSCREEN, 2), (STATE_RESIZING, 3), (STATE_ACTIVATED, 4)] {
             if states_in & bit != 0 {
                 states.extend_from_slice(&state.to_le_bytes());
             }
@@ -2596,6 +2631,7 @@ impl Client {
                 title: s.title.clone(),
                 request: s.request,
                 request_seq: s.request_seq,
+                fullscreen: s.fullscreen,
                 configure_pending: s.configure_sent != 0 && s.configure_sent != s.configure_acked,
                 x11: s.x11,
                 xid: s.xid,
@@ -4327,6 +4363,38 @@ mod tests {
         assert!(info(&c).configure_pending, "sent and not acked");
         c.receive(&Writer::new(7, 4).uint(u32::from_le_bytes(serial[..4].try_into().unwrap())).finish(), &[], &pool);
         assert!(!info(&c).configure_pending, "acked");
+    }
+
+    #[test]
+    fn a_fullscreen_window_is_a_state_the_host_reads_and_configures() {
+        // placed_window: toplevel 8 on xdg_surface 7, surface 6.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let info = |c: &Client| c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        assert!(!info(&c).fullscreen);
+        assert_eq!(info(&c).flags() & 1, 0, "a new window is not fullscreen");
+        let seq = info(&c).request_seq;
+        // set_fullscreen(output = null)
+        c.receive(&Writer::new(8, 11).uint(0).finish(), &[], &pool);
+        let i = info(&c);
+        assert!(i.fullscreen);
+        assert_eq!(i.flags() & 1, 1, "flags bit 0");
+        assert_eq!(i.request_seq, seq, "a state, not a numbered request");
+        // The host answers with the whole output and the fullscreen state.
+        c.take_outgoing();
+        c.configure(surface, 1280, 720, STATE_ACTIVATED | STATE_FULLSCREEN);
+        let out = messages(&c.take_outgoing());
+        let (_, _, cfg) = out.iter().find(|(id, op, _)| *id == 8 && *op == 0).expect("no configure");
+        let word = |i: usize| u32::from_le_bytes(cfg[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!((word(0), word(1)), (1280, 720));
+        assert_eq!(word(2), 8, "two states");
+        assert_eq!((word(3), word(4)), (2, 4), "fullscreen, then activated");
+        assert_eq!(c.take_fullscreen_changes(), vec![(surface, true)]);
+        // unset_fullscreen
+        c.receive(&Writer::new(8, 12).finish(), &[], &pool);
+        assert!(!info(&c).fullscreen);
+        assert_eq!(c.take_fullscreen_changes(), vec![(surface, false)]);
+        assert!(c.take_fullscreen_changes().is_empty(), "taken once");
     }
 
     #[test]
