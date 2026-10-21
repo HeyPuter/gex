@@ -511,3 +511,131 @@ pub fn prune_unit(wasm: &[u8], image: &[u8], key: &str, path: &str) -> Result<(V
     }
     Ok((out, stat))
 }
+
+/// `data` (a tar) with the regular file at `path` holding `bytes`: its
+/// entry rewritten in place of the old one (size and checksum), or a new
+/// ustar entry after the last when it has none. Links to it keep pointing
+/// at it.
+pub fn tar_put(data: &[u8], path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let want = clean(path);
+    let mut out = Vec::with_capacity(data.len() + bytes.len() + 1024);
+    let mut off = 0usize;
+    let mut long: Option<String> = None;
+    let mut done = false;
+    let mut end = data.len();
+    while off + 512 <= data.len() {
+        let h = &data[off..off + 512];
+        if h.iter().all(|&c| c == 0) {
+            end = off;
+            break;
+        }
+        let size = octal(&h[124..136]);
+        let kind = h[156];
+        let body = off + 512;
+        let next = body + size.div_ceil(512) * 512;
+        if next > data.len() {
+            bail!("a tar entry runs past the end ({off:#x})");
+        }
+        let mut name = field(&h[0..100]);
+        let prefix = field(&h[345..500]);
+        if !prefix.is_empty() {
+            name = format!("{prefix}/{name}");
+        }
+        if let Some(l) = long.take() {
+            name = l;
+        }
+        match kind {
+            b'L' => long = Some(field(&data[body..body + size])),
+            b'x' => {
+                let text = String::from_utf8_lossy(&data[body..body + size]);
+                for rec in text.lines() {
+                    if let Some(p) = rec.split_once(' ').and_then(|(_, kv)| kv.strip_prefix("path=")) {
+                        long = Some(p.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !done && matches!(kind, b'0' | 0 | b'7') && clean(&name) == want {
+            let mut nh = [0u8; 512];
+            nh.copy_from_slice(h);
+            set_size(&mut nh, bytes.len());
+            out.extend_from_slice(&nh);
+            out.extend_from_slice(bytes);
+            out.resize(out.len() + (512 - bytes.len() % 512) % 512, 0);
+            done = true;
+        } else {
+            out.extend_from_slice(&data[off..next]);
+        }
+        off = next;
+    }
+    if !done {
+        if want.len() > 99 {
+            bail!("{want}: too long a name for a new tar entry");
+        }
+        let mut nh = [0u8; 512];
+        nh[..want.len()].copy_from_slice(want.as_bytes());
+        nh[100..108].copy_from_slice(b"0000644\0");
+        nh[108..116].copy_from_slice(b"0000000\0");
+        nh[116..124].copy_from_slice(b"0000000\0");
+        nh[136..148].copy_from_slice(b"00000000000\0");
+        nh[156] = b'0';
+        nh[257..263].copy_from_slice(b"ustar\0");
+        nh[263..265].copy_from_slice(b"00");
+        set_size(&mut nh, bytes.len());
+        out.extend_from_slice(&nh);
+        out.extend_from_slice(bytes);
+        out.resize(out.len() + (512 - bytes.len() % 512) % 512, 0);
+    }
+    // The end: two zero blocks at least, as the original had.
+    let tail = (data.len() - end).max(1024);
+    out.resize(out.len() + tail, 0);
+    Ok(out)
+}
+
+/// A header's size field and its checksum, for `size`.
+fn set_size(h: &mut [u8; 512], size: usize) {
+    h[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+}
+
+#[cfg(test)]
+mod tar_put_tests {
+    use super::*;
+
+    fn entry(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[156] = if name.ends_with('/') { b'5' } else { b'0' };
+        set_size(&mut h, body.len());
+        let mut v = h.to_vec();
+        v.extend_from_slice(body);
+        v.resize(v.len() + (512 - body.len() % 512) % 512, 0);
+        v
+    }
+
+    #[test]
+    fn replaces_and_appends() {
+        let mut t = entry("pfx/", b"");
+        t.extend(entry("pfx/dll-bases", b"0x60000000 /a.dll\n"));
+        t.extend(entry("pfx/b.txt", b"bee"));
+        t.resize(t.len() + 1024, 0);
+        let long = vec![b'x'; 700];
+        let r = tar_put(&t, "/pfx/dll-bases", &long).unwrap();
+        let p = Tar::parse(&r).unwrap();
+        assert_eq!(p.read("pfx/dll-bases").unwrap(), &long[..]);
+        assert_eq!(p.read("pfx/b.txt").unwrap(), b"bee");
+        let r = tar_put(&r, "pfx/new", b"n").unwrap();
+        let p = Tar::parse(&r).unwrap();
+        assert_eq!(p.read("pfx/new").unwrap(), b"n");
+        assert_eq!(p.read("pfx/dll-bases").unwrap(), &long[..]);
+        // The checksum a tar reader checks.
+        let h = &r[512..1024];
+        let mut c = h.to_vec();
+        c[148..156].fill(b' ');
+        let sum: u32 = c.iter().map(|&b| b as u32).sum();
+        assert_eq!(octal(&h[148..156]) as u32, sum);
+    }
+}

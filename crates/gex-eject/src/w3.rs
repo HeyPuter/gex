@@ -75,7 +75,41 @@ pub struct W3Summary {
     pub unit_bytes: u64,
     pub bundle_bytes: u64,
     pub modules: usize,
+    pub providers: usize,
     pub kept_user: bool,
+}
+
+/// The provider modules (`providers/NAME-FINGERPRINT.wasm`, a unit cache's
+/// layout) that `units` (key, guest path) bind in `bundle`: each image's
+/// export providers that bind one of its exports, and the trampoline
+/// page's when any image is 32-bit.
+fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<String>> {
+    use gex_cgen::provider;
+    let tar = crate::reach::Tar::parse(bundle)?;
+    let file = |p: &provider::Provider| format!("providers/{}-{}.wasm", p.name, provider::fingerprint(std::slice::from_ref(p)));
+    let mut out = std::collections::BTreeSet::new();
+    let mut class32 = false;
+    for (_, path) in units {
+        let Some(data) = tar.read(path) else { continue };
+        let Ok(pe) = gex_ld::pe::parse(data) else { continue };
+        class32 |= !pe.is64;
+        let exports: std::collections::HashSet<&str> = pe
+            .exports
+            .entries
+            .iter()
+            .filter(|e| e.rva != 0 && e.forwarder.is_none())
+            .flat_map(|e| e.names.iter().map(|n| n.as_str()))
+            .collect();
+        for p in provider::for_image(&pe.exports.dll_name, !pe.is64, data) {
+            if p.binds.iter().any(|(_, e)| exports.contains(e.as_str())) {
+                out.insert(file(&p));
+            }
+        }
+    }
+    if class32 {
+        out.extend(provider::for_dll(provider::TRAMPOLINES_DLL, true).iter().filter(|p| !p.binds.is_empty()).map(file));
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
@@ -141,8 +175,28 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         for f in ["c.wasm", "c.entries"] {
             sum.unit_bytes += link_or_copy(&src.join(f), &out.join("units").join(key).join(f))?;
         }
+        // Its region entries, when the cache has them (`gexc cgen-image
+        // --entries`): where a run without translation resumes inside it.
+        let regions = src.parent().map(|c| c.join("regions").join(key));
+        if let Some(r) = regions.filter(|r| r.join("c.wasm").is_file() && r.join("c.entries").is_file()) {
+            for f in ["c.wasm", "c.entries"] {
+                sum.unit_bytes += link_or_copy(&r.join(f), &out.join("units/regions").join(key).join(f))?;
+            }
+        }
     }
     sum.units = units.len();
+    // The provider modules the units bind (as the page picks them, cgen.rs
+    // `unit_key`), and the trampolines' for a 32-bit program: an AOT-only
+    // page has no other code for them.
+    for file in provider_files(&std::fs::read(&bundle).with_context(|| format!("reading the bundle {bundle}"))?, &units)? {
+        let src = o.unit_cache.iter().map(|c| c.join(&file)).find(|p| p.is_file());
+        let Some(src) = src else {
+            bail!("no provider module {file} in the unit cache ({}): build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers",
+                o.unit_cache.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":"));
+        };
+        sum.unit_bytes += link_or_copy(&src, &out.join("units").join(&file))?;
+        sum.providers += 1;
+    }
     // The runtime: the browser shim, kernel and seed this page runs, and the
     // gexc that builds it.
     for f in RUNTIME_WASM {
@@ -170,10 +224,14 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
             if let Some(at) = u.get("at").filter(|a| matches!(a, Json::Num(_))) {
                 kv.push(("at", at.clone()));
             }
+            if let Some(b) = u.get("base").filter(|b| matches!(b, Json::Str(_))) {
+                kv.push(("base", b.clone()));
+            }
             obj(kv)
         }).collect())),
         ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
+        ("uncovered", Json::Arr(list(&v, "uncovered").to_vec())),
         ("modules", Json::Arr(modules.to_vec())),
         // The files the run opened (the recorder's `files_read`; null from an
         // older recorder): what `"bundle": "split"` keeps in the bundle.
@@ -441,6 +499,116 @@ fn set_services(v: &Json, web: &Path, services: &[(String, u32)]) -> Result<()> 
     Ok(())
 }
 
+/// An AOT-only build has no code but its units: code the recording ran
+/// translated in a unit's image (its `uncovered`) fails the build, named.
+fn check_covered(v: &Json, dir: &Path) -> Result<()> {
+    let mut regions: std::collections::HashMap<String, std::collections::HashSet<u64>> = Default::default();
+    let mut has = |key: &str, pc: u64| {
+        regions
+            .entry(key.to_string())
+            .or_insert_with(|| {
+                let b = std::fs::read(dir.join("units/regions").join(key).join("c.entries")).unwrap_or_default();
+                b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
+            })
+            .contains(&pc)
+    };
+    let missing: Vec<String> = list(v, "uncovered")
+        .iter()
+        .filter_map(|u| {
+            let pc = u.get("pc")?.as_str()?;
+            let key = u.get("key").and_then(|k| k.as_str()).unwrap_or("");
+            let at = u64::from_str_radix(pc.trim_start_matches("0x"), 16).ok();
+            if at.is_some_and(|a| has(key, a)) {
+                return None;
+            }
+            let path = u.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            Some(format!("{pc} ({path})"))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let shown = missing.iter().take(40).cloned().collect::<Vec<_>>().join(", ");
+    bail!(
+        "gexc eject build: the recording ran {} addresses no unit or region entry holds, and this project runs without translation: \
+         {shown}{}. Build region entries for them (gexc cgen-image --entries) into the unit cache and eject again, \
+         or keep the function JIT for them (user/eject.json \"cold\": \"jit\")",
+        missing.len(),
+        if missing.len() > 40 { ", ..." } else { "" }
+    )
+}
+
+/// Pin, in the bundle's prefix's `dll-bases`, every unit's image the file
+/// leaves to the loader, at the base the recording had it (its `base`): a
+/// unit is keyed by its image and its base, and the loader may place an
+/// unpinned image elsewhere in another run (another process's layout, the
+/// order things map), which an AOT-only page has no unit for. Images that
+/// cannot move (no relocations) are left out.
+fn pin_bases(v: &Json, units: &[Json], web: &Path) -> Result<()> {
+    let what = crate::project::PROJECT_FILE;
+    let path = web.join("rootfs.tar");
+    let bytes = std::fs::read(&path)?;
+    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
+    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_end_matches('/').to_string();
+    let file = format!("{}/dll-bases", prefix.trim_start_matches('/'));
+    let tar = crate::reach::Tar::parse(&bytes)?;
+    let old = tar.read(&file).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+    // The loader's name for a prefix file: the drive's, not the device's.
+    let on_drive = |p: &str| -> String {
+        match p.to_ascii_lowercase().find("/dosdevices/c:/") {
+            Some(i) => format!("{}/drive_c/{}", &p[..i], &p[i + "/dosdevices/c:/".len()..]),
+            None => p.to_string(),
+        }
+    };
+    let drive = |p: &str| on_drive(p).to_ascii_lowercase();
+    let pinned: std::collections::HashSet<String> =
+        old.lines().filter_map(|l| l.split_once(' ')).map(|(_, p)| drive(p.trim())).collect();
+    let mut taken: Vec<(u64, u64, String)> = Vec::new();
+    for l in old.lines() {
+        let Some((a, p)) = l.split_once(' ') else { continue };
+        let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) else { continue };
+        let size = tar.read(p.trim()).and_then(|d| gex_ld::pe::parse(d).ok()).map_or(0x10000, |pe| pe.image_size as u64);
+        taken.push((a, a + size, p.trim().to_string()));
+    }
+    let mut add = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for u in units {
+        let (Some(p), Some(b)) = (u.get("path").and_then(|x| x.as_str()), u.get("base").and_then(|x| x.as_str())) else { continue };
+        if p.starts_with('[') || pinned.contains(&drive(p)) || !seen.insert(drive(p)) {
+            continue;
+        }
+        let Ok(base) = u64::from_str_radix(b.trim_start_matches("0x"), 16) else { continue };
+        let Some(pe) = tar.read(p).and_then(|d| gex_ld::pe::parse(d).ok()) else { continue };
+        if pe.relocs.is_empty() {
+            continue;
+        }
+        let end = base + pe.image_size as u64;
+        if let Some((_, _, q)) = taken.iter().find(|(a, e, _)| base < *e && *a < end) {
+            eprintln!("gexc eject build: {p} at {base:#x} overlaps {q}'s pin: left unpinned");
+            continue;
+        }
+        taken.push((base, end, p.to_string()));
+        add.push(format!("{base:#x} {}", on_drive(p)));
+    }
+    if add.is_empty() {
+        return Ok(());
+    }
+    let mut text = old.clone();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for l in &add {
+        text.push_str(l);
+        text.push('\n');
+    }
+    let out = crate::reach::tar_put(&bytes, &file, text.as_bytes())?;
+    // web/rootfs.tar may be a hard link to the project's bundle.
+    let _ = std::fs::remove_file(&path);
+    write_file(&path, &out, false)?;
+    eprintln!("gexc eject build: pinned {} images in {file}: {}", add.len(), add.join(", "));
+    Ok(())
+}
+
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
@@ -485,6 +653,9 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     let aot = aot_only(&config)?;
     if aot && !off.iter().any(|x| x == "translation") {
         off.push("translation".to_string());
+    }
+    if aot {
+        check_covered(&v, dir)?;
     }
 
     let web = dir.join("build/web");
@@ -569,6 +740,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
         std::collections::HashMap::new()
     };
+    pin_bases(&v, units, &web)?;
     if !config.services.is_empty() {
         set_services(&v, &web, &config.services)?;
     }
@@ -737,6 +909,21 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         cold_units += 1;
     }
 
+    // The provider modules the units bind, beside them as in a unit cache.
+    if let Ok(rd) = std::fs::read_dir(dir.join("units/providers")) {
+        for e in rd.flatten() {
+            link_or_copy(&e.path(), &web.join("units/providers").join(e.file_name()))?;
+        }
+    }
+    // The units' region entries, whole.
+    if let Ok(rd) = std::fs::read_dir(dir.join("units/regions")) {
+        for e in rd.flatten() {
+            for f in ["c.wasm", "c.entries"] {
+                link_or_copy(&e.path().join(f), &web.join("units/regions").join(e.file_name()).join(f))?;
+            }
+        }
+    }
+
     // How the page starts the program: the recording's, less what the site
     // decides (where the bundle and the units are, what to preload).
     let rec = json::field(&v, "page", what)?;
@@ -865,6 +1052,26 @@ mod tests {
         let c = Config::load(&dir).unwrap().0;
         std::fs::remove_dir_all(&dir).unwrap();
         c
+    }
+
+    #[test]
+    fn an_aot_only_build_refuses_code_no_region_entry_holds() {
+        let dir = std::env::temp_dir().join(format!("gex-w3-covered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ok = Json::parse(r#"{"uncovered": []}"#).unwrap();
+        assert!(check_covered(&ok, &dir).is_ok());
+        let bad = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "k", "path": "/w3/combase.dll"}]}"#).unwrap();
+        let e = check_covered(&bad, &dir).unwrap_err().to_string();
+        assert!(e.contains("0x612c52cd (/w3/combase.dll)"), "{e}");
+        // A region entry of its unit's holds it.
+        std::fs::create_dir_all(dir.join("units/regions/k")).unwrap();
+        let entries: Vec<u8> = [0x612c0000u64, 0x612c52cd].iter().flat_map(|a| a.to_le_bytes()).collect();
+        std::fs::write(dir.join("units/regions/k/c.entries"), entries).unwrap();
+        assert!(check_covered(&bad, &dir).is_ok());
+        // Another unit's does not.
+        let other = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "j", "path": "/w3/ole32.dll"}]}"#).unwrap();
+        assert!(check_covered(&other, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

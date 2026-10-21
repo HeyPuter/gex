@@ -91,7 +91,8 @@ if (off.includes('compositor')) {
   const fillP = join(site, 'project/build/web/fill.json');
   const fill = existsSync(fillP) ? JSON.parse(readFileSync(fillP, 'utf8')) : { files: [] };
   const lateOnly = pre.filter(([k]) => /^late-/.test(k)).map(([k]) => k);
-  const boot = pre.filter(([k]) => /^tar:/.test(k)).reduce((a, [k]) => a + Number(k.slice(4)), 0);
+  // A unit's region entries are modules of their own in the archive, not units.
+  const boot = pre.filter(([k]) => /^tar:/.test(k)).reduce((a, [k, , o]) => a + Number(k.slice(4)) - (o?.regions ?? 0), 0);
   const inFill = new Set(fill.files.filter(([n]) => /^unit:.*\/c\.wasm$/.test(n)).map(([n]) => n.slice(5, -7)));
   const units = nt.units ?? [];
   if (fill.demand) {
@@ -266,7 +267,14 @@ while (Date.now() - t0 < timeout) {
   await sleep(500);
 }
 const secs = ((Date.now() - t0) / 1000).toFixed(1);
-if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleRe.source}/ (${secs} s; titles ${JSON.stringify(d?.titles ?? [])})`)) done();
+if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleRe.source}/ (${secs} s; titles ${JSON.stringify(d?.titles ?? [])})`)) {
+  // The programs' own output (Wine's stderr), for a diagnosis.
+  if (process.env.W3PAGE_CONSOLE) {
+    const { appendFileSync } = await import('node:fs');
+    appendFileSync(process.env.W3PAGE_CONSOLE, `== the programs' output\n${(await ev('String(globalThis.__nt?.out ?? "").slice(-200000)')) ?? ''}\n`);
+  }
+  done();
+}
 // The site's units are the ones the runtime looks for: a runtime whose unit
 // keys moved (gex-cgen's sources changed under it) misses every one and runs
 // the program on tier 1 -- it still reaches the window, slowly. An image

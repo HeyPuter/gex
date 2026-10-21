@@ -688,6 +688,16 @@ function w3Site() {
   // (preload.json `tar:N`, N the number of modules in it).
   const preload = [];
   const coldUnits = w3.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
+  // The provider modules the units bind (gexc eject: units/providers/),
+  // which the Workers read as unit-cache files.
+  const providers = existsSync(join(web, 'units', 'providers'))
+    ? readdirSync(join(web, 'units', 'providers')).filter((n) => n.endsWith('.wasm')).sort().map((n) => `providers/${n}`)
+    : [];
+  // The units' region entries (gexc eject: units/regions/KEY/), modules of
+  // their own the page publishes after each unit.
+  const regions = existsSync(join(web, 'units', 'regions'))
+    ? readdirSync(join(web, 'units', 'regions')).sort().map((k) => `regions/${k}`)
+    : [];
   if (!coldUnits) {
     // --late: the late files' units travel in the fill (above), not here.
     const bootUnits = w3.units.filter((u) => !lateKeys.has(u.key));
@@ -711,20 +721,23 @@ function w3Site() {
     }
     const unitTars = [];
     // Stateful providers (user/eject.json "providers", w3.json `stateful`):
-    // files of the unit cache, in the first archive.
+    // files of the unit cache, in the first archive, with the provider
+    // modules and the region entries.
     const statefulFiles = existsSync(join(web, 'units', 'stateful')) ? readdirSync(join(web, 'units', 'stateful')).map((f) => `stateful/${f}`) : [];
-    if (!groupsU.size && statefulFiles.length) groupsU.set(0, []);
+    if (!groupsU.size && (statefulFiles.length || providers.length || regions.length)) groupsU.set(0, []);
+    let firstGroup = true;
     let first = true;
     for (const g of [...groupsU.keys()].sort((a, b) => a - b)) {
       const us = groupsU.get(g).sort((a, b) => (a.key < b.key ? -1 : 1));
       const list = join(work, 'units-list');
-      writeFileSync(list, `${[...us.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]), ...(first ? statefulFiles : [])].join('\n')}\n`);
+      writeFileSync(list, `${[...us.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]), ...(first ? [...statefulFiles, ...providers, ...regions.flatMap((r) => [`${r}/c.wasm`, `${r}/c.entries`])] : [])].join('\n')}\n`);
       first = false;
       const ut = join(work, `units-${g}.tar`);
       execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '--format=gnu', '-cf', ut, '-T', list]);
       const site = piecesOn ? `project/build/web/pieces/u${sha(readFileSync(ut)).slice(0, 32)}.tar` : 'project/build/web/units.tar';
       place(ut, site);
-      unitTars.push([`/${site}`, us]);
+      unitTars.push([`/${site}`, us, firstGroup ? regions.length : 0]);
+      firstGroup = false;
     }
     if (piecesOn) console.log(`eject-site: unit pieces: ${unitTars.length} (${bootUnits.filter(stableU).length} of ${bootUnits.length} units stable)`);
     if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${w3.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
@@ -743,9 +756,9 @@ function w3Site() {
     const demand = timed ? bootUnits.filter((u) => !(typeof u.at === 'number' && u.at <= title)).map((u) => u.key) : [];
     if (demand.length) console.log(`eject-site: ${demand.length} units compiled when first mapped (${w3.units.filter((u) => demand.includes(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     const demandSet = new Set(demand);
-    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(unitTars.map(([url, us]) => {
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(unitTars.map(([url, us, nr]) => {
       const d = us.filter((u) => demandSet.has(u.key)).map((u) => u.key);
-      return [`tar:${us.length - d.length}`, url, ...(d.length ? [{ demand: d }] : [])];
+      return [`tar:${us.length - d.length + nr}`, url, ...(d.length || nr ? [{ ...(d.length ? { demand: d } : {}), ...(nr ? { regions: nr } : {}) }] : [])];
     })));
   }
   for (const u of coldUnits ? w3.units : []) {
@@ -761,6 +774,16 @@ function w3Site() {
       place(join(web, 'units', 'stateful', f), `project/build/web/units/stateful/${f}`);
       preload.push([`file:stateful/${f}`, `/project/build/web/units/stateful/${f}`, 0]);
     }
+  }
+  for (const r of coldUnits ? regions : []) {
+    place(join(web, 'units', r, 'c.wasm'), `project/build/web/units/${r}/c.wasm`);
+    place(join(web, 'units', r, 'c.entries'), `project/build/web/units/${r}/c.entries`);
+    preload.push([`cgen:${r}`, `/project/build/web/units/${r}/c.wasm`, statSync(join(web, 'units', r, 'c.wasm')).size]);
+    preload.push([`file:${r}/c.entries`, `/project/build/web/units/${r}/c.entries`, 0]);
+  }
+  for (const rel of coldUnits ? providers : []) {
+    place(join(web, 'units', rel), `project/build/web/units/${rel}`);
+    preload.push([`file:${rel}`, `/project/build/web/units/${rel}`, 0]);
   }
   preload.sort((a, b) => b[2] - a[2]);
   if (coldUnits) writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));

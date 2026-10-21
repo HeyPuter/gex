@@ -214,10 +214,11 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     &gex_eject::w3::W3Options { web_src, unit_cache, features_off },
                 )?;
                 eprintln!(
-                    "{}: a W3 page: {} processes, {} units ({} MiB), bundle {} MiB, {} wasm modules{}",
+                    "{}: a W3 page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
                     out.display(),
                     s.processes,
                     s.units,
+                    s.providers,
                     s.unit_bytes >> 20,
                     s.bundle_bytes >> 20,
                     s.modules,

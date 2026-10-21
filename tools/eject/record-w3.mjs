@@ -105,6 +105,9 @@ const units = new Map();     // key -> { path, hit, first: when it was first hit
 const processes = new Map(); // main image -> cmdline
 const modules = new Map();   // path -> content key
 const bases = new Map();     // unit key -> load base, for the images without one
+// Code a unit's image ran translated (gex.mjs `gex_cgen_set_record`): pc ->
+// { key, path }. An AOT-only project would have no code there.
+const uncovered = new Map();
 // An instrumented run's function coverage (gex.mjs `covFlush`, units from
 // `gexc cgen-split instrument`): unit key -> the slots entered.
 const coverage = new Map();
@@ -116,6 +119,10 @@ browser.on('Runtime.consoleAPICalled', (p) => {
     const was = units.get(m[1]);
     const hit = m[2] === 'hit' || !!was?.hit;
     units.set(m[1], { path: m[3], hit, first: was?.first ?? (m[2] === 'hit' ? Date.now() : undefined) });
+  } else if ((m = /^\[gex-record\] uncovered (0x[0-9a-f]+) ([0-9a-f]{64}(?:-[a-z][0-9a-f]{16})*) (.*?)\s*$/.exec(t))) {
+    if (!uncovered.has(m[1])) uncovered.set(m[1], { key: m[2], path: m[3] });
+  } else if ((m = /^\[gex-record\] base ([0-9a-f]{64}(?:-[a-z][0-9a-f]{16})*) (0x[0-9a-f]+)$/.exec(t))) {
+    bases.set(m[1], m[2]);
   } else if ((m = /^\[gex-record\] process (.*?) :: (.*)$/.exec(t))) {
     processes.set(m[1], m[2]);
   } else if ((m = /^\[gex-cov\] ([0-9a-f]{64}) (\S+)$/.exec(t))) {
@@ -211,8 +218,12 @@ const session = {
   // `at`: seconds from the start to the unit's first use. A unit first used
   // after the title is compiled when a process first maps it, not with the
   // page (web/eject-site.mjs, preload.json's `demand`).
-  units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path, at: +((u.first - t0) / 1000).toFixed(2) })),
+  // `base`: where its image was (gexc eject pins an image the prefix's
+  // dll-bases leaves to the loader there).
+  units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path, at: +((u.first - t0) / 1000).toFixed(2), ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
   unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path, ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
+  // Addresses in a unit's image that ran translated: what no unit holds.
+  uncovered: [...uncovered].map(([pc, u]) => ({ pc, ...u })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,
   // Which functions (slots of each unit's element segment) the run entered,
@@ -227,7 +238,7 @@ if (bootOut) {
   console.log(`${bootOut}: ${boot.length} of ${session.units.length} units' images by ${bootAfter} s after the title`);
 }
 console.log(`${out}/w3-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
-  + `${session.units.length} units (${session.unit_misses.length} images without one), ${session.modules.length} wasm modules`
+  + `${session.units.length} units (${session.unit_misses.length} images without one, ${session.uncovered.length} addresses no unit holds), ${session.modules.length} wasm modules`
   + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
 // --coverage-into SESSION: a run of a site built with "cold": "instrument"
 // (docs/eject.md, "Cold code") adds the functions it called to another

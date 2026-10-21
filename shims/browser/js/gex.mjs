@@ -1681,6 +1681,8 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+    // For gex-eject's W3 recorder: code a unit's image ran translated.
+    if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
@@ -2276,6 +2278,7 @@ export class Gex {
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
@@ -5603,6 +5606,7 @@ export class Gex {
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
     if (logOn('record')) console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
+    if (logOn('record') && e.gex_cgen_base) console.warn(`[gex-record] base ${key} 0x${BigInt.asUintN(64, BigInt(e.gex_cgen_base(u))).toString(16)}`);
     const program = /\.exe$/i.test(path) ? this.cmdline : undefined;
     if (program !== undefined && logOn('record')) console.warn(`[gex-record] process ${path} :: ${program}`);
     // The same, structured, for the page's start-up status (fetch-note.mjs).
