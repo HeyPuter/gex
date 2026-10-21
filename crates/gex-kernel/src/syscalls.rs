@@ -6511,13 +6511,16 @@ pub fn sleep_block(m: &GuestMem<'_>, n: u64, a: [u64; 6], clock: ClockFn, starte
     }
     let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
     // TIMER_ABSTIME: a deadline on the clock, not a duration. It was slept
-    // as a duration, so every absolute sleep lasted the 60 s cap below.
+    // as a duration, so every absolute sleep lasted the cap there was then.
     const TIMER_ABSTIME: u64 = 1;
     if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
         wait = wait.checked_sub(clock_nanos_at(clock, started, a[0])).filter(|&w| w > 0)?;
     }
-    // Capped, as before: a longer sleep returns early.
-    let wait = wait.min(60_000_000_000) as u64;
+    // The whole request: `sleep 2200` returned 0 after 60 s here (the
+    // session's stop timer fired 37 minutes early). Bounded only so a
+    // deadline added to a clock reading cannot overflow (a century).
+    const LONGEST: u128 = 100 * 365 * 24 * 3600 * 1_000_000_000;
+    let wait = wait.min(LONGEST) as u64;
     Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
 }
 
@@ -11254,9 +11257,14 @@ mod tests {
             (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_millis(5)),
             other => panic!("{other:?}"),
         }
-        // Absolute, two seconds ahead: about two seconds, not the 60 s cap.
+        // Absolute, two seconds ahead: about two seconds, not the whole clock reading.
         match ask(&mut k, &mut mem, 1, now + 2, 0) {
             (Some(BlockOp::Sleep(d)), _) => assert!(d <= std::time::Duration::from_secs(2), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Longer than a minute: all of it (it was cut to 60 s, answered 0).
+        match ask(&mut k, &mut mem, 0, 2200, 0) {
+            (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_secs(2200)),
             other => panic!("{other:?}"),
         }
         // Absolute and already past: returns at once.
