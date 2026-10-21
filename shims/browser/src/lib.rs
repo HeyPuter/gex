@@ -3380,11 +3380,16 @@ static STALE_FOREIGN_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// (`Jit::stale_again`).
 const STALE_AGAIN_MAX: u32 = 64;
 
-/// `GEX_JIT_DIAG`: the id of this process's own module just queued
-/// (`Jit::own_ids`); its `blocks` range is noted when it is queued.
+/// `GEX_JIT_DIAG`: the id and base of this process's own module just queued
+/// (`Jit::own_ids`, `Jit::own_bases`); its `blocks` range is noted when it is
+/// queued.
 fn note_module_dense(j: &mut Jit, module_id: u64) {
-    if j.pending.back().is_some_and(|p| p.dense.is_some()) && jit_diag() {
+    if !jit_diag() {
+        return;
+    }
+    if let Some(base) = j.pending.back().and_then(|p| p.dense.as_ref()).map(|d| d.base) {
         j.own_ids.insert(module_id as u32);
+        j.own_bases.insert(base);
     }
 }
 
@@ -3554,6 +3559,8 @@ struct Jit {
     /// translations were given, to say when a stale check comes from a
     /// module numbered elsewhere whose id is also one of these.
     own_ids: std::collections::HashSet<u32>,
+    /// `GEX_JIT_DIAG`: the dense bases of those translations.
+    own_bases: std::collections::HashSet<u32>,
     /// Times a stale page check translated each block start again
     /// (`PAGE_STALE`), for its bound ([`STALE_AGAIN_MAX`]).
     stale_again: std::collections::HashMap<u64, u32>,
@@ -10004,6 +10011,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         dense_base: Default::default(),
         module_dense: Default::default(),
         own_ids: Default::default(),
+        own_bases: Default::default(),
         stale_again: Default::default(),
         retired_pages: Default::default(),
         base_pages: Default::default(),
@@ -14178,11 +14186,18 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 let d = dense::lookup(start);
                 d != 0 && ours.is_some_and(|n| d < stale_base || d >= stale_base + n)
             };
-            if jit_diag() && ours.is_none() && j.own_ids.contains(&(stale_id as u32)) {
+            // A module served or restored here is numbered as it is queued, so
+            // its own range answers; one this process did not number has none.
+            // Either way the id never picks the range.
+            if jit_diag() && !j.own_bases.contains(&stale_base) && j.own_ids.contains(&(stale_id as u32)) {
                 let n = STALE_FOREIGN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n == 0 {
+                    let judged = match ours {
+                        Some(n) => format!("judged by its own range ({n} blocks at {stale_base:#x}): elsewhere {elsewhere}"),
+                        None => "not taken for elsewhere".to_string(),
+                    };
                     warn_line(&format!(
-                        "gex: pid {} stale block {start:#x} of a module this process did not number (base {stale_base:#x}), whose id {stale_id} one of its own has too; not taken for elsewhere\n",
+                        "gex: pid {} stale block {start:#x} of a module this process did not translate (base {stale_base:#x}), whose id {stale_id} one of its own has too; {judged}\n",
                         my_pid()
                     ));
                 }
