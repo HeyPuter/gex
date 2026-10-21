@@ -6,7 +6,7 @@
 //! `EPIPE`; the syscall layer raises SIGPIPE for it, as Linux does.
 //!
 //! Blocking uses a condition variable, which works because a guest thread is
-//! a real host thread (PLAN §2.5). The browser runtime blocks the same way
+//! a real host thread. The browser runtime blocks the same way
 //! through `Atomics.wait`.
 
 use crate::errno::{Errno, SysResult};

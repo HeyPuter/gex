@@ -1,4 +1,4 @@
-//! Signals (PLAN §8).
+//! Signals.
 //!
 //! Delivery works because of the tail-call design: every host call flushes the
 //! guest's registers to the thread context first, so at any syscall or safepoint
@@ -149,7 +149,7 @@ pub struct Itimer {
 const NO_TIMER: u64 = u64::MAX;
 
 /// The process's part of the signal state, shared by its threads and read
-/// without the kernel lock (docs/kernel-locking.md §3.8): dispositions behind
+/// without the kernel lock: dispositions behind
 /// an `RwLock`, the process-directed pending set as one atomic word (with
 /// its senders behind a `Mutex`), and the interval timers, whose earliest
 /// deadline is an atomic word so asking "is one due" takes no lock.
@@ -168,7 +168,7 @@ pub struct ProcSig {
     timer_next: AtomicU64,
     /// Held across a [`ProcSig::collect`]'s take of the inbox and its
     /// raise, so a collect that finds the inbox empty because another is
-    /// under way waits for that one's signals to be pending (L22d).
+    /// under way waits for that one's signals to be pending.
     collecting: Mutex<()>,
 }
 
@@ -380,7 +380,7 @@ pub struct Own {
 }
 
 /// Every thread's own signal state in a process, by tid, behind its own
-/// lock (L22d): what a `tgkill` to a thread of the same process raises on,
+/// lock: what a `tgkill` to a thread of the same process raises on,
 /// whether its sender holds the kernel or not. Shared (`Arc`) between the
 /// process's kernel and its host's lock-free calls; a fork's is new. A leaf
 /// lock: nothing is called with it held.
@@ -420,8 +420,8 @@ impl ThreadSigs {
 }
 
 /// One thread's signal state, shared (`Arc`) between the thread and whoever
-/// sends it a signal or asks whether it has one ready
-/// (docs/kernel-locking.md §3.8). Its pending set and mask are atomic words
+/// sends it a signal or asks whether it has one ready. Its pending set and
+/// mask are atomic words
 /// any thread reads without a lock; only the thread itself writes the mask
 /// and [`Own`].
 pub struct ThreadSig {
@@ -588,7 +588,7 @@ impl Signals {
     ///
     /// A handler is an address in the old image, so every caught signal reverts
     /// to default -- otherwise the new program inherits the address of a handler
-    /// that no longer exists (`timeout 3 sleep 30` jumped into dash's old
+    /// that no longer exists (`timeout 3 sleep 30` would jump into dash's old
     /// handler). Ignored stays ignored, the blocked mask and pending signals
     /// carry over, per POSIX; the alternate stack does not -- it too pointed into
     /// the old image.

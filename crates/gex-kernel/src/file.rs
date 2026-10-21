@@ -24,7 +24,7 @@ pub struct OpenFile {
     /// `lseek` of a seekable file: the offset's load, the transfer and the
     /// offset's update are one step, as Linux's `f_pos_lock` makes them (two
     /// threads reading one descriptor never get the same bytes). These calls
-    /// run without the kernel lock (docs/kernel-locking.md §3.4). A stream
+    /// run without the kernel lock. A stream
     /// has no position and locks itself.
     pos: Mutex<()>,
     /// Cursor into a directory listing, for `getdents64`.
@@ -359,10 +359,10 @@ struct Table {
 /// than that. A reader whose id falls outside takes the writers' mutex.
 pub const FD_READER_SLOTS: usize = 130;
 
-/// The per-process descriptor table (docs/kernel-locking.md §3.4).
+/// The per-process descriptor table.
 ///
 /// No kernel lock: a lookup reads the published snapshot
-/// ([`gex_atomic::rcu::Published`], announced in its epoch array, §4.2) and
+/// ([`gex_atomic::rcu::Published`], announced in its epoch array) and
 /// takes its own `Arc` to the description; a change (open, close, dup,
 /// F_DUPFD, pipe, socket, accept, exec, exit) takes the table's mutex,
 /// copies the snapshot, changes the copy and publishes it. The snapshot it
@@ -733,7 +733,7 @@ mod tests {
     }
 
     /// A close drops the description when it returns, with readers about:
-    /// the pipe's reader sees end of file at once (§3.4).
+    /// the pipe's reader sees end of file at once.
     #[test]
     fn a_close_closes_the_description_at_once() {
         let t = FdTable::new();

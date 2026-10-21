@@ -1,4 +1,4 @@
-//! The function table's host half (docs/merge-plan.md §9.8), shared by both
+//! The function table's host half, shared by both
 //! shims: which guest address has which [`gex_abi::ftab`] index, process-wide.
 //!
 //! A table belongs to one store natively and one Worker in the browser, so
@@ -22,7 +22,7 @@
 use gex_abi::ftab::{RESERVED, RESOLVE};
 use std::collections::BTreeMap;
 
-/// What made a function: the tiers of §9.2, for statistics and for what a
+/// What made a function: which tier built it, for statistics and for what a
 /// retirement has to check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -202,8 +202,8 @@ impl FuncMap {
     }
 
     /// Map more addresses to slots of install `install`: one module serving
-    /// several images (Wine's PE side as one module, docs/wine-native.md
-    /// §3.14, bound DLL by DLL as each maps). Nothing changes in any table
+    /// several images (Wine's PE side as one module, bound DLL by DLL as
+    /// each maps). Nothing changes in any table
     /// (the slots are filled already); an address already mapped is taken
     /// over as by [`FuncMap::publish`].
     pub fn bind(&mut self, install: u32, funcs: &[(u64, u32)]) {
@@ -274,7 +274,7 @@ impl FuncMap {
     }
 }
 
-/// What the host asks a run-time translator (the function JIT, stream F)
+/// What the host asks a run-time translator (the function JIT)
 /// for when a lookup finds no function at an address.
 pub struct Request<'a> {
     /// The guest process asking: what a translator learns of one process's

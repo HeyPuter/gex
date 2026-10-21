@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn a_group_can_be_named_even_when_it_is_group_one() {
         // The case `kill(-pgid)` cannot express: -1 is "everyone", so group 1
-        // has no negative spelling. It is the shell's group in every demo.
+        // has no negative spelling. A shell started first is in it.
         let t = ProcTable::new();
         let child = t.spawn(INIT_PID);
         let outsider = t.spawn(INIT_PID);

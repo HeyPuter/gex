@@ -1,6 +1,6 @@
 //! OSS audio devices, `/dev/dsp` and `/dev/mixer`: a null output for now.
 //!
-//! Native Wine's audio (W3.5, docs/wine-native.md) is mmdevapi over
+//! Wine's audio is mmdevapi over
 //! wineoss.drv, the OSSv4 driver, and this is the device it talks to: one
 //! playback engine that takes 16-, 24- and 32-bit and float PCM at any rate,
 //! and plays it into nothing at the rate it was set to. Its buffer drains

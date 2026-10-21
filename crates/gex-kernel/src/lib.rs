@@ -1,21 +1,17 @@
 //! `gex-kernel` — the Linux personality.
 //!
-//! A syscall implementation, not a machine emulator (PLAN §2.2). The kernel is
+//! A syscall implementation, not a machine emulator. The kernel is
 //! a plain Rust library that operates on the guest's linear memory as a byte
-//! slice, which is what lets the same code be linked into a native host today
-//! and compiled to wasm for the browser later without a second implementation.
-//!
-//! M0 covers tier T0 from PLAN §8 — enough for a static musl program to
-//! start, do I/O and exit — plus the file-descriptor and VFS plumbing the
-//! later tiers build on.
+//! slice, which is what lets the same code be linked into the native host and
+//! compiled to wasm for the browser without a second implementation.
 
 #![forbid(unsafe_code)]
 
 /// An address in the calling process's memory as it crosses between a
 /// process's shim and the global kernel module (the remote ops below and the
 /// browser's `k_*` imports): 64-bit for every flavour, since one kernel
-/// module serves processes with a 32-bit memory and with a memory64 (gex-kmem,
-/// docs/mem64.md step 6).
+/// module serves processes with a 32-bit memory and with a memory64
+/// (gex-kmem).
 pub type PAddr = u64;
 
 /// `GEX_MEM_TRACE`: say where a guest memory fill or copy of 8 MiB or more
@@ -78,7 +74,7 @@ pub use proclive::{KernelProcSource, ProcCell};
 
 /// Guest linear memory, addressed exactly as the guest addresses it.
 ///
-/// Guest virtual address equals byte offset (PLAN §2.3), so the kernel needs
+/// Guest virtual address equals byte offset, so the kernel needs
 /// no translation layer — just bounds checks, which are also the syscall
 /// ABI's `EFAULT` checks.
 pub struct GuestMem<'a> {
@@ -198,8 +194,8 @@ impl<'a> GuestMem<'a> {
     /// As [`Self::zero`], writing only the 4 KiB pages that are not zero
     /// already. For fresh anonymous memory: reading a page the host never
     /// touched costs no memory, writing it commits it, so a large
-    /// reservation zeroed with `zero` cost its whole size in resident memory
-    /// (a 1 GiB `PROT_NONE` mmap took ~1 GiB of RSS natively).
+    /// reservation zeroed with `zero` would cost its whole size in resident
+    /// memory (a 1 GiB `PROT_NONE` mmap, ~1 GiB of RSS natively).
     #[track_caller]
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero_dirty", len);

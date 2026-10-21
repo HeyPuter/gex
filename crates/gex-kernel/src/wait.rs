@@ -1,4 +1,4 @@
-//! Wait queues (docs/kernel-locking.md §5.2 step 2): Linux's wait-queue model.
+//! Wait queues: Linux's wait-queue model.
 //!
 //! Every waitable object -- a pipe, a socket, an eventfd, an epoll set, the
 //! terminal, a process's children -- owns a [`Queue`]. A thread that waits

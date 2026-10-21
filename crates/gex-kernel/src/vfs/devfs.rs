@@ -333,7 +333,7 @@ impl FileHandle for DevDir {
 
 /// Pseudorandom bytes.
 ///
-/// Deterministic by default so record/replay stays possible (PLAN §11); a
+/// Deterministic by default so record/replay stays possible; a
 /// host that wants real entropy replaces the `/dev/random` backend.
 /// `/dev/urandom` and `getrandom`'s bytes: splitmix64 over a per-thread
 /// state. The state was a constant xorshift seed in every thread, so every

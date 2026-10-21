@@ -2,9 +2,8 @@
 //!
 //! Guest threads run in parallel: native threads on the host, Workers in the
 //! page. So the guest gets the host's count, which is what sizes an engine's job
-//! pool, a GC's markers, or `make -j`. Before this, every layer said one
-//! processor, so a game ran its whole job system on one worker and left the
-//! other cores idle.
+//! pool, a GC's markers, or `make -j`. Told one processor, a program runs its
+//! whole job system on one worker and leaves the other cores idle.
 //!
 //! On the host the count comes from `std::thread::available_parallelism`, or
 //! from `GEX_CPUS` when that is set. The page has no such call in wasm, so its

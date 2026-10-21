@@ -1,6 +1,5 @@
 //! `/proc` for one process, read from the process's own published state
-//! rather than from a snapshot the kernel refreshes (docs/kernel-locking.md,
-//! L14a).
+//! rather than from a snapshot the kernel refreshes.
 //!
 //! What `/proc/self` shows is live everywhere it can be: the memory map
 //! through its own lock (`Mm::shared`), the descriptor table through its
@@ -23,8 +22,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 /// The descriptor table and the namespace are held weakly. The namespace
 /// mounts this process's `/proc`, whose source holds this: strong handles
 /// made a cycle, so an ended process's descriptor table was never dropped
-/// and its pipes and sockets never closed (native W3: the wineserver never
-/// saw a client go, and the process that waited for it hung).
+/// and its pipes and sockets never closed (the wineserver never saw a client
+/// go, and the process that waited for it hung).
 struct Live {
     pid: i32,
     procs: Arc<ProcTable>,
@@ -135,8 +134,8 @@ impl ProcSource for KernelProcSource {
     fn fd_link(&self, fd: i32) -> Option<String> {
         // One descriptor, not the whole table rendered. Its path as opened,
         // with the symlinks on it followed: a program asks this to learn a
-        // file's real name in one call (W3's wineserver, for every file it
-        // opens, where `realpath` was a `readlink` per directory, each one a
+        // file's real name in one call (the wineserver, for every file it
+        // opens, where `realpath` is a `readlink` per directory, each one a
         // proxied system call out of a door).
         let l = self.0.get()?;
         let path = l.fds.upgrade()?.get(fd).ok()?.path.clone();
