@@ -249,8 +249,8 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     let fallback = if crate::aot_only::enabled() {
         wasmtime::Func::wrap(
             &mut c,
-            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
-                crate::aot_only::fallback(&mut caller, ctx, ret as u64)
+            |mut caller: Caller<'_, HostState>, ctx: i32, depth: i32, need: i32, ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
+                crate::aot_only::fallback(&mut caller, ctx, depth, need, ret as u64)
             })()) },
         )
     } else {

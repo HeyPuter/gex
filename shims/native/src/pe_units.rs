@@ -373,7 +373,7 @@ fn regions_from(
     pcs: &[u64],
     jobs: usize,
 ) -> Result<Vec<u64>> {
-    use gex_xlate::func::{self as func, Code, RecoverOptions, Source};
+    use gex_xlate::func::{self as func, RecoverOptions, Source};
     struct Pv<'a> {
         stubs: &'a [u64],
     }

@@ -1841,6 +1841,19 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
         }
+        // A window-procedure thunk made at run time (gex_kernel::win::thunk):
+        // its store done here, then the call goes on to where it jumps.
+        if crate::compat_abi() {
+            if let Some(next) = gex_kernel::win::thunk::run(&mut gm, c, t) {
+                let _ = gm.write_u64(c + gex_abi::ctx::LAST_TARGET as u64, next);
+                let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, next);
+                if let Some(idx) = ftab(|m| m.get(next).map(|f| f.idx)) {
+                    // SAFETY: a host import taking scalars; nothing here holds a lock.
+                    return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
+                }
+                return gex_ftab_fallback(ctx, _depth, _need, ret);
+            }
+        }
         // The first call into a W3 image left unplaced at its mapping
         // (`w3_miss`; native Wine calls a DLL's entry point straight after
         // mapping it): its unit is placed now and served below.

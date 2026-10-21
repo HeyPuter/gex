@@ -8547,7 +8547,7 @@ fn is_clock_nr(n: u64) -> bool {
 
 /// `Kernel::compat` of this process, without the kernel: published with it
 /// at every change (`clock_constants`).
-fn compat_abi() -> bool {
+pub(crate) fn compat_abi() -> bool {
     CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1
 }
 

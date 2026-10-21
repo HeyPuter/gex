@@ -10,6 +10,8 @@ pub const TRAMPOLINES_END: u64 = 0x0040_0000;
 pub const NTDLL_HANDLE: u64 = 1;
 
 /// gex-private system call numbers, issued only by gex's own trampolines.
+pub mod thunk;
+
 pub mod nr {
     /// `__wine_unix_call_dispatcher(handle, code, args)`.
     pub const UNIX_CALL: u32 = 0x7f00_0001;
