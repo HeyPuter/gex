@@ -10,8 +10,9 @@ The page that runs gex in a browser, and the builds of what it loads:
   (`build-mesa-wasm.sh`);
 - Xwayland as wasm32, which runs in a Worker of the page and talks to
   `shims/hostwl` (`build-xwayland-wasm.sh`);
-- the guest root filesystems (`build-debian.sh`, `build-native-debian.sh`,
-  `build-graphics-rootfs.sh`, `rootfs-manifests/`).
+- the guest root filesystems come from the gex-debian repository, which
+  writes them into `web/public/rootfs` (and the desktop demo's launcher
+  packages into `web/public/pkgs`).
 
 ## The two builds
 
@@ -44,3 +45,18 @@ much longer than later ones. Stripping needs `wasm-tools`
 library, its runtime and Mesa, zstd-compressed assets, and the headers the
 host must send. The site's `index.html` belongs to the project, so the
 library can be imported into a page of your own.
+
+## The desktop demo
+
+`build-demo.sh` builds the desktop page into `web/dist-demo`. Its guest side
+(the base rootfs and the launcher's packages) comes from the gex-debian
+repository, built against this checkout first:
+
+```sh
+make -C path/to/gex-debian native GEXCC_PREFIX=...   # the gexcc .deb pool, once
+make -C path/to/gex-debian desktop GEX_DIR=$PWD      # web/public/rootfs/base.tar.zst, web/public/pkgs
+web/build-demo.sh
+```
+
+Without them `build-demo.sh` stops and says so. The other pages (`build-all.sh`)
+need nothing from gex-debian; their Debian demos say when their rootfs is missing.

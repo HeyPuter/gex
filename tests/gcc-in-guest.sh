@@ -20,7 +20,9 @@
 #
 #   GEX_DEBIAN_ROOTS="libc-bin base-files base-passwd dash coreutils gcc \
 #       binutils libc6-dev make grep sed findutils" \
-#     web/build-debian.sh /tmp/gcc-rootfs.tar /tmp/gex-gcc
+#     rootfs/build-debian.sh /tmp/gcc-rootfs.tar /tmp/gex-gcc
+#
+# (rootfs/build-debian.sh is in the gex-debian repository.)
 set -eu
 
 ROOT="${1:-/tmp/gex-gcc/root}"
