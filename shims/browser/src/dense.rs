@@ -57,7 +57,8 @@ pub(crate) fn on() -> bool {
 }
 
 /// Dense numbering on or off for this process, before anything is
-/// translated (and again in a forked child, whose shim is new).
+/// translated (and again in a forked child, whose shim is new): 0 off, 1 on,
+/// 2 on without catching up.
 #[no_mangle]
 pub extern "C" fn gex_set_dense(on: i32) {
     ON.store(on != 0, Ordering::Relaxed);
@@ -135,7 +136,7 @@ pub(crate) fn register(wasm: &mut [u8]) -> Option<Section> {
         return None;
     };
     let mut s = dense::section(wasm, &at)?;
-    let n = s.entries.len() as u32;
+    let n = s.span();
     let w = word(NEXT);
     let mut cur = w.load(Ordering::Acquire);
     let base = loop {
@@ -158,7 +159,7 @@ fn write(s: &Section, only_empty: bool) {
             continue;
         }
         let w = word(m + 4 * slot);
-        let d = s.base + j as u32;
+        let d = s.word(j);
         if only_empty {
             let _ = w.compare_exchange(0, d, Ordering::AcqRel, Ordering::Relaxed);
         } else {
@@ -170,6 +171,61 @@ fn write(s: &Section, only_empty: bool) {
 /// A registered module is installed: its slots point at its blocks.
 pub(crate) fn publish(s: &Section) {
     write(s, false);
+    // TEST(gex_test_dense_holes): the word one past this module's last
+    // block, in its last entry, when that entry has arms to spare.
+    if HOLES.load(Ordering::Relaxed) && s.entries.len() as u32 % dense::ARMS != 0 {
+        HOLE.store(((s.base + s.span() - 1) << 8) | (dense::ARMS - 1), Ordering::Relaxed);
+    }
+}
+
+/// `gex_test_dense_holes(1)` (GEX_TEST_DENSE_HOLES): a test switch, off in
+/// every real run. A miss at a slot no block was
+/// given first has its word pointed past the last block of the newest
+/// module ([`test_hole`]), as a word left stale would be; the retried
+/// dispatch must reach the miss stub through that entry's `br_table`
+/// default and the address be translated, not trap.
+static HOLES: AtomicBool = AtomicBool::new(false);
+static HOLE: AtomicU32 = AtomicU32::new(0);
+static HOLES_MADE: AtomicU32 = AtomicU32::new(0);
+static HOLES_REACHED: AtomicU32 = AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_test_dense_holes(on: i32) {
+    HOLES.store(on != 0, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// The last (pc, word) [`test_hole`] wrote.
+    static HOLE_AT: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// TEST(gex_test_dense_holes): at a miss, before the dense catch-up. A slot
+/// with no word gets the hole word; a miss at the slot it was written for,
+/// the word unchanged, came back through the hole.
+pub(crate) fn test_hole(pc: u64) {
+    if !HOLES.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(w) = slot_word(pc) else { return };
+    let now = w.load(Ordering::Acquire);
+    if now != 0 {
+        if HOLE_AT.with(|h| h.get()) == (pc, now) {
+            HOLE_AT.with(|h| h.set((0, 0)));
+            let n = HOLES_REACHED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::warn_line(&format!(
+                    "[gex] test: {n} of {} dense holes reached the miss stub through their entry\n",
+                    HOLES_MADE.load(Ordering::Relaxed)
+                ));
+            }
+        }
+        return;
+    }
+    let hole = HOLE.load(Ordering::Relaxed);
+    if hole != 0 && w.compare_exchange(0, hole, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        HOLES_MADE.fetch_add(1, Ordering::Relaxed);
+        HOLE_AT.with(|h| h.set((pc, hole)));
+    }
 }
 
 /// A module a forked child inherited (its base is the parent's, below this
@@ -180,7 +236,7 @@ pub extern "C" fn gex_dense_adopt(ptr: u32, len: u32) -> i32 {
         return 0;
     }
     let Some(s) = Section::decode(crate::shim_slice(ptr, len)) else { return -1 };
-    let end = s.base + s.entries.len() as u32;
+    let end = s.base + s.span();
     word(NEXT).fetch_max(end, Ordering::AcqRel);
     write(&s, true);
     0
@@ -197,29 +253,40 @@ pub(crate) fn child() {
     }
 }
 
-/// The index in `blocks` the slot of `pc` holds in this process, or 0.
+/// The `blocks` index the slot of `pc` names in this process, or 0.
+pub(crate) fn index(pc: u64) -> u32 {
+    dense::index_of(lookup(pc))
+}
+
+/// The slot map word of `pc` in this process, or 0: its index in `blocks`,
+/// and its arm in that entry (`gex_emit::dense`).
 pub(crate) fn lookup(pc: u64) -> u32 {
+    slot_word(pc).map_or(0, |w| w.load(Ordering::Acquire))
+}
+
+/// The slot map word of `pc`, where its page is in a dense table.
+fn slot_word(pc: u64) -> Option<&'static AtomicU32> {
     if !on() {
-        return 0;
+        return None;
     }
     let page = gex_abi::dispatch_page(pc);
     if page >= gex_abi::dispatch_max_pages() {
-        return 0;
+        return None;
     }
     let entry = word(gex_abi::dispatch_dir() + 4 * page).load(Ordering::Acquire);
     let k = gex_abi::dispatch_entry_table(entry);
     if entry == 0 || !dense::table(k) {
-        return 0;
+        return None;
     }
     let m = word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64).load(Ordering::Acquire);
     if m == 0 {
-        return 0;
+        return None;
     }
     let slot = gex_abi::dispatch_index(pc, entry);
     if slot >= dense::MAP_SLOTS {
-        return 0;
+        return None;
     }
-    word(m as u64 + 4 * slot).load(Ordering::Acquire)
+    Some(word(m as u64 + 4 * slot))
 }
 
 thread_local! {
@@ -276,12 +343,13 @@ pub(crate) fn alloc(n: u32) -> u32 {
     }
 }
 
-/// Point one slot (`table << 24 | slot`) at index `d`.
+/// Point one slot (`table << 24 | slot`) at index `d`, which holds one
+/// function for it (a bridge, as arm 0 of its entry).
 pub(crate) fn set_slot(entry: u32, d: u32) {
     let Some(m) = map(gex_abi::dispatch_entry_table(entry)) else { return };
     let slot = gex_abi::dispatch_entry_base(entry) as u64;
     if slot < dense::MAP_SLOTS {
-        word(m + 4 * slot).store(d, Ordering::Release);
+        word(m + 4 * slot).store(d << 8, Ordering::Release);
     }
 }
 
@@ -292,7 +360,7 @@ thread_local! {
 
 /// Note the index `pc`'s slot names, for JavaScript to instantiate.
 pub(crate) fn want(pc: u64) {
-    let d = lookup(pc);
+    let d = index(pc);
     WANT.with(|w| w.set(d));
 }
 

@@ -181,6 +181,9 @@ pub struct Context<'a> {
     pub safepoint: u32,
     /// Type index of the uniform block signature `(i32) -> ()`.
     pub block_ty: u32,
+    /// Type index of `(ctx, arm) -> ()`, the type of `blocks`' entries
+    /// (`crate::dense`); unused where dense dispatch is off.
+    pub entry_ty: u32,
     /// Guest address -> wasm function index, for blocks already assigned an
     /// index. A miss falls back to the dispatch table.
     pub blocks: &'a HashMap<u64, u32>,
@@ -5411,7 +5414,7 @@ impl<'a> Emitter<'a> {
         for k in (0..n).rev() {
             self.f.end();
             if crate::dense::table(k as usize) {
-                crate::dense::emit_arm(&mut self.f, k as usize, self.ctx_local, index, entry, self.cx.block_ty);
+                crate::dense::emit_arm(&mut self.f, k as usize, self.ctx_local, index, entry, self.cx.block_ty, self.cx.entry_ty);
                 continue;
             }
             self.f.local_get(self.ctx_local);

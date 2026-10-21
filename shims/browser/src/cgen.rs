@@ -2407,6 +2407,9 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
     let mut out = m[..8].to_vec();
     let mut p = 8;
     let mut tables = 0u32;
+    // `(ctx, arm) -> ()`, the type of `blocks`' entries, added after the
+    // module's own types.
+    let mut entry_ty = None;
     while p < m.len() {
         let id = m[p];
         p += 1;
@@ -2415,6 +2418,14 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
         p += len;
         let mut sec = Vec::new();
         match id {
+            1 => {
+                let mut q = 0;
+                let n = leb(body, &mut q)?;
+                entry_ty = Some(n);
+                put_leb(&mut sec, n + 1);
+                sec.extend_from_slice(&body[q..]);
+                sec.extend_from_slice(&[0x60, 0x02, 0x7f, 0x7f, 0x00]);
+            }
             2 => {
                 let mut q = 0;
                 let n = leb(body, &mut q)?;
@@ -2476,7 +2487,7 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                     if k + 1 < n {
                         sec.extend_from_slice(body.get(at..q)?);
                     } else {
-                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, 1, tables));
+                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, entry_ty?, 1, tables));
                     }
                 }
             }

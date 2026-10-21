@@ -303,6 +303,47 @@ function threadNotStarted(who, err) {
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
  */
+/** `gex_set_dense`'s argument (shims/browser/src/dense.rs): 0 off, 1 on,
+ *  2 on without catching up. */
+function denseArg(o, on) {
+  return on ? (o?.dense === 2 ? 2 : 1) : 0;
+}
+
+// `blocks` holds entries (gex_emit::dense): each entry
+// is `(ctx, arm) -> ()`. A function of the block type `(ctx) -> ()` that
+// must sit in `blocks` (the miss stub, a bridge) gets a wrapper that drops
+// the arm.
+// (module (type (func (param i32))) (type (func (param i32 i32)))
+//   (import "w" "f" (func (type 0)))
+//   (func (export "e") (type 1) local.get 0 return_call 0))
+const ENTRY_WRAP = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 10, 2, 96, 1, 127, 0, 96, 2, 127, 127, 0,
+  2, 7, 1, 1, 119, 1, 102, 0, 0,
+  3, 2, 1, 1,
+  7, 5, 1, 1, 101, 0, 1,
+  10, 8, 1, 6, 0, 32, 0, 18, 0, 11,
+]);
+// A watched arm of an entry: arm `arm` calls `hit` as the block-type watch
+// stub does (returns when it says so, else traps), every other arm goes on
+// to `old`.
+// (module (type (func (param i32 i32))) (type (func (param i32) (result i32)))
+//   (import "w" "old" (func (type 0))) (import "w" "hit" (func (type 1)))
+//   (import "w" "arm" (global i32))
+//   (func (export "c") (type 0)
+//     local.get 1 global.get 0 i32.eq
+//     if local.get 0 call 1 if return end unreachable end
+//     local.get 0 local.get 1 return_call 0))
+const ENTRY_WATCH = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 11, 2, 96, 2, 127, 127, 0, 96, 1, 127, 1, 127,
+  2, 26, 3, 1, 119, 3, 111, 108, 100, 0, 0, 1, 119, 3, 104, 105, 116, 0, 1, 1, 119, 3, 97, 114, 109, 3, 127, 0,
+  3, 2, 1, 0,
+  7, 5, 1, 1, 99, 0, 2,
+  10, 27, 1, 25, 0, 32, 1, 35, 0, 70, 4, 64, 32, 0, 16, 1, 4, 64, 15, 11, 0, 11, 32, 0, 32, 1, 18, 0, 11,
+]);
+let entryWrapMod = null, entryWatchMod = null;
+
 function growTable(table, delta, init, which) {
   const to = table.length + delta;
   if (to > (1 << 20)) console.warn(`[gex] dispatch table ${which} grows ${table.length} -> ${to} entries`);
@@ -890,6 +931,14 @@ export class Gex {
    *  dense table's slots live in the process's slot maps, and this Worker's
    *  only table for them is `blocks`, one entry per block. */
   #dense = false;
+  /** `blocks` holds entries (gex_emit::dense), as it does wherever dispatch
+   *  is dense: an entry is `(ctx, arm) -> ()`, and a slot map word
+   *  `entry << 8 | arm`. */
+  #entries = false;
+  /** Entry wrappers of block-type functions (`#entryOf`). */
+  #entryWraps = new WeakMap();
+  /** Entries with watched arms (`#refSet`): entry -> { orig, arms, fn }. */
+  #entryWatch = new Map();
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
@@ -2021,10 +2070,14 @@ export class Gex {
     // a closure image, whose libraries dispatch classically, does not).
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
-    e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
+    this.#entriesInit();
     // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
     // left numbered with no directory entry.
     if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
+    // Another (tests/x86-programs/dense-holes.c): stale words past a
+    // module's last block.
+    if (globalThis.process?.env?.GEX_TEST_DENSE_HOLES) e.gex_test_dense_holes?.(1);
     // Another (tests/x86-programs/served-entries.c): served modules are
     // installed one at a time, as when the merger declines them.
     if (globalThis.GEX_TEST_SERVE_UNMERGED || globalThis.process?.env?.GEX_TEST_SERVE_UNMERGED) e.gex_test_serve_unmerged?.(1);
@@ -2291,6 +2344,7 @@ export class Gex {
     // A thread joins its process's numbering; a forked child decides once its
     // kernel exists (`adoptProcess`).
     this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
+    this.#entriesInit();
     this.#offerToFill(this.#guest);
     _at('offerToFill done, catchUp');
     // Everything the process translated before this thread existed.
@@ -2875,7 +2929,8 @@ export class Gex {
     if (child.state?.length) this.#putBytes(child.state, e.gex_set_child_state);
     e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
     this.#dense = !!o.dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    e.gex_set_dense?.(this.#dense ? (o.dense === 2 ? 2 : 1) : 0);
+    e.gex_set_dense?.(denseArg(o, this.#dense));
+    this.#entriesInit();
     this.#opts = o;
     syncSlotShift(e);
     this.#childOpts(e, o, child.pid);
@@ -3079,7 +3134,8 @@ export class Gex {
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    e.gex_set_dense?.(this.#dense ? ((child.opts ?? {}).dense === 2 ? 2 : 1) : 0);
+    e.gex_set_dense?.(denseArg(child.opts, this.#dense));
+    this.#entriesInit();
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
@@ -3739,8 +3795,17 @@ export class Gex {
       console.error(`[catchup] installed ${n + reused} modules in ${Math.round(performance.now() - t0)}ms`
         + ` (${Math.round(this.#compileMs - comp0)}ms compile, ${reused} reused from siblings)`);
     }
-    if (globalThis.GEX_FILL_TIME) console.warn(`[gex] ${this.#whoFills()}: caught up, ${this.#fillCounts()}`);
+    if (globalThis.GEX_FILL_TIME) {
+      // The first catch-up ends a Worker's start: from its runtime's
+      // construction to holding what the process had translated.
+      const started = this.#startedMs < 0 ? (this.#startedMs = performance.now() - this.#bornAt) : -1;
+      console.warn(`[gex] ${this.#whoFills()}: caught up, ${this.#fillCounts()}${started >= 0 ? `, started in ${started.toFixed(1)} ms` : ''}`);
+    }
   }
+  /** When this runtime was made, and how long until its first catch-up
+   *  (`?filltime=1`). */
+  #bornAt = performance.now();
+  #startedMs = -1;
 
   /**
    * A `WebAssembly.Module` a sibling Worker compiled, relayed by the host. Kept
@@ -4220,7 +4285,7 @@ export class Gex {
     const blocks = this.#guest.exports.blocks;
     if (blocks) this.#growBlocks();
     for (let j = 0; j + 1 < regs.length; j += 2) {
-      (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+      (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
     }
     st.instances.push(inst);
     // The first Worker to install a JIT module writes the directory for the
@@ -4802,7 +4867,7 @@ export class Gex {
       }
       const st = this.#cgenStore();
       for (let j = 0; j + 1 < regs.length; j += 2) {
-        (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+        (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
       }
       e.gex_wasmdll_bind_done(i);
       this.#wasmdllHave++;
@@ -5561,7 +5626,7 @@ export class Gex {
         const blocks = this.#guest.exports.blocks;
         if (blocks) this.#growBlocks();
         for (let j = 0; j + 1 < regs.length; j += 2) {
-          (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+          (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
         }
       }
     }
@@ -6700,6 +6765,73 @@ export class Gex {
     return table === TABLE_NAMES.length ? this.#guest.exports.blocks : this.#dispatchTables()[table];
   }
 
+  /** `old` with arm `arm` watched (ENTRY_WATCH), made once per pair: a
+   *  call-out arms and disarms the same return over and over. */
+  #watchArms = new WeakMap();
+  #watchArm(old, arm) {
+    let m = this.#watchArms.get(old);
+    if (!m) this.#watchArms.set(old, (m = new Map()));
+    let fn = m.get(arm);
+    if (!fn) {
+      entryWatchMod ??= new WebAssembly.Module(ENTRY_WATCH);
+      this.#watchHitFn ??= (ctx) => this.#watchHit(ctx >>> 0);
+      fn = new WebAssembly.Instance(entryWatchMod, { w: { old, hit: this.#watchHitFn, arm: new WebAssembly.Global({ value: 'i32' }, arm) } }).exports.c;
+      m.set(arm, fn);
+    }
+    return fn;
+  }
+  #watchHitFn = null;
+
+  /** Whether a `gex_dispatch_ref` names an entry of this Worker's tables. A ref
+   *  into `blocks` is a slot map word: its entry
+   *  `index >>> 8`, its arm `index & 255`. */
+  #refHas(table, index) {
+    const t = this.#refTable(table);
+    if (!t) return false;
+    return (this.#entries && table === TABLE_NAMES.length ? index >>> 8 : index) < t.length;
+  }
+
+  /** What dispatch to a ref runs: the table's entry; in `blocks`
+   *  that arm of the entry (the watch stub for a watched arm), as a function
+   *  of `ctx` alone. */
+  #refGet(table, index) {
+    const t = this.#refTable(table);
+    if (!this.#entries || table !== TABLE_NAMES.length) return t.get(index);
+    const at = index >>> 8, arm = index & 255;
+    const now = t.get(at);
+    const w = this.#entryWatch.get(at);
+    if (w && w.fn === now) {
+      if (w.arms.has(arm)) return this.#watch();
+      return (ctx) => w.orig(ctx, arm);
+    }
+    return (ctx) => now(ctx, arm);
+  }
+
+  /** Point a ref at `f`. In `blocks` only the watch stub can be
+   *  put on an arm (anything else takes the watch off it): the entry is
+   *  wrapped, one wrapper per watched arm, around what it held. An install
+   *  that writes the entry since drops the wrappers, and `#armCallouts`
+   *  puts them back. */
+  #refSet(table, index, f) {
+    const t = this.#refTable(table);
+    if (!this.#entries || table !== TABLE_NAMES.length) {
+      t.set(index, f);
+      return;
+    }
+    const at = index >>> 8, arm = index & 255;
+    const now = t.get(at);
+    let w = this.#entryWatch.get(at);
+    if (!w || w.fn !== now) w = { orig: now, arms: new Set(), fn: now };
+    if (f === this.#watch()) w.arms.add(arm);
+    else w.arms.delete(arm);
+    let fn = w.orig;
+    for (const a of w.arms) fn = this.#watchArm(fn, a);
+    w.fn = fn;
+    t.set(at, fn);
+    if (w.arms.size) this.#entryWatch.set(at, w);
+    else this.#entryWatch.delete(at);
+  }
+
   /** Point every call-out's return entry at the watch stub, wherever
    *  dispatch now reaches its return (an install or a retirement may have
    *  moved or overwritten it); an untranslated return is caught by the miss
@@ -6712,18 +6844,17 @@ export class Gex {
       const table = ref < 0n ? -1 : Number(ref >> 32n), index = ref < 0n ? -1 : Number(ref & 0xffffffffn);
       if (c.w && (c.w.table !== table || c.w.index !== index)) this.#unwatch(c);
       if (table < 0) continue;
-      const t = this.#refTable(table);
-      if (!t || index >= t.length) continue;
+      if (!this.#refHas(table, index)) continue;
       if (c.w) {
-        const now = t.get(index);
+        const now = this.#refGet(table, index);
         if (now !== stub) c.w.old = now;
-        if (now !== stub) t.set(index, stub);
+        if (now !== stub) this.#refSet(table, index, stub);
         continue;
       }
       const shared = this.#callouts.find((o) => o !== c && o.w && o.w.table === table && o.w.index === index);
-      const old = shared ? shared.w.old : t.get(index);
+      const old = shared ? shared.w.old : this.#refGet(table, index);
       c.w = { table, index, old };
-      t.set(index, stub);
+      this.#refSet(table, index, stub);
     }
   }
 
@@ -6732,8 +6863,7 @@ export class Gex {
     const w = c.w;
     c.w = null;
     if (!w || this.#callouts.some((o) => o !== c && o.w && o.w.table === w.table && o.w.index === w.index)) return;
-    const t = this.#refTable(w.table);
-    if (t && w.index < t.length && t.get(w.index) === this.#watchStub) t.set(w.index, w.old);
+    if (this.#refHas(w.table, w.index) && this.#refGet(w.table, w.index) === this.#watchStub) this.#refSet(w.table, w.index, w.old);
   }
 
   /**
@@ -7233,15 +7363,33 @@ export class Gex {
   }
   #rowMemo = null;
 
-  #registryBytes(i) {
+  /** With `scratch`, the copy is a view of this Worker's one scratch buffer
+   * , good until the next such call: for a caller that
+   *  compiles and installs it without yielding. */
+  #registryBytes(i, scratch = false) {
     const { ptr, len, ext } = this.#registryRow(i);
     if (!len) return null;
+    let from;
     if (ext) {
       if (!this.#moduleStore) throw new Error(`gex: registry module ${i} is in the module store, and this Worker has none`);
-      return new Uint8Array(this.#moduleStore, ext - 1, len).slice();
+      from = new Uint8Array(this.#moduleStore, ext - 1, len);
+    } else {
+      from = this.#bytes().subarray(ptr, ptr + len);
     }
-    return this.#bytes().slice(ptr, ptr + len);
+    if (!scratch) return from.slice();
+    if (!this.#scratch || this.#scratch.byteLength < len) {
+      this.#scratch = new ArrayBuffer(Math.max(1 << 20, 2 ** Math.ceil(Math.log2(len))));
+    }
+    const view = new Uint8Array(this.#scratch, 0, len);
+    view.set(from);
+    return view;
   }
+  /** Where a synchronous install's module bytes are copied out of the
+   *  registry. A copy per module would be garbage that a Worker running
+   *  translated code may not collect for a long time (it allocates little
+   *  JavaScript), one copy of every module its thread ran; this holds the
+   *  largest one. */
+  #scratch = null;
 
   /** Before `gex_jit_installed`: when the registry will keep this module, put
    *  its bytes in the module store and tell the shim where, so it keeps the
@@ -7346,7 +7494,7 @@ export class Gex {
     for (; this.#installed < have; this.#installed++) {
       const i = this.#installed;
       if (this.#leaveDense(i)) continue;
-      const bytes = this.#registryBytes(i);
+      const bytes = this.#registryBytes(i, true);
       if (!bytes) continue;
       const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
@@ -7560,7 +7708,7 @@ export class Gex {
         if (globalThis.GEX_DENSE_DEBUG) {
           const theirs = bytes instanceof Uint8Array ? denseSection(mod) : null;
           const tb = theirs ? new DataView(theirs.buffer, theirs.byteOffset).getUint32(0, true) : base;
-          console.error(`[dense] pid ${e.gex_my_pid?.() ?? '?'} ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`
+          console.error(`[dense] pid ${e.gex_my_pid?.() ?? '?'} ${who} base=${base} n=${dv.getUint32(4, true) & 0x7fffffff} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`
             + (tb !== base ? ` (a module compiled elsewhere, at base ${tb})` : ''));
         }
         // Base 0 is a module nobody numbered: its blocks would land on the
@@ -8115,7 +8263,7 @@ export class Gex {
     this.#denseAsks++;
     const i = e.gex_dense_owner(d);
     if (i < 0) return;
-    const bytes = this.#registryBytes(i);
+    const bytes = this.#registryBytes(i, true);
     if (!bytes) return;
     const t0 = performance.now();
     const c0 = this.#compileMs, i0 = this.#instantiateMs, g0 = this.#growMs;
@@ -8169,7 +8317,7 @@ export class Gex {
   /** What this Worker holds, for `?filltime=1`. */
   #fillCounts() {
     return `${this.#installs} modules installed (${this.#compiles} compiled here), ` +
-      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left, blocks ${this.#guest?.exports?.blocks?.length ?? 0}, ` +
+      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left (${this.#denseAsks} asks), blocks ${this.#guest?.exports?.blocks?.length ?? 0}, ` +
       `${this.#sharedModules.size} modules held, ${this.#relaySkipped} not relayed`;
   }
   /** Dense registry modules this Worker's catch-up left to a miss. */
@@ -8271,6 +8419,38 @@ export class Gex {
    *  and up): its slots are the process's slot maps, never this table. */
   #denseTable(t) {
     return this.#dense && t >= DENSE_FIRST_TABLE;
+  }
+
+  /** Once this process's numbering is set (`gex_set_dense`, or the
+   *  process's for a thread), where dispatch is dense: `blocks[0]`, the miss
+   *  stub every entry not yet instantiated here holds, becomes its entry
+   *  wrapper. */
+  #entriesInit() {
+    const e = this.#shim.exports;
+    this.#entries = this.#dense;
+    const b = this.#guest?.exports?.blocks;
+    if (!this.#entries || !b) return;
+    const miss = b.get(0);
+    if (this.#entryWrapped.has(miss)) return;
+    const w = this.#entryOf(miss);
+    for (let i = 0; i < b.length; i++) if (b.get(i) === miss) b.set(i, w);
+  }
+
+  /** The wrappers `#entryOf` made. */
+  #entryWrapped = new WeakSet();
+
+  /** The `(ctx, arm)` entry wrapper of a block-type function, where
+   *  dispatch is dense (else `f` itself). */
+  #entryOf(f) {
+    if (!this.#entries || !f) return f;
+    let w = this.#entryWraps.get(f);
+    if (!w) {
+      entryWrapMod ??= new WebAssembly.Module(ENTRY_WRAP);
+      w = new WebAssembly.Instance(entryWrapMod, { w: { f } }).exports.e;
+      this.#entryWraps.set(f, w);
+      this.#entryWrapped.add(w);
+    }
+    return w;
   }
 
   /** Grow this Worker's `blocks` to every index the process has numbered
