@@ -54,7 +54,7 @@ rm -f "$L/hoststub.o" "$L/hoststub.elf"
 mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
 clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
-for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/*.s; do
+for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/*.s; do
   clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
