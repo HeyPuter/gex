@@ -601,11 +601,21 @@ if SHARED and not os.path.exists(DYLINK):
 
 
 def is_wasm_so(p):
+    """A side module: wasm whose first section is dylink.0. An object file
+    (its first section is code's, its custom ones `linking` and relocs)
+    is not one, though it is wasm too."""
     try:
         with open(p, 'rb') as f:
-            return f.read(4) == b'\0asm'
+            head = f.read(8 + 1 + 5 + 1 + 8)
     except OSError:
         return False
+    if head[:4] != b'\0asm' or len(head) < 10 or head[8] != 0:
+        return False
+    q = 9
+    while q < len(head) and head[q] & 0x80:  # the section's size
+        q += 1
+    q += 1
+    return head[q:q + 9] == b'\x08dylink.0'
 
 
 def sections(path):

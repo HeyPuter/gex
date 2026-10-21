@@ -94,4 +94,11 @@ printf '#define _GNU_SOURCE\n#include <stdio.h>\n#include <linux/fs.h>\nint f(vo
 printf '#define _GNU_SOURCE\n#include <linux/fs.h>\n#include <stdio.h>\nint f(void){return RENAME_NOREPLACE;}\n' > "$W/rn2.c"
 gexcc -Werror -c -o "$W/rn.o" "$W/rn.c" 2> "$W/log" && gexcc -Werror -c -o "$W/rn2.o" "$W/rn2.c" 2>> "$W/log"
 check $? "RENAME_EXCHANGE from <stdio.h> under _GNU_SOURCE"
+# two objects with one file name (libblkid's partitions/minix.c and
+# superblocks/minix.c) are two inputs, not one side module twice
+mkdir -p "$W/da" "$W/db"
+printf 'int fa(void){return 1;}\n' > "$W/da/m.c"; printf 'int fb(void){return 2;}\n' > "$W/db/m.c"
+GEXCC_SHARED=1 gexcc -fPIC -c "$W/da/m.c" -o "$W/da/la-m.o" && GEXCC_SHARED=1 gexcc -fPIC -c "$W/db/m.c" -o "$W/db/la-m.o" &&
+    GEXCC_SHARED=1 gexcc -shared -o "$W/libd.so" "$W/da/la-m.o" "$W/db/la-m.o" 2> "$W/log"
+check $? "a shared library of two objects with the same file name"
 exit $fail
