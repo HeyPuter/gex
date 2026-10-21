@@ -102,11 +102,14 @@ chmod +x "$B/$TRIPLE-strip"
 ln -sf "$TRIPLE-strip" "$B/gexcc-strip"
 cat > "$B/$TRIPLE-pkg-config" <<EOF
 #!/bin/sh
-# pkg-config over the gexcc sysroot's libraries only
+# pkg-config over the gexcc sysroot's libraries only (Debian's multiarch
+# directory first). Static links name every library's own dependencies;
+# with GEXCC_SHARED the libraries carry them.
 export PKG_CONFIG_SYSROOT_DIR="$PREFIX/sysroot"
-export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/pkgconfig:$PREFIX/sysroot/usr/share/pkgconfig:$PREFIX/sysroot/usr/local/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/wasm32-linux-musl/pkgconfig:$PREFIX/sysroot/usr/lib/pkgconfig:$PREFIX/sysroot/usr/share/pkgconfig:$PREFIX/sysroot/usr/local/lib/pkgconfig"
 unset PKG_CONFIG_PATH
-exec pkg-config --static "\$@"
+case \${GEXCC_SHARED:-0} in 0) exec pkg-config --static "\$@" ;; esac
+exec pkg-config "\$@"
 EOF
 chmod +x "$B/$TRIPLE-pkg-config"
 ln -sf "$TRIPLE-pkg-config" "$B/gexcc-pkg-config"
@@ -137,7 +140,14 @@ set(CMAKE_RANLIB "$B/$TRIPLE-ranlib" CACHE FILEPATH "")
 set(CMAKE_NM "$B/$TRIPLE-nm" CACHE FILEPATH "")
 set(CMAKE_STRIP "$B/$TRIPLE-strip" CACHE FILEPATH "")
 set(CMAKE_SYSROOT "$PREFIX/sysroot")
-set(CMAKE_STAGING_PREFIX "$PREFIX/sysroot/usr" CACHE PATH "")
+# Debian's multiarch directory (usr/lib/wasm32-linux-musl), where its
+# packages' libraries and CMake packages are
+set(CMAKE_LIBRARY_ARCHITECTURE wasm32-linux-musl)
+# A Debian package's build (dpkg-buildpackage exports DEB_HOST_ARCH) installs
+# into its own DESTDIR; anything else installs into the sysroot.
+if(NOT DEFINED ENV{DEB_HOST_ARCH})
+  set(CMAKE_STAGING_PREFIX "$PREFIX/sysroot/usr" CACHE PATH "")
+endif()
 set(CMAKE_FIND_ROOT_PATH "$PREFIX/sysroot")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
@@ -145,7 +155,16 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 set(CMAKE_CROSSCOMPILING_EMULATOR "$B/gexcc-run")
 set(PKG_CONFIG_EXECUTABLE "$B/$TRIPLE-pkg-config" CACHE FILEPATH "")
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
+# Static libraries unless GEXCC_SHARED (wasm side modules)
+if("\$ENV{GEXCC_SHARED}" STREQUAL "" OR "\$ENV{GEXCC_SHARED}" STREQUAL "0")
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
+endif()
+# A file of cache settings that win over the command line's -D options
+# (GEXCC_CMAKE_INIT; each set(... CACHE ... FORCE)): a packaging-level
+# override of what a build script passes
+if(DEFINED ENV{GEXCC_CMAKE_INIT})
+  include("\$ENV{GEXCC_CMAKE_INIT}")
+endif()
 EOF
 cat > "$S/meson-cross.ini" <<EOF
 # Meson cross file for gexcc: meson setup --cross-file $S/meson-cross.ini

@@ -78,6 +78,13 @@ BASE += ['-mllvm', '-wasm-enable-eh']
 # built shared exports what it would on Linux, and a static build is the
 # same code (docs/gexcc.md 7.3, pie-dv). A later -fvisibility= wins.
 BASE += ['-fvisibility=default']
+# A call to an undeclared C library function is a warning, as with GCC on
+# glibc in effect: glibc's headers declare much more than they must (its
+# <stdlib.h> and <unistd.h> bring in <string.h>'s functions), so programs
+# that call strcmp after <stdlib.h> alone build there. Clang gives the
+# library function its real type, so the call is right on wasm too.
+if not CXX:
+    BASE += ['-Wno-error=implicit-function-declaration']
 if CXX:
     BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
 # Where cross-built libraries install (--prefix=/usr DESTDIR=SYSROOT); the
@@ -123,17 +130,23 @@ if args == ['--print-prefix']:
     print(PREFIX); sys.exit(0)
 if args == ['-dumpmachine']:
     print(TRIPLE); sys.exit(0)
+# Debian's name for the target: its packages put libraries in
+# usr/lib/wasm32-linux-musl, which the searches below include.
+MULTIARCH = 'wasm32-linux-musl'
+if args in (['-print-multiarch'], ['--print-multiarch']):
+    print(MULTIARCH); sys.exit(0)
+LIBDIRS = [SYSROOT + '/lib', SYSROOT + '/usr/lib', SYSROOT + '/usr/lib/' + MULTIARCH, SYSROOT + '/lib/' + MULTIARCH]
 for a in args:
     if a.startswith('-print-file-name='):
         f = a.split('=', 1)[1]
-        for d in (SYSROOT + '/lib', SYSROOT + '/usr/lib'):
+        for d in LIBDIRS:
             if os.path.exists(os.path.join(d, f)):
                 print(os.path.join(d, f)); sys.exit(0)
         print(f); sys.exit(0)
     if a == '-print-libgcc-file-name':
         print(SYSROOT + '/lib/libclang_rt.builtins-wasm32.a'); sys.exit(0)
     if a == '-print-search-dirs':
-        print('programs: =%s\nlibraries: =%s/lib:%s/usr/lib' % (os.path.dirname(me), SYSROOT, SYSROOT)); sys.exit(0)
+        print('programs: =%s\nlibraries: =%s' % (os.path.dirname(me), ':'.join(LIBDIRS))); sys.exit(0)
     if a.startswith('-print-prog-name='):
         t = a.split('=', 1)[1]
         p = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), TRIPLE + '-' + t)
@@ -277,7 +290,8 @@ if out is None:
     out = 'a.out'
 
 LIB = SYSROOT + '/lib'
-SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib', LIB]
+SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib/' + MULTIARCH, SYSROOT + '/usr/lib',
+                    SYSROOT + '/lib/' + MULTIARCH, LIB]
 AR_MAGIC = b'!<arch>\n'
 
 
