@@ -89,4 +89,9 @@ if [ ! -e /usr/include/gexcc-driver-test ] && [ -w "$SR/usr/include" ]; then
     rm -r "$SR/usr/include/gexcc-driver-test"
     check $r "-I/usr/include/DIR is found in the sysroot"
 fi
+# glibc's renameat2 flags in <stdio.h> (fuse3), with <linux/fs.h> either side
+printf '#define _GNU_SOURCE\n#include <stdio.h>\n#include <linux/fs.h>\nint f(void){return RENAME_EXCHANGE;}\n' > "$W/rn.c"
+printf '#define _GNU_SOURCE\n#include <linux/fs.h>\n#include <stdio.h>\nint f(void){return RENAME_NOREPLACE;}\n' > "$W/rn2.c"
+gexcc -Werror -c -o "$W/rn.o" "$W/rn.c" 2> "$W/log" && gexcc -Werror -c -o "$W/rn2.o" "$W/rn2.c" 2>> "$W/log"
+check $? "RENAME_EXCHANGE from <stdio.h> under _GNU_SOURCE"
 exit $fail
