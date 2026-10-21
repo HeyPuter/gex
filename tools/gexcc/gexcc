@@ -91,6 +91,19 @@ BASE += ['-fvisibility=default']
 # library function its real type, so the call is right on wasm too.
 if not CXX:
     BASE += ['-Wno-error=implicit-function-declaration']
+# size_t is unsigned long on wasm32 and unsigned int on every other 32-bit
+# Linux target, so code that passes a size_t * where it means a uint32_t *
+# (kmod's __builtin_uadd_overflow) is right there and only mismatched here:
+# a warning, as same-size pointers were before GCC 14 and clang 16.
+if not CXX:
+    BASE += ['-Wno-error=incompatible-pointer-types']
+# `register` in C++17: GCC warns (it is still in glibc-era sources, libGLU),
+# clang's default is an error.
+if CXX:
+    BASE += ['-Wno-error=register']
+# An unused `static inline` function: GCC says nothing, clang warns, and a
+# -Werror build (keyutils) stops. Still a warning here.
+BASE += ['-Wno-error=unused-function']
 if CXX:
     BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
 # Where cross-built libraries install (--prefix=/usr DESTDIR=SYSROOT); the
@@ -191,8 +204,10 @@ SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
 # `.symver` (ELF symbol versions, in top-level asm) is a directive the wasm
 # assembler does not know, and a wasm module has no symbol versions. A
 # compile that fails on one is run again on the preprocessed source with
-# those asm statements taken out: the symbol itself is still defined, only
-# its versioned alias is not made.
+# those asm statements taken out. The default version's name (`.symver
+# impl, name@@V`) is what programs link to, and it is often not the C name
+# (fuse's fuse_parse_cmdline is fuse_parse_cmdline_312): in C it becomes an
+# alias of the C name. Older versions' names (name@V) are left out.
 SYMVER_ASM = re.compile(r'\b(?:__asm__|__asm|asm)\s*(?:volatile\s*|__volatile__\s*)?\(\s*'
                         r'"(?:\\t|\s)*\.symver\b(?:[^"\\]|\\.)*"(?:\s*"(?:[^"\\]|\\.)*")*\s*\)\s*;?')
 DEP_FLAGS = {'-MD', '-MMD', '-MP'}
@@ -227,9 +242,20 @@ def compile_cmd(cmd):
             sys.stderr.buffer.write(err)
             return r.returncode
         text = open(ii, encoding='utf-8', errors='surrogateescape').read()
-        n = len(SYMVER_ASM.findall(text))
-        open(ii, 'w', encoding='utf-8', errors='surrogateescape').write(SYMVER_ASM.sub('', text))
-        sys.stderr.write('gexcc: %s: %d .symver directive(s) left out (wasm has no symbol versions)\n' % (src, n))
+        found = SYMVER_ASM.findall(text)
+        aliases = {}
+        if not ii.endswith('.ii'):
+            for f in found:
+                d = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', f)).replace('\\t', ' ')
+                m = re.search(r'\.symver\s+([A-Za-z_][\w.$]*)\s*,\s*([A-Za-z_][\w.$]*)@@', d)
+                if m and m.group(1) != m.group(2):
+                    aliases[m.group(2)] = m.group(1)
+        body = SYMVER_ASM.sub('', text)
+        alias = ''.join('extern __typeof__(%s) %s __attribute__((alias("%s")));\n' % (c, a, c)
+                        for a, c in sorted(aliases.items()))
+        open(ii, 'w', encoding='utf-8', errors='surrogateescape').write(body + alias)
+        sys.stderr.write('gexcc: %s: %d .symver directive(s) left out (wasm has no symbol versions)%s\n'
+                         % (src, len(found), ', %d default name(s) made aliases' % len(aliases) if aliases else ''))
         out, skip = [], False
         for a in cmd:
             if skip:
@@ -241,12 +267,29 @@ def compile_cmd(cmd):
             if a.startswith(('-MF', '-MT', '-MQ')) and len(a) > 3:
                 continue
             out.append(ii if a == src else a)
-        return run(out + ['-Wno-unused-command-line-argument'])
+        out += ['-Wno-unused-command-line-argument']
+        if aliases:
+            r2 = subprocess.run(out, stderr=subprocess.PIPE)
+            if r2.returncode == 0:
+                sys.stderr.buffer.write(r2.stderr)
+                return 0
+            # an alias whose name the source declared with another type:
+            # the names are left out, as the versions are
+            open(ii, 'w', encoding='utf-8', errors='surrogateescape').write(body)
+            sys.stderr.write('gexcc: %s: the default names could not be aliases, left out\n' % src)
+        return run(out)
     finally:
         shutil.rmtree(tmpd, True)
 
 
 NOLINK = ('-c', '-S', '-E', '-M', '-MM', '-fsyntax-only', '--version', '-v', '-###', '--help')
+# -v on a link (CMake's compiler ABI check: `-v -Wl,-v` with the object) is
+# verbose, not a query: the version on stderr, as gcc prints it, then the
+# link itself
+if '-v' in args and not any(a in NOLINK and a != '-v' for a in args) and \
+        any(not a.startswith('-') for a in args):
+    subprocess.run([CLANG[0], '--target=' + TRIPLE, '--version'], stdout=sys.stderr)
+    args = [a for a in args if a != '-v']
 if not args or any(a in NOLINK or a.startswith(('-print-', '-dump')) for a in args):
     if args == ['-v'] or args == ['--version'] or not args:
         os.execvp(CLANG[0], [CLANG[0], '--target=' + TRIPLE] + args)
@@ -718,6 +761,12 @@ if shared and SHARED:
         pre += shared_undef()
     wasm = os.path.join(tmp, 'out.so')
     sos = by_soname(ins + tail)
+    # As ld -shared: an undefined symbol is the program's or another
+    # library's, bound at load (libfl's main calls the program's yylex),
+    # unless the link asked for every symbol defined (-z defs)
+    wl = ','.join(a[4:] for a in sys.argv[1:] if a.startswith('-Wl,'))
+    if not re.search(r'(^|,)(--no-undefined|-z,defs|-zdefs|-z defs)(,|$)', wl):
+        pre += ['--unresolved-symbols=import-dynamic']
     r = link_shared(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm]
             + ['--rpath=' + x for x in ld_opts['rpath']] + objs + pre + sos + ld_flags)
     if r:

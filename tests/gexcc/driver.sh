@@ -42,4 +42,35 @@ printf 'int main(void){return 0;}\n' | gexcc -x c -o "$W/prog" - 2> "$W/log"
 [ "$(readelf -h "$W/prog" | awk '/Section header string table index/{print $NF}')" = 1 ] && \
     readelf -S "$W/prog" | grep -q '\.shstrtab'
 check $? "a program has a section names' table"
+# the default version's name is an alias of the C name (fuse_parse_cmdline
+# is fuse_parse_cmdline_312), an older version's is left out
+cat > "$W/sv2.c" <<'EOF2'
+int lib_get_312(int a) { return a + 2; }
+int lib_get_30(int a) { return a + 1; }
+__asm__(".symver lib_get_312,lib_get@@L_3.12");
+__asm__(".symver lib_get_30,lib_get@L_3.0");
+EOF2
+gexcc -c "$W/sv2.c" -o "$W/sv2.o" 2> "$W/log" && llvm-nm "$W/sv2.o" | grep -q " T lib_get$"
+check $? "a default-version .symver name is an alias"
+# a shared library may leave a symbol to the program (libfl's main, yylex)
+printf 'int yylex(void);\nint main(void){return yylex();}\n' > "$W/fl.c"
+GEXCC_SHARED=1 gexcc -shared -fPIC -o "$W/libfl.so" "$W/fl.c" 2> "$W/log"
+check $? "a shared library links with an undefined symbol"
+GEXCC_SHARED=1 gexcc -shared -fPIC -Wl,-z,defs -o "$W/libfl2.so" "$W/fl.c" 2> "$W/log"
+[ $? != 0 ]; check $? "but not with -z defs"
+# glibc-isms: pread64 after _GNU_SOURCE, a size_t * for a uint32_t *, C++ register
+printf '#define _GNU_SOURCE\n#include <unistd.h>\n#include <stdint.h>\n#include <stddef.h>\n'\
+'static int f(uint32_t *p){return *p;}\nint g(int fd, char *b, size_t n){off64_t o=0; return pread64(fd,b,n,o)+f(&n);}\n' > "$W/g.c"
+gexcc -c -o "$W/g.o" "$W/g.c" 2> "$W/log"
+check $? "pread64 under _GNU_SOURCE, size_t * as uint32_t *"
+printf 'int h(int a){register int b = a; return b;}\n' > "$W/r.cpp"
+gexc++ -std=c++17 -c -o "$W/r.o" "$W/r.cpp" 2> "$W/log"
+check $? "register in C++17"
+printf 'static inline int unused(int a){return a;}\nint used(void){return 1;}\n' > "$W/u.c"
+gexcc -Wall -Werror -c -o "$W/u.o" "$W/u.c" 2> "$W/log"
+check $? "an unused static inline function under -Werror"
+# -v on a link is verbose (CMake's compiler ABI check), not a query
+printf 'int main(void){return 0;}\n' > "$W/v.c"
+gexcc -c -o "$W/v.o" "$W/v.c" && gexcc -v -Wl,-v "$W/v.o" -o "$W/v" 2> "$W/log" && [ -s "$W/v" ]
+check $? "-v -Wl,-v on a link still links"
 exit $fail
