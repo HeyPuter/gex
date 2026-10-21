@@ -44,7 +44,6 @@ web/public/fs/ld-musl-aarch64.so.1, web/public/fs/x86/ld-musl-x86_64.so.1
     other prebuilt guest programs and libraries in web/public/fs are built
     from gex's own sources, against musl (or glibc, under glibc/).
 
-tools/gexcc/debian/patches/, web/tint/dawn-tint-emscripten.patch,
-tools/unity-dotnet/mono/patches/
-    Changes to Debian packages, Dawn/Tint and .NET's Mono runtime. Each
+web/tint/dawn-tint-emscripten.patch, tools/unity-dotnet/mono/patches/
+    Changes to Dawn/Tint and .NET's Mono runtime. Each
     patch is under the licence of the project it applies to.

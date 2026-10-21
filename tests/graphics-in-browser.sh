@@ -26,7 +26,7 @@ R="${GEX_GRAPHICS_ROOT:-/tmp/gex-assets/graphics/root}"
 SEED="$ROOT/web/public/gex/seed.wasm"
 LIMIT="${GEX_LIMIT:-2400}"
 
-[ -x "$R/usr/bin/Xvfb" ] || { echo "skip: no graphics rootfs at $R (web/build-graphics-rootfs.sh)"; exit 0; }
+[ -x "$R/usr/bin/Xvfb" ] || { echo "skip: no graphics rootfs at $R (gex-debian: make graphics)"; exit 0; }
 [ -f "$SEED" ] || { echo "skip: no seed module (web/build-assets.sh)"; exit 0; }
 command -v node >/dev/null 2>&1 || { echo "skip: no node"; exit 0; }
 

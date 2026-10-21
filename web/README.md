@@ -10,8 +10,9 @@ The page that runs gex in a browser, and the builds of what it loads:
   (`build-mesa-wasm.sh`);
 - Xwayland as wasm32, which runs in a Worker of the page and talks to
   `shims/hostwl` (`build-xwayland-wasm.sh`);
-- the guest root filesystems (`build-debian.sh`, `build-native-debian.sh`,
-  `build-graphics-rootfs.sh`, `rootfs-manifests/`).
+- the guest root filesystems come from the gex-debian repository, which
+  writes them into `web/public/rootfs` (and the desktop demo's launcher
+  packages into `web/public/pkgs`).
 
 ## The two builds
 

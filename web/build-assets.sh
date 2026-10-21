@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build everything the page serves out of public/.
 #
-#   web/build-assets.sh [--debian]
+#   web/build-assets.sh
 #
 # The runtime is two wasm modules: the shim (the kernel, the loader and the
 # runtime translator) and a seed module that translates nothing. The seed is
@@ -119,29 +119,14 @@ EOF
 tar -C "$R" -cf "$PUB/rootfs/busybox.tar" .
 echo "  $PUB/rootfs/busybox.tar: $(du -h "$PUB/rootfs/busybox.tar" | cut -f1)"
 
-# -- debian rootfs ---------------------------------------------------------
-
-# `web/build-debian.sh` does this without root and without debootstrap: a
-# .deb is an `ar` archive with a tar inside, so unpacking the dependency
-# closure of `apt` into a directory is a working userspace. The old branch
-# here shelled out to `sudo debootstrap`, which is why the asset was never
-# built and the demo failed with "the rootfs has no /bin/bash".
+# -- the Debian root filesystems -------------------------------------------
 #
-# Skipped unless asked for, because it fetches about 40 MB of packages.
-if [ "${1-}" = "--debian" ]; then
-    "$HERE/build-debian.sh" "$PUB/rootfs/debian.tar"
-elif [ ! -f "$PUB/rootfs/debian.tar" ]; then
-    echo "no debian rootfs -- run web/build-assets.sh --debian to fetch one"
-fi
-
-# -- the graphics rootfs, for the Mesa demo --------------------------------
-#
-# Debian's own glxgears and Xvfb, and the Mesa they link against. The tree
-# it is built from is not fetched by default, so this is skipped rather than
-# failed when it is absent.
-if [ -x "$HERE/build-graphics-rootfs.sh" ]; then
-    "$HERE/build-graphics-rootfs.sh" "$PUB/rootfs/graphics.tar"
-fi
+# rootfs/debian.tar (the debian demo) and rootfs/graphics.tar (the Mesa and
+# compositor demos) come from the gex-debian repository (`make debian`,
+# `make graphics`); copy them into web/public/rootfs.
+for f in debian.tar graphics.tar; do
+    [ -f "$PUB/rootfs/$f" ] || echo "no rootfs/$f -- build it with gex-debian"
+done
 
 # -- the gears, and the GL driver it links against -------------------------
 #

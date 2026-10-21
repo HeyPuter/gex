@@ -2,7 +2,7 @@
 //
 // The demo desktop's launcher (web/src/desktop.js) adds a program by fetching
 // `pkgs/NAME.tar.zst` -- the program's closure minus the base rootfs, built by
-// web/build-demo.sh -- and writing its files straight into the global kernel's
+// gex-debian's desktop/build-rootfs.sh -- and writing its files straight into the global kernel's
 // filesystem while the guest runs. That is this Worker: an instance of the
 // global kernel of its own (as `persist-worker.js` is), calling `k_fs_*`
 // with the bytes in a scratch "process" memory. A Worker and not the page
