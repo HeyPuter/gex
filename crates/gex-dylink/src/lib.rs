@@ -335,6 +335,31 @@ impl Info {
         v
     }
 
+    /// A static program's undefined weak symbols, as ELF leaves them: a
+    /// `GOT.func` or `GOT.mem` import (the symbol's address) is 0, and a
+    /// weak function the program calls directly is [`Bind::Missing`] (a
+    /// trap if the null check is skipped). wasm-ld resolves everything else
+    /// in a static link, so any other `GOT.*` import is a strong undefined
+    /// symbol, an error here as a link error would have been.
+    /// `(module, name, binding)` per import it concerns.
+    pub fn static_weak_binds(&self) -> std::result::Result<Vec<(String, String, Bind)>, String> {
+        let mut out = Vec::new();
+        for imp in &self.imports {
+            match imp.module.as_str() {
+                "GOT.func" | "GOT.mem" if imp.weak => {
+                    let b = if imp.module == "GOT.func" { Bind::GotFunc(0) } else { Bind::GotMem(0) };
+                    out.push((imp.module.clone(), imp.name.clone(), b));
+                }
+                "GOT.func" | "GOT.mem" => return Err(format!("undefined symbol: {}", imp.name)),
+                "env" if imp.weak && imp.kind == Kind::Func => {
+                    out.push((imp.module.clone(), imp.name.clone(), Bind::Missing(String::new())));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
     /// A data export's address relative to `__memory_base`.
     pub fn data_offset(&self, name: &str) -> Option<u32> {
         let e = self.exports.get(name)?;
