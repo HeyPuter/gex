@@ -1,7 +1,7 @@
 /* PROVIDES msvcr120.dll i386 stateful nowine
  *
- * The CRT heap as native wasm (docs/merge-plan.md §9.9.2 step 4): dlmalloc
- * (2.8.6, as pewasm's dlmalloc32.inc) in place of msvcr120's heap over
+ * The CRT heap as native wasm: dlmalloc (2.8.6) in place of msvcr120's heap
+ * over
  * HeapAlloc(_crtheap). The whole family at once, because two allocators on
  * one heap corrupt it: every export that reaches _crtheap itself is here
  * (malloc, free, realloc, calloc, _msize, _expand, _recalloc, _calloc_crt);
@@ -17,7 +17,7 @@
  * _msize and _expand stop the run rather than guess its size.
  *
  * One lock (a futex on wasm atomics) for the heap, as Windows' process heap
- * and pewasm's mspace have. */
+ * has. */
 
 __attribute__((import_module("gex"), import_name("provider_alloc_top"))) int gex_provider_alloc(int size);
 __attribute__((import_module("gex"), import_name("provider_log"))) void gex_provider_log(const char *p, int n);

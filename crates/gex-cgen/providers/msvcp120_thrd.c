@@ -4,15 +4,15 @@
  * real handle to the current thread (DuplicateHandle of GetCurrentThread),
  * closes it again at once, and returns the closed handle's value with
  * GetCurrentThreadId: { eax = a handle that is no longer open, edx = id }.
- * Only the id is usable (_Thrd_equal compares ids). Noita asks about 1700
- * times a second on its main thread (std::this_thread::get_id), and in the
- * page each NtDuplicateObject and NtClose is a trip through the NT layer.
+ * Only the id is usable (_Thrd_equal compares ids). A program can ask
+ * thousands of times a second on its main thread
+ * (std::this_thread::get_id), and each NtDuplicateObject and NtClose is a
+ * system call.
  * When DuplicateHandle fails the DLL returns a handle of 0, which is what
  * this returns every time. Wine's own msvcp120 (dlls/msvcp90/misc.c,
  * thread_current) does the same: the same duplicate-then-close pair, the
- * same 8-byte struct in EDX:EAX on i386; on W3 each of the two is a call
- * into the wineserver (128 a world frame, 2.2 ms, docs/wine-overhead.md
- * F1), so this binds there too. cdecl, no arguments. */
+ * same 8-byte struct in EDX:EAX on i386; under Wine each of the two is a
+ * call into the wineserver, so this binds there too. cdecl, no arguments. */
 
 static GEX_PROVIDER(p_thrd_current) {
     (void)depth;

@@ -1,7 +1,7 @@
 /* PROVIDES libc.so.6 x86_64
  *
- * glibc's mem* and str* functions (x86-64) as native wasm
- * (docs/elf-providers.md §5): the first ELF provider. memcpy, memmove and
+ * glibc's mem* and str* functions (x86-64) as native wasm. memcpy, memmove
+ * and
  * memset are IFUNCs on x86-64; the host binds their resolvers to
  * `gexp__ifunc`. Bulk copies and fills are wasm memory.copy and
  * memory.fill. Results are what glibc's x86-64 implementations return:

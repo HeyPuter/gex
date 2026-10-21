@@ -1,4 +1,4 @@
-/* What every export provider (docs/merge-plan.md §9.9) includes after
+/* What every export provider includes after
  * gex_abi.h: the guest's registers and stack as an i386 callee sees them,
  * the return a provider makes, and waiting on a guest word.
  *
@@ -216,7 +216,7 @@ GEX_INLINE void gp_set_errno(int ctx, int32_t depth, uint32_t self, uint32_t cod
 }
 #define GP_EDOM 33u
 
-/* ---- SysV x86-64: ELF providers (docs/elf-providers.md) ----
+/* ---- SysV x86-64: ELF providers ----
  * A provider for a Linux library (first line `PROVIDES libc.so.6 x86_64`) binds
  * exports by versioned name (`memcpy@@GLIBC_2.14`, or a bare name for the
  * default version). Integer and pointer arguments come in rdi, rsi, rdx,

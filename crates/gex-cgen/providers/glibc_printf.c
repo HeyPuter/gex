@@ -1,7 +1,7 @@
 /* PROVIDES libc.so.6 x86_64 stateful
  *
- * glibc's string printf family (x86-64) as native wasm
- * (docs/elf-providers.md §5): snprintf, vsnprintf, sprintf, vsprintf. The
+ * glibc's string printf family (x86-64) as native wasm: snprintf,
+ * vsnprintf, sprintf, vsprintf. The
  * formatting is musl's printf core (src/stdio/vfprintf.c, MIT licence),
  * its floating-point conversion on double (exact, as glibc's is), with
  * glibc's conventions where the two differ: "(nil)" for a null %p, "(null)"
