@@ -171,14 +171,12 @@ pub(crate) mod stats {
     pub fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "ftab lookups={} translated={} fallback={} stale={} resumes={} exc_nested={} exc_escaped={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
+            "ftab lookups={} translated={} fallback={} stale={} resumes={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
             LOOKUPS.load(Relaxed),
             TRANSLATED.load(Relaxed),
             FALLBACKS.load(Relaxed),
             STALE.load(Relaxed),
             RESUMES.load(Relaxed),
-            crate::nt::EXC_NESTED.load(Relaxed),
-            crate::nt::EXC_ESCAPED.load(Relaxed),
             TRANSLATE_US.load(Relaxed) / 1000,
             COMPILE_US.load(Relaxed) / 1000,
             WORST_US.load(Relaxed) / 1000,
@@ -1055,7 +1053,7 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
-    if caller.data().nt.is_some() && crate::profile::active() {
+    if crate::profile::active() {
         crate::profile::note_nt_entry(target);
     }
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {

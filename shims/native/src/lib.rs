@@ -4149,73 +4149,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
                     }
-                    // The process's own fault hook (Wine's ntdll.so, W3):
-                    // an access violation, executing (DEP).
-                    if std::env::var_os("GEX_W3_TRACE").is_some() {
-                        if let Some(memory) = caller.data().memory.clone() {
-                            let gm = GuestMem::new(memory.bytes());
-                            let base = caller.data().thread.ctx_addr;
-                            let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
-                            let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
-                            let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
-                            eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
-                            let bt = wasmtime::WasmBacktrace::force_capture(&caller);
-                            for fr in bt.frames().iter().take(24) {
-                                eprintln!("gex-w3:   {}", fr.func_name().unwrap_or("?"));
-                            }
-                        }
-                    }
-                    if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {
-                        return Err(StopExecution.into());
-                    }
-                    // Code an ejected project was built without: say so,
-                    // rather than let it read as the guest's own crash.
-                    if let Some(detail) = aot::unseen_code(&mut caller, pc) {
-                        caller.data_mut().exit = Some(Exit::Signal {
-                            signal: signal::SIGSEGV,
-                            pc,
-                            detail,
-                            internal: true,
-                        });
-                        return Err(StopExecution.into());
-                    }
-                    // A wild branch is nearly always a bad return address or
-                    // function pointer: say where the last indirect branch
-                    // was aimed and what the stack holds, so the caller can
-                    // be found without a full trace.
-                    let detail = {
-                        let memory = caller.data().memory.clone();
-                        let state = caller.data();
-                        let base = state.thread.ctx_addr;
-                        match memory {
-                            Some(memory) => {
-                                let gm = GuestMem::new(memory.bytes());
-                                let last = gm.read_u64(base + ctx::LAST_TARGET as u64).unwrap_or(0);
-                                let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
-                                let code: Vec<String> = gm
-                                    .read(src, 24)
-                                    .map(|b| b.iter().map(|x| format!("{x:02x}")).collect())
-                                    .unwrap_or_default();
-                                let sp = gm.read_u64(base + ctx::SP as u64).unwrap_or(0);
-                                let stack: Vec<String> = (0..8)
-                                    .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
-                                    .collect();
-                                format!(
-                                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x} from block {src:#x} [{}]; sp={sp:#x} stack=[{}])",
-                                    code.join(" "),
-                                    stack.join(", ")
-                                )
-                            }
-                            None => format!("branch to 0x{pc:x}, which is not executable guest memory"),
-                        }
-                    };
-                    caller.data_mut().exit = Some(Exit::Signal {
-                        signal: signal::SIGSEGV,
-                        pc,
-                        detail,
-                        internal: false,
-                    });
-                    Err(StopExecution.into())
+                    branch_not_executable(&mut caller, pc)
                 }
                 Err(e) => {
                     caller.data_mut().exit = Some(Exit::Signal {
@@ -5903,6 +5837,80 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     caller.data_mut().resume_cause = Some(format!("guest fault {code:#x}"));
     caller.data_mut().resume_at = Some(next);
     Ok(true)
+}
+
+/// A branch to `pc`, which is not executable guest memory, in a process
+/// without the NT layer: the process's own fault hook takes it as an access
+/// violation, executing (Wine's ntdll.so); else it is a SIGSEGV. Always
+/// stops the guest call.
+pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<i32> {
+    // The process's own fault hook (Wine's ntdll.so, W3):
+    // an access violation, executing (DEP).
+    if std::env::var_os("GEX_W3_TRACE").is_some() {
+        if let Some(memory) = caller.data().memory.clone() {
+            let gm = GuestMem::new(memory.bytes());
+            let base = caller.data().thread.ctx_addr;
+            let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+            let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
+            let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
+            eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
+            let bt = wasmtime::WasmBacktrace::force_capture(&*caller);
+            for fr in bt.frames().iter().take(24) {
+                eprintln!("gex-w3:   {}", fr.func_name().unwrap_or("?"));
+            }
+        }
+    }
+    if deliver_guest_fault_kind(caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {
+        return Err(StopExecution.into());
+    }
+    // Code an ejected project was built without: say so,
+    // rather than let it read as the guest's own crash.
+    if let Some(detail) = aot::unseen_code(caller, pc) {
+        caller.data_mut().exit = Some(Exit::Signal {
+            signal: signal::SIGSEGV,
+            pc,
+            detail,
+            internal: true,
+        });
+        return Err(StopExecution.into());
+    }
+    // A wild branch is nearly always a bad return address or
+    // function pointer: say where the last indirect branch
+    // was aimed and what the stack holds, so the caller can
+    // be found without a full trace.
+    let detail = {
+        let memory = caller.data().memory.clone();
+        let state = caller.data();
+        let base = state.thread.ctx_addr;
+        match memory {
+            Some(memory) => {
+                let gm = GuestMem::new(memory.bytes());
+                let last = gm.read_u64(base + ctx::LAST_TARGET as u64).unwrap_or(0);
+                let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                let code: Vec<String> = gm
+                    .read(src, 24)
+                    .map(|b| b.iter().map(|x| format!("{x:02x}")).collect())
+                    .unwrap_or_default();
+                let sp = gm.read_u64(base + ctx::SP as u64).unwrap_or(0);
+                let stack: Vec<String> = (0..8)
+                    .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
+                    .collect();
+                format!(
+                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x} from block {src:#x} [{}]; sp={sp:#x} stack=[{}])",
+                    code.join(" "),
+                    stack.join(", ")
+                )
+            }
+            None => format!("branch to 0x{pc:x}, which is not executable guest memory"),
+        }
+    };
+    caller.data_mut().exit = Some(Exit::Signal {
+        signal: signal::SIGSEGV,
+        pc,
+        detail,
+        internal: false,
+    });
+    Err(StopExecution.into())
 }
 
 /// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`

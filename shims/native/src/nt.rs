@@ -321,10 +321,12 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     let co = crate::CALLOUTS.load(std::sync::atomic::Ordering::Relaxed);
                     let coa = crate::CALLOUT_ABORTS.load(std::sync::atomic::Ordering::Relaxed);
                     let cg = format!(
-                        "cgen nest_exits={nest_exits} callouts={co} callout_aborts={coa} provider_try={} provider_throw={} {}",
+                        "cgen nest_exits={nest_exits} callouts={co} callout_aborts={coa} provider_try={} provider_throw={} {} exc_nested={} exc_escaped={}",
                         crate::libprov::TRIES.load(std::sync::atomic::Ordering::Relaxed),
                         crate::libprov::THROWS.load(std::sync::atomic::Ordering::Relaxed),
-                        crate::ftab::stats::line()
+                        crate::ftab::stats::line(),
+                        EXC_NESTED.load(std::sync::atomic::Ordering::Relaxed),
+                        EXC_ESCAPED.load(std::sync::atomic::Ordering::Relaxed)
                     );
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
