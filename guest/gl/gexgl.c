@@ -51,6 +51,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "gexgl.h"
@@ -430,10 +431,30 @@ static void too_big(uint32_t opcode, size_t len) {
             opcode, len, ring ? ring->capacity : 0u);
 }
 
-/* 1: a publish is pending (persistent_publish); 2: it covers non-coherent
-   mappings too. */
+/* 1: a scan of every coherent mapping is pending (persistent_fallback,
+   persistent_publish); 2: of the non-coherent ones too. */
 static unsigned persistent_pending;
 static void persistent_settle(void);
+/* What a draw or another buffer reader is about to read of a coherent
+   persistent mapping, sent first (persistent_draw_core). */
+static void persistent_draw_arrays(int first, int count, int instances, unsigned baseinstance);
+static void persistent_draw_elements(int count, unsigned type, const void *indices, int basevertex,
+                                     int instances, unsigned baseinstance, int ranged,
+                                     unsigned start, unsigned end);
+static void persistent_read_target(unsigned target, long offset, long size);
+static void persistent_read_unknown(void);
+static void persistent_dispatch(void);
+static void persistent_unpack(const void *pixels, size_t bytes);
+static void persistent_indexed(unsigned target, unsigned index, unsigned buffer, long offset, long size);
+static void persistent_indexed_unknown(void);
+static void persistent_texbuffer(unsigned buffer, long offset, long size);
+static void persistent_vao_unknown(void);
+static void pv_bind_element(unsigned name);
+static void pv_bind_vao(unsigned name);
+static void pv_delete_vao(unsigned name);
+static void pv_attrib(unsigned index, unsigned buffer, const void *pointer, int stride, size_t element);
+static void pv_enable(unsigned index, int on);
+static void pv_divisor(unsigned index, unsigned divisor);
 
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
@@ -717,6 +738,16 @@ struct buffer_object_state {
        of a larger buffer reads back just its range. */
     uint8_t *mirror;
     int mapped_once;
+    /* Bound once as GL_ELEMENT_ARRAY_BUFFER: up to MIRROR_MAX bytes,
+       it keeps a mirror from its first upload, so a draw can find the
+       vertices its indices reach (persistent_draw_elements). */
+    unsigned char indices;
+    /* The host's copy may differ from the guest's map by more than what the
+       guest wrote: a command other than glBufferData/glBufferSubData may
+       have changed it since the map began. */
+    unsigned char host_wrote;
+    /* Its mirror is one of those kept only for being small (SMALL_MIRROR_MAX). */
+    unsigned char small;
     /* A persistent write mapping (GL_MAP_PERSISTENT_BIT): a 64-bit hash of
        each 4 KiB block of the map as the host last had it -- sent, or as the
        map started -- so persistent_publish can find what the application
@@ -730,20 +761,23 @@ static size_t persistent_live;
 #define MIRROR_MAX ((size_t)1 << 20)
 static struct buffer_target_state buffer_targets[16];
 static struct buffer_object_state *buffer_objects;
-static size_t mirrors_live;
+static size_t mirrors_live, mirrors_small;
 
 static void mirror_drop(struct buffer_object_state *object) {
     if (!object || !object->mirror) return;
     free(object->mirror);
     object->mirror = NULL;
     mirrors_live--;
+    if (object->small) { object->small = 0; mirrors_small -= object->size; }
 }
 
 /* Called first by every command that may change a buffer's contents other
    than glBufferData/glBufferSubData (tools/gl_buffer_writers.py). */
 static void buffer_contents_unknown(void) {
-    for (struct buffer_object_state *o = buffer_objects; o && mirrors_live; o = o->next)
+    for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
+        if (o->map) o->host_wrote = 1;
         mirror_drop(o);
+    }
 }
 
 static struct buffer_target_state *buffer_target(unsigned target) {
@@ -799,6 +833,11 @@ void glBindBuffer(unsigned target, unsigned name) {
     struct buffer_target_state *s = buffer_target(target);
     if (s) s->name = name;
     if (name) (void)buffer_object(name, 1);
+    if (target == 0x8893u) { /* GL_ELEMENT_ARRAY_BUFFER */
+        struct buffer_object_state *o = buffer_object(name, 0);
+        if (o) o->indices = 1;
+        pv_bind_element(name);
+    }
     CMD2(GEXGL_BIND_BUFFER, target, name);
 }
 
@@ -813,17 +852,61 @@ static size_t upload_chunk(void) {
     return step ? step : 4u;
 }
 
+/* Any buffer this small keeps a mirror from its storage on, up to
+   SMALL_MIRRORS_MAX bytes of them in all: its first upload may come by a
+   copy, before it is bound as an index buffer. */
+#define SMALL_MIRROR_MAX (64u << 10)
+#define SMALL_MIRRORS_MAX (16u << 20)
+
+/* New storage of `len` bytes, `data` or undefined (glBufferData,
+   glBufferStorage): a mapped buffer's mirror is its new contents, if given;
+   an index buffer's or a small one's, those or zeros. None above MIRROR_MAX. */
+static void buffer_new_storage(struct buffer_object_state *object, const void *data, size_t len) {
+    if (!object) return;
+    mirror_drop(object);
+    object->size = len;
+    object->host_wrote = 0;
+    const int indices = object->indices && len <= MIRROR_MAX;
+    const int small = !indices && len <= SMALL_MIRROR_MAX && mirrors_small + len <= SMALL_MIRRORS_MAX;
+    if (!len || len > MIRROR_MAX || !((object->mapped_once && data) || indices || small)) return;
+    if (!(object->mirror = data ? malloc(len) : calloc(1, len))) return;
+    if (data) memcpy(object->mirror, data, len);
+    mirrors_live++;
+    if (small && !(object->mapped_once && data)) { object->small = 1; mirrors_small += len; }
+}
+
+static int persistent_coherent(const struct buffer_object_state *o);
+
+/* glCopyBufferSubData changes only the buffer bound to writeTarget: its
+   mirror takes the bytes copied when the guest knows them -- the source's
+   coherent persistent map, which the reader settle has just sent and which
+   nothing but the guest has written since it began, else its mirror -- and
+   is dropped otherwise. */
+static void buffer_copy(unsigned read_target, unsigned write_target, long read_offset,
+                        long write_offset, long size) {
+    struct buffer_object_state *src = buffer_object(bound_buffer(read_target), 0);
+    struct buffer_object_state *dst = buffer_object(bound_buffer(write_target), 0);
+    if (!dst) return;
+    if (dst->map) dst->host_wrote = 1;
+    if (!dst->mirror) return;
+    const size_t at = (size_t)read_offset, to = (size_t)write_offset, n = (size_t)size;
+    const uint8_t *from = NULL;
+    if (read_offset >= 0 && write_offset >= 0 && size >= 0 && to <= dst->size && n <= dst->size - to && src) {
+        if (persistent_coherent(src) && !src->host_wrote && at >= src->map_offset &&
+            at - src->map_offset <= src->map_length && n <= src->map_length - (at - src->map_offset))
+            from = (const uint8_t *)src->map + (at - src->map_offset);
+        else if (src->mirror && at <= src->size && n <= src->size - at)
+            from = src->mirror + at;
+    }
+    if (from) memmove(dst->mirror + to, from, n);
+    else mirror_drop(dst);
+}
+
 void glBufferData(unsigned target, long size, const void *data, unsigned usage) {
     if (size < 0) return;
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
-    if (object) object->size = len;
-    /* New storage: a mapped buffer's copy is its new contents, if given. */
-    mirror_drop(object);
-    if (object && object->mapped_once && data && len && len <= MIRROR_MAX && (object->mirror = malloc(len))) {
-        memcpy(object->mirror, data, len);
-        mirrors_live++;
-    }
+    buffer_new_storage(object, data, len);
     /* Contents larger than one command can carry go as a bare allocation,
        then glBufferSubData in parts. */
     int split = data && len > upload_chunk();
@@ -936,6 +1019,7 @@ void *glMapBufferRange(unsigned target, long offset, long length,
        and keeps the copy; later maps copy from it. A large buffer's map
        reads its own range into the shadow (below), never a whole copy. */
     object->mapped_once = 1;
+    object->host_wrote = 0;
     if (!object->mirror && keep && object->size && object->size <= MIRROR_MAX &&
         (object->mirror = malloc(object->size))) {
         if (buffer_read(target, 0, (long)object->size, object->mirror)) {
@@ -996,34 +1080,62 @@ static void persistent_send(struct buffer_object_state *o, size_t start, size_t 
 
 /* GEXGL_PERSIST_TRACE (debug, off by default): the publishes asked for
    while there was a mapping to look at, by caller, the scans they came to,
-   and the bytes hashed and sent -- said at the 1st, 2nd, 4th, ... 512th
-   scan and then every 1000th. */
+   and the bytes hashed and sent (persistent_say). */
 static int persist_trace = -1;
 static unsigned long long persist_calls[PUBLISH_WHY], persist_scans, persist_hashed, persist_sent;
+static unsigned long long persist_ranges, persist_range_bytes, persist_fallbacks, persist_ns;
+/* Fallbacks by cause: an unknown reader, unknown vertex array or binding
+   state, a fixed-function array, an attribute of unknown size, an index
+   range out of reach. */
+enum { PV_WHY_READER, PV_WHY_STATE, PV_WHY_FF, PV_WHY_SIZE, PV_WHY_INDICES, PV_WHY_N };
+static unsigned long long persist_fallback_why[PV_WHY_N];
 
 static int persistent_tracing(void) {
     if (persist_trace < 0) persist_trace = getenv("GEXGL_PERSIST_TRACE") != NULL;
     return persist_trace;
 }
 
+/* Nanoseconds, while tracing: the time scans and reader ranges take. */
+static unsigned long long persistent_clock(void) {
+    struct timespec t;
+    if (!persistent_tracing() || clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+
+static void persistent_say(void);
 static void persistent_trace(size_t hashed, size_t sent) {
     persist_scans++;
     persist_hashed += hashed;
     persist_sent += sent;
-    unsigned long long n = persist_scans;
+    persistent_say();
+}
+
+/* Said at the 1st, 2nd, 4th, ... 512th scan or reader range and then every
+   1000th. */
+static void persistent_say(void) {
+    unsigned long long n = persist_scans + persist_ranges;
     if (n & (n - 1) && (n < 1000u || n % 1000u)) return;
     fprintf(stderr, "gexgl: %llu persistent publishes (flush %llu, finish %llu, fence %llu, swap %llu,"
-                    " barrier %llu), %llu scans: %llu MiB hashed, %llu KiB sent\n",
+                    " barrier %llu), %llu scans: %llu MiB hashed, %llu KiB sent; %llu reader ranges:"
+                    " %llu KiB hashed; %llu reader fallbacks (reader %llu, state %llu, ff %llu, size %llu, indices %llu);"
+                    " %llu.%03llu ms in all\n",
             persist_calls[PUBLISH_FLUSH] + persist_calls[PUBLISH_FINISH] + persist_calls[PUBLISH_FENCE] +
                 persist_calls[PUBLISH_SWAP] + persist_calls[PUBLISH_BARRIER],
             persist_calls[PUBLISH_FLUSH], persist_calls[PUBLISH_FINISH], persist_calls[PUBLISH_FENCE],
-            persist_calls[PUBLISH_SWAP], persist_calls[PUBLISH_BARRIER], n, persist_hashed >> 20,
-            persist_sent >> 10);
+            persist_calls[PUBLISH_SWAP], persist_calls[PUBLISH_BARRIER], persist_scans, persist_hashed >> 20,
+            persist_sent >> 10, persist_ranges, persist_range_bytes >> 10, persist_fallbacks,
+            persist_fallback_why[PV_WHY_READER], persist_fallback_why[PV_WHY_STATE], persist_fallback_why[PV_WHY_FF],
+            persist_fallback_why[PV_WHY_SIZE], persist_fallback_why[PV_WHY_INDICES],
+            persist_ns / 1000000u, persist_ns / 1000u % 1000u);
 }
 
+/* A flush, finish, fence or swap reads no buffer, and each command that does
+   sends what it reads of a coherent mapping first (persistent_draw_core), so
+   those publish nothing. A client-mapped-buffer barrier publishes every
+   mapping, the non-coherent ones with it. */
 static void persistent_publish(int all, int why) {
     if (!persistent_live) return;
-    persistent_pending |= 1u | (all ? 2u : 0u);
+    if (all) persistent_pending |= 3u;
     if (persistent_tracing()) persist_calls[why]++;
 }
 
@@ -1031,6 +1143,7 @@ static void persistent_settle(void) {
     unsigned pending = persistent_pending;
     persistent_pending = 0; /* before anything below records a command */
     if (!(pending & 1u) || !persistent_live) return;
+    const unsigned long long t0 = persistent_clock();
     const int all = (pending & 2u) != 0;
     const size_t block = PERSIST_BLOCK, most = 4u << 20;
     size_t hashed = 0, sent = 0;
@@ -1056,6 +1169,7 @@ static void persistent_settle(void) {
         if (start != SIZE_MAX) { persistent_send(o, start, n); sent += n - start; bound = 1; }
     }
     if (bound) glBindBuffer(0x8F37u, was);
+    if (t0) persist_ns += persistent_clock() - t0;
     if (persistent_tracing()) persistent_trace(hashed, sent);
 }
 
@@ -1132,6 +1246,7 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
 }
 
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
+    persistent_indexed(target, index, buffer, 0, 0);
     CMD3(GEXGL_BIND_BUFFER_BASE, target, index, buffer);
 }
 
@@ -1625,16 +1740,19 @@ static size_t attrib_element_bytes(int size, unsigned type) {
     case 0x8D9F: case 0x8368: case 0x8C3B: return 4;
     default: return 0;
     }
+    if (size == 0x80E1) size = 4; /* GL_BGRA: four components */
     if (size < 1 || size > 4) return 0;
     return component * (size_t)size;
 }
 
 void glEnableVertexAttribArray(unsigned i) {
     if (i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS) vertex_attribs[i].enabled = 1;
+    pv_enable(i, 1);
     CMD1(GEXGL_ENABLE_VERTEX_ATTRIB_ARRAY, i);
 }
 void glDisableVertexAttribArray(unsigned i) {
     if (i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS) vertex_attribs[i].enabled = 0;
+    pv_enable(i, 0);
     CMD1(GEXGL_DISABLE_VERTEX_ATTRIB_ARRAY, i);
 }
 
@@ -1653,6 +1771,7 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
     /* GL_ARRAY_BUFFER. Which one is bound *now* is what decides, for good:
        binding a buffer afterwards does not retroactively capture the array. */
     a->client = bound_buffer(0x8892u) == 0 && pointer != NULL;
+    pv_attrib(index, bound_buffer(0x8892u), pointer, stride, attrib_element_bytes(size, type));
     if (a->client != was_client)
         vertex_attrib_client_count += a->client ? 1 : -1;
 }
@@ -1964,6 +2083,7 @@ void glVertexAttribIPointer(unsigned index, int size, unsigned type,
 void glVertexAttribDivisor(unsigned index, unsigned divisor) {
     if (index < GEXGL_MAX_VERTEX_ATTRIB_POINTERS)
         vertex_attribs[index].divisor = divisor;
+    pv_divisor(index, divisor);
     CMD2(GEXGL_VERTEX_ATTRIB_DIVISOR, index, divisor);
 }
 void glVertexAttrib4f(unsigned index, float x, float y, float z, float w) {
@@ -1987,9 +2107,9 @@ void glDeleteVertexArrays(int n, const unsigned *names) {
     uint32_t *p = begin(GEXGL_DELETE_VERTEX_ARRAYS, 1 + (size_t)n, 0);
     if (!p) return;
     p[0] = (uint32_t)n;
-    for (int i = 0; i < n; i++) p[1 + i] = names[i];
+    for (int i = 0; i < n; i++) { p[1 + i] = names[i]; pv_delete_vao(names[i]); }
 }
-void glBindVertexArray(unsigned name) { CMD1(GEXGL_BIND_VERTEX_ARRAY, name); }
+void glBindVertexArray(unsigned name) { pv_bind_vao(name); CMD1(GEXGL_BIND_VERTEX_ARRAY, name); }
 
 void glGenTextures(int n, unsigned *out) {
     uint32_t *p = begin(GEXGL_GEN_TEXTURES, 1 + (size_t)n, 0);
@@ -2096,6 +2216,7 @@ static int tex_sub_image_2d_bands(unsigned target, int level, int x, int y, int 
 void glTexImage2D(unsigned target, int level, int internal, int w, int h, int border,
                   unsigned format, unsigned type, const void *pixels) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
+    if (pbo) persistent_unpack(pixels, pixel_transfer_bytes(format, type, w, h, -1, &unpack_store, NULL));
     size_t len = pixels && !pbo ? pixel_transfer_bytes(format, type, w, h, -1,
                                                         &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
@@ -2118,6 +2239,7 @@ void glTexImage2D(unsigned target, int level, int internal, int w, int h, int bo
 void glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
                      unsigned format, unsigned type, const void *pixels) {
     int pbo = bound_buffer(0x88ECu) != 0;
+    if (pbo) persistent_unpack(pixels, pixel_transfer_bytes(format, type, w, h, -1, &unpack_store, NULL));
     size_t len = pixels && !pbo ? pixel_transfer_bytes(format, type, w, h, -1,
                                                         &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
@@ -2206,6 +2328,7 @@ void glTexImage3D(unsigned target, int level, int internal, int width,
                   int height, int depth, int border, unsigned format,
                   unsigned type, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0;
+    if (pbo) persistent_unpack(data, pixel_transfer_bytes(format, type, width, height, depth, &unpack_store, NULL));
     size_t len = data && !pbo ? pixel_transfer_bytes(format, type, width, height, depth,
                                                       &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
@@ -2232,6 +2355,7 @@ void glFramebufferTextureLayer(unsigned target, unsigned attachment,
 }
 
 void glDrawArrays(unsigned mode, int first, int count) {
+    persistent_draw_arrays(first, count, 1, 0);
     if (first >= 0 && count > 0)
         gexgl_upload_client_arrays((size_t)first + (size_t)count, 1);
     CMD3(GEXGL_DRAW_ARRAYS, mode, first, count);
@@ -2276,11 +2400,305 @@ static size_t gexgl_client_index_extent(const void *indices, int count,
     return highest + 1;
 }
 
+/* Coherent persistent mappings, at the commands that read them.
+
+   A client write into a GL_MAP_COHERENT_BIT persistent mapping is visible to
+   every GL command after it, with no flush: a draw issued straight after the
+   write reads the new bytes (wined3d writes its vertices into a coherent
+   chunk and draws at once). Hashing the whole mapping before every draw is
+   correct and far too slow (a 64 MiB chunk per draw), so each command that
+   reads a buffer sends first only what it can read: a draw the index range
+   of its element buffer and, for each enabled attribute, the vertices from
+   the lowest index it reaches to the highest, and its indexed and texture
+   buffer bindings; a copy, a readback or an unpack upload its source range.
+   Nothing else reads a buffer, so a flush, fence or swap publishes nothing.
+   Where the range cannot be known -- indirect and multi draws, vertex state
+   set through ARB_vertex_attrib_binding or direct state access, indices the
+   guest has no copy of -- the whole of every coherent mapping is published
+   instead (persistent_fallback, counted for GEXGL_PERSIST_TRACE). Index
+   buffers keep a mirror for this (buffer_new_storage).
+
+   The vertex state this needs is a vertex array object's, so it is kept per
+   object: the default one and up to PV_VAOS others, the ones past that
+   unknown. */
+#define PV_VAOS 8
+#define PV_BINDINGS 32
+struct pv_attrib {
+    unsigned char enabled;
+    unsigned buffer;
+    uintptr_t pointer;
+    int stride;
+    size_t element;
+    unsigned divisor;
+};
+struct pv_vao {
+    unsigned name;
+    unsigned char used, unknown;
+    unsigned element;
+    struct pv_attrib a[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+};
+static struct pv_vao pv_default = { 0, 1, 0, 0, { { 0 } } };
+static struct pv_vao pv_overflow = { 0, 1, 1, 0, { { 0 } } };
+static struct pv_vao pv_vaos[PV_VAOS];
+static struct pv_vao *pv_cur = &pv_default;
+/* Buffers a draw may read other than its vertices and indices: indexed
+   bindings (uniform, storage, atomic counter) and texture buffers. */
+struct pv_binding { unsigned target, index, buffer; size_t offset, size; };
+static struct pv_binding pv_bindings[PV_BINDINGS];
+static int pv_bindings_unknown;
+
+static void pv_bind_element(unsigned name) { pv_cur->element = name; }
+static void pv_bind_vao(unsigned name) {
+    if (!name) { pv_cur = &pv_default; return; }
+    struct pv_vao *free_slot = NULL;
+    for (int i = 0; i < PV_VAOS; i++) {
+        if (pv_vaos[i].used && pv_vaos[i].name == name) { pv_cur = &pv_vaos[i]; return; }
+        if (!pv_vaos[i].used && !free_slot) free_slot = &pv_vaos[i];
+    }
+    if (!free_slot) { pv_cur = &pv_overflow; return; }
+    /* First bound here: GL creates it now, in its default state. */
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->name = name;
+    free_slot->used = 1;
+    pv_cur = free_slot;
+}
+static void pv_delete_vao(unsigned name) {
+    if (!name) return;
+    for (int i = 0; i < PV_VAOS; i++) {
+        if (!pv_vaos[i].used || pv_vaos[i].name != name) continue;
+        if (pv_cur == &pv_vaos[i]) pv_cur = &pv_default;
+        pv_vaos[i].used = 0;
+    }
+}
+static void pv_attrib(unsigned index, unsigned buffer, const void *pointer, int stride, size_t element) {
+    if (index >= GEXGL_MAX_VERTEX_ATTRIB_POINTERS) return;
+    struct pv_attrib *a = &pv_cur->a[index];
+    a->buffer = buffer;
+    a->pointer = (uintptr_t)pointer;
+    a->stride = stride;
+    a->element = element;
+}
+static void pv_enable(unsigned index, int on) {
+    if (index < GEXGL_MAX_VERTEX_ATTRIB_POINTERS) pv_cur->a[index].enabled = (unsigned char)on;
+}
+static void pv_divisor(unsigned index, unsigned divisor) {
+    if (index < GEXGL_MAX_VERTEX_ATTRIB_POINTERS) pv_cur->a[index].divisor = divisor;
+}
+static void persistent_vao_unknown(void) {
+    pv_default.unknown = 1;
+    for (int i = 0; i < PV_VAOS; i++) pv_vaos[i].unknown = 1;
+}
+
+static void persistent_indexed(unsigned target, unsigned index, unsigned buffer, long offset, long size) {
+    if (target == 0x8C8Eu) return; /* GL_TRANSFORM_FEEDBACK_BUFFER: written, not read */
+    struct pv_binding *free_slot = NULL;
+    for (int i = 0; i < PV_BINDINGS; i++) {
+        struct pv_binding *b = &pv_bindings[i];
+        if (b->buffer && b->target == target && b->index == index) {
+            b->buffer = 0;
+            if (!free_slot) free_slot = b;
+        } else if (!b->buffer && !free_slot) {
+            free_slot = b;
+        }
+    }
+    if (!buffer) return;
+    if (!free_slot) { pv_bindings_unknown = 1; return; }
+    *free_slot = (struct pv_binding){ target, index, buffer,
+                                      offset > 0 ? (size_t)offset : 0, size > 0 ? (size_t)size : 0 };
+}
+static void persistent_indexed_unknown(void) { pv_bindings_unknown = 1; }
+/* A texture buffer reads its buffer wherever the texture is bound: the last
+   PV_TEXBUFFERS of them are kept, under a target of their own, so the other
+   bindings keep the rest of the slots. */
+#define PV_TEXBUFFERS 8
+static void persistent_texbuffer(unsigned buffer, long offset, long size) {
+    static unsigned next;
+    if (buffer) persistent_indexed(0x8C2Au /* GL_TEXTURE_BUFFER */, next++ % PV_TEXBUFFERS, buffer, offset, size);
+}
+
+/* The whole of every coherent mapping, before the next command: what a
+   reader whose range is unknown gets. */
+static void persistent_fallback(int why) {
+    if (!persistent_live) return;
+    persistent_pending |= 1u;
+    persist_fallbacks++;
+    persist_fallback_why[why]++;
+}
+static void persistent_read_unknown(void) { persistent_fallback(PV_WHY_READER); }
+
+static int persistent_coherent(const struct buffer_object_state *o) {
+    return o && o->sent && o->map && (o->map_access & 0x80u);
+}
+
+/* Send what changed in [start, end) of the buffer (its offsets) that its
+   coherent persistent mapping covers. */
+static void persistent_settle_range(struct buffer_object_state *o, size_t start, size_t end) {
+    if (!persistent_coherent(o) || end <= start) return;
+    const size_t lo = o->map_offset, hi = o->map_offset + o->map_length;
+    if (end <= lo || start >= hi) return;
+    if (start < lo) start = lo;
+    if (end > hi) end = hi;
+    start -= lo;
+    end -= lo;
+    const unsigned long long t0 = persistent_clock();
+    const size_t block = PERSIST_BLOCK, most = 4u << 20;
+    const size_t first = start / block, last = (end + block - 1) / block;
+    unsigned was = bound_buffer(0x8F37u); /* GL_COPY_WRITE_BUFFER */
+    int bound = 0;
+    size_t run = SIZE_MAX;
+    for (size_t b = first; b < last; b++) {
+        size_t at = b * block, len = o->map_length - at < block ? o->map_length - at : block;
+        uint64_t h = persistent_block_hash(o, b);
+        int changed = h != o->sent[b];
+        o->sent[b] = h;
+        if (changed && run == SIZE_MAX) run = at;
+        if (run != SIZE_MAX && (!changed || at + len - run >= most)) {
+            persistent_send(o, run, changed ? at + len : at);
+            persist_sent += (changed ? at + len : at) - run;
+            bound = 1;
+            run = SIZE_MAX;
+        }
+    }
+    if (run != SIZE_MAX) {
+        size_t stop = last * block < o->map_length ? last * block : o->map_length;
+        persistent_send(o, run, stop);
+        persist_sent += stop - run;
+        bound = 1;
+    }
+    if (bound) glBindBuffer(0x8F37u, was);
+    persist_ranges++;
+    persist_range_bytes += (last - first) * block;
+    if (t0) persist_ns += persistent_clock() - t0;
+    if (persistent_tracing()) persistent_say();
+}
+
+static void persistent_bindings(void) {
+    for (int i = 0; i < PV_BINDINGS; i++) {
+        const struct pv_binding *b = &pv_bindings[i];
+        if (!b->buffer) continue;
+        struct buffer_object_state *o = buffer_object(b->buffer, 0);
+        if (!persistent_coherent(o)) continue;
+        persistent_settle_range(o, b->offset, b->size ? b->offset + b->size : o->map_offset + o->map_length);
+    }
+}
+
+/* Vertices [lo, hi) of the divisor-0 attributes, and the instances of the
+   instanced ones. */
+static void persistent_draw_core(size_t lo, size_t hi, int instances, unsigned baseinstance) {
+    if (pv_cur->unknown || pv_bindings_unknown) { persistent_fallback(PV_WHY_STATE); return; }
+    for (unsigned i = 0; i < GEXGL_FF_ARRAYS; i++)
+        if (ff_arrays[i].enabled && !ff_arrays[i].client && ff_arrays[i].pointer) {
+            persistent_fallback(PV_WHY_FF);
+            return;
+        }
+    for (unsigned i = 0; i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS; i++) {
+        const struct pv_attrib *a = &pv_cur->a[i];
+        if (!a->enabled || !a->buffer) continue;
+        struct buffer_object_state *o = buffer_object(a->buffer, 0);
+        if (!persistent_coherent(o)) continue;
+        if (!a->element) { persistent_fallback(PV_WHY_SIZE); return; }
+        const size_t stride = a->stride > 0 ? (size_t)a->stride : a->element;
+        size_t first = lo, n = hi > lo ? hi - lo : 0;
+        if (a->divisor) {
+            const size_t k = instances > 0 ? (size_t)instances : 1;
+            first = baseinstance;
+            n = (k + a->divisor - 1) / a->divisor;
+        }
+        if (!n) continue;
+        if (first + n - 1 > (SIZE_MAX - a->pointer - a->element) / stride) { persistent_fallback(PV_WHY_SIZE); return; }
+        const size_t start = a->pointer + first * stride;
+        persistent_settle_range(o, start, start + (n - 1) * stride + a->element);
+    }
+    persistent_bindings();
+}
+
+static void persistent_draw_arrays(int first, int count, int instances, unsigned baseinstance) {
+    if (!persistent_live || count <= 0 || first < 0) return;
+    persistent_draw_core((size_t)first, (size_t)first + (size_t)count, instances, baseinstance);
+}
+
+/* The lowest and highest index of `count` indices of `size` bytes. */
+static void index_bounds(const void *at, int count, size_t size, size_t *low, size_t *high) {
+    size_t lo = SIZE_MAX, hi = 0;
+    for (int i = 0; i < count; i++) {
+        size_t v = size == 1 ? ((const uint8_t *)at)[i]
+                 : size == 2 ? ((const uint16_t *)at)[i] : ((const uint32_t *)at)[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    *low = lo;
+    *high = hi;
+}
+
+static void persistent_draw_elements(int count, unsigned type, const void *indices, int basevertex,
+                                     int instances, unsigned baseinstance, int ranged,
+                                     unsigned start, unsigned end) {
+    if (!persistent_live || count <= 0) return;
+    const size_t size = index_element_bytes(type);
+    if (!size) return;
+    size_t lo = start, hi = end;
+    const unsigned element = pv_cur->unknown ? 0 : pv_cur->element;
+    if (pv_cur->unknown) { persistent_fallback(PV_WHY_STATE); return; }
+    if (!element) {
+        /* Client indices, here in this process. */
+        if (!indices) return;
+        if (!ranged) index_bounds(indices, count, size, &lo, &hi);
+    } else {
+        struct buffer_object_state *o = buffer_object(element, 0);
+        const size_t offset = (size_t)(uintptr_t)indices;
+        const size_t bytes = (size_t)count * size;
+        if (persistent_coherent(o)) persistent_settle_range(o, offset, offset + bytes);
+        if (!ranged) {
+            /* The indices themselves: in a mapping that covers them, else in
+               the buffer's mirror, else only on the host. */
+            if (o && o->map && offset >= o->map_offset &&
+                offset - o->map_offset <= o->map_length &&
+                bytes <= o->map_length - (offset - o->map_offset)) {
+                index_bounds((const uint8_t *)o->map + (offset - o->map_offset), count, size, &lo, &hi);
+            } else if (o && o->mirror && offset <= o->size && bytes <= o->size - offset) {
+                index_bounds(o->mirror + offset, count, size, &lo, &hi);
+            } else {
+                persistent_fallback(PV_WHY_INDICES);
+                return;
+            }
+        }
+    }
+    if (lo > hi) return;
+    /* basevertex moves the vertices the indices name. */
+    long long first = (long long)lo + basevertex, last = (long long)hi + basevertex;
+    if (last < 0) return;
+    if (first < 0) first = 0;
+    persistent_draw_core((size_t)first, (size_t)last + 1, instances, baseinstance);
+}
+
+static void persistent_dispatch(void) {
+    if (!persistent_live) return;
+    if (pv_bindings_unknown) { persistent_fallback(PV_WHY_STATE); return; }
+    persistent_bindings();
+}
+
+static void persistent_read_target(unsigned target, long offset, long size) {
+    if (!persistent_live || size <= 0 || offset < 0) return;
+    struct buffer_object_state *o = buffer_object(bound_buffer(target), 0);
+    if (persistent_coherent(o)) persistent_settle_range(o, (size_t)offset, (size_t)offset + (size_t)size);
+}
+
+/* An upload from the bound GL_PIXEL_UNPACK_BUFFER of `bytes` at `pixels` (an
+   offset into it); zero bytes: as far as the buffer goes. */
+static void persistent_unpack(const void *pixels, size_t bytes) {
+    if (!persistent_live) return;
+    struct buffer_object_state *o = buffer_object(bound_buffer(0x88ECu), 0);
+    if (!persistent_coherent(o)) return;
+    const size_t start = (size_t)(uintptr_t)pixels;
+    persistent_settle_range(o, start, bytes ? start + bytes : o->map_offset + o->map_length);
+}
+
 void glDrawElements(unsigned mode, int count, unsigned type, const void *offset) {
     /* With no element array buffer bound, `offset` is a pointer into the
      * client's own memory and means nothing on the host -- sending it as an
      * offset had the host dereference its own address space. The indices
      * travel with the command instead. */
+    persistent_draw_elements(count, type, offset, 0, 1, 0, 0, 0, 0);
     const int client = bound_buffer(0x8893u) == 0; /* GL_ELEMENT_ARRAY_BUFFER */
     const size_t element = index_element_bytes(type);
     /* Client vertex arrays are uploaded as far as these indices reach. With
@@ -2309,12 +2727,14 @@ void glDrawBuffers(int count, const unsigned *buffers) {
     for(int i=0;i<count;i++)p[1+i]=buffers[i];
 }
 void glDrawArraysInstanced(unsigned mode, int first, int count, int instances) {
+    persistent_draw_arrays(first, count, instances, 0);
     if (first >= 0 && count > 0)
         gexgl_upload_client_arrays((size_t)first + (size_t)count, instances);
     CMD4(GEXGL_DRAW_ARRAYS_INSTANCED,mode,first,count,instances);
 }
 void glDrawElementsInstanced(unsigned mode, int count, unsigned type,
                              const void *offset, int instances) {
+    persistent_draw_elements(count, type, offset, 0, instances, 0, 0, 0, 0);
     uint32_t *p=begin(GEXGL_DRAW_ELEMENTS_INSTANCED,5,0); if(!p)return;
     p[0]=mode;p[1]=(uint32_t)count;p[2]=type;
     p[3]=(uint32_t)(uintptr_t)offset;p[4]=(uint32_t)instances;

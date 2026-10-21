@@ -418,7 +418,7 @@ def defined_in(path):
 
 def emit_guest(cmds, plans, opcodes):
     sys.path.insert(0, str(ROOT / "tools"))
-    from gl_buffer_writers import mark_buffer_writer
+    from gl_buffer_writers import mark_buffer_writer, mark_persistent_reader
     hand = set()
     for f in ("gexgl.c", "gl44-generated.inc", "gexgl-glx.inc"):
         hand |= defined_in(ROOT / "guest/gl" / f)
@@ -449,7 +449,7 @@ def emit_guest(cmds, plans, opcodes):
             body += f"uint32_t ret__ = (uint32_t){call}; float f__; memcpy(&f__, &ret__, 4); return f__;"
         else:
             body += f"return ({rt}){call};"
-        out.append(mark_buffer_writer(name, f"{rt} {name}({params}) {{\n    {body}\n}}"))
+        out.append(mark_persistent_reader(name, mark_buffer_writer(name, f"{rt} {name}({params}) {{\n    {body}\n}}")))
         n += 1
     out.insert(6, f"/* {n} entry points. */")
     return "\n".join(out) + "\n"
