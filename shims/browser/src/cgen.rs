@@ -8,7 +8,7 @@
 //! and the publish -- a range of the function table, the address map, the
 //! bridges in tier-1's dispatch slots, the directory -- as the native
 //! `ftab::publish` does it. A unit's wasm never enters the shim's heap
-//! (noita.exe's is ~195 MiB): JavaScript fetches and compiles it, hands over
+//! (a large game's is ~195 MiB): JavaScript fetches and compiles it, hands over
 //! only its slot list (`c.entries`, the `gex.funcs` section's), and each
 //! Worker instantiates it into its own function table with `__table_base` at
 //! the unit's range as it replays the table's log. Units are kept in a list
@@ -204,7 +204,7 @@ static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// process can load and publish the same unit; the second publish found every
 /// page numbered already and replaced the unit's `dirs` with nothing, and
 /// whichever install read them after that wrote no directory entry at all
-/// (Paint's startup livelock, scratch/P/stall85, run 104: uiribbon placed
+/// (a startup livelock: one DLL placed
 /// twice). The first claim publishes; the others only install.
 static CLAIMED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 /// Publishes refused because another Worker had claimed the unit.
@@ -250,8 +250,8 @@ static FTAB_SIZE: AtomicU32 = AtomicU32::new(0);
 // (`#cgenGrow`, with room over), so a thread that last caught up before
 // another thread installed a large unit read the new index as a hit and
 // called past its table's end ("table index is out of bounds":
-// StructuredQuery.dll's DllMain through winepe in the Win7 shell's Computer
-// window, tests/w3/ftabstale.sh). So every Worker that may be running guest
+// a DllMain through winepe,
+// tests/w3/ftabstale.sh). So every Worker that may be running guest
 // code says how long its table is, and an index goes into the cache only
 // when every one of their tables holds it; otherwise the cache slot stays
 // resolve and the call comes through `lookup`, which catches the caller up.
@@ -566,7 +566,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
 /// never runs is then never read, hashed or placed: a resource DLL (22 MB
 /// of ehres.dll mapped three times by the shell for icons, 20 tzres.dll
 /// maps for time zone names), each KnownDll wineboot maps for its imports
-/// (40 of them, 3.8 s of a W64 game's start), the game's exe in the
+/// (40 of them, 3.8 s of a W64 program's start), the game's exe in the
 /// first process, which only hands it to start.exe (its 261 MiB unit
 /// fetched, compiled and placed for nothing). One that runs is placed at
 /// its first miss, as a relocated image's is.
@@ -1428,7 +1428,7 @@ pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
     // W3 with the split (`?w3split=1`): the guest's 2 GiB are Wine's and a
-    // game may fill them (Hades x86 with its units: no room for a Worker's
+    // game may fill them (one with its units left no room for a Worker's
     // stack), while only wasm code runs on this one. It comes from the shim's
     // heap, above 2 GiB, zeroed, and lives as long as the process.
     if crate::winspace::w3_split() && crate::nt::process().is_none() {
@@ -1760,8 +1760,8 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         } else {
             let page = addr / gex_abi::DISPATCH_PAGE;
             let patched = mem.get((gex_abi::patched_pages() + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
-            // A provider serves the export whatever its bytes became: Noita's
-            // mod sandbox rewrites lua51's entry points, which the Lua provider
+            // A provider serves the export whatever its bytes became: a game's
+            // mod sandbox may rewrite a DLL's entry points, which the Lua provider
             // replaces (as natively, ftab.rs `current`).
             patched && m.install(f.install).module < PROVIDER
         };
@@ -2532,8 +2532,8 @@ pub(crate) fn leaves() -> u64 {
 pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
     libprov::forget_gone(gone);
-    // W64 only: on W3 it hung the Win7 shell's boot (X's 1016m: explorer
-    // went quiet after loading wer.dll).
+    // W64 only: on W3 it hung a desktop shell's boot (explorer
+    // went quiet after loading a DLL).
     if wasmprog::guest_x86_64() {
         wasmdll::forget_gone(gone);
     }

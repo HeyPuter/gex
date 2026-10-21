@@ -695,7 +695,7 @@ impl WaylandDevice {
     /// hang-up to read, bytes still owed to one, an X window manager to
     /// drive, or input in the ring for a client that takes it -- or the floor
     /// (`PUMP_FLOOR_NS`) has passed. Asked on every scheduler turn of every
-    /// Worker (once under the lock, as the pump was): Undertale's game process pumped 7,000
+    /// Worker (once under the lock, as the pump was): a game's process pumped 7,000
     /// times a second, nearly all with nothing to move, and the pump was 311
     /// of the 546 ms a 10 s window held the lock for the turn (census)
     /// -- the turn that is 70% of the game's lock wait.

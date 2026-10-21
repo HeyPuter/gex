@@ -1025,8 +1025,8 @@ async function handle(msg) {
       const ring = gex.audioRing?.();
       if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
       // The files are in the kernel's filesystem now, copied. The views here
-      // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for the
-      // mspaint demo), which stays resident while anything views it: let go,
+      // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for a
+      // demo), which stays resident while anything views it: let go,
       // and tell the page so it can let go of its own.
       if (msg.files) {
         msg.files = null;

@@ -506,8 +506,8 @@ class Compositor {
     if (!held) return null;
     // A shared memory grown by another thread can keep its buffer object and
     // only grow its length (overlay-worker.js's check): a view from before
-    // then stops short, and the windows of a process that grew past it (the
-    // Win7 desktop and taskbar, with explorer /desktop a process of its own)
+    // then stops short, and the windows of a process that grew past it (a
+    // desktop and taskbar, with explorer /desktop a process of its own)
     // were never painted again.
     const buf = held.memory.buffer;
     if (held.view.buffer !== buf || held.view.length !== buf.byteLength) {
@@ -1584,7 +1584,7 @@ class Compositor {
 
   key(code, pressed, mods, time) {
     // No window has the keyboard: a placed window's client never said it is
-    // active (Momodora's Wine window, placed, never activated, so every key
+    // active (a game's Wine window, placed, never activated, so every key
     // was dropped). The topmost toplevel gets it, as gexc's native
     // compositor does (shims/native/src/wayland.rs, route). Only when no
     // window has it (a focused window keeps it), and only to a toplevel that

@@ -49,9 +49,8 @@ pub(crate) struct Shared {
     pub dyproc: Option<crate::dylink::DyProcess>,
     /// Installs that are export providers (`publish_pairs`): native code in
     /// place of a library's, so a rewrite of the library's bytes there does
-    /// not retire them (the bytes are not what runs). Noita's mod sandbox
-    /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
-    /// native too, ignores those writes the same way.
+    /// not retire them (the bytes are not what runs). A game's mod sandbox
+    /// may overwrite a hundred or more of a DLL's entry points.
     pub providers: std::collections::HashSet<u32>,
     /// Which guest process this is, for the run-time translator
     /// (`ftab::Request::process`): one per process image, shared with a
@@ -647,8 +646,8 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 /// bytes at it. Its discovery follows `call [iat]` into other images, and a
 /// retirement forgets the bridges of a page's providers while keeping the
 /// providers (a Detours hook in a W3 builtin's skeleton): lifted, the
-/// untouched exports beside the hook ran their `ud2` stubs (IE8's
-/// RegisterClassW, c000001d).
+/// untouched exports beside the hook ran their `ud2` stubs
+/// (c000001d).
 pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64) -> bool {
     !s.ftab.tier1_only.contains(&addr) && s.ftab.map.get(addr).is_some_and(|f| current(s, memory, addr, f))
 }

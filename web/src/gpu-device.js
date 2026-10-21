@@ -150,13 +150,13 @@ export function requestGexDevice() {
     // layers, GL 4.3's compute shaders 1024 invocations a workgroup and
     // 32 KiB of shared memory; WebGPU's defaults (8192, 256; 256, 16 KiB)
     // keep the context at GL 4.0. Unity drops shaders whose target the
-    // context is below: at 4.0 Muck's grass geometry shader ("Shader
+    // context is below: at 4.0 a game's grass geometry shader ("Shader
     // Unsupported ... All passes removed") left the grass as dots; at 4.2
-    // with mesa-wink 60202246 it draws blades (U, mpg3).
+    // with mesa-wink 60202246 it draws blades.
     //
     // Compute is the adapter's own limits, not just GL's minimum: a Windows
     // driver's context is 4.6 with compute, and games look for it whatever
-    // version they ask for. Mosa Lina asks for 3.2 core, then gives up
+    // version they ask for. A game may ask for 3.2 core, then give up
     // ("OpenGL 3.2+ is required") when wglGetProcAddress has no
     // glDispatchCompute -- st/mesa only advertises ARB_compute_shader at
     // 1024 invocations a workgroup, and the device's default is 256.

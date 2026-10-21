@@ -1,7 +1,7 @@
 //! Stateful export providers (docs/eject-pe.md §5.1): a library of native
 //! wasm in place of a guest DLL's exports, with data, a C stack and a heap of
 //! its own -- what gex-cgen's built-in providers (no data, no stack) cannot
-//! be. An ejected Noita's Lua (PUC Lua 5.1 for LuaJIT's lua51.dll) is one.
+//! be. A Lua (PUC Lua 5.1 in place of LuaJIT's lua51.dll) is one.
 //!
 //! The module is a position-independent wasm module (`wasm-ld
 //! --experimental-pic -shared --shared-memory`), bound like any provider:
@@ -847,7 +847,7 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         // None of the replaced library's code may run, so the function JIT must not translate it
         // either: following a PLT's folded GOT load into it would publish the library's own code
-        // over the provider's bindings (Muck under --fjit then ran Boehm's GC_exclude_static_roots
+        // over the provider's bindings (a game under --fjit then ran Boehm's GC_exclude_static_roots
         // forever).
         replaced_add(lo.wrapping_add(bias), hi.wrapping_add(bias));
         for lp in libs {

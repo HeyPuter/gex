@@ -2062,7 +2062,7 @@ const BIG_HEAP: Heap<true> = talc::sync::TalcLock::new(ShimRegion);
 
 /// Allocations this big or bigger come from a heap of their own.
 ///
-/// One heap for everything fragmented to exhaustion: Noita at world load had
+/// One heap for everything fragmented to exhaustion: a game at world load had
 /// 510 MiB live in 2 GiB of spans, because the megabyte-sized buffers a
 /// translation and a GL frame churn through (encoding buffers, module copies,
 /// readbacks) came back to holes that small objects had since split, and the
@@ -3512,7 +3512,7 @@ struct Jit {
     /// store (`Gex#moduleStore`) as `(offset, len)`, or `None` when they are in
     /// `registry` itself. An entry kept there holds no bytes in this module's
     /// heap: the registry grew without bound in a long fjit run (980 MiB of
-    /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
+    /// a game's 1670 MiB heap at the 2 GiB arena's OOM).
     registry_ext: Vec<Option<(u64, u32, u64)>>,
     /// The bytes of the last modules kept in the JS-side store, still alive:
     /// a sibling Worker that read the pending queue's front just before this
@@ -3565,7 +3565,7 @@ struct Jit {
     /// (`PAGE_STALE`), for its bound ([`STALE_AGAIN_MAX`]).
     stale_again: std::collections::HashMap<u64, u32>,
     /// Pages whose translations were retired (code unmapped, reprotected or
-    /// flushed: Detours patching noita.exe). A stored module covering one may
+    /// flushed: a Detours hook patching an executable). A stored module covering one may
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
@@ -3599,7 +3599,7 @@ struct Jit {
     reuse_served: u64,
     /// The index in `blocks` each dense slot's bridge was given
     /// (`cgen::bridges`, by `table << 24 | slot`): a slot bridged again gets
-    /// the same one. A fresh index per bridge numbered Hades x64's re-bridge
+    /// the same one. A fresh index per bridge numbered a 64-bit game's re-bridge
     /// churn (8 Workers, each missing at an index its siblings wrote) at
     /// ~8,000 a second, and every Worker's `blocks` grew with it until the
     /// renderer ran out of V8 heap.
@@ -3921,7 +3921,7 @@ fn with_own_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     // gives it back. `do_exec` takes it (`jit_in_held(&mut h.jit)`) under an
     // adoption (`gex_adopted_exec`): kept, it went into the new program with
     // the thread and every exec'd process's first trap said "BUG: trapped
-    // out to JS holding the JIT lock" (B18, 9 in a Win7 shell boot), its
+    // out to JS holding the JIT lock" (9 in a desktop shell's boot), its
     // other threads waiting on the lock meanwhile.
     jit_give();
     r
@@ -5746,7 +5746,7 @@ pub extern "C" fn gex_pin_report() {
 /// so that it never needs a buffer of the file's size in this module's heap:
 /// the heap never gives a span back, and before a Windows program boots
 /// whatever the heap has taken is address space the program cannot have
-/// (`nt::boot`). Noita's music bank is 324 MiB.
+/// (`nt::boot`). One game's music bank is 324 MiB.
 #[no_mangle]
 pub extern "C" fn gex_add_file_part(path: u32, path_len: u32, offset: u64, data: u32, data_len: u32) {
     if offset == 0 {
@@ -7853,7 +7853,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // The host's integrity check, the process's pid and the pin report are
     // done inside the locked section below: each took the host lock on its
     // own, and with a W3 game's ~25 Wine Workers contending for it every take
-    // costs (Undertale's game thread spent ~14 ms a frame on this path).
+    // costs (a game thread spent ~14 ms a frame on this path).
     // Every syscall timed, with a heartbeat or a trace on (`sys_timed`): a
     // blocking call parks the Worker here, so this covers waiting as well as
     // work. Off by default: two clock reads (JS calls) and two read-modify-
@@ -8569,7 +8569,7 @@ fn clock_constants(compat: bool, started: u128) {
 /// `sched_yield` are answered here, always, from the clock and the process's
 /// constants (`gex_kernel::syscalls::clock_call`, `EFAULT` included). They
 /// read nothing the kernel guards: the time base is fixed at boot
-/// (`k_boot_secs`), the ABI and start at load. Undertale's game process makes
+/// (`k_boot_secs`), the ABI and start at load. A Wine game's process makes
 /// about 7,000 of them a second (Wine's `NtDelayExecution` is getrusage,
 /// sched_yield, getrusage, and its timers read the clock).
 ///
@@ -8765,7 +8765,7 @@ thread_local! {
 fn wasm32_wait(pc: u64) -> i32 {
     // Narration, once per Worker: a wasm32 program's every blocking call
     // comes through here (all of W3's Wine), and a line per call was about
-    // 90 console.debug lines a second on Undertale; its wined3d thread spent
+    // 90 console.debug lines a second in a game; its wined3d thread spent
     // 1.4 ms a frame in them under the profiler. The check also took the
     // kernel's lock on every pass of the loop; it is made on the first pass.
     //
@@ -9605,7 +9605,7 @@ fn set_resume_ctx(v: u64) {
 /// Per Worker: it was one static for the process, so with threads it named
 /// whichever Worker last made a syscall -- and the run loop's recovery from a
 /// table that lagged a sibling's numbering resumed the trapping thread at
-/// *another thread's* last branch target (`gex_last_target`). In Noita a
+/// *another thread's* last branch target (`gex_last_target`). In one game a
 /// worker thread calling a functor's `_Do_call` came back at the neighbouring
 /// slot of the same vtable, and returned with its stack 4 bytes off.
 #[cfg(feature = "shared-memory")]
@@ -10105,8 +10105,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     kernel.tid = pid;
     // Contexts above the main thread's: its context is the one the parent
     // forked from, slot N when the forking thread was not the first, and clones
-    // numbered from 1 reached N and drove two threads through one context (the
-    // Win7 shell's COM factory child of explorer: its fifth thread ran on the
+    // numbered from 1 reached N and drove two threads through one context (a
+    // COM factory child of explorer: its fifth thread ran on the
     // main thread's registers).
     kernel.next_ctx_slot.fetch_max(ctx_slots_below(ctx_addr), std::sync::atomic::Ordering::AcqRel);
     // The process's start, unless this is a vfork child's kernel: the
@@ -10464,7 +10464,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             if a < b {
                 // Only the pages the old program wrote: a mapping it reserved
                 // and never touched reads as zero already, and filling it
-                // would commit all of it (the mspaint demo's Wine processes
+                // would commit all of it (a demo's Wine processes
                 // carried ~80 MiB each of exactly that).
                 gex_kernel::zero_dirty_bytes(&mut data[a..b]);
             }
@@ -15460,7 +15460,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     .filter(|(_, _, d, _)| {
                         // Nor one covering a page retired here: it may have
                         // been built from the code before the change (a
-                        // translation of noita.exe before Detours patched it),
+                        // translation of an image before a Detours hook patched it),
                         // and serving it would run that code again.
                         //
                         // AArch64 too. Its numberings diverge across an
@@ -15751,7 +15751,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // every block of it that runs into that page (an instruction
             // across the boundary) fails its page check against the empty
             // entry, asks to be translated again, and gets the same check: a
-            // miss loop for ever (Undertale, frozen at its first frame, when
+            // miss loop for ever (a game frozen at its first frame, when
             // any retire dropped the unit). After an `execve` the table is
             // the new program's, and nothing of this unit is in it.
             if !execd {
@@ -16102,7 +16102,7 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     // the lock is given back for the lift, so `jit_holds` is false, but the
     // trap is the translator's. Made the guest's, its SIGSEGV went to Wine's
     // handler, whose KiUserExceptionDispatcher miss asked for the JIT state
-    // still out with this Worker (Hades on the twin: "the JIT state was
+    // still out with this Worker (a W64 game: "the JIT state was
     // asked for in the middle of this Worker's own translation"). Pairs with
     // the `jitout::OUT` stores in the miss and object paths.
     if jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
@@ -16191,7 +16191,7 @@ fn fault_pc(pc: i64) -> i64 {
 /// shared page table and their directory entries go back to the miss stub,
 /// so the next branch there, from any Worker, lifts what is mapped there
 /// now. Without this a `dlclose` and a `dlopen` that reuses the address ran
-/// the old library's blocks (Half-Life: SDL's libudev landing where an
+/// the old library's blocks (SDL's libudev landing where an
 /// earlier library had been, entered in the middle of an instruction).
 fn retire_unmapped_code_in(h: &mut Host) {
     let mm = &h.kernel.mem;

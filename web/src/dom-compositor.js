@@ -485,8 +485,8 @@ export class DomDesktop {
     if (!held) return null;
     // A shared memory grown by another thread can keep its buffer object and
     // only grow its length (overlay-worker.js's check): a view from before
-    // then stops short, and the windows of a process that grew past it (the
-    // Win7 desktop and taskbar, with explorer /desktop a process of its own)
+    // then stops short, and the windows of a process that grew past it (a
+    // desktop and taskbar, with explorer /desktop a process of its own)
     // were never painted again.
     const buf = held.memory.buffer;
     if (held.view.buffer !== buf || held.view.length !== buf.byteLength) {
@@ -500,7 +500,7 @@ export class DomDesktop {
     // Its block in the arena too, as compositor-worker.js does: a process that
     // exited kept its block here, so on a page with more than a few window
     // processes a new one took a live, idle process's block (its heartbeat is
-    // its last publish) -- the Win7 desktop's windows were then read out of
+    // its last publish) -- a desktop's windows were then read out of
     // another process's memory and never painted.
     releaseToken(this.#channel, token);
     // And whatever that process had on the host's GL: its context, its
@@ -587,7 +587,7 @@ export class DomDesktop {
         if (s.role === ROLE_CURSOR) this.#cursor = win;
         else this.onwindow?.(win);
         // Not a placed one: its client says when it has the keyboard
-        // (`activate`), as in the scene compositor. Win7's Start menu shows
+        // (`activate`), as in the scene compositor. A Start menu may show
         // the user's picture as a placed toplevel of its own; it took the
         // keyboard on appearing, search hid it, and with the focus gone every
         // key after the first was dropped.

@@ -30,7 +30,7 @@ mod wait;
 pub const STACK_BYTES: u32 = 256 * 1024;
 /// Bounds Workers running *at once* (a slice is handed back when one ends),
 /// in every process of the page together. 32 was too few once threads
-/// existed, and 128 once the Win7 shell opened its Games folder ("the global
+/// existed, and 128 once a desktop shell opened a folder ("the global
 /// kernel has 128 stacks and this is Worker 129"); the slices are no longer
 /// in `.bss` (memory every host had to provide before the kernel linked) but
 /// taken from the heap on first use: a reservation of address space in the

@@ -1269,7 +1269,7 @@ fn w3_trampolines(caller: &mut Caller<'_, HostState>, class32: bool) -> Result<(
 /// Compile a unit's module. The compiled form is kept beside the unit
 /// (`c.cwasm`), not in the shared module cache: a large image's is hundreds
 /// of MiB, which that cache's LRU budget evicts at once, and Cranelift over
-/// noita.exe's unit takes about a minute. Not keyed on the build of gex: the
+/// a large game's unit takes about a minute. Not keyed on the build of gex: the
 /// unit directory is keyed on the module's content already, and wasmtime
 /// refuses an artifact from an incompatible engine, which recompiles it.
 /// The largest function body in a wasm module, in bytes.
@@ -1951,8 +1951,8 @@ fn spawn_elf_build(path: &str, base: u64) {
 /// its unit's (or with none) stays on tier-1.
 pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: gex_ld::pe::PeImage) -> Result<()> {
     // 0: none; all: every image; otherwise Wine's own (its dll directory).
-    // A program's images are not the default: Undertale's exe with its unit
-    // never reached its first frame (2026-10-09, open).
+    // A program's images are not the default: a game's exe with its unit
+    // has been seen never to reach its first frame.
     static WHICH: OnceLock<u8> = OnceLock::new();
     let which = *WHICH.get_or_init(|| match std::env::var("GEX_W3_UNITS").as_deref() {
         Ok("0") => 0,
@@ -2069,7 +2069,7 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     // A unit not yet compiled for this host is compiled in the background,
     // and this process runs the image on tier-1: compiling here would stop
     // the guest for as long as Cranelift takes (d3dx9_43's 7.9 MB unit:
-    // ten minutes; Undertale never reached a frame).
+    // ten minutes; a game never reached a frame).
     if cache.is_some() && !pl.path.with_extension("cwasm").exists() {
         compile_later(pl.path.clone(), &pl.cwasm);
         if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {

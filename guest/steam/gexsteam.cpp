@@ -91,7 +91,7 @@ static void *gex_find(const char *version) {
     if (!version) return 0;
 #define GEX_MATCH(cls, ver) if (!strcmp(version, ver)) return &inst_##cls;
     GEX_STEAM_INTERFACES(GEX_MATCH)
-    /* Another version of a known interface (Baba Is You asks for
+    /* Another version of a known interface (a game may ask for
      * STEAMUSERSTATS_INTERFACE_VERSION012; this SDK has 013): the one this
      * SDK has. Versions mostly append methods, and callers clean the stack
      * on both i386 and x86-64, so the slots a game uses line up. */

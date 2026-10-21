@@ -306,7 +306,7 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
 /// the caller lets tier-1 translate `pc`.
 ///
 /// [`forget_gone`] catches a view unmapped, but not every way new code
-/// lands where a skeleton was: FL Studio's page start had two pages of
+/// lands where a skeleton was: one program's page start had two pages of
 /// anonymous code at 0x7fc11000 and 0x7fc31000, where a skeleton had been
 /// mapped as an image view, rebridged to the native export at every call
 /// (`elfprov::rebridge`, "provider re-bridge", 254 misses running) while

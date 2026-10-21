@@ -455,7 +455,7 @@ fn clr_images_fail_loudly() {
     assert!(e.to_string().contains(".NET/CLR"), "{e}");
 }
 
-/// A mixed-mode image (C++/CLI, Hades' BasecampBugReporter.Native.dll)
+/// A mixed-mode image (C++/CLI)
 /// loads as native code: its native entry point, no COM descriptor, and
 /// its managed entries returning 0.
 #[test]
@@ -473,7 +473,7 @@ fn mixed_mode_images_load_as_native_code() {
 }
 
 /// A certificate table past the end of the file (a signature cut off after
-/// signing, as in Undertale's executable) is ignored, as Windows' loader
+/// signing, as some shipped executables have) is ignored, as Windows' loader
 /// does: the table is never mapped.
 #[test]
 fn a_truncated_certificate_table_is_ignored() {

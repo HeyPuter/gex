@@ -143,8 +143,8 @@ function writtenPaths() {
 
 /** What a snapshot looks at, as path -> meta (see `pick`). A walk of `root`
  *  only from a kernel without `k_fs_written`: it reads every file under the
- *  root, which for a root over the lazy part of a bundle (FL Studio's /pfx,
- *  3.3 GB) faults all of it in. */
+ *  root, which for a root over the lazy part of a bundle (a large
+ *  program's /pfx, 3.3 GB) faults all of it in. */
 function candidates() {
   const written = writtenPaths();
   return written ? pick(root, written, known.keys(), meta) : walk(root, new Map());

@@ -150,7 +150,7 @@ log "win64 prefix ($P)"; step pfx64-$P pfx_make
 # §3.17): the 64-bit loader has no Unix side for MountMgr, winebus,
 # wineusb or winebth either, so services.exe started a winedevice for each
 # only to see DriverEntry fail (c0000135), one after another, before
-# wineboot let the program start (W64 Dicey Dungeons on edger: the game
+# wineboot let the program start (a W64 game
 # 5 s sooner). On a copy, so the session changes without a new wineboot.
 R=$(cat "$here"/w3-session.reg "$here"/reg-apply.py | sha256sum | cut -c1-10)
 pfs_make() {

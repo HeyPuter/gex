@@ -18,7 +18,7 @@
 
 import { single, sched } from './single.mjs';
 
-/** Processes that can publish surfaces at once (the Win7 shell has more
+/** Processes that can publish surfaces at once (a desktop shell has more
  *  than eight: winlogon, the desktop, explorer, its COM servers). */
 const BLOCKS = 32;
 /** Surfaces one process can have on screen. */

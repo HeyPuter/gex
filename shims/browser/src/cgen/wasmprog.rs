@@ -189,8 +189,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // with the shim's heap, so the memory reaches only as high as used.
         // Or the NT layer's split, for a site that asks (`?w3split=1`), and
         // always for a 64-bit (W64) process: the compact space ends at 2 GiB,
-        // and a 64-bit Wine maps past it (Hades x64's page ran out of memory
-        // at 2 GiB with it).
+        // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
+        // memory at 2 GiB with it).
         if flags & FLAG_GUEST_X86_64 != 0 {
             crate::winspace::set_w3_split(true);
         }

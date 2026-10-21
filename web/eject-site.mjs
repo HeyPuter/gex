@@ -197,7 +197,7 @@ walk(units, (p, rel) => {
   if (name !== 'c.wasm') preload.push([`file:${rel}`, url]);
 });
 
-// Largest first: noita.exe's unit is most of the compile.
+// Largest first: a game's exe unit is often most of the compile.
 preload.sort((a, b) => (files[b[1]]?.size ?? 0) - (files[a[1]]?.size ?? 0));
 writeFileSync(join(out, 'project', cgen, 'preload.json'), JSON.stringify(preload));
 
@@ -217,7 +217,7 @@ place(tar, 'project/build/web/rootfs.tar');
 const bench = /^(GEX_NT_INPUT|GEX_NT_TIME_SCALE|GEX_NT_FIXED_TIME)=/;
 let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.test(s));
 // --input SCRIPT: GEX_NT_INPUT instead of the recorded one (a benchmark's
-// clicks, by presented frame, as pewasm's NOITA_INPUT).
+// clicks, by presented frame).
 if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
 // --args 'A B': the program's arguments instead of the recorded ones ('' for none).
 const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
@@ -404,7 +404,7 @@ function pieces(x) {
   // copies (Wine's builtin in /w3 and its copy in system32, the four of each
   // .nls) are stored once, in one piece. By its own path they fell in
   // different pieces, and zstd, a piece at a time, stored each: 22.5 MB of
-  // the Win7 shell's 479 MB, 7.7 MB packed. Still a function of the files
+  // a desktop shell's 479 MB, 7.7 MB packed. Still a function of the files
   // alone: the same files give the same pieces.
   const found = []; // [rel, bytes, class, hash]
   walk(x, (p, rel) => {
@@ -535,9 +535,9 @@ function w3Site() {
   const lateGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
   const lateKeys = new Set();
   // --boot-units FILE: the images (guest paths, one a line) whose units the
-  // program loads before it is up (the Win7 shell's taskbar), recorded from
+  // program loads before it is up (a shell's taskbar), recorded from
   // a run of the page. Every other unit goes to the background fill, after
-  // the boot's download, not in it: the shell's IE, Paint and Sticky Notes
+  // the boot's download, not in it: the shell's bundled programs
   // units, 58 MB of its 285 MB first download, which nothing maps before
   // the taskbar. They are shared as bytes and compiled when a process first
   // maps one (preload.json's `demand`; fill.json's `demand`), as a unit the
@@ -747,8 +747,8 @@ function w3Site() {
     // not at all (no `at`: a unit built for every DLL of the prefix), go to
     // the Workers as bytes, and the first process to map one compiles it
     // (gex.mjs `#cgenModule`) and shares it. Compiled, each held 2.8 times
-    // its size of the renderer's code space and a copy of its bytes: the
-    // Win7 shell's IE units, 170 MiB that no process mapped at start-up,
+    // its size of the renderer's code space and a copy of its bytes: a
+    // shell's bundled programs' units, 170 MiB that no process mapped at start-up,
     // were 640 MiB of the renderer's VmData. A recording that timed no unit
     // (an older recorder) has every unit compiled with the page.
     const title = typeof w3.title_seconds === 'number' ? w3.title_seconds : null;

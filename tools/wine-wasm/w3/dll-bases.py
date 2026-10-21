@@ -8,8 +8,8 @@ compact space), and gex keeps
 [0x11000000, 0x20000000) as an island for these pins. An image left at its
 own base (w3-bases.txt puts the dist's DLLs at 0x20000000-0x7b000000) is
 mapped wherever the shim's heap may already sit once the arena's cursor has
-passed it: the mapping is refused, and a game that needs the room (Hades
-x86, N++) runs out. So the DLLs a program loads go in the band, bottom-up
+passed it: the mapping is refused, and a game that needs the room
+runs out. So the DLLs a program loads go in the band, bottom-up
 from 0x11000000, each at its size rounded to 64 KiB plus a 64 KiB gap, in
 the order given (keep the list's order stable: a function-tier unit is keyed
 by its image and its base).

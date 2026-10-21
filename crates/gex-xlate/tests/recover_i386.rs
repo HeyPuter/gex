@@ -282,7 +282,7 @@ fn illegal_blocks(prog: &gex_xlate::func::Program) -> Vec<u64> {
 /// so an instruction that ends `.text` in a zero byte used to be cut short
 /// and lift as illegal: libb.dll's `ret $0xc` (`c2 0c 00`), and an import
 /// thunk `jmp *slot` last in `.text` once the image is rebased where the
-/// slot's address has a zero high byte (Noita's lua51.dll at 0xb70000:
+/// slot's address has a zero high byte (a DLL at 0xb70000:
 /// `ff 25 1c f0 bb 00`). liba.dll's thunk is followed by two `nop`s of
 /// padding; zeroed, it is that shape at base 0x10000 (slot 0x15030).
 #[test]
