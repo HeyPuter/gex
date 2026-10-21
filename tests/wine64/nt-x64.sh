@@ -407,6 +407,105 @@ if [ -n "$twin" ] && [ -f "$w/highdata.exe" ]; then
 	UNIX=1 MARK=hades.exe check direct-image 0 "flavour 64" "$w/hades.exe" where
 fi
 
+# The translation cache across loads (?xcache=1) for code Wine reads into
+# memory: a DLL whose sections are not page-aligned in its file (MinGW's
+# 512-byte file alignment) is read, relocated and protected, and named by its
+# bytes at that address. In the page only: a first run saves the cache, a
+# second restores it and lifts next to nothing of the DLL (under 5% of the
+# first run's blocks), and a run that loads the DLL at another base (so
+# relocated differently) gets none of the first base's translations (at least
+# half the blocks again).
+if [ -n "$page" ] && case " ${CASES:-xcache} " in *" xcache "*) true ;; *) false ;; esac; then
+	if x86_64-w64-mingw32-gcc -O1 -o "$w/xcload.exe" "$here/xcload.c" &&
+		python3 "$here/dllcycle-gen.py" 1000 "$w/xcbig.c" &&
+		x86_64-w64-mingw32-gcc -O1 -shared -o "$w/xcbig.dll" "$w/xcbig.c"; then
+		xv=$(python3 "$here/dllcycle-gen.py" 1000 --expect 1)
+		any="([^$nl]*$nl)*" tail="($nl[^$nl]*)*" got="x=$xv base=[0-9A-Fa-f]+ size=[0-9a-f]+"
+		rm -rf "$w/xcdir"; mkdir -p "$w/xcdir"
+		export GEX_XCACHE=nt-x64 GEX_XCACHE_DIR=$w/xcdir GEX_XCACHE_MIN=0 GEX_TIME_JIT=1
+		CASES=xcache-save EXTRA="$w/xcbig.dll" check xcache-save 0 "$any$got$tail" "$w/xcload.exe" xcbig.dll
+		CASES=xcache-restore EXTRA="$w/xcbig.dll" check xcache-restore 0 "$any$got$tail" "$w/xcload.exe" xcbig.dll
+		CASES=xcache-moved EXTRA="$w/xcbig.dll" check xcache-moved 0 "${any}first base=[0-9A-Fa-f]+$nl$got$tail" "$w/xcload.exe" xcbig.dll move
+		unset GEX_XCACHE GEX_XCACHE_DIR GEX_XCACHE_MIN GEX_TIME_JIT
+		# The blocks a run lifted in the DLL: its process's objects at the
+		# address it printed (each object as name=blocks@first..last).
+		blocks() {
+			python3 -c '
+import re, sys
+o = open(sys.argv[1]).read()
+m = re.findall(r"x=\d+ base=([0-9A-Fa-f]+) size=([0-9a-f]+)", o)
+if not m: sys.exit()
+lo = int(m[-1][0], 16); hi = lo + int(m[-1][1], 16)
+n = 0
+for l in open(sys.argv[2], errors="replace"):
+    if " pid " in l and "translating" in l:
+        n = max([n] + [int(b) for b, a in re.findall(r"=(\d+)@0x([0-9a-f]+)\.\.", l) if lo <= int(a, 16) < hi])
+print(n, hex(lo))' "$w/$1.out" "$w/$1.err"
+		}
+		read -r b1 at1 < <(blocks xcache-save); read -r b2 at2 < <(blocks xcache-restore); read -r b3 at3 < <(blocks xcache-moved)
+		r2=$(grep -aho 'restored [1-9][0-9]* modules' "$w/xcache-restore.out" | head -1)
+		if [ "${b1:-0}" -gt 1000 ] && [ "$at2" = "$at1" ] && [ -n "$r2" ] && [ "${b2:-0}" -lt $((b1 / 20)) ] &&
+			[ -n "$at3" ] && [ "$at3" != "$at1" ] && [ "${b3:-0}" -ge $((b1 / 2)) ]; then
+			pass=$((pass + 1)); echo "ok   x64/xcache ($tag): the DLL's blocks lifted: $b1 at $at1, $b2 at $at2 after the cache ($r2), $b3 at $at3"
+		else
+			fail=$((fail + 1)); echo "FAIL x64/xcache ($tag): the DLL's blocks lifted: '$b1' at $at1, '$b2' at $at2 after the cache ($r2), '$b3' at $at3 (want under 5% of the first, then at least half at another base)"
+		fi
+	else
+		fail=$((fail + 1)); echo "FAIL x64/xcache ($tag): x86_64-w64-mingw32-gcc"
+	fi
+fi
+# The same cache with two such DLLs that trade places: each run loads A then
+# B, unloads both and loads B then A, so each image comes back where the other
+# was. The restored run must give every call's result, finish, and lift under
+# 5% of the first run's blocks in the two images. A third run loads them in
+# the other order on the same cache and must give every result and finish.
+if [ -n "$page" ] && case " ${CASES:-xcache2} " in *" xcache2 "*) true ;; *) false ;; esac; then
+	if x86_64-w64-mingw32-gcc -O1 -o "$w/xcload2.exe" "$here/xcload2.c" &&
+		python3 "$here/dllcycle-gen.py" 1000 "$w/xca.c" && python3 "$here/dllcycle-gen.py" 700 "$w/xcb.c" &&
+		x86_64-w64-mingw32-gcc -O1 -shared -o "$w/xca.dll" "$w/xca.c" &&
+		x86_64-w64-mingw32-gcc -O1 -shared -o "$w/xcb.dll" "$w/xcb.c"; then
+		xa=$(python3 "$here/dllcycle-gen.py" 1000 --expect 1) xb=$(python3 "$here/dllcycle-gen.py" 700 --expect 1)
+		pa="xca.dll x=$xa base=[0-9A-Fa-f]+ size=[0-9a-f]+" pb="xcb.dll x=$xb base=[0-9A-Fa-f]+ size=[0-9a-f]+"
+		want="([^$nl]*$nl)*$pa$nl$pb${nl}unloaded$nl$pb$nl$pa($nl[^$nl]*)*"
+		rm -rf "$w/xcdir2"; mkdir -p "$w/xcdir2"
+		export GEX_XCACHE=nt-x64-2 GEX_XCACHE_DIR=$w/xcdir2 GEX_XCACHE_MIN=0 GEX_TIME_JIT=1
+		for r in save restore; do
+			CASES=xcache2-$r EXTRA="$w/xca.dll $w/xcb.dll" TMO=200 check xcache2-$r 0 "$want" \
+				"$w/xcload2.exe" xca.dll xcb.dll - xcb.dll xca.dll
+		done
+		# The other order on the same cache: at every base the cache holds
+		# translations of the other image's bytes, which must not run.
+		CASES=xcache2-swapped EXTRA="$w/xca.dll $w/xcb.dll" TMO=200 check xcache2-swapped 0 \
+			"([^$nl]*$nl)*$pb$nl$pa${nl}unloaded$nl$pa$nl$pb($nl[^$nl]*)*" \
+			"$w/xcload2.exe" xcb.dll xca.dll - xca.dll xcb.dll
+		unset GEX_XCACHE GEX_XCACHE_DIR GEX_XCACHE_MIN GEX_TIME_JIT
+		# The blocks a run lifted in the images: for every range a load
+		# printed, its largest object count there, summed.
+		blocks2() {
+			python3 -c '
+import re, sys
+o = open(sys.argv[1]).read()
+rs = sorted({(int(b, 16), int(b, 16) + int(z, 16)) for b, z in re.findall(r"x=\d+ base=([0-9A-Fa-f]+) size=([0-9a-f]+)", o)})
+if len(rs) < 2: sys.exit()
+best = {r: 0 for r in rs}
+for l in open(sys.argv[2], errors="replace"):
+    if " pid " in l and "translating" in l:
+        for b, a in re.findall(r"=(\d+)@0x([0-9a-f]+)\.\.", l):
+            for lo, hi in rs:
+                if lo <= int(a, 16) < hi: best[(lo, hi)] = max(best[(lo, hi)], int(b))
+print(sum(best.values()), len(rs))' "$w/$1.out" "$w/$1.err"
+		}
+		read -r c1 n1 < <(blocks2 xcache2-save); read -r c2 n2 < <(blocks2 xcache2-restore)
+		r2=$(grep -aho 'restored [1-9][0-9]* modules' "$w/xcache2-restore.out" | head -1)
+		if [ "${c1:-0}" -gt 1000 ] && [ "${n1:-0}" -ge 2 ] && [ "$n2" = "$n1" ] && [ -n "$r2" ] && [ "${c2:-0}" -lt $((c1 / 20)) ]; then
+			pass=$((pass + 1)); echo "ok   x64/xcache2 ($tag): blocks lifted in $n1 image ranges: $c1, then $c2 after the cache ($r2)"
+		else
+			fail=$((fail + 1)); echo "FAIL x64/xcache2 ($tag): blocks lifted in '$n1' image ranges: '$c1', then '$c2' in '$n2' after the cache ($r2) (want under 5% of the first)"
+		fi
+	else
+		fail=$((fail + 1)); echo "FAIL x64/xcache2 ($tag): x86_64-w64-mingw32-gcc"
+	fi
+fi
 # W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
 # called from x64 code through every kind of Win64 entry adapter, and
 # calling back (tests/wasm64/dll)

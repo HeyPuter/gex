@@ -3747,14 +3747,14 @@ impl MapIo<'_> {
             }
             nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
             nr::MREMAP => self.mremap(m, a),
-            nr::MPROTECT => self.mprotect(a),
+            nr::MPROTECT => self.mprotect(m, a),
             nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
             _ => return None,
         })
     }
 
     /// `mprotect`.
-    pub fn mprotect(&self, a: [u64; 6]) -> SysResult {
+    pub fn mprotect(&self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
         // Losing execute retires the translations as surely as
         // unmapping does: `ld.so` applies RELRO by dropping write,
         // but a JIT in the guest flips a page from executable back to
@@ -3780,7 +3780,21 @@ impl MapIo<'_> {
             if end > start {
                 mm.log.recheck_code.push((start, end));
                 crate::note_code_change();
+                // Code read into anonymous memory (an image whose sections are
+                // not page-aligned in its file) is named by its bytes, so the
+                // same code at the same address is known as such in another
+                // process and on another load.
+                // Only when something keeps translations by that name.
+                if crate::mem::content_names() {
+                    mm.name_by_content(start, end, |lo, hi| {
+                        m.read(lo, (hi - lo) as usize).ok().map(|b| content_id(b))
+                    });
+                }
             }
+        }
+        if r.is_ok() && (a[2] as u32) & crate::mem::prot::WRITE != 0 {
+            let start = crate::mem::page_align_down(a[0]);
+            mm.forget_content(start, crate::mem::page_align_up(a[0].saturating_add(a[1])));
         }
         r
     }
@@ -7388,6 +7402,30 @@ pub enum Unalias {
     Keep,
     Whole(u64, u64),
     Plain,
+}
+
+/// The identity of code named by its bytes ([`crate::mem::MemoryMap::name_by_content`]):
+/// [`crate::mem::CONTENT_ID`], the length and two 64-bit lanes of a hash over
+/// the bytes, so two different images agree only by a 128-bit accident.
+pub fn content_id(bytes: &[u8]) -> String {
+    let (mut a, mut b): (u64, u64) = (0xcbf2_9ce4_8422_2325, 0x6c62_272e_07bb_0142);
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        let x = u64::from_le_bytes(w.try_into().unwrap());
+        a = (a ^ x).wrapping_mul(0x100_0000_01b3);
+        b = (b ^ x.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        b ^= b >> 31;
+    }
+    for &c in words.remainder() {
+        a = (a ^ c as u64).wrapping_mul(0x100_0000_01b3);
+        b = (b ^ c as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    let mix = |mut h: u64| {
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^ (h >> 33)
+    };
+    format!("{}{:x}:{:016x}{:016x}", crate::mem::CONTENT_ID, bytes.len(), mix(a), mix(b))
 }
 
 /// The hash a [`SharedMap`] keeps of a page.
