@@ -9,8 +9,8 @@
 //!
 //! Guest memory is shared mutable state by construction; no Rust type describes
 //! it faithfully, and wrapping every access in an atomic would be both wrong
-//! (the guest's own atomics decide ordering) and ruinous. Per PLAN §5.8, a data
-//! race in the guest stays one, observed as whatever the hardware does. So the
+//! (the guest's own atomics decide ordering) and ruinous. A data race in the
+//! guest stays one, observed as whatever the hardware does. So the
 //! host reads these bytes as an ordinary slice, isolated here so the host itself
 //! keeps `#![forbid(unsafe_code)]`.
 //!

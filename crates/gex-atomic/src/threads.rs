@@ -1,5 +1,4 @@
-//! A process's thread table, read and grown without a lock
-//! (docs/kernel-locking.md §3.7, L23).
+//! A process's thread table, read and grown without a lock.
 //!
 //! Slots in chunks that are never moved or freed while the table lives: a
 //! new thread claims the next slot with one atomic add, fills it, and

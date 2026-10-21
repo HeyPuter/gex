@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <protocol name="gex_window_placement_v1">
   <copyright>
-    Copyright 2026 the gex authors. Same terms as the rest of gex.
+    Copyright (C) 2026 Puter Technologies Inc. AGPL-3.0-only, as the rest of gex.
   </copyright>
 
   <description summary="client-chosen window positions and stacking">

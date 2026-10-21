@@ -7,9 +7,9 @@
 //! constant folding, dead stores, dead code. Dead flags are found across
 //! blocks with gex-cgen's liveness, whose exits read everything, so only a
 //! flag overwritten before any exit or read is dropped; other registers only
-//! within a block, as tier-1 does (function-tier.md §5.1: no host-visible
-//! point lies between a block's statements but the traps and clobbering
-//! host calls the pass already respects).
+//! within a block, as tier-1 does (no host-visible point lies between a
+//! block's statements but the traps and clobbering host calls the pass
+//! already respects).
 //!
 //! Values are renumbered per block (they are block-local in memory form), so
 //! everything indexed by value is as small as the largest block.

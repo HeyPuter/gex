@@ -17,10 +17,10 @@
 /// Which memories the process's address space is imported as. The kernel's
 /// own is 0; a process's is appended to the import section after it, as two
 /// imports (`tools/add-memory.mjs`): 1, a 32-bit memory, and 2, a memory64
-/// (docs/mem64.md step 6). A Worker gives its kernel instance its process's
+/// A Worker gives its kernel instance its process's
 /// memory as the one of its type and an empty one (no pages) as the other:
 /// one kernel module serves both flavours, so a page whose processes differ
-/// (W64's wasm32 server beside a 64-bit memory's loader) has one kernel data
+/// (64-bit Wine's wasm32 server beside a 64-bit memory's loader) has one kernel data
 /// layout. Two builds, one per flavour, put their statics 16 bytes apart and
 /// read each other's state wrong in one kernel memory.
 pub const PROCESS_MEMORY: u32 = 1;

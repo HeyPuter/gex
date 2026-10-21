@@ -1,4 +1,4 @@
-//! A content-addressed cache of compiled modules (PLAN §10).
+//! A content-addressed cache of compiled modules.
 //!
 //! Compiling translated wasm to machine code is the slow part of startup
 //! (Cranelift takes ~30s on a large program) and is identical on every run of
@@ -125,7 +125,7 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("modules"))
 }
 
-/// Where the learned 64-bit memory records live (docs/mem64.md §5): one
+/// Where the learned 64-bit memory records live: one
 /// file per program image that needed more address space than a wasm32
 /// memory has, named by the sha256 of the image.
 pub fn mem64_dir() -> Option<PathBuf> {
@@ -294,7 +294,7 @@ pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<M
 /// and handed to every later request for the same bytes: a module is
 /// immutable code and every store of one engine can instantiate it, so a
 /// guest process that starts the same program or library as an earlier one
-/// (every Wine child starts the 5.7 MB W3 loader; 2 s of Cranelift each)
+/// (every Wine child starts the same 5.7 MB loader; 2 s of Cranelift each)
 /// takes the compiled one. Small modules (runtime translations, by the
 /// hundred thousand, rarely repeated) are not kept.
 const MEMO_MIN_BYTES: usize = 1 << 20;
@@ -348,7 +348,7 @@ fn serialize(m: &Module) -> Option<Vec<u8>> {
 
 /// [`key`], remembered for the host process when the fields come to
 /// [`MEMO_MIN_BYTES`] or more, by a 128-bit SipHash of the same
-/// length-prefixed stream: under W3 every Wine child execs the same 5.7 MB
+/// length-prefixed stream: under 32-bit Wine every child execs the same 5.7 MB
 /// loader and installs the same 8.8 MB PE module, and SHA-256 over them was
 /// about a tenth of a session boot's host CPU.
 pub fn key_memo<'a>(build: &str, fields: impl IntoIterator<Item = &'a [u8]> + Clone) -> String {
@@ -459,8 +459,8 @@ pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
         return compile(engine, wasm);
     };
     let name = content_name(wasm);
-    // And in memory for the host process: under W3 every Wine child execs
-    // the same 5.7 MB loader.
+    // And in memory for the host process: under 32-bit Wine every child
+    // execs the same 5.7 MB loader.
     memo(engine, wasm.len(), || format!("cc:{name}"), || {
         let path = dir.join(&name);
         if let Ok(bytes) = std::fs::read(&path) {

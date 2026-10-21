@@ -1,5 +1,5 @@
-//! One recovered guest function → one wasm function with the `F_body` ABI
-//! (docs/function-tier.md §7), plus a function per outermost loop (§7.2).
+//! One recovered guest function → one wasm function with the `F_body` ABI,
+//! plus a function per outermost loop.
 //!
 //! The decisions are gex-cgen's (`func.rs`), made by the same analyses
 //! (liveness, dirty-in, trap-free, outer loops); this emits wasm where that
@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// `need`: the caller's continuation reads a flag.
 pub const NEED_FLAGS: i32 = 1;
 pub const NEED_ALL: i32 = -1;
-/// A loop function's results beyond the body's 0 and 1 (§7.2).
+/// A loop function's results beyond the body's 0 and 1.
 pub const LOOP_CHUNK: i32 = 2;
 pub const LOOP_EXIT: i32 = 3;
 
@@ -52,7 +52,7 @@ pub enum Linkage<'a> {
     /// `(ctx, target, depth, need, ret) -> i32`, -1 when no function here
     /// starts at the target; a direct one leaves for the root.
     Image { ic: u32 },
-    /// Installed in the process's function table (merge-plan §9.8.1):
+    /// Installed in the process's function table:
     /// anything outside the module is a probe of the cache and a call
     /// through table `table`; a function checks, on entry, that each page
     /// it covers still holds the `PAGE_GEN` value in `pages` (by entry).
@@ -211,11 +211,11 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let graph = Graph { succs: succs.clone(), entry: 0 };
     // In the browser the structured layout's emission recurses about as deep
     // as the function's structure, on a Worker's stack (about 1 MB): a function
-    // of thousands of blocks (UnityPlayer has them) overflowed it
+    // of thousands of blocks (large game engines have them) overflows it
     // ("Maximum call stack size exceeded" in `tree`/`within`/`node`). Such a
     // function is laid out flat there.
-    // The block count alone missed some (mp9: Muck's UnityPlayer still
-    // overflowed), so the nesting is bounded too (`nest_bound`).
+    // The block count alone misses some deeply nested functions, so the
+    // nesting is bounded too (`nest_bound`).
     // `GEX_CGEN_EXP=WASMFLAT`: the same cuts natively, to test the browser's layouts there.
     let browser = cfg!(target_family = "wasm") || cf::exp("WASMFLAT");
     let too_deep = browser && succs.len() > FLAT_ABOVE;
@@ -274,7 +274,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let rk = b.local(ValType::I32);
     let e64 = b.local(ValType::I64);
     // Its pages unchanged since translation, or the table's newer function
-    // for this address (merge-plan §9.8.1; `gex.lookup` retires this one and
+    // for this address (`gex.lookup` retires this one and
     // finds or makes it), before anything else.
     if let Linkage::Runtime { table, pages } = &m.linkage {
         let none: &[(u64, u32)] = &[];
@@ -303,7 +303,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
             fb.end();
         }
     }
-    // The recursion-depth guard, before anything is loaded (§7.1).
+    // The recursion-depth guard, before anything is loaded.
     if !m.trapfree.contains_key(&f.entry) {
         let limit = cf::stack_budget().saturating_sub(weight + cf::TRAPFREE_RESERVE);
         let fb = b.f();
@@ -982,7 +982,7 @@ impl E<'_, '_> {
                 if let Some(k) = loops.iter().position(|lp| handover_edge(f, lp, i, t)) {
                     // An outermost loop's back-edge in the body: the first
                     // 1024 trips run here, then the loop moves to its own
-                    // function, a fresh call per chunk (§7.2).
+                    // function, a fresh call per chunk.
                     let nested = loops[k].nested;
                     self.poll_expired();
                     let p = self.locals.poll;
@@ -1148,7 +1148,7 @@ impl E<'_, '_> {
 
     /// Push the table index for the target `t` (a constant or the
     /// operand), after storing it in `ctx::LAST_TARGET` -- every call
-    /// through the table does, for the resolve stub (merge-plan §9.8.1).
+    /// through the table does, for the resolve stub.
     /// The caller pushes the arguments in between: `before` does.
     fn probe_call(&mut self, t: Target, before: &mut dyn FnMut(&mut Self), tail: bool) {
         let Linkage::Runtime { table, .. } = self.m.linkage else { unreachable!("a probe outside the runtime linkage") };
@@ -1523,7 +1523,7 @@ impl E<'_, '_> {
         let live = self.live;
         // A known callee with a summary needs its inputs, the continuation
         // what is live there; non-flag registers are limited only for a
-        // trap-free callee (function-tier.md §5.1). Anything else may read
+        // trap-free callee. Anything else may read
         // everything.
         let need = match (callee, ret) {
             (Callee::Direct(t), Some(r)) if m.bodies.contains_key(&t) => match m.sums.get(&t) {

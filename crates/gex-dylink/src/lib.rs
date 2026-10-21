@@ -1,4 +1,4 @@
-//! Shared libraries for native wasm32 programs (docs/gexcc.md §7).
+//! Shared libraries for native wasm32 programs.
 //!
 //! A gexcc shared library is an emscripten-style side module: a wasm module
 //! with a `dylink.0` section (its data size and alignment, its table size,
@@ -39,7 +39,7 @@ pub const DEFAULT_DIRS: &[&str] = &[
     "/usr/local/lib/wasm32-linux-musl",
 ];
 
-/// The custom section a library's fork summary is in (§7.5): which of its
+/// The custom section a library's fork summary is in: which of its
 /// exports may unwind for a fork.
 pub const FORKREACH_SECTION: &str = "gex.forkreach";
 
@@ -98,7 +98,7 @@ pub struct Info {
     pub forkreach: Option<ForkReach>,
 }
 
-/// A library's fork summary (`gex.forkreach`, docs/gexcc.md §7.5).
+/// A library's fork summary (`gex.forkreach`).
 #[derive(Clone, Debug, Default)]
 pub struct ForkReach {
     /// Exports that may unwind (fork, or call something that may).
@@ -353,7 +353,7 @@ impl Info {
 /// preemptible -- called through an `env` import even with `-Bsymbolic` --
 /// and musl's weak aliases (`malloc`, `lseek`, the `*_l` functions) and
 /// every C++ inline function are weak. gex's loader does not interpose a
-/// library's own calls (docs/gexcc.md §7.2), so they are bound here, once,
+/// library's own calls, so they are bound here, once,
 /// at build time. Returns the module unchanged when nothing is imported
 /// that it defines.
 pub fn selfbind(wasm: &[u8]) -> Result<Vec<u8>> {
