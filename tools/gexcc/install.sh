@@ -112,8 +112,20 @@ cat > "$B/$TRIPLE-pkg-config" <<EOF
 export PKG_CONFIG_SYSROOT_DIR="$PREFIX/sysroot"
 export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/wasm32-linux-musl/pkgconfig:$PREFIX/sysroot/usr/lib/pkgconfig:$PREFIX/sysroot/usr/share/pkgconfig:$PREFIX/sysroot/usr/local/lib/pkgconfig"
 unset PKG_CONFIG_PATH
-case \${GEXCC_SHARED:-0} in 0) exec pkg-config --static "\$@" ;; esac
-exec pkg-config "\$@"
+st=; case \${GEXCC_SHARED:-0} in 0) st=--static ;; esac
+# A variable naming a directory the sysroot does not have is where the
+# package installs to (udev's udevdir: /usr/lib/udev), not a place to read
+# from (wayland-protocols' pkgdatadir): the target's path, unprefixed.
+case " \$* " in
+*" --variable"*)
+    v=\$(pkg-config \$st "\$@") || exit
+    case \$v in
+    "\$PKG_CONFIG_SYSROOT_DIR"/*) [ -e "\$v" ] || v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
+    esac
+    printf '%s\n' "\$v"
+    exit 0 ;;
+esac
+exec pkg-config \$st "\$@"
 EOF
 chmod +x "$B/$TRIPLE-pkg-config"
 ln -sf "$TRIPLE-pkg-config" "$B/gexcc-pkg-config"
