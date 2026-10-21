@@ -436,6 +436,7 @@ const host = new ProcessHost({
     providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
     eagerBlocks: !!process.env.GEX_EAGER_BLOCKS,
     fillTime: !!process.env.GEX_FILL_TIME,
+    relayAll: !!process.env.GEX_RELAY_ALL,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
     trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,

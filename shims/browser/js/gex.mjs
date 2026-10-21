@@ -26,6 +26,9 @@ const FTAB_SPARE_THREADED = 65536;
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
 const LIMIT64_BYTES = 16 * 2 ** 30;
+/** The smallest module a Worker hands its siblings compiled (`Gex#offerModule`).
+ *  Below it a sibling compiles the bytes itself: at most a few milliseconds. */
+const RELAY_MIN_BYTES = 256 * 1024;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
@@ -3898,7 +3901,7 @@ export class Gex {
     console.warn(`[unit] ${key.slice(0, 16)} ${((got.wasm.byteLength ?? 0) / 1048576).toFixed(1)} MiB: `
       + `load ${Math.round(t0 - tl)} ms, compile ${Math.round(performance.now() - t0)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
-    this.#env.shareModule?.(name, mod);
+    this.#offerModule(name, mod, got.wasm.byteLength ?? Infinity);
     return mod;
   }
 
@@ -4298,7 +4301,7 @@ export class Gex {
     console.warn(`[cold] ${key.slice(0, 16)} ${c}: ${zlen} bytes (${len} unpacked), fetch ${(t1 - t0).toFixed(1)} ms, `
       + `decode ${(t2 - t1).toFixed(1)} ms, compile ${(t3 - t2).toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
-    this.#env.shareModule?.(name, mod);
+    this.#offerModule(name, mod, bytes.byteLength);
     return mod;
   }
 
@@ -4509,7 +4512,7 @@ export class Gex {
       if (!mod) {
         mod = new WebAssembly.Module(wasm);
         this.#sharedModules.set(name, mod);
-        this.#env.shareModule?.(name, mod);
+        this.#offerModule(name, mod, wasm.byteLength);
       }
       const dv = new DataView(this.#memory.buffer);
       const cv = new Map();
@@ -4624,7 +4627,7 @@ export class Gex {
     if (!bytes) throw new Error(`gex-cgen: ${file} was published but cannot be loaded here`);
     mod = new WebAssembly.Module(bytes);
     this.#sharedModules.set(name, mod);
-    this.#env.shareModule?.(name, mod);
+    this.#offerModule(name, mod, bytes.byteLength);
     return mod;
   }
 
@@ -4726,7 +4729,7 @@ export class Gex {
       this.#fjitNextReport = t0 + 60000;
     }
     this.#sharedModules.set(name, mod);
-    this.#env.shareModule?.(name, mod);
+    this.#offerModule(name, mod, bytes.byteLength);
     return mod;
   }
 
@@ -7312,7 +7315,7 @@ export class Gex {
     if (!mod) return;
     this.#sharedModules.set(ukey, mod);
     this.#deadKeys.delete(ukey);
-    this.#env.shareModule?.(ukey, mod);
+    this.#offerModule(ukey, mod, Number(ukey.split(':')[1]) || 0);
   }
 
   /** `#catchUp` (eager) without yielding, for `#ntCallback`. */
@@ -7495,7 +7498,13 @@ export class Gex {
       throw err;
     }
     this.#compileMs += performance.now() - tc;
-    if (mod !== precompiled && mod !== bytes) this.#compiles++;
+    if (mod !== precompiled && mod !== bytes) {
+      this.#compiles++;
+      // `?filltime=1`: what a big module cost to compile here, not handed one.
+      if (globalThis.GEX_FILL_TIME && bytes?.byteLength >= 1 << 20) {
+        console.warn(`[gex] ${this.#whoFills()}: compiled ${(bytes.byteLength / 1048576).toFixed(1)} MiB here in ${(performance.now() - tc).toFixed(1)} ms`);
+      }
+    }
     // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
     // looking at what a translation is made of (docs/jit-guest.md).
     if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
@@ -8141,7 +8150,8 @@ export class Gex {
   /** What this Worker holds, for `?filltime=1`. */
   #fillCounts() {
     return `${this.#installs} modules installed (${this.#compiles} compiled here), ` +
-      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left, blocks ${this.#guest?.exports?.blocks?.length ?? 0}`;
+      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left, blocks ${this.#guest?.exports?.blocks?.length ?? 0}, ` +
+      `${this.#sharedModules.size} modules held, ${this.#relaySkipped} not relayed`;
   }
   /** Dense registry modules this Worker's catch-up left to a miss. */
   #denseLeft = 0;
@@ -8155,8 +8165,27 @@ export class Gex {
   #shareRegistry(i, key, mod) {
     const e = this.#shim.exports;
     if (this.#dense && !globalThis.GEX_EAGER_BLOCKS && e.gex_registry_dense_n && (e.gex_registry_dense_n(i) >>> 0)) return;
+    this.#offerModule(key, mod, this.#registryRow(i).len);
+  }
+
+  /** A module this Worker compiled from `bytes` bytes, to the host's relay
+   *  for the process's other Workers (and, by its key, the page's caches) --
+   *  unless it is smaller than RELAY_MIN_BYTES. Every relayed module is held
+   *  by the page's main thread as well as by each Worker it reaches, and
+   *  each collection on the main thread takes longer for every module alive
+   *  in the renderer, holding up compiles on every Worker meanwhile; a small
+   *  module costs a sibling little to compile from its bytes, less while any
+   *  Worker holds the same bytes compiled. A native program or library
+   *  (`wasm:`) is relayed at any size: the page keeps those for the
+   *  processes that run it next. `?relayall=1` relays every module. */
+  #offerModule(key, mod, bytes) {
+    if (!(bytes >= RELAY_MIN_BYTES) && !globalThis.GEX_RELAY_ALL && !String(key).startsWith('wasm:')) {
+      this.#relaySkipped++;
+      return;
+    }
     this.#env.shareModule?.(key, mod);
   }
+  #relaySkipped = 0;
 
   /** Whether catching up skips registry module `i`: a dense module, which
    *  the first dispatch that wants one of its blocks instantiates here
