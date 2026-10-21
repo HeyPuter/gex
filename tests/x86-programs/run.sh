@@ -250,6 +250,13 @@ for src in "$HERE"/*.c; do
             args=$(head -1 "$WORK/mem64-net.port")
             [ -n "$args" ] || { echo "FAIL $name: its server did not start"; fail=1; continue; }
         fi
+        # threads-many: its 300-thread round needs that many host threads (a
+        # Worker each on the page); under a smaller task cap than that it
+        # runs its first round only, natively and on gex alike.
+        if [ $name = threads-many ]; then
+            pm=$(cat "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/pids.max" 2>/dev/null)
+            case $pm in ''|max) ;; *) [ "$pm" -lt 1024 ] && args=first ;; esac
+        fi
         native=$("$bin" $args 2>/dev/null); ns=$?
         # smc-race: the translator waits between decoding a JIT-code block
         # and fixing its guard, so the writer's stores land in between.
