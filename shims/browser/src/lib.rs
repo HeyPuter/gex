@@ -314,7 +314,7 @@ extern "C" {
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
     /// pid in the high 32 bits, wait status in the low 32; zero for none.
-    fn k_wait(ppid: i32, want: i32) -> i64;
+    fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64;
     fn k_wait_ready(ppid: i32, want: i32) -> i32;
     fn k_has_children(ppid: i32) -> i32;
     fn k_kill(caller: i32, target: i32, signo: u32) -> i32;
@@ -687,8 +687,8 @@ extern "C" fn r_exit(pid: i32, status: i32) {
 extern "C" fn r_reap(pid: i32) {
     unsafe { k_reap(pid) }
 }
-extern "C" fn r_wait(ppid: i32, want: i32) -> i64 {
-    unsafe { k_wait(ppid, want) }
+extern "C" fn r_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
+    unsafe { k_wait(ppid, want, nowait) }
 }
 extern "C" fn r_wait_ready(ppid: i32, want: i32) -> i32 {
     unsafe { k_wait_ready(ppid, want) }
@@ -13310,13 +13310,17 @@ fn finish_parked(
             want,
             wstatus,
             nohang,
-            ..
+            waitid,
         } => {
+            let nowait = waitid.is_some_and(|w| w.nowait);
             // A shared table already holds the status in the form `wait4`
             // reports it, because the child's own Worker published it there
             // as it exited. Nothing here has to reconstruct it.
             if procs.is_shared() {
-                if let Some((pid, word)) = procs.collect(*ppid, *want) {
+                if let Some((pid, word)) = procs.collect(*ppid, *want, nowait) {
+                    if let Some(w) = waitid {
+                        return w.report(gm, pid, word as u32);
+                    }
                     if *wstatus != 0 {
                         gm.write_u32(*wstatus, word as u32)?;
                     }
@@ -13341,7 +13345,10 @@ fn finish_parked(
                     ));
                 }
                 return if *nohang && kids {
-                    Ok(0)
+                    match waitid {
+                        Some(w) => w.report(gm, 0, 0),
+                        None => Ok(0),
+                    }
                 } else {
                     Err(Errno::ECHILD)
                 };
@@ -13351,21 +13358,32 @@ fn finish_parked(
                     continue;
                 }
                 let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(code) = st.take() {
-                    c.reaped.store(true, std::sync::atomic::Ordering::Release);
-                    procs.reap(c.pid);
+                if let Some(code) = if nowait { *st } else { st.take() } {
+                    if !nowait {
+                        c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                        procs.reap(c.pid);
+                    }
+                    // `WIFEXITED`: the code in the second byte, low bits
+                    // clear. `WIFSIGNALED`: the signal in the low seven,
+                    // which is what a negative code means here.
+                    let word = if code < 0 {
+                        (-code) as u32 & 0x7f
+                    } else {
+                        ((code as u32) & 0xff) << 8
+                    };
+                    if let Some(w) = waitid {
+                        return w.report(gm, c.pid, word);
+                    }
                     if *wstatus != 0 {
-                        // `WIFEXITED`: the code in the second byte, low bits
-                        // clear. `WIFSIGNALED`: the signal in the low seven,
-                        // which is what a negative code means here.
-                        let word = if code < 0 {
-                            (-code) as u32 & 0x7f
-                        } else {
-                            ((code as u32) & 0xff) << 8
-                        };
                         gm.write_u32(*wstatus, word)?;
                     }
                     return Ok(c.pid as u64);
+                }
+            }
+            // A `waitid` with `WNOHANG` and a child not done yet: zero.
+            if let (Some(w), true) = (waitid, *nohang) {
+                if children.iter().any(|c| *want <= 0 || c.pid == *want) {
+                    return w.report(gm, 0, 0);
                 }
             }
             Err(Errno::ECHILD)

@@ -1877,10 +1877,12 @@ fn perform_block(
             want,
             wstatus,
             nohang,
+            waitid,
             // The children list passed in is already this process's, so ppid
             // is redundant here.
             ppid: _,
         } => {
+            let nowait = waitid.is_some_and(|w| w.nowait);
             let candidates: Vec<_> = children
                 .iter()
                 .filter(|c| want <= 0 || c.pid == want)
@@ -1891,7 +1893,15 @@ fn perform_block(
             loop {
                 for c in &candidates {
                     let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(code) = st.take() {
+                    if let Some(code) = if nowait { *st } else { st.take() } {
+                        if let Some(w) = waitid {
+                            if !nowait {
+                                c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                                procs.reap(c.pid);
+                            }
+                            let mut mem = GuestMem::new(data);
+                            return w.report(&mut mem, c.pid, code as u32);
+                        }
                         c.reaped.store(true, std::sync::atomic::Ordering::Release);
                         // Collected, so the table can forget it. Without this
                         // an init that respawns for the life of the machine
@@ -1907,7 +1917,10 @@ fn perform_block(
                     }
                 }
                 if nohang {
-                    return Ok(0);
+                    return match waitid {
+                        Some(w) => w.report(&mut GuestMem::new(data), 0, 0),
+                        None => Ok(0),
+                    };
                 }
                 // A halt reaches a parked `wait4` here; `EINTR` sends it back
                 // to a syscall where the halt check stops it.

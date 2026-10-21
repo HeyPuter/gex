@@ -1681,21 +1681,24 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
 }
 
 /// Collect a finished child of `ppid`. Zero if none is ready. `want` is a
-/// specific pid, or -1 for any.
+/// specific pid, or -1 for any. `nowait` non-zero (`waitid`'s `WNOWAIT`)
+/// reports the child without collecting it.
 ///
 /// Returns pid in the high 32 bits, wait status in the low 32 -- paired
 /// atomically, since two Workers can collect at once and a status left in a
 /// static between calls would go to whichever asked last.
 #[no_mangle]
-pub extern "C" fn k_wait(ppid: i32, want: i32) -> i64 {
+pub extern "C" fn k_wait(ppid: i32, want: i32, nowait: i32) -> i64 {
     for c in procs().children(ppid) {
         if want > 0 && c.pid != want {
             continue;
         }
         let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(code) = st.take() {
-            c.reaped.store(true, std::sync::atomic::Ordering::Release);
-            procs().reap(c.pid);
+        if let Some(code) = if nowait != 0 { *st } else { st.take() } {
+            if nowait == 0 {
+                c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                procs().reap(c.pid);
+            }
             // `WIFEXITED`: the code in the second byte, low bits clear.
             // `WIFSIGNALED`: the signal in the low seven, which is what a
             // negative code means here.

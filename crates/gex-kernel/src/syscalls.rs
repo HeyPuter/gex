@@ -193,6 +193,7 @@ pub mod nr {
     pub const MADVISE: u64 = 233;
     pub const MSYNC: u64 = 227;
     pub const WAIT4: u64 = 260;
+    pub const WAITID: u64 = 95;
     pub const PRLIMIT64: u64 = 261;
     pub const GETRANDOM: u64 = 278;
     pub const RSEQ: u64 = 293;
@@ -409,7 +410,52 @@ pub enum BlockOp {
         wstatus: u64,
         /// `WNOHANG`: report nothing rather than blocking.
         nohang: bool,
+        /// `waitid`'s answer instead of `wait4`'s: a `siginfo_t` and zero.
+        /// (`si_uid` is left zero.)
+        waitid: Option<WaitidOut>,
     },
+}
+
+/// Where and how `waitid` reports the child it found ([`waitid_child`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitidOut {
+    /// The caller's `siginfo_t`, or zero.
+    pub info: u64,
+    /// `WNOWAIT`: report the child and leave it to be waited for again.
+    pub nowait: bool,
+    /// A 32-bit caller's `siginfo_t` (its union at 12, not 16).
+    pub compat: bool,
+}
+
+impl WaitidOut {
+    /// Fill the `siginfo_t` for child `pid` with wait status `word` (`wait4`'s
+    /// encoding), or for no child yet (`pid` 0: Linux zeroes it, and callers
+    /// read `si_pid` to tell). The call's own answer is zero either way.
+    pub fn report(&self, m: &mut GuestMem<'_>, pid: i32, word: u32) -> Result<u64, Errno> {
+        if self.info == 0 {
+            return Ok(0);
+        }
+        let u = if self.compat { 12 } else { 16 };
+        for off in (0..u + 12).step_by(4) {
+            m.write_u32(self.info + off, 0)?;
+        }
+        if pid <= 0 {
+            return Ok(0);
+        }
+        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the signal.
+        let (code, status) = if word & 0x7f == 0 {
+            (1, (word >> 8) & 0xff)
+        } else if word & 0x80 != 0 {
+            (3, word & 0x7f)
+        } else {
+            (2, word & 0x7f)
+        };
+        m.write_u32(self.info, crate::signal::sig::SIGCHLD)?;
+        m.write_u32(self.info + 8, code)?;
+        m.write_u32(self.info + u, pid as u32)?;
+        m.write_u32(self.info + u + 8, status)?;
+        Ok(0)
+    }
 }
 
 /// A parked call a signal ended that starts again ([`BlockOp::restart`],
@@ -4638,8 +4684,9 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     // descriptor made from it is the same kind.
     if let Ok(listener) = io.remote_unix_of(fd) {
         let session = listener.accept()?;
-        let path = listener.bound_path().unwrap_or_default();
-        Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+        // The peer's address: a client that never bound has an unnamed one,
+        // as Linux reports it (the family alone), not the listener's path.
+        Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
         let nonblock = flags & SOCK_NONBLOCK != 0;
         session.set_nonblocking(nonblock);
         let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -4649,8 +4696,7 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     }
     let listener = io.unix_of(fd)?;
     let session = listener.accept()?;
-    let path = listener.bound_path().unwrap_or_default();
-    Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+    Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
     let nonblock = flags & SOCK_NONBLOCK != 0;
     session.set_nonblocking(nonblock);
     let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5139,7 +5185,7 @@ pub fn is_thread_own(n: u64) -> bool {
 /// itself: the live thread count (an atomic), the thread's own signal
 /// state and fs_struct, the futexes and the process table. Canonical.
 pub fn is_lifecycle_end(n: u64) -> bool {
-    matches!(n, nr::EXIT | nr::EXIT_GROUP | nr::WAIT4 | nr::REBOOT)
+    matches!(n, nr::EXIT | nr::EXIT_GROUP | nr::WAIT4 | nr::WAITID | nr::REBOOT)
 }
 
 /// Count one thread out of `live` if it is not the last: whether `exit`
@@ -5333,7 +5379,42 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         want: a[0] as i32,
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
+        waitid: None,
     }
+}
+
+/// `waitid(idtype, id, infop, options, rusage)` as `wait4`'s park: `P_ALL`
+/// and `P_PID` (and `P_PGID`, as any child: process groups are not told
+/// apart, as for `wait4`), `WEXITED` with `WNOHANG` and `WNOWAIT`. No child
+/// stops or continues here, so `WSTOPPED`/`WCONTINUED` alone find nothing.
+/// `P_PIDFD` is `EINVAL`, as a kernel without pidfds answers, which is what
+/// sends a caller (Qt's forkfd) to its `SIGCHLD` path.
+fn waitid_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6], compat: bool) -> Result<BlockOp, Errno> {
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    let (idtype, id, options) = (a[0] as u32, a[1] as i32, a[3]);
+    if options & !KNOWN != 0 || options & (WSTOPPED | WEXITED | WCONTINUED) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let want = match idtype {
+        0 | 2 => -1,
+        1 if id > 0 => id,
+        _ => return Err(Errno::EINVAL),
+    };
+    let mut op = wait_child(procs, pid, [want as u64, 0, options & WNOHANG, 0, 0, 0]);
+    if let BlockOp::WaitChild { waitid, nohang, .. } = &mut op {
+        *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat });
+        // Only exits are ever waited for here: without WEXITED a wait would
+        // never end, so it reports none (zero, or ECHILD with no children).
+        if options & WEXITED == 0 {
+            *nohang = true;
+        }
+    }
+    Ok(op)
 }
 
 /// [`is_thread_own`]'s calls, for thread `tid` (context at `ctx_addr`,
@@ -6227,6 +6308,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 return FreeOutcome::Exit((a[0] & 0xff) as i32);
             }
             nr::WAIT4 => return FreeOutcome::Blocking(wait_child(f.procs, f.pid, a), None),
+            nr::WAITID => match waitid_child(f.procs, f.pid, a, compat) {
+                Ok(op) => return FreeOutcome::Blocking(op, None),
+                Err(e) => Err(e),
+            },
             _ => match reboot_halts(a[2]) {
                 Some(_) => {
                     f.procs.request_halt(0);
@@ -8876,6 +8961,8 @@ impl Kernel {
                 futex_block(&self.futex_cx(&mapped), m, a)
             }
             nr::WAIT4 => Some(wait_child(&self.procs, self.pid, a)),
+            // Its argument errors are the dispatch's (below).
+            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).ok(),
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
                 // The clocks as of now, the processor-time ones counted from
                 // a start this sets if it has none yet.
@@ -9088,6 +9175,8 @@ impl Kernel {
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
+            // A waitid that parks is `blocking_op`'s; one that gets here had bad arguments.
+            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).map(|_| 0),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -10235,7 +10324,9 @@ impl Kernel {
         Ok(String::from_utf8_lossy(&path[..end]).into_owned())
     }
 
-    /// Write a `struct sockaddr_un` back, for `getsockname` and `accept`.
+    /// Write a `struct sockaddr_un` back, for `getsockname`, `recvfrom` and
+    /// `recvmsg`: at most the caller's `*len_out` bytes of it (a
+    /// `struct sockaddr` of 16 is a common buffer), its whole length reported.
     fn write_sockaddr_un(
         m: &mut GuestMem<'_>,
         addr: u64,
@@ -10250,7 +10341,9 @@ impl Kernel {
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
-            m.write(addr, &buf[..2 + n + usize::from(!abstract_name)])?;
+            let whole = 2 + n + usize::from(!abstract_name);
+            let room = if len_out != 0 { m.read_u32(len_out)? as usize } else { whole };
+            m.write(addr, &buf[..whole.min(room)])?;
         }
         // An abstract name's length is exactly its bytes (no terminating NUL:
         // the name may hold NULs), as Linux reports it; a path's counts one.
@@ -10795,6 +10888,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::MADVISE => "madvise",
         nr::MSYNC => "msync",
         nr::WAIT4 => "wait4",
+        nr::WAITID => "waitid",
         nr::PRLIMIT64 => "prlimit64",
         nr::GETRANDOM => "getrandom",
         nr::RSEQ => "rseq",
@@ -11476,6 +11570,21 @@ mod tests {
             let s = ret(&m, at);
             assert!(s > 0, "accept, lock_free {lock_free}: {s}");
             assert!(k.fds.cloexec(s as i32).unwrap());
+            // A second client, accepted into a `struct sockaddr` (16 bytes):
+            // its peer never bound, so the address is the family alone, and
+            // nothing past the 16 bytes is written.
+            set_args(&mut m, at, nr::SOCKET, &[AF_UNIX, SOCK_STREAM, 0]);
+            call(&mut m, &mut k);
+            let c2 = ret(&m, at) as u64;
+            set_args(&mut m, at, nr::CONNECT, &[c2, 0x20400, sa.len() as u64]);
+            call(&mut m, &mut k);
+            m.write(0x20600, &[0xee; 32]).unwrap();
+            m.write_u32(0x205f0, 16).unwrap();
+            set_args(&mut m, at, nr::ACCEPT4, &[l, 0x20600, 0x205f0, 0]);
+            call(&mut m, &mut k);
+            assert!(ret(&m, at) > 0, "second accept, lock_free {lock_free}");
+            assert_eq!((m.read_u32(0x205f0).unwrap(), m.read(0x20600, 2).unwrap()), (2, &[1u8, 0][..]));
+            assert!(m.read(0x20610, 16).unwrap().iter().all(|&b| b == 0xee), "accept wrote past the caller's 16 bytes");
             // The options: a stream, no error.
             set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 3, 0x20500, 0]);
             call(&mut m, &mut k);
@@ -11966,6 +12075,27 @@ mod tests {
             k.syscall(&mut m, 0),
             SyscallOutcome::Blocking(BlockOp::WaitChild { ppid, want: -1, nohang: false, .. }) if ppid == pid
         ));
+        // waitid parks the same, with its siginfo and WNOWAIT; P_PIDFD and
+        // no wait kind are EINVAL, with and without the kernel.
+        set_args(&mut m, main.ctx_addr, nr::WAITID, &[1, 7, 0x32000, 4 | 1 | 0x0100_0000]);
+        let info = WaitidOut { info: 0x32000, nowait: true, compat: false };
+        assert!(matches!(
+            free(&k, &mut m, main.ctx_addr),
+            FreeOutcome::Blocking(BlockOp::WaitChild { ppid, want: 7, nohang: true, waitid: Some(w), .. }, None) if ppid == pid && w == info
+        ));
+        set_args(&mut m, main.ctx_addr, nr::WAITID, &[0, 0, 0x32000, 4]);
+        assert!(matches!(
+            k.syscall(&mut m, 0),
+            SyscallOutcome::Blocking(BlockOp::WaitChild { want: -1, nohang: false, waitid: Some(WaitidOut { nowait: false, .. }), .. })
+        ));
+        for args in [[3u64, 5, 0x32000, 4 | 1], [0, 0, 0x32000, 1]] {
+            set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
+            assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Done(_)));
+            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+            set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
+            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+        }
         // reboot: CAD_OFF answers 0 and halts nothing; a halt ends the
         // process with 0 and halts the machine.
         for kernel in [true, false] {
@@ -11981,6 +12111,28 @@ mod tests {
         set_args(&mut m, main.ctx_addr, nr::REBOOT, &[0xfee1_dead, 0x2812_1969, 0x4321_fedc]);
         assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Exit(0)));
         assert_eq!(k.procs.halt_code(), Some(0));
+    }
+
+    /// `waitid`'s `siginfo_t`: SIGCHLD, the CLD_* code, the pid and the exit
+    /// code or signal at the 64-bit and the 32-bit offsets; nothing ready is
+    /// all zero.
+    #[test]
+    fn waitid_reports_a_siginfo() {
+        let mut buf = vec![0xaau8; 0x100];
+        let mut m = GuestMem::new(&mut buf);
+        let w = WaitidOut { info: 0x10, nowait: false, compat: false };
+        assert_eq!(w.report(&mut m, 42, 3 << 8), Ok(0));
+        let rd = |m: &GuestMem<'_>, o: u64| m.read_u32(0x10 + o).unwrap();
+        assert_eq!([rd(&m, 0), rd(&m, 4), rd(&m, 8), rd(&m, 16), rd(&m, 20), rd(&m, 24)], [17, 0, 1, 42, 0, 3]);
+        assert_eq!(w.report(&mut m, 42, 9), Ok(0));
+        assert_eq!([rd(&m, 8), rd(&m, 24)], [2, 9]);
+        assert_eq!(w.report(&mut m, 42, 0x80 | 11), Ok(0));
+        assert_eq!([rd(&m, 8), rd(&m, 24)], [3, 11]);
+        assert_eq!(w.report(&mut m, 0, 0), Ok(0));
+        assert!((0..28).step_by(4).all(|o| rd(&m, o) == 0));
+        let c = WaitidOut { compat: true, ..w };
+        assert_eq!(c.report(&mut m, 5, 1 << 8), Ok(0));
+        assert_eq!([rd(&m, 0), rd(&m, 8), rd(&m, 12), rd(&m, 20)], [17, 1, 5, 1]);
     }
 
     /// `clone` and `clone3` that make a thread answer the same with

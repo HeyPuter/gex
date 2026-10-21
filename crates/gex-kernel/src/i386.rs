@@ -106,6 +106,7 @@ pub mod raw {
     pub const LSTAT: u64 = 107;
     pub const FSTAT: u64 = 108;
     pub const WAIT4: u64 = 114;
+    pub const WAITID: u64 = 284;
     pub const SYSINFO: u64 = 116;
     pub const FSYNC: u64 = 118;
     pub const CLONE: u64 = 120;
@@ -434,6 +435,12 @@ pub fn translate(
         x::WAITPID => {
             *a = [sext(a[0]), a[1], a[2], 0, 0, 0];
             nr::WAIT4
+        }
+        x::WAITID => {
+            // idtype, id, infop, options; the 32-bit rusage is not filled (as
+            // for wait4).
+            *a = [a[0], sext(a[1]), a[2], a[3], 0, 0];
+            nr::WAITID
         }
         x::WAIT4 => {
             // The 32-bit rusage has a layout of its own; nothing here asks
