@@ -11,10 +11,11 @@
  *   asiohost.exe [SECS [BUFFER]]
  *
  * Prints "asio driver NAME", "asio rate R buffer B inputs I outputs O
- * latency in LI out LO", "asio switches N want W", and with inputs
+ * latency in LI out LO", "asio switches N want W (first after MS ms)", and with inputs
  * "asio rt frames MIN MED MAX (N) ms MED". Exit 0 when the switch count is
- * within 10% of SECS * rate / buffer, the time info's sample positions
- * advance by one buffer each, and, with inputs, the impulses came back. */
+ * within 10% of what the rate gives from the first switch on (else 3), the time info's sample
+ * positions advance by one buffer each and the position can be read (else
+ * 4), and, with inputs, an impulse came back (else 5). */
 #include <windows.h>
 #include <objbase.h>
 #include <math.h>
@@ -79,6 +80,7 @@ static volatile LONG switches, bad_pos;
 static ULONGLONG last_pos = ~0ull;
 static long long sample; /* frames handed to the host so far */
 static long long sent[PULSES], back[PULSES];
+static LARGE_INTEGER started, first; /* start(), the first bufferSwitch */
 static int nsent, nback;
 
 static void fill(LONG index)
@@ -100,6 +102,7 @@ static void fill(LONG index)
 		}
 	}
 	sample += frames;
+	if (!switches) QueryPerformanceCounter(&first);
 	InterlockedIncrement(&switches);
 }
 
@@ -169,17 +172,28 @@ int main(int argc, char **argv)
 	printf("asio rate %.0f buffer %d (min %ld max %ld) inputs %ld outputs %ld latency in %ld out %ld\n",
 	       rate, frames, (long)mn, (long)mx, (long)ins, (long)outs, (long)li, (long)lo);
 	fflush(stdout);
+	QueryPerformanceCounter(&started);
 	if ((r = a->v->start(a))) { printf("asio start %ld\n", (long)r); return 1; }
 	Sleep(secs * 1000);
 	asio64 sp, ts;
 	LONG pr = a->v->getSamplePosition(a, &sp, &ts);
+	LARGE_INTEGER now, hz;
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&hz);
+	LONG n = switches;
 	a->v->stop(a);
-	long want = (long)(secs * rate / frames);
-	printf("asio switches %ld want %ld, position %s, time info %s\n", (long)switches, want,
+	/* The device's rate from its first buffer on: how long the driver and
+	 * this program take to reach the first bufferSwitch (a thread, its
+	 * first translation) is not the device's. */
+	double ran = n ? (double)(now.QuadPart - first.QuadPart) / hz.QuadPart : secs;
+	long want = (long)(ran * rate / frames) + (n ? 1 : 0);
+	printf("asio switches %ld want %ld (first after %ld ms), position %s, time info %s\n", (long)n, want,
+	       n ? (long)((first.QuadPart - started.QuadPart) * 1000 / hz.QuadPart) : -1L,
 	       pr ? "failed" : "ok", bad_pos ? "skips" : "steady");
-	int ok = labs(switches - want) <= want / 10 && !bad_pos && !pr;
+	switches = n;
+	int rc = labs(switches - want) > want / 10 ? 3 : bad_pos || pr ? 4 : 0;
 	if (nin) {
-		if (!nback) { printf("asio no impulse came back (%d sent)\n", nsent); ok = 0; }
+		if (!nback) { printf("asio no impulse came back (%d sent)\n", nsent); if (!rc) rc = 5; }
 		else {
 			qsort(back, nback, sizeof back[0], cmp);
 			printf("asio rt frames %lld %lld %lld (%d) ms %.1f\n", back[0], back[nback / 2], back[nback - 1], nback,
@@ -189,5 +203,5 @@ int main(int argc, char **argv)
 	a->v->disposeBuffers(a);
 	a->v->Release(a);
 	CoUninitialize();
-	return ok ? 0 : 3;
+	return rc;
 }

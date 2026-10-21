@@ -321,17 +321,21 @@ fi
 # The ASIO host (asiohost.c): gex audio (ASIO), Wine's dlls/gexasio, its
 # Unix side in the loader (link-w64.sh), registered, created by its class id
 # and run for 10 s of bufferSwitch at 256 frames, the switch count within
-# 10% of 10 s's. In the page with GEX_AUDIO_LOOP=1 (run-node's player and
-# its loopback: ASIO_LOOP=1) the inputs bring an impulse back, timed.
+# 10% of what the rate gives from the first switch to the end. In the page the device has capture, so the inputs must
+# bring an impulse back: there the case runs with run-node's player and its
+# loopback (GEX_AUDIO_PLAYER=1 GEX_AUDIO_LOOP=1) and times the round trip.
 if ! grep -q gexasio.so "$wine" || [ ! -e "$dist/lib/wine/x86_64-windows/gexasio.dll" ]; then
 	case " ${CASES:-asio} " in *" asio "*)
 		echo "skip x64/asio ($tag): no gexasio in this dist (Wine's dlls/gexasio)" ;; esac
 elif x86_64-w64-mingw32-gcc -O1 -o "$w/asiohost.exe" "$here/asiohost.c" -lole32 -ladvapi32; then
-	rt=; [ -n "$page" ] && [ "${ASIO_LOOP:-0}" = 1 ] && rt="${nl}asio rt frames [0-9 ]+\\([0-9]+\\) ms [0-9.]+"
+	rt=; [ -n "$page" ] && rt="${nl}asio rt frames [0-9 ]+\\([0-9]+\\) ms [0-9.]+"
 	inputs='[02]'
 	# (beside the program: the prefix predates the DLL, and Wine loads a
 	# builtin only through its file in the prefix, as wineboot installs it)
-	EXTRA="$dist/lib/wine/x86_64-windows/gexasio.dll" check asio 0 "asio driver gex audio${nl}asio rate [0-9]+ buffer 256 \\(min 64 max 2048\\) inputs $inputs outputs 2 latency in [0-9]+ out [0-9]+${nl}asio switches [0-9]+ want [0-9]+, position ok, time info steady$rt" "$w/asiohost.exe"
+	was=$(declare -p GEX_AUDIO_PLAYER GEX_AUDIO_LOOP 2>/dev/null)
+	[ -n "$page" ] && export GEX_AUDIO_PLAYER="${GEX_AUDIO_PLAYER:-1}" GEX_AUDIO_LOOP=1
+	EXTRA="$dist/lib/wine/x86_64-windows/gexasio.dll" check asio 0 "asio driver gex audio${nl}asio rate [0-9]+ buffer 256 \\(min 64 max 2048\\) inputs $inputs outputs 2 latency in [0-9]+ out [0-9]+${nl}asio switches [0-9]+ want [0-9]+ \\(first after [0-9]+ ms\\), position ok, time info steady$rt" "$w/asiohost.exe"
+	unset GEX_AUDIO_PLAYER GEX_AUDIO_LOOP; eval "$was"
 else
 	fail=$((fail + 1)); echo "FAIL x64/asio ($tag): x86_64-w64-mingw32-gcc"
 fi
