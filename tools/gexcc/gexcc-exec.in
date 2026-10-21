@@ -41,6 +41,13 @@ if [ "$slots" -gt 0 ] 2>/dev/null && command -v flock >/dev/null; then
   fi
 fi
 
+# A shared program finds libc.so and the libraries built so far where the
+# target has them; on the build machine those are the sysroot's (after any
+# the caller named: help2man running a just-built tool)
+sr=${GEXCC_SYSROOT:-$L/../../sysroot}
+LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$sr/lib:$sr/usr/lib/wasm32-linux-musl
+export LD_LIBRARY_PATH
+
 bb=${GEXCC_BUSYBOX-$L/busybox}
 if [ -n "$bb" ] && [ -f "$bb" ]; then
   if [ "$bb" = "$L/busybox" ] && [ -z "${GEX_BUSYBOX_APPLETS:-}" ] && [ -f "$L/busybox.applets" ]; then
