@@ -677,6 +677,13 @@ mod tests {
     /// taking that stream). Other tests' streams stay on the clock.
     static PLAYER: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 
+    /// What the test player has not played of `stream`, now.
+    fn set_pending(stream: u32, frames: u32) {
+        let mut p = PLAYER.lock().unwrap();
+        p.retain(|e| e.0 != stream);
+        p.push((stream, frames));
+    }
+
     fn test_player(stream: u32, _ms: u32) -> Option<u32> {
         PLAYER.lock().unwrap().iter().find(|e| e.0 == stream).map(|e| e.1)
     }
@@ -707,6 +714,150 @@ mod tests {
         PLAYER.lock().unwrap().retain(|e| e.0 != h.id);
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
+    }
+
+    /// The page's player as web/src/audio.js plays one stream at its own
+    /// rate: it starts (and starts again after running dry) once 6 ms of
+    /// frames are queued, or (`stalls`) once its writer has added none for
+    /// 6 ms with two or more queued; then it reads a render quantum at a
+    /// time while two frames are left, keeping the last.
+    struct Worklet {
+        written: u64,
+        read: u64,
+        waiting: bool,
+        played: u64,
+        stalls: bool,
+        last: u64,
+        still: u64,
+    }
+
+    impl Worklet {
+        fn new(stalls: bool) -> Self {
+            Worklet { written: 0, read: 0, waiting: true, played: 0, stalls, last: 0, still: 0 }
+        }
+
+        fn quantum(&mut self, rate: u64) {
+            let avail = self.written - self.read;
+            self.still = if self.written == self.last { self.still + PLAYER_QUANTUM_FRAMES } else { 0 };
+            self.last = self.written;
+            let stalled = self.stalls && avail >= 2 && self.still * 1000 >= 6 * rate;
+            if self.waiting && avail * 1000 < 6 * rate && !stalled {
+                return;
+            }
+            self.waiting = false;
+            let n = PLAYER_QUANTUM_FRAMES.min(avail.saturating_sub(1));
+            self.read += n;
+            self.played += n;
+            if n < PLAYER_QUANTUM_FRAMES {
+                self.waiting = true;
+            }
+        }
+    }
+
+    #[test]
+    fn a_player_short_of_its_start_with_its_writer_waiting_plays() {
+        set_audio_pending(test_player);
+        // gexasio's stream (float stereo at 44.1 kHz, two fragments of one
+        // 256-frame buffer each) as a page run found it: the player ran dry
+        // with 3 frames left and is waiting for its 6 ms start (265 frames),
+        // with one buffer written since (259 queued), and 2024 bytes of a
+        // 2048-byte buffer's room free. The device takes what fits, so the
+        // writer adds the frames the start waits for, whether or not the
+        // player also starts on a writer that stopped adding.
+        for stalls in [false, true] {
+            let h = OssHandle::new(OssNode::Dsp);
+            {
+                let mut s = h.stream.lock().unwrap();
+                s.format = AFMT_F32_LE;
+                s.rate = 44100;
+                s.channels = 2;
+                (s.fragsize, s.fragments) = frag_layout(0x0002_000b);
+            }
+            let mut p = Worklet::new(stalls);
+            set_pending(h.id, 0);
+            assert_eq!(h.write_at(0, &[0u8; 24]).unwrap(), 24);
+            set_pending(h.id, 3);
+            assert_eq!(h.write_at(0, &[0u8; 2048]).unwrap(), 2048);
+            p.written = 259;
+            set_pending(h.id, 259);
+            let buffer = vec![0u8; 2048];
+            let mut left = buffer.len();
+            let mut made = 259u64;
+            for q in 0..3000u64 {
+                // A new buffer every other quantum (256 frames of 256's
+                // time), the rest of one as soon as the device takes it.
+                if left == 0 && q % 2 == 0 {
+                    left = buffer.len();
+                    made += 256;
+                }
+                while left > 0 {
+                    match h.write_at(0, &buffer[buffer.len() - left..]) {
+                        Ok(n) => {
+                            left -= n as usize;
+                            p.written += n / 8;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                p.quantum(44100);
+                set_pending(h.id, (p.written - p.read) as u32);
+            }
+            PLAYER.lock().unwrap().retain(|e| e.0 != h.id);
+            // Everything made since played, but what is queued.
+            assert!(p.played + 512 >= made, "stalls {stalls}: played {} of {made} frames", p.played);
+        }
+    }
+
+    #[test]
+    fn a_buffer_shorter_than_the_players_start_plays() {
+        set_audio_pending(test_player);
+        // gexasio's stream with 64-, 128- and 256-frame ASIO buffers (two
+        // fragments of one each; the first two hold less than the player's
+        // 6 ms start), its thread making audio at the rate and at two thirds
+        // of it (running dry each time).
+        for frames in [64u64, 128, 256] {
+            for speed in [3u64, 2] {
+                let h = OssHandle::new(OssNode::Dsp);
+                let bytes = frames * 8;
+                {
+                    let mut s = h.stream.lock().unwrap();
+                    s.format = AFMT_F32_LE;
+                    s.rate = 44100;
+                    s.channels = 2;
+                    (s.fragsize, s.fragments) = frag_layout(0x0002_0000 | bytes.trailing_zeros());
+                    assert_eq!(s.bufsize(), 2 * bytes);
+                }
+                PLAYER.lock().unwrap().push((h.id, 0));
+                let mut p = Worklet::new(true);
+                let buffer = vec![0u8; bytes as usize];
+                let (mut made, mut taken, mut left) = (0u64, 0u64, 0usize);
+                for _ in 0..3000 {
+                    // Each quantum's audio made (speed thirds of 128 frames),
+                    // and written a buffer at a time as the device takes it.
+                    made += PLAYER_QUANTUM_FRAMES * speed / 3;
+                    loop {
+                        if left == 0 && taken + frames <= made {
+                            left = buffer.len();
+                            taken += frames;
+                        }
+                        if left == 0 {
+                            break;
+                        }
+                        match h.write_at(0, &buffer[..left]) {
+                            Ok(n) => {
+                                left -= n as usize;
+                                p.written += n / 8;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    p.quantum(44100);
+                    set_pending(h.id, (p.written - p.read) as u32);
+                }
+                PLAYER.lock().unwrap().retain(|e| e.0 != h.id);
+                assert!(p.played >= made * 9 / 10, "{frames}-frame buffers at {speed}/3 speed: played {} of {made} frames", p.played);
+            }
+        }
     }
 
     #[test]

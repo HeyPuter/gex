@@ -46,7 +46,7 @@ class GexDsp extends AudioWorkletProcessor {
       this.nslots = this.words[2]; this.cap = this.words[3]; this.ccap = this.words[8];
       this.slots = [];
       for (let s = 0; s < this.nslots; s++) {
-        this.slots.push({ base: HDR + s * SW, f: new Float32Array(buffer, at + OFF + s * this.cap * 8, this.cap * 2), ri: null, fr: 0, gen: -1, waiting: true });
+        this.slots.push({ base: HDR + s * SW, f: new Float32Array(buffer, at + OFF + s * this.cap * 8, this.cap * 2), ri: null, fr: 0, gen: -1, waiting: true, lastW: 0, still: 0 });
       }
       this.capture = new Float32Array(buffer, at + OFF + this.nslots * this.cap * 8, this.ccap * 2);
       Atomics.store(this.words, 5, sampleRate);
@@ -64,11 +64,17 @@ class GexDsp extends AudioWorkletProcessor {
     const w = Atomics.load(W, b + 3);
     const rate = W[b + 1] || sampleRate;
     const gen = Atomics.load(W, b + 2);
-    if (sl.ri === null || gen !== sl.gen) { sl.gen = gen; sl.ri = w; sl.fr = 0; sl.waiting = true; }
+    if (sl.ri === null || gen !== sl.gen) { sl.gen = gen; sl.ri = w; sl.fr = 0; sl.waiting = true; sl.lastW = w; sl.still = 0; }
     let avail = (w - sl.ri) >>> 0;
     // Lapped (or wrapped past), or far behind the writer: the newest frames, a short latency.
     if (avail > this.cap || avail > HIGH * rate) { sl.ri = (w - Math.floor(BACK * rate)) >>> 0; avail = (w - sl.ri) >>> 0; sl.fr = 0; }
-    if (sl.waiting && avail < this.low * rate) { Atomics.store(W, b + 4, sl.ri); return false; }
+    // Frames of the context's time since the writer last added any.
+    sl.still = w === sl.lastW ? sl.still + n : 0;
+    sl.lastW = w;
+    // Waiting for the start's worth, unless the writer has added nothing
+    // for as long: a device buffer shorter than the start holds all it can
+    // (the writer waits for room), and only playing frees it.
+    if (sl.waiting && avail < this.low * rate && !(avail >= 2 && sl.still >= this.low * sampleRate)) { Atomics.store(W, b + 4, sl.ri); return false; }
     sl.waiting = false;
     const ms = avail * 1000 / rate;
     if (ms > this.qmax) this.qmax = ms;
