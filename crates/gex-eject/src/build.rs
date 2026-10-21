@@ -32,7 +32,7 @@ pub struct BuildReport {
     pub rootfs_files: usize,
     /// A Windows program's build (`pe`).
     pub pe: Option<crate::pe::PeReport>,
-    /// A W3 page's build.
+    /// A 32-bit Wine page's build.
     pub w3: Option<crate::w3::W3Report>,
 }
 

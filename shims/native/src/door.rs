@@ -1,4 +1,4 @@
-//! Door calls into a wineserver on its own memory (docs/wineserver-kernel.md).
+//! Door calls into a wineserver on its own memory.
 //!
 //! The server (Wine's `server/door.c`) is a native wasm32 program, its own
 //! process. When it is up it publishes a door area (`gex.door_publish`).
@@ -362,8 +362,8 @@ fn instantiate(engine: &Engine, s: &Arc<Server>) -> Result<Inst> {
     Ok(Inst { id: s.id, store, dispatch, sp })
 }
 
-/// Client wait pipes the server writes in place (`gex.wake_pipe`,
-/// docs/wineserver-kernel.md §4.5), by the index `wake_pipe` returned.
+/// Client wait pipes the server writes in place (`gex.wake_pipe`), by the
+/// index `wake_pipe` returned.
 static WAKES: Mutex<Vec<Option<Arc<dyn gex_kernel::vfs::FileHandle>>>> = Mutex::new(Vec::new());
 
 /// `gex.wake_pipe(fd)` from the server process itself (the pump): its
@@ -400,7 +400,7 @@ pub(crate) fn wake_close(id: i32) {
 }
 
 /// `gex.session_copy(dst, off, size)`: copies the server's session block
-/// (docs/wineserver-kernel.md §6.1) into the caller; the bytes copied, -1
+/// into the caller; the bytes copied, -1
 /// with no door session, the session's size for a size of 0.
 pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u32, size: u32) -> Result<i32> {
     let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(-1) };
@@ -422,8 +422,8 @@ pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u3
 }
 
 /// `gex.usd_copy(dst, size)` / `gex.usd_publish(src, size)`: the server's
-/// user shared data page to or from the caller (docs/wineserver-kernel.md
-/// §6.2); the bytes copied, -1 with no door.
+/// user shared data page to or from the caller; the bytes copied, -1 with
+/// no door.
 pub(crate) fn usd_move(caller: &mut Caller<'_, HostState>, at: u32, size: u32, publish: bool) -> Result<i32> {
     let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(-1) };
     let usd = s.get(area::USD);
@@ -455,7 +455,7 @@ pub(crate) fn session_seq(off: u32) -> i64 {
 
 /// Where a client's `struct __server_request_info` keeps its gather list,
 /// past the 64-byte request/reply union: (data_count, reply_data, data[0],
-/// one data[] entry's size). ILP32 (W3) and LP64 (W64's lowered wasm32
+/// one data[] entry's size). ILP32 (32-bit Wine) and LP64 (64-bit Wine's lowered wasm32
 /// client, `gex.door_call_lp64`: pointers 8 bytes, below 4 GiB).
 pub(crate) const fn req_layout(lp64: bool) -> (u32, u32, u32, u32) {
     if lp64 { (64, 72, 80, 16) } else { (64, 68, 72, 8) }
@@ -516,7 +516,7 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
             Ok(r) => r as u32,
             Err(e) => {
                 // The handler was cut off midway: the server's state cannot
-                // be trusted (its pump exits at its next lock; §4.2).
+                // be trusted (its pump exits at its next lock).
                 s.put(area::POISONED, tid.max(1) as u32);
                 s.unlock();
                 s.kick();

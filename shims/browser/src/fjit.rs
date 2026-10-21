@@ -1,5 +1,5 @@
-//! The function JIT in the browser (`gex_xlate::fjit`, docs/merge-plan.md
-//! §9.8 stream F): the browser half of `gexc run --fjit`, as the native
+//! The function JIT in the browser (`gex_xlate::fjit`): the browser half of
+//! `gexc run --fjit`, as the native
 //! `ftab::lookup`/`serve` do it.
 //!
 //! * A `gex.lookup` miss (cgen.rs) translates the function at the address on
@@ -296,11 +296,10 @@ fn loads(elf: &[u8]) -> Vec<(u64, u64, u64)> {
 /// function (a signal's return, a block boundary of the fallback's), not an
 /// entry. Translated as a root, `recover_one` records it as a function start
 /// for good, and every later translation of the function around it ends at
-/// it as at a tail call, with the flags dead across it: libxcb's
-/// `_xcb_in_read_block` lost its `cmp` before the `cmovle` at +0x30 and took
-/// `min(queue_len, len)` from stale flags (hp8, hu16: memmove of -8 bytes),
-/// and SDL's X11 connect failed the same way (hb26, hb45). The fallback runs
-/// it instead; the function's real entry still gets translated.
+/// it as at a tail call, with the flags dead across it: a `cmov` after the
+/// point then reads flags its `cmp` set before it (in libxcb's
+/// `_xcb_in_read_block`, a memmove of -8 bytes). The fallback runs it
+/// instead; the function's real entry still gets translated.
 fn mid_function(addr: u64) -> bool {
     let home = crate::sigs::proc_home();
     let found = home.mm().lock().vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)));
@@ -349,13 +348,10 @@ fn mid_function(addr: u64) -> bool {
 }
 
 /// Code in `ranges` was unmapped or reprotected (`retire_unmapped_code`):
-/// what the JIT learned there goes (`Jit::retire`). HK's SDL loads libdbus,
+/// what the JIT learned there goes (`Jit::retire`). SDL loads libdbus,
 /// unloads it, and maps libxcb over the same range; with libdbus's starts
-/// kept, libxcb's `_xcb_in_read_block` ended at a libdbus function's address
-/// (+0x30, the `cmovle` of `min(queue_len, len)`) as at a tail call, flags
-/// dead, and read the setup reply out of an empty queue: X11 video init
-/// failed, the black screen (hb26, hb45; `scanconst=` in hs5 showed the
-/// start was libdbus's), and with the unit, a memmove of -8 bytes (hp8).
+/// kept, a libxcb function ends at a libdbus function's address as at a
+/// tail call, flags dead, and computes from stale flags.
 pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
     if let Some(jit) = JIT.get() {
         jit.retire(0, ranges);
@@ -375,7 +371,7 @@ static SEEDED: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 /// jumps to. Offline, translating each of libasound's 1,698 exports in
 /// turn made 57.2 MiB of wasm in 16.4 s without its starts and 9.7 MiB in
 /// 7.1 s with them (one function per module: 49.7 MiB and 14.1 s against
-/// 3.2 MiB and 1.7 s); HK's menu had 20 MiB of libasound wasm (hp13).
+/// 3.2 MiB and 1.7 s).
 fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
     let home = crate::sigs::proc_home();
     let maps: Vec<(u64, String, u64)> = {
@@ -451,17 +447,14 @@ fn translate_root(addr: u64) -> Option<u32> {
     let rules = !lock(&LIBS).is_empty();
     // A callee a unit or the JIT already serves is not brought into the
     // batch: the call reaches it through the table. Without this, a miss in
-    // UnityPlayer (a function its unit lacks) re-translated up to 63 of the
-    // unit's own functions with it -- 3,667 functions and 36 MiB of wasm by
-    // HK's menu (ht3), JIT code shadowing clang's -- and libasound's served
-    // callees went into every batch (28 MiB of wasm by the menu, hp12).
+    // a library with a unit (a function the unit lacks) re-translates dozens
+    // of the unit's own functions with it, JIT code shadowing clang's, and a
+    // served library's callees go into every batch (tens of MiB of wasm).
     // `skip` bounds the batch only. Asked of instruction fetch (as part of
     // `executable`), an entry inside the function being recovered -- a
     // resume point, or a root the JIT took inside a function and, since
     // misses no longer make starts, does not stop recovery at -- read as
-    // non-code and decoded as illegal: `cmovle` in libxcb's
-    // `_xcb_in_read_block` (hu15), and SIGILL at HK's start-up without the
-    // unit (hb52).
+    // non-code and decoded as illegal (a SIGILL on a valid `cmovle`).
     let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
     let served = |a: u64| *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a) || crate::cgen::jit_serves(a));
     // Asked of every byte fetched: the providers' addresses and replaced

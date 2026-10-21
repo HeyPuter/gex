@@ -1,4 +1,4 @@
-// The translation cache across page loads (docs/gexcc.md §8): where the
+// The translation cache across page loads: where the
 // global kernel's saved module store is kept. OPFS in a browser (a Worker
 // or the page), a directory under Node (GEX_XCACHE_DIR, for run-node).
 // One file per fingerprint; the name is the fingerprint.

@@ -41,8 +41,8 @@ struct Session {
     /// Where requests are read into, kept: `pump` runs at every syscall of
     /// every thread, and a fresh 64 KiB zeroed buffer each time (calloc's
     /// memset, and glibc growing and trimming its heap around it) was most
-    /// of what a W3 game's threads spent their CPU on. Keeping it took
-    /// Retrocycles (edger, gameplay) from 3.0-3.5 fps to 38-46 fps.
+    /// of what a Wine game's threads spent their CPU on; keeping it made such
+    /// a game more than ten times faster.
     rbuf: Vec<u8>,
 }
 

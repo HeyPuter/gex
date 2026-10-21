@@ -1,4 +1,4 @@
-//! The host half of a stateful provider's own JIT (docs/unity-dotnet.md P5):
+//! The host half of a stateful provider's own JIT:
 //! Mono's runtime wasm JIT (r58Playz/dotnet-runtime, `mini-wasm.c`) compiles
 //! a managed method to a wasm module at run time and, in the browser,
 //! instantiates it on each worker with `new WebAssembly.Instance`, then
@@ -93,7 +93,7 @@ fn instantiate(
     let engine = caller.data().jit.as_ref().map(|j| j.engine.clone()).ok_or_else(|| anyhow!("wasmjit: no engine"))?;
     // The module cache's directory and this build's name: compiled JIT modules are kept on disk by
     // their bytes, so the next run of the same program loads them instead of compiling
-    // (`GEX_WASMJIT_CACHE=0` turns it off; Hollow Knight's start-up compiles thousands).
+    // (`GEX_WASMJIT_CACHE=0` turns it off; a large game's start-up compiles thousands).
     let disk = caller.data().jit.as_ref().and_then(|j| j.cache.clone()).filter(|_| {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("GEX_WASMJIT_CACHE").map_or(true, |v| v != "0"))
