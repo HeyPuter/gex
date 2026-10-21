@@ -7363,15 +7363,33 @@ export class Gex {
   }
   #rowMemo = null;
 
-  #registryBytes(i) {
+  /** With `scratch`, the copy is a view of this Worker's one scratch buffer
+   * , good until the next such call: for a caller that
+   *  compiles and installs it without yielding. */
+  #registryBytes(i, scratch = false) {
     const { ptr, len, ext } = this.#registryRow(i);
     if (!len) return null;
+    let from;
     if (ext) {
       if (!this.#moduleStore) throw new Error(`gex: registry module ${i} is in the module store, and this Worker has none`);
-      return new Uint8Array(this.#moduleStore, ext - 1, len).slice();
+      from = new Uint8Array(this.#moduleStore, ext - 1, len);
+    } else {
+      from = this.#bytes().subarray(ptr, ptr + len);
     }
-    return this.#bytes().slice(ptr, ptr + len);
+    if (!scratch) return from.slice();
+    if (!this.#scratch || this.#scratch.byteLength < len) {
+      this.#scratch = new ArrayBuffer(Math.max(1 << 20, 2 ** Math.ceil(Math.log2(len))));
+    }
+    const view = new Uint8Array(this.#scratch, 0, len);
+    view.set(from);
+    return view;
   }
+  /** Where a synchronous install's module bytes are copied out of the
+   *  registry. A copy per module would be garbage that a Worker running
+   *  translated code may not collect for a long time (it allocates little
+   *  JavaScript), one copy of every module its thread ran; this holds the
+   *  largest one. */
+  #scratch = null;
 
   /** Before `gex_jit_installed`: when the registry will keep this module, put
    *  its bytes in the module store and tell the shim where, so it keeps the
@@ -7476,7 +7494,7 @@ export class Gex {
     for (; this.#installed < have; this.#installed++) {
       const i = this.#installed;
       if (this.#leaveDense(i)) continue;
-      const bytes = this.#registryBytes(i);
+      const bytes = this.#registryBytes(i, true);
       if (!bytes) continue;
       const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
@@ -8245,7 +8263,7 @@ export class Gex {
     this.#denseAsks++;
     const i = e.gex_dense_owner(d);
     if (i < 0) return;
-    const bytes = this.#registryBytes(i);
+    const bytes = this.#registryBytes(i, true);
     if (!bytes) return;
     const t0 = performance.now();
     const c0 = this.#compileMs, i0 = this.#instantiateMs, g0 = this.#growMs;
