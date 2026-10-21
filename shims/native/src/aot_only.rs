@@ -137,9 +137,23 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
 
 /// Index 1 of an AOT-only process's function table: the call that reached
 /// it named an address no installed function serves.
-pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i32> {
+pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i32> {
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let target = GuestMem::new(memory.bytes()).read_u64(ctx as u32 as u64 + ctx::LAST_TARGET as u64).unwrap_or(0);
+    // The awaited return itself, reached with the stack moved: leave, and
+    // the caller's return check resumes there (as `ftab::fallback` does).
+    if target == ret {
+        return Ok(gex_abi::ftab::RET_LEFT);
+    }
+    // A call-out's return (native Wine's return pad, which no function
+    // holds), reached through the table rather than the dispatch slot that
+    // watches it: that call-out ends here, as the slot would end it.
+    let sp = GuestMem::new(memory.bytes()).read_u64(ctx as u32 as u64 + ctx::x(sp_index()) as u64).unwrap_or(0);
+    if let Some(i) = caller.data().callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_UNWOUND) {
+        let _ = GuestMem::new(memory.bytes()).write_u64(ctx as u32 as u64 + ctx::PC as u64, target);
+        caller.data_mut().callout_signal = Some(CalloutSignal::Return(i));
+        return Err(StopExecution.into());
+    }
     // An exception dispatched nested whose handler jumps back above it:
     // not a call into code, the frames below resume there.
     if nt::exc_escape(caller, target) {
