@@ -513,15 +513,21 @@ fn copy_regions(dir: &Path, web: &Path, site_key: &dyn Fn(&str) -> String) -> Re
 }
 
 /// An AOT-only build has no code but its units: code the recording ran
-/// translated in a unit's image (its `uncovered`) fails the build, named.
+/// translated in a unit's image (its `uncovered`) that neither the unit nor
+/// its region entries hold fails the build, named.
 fn check_covered(v: &Json, dir: &Path) -> Result<()> {
-    let mut regions: std::collections::HashMap<String, std::collections::HashSet<u64>> = Default::default();
+    let mut entries: std::collections::HashMap<String, std::collections::HashSet<u64>> = Default::default();
     let mut has = |key: &str, pc: u64| {
-        regions
+        entries
             .entry(key.to_string())
             .or_insert_with(|| {
-                let b = std::fs::read(dir.join("units/regions").join(key).join("c.entries")).unwrap_or_default();
-                b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
+                [dir.join("units").join(key), dir.join("units/regions").join(key)]
+                    .iter()
+                    .flat_map(|d| std::fs::read(d.join("c.entries")).unwrap_or_default())
+                    .collect::<Vec<u8>>()
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
             })
             .contains(&pc)
     };
@@ -1077,6 +1083,10 @@ mod tests {
         // Another unit's does not.
         let other = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "j", "path": "/w3/ole32.dll"}]}"#).unwrap();
         assert!(check_covered(&other, &dir).is_err());
+        // Its unit's own entries hold it too (a later recovery found it).
+        std::fs::create_dir_all(dir.join("units/j")).unwrap();
+        std::fs::write(dir.join("units/j/c.entries"), 0x612c52cdu64.to_le_bytes()).unwrap();
+        assert!(check_covered(&other, &dir).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
