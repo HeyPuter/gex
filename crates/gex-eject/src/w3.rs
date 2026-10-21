@@ -499,6 +499,19 @@ fn set_services(v: &Json, web: &Path, services: &[(String, u32)]) -> Result<()> 
     Ok(())
 }
 
+/// The units' region entries, whole, each under its unit's key on the
+/// site: the page looks them up by the key it computes for the image.
+fn copy_regions(dir: &Path, web: &Path, site_key: &dyn Fn(&str) -> String) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(dir.join("units/regions")) else { return Ok(()) };
+    for e in rd.flatten() {
+        let key = site_key(&e.file_name().to_string_lossy());
+        for f in ["c.wasm", "c.entries"] {
+            link_or_copy(&e.path().join(f), &web.join("units/regions").join(&key).join(f))?;
+        }
+    }
+    Ok(())
+}
+
 /// An AOT-only build has no code but its units: code the recording ran
 /// translated in a unit's image (its `uncovered`) fails the build, named.
 fn check_covered(v: &Json, dir: &Path) -> Result<()> {
@@ -915,14 +928,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             link_or_copy(&e.path(), &web.join("units/providers").join(e.file_name()))?;
         }
     }
-    // The units' region entries, whole.
-    if let Ok(rd) = std::fs::read_dir(dir.join("units/regions")) {
-        for e in rd.flatten() {
-            for f in ["c.wasm", "c.entries"] {
-                link_or_copy(&e.path().join(f), &web.join("units/regions").join(e.file_name()).join(f))?;
-            }
-        }
-    }
+    copy_regions(dir, &web, &site_key)?;
 
     // How the page starts the program: the recording's, less what the site
     // decides (where the bundle and the units are, what to preload).
@@ -1071,6 +1077,23 @@ mod tests {
         // Another unit's does not.
         let other = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "j", "path": "/w3/ole32.dll"}]}"#).unwrap();
         assert!(check_covered(&other, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn region_entries_follow_their_units_new_key() {
+        let dir = std::env::temp_dir().join(format!("gex-w3-regions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for k in ["old", "kept"] {
+            std::fs::create_dir_all(dir.join("units/regions").join(k)).unwrap();
+            std::fs::write(dir.join("units/regions").join(k).join("c.wasm"), k).unwrap();
+            std::fs::write(dir.join("units/regions").join(k).join("c.entries"), k).unwrap();
+        }
+        let web = dir.join("web");
+        copy_regions(&dir, &web, &|k: &str| if k == "old" { "new".into() } else { k.to_string() }).unwrap();
+        assert_eq!(std::fs::read_to_string(web.join("units/regions/new/c.wasm")).unwrap(), "old");
+        assert!(web.join("units/regions/kept/c.entries").is_file());
+        assert!(!web.join("units/regions/old").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
