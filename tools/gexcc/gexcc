@@ -172,7 +172,7 @@ LIBC_NAMES = {'c', 'm', 'pthread', 'dl', 'rt', 'util', 'crypt', 'xnet', 'resolv'
               'atomic', 'ssp', 'ssp_nonshared', 'unwind'}
 SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
 # Linker options with no meaning for a static wasm module, dropped quietly.
-LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--version-script|-z|--as-needed|--no-as-needed|'
+LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--?version-script|-z|--as-needed|--no-as-needed|'
                      r'--no-undefined|-O\d|--hash-style|--build-id|--enable-new-dtags|--disable-new-dtags|'
                      r'-Bsymbolic|-Bsymbolic-functions|--start-group|--end-group|--sort-common|--warn-common|'
                      r'--sort-section|--dynamic-list|-E|--export-dynamic|--no-copy-dt-needed-entries|'
@@ -181,7 +181,7 @@ LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--version-script|
                      r'--pop-state|-dynamic-linker|--dynamic-linker|--allow-shlib-undefined|--exclude-libs|'
                      r'--undefined-version|--no-undefined-version|-nostdlib|-stats|--stats|--no-keep-memory|'
                      r'--reduce-memory-overheads)(=.*)?$')
-LD_ARG = {'-rpath', '-rpath-link', '-soname', '-h', '--version-script', '-z', '--sort-section', '--dynamic-list',
+LD_ARG = {'-rpath', '-rpath-link', '-soname', '-h', '--version-script', '-version-script', '-z', '--sort-section', '--dynamic-list',
           '-dynamic-linker', '--dynamic-linker', '--exclude-libs'}
 
 out = None
