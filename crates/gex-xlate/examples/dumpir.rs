@@ -30,6 +30,7 @@ fn main() {
         safepoint: 8,
         x87: 9,
         block_ty: 0,
+        entry_ty: 0,
         blocks: &blocks,
         gir: &gir,
         profile: None,
