@@ -958,7 +958,10 @@ function launchBuild(m, at) {
  * runtime.js and the Workers read. One list, for the library and the test page.
  */
 export function setGlobals(get, b = {}) {
-  globalThis.GEX_ARCH = 'x86';
+  // The guest's architecture: x86 unless the build says aarch64 (a Linux
+  // tree of Debian's arm64 packages), which picks the aarch64 shim, seed and
+  // kernel (runtime.js).
+  globalThis.GEX_ARCH = b.arch === 'aarch64' ? 'aarch64' : 'x86';
   if (get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;

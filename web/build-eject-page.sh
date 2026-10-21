@@ -37,6 +37,12 @@ cp "$WEB/eject-site/vendor/zstddec-stream.mjs" "$WEB/eject-site/vendor/zstddec-L
 for f in gex_browser.x86.shared.wasm gex_kernel.x86.wasm seed.x86.shared.wasm; do
     cp "$WEB/public/gex/$f" "$OUT/gex/$f"
 done
+# The aarch64 set, for a build whose guest is arm64 (start's build.arch),
+# when this tree has it (GEX_ARCH=aarch64 shims/browser/build.sh)
+for f in gex_browser.shared.wasm gex_kernel.wasm seed.shared.wasm; do
+    rm -f "$OUT/gex/$f"
+    [ ! -f "$WEB/public/gex/$f" ] || cp "$WEB/public/gex/$f" "$OUT/gex/$f"
+done
 for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
     if [ -f "$WEB/public/gex/$f" ]; then cp "$WEB/public/gex/$f" "$OUT/gex/$f"
     else echo "build-eject-page: no web/public/gex/$f (web/build-mesa-wasm.sh): the build has no OpenGL" >&2; fi
