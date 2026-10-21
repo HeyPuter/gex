@@ -1,99 +1,46 @@
-# Browser demo
+# web
 
-The SuperTuxKart demo uses the direct graphics path:
+The page that runs gex in a browser, and the builds of what it loads:
 
-```text
-stock application -> guest libGL/libEGL marshaller -> gex-gl wire
-    -> web/mesa/gexgl-mesa.cpp -> Mesa st/mesa -> Gallium driver
-```
+- the browser shim, the shared kernel module and the seed, from
+  `shims/browser` and `shims/kernel` (`build-assets.sh`);
+- Mesa for wasm32, from the `third_party/mesa` submodule. It draws through
+  Gallium's `gex_wgpu` driver on the browser's WebGPU. A guest's GL calls
+  reach it through `guest/gl` and `web/mesa/gexgl-mesa.cpp`
+  (`build-mesa-wasm.sh`);
+- Xwayland as wasm32, which runs in a Worker of the page and talks to
+  `shims/hostwl` (`build-xwayland-wasm.sh`);
+- the guest root filesystems (`build-debian.sh`, `build-native-debian.sh`,
+  `build-graphics-rootfs.sh`, `rootfs-manifests/`).
 
-It does not run guest Mesa. The direct path intercepts the standard library
-ABI, so STK and other desktop applications require no source modification; the
-guest's GL calls cross to the page and run on Mesa compiled to wasm, on the
-gex_wgpu Gallium driver, straight onto the browser's WebGPU (built from
-mesa-wink's `wink` branch, the `third_party/mesa` submodule).
+## The two builds
 
-Build the Mesa modules, then publish the assets:
+| build | dist | threads | hosting |
+|-------|------|---------|---------|
+| multi-process (default) | `web/dist` | each guest thread is a Worker on shared memory | needs COOP/COEP (SharedArrayBuffer) |
+| single-thread | `web/dist-sp` | every guest thread is a fiber in one Worker | any static host |
+
+Both builds load the same shim, kernel and seed. Each builds its own Mesa
+and Xwayland, with or without `-pthread`. The dists ship stripped wasm.
+Unstripped copies stay in `target/web-debug/<mp|sp>/`, and `--debug` ships
+them instead.
 
 ```sh
 git submodule update --init third_party/mesa
-web/build-mesa-wasm.sh          # gex-wgpu-replay (needs emdawnwebgpu and Tint)
-(cd web && npm run assets)
-```
-
-The first `build-mesa-wasm.sh` run builds Tint (`web/tint/build-tint.sh`) and is
-substantially slower than subsequent incremental builds.
-
-## The two builds: multi-process (default) and single-thread
-
-The page has two builds, each with its own dist:
-
-- **MP** (`web/dist`), the multi-process build, is the default. Every guest
-  thread is its own Worker on a shared memory. It needs SharedArrayBuffer, so
-  it needs COOP/COEP.
-- **SP** (`web/dist-sp`), the single-thread build, runs on any static host. Every guest thread is
-  a JSPI fiber in one Worker.
-
-Both load the same shim, kernel and seed, which are built once and copied
-into both dists. Mesa and Xwayland are built per flavour, with or without
-`-pthread`, and each dist carries only its own. The dists strip DWARF and
-name sections from the large wasm files. The unstripped copies are in
-`target/web-debug/<mp|sp>/`, and `--debug` ships them.
-
-```sh
-web/build-all.sh            # MP (the default)
-web/build-all.sh --sp       # SP
-web/build-all.sh --both     # both
-```
-
-Serve both at once:
-
-```sh
+web/build-all.sh             # multi-process
+web/build-all.sh --sp        # single-thread
+web/build-all.sh --both
 node web/serve-dist.mjs 8088 --sp-port 8089
 ```
 
-This serves MP on 8088 and SP on 8089.
+The first Mesa build also builds Tint (`tint/build-tint.sh`), so it takes
+much longer than later ones. Stripping needs `wasm-tools`
+(`cargo install wasm-tools`).
 
-Tests:
-- the MP page smoke test: `node web/test/site.mjs`;
-- the SP leg: `tests/single/run.sh`, which runs `tests/single-callout` and then
-  the same demos against `web/dist-sp` without COOP/COEP.
+## Ejected programs
 
-## OpenGL 4.4 validation
-
-The complete 543-command core-4.4 command surface and the guest library's
-coverage of it have a structural gate:
-
-```sh
-tests/gl44-layer.sh
-```
-
-That is deliberately not a conformance claim. Official semantic evidence comes
-from the pinned Khronos GL CTS (`opengl-cts-4.6.8.1`):
-
-```sh
-export GEX_CTS_TOOLCHAIN=/path/to/aarch64-linux-musl-cross
-tests/gl44-cts.sh
-tests/gl44-cts-browser.sh
-```
-
-The second command runs a real `KHR-GL44` case through the persistent browser
-and the Mesa/gex_wgpu path. `GEX_CTS_CASE=KHR-GL44.…` selects another case;
-the growing pass list, rather than symbol coverage or an advertised version
-string, is the compliance measure.
-
-## SuperTuxKart real-present benchmark
-
-With the persistent browser CDP server on port 9335 and the demo server on
-port 8091, run:
-
-```sh
-tests/stk-webgpu-fps.sh
-```
-
-The gate profiles a race and separately measures browser animation ticks and
-distinct WebGPU canvas frames over the final ten seconds. It requires at least
-59.8 real presents per second, 99.5% fresh-frame coverage, and no more than one
-missed animation tick. The game can produce frames faster than the browser can
-display them, so its own `Average FPS` is diagnostic rather than the pass/fail
-metric.
+`build-eject-page.sh` builds the page library that an ejected project ships.
+`eject-site.mjs PROJECT OUT` packs a built project into a static site: the
+library, its runtime and Mesa, zstd-compressed assets, and the headers the
+host must send. The site's `index.html` belongs to the project, so the
+library can be imported into a page of your own.
