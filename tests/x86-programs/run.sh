@@ -203,10 +203,15 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # live register in the handler's ucontext, at whatever safepoint it lands
 # (Wine's suspend sends the frame's context to the server and resumes from
 # it). x86-64 only (its loops are assembly); under the function JIT too.
+# dense-holes: in the page with GEX_TEST_DENSE_HOLES, which points a missing
+# slot's word past the last block of the newest translation first (a word
+# left stale): the dispatch must reach the miss stub through the entry's
+# default arm and the code be translated, not trap. The page's stderr must
+# say a hole was reached.
 # null-access (with GEX_NULL_GUARD=1, the debug opt-in): loads and stores
 # through null pointers (and below 64 KiB) fault: a SIGSEGV handler runs and
 # jumps back out, and with no handler the process dies of SIGSEGV.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access sig-regs-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access sig-regs-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -257,6 +262,7 @@ for src in "$HERE"/*.c; do
         # mem64-net reaches the host: the page gets a network of real TCP sockets.
         [ $name = mem64-net ] && envs="GEX_NETWORK=1"
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
+        [ $name = dense-holes ] && [ $tier = page ] && envs="GEX_TEST_DENSE_HOLES=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
         { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ] || [ $name = fs-threads ] || [ $name = exec-dethread ] || [ $name = fork-thread-ctx ] || [ $name = file-stale-loop ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
@@ -271,6 +277,9 @@ for src in "$HERE"/*.c; do
                 env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" $args >"$WORK/$name.page" 2>/dev/null; gs=$?
             fi
             gex=$(grep -v '^\[host\]' "$WORK/$name.page")
+            if [ $name = dense-holes ] && ! grep -q 'dense holes reached the miss stub' "$WORK/$name.page.err"; then
+                gex="$gex (no dense hole reached the miss stub)"
+            fi
             if [ $name = fork-dirs ] && grep -q 'gex: heal' "$WORK/$name.page.err"; then
                 grep 'gex: heal' "$WORK/$name.page.err" | head -3
                 gex="$gex (heal lines)"

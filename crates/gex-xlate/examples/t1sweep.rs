@@ -116,6 +116,7 @@ fn main() {
                 safepoint: 8,
                 x87: 9,
                 block_ty: 0,
+                entry_ty: 0,
                 blocks: &ids,
                 gir: &gir,
                 profile: None,

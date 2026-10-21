@@ -3367,7 +3367,7 @@ fn push_pending(j: &mut Jit, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8
     // be elsewhere (`PAGE_STALE`) and resumes at the newer block, where
     // translating it again would never move the sibling off its own copy.
     if let Some(d) = &dense {
-        j.module_dense.insert(d.base, d.entries.len() as u32);
+        j.module_dense.insert(d.base, d.span());
     }
     j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
@@ -11627,7 +11627,7 @@ fn backfill_registry(j: &mut Jit) {
             if let Some(at) = gex_emit::dense::locate(&wasm) {
                 let Some(&base) = j.dense_base.get(&id) else { continue };
                 gex_emit::dense::set_base(&mut wasm, &at, base);
-                range = (base, gex_emit::dense::section(&wasm, &at).map_or(0, |s| s.entries.len() as u32));
+                range = (base, gex_emit::dense::section(&wasm, &at).map_or(0, |s| s.span()));
             }
         }
         j.registry_dense.push(range);
@@ -14183,7 +14183,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let (stale_base, stale_id) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
             let ours = j.module_dense.get(&stale_base).copied();
             let elsewhere = dense::on() && stale_base != 0 && {
-                let d = dense::lookup(start);
+                let d = dense::index(start);
                 d != 0 && ours.is_some_and(|n| d < stale_base || d >= stale_base + n)
             };
             // A module served or restored here is numbered as it is queued, so
@@ -14193,7 +14193,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 let n = STALE_FOREIGN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n == 0 {
                     let judged = match ours {
-                        Some(n) => format!("judged by its own range ({n} blocks at {stale_base:#x}): elsewhere {elsewhere}"),
+                        Some(n) => format!("judged by its own range ({n} entries at {stale_base:#x}): elsewhere {elsewhere}"),
                         None => "not taken for elsewhere".to_string(),
                     };
                     warn_line(&format!(
@@ -14703,7 +14703,7 @@ const MISS_WAYS: [&str; 14] = [
 fn miss_way(pc: u64, way: u8) {
     if pwatched(gex_abi::dispatch_page(pc)) {
         pwatch_say(gex_abi::dispatch_page(pc), || {
-            format!("miss at {pc:#x}: {}, dense index {}", MISS_WAYS.get(way as usize).unwrap_or(&"?"), dense::lookup(pc))
+            format!("miss at {pc:#x}: {}, dense index {}", MISS_WAYS.get(way as usize).unwrap_or(&"?"), dense::index(pc))
         });
     }
     MISS_WAY.with(|c| {
@@ -14753,7 +14753,7 @@ fn livelock_note(pc: u64) {
         my_pid(),
         object_off_at(pc),
         pages.join("; "),
-        dense::lookup(pc),
+        dense::index(pc),
         cgen::knows(pc),
         cgen::index_of(pc),
         cgen::unit_serves(pc),
@@ -14878,6 +14878,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         miss_way(pc, 3);
         return gex_emit::module::DISPATCH_MISS_LEAVE;
     }
+    // TEST(gex_test_dense_holes): a stale word at an untranslated slot.
+    dense::test_hole(pc);
     // A block this process has (the slot names it in `blocks`) that this
     // Worker has not instantiated: JavaScript catches up, then the dispatch
     // is retried (`dense::missing`).
@@ -14889,7 +14891,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
         if unsafe { TRACE_MISSES } {
-            trace_line(&format!("[gex] dense miss at pc={pc:#x}: index {} not in this Worker's blocks\n", dense::lookup(pc)));
+            trace_line(&format!("[gex] dense miss at pc={pc:#x}: index {} not in this Worker's blocks\n", dense::index(pc)));
         }
         if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
             // A module inherited lazily is instantiated by the fill path.
@@ -16461,7 +16463,7 @@ fn track_dense(j: &mut Jit, d: &gex_emit::dense::Section) {
     for &p in &pages {
         j.dense_on_page.entry(p).or_default().push(d.base);
     }
-    j.dense_live.insert(d.base, (d.entries.len() as u32, pages.len() as u32));
+    j.dense_live.insert(d.base, (d.span(), pages.len() as u32));
 }
 
 /// A runtime module none of whose pages is live any more: no dispatch can
@@ -17753,7 +17755,7 @@ pub extern "C" fn gex_jit_installed() {
                 regview::publish_module(j.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some(off), key);
                 j.registry.push(Vec::new());
                 j.registry_ext.push(Some((off, len, key)));
-                j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
+                j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.span())));
                 j.store_grace.push_back(done.wasm);
                 if j.store_grace.len() > STORE_GRACE {
                     j.store_grace.pop_front();
@@ -17771,7 +17773,7 @@ pub extern "C" fn gex_jit_installed() {
             regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None, content_key(&wasm));
             j.registry.push(wasm);
             j.registry_ext.push(None);
-            j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
+            j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.span())));
         }
         publish_pending(j);
     });

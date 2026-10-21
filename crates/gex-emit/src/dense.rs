@@ -10,24 +10,30 @@
 //! four bytes of every page of code ever translated, millions), and in the
 //! browser every Worker has its own copy on the V8 heap. Dense, it is a
 //! `u32` in the process's linear memory -- the *slot map* of table `k` --
-//! holding an index into one more table, `blocks`, which has one entry per
-//! block (or shared-slot trampoline) the process installed:
+//! holding a word `entry << 8 | arm` for one more table, `blocks`. A module
+//! with `n` dense blocks (or shared-slot trampolines) puts `ceil(n / 256)`
+//! *entry functions* in `blocks`, each `(ctx, arm) -> ()` and a `br_table`
+//! on `arm` to a `return_call` of the block ([`entry_body`]), so a Worker's
+//! `blocks` has one entry per 256 blocks the process installed:
 //!
 //! ```text
 //! entry = DISPATCH_DIR[page]; k = entry >> 24; slot = (entry & mask) + off
 //! map   = MAPS[k - FIRST_TABLE]                  ;; 0: table k is classic
-//! map ? return_call_indirect blocks[map[slot]] : return_call_indirect table_k[slot]
+//! map ? (w = map[slot]; return_call_indirect blocks[w >> 8](ctx, w & 255))
+//!     : return_call_indirect table_k[slot]
 //! ```
 //!
-//! A slot nobody installed reads 0, and `blocks[0]` is the miss stub, as
-//! table 0's low slots are.
+//! A slot nobody installed reads 0, and `blocks[0]` is the miss stub (as an
+//! entry: the host wraps it), as table 0's low slots are; so is an arm past
+//! its entry's blocks (a word left pointing past a module's last block),
+//! which the `br_table` sends there.
 //!
 //! * The slot maps are process-wide (one memory per process), so a block is
 //!   numbered once per process, not per thread; each Worker's `blocks` table
-//!   is as long as the number of blocks, about a tenth of the slots.
-//! * A module's dense blocks are one active element segment on `blocks` at
-//!   a constant offset, its *dense base*, and its custom section
-//!   [`SECTION`] lists the slot of each element in order. The host assigns
+//!   is as long as the number of entries.
+//! * A module's entry functions are one active element segment on `blocks`
+//!   at a constant offset, its *dense base*, and its custom section
+//!   [`SECTION`] lists the slot of each block in order. The host assigns
 //!   the base when the module becomes the process's (and writes it into the
 //!   module with [`set_base`]) and writes the slot maps when it publishes it.
 //! * Only tables `FIRST_TABLE..` can be dense: tables below are a closure's
@@ -80,6 +86,19 @@ pub const GLOBAL: &str = "dense_base";
 
 static ON: AtomicBool = AtomicBool::new(false);
 
+/// The blocks one entry of `blocks` dispatches among.
+pub const ARMS: u32 = 256;
+
+/// How many `blocks` entries `n` dense blocks take.
+pub fn span(n: u32) -> u32 {
+    n.div_ceil(ARMS)
+}
+
+/// The `blocks` index a slot map word names (0 for none).
+pub fn index_of(word: u32) -> u32 {
+    word >> 8
+}
+
 /// Emit dense dispatch and dense element segments from now on.
 pub fn set(on: bool) {
     ON.store(on, Ordering::Relaxed);
@@ -98,11 +117,22 @@ pub fn table(k: usize) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Section {
     pub base: u32,
-    /// Directory-style `table << 24 | slot`, one per element, in order.
+    /// Directory-style `table << 24 | slot`, one per block, in order: block
+    /// `j` is arm `j % 256` of index `base + j / 256`.
     pub entries: Vec<u32>,
 }
 
 impl Section {
+    /// How many `blocks` indices from `base` the module fills.
+    pub fn span(&self) -> u32 {
+        span(self.entries.len() as u32)
+    }
+
+    /// The slot map word for block `j`.
+    pub fn word(&self, j: usize) -> u32 {
+        ((self.base + j as u32 / ARMS) << 8) | (j as u32 % ARMS)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(8 + 4 * self.entries.len());
         v.extend_from_slice(&self.base.to_le_bytes());
@@ -256,16 +286,18 @@ pub fn section(wasm: &[u8], at: &Located) -> Option<Section> {
 }
 
 /// Emit the dispatch to table `k`'s slot in local `index` with `ctx` in local
-/// `ctx`: through `blocks` when `k`'s map word is set, else the classic table.
-/// `scratch` is an i32 local this may overwrite. For [`table`]`(k)` only.
-pub fn emit_arm(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, scratch: u32, block_ty: u32) {
-    emit_arm_at(f, k, ctx, index, scratch, block_ty, k as u32, TABLE_INDEX);
+/// `ctx`: through `blocks` when `k`'s map word is set (the word's entry,
+/// called with its arm), else the classic table. `scratch` is an i32 local
+/// this may overwrite; `entry_ty` the module's `(ctx, arm) -> ()`. For
+/// [`table`]`(k)` only.
+pub fn emit_arm(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, scratch: u32, block_ty: u32, entry_ty: u32) {
+    emit_arm_at(f, k, ctx, index, scratch, block_ty, entry_ty, k as u32, TABLE_INDEX);
 }
 
 /// [`emit_arm`] in a module whose dispatch table `k` is table `classic` and
 /// whose `blocks` is table `blocks`.
 #[allow(clippy::too_many_arguments)]
-pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, scratch: u32, block_ty: u32, classic: u32, blocks: u32) {
+pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, scratch: u32, block_ty: u32, entry_ty: u32, classic: u32, blocks: u32) {
     debug_assert!(k >= FIRST_TABLE);
     f.addr_const(0);
     f.load(0x28, 2, (MAPS + 4 * (k - FIRST_TABLE) as u64) as u32); // i32.load
@@ -278,12 +310,48 @@ pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32
     f.byte(0x74); // i32.shl
     f.byte(0x6a); // i32.add
     f.addr_i32(); // the map is in the runtime's low memory
-    f.load(0x28, 2, 0); // i32.load: the block's index in `blocks`
-    f.return_call_indirect(block_ty, blocks);
+    f.load(0x28, 2, 0); // i32.load: the slot's map word
+    f.local_tee(scratch);
+    f.i32_const(ARMS as i32 - 1);
+    f.byte(0x71); // i32.and: the arm
+    f.local_get(scratch);
+    f.i32_const(8);
+    f.byte(0x76); // i32.shr_u: the entry
+    f.return_call_indirect(entry_ty, blocks);
     f.end();
     f.local_get(ctx);
     f.local_get(index);
     f.return_call_indirect(block_ty, classic);
+}
+
+/// An entry function's body (code-section entry: size, locals, code):
+/// `(ctx, arm) -> ()`, a `br_table` on `arm`
+/// to a `return_call` of `funcs[arm]` (at most [`ARMS`]), and any other arm
+/// to `blocks[0]`, the miss stub, through table `blocks`.
+pub fn entry_body(entry_ty: u32, blocks: u32, funcs: &[u32]) -> Vec<u8> {
+    use crate::wasm::FuncBody;
+    debug_assert!(!funcs.is_empty() && funcs.len() <= ARMS as usize);
+    let n = funcs.len() as u32;
+    let mut f = FuncBody::new(2);
+    // The default's block outermost, then one per arm, arm 0 innermost:
+    // `br j` leaves arm j's block and runs what follows its `end`.
+    for _ in 0..=n {
+        f.block_void();
+    }
+    f.local_get(1);
+    let targets: Vec<u32> = (0..n).collect();
+    f.br_table(&targets, n);
+    for &func in funcs {
+        f.end();
+        f.local_get(0);
+        f.return_call(func);
+    }
+    f.end();
+    f.local_get(0);
+    f.i32_const(0);
+    f.i32_const(0);
+    f.return_call_indirect(entry_ty, blocks);
+    f.finish()
 }
 
 /// `(ctx) -> ()`: tail-call the block for `ctx::LAST_TARGET`, as tier-1's
@@ -291,7 +359,7 @@ pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32
 /// for a module whose dispatch tables are tables `first..` and whose
 /// `blocks` is table `blocks` (the function table's runtime module, whose
 /// bridge carries on in tier-1 through such a function).
-pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
+pub fn dispatch_body(block_ty: u32, entry_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     use crate::wasm::{FuncBody, ValType};
     use gex_abi::{ctx, DISPATCH_PAGE};
     let mut f = FuncBody::new(1);
@@ -343,7 +411,7 @@ pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     for k in (0..n).rev() {
         f.end();
         if k as usize >= FIRST_TABLE {
-            emit_arm_at(&mut f, k as usize, 0, index, entry, block_ty, first + k, blocks);
+            emit_arm_at(&mut f, k as usize, 0, index, entry, block_ty, entry_ty, first + k, blocks);
             continue;
         }
         f.local_get(0);
@@ -415,6 +483,13 @@ mod tests {
     fn section_roundtrips() {
         let s = Section { base: 77, entries: vec![(4 << 24) | 5, (4 << 24) | 1029] };
         assert_eq!(Section::decode(&s.encode()), Some(s));
+        let s = Section { base: 9, entries: vec![(4 << 24) | 5; 300] };
+        assert_eq!(Section::decode(&s.encode()), Some(s.clone()));
+        assert_eq!(s.span(), 2);
+        assert_eq!(s.word(0), 9 << 8);
+        assert_eq!(s.word(255), (9 << 8) | 255);
+        assert_eq!(s.word(256), 10 << 8);
+        assert_eq!(s.word(299), (10 << 8) | 43);
     }
 
     #[test]

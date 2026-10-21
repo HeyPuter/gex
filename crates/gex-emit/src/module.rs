@@ -595,6 +595,9 @@ pub struct ModuleBuilder {
     /// Every page a block landed on, whether or not this module claimed it.
     covered: Vec<(u64, u32)>,
     block_ty: u32,
+    /// `(ctx, arm) -> ()`, the type of `blocks`' entries (`crate::dense`),
+    /// where dense dispatch is on.
+    entry_ty: u32,
     miss_stub: u32,
     /// `enter(ctx, pc)`, which the miss stub re-dispatches through.
     enter: u32,
@@ -786,6 +789,12 @@ impl ModuleBuilder {
         let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
             .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
 
+        let entry_ty = if crate::dense::on() {
+            m.func_type(FuncType::new(vec![p, ValType::I32], vec![]))
+        } else {
+            0
+        };
+
         // The miss stub and `enter` are the first two local functions, so
         // their indices are known before any block is declared.
         let miss_stub = m.declare_func(block_ty);
@@ -799,6 +808,7 @@ impl ModuleBuilder {
             new_pages: Vec::new(),
             covered: Vec::new(),
             block_ty,
+            entry_ty,
             miss_stub,
             enter,
             dispatch,
@@ -968,6 +978,7 @@ impl ModuleBuilder {
                 fma: self.imports.fma,
                 x87: self.imports.x87,
                 block_ty: self.block_ty,
+                entry_ty: self.entry_ty,
                 blocks: &self.blocks,
                 gir: &gir,
                 profile: profile_emit.as_ref(),
@@ -1225,13 +1236,24 @@ impl ModuleBuilder {
                     }
                 }
                 if !dense_funcs.is_empty() {
+                    // The segment holds the module's entry functions, one per
+                    // `ARMS` blocks in order, so block `j` is arm `j % ARMS`
+                    // of element `j / ARMS` (`Section::word`).
+                    let funcs = dense_funcs
+                        .chunks(crate::dense::ARMS as usize)
+                        .map(|arms| {
+                            let f = self.m.declare_func(self.entry_ty);
+                            self.m.define_func(f, crate::dense::entry_body(self.entry_ty, crate::dense::TABLE_INDEX, arms));
+                            f
+                        })
+                        .collect();
                     // At base 0 until the host gives the module one
                     // (`crate::dense::set_base`).
                     self.m.element(ElementSegment {
                         table: crate::dense::TABLE_INDEX,
                         offset: 0,
                         page_base: 0,
-                        funcs: dense_funcs,
+                        funcs,
                         passive: false,
                         guest_page: 0,
                         padded: true,
@@ -1474,7 +1496,7 @@ impl ModuleBuilder {
         for k in (0..n).rev() {
             f.end();
             if crate::dense::table(k as usize) {
-                crate::dense::emit_arm(&mut f, k as usize, 0, index, entry, self.block_ty);
+                crate::dense::emit_arm(&mut f, k as usize, 0, index, entry, self.block_ty, self.entry_ty);
                 continue;
             }
             f.local_get(0); // ctx argument for the target block
