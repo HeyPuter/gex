@@ -1586,7 +1586,7 @@ impl MemoryMap {
     /// identity of the bytes in `[lo, hi)` ([`CONTENT_ID`] and a hash), or
     /// `None` to leave the mapping unnamed. A mapping named this way before
     /// is named again, since its bytes may have changed while it was
-    /// writable. Mappings from a file keep their file identity. A
+    /// writable. Mappings from a file are never named by their bytes. A
     /// mapping named [`CONTENT_NAMINGS`] times already stays unnamed.
     ///
     /// This is how code that was read into memory rather than mapped from a
@@ -1621,19 +1621,22 @@ impl MemoryMap {
         }
     }
 
-    /// Drop the content identities ([`Self::name_by_content`]) over
-    /// `[start, end)`: the range is writable now, so what it will hold is
-    /// not what was named.
-    pub fn forget_content(&mut self, start: u64, end: u64) {
+    /// The mappings over `[start, end)` lose what their code was loaded from
+    /// (`code`), a file or their bytes ([`Self::name_by_content`]): they have
+    /// been made writable, so their bytes may no longer be the ones named, and
+    /// a translation another process (or this one, before the write) made of
+    /// the named bytes there is not of what is there now. Kept, the name gives
+    /// a rewritten page back its old number, and a block of the old code that
+    /// a sibling jumps to directly passes its page check.
+    pub fn forget_code(&mut self, start: u64, end: u64) {
         let mut changed = false;
         for v in self.vmas.iter_mut() {
-            if v.end <= start || v.start >= end {
+            if v.end <= start || v.start >= end || v.code.is_none() {
                 continue;
             }
-            if v.code.as_ref().is_some_and(|(id, _)| id.starts_with(CONTENT_ID)) {
-                v.code = None;
-                changed = true;
-            }
+            debug_assert!(v.start >= start && v.end <= end, "forget_code after the protect that split the range");
+            v.code = None;
+            changed = true;
         }
         if changed {
             self.generation += 1;
@@ -1772,6 +1775,19 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page of mapped code made writable no longer names the file as its
+    /// code's source; the rest of the mapping still does.
+    #[test]
+    fn writable_code_loses_its_file_name() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let at = MMAP_BOTTOM;
+        m.adopt(at, at + 0x2000, prot::READ | prot::EXEC, "/lib/x.so", Some(("/lib/x.so".into(), 0)));
+        m.protect(at, 0x1000, prot::READ | prot::WRITE).unwrap();
+        m.forget_code(at, at + 0x1000);
+        let code: Vec<_> = m.vmas().iter().map(|v| (v.start, v.code.clone())).collect();
+        assert_eq!(code, vec![(at, None), (at + 0x1000, Some(("/lib/x.so".into(), 0x1000)))]);
+    }
 
     /// A refused large mapping explains what holds the space, once, without
     /// tripping over mappings that straddle `MMAP_TOP` or sit below the arena.
@@ -2361,7 +2377,7 @@ mod tests {
         assert_eq!(code(&m, lib), Some(("libx.so".into(), 0)));
         // Writable again, then executable: named afresh.
         m.protect(a, 0x2000, rw).unwrap();
-        m.forget_content(a, a + 0x2000);
+        m.forget_code(a, a + 0x2000);
         assert_eq!(code(&m, a), None);
         m.protect(a, 0x2000, rx).unwrap();
         m.name_by_content(a, a + 0x2000, &mut name);
@@ -2370,7 +2386,7 @@ mod tests {
         // Flipped on and on, as generated code is: named no more.
         for _ in 0..CONTENT_NAMINGS {
             m.protect(a, 0x2000, rw).unwrap();
-            m.forget_content(a, a + 0x2000);
+            m.forget_code(a, a + 0x2000);
             m.protect(a, 0x2000, rx).unwrap();
             m.name_by_content(a, a + 0x2000, &mut name);
         }
