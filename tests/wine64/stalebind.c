@@ -46,6 +46,16 @@ static void put_function(unsigned char *at, DWORD value) {
     FlushInstructionCache(GetCurrentProcess(), at, 6);
 }
 
+/* The same calls from another thread: in the page, a thread's Worker has
+ * instantiated none of the process's code yet when it first calls there. */
+struct call { DWORD (*fn)(void); DWORD want; int bad; };
+static DWORD WINAPI call_thread(void *p) {
+    struct call *c = p;
+    for (int i = 0; i < 2000; i++)
+        if (c->fn() != c->want) c->bad++;
+    return 0;
+}
+
 int main(void) {
     WCHAR path[MAX_PATH];
     GetSystemDirectoryW(path, MAX_PATH);
@@ -81,6 +91,12 @@ int main(void) {
         put_function(mem + rva, 2000 + round);
         for (int i = 0; i < 2000; i++)
             if (fn() != 2000 + round) bad++;
+        struct call c = { fn, 2000 + round, 0 };
+        HANDLE t = CreateThread(NULL, 0, call_thread, &c, 0, NULL);
+        if (!t) { printf("thread failed %lu\n", GetLastError()); return 6; }
+        WaitForSingleObject(t, INFINITE);
+        CloseHandle(t);
+        bad += c.bad;
         if (bad) { failures++; printf("FAIL round %d: %d calls at %p returned something else\n", round, bad, (void *)fn); }
         else printf("ok   round %d: the program's code at a former export runs\n", round);
         VirtualFree(mem, 0, MEM_RELEASE);
