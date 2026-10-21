@@ -31,4 +31,10 @@ check $? ".symver asm compiles"
 grep -q "2 .symver directive(s) left out" "$W/log"; check $? "and says how many it left out"
 grep -q "^$W/sv.o:" "$W/sv.d"; check $? "the dependency file names the object"
 llvm-nm "$W/sv.o" | grep -q " T libx_get$"; check $? "the versioned symbol is still defined"
+# as TRIPLE-cpp: stdin with no file, `cpp IN OUT`
+ln -s "$(command -v gexcc)" "$W/wasm32-linux-musl-cpp"
+[ "$(printf 'l unix if\n' | "$W/wasm32-linux-musl-cpp" -undef 2>/dev/null | tail -1)" = "l unix if" ]
+check $? "cpp -undef reads standard input"
+printf '#define A 7\nA\n' > "$W/a.h"; "$W/wasm32-linux-musl-cpp" "$W/a.h" "$W/a.out" 2>/dev/null
+[ "$(tail -1 "$W/a.out")" = 7 ]; check $? "cpp IN OUT"
 exit $fail

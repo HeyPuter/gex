@@ -160,6 +160,30 @@ for a in args:
     if a == '-print-multi-os-directory':
         print('.'); sys.exit(0)
 
+# --- as cpp -------------------------------------------------------------------
+# Installed as TRIPLE-cpp: the C preprocessor, which reads standard input
+# when given no file (xorg-macros' RAWCPP check: `cpp -undef < conftest`)
+# and takes `cpp IN OUT`.
+if name == 'cpp' or name.endswith('-cpp'):
+    CPP_ARG = {'-I', '-D', '-U', '-include', '-imacros', '-isystem', '-idirafter', '-iquote', '-MF', '-MT', '-MQ', '-o',
+               '-x', '-std', '-iprefix', '-iwithprefix', '-isysroot', '-target', '--target'}
+    files, k = [], 0
+    while k < len(args):
+        if args[k] in CPP_ARG:
+            k += 2; continue
+        if args[k] == '-' or not args[k].startswith('-'):
+            files.append(k)
+        k += 1
+    cmd = list(args)
+    if len(files) == 2:  # cpp IN OUT
+        out_at = files[1]
+        cmd = cmd[:out_at] + cmd[out_at + 1:] + ['-o', args[out_at]]
+    elif not files:
+        cmd.append('-')
+    if not any(a == '-x' or a.startswith('-x') for a in cmd):
+        cmd = ['-x', 'c'] + cmd
+    os.execvp(CLANG[0], CLANG + ['-E'] + cmd + CLANG_TAIL)
+
 # --- compile only -----------------------------------------------------------
 SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
 # `.symver` (ELF symbol versions, in top-level asm) is a directive the wasm
