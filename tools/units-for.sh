@@ -22,6 +22,9 @@
 # build holds DIR/ukeys/.lock, so legs sharing DIR wait for one build. The
 # three most recently used sets are kept; older ones are removed.
 #
+# Besides the images, each set holds the i386 trampoline page's unit
+# (`gexc cgen-image --nt-trampolines32`).
+#
 # Stdout: the set's directory. Stderr: one line when a set is built ("units:
 # built ...", with the time and the log), or the failure. Exit 1 on failure:
 # a GEXC that is not an x86 gexc (no wine_libm provider), an image that does
@@ -70,6 +73,13 @@ if [ ! -f "$U/.complete" ]; then
 	mv "$U.new" "$U" && touch "$U/.complete"
 	echo "units: built $n images for inputs $K in $(( $(date +%s) - t0 )) s ($nohints without an indirect-call profile, $nocode with no code; log $log)" >&2
 fi
+# The i386 trampoline page's unit, which no image in units.list is: a W3
+# page with units places it with its first image and wants it. Added to a set
+# built before it was (cached: a no-op once there).
+if ! GEX_CGEN_CACHE="$U" GEX_CGEN_ICALL_COUNT=0 systemd-run --user --scope -q -p TasksMax=4096 -p MemoryMax=32G nice -n 19 "$G" cgen-image --nt-trampolines32 > "$U.tramp.log" 2>&1; then
+	fail "the trampoline page's unit did not build (log $U.tramp.log)"
+fi
+rm -f "$U.tramp.log"
 touch "$U"
 # Keep the three most recently used sets.
 ls -1dt "$D"/ukeys/*/ 2>/dev/null | tail -n +4 | while read -r old; do
