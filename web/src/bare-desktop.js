@@ -1,7 +1,7 @@
 // The page with no compositor: a program's windows drawn straight into the
 // page, one canvas each, laid out by the browser.
 //
-// gex-eject's `"compositor": false` (docs/eject.md, "Features"). The scene
+// gex-eject's `"compositor": false` (crates/gex-eject/README.md). The scene
 // compositor (`compositor-worker.js`) draws every surface into one WebGPU
 // canvas, with a frame and a title bar around each toplevel, a cursor sprite
 // and its own hit testing. A program that draws its own frames -- Wine does,

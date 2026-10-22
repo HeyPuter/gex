@@ -6,7 +6,7 @@
 ORIG.wasm is the link's plain module (gex-wgpu-replay.wasm.orig: the target
 links with -sSPLIT_MODULE=1, so the .wasm beside it is wasm-split's
 instrumented one and never shipped). HOT.txt lists the functions to keep in
-the primary (web/mesa-hot.txt; docs/mesa-wasm-size.md says how it is made).
+the primary (web/mesa-hot.txt, from a GEX_MESA_PROFILE=1 build's run).
 Writes OUTDIR/gex-wgpu-replay.wasm (names kept) and, when anything is left
 over, OUTDIR/gex-wgpu-replay.deferred.wasm (names stripped). --max-cold
 fails the split when the cold part is that big or bigger (default: no

@@ -71,7 +71,7 @@
 # transport. What the page loads is built by the link at the end of this file.
 set -eu
 
-# GEX_XWL_THREADS=0: the single-thread build's server (docs/single-thread.md).
+# GEX_XWL_THREADS=0: the single-thread build's server.
 # Without -pthread anywhere, so its memory is a plain one: the compositor runs
 # in the same realm there and reads the pixels by reference, not through a
 # SharedArrayBuffer. Its own output directory, published as xwayland-st/.

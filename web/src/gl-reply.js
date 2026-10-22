@@ -2,11 +2,10 @@
 //
 // The ring's reply area has a fixed capacity (guest/gl/gexgl.c: 32 MiB).
 // When the replies of one batch add up to more, the native host
-// (shims/native/src/gl.rs) copies what fits and reports success; the page
-// used to report BAD_ARGUMENT instead, which makes the guest drop the whole
-// queued batch and every one after it, so a game that runs natively showed
-// a black window in the page (Hyper Light Drifter on W64, 2026-10-18). Both
-// now do the same: the reply is cut to the capacity, and the cut is counted
+// (shims/native/src/gl.rs) copies what fits and reports success, and so
+// does the page: BAD_ARGUMENT would make the guest drop the whole queued
+// batch and every one after it, and a game that runs natively would show a
+// black window in the page. The reply is cut to the capacity, and the cut is counted
 // so the page's GL summary names it.
 
 /** The reply length to copy, and whether it was cut. */

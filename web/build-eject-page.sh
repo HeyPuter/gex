@@ -1,5 +1,5 @@
 #!/bin/sh
-# An ejected program's web build (docs/eject.md, "The web build"): gex's app
+# An ejected program's web build (crates/gex-eject/README.md): gex's app
 # library (web/src/app.js) built with vite into DIR as app.mjs, its chunks
 # under assets/, and beside it under gex/ the x86 shared-memory shim, kernel
 # and seed, Mesa (the wgpu replay, web/build-mesa-wasm.sh) for programs with
@@ -55,7 +55,7 @@ for d in xwayland xwayland-st; do
     if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
     elif [ "$d" = xwayland ]; then echo "build-eject-page: no web/public/gex/$d (web/build-xwayland-wasm.sh): the build runs no X11 programs" >&2; fi
 done
-# Mesa's cold part, when the build split one off (docs/mesa-wasm-size.md).
+# Mesa's cold part, when the build split one off (web/mesa-split.py).
 rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
 [ ! -f "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" ] ||
     cp "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" "$OUT/gex/"

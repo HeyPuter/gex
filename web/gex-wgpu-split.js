@@ -1,4 +1,4 @@
-// Mesa's cold part (docs/mesa-wasm-size.md): a --pre-js of gex-wgpu-replay.
+// Mesa's cold part (web/mesa-split.py): a --pre-js of gex-wgpu-replay.
 //
 // The build splits the module with Binaryen's wasm-split (web/mesa-split.py).
 // The functions the page's workloads run stay in gex-wgpu-replay.wasm; the

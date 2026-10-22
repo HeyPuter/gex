@@ -1,6 +1,6 @@
 // JSPI bridge for synchronous Gallium readback.  The exported smoke/replay
 // entry must be wrapped with WebAssembly.promising by its JavaScript caller.
-// A profiling build (wasm-split --instrument --in-memory; docs/mesa-wasm-size.md)
+// A profiling build (wasm-split --instrument --in-memory; GEX_MESA_PROFILE=1)
 // exports __write_profile: a flag per defined function, set the first time it
 // runs. Every 2 s, when the set has grown, the module prints it as a bitmap --
 // `[gex-wgpu] mesa-profile N HITS BASE64`, bit i for defined function i -- to

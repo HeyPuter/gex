@@ -1,12 +1,10 @@
 // WebGPU validation errors from the GL device: kept and logged, never fatal.
 //
 // A validation error refuses one call -- a writeTexture, a submit -- and the
-// device goes on working. Treating the first as the device's death (as
-// mesa-gl.js once did) turned one bad upload into a dead session: `ok` went
-// false for good, the compositor stopped giving GL windows their frames
-// (Undertale's window stayed Wine's white) and every later batch was refused
-// (the game stopped after five presents). wined3d's 1x1 multisample dummy
-// texture was enough to trigger it. Device loss is still fatal; that is
+// device goes on working. Treating the first as the device's death would
+// turn one bad upload into a dead session: `ok` false for good, GL windows
+// given no more frames and every later batch refused. wined3d's 1x1
+// multisample dummy texture is enough to trigger one. Device loss is still fatal; that is
 // mesa-gl.js's business, not this.
 //
 // A game that raises one error a frame must not flood the console either: the

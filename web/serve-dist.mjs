@@ -3,7 +3,7 @@
 //     node web/serve-dist.mjs [port] [--sp-port N]
 //
 // `--sp-port N` also serves web/dist-sp, the single-thread build's dist
-// (web/build-all.sh --sp; docs/single-thread.md), on N without the isolation
+// (web/build-all.sh --sp), on N without the isolation
 // headers: MP on [port], SP on N, side by side. `GEX_NO_COI=1` drops the
 // headers on [port] too.
 //
@@ -58,7 +58,7 @@ const serve = (root, coi) => async (req, res) => {
   const headers = {
     // What buys `SharedArrayBuffer`. See the note at the top. `GEX_NO_COI=1`
     // leaves them off, as any static host would: the page then runs the
-    // single-thread build (docs/single-thread.md).
+    // single-thread build.
     ...(!coi ? {} : {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',

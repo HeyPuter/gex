@@ -1,4 +1,4 @@
-// The demo desktop (docs/gexcc.md §9): one page that is a desktop.
+// The demo desktop: one page that is a desktop.
 //
 // The compositor's output fills the screen; the panel, the launcher and the
 // console are the page's own DOM, so the shell chrome costs the guest's

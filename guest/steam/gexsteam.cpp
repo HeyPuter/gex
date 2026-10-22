@@ -1,4 +1,4 @@
-/* gex-steam: libsteam_api.so for guests (docs/games.md).
+/* gex-steam: libsteam_api.so for guests.
  *
  * A game linked against Valve's libsteam_api.so loads this one instead: the
  * same flat entry points and interface versions, answered here, so the game
