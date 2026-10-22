@@ -30,18 +30,18 @@ struct Bound {
 }
 
 static BOUND: Mutex<Vec<Bound>> = Mutex::new(Vec::new());
-/// Provider-only units JS has still to serve.
-static QUEUE: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
-/// `QUEUE`'s length, kept with every change, so a syscall that mapped
-/// nothing asks it without the lock ([`maps`]).
-static QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Provider-only units JS has still to serve, per Worker: queued by the
+    /// syscall that mapped their library (or a new process's rescan), on the
+    /// Worker that made it, which serves them before its guest goes on
+    /// ([`maps`]'s return). Other Workers install them from the function
+    /// table's log, as before; none needs this queue, so it takes no lock.
+    static QUEUE: std::cell::RefCell<VecDeque<usize>> = const { std::cell::RefCell::new(VecDeque::new()) };
+}
 
-/// `QUEUE`, changed under its lock, with `QUEUED` kept equal to its length.
+/// This Worker's `QUEUE`.
 fn queue<R>(f: impl FnOnce(&mut VecDeque<usize>) -> R) -> R {
-    let mut q = lock(&QUEUE);
-    let r = f(&mut q);
-    QUEUED.store(q.len(), Ordering::Release);
-    r
+    QUEUE.with(|q| f(&mut q.borrow_mut()))
 }
 /// The process the state above is for: a forked child's shim may start
 /// with its parent's copy, which describes the parent's table.
@@ -99,9 +99,9 @@ fn rescan_if_new() -> bool {
 /// whether JS has providers to serve before the guest goes on.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
     // Nothing mapped (almost every call): only whether JS has a unit queued
-    // from before. The rest takes three locks and copies two lists.
+    // from before. The rest takes locks and copies two lists.
     if mapped.is_empty() {
-        return QUEUED.load(Ordering::Acquire) != 0;
+        return queue(|q| !q.is_empty());
     }
     // A replaced library (a stateful Linux provider, libprov.rs) is served the same way.
     if let Some(u) = super::libprov::maps(mapped) {
@@ -110,7 +110,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
     // Function-tier units for listed shared objects (libprov.rs, B4).
     let unit = super::libprov::elf_unit_maps(mapped);
     if !on() {
-        return unit || QUEUED.load(Ordering::Acquire) != 0;
+        return unit || queue(|q| !q.is_empty());
     }
     if PID.load(Ordering::Acquire) == 0 {
         PID.store(crate::my_pid(), Ordering::Release);
@@ -179,7 +179,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         };
         queue(|q| q.push_back(u));
     }
-    unit || QUEUED.load(Ordering::Acquire) != 0
+    unit || queue(|q| !q.is_empty())
 }
 
 /// Whether install `i` is an export provider's module.
