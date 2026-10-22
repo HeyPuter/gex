@@ -39,11 +39,6 @@ guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
     Generated from the Khronos OpenGL API registry (gl.xml), Copyright
     The Khronos Group Inc. Apache-2.0.
 
-web/public/fs/ld-musl-aarch64.so.1, web/public/fs/x86/ld-musl-x86_64.so.1
-    musl libc, Copyright (C) 2005-2020 Rich Felker et al. MIT licence. The
-    other prebuilt guest programs and libraries in web/public/fs are built
-    from gex's own sources, against musl (or glibc, under glibc/).
-
 web/tint/dawn-tint-emscripten.patch, tools/unity-dotnet/mono/patches/
     Changes to Dawn/Tint and .NET's Mono runtime. Each
     patch is under the licence of the project it applies to.

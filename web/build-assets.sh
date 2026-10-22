@@ -221,8 +221,21 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
         cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
            "$WORK/gldriver-glibc/libEGL.so.1" \
            "$WORK/gldriver-glibc/libGL.so.1" "$PUB/fs/glibc/"
+        GEX_CC="$(command -v aarch64-linux-gnu-gcc)" "$ROOT/guest/glx-init/build.sh" "$WORK/glx-init" >/dev/null 2>&1 &&
+            cp "$WORK/glx-init/glx-init" "$WORK/glx-init/egl-init" "$PUB/fs/glibc/" || true
+    elif [ -x "$HOME/toolchains/zig/zig" ]; then
+        # zig cc for aarch64 glibc, as web/build-demo.sh does.
+        mkdir -p "$PUB/fs/glibc"
+        printf '#!/bin/sh\nexec %s cc -target aarch64-linux-gnu.2.36 "$@"\n' "$HOME/toolchains/zig/zig" > "$WORK/aarch64-gnu-cc"
+        chmod +x "$WORK/aarch64-gnu-cc"
+        GEX_CC="$WORK/aarch64-gnu-cc" "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
+        cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
+           "$WORK/gldriver-glibc/libEGL.so.1" \
+           "$WORK/gldriver-glibc/libGL.so.1" "$PUB/fs/glibc/"
+        GEX_CC="$WORK/aarch64-gnu-cc" "$ROOT/guest/glx-init/build.sh" "$WORK/glx-init" >/dev/null 2>&1 &&
+            cp "$WORK/glx-init/glx-init" "$WORK/glx-init/egl-init" "$PUB/fs/glibc/" || true
     else
-        echo "skipping glibc GL driver: no aarch64-linux-gnu-gcc"
+        echo "skipping glibc GL driver: no aarch64-linux-gnu-gcc or ~/toolchains/zig"
     fi
     cp "$MUSL" "$PUB/fs/ld-musl-aarch64.so.1"
 else

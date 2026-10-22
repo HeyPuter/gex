@@ -7,7 +7,9 @@ web/dist-demo/
 web/public/gex/
 web/public/rootfs/
 web/public/closure/
-/web/public/fs/glcts
+/web/public/fs/
+guest/gl/out*/
+guest/glx-init/out/
 __pycache__/
 
 # Scratch and build caches
