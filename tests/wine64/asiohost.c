@@ -6,16 +6,19 @@
  * half second; with the player's loopback (the page's ?audioloop=1,
  * run-node's GEX_AUDIO_LOOP=1) the inputs bring it back, and the round
  * trip is timed in frames: from the bufferSwitch that wrote it to the one
- * whose input holds it.
+ * whose input holds it. One impulse is out at a time; one not back within
+ * a second is given up and the next goes out (a loopback that drops a
+ * buffer under load loses that impulse, not the rest).
  *
  *   asiohost.exe [SECS [BUFFER]]
  *
  * Prints "asio driver NAME", "asio rate R buffer B inputs I outputs O
  * latency in LI out LO", "asio switches N want W (first after MS ms)", and with inputs
- * "asio rt frames MIN MED MAX (N) ms MED". Exit 0 when the switch count is
+ * "asio rt frames MIN MED MAX (N of S) ms MED" (N of the S impulses sent came
+ * back). Exit 0 when the switch count is
  * within 10% of what the rate gives from the first switch on (else 3), the time info's sample
  * positions advance by one buffer each and the position can be read (else
- * 4), and, with inputs, an impulse came back (else 5). */
+ * 4), and, with inputs, at least one impulse came back (else 5). */
 #include <windows.h>
 #include <objbase.h>
 #include <math.h>
@@ -79,9 +82,10 @@ static double rate;
 static volatile LONG switches, bad_pos;
 static ULONGLONG last_pos = ~0ull;
 static long long sample; /* frames handed to the host so far */
-static long long sent[PULSES], back[PULSES];
+static long long back[PULSES];
 static LARGE_INTEGER started, first; /* start(), the first bufferSwitch */
 static int nsent, nback;
+static long long out_at = -1; /* the impulse awaited, or -1 */
 
 static void fill(LONG index)
 {
@@ -90,18 +94,20 @@ static void fill(LONG index)
 		float *b = bi[c].buf[index];
 		if (bi[c].isInput) {
 			if (c == 0 || bi[c - 1].isInput == 0)
-				for (int i = 0; i < frames && nback < nsent; i++)
-					if (fabsf(b[i]) > 0.5f) { back[nback] = sample + i - sent[nback]; nback++; break; }
+				for (int i = 0; i < frames && out_at >= 0; i++)
+					if (fabsf(b[i]) > 0.5f && sample + i >= out_at) { back[nback++] = sample + i - out_at; out_at = -1; }
 			continue;
 		}
 		for (int i = 0; i < frames; i++) b[i] = 0;
 		long long at = ((sample + every - 1) / every) * every;
-		if (sample > 0 && at < sample + frames && nsent < PULSES && nsent == nback) {
+		if (sample > 0 && at < sample + frames && nsent < PULSES && out_at < 0) {
 			b[at - sample] = 0.9f;
-			if (bi[c].channel == 1) sent[nsent++] = at;
+			if (bi[c].channel == 1) { out_at = at; nsent++; }
 		}
 	}
 	sample += frames;
+	/* Not back within a second: lost, and the next one goes out. */
+	if (out_at >= 0 && sample - out_at > (long long)rate) out_at = -1;
 	if (!switches) QueryPerformanceCounter(&first);
 	InterlockedIncrement(&switches);
 }
@@ -196,7 +202,7 @@ int main(int argc, char **argv)
 		if (!nback) { printf("asio no impulse came back (%d sent)\n", nsent); if (!rc) rc = 5; }
 		else {
 			qsort(back, nback, sizeof back[0], cmp);
-			printf("asio rt frames %lld %lld %lld (%d) ms %.1f\n", back[0], back[nback / 2], back[nback - 1], nback,
+			printf("asio rt frames %lld %lld %lld (%d of %d) ms %.1f\n", back[0], back[nback / 2], back[nback - 1], nback, nsent,
 			       back[nback / 2] * 1000.0 / rate);
 		}
 	}
