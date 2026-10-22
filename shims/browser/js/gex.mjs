@@ -6819,7 +6819,7 @@ export class Gex {
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
       const c = this.#callouts[k];
       if (c.nestAt < lastCallback) break;
-      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + CALLOUT_UNWOUND) { i = k; break; }
+      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
     }
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
@@ -7026,10 +7026,15 @@ export class Gex {
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
     const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
-    // A guest call from native Wine (its return is gex-kernel's
-    // NATIVE_RETURN_PAD): its native caller's frames are just above the
-    // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
-    c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
+    // How far above spWant its return comes back (`span`), and past which
+    // the stack has left its caller (`unwound`). A guest call from native
+    // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
+    // callee's argument bytes (cgen.rs `callout_span`): exactly those, as
+    // its native caller's frames start just above them. One that names
+    // none: NATIVE_UNWOUND past the arguments.
+    const span = e.gex_callout_span?.() ?? -1n;
+    c.span = span >= 0n ? span : CALLOUT_UNWOUND;
+    c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
     this.#nest.push(suspendable ? 'callout~' : 'callout');
     this.#calloutsMade++;

@@ -1940,12 +1940,14 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
     let delta = if !gex_abi::X86 { 0 } else if gex_xlate::arch::compat() { 4 } else { 8 };
     let want = sp + delta;
+    let span = callout_span(ret as u64, _need as u32);
     let cb = CB_DEPTH.with(|d| d.get());
     let depth = CALLOUTS.with(|c| {
         let mut c = c.borrow_mut();
-        c.push((ret as u64, want, cb));
+        c.push((ret as u64, want, cb, span));
         c.len() - 1
     });
+    OPENED_SPAN.with(|s| s.set(span as i64));
     CALLOUT_N.fetch_add(1, Ordering::Relaxed);
     // Opened (result -1): one that never closes was abandoned by a throw.
     CALLOUT_RING.with(|x| {
@@ -2064,13 +2066,38 @@ const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
 /// the stack has unwound beyond its caller: as natively.
 pub(crate) const CALLOUT_UNWOUND: u64 = 64 << 10;
 
+/// How far above `sp_want` the return of a call-out to `ret` made with
+/// `need` may come back: for a guest call from native code (`ret` the
+/// native return pad) that names its callee's argument bytes
+/// (`ftab::need_args`), exactly those, so that a return to the pad for an
+/// outer native caller is not taken as this one's; otherwise
+/// [`CALLOUT_UNWOUND`].
+fn callout_span(ret: u64, need: u32) -> u64 {
+    match gex_abi::ftab::need_args(need) {
+        Some(args) if ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD => args,
+        _ => CALLOUT_UNWOUND,
+    }
+}
+
+/// The span of the call-out `gex_ftab_fallback` just opened, for JS's loop
+/// that runs it (`gex_callout_span`); -1 once read, or when the call-out
+/// came from elsewhere.
+#[no_mangle]
+pub extern "C" fn gex_callout_span() -> i64 {
+    OPENED_SPAN.with(|s| s.replace(-1))
+}
+
 static CALLOUT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CALLOUT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// This Worker's call-outs in progress: `(ret, sp_want, NT callbacks in
-    /// progress when it began)`, innermost last.
-    static CALLOUTS: std::cell::RefCell<Vec<(u64, u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// progress when it began, span)`, innermost last. The return is the
+    /// call-out's with the stack from `sp_want` to `sp_want + span`
+    /// (`callout_span`).
+    static CALLOUTS: std::cell::RefCell<Vec<(u64, u64, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// [`gex_callout_span`].
+    static OPENED_SPAN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
     /// NT user-mode callbacks in progress on this Worker (nt.rs).
     static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The call-out whose return a dispatch miss found (`returned`), or -1.
@@ -2133,7 +2160,7 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
     let cb = CB_DEPTH.with(|d| d.get());
     let hit = CALLOUTS.with(|c| {
         let v = c.borrow();
-        v.iter().rposition(|&(r, w, d)| d == cb && r == pc && sp >= w && sp <= w + CALLOUT_UNWOUND)
+        v.iter().rposition(|&(r, w, d, span)| d == cb && r == pc && sp >= w && sp <= w + span)
     });
     match hit {
         Some(i) => {
@@ -2264,7 +2291,7 @@ pub(crate) fn callouts_recent() -> Vec<(u64, u64, u64, u32, i32, u64)> {
 /// code running now has the provider's wasm frames below it, which a trap to
 /// JS's run loop would abandon.
 pub(crate) fn provider_callout_open() -> bool {
-    libprov::guest_call_open() || CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _)| libprov::provider_return(r)))
+    libprov::guest_call_open() || CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _, _)| libprov::provider_return(r)))
 }
 
 /// [`LOOKUP_RING`], for a diagnostic.
@@ -2279,7 +2306,7 @@ pub(crate) fn provider_calls_recent() -> Vec<(u64, u64, u64)> {
 
 /// The call-outs this Worker has open, for a diagnostic: (return, sp wanted, callback depth).
 pub(crate) fn callouts_open() -> Vec<(u64, u64, u32)> {
-    CALLOUTS.with(|c| c.borrow().clone())
+    CALLOUTS.with(|c| c.borrow().iter().map(|&(r, w, d, _)| (r, w, d)).collect())
 }
 
 /// A call-out at depth `depth` (and every deeper one) was left by an

@@ -256,7 +256,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     } else {
         wasmtime::Func::wrap(
             &mut c,
-            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { fallback(&mut caller, ctx, ret as u64) })()) },
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, need: i32, ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { fallback(&mut caller, ctx, need as u32, ret as u64) })()) },
         )
     };
     let want = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size() + HEADROOM;
@@ -1041,7 +1041,7 @@ pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool>
 
 /// Index 1: code no function holds, under the `F_body` contract -- tier-1
 /// run nested until the guest returns to `ret` (the call-out).
-fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i32> {
+fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -> Result<i32> {
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let gm = GuestMem::new(memory.bytes());
     let c = ctx as u32 as u64;
@@ -1074,7 +1074,7 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
     if ret == gex_abi::ftab::NO_RETURN || target == ret {
         return Ok(gex_abi::ftab::RET_LEFT);
     }
-    call_out(caller, ctx, target, ret, sp + delta)
+    call_out(caller, ctx, target, ret, sp + delta, need)
 }
 
 /// Write the bridge into this store's dispatch tables at `slots`, each a

@@ -717,6 +717,22 @@ pub mod ftab {
     /// return writes the flags back too. A root passes [`NEED_ALL`].
     pub const NEED_FLAGS: u32 = 1;
     pub const NEED_ALL: u32 = u32::MAX;
+    /// `need` bits of a guest call from native code (its `ret` the native
+    /// return pad): the bytes of arguments the callee may pop. Its return
+    /// is the call's only with the stack pointer at most that far above the
+    /// return address's slot. Bodies read only [`NEED_FLAGS`] and pass
+    /// `need` on unchanged.
+    pub const NEED_ARGS: u32 = !3;
+
+    /// The argument bytes a native caller's `need` bounds its callee's
+    /// return by ([`NEED_ARGS`]); `None` for [`NEED_ALL`], which names none.
+    pub const fn need_args(need: u32) -> Option<u64> {
+        if need == NEED_ALL {
+            None
+        } else {
+            Some((need & NEED_ARGS) as u64)
+        }
+    }
 
     /// The `ret` a root passes: no code is there, so no return is predicted.
     pub const NO_RETURN: u64 = u64::MAX;
