@@ -273,6 +273,21 @@ else
 	case " ${CASES:-authattrs} " in *" authattrs "*)
 		fail=$((fail + 1)); echo "FAIL x64/authattrs ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
+# slots_bound NAME RUN1 RUN2 LOADS: the dispatch slots RUN2 spent beyond RUN1
+# (the lowest count left that a process exit reported, GEX_TIME_JIT), per
+# one of LOADS further image loads, must be under a page's worth.
+slots_bound() {
+	local l1 l2
+	l1=$(grep -ao 'slots left [0-9]*k' "$w/$2.err" | grep -o '[0-9]*' | sort -n | head -1)
+	l2=$(grep -ao 'slots left [0-9]*k' "$w/$3.err" | grep -o '[0-9]*' | sort -n | head -1)
+	if [ -z "$l1" ] || [ -z "$l2" ]; then
+		fail=$((fail + 1)); echo "FAIL x64/$1 ($tag): no slot counts in $2.err / $3.err"
+	elif [ $(( (l1 - l2) * 1000 / $4 )) -lt 4096 ]; then
+		pass=$((pass + 1)); echo "ok   x64/$1 ($tag): $(( (l1 - l2) * 1000 / $4 )) dispatch slots per further load (${l1}k -> ${l2}k left)"
+	else
+		fail=$((fail + 1)); echo "FAIL x64/$1 ($tag): $(( (l1 - l2) * 1000 / $4 )) dispatch slots per further load, want under 4096 (${l1}k -> ${l2}k left)"
+	fi
+}
 # Images loaded, run and unloaded one after another (dllcycle.c: 24 distinct
 # DLLs of ~1000 functions each, dllcycle-gen.py), as a plugin scan does: each
 # one's translations must go with it once it is unloaded. In the page, the
@@ -299,8 +314,8 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
 	if [ -n "$page" ] && case " ${CASES:-dllcycle} " in *" dllcycle "*) true ;; *) false ;; esac; then
 		f0=$fail; R=${RSS_ROUNDS:-4}
 		xR=$(python3 "$here/dllcycle-gen.py" 1000 --expect $((24 * R)))
-		EXTRA="$plugs" RSS_OUT="$w/rss1" CASES=dllcycle check dllcycle 0 "dllcycle 24 x $x24" "$w/dllcycle.exe" 24 1
-		EXTRA="$plugs" RSS_OUT="$w/rssR" CASES=dllcycleR TMO=${TMO:-$((300 * R))} check dllcycleR 0 "dllcycle $((24 * R)) x $xR" "$w/dllcycle.exe" 24 $R
+		EXTRA="$plugs" RSS_OUT="$w/rss1" CASES=dllcycle GEX_TIME_JIT=1 check dllcycle 0 "dllcycle 24 x $x24" "$w/dllcycle.exe" 24 1
+		EXTRA="$plugs" RSS_OUT="$w/rssR" CASES=dllcycleR GEX_TIME_JIT=1 TMO=${TMO:-$((300 * R))} check dllcycleR 0 "dllcycle $((24 * R)) x $xR" "$w/dllcycle.exe" 24 $R
 		if [ "$fail" = "$f0" ] && [ -s "$w/rss1" ] && [ -s "$w/rssR" ]; then
 			# KiB difference over the further loads, in MiB (one decimal kept for the log)
 			per10=$(( ($(cat "$w/rssR") - $(cat "$w/rss1")) * 10 / (24 * (R - 1)) / 1024 ))
@@ -311,6 +326,9 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
 				fail=$((fail + 1)); echo "FAIL x64/dllcycle-rss ($tag): $per MiB per further unloaded image (bound ${DLLCYCLE_MB:-18}; rss $(cat "$w/rss1") -> $(cat "$w/rssR") KiB, 24 -> $((24 * R)) loads)"
 			fi
 		fi
+		# An image loaded again at its base is numbered as before: the
+		# further rounds spend under a page of dispatch slots per load.
+		[ "$fail" = "$f0" ] && slots_bound dllcycle-slots dllcycle dllcycleR $((24 * (R - 1)))
 	else
 		EXTRA="$plugs" check dllcycle 0 "dllcycle 24 x $x24" "$w/dllcycle.exe" 24 1
 	fi
@@ -452,6 +470,35 @@ print(n, hex(lo))' "$w/$1.out" "$w/$1.err"
 		fi
 	else
 		fail=$((fail + 1)); echo "FAIL x64/xcache ($tag): x86_64-w64-mingw32-gcc"
+	fi
+fi
+# Three images that take turns at one address, each loaded, run and unloaded
+# in turn, as Wine's ACM codecs are (xcload2.c), with no translation cache:
+# each comes back at the base the others used. Every call gives its result,
+# and eight rounds spend under a page of dispatch slots per load beyond
+# one round.
+if [ -n "$page" ] && case " ${CASES:-dllswap} " in *" dllswap "*) true ;; *) false ;; esac; then
+	if x86_64-w64-mingw32-gcc -O1 -o "$w/xcload2.exe" "$here/xcload2.c" &&
+		for n in 1000 700 400; do
+			python3 "$here/dllcycle-gen.py" $n "$w/swap$n.c" &&
+				x86_64-w64-mingw32-gcc -O1 -shared -o "$w/swap$n.dll" "$w/swap$n.c" -Wl,--image-base=0x340000000 || exit 1
+		done; then
+		ops=() want=
+		for r in $(seq 8); do
+			for n in 1000 700 400; do
+				ops+=(swap$n.dll -)
+				want+="swap$n.dll x=$(python3 "$here/dllcycle-gen.py" $n --expect 1) base=[0-9A-Fa-f]+ size=[0-9a-f]+${nl}unloaded${nl}"
+			done
+			[ $r = 1 ] && { ops1=("${ops[@]}"); want1=$want; }
+		done
+		EXTRA="$w/swap1000.dll $w/swap700.dll $w/swap400.dll" CASES=dllswap GEX_TIME_JIT=1 \
+			check dllswap 0 "${want1%$nl}" "$w/xcload2.exe" "${ops1[@]}"
+		f0=$fail
+		EXTRA="$w/swap1000.dll $w/swap700.dll $w/swap400.dll" CASES=dllswap8 GEX_TIME_JIT=1 TMO=600 \
+			check dllswap8 0 "${want%$nl}" "$w/xcload2.exe" "${ops[@]}"
+		[ "$fail" = "$f0" ] && slots_bound dllswap-slots dllswap dllswap8 21
+	else
+		fail=$((fail + 1)); echo "FAIL x64/dllswap ($tag): x86_64-w64-mingw32-gcc"
 	fi
 fi
 # The same cache with two such DLLs that trade places: each run loads A then

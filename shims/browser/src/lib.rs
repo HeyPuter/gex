@@ -642,6 +642,21 @@ fn shared_page_table(
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
         let base = unsafe { k_slot_alloc(n) };
+        // Each tenth of the runtime space (the upper half of the tables)
+        // spent is said once, by the allocation that crosses it (ranges are
+        // disjoint, so one in the whole system), so a run can be watched
+        // approaching the end.
+        {
+            let runtime = slot_space_top() / 2;
+            let tenth = |s: u64| s.saturating_sub(runtime) * 10 / runtime;
+            if tenth(base + n) > tenth(base) {
+                warn_line(&format!(
+                    "[gex] dispatch slots: {}0% of the runtime space spent ({}k left)\n",
+                    tenth(base + n).min(10),
+                    slot_space_top().saturating_sub(base + n) / 1000
+                ));
+            }
+        }
         // The one place every runtime slot comes from, so the one place that
         // can say the space is gone. Past the top of the last dispatch table
         // `PageTable::base` divides into a table index of `DISPATCH_TABLES`,
@@ -2607,7 +2622,15 @@ pub(crate) fn xlate_add(i: usize, n: u64) {
 
 #[no_mangle]
 pub extern "C" fn gex_xlate_stat(i: u32) -> i64 {
-    XLATE_STAT.get(i as usize).map_or(-1, |c| c.load(std::sync::atomic::Ordering::Relaxed) as i64)
+    // 10 and 11: code named by its bytes, mappings and bytes hashed.
+    let c = match i {
+        10 | 11 => &gex_kernel::mem::CONTENT_HASHED[i as usize - 10],
+        _ => match XLATE_STAT.get(i as usize) {
+            Some(c) => c,
+            None => return -1,
+        },
+    };
+    c.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 /// `gex_set_inline_dispatch(1)` (`?inlinedispatch=1`, `GEX_INLINE_DISPATCH=1`
@@ -11799,11 +11822,15 @@ pub extern "C" fn gex_xcache_restore() -> i32 {
     unsafe { k_store_restore() }
 }
 
-/// Name code read into memory by its bytes only in a load that keeps a cache
-/// of translations by name (`k_xcache_on`): the hashing is that cache's cost.
+/// Name code read into memory by its bytes wherever something keeps
+/// translations by name: a cache of translations (`k_xcache_on`), or the
+/// system's slot map, which numbers x86 pages by identity
+/// (`shared_page_table`). Unnamed, an image read into memory and unloaded
+/// gets fresh dispatch slots at every load, at the same address too, and a
+/// run that cycles a few such images spends the whole slot space.
 fn note_content_names() {
     // SAFETY: scalars out of the kernel, no borrow.
-    let on = unsafe { k_present() != 0 && k_xcache_on() != 0 };
+    let on = unsafe { k_present() != 0 && (gex_abi::X86 || k_xcache_on() != 0) };
     gex_kernel::mem::set_content_names(on);
 }
 
