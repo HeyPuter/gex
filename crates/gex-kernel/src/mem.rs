@@ -50,9 +50,14 @@ pub const CONTENT_ID: &str = "content:";
 pub const CONTENT_NAMINGS: u32 = 4;
 
 /// Whether code is named by its bytes at all: only something that keeps
-/// translations by name (a translation cache across loads) needs it, so with
-/// none it costs nothing. The host sets it; off until it does.
+/// translations by name (a translation cache across loads, a system-wide
+/// numbering of pages by identity) needs it, so with none it costs nothing.
+/// The host sets it; off until it does.
 static CONTENT_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Code named by its bytes so far in this process: how many mappings, and
+/// how many bytes were hashed for them (`GEX_TIME_JIT`'s `named`).
+pub static CONTENT_HASHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Name code by its bytes from now on ([`MemoryMap::name_by_content`]).
 pub fn set_content_names(on: bool) {
@@ -1608,7 +1613,13 @@ impl MemoryMap {
                 continue;
             }
             v.namings = v.namings.saturating_add(1);
-            let fresh = if v.namings <= CONTENT_NAMINGS { name(v.start, v.end) } else { None };
+            let fresh = if v.namings <= CONTENT_NAMINGS {
+                CONTENT_HASHED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                CONTENT_HASHED[1].fetch_add(v.end - v.start, std::sync::atomic::Ordering::Relaxed);
+                name(v.start, v.end)
+            } else {
+                None
+            };
             if fresh.is_none() && v.code.is_none() {
                 continue;
             }
