@@ -14,7 +14,7 @@ const GUEST_BYTES = 0xffff0000;
 import { kernelThread, lazyFetch, processMemories } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
-import { logOn, logQuiet } from "./log.mjs";
+import { logNamed, logOn, logQuiet } from "./log.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -328,6 +328,19 @@ const ENTRY_WRAP = new Uint8Array([
   3, 2, 1, 1,
   7, 5, 1, 1, 101, 0, 1,
   10, 8, 1, 6, 0, 32, 0, 18, 0, 11,
+]);
+// `GEX_LOG=bridges`: a unit bridge that tells `count` the context, then goes
+// on to the bridge.
+// (module (type (func (param i32)))
+//   (import "w" "count" (func (type 0))) (import "w" "real" (func (type 0)))
+//   (func (export "c") (type 0) local.get 0 call 0 local.get 0 return_call 1))
+const BRIDGE_COUNT = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 5, 1, 96, 1, 127, 0,
+  2, 20, 2, 1, 119, 5, 99, 111, 117, 110, 116, 0, 0, 1, 119, 4, 114, 101, 97, 108, 0, 0,
+  3, 2, 1, 0,
+  7, 5, 1, 1, 99, 0, 2,
+  10, 12, 1, 10, 0, 32, 0, 16, 0, 32, 0, 18, 1, 11,
 ]);
 // A watched arm of an entry: arm `arm` calls `hit` as the block-type watch
 // stub does (returns when it says so, else traps), every other arm goes on
@@ -4106,7 +4119,8 @@ export class Gex {
     // Dense: the shim's runtime module dispatches through `blocks` too.
     if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
-    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri], dyl: new Map() };
+    const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map() };
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
@@ -4374,6 +4388,7 @@ export class Gex {
     for (let j = 0; j + 1 < regs.length; j += 2) {
       (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
     }
+    if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
     st.instances.push(inst);
     // The first Worker to install a JIT module writes the directory for the
     // pages it numbered (idempotent).
@@ -4975,6 +4990,7 @@ export class Gex {
       for (let j = 0; j + 1 < regs.length; j += 2) {
         (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
       }
+      if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       e.gex_wasmdll_bind_done(i);
       this.#wasmdllHave++;
     }
@@ -5734,6 +5750,7 @@ export class Gex {
         for (let j = 0; j + 1 < regs.length; j += 2) {
           (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
         }
+        if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       }
     }
     // A Worker with the function JIT on but no units of its own still
@@ -8555,6 +8572,35 @@ export class Gex {
     if (this.#entryWrapped.has(miss)) return;
     const w = this.#entryOf(miss);
     for (let i = 0; i < b.length; i++) if (b.get(i) === miss) b.set(i, w);
+  }
+
+  /** `GEX_LOG=bridges`: the unit-entry addresses this Worker entered
+   *  through a bridge, and the bridges it wrote into its tables. */
+  #bridgeCount = null;
+
+  /** `real` (the runtime module's unit bridge), counting the distinct
+   *  addresses entered through it. A line names the new ones: the first
+   *  eight at once, then at most one line a second or per 64 -- a Worker
+   *  parked in a wait says nothing later. */
+  #countBridges(real) {
+    const seen = new Set();
+    let fresh = [];
+    let said = 0;
+    const c = { bridged: 0 };
+    this.#bridgeCount = c;
+    const say = () => {
+      console.error(`[bridges] ${this.#whoFills()}: entered ${seen.size} of ${c.bridged} bridged; new ${fresh.map((pc) => pc.toString(16)).join(',')}`);
+      fresh = [];
+      said = performance.now();
+    };
+    const count = (ctx) => {
+      const pc = new DataView(this.#memory.buffer).getBigUint64((ctx >>> 0) + CTX_LAST_TARGET, true);
+      if (seen.has(pc)) return;
+      seen.add(pc);
+      fresh.push(pc);
+      if (seen.size <= 8 || fresh.length >= 64 || performance.now() - said >= 1000) say();
+    };
+    return new WebAssembly.Instance(new WebAssembly.Module(BRIDGE_COUNT), { w: { count, real } }).exports.c;
   }
 
   /** The wrappers `#entryOf` made. */
