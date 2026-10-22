@@ -59,4 +59,20 @@ for src in "$HERE"/*.c "$HERE"/*.cpp; do
         fail=1
     fi
 done
+# Whatever GEXCC_SHARED says above: a program linked against libc.so starts
+# (gex's loader fills libc's registry of shared libraries, which a musl
+# without it does not have), in C and in C++ with a throw caught.
+printf '#include <stdio.h>\nint main(void){puts("shared c");return 0;}\n' > "$WORK/sh.c"
+printf '#include <cstdio>\nint main(){try{throw 7;}catch(int e){std::printf("shared c++ %%d\\n",e);}return 0;}\n' > "$WORK/shx.cpp"
+for t in "gexcc sh.c sh shared c" "gexc++ shx.cpp shx shared c++ 7"; do
+    set -- $t; cc_=$1; src=$2; out=$3; shift 3; want="$*"
+    got=$(cd "$WORK" && GEXCC_SHARED=1 $cc_ -O2 -o "$out" "$src" 2>&1 &&
+          LD_LIBRARY_PATH="$(gexcc --print-sysroot)/lib" "./$out" 2>&1)
+    if [ "$got" = "$want" ]; then
+        echo "ok   shared-$out"
+    else
+        echo "FAIL shared-$out: '$got' (want '$want')"
+        fail=1
+    fi
+done
 exit $fail
