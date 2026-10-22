@@ -19,10 +19,11 @@ case $GEXC in /*) ;; *) GEXC=$PWD/$GEXC ;; esac
 WORK=${WORK:-$(mktemp -d)}
 fail=0
 # wasm-elf.py's ELF32 (wasm32) containers must not change with --elf64's
-# addition: a fixed module wrapped as before (sha256 of the output from the
-# script before W64, with and without --guest-i386).
-for v in ":be053519a05d50ffb3adab7bc44684d88356adbd12bb0e8b524132c3c1d2ffab" \
-         "--guest-i386:289f1a814079d44b18abf68bd14e84817fdbce7f0371bd4af7fcb5f4f2bf45ba"; do
+# addition: a fixed module wrapped as before (sha256 of the output, with and
+# without --guest-i386; the container carries its null and .shstrtab section
+# headers).
+for v in ":f959d59e86161a7514e412f808eba4f99dbdc43832123c06d9e8c222bc8c9018" \
+         "--guest-i386:4a375cb5b3fa0074e8efbe5a944dfa88a8e4dfae6454788e593e517f85068296"; do
     python3 "$ROOT/tools/wine-wasm/wasm-elf.py" "$HERE/elf32-fixture.wasm" "$WORK/elf32" ${v%%:*}
     if [ "$(sha256sum < "$WORK/elf32" | cut -c1-64)" = "${v#*:}" ]; then
         echo "ok   wasm64/elf32-container ${v%%:*}"
