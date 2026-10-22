@@ -2093,6 +2093,20 @@ fn run_thread_loop(
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
     store.data_mut().root_enter = Some(enter.clone());
+    // Units for code that is in place before the first instruction (the
+    // interpreter, which gex's loader places): installed now, not at the
+    // first syscall, or what runs before it -- ld.so relocating itself --
+    // goes to the runtime translator in every process. The maps stay
+    // pending for the first syscall's other consumers.
+    if store.data().jit.is_some() {
+        let pending: Vec<gex_kernel::CodeMap> = store.data_mut().with_kernel(|k| k.mem.lock().log.new_code.clone());
+        if !pending.is_empty() {
+            let place = wasmtime::Func::wrap(&mut *store, move |mut caller: Caller<'_, HostState>| -> wasmtime::Result<()> {
+                crate::host(pe_units::on_elf_maps(&mut caller, &pending))
+            });
+            place.call(&mut *store, &[], &mut [])?;
+        }
+    }
     let mut pc = entry;
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
     loop {

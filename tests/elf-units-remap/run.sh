@@ -5,7 +5,8 @@
 # code was unmapped is retired, not revived by the next object's mapping
 # (pe_units::on_retire, ftab::on_retire; the browser's cgen::on_retire).
 # The interpreter has a unit too: gex's loader places it, and the kernel
-# announces it as the guest's own mmap would have (CodeMap::of_placed).
+# announces it as the guest's own mmap would have (CodeMap::of_placed), and
+# its unit is installed before ld.so's first instruction.
 #
 #   tests/elf-units-remap/run.sh [gexc]      (needs gcc; host glibc as the guest's)
 set -u
@@ -41,4 +42,16 @@ for flags in "" "--fjit"; do
 		printf 'native:\n%s\ngex:\n%s\n' "$native" "$gex"; tail -20 "$W/err.txt"; fail=1
 	fi
 done
+# The interpreter's unit is in before its first instruction: ld.so's own
+# start (relocating itself, up to its first system call) runs on the unit,
+# not on the runtime translator. Its line comes before the first syscall's.
+timeout 60 "$GEXC" run --strace --pin "$W/pins.txt" "$W/main" "$W" > /dev/null 2> "$W/strace.txt"
+first_unit=$(grep -n "function tier for $INTERP at 0x4a00000" "$W/strace.txt" | head -1 | cut -d: -f1)
+first_sys=$(grep -n '^\[gex:1\] pc=' "$W/strace.txt" | head -1 | cut -d: -f1)
+if [ -n "$first_unit" ] && [ -n "$first_sys" ] && [ "$first_unit" -lt "$first_sys" ]; then
+	echo "ok   elf-units-remap interpreter unit before its first system call"
+else
+	echo "FAIL elf-units-remap interpreter unit before its first system call (unit line ${first_unit:-none}, first system call line ${first_sys:-none})"
+	head -6 "$W/strace.txt"; fail=1
+fi
 exit $fail
