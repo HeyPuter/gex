@@ -549,11 +549,13 @@ for k, (s, lang) in enumerate(srcs):
     if r:
         sys.exit(r)
     objs.append(o)
-if not objs and not inputs:
-    # build systems ask the linker who it is (Meson: -Wl,--version)
+if not objs and all(x.startswith('-l') for x in inputs):
+    # build systems ask the linker who it is (Meson: -Wl,--version, with
+    # the project's link arguments, libraries too)
     if any(f in ('--version', '-v', '--help') for f in ld_flags):
         os.execvp('wasm-ld', ['wasm-ld'] + [f for f in ld_flags if f in ('--version', '-v', '--help')][:1])
-    die('no input files')
+    if not inputs:
+        die('no input files')
 if out is None:
     out = 'a.out'
 if out == '/dev/null':

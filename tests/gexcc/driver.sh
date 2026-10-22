@@ -163,4 +163,10 @@ GEXCC_SHARED=1 gexcc -shared -fPIC -o "$W/vr/libvr.so" "$W/vr/l.c" &&
     GEXCC_SHARED=1 gexcc -o "$W/vr/m" "$W/vr/m.c" -L"$W/vr" -lvr 2> "$W/log" &&
     grep -q 'its result is dropped' "$W/log" && ! grep -q 'calls to it trap' "$W/log"
 check $? "a void declaration of a library's int function calls it"
+# Meson asks the linker's version with the project's link arguments (systemd: -lm)
+for env in "" GEXCC_SHARED=1; do
+    env $env gexcc -Wl,--version -Wl,--push-state,--no-as-needed,-lm,--pop-state > "$W/log" 2>&1 &&
+        grep -q LLD "$W/log"
+    check $? "-Wl,--version with a library to link answers the linker's version${env:+ ($env)}"
+done
 exit $fail
