@@ -1365,6 +1365,7 @@ fn run_program_with(
         prof_proc: prof_proc.clone(),
         nt: store.data().nt.clone(),
     });
+    note_live_process(&spawn);
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
     // The interpreter is placed by gex's own loader, not by a guest `mmap`,
@@ -1516,6 +1517,36 @@ fn run_program_with(
         }
     }
     Ok((exit, stats))
+}
+
+/// The processes of this run, while recording: when the run ends, those still
+/// going are stopped so that their threads fold their counts in.
+static LIVE_PROCESSES: Mutex<Vec<std::sync::Weak<SpawnContext>>> = Mutex::new(Vec::new());
+
+fn note_live_process(spawn: &Arc<SpawnContext>) {
+    if !profile::active() {
+        return;
+    }
+    let mut live = LIVE_PROCESSES.lock().unwrap_or_else(|e| e.into_inner());
+    live.retain(|w| w.strong_count() > 0);
+    live.push(Arc::downgrade(spawn));
+}
+
+/// Ask every process still running to stop, as its own end would: each
+/// thread stops at its next syscall or safepoint, or wakes from a wait.
+pub(crate) fn stop_every_process() {
+    let live: Vec<Arc<SpawnContext>> = LIVE_PROCESSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    for spawn in &live {
+        spawn.stopping.store(true, std::sync::atomic::Ordering::Release);
+        let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        k.futexes.wake_everything();
+    }
+    ready::notify();
 }
 
 /// Bring every other guest thread to a halt after the process has exited.
@@ -2432,6 +2463,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // Windows has no fork: only a Linux process gets here.
         nt: None,
     });
+    note_live_process(&child_cx);
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.procs

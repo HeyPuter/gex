@@ -21,7 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use gex_xlate::profile::{self as gp, FileEntry, ObjectEntry, Placements, Profile, Session};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::{AsContextMut, Memory, MemoryType};
 
@@ -47,6 +47,9 @@ pub struct Recorder {
     /// The top-level run has finished and written its files; later harvests
     /// (a child that outlived it) rewrite them.
     finished: AtomicBool,
+    /// Stores whose counts have not had their last harvest: a process still
+    /// running when the run ends holds some, and `finish` waits for them.
+    live: AtomicUsize,
 }
 
 struct RecState {
@@ -78,6 +81,31 @@ pub struct StoreProf {
     syscalls: HashMap<(u64, Option<u64>, u64), u64>,
     /// An open/openat/execve in flight: `(canonical nr, path, flags, dirfd)`.
     pending: Option<(u64, String, u64, u64)>,
+    /// Counted in `Recorder::live` until the thread's last harvest.
+    live: Live,
+}
+
+/// One store's place in `Recorder::live`, given up once.
+struct Live(AtomicBool);
+
+impl Live {
+    fn new(rec: &Recorder) -> Live {
+        rec.live.fetch_add(1, Ordering::AcqRel);
+        Live(AtomicBool::new(true))
+    }
+    fn release(&self) {
+        if self.0.swap(false, Ordering::AcqRel) {
+            if let Some(rec) = recorder() {
+                rec.live.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Name syscalls in written profiles and manifests with the kernel's full
@@ -120,6 +148,7 @@ pub fn start(out: PathBuf, opts: &crate::RunOptions) -> Result<()> {
         }),
         epoch: AtomicU64::new(0),
         finished: AtomicBool::new(false),
+        live: AtomicUsize::new(0),
     });
     if RECORDER.set(Arc::clone(&rec)).is_err() {
         return Ok(());
@@ -456,6 +485,7 @@ pub fn link(
             proc,
             syscalls: HashMap::new(),
             pending: None,
+            live: Live::new(rec),
         });
     }
     let mem = store.as_context().data().prof.as_ref().unwrap().mem;
@@ -496,9 +526,18 @@ pub fn attach(mut store: impl AsContextMut<Data = HostState>, instance: &wasmtim
     Ok(())
 }
 
-/// Fold this store's counts into the recorder, zeroing them. Called when a
-/// thread or process ends, and for an on-demand dump.
+/// A thread has stopped running guest code: fold its counts in for the last
+/// time.
 pub fn harvest(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
+    let r = fold(&mut store);
+    if let Some(p) = store.as_context().data().prof.as_ref() {
+        p.live.release();
+    }
+    r
+}
+
+/// Fold this store's counts into the recorder, zeroing them.
+fn fold(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
     let Some(rec) = recorder() else {
         return Ok(());
     };
@@ -541,7 +580,7 @@ pub fn poll(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
         .is_some_and(|p| p.seen_epoch < now);
     if behind {
         store.as_context_mut().data_mut().prof.as_mut().unwrap().seen_epoch = now;
-        harvest(&mut store)?;
+        fold(&mut store)?;
         write(rec)?;
     }
     Ok(())
@@ -696,10 +735,24 @@ fn write(rec: &Recorder) -> Result<()> {
 }
 
 /// The top-level run is over: record how it ended and write the files.
+/// Processes still running (daemons the run started) are stopped first, so
+/// their counts are folded in rather than lost when the host exits.
 pub fn finish(exit: &crate::Exit) -> Result<Option<PathBuf>> {
     let Some(rec) = recorder() else {
         return Ok(None);
     };
+    if rec.live.load(Ordering::Acquire) > 0 {
+        let started = std::time::Instant::now();
+        crate::stop_every_process();
+        let deadline = started + std::time::Duration::from_secs(10);
+        while rec.live.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let left = rec.live.load(Ordering::Acquire);
+        if left > 0 {
+            eprintln!("gex: profile: {left} threads did not stop at the end of the run; their counts are missing");
+        }
+    }
     {
         let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
         st.session.exit = Some(match exit {
@@ -744,8 +797,50 @@ mod tests {
             ];
             (code.iter().flat_map(|w| w.to_le_bytes()).collect(), 20)
         };
+        let image = image(base, bytes);
+        let _one = ONE_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir();
+        let opts = crate::RunOptions {
+            args: vec!["/nonexistent/prog".into()],
+            record: Some(dir.clone()),
+            jit: true,
+            cache: false,
+            ..Default::default()
+        };
+        let (exit, _) = crate::run_image(&image, &opts, &gex_xlate::Options::default()).unwrap();
+        assert_eq!(exit, crate::Exit::Status(0));
+        let out = super::finish(&exit).unwrap().unwrap();
+        let text = std::fs::read_to_string(out.join("profile.json")).unwrap();
+        let p = gex_xlate::profile::Profile::from_json(&text).unwrap();
+        // No file behind the image, so its code is anonymous, by address.
+        let o = &p.objects[gex_xlate::profile::ANON];
+        let f = &o.blocks[&(base + f_off)];
+        assert_eq!((f.n, f.call), (2, 2), "{text}");
+        let r = &o.returns[&(base + f_off)];
+        assert_eq!((r.expected, r.unexpected), (2, 0), "{text}");
+        let sys: u64 = o.syscalls.iter().filter(|((_, _, nr), _)| *nr == 94).map(|(_, n)| n).sum();
+        assert_eq!(sys, 1, "{text}");
+        let session = std::fs::read_to_string(out.join("session.json")).unwrap();
+        let s = gex_xlate::profile::Session::from_json(&session).unwrap();
+        assert_eq!(s.syscalls.get(&94), Some(&1));
+        assert_eq!(s.exit.as_deref(), Some("status 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recorder is one per process, so the tests take turns with it and
+    /// share its directory, which each makes and removes.
+    static ONE_RECORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gex-profile-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An image of `bytes` at `base`, read and run in place.
+    fn image(base: u64, bytes: Vec<u8>) -> Image {
         let len = bytes.len() as u64;
-        let image = Image {
+        Image {
             soname: None,
             needed: Vec::new(),
             runpath: Vec::new(),
@@ -775,8 +870,55 @@ mod tests {
             irelative: Vec::new(),
             pie: false,
             interp: None,
+        }
+    }
+
+    /// A child still running when the run ends: its counts are in the
+    /// profile. The parent forks, waits on a pipe until the child has called
+    /// `f`, and exits (`exit`, so the other test's `exit_group` count is its
+    /// own); the child then sleeps in `ppoll` for ever.
+    #[test]
+    fn records_a_process_still_running_at_the_end() {
+        let base = 0x50_0000u64;
+        let (bytes, f_off): (Vec<u8>, u64) = if gex_abi::X86 {
+            (
+                vec![
+                    72, 131, 236, 16, // sub rsp, 16
+                    72, 137, 231, // mov rdi, rsp
+                    49, 246, // xor esi, esi
+                    184, 37, 1, 0, 0, 15, 5, // pipe2
+                    184, 57, 0, 0, 0, 15, 5, // fork
+                    72, 133, 192, 116, 26, // test rax, rax; jz child
+                    139, 60, 36, 72, 141, 116, 36, 8, 186, 1, 0, 0, 0, 49, 192, 15, 5, // read(fds[0], rsp+8, 1)
+                    49, 255, 184, 60, 0, 0, 0, 15, 5, // exit(0)
+                    232, 39, 0, 0, 0, // child: call f
+                    139, 124, 36, 4, 72, 141, 116, 36, 8, 186, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, // write(fds[1], rsp+8, 1)
+                    49, 255, 49, 246, 49, 210, 69, 49, 210, 184, 15, 1, 0, 0, 15, 5, // ppoll(0, 0, 0, 0)
+                    235, 238, // jmp back to the ppoll
+                    195, // f: ret
+                ],
+                98,
+            )
+        } else {
+            let code: [u32; 35] = [
+                0xd10043ff, // sub sp, sp, #16
+                0x910003e0, 0xd2800001, 0xd2800768, 0xd4000001, // pipe2(sp, 0)
+                0xd2800220, 0xd2800001, 0xd2800002, 0xd2800003, 0xd2800004, 0xd2801b88,
+                0xd4000001, // clone(SIGCHLD, 0, 0, 0, 0)
+                0xb4000120, // cbz x0, child
+                0xb94003e0, 0x910023e1, 0xd2800022, 0xd28007e8, 0xd4000001, // read(fds[0], sp+8, 1)
+                0xd2800000, 0xd2800ba8, 0xd4000001, // exit(0)
+                0x9400000d, // child: bl f
+                0xb94007e0, 0x910023e1, 0xd2800022, 0xd2800808, 0xd4000001, // write(fds[1], sp+8, 1)
+                0xd2800000, 0xd2800001, 0xd2800002, 0xd2800003, 0xd2800928,
+                0xd4000001, // ppoll(0, 0, 0, 0)
+                0x17fffffa, // b back to the ppoll
+                0xd65f03c0, // f: ret
+            ];
+            (code.iter().flat_map(|w| w.to_le_bytes()).collect(), 136)
         };
-        let dir = std::env::temp_dir().join(format!("gex-profile-test-{}", std::process::id()));
+        let _one = ONE_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir();
         let opts = crate::RunOptions {
             args: vec!["/nonexistent/prog".into()],
             record: Some(dir.clone()),
@@ -784,23 +926,14 @@ mod tests {
             cache: false,
             ..Default::default()
         };
-        let (exit, _) = crate::run_image(&image, &opts, &gex_xlate::Options::default()).unwrap();
+        let (exit, _) = crate::run_image(&image(base, bytes), &opts, &gex_xlate::Options::default()).unwrap();
         assert_eq!(exit, crate::Exit::Status(0));
         let out = super::finish(&exit).unwrap().unwrap();
         let text = std::fs::read_to_string(out.join("profile.json")).unwrap();
         let p = gex_xlate::profile::Profile::from_json(&text).unwrap();
-        // No file behind the image, so its code is anonymous, by address.
         let o = &p.objects[gex_xlate::profile::ANON];
-        let f = &o.blocks[&(base + f_off)];
-        assert_eq!((f.n, f.call), (2, 2), "{text}");
-        let r = &o.returns[&(base + f_off)];
-        assert_eq!((r.expected, r.unexpected), (2, 0), "{text}");
-        let sys: u64 = o.syscalls.iter().filter(|((_, _, nr), _)| *nr == 94).map(|(_, n)| n).sum();
-        assert_eq!(sys, 1, "{text}");
-        let session = std::fs::read_to_string(out.join("session.json")).unwrap();
-        let s = gex_xlate::profile::Session::from_json(&session).unwrap();
-        assert_eq!(s.syscalls.get(&94), Some(&1));
-        assert_eq!(s.exit.as_deref(), Some("status 0"));
+        let f = o.blocks.get(&(base + f_off)).map(|b| b.n);
+        assert_eq!(f, Some(1), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
