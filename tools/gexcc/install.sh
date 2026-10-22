@@ -54,11 +54,18 @@ rm -f "$L/hoststub.o" "$L/hoststub.elf"
 mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
 clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
-for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/*.s; do
+for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/poll.s; do
   clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
 llvm-ar crs "$PREFIX/sysroot/lib/libgexcc.a" "$PREFIX"/build/rt/*.o
+# the C++ exception tag: a static program's own; libc.so's for a shared
+# program and its libraries, which import it (so not in libgexcc.a, which
+# each module links)
+mkdir -p "$PREFIX/build/rt-eh"
+clang $WASM_CFLAGS -c "$HERE/rt/cpp_exception.s" -o "$PREFIX/build/rt-eh/cpp_exception.o"
+rm -f "$PREFIX/sysroot/lib/libgexcc_eh.a"
+llvm-ar crs "$PREFIX/sysroot/lib/libgexcc_eh.a" "$PREFIX/build/rt-eh/cpp_exception.o"
 # an empty object: -shared's archives carry their deps in a copy of it
 echo 'typedef int gexcc_empty;' | clang $WASM_CFLAGS -x c -c - -o "$L/empty.o"
 GEXC=${GEXC:-}

@@ -920,11 +920,23 @@ LDC_SHARED = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memo
               '--extra-features=atomics,bulk-memory']
 
 
+def own_unwind():
+    """libunwind ahead of the side modules: every C++ library has its own
+    copy and exports its landing-pad context, which is thread-local in the
+    module that defines it but plain data as another module's export, so a
+    module whose code throws or catches takes libunwind's own (each module
+    unwinds through its own copy, as -Bsymbolic has a library do)."""
+    if nostdlib or nodefaultlibs or not os.path.exists(LIB + '/libunwind.a'):
+        return []
+    return [LIB + '/libunwind.a']
+
+
 def shared_undef():
-    """setjmp's exception tag is libc's (libgex), one for the process so a
-    longjmp crosses modules: imported (a .so's symbols carry no tags)."""
+    """setjmp's exception tag and C++'s are libc's (libgex, libgexcc), one
+    for the process so a longjmp or a throw crosses modules: imported (a
+    .so's symbols carry no tags)."""
     f = os.path.join(tmp, 'undef-tags')
-    open(f, 'w').write('__c_longjmp\n')
+    open(f, 'w').write('__c_longjmp\n__cpp_exception\n')
     return ['--allow-undefined-file=' + f]
 
 if shared and SHARED:
@@ -950,7 +962,7 @@ if shared and SHARED:
     if not re.search(r'(^|,)(--no-undefined|-z,defs|-zdefs|-z defs)(,|$)', wl):
         pre += ['--unresolved-symbols=import-dynamic']
     r = link_shared(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm]
-            + ['--rpath=' + x for x in ld_opts['rpath']] + objs + pre + sos + ld_flags)
+            + ['--rpath=' + x for x in ld_opts['rpath']] + objs + pre + own_unwind() + sos + ld_flags)
     if r:
         sys.exit(r)
     finish_shared(wasm, sos, True)
@@ -1010,6 +1022,9 @@ if not (nostdlib or nodefaultlibs):
     # gex's support library first: its dlopen, __dlsym and vfork replace
     # libc's; the setjmp runtime and the signal frames are only there.
     libs += [LIB + '/libgex.a', LIB + '/libc.a', LIB + '/libclang_rt.builtins-wasm32.a']
+    # the C++ exception tag (a shared program imports libc.so's)
+    if os.path.exists(LIB + '/libgexcc_eh.a'):
+        libs.append(LIB + '/libgexcc_eh.a')
     # gexcc's runtime: the loop safepoint (rt/poll.c)
     if os.path.exists(LIB + '/libgexcc.a'):
         libs.insert(0, LIB + '/libgexcc.a')
@@ -1031,7 +1046,7 @@ if SHARED:
     # it calls the program's __gex_start_c, and libc gives the program's
     # thread-local block its place (dso.o: its __tls_base setter)
     if not (nostdlib or nodefaultlibs):
-        libs = [l for l in libs if not l.endswith(('/libgex.a', '/libc.a', '/libgexcc.a'))]
+        libs = [l for l in libs if not l.endswith(('/libgex.a', '/libc.a', '/libgexcc.a', '/libgexcc_eh.a'))]
         libs = [LIB + '/libc_nonshared.a', LIB + '/libc.so', LIB + '/libgexcc.a'] + libs
     sos = by_soname(ins + libs)
     exp = ['--export=__gex_start_c', '--export-if-defined=__wasm_init_tls', '--export-if-defined=__tls_size',
@@ -1039,7 +1054,7 @@ if SHARED:
     if export_dynamic:
         exp.append('--export-dynamic')
     cmd = LDC_SHARED + ['-pie', '--no-entry', '-o', wasm] + exp + ['--rpath=' + x for x in ld_opts['rpath']] \
-        + crt + objs + [os.path.join(LIBDIR, 'dso.o')] + sos + ld_flags + shared_undef()
+        + crt + objs + [os.path.join(LIBDIR, 'dso.o')] + own_unwind() + sos + ld_flags + shared_undef()
     r = link_shared(cmd)
     if r:
         sys.exit(r)

@@ -16,7 +16,7 @@ rm -rf "$W"; mkdir -p "$W/lc" "$W/gx" "$W/ns"
 clang $WASM_CFLAGS -c "$HERE/dso.s" -o "$PREFIX/lib/gexcc/dso.o"
 # musl's archive repeats member names: extracted under unique ones
 python3 "$HERE/arx.py" "$L/libc.a" "$W/lc"
-(cd "$W/gx" && llvm-ar x "$L/libgex.a" && llvm-ar x "$L/libgexcc.a")
+(cd "$W/gx" && llvm-ar x "$L/libgex.a" && llvm-ar x "$L/libgexcc.a" && llvm-ar x "$L/libgexcc_eh.a")
 # the loop safepoint's countdown is every module's own (gexcc links
 # libgexcc.a's into each)
 rm -f "$W"/gx/poll.*
