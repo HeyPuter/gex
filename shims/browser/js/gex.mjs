@@ -4543,6 +4543,25 @@ export class Gex {
     return this.#provTag;
   }
 
+  /** What reached the run loop, for a crash report: an Error's message, a
+   *  wasm exception by the export name of its tag in this Worker's modules
+   *  (a C++ throw or a longjmp whose catching frame is not on this stack),
+   *  anything else as itself. Asked only when reporting. */
+  #thrownName(err) {
+    if (err instanceof Error) return err.message;
+    if (typeof WebAssembly.Exception === 'function' && err instanceof WebAssembly.Exception) {
+      const mods = [['shim', this.#shim], ['guest', this.#guest], ...(this.#cgen?.instances ?? []).map((m, i) => [`unit ${i}`, m])];
+      for (const [who, inst] of mods) {
+        for (const [name, v] of Object.entries(inst?.exports ?? {})) {
+          if (v instanceof WebAssembly.Tag && err.is(v)) return `a wasm exception, tag ${name} of the ${who} module`;
+        }
+      }
+      if (this.#provTag && err.is(this.#provTag)) return 'a wasm exception, the provider tag';
+      return 'a wasm exception whose tag no module of this Worker exports';
+    }
+    return `a thrown ${typeof err}: ${String(err)}`;
+  }
+
   /** What a replaced Linux library's wasm64 provider imports from `gex` (the native
    *  `libprov::register64`; docs/unity-dotnet.md P5 B1). Pointers and table indices
    *  are i64 (BigInt). */
@@ -6100,7 +6119,7 @@ export class Gex {
             );
           });
           throw new Error(
-            `the gex runtime trapped inside the shim (${err.message}${at}${lr}${nr}` +
+            `the gex runtime trapped inside the shim (${this.#thrownName(err)}${at}${lr}${nr}` +
               `${code}${heap}${where}` +
               `${this.#shim.exports.gex_panic_reporting?.() ? '; it panicked again inside the panic report, whose message is lost (the first is above)' : ''}` +
               `). That is a crash in the runtime, not a guest exit; ` +
