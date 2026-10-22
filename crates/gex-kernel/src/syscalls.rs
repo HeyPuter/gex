@@ -4334,7 +4334,7 @@ impl NetIo<'_> {
             // treat the socket as broken.
             // agreed to without effect, on a descriptor that exists
             nr::SETSOCKOPT => io.fds.get(fd).map(|_| 0),
-            nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3]),
+            nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
             // global kernel; the proxied network's as it can; anything else
             // just agrees.
@@ -4794,7 +4794,7 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     }
 }
 
-fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64) -> SysResult {
+fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64, optlen: u64) -> SysResult {
     const SOL_SOCKET: u64 = 1;
     const SO_TYPE: u64 = 3;
     const SO_ERROR: u64 = 4;
@@ -4826,32 +4826,92 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         socket_family_type(io, fd)?;
         return Err(Errno::ENOPROTOOPT);
     }
-    let err = if name == SO_ERROR {
+    if level == SOL_SOCKET && name == SO_ERROR {
         // A unix socket (local or the global kernel's) has no connect
         // in progress to report: zero, as for a socketpair end on Linux.
-        let Ok(sock) = io.socket_of(fd) else {
-            socket_family_type(io, fd)?;
-            if val != 0 {
-                m.write_u32(val, 0)?;
+        let err = match io.socket_of(fd) {
+            Err(_) => {
+                socket_family_type(io, fd)?;
+                0
             }
-            return Ok(0);
+            Ok(sock) => match sock.status() {
+                net::Status::Refused => Errno::ECONNREFUSED.0,
+                // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
+                // *finished*, and Linux leaves it zero until one has; a
+                // caller is meant to learn "not yet" from the descriptor not
+                // being writable, which is what `poll_writable` now says.
+                // Reporting it here made `apt` treat "still connecting" as
+                // the error that stopped it.
+                _ => 0,
+            },
         };
-        match sock.status() {
-            net::Status::Refused => Errno::ECONNREFUSED.0,
-            // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
-            // *finished*, and Linux leaves it zero until one has; a
-            // caller is meant to learn "not yet" from the descriptor not
-            // being writable, which is what `poll_writable` now says.
-            // Reporting it here made `apt` treat "still connecting" as
-            // the error that stopped it.
-            net::Status::Connecting => 0,
-            _ => 0,
+        if val != 0 {
+            m.write_u32(val, err as u32)?;
         }
-    } else {
-        0
+        return Ok(0);
+    }
+    socket_family_type(io, fd)?;
+    // `setsockopt` takes every option without effect, so these read back
+    // as a Linux socket's defaults: the options programs ask about (Wine's
+    // ws2_32 for Windows programs, libuv, Chromium's net stack, dbus).
+    // Anything else is an option this kernel does not have, said as Linux
+    // says it, rather than a success with a value of 0 (dbus-daemon took
+    // that 0 as a descriptor, see above).
+    const IPPROTO_IP: u64 = 0;
+    const IPPROTO_TCP: u64 = 6;
+    const IPPROTO_IPV6: u64 = 41;
+    let ptr = if io.compat { 4 } else { 8 };
+    let (v, len): (u64, u64) = match (level, name) {
+        // SO_DEBUG, SO_REUSEADDR, SO_DONTROUTE, SO_BROADCAST, SO_KEEPALIVE,
+        // SO_OOBINLINE, SO_NO_CHECK, SO_PRIORITY, SO_REUSEPORT,
+        // SO_PASSCRED, SO_TIMESTAMP, SO_PASSSEC, SO_MARK
+        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 16 | 29 | 34 | 36) => (0, 4),
+        // SO_SNDBUF, SO_RCVBUF: Linux's defaults, as it reports them
+        (SOL_SOCKET, 7) => (212_992, 4),
+        (SOL_SOCKET, 8) => (212_992, 4),
+        // SO_RCVLOWAT, SO_SNDLOWAT
+        (SOL_SOCKET, 18 | 19) => (1, 4),
+        // SO_ACCEPTCONN
+        (SOL_SOCKET, 30) => (io.socket_of(fd).map(|s| s.is_listening()).unwrap_or(false) as u64, 4),
+        // SO_PEERCRED: a pid of 0, as before (the rest of the struct is
+        // left as the caller had it)
+        (SOL_SOCKET, 17) => (0, 0),
+        // SO_LINGER: off (struct linger, two ints)
+        (SOL_SOCKET, 13) => (0, 8),
+        // SO_RCVTIMEO, SO_SNDTIMEO (and their 64-bit-time forms): none
+        (SOL_SOCKET, 20 | 21) => (0, 2 * ptr),
+        (SOL_SOCKET, 66 | 67) => (0, 16),
+        // IP_TOS, IP_TTL, IP_HDRINCL, IP_PKTINFO, IP_MTU_DISCOVER,
+        // IP_MULTICAST_TTL, IP_MULTICAST_LOOP
+        (IPPROTO_IP, 1) => (0, 4),
+        (IPPROTO_IP, 2) => (64, 4),
+        (IPPROTO_IP, 3 | 8 | 10) => (0, 4),
+        (IPPROTO_IP, 33 | 34) => (1, 4),
+        // TCP_NODELAY, TCP_MAXSEG, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
+        (IPPROTO_TCP, 1) => (0, 4),
+        (IPPROTO_TCP, 2) => (1448, 4),
+        (IPPROTO_TCP, 4) => (7200, 4),
+        (IPPROTO_TCP, 5) => (75, 4),
+        (IPPROTO_TCP, 6) => (9, 4),
+        // IPV6_UNICAST_HOPS, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP,
+        // IPV6_V6ONLY
+        (IPPROTO_IPV6, 16) => (64, 4),
+        (IPPROTO_IPV6, 18 | 19) => (1, 4),
+        (IPPROTO_IPV6, 26) => (0, 4),
+        _ => return Err(Errno::ENOPROTOOPT),
     };
     if val != 0 {
-        m.write_u32(val, err as u32)?;
+        if len == 0 {
+            m.write_u32(val, 0)?;
+        } else {
+            let mut bytes = vec![0u8; len as usize];
+            bytes[..4].copy_from_slice(&(v as u32).to_le_bytes());
+            let room = if optlen != 0 { m.read_u32(optlen)? as u64 } else { len };
+            m.write(val, &bytes[..len.min(room) as usize])?;
+            if optlen != 0 {
+                m.write_u32(optlen, len.min(room) as u32)?;
+            }
+        }
     }
     Ok(0)
 }
@@ -11656,6 +11716,15 @@ mod tests {
                 call(&mut m, &mut k);
                 assert_eq!(ret(&m, at), -92, "getsockopt option {opt}");
             }
+            // A buffer size reads back as Linux's default, its length
+            // written; an option this kernel does not have is refused.
+            m.write_u32(0x205f0, 4).unwrap();
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 8, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap(), m.read_u32(0x205f0).unwrap()), (0, 212_992, 4));
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 1000, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -92);
             set_args(&mut m, at, nr::SETSOCKOPT, &[c, 1, 2, 0x20500, 4]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), 0);
