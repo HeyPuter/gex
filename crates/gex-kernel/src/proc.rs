@@ -38,8 +38,9 @@ pub struct Remote {
     /// Collect a finished child: pid in the high 32 bits, wait status in the low
     /// 32, or zero if none. Packed into one return because two Workers may
     /// collect at once and a status left between calls belongs to whoever asked
-    /// last.
-    pub wait: extern "C" fn(ppid: i32, want: i32) -> i64,
+    /// last. `nowait` non-zero (`waitid`'s `WNOWAIT`) reports the child and
+    /// leaves it to be collected.
+    pub wait: extern "C" fn(ppid: i32, want: i32, nowait: i32) -> i64,
     pub has_children: extern "C" fn(ppid: i32) -> i32,
     pub kill: extern "C" fn(caller: i32, target: i32, signo: u32) -> i32,
     /// Signal every process in a group, naming it *positively*.
@@ -888,9 +889,10 @@ impl ProcTable {
     /// Collect a finished child of `ppid` from a remote table. `Some((pid,
     /// status))` when ready, `None` when none -- distinguish `ECHILD` with
     /// `wait_ready`. Also `None` if the table is local: check `is_shared` first.
-    pub fn collect(&self, ppid: i32, want: i32) -> Option<(i32, i32)> {
+    /// `nowait` leaves the child there (`WNOWAIT`).
+    pub fn collect(&self, ppid: i32, want: i32, nowait: bool) -> Option<(i32, i32)> {
         let r = self.remote?;
-        let packed = (r.wait)(ppid, want);
+        let packed = (r.wait)(ppid, want, nowait as i32);
         let pid = (packed >> 32) as i32;
         (pid > 0).then(|| (pid, packed as u32 as i32))
     }

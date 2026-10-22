@@ -600,7 +600,7 @@ async function runInSystemWorker(term, opts) {
           networkUrl: network?.url ?? null,
           wl: canvas ? { inRealm: true } : undefined,
           gl: glHere ? 'compositor' : undefined,
-          hostX: xHere || undefined,
+          hostX: xHere ? hostX : undefined,
         },
       });
     });
@@ -971,6 +971,9 @@ async function runProgramHere(
       // count up from 1, and this is 'xwl1' as ASCII.
       token: 0x78776c31,
       display: ':0',
+      // `hostX: 'rootful'`: one fullscreen X screen with no window manager of
+      // the compositor's, for a session that runs its own (KWin, ...).
+      rootful: hostX === 'rootful' || undefined,
       // `?xverbose=N`: the X server's own log, which is the only thing that
       // says what it told a client.
       verbose: globalThis.GEX_HOSTX_VERBOSE || Number(pageParams().get('xverbose')) || undefined,

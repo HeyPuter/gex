@@ -153,6 +153,7 @@ pub mod raw {
     pub const EXECVE: u64 = 59;
     pub const EXIT: u64 = 60;
     pub const WAIT4: u64 = 61;
+    pub const WAITID: u64 = 247;
     pub const KILL: u64 = 62;
     pub const UNAME: u64 = 63;
     pub const FCNTL: u64 = 72;
@@ -427,6 +428,7 @@ pub fn translate(
         x::EXECVE => nr::EXECVE,
         x::EXIT => nr::EXIT,
         x::WAIT4 => nr::WAIT4,
+        x::WAITID => nr::WAITID,
         x::KILL => nr::KILL,
         x::UNAME => nr::UNAME,
         x::FCNTL => nr::FCNTL,

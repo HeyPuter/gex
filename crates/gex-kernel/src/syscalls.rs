@@ -193,6 +193,7 @@ pub mod nr {
     pub const MADVISE: u64 = 233;
     pub const MSYNC: u64 = 227;
     pub const WAIT4: u64 = 260;
+    pub const WAITID: u64 = 95;
     pub const PRLIMIT64: u64 = 261;
     pub const GETRANDOM: u64 = 278;
     pub const RSEQ: u64 = 293;
@@ -409,7 +410,52 @@ pub enum BlockOp {
         wstatus: u64,
         /// `WNOHANG`: report nothing rather than blocking.
         nohang: bool,
+        /// `waitid`'s answer instead of `wait4`'s: a `siginfo_t` and zero.
+        /// (`si_uid` is left zero.)
+        waitid: Option<WaitidOut>,
     },
+}
+
+/// Where and how `waitid` reports the child it found ([`waitid_child`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitidOut {
+    /// The caller's `siginfo_t`, or zero.
+    pub info: u64,
+    /// `WNOWAIT`: report the child and leave it to be waited for again.
+    pub nowait: bool,
+    /// A 32-bit caller's `siginfo_t` (its union at 12, not 16).
+    pub compat: bool,
+}
+
+impl WaitidOut {
+    /// Fill the `siginfo_t` for child `pid` with wait status `word` (`wait4`'s
+    /// encoding), or for no child yet (`pid` 0: Linux zeroes it, and callers
+    /// read `si_pid` to tell). The call's own answer is zero either way.
+    pub fn report(&self, m: &mut GuestMem<'_>, pid: i32, word: u32) -> Result<u64, Errno> {
+        if self.info == 0 {
+            return Ok(0);
+        }
+        let u = if self.compat { 12 } else { 16 };
+        for off in (0..u + 12).step_by(4) {
+            m.write_u32(self.info + off, 0)?;
+        }
+        if pid <= 0 {
+            return Ok(0);
+        }
+        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the signal.
+        let (code, status) = if word & 0x7f == 0 {
+            (1, (word >> 8) & 0xff)
+        } else if word & 0x80 != 0 {
+            (3, word & 0x7f)
+        } else {
+            (2, word & 0x7f)
+        };
+        m.write_u32(self.info, crate::signal::sig::SIGCHLD)?;
+        m.write_u32(self.info + 8, code)?;
+        m.write_u32(self.info + u, pid as u32)?;
+        m.write_u32(self.info + u + 8, status)?;
+        Ok(0)
+    }
 }
 
 /// A parked call a signal ended that starts again ([`BlockOp::restart`],
@@ -2979,13 +3025,22 @@ impl PathIo<'_> {
             };
             Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
         } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
-            let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-            let h = self.ns.open(
-                &tmp,
-                oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
-                if mode == 0 { 0o600 } else { mode },
-            )?;
+            // A name can be taken already: one left by a gex that was
+            // killed with the descriptor open, from a process that had this
+            // pid (pids repeat from run to run). The next number, then.
+            let mut tries = 0;
+            let (tmp, h) = loop {
+                let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
+                match self.ns.open(
+                    &tmp,
+                    oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
+                    if mode == 0 { 0o600 } else { mode },
+                ) {
+                    Err(Errno::EEXIST) if tries < 256 => tries += 1,
+                    r => break (tmp, r?),
+                }
+            };
             // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
             // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
             // into place; the name is removed when the descriptor closes (see
@@ -4321,7 +4376,7 @@ impl NetIo<'_> {
             // treat the socket as broken.
             // agreed to without effect, on a descriptor that exists
             nr::SETSOCKOPT => io.fds.get(fd).map(|_| 0),
-            nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3]),
+            nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
             // global kernel; the proxied network's as it can; anything else
             // just agrees.
@@ -4680,8 +4735,9 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     // descriptor made from it is the same kind.
     if let Ok(listener) = io.remote_unix_of(fd) {
         let session = listener.accept()?;
-        let path = listener.bound_path().unwrap_or_default();
-        Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+        // The peer's address: a client that never bound has an unnamed one,
+        // as Linux reports it (the family alone), not the listener's path.
+        Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
         let nonblock = flags & SOCK_NONBLOCK != 0;
         session.set_nonblocking(nonblock);
         let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -4691,8 +4747,7 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     }
     let listener = io.unix_of(fd)?;
     let session = listener.accept()?;
-    let path = listener.bound_path().unwrap_or_default();
-    Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+    Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
     let nonblock = flags & SOCK_NONBLOCK != 0;
     session.set_nonblocking(nonblock);
     let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -4781,7 +4836,7 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     }
 }
 
-fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64) -> SysResult {
+fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64, optlen: u64) -> SysResult {
     const SOL_SOCKET: u64 = 1;
     const SO_TYPE: u64 = 3;
     const SO_ERROR: u64 = 4;
@@ -4802,32 +4857,103 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         }
         return Ok(0);
     }
-    let err = if name == SO_ERROR {
+    // A pidfd for the peer (Linux 6.5) and its security label: gex has
+    // neither, and says so as a kernel without them does. A success here
+    // hands back descriptor 0 as the peer's pidfd, which dbus-daemon
+    // duplicates and later closes -- its own standard input, and then
+    // whatever took that number next.
+    const SO_PEERSEC: u64 = 31;
+    const SO_PEERPIDFD: u64 = 77;
+    if level == SOL_SOCKET && matches!(name, SO_PEERSEC | SO_PEERPIDFD) {
+        socket_family_type(io, fd)?;
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if level == SOL_SOCKET && name == SO_ERROR {
         // A unix socket (local or the global kernel's) has no connect
         // in progress to report: zero, as for a socketpair end on Linux.
-        let Ok(sock) = io.socket_of(fd) else {
-            socket_family_type(io, fd)?;
-            if val != 0 {
-                m.write_u32(val, 0)?;
+        let err = match io.socket_of(fd) {
+            Err(_) => {
+                socket_family_type(io, fd)?;
+                0
             }
-            return Ok(0);
+            Ok(sock) => match sock.status() {
+                net::Status::Refused => Errno::ECONNREFUSED.0,
+                // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
+                // *finished*, and Linux leaves it zero until one has; a
+                // caller is meant to learn "not yet" from the descriptor not
+                // being writable, which is what `poll_writable` now says.
+                // Reporting it here made `apt` treat "still connecting" as
+                // the error that stopped it.
+                _ => 0,
+            },
         };
-        match sock.status() {
-            net::Status::Refused => Errno::ECONNREFUSED.0,
-            // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
-            // *finished*, and Linux leaves it zero until one has; a
-            // caller is meant to learn "not yet" from the descriptor not
-            // being writable, which is what `poll_writable` now says.
-            // Reporting it here made `apt` treat "still connecting" as
-            // the error that stopped it.
-            net::Status::Connecting => 0,
-            _ => 0,
+        if val != 0 {
+            m.write_u32(val, err as u32)?;
         }
-    } else {
-        0
+        return Ok(0);
+    }
+    socket_family_type(io, fd)?;
+    // `setsockopt` takes every option without effect, so these read back
+    // as a Linux socket's defaults: the options programs ask about (Wine's
+    // ws2_32 for Windows programs, libuv, Chromium's net stack, dbus).
+    // Anything else is an option this kernel does not have, said as Linux
+    // says it, rather than a success with a value of 0 (dbus-daemon took
+    // that 0 as a descriptor, see above).
+    const IPPROTO_IP: u64 = 0;
+    const IPPROTO_TCP: u64 = 6;
+    const IPPROTO_IPV6: u64 = 41;
+    let ptr = if io.compat { 4 } else { 8 };
+    let (v, len): (u64, u64) = match (level, name) {
+        // SO_DEBUG, SO_REUSEADDR, SO_DONTROUTE, SO_BROADCAST, SO_KEEPALIVE,
+        // SO_OOBINLINE, SO_NO_CHECK, SO_PRIORITY, SO_REUSEPORT,
+        // SO_PASSCRED, SO_TIMESTAMP, SO_PASSSEC, SO_MARK
+        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 16 | 29 | 34 | 36) => (0, 4),
+        // SO_SNDBUF, SO_RCVBUF: Linux's defaults, as it reports them
+        (SOL_SOCKET, 7) => (212_992, 4),
+        (SOL_SOCKET, 8) => (212_992, 4),
+        // SO_RCVLOWAT, SO_SNDLOWAT
+        (SOL_SOCKET, 18 | 19) => (1, 4),
+        // SO_ACCEPTCONN
+        (SOL_SOCKET, 30) => (io.socket_of(fd).map(|s| s.is_listening()).unwrap_or(false) as u64, 4),
+        // SO_PEERCRED: a pid of 0, as before (the rest of the struct is
+        // left as the caller had it)
+        (SOL_SOCKET, 17) => (0, 0),
+        // SO_LINGER: off (struct linger, two ints)
+        (SOL_SOCKET, 13) => (0, 8),
+        // SO_RCVTIMEO, SO_SNDTIMEO (and their 64-bit-time forms): none
+        (SOL_SOCKET, 20 | 21) => (0, 2 * ptr),
+        (SOL_SOCKET, 66 | 67) => (0, 16),
+        // IP_TOS, IP_TTL, IP_HDRINCL, IP_PKTINFO, IP_MTU_DISCOVER,
+        // IP_MULTICAST_TTL, IP_MULTICAST_LOOP
+        (IPPROTO_IP, 1) => (0, 4),
+        (IPPROTO_IP, 2) => (64, 4),
+        (IPPROTO_IP, 3 | 8 | 10) => (0, 4),
+        (IPPROTO_IP, 33 | 34) => (1, 4),
+        // TCP_NODELAY, TCP_MAXSEG, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
+        (IPPROTO_TCP, 1) => (0, 4),
+        (IPPROTO_TCP, 2) => (1448, 4),
+        (IPPROTO_TCP, 4) => (7200, 4),
+        (IPPROTO_TCP, 5) => (75, 4),
+        (IPPROTO_TCP, 6) => (9, 4),
+        // IPV6_UNICAST_HOPS, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP,
+        // IPV6_V6ONLY
+        (IPPROTO_IPV6, 16) => (64, 4),
+        (IPPROTO_IPV6, 18 | 19) => (1, 4),
+        (IPPROTO_IPV6, 26) => (0, 4),
+        _ => return Err(Errno::ENOPROTOOPT),
     };
     if val != 0 {
-        m.write_u32(val, err as u32)?;
+        if len == 0 {
+            m.write_u32(val, 0)?;
+        } else {
+            let mut bytes = vec![0u8; len as usize];
+            bytes[..4].copy_from_slice(&(v as u32).to_le_bytes());
+            let room = if optlen != 0 { m.read_u32(optlen)? as u64 } else { len };
+            m.write(val, &bytes[..len.min(room) as usize])?;
+            if optlen != 0 {
+                m.write_u32(optlen, len.min(room) as u32)?;
+            }
+        }
     }
     Ok(0)
 }
@@ -5181,7 +5307,7 @@ pub fn is_thread_own(n: u64) -> bool {
 /// itself: the live thread count (an atomic), the thread's own signal
 /// state and fs_struct, the futexes and the process table. Canonical.
 pub fn is_lifecycle_end(n: u64) -> bool {
-    matches!(n, nr::EXIT | nr::EXIT_GROUP | nr::WAIT4 | nr::REBOOT)
+    matches!(n, nr::EXIT | nr::EXIT_GROUP | nr::WAIT4 | nr::WAITID | nr::REBOOT)
 }
 
 /// Count one thread out of `live` if it is not the last: whether `exit`
@@ -5407,7 +5533,42 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         want: a[0] as i32,
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
+        waitid: None,
     }
+}
+
+/// `waitid(idtype, id, infop, options, rusage)` as `wait4`'s park: `P_ALL`
+/// and `P_PID` (and `P_PGID`, as any child: process groups are not told
+/// apart, as for `wait4`), `WEXITED` with `WNOHANG` and `WNOWAIT`. No child
+/// stops or continues here, so `WSTOPPED`/`WCONTINUED` alone find nothing.
+/// `P_PIDFD` is `EINVAL`, as a kernel without pidfds answers, which is what
+/// sends a caller (Qt's forkfd) to its `SIGCHLD` path.
+fn waitid_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6], compat: bool) -> Result<BlockOp, Errno> {
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    let (idtype, id, options) = (a[0] as u32, a[1] as i32, a[3]);
+    if options & !KNOWN != 0 || options & (WSTOPPED | WEXITED | WCONTINUED) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let want = match idtype {
+        0 | 2 => -1,
+        1 if id > 0 => id,
+        _ => return Err(Errno::EINVAL),
+    };
+    let mut op = wait_child(procs, pid, [want as u64, 0, options & WNOHANG, 0, 0, 0]);
+    if let BlockOp::WaitChild { waitid, nohang, .. } = &mut op {
+        *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat });
+        // Only exits are ever waited for here: without WEXITED a wait would
+        // never end, so it reports none (zero, or ECHILD with no children).
+        if options & WEXITED == 0 {
+            *nohang = true;
+        }
+    }
+    Ok(op)
 }
 
 /// [`is_thread_own`]'s calls, for thread `tid` (context at `ctx_addr`,
@@ -6301,6 +6462,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 return FreeOutcome::Exit((a[0] & 0xff) as i32);
             }
             nr::WAIT4 => return FreeOutcome::Blocking(wait_child(f.procs, f.pid, a), None),
+            nr::WAITID => match waitid_child(f.procs, f.pid, a, compat) {
+                Ok(op) => return FreeOutcome::Blocking(op, None),
+                Err(e) => Err(e),
+            },
             _ => match reboot_halts(a[2]) {
                 Some(_) => {
                     f.procs.request_halt(0);
@@ -6491,13 +6656,16 @@ pub fn sleep_block(m: &GuestMem<'_>, n: u64, a: [u64; 6], clock: ClockFn, starte
     }
     let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
     // TIMER_ABSTIME: a deadline on the clock, not a duration. It was slept
-    // as a duration, so every absolute sleep lasted the 60 s cap below.
+    // as a duration, so every absolute sleep lasted the cap there was then.
     const TIMER_ABSTIME: u64 = 1;
     if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
         wait = wait.checked_sub(clock_nanos_at(clock, started, a[0])).filter(|&w| w > 0)?;
     }
-    // Capped, as before: a longer sleep returns early.
-    let wait = wait.min(60_000_000_000) as u64;
+    // The whole request: `sleep 2200` returned 0 after 60 s here (the
+    // session's stop timer fired 37 minutes early). Bounded only so a
+    // deadline added to a clock reading cannot overflow (a century).
+    const LONGEST: u128 = 100 * 365 * 24 * 3600 * 1_000_000_000;
+    let wait = wait.min(LONGEST) as u64;
     Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
 }
 
@@ -9021,6 +9189,8 @@ impl Kernel {
                 futex_block(&self.futex_cx(&mapped), m, a)
             }
             nr::WAIT4 => Some(wait_child(&self.procs, self.pid, a)),
+            // Its argument errors are the dispatch's (below).
+            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).ok(),
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
                 // The clocks as of now, the processor-time ones counted from
                 // a start this sets if it has none yet.
@@ -9233,6 +9403,8 @@ impl Kernel {
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
+            // A waitid that parks is `blocking_op`'s; one that gets here had bad arguments.
+            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).map(|_| 0),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -10380,7 +10552,9 @@ impl Kernel {
         Ok(String::from_utf8_lossy(&path[..end]).into_owned())
     }
 
-    /// Write a `struct sockaddr_un` back, for `getsockname` and `accept`.
+    /// Write a `struct sockaddr_un` back, for `getsockname`, `recvfrom` and
+    /// `recvmsg`: at most the caller's `*len_out` bytes of it (a
+    /// `struct sockaddr` of 16 is a common buffer), its whole length reported.
     fn write_sockaddr_un(
         m: &mut GuestMem<'_>,
         addr: u64,
@@ -10395,7 +10569,9 @@ impl Kernel {
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
-            m.write(addr, &buf[..2 + n + usize::from(!abstract_name)])?;
+            let whole = 2 + n + usize::from(!abstract_name);
+            let room = if len_out != 0 { m.read_u32(len_out)? as usize } else { whole };
+            m.write(addr, &buf[..whole.min(room)])?;
         }
         // An abstract name's length is exactly its bytes (no terminating NUL:
         // the name may hold NULs), as Linux reports it; a path's counts one.
@@ -10623,7 +10799,9 @@ impl Kernel {
 }
 
 /// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
-/// magic, a 4 GiB volume half free).
+/// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
+/// always does: glibc's `statvfs` otherwise looks the mount flags up in
+/// /proc/mounts.
 pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
@@ -10639,8 +10817,10 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     put(&mut out, 32, 1 << 19); // f_bavail
     put(&mut out, 40, 1 << 18); // f_files
     put(&mut out, 48, 1 << 17); // f_ffree
-    put(&mut out, 72, 255); // f_namelen
-    put(&mut out, 80, 4096); // f_frsize
+    // f_fsid (8 bytes) at 56
+    put(&mut out, 64, 255); // f_namelen
+    put(&mut out, 72, 4096); // f_frsize
+    put(&mut out, 80, ST_VALID); // f_flags
     if compat {
         // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
         // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
@@ -10651,12 +10831,16 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
         c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
         w32(&mut c, 56, 255);
         w32(&mut c, 60, 4096);
+        w32(&mut c, 64, ST_VALID as u32);
         m.write(buf, &c)?;
         return Ok(0);
     }
     m.write(buf, &out)?;
     Ok(0)
 }
+
+/// `struct statfs`'s `f_flags` bit saying the flags are filled in.
+const ST_VALID: u64 = 0x20;
 
 /// `sysinfo`: a constant machine (4 GiB, half free, one process).
 pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
@@ -10940,6 +11124,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::MADVISE => "madvise",
         nr::MSYNC => "msync",
         nr::WAIT4 => "wait4",
+        nr::WAITID => "waitid",
         nr::PRLIMIT64 => "prlimit64",
         nr::GETRANDOM => "getrandom",
         nr::RSEQ => "rseq",
@@ -10963,6 +11148,26 @@ fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
 mod tests {
     use super::*;
     use crate::vfs::TmpFs;
+
+    /// Linux's 64-bit `struct statfs`: seven 8-byte counts and sizes, the
+    /// 8-byte fsid, then f_namelen, f_frsize, f_flags. The name length was
+    /// one field late (in f_frsize's place), so programs saw a 4096-byte
+    /// name limit and a fragment size of 0.
+    #[test]
+    fn statfs_fields_are_where_linux_puts_them() {
+        let mut buf = vec![0u8; 0x1000];
+        statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
+        let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
+        assert_eq!(q(8), 4096, "f_bsize");
+        assert_eq!(q(56), 0, "f_fsid");
+        assert_eq!(q(64), 255, "f_namelen");
+        assert_eq!(q(72), 4096, "f_frsize");
+        assert_eq!(q(80) & ST_VALID, ST_VALID, "f_flags");
+        let mut buf = vec![0u8; 0x1000];
+        statfs(&mut GuestMem::new(&mut buf), true, 0x100).unwrap();
+        let d = |at: usize| u32::from_le_bytes(buf[0x100 + at..0x104 + at].try_into().unwrap());
+        assert_eq!((d(56), d(60), d(64) & 0x20), (255, 4096, 0x20), "i386 statfs64: f_namelen, f_frsize, f_flags");
+    }
 
     #[test]
     fn poll_skips_negative_descriptors() {
@@ -11268,9 +11473,14 @@ mod tests {
             (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_millis(5)),
             other => panic!("{other:?}"),
         }
-        // Absolute, two seconds ahead: about two seconds, not the 60 s cap.
+        // Absolute, two seconds ahead: about two seconds, not the whole clock reading.
         match ask(&mut k, &mut mem, 1, now + 2, 0) {
             (Some(BlockOp::Sleep(d)), _) => assert!(d <= std::time::Duration::from_secs(2), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Longer than a minute: all of it (it was cut to 60 s, answered 0).
+        match ask(&mut k, &mut mem, 0, 2200, 0) {
+            (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_secs(2200)),
             other => panic!("{other:?}"),
         }
         // Absolute and already past: returns at once.
@@ -11621,6 +11831,21 @@ mod tests {
             let s = ret(&m, at);
             assert!(s > 0, "accept, lock_free {lock_free}: {s}");
             assert!(k.fds.cloexec(s as i32).unwrap());
+            // A second client, accepted into a `struct sockaddr` (16 bytes):
+            // its peer never bound, so the address is the family alone, and
+            // nothing past the 16 bytes is written.
+            set_args(&mut m, at, nr::SOCKET, &[AF_UNIX, SOCK_STREAM, 0]);
+            call(&mut m, &mut k);
+            let c2 = ret(&m, at) as u64;
+            set_args(&mut m, at, nr::CONNECT, &[c2, 0x20400, sa.len() as u64]);
+            call(&mut m, &mut k);
+            m.write(0x20600, &[0xee; 32]).unwrap();
+            m.write_u32(0x205f0, 16).unwrap();
+            set_args(&mut m, at, nr::ACCEPT4, &[l, 0x20600, 0x205f0, 0]);
+            call(&mut m, &mut k);
+            assert!(ret(&m, at) > 0, "second accept, lock_free {lock_free}");
+            assert_eq!((m.read_u32(0x205f0).unwrap(), m.read(0x20600, 2).unwrap()), (2, &[1u8, 0][..]));
+            assert!(m.read(0x20610, 16).unwrap().iter().all(|&b| b == 0xee), "accept wrote past the caller's 16 bytes");
             // The options: a stream, no error.
             set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 3, 0x20500, 0]);
             call(&mut m, &mut k);
@@ -11628,6 +11853,23 @@ mod tests {
             set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 4, 0x20500, 0]);
             call(&mut m, &mut k);
             assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap()), (0, 0));
+            // No peer pidfd and no security label, as on a kernel without
+            // them: an error, not descriptor 0 or an empty label.
+            for opt in [31u64, 77] {
+                m.write_u32(0x205f0, 4).unwrap();
+                set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, opt, 0x20500, 0x205f0]);
+                call(&mut m, &mut k);
+                assert_eq!(ret(&m, at), -92, "getsockopt option {opt}");
+            }
+            // A buffer size reads back as Linux's default, its length
+            // written; an option this kernel does not have is refused.
+            m.write_u32(0x205f0, 4).unwrap();
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 8, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap(), m.read_u32(0x205f0).unwrap()), (0, 212_992, 4));
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 1000, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -92);
             set_args(&mut m, at, nr::SETSOCKOPT, &[c, 1, 2, 0x20500, 4]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), 0);
@@ -12111,6 +12353,27 @@ mod tests {
             k.syscall(&mut m, 0),
             SyscallOutcome::Blocking(BlockOp::WaitChild { ppid, want: -1, nohang: false, .. }) if ppid == pid
         ));
+        // waitid parks the same, with its siginfo and WNOWAIT; P_PIDFD and
+        // no wait kind are EINVAL, with and without the kernel.
+        set_args(&mut m, main.ctx_addr, nr::WAITID, &[1, 7, 0x32000, 4 | 1 | 0x0100_0000]);
+        let info = WaitidOut { info: 0x32000, nowait: true, compat: false };
+        assert!(matches!(
+            free(&k, &mut m, main.ctx_addr),
+            FreeOutcome::Blocking(BlockOp::WaitChild { ppid, want: 7, nohang: true, waitid: Some(w), .. }, None) if ppid == pid && w == info
+        ));
+        set_args(&mut m, main.ctx_addr, nr::WAITID, &[0, 0, 0x32000, 4]);
+        assert!(matches!(
+            k.syscall(&mut m, 0),
+            SyscallOutcome::Blocking(BlockOp::WaitChild { want: -1, nohang: false, waitid: Some(WaitidOut { nowait: false, .. }), .. })
+        ));
+        for args in [[3u64, 5, 0x32000, 4 | 1], [0, 0, 0x32000, 1]] {
+            set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
+            assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Done(_)));
+            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+            set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
+            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+        }
         // reboot: CAD_OFF answers 0 and halts nothing; a halt ends the
         // process with 0 and halts the machine.
         for kernel in [true, false] {
@@ -12126,6 +12389,28 @@ mod tests {
         set_args(&mut m, main.ctx_addr, nr::REBOOT, &[0xfee1_dead, 0x2812_1969, 0x4321_fedc]);
         assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Exit(0)));
         assert_eq!(k.procs.halt_code(), Some(0));
+    }
+
+    /// `waitid`'s `siginfo_t`: SIGCHLD, the CLD_* code, the pid and the exit
+    /// code or signal at the 64-bit and the 32-bit offsets; nothing ready is
+    /// all zero.
+    #[test]
+    fn waitid_reports_a_siginfo() {
+        let mut buf = vec![0xaau8; 0x100];
+        let mut m = GuestMem::new(&mut buf);
+        let w = WaitidOut { info: 0x10, nowait: false, compat: false };
+        assert_eq!(w.report(&mut m, 42, 3 << 8), Ok(0));
+        let rd = |m: &GuestMem<'_>, o: u64| m.read_u32(0x10 + o).unwrap();
+        assert_eq!([rd(&m, 0), rd(&m, 4), rd(&m, 8), rd(&m, 16), rd(&m, 20), rd(&m, 24)], [17, 0, 1, 42, 0, 3]);
+        assert_eq!(w.report(&mut m, 42, 9), Ok(0));
+        assert_eq!([rd(&m, 8), rd(&m, 24)], [2, 9]);
+        assert_eq!(w.report(&mut m, 42, 0x80 | 11), Ok(0));
+        assert_eq!([rd(&m, 8), rd(&m, 24)], [3, 11]);
+        assert_eq!(w.report(&mut m, 0, 0), Ok(0));
+        assert!((0..28).step_by(4).all(|o| rd(&m, o) == 0));
+        let c = WaitidOut { compat: true, ..w };
+        assert_eq!(c.report(&mut m, 5, 1 << 8), Ok(0));
+        assert_eq!([rd(&m, 0), rd(&m, 8), rd(&m, 12), rd(&m, 20)], [17, 1, 5, 1]);
     }
 
     /// `clone` and `clone3` that make a thread answer the same with
@@ -13868,6 +14153,26 @@ mod tests {
         assert!(k.vfs.metadata(&name).is_ok(), "a copy is still open");
         assert_eq!(close(&mut m, &k, copy), 0);
         assert!(k.vfs.metadata(&name).is_err(), "{name} outlived its last descriptor");
+    }
+
+    /// A leftover `.gex-tmpfile-PID-N` (a gex killed with the descriptor
+    /// open; pids repeat) does not make the next `O_TMPFILE` fail with
+    /// EEXIST: QTemporaryFile then gave up, and ksmserver with it.
+    #[test]
+    fn a_tmpfile_skips_a_name_left_behind() {
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        for n in 0..3 {
+            let left = format!("/.gex-tmpfile-{}-{}\0", k.pid, n);
+            m.write(0x20100, left.as_bytes()).unwrap();
+            let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20100, oflags::O_CREAT | oflags::O_EXCL | oflags::O_RDWR, 0o600]);
+            assert!((fd as i64) >= 0, "the leftover {left}");
+        }
+        m.write(0x20000, b"/\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_TMPFILE | oflags::O_RDWR, 0o600]);
+        assert!((fd as i64) >= 0, "O_TMPFILE over leftovers: {}", fd as i64);
+        assert!(k.fds.get(fd as i32).unwrap().path.ends_with("-3"), "the first free number");
     }
 
     /// A call made through the kernel, its result.

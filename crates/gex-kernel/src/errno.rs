@@ -59,6 +59,7 @@ impl Errno {
     pub const ENOTSOCK: Errno = Errno(88);
     pub const EMSGSIZE: Errno = Errno(90);
     pub const EPROTOTYPE: Errno = Errno(91);
+    pub const ENOPROTOOPT: Errno = Errno(92);
     pub const ECONNRESET: Errno = Errno(104);
     pub const EISCONN: Errno = Errno(106);
     /// Only between a process and the global kernel, never a guest's: a
