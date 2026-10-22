@@ -5682,6 +5682,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     } else {
         format!("/{}", args[0])
     };
+    // The program's own code, when it has a unit (a Linux eject's
+    // programs), announced as the interpreter is above.
+    if nt_abi.is_none() && crate::cgen::libprov::elf_listed(&kernel.exe_path) {
+        let maps = gex_kernel::CodeMap::of_placed(&kernel.exe_path, bytes, program.exe.bias);
+        kernel.mem.lock().log.new_code.extend(maps);
+    }
     kernel.argv = args.clone();
     kernel.envp = env.to_vec();
     // Process one links for itself and leaves the answer for whoever runs the
@@ -10460,6 +10466,27 @@ fn note_exec(path: &str, argv: &[String]) {
     warn_line(&format!("[gex-info] pid {pid}: exec {path}{args}\n"));
 }
 
+/// After an `execve`: the program and its interpreter, which gex's loader
+/// placed, in the map's log of new code as their `mmap`s would have put them,
+/// so the syscall's return places their function-tier units. Only objects
+/// listed for units: everything else is left to dispatch, as before.
+fn announce_placed(h: &mut Host, p: &gex_ld::Program, path: &str) {
+    let mut objects = vec![(path.to_string(), p.exe.bias)];
+    if let (Some(i), Some(interp)) = (&p.exe.interp, &p.interp) {
+        objects.push((i.clone(), interp.bias));
+    }
+    for (file, bias) in objects {
+        if !crate::cgen::libprov::elf_listed(&file) {
+            continue;
+        }
+        let mut head = vec![0u8; 0x1000];
+        let Some(n) = h.kernel.read_file_at(&file, 0, &mut head) else { continue };
+        head.truncate(n);
+        let maps = gex_kernel::CodeMap::of_placed(&file, &head, bias);
+        h.kernel.mem.lock().log.new_code.extend(maps);
+    }
+}
+
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
     {
@@ -10858,6 +10885,13 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // writes the same blocks into the same slots, and its compile is shared
     // by content key.
     h.jit.installed_mods.clear();
+    // The new program and its interpreter, placed by gex's loader rather than
+    // mapped by the guest, announced as their `mmap`s would have been: the
+    // syscall's return serves their units before the interpreter's first
+    // instruction.
+    if let (Some(p), None) = (&program, &restored) {
+        announce_placed(h, p, path);
+    }
 
     let ctx_addr = h.threads[cur()].ctx_addr();
     let c = ctx_addr as usize;
@@ -14888,6 +14922,13 @@ fn livelock_note(pc: u64) {
         *n
     });
     if n != LIVELOCK_MISSES || !LIVE_SAID.with(|s| s.borrow_mut().insert(pc)) {
+        return;
+    }
+    // A unit's call-out returning through a miss every time (a qsort
+    // comparator in translated code, called from a library's unit) misses at
+    // the same return address as often as it is called, and each miss goes
+    // on: traffic, not a dispatch that does not converge.
+    if MISS_WAY_AT.with(|m| m.borrow().get(&pc).is_some_and(|&(w, _)| w == 3)) {
         return;
     }
     LIVELOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

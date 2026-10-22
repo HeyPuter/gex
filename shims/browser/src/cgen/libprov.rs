@@ -1009,6 +1009,12 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
 /// none of it, or its parent's copy, while its table has none of the units.
 static ELF_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Whether `path` names an object listed for a unit (`?elfunits=`).
+pub(crate) fn elf_listed(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    super::on() && lock(&ELF_UNITS).iter().any(|n| n == "all" || n == file)
+}
+
 /// Before a Worker's guest first runs (`gex_elfprov_wanted`): in a forked
 /// child, the listed objects it inherited want their units again. Returns
 /// whether one is now wanted.

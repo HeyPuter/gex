@@ -55,6 +55,7 @@ const PIECES = {
  *   args       the program's arguments (an array), instead of the recorded ones
  *   env        more environment, ['K=V', ...] or {K: V}; a name given replaces the build's
  *   cwd, exe   the working directory and program (a path in the bundle)
+ *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
  *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
@@ -749,6 +750,7 @@ async function begin(opts, base, at, state, meter) {
     env,
     args,
     cwd,
+    uid: opts.uid ?? b.uid,
     tty: false,
     gl: gl ? 'compositor' : null,
     glLazy,
