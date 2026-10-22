@@ -825,6 +825,7 @@ fn run_program_with(
     nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
     let fresh_process = inherited.is_none();
+    gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
     // decoded in compatibility mode, and the kernel below speaks its ABI.
@@ -2108,45 +2109,105 @@ fn run_thread_loop(
     }
 }
 
+/// A guest thread's whole host life, once it has a host thread.
+fn guest_thread_body(cx: Arc<SpawnContext>, child: ThreadState) {
+    let running = Arc::clone(&cx.running);
+    match run_guest_thread(Arc::clone(&cx), child) {
+        Err(e) => {
+            eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+            // A thread that fails takes its process with it, as on
+            // Linux: otherwise the other threads sit in a futex
+            // forever and every descriptor it holds stays open.
+            end_process(&cx, Exit::Signal {
+                signal: signal::SIGSEGV,
+                pc: 0,
+                detail: format!("thread {} failed: {e:#}", child.tid),
+                internal: true,
+            });
+            cx.kernel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fds
+                .close_all();
+        }
+        // `exit_group` or a fatal signal on this thread: the process
+        // ends with it, and the first thread, parked in a futex
+        // (`pthread_join`) or running, must hear how.
+        Ok(Some(exit)) => end_process(&cx, exit),
+        Ok(None) => {}
+    }
+    running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+type Runner = std::sync::mpsc::Sender<(Arc<SpawnContext>, ThreadState)>;
+
+thread_local! {
+    /// The host thread this host thread's `clone` was promised
+    /// (`take_runner`), until `start_guest_thread` hands it the guest thread
+    /// or `give_runner` lets it go. The kernel's thread maker promises and
+    /// the thread start follows on the same host thread, with no other
+    /// `clone` of it in between.
+    static PROMISED: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The kernel's `ThreadRunners::take` here: a host thread for the guest
+/// thread being made, started now and parked until it has one, so that a
+/// host that will not start another (a task limit) makes the guest's
+/// `clone` say `EAGAIN` before any of the thread exists, as Linux does at
+/// its own limit.
+fn take_runner() -> bool {
+    if PROMISED.with(|p| p.borrow().is_some()) {
+        return true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<(Arc<SpawnContext>, ThreadState)>();
+    let started = std::thread::Builder::new().name("gex-tid".into()).stack_size(guest_thread_stack()).spawn(move || {
+        // A promise given back (or its holder gone) ends the wait unused.
+        let Ok((cx, child)) = rx.recv() else { return };
+        // Named by its guest tid, as a thread spawned for it is (per-thread
+        // CPU by name, tests/games/thread-cpu.sh).
+        let _ = std::fs::write("/proc/thread-self/comm", format!("gex-tid-{}", child.tid));
+        guest_thread_body(cx, child);
+    });
+    match started {
+        Ok(_) => {
+            PROMISED.with(|p| *p.borrow_mut() = Some(tx));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The kernel's `ThreadRunners::give`: the thread was not made after all.
+fn give_runner() {
+    PROMISED.with(|p| p.borrow_mut().take());
+}
+
 /// Start a host thread for a guest thread a `clone` (or an NT thread
-/// creation) asked for. Called between guest calls, where nothing is borrowed.
+/// creation) asked for: the one its `clone` was promised, else a new one.
+/// Called between guest calls, where nothing is borrowed.
 fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
     // Detached: a guest thread is joined through its own futex, not
     // through the host's handle, and `exit_group` ends the process
     // whatever its threads are doing.
     cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let running = Arc::clone(&cx.running);
-    std::thread::Builder::new()
+    if let Some(tx) = PROMISED.with(|p| p.borrow_mut().take()) {
+        if let Err(std::sync::mpsc::SendError((cx, _))) = tx.send((Arc::clone(&cx), child)) {
+            cx.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(anyhow!("thread {}: its promised host thread is gone", child.tid));
+        }
+        return Ok(());
+    }
+    let spawned = std::thread::Builder::new()
         .name(format!("gex-tid-{}", child.tid))
         .stack_size(guest_thread_stack())
-        .spawn(move || {
-            match run_guest_thread(Arc::clone(&cx), child) {
-                Err(e) => {
-                    eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                    // A thread that fails takes its process with it, as on
-                    // Linux: otherwise the other threads sit in a futex
-                    // forever and every descriptor it holds stays open.
-                    end_process(&cx, Exit::Signal {
-                        signal: signal::SIGSEGV,
-                        pc: 0,
-                        detail: format!("thread {} failed: {e:#}", child.tid),
-                        internal: true,
-                    });
-                    cx.kernel
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .fds
-                        .close_all();
-                }
-                // `exit_group` or a fatal signal on this thread: the process
-                // ends with it, and the first thread, parked in a futex
-                // (`pthread_join`) or running, must hear how.
-                Ok(Some(exit)) => end_process(&cx, exit),
-                Ok(None) => {}
-            }
-            running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        })
-        .context("spawning a guest thread")?;
+        .spawn({
+            let cx = Arc::clone(&cx);
+            move || guest_thread_body(cx, child)
+        });
+    if spawned.is_err() {
+        cx.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    spawned.context("spawning a guest thread")?;
     Ok(())
 }
 
