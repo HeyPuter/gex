@@ -41,11 +41,21 @@ if [ "$slots" -gt 0 ] 2>/dev/null && command -v flock >/dev/null; then
   fi
 fi
 
+# A shared program finds libc.so where the target has it, in the multiarch
+# directory; on the build machine it is in the sysroot's lib/ (help2man
+# running a just-built tool). Only that directory, and only the guest's:
+# gexc and any host program a guest runs read LD_LIBRARY_PATH with the
+# host's loader, which takes a wasm library of a name it wants (gex-gl's
+# libEGL.so.1) for a broken one of its own.
+sr=${GEXCC_SYSROOT:-$L/../../sysroot}
+ldp=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$sr/lib
+unset LD_LIBRARY_PATH
+
 bb=${GEXCC_BUSYBOX-$L/busybox}
 if [ -n "$bb" ] && [ -f "$bb" ]; then
   if [ "$bb" = "$L/busybox" ] && [ -z "${GEX_BUSYBOX_APPLETS:-}" ] && [ -f "$L/busybox.applets" ]; then
     GEX_BUSYBOX_APPLETS=$(cat "$L/busybox.applets"); export GEX_BUSYBOX_APPLETS
   fi
-  exec "$G" run --busybox "$bb" "$@"
+  exec "$G" run --env "LD_LIBRARY_PATH=$ldp" --busybox "$bb" "$@"
 fi
-exec "$G" run "$@"
+exec "$G" run --env "LD_LIBRARY_PATH=$ldp" "$@"

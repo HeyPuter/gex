@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""objdump for gexcc's output. A wasm side module (a shared library or
+program built with GEXCC_SHARED=1) is described the way GNU objdump
+describes an ELF shared object, for the tools that read that (Debian's
+dh_makeshlibs and dpkg-shlibdeps, libtool):
+
+  -f   the file format line (elf32-wasm32)
+  -p   the dynamic section: NEEDED (dylink.0) and SONAME (the module name)
+  -T   the dynamic symbols: exports defined, env imports *UND*
+  -w and -R are accepted (no relocation records), -x is -fpT
+
+Anything else, or any other file, goes to llvm-objdump.
+"""
+import os, sys
+
+
+def leb(w, p):
+    r = sh = 0
+    while True:
+        x = w[p]; p += 1
+        r |= (x & 0x7f) << sh; sh += 7
+        if not x & 0x80:
+            return r, p
+
+
+def name(w, p):
+    n, p = leb(w, p)
+    return w[p:p + n].decode('utf-8', 'replace'), p + n
+
+
+def describe(path):
+    """(soname, needed, defined [(name, kind)], undefined [name]) of a side
+    module, or None for anything else."""
+    try:
+        w = open(path, 'rb').read()
+    except OSError:
+        return None
+    if w[:4] != b'\0asm':
+        return None
+    soname, needed, defined, undefined, dylink = None, [], [], [], False
+    p = 8
+    while p < len(w):
+        sid = w[p]; n, q = leb(w, p + 1); end = q + n
+        if sid == 0:
+            nm, q = name(w, q)
+            if nm == 'dylink.0':
+                dylink = True
+                while q < end:
+                    kind = w[q]; ln, q = leb(w, q + 1); sub_end = q + ln
+                    if kind == 2:  # WASM_DYLINK_NEEDED
+                        cnt, r = leb(w, q)
+                        for _ in range(cnt):
+                            lib, r = name(w, r); needed.append(lib)
+                    q = sub_end
+            elif nm == 'name' and w[q] == 0:  # module name
+                _, r = leb(w, q + 1)
+                soname, _ = name(w, r)
+        elif sid == 2:
+            cnt, q = leb(w, q)
+            for _ in range(cnt):
+                m, q = name(w, q); f, q = name(w, q)
+                kind = w[q]; q += 1
+                if kind == 0:
+                    _, q = leb(w, q)
+                    if m == 'env' or m == 'GOT.func':
+                        undefined.append(f)
+                elif kind == 1:
+                    q += 1; fl, q = leb(w, q); _, q = leb(w, q)
+                    if fl & 1:
+                        _, q = leb(w, q)
+                elif kind == 2:
+                    fl, q = leb(w, q); _, q = leb(w, q)
+                    if fl & 1:
+                        _, q = leb(w, q)
+                elif kind == 3:
+                    q += 2
+                elif kind == 4:
+                    q += 1; _, q = leb(w, q)
+        elif sid == 7:
+            cnt, q = leb(w, q)
+            for _ in range(cnt):
+                f, q = name(w, q)
+                kind = w[q]; q += 1
+                _, q = leb(w, q)
+                if kind in (0, 3) and not f.startswith('__'):
+                    defined.append((f, kind))
+        p = end
+    if not dylink:
+        return None
+    return soname or os.path.basename(path), needed, defined, sorted(set(undefined))
+
+
+def main():
+    args = sys.argv[1:]
+    flags, files, ok = set(), [], True
+    for a in args:
+        if a.startswith('--'):
+            ok = False
+        elif a.startswith('-'):
+            flags |= set(a[1:])
+        else:
+            files.append(a)
+    descs = [describe(f) for f in files]
+    if not ok or not files or not flags or flags - set('fpTwRx') or any(d is None for d in descs):
+        os.execvp('llvm-objdump', ['llvm-objdump'] + args)
+    if 'x' in flags:
+        flags |= set('fpT')
+    out = []
+    for f, (soname, needed, defined, undefined) in zip(files, descs):
+        out.append('\n%s:     file format elf32-wasm32\n' % f)
+        if 'f' in flags:
+            out.append('architecture: wasm32, flags 0x00000150:\nHAS_SYMS, DYNAMIC, D_PAGED\nstart address 0x00000000\n')
+        if 'p' in flags:
+            out.append('Dynamic Section:')
+            out += ['  NEEDED               %s' % n for n in needed]
+            out.append('  SONAME               %s' % soname)
+            out.append('')
+        if 'T' in flags:
+            out.append('DYNAMIC SYMBOL TABLE:')
+            for s in undefined:
+                out.append('00000000      DF *UND*\t00000000  Base        %s' % s)
+            for s, kind in defined:
+                out.append('00000000 g    %s .%s\t00000000  Base        %s' % ('DF' if kind == 0 else 'DO',
+                                                                       'text' if kind == 0 else 'data', s))
+            out.append('')
+    sys.stdout.write('\n'.join(out) + '\n')
+
+
+main()

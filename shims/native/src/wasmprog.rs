@@ -148,7 +148,20 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
             },
         );
         let extra = info.extra_slots().into_iter().map(|(k, name)| (inst.base + k, name)).collect();
-        s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports: Vec::new(), extra }));
+        // undefined weak symbols: null, as ELF leaves them
+        let imports = info
+            .static_weak_binds()
+            .map_err(|e| anyhow!("{path}: {e}"))?
+            .into_iter()
+            .map(|(m, name, b)| {
+                let nb = match b {
+                    gex_dylink::Bind::GotMem(v) | gex_dylink::Bind::GotFunc(v) => crate::dylink::NBind::Global(v),
+                    _ => crate::dylink::NBind::Missing(String::new()),
+                };
+                (m, name, nb)
+            })
+            .collect();
+        s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports, extra }));
         s.ftab.dyproc = Some(crate::dylink::DyProcess {
             link: gex_dylink::Link {
                 mods: vec![gex_dylink::Loaded { name: path.clone(), path, info, memory_base: mem_base as u32, table_base: inst.base }],

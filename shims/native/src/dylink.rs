@@ -393,6 +393,10 @@ pub(crate) fn define_imports(
         let Some(ty) = types.get(&(m.clone(), name.clone())) else {
             continue;
         };
+        // already given (ftab's stand-ins for clang's three names for main)
+        if l.get(&mut *c, m, name).is_ok() {
+            continue;
+        }
         match (b, ty) {
             (NBind::Shim, _) if m == "env" && (name == "__asyncify_state" || name == "__asyncify_data") => {
                 let g = asyncify_globals(c)?;

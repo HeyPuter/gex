@@ -211,6 +211,14 @@ pub(super) fn static_program(info: Option<&Info>, elem_len: u32) -> u32 {
 pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base: u32, mem_base: u32) {
     let Some(info) = info else { return };
     let mut text = String::new();
+    // undefined weak symbols: null, as ELF leaves them (a strong one stays
+    // an import nothing gives, and instantiating says so)
+    for (mo, na, b) in info.static_weak_binds().unwrap_or_default() {
+        text.push_str(&match b {
+            Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t1\n"),
+            _ => format!("M\t{mo}\t{na}\tsymbol lookup error: {path}: undefined weak symbol {na} called\n"),
+        });
+    }
     for (s, n) in info.extra_slots() {
         text.push_str(&format!("X\t{}\t{n}\n", base + s));
     }

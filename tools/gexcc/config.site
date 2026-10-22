@@ -6,6 +6,27 @@
 # replacement, which is always safe; several are gex gaps being fixed
 # (trailing slashes, select's EBADF, getgroups, sigaltstack), see
 # docs/gexcc.md. Regenerate: tests/gexcc/corpus/config-site.sh.
+# A Debian cross build (dpkg-buildpackage -a, which exports DEB_HOST_*) can
+# run a configure without --host, as some debian/rules do for a second
+# directory: that configure is still for the target, unless it was given a
+# compiler of its own
+if test -z "$host_alias" && test -n "$DEB_HOST_GNU_TYPE" && test "$DEB_HOST_GNU_TYPE" != "$DEB_BUILD_GNU_TYPE"; then
+  case ${CC:-$DEB_HOST_GNU_TYPE-} in
+  "$DEB_HOST_GNU_TYPE"-*)
+    host_alias=$DEB_HOST_GNU_TYPE
+    host=$DEB_HOST_GNU_TYPE
+    ac_tool_prefix=$DEB_HOST_GNU_TYPE-
+    cross_compiling=yes
+    test -n "$build_alias" || build_alias=$DEB_BUILD_GNU_TYPE ;;
+  esac
+fi
+# "whether system is ELF" (gpm and other old configure scripts, testing
+# __ELF__) asks whether -shared -Wl,-soname builds a shared library: on
+# gexcc it does (a wasm side module), though the object format is not ELF
+itz_cv_sys_elf=${itz_cv_sys_elf=yes}
+# X.Org's XORG_CHECK_MALLOC_ZERO (libX11, libXt and the rest): musl's
+# malloc(0) returns a unique pointer
+xorg_cv_malloc0_returns_null=${xorg_cv_malloc0_returns_null=no}
 ac_cv_func_chown_works=${ac_cv_func_chown_works=yes}
 ac_cv_func_getgroups_works=${ac_cv_func_getgroups_works=yes}
 ac_cv_func_malloc_0_nonnull=${ac_cv_func_malloc_0_nonnull=yes}

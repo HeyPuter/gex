@@ -34,8 +34,6 @@ cmake -G Ninja -S "$SRC/runtimes" -B "$B" \
   -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF \
   -DLIBUNWIND_INCLUDE_TESTS=OFF > "$B.cmake.log" 2>&1 || { tail -20 "$B.cmake.log"; exit 1; }
 ninja -C "$B" -j"$JOBS" install > "$B.build.log" 2>&1 || { grep -E 'error' "$B.build.log" | head -20; exit 1; }
-# the C++ exception tag (cpp_exception.s), next to Unwind-wasm.c's users
-HERE=$(dirname "$(realpath "$0")")
-clang --target=wasm32-unknown-linux-musl -mexception-handling -c "$HERE/cpp_exception.s" -o "$B/cpp_exception.o"
-for a in libc++.a libc++abi.a libunwind.a; do llvm-ar rs "$SR/lib/$a" "$B/cpp_exception.o"; done
+# (the C++ exception tag is libgexcc's, rt/cpp_exception.s: in libc.so, one
+# for every module of a process)
 echo "libc++: $SR/lib/libc++.a"

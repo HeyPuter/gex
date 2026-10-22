@@ -54,11 +54,18 @@ rm -f "$L/hoststub.o" "$L/hoststub.elf"
 mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
 clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
-for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/*.s; do
+for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/nlcompat.c "$HERE"/rt/poll.s; do
   clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
 llvm-ar crs "$PREFIX/sysroot/lib/libgexcc.a" "$PREFIX"/build/rt/*.o
+# the C++ exception tag: a static program's own; libc.so's for a shared
+# program and its libraries, which import it (so not in libgexcc.a, which
+# each module links)
+mkdir -p "$PREFIX/build/rt-eh"
+clang $WASM_CFLAGS -c "$HERE/rt/cpp_exception.s" -o "$PREFIX/build/rt-eh/cpp_exception.o"
+rm -f "$PREFIX/sysroot/lib/libgexcc_eh.a"
+llvm-ar crs "$PREFIX/sysroot/lib/libgexcc_eh.a" "$PREFIX/build/rt-eh/cpp_exception.o"
 # an empty object: -shared's archives carry their deps in a copy of it
 echo 'typedef int gexcc_empty;' | clang $WASM_CFLAGS -x c -c - -o "$L/empty.o"
 GEXC=${GEXC:-}
@@ -74,9 +81,13 @@ ln -sf gexcc "$B/gexc++"
 for t in cc gcc clang; do ln -sf gexcc "$B/$TRIPLE-$t"; done
 for t in c++ g++ clang++; do ln -sf gexcc "$B/$TRIPLE-$t"; done
 # (the driver picks C++ by its name ending in ++)
-for t in ar ranlib nm objdump strings size readelf objcopy; do
+for t in ar ranlib nm strings size readelf objcopy; do
   printf '#!/bin/sh\nexec llvm-%s "$@"\n' "$t" > "$B/$TRIPLE-$t"; chmod +x "$B/$TRIPLE-$t"
 done
+# objdump: a side module described as GNU objdump describes an ELF shared
+# object (Debian's dh_makeshlibs and dpkg-shlibdeps read SONAME and NEEDED)
+cp "$HERE/gexcc-objdump" "$B/gexcc-objdump"
+ln -sf gexcc-objdump "$B/$TRIPLE-objdump"
 for t in gexcc-ar gexcc-ranlib gexcc-nm; do
   printf '#!/bin/sh\nexec llvm-%s "$@"\n' "${t#gexcc-}" > "$B/$t"; chmod +x "$B/$t"
 done
@@ -102,11 +113,26 @@ chmod +x "$B/$TRIPLE-strip"
 ln -sf "$TRIPLE-strip" "$B/gexcc-strip"
 cat > "$B/$TRIPLE-pkg-config" <<EOF
 #!/bin/sh
-# pkg-config over the gexcc sysroot's libraries only
+# pkg-config over the gexcc sysroot's libraries only (Debian's multiarch
+# directory first). Static links name every library's own dependencies;
+# with GEXCC_SHARED the libraries carry them.
 export PKG_CONFIG_SYSROOT_DIR="$PREFIX/sysroot"
-export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/pkgconfig:$PREFIX/sysroot/usr/share/pkgconfig:$PREFIX/sysroot/usr/local/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$PREFIX/sysroot/usr/lib/wasm32-linux-musl/pkgconfig:$PREFIX/sysroot/usr/lib/pkgconfig:$PREFIX/sysroot/usr/share/pkgconfig:$PREFIX/sysroot/usr/local/lib/pkgconfig"
 unset PKG_CONFIG_PATH
-exec pkg-config --static "\$@"
+st=; case \${GEXCC_SHARED:-0} in 0) st=--static ;; esac
+# A variable naming a directory the sysroot does not have is where the
+# package installs to (udev's udevdir: /usr/lib/udev), not a place to read
+# from (wayland-protocols' pkgdatadir): the target's path, unprefixed.
+case " \$* " in
+*" --variable"*)
+    v=\$(pkg-config \$st "\$@") || exit
+    case \$v in
+    "\$PKG_CONFIG_SYSROOT_DIR"/*) [ -e "\$v" ] || v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
+    esac
+    printf '%s\n' "\$v"
+    exit 0 ;;
+esac
+exec pkg-config \$st "\$@"
 EOF
 chmod +x "$B/$TRIPLE-pkg-config"
 ln -sf "$TRIPLE-pkg-config" "$B/gexcc-pkg-config"
@@ -137,7 +163,14 @@ set(CMAKE_RANLIB "$B/$TRIPLE-ranlib" CACHE FILEPATH "")
 set(CMAKE_NM "$B/$TRIPLE-nm" CACHE FILEPATH "")
 set(CMAKE_STRIP "$B/$TRIPLE-strip" CACHE FILEPATH "")
 set(CMAKE_SYSROOT "$PREFIX/sysroot")
-set(CMAKE_STAGING_PREFIX "$PREFIX/sysroot/usr" CACHE PATH "")
+# Debian's multiarch directory (usr/lib/wasm32-linux-musl), where its
+# packages' libraries and CMake packages are
+set(CMAKE_LIBRARY_ARCHITECTURE wasm32-linux-musl)
+# A Debian package's build (dpkg-buildpackage exports DEB_HOST_ARCH) installs
+# into its own DESTDIR; anything else installs into the sysroot.
+if(NOT DEFINED ENV{DEB_HOST_ARCH})
+  set(CMAKE_STAGING_PREFIX "$PREFIX/sysroot/usr" CACHE PATH "")
+endif()
 set(CMAKE_FIND_ROOT_PATH "$PREFIX/sysroot")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
@@ -145,7 +178,16 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 set(CMAKE_CROSSCOMPILING_EMULATOR "$B/gexcc-run")
 set(PKG_CONFIG_EXECUTABLE "$B/$TRIPLE-pkg-config" CACHE FILEPATH "")
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
+# Static libraries unless GEXCC_SHARED (wasm side modules)
+if("\$ENV{GEXCC_SHARED}" STREQUAL "" OR "\$ENV{GEXCC_SHARED}" STREQUAL "0")
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
+endif()
+# A file of cache settings that win over the command line's -D options
+# (GEXCC_CMAKE_INIT; each set(... CACHE ... FORCE)): a packaging-level
+# override of what a build script passes
+if(DEFINED ENV{GEXCC_CMAKE_INIT})
+  include("\$ENV{GEXCC_CMAKE_INIT}")
+endif()
 EOF
 cat > "$S/meson-cross.ini" <<EOF
 # Meson cross file for gexcc: meson setup --cross-file $S/meson-cross.ini
