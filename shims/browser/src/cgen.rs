@@ -2671,9 +2671,10 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     // `ud2`'s fault hook leaves it, and a later trap must not resume there.
     // Another thread's context to resume with is the run loop's, as from
     // the hook: the resume point and context stay as the Unix side set them
-    // and the call leaves.
+    // and this thread traps out, as the `ud2`'s fault hook would leave
+    // (from a unit's call as from translated code's).
     if crate::resume_ctx().is_some_and(|v| v != c) {
-        return Some(gex_abi::ftab::RET_LEFT);
+        crate::trap();
     }
     crate::set_resume_none();
     crate::set_resume_ctx_none();
@@ -2690,21 +2691,12 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
 /// hook. True when it ran and the thread goes on at the context's PC (the
 /// caller dispatches there); false, and the `ud2` route as before, when it
 /// could not. A call that left another thread's context to resume with
-/// traps out from here, the way the fault hook's return would leave.
+/// traps out ([`w64_entry`]), the way the fault hook's return would leave.
 pub(crate) fn w64_entry_illegal(c: u64, pc: u64) -> bool {
     let gm = GuestMem::new(crate::guest_bytes());
     let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
     let Ok(ret) = gm.read_u64(sp) else { return false };
-    if w64_entry(&gm, c, pc, ret).is_none() {
-        return false;
-    }
-    // Another context to resume with, as the Unix side left it (resume
-    // point and context both, which `w64_entry` keeps): the run loop's,
-    // through a trap, as from the fault hook.
-    if crate::resume_ctx().is_some_and(|v| v != c) {
-        crate::trap();
-    }
-    true
+    w64_entry(&gm, c, pc, ret).is_some()
 }
 
 /// The process's handler for a guest's Unix call (W3), or 0.
