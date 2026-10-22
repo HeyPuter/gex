@@ -185,6 +185,9 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # many-workers: three children of 48 threads each, all parked at once: more
 # Workers than the global kernel had stacks for (128; the Win7 shell's
 # Games folder said "this is Worker 129").
+# threads-many: a hundred threads of one process live at once, more than a
+# process once had shim stack slots for (64), then 300, past the page's 256:
+# each thread runs, and past the limit pthread_create says EAGAIN.
 # poll-timeout: poll, ppoll, select and epoll_wait ended only by their
 # 100 ms deadline, after the stack went back to the page (the clock scope a
 # trap left open froze the clock, and they never returned).
@@ -214,7 +217,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # null-access (with GEX_NULL_GUARD=1, the debug opt-in): loads and stores
 # through null pointers (and below 64 KiB) fault: a SIGSEGV handler runs and
 # jumps back out, and with no handler the process dies of SIGSEGV.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -254,6 +257,13 @@ for src in "$HERE"/*.c; do
             fi
             args=$(head -1 "$WORK/mem64-net.port")
             [ -n "$args" ] || { echo "FAIL $name: its server did not start"; fail=1; continue; }
+        fi
+        # threads-many: its 300-thread round needs that many host threads (a
+        # Worker each on the page); under a smaller task cap than that it
+        # runs its first round only, natively and on gex alike.
+        if [ $name = threads-many ]; then
+            pm=$(cat "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/pids.max" 2>/dev/null)
+            case $pm in ''|max) ;; *) [ "$pm" -lt 1024 ] && args=first ;; esac
         fi
         native=$("$bin" $args 2>/dev/null); ns=$?
         # smc-race: the translator waits between decoding a JIT-code block

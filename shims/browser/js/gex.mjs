@@ -19,9 +19,14 @@ import { logOn, logQuiet } from "./log.mjs";
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
 /** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
- *  process with one Worker, and for one with threads. */
+ *  process with one Worker, and for one with threads. Room is only how soon
+ *  a Worker must grow again: an index past a running Worker's table never
+ *  enters the probe cache (cgen.rs `fcache_publish`), so a short table costs
+ *  a `lookup`, never a trap. Every entry is held per Worker in the
+ *  renderer's trusted range, which all its isolates share (1 GiB), so the
+ *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
-const FTAB_SPARE_THREADED = 65536;
+const FTAB_SPARE_THREADED = 8192;
 /** Tests only (tests/w3/ftabstale.sh): both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
@@ -1008,6 +1013,10 @@ export class Gex {
   #stackTop = null;
   /** The slot went back (`releaseWorker`): nothing may call in again. */
   #released = false;
+  /** A thread's Worker whose `clone` promised it a slot it has not claimed. */
+  #promise = false;
+  /** `gex_worker_init` found no slot: the instance has no thread-locals. */
+  #noSlot = false;
   /** This instance is a forked child's first: its slot bits are its parent's. */
   #forkChild = false;
   /** A forked child's inherited regions' ends, for its first arena claim. */
@@ -1161,11 +1170,16 @@ export class Gex {
         this.#inheritedEnds = [];
       }
       const at = this.#shim.exports.gex_worker_init?.(); 
-      // No slot: every one of the process's 64 is held by a live instance.
-      // Running on would put this instance's thread-locals at address zero
-      // (`__tls_base` unset), over the guest's memory.
+      // A thread's slot was promised by its `clone`: claimed now, or lost.
+      this.keepPromise();
+      // No slot (every one held by a live instance, or no arena for its
+      // stack). Running on, or calling into this instance at all, would
+      // put its thread-locals at address zero (`__tls_base` unset), over
+      // the thread contexts at the bottom of the memory: the instance is
+      // done (`noSlot`) and nothing calls in again.
       if (at === 0 && (isShared(this.#memory.buffer) || single.on)) {
-        throw new Error('gex: no shim stack slot left for this Worker (64 instances of this process are live)');
+        this.#noSlot = true;
+        throw new Error('gex: no shim stack slot left for this Worker (every slot of this process is held)');
       }
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
       // A test's: this Worker's stack guard broken, as an overrun leaves it,
@@ -1314,6 +1328,18 @@ export class Gex {
 
   /** The slot went back (`releaseWorker`): call nothing in this instance. */
   get released() { return this.#released; }
+  /** No slot was had (`#workerStack`): call nothing in this instance. */
+  get noSlot() { return this.#noSlot; }
+  /**
+   * A promised slot claimed, or never to be: told once, so the process's
+   * next `clone` can count on it. Pairs with `thread_runner_take` (the
+   * shim's), which promised it.
+   */
+  keepPromise() {
+    if (!this.#promise) return;
+    this.#promise = false;
+    try { this.#shim?.exports?.gex_worker_promise_done?.(); } catch {}
+  }
 
   /**
    * Give this instance's stack and thread-local slot back to the process
@@ -3319,13 +3345,19 @@ export class Gex {
    */
   #startThread(who = 'gex') {
     let thread;
+    // A thread that will not start gives back the slot its `clone` was
+    // promised (`gex_worker_promise_done`).
+    const lost = (err) => {
+      threadNotStarted(who, err);
+      try { this.#shim?.exports?.gex_worker_promise_done?.(); } catch {}
+    };
     try {
       thread = this.#takeThread();
     } catch (err) {
-      threadNotStarted(who, err);
+      lost(err);
       return;
     }
-    if (thread) this.#postThread(thread).catch((err) => threadNotStarted(who, err));
+    if (thread) this.#postThread(thread).catch(lost);
   }
 
   /** The thread `clone` left for the host, claimed: null with none. */
@@ -3395,6 +3427,7 @@ export class Gex {
   async adoptThread(shimWasm, guestWasm, thread) {
     this.#threaded();
     this.#threadTid = thread.tid;
+    this.#promise = true;
     await this.attach(shimWasm, guestWasm, { devices: false });
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
@@ -4044,7 +4077,10 @@ export class Gex {
     for (;;) {
       const want = size + this.#ftabSpare;
       const have = Number(st.ftab.length);
-      if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
+      if (have < want) {
+        st.ftab.grow(tIdx(want - have), st.resolve);
+        this.#tallyTables('ftab grew');
+      }
       // Counted for the probe cache's indices at this length (cgen.rs
       // `gex_ftab_enter`); again if another Worker allocated meanwhile.
       if (!e.gex_ftab_enter) return;
@@ -6477,6 +6513,7 @@ export class Gex {
           `dispatch table ${i} would not grow from ${tables[i].length} to ${want}: ${err.message}`,
         );
       }
+      this.#tallyTables(`dispatch${i} grew`);
     }
     return tables;
   }
@@ -6502,6 +6539,7 @@ export class Gex {
       try {
         growTable(tables[i], need - tables[i].length, stub, i);
         grew = true;
+        this.#tallyTables(`dispatch${i} grew to the claimed`);
       } catch {
         /* a table that will not grow is reported by the caller's retry cap */
       }
@@ -7894,6 +7932,7 @@ export class Gex {
     if (delta <= 0) return;
     const g0 = performance.now();
     growTable(tables[t], delta, stub, t);
+    this.#tallyTables(`dispatch${t} grew`);
     this.#pubGrewSlots += delta;
     this.#pubGrowMs += performance.now() - g0;
   }
@@ -8462,11 +8501,56 @@ export class Gex {
     const need = this.#shim.exports.gex_dense_size() >>> 0;
     const len = b.length;
     if (len >= need) return false;
-    const want = Math.max(need, Math.min(len * 2, len + (1 << 18)));
+    // An eighth over what is numbered (4096 entries at least), not double:
+    // each entry is per Worker in the renderer's trusted range, shared by
+    // all its isolates, and a doubled `blocks` was mostly never filled.
+    const want = need + Math.max(need >>> 3, 4096);
     growTable(b, want - len, b.get(0), 'blocks');
+    this.#tallyTables('blocks grew');
     return true;
   }
 
+  /**
+   * `GEX_LOG=tables`: this Worker's funcref tables, each as length/entries
+   * used (an entry other than the table's fill)/entries the process has
+   * numbered (where it says), one line, said when one of
+   * them grows -- a Worker parked in a wait says
+   * nothing later, so its last line is what it holds. V8 keeps each entry
+   * in the renderer's trusted range, which all its isolates share. Off: one
+   * call and a compare.
+   */
+  #tallyTables(why) {
+    if (!logOn('tables')) return;
+    const used = (t, fill) => {
+      let n = 0;
+      const len = Number(t.length);
+      for (let j = 0; j < len; j++) if (t.get(typeof t.length === 'bigint' ? BigInt(j) : j) !== fill) n++;
+      return `${len}/${n}`;
+    };
+    const seen = new Set();
+    const out = [];
+    // `need`: the entries the process has numbered, which the table must cover.
+    const note = (name, t, fill, need) => {
+      if (!t || seen.has(t)) return;
+      seen.add(t);
+      out.push(`${name}=${used(t, fill)}${need === undefined ? '' : `/${need >>> 0}`}`);
+    };
+    try {
+      const tables = this.#guest ? this.#dispatchTables() : [];
+      const stub = tables[0]?.get(0);
+      tables.forEach((t, i) => note(`dispatch${i}`, t, stub));
+      const b = this.#guest?.exports?.blocks;
+      const e = this.#shim.exports;
+      if (b) note('blocks', b, b.get(0), e.gex_dense_size?.());
+      if (this.#cgen) note('ftab', this.#cgen.ftab, this.#cgen.resolve, e.gex_ftab_size?.());
+      for (const [where, ex] of [['guest', this.#guest?.exports], ['shim', this.#shim?.exports]]) {
+        for (const [k, v] of Object.entries(ex ?? {})) if (v instanceof WebAssembly.Table) note(`${where}.${k}`, v, null);
+      }
+    } catch (err) {
+      out.push(`(tally failed: ${err?.message ?? err})`);
+    }
+    console.error(`[tables] ${this.#whoFills()} ${why}: ${out.join(' ')}`);
+  }
   /** Every dispatch table the guest module exports, in index order. */
   #dispatchTables() {
     const out = [];

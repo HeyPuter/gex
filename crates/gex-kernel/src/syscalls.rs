@@ -5303,12 +5303,44 @@ pub struct ThreadMaker<'a> {
     pub fs: &'a Arc<FsCwd>,
 }
 
+/// What the host runs a process's threads on, when it has only so many (the
+/// page: a shim stack and thread-local block per Worker). `take` promises
+/// one to a thread being made, or answers false when none is left; `give`
+/// takes back a promise the thread will not use.
+pub struct ThreadRunners {
+    pub take: fn() -> bool,
+    pub give: fn(),
+}
+
+static THREAD_RUNNERS: std::sync::OnceLock<ThreadRunners> = std::sync::OnceLock::new();
+
+/// Set once by a host with a limit; without one every thread can run.
+pub fn set_thread_runners(r: ThreadRunners) {
+    let _ = THREAD_RUNNERS.set(r);
+}
+
 impl ThreadMaker<'_> {
     /// Make a thread for `clone(a)` (`CLONE_THREAD`) called from the context
     /// at `parent`: its context a copy of the caller's with the child's
     /// answer (0), stack, tid and TLS, its id, its fs_struct and its own
-    /// signal state.
+    /// signal state. A thread the host has nothing to run on is refused
+    /// with `EAGAIN` before anything of it exists, as Linux refuses one
+    /// past its limits: made, it would never run.
     pub fn make(&self, m: &mut GuestMem<'_>, parent: u64, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
+        let runners = THREAD_RUNNERS.get();
+        if runners.is_some_and(|r| !(r.take)()) {
+            return Err(Errno::EAGAIN);
+        }
+        let made = self.make_promised(m, parent, a);
+        if made.is_err() {
+            if let Some(r) = runners {
+                (r.give)();
+            }
+        }
+        made
+    }
+
+    fn make_promised(&self, m: &mut GuestMem<'_>, parent: u64, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
         use std::sync::atomic::Ordering;
         let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
         if flags & clone_flags::THREAD == 0 {

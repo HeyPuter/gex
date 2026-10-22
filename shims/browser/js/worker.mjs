@@ -1313,12 +1313,17 @@ async function handle(msg) {
       && status >= 0 && status < 128 && !msg.network && !msg.wispUrl;
     port.post(exitMsg);
   } catch (e) {
+    // A thread that failed before its claim gives its promised slot back.
+    gex?.keepPromise?.();
+    // An instance that got no slot has no thread-locals: any call into it
+    // writes over the thread contexts at address zero (`Gex#noSlot`).
+    const inert = !!gex?.noSlot;
     // Where the guest was, not only what the engine said: a crash inside the
     // shim reaches the host as `unreachable`, and the guest pc and object are
     // readable here and nowhere else.
     let where = '';
     try {
-      const ex = gex.shim?.exports;
+      const ex = inert ? null : gex.shim?.exports;
       // Only if this Worker got as far as having a kernel: a failure during
       // load left no host, and `gex_current_pc` panicking on the way in
       // replaced the real error with a bare `unreachable`.
@@ -1362,8 +1367,12 @@ async function handle(msg) {
     // `gex_abandon` -- #69.
     try {
       // Dump guest registers first: a trap gives JavaScript no address.
-      gex?.shim?.exports?.gex_dump_state?.();
-      gex?.shim?.exports?.gex_abandon?.(-9);
+      // Not for an instance with no slot: its thread never ran, and the
+      // process runs on in its other Workers.
+      if (!inert) {
+        gex?.shim?.exports?.gex_dump_state?.();
+        gex?.shim?.exports?.gex_abandon?.(-9);
+      }
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
