@@ -627,7 +627,9 @@ impl Translation<'_> {
         gex_cgen::image::set_unguarded(true);
         let built = (|| {
             let mut images = Vec::new();
-            for p in self.placed.iter().filter(|p| p.pinned && (p.obj.role == "library" || p.obj.role == "interp")) {
+            // Programs too, at the base gex's loader gives them (PIE_BASE):
+            // one function tier for all of a Linux program's code.
+            for p in self.placed.iter().filter(|p| p.obj.role == "exe" || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp"))) {
                 let host = self.dir.join(rootfs_rel(&p.obj.path)?);
                 let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
                 let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)

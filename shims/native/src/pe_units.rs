@@ -1842,7 +1842,7 @@ pub fn elf_units_on() -> bool {
     elf_list().is_some_and(|l| !l.is_empty())
 }
 
-fn elf_wanted(path: &str) -> bool {
+pub(crate) fn elf_wanted(path: &str) -> bool {
     let Some(list) = elf_list() else { return false };
     let name = path.rsplit('/').next().unwrap_or(path);
     list.iter().any(|n| n == "all" || n == name)

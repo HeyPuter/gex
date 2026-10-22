@@ -1129,6 +1129,16 @@ fn run_program_with(
             kernel.mem.lock().log.new_code.extend(maps);
         }
     }
+    // The program itself, when it has a unit (GEX_ELF_UNITS names it): placed
+    // by gex's loader too, so announced the same way, and its unit is in
+    // before its first instruction (`run_thread_loop`).
+    if pe_units::elf_wanted(&kernel.exe_path) {
+        let path = kernel.exe_path.clone();
+        if let Some(bytes) = kernel.read_file(&path) {
+            let maps = gex_kernel::CodeMap::of_placed(&path, &bytes, image.bias);
+            kernel.mem.lock().log.new_code.extend(maps);
+        }
+    }
     // The first program (an exec says its own, `exec_program`).
     if fresh_process {
         note_exec(kernel.pid, opts.args.first().map_or("(program)", |a| a.as_str()), &opts.args);
