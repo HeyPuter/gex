@@ -3966,14 +3966,28 @@ impl MapIo<'_> {
             let mut addr = addr;
             let mut pinned = None;
             if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
-                let mut mm = self.mem.lock();
-                if let Some((path, base)) = mm.log.armed_pin.take() {
-                    if path.rsplit('/').next() == name.rsplit('/').next() {
-                        mm.log.armed_place = None;
+                let mut placed = None;
+                {
+                    let mut mm = self.mem.lock();
+                    if let Some((path, base)) = mm.log.armed_pin.take() {
+                        if path.rsplit('/').next() == name.rsplit('/').next() {
+                            mm.log.armed_place = None;
+                            addr = base;
+                            pinned = Some((path, base));
+                        } else {
+                            mm.log.armed_pin = Some((path, base));
+                        }
+                    }
+                    // Or the placement armed at its open, as for a
+                    // reservation (below): every process is given the
+                    // address the first one got.
+                    if pinned.is_none() && mm.log.armed_place.as_deref() == Some(name.as_str()) {
+                        placed = mm.log.armed_place.take();
+                    }
+                }
+                if let Some(path) = placed {
+                    if let Some(base) = self.place.and_then(|p| p.place(&path, len_aligned)) {
                         addr = base;
-                        pinned = Some((path, base));
-                    } else {
-                        mm.log.armed_pin = Some((path, base));
                     }
                 }
             }
