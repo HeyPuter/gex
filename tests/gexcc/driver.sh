@@ -116,4 +116,9 @@ GEXCC_SHARED=1 gexcc -shared -fPIC -Wl,-soname,libls.so.0 -o "$W/ls/libls.so.0" 
     printf 'int ls_get(void);\nint main(void){return ls_get() != 7;}\n' > "$W/ls/m.c" &&
     GEXCC_SHARED=1 gexcc -o "$W/ls/m" "$W/ls/m.c" -L"$W/ls" -lls 2> "$W/log"
 check $? "a GNU ld script in a library's place"
+# Debian's -Werror=implicit-function-declaration does not undo the warning
+# for a C library function (strcmp after <stdlib.h> alone, as glibc allows)
+printf '#include <stdlib.h>\nint main(void){return strcmp("a","b");}\n' > "$W/id.c"
+gexcc -O2 -Werror=implicit-function-declaration -c -o "$W/id.o" "$W/id.c" 2> "$W/log"
+check $? "an undeclared C library call under Debian's -Werror=implicit-function-declaration"
 exit $fail

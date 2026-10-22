@@ -126,6 +126,11 @@ POLL = os.environ.get('GEXCC_POLL', '1') != '0' and '-fno-gex-poll' not in sys.a
 if POLL and os.path.exists(os.path.join(LIBDIR, 'GexPoll.so')):
     CLANG += ['-fpass-plugin=' + os.path.join(LIBDIR, 'GexPoll.so')]
 CLANG_TAIL = INCS
+# and after the caller's flags too: Debian's build flags turn the warning
+# back into an error (-Werror=implicit-function-declaration, which GCC on
+# glibc passes for the same reason as above)
+if not CXX:
+    CLANG_TAIL = CLANG_TAIL + ['-Wno-error=implicit-function-declaration']
 
 
 def expand_rsp(args):
