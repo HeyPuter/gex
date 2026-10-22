@@ -155,6 +155,24 @@ function presentMode(adapter) {
   return info.isFallbackAdapter || info.architecture === 'swiftshader' ? 'readback' : 'canvas';
 }
 
+/** The largest damage rectangle (bytes) kept to tell an unchanged repaint
+ *  from a change: a client that commits the same pixels again and again
+ *  then costs a comparison, not an upload and a frame. */
+const SAME_MAX = 256 * 1024;
+
+/** Whether `a` and `b` hold the same bytes (equal lengths). */
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  if ((a.byteOffset & 3) === 0 && (b.byteOffset & 3) === 0 && (a.length & 3) === 0) {
+    const x = new Uint32Array(a.buffer, a.byteOffset, a.length >> 2);
+    const y = new Uint32Array(b.buffer, b.byteOffset, b.length >> 2);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 class Painter {
   constructor(device, context, format) {
     this.device = device;
@@ -436,6 +454,9 @@ class Compositor {
   /** A view onto guest memory can be refused by writeTexture; then we stage a copy. */
   #stagingOk = null;
   #staging = new Uint8Array(0);
+  /** Uploads made and their bytes, those of whole buffers among them, and
+   *  damage left out as unchanged (`describe().uploads`). */
+  #uploadStats = { n: 0, bytes: 0, same: 0, full: 0, fullBytes: 0 };
   /** A short history of what the scene did, for when a picture is not enough. */
   #log = [];
   /**
@@ -863,7 +884,7 @@ class Compositor {
       t = null;
     }
     if (!t) {
-      t = { tex: gpuTexture(this.#device, w, h), w, h, serial: 0 };
+      t = { tex: gpuTexture(this.#device, w, h), w, h, serial: 0, version: 0, last: null };
       this.#textures.set(k, t);
     }
     return t;
@@ -912,27 +933,69 @@ class Compositor {
       this.#note(`! ${k} buffer at ${start}+${need} past ${mem.length}`);
       return false;
     }
+    const row = w * 4;
+    const packed = row * h;
+    // A damage rectangle narrower than the buffer is copied out row by row,
+    // so the upload carries its own pixels and not the rest of every row it
+    // crosses (those of an 8-pixel column of a 1280-pixel buffer are 160
+    // times its pixels). A small rectangle is also kept: one whose pixels
+    // are those of the texture's last upload, of that same rectangle, is
+    // not uploaded and leaves the output as it was (no draw, no present).
+    const pack = need > 2 * packed;
+    const keep = packed <= SAME_MAX;
     let view;
-    if (this.#stagingOk === false) {
-      // A SharedArrayBuffer view was refused, so one staging copy it is.
-      if (this.#staging.length < need) this.#staging = new Uint8Array(need);
-      this.#staging.set(mem.subarray(start, start + need));
-      view = this.#staging.subarray(0, need);
+    let stride = s.stride;
+    if (pack || keep || this.#stagingOk === false) {
+      if (pack || keep) {
+        if (this.#staging.length < packed) this.#staging = new Uint8Array(packed);
+        for (let r = 0; r < h; r++) {
+          const from = start + r * s.stride;
+          this.#staging.set(mem.subarray(from, from + row), r * row);
+        }
+        view = this.#staging.subarray(0, packed);
+        stride = row;
+      } else {
+        // A SharedArrayBuffer view was refused, so one staging copy it is.
+        if (this.#staging.length < need) this.#staging = new Uint8Array(need);
+        this.#staging.set(mem.subarray(start, start + need));
+        view = this.#staging.subarray(0, need);
+      }
     } else {
       view = mem.subarray(start, start + need);
     }
+    if (keep) {
+      const l = t.last;
+      if (l && l.x === x && l.y === y && l.w === w && l.h === h && sameBytes(l.px, view)) {
+        this.#uploadStats.same++;
+        t.serial = s.serial;
+        return true;
+      }
+      if (l && l.px.length === packed) l.px.set(view);
+      else t.last = { x, y, w, h, px: view.slice() };
+      Object.assign(t.last, { x, y, w, h });
+    } else {
+      t.last = null;
+    }
     try {
       this.#device.queue.writeTexture({ texture: t.tex, origin: { x, y } }, view,
-        { offset: 0, bytesPerRow: s.stride, rowsPerImage: h }, { width: w, height: h });
+        { offset: 0, bytesPerRow: stride, rowsPerImage: h }, { width: w, height: h });
       if (this.#stagingOk === null) this.#stagingOk = true;
     } catch (e) {
       if (this.#stagingOk === null) {
         // Once, and then never again: fall back and redo this upload.
         this.#stagingOk = false;
+        t.last = null;
         return this.#upload(k, s);
       }
       throw e;
     }
+    this.#uploadStats.n++;
+    this.#uploadStats.bytes += view.length;
+    if (full) {
+      this.#uploadStats.full++;
+      this.#uploadStats.fullBytes += view.length;
+    }
+    t.version++;
     t.serial = s.serial;
     return true;
   }
@@ -1075,7 +1138,7 @@ class Compositor {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
         win.placed ? `p${win.layer}${win.unmanaged ? 'u' : ''}` : '',
-        f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null),
+        f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.version ?? '-', JSON.stringify(win.info?.glRect ?? null),
         glFrameFor(win)?.serial ?? '');
     }
     return parts.join('|');
@@ -1652,6 +1715,9 @@ class Compositor {
     }
     return {
       frames: this.#frames,
+      // Texture uploads, the bytes they carried, and damage whose pixels
+      // had not changed (not uploaded, nothing drawn for it).
+      uploads: { ...this.#uploadStats },
       windows: wins.length,
       surfaces: this.#windows.size,
       // Every surface the compositor is holding, so a test can see a window
