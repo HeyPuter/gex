@@ -4815,6 +4815,17 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         }
         return Ok(0);
     }
+    // A pidfd for the peer (Linux 6.5) and its security label: gex has
+    // neither, and says so as a kernel without them does. A success here
+    // hands back descriptor 0 as the peer's pidfd, which dbus-daemon
+    // duplicates and later closes -- its own standard input, and then
+    // whatever took that number next.
+    const SO_PEERSEC: u64 = 31;
+    const SO_PEERPIDFD: u64 = 77;
+    if level == SOL_SOCKET && matches!(name, SO_PEERSEC | SO_PEERPIDFD) {
+        socket_family_type(io, fd)?;
+        return Err(Errno::ENOPROTOOPT);
+    }
     let err = if name == SO_ERROR {
         // A unix socket (local or the global kernel's) has no connect
         // in progress to report: zero, as for a socketpair end on Linux.
@@ -11637,6 +11648,14 @@ mod tests {
             set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 4, 0x20500, 0]);
             call(&mut m, &mut k);
             assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap()), (0, 0));
+            // No peer pidfd and no security label, as on a kernel without
+            // them: an error, not descriptor 0 or an empty label.
+            for opt in [31u64, 77] {
+                m.write_u32(0x205f0, 4).unwrap();
+                set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, opt, 0x20500, 0x205f0]);
+                call(&mut m, &mut k);
+                assert_eq!(ret(&m, at), -92, "getsockopt option {opt}");
+            }
             set_args(&mut m, at, nr::SETSOCKOPT, &[c, 1, 2, 0x20500, 4]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), 0);
