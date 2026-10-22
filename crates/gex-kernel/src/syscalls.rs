@@ -8522,7 +8522,9 @@ impl Kernel {
             retry_sigwait: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
-            pins: Default::default(),
+            // The layout a closure build assumed holds in every process of
+            // the run: a child that maps a pinned object gets its base.
+            pins: self.pins.clone(),
             // The placement outlives any one process: a child that maps the
             // same library must be given the same address its parent was.
             place: self.place.clone(),
