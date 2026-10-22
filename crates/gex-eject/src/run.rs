@@ -23,6 +23,28 @@ pub struct RunFlags {
     pub display: Option<String>,
 }
 
+/// The guest memory every module `build` writes is for: the flavour a
+/// build runs in (`gexc eject build` never widens it).
+pub const BUILD_MEM: gex_abi::MemFlavor = gex_abi::MemFlavor::M32;
+
+/// The memory a run of a built project's modules gets: the build's, whatever
+/// a program's earlier runs taught gex (a learned 64-bit memory is not
+/// theirs). `requested` is the run's `--mem64`/`--mem32`, if any.
+pub fn build_mem(requested: Option<bool>) -> Result<gex_abi::MemFlavor> {
+    if requested == Some(true) && !BUILD_MEM.is_64() {
+        bail!("--mem64: the ejected project's modules are for a 32-bit memory; run with --mem32 (or without --mem64)");
+    }
+    Ok(BUILD_MEM)
+}
+
+/// A built project's modules and library pins, for an ordinary `gexc run`
+/// of the session it came from (`GEX_EJECT_BUILD`, a debugging aid): what
+/// they do not cover is translated as usual.
+pub fn debug_build(dir: &Path) -> Result<(Aot, Vec<(String, u64)>)> {
+    let manifest = BuildManifest::load(dir)?;
+    Ok((aot(dir, &manifest), manifest.pins.clone()))
+}
+
 /// The runtime's view of a built project.
 pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
     let mut aot = Aot::new(format!("the ejected project {}", dir.display()));

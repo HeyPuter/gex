@@ -225,6 +225,13 @@ fn eject_build_run_and_replace() {
     assert_eq!(files(&p), files(&p2), "two ejects of one session differ");
 
     build::build(&p).unwrap();
+    // GEX_EJECT_BUILD's view of it: the build's modules, and its memory
+    // whatever was learned; --mem64 asked of it is refused, naming --mem32.
+    let (aot, pins) = run::debug_build(&p).unwrap();
+    assert!(!aot.images.is_empty() && pins.is_empty(), "a static program's build: one image, no pins");
+    assert!(!run::build_mem(None).unwrap().is_64() && !run::build_mem(Some(false)).unwrap().is_64());
+    let e = run::build_mem(Some(true)).unwrap_err().to_string();
+    assert!(e.contains("--mem32") && !e.contains('\n'), "{e}");
     let flags = run::RunFlags::default();
     // The session made no system calls, so the ejected runtime allows none:
     // its exit_group is refused, by name.
