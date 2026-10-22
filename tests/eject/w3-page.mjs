@@ -36,7 +36,8 @@
 //   1b. fill.json's `demand` units (eject-site.mjs --boot-units: units no
 //      image loads before the program is up) are whole in the fill and in no
 //      boot archive; run, the fill ends (`[app] fill:`) with no unit of it
-//      failing (`[app] late unit`, `[app] the fill failed`);
+//      failing (`[app] a late unit failed`, `[app] the fill failed`; not the
+//      summary `[app] late units: N files from the fill`);
 //   1c. with pieces (eject-site.mjs --pieces), no bytes twice: files of one
 //      class with the same bytes share one piece's copy;
 //   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
@@ -227,6 +228,16 @@ await browser.send('Runtime.enable', {}, page);
 const units = { hit: new Set(), miss: new Set() };
 // The background fill: its end, and a unit of it that failed.
 const fillSeen = { done: null, failed: [] };
+// A line saying a unit of the fill failed (app.js), not its success summary.
+const fillFailure = (line) => /\[app\] (a late unit failed|the fill failed)/.test(line);
+for (const [line, want] of [
+  ['[app] late units: 60 files from the fill in 196 ms', false],
+  ['[app] fill: 132 files, 325.8 MiB in 2064 ms', false],
+  ['[app] a late unit failed: units/KEY/c.wasm: CompileError', true],
+  ['[app] the fill failed: TypeError: x', true],
+]) {
+  if (fillFailure(line) !== want) throw new Error(`w3-page: fillFailure(${JSON.stringify(line)}) is not ${want}`);
+}
 {
   const { appendFileSync } = await import('node:fs');
   const t0 = Date.now();
@@ -235,7 +246,7 @@ const fillSeen = { done: null, failed: [] };
     const u = /\[gex-record\] unit [0-9a-f-]+ (hit|miss) (\S+)/.exec(line);
     if (u) units[u[1]].add(u[2]);
     if (/\[app\] fill: \d+ files/.test(line)) fillSeen.done = line.replace(/^.*\[app\] /, '');
-    if (/\[app\] (late unit|the fill failed)/.test(line)) fillSeen.failed.push(line.replace(/^.*\[app\] /, ''));
+    if (fillFailure(line)) fillSeen.failed.push(line.replace(/^.*\[app\] /, ''));
     if (process.env.W3PAGE_CONSOLE) appendFileSync(process.env.W3PAGE_CONSOLE, `${Date.now() - t0} ${line}\n`);
   });
   browser.on('Target.attachedToTarget', async (p) => {

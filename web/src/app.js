@@ -626,7 +626,7 @@ async function begin(opts, base, at, state, meter) {
         if (m.cached) state.cached = (state.cached ?? 0) + m.n;
         else state.downloaded = (state.downloaded ?? 0) + m.n;
       } else if (m.kind === 'late') {
-        if (m.error) say(`[app] late unit ${m.error}\n`);
+        if (m.error) say(`[app] a late unit failed: ${m.error}\n`);
         else add(m.entry);
         if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
       } else if (m.kind === 'done') {
