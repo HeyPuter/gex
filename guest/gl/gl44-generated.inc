@@ -221,7 +221,9 @@ void glBufferStorage(unsigned target, long size, const void *data, unsigned flag
     if (!a) return;
     uint64_t bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)bytes; a[2] = (uint32_t)(bytes >> 32);
-    a[3] = flags; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
+    /* GL_DYNAMIC_STORAGE_BIT on the host whatever the application asked:
+       a mapping's writes reach the host as glBufferSubData. */
+    a[3] = flags | 0x0100u; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
 }
 void glClampColor(unsigned target, unsigned clamp) {
     uint32_t *packet = begin(1066, 2, 0);
@@ -600,7 +602,7 @@ void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned nu
     packet[at++] = (uint32_t)(num_groups_z);
 }
 void glDispatchComputeIndirect(long indirect) {
-    persistent_dispatch();
+    persistent_dispatch(); persistent_read_target(0x90EEu, indirect, 12);
     buffer_contents_unknown();
     uint32_t *packet = begin(1127, 2, 0);
     if (!packet) return;

@@ -911,7 +911,7 @@ enum { UP_APP, UP_UNMAP_WHOLE, UP_UNMAP_CHANGED, UP_FLUSH, UP_PERSIST, UP_SPLIT,
 static int upload_origin = UP_APP, upload_trace = -1;
 static unsigned long long upload_bytes[UP_N], upload_calls[UP_N], upload_total;
 static unsigned long long unmap_n, unmap_mirror, unmap_whole_bytes, unmap_map_bytes;
-static unsigned long long flush_hashed, flush_sent, flush_whole;
+static unsigned long long flush_hashed, flush_sent, flush_whole, flush_deferred;
 static unsigned unmap_access_seen[8], unmap_access_n[8];
 static size_t unmap_size_seen[8];
 static unsigned long long unmap_size_n[8];
@@ -925,8 +925,8 @@ static void upload_say(void) {
             upload_bytes[UP_FLUSH] >> 20, upload_calls[UP_FLUSH], upload_bytes[UP_PERSIST] >> 20, upload_calls[UP_PERSIST],
             upload_bytes[UP_SPLIT] >> 20, upload_calls[UP_SPLIT], unmap_n, unmap_mirror, unmap_map_bytes >> 20);
     for (int i = 0; i < 8 && unmap_access_n[i]; i++) fprintf(stderr, " %#x:%u", unmap_access_seen[i], unmap_access_n[i]);
-    fprintf(stderr, "; flush: %llu MiB hashed, %llu MiB sent of them, %llu MiB whole", flush_hashed >> 20, flush_sent >> 20, flush_whole >> 20);
-    flush_hashed = flush_sent = flush_whole = 0;
+    fprintf(stderr, "; flush: %llu MiB hashed, %llu MiB sent of them, %llu MiB whole, %llu MiB left to readers", flush_hashed >> 20, flush_sent >> 20, flush_whole >> 20, flush_deferred >> 20);
+    flush_hashed = flush_sent = flush_whole = flush_deferred = 0;
     fprintf(stderr, "; sizes:");
     for (int i = 0; i < 8 && unmap_size_n[i]; i++) fprintf(stderr, " %zu:%llu", unmap_size_seen[i], unmap_size_n[i]);
     fprintf(stderr, "\n");
@@ -1319,6 +1319,18 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
         (size_t)offset > object->map_length ||
         (size_t)length > object->map_length - (size_t)offset) return;
     const size_t start = (size_t)offset, end = start + (size_t)length;
+    /* A coherent mapping's writes reach the host anyway, by the range each
+       reader needs (persistent_settle_range at the draw, copy or upload that
+       reads them; persistent_fallback for a reader of unknown range): its
+       flush has nothing to add. wined3d flushes a Direct3D buffer's whole
+       range at each unmap -- Hades, tens of MiB a flush in play, of which a
+       few KiB changed -- so hashing the flushed range here cost more than
+       the readers' own ranges ever do. Unless the host's copy may have
+       changed under the map: then the flushed range goes whole, below. */
+    if (persistent_coherent(object) && !object->host_wrote) {
+        if (upload_tracing()) flush_deferred += end - start;
+        return;
+    }
     upload_origin = UP_FLUSH;
     if (!object->sent || object->host_wrote) {
         flush_send(target, object, start, end);

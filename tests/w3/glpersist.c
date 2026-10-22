@@ -23,6 +23,9 @@
  *      copy of A under the map, B written again (the same bytes as the
  *      map held), flushed -> B; and a glBufferSubData of A the same way
  *      -> B
+ *  10. a reader that is not a draw: glDispatchComputeIndirect's group
+ *      counts written into such a mapping and flushed; the shader then
+ *      stores a mark in a storage buffer, read back
  * Steps 1-6 put a flush, swap, fence, copy, barrier or explicit flush
  * between each write and the draw that reads it; 7 and 8 put nothing there:
  * a coherent write is visible to the next draw.
@@ -95,6 +98,10 @@ PROC(void *, glFenceSync, (GLenum, GLbitfield))
 PROC(void, glDeleteSync, (void *))
 PROC(void, glMemoryBarrier, (GLbitfield))
 PROC(void, glDrawRangeElementsBaseVertex, (GLenum, GLuint, GLuint, GLsizei, GLenum, const void *, GLint))
+PROC(void, glDispatchComputeIndirect, (ptrdiff_t))
+PROC(void, glBindBufferBase, (GLenum, GLuint, GLuint))
+PROC(void, glGetBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, void *))
+PROC(GLboolean, glUnmapBuffer, (GLenum))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static const char *vs_src = "#version 150 core\nin vec2 p;\nin vec4 col;\nflat out vec4 c0;\n"
@@ -164,7 +171,7 @@ int main(void) {
     LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glBufferSubData); LOAD(glBufferStorage); LOAD(glMapBufferRange);
     LOAD(glFlushMappedBufferRange); LOAD(glCopyBufferSubData); LOAD(glVertexAttribPointer);
     LOAD(glEnableVertexAttribArray); LOAD(glFenceSync); LOAD(glDeleteSync); LOAD(glMemoryBarrier);
-    LOAD(glDrawRangeElementsBaseVertex);
+    LOAD(glDrawRangeElementsBaseVertex); LOAD(glDispatchComputeIndirect); LOAD(glBindBufferBase); LOAD(glGetBufferSubData); LOAD(glUnmapBuffer);
     CHECK("entry points", pglBufferStorage && pglMapBufferRange && pglFlushMappedBufferRange &&
                           pglFenceSync && pglMemoryBarrier && pglCopyBufferSubData);
     if (failures) return 1;
@@ -366,6 +373,67 @@ int main(void) {
             pglFlushMappedBufferRange(GL_ARRAY_BUFFER, 0, BUF_SIZE);
             expect(k ? "9. the same bytes rewritten after glBufferSubData, flushed"
                      : "9. the same bytes rewritten after a GPU copy, flushed", wf[k], RANGE_OFF, 1);
+        }
+    }
+
+    /* 10. Not a draw: the indirect dispatch's group counts, in a coherent
+     * explicitly flushed mapping, reach the host before the dispatch. */
+    if (pglDispatchComputeIndirect) {
+        static const char *cs_src = "#version 430\nlayout(local_size_x = 1) in;\n"
+                                    "layout(std430, binding = 0) buffer M { uint mark; };\n"
+                                    "void main() { mark = 0x600du; }\n";
+        GLuint cs = pglCreateShader(0x91B9 /* GL_COMPUTE_SHADER */), cp = pglCreateProgram(), ind = 0, ssbo = 0;
+        pglShaderSource(cs, 1, &cs_src, NULL);
+        pglCompileShader(cs);
+        pglAttachShader(cp, cs);
+        pglLinkProgram(cp);
+        GLint ok = 0;
+        pglGetProgramiv(cp, GL_LINK_STATUS, &ok);
+        CHECK("10. compute program links", ok);
+        const unsigned zero = 0;
+        pglGenBuffers(1, &ssbo);
+        pglBindBuffer(0x90D2 /* GL_SHADER_STORAGE_BUFFER */, ssbo);
+        pglBufferData(0x90D2, 4, &zero, GL_DYNAMIC_DRAW);
+        pglBindBufferBase(0x90D2, 0, ssbo);
+        pglGenBuffers(1, &ind);
+        pglBindBuffer(0x90EE /* GL_DISPATCH_INDIRECT_BUFFER */, ind);
+        pglBufferStorage(0x90EE, 4096, NULL, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_DYNAMIC_STORAGE_BIT);
+        unsigned *g = pglMapBufferRange(0x90EE, 0, 4096, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                                        GL_MAP_COHERENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+        CHECK("10. indirect buffer mapped", g != NULL);
+        if (g && ok) {
+            g[64] = 1; g[65] = 1; g[66] = 1;
+            pglFlushMappedBufferRange(0x90EE, 0, 4096);
+            pglUseProgram(cp);
+            pglDispatchComputeIndirect(256);
+            pglMemoryBarrier(0x00002000 /* GL_BUFFER_UPDATE_BARRIER_BIT */);
+            unsigned mark = 0;
+            pglBindBuffer(0x90D2, ssbo);
+            pglGetBufferSubData(0x90D2, 0, 4, &mark);
+            char what[120];
+            snprintf(what, sizeof(what), "10. glDispatchComputeIndirect reads flushed counts: mark %#x (error %#x)", mark, glGetError());
+            CHECK(what, mark == 0x600du);
+            pglUseProgram(prog);
+        }
+    }
+
+    /* 11. Immutable storage without GL_DYNAMIC_STORAGE_BIT, written through a
+       plain write mapping: the unmap must still reach the host's copy. */
+    {
+        GLuint b = 0;
+        unsigned got[4] = {0};
+        pglGenBuffers(1, &b);
+        pglBindBuffer(0x8F36 /* GL_COPY_READ_BUFFER */, b);
+        pglBufferStorage(0x8F36, 4096, NULL, GL_MAP_WRITE_BIT);
+        unsigned *w = pglMapBufferRange(0x8F36, 0, 4096, GL_MAP_WRITE_BIT | 0x0004 /* INVALIDATE_RANGE */);
+        CHECK("11. non-dynamic storage mapped", w != NULL);
+        if (w) {
+            for (int i = 0; i < 1024; i++) w[i] = 0x51000000u + i;
+            pglUnmapBuffer(0x8F36);
+            pglGetBufferSubData(0x8F36, 1000 * 4, sizeof(got), got);
+            char what[120];
+            snprintf(what, sizeof(what), "11. non-dynamic storage keeps a mapping's writes: %#x (error %#x)", got[0], glGetError());
+            CHECK(what, got[0] == 0x51000000u + 1000 && got[3] == 0x51000000u + 1003);
         }
     }
 

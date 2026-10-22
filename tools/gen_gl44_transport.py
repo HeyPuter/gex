@@ -614,7 +614,9 @@ def guest_function(command: dict, opcode: int) -> str:
     if (!a) return;
     uint64_t bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)bytes; a[2] = (uint32_t)(bytes >> 32);
-    a[3] = flags; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
+    /* GL_DYNAMIC_STORAGE_BIT on the host whatever the application asked:
+       a mapping's writes reach the host as glBufferSubData. */
+    a[3] = flags | 0x0100u; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
 }}
 """
     if name in STRING_INPUT_COMMANDS | STRING_RETURN_COMMANDS.keys():
