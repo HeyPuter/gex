@@ -15626,6 +15626,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         let mut gm = GuestMem::new(guest_bytes());
                         dir_note(page, base, "miss-shared-slot");
                         let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
+                        // Published here, so a module with blocks on it is
+                        // tracked and goes when the page does (`track_dense`).
+                        j.base_pages.insert(base, page);
                     }
                 }
             }
@@ -15900,6 +15903,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             if gm.read_u32(at).unwrap_or(0) != base {
                 dir_note(page, base, "miss-reconcile-covered");
                 let _ = gm.write_u32(at, base);
+                j.base_pages.insert(base, page);
             }
         }
         j.blocks += stats.blocks as u64;
