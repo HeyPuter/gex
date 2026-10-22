@@ -22,6 +22,12 @@ ROOT=$(realpath "$HERE/../..")
 WW=$ROOT/tools/wine-wasm
 MUSL=$(realpath "${2:-$ROOT/../musl-wasm}")
 TRIPLE=wasm32-unknown-linux-musl
+# gex's loader fills musl's registry of shared libraries (__gex_dsos): a
+# musl without it builds, and then no shared program starts
+if [ ! -e "$MUSL/src/env/wasm32/__gex_dso.c" ]; then
+  echo "install.sh: $MUSL has no src/env/wasm32/__gex_dso.c (the shared-library registry gex's loader fills): use gex-wasm32-slim at or after the commit that adds it" >&2
+  exit 1
+fi
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 
 # the sysroot (musl, libgex, compiler-rt, UAPI headers, binaryen)
