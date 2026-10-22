@@ -121,4 +121,11 @@ check $? "a GNU ld script in a library's place"
 printf '#include <stdlib.h>\nint main(void){return strcmp("a","b");}\n' > "$W/id.c"
 gexcc -O2 -Werror=implicit-function-declaration -c -o "$W/id.o" "$W/id.c" 2> "$W/log"
 check $? "an undeclared C library call under Debian's -Werror=implicit-function-declaration"
+# a program's variable with a C library function's name (hunspell's `int
+# warn`) links, the program's code reaching its own, as on ELF
+printf 'int warn = 5;\nint get(void);\nint main(void){return get() != 5;}\n' > "$W/wv.c"
+printf 'extern int warn;\nint get(void){return warn;}\n' > "$W/wg.c"
+GEXCC_SHARED=1 gexcc -c -o "$W/wv.o" "$W/wv.c" && GEXCC_SHARED=1 gexcc -c -o "$W/wg.o" "$W/wg.c" &&
+    GEXCC_SHARED=1 gexcc -o "$W/wv" "$W/wv.o" "$W/wg.o" 2> "$W/log"
+check $? "a program's variable named as a C library function"
 exit $fail

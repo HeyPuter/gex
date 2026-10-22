@@ -687,6 +687,80 @@ def sections(path):
     return customs, exports
 
 
+def _uleb(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def rename_data(src, dst, old, new):
+    """A copy of the wasm object SRC as DST with its data symbol OLD
+    (defined or not) named NEW, in the `linking` section's symbol table;
+    relocations name symbols by index, so nothing else changes. False when
+    SRC has no such symbol (and DST is not written)."""
+    w = open(src, 'rb').read()
+    if w[:4] != b'\0asm':
+        return False
+
+    def leb(b, p):
+        r = sh = 0
+        while True:
+            x = b[p]; p += 1
+            r |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                return r, p
+
+    def name(b, p):
+        n, p = leb(b, p)
+        return b[p:p + n], p + n
+    out, p, hit = bytearray(w[:8]), 8, False
+    while p < len(w):
+        sid = w[p]; n, q = leb(w, p + 1); end = q + n
+        body = w[q:end]
+        nm, r = name(body, 0) if sid == 0 else (b'', 0)
+        if sid == 0 and nm == b'linking':
+            ver, r = leb(body, r)
+            nb = bytearray(body[:r])
+            while r < len(body):
+                kind = body[r]; ln, r2 = leb(body, r + 1); sub = body[r2:r2 + ln]
+                if kind == 8:  # WASM_SYMBOL_TABLE
+                    cnt, t = leb(sub, 0)
+                    ns = bytearray(_uleb(cnt))
+                    for _ in range(cnt):
+                        start = t
+                        k = sub[t]; flags, t = leb(sub, t + 1)
+                        head = sub[start:t]
+                        if k == 1:  # data: name, then where if defined
+                            sym, t = name(sub, t)
+                            rest_start = t
+                            if not flags & 0x10:
+                                for _ in range(3):
+                                    _, t = leb(sub, t)
+                            if sym == old.encode():
+                                sym, hit = new.encode(), True
+                            ns += head + _uleb(len(sym)) + sym + sub[rest_start:t]
+                        elif k == 3:  # section
+                            _, t = leb(sub, t)
+                            ns += sub[start:t]
+                        else:  # function, global, tag, table: index, name if any
+                            _, t = leb(sub, t)
+                            if not flags & 0x10 or flags & 0x40:
+                                _, t = name(sub, t)
+                            ns += sub[start:t]
+                    sub = bytes(ns)
+                nb += bytes([kind]) + _uleb(len(sub)) + sub
+                r = r2 + ln
+            body = bytes(nb)
+        out += bytes([sid]) + _uleb(len(body)) + body
+        p = end
+    if hit:
+        open(dst, 'wb').write(out)
+    return hit
+
+
 def soname_of(path):
     """A side module's soname: its name section's module name."""
     for name, data in sections(path)[0]:
@@ -796,6 +870,26 @@ def link_shared(cmd):
         found = re.findall(r'function signature mismatch: (\S+)\n>>> defined as \(([^)]*)\) -> (\S+) in (\S+)\n'
                            r'>>> defined as \([^)]*\) -> \S+ in (\S+)', p.stderr)
         found = [f for f in found if '/sonames/' in f[4] or is_wasm_so(f[4])]
+        # A program's own variable named as a library's function (hunspell's
+        # `int warn`, libc's warn()): on ELF the program's definition is the
+        # one its own code reaches, and so it is here, under a name of its
+        # own in the program's objects
+        clash = [m[0] for m in re.findall(
+            r'symbol type mismatch: (\S+)\n>>> defined as WASM_SYMBOL_TYPE_(DATA|FUNCTION) in (\S+)\n'
+            r'>>> defined as WASM_SYMBOL_TYPE_(DATA|FUNCTION) in (\S+)', p.stderr)
+            if {m[1], m[3]} == {'DATA', 'FUNCTION'}
+            and is_wasm_so(m[2] if m[1] == 'FUNCTION' else m[4])]
+        renamed = False
+        for name in clash:
+            for i, a in enumerate(cmd):
+                if a.startswith('-') or not os.path.isfile(a) or is_wasm_so(a) or is_archive(a):
+                    continue
+                o = os.path.join(tmp, 'own-%d-%s' % (i, os.path.basename(a)))
+                if rename_data(a, o, name, '__gexcc_own.' + name):
+                    cmd = cmd[:i] + [o] + cmd[i + 1:]
+                    renamed = True
+        if renamed:
+            continue
         if not found:
             sys.stderr.write(p.stderr)
             return p.returncode
