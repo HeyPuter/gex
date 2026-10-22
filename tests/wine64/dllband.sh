@@ -5,7 +5,8 @@
 # addresses it gives them, in [0x11000000, 0x20000000), in the program and in
 # a second process it starts, natively and in the page (run-node.mjs), and a
 # program's own DLL in a directory whose name has a space (C:\pin dir), its
-# pin a unix path with a space in it.
+# pin a unix path with a space in it, and a fixed-base one there (no dynamic
+# base) whose own base the program holds, relocated to its pin.
 # Also that PREFIX carries W3's session (w64-dist.sh applies w3-session.reg)
 # and that no driver fails to load in either leg.
 # Prints "ok   dllband64 <leg>" per leg.
@@ -28,6 +29,10 @@ rm -rf "$w"; mkdir -p "$w"
 x86_64-w64-mingw32-gcc -O1 -Wall -o "$w/dllband.exe" "$here/dllband.c" || exit 1
 # (relocatable, as a DLL that can be pinned must be)
 echo 'int pinme(void) { return 7; }' | x86_64-w64-mingw32-gcc -O1 -shared -Wl,--dynamicbase -o "$w/pinme.dll" -x c - || exit 1
+# A fixed-base DLL (no dynamic base, relocations kept) whose own base,
+# 0x30000000, the program holds before loading it (dllband.c FIXED_BASE)
+echo 'int fixedbase(void) { return 9; }' | x86_64-w64-mingw32-gcc -O1 -shared \
+	-Wl,--disable-dynamicbase,--enable-reloc-section,--image-base,0x30000000 -o "$w/fixed.dll" -x c - || exit 1
 dlls="version winmm dbghelp opengl32"
 fail=0
 verdict() { # LEG LOG
@@ -40,9 +45,9 @@ verdict() { # LEG LOG
 # resolves links: the drive, not dosdevices/c:)
 assign() {
 	local p=$1 at=$2 named=$3; shift 3
-	mkdir -p "$p/drive_c/pin dir" && cp "$w/pinme.dll" "$p/drive_c/pin dir/"
+	mkdir -p "$p/drive_c/pin dir" && cp "$w/pinme.dll" "$w/fixed.dll" "$p/drive_c/pin dir/"
 	{ for d in $dlls; do echo "$at/lib/wine/x86_64-windows/$d.dll"; done
-	  echo "$named/drive_c/pin dir/pinme.dll"; } |
+	  echo "$named/drive_c/pin dir/pinme.dll"; echo "$named/drive_c/pin dir/fixed.dll"; } |
 		python3 "$tool" assign "$p/dll-bases" "$@" >> "$w/assign.log" 2>&1 &&
 		python3 "$tool" check "$p/dll-bases" ||
 		{ echo "FAIL dllband64: dll-bases.py"; sed 's/^/  /' "$w/assign.log"; exit 1; }
