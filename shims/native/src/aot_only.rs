@@ -129,7 +129,7 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if caller.data().nt.is_some() {
                 return crate::host((|| -> anyhow::Result<i32> { Ok(0) })());
             }
-            crate::host(super::call_out(&mut caller, ctx, target as u64, ret as u64, sp as u64))
+            crate::host(super::call_out(&mut caller, ctx, target as u64, ret as u64, sp as u64, gex_abi::ftab::NEED_ALL))
         },
     )?;
     Ok(())
@@ -149,7 +149,7 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, depth: i32,
     // holds), reached through the table rather than the dispatch slot that
     // watches it: that call-out ends here, as the slot would end it.
     let sp = GuestMem::new(memory.bytes()).read_u64(ctx as u32 as u64 + ctx::x(sp_index()) as u64).unwrap_or(0);
-    if let Some(i) = caller.data().callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_UNWOUND) {
+    if let Some(i) = caller.data().callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span) {
         let _ = GuestMem::new(memory.bytes()).write_u64(ctx as u32 as u64 + ctx::PC as u64, target);
         caller.data_mut().callout_signal = Some(CalloutSignal::Return(i));
         return Err(StopExecution.into());

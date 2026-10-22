@@ -27,6 +27,48 @@ DWORD saved_esp, saved_ebp;
 volatile LONG caught;
 extern char cmp_resume[];
 int __cdecl cmp(const void *, const void *);
+/* The thread case: a thread's start routine (called by native Wine's
+ * BaseThreadInitThunk, also returning to the pad) with the same handler,
+ * resuming in its own frame, then (its argument nonzero) sleeping that many
+ * ms before it returns 0x55 (1000 when a register is lost). */
+DWORD t_saved_esp, t_saved_ebp;
+extern char tproc_resume[];
+DWORD WINAPI tproc(void *);
+void *sleep_fn;
+/* The outer-handler thread case: the start routine registers the handler
+ * and calls native Wine (ntdll's qsort), whose guest callback raises; the
+ * handler resumes the start routine past the qsort call, leaving qsort's
+ * native frames, and it then returns to its native caller's pad. */
+DWORD t2_saved_esp, t2_saved_ebp;
+extern char tproc2_resume[];
+DWORD WINAPI tproc2(void *);
+void *qsort_fn_p;
+int t2_v[4] = { 3, 1, 2, 0 };
+int __cdecl cmpraise(const void *a, const void *b) { (void)a; (void)b; ((void (*)(void))fault_code)(); return 0; }
+
+EXCEPTION_DISPOSITION __cdecl tproc2_handler(EXCEPTION_RECORD *rec, void *frame, CONTEXT *ctx, void *disp)
+{
+    (void)frame; (void)disp;
+    if (rec->ExceptionCode != STRAYRET_CODE || (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
+        return ExceptionContinueSearch;
+    caught++;
+    ctx->Esp = t2_saved_esp;
+    ctx->Ebp = t2_saved_ebp;
+    ctx->Eip = (DWORD)tproc2_resume;
+    return ExceptionContinueExecution;
+}
+
+EXCEPTION_DISPOSITION __cdecl tproc_handler(EXCEPTION_RECORD *rec, void *frame, CONTEXT *ctx, void *disp)
+{
+    (void)frame; (void)disp;
+    if (rec->ExceptionCode != STRAYRET_CODE || (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
+        return ExceptionContinueSearch;
+    caught++;
+    ctx->Esp = t_saved_esp;
+    ctx->Ebp = t_saved_ebp;
+    ctx->Eip = (DWORD)tproc_resume;
+    return ExceptionContinueExecution;
+}
 
 EXCEPTION_DISPOSITION __cdecl strayret_handler(EXCEPTION_RECORD *rec, void *frame, CONTEXT *ctx, void *disp)
 {
@@ -87,6 +129,117 @@ __asm__(
     "  pop %ebp\n"
     "  ret\n");
 
+__asm__(
+    ".text\n"
+    ".globl _tproc@4\n"
+    "_tproc@4:\n"
+    "  push %ebp\n"
+    "  mov %esp, %ebp\n"
+    "  push %ebx\n"
+    "  push %esi\n"
+    "  push %edi\n"
+    "  push $_tproc_handler\n"
+    "  push %fs:0\n"
+    "  mov %esp, %fs:0\n"
+    "  mov %esp, _t_saved_esp\n"
+    "  mov %ebp, _t_saved_ebp\n"
+    "  mov $0x1234, %ebx\n"
+    "  mov $0x5678, %esi\n"
+    "  mov $0x9abc, %edi\n"
+    "  call *_fault_code\n"
+    "  mov $2000, %eax\n"
+    "  jmp 2f\n"
+    ".globl _tproc_resume\n"
+    "_tproc_resume:\n"
+    "  mov 8(%ebp), %eax\n"
+    "  test %eax, %eax\n"
+    "  jz 3f\n"
+    "  push %eax\n"
+    "  call *_sleep_fn\n"
+    "3:\n"
+    "  mov $0x55, %eax\n"
+    "  cmp $0x1234, %ebx\n"
+    "  jne 1f\n"
+    "  cmp $0x5678, %esi\n"
+    "  jne 1f\n"
+    "  cmp $0x9abc, %edi\n"
+    "  je 2f\n"
+    "1:\n"
+    "  mov $1000, %eax\n"
+    "2:\n"
+    "  mov (%esp), %ecx\n"
+    "  mov %ecx, %fs:0\n"
+    "  add $8, %esp\n"
+    "  pop %edi\n"
+    "  pop %esi\n"
+    "  pop %ebx\n"
+    "  pop %ebp\n"
+    "  ret $4\n");
+
+__asm__(
+    ".text\n"
+    ".globl _tproc2@4\n"
+    "_tproc2@4:\n"
+    "  push %ebp\n"
+    "  mov %esp, %ebp\n"
+    "  push %ebx\n"
+    "  push %esi\n"
+    "  push %edi\n"
+    "  push $_tproc2_handler\n"
+    "  push %fs:0\n"
+    "  mov %esp, %fs:0\n"
+    "  mov %esp, _t2_saved_esp\n"
+    "  mov %ebp, _t2_saved_ebp\n"
+    "  mov $0x1234, %ebx\n"
+    "  mov $0x5678, %esi\n"
+    "  mov $0x9abc, %edi\n"
+    "  push $_cmpraise\n"
+    "  push $4\n"
+    "  push $4\n"
+    "  push $_t2_v\n"
+    "  call *_qsort_fn_p\n"
+    "  add $16, %esp\n"
+    "  mov $2000, %eax\n"
+    "  jmp 2f\n"
+    ".globl _tproc2_resume\n"
+    "_tproc2_resume:\n"
+    "  mov 8(%ebp), %eax\n"
+    "  test %eax, %eax\n"
+    "  jz 3f\n"
+    "  push %eax\n"
+    "  call *_sleep_fn\n"
+    "3:\n"
+    "  mov $0x55, %eax\n"
+    "  cmp $0x1234, %ebx\n"
+    "  jne 1f\n"
+    "  cmp $0x5678, %esi\n"
+    "  jne 1f\n"
+    "  cmp $0x9abc, %edi\n"
+    "  je 2f\n"
+    "1:\n"
+    "  mov $1000, %eax\n"
+    "2:\n"
+    "  mov (%esp), %ecx\n"
+    "  mov %ecx, %fs:0\n"
+    "  add $8, %esp\n"
+    "  pop %edi\n"
+    "  pop %esi\n"
+    "  pop %ebx\n"
+    "  pop %ebp\n"
+    "  ret $4\n");
+
+/* The thread case with `ms` of sleep after the resume: its exit code. */
+static DWORD thread_case(LPTHREAD_START_ROUTINE f, DWORD ms)
+{
+    DWORD code = 0;
+    HANDLE h = CreateThread(NULL, 0, f, (void *)(ULONG_PTR)ms, 0, NULL);
+    if (!h) return 0;
+    if (WaitForSingleObject(h, 30000) != WAIT_OBJECT_0) code = 3000;
+    else GetExitCodeThread(h, &code);
+    CloseHandle(h);
+    return code;
+}
+
 int main(void)
 {
     int v[] = { 7, 3, 9, 1, 8, 2, 6, 5, 4, 0 };
@@ -109,6 +262,12 @@ int main(void)
             return 1;
         }
     if (caught < N - 1) { printf("strayret: %ld exceptions caught, want %d or more\n", caught, N - 1); return 1; }
+    sleep_fn = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "Sleep");
+    qsort_fn_p = (void *)qs;
+    for (i = 0; i < 4; i++) {
+        DWORD ms = (i & 1) ? 50 : 0, code = thread_case(i < 2 ? tproc : tproc2, ms);
+        if (code != 0x55) { printf("strayret: thread case %d (sleep %lu): exit code %lu, want 85\n", i, ms, code); return 1; }
+    }
     printf("strayret ok %ld\n", caught);
     return 0;
 }

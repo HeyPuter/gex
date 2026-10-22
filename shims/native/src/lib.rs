@@ -4314,7 +4314,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::CALL_OUT,
         |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp_want: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
-            call_out(&mut caller, ctx, target as u64, ret as u64, sp_want as u64)
+            call_out(&mut caller, ctx, target as u64, ret as u64, sp_want as u64, gex_abi::ftab::NEED_ALL)
         })()) },
     )?;
 
@@ -5585,9 +5585,15 @@ struct Callout {
     ret: u64,
     sp_want: u64,
     /// How far above `sp_want` a safepoint must find the stack pointer to
-    /// call the caller unwound: `CALLOUT_UNWOUND`, or `NATIVE_UNWOUND` for a
-    /// guest call from native Wine.
+    /// call the caller unwound: `CALLOUT_UNWOUND`, or for a guest call from
+    /// native Wine its callee's argument bytes (`ftab::need_args`), or
+    /// `NATIVE_UNWOUND` when it names none.
     unwound: u64,
+    /// How far above `sp_want` the awaited return may come back:
+    /// `CALLOUT_UNWOUND`, or for a guest call from native Wine that names its
+    /// callee's argument bytes exactly those (a return to the pad with the
+    /// stack above them is an outer native caller's).
+    span: u64,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
@@ -5687,7 +5693,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let target = if gex_abi::X86 { gm.read_u64(c + ctx::LAST_TARGET as u64) } else { gm.read_u64(c + ctx::PC as u64) }.unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
         let state = caller.data_mut();
-        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_UNWOUND);
+        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);
         let signal = match hit {
             Some(i) => CalloutSignal::Return(i),
             None => {
@@ -6134,8 +6140,9 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
 /// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
 /// until it returns to `ret` with the stack pointer at `sp_want` (or what a
 /// callee popped above it), then let the C caller carry on (1); 0 when that
-/// cannot be done, and the caller leaves as before.
-fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64) -> Result<i32> {
+/// cannot be done, and the caller leaves as before. `need` is the caller's
+/// (`ftab::need_args` bounds a guest call from native Wine).
+fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64, need: u32) -> Result<i32> {
     if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
         if crate::stall::on() {
             crate::stall::callout(target, ret | 1 << 63, true);
@@ -6146,7 +6153,10 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
-    let unwound = if ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    let pad = ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
+    let args = gex_abi::ftab::need_args(need).filter(|_| pad);
+    let unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
+    let span = args.unwrap_or(CALLOUT_UNWOUND);
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
     // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
@@ -6163,7 +6173,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             }
         }
     }
-    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, slot: None, live: false });
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;
