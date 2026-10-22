@@ -16,6 +16,13 @@
  *   7. coherent: write B, draw at once; write A, draw again  -> B, then A
  *   8. coherent indices and colours, glDrawElements and
  *      glDrawRangeElementsBaseVertex at once                -> A, then B
+ *   9. coherent with explicit flushes, as wined3d maps its chunks, each
+ *      flush covering the whole Direct3D buffer (only the changed blocks
+ *      need go): write A, flush a range around it at no block bound -> A;
+ *      write B, flush the whole buffer -> B; flush it again -> B; a GPU
+ *      copy of A under the map, B written again (the same bytes as the
+ *      map held), flushed -> B; and a glBufferSubData of A the same way
+ *      -> B
  * Steps 1-6 put a flush, swap, fence, copy, barrier or explicit flush
  * between each write and the draw that reads it; 7 and 8 put nothing there:
  * a coherent write is visible to the next draw.
@@ -47,6 +54,7 @@
 #define GL_COPY_READ_BUFFER 0x8F36
 #define GL_MAP_READ_BIT 0x0001
 #define GL_MAP_FLUSH_EXPLICIT_BIT 0x0010
+#define GL_MAP_UNSYNCHRONIZED_BIT 0x0020
 #define GL_MAP_PERSISTENT_BIT 0x0040
 #define GL_MAP_COHERENT_BIT 0x0080
 #define GL_DYNAMIC_STORAGE_BIT 0x0100
@@ -76,6 +84,7 @@ PROC(void, glBindVertexArray, (GLuint))
 PROC(void, glGenBuffers, (GLsizei, GLuint *))
 PROC(void, glBindBuffer, (GLenum, GLuint))
 PROC(void, glBufferData, (GLenum, ptrdiff_t, const void *, GLenum))
+PROC(void, glBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, const void *))
 PROC(void, glBufferStorage, (GLenum, ptrdiff_t, const void *, GLbitfield))
 PROC(void *, glMapBufferRange, (GLenum, ptrdiff_t, ptrdiff_t, GLbitfield))
 PROC(void, glFlushMappedBufferRange, (GLenum, ptrdiff_t, ptrdiff_t))
@@ -152,7 +161,7 @@ int main(void) {
     LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glBindAttribLocation); LOAD(glLinkProgram);
     LOAD(glGetProgramiv); LOAD(glUseProgram); LOAD(glGenFramebuffers); LOAD(glBindFramebuffer);
     LOAD(glFramebufferTexture2D); LOAD(glGenVertexArrays); LOAD(glBindVertexArray); LOAD(glGenBuffers);
-    LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glBufferStorage); LOAD(glMapBufferRange);
+    LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glBufferSubData); LOAD(glBufferStorage); LOAD(glMapBufferRange);
     LOAD(glFlushMappedBufferRange); LOAD(glCopyBufferSubData); LOAD(glVertexAttribPointer);
     LOAD(glEnableVertexAttribArray); LOAD(glFenceSync); LOAD(glDeleteSync); LOAD(glMemoryBarrier);
     LOAD(glDrawRangeElementsBaseVertex);
@@ -306,6 +315,57 @@ int main(void) {
                      step ? "glDrawRangeElementsBaseVertex" : "glDrawElements", step ? "B" : "A",
                      px[0], px[1], px[2], px[3], err);
             CHECK(what, ok && err == GL_NO_ERROR);
+        }
+    }
+
+    /* Coherent, explicitly flushed, as wined3d maps its chunks: an unmap of
+     * a Direct3D buffer flushes all of the buffer's range, whatever was
+     * written. */
+    {
+        GLuint srcA = 0, wf[2] = {0};
+        /* Step 8 left the positions at vertices 100..102: back to the
+           triangle at 0..2. */
+        pglBindBuffer(GL_ARRAY_BUFFER, pos);
+        pglVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        pglGenBuffers(1, &srcA);
+        pglBindBuffer(GL_COPY_READ_BUFFER, srcA);
+        pglBufferData(GL_COPY_READ_BUFFER, RANGE_SIZE, colA, GL_STATIC_DRAW);
+        const GLbitfield wstore = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_DYNAMIC_STORAGE_BIT;
+        const GLbitfield wmap = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT |
+                                GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
+        pglGenBuffers(2, wf);
+        for (int k = 0; k < 2; k++) {
+            pglBindBuffer(GL_ARRAY_BUFFER, wf[k]);
+            pglBufferStorage(GL_ARRAY_BUFFER, BUF_SIZE, NULL, wstore);
+            unsigned char *f = pglMapBufferRange(GL_ARRAY_BUFFER, 0, BUF_SIZE, wmap);
+            CHECK("coherent explicit-flush persistent map", f != NULL);
+            if (!f) break;
+            memcpy(f + RANGE_OFF, colA, RANGE_SIZE);
+            pglFlushMappedBufferRange(GL_ARRAY_BUFFER, RANGE_OFF - 6000, RANGE_SIZE + 9000);
+            expect("9. explicit flush around the write", wf[k], RANGE_OFF, 0);
+            pglBindBuffer(GL_ARRAY_BUFFER, wf[k]);
+            memcpy(f + RANGE_OFF, colB, RANGE_SIZE);
+            pglFlushMappedBufferRange(GL_ARRAY_BUFFER, 0, BUF_SIZE);
+            expect("9. a write, the whole buffer flushed", wf[k], RANGE_OFF, 1);
+            pglBindBuffer(GL_ARRAY_BUFFER, wf[k]);
+            pglFlushMappedBufferRange(GL_ARRAY_BUFFER, 0, BUF_SIZE);
+            expect("9. the whole buffer flushed again", wf[k], RANGE_OFF, 1);
+            /* The host's copy changed under the map (a GPU copy, or the
+             * application's glBufferSubData); the write puts back the bytes
+             * the map already held, and the flush must still send them. */
+            if (k == 0) {
+                pglBindBuffer(GL_COPY_WRITE_BUFFER, wf[k]);
+                pglCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, RANGE_OFF, RANGE_SIZE);
+            } else {
+                pglBindBuffer(GL_ARRAY_BUFFER, wf[k]);
+                pglBufferSubData(GL_ARRAY_BUFFER, RANGE_OFF, RANGE_SIZE, colA);
+            }
+            expect(k ? "9. glBufferSubData under the map" : "9. GPU copy under the map", wf[k], RANGE_OFF, 0);
+            pglBindBuffer(GL_ARRAY_BUFFER, wf[k]);
+            memcpy(f + RANGE_OFF, colB, RANGE_SIZE);
+            pglFlushMappedBufferRange(GL_ARRAY_BUFFER, 0, BUF_SIZE);
+            expect(k ? "9. the same bytes rewritten after glBufferSubData, flushed"
+                     : "9. the same bytes rewritten after a GPU copy, flushed", wf[k], RANGE_OFF, 1);
         }
     }
 
