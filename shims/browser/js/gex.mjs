@@ -7202,6 +7202,11 @@ export class Gex {
           while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
           this.#catchUpSync();
           this.#cgenServe();
+          // A fork from the guest code this call-out runs (a function-tier
+          // unit's libc calling `fork`): its child is started from here, as
+          // the run loop starts one, since the guest goes on in this loop and
+          // may wait for it. The child's image is taken before this returns.
+          this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
           this.#startThread();
           // The fault hook as one of this loop's steps: on a stack that may
           // suspend in the single-thread build (`#driveAsync`).

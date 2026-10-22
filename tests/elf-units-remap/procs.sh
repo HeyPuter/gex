@@ -1,12 +1,13 @@
 #!/bin/bash
 # Every process that maps an object listed in GEX_ELF_UNITS runs its unit:
-# two.c maps liba.so at a pinned base, forks a child that calls into it, and
-# runs another program (other.c) that maps it while two.c still has it.
+# two.c maps liba.so at a pinned base, forks from the library's own code,
+# forks a child that calls into it, and runs another program (other.c) that
+# maps it while two.c still has it.
 #
 #   native  both programs place the unit (a forked child shares its
 #           parent's), under --sysroot, so the object is read through the
 #           guest's namespace; the pin holds in the forked program too
-#   browser all three processes place it: a forked child's shim starts with
+#   browser all four processes place it: a forked child's shim starts with
 #           its parent's list of placed objects but none of their units
 #
 #   tests/elf-units-remap/procs.sh [gexc]
@@ -37,6 +38,7 @@ printf '%s 0x10000 %s\n' $BASE "$w/liba.so" > "$w/pins-web.txt"
 export GEX_CGEN_CACHE=$w/cgen GEX_ELF_UNITS=liba.so GEX_ELF_UNITS_BUILD=0
 "$gexc" cgen-image --elf "$w/liba.so" --base $BASE --jobs 2 > "$w/cgen.log" 2>&1 || { cat "$w/cgen.log"; exit 1; }
 want="parent f(5)=51
+forked 3
 child f(9)=145
 other f(7)=92
 other exited 0"
@@ -68,7 +70,7 @@ if [ -e "$seed" ]; then
 		out=$(cd "$w" && GEX_PROVIDERS=$prov GEX_SHARED=1 GEX_PINS="$w/pins-web.txt" timeout 300 node "$root/shims/browser/js/run-node.mjs" --cgen-prefer \
 			--file "/lib/ld-musl-aarch64.so.1=$ldso" --file "$w/liba.so=$w/liba.so" --file "$w/two=$w/two" \
 			--file "$w/other=$w/other" "$seed" "$w/two" "$w" 2> "$w/browser$prov.err" | grep -av '^\[gex\]')
-		check "browser providers=$prov" "$w/browser$prov.err" "$out" 3
+		check "browser providers=$prov" "$w/browser$prov.err" "$out" 4
 	done
 else
 	echo "skip elf-units-procs browser ($seed is not there)"

@@ -27,6 +27,8 @@ int main(int argc, char **argv) {
 	if (!h) { printf("dlopen %s: %s\n", path, dlerror()); return 1; }
 	int (*f)(int) = (int (*)(int))dlsym(h, "f");
 	printf("parent f(5)=%d\n", f(5));
+	int (*forked)(void) = (int (*)(void))dlsym(h, "forked");
+	printf("forked %d\n", forked());
 	pid_t c = fork();
 	if (c == 0) {
 		printf("child f(9)=%d\n", f(9));

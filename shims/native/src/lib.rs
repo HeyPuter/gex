@@ -6200,6 +6200,21 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
             start_guest_thread(cx, child)?;
         }
+        // A fork from the guest code a call-out runs (a function-tier
+        // unit's libc calling `fork`): made here, as the run loop makes it,
+        // for the guest goes on in this loop and may wait for the child.
+        // Out of the gate while the copy holds every other thread still.
+        if let Some(req) = caller.data_mut().pending_fork.take() {
+            let gate = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
+            if let Some(g) = &gate {
+                g.leave();
+            }
+            let forked = fork_process(&*caller, req, false);
+            if let Some(g) = &gate {
+                g.enter();
+            }
+            forked?;
+        }
         let e = match r {
             Ok(()) => break Err(anyhow!("guest code returned out of a call-out")),
             Err(e) => anyhow::Error::from(e),
