@@ -297,6 +297,22 @@ for src in "$HERE"/*.c; do
             diff "$WORK/$name-$target.native" "$WORK/$name-$target.gex" | head -20
             fail=1
         fi
+        # threads-many once more in a scope with a small task limit: the
+        # host refusing a thread is EAGAIN to the guest, natively and on gex.
+        if [ $name = threads-many ] && [ $tier = t1 ] && systemd-run --user --scope -q true 2>/dev/null; then
+            capped() { systemd-run --user --scope -q -p TasksMax=160 "$@"; }
+            native=$(capped "$bin" capped 2>/dev/null); ns=$?
+            gex=$(capped "$GEXC" run $flags "$bin" capped 2>/dev/null); gs=$?
+            if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
+                echo "ok   $name capped ($target, $tier, exit $ns)"
+            else
+                echo "FAIL $name capped ($target, $tier): native exit $ns, gex exit $gs"
+                printf '%s\n' "$native" > "$WORK/$name-$target.capped.native"
+                printf '%s\n' "$gex" > "$WORK/$name-$target.capped.gex"
+                diff "$WORK/$name-$target.capped.native" "$WORK/$name-$target.capped.gex" | head -20
+                fail=1
+            fi
+        fi
     done
     done
 done

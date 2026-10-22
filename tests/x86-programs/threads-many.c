@@ -7,7 +7,10 @@
  * EAGAIN, and every thread it did start must run and be joined; natively
  * all 300 start. How many started goes to stderr, so the output is the same
  * either way. With the argument "first" (a host that cannot run 300
- * threads), the first round only. Prints "threads-many ok". */
+ * threads), the first round only. With "capped" (run.sh runs it in a
+ * scope with a small task limit), 50 and then 300: the host's own limit
+ * must come back as EAGAIN, with every thread that started run and
+ * joined. Prints "threads-many ok". */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -68,6 +71,13 @@ static int round_of(int want)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "capped")) {
+        if (round_of(50) != 50) return 1;
+        if (round_of(300) < 1) return 2;
+        printf("50, then 300 under a task limit: each started thread ran, the rest refused with EAGAIN\n");
+        printf("threads-many ok\n");
+        return 0;
+    }
     if (round_of(100) != 100) return 1;
     printf("100 threads live at once\n");
     if (argc > 1 && !strcmp(argv[1], "first")) {
