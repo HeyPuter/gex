@@ -131,6 +131,12 @@ CLANG_TAIL = INCS
 # glibc passes for the same reason as above)
 if not CXX:
     CLANG_TAIL = CLANG_TAIL + ['-Wno-error=implicit-function-declaration']
+# The C library's predefined macros (__STDC_ISO_10646__: wchar_t is UCS-4),
+# which GCC on Linux includes before every translation unit and clang's
+# wasm driver does not; libedit refuses to build without them
+PREDEF = os.path.join(SYSROOT, 'include', 'stdc-predef.h')
+if os.path.exists(PREDEF) and not any(a in ('-nostdinc', '-ffreestanding', '-undef') for a in sys.argv[1:]):
+    CLANG_TAIL = CLANG_TAIL + ['-include', PREDEF]
 
 
 def expand_rsp(args):
