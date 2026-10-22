@@ -302,11 +302,7 @@ pub(crate) fn install_shared(
         });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-            sh.page_table.insert_entries(&meta.dir_entries);
-            // Its slots continue the program image's, so what the runtime
-            // translates later (a library the build left out, code it never
-            // saw) is numbered after them, never over them.
-            sh.page_table.advance_to(meta.next_slot);
+            record_unit_pages(&mut sh.page_table, &meta);
             sh.registry.push(Arc::clone(&unit));
             crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
         }
@@ -314,6 +310,15 @@ pub(crate) fn install_shared(
         store.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
     Ok(())
+}
+
+/// A prebuilt closure module's pages and slots in the runtime's page table.
+/// Its slots continue the program image's, so what the runtime translates
+/// later (a library the build left out, code it never saw) is numbered
+/// after them, never over them.
+fn record_unit_pages(page_table: &mut gex_xlate::PageTable, meta: &gex_xlate::Metadata) {
+    page_table.insert_entries(&meta.dir_entries);
+    page_table.advance_to(meta.next_slot);
 }
 
 /// Record the replacement region in the process's memory map, so the guest's
@@ -777,6 +782,17 @@ mod tests {
         assert!(check_replacement(ADD, "sub", Abi::C).is_err());
         let e = format!("{:#}", check_replacement(IMPORTS_WASI, "x", Abi::C).unwrap_err());
         assert!(e.contains("wasi.x"), "{e}");
+    }
+
+    #[test]
+    fn runtime_translation_numbers_after_a_closure_module() {
+        // the program image's pages took slots 0..4, a closure module's 4..40
+        let mut pt = gex_xlate::PageTable::from_entries(&[(0x10000, 0)], 4);
+        let meta = gex_xlate::Metadata { dir_entries: vec![(0x7000000, 4), (0x7001000, 20)], next_slot: 40, ..Default::default() };
+        record_unit_pages(&mut pt, &meta);
+        assert_eq!(pt.lookup(0x7001000), Some(20));
+        let fresh = pt.base(0x9000000);
+        assert!(fresh as u64 >= 40, "a page translated at run time took slot {fresh}, inside the closure module's");
     }
 
     #[test]
