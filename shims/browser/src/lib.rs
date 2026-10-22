@@ -16459,6 +16459,12 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             // that numbered pages and has not installed (or never will)
             // leaves them (tests/x86-programs/page-cross-entry.c).
             if TEST_UNPUBLISHED.load(Ordering::Relaxed) {
+                // As a publisher numbers it: from what the page is now, not
+                // from the identities the last translation saw (the code
+                // retired here among them), which would hand the page its
+                // old base back. The snapshot is taken again before the next
+                // translation.
+                IDENT_SNAPSHOT.0.borrow_mut().clear();
                 let _ = j.page_table.base(page);
             }
         }
