@@ -154,4 +154,13 @@ check $? "gettext.m4's test for GNU gettext in the C library links"
 printf '#include <stdlib.h>\nint main(void){return 0;}\n' > "$W/ui.c"
 gexcc -I/usr/include -I /usr/include/ -isystem/usr/include -c -o "$W/ui.o" "$W/ui.c" 2> "$W/log"
 check $? "-I/usr/include does not reach the build machine's headers"
+# a library function returning int called through a void declaration
+# (gettext's tputs): the call goes through, its result dropped
+mkdir -p "$W/vr"
+printf 'int vr_hits;\nint vr(int n){vr_hits += n; return 9;}\n' > "$W/vr/l.c"
+printf 'extern int vr_hits;\nvoid vr(int);\nint main(void){vr(3); vr(4); return vr_hits != 7;}\n' > "$W/vr/m.c"
+GEXCC_SHARED=1 gexcc -shared -fPIC -o "$W/vr/libvr.so" "$W/vr/l.c" &&
+    GEXCC_SHARED=1 gexcc -o "$W/vr/m" "$W/vr/m.c" -L"$W/vr" -lvr 2> "$W/log" &&
+    grep -q 'its result is dropped' "$W/log" && ! grep -q 'calls to it trap' "$W/log"
+check $? "a void declaration of a library's int function calls it"
 exit $fail

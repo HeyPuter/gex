@@ -954,7 +954,11 @@ def link_shared(cmd):
     ELF link (which knows no types) goes through: configure's link tests
     declare `char f(void)` for every function they look for. As wasm-ld
     does for a static library's function of the wrong type, the link gets
-    a stub of the object's type that traps when called, with a warning."""
+    a stub of the object's type that traps when called, with a warning.
+    Unless the two differ only in the object's declaring no result
+    (gettext's `extern void tputs (...)` for ncurses' int one): then the
+    stub calls the library's and drops what it returns, as the ELF call
+    does."""
     stubs = []
     for _ in range(64):
         # (first: a definition the side module's then meets defined)
@@ -974,8 +978,8 @@ def link_shared(cmd):
             cmd = cmd + ['--strip-debug']
             continue
         found = re.findall(r'function signature mismatch: (\S+)\n>>> defined as \(([^)]*)\) -> (\S+) in (\S+)\n'
-                           r'>>> defined as \([^)]*\) -> \S+ in (\S+)', p.stderr)
-        found = [f for f in found if '/sonames/' in f[4] or is_wasm_so(f[4])]
+                           r'>>> defined as \(([^)]*)\) -> (\S+) in (\S+)', p.stderr)
+        found = [f for f in found if '/sonames/' in f[6] or is_wasm_so(f[6])]
         # A program's own variable named as a library's function (hunspell's
         # `int warn`, libc's warn()): on ELF the program's definition is the
         # one its own code reaches, and so it is here, under a name of its
@@ -999,22 +1003,36 @@ def link_shared(cmd):
         if not found:
             sys.stderr.write(p.stderr)
             return p.returncode
-        for name, params, ret, _, so in found:
+        for name, params, ret, _, lparams, lret, so in found:
             c = os.path.join(tmp, 'mismatch-%d.c' % len(stubs))
-            args = ', '.join('%s a%d' % (WASM_C[t.strip()], i) for i, t in enumerate(params.split(',')) if t.strip())
-            # (says so on stderr when reached: a call that gets here is a
-            # miscompile the build let through)
-            msg = 'gexcc: %s called through a declaration of the wrong type (stub)\n' % name
-            open(c, 'w').write('long write(int, const void *, unsigned long);\n'
-                               '%s %s(%s) { write(2, "%s", %d); __builtin_trap(); }\n'
-                               % (WASM_C.get(ret, 'void'), name, args or 'void', msg.replace('\n', '\\n'), len(msg)))
+            types = [WASM_C[t.strip()] for t in params.split(',') if t.strip()]
+            args = ', '.join('%s a%d' % (t, i) for i, t in enumerate(types))
+            drop = ret == 'void' and lret != 'void' and params == lparams
+            if drop:
+                # the library's, imported under its own name; the stub is
+                # the object's alone (hidden), not another definition
+                open(c, 'w').write('__attribute__((import_name("%s"))) %s __gexcc_lib_%s(%s);\n'
+                                   '__attribute__((visibility("hidden"))) void %s(%s) { __gexcc_lib_%s(%s); }\n'
+                                   % (name, WASM_C[lret], name, ', '.join(types) or 'void', name, args or 'void',
+                                      name, ', '.join('a%d' % i for i in range(len(types)))))
+            else:
+                # (says so on stderr when reached: a call that gets here is
+                # a miscompile the build let through)
+                msg = 'gexcc: %s called through a declaration of the wrong type (stub)\n' % name
+                open(c, 'w').write('long write(int, const void *, unsigned long);\n'
+                                   '%s %s(%s) { write(2, "%s", %d); __builtin_trap(); }\n'
+                                   % (WASM_C.get(ret, 'void'), name, args or 'void', msg.replace('\n', '\\n'), len(msg)))
             o = c[:-2] + '.o'
             if subprocess.call(['clang', '--target=' + TRIPLE, '-fPIC', '-c', '-w', '-fno-builtin', '-o', o, c]
                                + [a for a in BASE if a.startswith('-m') and a != '-mllvm']):
                 sys.stderr.write(p.stderr)
                 return p.returncode
-            sys.stderr.write('gexcc: warning: %s is declared (%s) -> %s but %s defines another type: '
-                             'calls to it trap\n' % (name, params, ret, os.path.basename(so)))
+            if drop:
+                sys.stderr.write('gexcc: note: %s is declared (%s) -> void but %s returns %s: its result is dropped\n'
+                                 % (name, params, os.path.basename(so), lret))
+            else:
+                sys.stderr.write('gexcc: warning: %s is declared (%s) -> %s but %s defines another type: '
+                                 'calls to it trap\n' % (name, params, ret, os.path.basename(so)))
             stubs.append(o)
     return 1
 
