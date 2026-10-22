@@ -600,7 +600,7 @@ void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned nu
     packet[at++] = (uint32_t)(num_groups_z);
 }
 void glDispatchComputeIndirect(long indirect) {
-    persistent_dispatch();
+    persistent_dispatch(); persistent_read_target(0x90EEu, indirect, 12);
     buffer_contents_unknown();
     uint32_t *packet = begin(1127, 2, 0);
     if (!packet) return;

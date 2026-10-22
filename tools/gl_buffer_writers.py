@@ -82,6 +82,8 @@ PERSISTENT_READS = {
     "glBindBufferRange": "persistent_indexed(target, index, buffer, offset, size);",
     "glTexBuffer": "persistent_texbuffer(buffer, 0, 0);",
     "glTexBufferRange": "persistent_texbuffer(buffer, offset, size);",
+    # The bindings, and the three group counts in GL_DISPATCH_INDIRECT_BUFFER.
+    "glDispatchComputeIndirect": "persistent_dispatch(); persistent_read_target(0x90EEu, indirect, 12);",
 }
 
 PERSISTENT_UNKNOWN_READS = re.compile(
