@@ -1,4 +1,4 @@
-/* Variadic functions an aarch64 guest calls (docs/gexcc.md §7.8), for a
+/* Variadic functions an aarch64 guest calls, for a
  * library whose own source uses va_list (sqlite3_mprintf, sqlite3_config):
  * build-sqlite.sh force-includes this, which makes va_list a gexva_list,
  * either wasm's own (`kind` 0: the library's calls among its functions) or

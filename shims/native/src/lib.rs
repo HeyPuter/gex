@@ -579,7 +579,7 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 
 /// [`cache_key`], remembered for this host process: every Wine process under
 /// W3 execs the same 5.7 MB program, and its SHA-256 was 0.36-0.58 s of each
-/// child's start on edger (with the other processes' threads busy). The memo
+/// child's start (with the other processes' threads busy). The memo
 /// is keyed by a 128-bit SipHash of the same fields, a few ms.
 fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -772,7 +772,7 @@ fn new_engine() -> Result<Engine> {
     // wasmtime 49 checks it against the async stack, used or not.
     config.async_stack_size(wasm_stack_bytes() + (1 << 20));
     // Traps are control flow here (a call-out's return, a resume, a callback's
-    // end, all StopExecution), hundreds a second in Noita, and each walked
+    // end, all StopExecution), hundreds a second in a game, and each walked
     // and symbolised the whole wasm stack for a backtrace nothing reads
     // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
     // them, for debugging.
@@ -1674,7 +1674,7 @@ fn store_limits() -> wasmtime::StoreLimits {
 /// `start.elapsed() >= d` and then computing `d - start.elapsed()` reads it
 /// twice, and a thread descheduled between the two (a loaded machine) got a
 /// second reading past the deadline and panicked subtracting durations,
-/// taking the guest thread with it (Baba Is You's, on gooner).
+/// taking the guest thread with it.
 fn time_left(deadline: std::time::Duration, elapsed: std::time::Duration) -> Option<std::time::Duration> {
     deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
 }
@@ -4944,7 +4944,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // unwind past. Its sp_want of 0 made every safepoint abandon
                 // it: a whole trap-out and re-entry per safepoint on every
                 // thread but the main one (wined3d's command-stream thread
-                // spun at a crawl, and Undertale drew no frame).
+                // spun at a crawl, and a game drew no frame).
                 if co.ret != 0 && sp > co.sp_want + co.unwound && !at_function() {
                     if wasm_trace() {
                         eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
@@ -5106,7 +5106,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
     // What is already translated, asked of the shared state per address
     // rather than copied: a copy of the set (half a million entries for
-    // Noita) per miss was 0.7% of tier-1's CPU in memcpy alone.
+    // a large game) per miss was 0.7% of tier-1's CPU in memcpy alone.
     // An address a function serves counts too: a miss there gets its bridge
     // (`ftab::serves`), and its bytes may be no code at all (a W3 builtin's
     // `ud2` stub).
@@ -5403,7 +5403,7 @@ fn publish_unit(
     // retired since then must stay retired (merging the snapshot brought it
     // back with its old base while its directory entry stayed zero, so every
     // translation in it reused that base, never wrote the directory, and
-    // missed again: Noita's retranslation livelock).
+    // missed again: a retranslation livelock).
     sh.page_table.insert_entries(&translated.dir_entries);
     // A block counts as translated only if its page still has the base it
     // was placed at; otherwise its slots are abandoned and the next miss
@@ -6574,7 +6574,7 @@ fn recompile_object(
     };
     // What is already translated, asked of the shared state per address
     // rather than copied: a copy of the set (half a million entries for
-    // Noita) per miss was 0.7% of tier-1's CPU in memcpy alone.
+    // a large game) per miss was 0.7% of tier-1's CPU in memcpy alone.
     let known = |a: u64| shared.lock().unwrap_or_else(|e| e.into_inner()).translated.contains(&a);
     let memory = caller
         .as_context()

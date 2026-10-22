@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run a Windows program on W3 (Wine's own Unix side as wasm32 on gex) with the
+# Run a Windows program on 32-bit Wine (Wine's own Unix side as wasm32 on gex) with the
 # dist and prefix `make -C tools/wine-wasm` builds, natively under gexc.
 #
 #   tools/wine-wasm/run.sh [options] EXE [ARGS...]
@@ -10,8 +10,8 @@
 # function-tier units (GEX_W3_UNITS=all) from one unit cache.
 #
 # --page TREE runs it in the browser instead: headless Chromium on a bench box
-# (scratch/bench/bench.sh: BENCH_HOST, BENCH_CLASS, BENCH_TIMEOUT, default
-# 20m), web/nt.html with gl=1, from TREE, a page-ready gex tree (web/node_modules,
+# through BENCH_SH (required: a runner taking `-s DIR... -- CMD`, which syncs
+# each DIR to the box; BENCH_TIMEOUT, default 20m), web/nt.html with gl=1, from TREE, a page-ready gex tree (web/node_modules,
 # web/public/gex's x86 shims and Mesa: GEX_ARCH=x86 shims/{kernel,browser}/build.sh,
 # web/build-mesa-wasm.sh). Two bundles: the dist at /w3 (W3_PAGE_DIR/w3-KEY.tar,
 # made once per dist) and the prefix at /pfx, the host's xkb data at /usr and
@@ -21,8 +21,8 @@
 # prints the program's output, "unitless:" lines and an "== w3 page:" result
 # (w3/page-run.mjs). With --build-units the unitless images' units are built
 # afterwards (w3/units.sh) for the next run: the page builds none itself.
-# W3_PAGE_DIR defaults to W3_CACHE/page; for BENCH_HOST=worldmachine it and the
-# unit cache must be under ~/gex-sandbox (bench.sh maps only those paths).
+# W3_PAGE_DIR defaults to W3_CACHE/page; on a remote box it and the unit
+# cache must be under paths the runner maps.
 #
 # Options:
 #   --null             the null display driver (no compositor; tests)
@@ -125,7 +125,7 @@ if [ -n "$page" ]; then
   tar -C "$st" --xattrs --xattrs-include='user.*' -cf "$rt/web/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"
   env=() ; for ((i = 1; i < ${#envs[@]}; i += 2)); do env+=("${envs[i]}"); done
   log=$pg/$name.log
-  BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:-$HOME/gex-sandbox/scratch/bench/bench.sh}" -s "$rt" -s "$units" -- \
+  BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:?--page needs BENCH_SH, a bench runner}" -s "$rt" -s "$units" -- \
     env W3_PAGE_TARS=/gex/nt/w3.tar,/gex/nt/app.tar W3_PAGE_SIZE="$size" W3_PAGE_DEBUG="$debug" \
     W3_PAGE_ENV="$(IFS=,; echo "${env[*]}")" ${W3_PAGE_Q+W3_PAGE_Q="$W3_PAGE_Q"} \
     bash "$rt/tools/wine-wasm/run.sh" --remote "$rt" "$units" "${tmo:-300}" "$(basename "$exe")" "$@" 2>&1 | tee "$log"

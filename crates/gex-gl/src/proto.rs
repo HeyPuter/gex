@@ -384,7 +384,7 @@ pub mod op {
 
     /* Fixed function, protocol 11: client-side vertex arrays and the matrix
      * and color calls programs written for OpenGL 1.x-2.x make every frame
-     * (Noita's renderer, through Wine's opengl32). The array pointers are
+     * (as Windows games do through Wine's opengl32). The array pointers are
      * offsets into the bound GL_ARRAY_BUFFER, as for VERTEX_ATTRIB_POINTER:
      * a guest with the data in client memory uploads it to a buffer of its
      * own before the draw. */
@@ -416,8 +416,8 @@ pub mod op {
     /// `{ func, ref as float }` -- glAlphaFunc.
     pub const ALPHA_FUNC: u32 = 197;
 
-    /* Protocol 12: the attribute stack, which Noita's gameplay renderer
-     * wraps passes in. */
+    /* Protocol 12: the attribute stack, which fixed-function renderers
+     * wrap passes in. */
     /// `{ mask }` -- glPushAttrib.
     pub const PUSH_ATTRIB: u32 = 198;
     /// `{}` -- glPopAttrib.

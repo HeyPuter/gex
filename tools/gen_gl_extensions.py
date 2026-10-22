@@ -116,8 +116,8 @@ CURATED_ALIASES = {
 # application that checks only the option then calls a null pointer. wined3d
 # does exactly that: its caps probe tests a vertex program with OPTION
 # NV_vertex_program2 when GL_NV_vertex_program2_option is listed, and on
-# NVIDIA's host (which lists it) Undertale and Katana ZERO died in
-# glGenProgramsARB at address 0. Each is claimable only with its base.
+# an NVIDIA host (which lists it) games then die in glGenProgramsARB at
+# address 0. Each is claimable only with its base.
 BUILDS_ON = {
     "GL_ARB_fragment_program_shadow": "GL_ARB_fragment_program",
     "GL_NV_fragment_program_option": "GL_ARB_fragment_program",

@@ -534,7 +534,7 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     // The page check's stale path (and the guard's) dispatch to this block's
     // own start, which for a neighbour's branch is the wrong address: a call
     // to a JIT trampoline at E ran a stale block for E+2 there, mid-
-    // instruction (Rain World's crashes in Mono's trampolines).
+    // instruction (crashes in Mono's JIT trampolines).
     if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
         e.emit_target_check(block.start);
     }
@@ -592,7 +592,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     // The page check's stale path (and the guard's) dispatch to this block's
     // own start, which for a neighbour's branch is the wrong address: a call
     // to a JIT trampoline at E ran a stale block for E+2 there, mid-
-    // instruction (Rain World's crashes in Mono's trampolines).
+    // instruction (crashes in Mono's JIT trampolines).
     if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
         e.emit_target_check(block.start);
     }
@@ -5446,8 +5446,8 @@ fn dying_after(block: &Block) -> Dying {
     let mut vals = vec![0u32; *start.last().unwrap_or(&0) as usize];
     // Only the statements counted above (`i + 1` within `start`): a block
     // with values but no statements defaults them to statement 0, which it
-    // does not have -- filling it anyway wrote past `vals` (Muck in the page,
-    // a tier-1 panic_bounds_check here).
+    // does not have -- filling it anyway wrote past `vals` (a tier-1
+    // panic_bounds_check here).
     for (v, lu) in last.into_iter().enumerate() {
         if let Some(i) = lu.filter(|&i| i + 1 < start.len()) {
             if let Some(at) = fill.get_mut(i) {

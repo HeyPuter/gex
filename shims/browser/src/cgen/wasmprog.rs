@@ -189,8 +189,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // with the shim's heap, so the memory reaches only as high as used.
         // Or the NT layer's split, for a site that asks (`?w3split=1`), and
         // always for a 64-bit (W64) process: the compact space ends at 2 GiB,
-        // and a 64-bit Wine maps past it (Hades x64's page ran out of memory
-        // at 2 GiB with it).
+        // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
+        // memory at 2 GiB with it).
         if flags & FLAG_GUEST_X86_64 != 0 {
             crate::winspace::set_w3_split(true);
         }
@@ -210,7 +210,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
     // Parsed once for everything below. Three parses and a name for every
     // slot of the element segment (`slot_names`) made publishing bash 1.38 ms
-    // of every fork child's start; this is 0.85 ms (worldmachine, demo page).
+    // of every fork child's start; this is 0.85 ms (demo page).
     let (info, libs) = match gex_dylink::Info::parse(&wasm).ok() {
         Some(i) if !i.needed.is_empty() => (None, Some(i)),
         other => (other, None),

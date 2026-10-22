@@ -1,5 +1,5 @@
-// Function pointers across an item-3 library's boundary (docs/gexcc.md
-// §7.8): an LP64 wasm library under an aarch64 guest program, the arm64
+// Function pointers across an item-3 library's boundary: an LP64 wasm library
+// under an aarch64 guest program, the arm64
 // counterpart of Wine's ICALL pass (tools/wine-wasm/icall/GexIcall.cpp).
 //
 // Exits. A function pointer the library calls may be the guest's (a

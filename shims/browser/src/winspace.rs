@@ -130,7 +130,7 @@ mod imp {
     /// memory grown to 2 GiB at start and the shim's heap above it, so
     /// everything below 2 GiB is Wine's. Costs the tab 2 GiB of data segment
     /// per process; for a game whose views and the heap do not fit together
-    /// under 2 GiB (Hades x86: 1.5 GiB of guest mappings, 164 MiB of heap).
+    /// under 2 GiB (one needed 1.5 GiB of guest mappings and 164 MiB of heap).
     static W3_SPLIT: AtomicBool = AtomicBool::new(false);
 
     pub(crate) fn set_w3_split(on: bool) {

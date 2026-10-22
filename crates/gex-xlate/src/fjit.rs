@@ -456,7 +456,7 @@ impl Jit {
 /// Memory form's rule, which the emitter relies on: every value a block
 /// uses is defined earlier in the same block. (Recovery has been seen to
 /// break it on code that jumps into the middle of a lifted block, in a
-/// packed section of noita.exe.)
+/// packed section of an executable.)
 fn block_local(f: &Function) -> Result<(), String> {
     for b in &f.blocks {
         let mut defined = HashSet::new();

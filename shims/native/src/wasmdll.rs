@@ -220,7 +220,7 @@ fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
 /// installs it shares (all but its data's address). Kept for the host
 /// process by path, size and modification time, so a Wine child does not
 /// read, hash and parse the 8.6 MB module again (0.3 s of each child's
-/// start on edger).
+/// start).
 struct ParsedModule {
     size: u32,
     align: u32,

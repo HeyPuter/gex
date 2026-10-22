@@ -1,6 +1,6 @@
-/* The run-time half of native Wine modules under gex (docs/wine-native.md
- * §3.3): calling guest (x86) code from native code. The ICALL pass's exit
- * stubs lay a call's arguments out as i386 stack words and call these.
+/* The run-time half of native Wine modules under gex: calling guest (x86)
+ * code from native code. The ICALL pass's exit stubs lay a call's
+ * arguments out as i386 stack words and call these.
  *
  * Compiled into every native module with gex_abi.h and provider.h (the
  * export providers' view of the guest's registers). */
@@ -30,7 +30,7 @@ uint64_t __gexw_guest_call(uint32_t target, const uint32_t *words, uint32_t n)
     gp_set(ctx, R_ESP, sp);
     GEX_C64(GEX_CTX_LAST_TARGET) = target;
     if (!GEX_FTAB(gex_ftab_idx(target))(ctx, gexw_get_depth() + 1, 0xffffffffu, ra))
-        __builtin_trap(); /* the guest left another way: W2 unwinds here */
+        __builtin_trap(); /* the guest left another way: the unwind ends here */
     gp_set(ctx, R_ESP, sp0);
     return ((uint64_t)gp_reg(ctx, R_EDX) << 32) | gp_reg(ctx, R_EAX);
 }

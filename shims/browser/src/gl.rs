@@ -103,8 +103,8 @@ fn submit_now(ring: u64, unwaited: bool) -> i32 {
 /// The submit the GL device's ioctl took, done now that the kernel's lock
 /// is released (`gex_syscall`): a synchronous submit waits for the page to
 /// run the batch, and under the lock every other thread's syscall waited
-/// with it (Muck's main thread spent 39% of its time on KLOCK while the
-/// render thread submitted, mp16). On failure the call's result becomes
+/// with it (a game's main thread spent 39% of its time on KLOCK while the
+/// render thread submitted). On failure the call's result becomes
 /// -EIO in `ctx`'s rax; a present's is its frames shown.
 pub(crate) fn submit_pending(ctx_addr: u64) {
     let Some((ring, unwaited, present)) = PENDING.with(|p| p.take()) else { return };

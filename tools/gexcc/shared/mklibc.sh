@@ -1,5 +1,5 @@
 #!/bin/sh
-# libc.so for gexcc's shared programs (docs/gexcc.md 7.4): musl, libgex and
+# libc.so for gexcc's shared programs: musl, libgex and
 # libgexcc as one wasm side module, linked by gexcc itself (GEXCC_SHARED) so
 # it gets the same finishing as every library (self-binding, asyncify for
 # fork, its gex.forkreach summary). Also libc_nonshared.a (what stays in the

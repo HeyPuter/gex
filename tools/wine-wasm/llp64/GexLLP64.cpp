@@ -1,5 +1,5 @@
 // GexLLP64: clang's wasm64 target with Windows x64's data model (LLP64), for
-// Wine's PE side under W64 (docs/wine-native-x64.md §1.2). clang has no
+// Wine's PE side under 64-bit Wine. clang has no
 // wasm64 Windows triple; this plugin changes the data model of the
 // wasm64-unknown-unknown target before anything is parsed:
 //   long 32 bits; long double = double (MSVC); size_t, ptrdiff_t, intptr_t,

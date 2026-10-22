@@ -1,5 +1,5 @@
 #!/bin/bash
-# item 3 (docs/gexcc.md §7.8): Debian's zlib as an LP64 wasm library that
+# item 3: Debian's zlib as an LP64 wasm library that
 # replaces libz.so.1 under an aarch64 program. Compiled for wasm64 (LP64:
 # long, pointers and size_t 64-bit, as aarch64's), linked position-
 # independent with adapters for each export (gen.py) and a runtime (lib.sh:
@@ -7,11 +7,12 @@
 # 32-bit memory (binaryen's --memory64-lowering: every address wrapped to
 # i32 at its access). With the libc, gz* (file I/O) is in too.
 #
-#   build.sh OUT   (GEXCC_PREFIX: the gexcc toolchain, for wasm-opt;
+#   build.sh OUT   (ZLIB_SRC: Debian's zlib source, unpacked;
+#                   GEXCC_PREFIX: the gexcc toolchain, for wasm-opt;
 #                   A64_SYSROOT; DEBIAN_ROOT for the test program)
 set -eu
 H=$(cd "$(dirname "$0")" && pwd); O=$(realpath -m "$1"); mkdir -p "$O"
-Z=${ZLIB_SRC:-$HOME/gex-sandbox/scratch/CC/debian/src/zlib-1.3.dfsg+really1.3.1-1}
+Z=${ZLIB_SRC:?the Debian zlib source (1.3.1), unpacked}
 OPT=${GEXCC_PREFIX:?}/sysroot/binaryen/bin/wasm-opt
 . "$H/lib.sh"
 lib_setup "$H" "$O"

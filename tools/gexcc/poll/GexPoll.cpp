@@ -1,7 +1,7 @@
-// GexPoll: safepoint polls in native wasm32 code (docs/gexcc.md §3).
+// GexPoll: safepoint polls in native wasm32 code.
 //
-// gex delivers a signal to a native program at a system call's return
-// (docs/wine-native.md §3.11): it cannot interrupt running wasm. A loop that
+// gex delivers a signal to a native program at a system call's return:
+// it cannot interrupt running wasm. A loop that
 // makes no system calls (a computation, a busy wait, a test that relies on
 // alarm() to stop it) would never see SIGALRM, SIGINT or SIGTERM. Translated
 // code polls at back-edges (tier-1's safepoint countdown); this pass gives

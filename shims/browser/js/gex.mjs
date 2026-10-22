@@ -184,7 +184,7 @@ function isShared(buf) {
 // 32-bit accumulators plus the exact length make a cheap content key; this is
 // validation against an index race, not a persistent content-addressed cache.
 /** The most the module store (`Gex#moduleStore`) may grow to, tried in turn:
- *  the first a runtime accepts. 4 GiB filled up in 22 minutes of Hollow Knight
+ *  the first a runtime accepts. 4 GiB filled up in 22 minutes of a game
  *  on Unity's own Mono (the translations of Mono's JIT output), after which
  *  the registry kept its bytes in the shim's heap again and that ran out.
  *  A growable SharedArrayBuffer only commits what it has grown to. */
@@ -1131,7 +1131,7 @@ export class Gex {
     if (this.#stackTop === null) {
       // `gex_worker_init` runs on a stack too, and until it answers this
       // instance's is wasm-ld's: the top of the guest's first 8 MiB, which is
-      // a Windows program's image (noita.exe's .text at 0x7ff000..0x800000
+      // a Windows program's image (a game's .text at 0x7ff000..0x800000
       // was overwritten by every thread that started). So it runs on a
       // bootstrap slice of the shim's own stack band below SHIM_STACK_TOP,
       // one of 32 handed out round-robin through a counter in the reserved
@@ -3358,7 +3358,7 @@ export class Gex {
    * call-out, an NT callback, a system call served in place: a Wine thread's
    * whole life can be one call-out). Nothing asynchronous unless a thread is
    * there: a promise per trap, its rejection handler holding the trap's scope
-   * (and so the trap's error), is a microtask that never runs, and Hades x64's
+   * (and so the trap's error), is a microtask that never runs, and a 64-bit game's
    * page queued 4 GB of them before the renderer died.
    */
   #startThread(who = 'gex') {
@@ -4170,14 +4170,14 @@ export class Gex {
     // (host.mjs), so a program run again, by any process, is not compiled
     // again, and a file apt replaced is not mistaken for the old one. Keyed
     // by path, winepe.wasm (8.9 MB) was compiled once per Wine process, ten
-    // times for the mspaint demo, each copy of its code resident.
+    // times in one demo, each copy of its code resident.
     // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
     // and the bytes copied out only when the page has no module for it.
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
     const pcopy = () => new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, plen).slice();
     let pbytes = null, pkey = null;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
-    // and hashes in one mspaint boot.
+    // and hashes in one demo's boot.
     if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
@@ -6508,7 +6508,7 @@ export class Gex {
       // growing by exactly what each module wants copies an ever-larger table
       // once per module. Doubling makes total copying linear in the final size.
       // Bounded: doubling a table of millions asks V8 for one FixedArray of
-      // tens of megabytes per table per Worker, and at Noita's world load
+      // tens of megabytes per table per Worker, and at one game's world load
       // that request killed the renderer (V8 OOM with an 87 MB heap). A
       // million entries (8 MB) at most beyond what is needed.
       const len = tables[i].length;
@@ -7379,7 +7379,7 @@ export class Gex {
    * The process's JS-side module store: a growable SharedArrayBuffer every
    * Worker of the process holds, where the registry keeps a joining Worker's
    * catch-up bytes instead of in the shim's heap (which shares a fixed 2 GiB
-   * arena; the registry alone reached 980 MiB in a Muck fjit run). Null where
+   * arena; the registry alone reached 980 MiB in a long fjit run). Null where
    * there is no growable SharedArrayBuffer; the registry then keeps the bytes
    * itself, as before.
    */
@@ -8438,7 +8438,7 @@ export class Gex {
   #deadKeys = new Set();
 
   /** Runtime modules of this process no dispatch can reach any more (all
-   *  their pages retired: an unloaded image's, FL Studio's plugin scan loads
+   *  their pages retired: an unloaded image's: a plugin scan loads
    *  and unloads dozens), let go of here: their `blocks` entries back to the
    *  miss stub, which kept each one's instance (and with it its code) alive in
    *  every Worker, and this Worker's own references dropped, so V8 frees them.

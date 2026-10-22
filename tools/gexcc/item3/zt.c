@@ -1,4 +1,4 @@
-/* item 3's test program (docs/gexcc.md §7.8): an arm64 Linux program that
+/* item 3's test program: an arm64 Linux program that
  * uses Debian's libz.so.1 -- translated by gex, or replaced by the LP64 wasm
  * build of the same zlib. No libc of its own (raw system calls, its own
  * _start; the dynamic linker still loads libz and the libc it needs).

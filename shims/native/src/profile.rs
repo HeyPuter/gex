@@ -705,7 +705,7 @@ fn write(rec: &Recorder) -> Result<()> {
     // One writer at a time, snapshot included: every thread folds its
     // counts in after a dump is asked for and may write; two renames of one
     // temporary file raced (the second found it gone, and the run ended on
-    // the error: Peggle under GEX_PROFILE_EVERY), and an older snapshot
+    // the error under GEX_PROFILE_EVERY), and an older snapshot
     // must not land after a newer one.
     static WRITING: Mutex<()> = Mutex::new(());
     let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());

@@ -355,8 +355,8 @@ S_API bool SteamAPI_RestartAppIfNecessary(unsigned) { return false; }
 S_API bool SteamAPI_IsSteamRunning() { gex_log("SteamAPI_IsSteamRunning"); return true; }
 S_API const char *SteamAPI_GetSteamInstallPath() { return gex_steam_dir(); }
 S_API void SteamAPI_RunCallbacks() {}
-/* Flat entry points of SDKs before 1.37, which CSteamworks.dll (Celeste,
- * TowerFall) imports: a run of one pipe's callbacks, the current user, and
+/* Flat entry points of SDKs before 1.37, which CSteamworks.dll
+ * imports: a run of one pipe's callbacks, the current user, and
  * the interface-function registration (nothing to register here). */
 S_API void Steam_RunCallbacks(int, bool) {}
 S_API int Steam_GetHSteamUserCurrent() { return 1; }

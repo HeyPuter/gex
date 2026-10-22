@@ -6,7 +6,7 @@
 // ~170 KB in 7 requests). With an HTTP cache that costs one download; on an
 // origin with no HTTP cache (the demo servers' self-signed cert: Chromium
 // keeps none for a certificate error) it was all of it again for each of
-// the ~110 Workers of the Win7 shell's start (16.6 MB, ~600 requests), and a
+// the ~110 Workers of a desktop shell's start (16.6 MB, ~600 requests), and a
 // round trip more for every process the guest started later.
 //
 // So the page fetches each module once (from the cache when a visit before

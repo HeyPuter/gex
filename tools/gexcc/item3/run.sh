@@ -1,5 +1,5 @@
 #!/bin/bash
-# on edger under bench.sh: zt (build.sh's test program) on Debian's arm64
+# under bench.sh: zt (build.sh's test program) on Debian's arm64
 # libz translated, and on the LP64 wasm zlib replacing it, at tier 1 (the
 # page's default) and with the function JIT, in the browser runtime under
 # node. ABBA, REPS rounds; one JSON line per run (median of 5 inside).

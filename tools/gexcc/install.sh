@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the gexcc toolchain (docs/gexcc.md) into PREFIX:
+# Install the gexcc toolchain into PREFIX:
 #
 #   tools/gexcc/install.sh PREFIX [MUSL_SRC]
 #
@@ -278,7 +278,7 @@ if [ -n "${BUSYBOX_TAR:-}" ]; then
   cp "$BB/busybox" "$L/busybox"
   GEXCC_BUSYBOX= "$B/gexcc-exec" run "$L/busybox" --list | tr '\n' ',' | sed 's/,$//' > "$L/busybox.applets"
 fi
-# shared libraries (GEXCC_SHARED=1, docs/gexcc.md 7): gex-dylink (cargo
+# shared libraries (GEXCC_SHARED=1): gex-dylink (cargo
 # build -p gex-dylink) and libc.so
 DL=${GEX_DYLINK:-$ROOT/target/release/gex-dylink}
 if [ -x "$DL" ]; then

@@ -1,18 +1,18 @@
 #!/bin/sh
-# The LP64 libc item 3's libraries build against (docs/gexcc.md §7.8): musl
-# with the gex `wasm64a64` arch (branch gex-wasm64-a64, from the Unity
-# provider's gex-wasm64): wasm64 code with aarch64's LP64 layout and
+# The LP64 libc item 3's libraries build against: musl
+# with the gex `wasm64a64` arch (branch gex-wasm64-a64, from gex-wasm64):
+# wasm64 code with aarch64's LP64 layout and
 # kernel ABI, aarch64 Linux syscalls through gex.syscall(ctx) on the
 # calling guest thread's context; and compiler-rt's builtins (long double
 # is IEEE quad, as on aarch64). The libraries are then lowered to the
 # guest's 32-bit memory (build.sh).
 #
-#   sysroot.sh OUT [MUSL_SRC]
+#   sysroot.sh OUT [MUSL_SRC]   (MUSL_SRC, argument or environment: required)
 #
 # OUT/sysroot gets include/, lib/libc.a and lib/libclang_rt.builtins-wasm64.a.
 set -eu
 OUT=$(realpath -m "$1")
-MUSL=$(realpath "${2:-$HOME/gex-sandbox/scratch/CC/musl-a64}")
+MUSL=$(realpath "${2:-${MUSL_SRC:?musl, branch gex-wasm64-a64}}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-8}
 . "$(dirname "$0")/flags.sh"

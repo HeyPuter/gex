@@ -1536,7 +1536,7 @@ impl Gl {
                     // element array buffer bound in the guest), the indices
                     // themselves: the guest's pointer means nothing here, and
                     // passing it as an offset had the host's GL read its own
-                    // address space (Retrocycles' arena: SIGSEGV in Mesa).
+                    // address space (a SIGSEGV in Mesa).
                     // Older guests send no fifth word.
                     match a.u32() {
                         Some(1) => {
@@ -1915,7 +1915,7 @@ mod tests {
 
     /// glDrawElements with client-side indices: they travel with the
     /// command (the guest's pointer, sent as the offset, must never reach
-    /// the host's GL: Retrocycles crashed Mesa that way).
+    /// the host's GL: it crashes Mesa).
     #[test]
     fn client_side_indices_come_with_the_draw() {
         let _serial = gl_lock();

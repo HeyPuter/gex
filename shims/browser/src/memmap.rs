@@ -3,7 +3,7 @@
 //! The guest, the shim and every Worker live in one linear memory with no
 //! protection between them, so a range handed to two owners is silent
 //! corruption: a Worker's first call running on wasm-ld's default stack wrote
-//! into noita.exe's .text for months. Every region is registered here with
+//! into a game's .text for months. Every region is registered here with
 //! its owner as it is created -- the fixed layout once, then each heap span,
 //! each Worker's stack and thread-local block, each arena span the guest's
 //! mappings take, the Windows address space at NT boot -- and a region that

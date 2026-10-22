@@ -6,8 +6,8 @@ for a stated and correct reason: a CPU rasteriser and a GPU disagree
 legitimately about interpolation precision and about which pixel a primitive
 edge lands on, so an exact digest is unusable. But a mean is blind to almost
 everything that matters. **A vertically flipped image has exactly the same
-mean and exactly the same coverage** -- and rendering SuperTuxKart's scene
-upside down is a bug this project actually shipped.
+mean and exactly the same coverage** -- and rendering a scene upside down
+is a real bug to catch.
 
 The way out is that legitimate disagreement is *confined to primitive edges*:
 a one-pixel fringe along a boundary. A real defect -- a dropped draw, a wrong

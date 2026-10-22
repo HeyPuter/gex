@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Adapters for a C library's exports, called by aarch64 guest code
-(docs/gexcc.md §7.8): for each export with a prototype in the headers, a gex
+"""Adapters for a C library's exports, called by aarch64 guest code:
+for each export with a prototype in the headers, a gex
 F_body `gexp_<name>` that reads AAPCS64's arguments (x0-x7, then the stack),
 calls the function and returns to x30 with the result in x0. Integer and
 pointer arguments and results, and structs by value as AAPCS64 passes them

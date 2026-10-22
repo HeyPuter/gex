@@ -83,7 +83,7 @@ const emptyMemories = new Map();
  * do not use (`processMemories`), made once and carried in the kernel spec
  * (`spare`) to every Worker: shared, a Worker's copy is the same memory.
  * One per Worker cost each Worker an engine reservation of its own (a
- * 32-bit memory's guard region; a memory64's), and Dicey Dungeons' page, a
+ * 32-bit memory's guard region; a memory64's), and a game's page, a
  * few dozen Workers, ran out ("WebAssembly.Memory(): could not allocate
  * memory" as a thread joined).
  */

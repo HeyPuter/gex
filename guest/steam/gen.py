@@ -59,7 +59,7 @@ OVERRIDES = {
     'ISteamGameServer::BLoggedOn': ('', 'return true;'),
     'ISteamGameServer::BSecure': ('', 'return false;'),
     'ISteamGameServer::GetSteamID': ('', 'return gex_steam_id();'),
-    # Stats are there and empty: Baba Is You quits when its request fails.
+    # Stats are there and empty: a game may quit when its request fails.
     'ISteamUserStats::RequestCurrentStats': ('', 'return true;'),
     'ISteamUserStats::StoreStats': ('', 'return true;'),
     'ISteamUserStats::SetAchievement': ('', 'return true;'),

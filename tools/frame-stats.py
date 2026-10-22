@@ -2,9 +2,9 @@
 """Summarise a rendered frame, so a gate can check the picture and not just
 the frame count.
 
-SuperTuxKart presented 600 of 600 frames for days while its scene rendered
-almost entirely black -- the counter cannot see that, and the harness's own
-closing line ("correctness needs the screenshot") had nobody reading it. These
+A game can present every frame while its scene renders almost entirely
+black -- the counter cannot see that, and a closing line that says
+"correctness needs the screenshot" has nobody reading it. These
 are the cheapest statistics that separate a rendered scene from a black one, a
 flat one, or a single-colour one:
 

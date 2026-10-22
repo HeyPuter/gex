@@ -21,8 +21,8 @@ pub enum Stream {
 /// reading it. The kernel has no host-system calls of its own, so the
 /// embedder sets this (gexc: `poll` on fd 0). Unset, stdin is always
 /// "readable", which a `select` on an empty pipe gets wrong: the guest then
-/// blocks in `read` (Warfork's dedicated server, its console polled every
-/// frame, stopped dead after loading).
+/// blocks in `read` (a game server that polls its console every frame
+/// stops dead).
 pub static STDIN_READY: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
 
 /// A standard stream, optionally reported as a terminal.

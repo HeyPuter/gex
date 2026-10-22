@@ -253,8 +253,8 @@ export class ProcessHost {
    * child is given that one (`#takeWorker`): its memory is grown to 177 MiB
    * at once, and a Worker taken for a thread or a fork dropped it unfreed --
    * the Worker then sits in wasm or a wait, its isolate never collects, and
-   * the dropped memory stays in the renderer's VmData (Paint: 24 of them
-   * alive at its window, 4.15 GiB; the Win7 shell: 58, 10 GiB).
+   * the dropped memory stays in the renderer's VmData (one program: 24 of them
+   * alive at its window, 4.15 GiB; a desktop shell: 58, 10 GiB).
    */
   #preattach(w) {
     if (!this.#kernel || !this.#stacks || !this.#extra?.shared || w[STACK_KEY]) return;
@@ -557,8 +557,7 @@ export class ProcessHost {
   /// Worker after another: called on a take alone, a take removed one and
   /// added one, and the pool never held more than one Worker. The second
   /// and third processes of a pipeline (`echo a | cat | cat`) then each
-  /// waited about 20 ms for a Worker made at their fork (worldmachine,
-  /// demo page).
+  /// waited about 20 ms for a Worker made at their fork (demo page).
   #topUp() {
     if (this.#warm.length >= this.#warmWanted) return;
     try {
@@ -855,7 +854,7 @@ export class ProcessHost {
             pageFlavours: this.#pageFlavours(),
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all
-            // again (each Noita thread spent ~3 s doing that, one after the
+            // again (each thread of a game spent ~3 s doing that, one after the
             // other, at start-up). The `start` closure above meant to send
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
