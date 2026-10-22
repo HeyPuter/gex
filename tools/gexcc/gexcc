@@ -567,12 +567,14 @@ LIB = SYSROOT + '/lib'
 SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib/' + MULTIARCH, SYSROOT + '/usr/lib',
                     SYSROOT + '/lib/' + MULTIARCH, LIB]
 AR_MAGIC = b'!<arch>\n'
+# a thin archive (Meson's static libraries: ar csrDT) names its members' files
+THIN_MAGIC = b'!<thin>\n'
 
 
 def is_archive(p):
     try:
         with open(p, 'rb') as f:
-            return f.read(8) == AR_MAGIC
+            return f.read(8) in (AR_MAGIC, THIN_MAGIC)
     except OSError:
         return False
 

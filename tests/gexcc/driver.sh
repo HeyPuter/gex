@@ -169,6 +169,16 @@ for env in "" GEXCC_SHARED=1; do
         grep -q LLD "$W/log"
     check $? "-Wl,--version with a library to link answers the linker's version${env:+ ($env)}"
 done
+# a thin archive (Meson's ar csrDT) in -shared: recorded as a dependency,
+# not put in the library as a member wasm-ld cannot read
+mkdir -p "$W/th"
+printf 'int th_get(void) { return 3; }\n' > "$W/th/t.c"
+printf 'int th_get(void);\nint main(void) { return th_get() != 3; }\n' > "$W/th/m.c"
+gexcc -c -o "$W/th/t.o" "$W/th/t.c" && llvm-ar csrT "$W/th/libt.a" "$W/th/t.o" &&
+    gexcc -shared -fPIC -o "$W/th/libth.so" -Wl,--whole-archive "$W/th/libt.a" -Wl,--no-whole-archive &&
+    ! llvm-ar t "$W/th/libth.so" | grep -q 'libt\.a' &&
+    gexcc -o "$W/th/m" "$W/th/m.c" "$W/th/libth.so" 2> "$W/log"
+check $? "a thin archive in -shared is linked from, not nested"
 # libucontext (systemd on musl): its functions link, from pkg-config's flags
 printf '#include <ucontext.h>\nint main(void){ucontext_t u; return getcontext(&u) != -1;}\n' > "$W/uc.c"
 gexcc -o "$W/uc" "$W/uc.c" $(PKG_CONFIG_SYSROOT_DIR="$SR" PKG_CONFIG_LIBDIR="$SR/usr/lib/pkgconfig" pkg-config --libs libucontext) 2> "$W/log"
