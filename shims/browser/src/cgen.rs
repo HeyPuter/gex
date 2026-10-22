@@ -296,7 +296,70 @@ fn ftab<R>(f: impl FnOnce(&mut FuncMap) -> R) -> R {
     let m = g.get_or_insert_with(FuncMap::new);
     let r = f(m);
     FTAB_SIZE.store(m.size(), SeqCst);
+    log_publish(m);
     r
+}
+
+// ---- The table's log, for every Worker to replay, read without the lock ----
+//
+// `FuncMap`'s log is append-only. Each change made under `FTAB` copies its
+// new events here, into segments that never move (segment k holds 1024 << k
+// events), and then publishes the length: a Worker asking how far the log
+// goes, every system call, and reading the events it lacks takes no lock.
+
+const LOG_SEG0: usize = 1024;
+static LOG_SEGS: [std::sync::atomic::AtomicPtr<AtomicU64>; 32] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 32];
+/// How many events `LOG_SEGS` holds, published after they are written.
+static LOG_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Event `i`'s segment and the index in it.
+fn log_at(i: usize) -> (usize, usize) {
+    let k = (usize::BITS - 1 - (i / LOG_SEG0 + 1).leading_zeros()) as usize;
+    (k, i - LOG_SEG0 * ((1 << k) - 1))
+}
+
+/// The events `m` has past the published length, copied and published.
+/// Under `FTAB` (writers are serialized by it).
+fn log_publish(m: &FuncMap) {
+    let have = LOG_LEN.load(Ordering::Relaxed);
+    let new = m.log_from(have);
+    if new.is_empty() {
+        return;
+    }
+    for (j, e) in new.iter().enumerate() {
+        let (k, at) = log_at(have + j);
+        let mut seg = LOG_SEGS[k].load(Ordering::Acquire);
+        if seg.is_null() {
+            let b: Box<[AtomicU64]> = (0..LOG_SEG0 << k).map(|_| AtomicU64::new(0)).collect();
+            seg = Box::into_raw(b) as *mut AtomicU64;
+            LOG_SEGS[k].store(seg, Ordering::Release);
+        }
+        let v = match e {
+            Event::Install(n) => (1u64 << 32) | *n as u64,
+            Event::Retire(idx) => (2u64 << 32) | *idx as u64,
+        };
+        // SAFETY: segment k holds `LOG_SEG0 << k` events and `at` is below
+        // that (`log_at`); it is never freed.
+        unsafe { (*seg.add(at)).store(v, Ordering::Relaxed) };
+    }
+    LOG_LEN.store(have + new.len(), Ordering::Release);
+}
+
+/// How many events the log has (published).
+fn log_len() -> usize {
+    LOG_LEN.load(Ordering::Acquire)
+}
+
+/// Event `i`, as `gex_ftab_event` gives it; 0 past the end.
+fn log_event(i: usize) -> u64 {
+    if i >= log_len() {
+        return 0;
+    }
+    let (k, at) = log_at(i);
+    let seg = LOG_SEGS[k].load(Ordering::Acquire);
+    // SAFETY: as in `log_publish`; published before the length was.
+    unsafe { (*seg.add(at)).load(Ordering::Relaxed) }
 }
 
 /// [`FuncMap::size`] as of the last change, read without the lock: what a
@@ -1751,7 +1814,7 @@ pub extern "C" fn gex_cgen_have(n: u32) {
 /// Whether this Worker has the function table's log still to replay: a miss
 /// at a unit's entry is then a catch-up, not a translation.
 pub(crate) fn behind() -> bool {
-    on() && (HAVE.with(|c| c.get()) as usize) < ftab(|m| m.log_len())
+    on() && (HAVE.with(|c| c.get()) as usize) < log_len()
 }
 
 /// [`behind`], for `gex.lookup`'s JS half.
@@ -1763,18 +1826,14 @@ pub extern "C" fn gex_ftab_behind() -> i32 {
 /// How many events the function table's log has.
 #[no_mangle]
 pub extern "C" fn gex_ftab_log_len() -> u32 {
-    ftab(|m| m.log_len() as u32)
+    log_len() as u32
 }
 
 /// Event `i` of the log: an install as `1 << 32 | install`, a retirement as
 /// `2 << 32 | index`; 0 past the end.
 #[no_mangle]
 pub extern "C" fn gex_ftab_event(i: u32) -> i64 {
-    ftab(|m| match m.log_from(i as usize).first() {
-        Some(Event::Install(n)) => (1i64 << 32) | *n as i64,
-        Some(Event::Retire(idx)) => (2i64 << 32) | *idx as i64,
-        None => 0,
-    })
+    log_event(i as usize) as i64
 }
 
 /// Install `n`'s table range starts here.
