@@ -229,6 +229,9 @@ check seh-traps 0 "$allok" seh.exe traps
 # procs entered from NtUser* calls (user callbacks), messages between threads
 [ -n "$page" ] && NULLDRV=1 check user_win_nd 0 "$allok" user_win.exe
 [ -n "$page" ] && NULLDRV=1 check wndproc_seh 0 "$allok" wndproc_seh.exe
+# A window proc's uncaught exception ends the user callback that entered it,
+# or unwinds into a same-thread SendMessage's sender (USER on the null driver)
+NULLDRV=1 check wndproc_uncaught 0 "$allok" wndproc_uncaught.exe
 # W64.2: MSVC's x64 C++ exceptions, SEH and setjmp/longjmp through msvcrt
 # (tests/nt/msvc/build-x64.sh)
 check msvc_cxxeh 0 "$allok" msvc_cxxeh.exe
