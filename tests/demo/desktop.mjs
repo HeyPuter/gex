@@ -251,6 +251,39 @@ async function canvasHash() {
     return h + ':' + lit;
   })()`);
 }
+/** The page's canvas sampled in the page itself for `ms`, every `every` ms,
+ *  each sample a hash of a copy at most 640 pixels wide: cheap enough that
+ *  the samples keep their cadence at any devicePixelRatio (a full-size
+ *  readback of a 2560-pixel canvas took 2 s a sample, and two of the
+ *  xterm's lines fell in one interval). Returns when each change was seen,
+ *  in ms from the first sample, and the samples' longest gap. */
+async function canvasChanges(ms, every) {
+  return ev(`(async () => {
+    const c = document.getElementById('out');
+    const k = Math.max(1, Math.ceil(c.width / 640));
+    const t = new OffscreenCanvas(Math.ceil(c.width / k), Math.ceil(c.height / k));
+    const g = t.getContext('2d', { willReadFrequently: true });
+    const hash = () => {
+      g.drawImage(c, 0, 0, t.width, t.height);
+      const d = g.getImageData(0, 0, t.width, t.height).data;
+      let h = 2166136261;
+      for (let i = 0; i < d.length; i += 4) h = Math.imul(h ^ d[i] ^ (d[i + 1] << 8) ^ (d[i + 2] << 16), 16777619) >>> 0;
+      return h;
+    };
+    const t0 = performance.now();
+    let last = hash(), prevAt = t0, gap = 0, samples = 1;
+    const at = [];
+    while (performance.now() - t0 < ${ms}) {
+      await new Promise((r) => setTimeout(r, ${every}));
+      const now = performance.now();
+      gap = Math.max(gap, now - prevAt); prevAt = now; samples++;
+      const h = hash();
+      if (h !== last) at.push(Math.round(now - t0));
+      last = h;
+    }
+    return { at, gap: Math.round(gap), samples };
+  })()`);
+}
 /** One key into the focused window, as the page gets it from a person. */
 async function typeKey(ch) {
   if (ch === '\n') {
@@ -485,20 +518,20 @@ async function legs() {
   // What the page's canvas holds (its last committed frame, drawn into a 2D
   // canvas), not a screenshot: headless Chromium's screenshots never contain
   // a WebGPU canvas a worker draws, so they cannot tell shown from not.
-  const held = [await canvasHash()];
-  const shown = [await screenHash()];
-  for (let i = 0; i < 4; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    held.push(await canvasHash());
-    shown.push(await screenHash());
-  }
-  const shots = shown.slice(1).filter((h, i) => h !== shown[i]).length;
+  // The xterm prints a line a second: the canvas should change with each, so
+  // its changes are counted as moments at least 500 ms apart (a line drawn
+  // over two frames is one), sampled in the page every 100 ms.
+  const shot0 = await screenHash();
+  const seen = await canvasChanges(4000, 100);
+  const shots = (await screenHash()) !== shot0 ? 1 : 0;
   const d1 = await ev('globalThis.__gexCompositor.describe()');
-  const changes = held.slice(1).filter((h, i) => h !== held[i]).length;
-  const okShown = changes >= 3;
+  const moments = [];
+  for (const t of seen.at) if (!moments.length || t - moments[moments.length - 1] >= 500) moments.push(t);
+  const okShown = moments.length >= 3;
   if (!okShown) failed = true;
-  log(`${okShown ? 'ok' : 'FAIL'} presentation leg: the page's canvas changed ${changes} times in 4 s of the xterm printing with no input`
-    + ` (compositor: ${d1.frames - d0.frames} frames drawn in ${d1.turns - d0.turns} turns; screenshots changed ${shots} times)`);
+  log(`${okShown ? 'ok' : 'FAIL'} presentation leg: the page's canvas changed at ${moments.length} moments in 4 s of the xterm printing a line a second with no input`
+    + ` (at ${JSON.stringify(moments)} ms; ${seen.samples} samples, longest gap ${seen.gap} ms;`
+    + ` compositor: ${d1.frames - d0.frames} frames drawn in ${d1.turns - d0.turns} turns; screenshot changed: ${shots ? 'yes' : 'no'})`);
   // What the xterm drew is what the page shows (bug 3): xwd and python come
   // as overlays, the way a person adds them from the launcher.
   await new Promise((r) => setTimeout(r, 3000));
