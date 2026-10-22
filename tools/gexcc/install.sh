@@ -81,9 +81,31 @@ ln -sf gexcc "$B/gexc++"
 for t in cc gcc clang; do ln -sf gexcc "$B/$TRIPLE-$t"; done
 for t in c++ g++ clang++; do ln -sf gexcc "$B/$TRIPLE-$t"; done
 # (the driver picks C++ by its name ending in ++)
-for t in ar ranlib nm strings size readelf objcopy; do
+for t in ar ranlib nm strings size readelf; do
   printf '#!/bin/sh\nexec llvm-%s "$@"\n' "$t" > "$B/$TRIPLE-$t"; chmod +x "$B/$TRIPLE-$t"
 done
+# objcopy: a gexcc program has no ELF interpreter, so its .interp, dumped
+# (libcap's loader.txt: the loader a runnable library names), is empty
+cat > "$B/$TRIPLE-objcopy" <<'OCEOF'
+#!/bin/sh
+case " $* " in
+*" --dump-section .interp="*)
+    out= in=
+    for a; do
+        case $a in
+        .interp=*) out=${a#.interp=} ;;
+        -*) ;;
+        *) [ -z "$in" ] && [ -f "$a" ] && in=$a ;;
+        esac
+    done
+    if [ -n "$out" ] && [ -n "$in" ] && ! llvm-readelf -S "$in" 2>/dev/null | grep -q ' \.interp '; then
+        : > "$out"
+        exit 0
+    fi ;;
+esac
+exec llvm-objcopy "$@"
+OCEOF
+chmod +x "$B/$TRIPLE-objcopy"
 # objdump: a side module described as GNU objdump describes an ELF shared
 # object (Debian's dh_makeshlibs and dpkg-shlibdeps read SONAME and NEEDED)
 cp "$HERE/gexcc-objdump" "$B/gexcc-objdump"
