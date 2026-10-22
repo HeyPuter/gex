@@ -2120,7 +2120,7 @@ fn exp_trap_callouts() -> bool {
 }
 pub(crate) static TRAP_CALLOUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn sp_index() -> u8 {
+pub(crate) fn sp_index() -> u8 {
     if gex_abi::X86 {
         4
     } else {

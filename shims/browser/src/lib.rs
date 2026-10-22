@@ -44,6 +44,7 @@ pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
 mod cgen;
+mod callers;
 mod dense;
 mod fjit;
 mod waitq;
@@ -7568,6 +7569,7 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
     };
     top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     top.truncate(10);
+    let callers_of: Vec<usize> = top.iter().take(6).map(|x| x.1).collect();
     let mut line = format!("[gex] {total} syscalls:");
     for (c, nr) in top {
         line.push_str(&format!(
@@ -7577,6 +7579,7 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
     }
     line.push('\n');
     trace_line(&line);
+    callers::report(&callers_of);
     // The same list ordered by time, not count: a slow run's cost is a single
     // call taking milliseconds, invisible in a count census.
     let mut slow: Vec<(u64, usize)> = unsafe {
@@ -7924,6 +7927,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
         }
     }
     count_syscall(this_nr, regs.a[0], regs.a[1]);
+    if unsafe { HEARTBEAT } != 0 {
+        callers::note(this_nr, ctx as u32 as u64, cgen::sp_index());
+    }
     watch_mem("syscall");
     stack_tripwire("a syscall");
     gex_kernel::phase::mark(13);
