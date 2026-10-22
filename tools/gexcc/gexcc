@@ -375,6 +375,14 @@ if '-v' in args and not any(a in NOLINK and a != '-v' for a in args) and \
         any(not a.startswith('-') for a in args):
     subprocess.run([CLANG[0], '--target=' + TRIPLE, '--version'], stdout=sys.stderr)
     args = [a for a in args if a != '-v']
+    # and the link line, as GCC prints collect2's: libtool reads the
+    # libraries after the object from it (postdeps) and names them itself
+    # when it links a C++ library with -nostdlib
+    if not any(a in ('-nostdlib', '-nodefaultlibs') for a in args):
+        rt = ['-lc++', '-lc++abi', '-lunwind'] if CXX else []
+        named = [a for k, a in enumerate(args) if (not a.startswith('-') or a.startswith('-l'))
+                 and (k == 0 or args[k - 1] != '-o')]
+        sys.stderr.write(' wasm-ld -L%s/lib %s\n' % (SYSROOT, ' '.join(named + rt + ['-lc'])))
 if not args or any(a in NOLINK or a.startswith(('-print-', '-dump')) for a in args):
     if args == ['-v'] or args == ['--version'] or not args:
         os.execvp(CLANG[0], [CLANG[0], '--target=' + TRIPLE] + args)
@@ -993,9 +1001,16 @@ def own_unwind():
     module that defines it but plain data as another module's export, so a
     module whose code throws or catches takes libunwind's own (each module
     unwinds through its own copy, as -Bsymbolic has a library do)."""
-    if nostdlib or nodefaultlibs or not os.path.exists(LIB + '/libunwind.a'):
+    if (nostdlib or nodefaultlibs) and not cxx_rt_named or not os.path.exists(LIB + '/libunwind.a'):
         return []
     return [LIB + '/libunwind.a']
+
+
+# The C++ runtime named outright (libtool's -nostdlib link of a C++ library,
+# with the libraries it learned from the -v link line): taken as though the
+# defaults were asked for
+cxx_rt_named = CXX and any(i in ('-lc++', '-lstdc++', '-lc++abi', '-lsupc++', '-lunwind') for i in inputs)
+libc_named = '-lc' in inputs
 
 
 def shared_undef():
@@ -1011,14 +1026,14 @@ if shared and SHARED:
     ins = whole_closed([x for x in ins if not x.startswith('-L')] + missing)
     soname = (ld_opts['soname'] or [os.path.basename(out)])[-1]
     tail = []
-    if not (nostdlib or nodefaultlibs):
+    if not (nostdlib or nodefaultlibs) or libc_named:
         tail = [LIB + '/libc.so', LIB + '/libgexcc.a', LIB + '/libclang_rt.builtins-wasm32.a']
         if CXX:
             for l in ('c++', 'c++abi', 'unwind'):
                 if os.path.exists('%s/lib%s.a' % (LIB, l)):
                     tail.insert(0, '%s/lib%s.a' % (LIB, l))
-    pre = [] if (nostdlib or nostartfiles) else [os.path.join(LIBDIR, 'dso.o')]
-    if not (nostdlib or nodefaultlibs):
+    pre = [] if (nostdlib or nostartfiles) and not libc_named else [os.path.join(LIBDIR, 'dso.o')]
+    if not (nostdlib or nodefaultlibs) or libc_named:
         pre += shared_undef()
     wasm = os.path.join(tmp, 'out.so')
     sos = by_soname(ins + tail)
