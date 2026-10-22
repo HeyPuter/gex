@@ -128,4 +128,20 @@ printf 'extern int warn;\nint get(void){return warn;}\n' > "$W/wg.c"
 GEXCC_SHARED=1 gexcc -c -o "$W/wv.o" "$W/wv.c" && GEXCC_SHARED=1 gexcc -c -o "$W/wg.o" "$W/wg.c" &&
     GEXCC_SHARED=1 gexcc -o "$W/wv" "$W/wv.o" "$W/wg.o" 2> "$W/log"
 check $? "a program's variable named as a C library function"
+# Debian's build flags for GCC: spec files, LTO, `-z relro`
+printf 'int main(void){return 0;}\n' > "$W/df.c"
+gexcc -Werror -flto=auto -ffat-lto-objects -specs=/usr/share/dpkg/pie-compile.specs -c -o "$W/df.o" "$W/df.c" 2> "$W/log" &&
+    gexcc -flto=auto -specs=/usr/share/dpkg/pie-link.specs -z relro -z now -o "$W/df" "$W/df.o" 2>> "$W/log"
+check $? "Debian's GCC flags (-specs=, -flto=auto -ffat-lto-objects, -z relro)"
+# a GNU ld link warning (alsa-lib's link_warning) is left out
+cat > "$W/lw.c" <<'EOF2'
+#define link_warning(symbol, msg) \
+  asm (".section " ".gnu.warning." #symbol "\n\t.previous"); \
+  static const char __evoke_link_warning_##symbol[] \
+    __attribute__ ((section (".gnu.warning." #symbol "\n\t#"))) = msg;
+int old_api(void) { return 1; }
+link_warning(old_api, "old_api is deprecated")
+EOF2
+gexcc -c -o "$W/lw.o" "$W/lw.c" 2> "$W/log" && llvm-nm "$W/lw.o" | grep -q " T old_api$"
+check $? "a GNU ld link warning is left out"
 exit $fail

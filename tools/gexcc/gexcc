@@ -173,6 +173,29 @@ def sysroot_dirs(argv):
 
 
 args = sysroot_dirs(args)
+
+
+def gcc_only(argv):
+    """What Debian's build flags hand GCC that means nothing here: its spec
+    files (-specs=, dpkg's PIE ones), link-time optimisation (-flto=auto
+    -ffat-lto-objects: wasm-ld would get LLVM bitcode where gexcc's link
+    reads wasm objects; the code is optimised per object as before), and
+    GCC's `-z KEYWORD`, which is the linker's -z (-Wl,-z,KEYWORD)."""
+    out, k = [], 0
+    while k < len(argv):
+        a = argv[k]
+        if a.startswith('-specs=') or a.startswith('-flto') or a in ('-fno-lto', '-ffat-lto-objects',
+                                                                      '-fno-fat-lto-objects'):
+            k += 1; continue
+        if a == '-specs' and k + 1 < len(argv):
+            k += 2; continue
+        if a == '-z' and k + 1 < len(argv):
+            out.append('-Wl,-z,' + argv[k + 1]); k += 2; continue
+        out.append(a); k += 1
+    return out
+
+
+args = gcc_only(args)
 # -pthread defines _REENTRANT, as GCC's and clang's Linux drivers do (not
 # clang's wasm one); configure scripts check it (unbound's AX_PTHREAD)
 if '-pthread' in args or '-pthreads' in args:
@@ -245,6 +268,21 @@ SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
 # alias of the C name. Older versions' names (name@V) are left out.
 SYMVER_ASM = re.compile(r'\b(?:__asm__|__asm|asm)\s*(?:volatile\s*|__volatile__\s*)?\(\s*'
                         r'"(?:\\t|\s)*\.symver\b(?:[^"\\]|\\.)*"(?:\s*"(?:[^"\\]|\\.)*")*\s*\)\s*;?')
+# GNU ld's link-time warnings (alsa-lib's and glibc's link_warning): an
+# asm statement that declares the .gnu.warning.SYMBOL section and data put
+# in it, in ELF assembler syntax. Taken out on the same retry: there is no
+# such warning on wasm, and nothing else is lost.
+ASM_STMT = re.compile(r'\b(?:__asm__|__asm|asm)\s*(?:volatile\s*|__volatile__\s*)?\(\s*'
+                      r'"(?:[^"\\]|\\.)*"(?:\s*"(?:[^"\\]|\\.)*")*\s*\)\s*;?')
+
+
+def gnu_warning(m):
+    """An asm statement whose text (its strings joined) names a
+    .gnu.warning section."""
+    return '.gnu.warning' in ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(0)))
+
+
+GNUWARN_ATTR = re.compile(r'__attribute__\s*\(\(\s*section\s*\(\s*"\.gnu\.warning(?:[^"\\]|\\.)*"(?:\s*"(?:[^"\\]|\\.)*")*\s*\)\s*\)\)')
 DEP_FLAGS = {'-MD', '-MMD', '-MP'}
 DEP_ARG = {'-MF', '-MT', '-MQ'}
 
@@ -254,7 +292,8 @@ def compile_cmd(cmd):
     r = subprocess.run(cmd, stderr=subprocess.PIPE)
     err = r.stderr
     srcs = [a for a in cmd[1:] if a.endswith(SRC_EXT) and not a.endswith(('.s', '.S')) and os.path.isfile(a)]
-    if r.returncode == 0 or b'.symver' not in err or b'unknown directive' not in err or len(srcs) != 1:
+    symver = b'.symver' in err and b'unknown directive' in err
+    if r.returncode == 0 or not (symver or b'.gnu.warning' in err) or len(srcs) != 1:
         sys.stderr.buffer.write(err)
         return r.returncode
     src = srcs[0]
@@ -286,11 +325,16 @@ def compile_cmd(cmd):
                 if m and m.group(1) != m.group(2):
                     aliases[m.group(2)] = m.group(1)
         body = SYMVER_ASM.sub('', text)
+        warns = sum(1 for m in ASM_STMT.finditer(body) if gnu_warning(m))
+        body = GNUWARN_ATTR.sub('', ASM_STMT.sub(lambda m: '' if gnu_warning(m) else m.group(0), body))
+        if warns:
+            sys.stderr.write('gexcc: %s: %d GNU ld link warning(s) left out\n' % (src, warns))
         alias = ''.join('extern __typeof__(%s) %s __attribute__((alias("%s")));\n' % (c, a, c)
                         for a, c in sorted(aliases.items()))
         open(ii, 'w', encoding='utf-8', errors='surrogateescape').write(body + alias)
-        sys.stderr.write('gexcc: %s: %d .symver directive(s) left out (wasm has no symbol versions)%s\n'
-                         % (src, len(found), ', %d default name(s) made aliases' % len(aliases) if aliases else ''))
+        if found:
+            sys.stderr.write('gexcc: %s: %d .symver directive(s) left out (wasm has no symbol versions)%s\n'
+                             % (src, len(found), ', %d default name(s) made aliases' % len(aliases) if aliases else ''))
         out, skip = [], False
         for a in cmd:
             if skip:
