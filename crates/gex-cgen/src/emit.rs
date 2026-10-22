@@ -839,6 +839,20 @@ impl<'a> Emitter<'a> {
     // -- statements -------------------------------------------------------
 
     pub(crate) fn stmt(&mut self, s: &Stmt) -> Result<()> {
+        // A bulk access is not volatile: no guest access moves across it
+        // (header.rs's GEX_ORDER).
+        let bulk = matches!(s, Stmt::MemCopy { .. } | Stmt::MemFill { .. } | Stmt::MemCmp { .. } | Stmt::StrOp { .. });
+        if bulk {
+            self.line("GEX_ORDER();");
+        }
+        self.stmt_inner(s)?;
+        if bulk {
+            self.line("GEX_ORDER();");
+        }
+        Ok(())
+    }
+
+    fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Def { dst, expr } => self.def(*dst, expr)?,
             Stmt::WriteReg { reg, val } => {
@@ -871,7 +885,7 @@ impl<'a> Emitter<'a> {
                         "__atomic_store_n(({at} *)({p}), ({nt}){v}, __ATOMIC_SEQ_CST);"
                     ));
                 } else {
-                    self.line(format!("*({ut} *)({p}) = ({nt}){v};"));
+                    self.line(format!("*(volatile {ut} *)({p}) = ({nt}){v};"));
                 }
             }
             Stmt::Trap { cond, pc, code } => {
@@ -936,6 +950,7 @@ impl<'a> Emitter<'a> {
             } => {
                 let p = self.address(*addr, *offset);
                 let v = self.v(*val);
+                self.line("GEX_ORDER();");
                 match bytes {
                     16 => self.line(format!("wasm_v128_store({p}, {v});")),
                     1 => self.line(format!("wasm_v128_store8_lane({p}, {v}, 0);")),
@@ -944,6 +959,7 @@ impl<'a> Emitter<'a> {
                     8 => self.line(format!("wasm_v128_store64_lane({p}, {v}, 0);")),
                     b => bail!("vector store of {b} bytes"),
                 }
+                self.line("GEX_ORDER();");
             }
             Stmt::MemCopy { dst, src, len } => {
                 let d = self.bulk_address(&self.v(*dst));
@@ -1348,11 +1364,11 @@ impl<'a> Emitter<'a> {
                         (MemSz::B8, _) => "gex_u64",
                     };
                     if *signed && *ty == Ty::I64 {
-                        format!("(uint64_t)(int64_t)*({vt} *)({p})")
+                        format!("(uint64_t)(int64_t)*(volatile {vt} *)({p})")
                     } else if *signed {
-                        format!("(uint32_t)(int32_t)*({vt} *)({p})")
+                        format!("(uint32_t)(int32_t)*(volatile {vt} *)({p})")
                     } else {
-                        format!("({t})*({vt} *)({p})")
+                        format!("({t})*(volatile {vt} *)({p})")
                     }
                 }
             }
@@ -1435,14 +1451,15 @@ impl<'a> Emitter<'a> {
                 bytes,
             } => {
                 let p = self.address(*addr, *offset);
-                match bytes {
+                let load = match bytes {
                     16 => format!("wasm_v128_load({p})"),
                     8 => format!("wasm_v128_load64_zero({p})"),
                     4 => format!("wasm_v128_load32_zero({p})"),
                     1 => format!("wasm_v128_load8_lane({p}, wasm_i64x2_const(0, 0), 0)"),
                     2 => format!("wasm_v128_load16_lane({p}, wasm_i64x2_const(0, 0), 0)"),
                     b => bail!("vector load of {b} bytes"),
-                }
+                };
+                format!("GEX_VLOAD({load})")
             }
             Expr::VConst(b) => {
                 let lo = u64::from_le_bytes(b[..8].try_into().unwrap());
