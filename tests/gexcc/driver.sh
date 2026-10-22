@@ -144,4 +144,9 @@ link_warning(old_api, "old_api is deprecated")
 EOF2
 gexcc -c -o "$W/lw.o" "$W/lw.c" 2> "$W/log" && llvm-nm "$W/lw.o" | grep -q " T old_api$"
 check $? "a GNU ld link warning is left out"
+# GNU gettext's configure test for the C library's gettext links (NLS on)
+printf '#include <libintl.h>\nextern int _nl_msg_cat_cntr;\nextern const char *_nl_expand_alias(const char *);\n'\
+'int main(void){bindtextdomain("",""); return *gettext("") + _nl_msg_cat_cntr + *_nl_expand_alias("");}\n' > "$W/nl.c"
+gexcc -o "$W/nl" "$W/nl.c" 2> "$W/log" && GEXCC_SHARED=1 gexcc -o "$W/nl2" "$W/nl.c" 2>> "$W/log"
+check $? "gettext.m4's test for GNU gettext in the C library links"
 exit $fail
