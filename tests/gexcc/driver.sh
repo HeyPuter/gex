@@ -149,4 +149,38 @@ printf '#include <libintl.h>\nextern int _nl_msg_cat_cntr;\nextern const char *_
 'int main(void){bindtextdomain("",""); return *gettext("") + _nl_msg_cat_cntr + *_nl_expand_alias("");}\n' > "$W/nl.c"
 gexcc -o "$W/nl" "$W/nl.c" 2> "$W/log" && GEXCC_SHARED=1 gexcc -o "$W/nl2" "$W/nl.c" 2>> "$W/log"
 check $? "gettext.m4's test for GNU gettext in the C library links"
+# -I/usr/include (cyrus-sasl's configure) names the target's system headers,
+# not the build machine's glibc ones
+printf '#include <stdlib.h>\nint main(void){return 0;}\n' > "$W/ui.c"
+gexcc -I/usr/include -I /usr/include/ -isystem/usr/include -c -o "$W/ui.o" "$W/ui.c" 2> "$W/log"
+check $? "-I/usr/include does not reach the build machine's headers"
+# a library function returning int called through a void declaration
+# (gettext's tputs): the call goes through, its result dropped
+mkdir -p "$W/vr"
+printf 'int vr_hits;\nint vr(int n){vr_hits += n; return 9;}\n' > "$W/vr/l.c"
+printf 'extern int vr_hits;\nvoid vr(int);\nint main(void){vr(3); vr(4); return vr_hits != 7;}\n' > "$W/vr/m.c"
+GEXCC_SHARED=1 gexcc -shared -fPIC -o "$W/vr/libvr.so" "$W/vr/l.c" &&
+    GEXCC_SHARED=1 gexcc -o "$W/vr/m" "$W/vr/m.c" -L"$W/vr" -lvr 2> "$W/log" &&
+    grep -q 'its result is dropped' "$W/log" && ! grep -q 'calls to it trap' "$W/log"
+check $? "a void declaration of a library's int function calls it"
+# Meson asks the linker's version with the project's link arguments (systemd: -lm)
+for env in "" GEXCC_SHARED=1; do
+    env $env gexcc -Wl,--version -Wl,--push-state,--no-as-needed,-lm,--pop-state > "$W/log" 2>&1 &&
+        grep -q LLD "$W/log"
+    check $? "-Wl,--version with a library to link answers the linker's version${env:+ ($env)}"
+done
+# a thin archive (Meson's ar csrDT) in -shared: recorded as a dependency,
+# not put in the library as a member wasm-ld cannot read
+mkdir -p "$W/th"
+printf 'int th_get(void) { return 3; }\n' > "$W/th/t.c"
+printf 'int th_get(void);\nint main(void) { return th_get() != 3; }\n' > "$W/th/m.c"
+gexcc -c -o "$W/th/t.o" "$W/th/t.c" && llvm-ar csrT "$W/th/libt.a" "$W/th/t.o" &&
+    gexcc -shared -fPIC -o "$W/th/libth.so" -Wl,--whole-archive "$W/th/libt.a" -Wl,--no-whole-archive &&
+    ! llvm-ar t "$W/th/libth.so" | grep -q 'libt\.a' &&
+    gexcc -o "$W/th/m" "$W/th/m.c" "$W/th/libth.so" 2> "$W/log"
+check $? "a thin archive in -shared is linked from, not nested"
+# libucontext (systemd on musl): its functions link, from pkg-config's flags
+printf '#include <ucontext.h>\nint main(void){ucontext_t u; return getcontext(&u) != -1;}\n' > "$W/uc.c"
+gexcc -o "$W/uc" "$W/uc.c" $(PKG_CONFIG_SYSROOT_DIR="$SR" PKG_CONFIG_LIBDIR="$SR/usr/lib/pkgconfig" pkg-config --libs libucontext) 2> "$W/log"
+check $? "libucontext's functions link"
 exit $fail

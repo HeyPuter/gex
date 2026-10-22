@@ -131,6 +131,9 @@ CLANG_TAIL = INCS
 # glibc passes for the same reason as above)
 if not CXX:
     CLANG_TAIL = CLANG_TAIL + ['-Wno-error=implicit-function-declaration']
+# GCC's warning options clang does not have (-Werror=clobbered, mbedtls):
+# GCC knows them, so a build that passes them with -Werror expects no error
+CLANG_TAIL = CLANG_TAIL + ['-Wno-unknown-warning-option']
 # The C library's predefined macros (__STDC_ISO_10646__: wchar_t is UCS-4),
 # which GCC on Linux includes before every translation unit and clang's
 # wasm driver does not; libedit refuses to build without them
@@ -165,16 +168,33 @@ def in_sysroot(path):
     return path
 
 
+# The target's own system header directories, as a build machine names them
+# (cyrus-sasl's configure adds -I/usr/include for each database it finds).
+# They are searched already, from the sysroot; GCC ignores a -I naming a
+# system directory, and here it would name the build machine's headers.
+SYSTEM_INCS = {'/usr/include', '/usr/local/include', '/usr/include/wasm32-linux-musl'}
+
+
+def system_inc(opt, path):
+    return opt != '-L' and os.path.normpath(path) in SYSTEM_INCS
+
+
 def sysroot_dirs(argv):
     out, k = [], 0
     while k < len(argv):
         a = argv[k]
         if a in ('-I', '-isystem', '-idirafter', '-L') and k + 1 < len(argv):
-            out += [a, in_sysroot(argv[k + 1])]; k += 2; continue
-        for opt in ('-isystem', '-I', '-L'):
+            if not system_inc(a, argv[k + 1]):
+                out += [a, in_sysroot(argv[k + 1])]
+            k += 2; continue
+        drop = False
+        for opt in ('-isystem', '-idirafter', '-I', '-L'):
             if a.startswith(opt + '/'):
+                drop = system_inc(opt, a[len(opt):])
                 a = opt + in_sysroot(a[len(opt):]); break
-        out.append(a); k += 1
+        if not drop:
+            out.append(a)
+        k += 1
     return out
 
 
@@ -529,11 +549,13 @@ for k, (s, lang) in enumerate(srcs):
     if r:
         sys.exit(r)
     objs.append(o)
-if not objs and not inputs:
-    # build systems ask the linker who it is (Meson: -Wl,--version)
+if not objs and all(x.startswith('-l') for x in inputs):
+    # build systems ask the linker who it is (Meson: -Wl,--version, with
+    # the project's link arguments, libraries too)
     if any(f in ('--version', '-v', '--help') for f in ld_flags):
         os.execvp('wasm-ld', ['wasm-ld'] + [f for f in ld_flags if f in ('--version', '-v', '--help')][:1])
-    die('no input files')
+    if not inputs:
+        die('no input files')
 if out is None:
     out = 'a.out'
 if out == '/dev/null':
@@ -545,12 +567,14 @@ LIB = SYSROOT + '/lib'
 SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib/' + MULTIARCH, SYSROOT + '/usr/lib',
                     SYSROOT + '/lib/' + MULTIARCH, LIB]
 AR_MAGIC = b'!<arch>\n'
+# a thin archive (Meson's static libraries: ar csrDT) names its members' files
+THIN_MAGIC = b'!<thin>\n'
 
 
 def is_archive(p):
     try:
         with open(p, 'rb') as f:
-            return f.read(8) == AR_MAGIC
+            return f.read(8) in (AR_MAGIC, THIN_MAGIC)
     except OSError:
         return False
 
@@ -934,17 +958,32 @@ def link_shared(cmd):
     ELF link (which knows no types) goes through: configure's link tests
     declare `char f(void)` for every function they look for. As wasm-ld
     does for a static library's function of the wrong type, the link gets
-    a stub of the object's type that traps when called, with a warning."""
+    a stub of the object's type that traps when called, with a warning.
+    Unless the two differ only in the object's declaring no result
+    (gettext's `extern void tputs (...)` for ncurses' int one): then the
+    stub calls the library's and drops what it returns, as the ELF call
+    does."""
     stubs = []
     for _ in range(64):
         # (first: a definition the side module's then meets defined)
+        if VERBOSE:
+            sys.stderr.write('+ %s\n' % ' '.join(cmd[:1] + stubs + cmd[1:]))
         p = subprocess.run(cmd[:1] + stubs + cmd[1:], capture_output=True, text=True)
         if p.returncode == 0:
             sys.stderr.write(p.stderr)
             return 0
+        # wasm-ld crashes writing debug sections whose relocations name a
+        # function the link imports from a side module (harfbuzz's tests:
+        # DWARF locations in hb_set_reference, defined in libharfbuzz.so):
+        # the link again without debug information
+        if 'CustomSection::writeTo' in p.stderr and '--strip-debug' not in cmd:
+            sys.stderr.write('gexcc: warning: wasm-ld failed on the debug sections; %s is linked without them\n'
+                             % os.path.basename(out))
+            cmd = cmd + ['--strip-debug']
+            continue
         found = re.findall(r'function signature mismatch: (\S+)\n>>> defined as \(([^)]*)\) -> (\S+) in (\S+)\n'
-                           r'>>> defined as \([^)]*\) -> \S+ in (\S+)', p.stderr)
-        found = [f for f in found if '/sonames/' in f[4] or is_wasm_so(f[4])]
+                           r'>>> defined as \(([^)]*)\) -> (\S+) in (\S+)', p.stderr)
+        found = [f for f in found if '/sonames/' in f[6] or is_wasm_so(f[6])]
         # A program's own variable named as a library's function (hunspell's
         # `int warn`, libc's warn()): on ELF the program's definition is the
         # one its own code reaches, and so it is here, under a name of its
@@ -968,22 +1007,36 @@ def link_shared(cmd):
         if not found:
             sys.stderr.write(p.stderr)
             return p.returncode
-        for name, params, ret, _, so in found:
+        for name, params, ret, _, lparams, lret, so in found:
             c = os.path.join(tmp, 'mismatch-%d.c' % len(stubs))
-            args = ', '.join('%s a%d' % (WASM_C[t.strip()], i) for i, t in enumerate(params.split(',')) if t.strip())
-            # (says so on stderr when reached: a call that gets here is a
-            # miscompile the build let through)
-            msg = 'gexcc: %s called through a declaration of the wrong type (stub)\n' % name
-            open(c, 'w').write('long write(int, const void *, unsigned long);\n'
-                               '%s %s(%s) { write(2, "%s", %d); __builtin_trap(); }\n'
-                               % (WASM_C.get(ret, 'void'), name, args or 'void', msg.replace('\n', '\\n'), len(msg)))
+            types = [WASM_C[t.strip()] for t in params.split(',') if t.strip()]
+            args = ', '.join('%s a%d' % (t, i) for i, t in enumerate(types))
+            drop = ret == 'void' and lret != 'void' and params == lparams
+            if drop:
+                # the library's, imported under its own name; the stub is
+                # the object's alone (hidden), not another definition
+                open(c, 'w').write('__attribute__((import_name("%s"))) %s __gexcc_lib_%s(%s);\n'
+                                   '__attribute__((visibility("hidden"))) void %s(%s) { __gexcc_lib_%s(%s); }\n'
+                                   % (name, WASM_C[lret], name, ', '.join(types) or 'void', name, args or 'void',
+                                      name, ', '.join('a%d' % i for i in range(len(types)))))
+            else:
+                # (says so on stderr when reached: a call that gets here is
+                # a miscompile the build let through)
+                msg = 'gexcc: %s called through a declaration of the wrong type (stub)\n' % name
+                open(c, 'w').write('long write(int, const void *, unsigned long);\n'
+                                   '%s %s(%s) { write(2, "%s", %d); __builtin_trap(); }\n'
+                                   % (WASM_C.get(ret, 'void'), name, args or 'void', msg.replace('\n', '\\n'), len(msg)))
             o = c[:-2] + '.o'
             if subprocess.call(['clang', '--target=' + TRIPLE, '-fPIC', '-c', '-w', '-fno-builtin', '-o', o, c]
                                + [a for a in BASE if a.startswith('-m') and a != '-mllvm']):
                 sys.stderr.write(p.stderr)
                 return p.returncode
-            sys.stderr.write('gexcc: warning: %s is declared (%s) -> %s but %s defines another type: '
-                             'calls to it trap\n' % (name, params, ret, os.path.basename(so)))
+            if drop:
+                sys.stderr.write('gexcc: note: %s is declared (%s) -> void but %s returns %s: its result is dropped\n'
+                                 % (name, params, os.path.basename(so), lret))
+            else:
+                sys.stderr.write('gexcc: warning: %s is declared (%s) -> %s but %s defines another type: '
+                                 'calls to it trap\n' % (name, params, ret, os.path.basename(so)))
             stubs.append(o)
     return 1
 
