@@ -501,6 +501,10 @@ struct JitShared {
     /// The trampoline page's unit is published (`pe_units`): once per
     /// address space, with its first Windows image.
     trampolines: bool,
+    /// The ELF objects `pe_units::on_elf_maps` has looked at in this address
+    /// space: a fork shares them (its table has their units), an exec starts
+    /// empty, so every program that maps an object gets its unit.
+    elf_units: Vec<pe_units::ElfPlaced>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -1248,6 +1252,7 @@ fn run_program_with(
                 wine_pe: None,
                 relocated: Default::default(),
                 trampolines: false,
+                elf_units: Vec::new(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1505,6 +1510,14 @@ fn run_program_with(
         };
         if opts.verbose {
             eprintln!("[gex] runtime translation: {blocks} blocks in {calls} compilations");
+        }
+        if log_on() {
+            // Runtime translations only (a unit's entries count as translated too).
+            let (units, blocks) = {
+                let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+                (sh.elf_units.clone(), sh.provider.keys().copied().collect::<Vec<u64>>())
+            };
+            pe_units::exit_line(store.data().kernel.lock().unwrap_or_else(|e| e.into_inner()).pid, &units, &blocks);
         }
         if let Some(dir) = &profile_dir {
             // Only addresses in the executable's own image are worth
@@ -6446,6 +6459,7 @@ fn retire_translations(
     pe_units::on_retire(&memory, ranges, &gone);
     pe_units::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    pe_units::forget_gone(&mut sh.elf_units, &gone);
     let mut pages = 0usize;
     for &(start, end) in ranges {
         sh.translated.retain(|a| *a < start || *a >= end);

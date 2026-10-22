@@ -1059,13 +1059,9 @@ static UNIT_PAGES: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 /// `gone` (within `ranges`): pages no longer mapped executable. A unit there
 /// is dead whatever the bytes still hash to -- an unmapped object's bytes stay
 /// until the next mapping overwrites them, and that mapping retires nothing
-/// (the browser's `cgen::on_retire`). An ELF object whose code was there is
-/// placed again if it is mapped again.
+/// (the browser's `cgen::on_retire`); an ELF object whose code was there is
+/// placed again if it is mapped again ([`forget_gone`]).
 pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
-    ELF_SEEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(_, _, (lo, hi))| !gone.iter().any(|&(s, e)| s < *hi && *lo < e));
     let memory = memory.bytes();
     let guard = UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = guard.as_ref() else { return };
@@ -1818,8 +1814,41 @@ fn elf_wanted(path: &str) -> bool {
     list.iter().any(|n| n == "all" || n == name)
 }
 
-/// Objects already looked at in this host process, by path and bias.
-static ELF_SEEN: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new());
+/// An ELF object looked at in an address space (`JitShared::elf_units`).
+#[derive(Clone, Debug)]
+pub(crate) struct ElfPlaced {
+    pub path: String,
+    pub base: u64,
+    /// Its executable segments' span.
+    pub span: (u64, u64),
+    /// The entries of its installed unit; 0 when it has none.
+    pub entries: usize,
+}
+
+/// Objects whose code was in `gone` (no longer mapped executable): placed
+/// again if they are mapped again, since their units went with the pages.
+pub(crate) fn forget_gone(seen: &mut Vec<ElfPlaced>, gone: &[(u64, u64)]) {
+    seen.retain(|o| !gone.iter().any(|&(s, e)| s < o.span.1 && o.span.0 < e));
+}
+
+/// A process's last word on its ELF units (debug output, GEX_LOG): which
+/// objects ran on units, and how many of the blocks runtime translation
+/// compiled (`blocks`, in its address space, a fork's parent's included)
+/// fall in them.
+pub(crate) fn exit_line(pid: i32, seen: &[ElfPlaced], blocks: &[u64]) {
+    let units: Vec<&ElfPlaced> = seen.iter().filter(|o| o.entries != 0).collect();
+    if seen.is_empty() {
+        return;
+    }
+    let inside = blocks.iter().filter(|&&a| units.iter().any(|o| o.span.0 <= a && a < o.span.1)).count();
+    let entries: usize = units.iter().map(|o| o.entries).sum();
+    eprintln!(
+        "gex-elf: pid {pid}: {} of {} listed objects on units ({entries} entries); {inside} of {} runtime-translated blocks are in them",
+        units.len(),
+        seen.len(),
+        blocks.len()
+    );
+}
 
 /// After a syscall that mapped code: install the unit of each listed ELF
 /// object (`GEX_ELF_UNITS`), before ld.so runs any of it.
@@ -1828,14 +1857,18 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         if !elf_wanted(&m.path) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&m.path) else {
-            eprintln!("gex-elf: {}: not readable on the host; no unit", m.path);
+        // From the guest's namespace, so a sysroot is honoured.
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)) else {
+            eprintln!("gex-elf: {}: not readable; no unit", m.path);
             continue;
         };
         let Some(base) = elf_bias(&bytes, m.start, m.offset) else {
             continue;
         };
-        if ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(p, b, _)| *p == m.path && *b == base) {
+        let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) else {
+            return Ok(());
+        };
+        if shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.iter().any(|o| o.path == m.path && o.base == base) {
             continue;
         }
         let t0 = std::time::Instant::now();
@@ -1844,7 +1877,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let span = image.segments.iter().filter(|s| s.executable).fold((u64::MAX, 0u64), |(lo, hi), s| {
             (lo.min(s.vaddr), hi.max(s.vaddr + s.bytes.len() as u64))
         });
-        ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((m.path.clone(), base, span));
+        shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.push(ElfPlaced { path: m.path.clone(), base, span, entries: 0 });
         let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
         let key = unit_key(&image, &none);
         let cwasm_path = cache_root()?.join(&key).join("c.wasm");
@@ -1895,12 +1928,16 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
-        // Once per object per process: debug output (GEX_LOG).
+        let n = entries.iter().filter(|&&a| a != 0).count();
+        if let Some(o) = shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.iter_mut().find(|o| o.path == m.path && o.base == base) {
+            o.entries = n;
+        }
+        // Once per object per address space: debug output (GEX_LOG).
         if crate::log_on() {
             eprintln!(
-                "gex-elf: function tier for {} at {base:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
+                "gex-elf: pid {}: function tier for {} at {base:#x}: {n} entries, {} MiB wasm, placed in {:.1}s",
+                caller.data_mut().with_kernel(|k| k.pid),
                 m.path,
-                entries.iter().filter(|&&a| a != 0).count(),
                 cwasm.len() >> 20,
                 t0.elapsed().as_secs_f64()
             );
