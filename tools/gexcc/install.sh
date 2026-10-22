@@ -281,6 +281,14 @@ if [ -x "$DL" ]; then
 else
   echo "gexcc: no $DL: GEXCC_SHARED unavailable (cargo build --release -p gex-dylink)"
 fi
+# What the toolchain was installed from, so a package built with it can be
+# told apart from one built before a fix: the gex commit (with "+" when the
+# tree had changes) and the musl one.
+{
+  echo "gex $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)$(git -C "$ROOT" diff --quiet HEAD -- tools/gexcc 2>/dev/null || echo +)"
+  echo "gex-repo $ROOT"
+  echo "musl $(git -C "$MUSL" rev-parse HEAD 2>/dev/null || echo unknown)"
+} > "$PREFIX/lib/gexcc/installed-from"
 echo "gexcc: $B/gexcc (sysroot $PREFIX/sysroot, runner $R)"
 # C++ (LLVM_SRC: an LLVM source tree of clang's version)
 if [ -n "${LLVM_SRC:-}" ]; then
