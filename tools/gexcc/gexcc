@@ -168,16 +168,33 @@ def in_sysroot(path):
     return path
 
 
+# The target's own system header directories, as a build machine names them
+# (cyrus-sasl's configure adds -I/usr/include for each database it finds).
+# They are searched already, from the sysroot; GCC ignores a -I naming a
+# system directory, and here it would name the build machine's headers.
+SYSTEM_INCS = {'/usr/include', '/usr/local/include', '/usr/include/wasm32-linux-musl'}
+
+
+def system_inc(opt, path):
+    return opt != '-L' and os.path.normpath(path) in SYSTEM_INCS
+
+
 def sysroot_dirs(argv):
     out, k = [], 0
     while k < len(argv):
         a = argv[k]
         if a in ('-I', '-isystem', '-idirafter', '-L') and k + 1 < len(argv):
-            out += [a, in_sysroot(argv[k + 1])]; k += 2; continue
-        for opt in ('-isystem', '-I', '-L'):
+            if not system_inc(a, argv[k + 1]):
+                out += [a, in_sysroot(argv[k + 1])]
+            k += 2; continue
+        drop = False
+        for opt in ('-isystem', '-idirafter', '-I', '-L'):
             if a.startswith(opt + '/'):
+                drop = system_inc(opt, a[len(opt):])
                 a = opt + in_sysroot(a[len(opt):]); break
-        out.append(a); k += 1
+        if not drop:
+            out.append(a)
+        k += 1
     return out
 
 

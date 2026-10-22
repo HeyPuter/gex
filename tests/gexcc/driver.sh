@@ -149,4 +149,9 @@ printf '#include <libintl.h>\nextern int _nl_msg_cat_cntr;\nextern const char *_
 'int main(void){bindtextdomain("",""); return *gettext("") + _nl_msg_cat_cntr + *_nl_expand_alias("");}\n' > "$W/nl.c"
 gexcc -o "$W/nl" "$W/nl.c" 2> "$W/log" && GEXCC_SHARED=1 gexcc -o "$W/nl2" "$W/nl.c" 2>> "$W/log"
 check $? "gettext.m4's test for GNU gettext in the C library links"
+# -I/usr/include (cyrus-sasl's configure) names the target's system headers,
+# not the build machine's glibc ones
+printf '#include <stdlib.h>\nint main(void){return 0;}\n' > "$W/ui.c"
+gexcc -I/usr/include -I /usr/include/ -isystem/usr/include -c -o "$W/ui.o" "$W/ui.c" 2> "$W/log"
+check $? "-I/usr/include does not reach the build machine's headers"
 exit $fail
