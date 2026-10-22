@@ -902,6 +902,63 @@ static void buffer_copy(unsigned read_target, unsigned write_target, long read_o
     else mirror_drop(dst);
 }
 
+/* GEXGL_UPLOAD_TRACE (debug, off by default): buffer upload bytes by where
+   they came from -- the application's glBufferSubData, an unmap (whole map
+   or changed blocks), a flush, a persistent publish, glBufferData's split --
+   with the map access flags and buffer sizes behind the unmaps, and what
+   explicit flushes hashed and sent. Said every 2 GiB or 20000 uploads. */
+enum { UP_APP, UP_UNMAP_WHOLE, UP_UNMAP_CHANGED, UP_FLUSH, UP_PERSIST, UP_SPLIT, UP_N };
+static int upload_origin = UP_APP, upload_trace = -1;
+static unsigned long long upload_bytes[UP_N], upload_calls[UP_N], upload_total;
+static unsigned long long unmap_n, unmap_mirror, unmap_whole_bytes, unmap_map_bytes;
+static unsigned long long flush_hashed, flush_sent, flush_whole;
+static unsigned unmap_access_seen[8], unmap_access_n[8];
+static size_t unmap_size_seen[8];
+static unsigned long long unmap_size_n[8];
+static void upload_say(void) {
+    fprintf(stderr, "gexgl: uploads %llu MiB: app %llu MiB/%llu, unmap-whole %llu MiB/%llu, unmap-changed %llu MiB/%llu,"
+                    " flush %llu MiB/%llu, persist %llu MiB/%llu, split %llu MiB/%llu; %llu unmaps (%llu with mirror,"
+                    " %llu MiB mapped); access:",
+            upload_total >> 20, upload_bytes[UP_APP] >> 20, upload_calls[UP_APP],
+            upload_bytes[UP_UNMAP_WHOLE] >> 20, upload_calls[UP_UNMAP_WHOLE],
+            upload_bytes[UP_UNMAP_CHANGED] >> 20, upload_calls[UP_UNMAP_CHANGED],
+            upload_bytes[UP_FLUSH] >> 20, upload_calls[UP_FLUSH], upload_bytes[UP_PERSIST] >> 20, upload_calls[UP_PERSIST],
+            upload_bytes[UP_SPLIT] >> 20, upload_calls[UP_SPLIT], unmap_n, unmap_mirror, unmap_map_bytes >> 20);
+    for (int i = 0; i < 8 && unmap_access_n[i]; i++) fprintf(stderr, " %#x:%u", unmap_access_seen[i], unmap_access_n[i]);
+    fprintf(stderr, "; flush: %llu MiB hashed, %llu MiB sent of them, %llu MiB whole", flush_hashed >> 20, flush_sent >> 20, flush_whole >> 20);
+    flush_hashed = flush_sent = flush_whole = 0;
+    fprintf(stderr, "; sizes:");
+    for (int i = 0; i < 8 && unmap_size_n[i]; i++) fprintf(stderr, " %zu:%llu", unmap_size_seen[i], unmap_size_n[i]);
+    fprintf(stderr, "\n");
+    memset(upload_bytes, 0, sizeof(upload_bytes)); memset(upload_calls, 0, sizeof(upload_calls));
+    memset(unmap_access_n, 0, sizeof(unmap_access_n)); memset(unmap_size_n, 0, sizeof(unmap_size_n));
+    upload_total = unmap_n = unmap_mirror = unmap_map_bytes = 0;
+}
+static int upload_tracing(void) {
+    if (upload_trace < 0) upload_trace = getenv("GEXGL_UPLOAD_TRACE") != NULL;
+    return upload_trace;
+}
+static void upload_note(size_t size) {
+    upload_bytes[upload_origin] += size;
+    upload_calls[upload_origin]++;
+    upload_total += size;
+    static unsigned long long calls;
+    if (upload_total >= (2048ull << 20) || ++calls % 20000u == 0) upload_say();
+}
+static void unmap_note(const struct buffer_object_state *o) {
+    unmap_n++;
+    unmap_mirror += o->mirror != NULL;
+    unmap_map_bytes += o->map_length;
+    for (int i = 0; i < 8; i++) {
+        if (!unmap_access_n[i]) unmap_access_seen[i] = o->map_access;
+        if (unmap_access_seen[i] == o->map_access) { unmap_access_n[i]++; break; }
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!unmap_size_n[i]) unmap_size_seen[i] = o->size;
+        if (unmap_size_seen[i] == o->size) { unmap_size_n[i]++; break; }
+    }
+}
+
 void glBufferData(unsigned target, long size, const void *data, unsigned usage) {
     if (size < 0) return;
     size_t len = (size_t)size;
@@ -919,11 +976,19 @@ void glBufferData(unsigned target, long size, const void *data, unsigned usage) 
     p[3] = (uint32_t)((uint64_t)size >> 32);
     p[4] = data != NULL && !split;
     put_blob(p + 5, data, blob_len);
-    if (split) glBufferSubData(target, 0, size, data);
+    if (split) { upload_origin = UP_SPLIT; glBufferSubData(target, 0, size, data); upload_origin = UP_APP; }
 }
 
 void glBufferSubData(unsigned target, long offset, long size, const void *data) {
     if (offset < 0 || size < 0 || (size && !data)) return;
+    if (upload_tracing()) upload_note((size_t)size);
+    /* The application's own upload into a mapped buffer (a persistent
+       mapping may stay while it does): the host's copy now differs from the
+       guest's map, so a flush of that map sends its whole range. */
+    if (upload_origin == UP_APP) {
+        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
+        if (object && object->map) object->host_wrote = 1;
+    }
     if (mirrors_live) {
         struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
         if (object && object->mirror) {
@@ -1075,7 +1140,9 @@ void *glMapBufferRange(unsigned target, long offset, long length,
    one. */
 static void persistent_send(struct buffer_object_state *o, size_t start, size_t end) {
     glBindBuffer(0x8F37u, o->name);
+    upload_origin = UP_PERSIST;
     glBufferSubData(0x8F37u, (long)(o->map_offset + start), (long)(end - start), (const uint8_t *)o->map + start);
+    upload_origin = UP_APP;
 }
 
 /* GEXGL_PERSIST_TRACE (debug, off by default): the publishes asked for
@@ -1216,11 +1283,16 @@ unsigned char glUnmapBuffer(unsigned target) {
        wrote (glFlushMappedBufferRange, already uploaded); uploading the
        whole shadow would overwrite the rest of the range with zeros --
        a ring buffer's other, in-flight, contents. */
+    if (upload_tracing()) unmap_note(object);
     if ((object->map_access & 2u) && !(object->map_access & 0x10u)) {
-        if (object->mirror && !(object->map_access & 0x4u))
+        if (object->mirror && !(object->map_access & 0x4u)) {
+            upload_origin = UP_UNMAP_CHANGED;
             upload_changed(target, object);
-        else
+        } else {
+            upload_origin = UP_UNMAP_WHOLE;
             glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
+        }
+        upload_origin = UP_APP;
     }
     if (object->sent) { free(object->sent); object->sent = NULL; persistent_live--; }
     free(object->map);
@@ -1229,20 +1301,55 @@ unsigned char glUnmapBuffer(unsigned target) {
     return 1;
 }
 
+/* A flush of a persistent write mapping sends only the 4 KiB blocks in its
+   range that differ from what the host last had (`sent`): wined3d flushes a
+   Direct3D buffer's whole range at each unmap, whatever the application
+   wrote -- Hades, a 2 MB index buffer and 400 KB vertex ranges several
+   times a frame, all of it sent each time. A block the host already has is
+   left. Not after a command other than glBufferData/glBufferSubData may have
+   changed the buffer since the map began (host_wrote): what the host has is
+   then not known, and the whole range goes. */
+static void flush_send(unsigned target, struct buffer_object_state *o, size_t start, size_t end) {
+    glBufferSubData(target, (long)(o->map_offset + start), (long)(end - start), (const uint8_t *)o->map + start);
+}
+
 void glFlushMappedBufferRange(unsigned target, long offset, long length) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map || offset < 0 || length < 0 ||
         (size_t)offset > object->map_length ||
         (size_t)length > object->map_length - (size_t)offset) return;
-    glBufferSubData(target, (long)(object->map_offset + (size_t)offset), length,
-                    (uint8_t *)object->map + offset);
-    /* The blocks the flush covers whole are now what the host has. One it
-       covers in part may hold other writes still to publish: left alone, it
-       is sent (again) at the next publish point. */
-    if (object->sent)
-        for (size_t b = ((size_t)offset + PERSIST_BLOCK - 1) / PERSIST_BLOCK;
-             (b + 1) * PERSIST_BLOCK <= (size_t)offset + (size_t)length; b++)
-            object->sent[b] = persistent_block_hash(object, b);
+    const size_t start = (size_t)offset, end = start + (size_t)length;
+    upload_origin = UP_FLUSH;
+    if (!object->sent || object->host_wrote) {
+        flush_send(target, object, start, end);
+        if (upload_tracing()) flush_whole += end - start;
+    } else {
+        /* Changed blocks, in runs; a block the range covers whole is then
+           what the host has. One it covers in part may hold other writes
+           still to publish: left alone, it is sent (again) at the next
+           publish point. */
+        size_t run = SIZE_MAX;
+        for (size_t b = start / PERSIST_BLOCK; b * PERSIST_BLOCK < end; b++) {
+            const size_t bs = b * PERSIST_BLOCK,
+                         be = bs + PERSIST_BLOCK < object->map_length ? bs + PERSIST_BLOCK : object->map_length;
+            const size_t from = bs > start ? bs : start, to = be < end ? be : end;
+            const uint64_t h = persistent_block_hash(object, b);
+            const int changed = h != object->sent[b];
+            if (changed && bs >= start && be <= end && be - bs == PERSIST_BLOCK) object->sent[b] = h;
+            if (changed && run == SIZE_MAX) run = from;
+            if (!changed && run != SIZE_MAX) {
+                flush_send(target, object, run, from);
+                if (upload_tracing()) flush_sent += from - run;
+                run = SIZE_MAX;
+            }
+        }
+        if (run != SIZE_MAX) {
+            flush_send(target, object, run, end);
+            if (upload_tracing()) flush_sent += end - run;
+        }
+        if (upload_tracing()) flush_hashed += end - start;
+    }
+    upload_origin = UP_APP;
 }
 
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
