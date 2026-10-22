@@ -152,6 +152,8 @@ check() {
 	local p=$w/pfx-$name out code src=$bin/$exe
 	case $exe in /*) src=$exe; exe=$(basename "$exe") ;; esac
 	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
+	# NULLDRV=1: Wine's null display driver (USER without a display)
+	[ -z "${NULLDRV:-}" ] || printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="null"\n' >> "$p/user.reg"
 	local wl=()
 	if [ -n "${WL:-}" ]; then
 		# the Wayland driver, gexc's compositor, its frames as PPMs; display
@@ -221,6 +223,9 @@ check cxx 0 "$allok" cxx.exe
 check exitproc 33 "worker exiting${nl}atexit ran" exitproc.exe
 check seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" seh.exe
 check seh-traps 0 "$allok" seh.exe traps
+# A window proc's uncaught exception ends the user callback that entered it,
+# or unwinds into a same-thread SendMessage's sender (USER on the null driver)
+NULLDRV=1 check wndproc_uncaught 0 "$allok" wndproc_uncaught.exe
 # W64.2: MSVC's x64 C++ exceptions, SEH and setjmp/longjmp through msvcrt
 # (tests/nt/msvc/build-x64.sh)
 check msvc_cxxeh 0 "$allok" msvc_cxxeh.exe
