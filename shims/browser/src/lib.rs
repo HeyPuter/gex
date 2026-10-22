@@ -15731,6 +15731,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         let mut keep: Vec<(u64, u32)> = Vec::new();
                         for (p, b) in d {
                             if !gex_abi::X86 {
+                                // The same check for a page this process can
+                                // name: an object another process had at the
+                                // same address (libXfixes where this process
+                                // has libvorbisfile) has its own base in the
+                                // identity map, and its blocks are not this
+                                // page's code. Unnamed pages are taken as before.
+                                // SAFETY: lookups in the kernel's memory, borrowing nothing here.
+                                let other = unsafe { k_present() } != 0
+                                    && page_identity(px, *p * gex_abi::DISPATCH_PAGE)
+                                        .is_some_and(|k| unsafe { k_slot_get(*p, k) } != *b);
+                                if other {
+                                    if tracing() {
+                                        trace_line(&format!(
+                                            "[gex] serve: page {p:#x} base {b:#x} is another object's here, entry dropped\n"
+                                        ));
+                                    }
+                                    continue;
+                                }
                                 j.page_table.assign(*p, *b);
                                 keep.push((*p, *b));
                                 continue;
