@@ -8,7 +8,9 @@
  * the pins an x86_64 builtin, whose own base (0x180000000) is beyond the
  * 4 GiB W64 is lowered to, lands top-down in the order a process loads
  * images, so its address differs between processes and a function-tier unit
- * (keyed by the image and its base) misses. Prints "dllband ok". */
+ * (keyed by the image and its base) misses. One of them is a program's own
+ * DLL in a directory whose name has a space (C:\pin dir\pinme.dll): its pin
+ * names a unix path with a space in it. Prints "dllband ok". */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +21,13 @@ static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok  " : "FAIL", name); fflush(stdout); if (!ok_) failures++; } while (0)
 
 /* (opengl32 has a base below 4 GiB of its own, 0x7a800000; the pin wins) */
-static const char *const dlls[] = {"version.dll", "winmm.dll", "dbghelp.dll", "opengl32.dll"};
+static const char *const dlls[] = {"version.dll", "winmm.dll", "dbghelp.dll", "opengl32.dll", "C:\\pin dir\\pinme.dll"};
+
+/* The file name of a DLL as loaded: what its pin's path ends in. */
+static const char *leaf(const char *dll) {
+    const char *b = strrchr(dll, '\\');
+    return b ? b + 1 : dll;
+}
 
 static ULONG_PTR pin_of(FILE *f, const char *dll) {
     char line[1024];
@@ -44,7 +52,7 @@ int main(int argc, char **argv) {
     CHECK(what, f != NULL);
     for (unsigned i = 0; i < sizeof(dlls) / sizeof(dlls[0]); i++) {
         HMODULE h = LoadLibraryA(dlls[i]);
-        ULONG_PTR at = (ULONG_PTR)h, want = pin_of(f, dlls[i]);
+        ULONG_PTR at = (ULONG_PTR)h, want = pin_of(f, leaf(dlls[i]));
         snprintf(what, sizeof(what), "%s: %s at %#llx, its pin %#llx, in [0x11000000, 0x20000000)", who, dlls[i],
                  (unsigned long long)at, (unsigned long long)want);
         CHECK(what, h && want && at == want && at >= 0x11000000 && at < 0x20000000);

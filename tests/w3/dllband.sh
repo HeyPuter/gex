@@ -3,7 +3,9 @@
 # dll-bases from tools/wine-wasm/w3/dll-bases.py, which must pass its own
 # check, and four of the dist's DLLs loaded at the addresses it gives them,
 # in [0x11000000, 0x20000000), natively and in the page, there both in the
-# compact space and with ?w3split=1. Prints "ok   dllband <leg>" per leg.
+# compact space and with ?w3split=1, and a program's own DLL in a directory
+# whose name has a space (C:\pin dir), its pin a unix path with a space in
+# it. Prints "ok   dllband <leg>" per leg.
 #
 #   tests/w3/dllband.sh DIST PREFIX [gexc]
 #
@@ -20,9 +22,15 @@ gexc=$(realpath -m "${3:-$root/target/x86/release/gexc}")
 w=${WORK:-$root/target/w3-dllband}
 rm -rf "$w"; mkdir -p "$w/wl"
 i686-w64-mingw32-gcc -O1 -Wall -o "$w/dllband.exe" "$here/dllband.c" || exit 1
-cp -a "$prefix" "$w/pfx"; cp "$w/dllband.exe" "$w/pfx/drive_c/"
-# The server names an image by the unix path it opened: natively the dist's.
-for d in version winmm dbghelp opengl32; do echo "$dist/lib/wine/i386-windows/$d.dll"; done |
+# (relocatable, as a DLL that can be pinned must be)
+echo 'int pinme(void) { return 7; }' | i686-w64-mingw32-gcc -O1 -shared -Wl,--dynamicbase -o "$w/pinme.dll" -x c - || exit 1
+# pinme PFX: the program's own DLL, in C:\pin dir
+pinme() { mkdir -p "$1/drive_c/pin dir" && cp "$w/pinme.dll" "$1/drive_c/pin dir/"; }
+cp -a "$prefix" "$w/pfx"; cp "$w/dllband.exe" "$w/pfx/drive_c/"; pinme "$w/pfx"
+# The server names an image by the unix path it opened, links resolved:
+# natively the dist's, and the prefix's drive (not dosdevices/c:).
+{ for d in version winmm dbghelp opengl32; do echo "$dist/lib/wine/i386-windows/$d.dll"; done
+  echo "$(realpath "$w/pfx")/drive_c/pin dir/pinme.dll"; } |
 	python3 "$root/tools/wine-wasm/w3/dll-bases.py" assign "$w/pfx/dll-bases" > "$w/assign.log" 2>&1 ||
 	{ echo "FAIL dllband: dll-bases.py assign"; sed 's/^/  /' "$w/assign.log"; exit 1; }
 python3 "$root/tools/wine-wasm/w3/dll-bases.py" check "$w/pfx/dll-bases" ||
@@ -51,9 +59,10 @@ for f in gex_browser.x86.shared.wasm seed.x86.shared.wasm; do
 	[ -f "$root/web/public/gex/$f" ] || { echo "skip page: no web/public/gex/$f"; exit $((fail > 0)); }
 done
 for leg in compact split; do
-	rm -rf "$w/pfx-$leg"; cp -a "$prefix" "$w/pfx-$leg"; mkdir -p "$w/t"
-	for d in version winmm dbghelp opengl32; do echo "/w3/lib/wine/i386-windows/$d.dll"; done |
-		python3 "$root/tools/wine-wasm/w3/dll-bases.py" assign "$w/pfx-$leg/dll-bases" --map /w3="$dist" >> "$w/assign.log" 2>&1
+	rm -rf "$w/pfx-$leg"; cp -a "$prefix" "$w/pfx-$leg"; mkdir -p "$w/t"; pinme "$w/pfx-$leg"
+	{ for d in version winmm dbghelp opengl32; do echo "/w3/lib/wine/i386-windows/$d.dll"; done
+	  echo "/pfx/drive_c/pin dir/pinme.dll"; } |
+		python3 "$root/tools/wine-wasm/w3/dll-bases.py" assign "$w/pfx-$leg/dll-bases" --map /w3="$dist" --map /pfx="$w/pfx-$leg" >> "$w/assign.log" 2>&1
 	split=; [ $leg = split ] && split=1
 	(cd "$root" && GEX_W3_SPLIT=$split GEX_DEBUG_EXIT=1 GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
 		node --max-old-space-size=8192 shims/browser/js/run-node.mjs --dir /w3="$dist" --dir /pfx="$w/pfx-$leg" \
