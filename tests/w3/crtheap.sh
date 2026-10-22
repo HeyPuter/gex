@@ -52,9 +52,13 @@ verdict() { # NAME LOG OWNER [REFERENCE_LOG]
 	if [ -z "$why" ]; then pass=$((pass + 1)); echo "ok   $1"
 	else fail=$((fail + 1)); echo "FAIL $1 ($why)"; grep -v '^\[host\]\|gex-console-error' "$2" | tail -6 | sed 's/^/  /'; fi
 }
+# With and without W3's KUSER fold: which key a run looks for depends on
+# whether the dist's Wine folds KUSER_SHARED_DATA.
 build() { # BASE [env...]
 	local base=$1; shift
-	env GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$@" "$gexc" cgen-image "$dist/lib/wine/i386-windows/msvcr120.dll" --pe-base "$base" --jobs 4 > "$w/build.log" 2>&1 ||
+	(for k in --w3-kuser ""; do
+		env GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$@" "$gexc" cgen-image "$dist/lib/wine/i386-windows/msvcr120.dll" --pe-base "$base" $k --jobs 4 || exit 1
+	done) > "$w/build.log" 2>&1 ||
 		{ echo "FAIL: msvcr120 unit at $base (tail: $(tail -2 "$w/build.log" | tr '\n' ' '))"; exit 1; }
 }
 GEX_CGEN_CACHE="$w/units" "$gexc" cgen-image --providers > "$w/providers.log" 2>&1 || { echo "FAIL: provider modules (tail: $(tail -2 "$w/providers.log" | tr '\n' ' '))"; exit 1; }

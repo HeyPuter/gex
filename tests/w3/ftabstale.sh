@@ -30,9 +30,13 @@ w=${WORK:-$root/target/w3-ftabstale}
 rm -rf "$w"; mkdir -p "$w/units"
 i686-w64-mingw32-gcc -O1 -o "$w/ftabstale.exe" "$here/ftabstale.c" || exit 1
 i686-w64-mingw32-gcc -O1 -shared -nostdlib -e _DllMain@12 -o "$w/ftabdll.dll" "$here/ftabdll.c" -lkernel32 || exit 1
+# Each with and without W3's KUSER fold: which key a run looks for depends on
+# whether the dist's Wine folds KUSER_SHARED_DATA.
 unit() { # IMAGE BASE
-	(GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$1" --pe-base "$2" --jobs 4 &&
-		GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 GEX_CGEN_GUARD=1 "$gexc" cgen-image "$1" --pe-base "$2" --jobs 4) >> "$w/build.log" 2>&1 ||
+	(for k in --w3-kuser ""; do
+		GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$1" --pe-base "$2" $k --jobs 4 &&
+			GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 GEX_CGEN_GUARD=1 "$gexc" cgen-image "$1" --pe-base "$2" $k --jobs 4 || exit 1
+	done) >> "$w/build.log" 2>&1 ||
 		{ echo "FAIL: unit of $1 at $2 (tail: $(tail -2 "$w/build.log" | tr '\n' ' '))"; exit 1; }
 }
 page() { # LOG [env...]
