@@ -938,10 +938,21 @@ def link_shared(cmd):
     stubs = []
     for _ in range(64):
         # (first: a definition the side module's then meets defined)
+        if VERBOSE:
+            sys.stderr.write('+ %s\n' % ' '.join(cmd[:1] + stubs + cmd[1:]))
         p = subprocess.run(cmd[:1] + stubs + cmd[1:], capture_output=True, text=True)
         if p.returncode == 0:
             sys.stderr.write(p.stderr)
             return 0
+        # wasm-ld crashes writing debug sections whose relocations name a
+        # function the link imports from a side module (harfbuzz's tests:
+        # DWARF locations in hb_set_reference, defined in libharfbuzz.so):
+        # the link again without debug information
+        if 'CustomSection::writeTo' in p.stderr and '--strip-debug' not in cmd:
+            sys.stderr.write('gexcc: warning: wasm-ld failed on the debug sections; %s is linked without them\n'
+                             % os.path.basename(out))
+            cmd = cmd + ['--strip-debug']
+            continue
         found = re.findall(r'function signature mismatch: (\S+)\n>>> defined as \(([^)]*)\) -> (\S+) in (\S+)\n'
                            r'>>> defined as \([^)]*\) -> \S+ in (\S+)', p.stderr)
         found = [f for f in found if '/sonames/' in f[4] or is_wasm_so(f[4])]
