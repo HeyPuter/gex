@@ -10,7 +10,10 @@
  * images, so its address differs between processes and a function-tier unit
  * (keyed by the image and its base) misses. One of them is a program's own
  * DLL in a directory whose name has a space (C:\pin dir\pinme.dll): its pin
- * names a unix path with a space in it. Prints "dllband ok". */
+ * names a unix path with a space in it. Another (fixed.dll) has no dynamic
+ * base and its own base (FIXED_BASE) is taken, by this program's reservation
+ * made before it loads: it is relocated to its pin, not to wherever there is
+ * room. Prints "dllband ok". */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +24,11 @@ static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok  " : "FAIL", name); fflush(stdout); if (!ok_) failures++; } while (0)
 
 /* (opengl32 has a base below 4 GiB of its own, 0x7a800000; the pin wins) */
-static const char *const dlls[] = {"version.dll", "winmm.dll", "dbghelp.dll", "opengl32.dll", "C:\\pin dir\\pinme.dll"};
+static const char *const dlls[] = {"version.dll", "winmm.dll", "dbghelp.dll", "opengl32.dll", "C:\\pin dir\\pinme.dll",
+                                   "C:\\pin dir\\fixed.dll"};
+
+/* fixed.dll's own base (dllband.sh links it there, without a dynamic base) */
+#define FIXED_BASE 0x30000000
 
 /* The file name of a DLL as loaded: what its pin's path ends in. */
 static const char *leaf(const char *dll) {
@@ -50,6 +57,9 @@ int main(int argc, char **argv) {
     FILE *f = file ? fopen(file, "r") : NULL;
     snprintf(what, sizeof(what), "%s: the dll-bases file is readable", who);
     CHECK(what, f != NULL);
+    /* fixed.dll's own base taken before it loads */
+    snprintf(what, sizeof(what), "%s: %#x reserved", who, FIXED_BASE);
+    CHECK(what, VirtualAlloc((void *)FIXED_BASE, 0x100000, MEM_RESERVE, PAGE_NOACCESS) == (void *)FIXED_BASE);
     for (unsigned i = 0; i < sizeof(dlls) / sizeof(dlls[0]); i++) {
         HMODULE h = LoadLibraryA(dlls[i]);
         ULONG_PTR at = (ULONG_PTR)h, want = pin_of(f, leaf(dlls[i]));
