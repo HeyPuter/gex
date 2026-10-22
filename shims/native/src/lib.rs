@@ -5703,7 +5703,13 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let gm = GuestMem::new(memory.bytes());
         let c = ctx as u32 as u64;
-        let target = if gex_abi::X86 { gm.read_u64(c + ctx::LAST_TARGET as u64) } else { gm.read_u64(c + ctx::PC as u64) }.unwrap_or(0);
+        // The dispatch's target, as the dispatcher recorded it. Not
+        // `ctx::PC`: after an indirect branch's safepoint that is the branch
+        // itself, to be re-executed (a callback's `ret` into a call-out's
+        // return), though dispatch goes on to the target. A64's inline
+        // dispatch records nothing, and leaves only the PC.
+        let at = if gex_abi::X86 || !gex_emit::tier1::inline_dispatch() { ctx::LAST_TARGET } else { ctx::PC };
+        let target = gm.read_u64(c + at as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
         let state = caller.data_mut();
         let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);

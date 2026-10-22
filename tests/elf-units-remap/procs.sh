@@ -1,6 +1,8 @@
 #!/bin/bash
 # Every process that maps an object listed in GEX_ELF_UNITS runs its unit:
 # two.c maps liba.so at a pinned base, forks from the library's own code,
+# has it call back into the program a million times (each call-out's return
+# is checked after a safepoint has left the context PC on the callback's `ret`),
 # forks a child that calls into it, and runs another program (other.c) that
 # maps it while two.c still has it.
 #
@@ -39,6 +41,7 @@ export GEX_CGEN_CACHE=$w/cgen GEX_ELF_UNITS=liba.so GEX_ELF_UNITS_BUILD=0
 "$gexc" cgen-image --elf "$w/liba.so" --base $BASE --jobs 2 > "$w/cgen.log" 2>&1 || { cat "$w/cgen.log"; exit 1; }
 want="parent f(5)=51
 forked 3
+each 3500000
 child f(9)=145
 other f(7)=92
 other exited 0"

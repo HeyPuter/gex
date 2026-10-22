@@ -12,3 +12,11 @@ int forked(void) {
 	waitpid(p, &st, 0);
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
+/* Calls back into the program n times (procs.sh): each call is a call-out
+ * from the unit, and the callback's return reaches the watched slot often
+ * right after its safepoint, which leaves the context PC on the `ret`. */
+long each(long (*cb)(long), long n) {
+	long s = 0;
+	for (long i = 0; i < n; i++) s += cb(i);
+	return s;
+}

@@ -228,7 +228,7 @@ pub fn set_inline_dispatch(on: bool) {
     INLINE_DISPATCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn inline_dispatch() -> bool {
+pub fn inline_dispatch() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
         || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
