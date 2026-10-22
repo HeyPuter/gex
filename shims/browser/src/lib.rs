@@ -13817,7 +13817,12 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // the illegal instruction, as shims/native's `deliver_guest_fault` does.
     // 64-bit native Wine's system and Unix calls are a ud2 at a fixed
     // address (signal_wasm64.c's W64_SYSCALL_ENTRY), which the hook runs and
-    // steps over.
+    // steps over. Reached from translated code (tier 1 dispatches to the
+    // context's PC when this returns), Wine's direct entry runs the call
+    // here instead, without the trap.
+    if gex_abi::X86 && (pc as u64 == W64_SYSCALL_ENTRY || pc as u64 == W64_UNIX_CALL_ENTRY) && cgen::w64_entry_illegal(my_ctx(), pc as u64) {
+        return;
+    }
     hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64);
     // Which process and what is mapped there: with a Worker per process the
     // console interleaves them all.

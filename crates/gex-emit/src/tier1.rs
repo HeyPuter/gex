@@ -4897,8 +4897,15 @@ impl<'a> Emitter<'a> {
                 self.f.i64_const(pc as i64);
                 self.f.i32_const(raw as i32);
                 self.f.call(self.cx.illegal);
-                // `illegal` raises SIGILL and never returns.
-                self.f.unreachable();
+                // `illegal` raises SIGILL and does not return, except where
+                // the host ran the instruction as a call (the browser:
+                // 64-bit native Wine's system call entry, a `ud2`): the
+                // thread goes on at the context's PC.
+                self.invalidate();
+                self.ctx_base();
+                self.f.load(0x29, 3, ctx::PC as u32);
+                self.f.local_set(self.scratch_i64);
+                self.emit_dispatch_tail_call();
             }
         }
     }

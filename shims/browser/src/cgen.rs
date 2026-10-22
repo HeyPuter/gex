@@ -2647,6 +2647,38 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
 /// before, unless the target is one of the two, Wine has registered that
 /// entry, the entry page holds Wine's pointer, and the call's return
 /// address is `ret`.
+/// The `ud2` at 64-bit native Wine's system or Unix call entry reached by
+/// translated code (a call from code no unit holds, opengl32's and win32u's
+/// stubs among them): Wine's direct entry runs the call here, as
+/// [`w64_entry`] does for a unit's, in place of a trap out to the fault
+/// hook. True when it ran and the thread goes on at the context's PC (the
+/// caller dispatches there); false, and the `ud2` route as before, when it
+/// could not. A call that left another thread's context to resume with
+/// traps out from here, the way the fault hook's return would leave.
+pub(crate) fn w64_entry_illegal(c: u64, pc: u64) -> bool {
+    let gm = GuestMem::new(crate::guest_bytes());
+    let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
+    let Ok(ret) = gm.read_u64(sp) else { return false };
+    LEFT_FOR.with(|l| l.set(None));
+    if w64_entry(&gm, c, pc, ret).is_none() {
+        return false;
+    }
+    if let Some(v) = LEFT_FOR.with(|l| l.take()) {
+        // Another context to resume with (`w64_entry` consumed it): the run
+        // loop's, through a trap, as the fault hook's return leaves it.
+        let at = GuestMem::new(crate::guest_bytes()).read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
+        crate::set_resume(at);
+        crate::set_resume_ctx(v);
+        crate::trap();
+    }
+    true
+}
+
+thread_local! {
+    /// The context [`w64_entry`]'s call left to resume with, when not its own.
+    static LEFT_FOR: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     let slot = match t {
         crate::W64_SYSCALL_ENTRY => 0,
@@ -2675,6 +2707,7 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     if let Some(v) = crate::resume_ctx() {
         crate::set_resume_ctx_none();
         if v != c {
+            LEFT_FOR.with(|l| l.set(Some(v)));
             return Some(gex_abi::ftab::RET_LEFT);
         }
     }
