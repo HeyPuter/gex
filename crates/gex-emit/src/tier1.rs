@@ -4894,17 +4894,22 @@ impl<'a> Emitter<'a> {
                 self.flush();
                 self.store_pc(pc);
                 self.f.local_get(self.ctx_local);
-                self.f.i64_const(pc as i64);
+                self.f.i64_const((pc | gex_abi::ILLEGAL_RETURNS_PC) as i64);
                 self.f.i32_const(raw as i32);
                 self.f.call(self.cx.illegal);
                 // `illegal` raises SIGILL and does not return, except where
                 // the host ran the instruction as a call (the browser:
-                // 64-bit native Wine's system call entry, a `ud2`): the
-                // thread goes on at the context's PC.
+                // 64-bit native Wine's system call entry, a `ud2`;
+                // `ILLEGAL_RETURNS_PC` says this code allows it): the
+                // thread goes on at the context's PC, through a safepoint,
+                // so a loop of nothing but system calls still reaches one.
                 self.invalidate();
                 self.ctx_base();
                 self.f.load(0x29, 3, ctx::PC as u32);
                 self.f.local_set(self.scratch_i64);
+                if gex_abi::X86 {
+                    self.emit_safepoint_no_flush_dynamic();
+                }
                 self.emit_dispatch_tail_call();
             }
         }

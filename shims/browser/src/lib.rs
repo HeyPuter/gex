@@ -13809,7 +13809,11 @@ fn hook_fault(pc: u64, code: u32, addr: u64) {
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // Whole-image units mark a fault they can go on after
     // (`gex_cgen::RESUMABLE_PC`); the browser still traps out of them.
-    let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
+    // Tier 1 marks a call it dispatches after (`gex_abi::ILLEGAL_RETURNS_PC`);
+    // every other caller (fjit, units, and a unit's resumable form, whose
+    // pc carries `RESUMABLE_PC` instead) never goes on after this returns.
+    let returns = pc as u64 & gex_abi::ILLEGAL_RETURNS_PC != 0;
+    let pc = fault_pc((pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64);
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
@@ -13817,10 +13821,10 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // the illegal instruction, as shims/native's `deliver_guest_fault` does.
     // 64-bit native Wine's system and Unix calls are a ud2 at a fixed
     // address (signal_wasm64.c's W64_SYSCALL_ENTRY), which the hook runs and
-    // steps over. Reached from translated code (tier 1 dispatches to the
-    // context's PC when this returns), Wine's direct entry runs the call
-    // here instead, without the trap.
-    if gex_abi::X86 && (pc as u64 == W64_SYSCALL_ENTRY || pc as u64 == W64_UNIX_CALL_ENTRY) && cgen::w64_entry_illegal(my_ctx(), pc as u64) {
+    // steps over. Reached from tier 1, which dispatches to the context's PC
+    // when this returns, Wine's direct entry runs the call here instead,
+    // without the trap.
+    if returns && gex_abi::X86 && (pc as u64 == W64_SYSCALL_ENTRY || pc as u64 == W64_UNIX_CALL_ENTRY) && cgen::w64_entry_illegal(my_ctx(), pc as u64) {
         return;
     }
     hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64);

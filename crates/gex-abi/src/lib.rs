@@ -1010,6 +1010,13 @@ pub const KUSER_WINDOWS: u64 = 0x7ffe_0000;
 /// One past the structure's page.
 pub const KUSER_WINDOWS_END: u64 = KUSER_WINDOWS + 0x1000;
 
+/// Set in the pc an `illegal` import is given by code that dispatches to the
+/// context's PC if the call returns (tier 1): the host may then run the
+/// instruction as a call (64-bit native Wine's system call entry, a `ud2`)
+/// instead of raising the fault. Every other caller's `illegal` never
+/// returns. The host masks it off.
+pub const ILLEGAL_RETURNS_PC: u64 = 1 << 61;
+
 /// Where W3's Wine maps KUSER_SHARED_DATA instead (wasm32): the top of the
 /// low space it reserves below the wasm32 program's stack (`STACK_TOP -
 /// STACK_SIZE`), so that a W3 process's memory need not reach 2 GiB. Wine's

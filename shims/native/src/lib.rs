@@ -4383,7 +4383,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
-            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
+            let pc = (pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64;
             if caller.data().nt.is_some() {
                 // What gex could not decode, or a deliberate trap: the bytes
                 // say which (the guest's handler may take it either way).
