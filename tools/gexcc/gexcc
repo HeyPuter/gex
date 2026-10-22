@@ -406,6 +406,7 @@ ld_skip = 0  # a dropped linker option's argument still to come (-Wl,-rpath -Wl,
 ld_want = None  # and which of ld_opts it goes to
 LD_KEEP = {'-soname': 'soname', '-h': 'soname', '-rpath': 'rpath'}
 ld_opts = {'soname': [], 'rpath': []}
+WHOLE = ('--whole-archive', '--no-whole-archive')
 export_dynamic = static = False
 i = 0
 while i < len(args):
@@ -452,6 +453,12 @@ while i < len(args):
                 k += 1; continue
             if p in ('-E', '--export-dynamic'):
                 export_dynamic = True
+            # --whole-archive applies to the inputs between it and
+            # --no-whole-archive (libtool's convenience libraries in a
+            # shared library: gnutls's ocsp_output.o, which nothing in the
+            # library itself calls): kept in place among the inputs
+            if p in WHOLE:
+                inputs.append(p); k += 1; continue
             # a library named to the linker (-Wl,-lc) is an input like any
             # other, found the same way
             if p.startswith('-l') and len(p) > 2:
@@ -599,6 +606,9 @@ def expand(items, seen):
     res, missing = [], []
     for it in items:
         if not it:
+            continue
+        if it in WHOLE:
+            res.append(it)
             continue
         if it.startswith('-l'):
             nm = it[2:]
@@ -830,6 +840,13 @@ def soname_of(path):
     return os.path.basename(path)
 
 
+def whole_closed(ins):
+    """The inputs with a --whole-archive left open closed after them, so
+    the libraries gexcc adds are not taken whole."""
+    marks = [x for x in ins if x in WHOLE]
+    return ins + ['--no-whole-archive'] if marks and marks[-1] == '--whole-archive' else ins
+
+
 def by_soname(paths):
     """Each side module as a link of its soname: wasm-ld records a NEEDED
     library by the name it was given, and the loader looks for sonames."""
@@ -991,7 +1008,7 @@ def shared_undef():
 
 if shared and SHARED:
     ins, missing = expand(inputs, set())
-    ins = [x for x in ins if not x.startswith('-L')] + missing
+    ins = whole_closed([x for x in ins if not x.startswith('-L')] + missing)
     soname = (ld_opts['soname'] or [os.path.basename(out)])[-1]
     tail = []
     if not (nostdlib or nodefaultlibs):
@@ -1022,13 +1039,15 @@ if shared and SHARED:
 
 if relocatable:
     ins, miss = expand(inputs, set())
-    sys.exit(run(['wasm-ld', '-r', '-o', out] + objs + ins + [f for f in ld_flags if not f.startswith('--export')]))
+    sys.exit(run(['wasm-ld', '-r', '-o', out] + objs + whole_closed(ins) + [f for f in ld_flags if not f.startswith('--export')]))
 
 if shared:
     # A static library under the shared name (see the module docstring).
     deps = []
     members = list(objs)
     for it in inputs:
+        if it in WHOLE:
+            continue
         if it.startswith('-l'):
             deps.append(it)
         elif is_archive(it):
@@ -1062,6 +1081,7 @@ ins = [x for x in ins if not x.startswith('-L')]
 if missing:
     # wasm-ld says which are missing, as ld would
     ins += missing
+ins = whole_closed(ins)
 crt = [] if (nostdlib or nostartfiles) else [LIB + '/crt1.o']
 libs = []
 if not (nostdlib or nodefaultlibs):
