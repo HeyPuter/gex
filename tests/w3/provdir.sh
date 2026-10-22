@@ -55,8 +55,12 @@ verdict() { # NAME LOG ABS ADD1 ADD2
 	if grep -q '^provdir done' "$2" && [ "$got" = "abs $3 sd_add $4 sd_add $5 " ]; then pass=$((pass + 1)); echo "ok   $1"
 	else fail=$((fail + 1)); echo "FAIL $1 (want abs $3, sd_add $4 then $5; got '$got')"; grep -v '^\[host\]\|gex-console-error' "$2" | tail -6 | sed 's/^/  /'; fi
 }
+# With and without W3's KUSER fold: which key a run looks for depends on
+# whether the dist's Wine folds KUSER_SHARED_DATA.
 build() { # BASE
-	GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$dist/lib/wine/i386-windows/msvcr120.dll" --pe-base "$1" --jobs 4 > "$w/build.log" 2>&1 ||
+	(for k in --w3-kuser ""; do
+		GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$dist/lib/wine/i386-windows/msvcr120.dll" --pe-base "$1" $k --jobs 4 || exit 1
+	done) > "$w/build.log" 2>&1 ||
 		{ echo "FAIL: msvcr120 unit at $1 (tail: $(tail -2 "$w/build.log" | tr '\n' ' '))"; exit 1; }
 }
 base() { sed -n 's/^msvcr120 at \(0x\)\?\([0-9a-fA-F]*\).*/0x\2/p' "$1" | head -1; }
