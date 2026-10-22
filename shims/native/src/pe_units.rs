@@ -119,7 +119,19 @@ fn trace() -> bool {
 }
 
 /// Where units live: `GEX_CGEN_CACHE`, else `<gex cache>/cgen`.
+/// Where units are, set by the program rather than `GEX_CGEN_CACHE`: an
+/// ejected project's build (`gex_eject`), which builds them and runs them.
+static CACHE_SET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// [`cache_root`] from now on (`None`: the environment's again).
+pub fn set_cache_root(dir: Option<std::path::PathBuf>) {
+    *CACHE_SET.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
 pub fn cache_root() -> Result<std::path::PathBuf> {
+    if let Some(d) = CACHE_SET.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(d);
+    }
     if let Some(d) = std::env::var_os("GEX_CGEN_CACHE") {
         return Ok(d.into());
     }
@@ -1804,12 +1816,34 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
     None
 }
 
-fn elf_wanted(path: &str) -> bool {
+/// The objects an ejected project ships units for (file names), set before
+/// it runs, in place of `GEX_ELF_UNITS`. Nothing is built for the next run:
+/// the project has every unit it will get.
+static ELF_SET: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Give the objects `names` their units (from [`cache_root`]) in this run.
+pub fn set_elf_units(names: Vec<String>) {
+    let _ = ELF_SET.set(names);
+}
+
+fn elf_list() -> Option<&'static Vec<String>> {
     static LIST: OnceLock<Option<Vec<String>>> = OnceLock::new();
-    let list = LIST.get_or_init(|| {
-        std::env::var("GEX_ELF_UNITS").ok().filter(|v| !v.is_empty() && v != "0").map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-    });
-    let Some(list) = list else { return false };
+    ELF_SET.get().or_else(|| {
+        LIST.get_or_init(|| {
+            std::env::var("GEX_ELF_UNITS").ok().filter(|v| !v.is_empty() && v != "0").map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        })
+        .as_ref()
+    })
+}
+
+/// Whether any ELF object gets a unit in this run (the runtime translator's
+/// machinery installs them, translation or not).
+pub fn elf_units_on() -> bool {
+    elf_list().is_some_and(|l| !l.is_empty())
+}
+
+fn elf_wanted(path: &str) -> bool {
+    let Some(list) = elf_list() else { return false };
     let name = path.rsplit('/').next().unwrap_or(path);
     list.iter().any(|n| n == "all" || n == name)
 }
@@ -1884,7 +1918,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let Ok(cwasm) = std::fs::read(&cwasm_path) else {
             eprintln!("gex-elf: no function-tier unit for {} at {base:#x} (key {key}); it runs on the runtime translator", m.path);
             NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {base:#x} (key {key})", m.path));
-            if std::env::var("GEX_ELF_UNITS_BUILD").as_deref() != Ok("0") {
+            if ELF_SET.get().is_none() && std::env::var("GEX_ELF_UNITS_BUILD").as_deref() != Ok("0") {
                 spawn_elf_build(&m.path, base);
             }
             continue;

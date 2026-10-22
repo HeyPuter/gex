@@ -1234,7 +1234,7 @@ fn run_program_with(
     // The machinery here installs a translated module into this store. The
     // miss handler is one user; static object recompilation is another.
     // `--no-jit` turns off the miss handler, not this.
-    if opts.jit || opts.recompile_objects || !aot_shared.is_empty() {
+    if opts.jit || opts.recompile_objects || !aot_shared.is_empty() || pe_units::elf_units_on() {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),

@@ -40,6 +40,9 @@ pub struct BuiltImage {
     /// `image`: a program's own module, looked up by `identity`. `shared`: a
     /// module of the closure of the program whose identity is `identity`
     /// (its interpreter or a library), installed before it starts.
+    /// `elf-unit`: a library's or the interpreter's function-tier unit,
+    /// whose `identity` is its key (the object as placed at `base`),
+    /// installed in any process that maps it there.
     pub kind: String,
     /// `gex_native::aot::image_identity` of the program's loaded image.
     pub identity: String,

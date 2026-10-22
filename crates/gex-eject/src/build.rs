@@ -506,8 +506,10 @@ impl Translation<'_> {
             .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
             .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
         let mut order: Vec<usize> = vec![main];
-        // (a library the window left out is translated by the run, in each process)
-        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe" && self.placed[i].pinned));
+        // (a placed library, and the interpreter, is a unit of its own:
+        // `units`; one the window left out is translated by the run, in
+        // each process)
+        let dynamic = self.placed.iter().any(|p| p.obj.role != "exe");
         let others: Vec<usize> = (0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role == "exe").collect();
         let main_identity = gex_native::aot::image_identity(&self.placed[main].image);
 
@@ -525,7 +527,7 @@ impl Translation<'_> {
             // the process starts from a seed module. An image module writing
             // its slots at instantiation does not mix with the pages the shim
             // numbers for itself.
-            let shared_image = web && order.len() > 1;
+            let shared_image = web && dynamic;
             let own = !shared_image && (n == 0 || !in_closure);
             let mut image = p.image.clone();
             gex_xlate::set_compat(image.class32);
@@ -604,7 +606,50 @@ impl Translation<'_> {
                 pins.push((o.path.clone(), image.bias));
             }
         }
+        pins.extend(self.placed.iter().filter(|p| p.obj.role == "library" && p.pinned).map(|p| (p.obj.path.clone(), p.image.bias)));
         Ok((images, pins, illegal))
+    }
+
+    /// The function-tier unit (`gexc cgen-image --elf`) of each placed
+    /// library and of the interpreter, into `out` (relative to the project).
+    /// A unit is keyed by its object as placed, not by any program, so every
+    /// process that maps the object at its base runs it. The native flavour
+    /// (no bounds guard), which the page runs as well.
+    fn units(&self, out: &str) -> Result<Vec<BuiltImage>> {
+        let cache = self.dir.join(out);
+        std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+        let jobs = std::env::var("GEX_ELF_UNITS_JOBS")
+            .ok()
+            .and_then(|j| j.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(8)));
+        let unguarded = gex_cgen::image::unguarded();
+        gex_native::pe_units::set_cache_root(Some(cache.clone()));
+        gex_cgen::image::set_unguarded(true);
+        let built = (|| {
+            let mut images = Vec::new();
+            for p in self.placed.iter().filter(|p| p.pinned && (p.obj.role == "library" || p.obj.role == "interp")) {
+                let host = self.dir.join(rootfs_rel(&p.obj.path)?);
+                let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
+                let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)
+                    .with_context(|| format!("the function-tier unit of {} at {:#x}", p.obj.path, p.image.bias))?;
+                let key = wasm.parent().and_then(|d| d.file_name()).map(|k| k.to_string_lossy().into_owned()).unwrap_or_default();
+                let entries = gex_cgen::image::read_entries(&wasm)?.iter().filter(|&&a| a != 0).count() as u64;
+                images.push(BuiltImage {
+                    kind: "elf-unit".to_string(),
+                    identity: key.clone(),
+                    base: p.image.bias,
+                    module: format!("{out}/{key}/c.wasm"),
+                    object: p.obj.id.clone(),
+                    path: p.obj.path.clone(),
+                    blocks: entries,
+                    bytes: std::fs::metadata(&wasm)?.len(),
+                });
+            }
+            Ok(images)
+        })();
+        gex_native::pe_units::set_cache_root(None);
+        gex_cgen::image::set_unguarded(unguarded);
+        built
     }
 }
 
@@ -688,7 +733,18 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
 
     let mut report = BuildReport { placement, ..BuildReport::default() };
     let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
-    let (images, pins, illegal) = t.translate("build/modules", false)?;
+    let (mut images, pins, illegal) = t.translate("build/modules", false)?;
+    let units = t.units("build/cgen")?;
+    if !units.is_empty() && !config.jit_fallback {
+        // Recovery leaves a function it could not delimit to the runtime
+        // translator, which a run without it does not have.
+        eprintln!(
+            "gex-eject: warning: {} library units leave what recovery missed to runtime translation; \
+             a run without \"jit_fallback\" stops at the first such function",
+            units.len()
+        );
+    }
+    images.extend(units);
     report.images = images;
     report.illegal_blocks = illegal;
 
@@ -717,7 +773,8 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                 for r in replacements.iter().filter(|r| !r.missing) {
                     crate::web::check_module(dir, &r.module, &r.export, r.abi)?;
                 }
-                let (images, _, _) = t.translate("build/web", true)?;
+                let (mut images, _, _) = t.translate("build/web", true)?;
+                images.extend(report.images.iter().filter(|i| i.kind == "elf-unit").cloned());
                 let spans: Vec<(String, u64, u64)> = placed
                     .iter()
                     .filter(|p| p.obj.role == "library" && p.pinned)

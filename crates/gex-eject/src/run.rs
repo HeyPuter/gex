@@ -42,14 +42,33 @@ pub fn build_mem(requested: Option<bool>) -> Result<gex_abi::MemFlavor> {
 /// they do not cover is translated as usual.
 pub fn debug_build(dir: &Path) -> Result<(Aot, Vec<(String, u64)>)> {
     let manifest = BuildManifest::load(dir)?;
+    use_units(dir, &manifest);
     Ok((aot(dir, &manifest), manifest.pins.clone()))
+}
+
+/// The libraries' function-tier units (`elf-unit`), for every process of the
+/// run that maps one at its base: from the project, and none built for
+/// another run.
+fn use_units(dir: &Path, manifest: &BuildManifest) {
+    let names: Vec<String> = manifest
+        .images
+        .iter()
+        .filter(|i| i.kind == "elf-unit")
+        .map(|i| i.path.rsplit('/').next().unwrap_or(&i.path).to_string())
+        .collect();
+    if !names.is_empty() {
+        gex_native::pe_units::set_cache_root(Some(dir.join("build/cgen")));
+        gex_native::pe_units::set_elf_units(names);
+    }
 }
 
 /// The runtime's view of a built project.
 pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
     let mut aot = Aot::new(format!("the ejected project {}", dir.display()));
     for i in &manifest.images {
-        if i.kind == "shared" {
+        if i.kind == "elf-unit" {
+            continue;
+        } else if i.kind == "shared" {
             aot.shared.entry(i.identity.clone()).or_default().push(dir.join(&i.module));
         } else {
             aot.images.insert(i.identity.clone(), dir.join(&i.module));
@@ -128,6 +147,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     } else {
         project.program.env.clone()
     };
+    use_units(dir, &manifest);
     let mut aot = aot(dir, &manifest);
     aot.syscalls = allowed_syscalls(dir, &config)?;
     aot.single_process = project.processes <= 1;
