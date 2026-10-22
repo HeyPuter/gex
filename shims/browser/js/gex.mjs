@@ -1255,6 +1255,19 @@ export class Gex {
   static identities = '';
   static #whySlot = 0;
 
+  /** A DataView of the memory, rebuilt as `#bytes` is: for `#hookStack`,
+   *  which every direct system call entry runs (a new view each call was
+   *  4.7% of Hades's render thread samples). */
+  #dv() {
+    const buf = this.#memory.buffer;
+    if (!this.#dview || this.#dview.buffer !== buf || this.#dview.byteLength !== buf.byteLength) {
+      this.#dview = new DataView(buf);
+    }
+    return this.#dview;
+  }
+
+  #dview = null;
+
   #bytes() {
     // Rebuilt when the memory has grown, not only when detached. A shared
     // memory never detaches -- the old SharedArrayBuffer stays valid at its
@@ -7254,11 +7267,11 @@ export class Gex {
     // its low 32 bits put the hook's frames, and the exception record it
     // writes, over whatever lives there, the runtime's own heap included.
     if (typeof cur === 'bigint') {
-      const rsp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+      const rsp = this.#dv().getBigUint64(ctx + CTX_SP, true);
       const low = cur !== 0n && cur < rsp ? cur : rsp;
       spG.value = (low - 4096n) & ~15n;
     } else {
-      const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
+      const esp = this.#dv().getUint32(ctx + CTX_SP, true);
       const low = Math.min(Number(cur) >>> 0, esp);
       spG.value = ((low - 4096) & ~15) | 0;
     }
