@@ -265,6 +265,14 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             continue;
         }
         if p == "/tmp" || p.starts_with("/tmp/") {
+            // Under a sysroot the recorded run's /tmp was a fresh tmpfs too:
+            // what it read there, the session made (by a way the open hook
+            // does not see as a create: a rename, a link, another process's
+            // O_TMPFILE), so it is an output, not an input
+            if sysroot.is_some() {
+                outputs.push(p.clone());
+                continue;
+            }
             bail!(
                 "the session read {p}, but a project's /tmp is a fresh tmpfs (as under any \
                  --sysroot); keep inputs outside /tmp and record again"
