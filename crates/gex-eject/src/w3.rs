@@ -151,6 +151,28 @@ fn add_trampolines(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> Res
     Ok(())
 }
 
+/// The project's units (w3.json `units`): each with its recorded `at` and
+/// `base`. The trampolines' unit, added by the eject (no recorded entry),
+/// is used by every 32-bit process from its first system call: `at` 0, so
+/// the page compiles it with the boot's units and packs it in the boot
+/// archive (web/eject-site.mjs), never as a unit compiled when first mapped,
+/// which no process maps.
+fn units_json(recorded: &[Json], units: &[(String, String)]) -> Json {
+    Json::Arr(units.iter().enumerate().map(|(i, (k, p))| {
+        let mut kv = vec![("key", s(k)), ("path", s(p))];
+        let u = recorded.get(i).filter(|u| json::opt_str(u, "key").as_deref() == Some(k.as_str()));
+        match u.and_then(|u| u.get("at")).filter(|a| matches!(a, Json::Num(_))) {
+            Some(at) => kv.push(("at", at.clone())),
+            None if p == TRAMPOLINES_PATH => kv.push(("at", json::n(0))),
+            None => {}
+        }
+        if let Some(b) = u.and_then(|u| u.get("base")).filter(|b| matches!(b, Json::Str(_))) {
+            kv.push(("base", b.clone()));
+        }
+        obj(kv)
+    }).collect())
+}
+
 /// A provider module's file in a unit cache, as a W3 page asks for it. The
 /// page runs with W3's KUSER_SHARED_DATA fold on (`gexc cgen-image
 /// --w3-kuser`), and a provider's fingerprint hashes the C header, which has
@@ -278,18 +300,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         // Each with `at`, when the recording first used it (seconds; none
         // from an older recorder): a unit first used after the title is
         // compiled when a process maps it (web/eject-site.mjs, `demand`).
-        // Those added here (the trampolines') have no recorded entry.
-        ("units", Json::Arr(units.iter().enumerate().map(|(i, (k, p))| {
-            let mut kv = vec![("key", s(k)), ("path", s(p))];
-            let u = list(&v, "units").get(i);
-            if let Some(at) = u.and_then(|u| u.get("at")).filter(|a| matches!(a, Json::Num(_))) {
-                kv.push(("at", at.clone()));
-            }
-            if let Some(b) = u.and_then(|u| u.get("base")).filter(|b| matches!(b, Json::Str(_))) {
-                kv.push(("base", b.clone()));
-            }
-            obj(kv)
-        }).collect())),
+        ("units", units_json(list(&v, "units"), &units)),
         ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
         ("uncovered", Json::Arr(list(&v, "uncovered").to_vec())),
@@ -1224,6 +1235,33 @@ mod tests {
         assert_eq!(units.len(), 2);
         assert_eq!(units[1], (keys[0].clone(), TRAMPOLINES_PATH.to_string()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_trampoline_unit_is_packed_with_the_boot() {
+        // eject-site.mjs compiles with the page (and counts in its boot
+        // archive) a unit whose `at` is at most the title's seconds; one
+        // with no `at` is left for the process that maps it, and none maps
+        // the trampolines' unit.
+        let recorded = Json::parse(r#"[{"key":"aa","path":"/x/a.dll","at":3.5,"base":"0x10000000"},{"key":"bb","path":"/x/b.dll"}]"#).unwrap();
+        let recorded = recorded.as_arr().unwrap();
+        let units = vec![
+            ("aa".to_string(), "/x/a.dll".to_string()),
+            ("bb".to_string(), "/x/b.dll".to_string()),
+            ("cc".to_string(), TRAMPOLINES_PATH.to_string()),
+        ];
+        let j = units_json(recorded, &units);
+        let us = j.as_arr().unwrap();
+        let at = |i: usize| us[i].get("at").cloned();
+        assert_eq!(at(0), Some(json::Json::Num("3.5".into())));
+        assert_eq!(us[0].get("base").cloned(), Some(s("0x10000000")));
+        assert_eq!(at(1), None);
+        assert_eq!(at(2), Some(json::n(0)));
+        assert_eq!(json::opt_str(&us[2], "path").as_deref(), Some(TRAMPOLINES_PATH));
+        // A session that recorded it keeps its own `at`.
+        let recorded2 = Json::parse(r#"[{"key":"cc","path":"[nt trampolines]","at":1.25}]"#).unwrap();
+        let j2 = units_json(recorded2.as_arr().unwrap(), &units[2..]);
+        assert_eq!(j2.as_arr().unwrap()[0].get("at").cloned(), Some(json::Json::Num("1.25".into())));
     }
 
     #[test]

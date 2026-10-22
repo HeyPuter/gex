@@ -624,11 +624,13 @@ function w3Site() {
           }
         }
         // --boot-units: the units no image of the list has, in the order the
-        // recording first used them (then the ones it never used).
+        // recording first used them (then the ones it never used). A unit
+        // that is no image's (gexc eject's "[nt trampolines]", which every
+        // 32-bit process uses from its first system call) stays in the boot.
         if (bootUnitsList) {
           const at = (u) => (typeof u.at === 'number' ? u.at : Infinity);
           const deferred = (w3.units ?? [])
-            .filter((u) => !bootUnitsList.has(lateGuest(u.path)) && !lateKeys.has(u.key) && existsSync(join(web, 'units', u.key, 'c.wasm')) && !existsSync(join(web, 'units', u.key, 'cold')))
+            .filter((u) => !String(u.path ?? '').startsWith('[') && !bootUnitsList.has(lateGuest(u.path)) && !lateKeys.has(u.key) && existsSync(join(web, 'units', u.key, 'c.wasm')) && !existsSync(join(web, 'units', u.key, 'cold')))
             .sort((a, b) => at(a) - at(b) || (a.key < b.key ? -1 : 1));
           for (const u of deferred) {
             if (lateKeys.has(u.key)) continue;
