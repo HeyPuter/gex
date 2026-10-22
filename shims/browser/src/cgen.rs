@@ -57,12 +57,80 @@ static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 /// Whether `PENDING` may hold something (set after a push, cleared before a
 /// drain takes it).
 static ANY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// How many units wait for their bytes (`WANTED`'s length), readable without
-/// its lock.
-static WANTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// ---- Where each unit is: wanted, claimed, published, installed ----
+//
+// One byte of flags per unit (an index into `UNITS`), changed with atomic
+// ors and ands: what `WANTED` (a queue), `CLAIMED` and `INSTALLED` (sets),
+// each under a mutex, were. Every system call's serve asks for the oldest
+// wanted unit; with none, that is two loads.
 
-fn lock_free_wanted_empty() -> bool {
-    WANTED_N.load(Ordering::Acquire) == 0
+/// Placed for an image and waiting for its bytes from JS.
+const U_WANTED: u8 = 1;
+/// A Worker has started publishing it: the others only install.
+const U_CLAIMED: u8 = 2;
+/// Published (also in `PUBLISHED`, in order).
+const U_PUBLISHED: u8 = 4;
+/// Published and installed by some Worker: its directory entries are written.
+const U_INSTALLED: u8 = 8;
+/// Units with flags; one past it has none.
+const U_MAX: usize = 1 << 16;
+static U_STATE: [std::sync::atomic::AtomicU8; U_MAX] = [const { std::sync::atomic::AtomicU8::new(0) }; U_MAX];
+/// One past the highest unit ever wanted (the scan's end).
+static U_HIGH: AtomicUsize = AtomicUsize::new(0);
+/// No unit below this is wanted (the scan's start). A unit is wanted once,
+/// when placed, and never again after it stops being: the cursor only rises.
+static U_LOW: AtomicUsize = AtomicUsize::new(0);
+
+fn u_state(u: usize) -> u8 {
+    U_STATE.get(u).map_or(0, |s| s.load(Ordering::Acquire))
+}
+
+/// Unit `u`, just placed, waits for its bytes.
+fn u_want(u: usize) {
+    let Some(s) = U_STATE.get(u) else {
+        crate::warn_line(&format!("gex-cgen: unit {u}: past {U_MAX} units; tier-1\n"));
+        return;
+    };
+    s.fetch_or(U_WANTED, Ordering::AcqRel);
+    U_HIGH.fetch_max(u + 1, Ordering::AcqRel);
+}
+
+/// Unit `u` waits no longer (published, held, or missing).
+fn u_unwant(u: usize) {
+    if let Some(s) = U_STATE.get(u) {
+        s.fetch_and(!U_WANTED, Ordering::AcqRel);
+    }
+}
+
+/// The oldest wanted unit `skip` lets through, moving the cursor past the
+/// ones no longer wanted.
+fn u_oldest(skip: impl Fn(u8) -> bool) -> Option<usize> {
+    let high = U_HIGH.load(Ordering::Acquire);
+    let mut low = U_LOW.load(Ordering::Acquire);
+    let mut found = None;
+    let mut u = low;
+    while u < high {
+        let st = u_state(u);
+        if st & U_WANTED != 0 {
+            if !skip(st) {
+                found = Some(u);
+                break;
+            }
+        } else if u == low {
+            // Not wanted, and nothing wanted below it: the cursor moves on.
+            match U_LOW.compare_exchange(low, u + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => low = u + 1,
+                Err(now) => low = now.max(low),
+            }
+        }
+        u += 1;
+    }
+    found
+}
+
+/// Whether any unit is wanted.
+fn wanted_any() -> bool {
+    u_oldest(|_| false).is_some()
 }
 
 /// A unit placed for an image: wanted until JS brings its bytes, then
@@ -195,32 +263,27 @@ fn known(base: u64, path: &str) -> Option<(String, String)> {
 }
 
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
-/// Units waiting for their bytes, oldest first (indices into `UNITS`).
-static WANTED: Mutex<std::collections::VecDeque<usize>> = Mutex::new(std::collections::VecDeque::new());
 /// Published units, in publish order: what every Worker installs.
 static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Units a Worker has started publishing. `gex_cgen_wanted` hands the queue's
-/// front to every Worker that asks until it is published, so two threads of a
-/// process can load and publish the same unit; the second publish found every
-/// page numbered already and replaced the unit's `dirs` with nothing, and
-/// whichever install read them after that wrote no directory entry at all
-/// (a startup livelock: one DLL placed
-/// twice). The first claim publishes; the others only install.
-static CLAIMED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+// Claims ([`U_CLAIMED`]): `gex_cgen_wanted` hands the oldest wanted unit to
+// every Worker that asks until it is published, so two threads of a process
+// can load and publish the same unit; the second publish found every page
+// numbered already and replaced the unit's `dirs` with nothing, and whichever
+// install read them after that wrote no directory entry at all (a startup
+// livelock: one DLL placed twice). The first claim publishes; the others
+// only install.
 /// Publishes refused because another Worker had claimed the unit.
 pub(crate) static TWICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Units published and then installed by some Worker: their pages' directory
-/// entries are written (`write_dirs`).
-static INSTALLED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 
-/// Whether `page` is a unit's whose publish has begun (`CLAIMED`) and whose
-/// install has not written its directory yet: a thread running the unit's
-/// code meanwhile finds the page numbered and its entry not yet written.
+/// Whether `page` is a unit's whose publish has begun ([`U_CLAIMED`]) and
+/// whose install has not written its directory yet: a thread running the
+/// unit's code meanwhile finds the page numbered and its entry not yet written.
 pub(crate) fn in_install_window(page: u64) -> bool {
-    let claimed: Vec<u32> = lock(&CLAIMED).iter().copied().collect();
-    let installed = lock(&INSTALLED).clone();
     let units = lock(&UNITS);
-    claimed.iter().filter(|u| !installed.contains(u)).any(|&u| units.get(u as usize).is_some_and(|x| x.pages.iter().any(|&(p, _)| p == page)))
+    units.iter().enumerate().any(|(u, x)| {
+        let st = u_state(u);
+        st & U_CLAIMED != 0 && st & U_INSTALLED == 0 && x.pages.iter().any(|&(p, _)| p == page)
+    })
 }
 /// The pages installed units cover, hashed as built (`on_retire`).
 static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
@@ -511,7 +574,7 @@ pub(crate) fn drain() -> bool {
         return false;
     }
     // Every syscall asks: an atomic load when nothing was mapped (no lock).
-    if !ANY_PENDING.load(Ordering::Acquire) && lock_free_wanted_empty() {
+    if !ANY_PENDING.load(Ordering::Acquire) && !wanted_any() {
         return false;
     }
     ANY_PENDING.store(false, Ordering::Release);
@@ -536,7 +599,7 @@ pub(crate) fn drain() -> bool {
         let wine = is_wine(&p.path);
         place(&image, &p.path, p.base, wine, Some(&p.pe));
     }
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
@@ -558,7 +621,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
     }
     w3_forget(base, pe.image_size as u64);
     place(&image, path, base, true, Some(pe));
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// Whether an image Wine's loader mapped at `base` can wait for its first
@@ -685,7 +748,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         return false;
     }
     place(&image, &d.path, d.base, true, Some(&pe));
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// A whole file, parsed as a PE image.
@@ -785,11 +848,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         slots: 0,
         providers,
     });
-    {
-        let mut w = lock(&WANTED);
-        w.push_back(units.len() - 1);
-        WANTED_N.store(w.len(), Ordering::Release);
-    }
+    u_want(units.len() - 1);
 }
 
 /// The key of the unit for `image` (the native host's `pe_units::unit_key`:
@@ -920,11 +979,9 @@ fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
 #[no_mangle]
 pub extern "C" fn gex_cgen_wanted() -> i32 {
     drain();
-    // Not one another Worker is publishing (`CLAIMED`): it leaves the queue
+    // Not one another Worker is publishing (claimed): it stops being wanted
     // when that publish ends.
-    let w = lock(&WANTED);
-    let claimed = lock(&CLAIMED);
-    w.iter().find(|&&u| !claimed.contains(&(u as u32))).map_or(-1, |&u| u as i32)
+    u_oldest(|st| st & U_CLAIMED != 0).map_or(-1, |u| u as i32)
 }
 
 /// `v` into a buffer of the shim's heap (above the guest's limit).
@@ -994,9 +1051,7 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
 /// image (not a Wine DLL) without one is refused: returns 1, and JS stops.
 #[no_mangle]
 pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
-    let mut wanted = lock(&WANTED);
-    wanted.retain(|&w| w != u as usize);
-    WANTED_N.store(wanted.len(), Ordering::Release);
+    u_unwant(u as usize);
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     if MODE.load(Ordering::Relaxed) == 2 && !x.wine {
@@ -1038,7 +1093,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 /// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
-    if !lock(&CLAIMED).insert(u) {
+    let claimed = U_STATE.get(u as usize).map_or(U_CLAIMED, |s| s.fetch_or(U_CLAIMED, Ordering::AcqRel));
+    if claimed & U_CLAIMED != 0 {
         TWICE.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
@@ -1075,12 +1131,11 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             }
         }
     }
-    {
-        let mut w = lock(&WANTED);
-        w.retain(|&x| x != u as usize);
-        WANTED_N.store(w.len(), Ordering::Release);
-    }
     lock(&PUBLISHED).push(u as usize);
+    if let Some(s) = U_STATE.get(u as usize) {
+        s.fetch_or(U_PUBLISHED, Ordering::AcqRel);
+    }
+    u_unwant(u as usize);
     0
 }
 
@@ -1115,9 +1170,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
 /// their code runs, so no member runs before it.
 #[no_mangle]
 pub extern "C" fn gex_cgen_hold(u: u32) {
-    let mut w = lock(&WANTED);
-    w.retain(|&x| x != u as usize);
-    WANTED_N.store(w.len(), Ordering::Release);
+    u_unwant(u as usize);
 }
 
 /// A link group's module as a unit of its own: key `groups/<key>` (the
@@ -2395,8 +2448,10 @@ pub extern "C" fn gex_cgen_installed(u: u32) {
     write_dirs(dirs);
     // A Worker that lost the claim installs too, possibly before the
     // claimant's publish has set `dirs`: only after the publish is it done.
-    if lock(&PUBLISHED).contains(&(u as usize)) {
-        lock(&INSTALLED).insert(u);
+    if let Some(s) = U_STATE.get(u as usize) {
+        if s.load(Ordering::Acquire) & U_PUBLISHED != 0 {
+            s.fetch_or(U_INSTALLED, Ordering::AcqRel);
+        }
     }
 }
 
