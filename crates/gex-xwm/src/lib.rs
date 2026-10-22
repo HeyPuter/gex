@@ -920,8 +920,8 @@ impl Xwm {
         // a client whose drawing goes to the host's GL rather than through X
         // never damages anything: SDL's window has no background, so not even
         // the initial fill happens. Xwayland created the surface, set its
-        // input region and allocated a 640x480 pool for SuperTuxKart -- and
-        // never committed, so the compositor never learned the window
+        // input region and allocated a pool for it -- and never
+        // committed, so the compositor never learned the window
         // existed and had nowhere to put the frames the host was drawing.
         //
         // A window this manager has adopted is a window that exists, which is

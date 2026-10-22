@@ -1,4 +1,4 @@
-//! `gex-rt`: the runtime of an ejected gex project (docs/eject-pe.md §7).
+//! `gex-rt`: the runtime of an ejected gex project.
 //!
 //! It runs what the project's build made -- function-tier units, export
 //! providers, and every runtime module, all compiled ahead of time -- and

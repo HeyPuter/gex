@@ -1,6 +1,6 @@
 [package]
 name = "gex-dylink"
-description = "Shared libraries for native wasm32 programs: dylink.0 side modules, their load plan, and the build-time self-binding of weak definitions (docs/gexcc.md §7)"
+description = "Shared libraries for native wasm32 programs: dylink.0 side modules, their load plan, and the build-time self-binding of weak definitions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

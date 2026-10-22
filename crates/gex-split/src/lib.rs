@@ -1,5 +1,5 @@
-//! Function-level splitting of a linked unit (`gex-cgen-image 3`,
-//! docs/function-tier.md §11), after the link: the functions a recorded run
+//! Function-level splitting of a linked unit (`gex-cgen-image 3`), after
+//! the link: the functions a recorded run
 //! called stay in the unit's module (the *primary*), every other function
 //! goes to a *cold cluster*, a module of its own fetched the first time one
 //! of its functions is called. Nothing is compiled again and nothing is
@@ -8,7 +8,7 @@
 //! A crate of its own, not a gex-cgen module: a unit's cache key hashes
 //! gex-cgen's sources (its `build.rs`), and the split, a step after the
 //! link that changes nothing a unit is built from, must not re-key every
-//! unit (it did, and an ejected page missed all 59 of Paint's units).
+//! unit (an ejected page would miss every unit it recorded).
 //!
 //! A unit's module is position-independent: it imports the memory, the
 //! process's function table, `__table_base` and a few host functions, and its

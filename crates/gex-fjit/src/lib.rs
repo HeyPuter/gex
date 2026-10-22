@@ -1,14 +1,12 @@
 //! The function JIT: a recovered guest function → one wasm function,
-//! emitted directly from GIR with no clang (docs/merge-plan.md §9.2, §9.8
-//! stream F).
+//! emitted directly from GIR with no clang.
 //!
-//! * The ABI is `F_body` (docs/function-tier.md §7): `(ctx, depth, need,
-//!   ret) -> i32`, 1 for the predicted return, 0 for "left, everything
-//!   written back, `ctx::PC` set"; the depth guard (§7.1) and loop outlining
-//!   (§7.2) as there.
+//! * The ABI is gex-cgen's `F_body`: `(ctx, depth, need, ret) -> i32`, 1
+//!   for the predicted return, 0 for "left, everything written back,
+//!   `ctx::PC` set"; the depth guard and loop outlining as there.
 //! * Control flow is structured (`cfg`): blocks become `block`/`loop`/`br`,
 //!   guest registers live in wasm locals across the whole function and are
-//!   written back only where §5.1 says.
+//!   written back only where gex-cgen writes them back.
 //! * Statements are tier-1's own lowering (`gex_emit::tier1::fmode`), so
 //!   memory, flags and FP are tier-1's bit for bit.
 //! * The decisions (what to write back, trap-free callees, outer loops) are
@@ -18,8 +16,8 @@
 //! Two linkages:
 //!
 //! * [`runtime`]: a run-time translation, one function and the callees it
-//!   brings, installed in the process's function table (merge-plan §9.8.1;
-//!   `gexc run --fjit`, through `gex_xlate::fjit`).
+//!   brings, installed in the process's function table (`gexc run --fjit`,
+//!   through `gex_xlate::fjit`).
 //! * [`build`], the whole-image form: every recovered function of an
 //!   image, spliced into the tier-1 module built from it, which both hosts
 //!   install unchanged (`gexc build --fjit`, `gexc run --fjit-image`).
@@ -38,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 pub use emit::Stats;
 
 /// The function-JIT version of a tier-1 module: `tier1` built from
-/// `blocks` (each with its tier-1 function index), with `functions` (S2's
+/// `blocks` (each with its tier-1 function index), with `functions` (gex-xlate's
 /// recovery, memory form) and their `summaries` emitted and spliced in.
 /// `intrinsics` are the entries tier-1 serves with a host builtin.
 pub fn build(

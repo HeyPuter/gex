@@ -37,8 +37,7 @@ pub fn image_identity(image: &Image) -> String {
 /// the same sources, and each decodes an image as its own guest's code. An
 /// aarch64 gexc run on an i386 DLL wrote a recovery of AArch64 instructions
 /// under the key the x86 gexc reads, and the x86 units built from it hung
-/// Wine's boot (1014b: rpcrt4 recovered as 1619 functions, not 2666;
-/// wineboot went silent after tzres). x86 adds nothing, so its keys, and
+/// Wine's boot. x86 adds nothing, so its keys, and
 /// every cache built with them, stay as they were.
 pub fn recovery_key(image: &Image, recovery_inputs: &str) -> String {
     let mut h = sha256::Sha256::new();
