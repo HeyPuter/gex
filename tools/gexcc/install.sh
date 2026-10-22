@@ -166,6 +166,10 @@ set(CMAKE_SYSROOT "$PREFIX/sysroot")
 # Debian's multiarch directory (usr/lib/wasm32-linux-musl), where its
 # packages' libraries and CMake packages are
 set(CMAKE_LIBRARY_ARCHITECTURE wasm32-linux-musl)
+# Linked with their install run path from the start: CMake's install step
+# rewrites an ELF's run path in place (file(RPATH_CHANGE)), which a wasm
+# module is not (exiv2)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH ON CACHE BOOL "")
 # A Debian package's build (dpkg-buildpackage exports DEB_HOST_ARCH) installs
 # into its own DESTDIR; anything else installs into the sysroot.
 if(NOT DEFINED ENV{DEB_HOST_ARCH})
