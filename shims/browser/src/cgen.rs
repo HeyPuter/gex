@@ -1994,7 +1994,9 @@ extern "C" {
     /// W64: call Wine's direct entry `idx` (a `void(int)`) for a unit's
     /// call to its system or Unix call entry, as the fault hook is called
     /// for the `ud2` there: 1; 0 when this build cannot (the `ud2` then).
-    fn entry_call(idx: i32, ctx: i32) -> i32;
+    /// `sp` is the guest's stack pointer, as the call left it (the hook's
+    /// C frames go below it), read here so the host need not.
+    fn entry_call(idx: i32, ctx: i32, sp: i64) -> i32;
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -2663,7 +2665,7 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
         return None;
     }
     // SAFETY: a host import taking scalars; nothing here holds a lock.
-    if unsafe { entry_call(idx as i32, c as i32) } == 0 {
+    if unsafe { entry_call(idx as i32, c as i32, sp as i64) } == 0 {
         return None;
     }
     // Where the Unix side's own calls left this Worker to resume (a user

@@ -1635,10 +1635,22 @@ export class Gex {
         // `w64_entry`): its C frames below the guest's, then what a hook's
         // return serves (a thread the call made). 0: not here (the
         // single-thread build: a blocking call needs a promising frame).
-        entry_call: (idx, ctx) => {
+        // `sp` (an i64) is the guest's stack pointer, which the shim read:
+        // the hook's frames go below it as `#hookStack` puts them, without
+        // touching the memory here (its buffer and a DataView per call
+        // were most of this glue's cost).
+        entry_call: (idx, ctx, sp) => {
           if (single.on) return 0;
           const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
-          const { spG, cur } = this.#hookStack(ctx >>> 0);
+          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+          const cur = spG.value;
+          if (typeof cur === 'bigint') {
+            const rsp = BigInt.asUintN(64, sp);
+            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+          } else {
+            const esp = Number(sp & 0xffffffffn);
+            spG.value = ((Math.min(Number(cur) >>> 0, esp) - 4096) & ~15) | 0;
+          }
           try {
             f(ctx);
           } finally {
@@ -4177,7 +4189,12 @@ export class Gex {
     const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
     const lowered = (libprov || progLowered || dllLowered) && !m64();
     const w64 = m64() || lowered;
-    if (wasmprog) this.#wasmprogWide = m64() || progLowered;
+    if (wasmprog) {
+      this.#wasmprogWide = m64() || progLowered;
+      // `entry_call` takes the cached global as it is: one of the other
+      // width is made again here, as `#wasmprogStack` would.
+      if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== this.#wasmprogWide) this.#wasmprogSp = null;
+    }
     // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
     // (`wasm:`), not its path: the page keeps those for every process
     // (host.mjs), so a program run again, by any process, is not compiled
