@@ -52,7 +52,30 @@ pub(super) fn is_lowered(wasm: &[u8]) -> bool {
 pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
 /// The program to publish (entry, whether its data is fresh, the table base
 /// it must have: a fork's child's, the parent's).
-static STAGED: Mutex<Option<(u64, bool, Option<u32>)>> = Mutex::new(None);
+type Staged = (u64, bool, Option<u32>);
+/// [`Staged`], boxed, or null: one slot, set by a load, exec or fork and
+/// taken by whichever Worker serves next, with no lock (every syscall's
+/// serve asks: a load of null).
+static STAGED: std::sync::atomic::AtomicPtr<Staged> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn put_staged(v: Option<Staged>) {
+    let p = v.map_or(std::ptr::null_mut(), |s| Box::into_raw(Box::new(s)));
+    let old = STAGED.swap(p, Ordering::AcqRel);
+    if !old.is_null() {
+        // SAFETY: every non-null pointer in the slot came from
+        // `Box::into_raw` above, and the swap made this one ours alone.
+        drop(unsafe { Box::from_raw(old) });
+    }
+}
+
+fn take_staged() -> Option<Staged> {
+    if STAGED.load(Ordering::Acquire).is_null() {
+        return None;
+    }
+    let p = STAGED.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    // SAFETY: as in `put_staged`: ours alone after the swap.
+    (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
+}
 /// This process's program's entry while it is a wasm32 one, for a fork.
 pub(super) static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// And its module's `__table_base`.
@@ -103,14 +126,14 @@ pub(crate) fn is_wasm32(program: &gex_ld::Program) -> bool {
 /// it runs if it is a wasm32 one.
 pub(crate) fn stage(program: Option<&gex_ld::Program>) {
     CURRENT.store(0, Ordering::Relaxed);
-    *lock(&STAGED) = program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true, None));
+    put_staged(program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true, None)));
 }
 
 /// [`stage`] for an exec, which places its program from the files and knows
 /// whether it is a wasm32 one by the placed bytes: its entry if so.
 pub(crate) fn stage_entry(entry: Option<u64>) {
     CURRENT.store(0, Ordering::Relaxed);
-    *lock(&STAGED) = entry.map(|e| (e, true, None));
+    put_staged(entry.map(|e| (e, true, None)));
 }
 
 /// A fork's child of a wasm32 program at `entry`: the same module, over the
@@ -118,7 +141,7 @@ pub(crate) fn stage_entry(entry: Option<u64>) {
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_adopt(entry: u64) {
     if entry != 0 {
-        *lock(&STAGED) = Some((entry, false, None));
+        put_staged(Some((entry, false, None)));
     }
 }
 
@@ -128,7 +151,7 @@ pub extern "C" fn gex_wasmprog_adopt(entry: u64) {
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_adopt_at(entry: u64, base: u32) {
     if entry != 0 {
-        *lock(&STAGED) = Some((entry, false, (base != 0).then_some(base)));
+        put_staged(Some((entry, false, (base != 0).then_some(base))));
     }
 }
 
@@ -147,7 +170,7 @@ pub extern "C" fn gex_wasmprog_entry() -> u64 {
 /// Publish the staged program: its provider module number, or -1.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_serve() -> i32 {
-    let Some((entry, relocate, at)) = lock(&STAGED).take() else { return -1 };
+    let Some((entry, relocate, at)) = take_staged() else { return -1 };
     match publish(entry, relocate, at) {
         Ok(n) => n as i32,
         Err(e) => {
