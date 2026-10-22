@@ -11,6 +11,11 @@
 # once per thread.
 set -eu
 OUT=$(realpath -m "$1")
+# One build of a sysroot at a time: two at once replace each other's
+# compiler-rt archive and binaryen install half way through.
+mkdir -p "$(dirname "$OUT")"
+exec 9>"$OUT.lock"
+flock 9
 HERE=$(dirname "$(realpath "$0")")
 MUSL=$(realpath "${2:-$HERE/../../../musl-wasm}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
