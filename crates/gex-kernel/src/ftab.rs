@@ -19,7 +19,7 @@
 //! Worker's `WebAssembly.Table`. A slot nobody has filled holds the resolve
 //! stub, so a thread behind the log is never wrong, only slower.
 
-use gex_abi::ftab::{RESERVED, RESOLVE};
+use gex_abi::ftab::RESERVED;
 use std::collections::BTreeMap;
 
 /// What made a function: which tier built it, for statistics and for what a
@@ -574,10 +574,10 @@ mod tests {
         let entry = |mem: &[u8]| u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
         fcache_write(&mut mem, high, 7);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), high), 7);
-        assert_eq!(gex_abi::fcache_probe(entry(&mem), t), RESOLVE);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), t), gex_abi::ftab::RESOLVE);
         fcache_write(&mut mem, t, 8);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), t), 8);
-        assert_eq!(gex_abi::fcache_probe(entry(&mem), high), RESOLVE);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), high), gex_abi::ftab::RESOLVE);
         // A Wine image near the top of a 16 GiB memory.
         fcache_write(&mut mem, 0x3_ffdd_1ce4, 9);
         let at = gex_abi::fcache_entry(0x3_ffdd_1ce4) as usize;
