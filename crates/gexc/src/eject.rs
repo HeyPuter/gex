@@ -327,6 +327,16 @@ fn build(dir: &std::path::Path) -> Result<()> {
     for i in &r.images {
         eprintln!("  {:<40} {:>7} blocks {:>7} KiB  {}", i.path, i.blocks, i.bytes / 1024, i.module);
     }
+    let pl = &r.placement;
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    eprintln!(
+        "  placed {} of {} libraries ({:.1} of {:.1} MiB){}",
+        pl.placed,
+        pl.libraries,
+        mib(pl.placed_bytes),
+        mib(pl.library_bytes),
+        if pl.placed < pl.libraries { "; the rest translate in each process" } else { "" }
+    );
     let missing = r.replacements.iter().filter(|x| x.missing).count();
     for x in r.replacements.iter().filter(|x| !x.missing) {
         eprintln!(

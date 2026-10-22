@@ -34,6 +34,8 @@ pub struct BuildReport {
     pub pe: Option<crate::pe::PeReport>,
     /// A W3 page's build.
     pub w3: Option<crate::w3::W3Report>,
+    /// The libraries the placement window holds, of the closure's.
+    pub placement: Placement,
 }
 
 /// Check the project's `rootfs/` is what the eject wrote.
@@ -82,39 +84,106 @@ pub(crate) fn find_object<'a>(placed: &'a [Placed], name: &str) -> Result<&'a Pl
 pub(crate) struct Placed {
     pub(crate) obj: Object,
     pub(crate) image: gex_ld::Image,
+    /// Whether the run pins it there. A library left out of the placement
+    /// window is not: the run loads it wherever and translates it in each
+    /// process, and its `image` is only loaded somewhere to be read.
+    pub(crate) pinned: bool,
+}
+
+/// How much of the closure's libraries the placement window holds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Placement {
+    pub placed: usize,
+    pub placed_bytes: u64,
+    pub libraries: usize,
+    pub library_bytes: u64,
 }
 
 /// Place every object as the run will: executables at `PIE_BASE` (gex's
 /// loader), the interpreter at `INTERP_BASE` (likewise), and libraries up
 /// from `MMAP_BOTTOM` in the session's order, each at a base the run pins
 /// with `RunOptions::pins`. The same rule as `gexc build --closure`.
-pub(crate) fn layout(dir: &Path, project: &Project) -> Result<Vec<Placed>> {
+///
+/// When the libraries do not all fit below `PLACE_TOP`, the window takes
+/// the hottest that fit (by the blocks `profile` says each ran, then the
+/// session's order) and the rest are left unpinned.
+pub(crate) fn layout(
+    dir: &Path,
+    project: &Project,
+    profile: Option<&gex_xlate::profile::Profile>,
+) -> Result<(Vec<Placed>, Placement)> {
     const SLACK: u64 = 0x10000;
-    let mut next = gex_abi::MMAP_BOTTOM;
-    let mut out = Vec::new();
+    let round = |n: u64| (n + SLACK - 1) & !(SLACK - 1);
+    let mut loaded = Vec::new();
     for o in &project.objects {
         let p = dir.join(rootfs_rel(&o.path)?);
         let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-        let load = |base: u64| gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path));
-        let image = match o.role.as_str() {
-            "exe" => load(gex_abi::PIE_BASE)?,
-            "interp" => load(gex_abi::INTERP_BASE)?,
-            "library" => {
-                // Measured by loading it once at the bottom (not at zero,
-                // which gex-ld refuses as the runtime's region).
-                let span = load(gex_abi::MMAP_BOTTOM)?.brk - gex_abi::MMAP_BOTTOM;
-                let base = (next + SLACK - 1) & !(SLACK - 1);
-                next = base + ((span + SLACK - 1) & !(SLACK - 1)) + SLACK;
-                if next > gex_abi::PLACE_TOP {
-                    bail!("the closure does not fit below {:#x}", gex_abi::PLACE_TOP);
-                }
-                load(base)?
-            }
+        let base = match o.role.as_str() {
+            "exe" => gex_abi::PIE_BASE,
+            "interp" => gex_abi::INTERP_BASE,
+            // Measured by loading it once at the bottom (not at zero, which
+            // gex-ld refuses as the runtime's region).
+            "library" => gex_abi::MMAP_BOTTOM,
             r => bail!("{}: unknown object role {r:?}", o.path),
         };
-        out.push(Placed { obj: o.clone(), image });
+        let image = gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path))?;
+        loaded.push((o, bytes, image));
     }
-    Ok(out)
+    // Each library's share of the window: its span and the slack after it.
+    let share = |image: &gex_ld::Image| round(image.brk - gex_abi::MMAP_BOTTOM) + SLACK;
+    let libs: Vec<usize> = (0..loaded.len()).filter(|&i| loaded[i].0.role == "library").collect();
+    let window = gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM;
+    let total: u64 = libs.iter().map(|&i| share(&loaded[i].2)).sum();
+    let heat = |i: usize| -> u64 {
+        profile
+            .and_then(|pr| pr.objects.get(&loaded[i].0.id))
+            .map_or(0, |op| op.blocks.values().map(|b| b.n).sum())
+    };
+    let fits = fit_window(
+        &libs.iter().map(|&i| (share(&loaded[i].2), heat(i))).collect::<Vec<_>>(),
+        window,
+    );
+    let mut pinned = vec![true; loaded.len()];
+    for (k, &i) in libs.iter().enumerate() {
+        pinned[i] = fits[k];
+    }
+    let mut placement = Placement { libraries: libs.len(), library_bytes: total, ..Placement::default() };
+    let mut next = gex_abi::MMAP_BOTTOM;
+    let mut out = Vec::new();
+    for (i, (o, bytes, image)) in loaded.into_iter().enumerate() {
+        let image = if o.role == "library" && pinned[i] {
+            let base = round(next);
+            next = base + share(&image);
+            placement.placed += 1;
+            placement.placed_bytes += share(&image);
+            gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path))?
+        } else {
+            image
+        };
+        out.push(Placed { obj: o.clone(), image, pinned: pinned[i] });
+    }
+    Ok((out, placement))
+}
+
+/// Which libraries, given as (window share, blocks run) in the session's
+/// order, the window holds: all when they fit, else the hottest that fit
+/// (a tie by the session's order), each one that would overflow skipped for
+/// the next.
+fn fit_window(libs: &[(u64, u64)], window: u64) -> Vec<bool> {
+    if libs.iter().map(|l| l.0).sum::<u64>() <= window {
+        return vec![true; libs.len()];
+    }
+    let mut by_heat: Vec<usize> = (0..libs.len()).collect();
+    by_heat.sort_by_key(|&i| (std::cmp::Reverse(libs[i].1), i));
+    let mut fits = vec![false; libs.len()];
+    let mut used = 0;
+    for i in by_heat {
+        if used + libs[i].0 <= window {
+            used += libs[i].0;
+            fits[i] = true;
+        }
+    }
+    fits
 }
 
 /// The bytes of an image at `[addr, addr + len)`, if they are all loaded.
@@ -209,9 +278,12 @@ fn bind_replacements(
             if want.is_some() {
                 bail!("{what}: a \"sha256\" needs the \"object\" it is the hash of");
             }
-            placed.iter().collect()
+            placed.iter().filter(|p| p.pinned).collect()
         } else {
             let p = find_object(placed, object).with_context(|| what.clone())?;
+            if !p.pinned {
+                bail!("{what}: {} is not in the placement window (the closure's hottest libraries are), so nothing translates it ahead of time", p.obj.path);
+            }
             if let Some(want) = want {
                 if *want != p.obj.id {
                     bail!(
@@ -343,7 +415,7 @@ fn bind_replacements(
 /// its bytes' hash filled in. `what` is a symbol or a `0x` link-time offset.
 pub fn describe(dir: &Path, object: &str, what: &str, size: Option<u64>) -> Result<String> {
     let project = Project::load(dir)?;
-    let placed = layout(dir, &project)?;
+    let (placed, _) = layout(dir, &project, None)?;
     let p = find_object(&placed, object)?;
     let name = p.obj.path.rsplit('/').next().unwrap_or(&p.obj.path).to_string();
     let (kv, addr, size) = if let Some(h) = what.strip_prefix("0x") {
@@ -434,7 +506,8 @@ impl Translation<'_> {
             .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
             .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
         let mut order: Vec<usize> = vec![main];
-        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe"));
+        // (a library the window left out is translated by the run, in each process)
+        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe" && self.placed[i].pinned));
         let others: Vec<usize> = (0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role == "exe").collect();
         let main_identity = gex_native::aot::image_identity(&self.placed[main].image);
 
@@ -565,7 +638,17 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         Err(e) => return Err(anyhow!("reading session/profile.json: {e}")),
     };
 
-    let placed = layout(dir, &project)?;
+    let (placed, placement) = layout(dir, &project, profile.as_ref())?;
+    if placement.placed < placement.libraries && !config.jit_fallback {
+        bail!(
+            "the closure's {} libraries ({} MiB) do not fit the {} MiB placement window, which takes \
+             the {} hottest; the rest are translated as they run, so set \"jit_fallback\": true in {CONFIG_FILE}",
+            placement.libraries,
+            placement.library_bytes >> 20,
+            (gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM) >> 20,
+            placement.placed
+        );
+    }
     let (replacements, replaced) = bind_replacements(dir, &placed, &config)?;
 
     let out = dir.join("build");
@@ -582,7 +665,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     // over the whole closure since a call resolves to another object's
     // definition, as a closure build and the runtime translator use them.
     let mut intrinsics: HashMap<u64, Intrinsic> = HashMap::new();
-    for p in &placed {
+    for p in placed.iter().filter(|p| p.pinned) {
         // Not for 32-bit (i386) objects: the intrinsic block reads the 64-bit
         // register arguments and pops an 8-byte return address, and i386
         // cdecl passes them on the stack.
@@ -603,7 +686,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     // Then the user's replacements over them.
     intrinsics.extend(replaced);
 
-    let mut report = BuildReport::default();
+    let mut report = BuildReport { placement, ..BuildReport::default() };
     let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
     let (images, pins, illegal) = t.translate("build/modules", false)?;
     report.images = images;
@@ -637,7 +720,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                 let (images, _, _) = t.translate("build/web", true)?;
                 let spans: Vec<(String, u64, u64)> = placed
                     .iter()
-                    .filter(|p| p.obj.role == "library")
+                    .filter(|p| p.obj.role == "library" && p.pinned)
                     .map(|p| (p.obj.path.clone(), p.image.bias, p.image.brk - p.image.bias))
                     .collect();
                 let allowed = crate::run::allowed_syscalls(dir, &config)?;
@@ -662,3 +745,19 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::fit_window;
+
+    #[test]
+    fn the_window_takes_the_hottest_libraries_that_fit() {
+        // all fit: all placed, whatever ran
+        assert_eq!(fit_window(&[(4, 0), (4, 9)], 8), vec![true, true]);
+        // the hottest first; one that would overflow is skipped for a smaller one
+        assert_eq!(fit_window(&[(4, 1), (6, 9), (3, 5), (2, 0)], 10), vec![false, true, true, false]);
+        assert_eq!(fit_window(&[(4, 1), (6, 9), (5, 5), (4, 0)], 10), vec![true, true, false, false]);
+        // no profile: the session's order
+        assert_eq!(fit_window(&[(4, 0), (4, 0), (4, 0)], 8), vec![true, true, false]);
+    }
+}

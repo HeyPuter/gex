@@ -68,7 +68,7 @@ pub fn decompile(dir: &Path, object: &str, what: &str, size: Option<u64>, callee
     if project.isa != gex_abi::ARCH_NAME {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);
     }
-    let placed = layout(dir, &project)?;
+    let (placed, _) = layout(dir, &project, None)?;
     let p: &Placed = find_object(&placed, object)?;
     if p.image.class32 {
         bail!("{} is 32-bit (i386) code, which the function tier does not take yet", p.obj.path);
