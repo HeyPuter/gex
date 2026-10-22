@@ -1632,8 +1632,9 @@ export class Gex {
         ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
         // W64: a unit's call to Wine's system or Unix call entry, run by
         // Wine's direct entry as the fault hook runs the `ud2` (cgen.rs
-        // `w64_entry`): its C frames below the guest's, then what a hook's
-        // return serves (a thread the call made). 0: not here (the
+        // `w64_entry`): its C frames below the guest's, then the units a
+        // hook's return serves (a thread the call made: `thread_start`,
+        // below, which the shim calls). 0: not here (the
         // single-thread build: a blocking call needs a promising frame).
         // `sp` (an i64) is the guest's stack pointer, which the shim read:
         // the hook's frames go below it as `#hookStack` puts them, without
@@ -1657,9 +1658,11 @@ export class Gex {
             spG.value = cur;
           }
           this.#cgenServe();
-          this.#startThread();
           return 1;
         },
+        // A thread a direct entry's call staged (cgen.rs `w64_entry` asks
+        // only when there is one).
+        thread_start: () => this.#startThread(),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).

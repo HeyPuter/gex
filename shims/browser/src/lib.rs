@@ -9847,6 +9847,12 @@ static THREAD: [std::sync::atomic::AtomicU64; 3] =
 /// `THREAD[0]` while a stage writes the other two words (`stage_thread`).
 const STAGING: u64 = u64::MAX;
 
+/// Whether a thread is staged for the host (`gex_thread_pending` to claim):
+/// a look, for the shim to call the host's start only then.
+pub(crate) fn thread_staged() -> bool {
+    THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
 // A thread is a Worker. There is no second shape.
 //
 // There used to be a `THREAD_WORKERS` switch and, behind it, a scheduler that

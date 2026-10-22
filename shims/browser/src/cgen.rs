@@ -1997,6 +1997,9 @@ extern "C" {
     /// `sp` is the guest's stack pointer, as the call left it (the hook's
     /// C frames go below it), read here so the host need not.
     fn entry_call(idx: i32, ctx: i32, sp: i64) -> i32;
+    /// Start the thread the call staged (`#startThread`), after
+    /// `entry_call`: called only when one is staged.
+    fn thread_start();
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -2667,6 +2670,12 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     // SAFETY: a host import taking scalars; nothing here holds a lock.
     if unsafe { entry_call(idx as i32, c as i32, sp as i64) } == 0 {
         return None;
+    }
+    // A thread the call made (NtCreateThreadEx's clone): started as the
+    // fault hook's return would, before anything below may trap out.
+    if crate::thread_staged() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { thread_start() };
     }
     // Where the Unix side's own calls left this Worker to resume (a user
     // callback's loop, a wait): the call's return is in the context, as the
