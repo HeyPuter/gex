@@ -11,6 +11,8 @@
 //   GEX_LOG=debug        the narration (Worker hand-offs, fork costs, the shim's lines)
 //   GEX_LOG=record       the `[gex-record]` lines (tools/eject/record-w3.mjs)
 //   GEX_LOG=unit         a line per function-tier unit placed in a process
+//   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
+//                        (only when named: it puts a call on every such entry)
 //   GEX_LOG=a,b          several of those
 //   GEX_LOG=off          not even the default lines (tests that compare a
 //                        program's output with its native run)
@@ -46,6 +48,12 @@ export function logOn(what) {
   if (v === '1' || v === 'all') return true;
   const kinds = v.split(',');
   return what === undefined ? kinds.length > 0 : kinds.includes(what);
+}
+
+/** Whether kind `what` is named outright (not just on through `1`/`all`). */
+export function logNamed(what) {
+  const v = value();
+  return v !== null && v.split(',').includes(what);
 }
 
 /** Set from a Worker's start message (`extra.log`): a browser Worker sees
