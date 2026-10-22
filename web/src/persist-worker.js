@@ -43,7 +43,8 @@ function putPath(p) {
 function meta(path) {
   const n = putPath(path);
   const at = SCRATCH + ((n + 15) & ~15);
-  ensure(at - SCRATCH + 64);
+  // What k_fs_path_meta writes: the kernel's `remote::META_BYTES`.
+  ensure(at - SCRATCH + 72);
   if (k.k_fs_path_meta(BigInt(SCRATCH), n, BigInt(at)) < 0) return null;
   const v = new DataView(mem.buffer, at, 36);
   return {
