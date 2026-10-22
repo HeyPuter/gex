@@ -328,7 +328,7 @@ if ! grep -q gexasio.so "$wine" || [ ! -e "$dist/lib/wine/x86_64-windows/gexasio
 	case " ${CASES:-asio} " in *" asio "*)
 		echo "skip x64/asio ($tag): no gexasio in this dist (Wine's dlls/gexasio)" ;; esac
 elif x86_64-w64-mingw32-gcc -O1 -o "$w/asiohost.exe" "$here/asiohost.c" -lole32 -ladvapi32; then
-	rt=; [ -n "$page" ] && rt="${nl}asio rt frames [0-9 ]+\\([0-9]+\\) ms [0-9.]+"
+	rt=; [ -n "$page" ] && rt="${nl}asio rt frames [0-9 ]+\\([0-9]+ of [0-9]+\\) ms [0-9.]+"
 	inputs='[02]'
 	# (beside the program: the prefix predates the DLL, and Wine loads a
 	# builtin only through its file in the prefix, as wineboot installs it)
