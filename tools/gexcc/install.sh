@@ -122,10 +122,16 @@ unset PKG_CONFIG_PATH
 st=; case \${GEXCC_SHARED:-0} in 0) st=--static ;; esac
 # A variable naming a directory the sysroot does not have is where the
 # package installs to (udev's udevdir: /usr/lib/udev), not a place to read
-# from (wayland-protocols' pkgdatadir): the target's path, unprefixed.
+# from (wayland-protocols' pkgdatadir): the target's path, unprefixed. So is
+# every variable of a package whose .pc only says where others install
+# (bash-completion's completionsdir, which the sysroot has once a package
+# put a completion there; systemd's unit directories; udev's).
 case " \$* " in
 *" --variable"*)
     v=\$(pkg-config \$st "\$@") || exit
+    case " \$* " in
+    *" bash-completion "*|*" systemd "*|*" udev "*) v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
+    esac
     case \$v in
     "\$PKG_CONFIG_SYSROOT_DIR"/*) [ -e "\$v" ] || v=\${v#"\$PKG_CONFIG_SYSROOT_DIR"} ;;
     esac
