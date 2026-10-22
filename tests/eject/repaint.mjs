@@ -11,7 +11,7 @@
 // Checks: unchanged damage draws no frame and uploads nothing; changed
 // damage draws at most one frame per commit and at least one per two, and
 // an upload carries the rectangle's pixels (8x400x4 bytes), not the
-// buffer's rows across it. Prints PASS/FAIL lines and "ok eject-repaint" or
+// buffer's rows across it; the still output reads back. Prints PASS/FAIL lines and "ok eject-repaint" or
 // "FAIL eject-repaint".
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -113,4 +113,10 @@ check(same.n === 0 && same.same >= ROUNDS / 2, `unchanged damage uploads nothing
 check(change.frames >= ROUNDS / 2 && change.frames <= ROUNDS, `changed damage draws one frame a commit at most, one per two at least: ${change.frames} in ${ROUNDS}`);
 check(change.n > change.full && change.bytes - change.fullBytes <= (change.n - change.full) * RECT,
   `an upload carries the rectangle, not the rows: ${change.bytes - change.fullBytes} bytes in ${change.n - change.full} uploads (the rectangle is ${RECT}; ${change.full} whole-buffer uploads apart)`);
+// The output can be read on a still screen: on a WebGPU canvas, drawn
+// straight into the canvas's texture, the first read draws the scene again
+// for itself.
+const px = await ev('globalThis.__gexCompositor.describe().then((d) => ({ lit: d.lit, hash: d.hash }))').catch((e) => ({ err: e.message }));
+const px2 = await ev('globalThis.__gexCompositor.describe().then((d) => ({ lit: d.lit, hash: d.hash }))').catch((e) => ({ err: e.message }));
+check(px.lit > 0 && px2.lit === px.lit && px2.hash === px.hash, `the still output reads back, the same twice: ${JSON.stringify(px)} ${JSON.stringify(px2)}`);
 done();

@@ -138,7 +138,7 @@ function gpuTexture(device, w, h) {
 
 /**
  * How the scene reaches the output canvas: 'canvas' (a WebGPU canvas
- * context, the scene copied into it) or 'readback' (read back into a 2D
+ * context, the scene drawn into its texture) or 'readback' (read back into a 2D
  * canvas).
  *
  * Readback is for software WebGPU (SwiftShader, the fallback adapter), which is
@@ -208,6 +208,7 @@ class Painter {
     device.queue.writeTexture({ texture: this.white }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1]);
     this.groups = new WeakMap();
     this.scene = null;
+    this.keep = false;
   }
 
   #group(tex, nearest) {
@@ -228,22 +229,31 @@ class Painter {
   }
 
   begin(w, h) {
-    // The scene is drawn into a texture of its own and copied to the canvas:
-    // `describe` can read it back after the canvas texture has been presented.
-    if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
-      this.scene?.destroy();
-      this.scene = this.device.createTexture({
-        size: [w, h],
-        format: this.format,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-      });
+    // A WebGPU canvas is drawn straight into, in one pass: its texture is
+    // written by nothing else. Once a read has asked for the output (a
+    // harness, `describe`), the scene is drawn into a texture of its own and
+    // copied to the canvas, so it can be read back after the canvas texture
+    // has been presented.
+    let target;
+    if (this.context && !this.keep) {
+      target = this.context.getCurrentTexture();
+    } else {
+      if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
+        this.scene?.destroy();
+        this.scene = this.device.createTexture({
+          size: [w, h],
+          format: this.format,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+      }
+      target = this.scene;
     }
     this.w = w;
     this.h = h;
     this.n = 0;
     this.encoder = this.device.createCommandEncoder();
     this.pass = this.encoder.beginRenderPass({
-      colorAttachments: [{ view: this.scene.createView(), loadOp: 'clear', storeOp: 'store',
+      colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store',
         clearValue: { r: COL.desktop[0], g: COL.desktop[1], b: COL.desktop[2], a: 1 } }],
     });
     this.pass.setPipeline(this.pipeline);
@@ -281,7 +291,7 @@ class Painter {
   end() {
     this.pass.end();
     if (this.n) this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
-    if (this.context) {
+    if (this.context && this.keep) {
       const out = this.context.getCurrentTexture();
       this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
     }
@@ -289,6 +299,29 @@ class Painter {
     this.pass = null;
     this.encoder = null;
     if (this.ctx2d) this.#show();
+    const waiting = this.#drawn;
+    this.#drawn = [];
+    for (const f of waiting) f();
+  }
+
+  /* Who waits for the next scene drawn (`sceneFor`). */
+  #drawn = [];
+
+  /** Whether `read` has a scene to read: false the first time a WebGPU
+   *  canvas's output is asked for, when from the next frame on the scene is
+   *  kept (`begin`), and `drawn` resolves once one has been. */
+  sceneFor() {
+    if (!this.context || this.keep) return true;
+    this.keep = true;
+    return false;
+  }
+
+  /** Resolves when the next scene has been drawn, or after `ms`. */
+  drawn(ms) {
+    return new Promise((res) => {
+      const t = setTimeout(res, ms);
+      this.#drawn.push(() => { clearTimeout(t); res(); });
+    });
   }
 
   /** Direct present: `tex` (a GL frame) is the whole output, `w` x `h`, drawn
@@ -1669,10 +1702,20 @@ class Compositor {
       win.surface);
   }
 
+  /* The scene, drawn again first when the output has not been kept as one
+   * (`Painter.sceneFor`): a still screen draws no frame of its own. */
+  async #read() {
+    if (!this.#painter.sceneFor()) {
+      this.#lastSig = null;
+      await this.#painter.drawn(1000);
+    }
+    return this.#painter.read();
+  }
+
   /** The output as it was last composited: `{ w, h, px }` (RGBA, top row first). */
   async readout() {
     try {
-      return await this.#painter.read();
+      return await this.#read();
     } catch (e) {
       // Said, so a harness that gets null can tell why (`describe().log`).
       this.#note(`readout failed: ${e?.message ?? e}`);
@@ -1699,7 +1742,7 @@ class Compositor {
     // pixels of a button going darker.
     let hash = pixels ? 2166136261 : null;
     if (pixels) try {
-      const r = await this.#painter.read();
+      const r = await this.#read();
       const px = r?.px ?? new Uint8Array(0);
       // Above the desktop's own colour, so the background does not count as
       // something drawn.
