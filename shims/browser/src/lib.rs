@@ -8686,6 +8686,13 @@ fn clock_syscall(ctx: i32) -> bool {
     let mut gm = GuestMem::new(guest_bytes());
     let started = CLOCK_STARTED.load(Acquire) as u128;
     let at = ctx as u32 as u64;
+    // The census's number, read before the call: x86-64's number slot is
+    // `rax`, which the result overwrites (0 read as `read`).
+    let census_nr = if unsafe { HEARTBEAT } != 0 && abi != 1 {
+        gex_kernel::syscalls::call_regs(&gm, at, false).canonical(false)
+    } else {
+        0
+    };
     if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started)
         && !ident_syscall(&mut gm, at, abi == 1)
     {
@@ -8699,11 +8706,10 @@ fn clock_syscall(ctx: i32) -> bool {
     }
     // The heartbeat's census counts these too, with their callers, by
     // canonical number as the full path counts (the raw slot holds x86-64's
-    // own: 228, not `clock_gettime`). Not i386's: `x0` is the result by now.
+    // own: 228, not `clock_gettime`). Not i386's.
     if unsafe { HEARTBEAT } != 0 && abi != 1 {
-        let nr = gex_kernel::syscalls::call_regs(&gm, at, false).canonical(false);
-        count_syscall(nr, 0, 0);
-        callers::note(nr, at, cgen::sp_index());
+        count_syscall(census_nr, 0, 0);
+        callers::note(census_nr, at, cgen::sp_index());
     }
     // A provider's collection running: park here, as the full path does on
     // its way back to guest code.
