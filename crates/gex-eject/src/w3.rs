@@ -86,7 +86,7 @@ pub struct W3Summary {
 fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<String>> {
     use gex_cgen::provider;
     let tar = crate::reach::Tar::parse(bundle)?;
-    let file = |p: &provider::Provider| format!("providers/{}-{}.wasm", p.name, provider::fingerprint(std::slice::from_ref(p)));
+    let file = provider_file;
     let mut out = std::collections::BTreeSet::new();
     let mut class32 = false;
     for (_, path) in units {
@@ -110,6 +110,58 @@ fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<Strin
         out.extend(provider::for_dll(provider::TRAMPOLINES_DLL, true).iter().filter(|p| !p.binds.is_empty()).map(file));
     }
     Ok(out.into_iter().collect())
+}
+
+/// Whether any of `units` (key, guest path) is a 32-bit image in `bundle`.
+fn class32(bundle: &[u8], units: &[(String, String)]) -> Result<bool> {
+    let tar = crate::reach::Tar::parse(bundle)?;
+    Ok(units.iter().any(|(_, path)| tar.read(path).and_then(|d| gex_ld::pe::parse(d).ok()).is_some_and(|pe| !pe.is64)))
+}
+
+/// The guest path a project names the NT trampoline page's unit by.
+pub(crate) const TRAMPOLINES_PATH: &str = "[nt trampolines]";
+
+/// The keys a W3 page may ask for the 32-bit NT trampoline page's unit by:
+/// W3's KUSER fold on (`gexc cgen-image --w3-kuser --nt-trampolines32`),
+/// guarded or not (see `rsrc::FLAVORS`).
+fn trampoline_keys() -> [String; 2] {
+    let (image, _) = gex_kernel::nt::boot::trampoline_input(true);
+    [false, true].map(|unguarded| crate::rsrc::key_with(&image, (unguarded, true)))
+}
+
+/// Adds the trampoline page's unit to `units`, each of its keys a cache in
+/// `caches` holds and `units` does not name yet; none in any cache fails
+/// the eject, with the command that builds it.
+fn add_trampolines(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> Result<()> {
+    let keys = trampoline_keys();
+    let held = |k: &str| caches.iter().any(|c| c.join(k).join("c.wasm").is_file() && c.join(k).join("c.entries").is_file());
+    let found: Vec<&String> = keys.iter().filter(|k| held(k)).collect();
+    if found.is_empty() {
+        bail!(
+            "no unit of the NT trampolines ({}) in the unit cache ({}): build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --w3-kuser --nt-trampolines32",
+            keys.join(" or "),
+            caches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":")
+        );
+    }
+    for k in found {
+        if !units.iter().any(|(u, _)| u == k) {
+            units.push((k.clone(), TRAMPOLINES_PATH.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// A provider module's file in a unit cache, as a W3 page asks for it. The
+/// page runs with W3's KUSER_SHARED_DATA fold on (`gexc cgen-image
+/// --w3-kuser`), and a provider's fingerprint hashes the C header, which has
+/// the fold's helpers only then; the fold is set for the call and put back,
+/// as `rsrc.rs` `abi_hash` does.
+fn provider_file(p: &gex_cgen::provider::Provider) -> String {
+    let was = gex_abi::kuser_fold();
+    gex_abi::set_kuser_fold(true);
+    let f = gex_cgen::provider::fingerprint(std::slice::from_ref(p));
+    gex_abi::set_kuser_fold(was);
+    format!("providers/{}-{f}.wasm", p.name)
 }
 
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
@@ -140,12 +192,19 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
     let bundle = json::opt_str(&v, "bundle").ok_or_else(|| {
         anyhow!("{what}: no \"bundle\": record with --bundle PATH, the tar the page fetched")
     })?;
-    let units: Vec<(String, String)> = list(&v, "units")
+    let mut units: Vec<(String, String)> = list(&v, "units")
         .iter()
         .map(|u| Ok((json::str_field(u, "key", what)?, json::str_field(u, "path", what)?)))
         .collect::<Result<_>>()?;
     if units.iter().any(|(k, _)| k.len() != 64 || !k.bytes().all(|c| c.is_ascii_hexdigit())) {
         bail!("{what}: a unit key that is not 64 hex digits");
+    }
+    let bundle_bytes = std::fs::read(&bundle).with_context(|| format!("reading the bundle {bundle}"))?;
+    // The NT trampoline page's unit, which is no image's and so in no
+    // recording's units: a 32-bit program's system calls go through it, and
+    // an AOT-only page has no other code for them.
+    if class32(&bundle_bytes, &units)? {
+        add_trampolines(&mut units, &o.unit_cache)?;
     }
     for f in RUNTIME_WASM {
         if !o.web_src.join("public/gex").join(f).is_file() {
@@ -188,7 +247,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
     // The provider modules the units bind (as the page picks them, cgen.rs
     // `unit_key`), and the trampolines' for a 32-bit program: an AOT-only
     // page has no other code for them.
-    for file in provider_files(&std::fs::read(&bundle).with_context(|| format!("reading the bundle {bundle}"))?, &units)? {
+    for file in provider_files(&bundle_bytes, &units)? {
         let src = o.unit_cache.iter().map(|c| c.join(&file)).find(|p| p.is_file());
         let Some(src) = src else {
             bail!("no provider module {file} in the unit cache ({}): build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers",
@@ -219,12 +278,14 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         // Each with `at`, when the recording first used it (seconds; none
         // from an older recorder): a unit first used after the title is
         // compiled when a process maps it (web/eject-site.mjs, `demand`).
-        ("units", Json::Arr(list(&v, "units").iter().zip(&units).map(|(u, (k, p))| {
+        // Those added here (the trampolines') have no recorded entry.
+        ("units", Json::Arr(units.iter().enumerate().map(|(i, (k, p))| {
             let mut kv = vec![("key", s(k)), ("path", s(p))];
-            if let Some(at) = u.get("at").filter(|a| matches!(a, Json::Num(_))) {
+            let u = list(&v, "units").get(i);
+            if let Some(at) = u.and_then(|u| u.get("at")).filter(|a| matches!(a, Json::Num(_))) {
                 kv.push(("at", at.clone()));
             }
-            if let Some(b) = u.get("base").filter(|b| matches!(b, Json::Str(_))) {
+            if let Some(b) = u.and_then(|u| u.get("base")).filter(|b| matches!(b, Json::Str(_))) {
                 kv.push(("base", b.clone()));
             }
             obj(kv)
@@ -1056,6 +1117,9 @@ pub fn build(dir: &Path) -> Result<W3Report> {
 mod tests {
     use super::*;
 
+    /// The tests that set the process's KUSER fold, one at a time.
+    static FOLD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn config(features: &str, cold: Option<&str>) -> Config {
         let dir = std::env::temp_dir().join(format!("gex-eject-wine32-aot-{}-{}", std::process::id(), features.len() + cold.map_or(0, |c| c.len() * 7)));
         std::fs::create_dir_all(dir.join("user")).unwrap();
@@ -1104,6 +1168,61 @@ mod tests {
         assert_eq!(std::fs::read_to_string(web.join("units/regions/new/c.wasm")).unwrap(), "old");
         assert!(web.join("units/regions/kept/c.entries").is_file());
         assert!(!web.join("units/regions/old").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The trampolines' provider is an x86 guest's (`--features x86`, as gexc's).
+    #[cfg(feature = "x86")]
+    #[test]
+    fn provider_files_name_the_w3_kuser_build() {
+        use gex_cgen::provider;
+        let _fold = FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let was = gex_abi::kuser_fold();
+        let ps = provider::for_dll(provider::TRAMPOLINES_DLL, true);
+        let p = ps.iter().find(|p| !p.binds.is_empty()).expect("the trampolines have a provider");
+        let fp = |on: bool| {
+            gex_abi::set_kuser_fold(on);
+            let f = provider::fingerprint(std::slice::from_ref(p));
+            gex_abi::set_kuser_fold(was);
+            f
+        };
+        let (on, off) = (fp(true), fp(false));
+        assert_ne!(on, off, "the fold changes the provider's header");
+        // The fold-on name (what `cgen-image --w3-kuser --providers` builds and
+        // the page asks for), whatever the caller's fold, which is put back.
+        for caller in [false, true] {
+            gex_abi::set_kuser_fold(caller);
+            assert_eq!(provider_file(p), format!("providers/{}-{on}.wasm", p.name));
+            assert_eq!(gex_abi::kuser_fold(), caller);
+        }
+        gex_abi::set_kuser_fold(was);
+    }
+
+    #[test]
+    fn a_w3_eject_ships_the_w3_kuser_trampoline_unit() {
+        let _fold = FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("gex-w3-tramp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let was = gex_abi::kuser_fold();
+        let keys = trampoline_keys();
+        // The fold-on keys, not this process's flavor: a gexc eject runs with the fold off.
+        let (image, _) = gex_kernel::nt::boot::trampoline_input(true);
+        assert!(!keys.contains(&crate::rsrc::key_with(&image, (false, false))));
+        assert!(keys.iter().all(|k| k.len() == 64));
+        assert_eq!(gex_abi::kuser_fold(), was);
+        let mut units = vec![("a".repeat(64), "/w3/lib/wine/i386-windows/ntdll.dll".to_string())];
+        // None in the cache: the eject fails, naming the build.
+        let e = add_trampolines(&mut units, &[dir.clone()]).unwrap_err().to_string();
+        assert!(e.contains("--w3-kuser --nt-trampolines32"), "{e}");
+        // One in the cache: added once, by its key.
+        std::fs::create_dir_all(dir.join(&keys[0])).unwrap();
+        for f in ["c.wasm", "c.entries"] {
+            std::fs::write(dir.join(&keys[0]).join(f), f).unwrap();
+        }
+        add_trampolines(&mut units, &[dir.clone()]).unwrap();
+        add_trampolines(&mut units, &[dir.clone()]).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[1], (keys[0].clone(), TRAMPOLINES_PATH.to_string()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
