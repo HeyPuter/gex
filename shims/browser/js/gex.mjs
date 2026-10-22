@@ -5814,7 +5814,7 @@ export class Gex {
       return;
     }
     this.#cgenProviders(u);
-    if (logOn('unit')) console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (logOn('unit')) console.error(`gex-nt: pid ${e.gex_my_pid?.() ?? '?'}: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
   }
 

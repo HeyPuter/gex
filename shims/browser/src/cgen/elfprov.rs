@@ -238,6 +238,8 @@ pub extern "C" fn gex_elfprov_wanted() -> i32 {
     if let Some(u) = super::libprov::rescan_if_new() {
         queue(|q| q.push_back(u));
     }
+    // Listed objects' units (served by `gex_cgen_wanted`, which JS asks next).
+    super::libprov::elf_rescan_if_new();
     queue(|q| q.pop_front()).map_or(-1, |u| u as i32)
 }
 

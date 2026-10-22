@@ -1005,12 +1005,36 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
     None
 }
 
+/// The process [`ELF_PLACED`] is for: a forked child's shim starts with
+/// none of it, or its parent's copy, while its table has none of the units.
+static ELF_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Before a Worker's guest first runs (`gex_elfprov_wanted`): in a forked
+/// child, the listed objects it inherited want their units again. Returns
+/// whether one is now wanted.
+pub(crate) fn elf_rescan_if_new() -> bool {
+    // A vfork child runs in its parent's memory, with its parent's table.
+    if crate::vfork::active() || lock(&ELF_UNITS).is_empty() {
+        return false;
+    }
+    let pid = crate::my_pid();
+    let was = ELF_PID.swap(pid, Ordering::AcqRel);
+    if was == pid {
+        return false;
+    }
+    lock(&ELF_PLACED).clear();
+    elf_unit_maps(&crate::sigs::proc_home().code_maps())
+}
+
 /// After a syscall that mapped code: want the unit of each listed object.
 /// Returns whether one is now wanted.
 pub(crate) fn elf_unit_maps(mapped: &[gex_kernel::CodeMap]) -> bool {
     let list = lock(&ELF_UNITS).clone();
     if list.is_empty() || !super::on() {
         return false;
+    }
+    if ELF_PID.load(Ordering::Acquire) == 0 {
+        ELF_PID.store(crate::my_pid(), Ordering::Release);
     }
     let mut any = false;
     for m in mapped {
