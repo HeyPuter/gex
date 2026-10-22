@@ -8697,6 +8697,13 @@ fn clock_syscall(ctx: i32) -> bool {
         let ret = gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0);
         trace_line(&format!("[sys] {nr} (no kernel lock) = {ret:#x}\n"));
     }
+    // The heartbeat's census counts these too, with their callers (the
+    // number as the call left it: `x0` is the result by now on i386).
+    if unsafe { HEARTBEAT } != 0 && abi != 1 {
+        let nr = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(0);
+        count_syscall(nr, 0, 0);
+        callers::note(nr, at, cgen::sp_index());
+    }
     // A provider's collection running: park here, as the full path does on
     // its way back to guest code.
     if cgen::libprov::stop_active() {

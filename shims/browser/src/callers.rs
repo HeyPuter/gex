@@ -4,7 +4,7 @@
 //! executable file mapping that is not Wine's own (`/w64/`, `/w3/`, `wine`),
 //! else the first inside any: the return address into whatever called the
 //! API that ended in this call. Printed with the heartbeat's census as the
-//! file's name and the offset from its lowest mapping (an image's RVA).
+//! file's name, its lowest mapping (an image's base) and the offset from it.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -87,7 +87,7 @@ pub(crate) fn report(nrs: &[usize]) {
         match find(&maps, w) {
             Some(m) => {
                 let base = maps.iter().filter(|x| x.path == m.path).map(|x| x.start).min().unwrap_or(m.start);
-                format!("{}+{:#x}", m.path.rsplit('/').next().unwrap_or(&m.path), w - base)
+                format!("{}@{base:#x}+{:#x}", m.path.rsplit('/').next().unwrap_or(&m.path), w - base)
             }
             None => format!("{w:#x}"),
         }
