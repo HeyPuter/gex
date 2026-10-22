@@ -1,5 +1,5 @@
 // The single-thread build: every guest process and thread on one JS thread,
-// with no SharedArrayBuffer (docs/single-thread.md).
+// with no SharedArrayBuffer.
 //
 // The default build gives each guest thread a Worker and shares state through
 // SharedArrayBuffers: the process's memory between its threads' Workers, the
@@ -199,10 +199,10 @@ export class Sched {
   #global = new Set();
   /** Fibers parked on a futex, by address. */
   #futex = new Map();
-  /** Fibers parked on their wait slot (`k_ws_park`, docs/kernel-locking.md
-   *  §5.2 step 2). A notify bumps the slot's word in the kernel's (plain)
-   *  memory and its `memory.atomic.notify` wakes nobody, so whoever may have
-   *  notified asks `checkSlots` -- and every park and yield does. */
+  /** Fibers parked on their wait slot (`k_ws_park`). A notify bumps the
+   *  slot's word in the kernel's (plain) memory and its
+   *  `memory.atomic.notify` wakes nobody, so whoever may have notified asks
+   *  `checkSlots` -- and every park and yield does. */
   #slots = new Set();
   /** Resolutions held back for a macrotask (see `#resume`). */
   #held = [];

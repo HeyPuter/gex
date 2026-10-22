@@ -1,6 +1,5 @@
 /**
  * Do the wait queues wake exactly the waiters registered on them, at once?
- * (docs/kernel-locking.md §5.2 step 2.)
  *
  * Each thread owns one wait slot (`k_ws_*`); a wait registers the slot on the
  * queue of every object it waits for (`k_wq_add`) and parks on it
@@ -9,8 +8,8 @@
  * parks them the way a guest's Worker does:
  *
  *   - a poll over two pipes is woken by a write to the second, within
- *     `WITHIN_MS` (1 ms on a quiet box, which is how it is timed: edger or
- *     worldmachine, never a build box; 20 ms by default, which no bounded
+ *     `WITHIN_MS` (1 ms on a quiet box, which is how it is timed: a quiet
+ *     host, never a build box; 20 ms by default, which no bounded
  *     re-check could meet by luck against the 5 s park);
  *   - a waiter on a third pipe sleeps on through both writes (its own 600 ms
  *     timeout, 2): one object's change wakes nobody else;

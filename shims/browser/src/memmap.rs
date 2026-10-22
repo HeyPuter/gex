@@ -36,7 +36,7 @@ pub enum Kind {
     /// allocator): the arena steps over it.
     Foreign = 8,
     /// The guest's, above the arena's cursor: a mapping placed at a fixed
-    /// address there (W3's compact space: KUSER_SHARED_DATA, an image at its
+    /// address there (32-bit Wine's compact space: KUSER_SHARED_DATA, an image at its
     /// base), or one a forked child inherited. The guest's like `Guest`,
     /// and the arena steps over it as over `Foreign`, rather than the cursor
     /// jumping past it and everything between staying unused.

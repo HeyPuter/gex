@@ -1,4 +1,4 @@
-//! Native wasm32 programs (stream W, docs/wine-native.md §3.2): a Linux
+//! Native wasm32 programs: a Linux
 //! program compiled to wasm32 against gex's musl port, run as a gex process
 //! with the i386 Linux ABI. No guest code is translated: the program is one
 //! position-independent wasm module, installed in the function table like a
@@ -41,11 +41,11 @@ pub(crate) fn is_wasm32(program: &Program) -> bool {
     })
 }
 
-/// Header flag (offset 36): the program runs i386 code (Wine, W3), so the
+/// Header flag (offset 36): the program runs i386 code (32-bit Wine), so the
 /// process translates i386 and leaves Windows' fixed addresses free.
 pub const FLAG_GUEST_I386: u32 = 1;
-/// Header flag: the program runs x86-64 code (64-bit native Wine, W64:
-/// docs/wine-native-x64.md). It shares W3's address space and trampoline
+/// Header flag: the program runs x86-64 code (64-bit native Wine). It
+/// shares 32-bit Wine's address space and trampoline
 /// page ([`FLAG_WINDOWS_SPACE`]), never its i386 decoding.
 pub const FLAG_GUEST_X86_64: u32 = 2;
 /// The flags whose process leaves Windows' fixed addresses free and gets
@@ -97,7 +97,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
         .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
         .to_vec();
-    // A program linked against shared libraries (docs/gexcc.md §7).
+    // A program linked against shared libraries.
     if let Some(info) = crate::dylink::wanted(&wasm) {
         let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
         crate::dylink::install_program(store, memory, &path, wasm, info, mem_base, entry, thread_entry)?;

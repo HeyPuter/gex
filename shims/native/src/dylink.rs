@@ -1,5 +1,5 @@
-//! Shared libraries for native wasm32 programs, native half (docs/gexcc.md
-//! §7; the shim-independent half is the `gex-dylink` crate).
+//! Shared libraries for native wasm32 programs, native half (the
+//! shim-independent half is the `gex-dylink` crate).
 //!
 //! A program whose module names libraries (`dylink.0` NEEDED) is installed
 //! with them: each library's data is mapped like `ld.so` maps it, every

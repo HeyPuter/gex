@@ -55,7 +55,7 @@ const _: () = assert!(REPL_BASE >= gex_abi::MMAP_TOP && REPL_END <= gex_abi::GUE
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Abi {
     /// `void f(uint32_t ctx)`: the function reads the guest's registers from
-    /// the context and writes its result there itself, like a pewasm import
+    /// the context and writes its result there itself, like an import
     /// binding. Full control: stack arguments, structs, several results.
     Ctx,
     /// A plain C function, `r f(a, b, ...)`, typed by its wasm signature: the
@@ -100,7 +100,7 @@ pub struct Replacement {
     /// How many times it ran, over every thread and process of the run.
     pub calls: Arc<std::sync::atomic::AtomicU64>,
     /// A function of a replaced library the module does not provide: calling
-    /// it stops the run, naming it (pewasm's aborting placeholder).
+    /// it stops the run, naming it (an aborting placeholder).
     pub missing: bool,
 }
 
@@ -503,7 +503,7 @@ fn engine_config() -> wasmtime::Config {
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
     config.shared_memory(true);
     // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
-    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     config.wasm_multi_memory(true);

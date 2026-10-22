@@ -2,7 +2,7 @@
 //! tier's C for a guest function, written into `user/src/` as an editable
 //! override.
 //!
-//! The C is exactly what the function tier (`gex-cgen`, Phase B) emits for the
+//! The C is exactly what the function tier (`gex-cgen`) emits for the
 //! function, as a standalone unit (`gex_cgen::standalone`): registers as C
 //! locals, guest memory through `gex_abi.h`'s helpers, system calls and
 //! safepoints through the `gex.*` host functions. Its one export,
