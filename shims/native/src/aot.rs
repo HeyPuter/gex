@@ -303,6 +303,10 @@ pub(crate) fn install_shared(
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.page_table.insert_entries(&meta.dir_entries);
+            // Its slots continue the program image's, so what the runtime
+            // translates later (a library the build left out, code it never
+            // saw) is numbered after them, never over them.
+            sh.page_table.advance_to(meta.next_slot);
             sh.registry.push(Arc::clone(&unit));
             crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
         }
