@@ -86,7 +86,7 @@ pub struct W3Summary {
 fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<String>> {
     use gex_cgen::provider;
     let tar = crate::reach::Tar::parse(bundle)?;
-    let file = |p: &provider::Provider| format!("providers/{}-{}.wasm", p.name, provider::fingerprint(std::slice::from_ref(p)));
+    let file = provider_file;
     let mut out = std::collections::BTreeSet::new();
     let mut class32 = false;
     for (_, path) in units {
@@ -110,6 +110,19 @@ fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<Strin
         out.extend(provider::for_dll(provider::TRAMPOLINES_DLL, true).iter().filter(|p| !p.binds.is_empty()).map(file));
     }
     Ok(out.into_iter().collect())
+}
+
+/// A provider module's file in a unit cache, as a W3 page asks for it. The
+/// page runs with W3's KUSER_SHARED_DATA fold on (`gexc cgen-image
+/// --w3-kuser`), and a provider's fingerprint hashes the C header, which has
+/// the fold's helpers only then; the fold is set for the call and put back,
+/// as `rsrc.rs` `abi_hash` does.
+fn provider_file(p: &gex_cgen::provider::Provider) -> String {
+    let was = gex_abi::kuser_fold();
+    gex_abi::set_kuser_fold(true);
+    let f = gex_cgen::provider::fingerprint(std::slice::from_ref(p));
+    gex_abi::set_kuser_fold(was);
+    format!("providers/{}-{f}.wasm", p.name)
 }
 
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
@@ -1105,6 +1118,32 @@ mod tests {
         assert!(web.join("units/regions/kept/c.entries").is_file());
         assert!(!web.join("units/regions/old").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The trampolines' provider is an x86 guest's (`--features x86`, as gexc's).
+    #[cfg(feature = "x86")]
+    #[test]
+    fn provider_files_name_the_w3_kuser_build() {
+        use gex_cgen::provider;
+        let was = gex_abi::kuser_fold();
+        let ps = provider::for_dll(provider::TRAMPOLINES_DLL, true);
+        let p = ps.iter().find(|p| !p.binds.is_empty()).expect("the trampolines have a provider");
+        let fp = |on: bool| {
+            gex_abi::set_kuser_fold(on);
+            let f = provider::fingerprint(std::slice::from_ref(p));
+            gex_abi::set_kuser_fold(was);
+            f
+        };
+        let (on, off) = (fp(true), fp(false));
+        assert_ne!(on, off, "the fold changes the provider's header");
+        // The fold-on name (what `cgen-image --w3-kuser --providers` builds and
+        // the page asks for), whatever the caller's fold, which is put back.
+        for caller in [false, true] {
+            gex_abi::set_kuser_fold(caller);
+            assert_eq!(provider_file(p), format!("providers/{}-{on}.wasm", p.name));
+            assert_eq!(gex_abi::kuser_fold(), caller);
+        }
+        gex_abi::set_kuser_fold(was);
     }
 
     #[test]
