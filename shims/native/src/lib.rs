@@ -317,6 +317,9 @@ struct SpawnContext {
     /// Set when the process is ending, so every other thread stops at its
     /// next safepoint instead of running on into a torn-down world.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// The process's threads running guest code, held still while a fork
+    /// copies the address space.
+    gate: Arc<GuestGate>,
     /// How many spawned threads have not yet noticed.
     running: Arc<std::sync::atomic::AtomicUsize>,
     /// How the process ended when a thread other than the first ended it
@@ -1349,6 +1352,7 @@ fn run_program_with(
         sampler: sampler.clone(),
         wayland: compositor.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        gate: Arc::new(GuestGate::default()),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ended: Arc::new(Mutex::new(None)),
         exec: Arc::new(Mutex::new(None)),
@@ -1547,6 +1551,82 @@ pub(crate) fn stop_every_process() {
         k.futexes.wake_everything();
     }
     ready::notify();
+}
+
+/// How many of a process's threads are running guest code, and a fork's
+/// request that they stop.
+///
+/// Linux copies a process's memory at one instant; gex copies it page by
+/// page while the other threads go on writing, so without this the child
+/// sees each page as it was at a different moment. A list another thread
+/// was changing (glibc's thread stacks, moved between its cache and its
+/// list in use by every pthread_create and join) arrived as a cycle, and
+/// the child's glibc walked it for ever. A thread counts as in guest code
+/// from the run loop's entry into it until it blocks in a syscall or
+/// returns; at a safepoint or a syscall it stops while a fork copies.
+#[derive(Default)]
+pub(crate) struct GuestGate {
+    pausing: std::sync::atomic::AtomicBool,
+    in_guest: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl GuestGate {
+    fn enter(&self) {
+        let mut n = self.in_guest.lock().unwrap_or_else(|e| e.into_inner());
+        while self.pausing.load(std::sync::atomic::Ordering::Acquire) {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+    }
+
+    fn leave(&self) {
+        let mut n = self.in_guest.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.cv.notify_all();
+    }
+
+    /// At a safepoint or syscall: wait here while a fork copies.
+    fn pause_point(&self) {
+        if self.pausing.load(std::sync::atomic::Ordering::Acquire) {
+            self.leave();
+            self.enter();
+        }
+    }
+
+    /// Stop every other thread running guest code until the guard drops.
+    /// The caller is outside guest code (the run loop's fork).
+    fn pause(&self) -> GatePaused<'_> {
+        use std::sync::atomic::Ordering;
+        let mut n = self.in_guest.lock().unwrap_or_else(|e| e.into_inner());
+        // Another fork is copying: wait for it like any other thread.
+        while self.pausing.load(Ordering::Acquire) {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        self.pausing.store(true, Ordering::Release);
+        // Bounded: a thread in a long host call (a GL readback) is not
+        // waited for past this.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                eprintln!("gex: fork: {} threads did not stop for the copy", *n);
+                break;
+            }
+            n = self.cv.wait_timeout(n, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        GatePaused(self)
+    }
+}
+
+struct GatePaused<'a>(&'a GuestGate);
+
+impl Drop for GatePaused<'_> {
+    fn drop(&mut self) {
+        let _n = self.0.in_guest.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.pausing.store(false, std::sync::atomic::Ordering::Release);
+        self.0.cv.notify_all();
+    }
 }
 
 /// Bring every other guest thread to a halt after the process has exited.
@@ -2001,12 +2081,19 @@ fn run_thread_loop(
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
     store.data_mut().root_enter = Some(enter.clone());
     let mut pc = entry;
+    let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
     loop {
+        if let Some(g) = &gate {
+            g.enter();
+        }
         let result = enter
             .call(&mut *store, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut [])
             .map_err(anyhow::Error::from);
+        if let Some(g) = &gate {
+            g.leave();
+        }
         if let Some(req) = store.data_mut().pending_fork.take() {
-            fork_process(&*store, req)?;
+            fork_process(&*store, req, false)?;
         }
         if let Some(child) = store.data_mut().pending_spawn.take() {
             let cx = store
@@ -2324,7 +2411,7 @@ pub(crate) fn wasm_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("GEX_WASM_TRACE").is_some())
 }
 
-fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest) -> Result<()> {
+fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
         if aot.single_process {
@@ -2352,6 +2439,12 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // handles, so parent and child share the open file descriptions exactly
     // as Linux does, while the VMA tree and the child list are its own.
     let child_proc = Arc::new(ProcCell::default());
+    // The other threads hold still from the parent's map to the end of the
+    // copy, so the child gets the memory of one moment (`GuestGate`). Not a
+    // native wasm32 program's fork (`inside`, made within the syscall): its
+    // code has safepoints only where gexcc put polls, so a thread computing
+    // without system calls would never stop.
+    let paused = (!inside).then(|| cx.gate.pause());
     let (mut child_kernel, regions, ctx_addr) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         // What the parent has mapped, less what it is known to hold only
@@ -2416,6 +2509,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // A monitor is per-thread; the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
     }
+    drop(paused);
 
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
@@ -2443,6 +2537,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         sampler: cx.sampler.clone(),
         wayland: cx.wayland.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        gate: Arc::new(GuestGate::default()),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ended: Arc::new(Mutex::new(None)),
         exec: Arc::new(Mutex::new(None)),
@@ -3899,6 +3994,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 state.exit = Some(Exit::Status(0));
                 return Err(StopExecution.into());
             }
+            // A fork in another thread is copying the address space.
+            if let Some(s) = &state.spawn {
+                s.gate.pause_point();
+            }
             let mut gm = GuestMem::new(data);
             // /proc must reflect the state this syscall will see, so the
             // snapshot is refreshed before the call rather than after.
@@ -4026,7 +4125,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // Blocked in the kernel counts as stopped for a provider's
                 // collection; the thread parks on its way out if one runs.
                 libprov::guest_stop().enter_kernel(waiting_tid as u32);
+                // Blocked, the thread does not hold up a fork's copy; it
+                // waits for the copy before writing its result.
+                let gate = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
+                if let Some(g) = &gate {
+                    g.leave();
+                }
                 let r = perform_block(op, memory.bytes(), &service, &interrupted);
+                if let Some(g) = &gate {
+                    g.enter();
+                }
                 libprov::guest_stop().leave_kernel(waiting_tid as u32, memory.bytes());
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
@@ -4144,7 +4252,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // that cannot be resumed at a guest PC, so the child is
                     // made here and the parent carries on (`wasmprog`).
                     if state.jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program) {
-                        fork_process(&caller, ForkRequest { pid, child_stack, tls })?;
+                        fork_process(&caller, ForkRequest { pid, child_stack, tls }, true)?;
                         return Ok(());
                     }
                     let state = caller.data_mut();
@@ -4868,6 +4976,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             {
                 state.exit = Some(Exit::Status(0));
                 return Err(StopExecution.into());
+            }
+            // A fork in another thread is copying the address space.
+            if let Some(s) = &state.spawn {
+                s.gate.pause_point();
             }
             // An NT thread another has suspended (NtSuspendThread) stops
             // here, its registers written back, until it is resumed.
