@@ -59,6 +59,13 @@ for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
 llvm-ar crs "$PREFIX/sysroot/lib/libgexcc.a" "$PREFIX"/build/rt/*.o
+# libucontext (pkg-config libucontext): the <ucontext.h> functions, which
+# fail (rt/ucontext.c)
+clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$HERE/rt/ucontext.c" -o "$PREFIX/build/ucontext.o"
+rm -f "$PREFIX/sysroot/lib/libucontext.a"
+llvm-ar crs "$PREFIX/sysroot/lib/libucontext.a" "$PREFIX/build/ucontext.o"
+printf 'libdir=/lib\nincludedir=/include\n\nName: libucontext\nDescription: ucontext functions (no stack switching on wasm32: they fail with ENOSYS)\nVersion: 1.3\nLibs: -L${libdir} -lucontext\nCflags:\n' \
+  > "$PREFIX/sysroot/usr/lib/pkgconfig/libucontext.pc"
 # the C++ exception tag: a static program's own; libc.so's for a shared
 # program and its libraries, which import it (so not in libgexcc.a, which
 # each module links)

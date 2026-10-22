@@ -169,4 +169,8 @@ for env in "" GEXCC_SHARED=1; do
         grep -q LLD "$W/log"
     check $? "-Wl,--version with a library to link answers the linker's version${env:+ ($env)}"
 done
+# libucontext (systemd on musl): its functions link, from pkg-config's flags
+printf '#include <ucontext.h>\nint main(void){ucontext_t u; return getcontext(&u) != -1;}\n' > "$W/uc.c"
+gexcc -o "$W/uc" "$W/uc.c" $(PKG_CONFIG_SYSROOT_DIR="$SR" PKG_CONFIG_LIBDIR="$SR/usr/lib/pkgconfig" pkg-config --libs libucontext) 2> "$W/log"
+check $? "libucontext's functions link"
 exit $fail
