@@ -1816,6 +1816,18 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
     None
 }
 
+/// Programs gex's loader placed whose files the guest cannot read back (a
+/// sysroot's /tmp is under the guest's own), by guest path.
+static PLACED_FILES: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
+
+pub(crate) fn note_placed_file(path: &str, bytes: &[u8]) {
+    PLACED_FILES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(path.to_string(), Arc::new(bytes.to_vec()));
+}
+
+fn placed_file(path: &str) -> Option<Vec<u8>> {
+    PLACED_FILES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(path).map(|b| b.to_vec())
+}
+
 /// The objects an ejected project ships units for (file names), set before
 /// it runs, in place of `GEX_ELF_UNITS`. Nothing is built for the next run:
 /// the project has every unit it will get.
@@ -1891,8 +1903,9 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         if !elf_wanted(&m.path) {
             continue;
         }
-        // From the guest's namespace, so a sysroot is honoured.
-        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)) else {
+        // From the guest's namespace, so a sysroot is honoured (or the
+        // program's file as gex's loader read it, `note_placed_file`).
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)).or_else(|| placed_file(&m.path)) else {
             eprintln!("gex-elf: {}: not readable; no unit", m.path);
             continue;
         };

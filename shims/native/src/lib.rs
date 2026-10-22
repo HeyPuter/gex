@@ -924,10 +924,19 @@ fn run_program_with(
         // An ejected Windows program: no tier-1 module, only the root's
         // entry (`aot_only`).
         (gex_cache::compile(&engine, &aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
-    } else if let Some(aot) = &opts.aot {
+    } else if let Some(aot) = opts.aot.as_ref().filter(|a| {
+        // A program whose own code is a function-tier unit has no image
+        // module: it starts from the seed (a tier-1 module that translates
+        // nothing), and its units are in before its first instruction.
+        !(a.images.get(&aot::image_identity(image)).is_none()
+            && opts.args.first().is_some_and(|p| pe_units::elf_wanted(p)))
+    }) {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
         aot::image_module(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
+    } else if opts.aot.is_some() {
+        let seed = gex_xlate::seed_module(true);
+        (gex_cache::compile(&engine, &seed.wasm).context("compiling the seed of a program on its unit")?, seed.metadata())
     } else {
         match use_cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
@@ -1134,7 +1143,13 @@ fn run_program_with(
     // before its first instruction (`run_thread_loop`).
     if pe_units::elf_wanted(&kernel.exe_path) {
         let path = kernel.exe_path.clone();
-        if let Some(bytes) = kernel.read_file(&path) {
+        // From the host when the guest cannot read it back: a sysroot's /tmp
+        // is hidden under the guest's own (`TmpFs`).
+        let host = || match &opts.sysroot {
+            Some(r) => std::fs::read(r.join(path.trim_start_matches('/'))).ok(),
+            None => std::fs::read(&path).ok(),
+        };
+        if let Some(bytes) = kernel.read_file(&path).or_else(|| host().inspect(|b| pe_units::note_placed_file(&path, b))) {
             let maps = gex_kernel::CodeMap::of_placed(&path, &bytes, image.bias);
             kernel.mem.lock().log.new_code.extend(maps);
         }

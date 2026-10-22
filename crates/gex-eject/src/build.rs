@@ -496,7 +496,9 @@ impl Translation<'_> {
     /// Translate every object into `out` (relative to the project): the
     /// native set, or (`web`) the browser shim's. Returns the modules, the
     /// libraries' pins and the count of blocks ending in SIGILL.
-    fn translate(&self, out: &str, web: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
+    /// The programs' image modules (none when `programs` is false: they are
+    /// units, `units`), and the pins every run places the libraries at.
+    fn translate(&self, out: &str, web: bool, programs: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
         // The program's closure is numbered as one: its image owns the memory and
         // tables, and every other object's slots continue where the last one's
         // stopped. Other executables (programs the session exec'd) are images of
@@ -517,7 +519,7 @@ impl Translation<'_> {
         let mut illegal = 0;
         let mut pins = Vec::new();
         let mut first_slot = 0u64;
-        for (n, &i) in order.iter().chain(others.iter()).enumerate() {
+        for (n, &i) in order.iter().chain(others.iter()).enumerate().filter(|_| programs) {
             let p = &self.placed[i];
             let o = &p.obj;
             let in_closure = n < order.len();
@@ -615,7 +617,7 @@ impl Translation<'_> {
     /// A unit is keyed by its object as placed, not by any program, so every
     /// process that maps the object at its base runs it. The native flavour
     /// (no bounds guard), which the page runs as well.
-    fn units(&self, out: &str) -> Result<Vec<BuiltImage>> {
+    fn units(&self, out: &str, programs: bool) -> Result<Vec<BuiltImage>> {
         let cache = self.dir.join(out);
         std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
         let jobs = std::env::var("GEX_ELF_UNITS_JOBS")
@@ -629,7 +631,7 @@ impl Translation<'_> {
             let mut images = Vec::new();
             // Programs too, at the base gex's loader gives them (PIE_BASE):
             // one function tier for all of a Linux program's code.
-            for p in self.placed.iter().filter(|p| p.obj.role == "exe" || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp"))) {
+            for p in self.placed.iter().filter(|p| (programs && p.obj.role == "exe") || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp"))) {
                 let host = self.dir.join(rootfs_rel(&p.obj.path)?);
                 let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
                 let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)
@@ -735,13 +737,17 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
 
     let mut report = BuildReport { placement, ..BuildReport::default() };
     let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
-    let (mut images, pins, illegal) = t.translate("build/modules", false)?;
-    let units = t.units("build/cgen")?;
+    // The programs are function-tier units too, unless the user replaces
+    // functions in them: a replacement is made in an image module's
+    // translation (`intrinsics`), which a unit does not take.
+    let program_units = replacements.is_empty();
+    let (mut images, pins, illegal) = t.translate("build/modules", false, !program_units)?;
+    let units = t.units("build/cgen", program_units)?;
     if !units.is_empty() && !config.jit_fallback {
         // Recovery leaves a function it could not delimit to the runtime
         // translator, which a run without it does not have.
         eprintln!(
-            "gex-eject: warning: {} library units leave what recovery missed to runtime translation; \
+            "gex-eject: warning: {} units (libraries, programs) leave what recovery missed to runtime translation; \
              a run without \"jit_fallback\" stops at the first such function",
             units.len()
         );
@@ -775,7 +781,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                 for r in replacements.iter().filter(|r| !r.missing) {
                     crate::web::check_module(dir, &r.module, &r.export, r.abi)?;
                 }
-                let (mut images, _, _) = t.translate("build/web", true)?;
+                let (mut images, _, _) = t.translate("build/web", true, true)?;
                 images.extend(report.images.iter().filter(|i| i.kind == "elf-unit").cloned());
                 let spans: Vec<(String, u64, u64)> = placed
                     .iter()

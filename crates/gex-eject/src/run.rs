@@ -57,6 +57,8 @@ fn use_units(dir: &Path, manifest: &BuildManifest) {
         .map(|i| i.path.rsplit('/').next().unwrap_or(&i.path).to_string())
         .collect();
     if !names.is_empty() {
+        // The flavour `units` builds them in, whoever runs the project.
+        gex_cgen::image::set_unguarded(true);
         gex_native::pe_units::set_cache_root(Some(dir.join("build/cgen")));
         gex_native::pe_units::set_elf_units(names);
     }

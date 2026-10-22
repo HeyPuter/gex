@@ -228,7 +228,9 @@ fn eject_build_run_and_replace() {
     // GEX_EJECT_BUILD's view of it: the build's modules, and its memory
     // whatever was learned; --mem64 asked of it is refused, naming --mem32.
     let (aot, pins) = run::debug_build(&p).unwrap();
-    assert!(!aot.images.is_empty() && pins.is_empty(), "a static program's build: one image, no pins");
+    // With no replacements the program is a function-tier unit: no image module.
+    let built = std::fs::read_to_string(p.join("build/build.json")).unwrap();
+    assert!(aot.images.is_empty() && built.contains("\"elf-unit\"") && pins.is_empty(), "a static program's build: its unit, no pins");
     assert!(!run::build_mem(None).unwrap().is_64() && !run::build_mem(Some(false)).unwrap().is_64());
     let e = run::build_mem(Some(true)).unwrap_err().to_string();
     assert!(e.contains("--mem32") && !e.contains('\n'), "{e}");
