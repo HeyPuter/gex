@@ -1617,6 +1617,24 @@ export class Gex {
           : (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
         // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
         ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
+        // W64: a unit's call to Wine's system or Unix call entry, run by
+        // Wine's direct entry as the fault hook runs the `ud2` (cgen.rs
+        // `w64_entry`): its C frames below the guest's, then what a hook's
+        // return serves (a thread the call made). 0: not here (the
+        // single-thread build: a blocking call needs a promising frame).
+        entry_call: (idx, ctx) => {
+          if (single.on) return 0;
+          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const { spG, cur } = this.#hookStack(ctx >>> 0);
+          try {
+            f(ctx);
+          } finally {
+            spG.value = cur;
+          }
+          this.#cgenServe();
+          this.#startThread();
+          return 1;
+        },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -7217,6 +7235,16 @@ export class Gex {
     }
     const f = this.#cgenStore().ftab.get(tIdx(hook));
     if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
+    const { spG, cur } = this.#hookStack(ctx);
+    // W64's hook (signal_wasm64.c) takes the address as a 64-bit integer
+    // (above 4 GiB in a 64-bit memory), W3's (signal_wasm32.c) as 32 bits.
+    const wide = e.gex_guest_x86_64?.() === 1;
+    return { f, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+  }
+
+  /** The program's stack pointer moved below the guest's for a hook's C
+   *  frames: { spG, cur } (the caller puts `spG` back to `cur`). */
+  #hookStack(ctx) {
     // The hook's C frames go below the guest's stack pointer, as a signal
     // frame does, with room for the exception frame it builds there.
     const spG = this.#wasmprogStack();
@@ -7234,10 +7262,7 @@ export class Gex {
       const low = Math.min(Number(cur) >>> 0, esp);
       spG.value = ((low - 4096) & ~15) | 0;
     }
-    // W64's hook (signal_wasm64.c) takes the address as a 64-bit integer
-    // (above 4 GiB in a 64-bit memory), W3's (signal_wasm32.c) as 32 bits.
-    const wide = e.gex_guest_x86_64?.() === 1;
-    return { f, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+    return { spG, cur };
   }
 
   /**

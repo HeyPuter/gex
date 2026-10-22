@@ -9405,6 +9405,16 @@ fn rebuild_carried(
 /// data goes above 2 GiB; the page's guest ends below that.
 pub(crate) const W64_PE_DATA: (u64, u64) = (0x7fde_0000, 0x7ffe_0000);
 
+/// W64: 64-bit native Wine's entry page, the page after KUSER_SHARED_DATA
+/// (its ntdll maps it at start). At its start, the pointer x86-64 system
+/// call stubs call through, holding [`W64_SYSCALL_ENTRY`]; that entry and
+/// [`W64_UNIX_CALL_ENTRY`] (winecrt0's Unix calls) are each a `ud2` Wine's
+/// fault hook runs as the call. Its direct entries for the same calls are
+/// `gex.unix_dispatcher`'s ops 0 and 4.
+pub(crate) const W64_ENTRY_PAGE: u64 = gex_abi::KUSER_WINDOWS_END;
+pub(crate) const W64_SYSCALL_ENTRY: u64 = W64_ENTRY_PAGE + 0x10;
+pub(crate) const W64_UNIX_CALL_ENTRY: u64 = W64_ENTRY_PAGE + 0x20;
+
 /// In a 64-bit memory (a twin install's 64-bit process, docs/mem64.md §5)
 /// Wine places its images top down from the top of the 16 GiB, far above
 /// [`W64_PE_DATA`]: the window is the top of that space instead (below a

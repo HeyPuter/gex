@@ -1876,6 +1876,11 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if !crate::jit_on() && t == ret as u64 {
         return gex_abi::ftab::RET_LEFT;
     }
+    // 64-bit native Wine's system and Unix calls (a call to its entry page):
+    // its direct entry, here, in place of a call-out that runs the `ud2`.
+    if let Some(r) = w64_entry(&gm, c, t, ret as u64) {
+        return r;
+    }
     if !crate::jit_on() {
         let path = lock(&UNITS)
             .iter()
@@ -1986,6 +1991,10 @@ extern "C" {
     /// Call function-table entry `idx`, a `void(int)` (W3: ntdll.so's
     /// handler for a guest's Unix call, given the thread's context).
     pub(crate) fn ftab_call_vi(idx: i32, arg: i32);
+    /// W64: call Wine's direct entry `idx` (a `void(int)`) for a unit's
+    /// call to its system or Unix call entry, as the fault hook is called
+    /// for the `ud2` there: 1; 0 when this build cannot (the `ud2` then).
+    fn entry_call(idx: i32, ctx: i32) -> i32;
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -2625,6 +2634,54 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
         return 0;
     }
     slot.load(Ordering::Relaxed)
+}
+
+/// A call to 64-bit native Wine's system or Unix call entry
+/// (`crate::W64_SYSCALL_ENTRY`, `W64_UNIX_CALL_ENTRY`) from code no
+/// nested dispatch need run: Wine's direct entry for it
+/// (`gex.unix_dispatcher` op 0 or 4) takes the registers as the call left
+/// them, its return address at `[sp]`, and returns as the `ud2` route does,
+/// PC at that address and the address popped. That is the predicted return;
+/// a call that ends elsewhere (NtContinue, a raised exception, the thread's
+/// end) leaves with PC where Wine put it. None, and the `ud2` route as
+/// before, unless the target is one of the two, Wine has registered that
+/// entry, the entry page holds Wine's pointer, and the call's return
+/// address is `ret`.
+fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
+    let slot = match t {
+        crate::W64_SYSCALL_ENTRY => 0,
+        crate::W64_UNIX_CALL_ENTRY => 2,
+        _ => return None,
+    };
+    let idx = UNIX_DISPATCHERS[slot].load(Ordering::Relaxed);
+    if idx == 0 || gm.read_u64(crate::W64_ENTRY_PAGE).ok()? != crate::W64_SYSCALL_ENTRY {
+        return None;
+    }
+    let sp_at = c + gex_abi::ctx::x(sp_index()) as u64;
+    let sp = gm.read_u64(sp_at).ok()?;
+    if gm.read_u64(sp).ok()? != ret {
+        return None;
+    }
+    // SAFETY: a host import taking scalars; nothing here holds a lock.
+    if unsafe { entry_call(idx as i32, c as i32) } == 0 {
+        return None;
+    }
+    // Where the Unix side's own calls left this Worker to resume (a user
+    // callback's loop, a wait): the call's return is in the context, as the
+    // `ud2`'s fault hook leaves it, and a later trap must not resume there.
+    // Another thread's context to resume with is the run loop's, as from
+    // the hook.
+    crate::set_resume_none();
+    if let Some(v) = crate::resume_ctx() {
+        crate::set_resume_ctx_none();
+        if v != c {
+            return Some(gex_abi::ftab::RET_LEFT);
+        }
+    }
+    let gm = GuestMem::new(crate::guest_bytes());
+    let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
+    let back = gm.read_u64(sp_at).unwrap_or(0);
+    Some(if pc == ret && back == sp + 8 { gex_abi::ftab::RET_PREDICTED } else { gex_abi::ftab::RET_LEFT })
 }
 
 /// The process's handler for a guest's Unix call (W3), or 0.

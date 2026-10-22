@@ -56,6 +56,8 @@
 # runs on a page prefix template made from PREFIX (page-prefix.sh). With
 # NATIVE or NTDLL the overlay is hard links (a page mount does not follow
 # a link out of it). Not with WL or GL.
+# CGEN=DIR (PAGE): function-tier units from DIR where it has one for an
+# image (run-node.mjs --cgen-prefer), tier-1 for the rest.
 set -u
 # Output is compared with the native run: not even gex's default lines (log.mjs).
 export GEX_LOG=${GEX_LOG:-off}
@@ -152,6 +154,8 @@ check() {
 	local p=$w/pfx-$name out code src=$bin/$exe
 	case $exe in /*) src=$exe; exe=$(basename "$exe") ;; esac
 	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
+	# NULLDRV=1: Wine's null display driver (USER without a display)
+	[ -z "${NULLDRV:-}" ] || printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="null"\n' >> "$p/user.reg"
 	local wl=()
 	if [ -n "${WL:-}" ]; then
 		# the Wayland driver, gexc's compositor, its frames as PPMs; display
@@ -179,10 +183,10 @@ check() {
 		[ "${DIRECT:-0}" = 0 ] || run=(--env GEX_MEM64=1 --argv0 /w64/lib/wine/x86_64-unix/wine "$seed" "$wine")
 		# UNIX=1: the program named by its Unix path (wine /game/x.exe)
 		local prog="C:\\$exe"; [ "${UNIX:-0}" = 0 ] || prog=/pfx/drive_c/$exe
-		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 "${rss[@]}" timeout -k 10 "${TMO:-300}" \
+		out=$(cd "$root" && env ${CGEN:+GEX_CGEN_CACHE=$CGEN} ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 "${rss[@]}" timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
-			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
+			shims/browser/js/run-node.mjs ${CGEN:+--cgen-prefer} --dir /w64="$dist" --dir /pfx="$p" \
 			--env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
 			--cwd /pfx/drive_c "${run[@]}" "$prog" "$@" 2>"$w/$name.err"; echo "exit=$?")
 	else
@@ -221,6 +225,10 @@ check cxx 0 "$allok" cxx.exe
 check exitproc 33 "worker exiting${nl}atexit ran" exitproc.exe
 check seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" seh.exe
 check seh-traps 0 "$allok" seh.exe traps
+# USER without a display in the page (its WL cases do not run there): window
+# procs entered from NtUser* calls (user callbacks), messages between threads
+[ -n "$page" ] && NULLDRV=1 check user_win_nd 0 "$allok" user_win.exe
+[ -n "$page" ] && NULLDRV=1 check wndproc_seh 0 "$allok" wndproc_seh.exe
 # W64.2: MSVC's x64 C++ exceptions, SEH and setjmp/longjmp through msvcrt
 # (tests/nt/msvc/build-x64.sh)
 check msvc_cxxeh 0 "$allok" msvc_cxxeh.exe
