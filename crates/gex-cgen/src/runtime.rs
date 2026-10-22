@@ -105,14 +105,14 @@ pub fn emit_probe(f: &mut Function, t: u32, e: u32) {
     crate::splice::widen_addr(f);
     f.instruction(&I::I64Load(m));
     f.instruction(&I::LocalTee(e));
-    // hit ? e >> 32 : 0, where hit compares the whole target with the low
-    // half (a target past 4 GiB never hits).
-    f.instruction(&I::I64Const(32));
+    // hit ? e >> TAG_BITS : 0, where hit compares the whole target with the
+    // entry's address bits (`gex_abi::fcache_probe`).
+    f.instruction(&I::I64Const(gex_abi::FCACHE_TAG_BITS as i64));
     f.instruction(&I::I64ShrU);
     f.instruction(&I::I32WrapI64);
     f.instruction(&I::I32Const(ftab::RESOLVE as i32));
     f.instruction(&I::LocalGet(e));
-    f.instruction(&I::I64Const(0xffff_ffff));
+    f.instruction(&I::I64Const(gex_abi::FCACHE_TAG_MASK as i64));
     f.instruction(&I::I64And);
     f.instruction(&I::LocalGet(t));
     f.instruction(&I::I64Eq);

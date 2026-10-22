@@ -1748,6 +1748,9 @@ pub extern "C" fn gex_ftab_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let addr = addr as u64;
+    if FCACHE_STATS.load(Ordering::Relaxed) {
+        fcache_stat(addr);
+    }
     // Filler no function has (`STRAY_PC`): the fallback's.
     if addr == STRAY_PC {
         return gex_abi::ftab::FALLBACK as i32;
@@ -1802,6 +1805,51 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         });
     }
     idx as i32
+}
+
+/// `?fcachestats=1` (GEX_FCACHE_STATS=1): the probe cache's misses (every
+/// `gex.lookup` is one), said by each Worker at most every 10 s, with how
+/// many were above 4 GiB and the addresses that missed most. A debugging
+/// opt-in: nothing is counted with it off.
+static FCACHE_STATS: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_fcache_stats(on: i32) {
+    FCACHE_STATS.store(on != 0, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// This Worker's misses since its last line: (since ns, above 4 GiB, by address).
+    static FCACHE_MISSES: std::cell::RefCell<(u64, u64, std::collections::HashMap<u64, u64>)> = Default::default();
+}
+
+fn fcache_stat(addr: u64) {
+    FCACHE_MISSES.with(|m| {
+        let mut m = m.borrow_mut();
+        let now = crate::now_ns();
+        if m.0 == 0 {
+            m.0 = now;
+        }
+        m.1 += (addr >> 32 != 0) as u64;
+        *m.2.entry(addr).or_insert(0) += 1;
+        let secs = now.saturating_sub(m.0) as f64 / 1e9;
+        if secs < 10.0 {
+            return;
+        }
+        let n: u64 = m.2.values().sum();
+        let mut top: Vec<(u64, u64)> = m.2.iter().map(|(a, c)| (*c, *a)).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        let top: Vec<String> = top.iter().take(5).map(|(c, a)| format!("{a:#x} {c}")).collect();
+        crate::warn_line(&format!(
+            "[gex] fcache: pid {} {n} probe misses in {secs:.1} s ({:.0}/s), {} above 4 GiB, {} addresses; most: {}\n",
+            crate::gex_my_pid(),
+            n as f64 / secs,
+            m.1,
+            m.2.len(),
+            top.join(", ")
+        ));
+        *m = (now, 0, Default::default());
+    });
 }
 
 /// The table's index 1: code no function body holds, under the `F_body`

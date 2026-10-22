@@ -343,13 +343,19 @@ pub fn translator() -> Option<&'static dyn Translator> {
     TRANSLATOR.get().map(|b| &**b)
 }
 
-/// Write `addr → idx` into the probe cache in guest memory `mem`.
+/// Write `addr → idx` into the probe cache in guest memory `mem`. An
+/// address or index no entry can hold (`gex_abi::fcache_pack`) clears the
+/// slot instead, so it is left to miss.
 pub fn fcache_write(mem: &mut [u8], addr: u64, idx: u32) {
     let at = gex_abi::fcache_entry(addr) as usize;
+    let v = gex_abi::fcache_pack(addr, idx).unwrap_or(FCACHE_EMPTY);
     if let Some(e) = mem.get_mut(at..at + 8) {
-        e.copy_from_slice(&gex_abi::fcache_pack(addr, idx).to_le_bytes());
+        e.copy_from_slice(&v.to_le_bytes());
     }
 }
+
+/// An empty probe cache entry: address 0, the resolve stub.
+const FCACHE_EMPTY: u64 = 0;
 
 /// Empty the whole probe cache: every entry the resolve stub. For a memory
 /// whose cache names another table's indices -- an `execve`'s new program,
@@ -357,7 +363,7 @@ pub fn fcache_write(mem: &mut [u8], addr: u64, idx: u32) {
 /// the parent's while its table is its own.
 pub fn fcache_reset(mem: &mut [u8]) {
     let (lo, hi) = (gex_abi::FCACHE as usize, (gex_abi::FCACHE + gex_abi::FCACHE_BYTES) as usize);
-    let empty = gex_abi::fcache_pack(0, RESOLVE).to_le_bytes();
+    let empty = FCACHE_EMPTY.to_le_bytes();
     if let Some(c) = mem.get_mut(lo..hi) {
         for e in c.chunks_exact_mut(8) {
             e.copy_from_slice(&empty);
@@ -371,8 +377,8 @@ pub fn fcache_clear(mem: &mut [u8], addr: u64) {
     let at = gex_abi::fcache_entry(addr) as usize;
     if let Some(e) = mem.get_mut(at..at + 8) {
         let v = u64::from_le_bytes(e.try_into().unwrap());
-        if v & 0xffff_ffff == addr & 0xffff_ffff {
-            e.copy_from_slice(&gex_abi::fcache_pack(0, RESOLVE).to_le_bytes());
+        if v & gex_abi::FCACHE_TAG_MASK == addr {
+            e.copy_from_slice(&FCACHE_EMPTY.to_le_bytes());
         }
     }
 }
@@ -548,11 +554,42 @@ mod tests {
         fcache_write(&mut mem, 0x40_1234, 99);
         let at = gex_abi::fcache_entry(0x40_1234) as usize;
         let v = u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
-        assert_eq!((v as u32, (v >> 32) as u32), (0x40_1234, 99));
+        assert_eq!(gex_abi::fcache_probe(v, 0x40_1234), 99);
         // Another address sharing the slot does not clear it.
         fcache_clear(&mut mem, 0x40_1235);
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), v);
         fcache_clear(&mut mem, 0x40_1234);
+        assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
+    }
+
+    /// A 64-bit memory's code above 4 GiB: an entry names its whole address,
+    /// so a function at t + 4 GiB (the same slot, the same low 32 bits) is
+    /// never taken for the one at t, and the one above 4 GiB hits.
+    #[test]
+    fn probe_cache_entries_above_4_gib() {
+        let mut mem = vec![0u8; (gex_abi::FCACHE + gex_abi::FCACHE_BYTES) as usize];
+        let (t, high) = (0x2000_0000u64, 0x1_2000_0000u64);
+        assert_eq!(gex_abi::fcache_entry(t), gex_abi::fcache_entry(high));
+        let at = gex_abi::fcache_entry(t) as usize;
+        let entry = |mem: &[u8]| u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
+        fcache_write(&mut mem, high, 7);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), high), 7);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), t), RESOLVE);
+        fcache_write(&mut mem, t, 8);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), t), 8);
+        assert_eq!(gex_abi::fcache_probe(entry(&mem), high), RESOLVE);
+        // A Wine image near the top of a 16 GiB memory.
+        fcache_write(&mut mem, 0x3_ffdd_1ce4, 9);
+        let at = gex_abi::fcache_entry(0x3_ffdd_1ce4) as usize;
+        assert_eq!(gex_abi::fcache_probe(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0x3_ffdd_1ce4), 9);
+        // The other address clearing the slot leaves it; its own clears it.
+        fcache_clear(&mut mem, 0x3_ffdd_1ce4 + (1 << 32));
+        assert_ne!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
+        fcache_clear(&mut mem, 0x3_ffdd_1ce4);
+        assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
+        // What no entry can hold misses rather than wraps.
+        fcache_write(&mut mem, 1 << 40, 3);
+        let at = gex_abi::fcache_entry(1 << 40) as usize;
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
     }
 

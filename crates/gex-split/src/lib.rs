@@ -426,12 +426,12 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
                         s.instruction(&I::I32Const(probe as i32));
                         s.instruction(&I::I64Load(wasm_encoder::MemArg { offset: gex_abi::FCACHE, align: 3, memory_index: 0 }));
                         s.instruction(&I::LocalTee(4));
-                        s.instruction(&I::I64Const(32));
+                        s.instruction(&I::I64Const(gex_abi::FCACHE_TAG_BITS as i64));
                         s.instruction(&I::I64ShrU);
                         s.instruction(&I::I32WrapI64);
                         s.instruction(&I::I32Const(gex_abi::ftab::RESOLVE as i32));
                         s.instruction(&I::LocalGet(4));
-                        s.instruction(&I::I64Const(0xffff_ffff));
+                        s.instruction(&I::I64Const(gex_abi::FCACHE_TAG_MASK as i64));
                         s.instruction(&I::I64And);
                         s.instruction(&I::I64Const(addr as i64));
                         s.instruction(&I::I64Eq);

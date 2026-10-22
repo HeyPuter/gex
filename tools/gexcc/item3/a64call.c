@@ -23,7 +23,7 @@ static uint32_t ftab_idx(uint64_t t)
 	}
 	uint64_t slot = (uint32_t)((uint32_t)t * 0x9e3779b1u) >> (32 - fcache_bits);
 	uint64_t e = __atomic_load_n((uint64_t *)(uintptr_t)(fcache + 8 * slot), __ATOMIC_RELAXED);
-	return (e & 0xffffffffull) == (t & 0xffffffffull) ? (uint32_t)(e >> 32) : 0;
+	return (e & ((1ull << 36) - 1)) == t ? (uint32_t)(e >> 36) : 0 /* gex_abi::FCACHE_TAG_BITS, 36 */;
 }
 
 static uint64_t ctx_v;

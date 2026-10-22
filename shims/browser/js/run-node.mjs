@@ -463,6 +463,8 @@ const host = new ProcessHost({
     trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,
     // GEX_DOOR_STATS: wineserver door call counts every 10 s.
     doorStats: process.env.GEX_DOOR_STATS ? Number(process.env.GEX_DOOR_STATS) || 1 : undefined,
+    // GEX_FCACHE_STATS=1: the function probe cache's misses, every 10 s.
+    fcacheStats: process.env.GEX_FCACHE_STATS ? 1 : undefined,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,
