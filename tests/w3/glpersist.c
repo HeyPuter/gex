@@ -101,6 +101,7 @@ PROC(void, glDrawRangeElementsBaseVertex, (GLenum, GLuint, GLuint, GLsizei, GLen
 PROC(void, glDispatchComputeIndirect, (ptrdiff_t))
 PROC(void, glBindBufferBase, (GLenum, GLuint, GLuint))
 PROC(void, glGetBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, void *))
+PROC(GLboolean, glUnmapBuffer, (GLenum))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static const char *vs_src = "#version 150 core\nin vec2 p;\nin vec4 col;\nflat out vec4 c0;\n"
@@ -170,7 +171,7 @@ int main(void) {
     LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glBufferSubData); LOAD(glBufferStorage); LOAD(glMapBufferRange);
     LOAD(glFlushMappedBufferRange); LOAD(glCopyBufferSubData); LOAD(glVertexAttribPointer);
     LOAD(glEnableVertexAttribArray); LOAD(glFenceSync); LOAD(glDeleteSync); LOAD(glMemoryBarrier);
-    LOAD(glDrawRangeElementsBaseVertex); LOAD(glDispatchComputeIndirect); LOAD(glBindBufferBase); LOAD(glGetBufferSubData);
+    LOAD(glDrawRangeElementsBaseVertex); LOAD(glDispatchComputeIndirect); LOAD(glBindBufferBase); LOAD(glGetBufferSubData); LOAD(glUnmapBuffer);
     CHECK("entry points", pglBufferStorage && pglMapBufferRange && pglFlushMappedBufferRange &&
                           pglFenceSync && pglMemoryBarrier && pglCopyBufferSubData);
     if (failures) return 1;
@@ -413,6 +414,26 @@ int main(void) {
             snprintf(what, sizeof(what), "10. glDispatchComputeIndirect reads flushed counts: mark %#x (error %#x)", mark, glGetError());
             CHECK(what, mark == 0x600du);
             pglUseProgram(prog);
+        }
+    }
+
+    /* 11. Immutable storage without GL_DYNAMIC_STORAGE_BIT, written through a
+       plain write mapping: the unmap must still reach the host's copy. */
+    {
+        GLuint b = 0;
+        unsigned got[4] = {0};
+        pglGenBuffers(1, &b);
+        pglBindBuffer(0x8F36 /* GL_COPY_READ_BUFFER */, b);
+        pglBufferStorage(0x8F36, 4096, NULL, GL_MAP_WRITE_BIT);
+        unsigned *w = pglMapBufferRange(0x8F36, 0, 4096, GL_MAP_WRITE_BIT | 0x0004 /* INVALIDATE_RANGE */);
+        CHECK("11. non-dynamic storage mapped", w != NULL);
+        if (w) {
+            for (int i = 0; i < 1024; i++) w[i] = 0x51000000u + i;
+            pglUnmapBuffer(0x8F36);
+            pglGetBufferSubData(0x8F36, 1000 * 4, sizeof(got), got);
+            char what[120];
+            snprintf(what, sizeof(what), "11. non-dynamic storage keeps a mapping's writes: %#x (error %#x)", got[0], glGetError());
+            CHECK(what, got[0] == 0x51000000u + 1000 && got[3] == 0x51000000u + 1003);
         }
     }
 
