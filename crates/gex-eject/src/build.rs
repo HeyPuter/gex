@@ -613,30 +613,64 @@ impl Translation<'_> {
         let unguarded = gex_cgen::image::unguarded();
         gex_native::pe_units::set_cache_root(Some(cache.clone()));
         gex_cgen::image::set_unguarded(true);
-        let built = (|| {
-            let mut images = Vec::new();
-            // Programs too, at the base gex's loader gives them (PIE_BASE):
-            // one function tier for all of a Linux program's code.
-            for p in self.placed.iter().filter(|p| (programs && p.obj.role == "exe") || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp"))) {
-                let host = self.dir.join(rootfs_rel(&p.obj.path)?);
-                let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
-                let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)
-                    .with_context(|| format!("the function-tier unit of {} at {:#x}", p.obj.path, p.image.bias))?;
-                let key = wasm.parent().and_then(|d| d.file_name()).map(|k| k.to_string_lossy().into_owned()).unwrap_or_default();
-                let entries = gex_cgen::image::read_entries(&wasm)?.iter().filter(|&&a| a != 0).count() as u64;
-                images.push(BuiltImage {
-                    kind: "elf-unit".to_string(),
-                    identity: key.clone(),
-                    base: p.image.bias,
-                    module: format!("{out}/{key}/c.wasm"),
-                    object: p.obj.id.clone(),
-                    path: p.obj.path.clone(),
-                    blocks: entries,
-                    bytes: std::fs::metadata(&wasm)?.len(),
-                });
-            }
-            Ok(images)
-        })();
+        // Several objects at once: much of a unit's time (recovering the
+        // functions, linking) is one thread's, and most objects are small.
+        let workers = std::env::var("GEX_ELF_UNITS_PAR")
+            .ok()
+            .and_then(|j| j.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / jobs))
+            .max(1);
+        // Programs too, at the base gex's loader gives them (PIE_BASE):
+        // one function tier for all of a Linux program's code.
+        let todo: Vec<&Placed> = self
+            .placed
+            .iter()
+            .filter(|p| (programs && p.obj.role == "exe") || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp")))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let unit = |p: &Placed| -> Result<BuiltImage> {
+            let host = self.dir.join(rootfs_rel(&p.obj.path)?);
+            let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
+            let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)
+                .with_context(|| format!("the function-tier unit of {} at {:#x}", p.obj.path, p.image.bias))?;
+            let key = wasm.parent().and_then(|d| d.file_name()).map(|k| k.to_string_lossy().into_owned()).unwrap_or_default();
+            let entries = gex_cgen::image::read_entries(&wasm)?.iter().filter(|&&a| a != 0).count() as u64;
+            Ok(BuiltImage {
+                kind: "elf-unit".to_string(),
+                identity: key.clone(),
+                base: p.image.bias,
+                module: format!("{out}/{key}/c.wasm"),
+                object: p.obj.id.clone(),
+                path: p.obj.path.clone(),
+                blocks: entries,
+                bytes: std::fs::metadata(&wasm)?.len(),
+            })
+        };
+        let built = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers.min(todo.len()))
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(p) = todo.get(i) else { break };
+                            let r = unit(p);
+                            let failed = r.is_err();
+                            done.push((i, r));
+                            if failed {
+                                // The others stop at their next object.
+                                next.store(todo.len(), std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        done
+                    })
+                })
+                .collect();
+            let mut all: Vec<(usize, Result<BuiltImage>)> = handles.into_iter().flat_map(|h| h.join().expect("a unit build panicked")).collect();
+            all.sort_by_key(|(i, _)| *i);
+            all.into_iter().map(|(_, r)| r).collect::<Result<Vec<_>>>()
+        });
         gex_native::pe_units::set_cache_root(None);
         gex_cgen::image::set_unguarded(unguarded);
         built
