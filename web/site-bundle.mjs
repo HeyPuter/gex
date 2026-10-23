@@ -5,7 +5,7 @@
 // and the tar written again, deduplicated by content.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 const sha = (b) => createHash('sha256').update(b).digest('hex');
@@ -35,7 +35,10 @@ export function stripper(work, on) {
  * TAR extracted into WORK/tarx. A read-only directory (a prefix's Start menu
  * folders, which the shell reads desktop.ini names from only when read only)
  * is made writable while files leave it, and packed with its own mode again
- * (`pack`).
+ * (`pack`). Every directory's times are the bundle's again when it is packed:
+ * the files that leave it (the split) do not stamp it with the build's time,
+ * which a program may key a cache on (KDE's app database, a Windows app's),
+ * and the site is the same bytes each build.
  */
 export function extract(tar, work) {
   const x = join(work, 'tarx');
@@ -52,12 +55,28 @@ export function extract(tar, work) {
     }
   };
   unlock(x);
-  return { x, readOnly };
+  const dirTimes = [];
+  const times = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const p = join(d, e.name);
+      const st = statSync(p);
+      dirTimes.push([p, st.atime, st.mtime]);
+      times(p);
+    }
+  };
+  times(x);
+  return { x, readOnly, dirTimes };
 }
 
-/** --strip: every .wasm of the tree stripped. */
+/** --strip: every .wasm of the tree stripped, with the file's own times. */
 export function stripTree(x, stripped) {
-  walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
+  walk(x, (p) => {
+    if (!p.endsWith('.wasm')) return;
+    const st = statSync(p);
+    copyFileSync(stripped(p), p);
+    utimesSync(p, st.atime, st.mtime);
+  });
 }
 
 /** --prune: the files the browser never reads (precompiled .cwasm, static archives). */
@@ -95,7 +114,7 @@ export function splitTree(x, read, store) {
 /** The tree as the tar TAR again: directories first, then the files, with
  *  `dedupe` identical files next to each other (zstd's window stores the
  *  second as a match). */
-export function pack({ x, readOnly }, tar, work, dedupe) {
+export function pack({ x, readOnly, dirTimes }, tar, work, dedupe) {
   const dirs = [];
   const byHash = new Map();
   const all = (d, rel) => {
@@ -112,6 +131,8 @@ export function pack({ x, readOnly }, tar, work, dedupe) {
   const list = join(work, 'tar-list');
   writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
   for (const [p, mode] of readOnly) chmodSync(p, mode);
+  // Deepest first; a directory removed since (none is) is skipped.
+  for (const [p, at, mt] of [...dirTimes].reverse()) if (existsSync(p)) utimesSync(p, at, mt);
   execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
   for (const [p, mode] of readOnly) chmodSync(p, mode | 0o700);
 }
