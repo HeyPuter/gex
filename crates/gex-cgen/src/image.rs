@@ -733,7 +733,10 @@ fn emit_and_link(
             }
         }
         }
-        if unit.len() > 0 {
+        // An image with no code to translate (every export a forwarder, or
+        // served by Wine's PE module) still gets its unit, an empty one, so
+        // the link has an input and hosts find the image covered.
+        if unit.len() > 0 || (objs.is_empty() && providers.sources.is_empty()) {
             emit(&mut unit, k, &mut objs, &mut stats, None)?;
         }
         // The providers' own translation units, cached by their C as units are.
@@ -818,7 +821,9 @@ pub fn funcs_section(wasm: &[u8]) -> Result<Vec<u64>> {
             _ => {}
         }
     }
-    if names.is_empty() {
+    // A unit with slots but no names was stripped; an empty one (an image
+    // with no code to translate) has neither.
+    if names.is_empty() && !slots.is_empty() {
         bail!("the unit has no function names (was it linked with names stripped?)");
     }
     Ok(slots.iter().map(|f| names.get(f).copied().unwrap_or(0)).collect())
