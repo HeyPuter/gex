@@ -16,6 +16,14 @@ SR=$PREFIX/sysroot
 JOBS=${JOBS:-6}
 export PATH=$PREFIX/bin:$PATH
 rm -rf "$B"
+# Our changes to the LLVM runtimes (patches/libcxx-*.patch, each saying why),
+# applied to LLVM_SRC once
+for p in "$(dirname "$0")"/patches/libcxx-*.patch; do
+  [ -e "$p" ] || continue
+  if ! patch -d "$SRC" -p1 -R -s -f --dry-run < "$p" > /dev/null 2>&1; then
+    patch -d "$SRC" -p1 -s -N < "$p" || { echo "build-cxx.sh: $p does not apply" >&2; exit 1; }
+  fi
+done
 # wasm is not ELF, so libunwind would mark its exports __declspec(dllexport)
 # unless told the symbols are hidden (one static module: they need not be
 # exported at all).

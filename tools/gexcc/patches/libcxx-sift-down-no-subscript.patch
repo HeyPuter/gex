@@ -1,0 +1,51 @@
+libc++'s heap algorithms reach elements through *(it + n), not it[n]: iterator
+adaptors written against libstdc++ (Qt's QTaggedIterator) have no operator[].
+
+--- a/libcxx/include/__algorithm/sift_down.h	2026-10-23 09:14:14.347402961 -0400
++++ b/libcxx/include/__algorithm/sift_down.h	2026-10-23 09:14:14.354402975 -0400
+@@ -45,21 +45,21 @@
+ 
+   if _LIBCPP_CONSTEXPR (__assume_both_children) {
+     // right-child exists and is greater than left-child
+-    __child += __comp(__first[__child], __first[__child + 1]);
+-  } else if ((__child + 1) < __len && __comp(__first[__child], __first[__child + 1])) {
++    __child += __comp(*(__first + (__child)), *(__first + (__child + 1)));
++  } else if ((__child + 1) < __len && __comp(*(__first + (__child)), *(__first + (__child + 1)))) {
+     // right-child exists and is greater than left-child
+     ++__child;
+   }
+ 
+   // check if we are in heap-order
+-  if (__comp(__first[__child], __first[__start]))
++  if (__comp(*(__first + (__child)), *(__first + (__start))))
+     // we are, __start is larger than its largest child
+     return;
+ 
+   value_type __top(_Ops::__iter_move(__first + __start));
+   do {
+     // we are not in heap-order, swap the parent with its largest child
+-    __first[__start] = _Ops::__iter_move(__first + __child);
++    *(__first + (__start)) = _Ops::__iter_move(__first + __child);
+     __start          = __child;
+ 
+     if ((__len - 2) / 2 < __child)
+@@ -69,15 +69,15 @@
+     __child = 2 * __child + 1;
+ 
+     if _LIBCPP_CONSTEXPR (__assume_both_children) {
+-      __child += __comp(__first[__child], __first[__child + 1]);
+-    } else if ((__child + 1) < __len && __comp(__first[__child], __first[__child + 1])) {
++      __child += __comp(*(__first + (__child)), *(__first + (__child + 1)));
++    } else if ((__child + 1) < __len && __comp(*(__first + (__child)), *(__first + (__child + 1)))) {
+       // right-child exists and is greater than left-child
+       ++__child;
+     }
+ 
+     // check if we are in heap-order
+-  } while (!__comp(__first[__child], __top));
+-  __first[__start] = std::move(__top);
++  } while (!__comp(*(__first + (__child)), __top));
++  *(__first + (__start)) = std::move(__top);
+ }
+ 
+ template <class _AlgPolicy, class _Compare, class _RandomAccessIterator>
