@@ -425,6 +425,17 @@ GEX_INLINE uint32_t gex_ftab_idx(uint64_t t) {
    spin-wait on a flag another thread sets). A compiler-only fence: no code. */
 #define GEX_BACKEDGE() __atomic_signal_fence(__ATOMIC_SEQ_CST)
 
+/* x86 orders every load after the loads before it and every store after
+   the accesses before it (TSO), and other threads' code relies on it
+   (seqlocks, published pointers). The guest's plain scalar loads and stores
+   are therefore volatile: the C compiler keeps them in program order and
+   neither merges, caches nor drops one. Bulk and vector accesses, which
+   are not volatile, sit between two compiler-only fences instead: no code,
+   and no other guest access moves across them. On an x86 host the wasm
+   engine keeps memory accesses in that order. */
+#define GEX_ORDER() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#define GEX_VLOAD(e) __extension__({ GEX_ORDER(); v128_t gex_vl_ = (e); GEX_ORDER(); gex_vl_; })
+
 /* Old value of a compare-and-swap, at each width. */
 #define GEX_CAS(T, p, e, r) __sync_val_compare_and_swap((T *)(p), (e), (r))
 
