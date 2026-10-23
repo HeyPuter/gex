@@ -256,6 +256,11 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         // now, as the session saw it (a failed look stays missing, as a
         // failed open does). One under /tmp, or gone since, the session made.
         let looked = f.stat && !f.read && !f.write && !f.create && !f.directory;
+        // A look through `..` (a stat of `dir/..`) names, as the program
+        // wrote it, a directory it reached by another path.
+        if looked && p.split('/').any(|c| c == "..") {
+            continue;
+        }
         if looked && f.ok > 0 {
             if p == "/tmp" || p.starts_with("/tmp/") {
                 continue;

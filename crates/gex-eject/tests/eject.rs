@@ -354,6 +354,8 @@ fn eject_keeps_files_only_looked_at() {
         looked(at("in/none.qml"), 0),
         // There when the session looked, gone by the eject.
         looked(at("in/gone.qml"), 1),
+        // A stat of `dir/..`: the directory is reached by its own path.
+        looked(at("in/ui/.."), 1),
     ] {
         session.files.insert(f.path.clone(), f);
     }
