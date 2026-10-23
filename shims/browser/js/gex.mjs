@@ -5572,7 +5572,7 @@ export class Gex {
     // reply_size 0 it is whatever the client's stack held, so it is read
     // only then (a stale one made #doorGuest rebuild its views per call).
     const replyData = !replyMax ? 0 : wide ? Number(cdv.getBigUint64(req + 72, true)) : cdv.getUint32(req + (lp64 ? 72 : 68), true);
-    if (st && replyData > st.hi) st.hi = replyData;
+    if (st && replyData + replyMax > st.hi) st.hi = replyData + replyMax;
     const data0 = lp64 ? 80 : 72, entry = lp64 ? 16 : 8;
     const a = d.area;
     // The door buffer's place and size never change: read once per door.
@@ -5610,7 +5610,7 @@ export class Gex {
         const e0 = req + data0 + entry * k;
         if (e0 + entry > g.u8.length) g = this.#doorGuest(e0 + entry);
         const ptr = wide ? Number(g.dv.getBigUint64(e0, true)) : g.dv.getUint32(e0, true), size = g.dv.getUint32(e0 + entry / 2, true);
-        if (st && ptr > st.hi) st.hi = ptr;
+        if (st && ptr + size > st.hi) st.hi = ptr + size;
         if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
         u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
