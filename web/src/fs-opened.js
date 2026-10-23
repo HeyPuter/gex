@@ -1,5 +1,5 @@
-// The files a run has opened in the global kernel's filesystem (TmpFs's
-// `opened`, shims/kernel `k_fs_opened`): what gex-eject's W3 recorder
+// The files whose bytes a run used in the global kernel's filesystem (TmpFs's
+// `read_set`, shims/kernel `k_fs_opened`; an open or a stat alone is not a use): what gex-eject's W3 recorder
 // (tools/eject/record-w3.mjs) keeps as the run's read set, so that the site
 // can ship those in its bundle and serve the rest as lazy files
 // (docs/eject.md, "The bundle split").
