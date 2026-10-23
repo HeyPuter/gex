@@ -166,6 +166,14 @@ const tIdx = (v) => (m64() ? BigInt(v) : v);
  * memory needs the `slice` copy; it is only paid when the memory is shared.
  */
 const DECODER = new TextDecoder();
+/** Byte, word and DataView views of all of `buf`: what a door call reads a
+ *  client's request through. The word view's length is computed without
+ *  `>>> 2`, which wraps for a 64-bit memory past 4 GiB (a memory of 4 GiB +
+ *  64 KiB gave a view of 16384 words). */
+export function memoryViews(buf) {
+  return { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, Math.floor(buf.byteLength / 4)), dv: new DataView(buf) };
+}
+
 export function utf8(view) {
   return DECODER.decode(isShared(view.buffer) ? view.slice() : view);
 }
@@ -5303,7 +5311,7 @@ export class Gex {
   #doorInst = null;
   #doorViews = null;
   /** Census: door calls, fallbacks, proxies. */
-  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0, tProxy: 0, byNr: {} };
+  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, hi: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0, tProxy: 0, byNr: {} };
 
   /** The server: `area` is its door area, in this process's memory. */
   #doorPublish(area) {
@@ -5553,10 +5561,10 @@ export class Gex {
    *  it stays optimised: every server request of a W3 process comes here
    *  (docs/wine-overhead.md). */
   #doorCall(req, pid, tid, lp64) {
-    // A 64-bit memory's client (W64's memory64 flavour) goes by the pipes:
-    // the server is a wasm32 program, which a door runs in the client's
-    // Worker on this Worker's shim, and the request's pointers may pass 4 GiB.
-    if (m64()) return 1;
+    // A 64-bit memory's client (W64's memory64 flavour) takes the door too:
+    // the server's instance here touches only the server's own wasm32
+    // memory, and the request is copied in and out at full 64-bit
+    // addresses (`#doorRun`'s `wide`).
     if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid, lp64);
     const d = this.#door;
     if (!d || single.on) return 1;
@@ -5586,7 +5594,7 @@ export class Gex {
     let g = this.#doorGv;
     if (!g || end > g.u8.length) {
       const buf = this.#memory.buffer;
-      g = this.#doorGv = { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, buf.byteLength >>> 2), dv: new DataView(buf) };
+      g = this.#doorGv = memoryViews(buf);
     }
     return g;
   }
@@ -5600,9 +5608,12 @@ export class Gex {
   /** One door call under the door lock (`st`: the statistics, or null).
    *  The client's `struct __server_request_info`, past its 64-byte union:
    *  data_count, reply_data and data[] (pointer, size) at 64, 68 and 72 in
-   *  8-byte entries (ILP32), or at 64, 72 and 80 in 16-byte ones (`lp64`,
-   *  pointers below 4 GiB). */
+   *  8-byte entries (ILP32), or at 64, 72 and 80 in 16-byte ones (`lp64`).
+   *  A lowered LP64 client's pointers are below 4 GiB; a 64-bit memory's
+   *  (`wide`) are read whole, and its addresses, which pass 4 GiB, are
+   *  never put through 32-bit operators. */
   #doorRun(d, req, pid, tid, st, lp64) {
+    const wide = m64();
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
@@ -5615,7 +5626,8 @@ export class Gex {
     // reply_data is set only for a request with a reply buffer: with
     // reply_size 0 it is whatever the client's stack held, so it is read
     // only then (a stale one made #doorGuest rebuild its views per call).
-    const replyData = replyMax ? cdv.getUint32(req + (lp64 ? 72 : 68), true) : 0;
+    const replyData = !replyMax ? 0 : wide ? Number(cdv.getBigUint64(req + 72, true)) : cdv.getUint32(req + (lp64 ? 72 : 68), true);
+    if (st && replyData + replyMax > st.hi) st.hi = replyData + replyMax;
     const data0 = lp64 ? 80 : 72, entry = lp64 ? 16 : 8;
     const a = d.area;
     // The door buffer's place and size never change: read once per door.
@@ -5644,7 +5656,7 @@ export class Gex {
       let di = this.#doorInst;
       if (!di || di.door !== d) di = this.#doorInst = this.#doorInstantiate(d);
       // The 64-byte header as 16 words (no subarray views), then the data.
-      if (((req | buf) & 3) === 0) {
+      if (!wide && ((req | buf) & 3) === 0) {
         const gi = g.i32, s0 = req >>> 2, d0 = buf >>> 2;
         for (let k = 0; k < 16; k++) i32[d0 + k] = gi[s0 + k];
       } else u8.set(g.u8.subarray(req, req + 64), buf);
@@ -5652,7 +5664,8 @@ export class Gex {
       for (let k = 0; k < count; k++) {
         const e0 = req + data0 + entry * k;
         if (e0 + entry > g.u8.length) g = this.#doorGuest(e0 + entry);
-        const ptr = g.dv.getUint32(e0, true), size = g.dv.getUint32(e0 + entry / 2, true);
+        const ptr = wide ? Number(g.dv.getBigUint64(e0, true)) : g.dv.getUint32(e0, true), size = g.dv.getUint32(e0 + entry / 2, true);
+        if (st && ptr + size > st.hi) st.hi = ptr + size;
         if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
         u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
@@ -5675,7 +5688,7 @@ export class Gex {
         const ro = buf + r;
         // the dispatch may have grown the guest's memory (a request that maps)
         g = this.#doorGuest(Math.max(req + 64, replyData + replyMax));
-        if (((req | ro) & 3) === 0) {
+        if (!wide && ((req | ro) & 3) === 0) {
           const gi = g.i32, s0 = ro >>> 2, d0 = req >>> 2;
           for (let k = 0; k < 16; k++) gi[d0 + k] = i32[s0 + k];
         } else g.u8.set(u8.subarray(ro, ro + 64), req);
@@ -5728,6 +5741,7 @@ export class Gex {
       if (!(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
       return 1;
     }
+    st.hi = Math.max(st.hi, req);
     const r = this.#doorRun(d, req, pid, tid, st, lp64);
     const { i32, dv } = this.#doorView();
     const a = d.area;
@@ -5744,7 +5758,7 @@ export class Gex {
         + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
         + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
         + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
-        + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
+        + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms; highest client address 0x${st.hi.toString(16)}`);
       st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
       st.byNr = {};
       st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
