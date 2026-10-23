@@ -188,6 +188,25 @@ struct Proc {
     queue: crate::wait::Queue,
     /// See [`ProcTable::set_info`].
     info: Vec<u8>,
+    /// Its address space, for another process's `process_vm_readv` and
+    /// `process_vm_writev`: see [`ProcTable::set_vm`]. `None` once it exits.
+    vm: Option<Arc<PeerVm>>,
+}
+
+/// Another process's memory as a host holds it: bytes at a guest address,
+/// copied out or in. `false` when the range is past the memory's end.
+pub trait PeerMem: Send + Sync {
+    fn read(&self, addr: u64, out: &mut [u8]) -> bool;
+    fn write(&self, addr: u64, data: &[u8]) -> bool;
+}
+
+/// A process's address space as another process reaches it: its memory map,
+/// which says what is mapped and how, and its memory. Replaced whole at an
+/// `execve`, so a holder that still has the old one is told by
+/// [`ProcTable::vm`] no longer handing it out.
+pub struct PeerVm {
+    pub mm: crate::mem::Mm,
+    pub mem: Arc<dyn PeerMem>,
 }
 
 struct Table {
@@ -265,6 +284,7 @@ impl ProcTable {
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
+                    vm: None,
                 }],
             }),
         }
@@ -300,8 +320,32 @@ impl ProcTable {
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
+            vm: None,
         });
         pid
+    }
+
+    /// Publish `pid`'s address space for other processes (at its start and
+    /// at each `execve`), or withdraw it. A table that is somewhere else
+    /// keeps none: there each process's memory is its own Worker's.
+    pub fn set_vm(&self, pid: i32, vm: Option<Arc<PeerVm>>) {
+        if self.remote.is_some() {
+            return;
+        }
+        let mut t = self.lock();
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
+            p.vm = vm;
+        }
+    }
+
+    /// `pid`'s address space as last published: `ESRCH` for no such process
+    /// or one that has exited, `ENOSYS` where the table keeps none.
+    pub fn vm(&self, pid: i32) -> Result<Arc<PeerVm>, Errno> {
+        if self.remote.is_some() {
+            return Err(Errno::ENOSYS);
+        }
+        let t = self.lock();
+        t.procs.iter().find(|p| p.pid == pid).and_then(|p| p.vm.clone()).ok_or(Errno::ESRCH)
     }
 
     /// A new thread of `pid`, and its id: from the numbering the processes'
@@ -449,8 +493,11 @@ impl ProcTable {
             let parent_q = ppid
                 .and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid))
                 .map_or(0, |p| p.queue.id());
-            match t.procs.iter().find(|p| p.pid == pid) {
-                Some(p) => (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q),
+            match t.procs.iter_mut().find(|p| p.pid == pid) {
+                Some(p) => {
+                    p.vm = None;
+                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q)
+                }
                 None => return,
             }
         };

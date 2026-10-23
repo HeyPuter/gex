@@ -242,6 +242,8 @@ pub mod raw {
     pub const SENDMMSG: u64 = 345;
     pub const RENAMEAT2: u64 = 353;
     pub const GETRANDOM: u64 = 355;
+    pub const PROCESS_VM_READV: u64 = 347;
+    pub const PROCESS_VM_WRITEV: u64 = 348;
     pub const MEMFD_CREATE: u64 = 356;
     pub const SOCKET: u64 = 359;
     pub const SOCKETPAIR: u64 = 360;
@@ -929,6 +931,8 @@ pub fn translate(
         x::UNAME => nr::UNAME,
         x::SYSINFO => nr::SYSINFO,
         x::GETRANDOM => nr::GETRANDOM,
+        x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
+        x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
         x::RT_SIGACTION => nr::RT_SIGACTION,
         x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
         x::RT_SIGRETURN | x::SIGRETURN => nr::RT_SIGRETURN,

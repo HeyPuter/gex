@@ -282,6 +282,8 @@ pub mod raw {
     pub const GETCPU: u64 = 309;
     pub const RENAMEAT2: u64 = 316;
     pub const GETRANDOM: u64 = 318;
+    pub const PROCESS_VM_READV: u64 = 310;
+    pub const PROCESS_VM_WRITEV: u64 = 311;
     pub const MEMFD_CREATE: u64 = 319;
     pub const MEMBARRIER: u64 = 324;
     pub const COPY_FILE_RANGE: u64 = 326;
@@ -595,6 +597,8 @@ pub fn translate(
         x::GETCPU => nr::GETCPU,
         x::RENAMEAT2 => nr::RENAMEAT2,
         x::GETRANDOM => nr::GETRANDOM,
+        x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
+        x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
         x::MEMFD_CREATE => nr::MEMFD_CREATE,
         x::MEMBARRIER => nr::MEMBARRIER,
         x::COPY_FILE_RANGE => nr::COPY_FILE_RANGE,
