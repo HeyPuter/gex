@@ -15280,8 +15280,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
                 ));
             }
-            set_exit(128 + 11);
         })();
+        branch_fault(pc);
         trap();
     }
     // Which of this object's functions the backend serves itself, before either
@@ -16233,9 +16233,30 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             ));
         })();
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
-        set_exit(128 + 11);
+        branch_fault(pc);
     }
     trap();
+}
+
+/// A branch to `pc`, where there is nothing to run: SIGSEGV there, for the
+/// guest's handler if it has one, else the process dies of it, as on Linux.
+/// The whole process: a status set for this thread alone left the others
+/// running and its parent waiting.
+fn branch_fault(pc: u64) {
+    let c = my_ctx();
+    let mut gm = GuestMem::new(guest_bytes());
+    match sigs::fault(&mut gm, c, 11, pc, pc) {
+        gex_kernel::signal::Delivery::Resume(target) => {
+            if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+            }
+            set_resume(target);
+            set_resume_ctx(c);
+        }
+        _ => {
+            exit_here(-11, Some(pc));
+        }
+    }
 }
 
 

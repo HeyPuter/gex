@@ -6123,8 +6123,8 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
 
 /// A branch to `pc`, which is not executable guest memory, in a process
 /// without the NT layer: the process's own fault hook takes it as an access
-/// violation, executing (Wine's ntdll.so); else it is a SIGSEGV. Always
-/// stops the guest call.
+/// violation, executing (Wine's ntdll.so); else it is a SIGSEGV, for the
+/// program's handler if it has one. Always stops the guest call.
 pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<i32> {
     // The process's own fault hook (Wine's ntdll.so, W3):
     // an access violation, executing (DEP).
@@ -6155,6 +6155,16 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
             internal: true,
         });
         return Err(StopExecution.into());
+    }
+    // The program's own SIGSEGV handler, at the branch's target.
+    if let Some(memory) = caller.data().memory.clone() {
+        let mut gm = GuestMem::new(memory.bytes());
+        let state = caller.data_mut();
+        if let gex_kernel::signal::Delivery::Resume(target) = state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, pc)) {
+            state.resume_cause = Some("SIGSEGV".into());
+            state.resume_at = Some(target);
+            return Err(StopExecution.into());
+        }
     }
     // A wild branch is nearly always a bad return address or
     // function pointer: say where the last indirect branch
