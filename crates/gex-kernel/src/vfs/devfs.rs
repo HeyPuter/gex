@@ -245,7 +245,10 @@ impl FileSystem for DevFs {
             "stdout" => "/proc/self/fd/1".to_string(),
             "stderr" => "/proc/self/fd/2".to_string(),
             "fd" => "/proc/self/fd".to_string(),
-            _ => return Err(Errno::EINVAL),
+            _ => {
+                self.metadata(path)?;
+                return Err(Errno::EINVAL);
+            }
         })
     }
 }
