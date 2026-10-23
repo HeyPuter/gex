@@ -65,11 +65,7 @@ page() { # LOG [env...]
 }
 page "$w/page.log"
 # (GEX_LOG=unit: the unit's "function tier for" line is debug output.)
-# With the exe's unit the thread case's start routine can be a null
-# function-table slot (a separate known bug): the main thread's case decides,
-# the threads' is reported.
-if grep -q 'function tier for .*/nativeleft.exe' "$w/page.log"; then verdict page "$w/page.log" '^nativeleft main ok [1-9]'
-	grep -q '^nativeleft ok [1-9]' "$w/page.log" || echo "known page: the thread case did not pass (null function-table slot at a start routine)"
+if grep -q 'function tier for .*/nativeleft.exe' "$w/page.log"; then verdict page "$w/page.log" '^nativeleft ok [1-9]'
 else fail=$((fail + 1)); echo "FAIL page: nativeleft.exe ran without its unit"; grep -i 'nativeleft.exe' "$w/page.log" | head -3 | sed 's/^/  /'; fi
 # Without the exe's unit: its code runs on tier-1, so the guest calls from
 # native Wine are call-outs and the NATIVE_LEFT leaves the comparator's.
