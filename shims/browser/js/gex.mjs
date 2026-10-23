@@ -2168,11 +2168,10 @@ export class Gex {
     if (globalThis.GEX_TEST_SERVE_UNMERGED || globalThis.process?.env?.GEX_TEST_SERVE_UNMERGED) e.gex_test_serve_unmerged?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
-    if (opts.fjit && e.gex_set_fjit) {
-      e.gex_set_fjit(opts.fjit === 2 ? 2 : 1);
-      if (opts.fjitMax != null || opts.fjitOnly) e.gex_fjit_limit?.(opts.fjitMax ?? 0xffffffff, BigInt(opts.fjitOnly ?? 0));
-      if (!(this.#cgenMode & 3)) this.useCgen(this.#cgenMode | 1);
-    }
+    // Carried into every child (the fork and exec records' `opts`, `#childOpts`):
+    // a Wine program runs in an exec'd process, never in pid 1.
+    Object.assign(this.#opts, { fjit: opts.fjit, fjitMax: opts.fjitMax, fjitOnly: opts.fjitOnly });
+    this.#fjitOn(e, opts);
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -3027,7 +3026,15 @@ export class Gex {
   }
 
   /** A child's run options, said to its kernel (`adoptProcess`). */
+  #fjitOn(e, o) {
+    if (!o.fjit || !e.gex_set_fjit) return;
+    e.gex_set_fjit(o.fjit === 2 ? 2 : 1);
+    if (o.fjitMax != null || o.fjitOnly) e.gex_fjit_limit?.(o.fjitMax ?? 0xffffffff, BigInt(o.fjitOnly ?? 0));
+    if (!(this.#cgenMode & 3)) this.useCgen(this.#cgenMode | 1);
+  }
+
   #childOpts(e, o, pid) {
+    this.#fjitOn(e, o);
     // `?strace=1` narrates every process; `?stracepid=N` only that one, which
     // is what a run that must stay alive can afford.
     if (o.strace || (o.stracePid && o.stracePid === pid)) { e.gex_set_trace(1); this.#traced = true; }
