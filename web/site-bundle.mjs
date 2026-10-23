@@ -136,3 +136,64 @@ export function pack({ x, readOnly, dirTimes }, tar, work, dedupe) {
   execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
   for (const [p, mode] of readOnly) chmodSync(p, mode | 0o700);
 }
+
+/** A unit's image path as a list of guest paths names it: Wine's drive path
+ *  (/pfx/dosdevices/c:/...) as the bundle's (/pfx/drive_c/...), lower case. */
+export const unitGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
+
+/** A list of guest paths, one a line, `#` comments (--late, --boot-units). */
+export const readPathList = (file) => readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+
+/**
+ * The background fill: bytes the page downloads after the boot's, while the
+ * guest runs (app.js `fill`; fill.json names where each file starts).
+ *
+ * - `late`: guest paths of lazy files (`lazy`, splitTree's list, their bytes in
+ *   `store`), each followed by its image's units (`unit:KEY/FILE`), which the
+ *   page compiles from the fill once their bytes are in;
+ * - `boot`: the images whose units the program loads before it is up (a
+ *   shell's taskbar). Every other unit follows, in the order the recording
+ *   first used them, then the ones it never used: shared as bytes and compiled
+ *   when a process first maps one (fill.json's `demand`); a process that maps
+ *   one before the fill has it waits for its bytes there (worker.mjs
+ *   `loadFile`). A unit that is no image's (gexc eject's "[nt trampolines]",
+ *   which every 32-bit process uses from its first system call) stays in the
+ *   boot.
+ *
+ * `units`: the recording's units ({ key, path, at }); `unitDir`: the unit cache
+ * (KEY/c.wasm, KEY/c.entries); `lazyUrl(hash)`: a lazy file's name in the
+ * fill. Returns { bytes, files: [[name, offset, size]], demand: [KEY], keys:
+ * every unit KEY in the fill, lateFiles: how many lazy files }.
+ */
+export function buildFill({ late = [], lazy = [], store, boot = null, units = [], unitDir, lazyUrl }) {
+  const usable = (u) => existsSync(join(unitDir, u.key, 'c.wasm')) && !existsSync(join(unitDir, u.key, 'cold'));
+  const byPath = new Map(lazy.map((f) => [f[0], f]));
+  const seen = new Set();
+  const keys = new Set();
+  const demand = [];
+  const files = [];
+  const parts = [];
+  let off = 0;
+  const put = (name, bytes) => { files.push([name, off, bytes.length]); parts.push(bytes); off += bytes.length; };
+  const putUnit = (u) => { keys.add(u.key); for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(unitDir, u.key, n))); };
+  for (const p of late) {
+    const f = byPath.get(p);
+    if (f && !seen.has(f[2])) {
+      seen.add(f[2]);
+      put(lazyUrl(f[2]), readFileSync(join(store, f[2])));
+    }
+    for (const u of units.filter((u) => unitGuest(u.path) === p.toLowerCase())) if (!keys.has(u.key) && usable(u)) putUnit(u);
+  }
+  if (boot) {
+    const at = (u) => (typeof u.at === 'number' ? u.at : Infinity);
+    const deferred = units
+      .filter((u) => !String(u.path ?? '').startsWith('[') && !boot.has(unitGuest(u.path)) && !keys.has(u.key) && usable(u))
+      .sort((a, b) => at(a) - at(b) || (a.key < b.key ? -1 : 1));
+    for (const u of deferred) {
+      if (keys.has(u.key)) continue;
+      demand.push(u.key);
+      putUnit(u);
+    }
+  }
+  return { bytes: Buffer.concat(parts), files, demand, keys, lateFiles: seen.size };
+}

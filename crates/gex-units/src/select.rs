@@ -228,18 +228,11 @@ pub fn write_selection(sel: &BTreeMap<String, String>) -> String {
 /// Read `select.json` (a flat object of strings, as [`write_selection`]
 /// writes it).
 pub fn read_selection(text: &str) -> Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    let body = text.trim().trim_start_matches('{').trim_end_matches('}');
-    for item in body.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let (k, v) = item.split_once(':').with_context(|| format!("select.json: {item:?}"))?;
-        let unq = |x: &str| x.trim().trim_matches('"').to_string();
-        out.insert(unq(k), unq(v));
-    }
-    Ok(out)
+    // Every string in order, key then value (a value's ranges have commas,
+    // no string has a quote).
+    let strs: Vec<&str> = text.split('"').skip(1).step_by(2).collect();
+    anyhow::ensure!(strs.len() % 2 == 0, "select.json: a key without a value");
+    Ok(strs.chunks(2).map(|kv| (kv[0].to_string(), kv[1].to_string())).collect())
 }
 
 #[cfg(test)]
@@ -263,6 +256,8 @@ mod tests {
         assert!(s.best >= 1);
         let sel = selection(&units, &s, 1);
         assert_eq!(sel["k"], "0");
+        let two = read_selection("{\n  \"a\": \"1-3,7\",\n  \"b\": \"0\"\n}\n").unwrap();
+        assert_eq!((two["a"].as_str(), two["b"].as_str()), ("1-3,7", "0"));
         assert_eq!(read_selection(&write_selection(&sel)).unwrap(), sel);
     }
 }
