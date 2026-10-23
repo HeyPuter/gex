@@ -16,9 +16,12 @@
 //! - `gexc units build CACHE SELECT OUT [--fallback jit|CLUSTERING]`: each
 //!   unit of CACHE into OUT, a unit cache: the slots SELECT names compiled,
 //!   every other slot left to the fallback (the function JIT, or cold
-//!   clusters); `--whole` ships every unit whole, `--keys LIST` only those;
+//!   clusters); `--whole` ships every unit whole, `--keys LIST` only those
+//!   (and `--providers LIST` only those providers), `--whole-keys LIST`
+//!   those whole whatever SELECT says;
 //!   `--preload PREFIX` writes OUT/preload.json for the page (PREFIX: the
-//!   URL OUT is served at, the page's `cgenurl`).
+//!   URL OUT is served at, the page's `cgenurl`): the units SELECT names and
+//!   the whole ones.
 use anyhow::{bail, Context, Result};
 use gex_units::profile::Profile;
 use gex_units::select;
@@ -79,7 +82,7 @@ fn key_list(args: &[String], flag: &str, cache: &Path) -> Result<Vec<String>> {
 }
 
 pub fn cmd_units(args: &[String]) -> Result<()> {
-    let usage = "usage: gexc units profile OUT LOG... | select PROFILE CACHE OUT [options] | build CACHE SELECT OUT [--fallback jit|CLUSTERING] [--whole] [--keys LIST] [--preload PREFIX]";
+    let usage = "usage: gexc units profile OUT LOG... | select PROFILE CACHE OUT [options] | build CACHE SELECT OUT [--fallback jit|CLUSTERING] [--whole] [--keys LIST] [--whole-keys LIST] [--providers LIST] [--preload PREFIX]";
     let Some(what) = args.first() else { bail!("{usage}") };
     let rest = &args[1..];
     let pos = positional(rest);
@@ -165,14 +168,25 @@ pub fn cmd_units(args: &[String]) -> Result<()> {
             };
             let fallback = opt(rest, "--fallback").unwrap_or_else(|| "jit".to_string());
             let how: Option<gex_units::Clustering> = if fallback == "jit" { None } else { Some(fallback.parse()?) };
-            let keys = key_list(rest, "--keys", &cache)?;
+            let mut keys = key_list(rest, "--keys", &cache)?;
+            // `--whole-keys LIST`: units shipped whole whatever SELECT says
+            // (one no image has, as the NT trampolines').
+            let whole_keys: Vec<String> = match opt(rest, "--whole-keys") {
+                Some(_) => key_list(rest, "--whole-keys", &cache)?,
+                None => Vec::new(),
+            };
+            for k in &whole_keys {
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
             let (mut jit, mut cold, mut kept) = (0, 0, 0);
             for k in &keys {
                 let hot = match sel.get(k) {
                     Some(r) => gex_units::slot_ranges(r)?,
                     None => Default::default(),
                 };
-                let shape = if whole {
+                let shape = if whole || whole_keys.contains(k) {
                     gex_units::Shape::Whole
                 } else if let Some(how) = how {
                     gex_units::Shape::Split(&hot, how)
@@ -184,9 +198,17 @@ pub fn cmd_units(args: &[String]) -> Result<()> {
                 cold += s.cold as usize;
                 kept += hot.len();
             }
-            // The providers the units bind, as in a unit cache.
+            // The providers the units bind, as in a unit cache: every one, or
+            // those `--providers LIST` names (a file of provider file names).
+            let only: Option<Vec<String>> = match opt(rest, "--providers") {
+                Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("reading {f}"))?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()),
+                None => None,
+            };
             if let Ok(rd) = std::fs::read_dir(cache.join("providers")) {
                 for e in rd.flatten() {
+                    if only.as_ref().is_some_and(|o| !o.iter().any(|n| e.file_name().to_string_lossy() == n.as_str())) {
+                        continue;
+                    }
                     gex_units::link_or_copy(&e.path(), &out.join("providers").join(e.file_name()))?;
                 }
             }
@@ -194,10 +216,12 @@ pub fn cmd_units(args: &[String]) -> Result<()> {
             // fetch and compile while it loads (app.js `preloadUnits`), every
             // unit and provider under PREFIX, the URL the page serves OUT at
             // (its `cgenurl`): no unit is a synchronous fetch at first map.
+            // With a selection, only its units and the whole ones: a unit of
+            // stubs alone is fetched when a process first maps it.
             if let Some(prefix) = opt(rest, "--preload") {
                 let prefix = prefix.trim_end_matches('/');
                 let mut items: Vec<(u64, String)> = Vec::new();
-                for k in &keys {
+                for k in keys.iter().filter(|k| whole || whole_keys.contains(k) || sel.contains_key(k.as_str())) {
                     let w = std::fs::metadata(out.join(k).join("c.wasm")).map_or(0, |m| m.len());
                     items.push((w, format!("[\"cgen:{k}\",\"{prefix}/{k}/c.wasm\"]")));
                     items.push((0, format!("[\"file:{k}/c.entries\",\"{prefix}/{k}/c.entries\"]")));
