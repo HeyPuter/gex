@@ -5241,30 +5241,47 @@ export class Gex {
   }
 
   #sessTr = 0;
-  #sessionCopy(dst, off, size) {
+  /** The door session (the server's session block, `#sessionCopy`): its
+   *  place and size, which never change once the server has published it,
+   *  and views of the server's memory taken when it was first read. A
+   *  shared memory's old buffer stays valid at its old length, so the
+   *  views serve every later read; win32u reads the session several times
+   *  per call (a seqlock's copy and its release, per shared object: four
+   *  for GetKeyState), and each read went through `memory.buffer` twice. */
+  #sess = null;
+  #session() {
     const d = this.#door;
+    if (!d) return null;
+    let s = this.#sess;
+    if (s && s.door === d && s.u8.length >= s.end) return s;
+    const v = this.#doorView();
+    const base = v.dv.getUint32(d.area + 128, true), len = v.dv.getUint32(d.area + 132, true);
+    if (!base || !len) return null;
+    s = { door: d, base, len, end: base + len, u8: v.u8, i64: v.i64 };
+    // not yet inside the views (a server that grew since): read once more next time
+    if (v.u8.length < s.end) return null;
+    return this.#sess = s;
+  }
+
+  #sessionCopy(dst, off, size) {
     if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] copy ${this.#sessTr} off ${off} size ${size}`);
-    if (!d) return -1;
-    const { u8, dv } = this.#doorView();
-    const base = dv.getUint32(d.area + 128, true), len = dv.getUint32(d.area + 132, true);
-    if (!base || !len) return -1;
-    if (!size) return len;
-    if (off >= len) return -1;
-    const n = Math.min(size, len - off);
-    this.#bytes().set(u8.subarray(base + off, base + off + n), dst);
+    const s = this.#session();
+    if (!s) return -1;
+    if (!size) return s.len;
+    if (off >= s.len) return -1;
+    const n = Math.min(size, s.len - off);
+    this.#doorGuest(dst + n).u8.set(s.u8.subarray(s.base + off, s.base + off + n), dst);
     return n;
   }
 
   #sessionSeq(off) {
-    const d = this.#door;
-    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] seq ${this.#sessTr} off ${off} base ${d && this.#doorView().dv.getUint32(d.area + 128, true)}`);
-    const { dv } = this.#doorView();
-    const base = d ? dv.getUint32(d.area + 128, true) : 0;
-    if (!base) return 0n;
-    const at = base + off;
+    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] seq ${this.#sessTr} off ${off}`);
+    const s = this.#session();
+    if (!s) return 0n;
+    const at = s.base + off;
     // A seqlock's word: whole, as the server stores it (8-aligned).
-    if (!(at & 7)) return Atomics.load(this.#doorView().i64, at / 8);
-    return dv.getBigInt64(at, true);
+    if (!(at & 7)) return Atomics.load(s.i64, at / 8);
+    return new DataView(s.u8.buffer).getBigInt64(at, true);
   }
 
   /** The door server, from the host (all Workers of the session). */
