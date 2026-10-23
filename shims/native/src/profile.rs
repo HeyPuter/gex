@@ -618,16 +618,22 @@ pub fn syscall_enter(
             85 => Some((a(0), 0o1101, AT_FDCWD)),         // creat
             257 => Some((a(1), a(2), a(0))),              // openat
             59 => Some((a(0), 0, AT_FDCWD)),              // execve
+            4 | 6 | 21 | 89 => Some((a(0), 0, AT_FDCWD)), // stat, lstat, access, readlink
+            262 | 269 | 332 | 439 | 267 => Some((a(1), 0, a(0))), // newfstatat, faccessat, statx, faccessat2, readlinkat
             _ => None,
         }
     } else {
         match raw {
             56 => Some((a(1), a(2), a(0))), // openat
             221 => Some((a(0), 0, AT_FDCWD)), // execve
+            79 | 291 | 48 | 439 | 78 => Some((a(1), 0, a(0))), // newfstatat, statx, faccessat, faccessat2, readlinkat
             _ => None,
         }
     };
-    sp.pending = named.and_then(|(ptr, flags, dirfd)| Some((nr, read_cstr(gm, ptr)?, flags, dirfd)));
+    // (`fstatat(fd, "", AT_EMPTY_PATH)` names no file: an fstat.)
+    sp.pending = named
+        .and_then(|(ptr, flags, dirfd)| Some((nr, read_cstr(gm, ptr)?, flags, dirfd)))
+        .filter(|(_, path, _, _)| !path.is_empty());
 }
 
 /// After a syscall: record the outcome of a pending open.
@@ -669,7 +675,11 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
     const O_ACCMODE: u64 = 3;
     const O_CREAT: u64 = 0o100;
     const O_DIRECTORY: u64 = if gex_abi::X86 { 0o200000 } else { 0o40000 };
-    if nr == 221 {
+    // The stat family, canonically numbered: looked at, not opened.
+    const LOOKED: [u64; 5] = [79, 291, 48, 439, 78];
+    if LOOKED.contains(&nr) {
+        f.stat = true;
+    } else if nr == 221 {
         f.read = true;
     } else {
         match flags & O_ACCMODE {

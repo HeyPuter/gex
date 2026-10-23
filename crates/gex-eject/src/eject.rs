@@ -252,6 +252,23 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         if synthetic(p) || objects.iter().any(|x| &x.path == p) {
             continue;
         }
+        // Only looked at (stat, access, readlink): an input when it is there
+        // now, as the session saw it (a failed look stays missing, as a
+        // failed open does). One under /tmp, or gone since, the session made.
+        let looked = f.stat && !f.read && !f.write && !f.create && !f.directory;
+        if looked && f.ok > 0 {
+            if p == "/tmp" || p.starts_with("/tmp/") {
+                continue;
+            }
+            match std::fs::metadata(host_path(sysroot, p)) {
+                Ok(m) if m.is_dir() => {
+                    dirs.insert(p.clone());
+                    continue;
+                }
+                Ok(m) if m.is_file() => {}
+                _ => continue,
+            }
+        }
         if f.ok == 0 {
             missing.push(p.clone());
             continue;
@@ -260,7 +277,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             dirs.insert(p.clone());
             continue;
         }
-        if f.create || !f.read {
+        if f.create || !(f.read || looked) {
             outputs.push(p.clone());
             continue;
         }

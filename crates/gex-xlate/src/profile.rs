@@ -980,6 +980,10 @@ pub struct FileEntry {
     pub write: bool,
     pub create: bool,
     pub directory: bool,
+    /// Looked at without being opened (`stat`, `access`, `readlink`): a file
+    /// the program needs to be there even if it never reads it (Qt checks a
+    /// QML source's time and loads its cached compilation instead).
+    pub stat: bool,
     pub ok: u64,
     pub failed: u64,
     /// The last errno a failed open returned.
@@ -1074,7 +1078,7 @@ impl Session {
     ///   "processes": n, "threads": n,
     ///   "syscalls": [{"nr": 64, "name": "write", "n": 12}],
     ///   "files":    [{"path": "/etc/passwd", "read": true, "write": false,
-    ///                 "create": false, "directory": false, "ok": 1,
+    ///                 "create": false, "directory": false, "stat": false, "ok": 1,
     ///                 "failed": 0, "errno": null}],
     ///   "exit": "status 0" | "signal 11" | null }
     /// ```
@@ -1140,12 +1144,13 @@ impl Session {
             }
             let _ = write!(
                 s,
-                "\n{{\"path\":{},\"read\":{},\"write\":{},\"create\":{},\"directory\":{},\"ok\":{},\"failed\":{},\"errno\":{}}}",
+                "\n{{\"path\":{},\"read\":{},\"write\":{},\"create\":{},\"directory\":{},\"stat\":{},\"ok\":{},\"failed\":{},\"errno\":{}}}",
                 jstr(&f.path),
                 f.read,
                 f.write,
                 f.create,
                 f.directory,
+                f.stat,
                 f.ok,
                 f.failed,
                 f.errno.map(|e| e.to_string()).unwrap_or_else(|| "null".into())
@@ -1281,6 +1286,7 @@ impl Session {
                     write: b("write"),
                     create: b("create"),
                     directory: b("directory"),
+                    stat: b("stat"),
                     ok: f.get("ok").and_then(Json::as_u64).unwrap_or(0),
                     failed: f.get("failed").and_then(Json::as_u64).unwrap_or(0),
                     errno: f.get("errno").and_then(Json::as_i64),
