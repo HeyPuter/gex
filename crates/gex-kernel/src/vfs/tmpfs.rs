@@ -1256,7 +1256,22 @@ impl FileSystem for TmpFs {
         let inner = self.inner.read().unwrap();
         match inner.nodes.get(path) {
             Some(Node::Symlink(t)) => Ok(t.clone()),
-            _ => Err(Errno::EINVAL),
+            Some(_) => Err(Errno::EINVAL),
+            // A name that is not there is ENOENT (or ENOTDIR), not EINVAL:
+            // `realpath` takes EINVAL for "there, and not a link" and
+            // resolves a file that does not exist.
+            None => {
+                let mut at = path;
+                while let Some(i) = at.rfind('/') {
+                    at = &at[..i];
+                    match inner.nodes.get(at) {
+                        Some(Node::Dir) => break,
+                        Some(_) => return Err(Errno::ENOTDIR),
+                        None => {}
+                    }
+                }
+                Err(Errno::ENOENT)
+            }
         }
     }
 
@@ -1789,6 +1804,22 @@ mod tests {
         fs.add_file("f", b"x".to_vec());
         assert_eq!(fs.rmdir("nothing-here").err(), Some(Errno::ENOENT));
         assert_eq!(fs.rmdir("f").err(), Some(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn read_link_tells_a_missing_name_from_one_that_is_not_a_link() {
+        // glibc's `realpath` reads the difference: EINVAL is "there, and not
+        // a link", so a missing name answered with it came back resolved,
+        // and KService took every mimeapps.list it looked for as present.
+        let fs = TmpFs::new();
+        fs.add_file("f", b"x".to_vec());
+        fs.symlink("f", "l").unwrap();
+        assert_eq!(fs.read_link("l"), Ok("f".to_string()));
+        assert_eq!(fs.read_link("f"), Err(Errno::EINVAL));
+        assert_eq!(fs.read_link(""), Err(Errno::EINVAL));
+        assert_eq!(fs.read_link("nothing-here"), Err(Errno::ENOENT));
+        assert_eq!(fs.read_link("no-dir/x"), Err(Errno::ENOENT));
+        assert_eq!(fs.read_link("f/x"), Err(Errno::ENOTDIR));
     }
 
     #[test]

@@ -377,6 +377,7 @@ impl FileSystem for ProcFs {
                     let fd: i32 = n.parse().map_err(|_| Errno::ENOENT)?;
                     return self.source.fd_link(fd).ok_or(Errno::ENOENT);
                 }
+                self.metadata(other)?;
                 Err(Errno::EINVAL)
             }
         }
@@ -662,6 +663,11 @@ mod syscpu_tests {
         assert_eq!(read("cpu0/topology/physical_package_id"), "0\n");
         assert!(SysCpuFs.metadata("cpu3/topology").is_ok());
         assert_eq!(SysCpuFs.metadata("cpu4").unwrap_err(), Errno::ENOENT);
+        // A filesystem without links: lstat and readlink, each the other's
+        // default, answer without asking each other round.
+        assert_eq!(SysCpuFs.metadata_nofollow("cpu3/topology").unwrap().file_type, FileType::Directory);
+        assert_eq!(SysCpuFs.read_link("cpu3/topology"), Err(Errno::EINVAL));
+        assert_eq!(SysCpuFs.read_link("cpu4"), Err(Errno::ENOENT));
         assert!(SysCpuFs.open("cpu9/topology/core_id", 0, 0).is_err());
     }
 }

@@ -728,8 +728,11 @@ pub trait FileSystem: Send + Sync {
         let _ = mode;
         self.metadata(path).map(|_| ())
     }
+    /// No links here: `EINVAL` for a name that is there, and the lookup's
+    /// error (`ENOENT`) for one that is not. (`metadata`: the default
+    /// `metadata_nofollow` asks this.)
     fn read_link(&self, path: &str) -> Result<String, Errno> {
-        let _ = path;
+        self.metadata(path)?;
         Err(Errno::EINVAL)
     }
     /// Absolute path `abs` with the symlinks among its directories followed
