@@ -711,20 +711,6 @@ pub struct W3Report {
     pub units: usize,
 }
 
-/// Slot ranges, `a-b,c,...` (the recorder's coverage of one unit).
-fn slot_ranges(r: &str) -> Result<std::collections::HashSet<u32>> {
-    let mut hot = std::collections::HashSet::new();
-    for x in r.split(',').map(str::trim).filter(|x| !x.is_empty()) {
-        match x.split_once('-') {
-            Some((a, b)) => hot.extend(a.parse::<u32>()?..=b.parse::<u32>()?),
-            None => {
-                hot.insert(x.parse::<u32>()?);
-            }
-        }
-    }
-    Ok(hot)
-}
-
 /// A new W3 project's `"cold"`: none. Every unit ships whole, in the site's
 /// one units archive (web/eject-site.mjs), and nothing is fetched on a call.
 /// A split (`"chunk:256"` and the other clusterings) is opt-in: it cuts the
@@ -958,46 +944,31 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     }
     for u in units {
         let key = json::str_field(u, "key", what)?;
+        let from = dir.join("units").join(&key);
         let to = web.join("units").join(site_key(&key));
         let jit = coverage.is_some() && config.cold.as_deref() == Some("jit");
-        if !jit {
-            link_or_copy(&dir.join("units").join(&key).join("c.entries"), &to.join("c.entries"))?;
-        }
-        if instrument {
-            let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
-            write_file(&to.join("c.wasm"), &gex_split::instrument(&wasm)?, false)?;
-            continue;
-        }
-        if let Some(w) = pruned.get(&key) {
-            write_file(&to.join("c.wasm"), w, false)?;
-            continue;
-        }
-        let (Some(cov), Some(how)) = (coverage, config.cold.as_deref()) else {
-            link_or_copy(&dir.join("units").join(&key).join("c.wasm"), &to.join("c.wasm"))?;
-            continue;
+        let hot;
+        let shape = if instrument {
+            gex_units::Shape::Instrument
+        } else if let Some(w) = pruned.get(&key) {
+            gex_units::Shape::Pruned(w)
+        } else if let (Some(cov), Some(how)) = (coverage, config.cold.as_deref()) {
+            hot = match cov.iter().find(|(k, _)| *k == key).map(|(_, r)| r) {
+                Some(Json::Str(r)) => gex_units::slot_ranges(r).with_context(|| format!("the recording's coverage of {key}"))?,
+                _ => std::collections::HashSet::new(),
+            };
+            if jit {
+                gex_units::Shape::Jit(&hot)
+            } else {
+                gex_units::Shape::Split(&hot, how.parse()?)
+            }
+        } else {
+            gex_units::Shape::Whole
         };
-        let hot = match cov.iter().find(|(k, _)| *k == key).map(|(_, r)| r) {
-            Some(Json::Str(r)) => slot_ranges(r).with_context(|| format!("the recording's coverage of {key}"))?,
-            _ => std::collections::HashSet::new(),
-        };
-        let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
-        if jit {
-            // Only what the run called is the unit's; the rest is the
-            // function JIT's, translated in the page on first call.
-            let (module, entries) = gex_split::jit(&wasm, &hot).with_context(|| format!("unit {key}"))?;
-            write_file(&to.join("c.wasm"), &module, false)?;
-            write_file(&to.join("c.entries"), &entries.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>(), false)?;
-            jit_units += 1;
-            continue;
-        }
-        let (primary, clusters, _) = gex_split::split(&wasm, &hot, how.parse()?)
-            .with_context(|| format!("splitting unit {key}"))?;
-        write_file(&to.join("c.wasm"), &primary, false)?;
-        std::fs::create_dir_all(to.join("cold"))?;
-        for (i, c) in clusters.iter().enumerate() {
-            write_file(&to.join("cold").join(format!("{i}.wasm")), c, false)?;
-        }
-        cold_units += 1;
+        let what_unit = if jit { format!("unit {key}") } else { format!("splitting unit {key}") };
+        let shipped = gex_units::ship(&from, &to, shape).with_context(|| what_unit)?;
+        jit_units += shipped.jit as usize;
+        cold_units += shipped.cold as usize;
     }
 
     // The provider modules the units bind, beside them as in a unit cache.

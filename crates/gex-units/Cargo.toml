@@ -1,0 +1,10 @@
+[package]
+name = "gex-units"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "What a build ships of its function-tier units: each unit whole, instrumented, or cut to a set of slots (the rest split into cold clusters or left to the function JIT)"
+
+[dependencies]
+gex-split.workspace = true
+anyhow = "1"

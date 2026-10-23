@@ -645,6 +645,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-split",
+ "gex-units",
  "gex-xlate",
  "wasmparser 0.219.2",
 ]
@@ -822,6 +823,14 @@ dependencies = [
  "gex-abi",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
+]
+
+[[package]]
+name = "gex-units"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-split",
 ]
 
 [[package]]
