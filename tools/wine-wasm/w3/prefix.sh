@@ -5,9 +5,11 @@
 #       Wine's full install into a copy of the bare staged prefix: under GEXC,
 #       a console launcher (tests/nt/bin/x86/childcon.exe) runs
 #       `wineboot.exe -u`, whose children run wine.inf's PreInstall and
-#       DefaultInstall (Mono and Gecko off, as in any unattended prefix).
-#       Fails unless the registry has the crypto providers and wineboot
-#       exited 0.
+#       DefaultInstall (Mono and Gecko off, as in any unattended prefix);
+#       then Wine's reg.exe turns winedbg's crash dialog off, so a crash a
+#       debugger attaches to ends with its text report rather than a dialog
+#       that waits for a click. Fails unless the registry has the crypto
+#       providers and that setting, and wineboot exited 0.
 #   w3/prefix.sh ready INSTALLED DIST GRAPHICS OUT
 #       a ready-to-run prefix from the installed one (page-prefix.sh): real
 #       files, the W3 session (w3-session.reg), the install marked current
@@ -29,6 +31,9 @@ install)
     "$dist/lib/wine/i386-unix/wine" ./launch.exe 'C:\windows\system32\wineboot.exe -u') > "$log" 2>&1 || true
   n=$(grep -c 'Cryptography\\\\Defaults\\\\Provider' "$out.tmp/system.reg" 2>/dev/null || true)
   e=$(grep -a '^child exit' "$log" | tr -d '\r' | tail -1)
+  (cd "$out.tmp/drive_c" && timeout -k 10 600 "$gexc" run --env WINEPREFIX="$out.tmp" --env WINEDEBUG=-all \
+    "$dist/lib/wine/i386-unix/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f) >> "$log" 2>&1 || true
+  grep -q '^"ShowCrashDialog"=dword:00000000' "$out.tmp/user.reg" || e="$e, no ShowCrashDialog"
   if [ "${n:-0}" -gt 0 ] && [ "$e" = "child exit 0" ]; then
     rm -f "$out.tmp/drive_c/launch.exe"; rm -rf "$out" && mv "$out.tmp" "$out"
     echo "w3/prefix: installed $out ($n crypto provider keys)"
