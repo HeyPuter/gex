@@ -6876,7 +6876,7 @@ export class Gex {
       this.#calloutSignal = { kind: 'return', i };
       // The innermost call-out's return with only tail calls since its
       // loop's `enter`: the stub returns, and that `enter` with it.
-      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(i + 1) ? 1 : 0;
+      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(this.#callouts[i].ri + 1) ? 1 : 0;
     }
     const ref = this.#shim.exports.gex_dispatch_ref(target);
     const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
@@ -7075,7 +7075,13 @@ export class Gex {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    // `ri`: this call-out's index in the shim's list (cgen.rs `CALLOUTS`),
+    // which `gex_callout_hit`, `gex_callout_leave_ok` and
+    // `gex_callout_may_return` speak in; -1 for one the shim did not open
+    // (native Wine's own for a thread's loop, `gex_call_out(ctx, pc, 0, 0)`).
+    // This list's index is not it.
+    const ri = e.gex_callout_opened?.() ?? me;
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length, ri };
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -7100,10 +7106,10 @@ export class Gex {
           if (next) {
             const f = next;
             next = null;
-            e.gex_callout_leave_ok?.(me + 1);
+            e.gex_callout_leave_ok?.(ri + 1);
             yield ['call', f, ctx];
           } else {
-            e.gex_callout_leave_ok?.(me + 1);
+            e.gex_callout_leave_ok?.(ri + 1);
             yield ['enter', ctx, pc];
           }
           // A watched return with only tail calls since this `enter`
@@ -7117,7 +7123,7 @@ export class Gex {
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
-          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return hit === me ? 1 : 0; }
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return hit === ri ? 1 : 0; }
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {
@@ -7158,7 +7164,7 @@ export class Gex {
             if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1)) throw err;
           }
           const hit = e.gex_callout_hit();
-          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === me ? 1 : 0); }
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === ri ? 1 : 0); }
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
@@ -7241,8 +7247,10 @@ export class Gex {
             return mine ? 1 : 0;
           }
           // The stack unwound past the caller (longjmp, an exception
-          // handled further out): its frame is gone, so it leaves.
-          if (sp > c.spWant + c.unwound) {
+          // handled further out): its frame is gone, so it leaves. A call-out
+          // that wants no stack (native Wine's thread loop) has no caller's
+          // frame to unwind past.
+          if (c.spWant !== 0n && sp > c.spWant + c.unwound) {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
