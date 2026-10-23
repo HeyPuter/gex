@@ -6,7 +6,7 @@
    The grandchild's exec may fail, and its parent must hear why: from a pipe
    (musl's posix_spawn, Qt's startDetached), and from the memory the two
    share, which the grandchild writes before it exits (glibc's posix_spawn:
-   `args->err`). */
+   `args->err`). And a vfork child may fork. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <sched.h>
@@ -31,6 +31,17 @@ static int spawned(void *a) {
     pid_t g;
     int r = posix_spawn(&g, j->path, NULL, NULL, j->args, environ);
     _exit(r == 0 ? 0 : 100 + r);
+}
+
+/* a vfork child may fork too: its child is a copy of the memory */
+static int forked(void *a) {
+    struct job *j = a;
+    pid_t g = fork();
+    if (g == 0) {
+        execve(j->path, j->args, environ);
+        _exit(127);
+    }
+    _exit(g > 0 ? 0 : 99);
 }
 
 static int grand(void *a) {
@@ -82,7 +93,10 @@ int main(int argc, char **argv) {
     struct job ok = {"/proc/self/exe", args, 0}, missing = {"/no/such/program", args, 0};
     run("spawn", spawned, &ok, p[0]);
     run("spawn missing", spawned, &missing, p[0]);
-    if (argc > 1 && !strcmp(argv[1], "pipe")) return 0; /* the pipe cases alone */
+    /* argv[1]: "pipe" leaves out the shared-memory cases, "nofork" the fork */
+    const char *only = argc > 1 ? argv[1] : "";
+    if (!strstr(only, "nofork")) run("fork", forked, &ok, p[0]);
+    if (strstr(only, "pipe")) return 0;
     run("shared", shared, &ok, p[0]);
     run("shared missing", shared, &missing, p[0]);
     return 0;

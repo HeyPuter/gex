@@ -281,7 +281,9 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
 /// it ends the child (as a crash: `posix_spawn`'s child makes none). So does
 /// a further clone, except a `CLONE_VM | CLONE_VFORK` one, which shares the
 /// map rather than changes it: Qt's `startDetached` spawns from its vfork
-/// child (`vforkfd`), and that grandchild runs here, nested (`note_clone`).
+/// child (`vforkfd`), and that grandchild runs here, nested (`note_clone`);
+/// and except a fork, whose child is a copy of the memory as this child
+/// sees it.
 pub(crate) fn check(nr: u64, a0: u64) {
     use gex_kernel::syscalls::nr::*;
     const SPAWN: u64 = 0x100 | 0x4000; // CLONE_VM | CLONE_VFORK
@@ -290,7 +292,9 @@ pub(crate) fn check(nr: u64, a0: u64) {
         CLONE3 => GuestMem::new(guest_bytes()).read_u64(a0).unwrap_or(0),
         _ => 0,
     };
-    if flags & SPAWN == SPAWN {
+    // A spawn shares the map; a fork (no CLONE_VM) copies it, and its
+    // child gets a Worker of its own, as any fork's does.
+    if flags & SPAWN == SPAWN || (matches!(nr, CLONE | CLONE3) && flags & 0x100 == 0) {
         return;
     }
     let name = match nr {
@@ -304,7 +308,7 @@ pub(crate) fn check(nr: u64, a0: u64) {
         _ => return,
     };
     warn_line(&format!(
-        "[gex] pid {}: a vfork child called {name}, which would change its parent's memory map; ended",
+        "[gex] pid {}: a vfork child called {name} ({a0:#x}), which would change its parent's memory map; ended",
         PID.with(|c| c.get())
     ));
     WHY.with(|c| c.set(UNSUPPORTED));

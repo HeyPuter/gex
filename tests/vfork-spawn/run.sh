@@ -23,6 +23,8 @@ rm -rf "$w"; mkdir -p "$w"
 want="spawn: exited 0
 grandchild ran
 spawn missing: exited 102
+fork: exited 0
+grandchild ran
 shared: exited 0
 grandchild ran
 shared missing: exited 2"
@@ -40,7 +42,7 @@ check() { # NAME OUT ERR [WANT]
 # parent (and the parent then waits on the pipe for a grandchild that never
 # ran).
 out=$(timeout 120 "$gexc" run --sysroot "$w" "$w/spawn" pipe 2> "$w/native.err")
-check native "$out" "$w/native.err" "$(printf '%s\n' "$want" | head -3)"
+check native "$out" "$w/native.err" "$(printf '%s\n' "$want" | head -5)"
 seed=$root/web/public/gex/seed.shared.wasm
 if [ -e "$seed" ]; then
 	out=$(cd "$w" && GEX_SHARED=1 timeout 120 node "$root/shims/browser/js/run-node.mjs" \
@@ -48,9 +50,11 @@ if [ -e "$seed" ]; then
 	check browser "$out" "$w/browser.err"
 	if [ -n "${GEXCC:-}" ]; then
 		"$GEXCC" -O1 -o "$w/spawn32" "$here/spawn.c" || exit 1
+		# No fork: a wasm32 program's fork maps memory, which a vfork child
+		# may not
 		out=$(cd "$w" && GEX_SHARED=1 timeout 120 node "$root/shims/browser/js/run-node.mjs" \
-			--file "$w/spawn32=$w/spawn32" "$seed" "$w/spawn32" 2> "$w/wasm32.err" | grep -av '^\[gex\]')
-		check "browser wasm32" "$out" "$w/wasm32.err"
+			--file "$w/spawn32=$w/spawn32" "$seed" "$w/spawn32" nofork 2> "$w/wasm32.err" | grep -av '^\[gex\]')
+		check "browser wasm32" "$out" "$w/wasm32.err" "$(printf '%s\n' "$want" | sed '/^fork:/,+1d')"
 	fi
 else
 	echo "skip vfork-spawn browser ($seed is not there)"
