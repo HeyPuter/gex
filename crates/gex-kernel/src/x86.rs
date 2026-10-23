@@ -606,9 +606,13 @@ pub fn translate(
         x::OPENAT2 => nr::OPENAT2,
         x::FACCESSAT2 => nr::FACCESSAT2,
         x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
-        // Advisory: fadvise64, readahead, sync_file_range, mlock, munlock,
-        // mlockall, munlockall, mincore-free, sched_setaffinity.
-        221 | 187 | 277 | 149 | 150 | 151 | 152 | 203 => nr::NOOP_OK,
+        149 => nr::MLOCK,
+        150 => nr::MUNLOCK,
+        151 => nr::MLOCKALL,
+        152 => nr::MUNLOCKALL,
+        325 => nr::MLOCK2,
+        // Advisory: fadvise64, readahead, sync_file_range, sched_setaffinity.
+        221 | 187 | 277 | 203 => nr::NOOP_OK,
         _ => UNKNOWN,
     }
 }

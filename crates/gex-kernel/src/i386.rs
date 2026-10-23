@@ -180,6 +180,7 @@ pub mod raw {
     pub const MUNLOCK: u64 = 151;
     pub const MLOCKALL: u64 = 152;
     pub const MUNLOCKALL: u64 = 153;
+    pub const MLOCK2: u64 = 376;
     pub const GETDENTS64: u64 = 220;
     pub const FCNTL64: u64 = 221;
     pub const GETTID: u64 = 224;
@@ -924,8 +925,11 @@ pub fn translate(
         x::PRCTL => nr::PRCTL,
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
         x::PERSONALITY => nr::NOOP_OK,
-        // Advisory, as for x86-64: memory is never paged out.
-        x::MLOCK | x::MUNLOCK | x::MLOCKALL | x::MUNLOCKALL => nr::NOOP_OK,
+        x::MLOCK => nr::MLOCK,
+        x::MUNLOCK => nr::MUNLOCK,
+        x::MLOCKALL => nr::MLOCKALL,
+        x::MUNLOCKALL => nr::MUNLOCKALL,
+        x::MLOCK2 => nr::MLOCK2,
         x::UNAME => nr::UNAME,
         x::SYSINFO => nr::SYSINFO,
         x::GETRANDOM => nr::GETRANDOM,
