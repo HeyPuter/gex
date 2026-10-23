@@ -7870,8 +7870,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
-        // says a program ran but not which. `openat`'s path is arg 1, the rest
-        // arg 0.
+        // says a program ran but not which. `execve`'s path is arg 0, the
+        // `*at` calls' arg 1.
         let path = |at: u64| {
             gm.read_cstr(at, 255)
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -7879,8 +7879,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
         };
         use gex_kernel::syscalls::nr;
         let named = match n {
-            nr::EXECVE | nr::STATX => Some(path(g(0))),
-            nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT => Some(path(g(1))),
+            nr::EXECVE => Some(path(g(0))),
+            nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT
+            | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT => Some(path(g(1))),
             _ => None,
         };
         // For calls whose first argument is a descriptor, what it *is*: an fd
