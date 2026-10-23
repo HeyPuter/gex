@@ -13891,21 +13891,43 @@ mod fault_code {
 
 /// A fault for the process's guest fault hook (Wine's ntdll.so), as
 /// shims/native's `deliver_guest_fault`: the context's PC set to `pc` (where
-/// the hook sees the fault, after an int3 for a breakpoint), the fault
-/// staged for the host (`gex_fault_take`), and out to it. Returns only
+/// the hook sees the fault, after an int3 for a breakpoint), then the hook.
+/// From code that goes on after the import returns (`resumable`: a unit's
+/// `gex_cgen::RESUMABLE_PC`) the hook runs here, in place, so the wasm
+/// frames under the fault (a native `__TRY`'s, a native caller's) survive
+/// its dispatch: true, and the caller returns to that code, which goes on
+/// at the context's PC. Otherwise the fault is staged for the host
+/// (`gex_fault_take`) and the thread traps out to it. Returns false only
 /// when the process has no hook.
-fn hook_fault(pc: u64, code: u32, addr: u64) {
+#[must_use]
+fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     if cgen::fault_hook() == 0 {
-        return;
+        return false;
     }
     // No lock: the context is this Worker's thread's own (`my_ctx`).
     let mut gm = GuestMem::new(guest_bytes());
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
+    if resumable && cgen::fault_in_place(c, code, addr, 0) {
+        return true;
+    }
     cgen::fault_stage(code, addr, 0);
     set_resume(pc);
     set_resume_ctx(c);
     trap();
+}
+
+/// `?sehreport=1` (`GEX_SEH_REPORT`): a crash report also names an i386
+/// thread's SEH chain, the Worker's last resumes and a longjmp's jmp_buf.
+static SEH_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn seh_report() -> bool {
+    SEH_REPORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_set_seh_report(on: i32) {
+    SEH_REPORT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -13916,6 +13938,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // every other caller (fjit, units, and a unit's resumable form, whose
     // pc carries `RESUMABLE_PC` instead) never goes on after this returns.
     let returns = pc as u64 & gex_abi::ILLEGAL_RETURNS_PC != 0;
+    let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
     let pc = fault_pc((pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64);
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
@@ -13930,7 +13953,9 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if returns && gex_abi::X86 && (pc as u64 == W64_SYSCALL_ENTRY || pc as u64 == W64_UNIX_CALL_ENTRY) && cgen::w64_entry_illegal(my_ctx(), pc as u64) {
         return;
     }
-    hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64);
+    if hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64, resumable) {
+        return;
+    }
     // Which process and what is mapped there: with a Worker per process the
     // console interleaves them all.
     let vma = named_mm()
@@ -14019,7 +14044,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     if raw == gex_abi::imports::BRK_KUSER_UNFOLDED {
         kuser_unfolded(pc);
     }
-    // As in `gex_illegal`: the browser traps out of a resumable fault too.
+    let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
     let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
     // Native Wine's return pad (its int3 filler), translated by an earlier
     // stray return, reached past the call-outs waiting: as the miss path.
@@ -14071,14 +14096,19 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     {
         use gex_abi::imports as i;
         let pc = pc as u64;
-        if raw == i::BRK_DIVIDE_BY_ZERO {
-            hook_fault(pc, fault_code::INT_DIVIDE_BY_ZERO, 0);
+        let delivered = if raw == i::BRK_DIVIDE_BY_ZERO {
+            hook_fault(pc, fault_code::INT_DIVIDE_BY_ZERO, 0, resumable)
         } else if raw == i::BRK_DIVIDE_OVERFLOW {
-            hook_fault(pc, fault_code::INT_OVERFLOW, 0);
+            hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
-            hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff);
+            hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
         } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
-            hook_fault(pc + 1, fault_code::BREAKPOINT, pc);
+            hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
+        } else {
+            false
+        };
+        if delivered {
+            return;
         }
     }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
@@ -18141,6 +18171,28 @@ pub extern "C" fn gex_dump_state() {
             let fs = gm.read_u64(c + ctx::FS_BASE as u64).unwrap_or(0);
             let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
             warn_line(&format!("gex:   fs_base={fs:#x} in {}  last_target={last:#x} in {}\n", where_is(fs), where_is(last)));
+            // An i386 thread's SEH chain (TEB+0, each record `next, handler`):
+            // a handler whose frame is no longer on this Worker's stack is
+            // where a longjmp out of it lands nowhere.
+            if !seh_report() {
+                return;
+            }
+            if fs != 0 && fs < 1 << 32 {
+                let w32 = |a: u64| gm.read_u64(a).map(|v| v as u32 as u64);
+                let mut rec = w32(fs).unwrap_or(u32::MAX as u64);
+                let mut chain = String::new();
+                for _ in 0..12 {
+                    if rec == u32::MAX as u64 || rec == 0 {
+                        break;
+                    }
+                    let h = w32(rec + 4).unwrap_or(0);
+                    chain.push_str(&format!(" {rec:#x}:{h:#x} ({})", where_is(h)));
+                    rec = w32(rec).unwrap_or(u32::MAX as u64);
+                }
+                warn_line(&format!("gex:   SEH chain (record:handler):{}\n", if chain.is_empty() { " empty" } else { &chain }));
+            }
+            let ring = RESUME_RING.with(|r| r.borrow().iter().map(|(l, v)| format!(" {v:#x}@{l}")).collect::<String>());
+            warn_line(&format!("gex:   this Worker's last resumes (pc@line):{ring}\n"));
             return;
         }
         for (name, a) in [

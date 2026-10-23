@@ -2225,6 +2225,10 @@ extern "C" {
     /// Start the thread the call staged (`#startThread`), after
     /// `entry_call`: called only when one is staged.
     fn thread_start();
+    /// Call the guest fault hook `idx` (`void(int ctx, unsigned code,
+    /// address, unsigned kind)`) here, its C frames below the guest's stack
+    /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
+    fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -2998,10 +3002,100 @@ thread_local! {
     static FAULT_PENDING: std::cell::Cell<Option<(u32, u64, u32)>> = const { std::cell::Cell::new(None) };
 }
 
+/// How many faults may be delivered in place one inside another's
+/// dispatch on one thread (a handler that faults, its handler faulting
+/// again): each holds the hook's and the dispatch's wasm frames. Past this
+/// the fault is staged and the thread traps out, which drops them.
+const FAULT_NEST_MAX: usize = 64;
+
+thread_local! {
+    /// The guest stack pointer of each in-place delivery whose dispatch may
+    /// still be running on this thread, outermost first. One the guest
+    /// stack has since come back above (its dispatch left, by a handler's
+    /// jump, a longjmp or NtContinue) is over.
+    static FAULT_NEST: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Deliver a guest fault to the hook in place, from code that goes on
+/// after the import returns (lib.rs `hook_fault`): true when the hook ran
+/// and the context's PC is where the thread goes on (the dispatcher). The
+/// hook may also leave by unwinding (a native `__EXCEPT`'s longjmp) through
+/// this frame, which holds nothing that needs dropping. False when it
+/// cannot here; the caller stages the fault and traps.
+pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
+    let idx = fault_hook();
+    if idx == 0 {
+        return false;
+    }
+    let gm = GuestMem::new(crate::guest_bytes());
+    let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
+    let deep = FAULT_NEST.with(|n| {
+        let mut n = n.borrow_mut();
+        while n.last().is_some_and(|&s| s < sp) {
+            n.pop();
+        }
+        if n.len() >= FAULT_NEST_MAX {
+            n.clear();
+            return true;
+        }
+        n.push(sp);
+        false
+    });
+    if deep {
+        crate::warn_line(&format!(
+            "gex: faults nested {FAULT_NEST_MAX} deep in their own dispatch (code {code:#010x}); this one is delivered from the run loop\n"
+        ));
+        return false;
+    }
+    // SAFETY: a host import taking scalars; nothing here holds a lock or a
+    // borrow, since the hook's dispatch may unwind through this frame.
+    unsafe { fault_call(idx as i32, c as i32, code as i32, addr as i64, kind as i32, sp as i64) != 0 }
+}
+
 /// Stage a fault for the host to give the hook (`gex_fault_take`); the
 /// caller writes the faulting PC into the context and traps.
 pub(crate) fn fault_stage(code: u32, addr: u64, kind: u32) {
     FAULT_PENDING.with(|f| f.set(Some((code, addr, kind))));
+}
+
+/// A longjmp or unwind that reached this Worker's outermost run loop
+/// (gex.mjs): the frame that was to catch it is gone, so the exception it
+/// carried cannot be handled where the program said. `jmp` is a longjmp's
+/// jmp_buf (0 for another tag). When it is a native `__TRY`'s (Wine's
+/// `__WINE_FRAME`, the jmp_buf 16 bytes in, the exception code after its
+/// 64: a frame at the head of the thread's SEH chain, or just taken off it,
+/// its `Prev` the head), the exception is
+/// raised again with no handler left (the chain emptied), as an exception
+/// no frame handles is on Windows: Wine ends the process with its code. 1,
+/// and the run loop delivers the staged fault; 0 when it is not one
+/// (the caller reports a crash). Said, as a critical error.
+#[no_mangle]
+pub extern "C" fn gex_handler_lost(ctx_addr: u32, jmp: u32) -> u32 {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if fault_hook() == 0 || jmp < 16 || gex_abi::mem64() {
+        return 0;
+    }
+    let c = ctx_addr as u64;
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    let teb = gm.read_u64(c + gex_abi::ctx::FS_BASE as u64).unwrap_or(0) & 0xffff_ffff;
+    let frame = jmp as u64 - 16;
+    let (Ok(head), Ok(prev), Ok(code)) = (gm.read_u32(teb), gm.read_u32(frame), gm.read_u32(jmp as u64 + 64)) else { return 0 };
+    if teb == 0 || code == 0 || (head as u64 != frame && head != prev) {
+        return 0;
+    }
+    // A second loss on this Worker while the first is being raised: give up.
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return 0;
+    }
+    let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
+    crate::warn_line(&format!(
+        "gex: exception {code:#010x}: the native handler frame that caught it is gone (pc {pc:#x}); raised again with no handler\n"
+    ));
+    let _ = gm.write_u32(teb, 0xffff_ffff);
+    fault_stage(code, pc, 0);
+    crate::set_resume(pc);
+    crate::set_resume_ctx(c);
+    1
 }
 
 /// The staged fault, taken: the hook's table index (0: none staged), with

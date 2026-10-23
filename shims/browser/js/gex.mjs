@@ -1165,6 +1165,8 @@ export class Gex {
       // `?pinregion=BYTES`: a project's libraries' region above the placement
       // window, before the first claim of arena (gex_abi::set_pin_region).
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
+      // `?sehreport=1`: crash reports name the SEH chain and a longjmp's jmp_buf.
+      if (globalThis.GEX_SEH_REPORT) this.#shim.exports.gex_set_seh_report?.(1);
       // Which memory flavours the page runs (docs/mem64.md §5): what an exec
       // may ask for (vfork.rs `gex_set_page_flavours`).
       if (globalThis.GEX_PAGE_FLAVOURS !== undefined) this.#shim.exports.gex_set_page_flavours?.(globalThis.GEX_PAGE_FLAVOURS | 0);
@@ -1691,6 +1693,31 @@ export class Gex {
         // A thread a direct entry's call staged (cgen.rs `w64_entry` asks
         // only when there is one).
         thread_start: () => this.#startThread(),
+        // A guest fault given to the process's fault hook in place (cgen.rs
+        // `fault_in_place`), its C frames below the guest's stack pointer
+        // as `#hookStack` puts them. A native __EXCEPT's longjmp out of the
+        // hook's dispatch passes through here to its own frame. 0: not here
+        // (the single-thread build: the staged fault then).
+        fault_call: (idx, ctx, code, addr, kind, sp) => {
+          if (single.on) return 0;
+          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+          const cur = spG.value;
+          const wide = typeof cur === 'bigint';
+          if (wide) {
+            const rsp = BigInt.asUintN(64, sp);
+            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+          } else {
+            const esp = Number(sp & 0xffffffffn);
+            spG.value = ((Math.min(Number(cur) >>> 0, esp) - 4096) & ~15) | 0;
+          }
+          try {
+            f(ctx, code, this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind);
+          } finally {
+            spG.value = cur;
+          }
+          return 1;
+        },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -4641,6 +4668,22 @@ export class Gex {
     return this.#provTag;
   }
 
+  /** A native `__TRY`'s longjmp that reached the outermost run loop, its
+   *  frame gone (cgen.rs `gex_handler_lost`): true when the shim raised the
+   *  exception again with no handler, a fault the loop delivers. */
+  #handlerLost(err, ctx) {
+    const e = this.#shim.exports;
+    if (!e.gex_handler_lost || typeof WebAssembly.Exception !== 'function' || !(err instanceof WebAssembly.Exception)) return false;
+    for (const inst of [this.#guest, ...(this.#cgen?.instances ?? [])]) {
+      const tag = inst?.exports?.__c_longjmp;
+      if (!(tag instanceof WebAssembly.Tag) || !err.is(tag)) continue;
+      const p = Number(err.getArg(tag, 0)) >>> 0;
+      const jmp = new DataView(this.#memory.buffer).getUint32(p, true);
+      return e.gex_handler_lost(ctx, jmp) === 1;
+    }
+    return false;
+  }
+
   /** What reached the run loop, for a crash report: an Error's message, a
    *  wasm exception by the export name of its tag in this Worker's modules
    *  (a C++ throw or a longjmp whose catching frame is not on this stack),
@@ -4651,7 +4694,19 @@ export class Gex {
       const mods = [['shim', this.#shim], ['guest', this.#guest], ...(this.#cgen?.instances ?? []).map((m, i) => [`unit ${i}`, m])];
       for (const [who, inst] of mods) {
         for (const [name, v] of Object.entries(inst?.exports ?? {})) {
-          if (v instanceof WebAssembly.Tag && err.is(v)) return `a wasm exception, tag ${name} of the ${who} module`;
+          if (v instanceof WebAssembly.Tag && err.is(v)) {
+            // A longjmp's payload (libgex/winecrt0 setjmp: `&jb->arg`, the
+            // jmp_buf and the value), for finding whose frame it wanted.
+            let arg = '';
+            if (name === '__c_longjmp' && globalThis.GEX_SEH_REPORT) {
+              try {
+                const p = Number(err.getArg(v, 0)) >>> 0;
+                const dv = new DataView(this.#memory.buffer);
+                arg = ` (jmp_buf 0x${dv.getUint32(p, true).toString(16)}, value ${dv.getInt32(p + 4, true)})`;
+              } catch {}
+            }
+            return `a wasm exception, tag ${name} of the ${who} module${arg}`;
+          }
         }
       }
       if (this.#provTag && err.is(this.#provTag)) return 'a wasm exception, the provider tag';
@@ -6110,8 +6165,8 @@ export class Gex {
         // process's death by SIGSEGV -- and the trap is a handoff after all.
         // Not when the shim says the trap was its own (in a syscall, or
         // translating): that stays a crash.
-        const guestFault = crashed && /memory access out of bounds/.test(err?.message ?? '') &&
-          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1;
+        const guestFault = crashed && ((/memory access out of bounds/.test(err?.message ?? '') &&
+          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1) || this.#handlerLost(err, ctx));
         if (crashed && !guestFault && this.#vfork.length && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.

@@ -413,6 +413,8 @@ const host = new ProcessHost({
     nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
     // GEX_PIN_REGION=BYTES: as the page's ?pinregion= (gex_abi::set_pin_region).
     pinRegion: process.env.GEX_PIN_REGION ? Number(process.env.GEX_PIN_REGION) : undefined,
+    // GEX_SEH_REPORT=1: as the page's ?sehreport=1.
+    sehReport: process.env.GEX_SEH_REPORT === '1' || undefined,
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
     // its start (tests/browser-stack-tripwire.sh).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
