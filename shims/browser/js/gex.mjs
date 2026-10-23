@@ -3577,10 +3577,10 @@ export class Gex {
     return true;
   }
 
-  /** A translated program's posix_spawn child, running in this Worker's
-   *  run loop in place of the thread that cloned it (vfork.rs); null when
-   *  none is. */
-  #vfork = null;
+  /** A translated program's posix_spawn children, running in this
+   *  Worker's run loop in place of the thread that cloned them (vfork.rs):
+   *  the innermost last, a child that spawned waiting under its own. */
+  #vfork = [];
 
   /** Start the staged vfork child here: where to enter it, or null when
    *  there was nothing to start. */
@@ -3590,7 +3590,7 @@ export class Gex {
     const entry = e.gex_vfork_begin();
     if (!entry) return null;
     const ctx = Number(e.gex_fork_ctx());
-    this.#vfork = { t0, pid: e.gex_vfork_pid(), ctx };
+    this.#vfork.push({ t0, pid: e.gex_vfork_pid(), ctx });
     return { pc: entry, ctx };
   }
 
@@ -3599,7 +3599,7 @@ export class Gex {
    *  `clone`. */
   #vforkLeave(crash) {
     const e = this.#shim.exports;
-    const { t0, pid, ctx } = this.#vfork;
+    const { t0, pid, ctx } = this.#vfork.at(-1);
     const w = e.gex_vfork_why();
     let why = crash ? 'crash' : w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
     let exec = null;
@@ -3611,7 +3611,7 @@ export class Gex {
       try { e.gex_process_gone?.(137); } catch {}
     }
     const resume = e.gex_vfork_end();
-    this.#vfork = null;
+    this.#vfork.pop();
     if (exec) {
       this.#env.spawnProcess(exec).catch((err) => console.error(`[gex] starting pid ${pid} after its exec: ${err.message ?? err}`));
     }
@@ -3681,7 +3681,7 @@ export class Gex {
     vforkTrace(`[vfork] not here: ${why}`);
     if (this.#vforkCopiedSaid) return;
     this.#vforkCopiedSaid = true;
-    const reason = { [-1]: 'a vfork child is already running here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'another thread staged the fork' }[why] ?? `code ${why}`;
+    const reason = { [-1]: 'vfork children nest too deep here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'another thread staged the fork' }[why] ?? `code ${why}`;
     console.error(`[gex] pid ${this.wlToken()}: a CLONE_VM|CLONE_VFORK child is copied, not run in place (${reason}); said once per Worker`);
   }
 
@@ -6028,7 +6028,7 @@ export class Gex {
         // translating): that stays a crash.
         const guestFault = crashed && /memory access out of bounds/.test(err?.message ?? '') &&
           (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1;
-        if (crashed && !guestFault && this.#vfork && !/table index is out of bounds/.test(err?.message ?? '')) {
+        if (crashed && !guestFault && this.#vfork.length && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
           this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
@@ -6249,20 +6249,19 @@ export class Gex {
         // posix_spawn's child in this Worker, in place of the thread that
         // cloned it (shims/browser/src/vfork.rs): over when it exits or
         // execs, and then that thread goes on after its `clone`.
-        if (this.#vfork && e.gex_vfork_over()) {
+        if (this.#vfork.length && e.gex_vfork_over()) {
           ({ pc, ctx } = this.#vforkLeave(null));
           continue;
         }
-        if (!this.#vfork) {
-          const ok = e.gex_vfork_ok?.() ?? 0;
-          if (ok > 0) {
-            const at = this.#vforkEnter();
-            if (at) {
-              ({ pc, ctx } = at);
-              continue;
-            }
-          } else if (ok !== -2) this.#vforkCopied(ok);
-        }
+        // One a running child makes nests (vfork.rs says how deep).
+        const vforkOk = e.gex_vfork_ok?.() ?? 0;
+        if (vforkOk > 0) {
+          const at = this.#vforkEnter();
+          if (at) {
+            ({ pc, ctx } = at);
+            continue;
+          }
+        } else if (vforkOk !== -2) this.#vforkCopied(vforkOk);
         this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --

@@ -1,8 +1,14 @@
 /* A vfork child that spawns (Qt's QProcess::startDetached: vfork, and in the
    child vforkfd, a CLONE_VM | CLONE_VFORK clone, then exec): the grandchild
    runs and the parent hears from it. musl's vfork is a fork on AArch64, so
-   the child is cloned as glibc's vfork clones it. */
+   the child is cloned as glibc's vfork clones it.
+
+   The grandchild's exec may fail, and its parent must hear why: from a pipe
+   (musl's posix_spawn, Qt's startDetached), and from the memory the two
+   share, which the grandchild writes before it exits (glibc's posix_spawn:
+   `args->err`). */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
@@ -14,12 +20,51 @@
 
 extern char **environ;
 
-static int child(void *a) {
-    char **args = a;
+struct job {
+    const char *path; /* what the grandchild runs */
+    char **args;
+    volatile int err; /* the grandchild's exec error, as glibc's spawni keeps it */
+};
+
+static int spawned(void *a) {
+    struct job *j = a;
     pid_t g;
-    /* by /proc/self/exe: argv[0] is a host path natively */
-    int r = posix_spawn(&g, "/proc/self/exe", NULL, NULL, args, environ);
+    int r = posix_spawn(&g, j->path, NULL, NULL, j->args, environ);
     _exit(r == 0 ? 0 : 100 + r);
+}
+
+static int grand(void *a) {
+    struct job *j = a;
+    execve(j->path, j->args, environ);
+    j->err = errno;
+    _exit(127);
+}
+
+static int shared(void *a) {
+    struct job *j = a;
+    static char stack[16 * 1024] __attribute__((aligned(16)));
+    j->err = 0;
+    pid_t g = clone(grand, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD, j);
+    if (g < 0) _exit(99);
+    /* back only once the grandchild has exec'd or exited */
+    _exit(j->err);
+}
+
+static int run(const char *name, int (*fn)(void *), struct job *j, int rd) {
+    static char stack[64 * 1024] __attribute__((aligned(16)));
+    pid_t c = clone(fn, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD, j);
+    int st = 0;
+    waitpid(c, &st, 0);
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
+    printf("%s: exited %d\n", name, code);
+    if (code == 0) {
+        char buf[64];
+        ssize_t n = read(rd, buf, sizeof buf - 1);
+        buf[n > 0 ? n : 0] = 0;
+        printf("%s", n > 0 ? buf : "no word from the grandchild\n");
+    }
+    fflush(stdout);
+    return code;
 }
 
 int main(int argc, char **argv) {
@@ -32,16 +77,13 @@ int main(int argc, char **argv) {
     if (pipe(p)) return 1;
     char fd[16];
     snprintf(fd, sizeof fd, "%d", p[1]);
-    static char stack[64 * 1024] __attribute__((aligned(16)));
     char *args[] = {argv[0], "grand", fd, NULL};
-    pid_t c = clone(child, stack + sizeof stack, CLONE_VM | CLONE_VFORK | SIGCHLD, args);
-    int st = 0;
-    waitpid(c, &st, 0);
-    printf("child: exited %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st));
-    close(p[1]);
-    char buf[64];
-    ssize_t n = read(p[0], buf, sizeof buf - 1);
-    buf[n > 0 ? n : 0] = 0;
-    printf("%s", n > 0 ? buf : "no word from the grandchild\n");
+    /* by /proc/self/exe: argv[0] is a host path natively */
+    struct job ok = {"/proc/self/exe", args, 0}, missing = {"/no/such/program", args, 0};
+    run("spawn", spawned, &ok, p[0]);
+    run("spawn missing", spawned, &missing, p[0]);
+    if (argc > 1 && !strcmp(argv[1], "pipe")) return 0; /* the pipe cases alone */
+    run("shared", shared, &ok, p[0]);
+    run("shared missing", shared, &missing, p[0]);
     return 0;
 }
