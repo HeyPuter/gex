@@ -78,6 +78,11 @@ pub struct Unit<'a> {
     table_base: u32,
     /// The body type every slot holds.
     body_ty: u32,
+    /// The memory is 64-bit (memory64): addresses are i64.
+    m64: bool,
+    /// Table 0 is 64-bit (table64): `__table_base` and the indices into it
+    /// are i64.
+    t64: bool,
     /// Raw custom sections to keep in the primary, in order (`dylink.0`
     /// first, `gex.funcs`).
     keep_custom: Vec<(String, &'a [u8])>,
@@ -86,6 +91,18 @@ pub struct Unit<'a> {
 }
 
 impl<'a> Unit<'a> {
+    /// Push `__table_base + k`, in the table's index type.
+    fn slot_index(&self, f: &mut Function, k: u32) {
+        f.instruction(&I::GlobalGet(self.table_base));
+        if self.t64 {
+            f.instruction(&I::I64Const(k as i64));
+            f.instruction(&I::I64Add);
+        } else {
+            f.instruction(&I::I32Const(k as i32));
+            f.instruction(&I::I32Add);
+        }
+    }
+
     pub fn parse(wasm: &'a [u8]) -> Result<Unit<'a>> {
         let mut u = Unit {
             types_raw: &[],
@@ -99,6 +116,8 @@ impl<'a> Unit<'a> {
             names: HashMap::new(),
             table_base: u32::MAX,
             body_ty: u32::MAX,
+            m64: false,
+            t64: false,
             keep_custom: Vec::new(),
             callees: Vec::new(),
         };
@@ -122,6 +141,8 @@ impl<'a> Unit<'a> {
                                 }
                                 nglobals += 1;
                             }
+                            TypeRef::Memory(m) => u.m64 |= m.memory64,
+                            TypeRef::Table(t) => u.t64 |= t.table64,
                             _ => {}
                         }
                         u.imports.push((imp.module.to_string(), imp.name.to_string(), imp.ty));
@@ -375,9 +396,7 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
                         anyhow!("{} calls {}, which is neither held nor a guest function", u.name(f).unwrap_or("?"), u.name(function_index).unwrap_or("?"))
                     })?;
                     let tail = matches!(op, Operator::ReturnCall { .. });
-                    out.instruction(&I::GlobalGet(u.table_base));
-                    out.instruction(&I::I32Const(k as i32));
-                    out.instruction(&I::I32Add);
+                    u.slot_index(&mut out, k);
                     if tail {
                         out.instruction(&I::ReturnCallIndirect { type_index: u.body_ty, table_index: 0 });
                     } else {
@@ -417,19 +436,31 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
                         let mut s = Function::new([(1, ValType::I64)]);
                         let ctx_at = |off: usize| wasm_encoder::MemArg { offset: off as u64, align: 3, memory_index: 0 };
                         s.instruction(&I::LocalGet(0));
+                        if u.m64 {
+                            // ctx is an i32 offset into the memory either way.
+                            s.instruction(&I::I64ExtendI32U);
+                        }
                         s.instruction(&I::I64Const(addr as i64));
                         s.instruction(&I::I64Store(ctx_at(gex_abi::ctx::LAST_TARGET)));
                         for p in 0..4 {
                             s.instruction(&I::LocalGet(p));
                         }
                         let probe = ((addr as u32).wrapping_mul(gex_abi::FCACHE_MUL) >> (32 - gex_abi::FCACHE_BITS)) << 3;
-                        s.instruction(&I::I32Const(probe as i32));
+                        if u.m64 {
+                            s.instruction(&I::I64Const(probe as i64));
+                        } else {
+                            s.instruction(&I::I32Const(probe as i32));
+                        }
                         s.instruction(&I::I64Load(wasm_encoder::MemArg { offset: gex_abi::FCACHE, align: 3, memory_index: 0 }));
                         s.instruction(&I::LocalTee(4));
                         s.instruction(&I::I64Const(gex_abi::FCACHE_TAG_BITS as i64));
                         s.instruction(&I::I64ShrU);
-                        s.instruction(&I::I32WrapI64);
-                        s.instruction(&I::I32Const(gex_abi::ftab::RESOLVE as i32));
+                        if u.t64 {
+                            s.instruction(&I::I64Const(gex_abi::ftab::RESOLVE as i64));
+                        } else {
+                            s.instruction(&I::I32WrapI64);
+                            s.instruction(&I::I32Const(gex_abi::ftab::RESOLVE as i32));
+                        }
                         s.instruction(&I::LocalGet(4));
                         s.instruction(&I::I64Const(gex_abi::FCACHE_TAG_MASK as i64));
                         s.instruction(&I::I64And);
@@ -463,9 +494,7 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
                         for p in 0..4 {
                             s.instruction(&I::LocalGet(p));
                         }
-                        s.instruction(&I::GlobalGet(u.table_base));
-                        s.instruction(&I::I32Const(k as i32));
-                        s.instruction(&I::I32Add);
+                        u.slot_index(&mut s, k as u32);
                         s.instruction(&I::ReturnCallIndirect { type_index: u.body_ty, table_index: 0 });
                         s.instruction(&I::End);
                         code.function(&s);
@@ -492,9 +521,9 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
             let mut init = Function::new([]);
             for (i, (s, v)) in runs.iter().enumerate() {
                 elems.passive(Elements::Functions(v.as_slice().into()));
-                init.instruction(&I::GlobalGet(u.table_base));
-                init.instruction(&I::I32Const(*s as i32));
-                init.instruction(&I::I32Add);
+                // The destination in the table's index type; the segment's
+                // offset and the count are i32.
+                u.slot_index(&mut init, *s);
                 init.instruction(&I::I32Const(0));
                 init.instruction(&I::I32Const(v.len() as i32));
                 init.instruction(&I::TableInit { elem_index: i as u32, table: 0 });
@@ -579,9 +608,6 @@ fn funcs_section(addrs: &[u64]) -> Vec<u8> {
 /// address (a helper) or a lifted twin stays compiled.
 pub fn jit(wasm: &[u8], hot: &HashSet<u32>) -> Result<(Vec<u8>, Vec<u64>)> {
     let u = Unit::parse(wasm)?;
-    if u.imports.iter().any(|(_, _, t)| matches!(t, TypeRef::Memory(m) if m.memory64)) {
-        bail!("a unit over 64-bit memory: the JIT split's stubs address memory with i32");
-    }
     if !u.keep_custom.iter().any(|(n, _)| n == "gex.funcs") {
         bail!("no gex.funcs section: the slots' guest addresses are unknown");
     }
@@ -590,7 +616,9 @@ pub fn jit(wasm: &[u8], hot: &HashSet<u32>) -> Result<(Vec<u8>, Vec<u64>)> {
         bail!("gex.funcs has {} addresses for {} slots", addrs.len(), u.slots.len());
     }
     let n = u.slots.len() as u32;
-    let keep = |k: u32| hot.contains(&k) || addrs[k as usize] == 0 || addrs[k as usize] >> 63 != 0 || addrs[k as usize] > u32::MAX as u64;
+    // Code the probe cache cannot tag (at or above 64 GiB) stays compiled:
+    // its stub would ask the host on every call.
+    let keep = |k: u32| hot.contains(&k) || addrs[k as usize] == 0 || addrs[k as usize] >> 63 != 0 || addrs[k as usize] > gex_abi::FCACHE_TAG_MASK;
     let of: Vec<Option<u32>> = (0..n).map(|k| if keep(k) { None } else { Some(0) }).collect();
     let owned: Vec<u32> = (0..n).filter(|&k| keep(k)).collect();
     let module = build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: false, jit: true })?;
