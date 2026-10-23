@@ -14313,26 +14313,6 @@ pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::a
 /// since units are published once (`cgen::CLAIMED`) and list every page they
 /// cover (`cgen::bridges`), none should happen, so a heal line is a bug
 /// report (something numbered a page and left its entry unwritten).
-/// Retire `page`'s translations in this process, as a flushed code page's
-/// are: its page-table base is forgotten and its directory entry cleared, so
-/// the next branch there misses and translates the bytes again into fresh
-/// slots (the old ones leak, unreachable). False when the page had no base.
-fn retire_dispatch_page(j: &mut Jit, page: u64, at: u64, pc: u64, why: &'static str) -> bool {
-    if j.page_table.forget(page).is_none() {
-        return false;
-    }
-    j.retired_pages.insert(page);
-    let home = if jit_diag() { sigs::home() } else { None };
-    note_page_retired(home.as_ref().map(|h| h.mm()), page, &gex_kernel::RetireWhy { start: at, end: at + 1, why, prot: 0, pc });
-    let mut gm = GuestMem::new(guest_bytes());
-    let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, 0);
-    let lo = page * gex_abi::DISPATCH_PAGE;
-    let hi = lo + gex_abi::DISPATCH_PAGE;
-    j.translated.retain(|&a| a < lo || a >= hi);
-    j.provider.retain(|&a, _| a < lo || a >= hi);
-    true
-}
-
 thread_local!(static STALE_INFO: std::cell::RefCell<String> = Default::default());
 
 fn heal_dirs(start: u64) {
@@ -14508,40 +14488,6 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             if again {
                 j.translated.remove(&start);
                 j.provider.remove(&start);
-            } else if elsewhere {
-                // Dispatch at `start` reaches a newer block, yet this stale
-                // one was run: a sibling of its own module branched to it
-                // directly, and that sibling's own page check passes (it lies
-                // on a page whose entry did not change; this block runs onto
-                // one that did). The edge is stale for good -- resumed from
-                // JavaScript, the sibling would come back here on every entry,
-                // a trip out and back each time (a hot libc or glib function
-                // called from a unit cost most of a Plasma shell's start-up).
-                // So the pages of every block that module provides here are
-                // retired now, as a flushed page's are, and its blocks are
-                // translated again with the numbering as it is. Its blocks are
-                // the addresses whose slots name its range of `blocks` (its
-                // dense base, unique in the process); its id alone is not
-                // enough, since a module adopted from another process or
-                // restored from the translation cache carries an id that one
-                // of this process's own may have too.
-                let n = ours.unwrap_or(0);
-                let mut pages: std::collections::BTreeSet<u64> = j
-                    .provider
-                    .keys()
-                    .filter(|&&a| {
-                        let d = dense::index(a);
-                        d >= stale_base && d < stale_base + n
-                    })
-                    .map(|&a| gex_abi::dispatch_page(a))
-                    .collect();
-                pages.insert(gex_abi::dispatch_page(start));
-                if jit_diag() {
-                    warn_line(&format!("[gex] stale block {start:#x} reached by a direct branch: its translation's {} page(s) retired\n", pages.len()));
-                }
-                for page in pages {
-                    retire_dispatch_page(j, page, start, _pc as u64, "stale sibling");
-                }
             }
             again
         });
@@ -14648,9 +14594,21 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
         with_jit_only(|j| {
-            if !retire_dispatch_page(j, page, addr as u64, _pc as u64, "guard") {
+            if j.page_table.forget(page).is_none() {
                 return;
             }
+            j.retired_pages.insert(page);
+            let home = if jit_diag() { sigs::home() } else { None };
+            note_page_retired(
+                home.as_ref().map(|h| h.mm()),
+                page,
+                &gex_kernel::RetireWhy { start: addr as u64, end: addr as u64 + 1, why: "guard", prot: 0, pc: _pc as u64 },
+            );
+            let mut gm = GuestMem::new(guest_bytes());
+            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, 0);
+            let lo = page * gex_abi::DISPATCH_PAGE;
+            let hi = lo + gex_abi::DISPATCH_PAGE;
+            j.translated.retain(|&a| a < lo || a >= hi);
             xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
