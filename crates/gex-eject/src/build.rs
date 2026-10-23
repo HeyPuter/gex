@@ -145,13 +145,21 @@ pub(crate) fn layout(
     let in_region = total > window;
     let mut placement = Placement { libraries: libs.len(), library_bytes: total, ..Placement::default() };
     let mut next = if in_region { gex_abi::PLACE_TOP } else { gex_abi::MMAP_BOTTOM };
+    // In path order, not the session's load order, so that a project
+    // recorded again keeps its bases and the units built for them.
+    let mut by_path = libs.clone();
+    by_path.sort_by(|&a, &b| loaded[a].0.path.cmp(&loaded[b].0.path));
+    let mut bases = HashMap::new();
+    for &i in &by_path {
+        let base = round(next);
+        next = base + share(&loaded[i].2);
+        placement.placed += 1;
+        placement.placed_bytes += share(&loaded[i].2);
+        bases.insert(i, base);
+    }
     let mut out = Vec::new();
-    for (o, bytes, image) in loaded {
-        let image = if o.role == "library" {
-            let base = round(next);
-            next = base + share(&image);
-            placement.placed += 1;
-            placement.placed_bytes += share(&image);
+    for (i, (o, bytes, image)) in loaded.into_iter().enumerate() {
+        let image = if let Some(&base) = bases.get(&i) {
             gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path))?
         } else {
             image
@@ -776,4 +784,65 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     report.replacements = replacements;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shared object of one `PT_LOAD` at zero, `memsz` long.
+    fn library(memsz: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 0x1000];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[6] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[52..54].copy_from_slice(&64u16.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let p = 64;
+        b[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
+        b[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+        b[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[p + 40..p + 48].copy_from_slice(&memsz.to_le_bytes());
+        b[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    /// The pin region's bases do not depend on the order the session
+    /// loaded the libraries in.
+    #[test]
+    fn pin_bases_follow_paths_not_load_order() {
+        let dir = std::env::temp_dir().join(format!("gex-eject-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = ["/lib/c.so", "/lib/a.so", "/lib/b.so"];
+        for (i, n) in names.iter().enumerate() {
+            let p = dir.join(rootfs_rel(n).unwrap());
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            // Together more than the window, so they go in the region.
+            std::fs::write(&p, library((30 + i as u64) << 20)).unwrap();
+        }
+        let project = |order: &[usize]| Project {
+            objects: order
+                .iter()
+                .map(|&i| Object { path: names[i].into(), role: "library".into(), ..Object::default() })
+                .collect(),
+            ..Project::default()
+        };
+        let bases = |order: &[usize]| {
+            let (placed, placement) = layout(&dir, &project(order), None).unwrap();
+            assert!(placement.region > 0, "three libraries of 30 MiB and more fit the window?");
+            let mut b: Vec<(String, u64)> = placed.iter().map(|p| (p.obj.path.clone(), p.image.bias)).collect();
+            b.sort();
+            b
+        };
+        let one = bases(&[0, 1, 2]);
+        assert_eq!(one, bases(&[2, 0, 1]));
+        assert_eq!(one[0], ("/lib/a.so".into(), gex_abi::PLACE_TOP), "the first path is placed first");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
