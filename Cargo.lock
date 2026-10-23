@@ -876,6 +876,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-split",
+ "gex-units",
  "gex-xlate",
  "libc",
 ]

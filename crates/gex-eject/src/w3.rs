@@ -372,7 +372,7 @@ fn template(off: &[String]) -> String {
 fn aot_only(config: &Config) -> Result<bool> {
     let on = config.features_on.iter().any(|x| x == "translation");
     let off = config.features_off.iter().any(|x| x == "translation");
-    let cold_jit = config.cold.as_deref() == Some("jit");
+    let cold_jit = matches!(config.cold.as_deref(), Some("jit" | "tier1"));
     if off && cold_jit {
         bail!(
             "user/eject.json: \"translation\": false, and \"cold\": \"jit\" leaves the cold code to the \
@@ -823,8 +823,17 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     }
     let site_key = |k: &str| rekeyed.get(k).cloned().unwrap_or_else(|| k.to_string());
     let instrument = config.cold.as_deref() == Some("instrument");
+    // `user/select.json` (`gexc units select`): the slots to ship, in place
+    // of the recording's coverage.
+    let selected: Option<Vec<(String, Json)>> = match std::fs::read_to_string(dir.join("user/select.json")) {
+        Ok(t) if config.cold.is_some() && !instrument => Some(
+            gex_units::select::read_selection(&t)?.into_iter().map(|(k, r)| (k, Json::Str(r))).collect(),
+        ),
+        _ => None,
+    };
     let coverage = match (&config.cold, v.get("coverage")) {
         (None, _) => None,
+        _ if selected.is_some() => selected.as_ref(),
         _ if instrument => None,
         (Some(_), Some(Json::Obj(kv))) => Some(kv),
         (Some(_), _) => {
@@ -946,7 +955,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         let key = json::str_field(u, "key", what)?;
         let from = dir.join("units").join(&key);
         let to = web.join("units").join(site_key(&key));
-        let jit = coverage.is_some() && config.cold.as_deref() == Some("jit");
+        let jit = coverage.is_some() && matches!(config.cold.as_deref(), Some("jit" | "tier1"));
         let hot;
         let shape = if instrument {
             gex_units::Shape::Instrument
@@ -1025,7 +1034,8 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         params.push(("cold".to_string(), s("1")));
     }
     // `"cold": "jit"`: what the units leave out is the function JIT's.
-    if jit_units > 0 {
+    // `"tier1"`: the same units, and tier 1 for the rest.
+    if jit_units > 0 && config.cold.as_deref() == Some("jit") {
         params.retain(|(k, _)| k != "fjit");
         params.push(("fjit".to_string(), s("1")));
     }

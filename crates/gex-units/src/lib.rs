@@ -11,6 +11,9 @@
 //! `?cgenurl=`, which reads `<key>/c.wasm` and `c.entries`, and a split
 //! unit's `cold/`) and an eject (gex-eject, which packs it) read it, for PE
 //! and ELF images alike: nothing here depends on the image's format.
+pub mod profile;
+pub mod select;
+
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::Path;

@@ -119,7 +119,8 @@ pub struct Config {
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (docs/eject.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the
-    /// guest's code on first call (gex_split::jit).
+    /// guest's code on first call (gex_split::jit). `"tier1"`: the same
+    /// units, with the function JIT off, so the rest runs on tier 1.
     pub cold: Option<String>,
     /// W3 pages: which functions the build may leave out of the units. A
     /// pruned function that runs traps, naming its address.
@@ -380,12 +381,12 @@ impl Config {
         c.cold = match v.get("cold") {
             None | Some(Json::Null) => None,
             Some(Json::Str(x)) if x == "none" => None,
-            Some(Json::Str(x)) if x == "instrument" || x == "jit" => Some(x.clone()),
+            Some(Json::Str(x)) if x == "instrument" || x == "jit" || x == "tier1" => Some(x.clone()),
             Some(Json::Str(x)) => {
                 x.parse::<gex_split::Clustering>().map_err(|e| anyhow::anyhow!("{what}: \"cold\": {e}"))?;
                 Some(x.clone())
             }
-            Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"jit\", \"instrument\" or \"none\""),
+            Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"jit\", \"tier1\", \"instrument\" or \"none\""),
         };
         c.prune = match v.get("prune") {
             None | Some(Json::Null) => None,
