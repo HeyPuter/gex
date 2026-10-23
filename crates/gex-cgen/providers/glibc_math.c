@@ -1,11 +1,12 @@
 /* PROVIDES libm.so.6 x86_64
  *
- * glibc's libm rounding functions (x86-64) as native wasm
- * (docs/elf-providers.md §5): floor, ceil, trunc, round and their float
+ * glibc's libm rounding functions (x86-64) as native wasm: floor, ceil,
+ * trunc, round and their float
  * forms. Each result is exact, so it is glibc's bit for bit; a NaN comes
  * back quieted, as glibc's x + x makes it (wasm would be free to choose
  * the payload). Under gex's CPUID (no SSE4.1) glibc's IFUNCs pick the C
- * versions, bit manipulation (__floorf_c was 0.4% of Warfork's server). No
+ * versions, bit manipulation (__floorf_c can be a visible share of a
+ * program's time). No
  * exception flags are raised here; glibc's raise none for these either,
  * except invalid for a signalling NaN. sin, cos and sincos stay glibc's:
  * nothing short of glibc's own algorithm returns its bits. */

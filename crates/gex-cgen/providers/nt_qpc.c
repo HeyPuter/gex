@@ -2,8 +2,8 @@
  *
  * RtlQueryPerformanceCounter without a syscall. Wine's i386 ntdll makes
  * NtQueryPerformanceCounter for each call (no TSC bypass in this build),
- * and Noita's frame timer calls it about a thousand times a frame (70,000
- * syscalls a second, each a full trip through the NT layer). The counter
+ * and a frame timer can call it about a thousand times a frame (tens of
+ * thousands of system calls a second). The counter
  * is the syscall's own (gex.nt_qpc: the process clock in 100 ns units, the
  * frequency RtlQueryPerformanceFrequency reports), so the two agree.
  *

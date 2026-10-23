@@ -1,4 +1,4 @@
-//! The function table's runtime functions (docs/merge-plan.md §9.8): a small
+//! The function table's runtime functions: a small
 //! module every store (every Worker) instantiates once, against the process's
 //! memory and its own `gex.ftab`.
 //!
@@ -14,7 +14,7 @@
 //!   returns: the host stops it by trapping out, as tier-1's `enter`.
 //!
 //! * `bridge(ctx)`, what tier-1's dispatch slot holds for an address a
-//!   function body serves (while tier-1 is the fallback, §9.4 step 3):
+//!   function body serves (while tier-1 is the fallback):
 //!   `(ctx) -> ()` like a block, it calls the function for
 //!   `ctx::LAST_TARGET` with no predicted return, then dispatches on
 //!   `ctx::PC` as the old nest roots did. An address in the slot that no
@@ -42,8 +42,7 @@ pub fn body_params() -> [ValType; 4] {
 }
 
 /// The process's table, as a module imports it: a table64 in a process with
-/// a memory64 guest memory, as clang's wasm64 units import it
-/// (docs/mem64.md §4).
+/// a memory64 guest memory, as clang's wasm64 units import it.
 pub fn ftab_type() -> TableType {
     TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: gex_abi::mem64(), shared: false }
 }
@@ -342,7 +341,7 @@ pub fn module() -> Vec<u8> {
     m.finish()
 }
 
-/// A module in the shape every run-time translation has (§9.8.1), as a
+/// A module in the shape every run-time translation has, as a
 /// reference and for testing the host's half: one `F_body` per address of
 /// `addrs`, each re-entering the table's fallback (index 1) with
 /// `ctx::LAST_TARGET` = its address; its element segment fills the table

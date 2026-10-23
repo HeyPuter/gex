@@ -3,9 +3,8 @@
  * The MSVC 2013 Concurrency Runtime surface programs and msvcp120 use
  * (std::mutex and std::condition_variable are built on critical_section and
  * _Condition_variable), on wasm atomics instead of ConcRT's scheduler, whose
- * real implementation spins and yields through its resource manager.
- * pewasm's port/src/noita_concrt.c, in the F_body form (docs/merge-plan.md
- * §9.9.2 step 1).
+ * real implementation spins and yields through its resource manager. In
+ * the F_body form.
  *
  * Object state lives in the first words of each ConcRT object, which the
  * callers allocate at its real (larger) size. The waits that poll the
@@ -185,9 +184,8 @@ static GEX_PROVIDER(cond_ctor) {
  * One wait on the generation word for the whole timeout, not 1 ms waits
  * re-armed: a notification always changes the word before its wake, and the
  * wait compares the word first, so no wake is missed; and with no safepoint
- * here there is nothing for a bounded wait to poll. Re-arming every 1 ms woke
- * each idle thread ~1000 times a second (Noita: four Workers parked here,
- * docs/wine-overhead.md). Only notifications wake this word, so a wake with
+ * here there is nothing for a bounded wait to poll. Re-arming every 1 ms
+ * would wake each idle thread ~1000 times a second. Only notifications wake this word, so a wake with
  * the word unchanged is spurious and waits again (with no timeout; a timed
  * wait ends then, as a wait that may end early is allowed to). */
 static int cond_wait(int ctx, uint32_t c, uint32_t cs, uint32_t timeout) {
@@ -233,9 +231,8 @@ static GEX_PROVIDER(cond_notify) {
 /* ---- scheduler queries, yielding and tasks ---- */
 
 /* _Context::_Yield and _UnderlyingYield are not provided: the guest's own
- * (SwitchToThread, a host yield) measured better than a 1 ms wait, for
- * world loading (447 s against 468 s) and steady state (18.2 against 16.7
- * world fps; tier-1, two paired runs each, docs/noita-perf.md). */
+ * (SwitchToThread, a host yield) measures better than a 1 ms wait, both
+ * while a program loads and in its steady state. */
 
 /* ?wait@Concurrency@@YAXI@Z (cdecl, milliseconds) */
 static GEX_PROVIDER(wait_ms) {

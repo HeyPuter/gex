@@ -1,5 +1,5 @@
 //! Splicing a clang-built module into the tier-1 module built from the same
-//! blocks (`docs/function-tier.md` §1).
+//! blocks.
 //!
 //! The tier-1 module keeps everything the hosts rely on -- imports, exports,
 //! tables, element layout, data, `gex.meta` -- and gains the C side's
@@ -52,7 +52,7 @@ fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
     parse_c_as(wasm, false)
 }
 
-/// [`parse_c`]; `image`: a whole-image unit (docs/function-tier.md §11),
+/// [`parse_c`]; `image`: a whole-image unit,
 /// which has a function table of its own holding its entries.
 fn parse_c_as(wasm: &[u8], image: bool) -> Result<CModule<'_>> {
     let mut m = CModule {
@@ -96,8 +96,8 @@ fn parse_c_as(wasm: &[u8], image: bool) -> Result<CModule<'_>> {
                                 );
                             }
                         }
-                        // A whole-image unit is linked position-independent
-                        // (docs/merge-plan.md §9.8.1): it imports the
+                        // A whole-image unit is linked position-independent:
+                        // it imports the
                         // function table and its base.
                         TypeRef::Table(_) if image => m.pic = true,
                         TypeRef::Global(_) if image => {
@@ -159,8 +159,8 @@ fn parse_c_as(wasm: &[u8], image: bool) -> Result<CModule<'_>> {
     Ok(m)
 }
 
-/// Per-function checks from `docs/function-tier.md` §1 and §4, and the calls
-/// each function makes (for reachability).
+/// Per-function checks (what the splice can take), and the calls each
+/// function makes (for reachability).
 fn scan(
     m: &CModule<'_>,
     f: u32,
@@ -509,8 +509,8 @@ pub fn splice(
 
 /// A module of one function, `dispatch : (i32) -> ()`, that does tier-1's
 /// dispatch (the function below) over the process's imported dispatch tables
-/// and memory: what a whole-image unit imports as `gexc.dispatch`
-/// (docs/function-tier.md §11), instantiated once per store, so the unit's
+/// and memory: what a whole-image unit imports as `gexc.dispatch`,
+/// instantiated once per store, so the unit's
 /// own module is clang's as linked.
 pub fn dispatcher_module() -> Vec<u8> {
     use wasm_encoder::{EntityType, ExportKind, ExportSection, ImportSection, MemoryType, RefType, TableType};
@@ -756,7 +756,7 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
 }
 
 /// Make the i32 address on the stack the guest memory's index type: nothing
-/// for wasm32, a zero-extension for a memory64 guest memory (docs/mem64.md).
+/// for wasm32, a zero-extension for a memory64 guest memory.
 pub(crate) fn widen_addr(f: &mut Function) {
     if gex_abi::mem64() {
         f.instruction(&Instruction::I64ExtendI32U);

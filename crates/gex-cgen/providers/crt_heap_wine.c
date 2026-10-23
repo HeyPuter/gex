@@ -1,15 +1,16 @@
 /* PROVIDES msvcr120.dll i386 stateful wineonly
  *
- * crt_heap.c's dlmalloc heap for Wine's own build of msvcr120 (the one W3
- * runs), whose heap code crt_heap.c cannot route: Wine's operator new and
+ * crt_heap.c's dlmalloc heap for Wine's own build of msvcr120 (the one
+ * 32-bit Wine runs), whose heap code crt_heap.c cannot route: Wine's operator new and
  * delete, calloc, realloc, _expand, _recalloc and _aligned_offset_realloc
  * reach the process heap through static helpers (msvcrt_heap_alloc,
  * msvcrt_heap_realloc) or HeapFree/HeapSize directly, not through the
  * exports. So every export of dlls/msvcrt/heap.c that reaches the heap is
  * here; the rest (_aligned_malloc, _aligned_offset_malloc, _aligned_free,
  * _aligned_msize, _aligned_realloc, _strdup and the like) call these exports,
- * which the library's unit routes here. W's Noita profile: 0.58 ms a world
- * frame on the main thread in Wine's heap under operator new and delete.
+ * which the library's unit routes here. A program that allocates through
+ * operator new and delete every frame otherwise spends a measurable part
+ * of its main thread in Wine's heap.
  *
  * Wine's semantics, as dlls/msvcrt/heap.c has them over HeapAlloc:
  * - _msize is the size asked for (HeapSize), not the block's: a block keeps

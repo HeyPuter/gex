@@ -1,6 +1,6 @@
 /* PROVIDES msvcr120.dll i386 wineonly lifted
  *
- * Wine's msvcr120 trigonometry (docs/merge-plan.md §9.9.2 step 3): sin, cos,
+ * Wine's msvcr120 trigonometry: sin, cos,
  * tan, atan, atan2 and rint, with their x87-ABI (_CI*) and SSE2-ABI
  * (__libm_sse2_*, _libm_sse2_*_precise) entries. Wine builds these from
  * its copy of musl (libs/musl/src/math) as i386 code, so they run on the

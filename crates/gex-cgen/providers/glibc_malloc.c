@@ -1,6 +1,6 @@
 /* PROVIDES libc.so.6 x86_64 stateful
  *
- * glibc's heap (x86-64) as native wasm (docs/elf-providers.md §5): dlmalloc
+ * glibc's heap (x86-64) as native wasm: dlmalloc
  * (2.8.6, as crt_heap.c) in place of ptmalloc, the whole family or none of
  * it (GEX_GROUP below): two allocators over one heap are fatal. Bound by
  * address, so the library's own calls (strdup, fopen, the dynamic linker
@@ -16,12 +16,10 @@
  * errno (ENOMEM, EINVAL) through the library's __errno_location. One lock
  * for the heap.
  *
- * NOT REGISTERED (provider.rs SOURCES): it agrees with glibc
- * (tests/elf-prov/malloc.c) but measured no faster than translated
- * ptmalloc, whose tcache fast path is short: 400000 malloc/free pairs took
- * 177 ms with it against 175 ms without (median of 12 ABBA runs under
- * run-node, worldmachine, 2026-10-05). Register it again when a profile
- * shows a heap-bound workload it wins on. */
+ * NOT REGISTERED (provider.rs SOURCES): it agrees with glibc but is no
+ * faster than translated ptmalloc, whose tcache fast path is short (400000
+ * malloc/free pairs take about the same time either way). Register it when
+ * a profile shows a heap-bound workload it wins on. */
 
 __attribute__((import_module("gex"), import_name("provider_alloc_top"))) int gex_provider_alloc(int size);
 __attribute__((import_module("gex"), import_name("provider_log"))) void gex_provider_log(const char *p, int n);

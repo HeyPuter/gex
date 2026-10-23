@@ -1,10 +1,9 @@
 /* PROVIDES msvcr120.dll,msvcrt.dll,ucrtbase.dll i386
  *
- * The CRT's exactly specified math (docs/merge-plan.md §9.9.2 step 3):
+ * The CRT's exactly specified math:
  * floor, ceil, modf and sqrt, whose IEEE results do not depend on the
- * library, so native wasm matches any CRT to the bit (tests/providers
- * crtmath checks it against the guest's own: Microsoft's msvcr120 for
- * Noita, Wine's for the prefix). The x87-ABI exports (cdecl, a double on the
+ * library, so native wasm matches any CRT to the bit (Microsoft's msvcr120
+ * and Wine's alike). The x87-ABI exports (cdecl, a double on the
  * stack, the result pushed on the x87 stack) and msvcr120's
  * `_libm_sse2_sqrt_precise` (xmm0 in and out).
  *

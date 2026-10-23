@@ -1,8 +1,7 @@
 /* PROVIDES msvcr120.dll,msvcrt.dll,ucrtbase.dll i386
  *
  * The CRT's mem* and str* functions (msvcr120, msvcrt, UCRT) as native
- * wasm (docs/merge-plan.md §9.9.2 step 2): pewasm's host.c and host_ucrt.c
- * (pe_host_memcpy and the rest), in the F_body form. Bulk copies and fills
+ * wasm, in the F_body form. Bulk copies and fills
  * are wasm memory.copy and memory.fill. All are cdecl (the caller pops),
  * none sets errno; the _s forms (errno, the invalid-parameter handler) stay
  * lifted. Comparisons return -1, 0 or 1, as msvcr120's do. */

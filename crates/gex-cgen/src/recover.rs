@@ -1,6 +1,6 @@
-//! A stand-in for function recovery, until S2's lands in gex-xlate.
+//! A stand-in for function recovery, kept to compare gex-xlate's against.
 //!
-//! **Temporary.** Forms memory-form [`Function`]s from the tier-1 block list
+//! Forms memory-form [`Function`]s from the tier-1 block list
 //! alone: entries are the function symbols and every direct call target; a
 //! function owns the blocks its entry reaches through direct jumps, branches
 //! and syscall fall-throughs, stopping at other functions' entries. It knows
