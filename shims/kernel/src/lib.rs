@@ -2853,13 +2853,14 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
     }
 }
 
-/// The files something has opened (`TmpFs::opened`), one path a line, at
+/// The files whose bytes something used (`TmpFs::read_set`: read, mapped,
+/// written into; an open or a stat alone does not count), one path a line, at
 /// `at`; their length, or `-ERANGE` with nothing written when `cap` will not
 /// hold them (ask again with more). A recorded run's read set: gex-eject's
 /// bundle split (web/src/fs-opened.js asks).
 #[no_mangle]
 pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let mut b = rootfs().opened().join("\n");
+    let mut b = rootfs().read_set().join("\n");
     if !b.is_empty() {
         b.push('\n');
     }

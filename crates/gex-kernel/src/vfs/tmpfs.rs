@@ -44,9 +44,14 @@ pub struct FileNode {
     /// Access and change times and the nanoseconds (`Times`), once
     /// `utimensat` set any; until then every time is `mtime`.
     times: Mutex<super::Times>,
-    /// Whether anything has opened the file ([`TmpFs::opened`]): what a run
-    /// needed of its bundle, which gex-eject's split keeps in the bundle.
-    opened: core::sync::atomic::AtomicBool,
+    /// Whether anything has used the file's bytes ([`TmpFs::read_set`]): a
+    /// read of any kind (`read`, `pread`, `readv`, the source of `sendfile`,
+    /// `splice` or `copy_file_range`), a mapping's copy, an advice that
+    /// fetches, a write into it. Not an open, a `stat` or an `fstat`: Wine
+    /// opens every SystemLink font to stat it and never reads one before the
+    /// desktop. What a run needed of its bundle, which gex-eject's split
+    /// keeps in the bundle.
+    read: core::sync::atomic::AtomicBool,
     /// Whether the program has made or changed the file since the root was
     /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
     /// rename. Not a time set (`utimensat`, which a program can aim at any
@@ -68,7 +73,7 @@ impl FileNode {
             ino,
             mtime: AtomicI64::new(now()),
             times: Mutex::new(Default::default()),
-            opened: core::sync::atomic::AtomicBool::new(false),
+            read: core::sync::atomic::AtomicBool::new(false),
             written: core::sync::atomic::AtomicBool::new(false),
             changes: core::sync::atomic::AtomicU64::new(1),
         }
@@ -81,6 +86,13 @@ impl FileNode {
     fn touch(&self) {
         self.mark_written();
         self.stamp(now());
+    }
+    /// Its bytes used ([`FileNode::read`]). A load first: a store to a line
+    /// every Worker reads would bounce it at each read.
+    fn mark_read(&self) {
+        if !self.read.load(Ordering::Relaxed) {
+            self.read.store(true, Ordering::Relaxed);
+        }
     }
     fn mark_written(&self) {
         if !self.written.load(Ordering::Relaxed) {
@@ -132,6 +144,8 @@ impl FileNode {
     /// Make a lazy file an ordinary one (all of it fetched), before a write
     /// or a truncation changes it.
     fn materialize(&self) -> Result<(), Errno> {
+        // What a write or a truncation leaves of the file is the bundle's.
+        self.mark_read();
         let mut lazy = self.lazy.lock().unwrap();
         let Some(l) = lazy.as_mut() else { return Ok(()) };
         let mut all = vec![0u8; l.size as usize];
@@ -671,17 +685,17 @@ impl TmpFs {
             .collect()
     }
 
-    /// Every file something has opened, by path (with its leading `/`; a
-    /// hard-linked file under each of its names), sorted. A recorded run's
-    /// read set: gex-eject's bundle split keeps these in the bundle and
-    /// serves the rest as lazy files.
-    pub fn opened(&self) -> Vec<String> {
+    /// Every file whose bytes something used ([`FileNode::read`]), by path
+    /// (with its leading `/`; a hard-linked file under each of its names),
+    /// sorted. A recorded run's read set: gex-eject's bundle split keeps
+    /// these in the bundle and serves the rest as lazy files.
+    pub fn read_set(&self) -> Vec<String> {
         let inner = self.inner.read().unwrap();
         inner
             .nodes
             .iter()
             .filter_map(|(p, n)| match n {
-                Node::File(f) if f.opened.load(core::sync::atomic::Ordering::Relaxed) => Some(format!("/{p}")),
+                Node::File(f) if f.read.load(Ordering::Relaxed) => Some(format!("/{p}")),
                 _ => None,
             })
             .collect()
@@ -886,6 +900,7 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
         };
+        file.mark_read();
         if let Some(l) = file.lazy.lock().unwrap().as_mut() {
             return l.read(offset, buf);
         }
@@ -905,6 +920,7 @@ impl FileHandle for TmpHandle {
         if file.lazy.lock().unwrap().is_some() {
             return None;
         }
+        file.mark_read();
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = len.min(data.len() - start);
@@ -914,6 +930,10 @@ impl FileHandle for TmpHandle {
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         let Some(file) = &self.file else { return Ok(()) };
+        // The advice that fetches: a range wanted, an image mapped.
+        if advice == super::FADV_WILLNEED || advice == super::FADV_GEX_IMAGE {
+            file.mark_read();
+        }
         match file.lazy.lock().unwrap().as_mut() {
             Some(l) => l.advise(offset, len, advice),
             None => Ok(()),
@@ -1168,14 +1188,7 @@ impl FileSystem for TmpFs {
                         }
                     }
                     match inner.nodes.get(&path) {
-                        Some(Node::File(f)) => {
-                            // A load first: a store to a line every Worker
-                            // reads would bounce it at each open.
-                            if !f.opened.load(core::sync::atomic::Ordering::Relaxed) {
-                                f.opened.store(true, core::sync::atomic::Ordering::Relaxed);
-                            }
-                            Some(Arc::clone(f))
-                        }
+                        Some(Node::File(f)) => Some(Arc::clone(f)),
                         _ => None,
                     }
                 }
@@ -1925,18 +1938,35 @@ mod lazy_tests {
     }
 
     #[test]
-    fn opened_lists_the_files_something_opened() {
+    fn read_set_lists_the_files_whose_bytes_were_used() {
+        set_lazy_fetch(fake);
         let fs = TmpFs::new();
-        fs.add_file("/a/read", b"x".to_vec());
-        fs.add_file("/a/unread", b"y".to_vec());
-        fs.add_lazy("/a/lazy", 5, "/l");
+        for f in ["/a/read", "/a/stat", "/a/pread", "/a/with", "/a/mapped", "/a/wrote", "/a/unread"] {
+            fs.add_file(f, b"xyz".to_vec());
+        }
+        fs.add_lazy("/a/lazy", 5, "/data/f");
+        fs.add_lazy("/a/lazystat", 5, "/data/f");
         fs.add_dir("/a/dir");
-        assert!(fs.opened().is_empty());
-        fs.open("a/read", 0, 0).unwrap();
-        fs.open("a/lazy", 0, 0).unwrap();
-        fs.open("a/dir", 0, 0).unwrap();
+        assert!(fs.read_set().is_empty());
+        // An open and an fstat, of a file and of a lazy one: no bytes used.
+        for f in ["a/stat", "a/lazystat", "a/dir"] {
+            fs.open(f, oflags::O_RDONLY, 0).unwrap().metadata().unwrap();
+        }
+        FileSystem::metadata(&fs, "a/unread").unwrap();
         assert!(fs.open("a/missing", 0, 0).is_err());
-        assert_eq!(fs.opened(), vec!["/a/lazy".to_string(), "/a/read".to_string()]);
+        assert!(fs.read_set().is_empty(), "{:?}", fs.read_set());
+        // Then an open and a read marks it, and every other use of the bytes.
+        let mut buf = [0u8; 2];
+        fs.open("a/read", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        fs.open("a/pread", oflags::O_RDONLY, 0).unwrap().read_at(1, &mut buf).unwrap();
+        fs.open("a/lazy", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        fs.open("a/with", oflags::O_RDONLY, 0).unwrap().read_with(0, 3, &mut |_| ()).unwrap().unwrap();
+        fs.open("a/mapped", oflags::O_RDONLY, 0).unwrap().advise(0, 0, super::super::FADV_GEX_IMAGE).unwrap();
+        fs.open("a/wrote", oflags::O_RDWR, 0).unwrap().write_at(1, b"q").unwrap();
+        assert_eq!(
+            fs.read_set(),
+            ["/a/lazy", "/a/mapped", "/a/pread", "/a/read", "/a/with", "/a/wrote"].map(String::from).to_vec()
+        );
     }
 
     /// `written` lists what the program made or changed -- a create, a
