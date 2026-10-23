@@ -201,6 +201,8 @@ pub mod nr {
     pub const WAITID: u64 = 95;
     pub const PRLIMIT64: u64 = 261;
     pub const GETRANDOM: u64 = 278;
+    pub const PROCESS_VM_READV: u64 = 270;
+    pub const PROCESS_VM_WRITEV: u64 = 271;
     pub const RSEQ: u64 = 293;
     pub const FACCESSAT2: u64 = 439;
 
@@ -5250,15 +5252,111 @@ pub fn is_own_state(n: u64) -> bool {
     matches!(n, nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::SIGALTSTACK | nr::SETITIMER | nr::GETITIMER | nr::ALARM | nr::GETRANDOM)
 }
 
+/// `process_vm_readv` (`write` false) and `process_vm_writev`: bytes
+/// between this process's buffers and another's, the remote side as that
+/// process's own map allows (mapped, and readable or writable as the
+/// direction needs). The transfer stops at the first remote byte that is
+/// not, or at the first local buffer past this memory's end, and answers
+/// what it moved before that, or `EFAULT` if nothing. Bytes written over
+/// the target's code retire that code's translations, as a write after
+/// `mprotect` would.
+pub fn process_vm(procs: &ProcTable, m: &mut GuestMem<'_>, compat: bool, write: bool, a: [u64; 6]) -> SysResult {
+    const CHUNK: u64 = 64 << 10;
+    let pid = a[0] as i32;
+    if a[5] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let local = Kernel::read_iovecs(m, a[1], a[2], compat)?;
+    let remote = Kernel::read_iovecs(m, a[3], a[4], compat)?;
+    if pid <= 0 {
+        return Err(Errno::ESRCH);
+    }
+    let peer = procs.vm(pid)?;
+    let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
+    let total: u64 = local.iter().map(|v| v.1).sum::<u64>().min(remote.iter().map(|v| v.1).sum());
+    let mut buf = vec![0u8; total.min(CHUNK) as usize];
+    let (mut li, mut lo, mut ri, mut ro) = (0usize, 0u64, 0usize, 0u64);
+    let mut done = 0u64;
+    let mut fault = false;
+    loop {
+        while li < local.len() && lo == local[li].1 {
+            (li, lo) = (li + 1, 0);
+        }
+        while ri < remote.len() && ro == remote[ri].1 {
+            (ri, ro) = (ri + 1, 0);
+        }
+        if li == local.len() || ri == remote.len() {
+            break;
+        }
+        let (la, ra) = (local[li].0.wrapping_add(lo), remote[ri].0.wrapping_add(ro));
+        let want = (local[li].1 - lo).min(remote[ri].1 - ro).min(CHUNK);
+        let (n, code) = {
+            let mm = peer.mm.lock();
+            let mut at = ra;
+            let end = ra.saturating_add(want);
+            let mut code = false;
+            while at < end {
+                match mm.vma_at(at) {
+                    Some(v) if v.prot & need == need => {
+                        code |= v.prot & crate::mem::prot::EXEC != 0;
+                        at = v.end;
+                    }
+                    _ => break,
+                }
+            }
+            (at.min(end) - ra, code)
+        };
+        // An exec or an exit since the lookup: the memory is no longer
+        // that process's.
+        if n == 0 || !procs.vm(pid).is_ok_and(|now| Arc::ptr_eq(&now, &peer)) {
+            fault = true;
+            break;
+        }
+        let b = &mut buf[..n as usize];
+        let moved = if write {
+            match m.read(la, n as usize) {
+                Ok(src) => {
+                    b.copy_from_slice(src);
+                    peer.mem.write(ra, b)
+                }
+                Err(_) => false,
+            }
+        } else {
+            peer.mem.read(ra, b) && m.write(la, b).is_ok()
+        };
+        if !moved {
+            fault = true;
+            break;
+        }
+        if write && code {
+            let (start, end) = (crate::mem::page_align_down(ra), crate::mem::page_align_up(ra + n));
+            peer.mm.lock().log.retired_code.push((start, end));
+            crate::note_code_change();
+        }
+        done += n;
+        lo += n;
+        ro += n;
+        if n < want {
+            fault = true;
+            break;
+        }
+    }
+    if done == 0 && fault {
+        return Err(Errno::EFAULT);
+    }
+    Ok(done)
+}
+
 /// The small descriptor and process calls that need no more than the
 /// descriptor table, the global kernel's pipes, the resource limits'
-/// own lock or nothing at all: `epoll_ctl`, `pipe2`, `ftruncate`, `fadvise64`,
-/// `statfs`/`fstatfs`, `getpriority`/`setpriority`, `sysinfo` and
-/// `prlimit64`. Canonical.
+/// own lock, the process table or nothing at all: `epoll_ctl`, `pipe2`,
+/// `ftruncate`, `fadvise64`, `statfs`/`fstatfs`, `getpriority`/`setpriority`,
+/// `sysinfo`, `prlimit64` and `process_vm_readv`/`writev`. Canonical.
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
         nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+            | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV
     )
 }
 
@@ -6126,6 +6224,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETPRIORITY => nr::GETPRIORITY,
             x::SETPRIORITY => nr::SETPRIORITY,
             x::SYSINFO => nr::SYSINFO,
+            x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
+            x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
             x::GETRLIMIT | x::UGETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
             x::SOCKET => nr::SOCKET,
             x::SOCKETPAIR => nr::SOCKETPAIR,
@@ -6224,6 +6324,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETPRIORITY => nr::GETPRIORITY,
             x::SETPRIORITY => nr::SETPRIORITY,
             x::SYSINFO => nr::SYSINFO,
+            x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
+            x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
             x::GETRLIMIT | x::SETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
             x::SOCKET => nr::SOCKET,
             x::SOCKETPAIR => nr::SOCKETPAIR,
@@ -6629,6 +6731,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
             nr::SYSINFO => sysinfo(m, compat, a[0]),
+            nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
             _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
         }
     } else if is_socket_call(n) {
@@ -9490,6 +9593,8 @@ impl Kernel {
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
+            nr::PROCESS_VM_READV => self.sys_process_vm(m, false, a),
+            nr::PROCESS_VM_WRITEV => self.sys_process_vm(m, true, a),
             // Interval timers raise their signal when due (`check_timers`,
             // and a page Worker's own `sigs::gather`).
             nr::SETITIMER => self.sys_itimer(m, a[0], a[1], a[2], true),
@@ -10894,6 +10999,10 @@ impl Kernel {
         sysinfo(m, self.compat, buf)
     }
 
+    fn sys_process_vm(&mut self, m: &mut GuestMem<'_>, write: bool, a: [u64; 6]) -> SysResult {
+        process_vm(&self.procs, m, self.compat, write, a)
+    }
+
     fn sys_getrandom(&mut self, m: &mut GuestMem<'_>, buf: u64, len: u64) -> SysResult {
         getrandom(&self.vfs, m, buf, len)
     }
@@ -11237,6 +11346,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::WAITID => "waitid",
         nr::PRLIMIT64 => "prlimit64",
         nr::GETRANDOM => "getrandom",
+        nr::PROCESS_VM_READV => "process_vm_readv",
+        nr::PROCESS_VM_WRITEV => "process_vm_writev",
         nr::RSEQ => "rseq",
         _ => "unknown",
     }
@@ -11286,6 +11397,77 @@ mod tests {
         assert_eq!(poll_revents(&slot(-1)), 0);
         assert_eq!(poll_revents(&slot(7)), 0x020);
         assert!(!poll_ready(&[slot(-1), slot(-1)]));
+    }
+
+    /// A process's memory for another's `process_vm_*`: a plain buffer.
+    struct BufPeer(std::sync::Mutex<Vec<u8>>);
+
+    impl crate::proc::PeerMem for BufPeer {
+        fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+            let b = self.0.lock().unwrap();
+            let a = addr as usize;
+            a + out.len() <= b.len() && {
+                out.copy_from_slice(&b[a..a + out.len()]);
+                true
+            }
+        }
+        fn write(&self, addr: u64, data: &[u8]) -> bool {
+            let mut b = self.0.lock().unwrap();
+            let a = addr as usize;
+            a + data.len() <= b.len() && {
+                b[a..a + data.len()].copy_from_slice(data);
+                true
+            }
+        }
+    }
+
+    /// `process_vm_readv`/`writev` against a second process whose map has
+    /// one read-write page and one read-only page after it: a
+    /// transfer stops at the first page the direction may not touch, with
+    /// what it moved before; `EFAULT` when that is nothing; `EINVAL` for
+    /// flags; `ESRCH` for no such process and for one that has exited.
+    #[test]
+    fn process_vm_moves_what_the_target_map_allows() {
+        use crate::mem::{flags as mf, prot as mp};
+        let (mut mem, mut k) = setup();
+        let mut peer = k.fork_kernel();
+        peer.pid = k.procs.spawn(k.pid);
+        let b = gex_abi::MMAP_BOTTOM;
+        let fl = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
+        peer.mem.lock().mmap(b, 0x1000, mp::READ | mp::WRITE, fl, "rw").unwrap();
+        peer.mem.lock().mmap(b + 0x1000, 0x1000, mp::READ, fl, "ro").unwrap();
+        let mut bytes = vec![0u8; (b + 0x3000) as usize];
+        bytes[b as usize..(b + 0x2000) as usize].iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        let pm = Arc::new(BufPeer(std::sync::Mutex::new(bytes)));
+        let vm = crate::proc::PeerVm { mm: peer.mem.shared(), mem: pm.clone() };
+        k.procs.set_vm(peer.pid, Some(Arc::new(vm)));
+        let mut m = GuestMem::new(&mut mem);
+        // Local iovec at 0x100, remote at 0x200: (base, len) pairs.
+        let iov = |m: &mut GuestMem<'_>, at: u64, base: u64, len: u64| {
+            m.write_u64(at, base).unwrap();
+            m.write_u64(at + 8, len).unwrap();
+        };
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, write: bool, pid: i32, flags: u64| {
+            k.sys_process_vm(m, write, [pid as u64, 0x100, 1, 0x200, 1, flags])
+        };
+        let pid = peer.pid;
+        iov(&mut m, 0x100, 0x2000, 0x3000);
+        iov(&mut m, 0x200, b, 0x3000);
+        assert_eq!(call(&mut k, &mut m, false, pid, 0), Ok(0x2000), "a read stops past the mapped pages");
+        assert_eq!(m.read(0x2000 + 0x1fff, 1).unwrap()[0], 0xff);
+        iov(&mut m, 0x200, b + 0x2000, 0x10);
+        assert_eq!(call(&mut k, &mut m, false, pid, 0), Err(Errno::EFAULT), "nothing mapped there");
+        m.write(0x3000, &[9, 8, 7, 6]).unwrap();
+        iov(&mut m, 0x100, 0x3000, 4);
+        iov(&mut m, 0x200, b + 0xffe, 4);
+        assert_eq!(call(&mut k, &mut m, true, pid, 0), Ok(2), "a write stops at the read-only page");
+        assert_eq!(&pm.0.lock().unwrap()[(b + 0xffe) as usize..(b + 0x1002) as usize], &[9, 8, 0, 1]);
+        iov(&mut m, 0x200, b + 0x1000, 4);
+        assert_eq!(call(&mut k, &mut m, true, pid, 0), Err(Errno::EFAULT));
+        assert_eq!(call(&mut k, &mut m, false, pid, 1), Err(Errno::EINVAL));
+        assert_eq!(call(&mut k, &mut m, false, 9999, 0), Err(Errno::ESRCH));
+        k.procs.exit(pid, 0);
+        assert_eq!(call(&mut k, &mut m, false, pid, 0), Err(Errno::ESRCH), "an exited process");
     }
 
     fn setup() -> (Vec<u8>, Kernel) {

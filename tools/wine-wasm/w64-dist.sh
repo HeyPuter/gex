@@ -152,10 +152,17 @@ log "win64 prefix ($P)"; step pfx64-$P pfx_make
 # only to see DriverEntry fail (c0000135), one after another, before
 # wineboot let the program start (a W64 game
 # 5 s sooner). On a copy, so the session changes without a new wineboot.
-R=$(cat "$here"/w3-session.reg "$here"/reg-apply.py | sha256sum | cut -c1-10)
+# And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
+# a debugger attaches to ends with its text report, not a dialog that waits
+# for a click.
+R=$( (cat "$here"/w3-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$P/pfx" pfx
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/w3-session.reg"
+	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
+		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
+	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
+	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
 }
 log "win64 prefix's session ($P, $R)"; step pfs64-$P-$R pfs_make
 

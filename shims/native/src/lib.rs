@@ -1229,6 +1229,7 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    store.data_mut().with_kernel(|k| publish_vm(k, &memory));
     // The memory is new, so all of the guest's part of it reads as zero: an
     // anonymous mapping there need not be scanned to be zeroed (Wine reserves
     // ~3 GiB at each process start), until something is mapped with contents
@@ -2463,6 +2464,41 @@ pub(crate) fn wasm_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("GEX_WASM_TRACE").is_some())
 }
 
+/// A process's memory as another process's `process_vm_readv` and
+/// `process_vm_writev` reach it.
+struct PeerMemory(gex_mem::GuestMemory);
+
+impl gex_kernel::proc::PeerMem for PeerMemory {
+    fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+        let b = self.0.bytes();
+        match usize::try_from(addr).ok().and_then(|a| Some(a..a.checked_add(out.len())?)) {
+            Some(r) if r.end <= b.len() => {
+                out.copy_from_slice(&b[r]);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        let b = self.0.bytes();
+        match usize::try_from(addr).ok().and_then(|a| Some(a..a.checked_add(data.len())?)) {
+            Some(r) if r.end <= b.len() => {
+                b[r].copy_from_slice(data);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Publish `k`'s process's address space, `memory` and its map, for other
+/// processes (`ProcTable::set_vm`): at its start, a fork, and each `execve`.
+fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
+    let vm = gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(memory.clone())) };
+    k.procs.set_vm(k.pid, Some(Arc::new(vm)));
+}
+
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
@@ -2562,6 +2598,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
     }
     drop(paused);
+    publish_vm(&child_kernel, &child_mem);
 
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
