@@ -11042,6 +11042,36 @@ fn shared_slot(j: &Jit, page: u64, key: u64) -> Option<u32> {
     j.shared.get(&(page, key)).copied()
 }
 
+/// A base for `page`, which has none in this process: the one another
+/// process gave the same code, else a new one, published for the next.
+///
+/// A unit's bridges number every page its entries are on, and a library's
+/// unit is the same code at the same base in every process that maps it.
+/// Numbered afresh in each, a session of a few hundred libraries and a
+/// dozen processes spent the page's whole slot space in minutes. (x86-64's
+/// table numbers every page by identity itself.)
+pub(crate) fn number_by_identity(j: &mut Jit, page: u64) -> u32 {
+    if gex_abi::X86 || unsafe { k_present() } == 0 {
+        return j.page_table.base(page);
+    }
+    let Some((pid, key)) = with_px(|px| page_identity(px, page * gex_abi::DISPATCH_PAGE).map(|k| (px.pid, k))) else {
+        return j.page_table.base(page);
+    };
+    if let Some(base) = shared_slot(j, page, key) {
+        if tracing() {
+            trace_line(&format!("[gex] pid {pid}: unit page {page:#x} adopts base {base:#x}\n"));
+        }
+        j.page_table.assign(page, base);
+        return base;
+    }
+    let base = j.page_table.base(page);
+    if tracing() {
+        trace_line(&format!("[gex] pid {pid}: unit page {page:#x} numbered {base:#x}\n"));
+    }
+    record_shared_slot(j, pid, page, key, base);
+    base
+}
+
 /// Record it in both, first writer winning in each.
 fn record_shared_slot(j: &mut Jit, pid: i32, page: u64, key: u64, base: u32) {
     j.shared.entry((page, key)).or_insert(base);

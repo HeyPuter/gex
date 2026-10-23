@@ -1291,7 +1291,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
             }
             let base = match j.page_table.lookup(page) {
                 Some(b) => b,
-                None => j.page_table.base(page),
+                None => crate::number_by_identity(j, page),
             };
             pages.insert(page, base);
             let t = gex_abi::dispatch_entry_table(base) as u32;

@@ -75,6 +75,17 @@ if [ -e "$seed" ]; then
 			--file "$w/other=$w/other" "$seed" "$w/two" "$w" 2> "$w/browser$prov.err" | grep -av '^\[gex\]')
 		check "browser providers=$prov" "$w/browser$prov.err" "$out" 4
 	done
+	# A later process numbers the unit's pages as the first did (by the code's
+	# identity), rather than spending dispatch slots of its own on them.
+	(cd "$w" && GEX_SHARED=1 GEX_PINS="$w/pins-web.txt" timeout 300 node "$root/shims/browser/js/run-node.mjs" --strace --cgen-prefer \
+		--file "/lib/ld-musl-aarch64.so.1=$ldso" --file "$w/liba.so=$w/liba.so" --file "$w/two=$w/two" \
+		--file "$w/other=$w/other" "$seed" "$w/two" "$w" > /dev/null 2> "$w/browser-traced.err")
+	first=$(grep -ao 'unit page 0x30000 numbered 0x[0-9a-f]*' "$w/browser-traced.err" | head -1 | awk '{print $NF}')
+	if [ -n "$first" ] && grep -aq "unit page 0x30000 adopts base $first" "$w/browser-traced.err"; then
+		echo "ok   elf-units-procs browser numbering (a later process adopts the unit page's base)"
+	else
+		echo "FAIL elf-units-procs browser numbering"; grep -a 'unit page' "$w/browser-traced.err" | head -5; fail=1
+	fi
 else
 	echo "skip elf-units-procs browser ($seed is not there)"
 fi
