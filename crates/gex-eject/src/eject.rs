@@ -305,7 +305,9 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             missing.push(p.clone());
             continue;
         }
-        if f.directory {
+        // A directory, unless it is a file the session read: a recording
+        // could mark a file a directory after a failed O_DIRECTORY open of it
+        if f.directory && !(f.read && std::fs::metadata(host_path(sysroot, p)).is_ok_and(|m| m.is_file())) {
             dirs.insert(p.clone());
             continue;
         }

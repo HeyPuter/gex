@@ -691,7 +691,10 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
             }
         }
         f.create |= flags & O_CREAT != 0;
-        f.directory |= flags & O_DIRECTORY != 0;
+        // Only an open that succeeded says the path is a directory: a
+        // directory walk (Qt's) tries O_DIRECTORY on every entry, and a
+        // file's ENOTDIR says the opposite
+        f.directory |= flags & O_DIRECTORY != 0 && !(ret < 0 && ret > -4096);
     }
     // An execve that succeeds does not return here, so it counts as ok only
     // when it fails; the exec itself is in `programs`.

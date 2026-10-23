@@ -375,6 +375,53 @@ fn eject_keeps_files_only_looked_at() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// A file the session read, marked a directory as well (a directory walk
+/// tried O_DIRECTORY on it, which failed), is kept as the file: as an empty
+/// directory, a time zone or an icon would be gone.
+#[test]
+fn eject_keeps_a_read_file_tried_as_a_directory() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gex-eject-notdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("rec")).unwrap();
+    std::fs::create_dir_all(tmp.join("in/zoneinfo/sub")).unwrap();
+    let exe = tmp.join("prog");
+    let bytes = elf();
+    std::fs::write(&exe, &bytes).unwrap();
+    std::fs::write(tmp.join("in/zoneinfo/UTC"), b"TZif").unwrap();
+    let path = exe.to_string_lossy().into_owned();
+    let at = |rel: &str| tmp.join(rel).to_string_lossy().into_owned();
+    let mut session = Session {
+        isa: gex_abi::ARCH_NAME.into(),
+        argv: vec![path.clone()],
+        cwd: Some("/".into()),
+        objects: vec![ObjectEntry {
+            id: eject::sha256(&bytes),
+            path: path.clone(),
+            host_path: None,
+            size: bytes.len() as u64,
+            role: "exe".into(),
+        }],
+        programs: vec![ProgramEntry { pid: 1, exe: path.clone(), argv: vec![path.clone()], env: vec![] }],
+        processes: 1,
+        threads: 1,
+        ..Session::default()
+    };
+    for f in [
+        FileEntry { path: at("in/zoneinfo/UTC"), read: true, directory: true, ok: 5, ..Default::default() },
+        FileEntry { path: at("in/zoneinfo/sub"), read: true, directory: true, ok: 1, ..Default::default() },
+    ] {
+        session.files.insert(f.path.clone(), f);
+    }
+    std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let p = tmp.join("p");
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
+    assert_eq!(std::fs::read(root("in/zoneinfo/UTC")).unwrap(), b"TZif");
+    assert!(root("in/zoneinfo/sub").is_dir());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// A project's directories keep the run's modification times, not the
 /// eject's: KDE's ksycoca is rebuilt when a directory it indexes looks newer
 /// than the database.
