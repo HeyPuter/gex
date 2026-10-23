@@ -17,6 +17,12 @@ pub const CFLAGS: &[&str] = &[
     // (br_table) are unaffected.
     "-mllvm",
     "-switch-to-lookup=false",
+    // No SLP vectorization: it packs a run of scalar compares into a vector
+    // of booleans and reduces it through a bitcast, which wasm lowers with a
+    // shadow-stack slot. A function with a shadow-stack frame cannot be
+    // spliced, and a trap-free one cannot be left to tier-1 either. Loop
+    // vectorization is unaffected.
+    "-fno-slp-vectorize",
     "-mtail-call",
     "-msimd128",
     "-matomics",
