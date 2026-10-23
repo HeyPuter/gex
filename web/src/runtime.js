@@ -1300,6 +1300,8 @@ async function runProgramHere(
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.
         stracePid: globalThis.GEX_STRACE_PID || undefined,
+        // `?straceexe=NAME`: the process that execs NAME, whatever its pid.
+        straceExe: globalThis.GEX_STRACE_EXE || undefined,
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.
         //

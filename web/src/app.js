@@ -1013,6 +1013,7 @@ export function setGlobals(get, b = {}) {
   if (get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   if (get('strace')) globalThis.GEX_STRACE = 1;
   if (get('stracepid')) globalThis.GEX_STRACE_PID = Number(get('stracepid'));
+  if (get('straceexe')) globalThis.GEX_STRACE_EXE = get('straceexe');
   if (get('liftmax')) globalThis.GEX_LIFT_MAX = Number(get('liftmax'));
   globalThis.GEX_UNIT_CACHE = get('unitcache') !== null ? Number(get('unitcache')) : 1;
   if (get('t1fold')) globalThis.GEX_T1_FOLD = Number(get('t1fold'));

@@ -1591,6 +1591,13 @@ export class Gex {
           // starting, log.mjs): information, not a warning.
           if (text.startsWith('[gex-info] ')) {
             if (!logQuiet()) console.info(`[gex] ${text.slice(11)}`);
+            // `?straceexe=NAME`: narrate the process that execs a program
+            // of that name, whatever its pid
+            const ex = this.#opts?.straceExe && /^pid \d+: exec (\S+)/.exec(text.slice(11));
+            if (ex && ex[1].split('/').pop() === this.#opts.straceExe) {
+              this.#shim.exports.gex_set_trace(1);
+              this.#traced = true;
+            }
             return;
           }
           // The shim's own per-library line, said once per session instead
@@ -1848,6 +1855,7 @@ export class Gex {
       // the interesting process is usually a child, and a whole session's
       // syscalls is more output than a page survives.
       stracePid: opts.stracePid,
+      straceExe: opts.straceExe,
       tty: opts.tty, uid: opts.uid, gid: opts.gid,
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
       jitDiag: opts.jitDiag,
