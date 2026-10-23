@@ -160,6 +160,11 @@ const port = {
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+// Which guest thread this Worker runs, asked for by a profiler or
+// debugger (`Runtime.evaluate` in the Worker's session): a pooled Worker is
+// made before it has a process, so its name cannot say. Read when asked,
+// so it follows an `execve`.
+globalThis.__gexWho = () => workerGex?.who ?? null;
 /// The page's modules, given while this Worker waited in the host's pool
 /// (`pooledModules`): its runtime starts with them, and the start message
 /// carries only those it lacks.

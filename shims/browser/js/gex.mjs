@@ -1472,6 +1472,11 @@ export class Gex {
     e.gex_free?.(p, max);
     return s;
   }
+  /// The guest thread this realm runs: its process, its thread (0 for the
+  /// process's first) and the program's argv as it now is.
+  get who() {
+    return { pid: this.#shim?.exports?.gex_my_pid?.() ?? null, tid: this.#threadTid, cmdline: this.cmdline };
+  }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
     const e = this.#shim?.exports;
