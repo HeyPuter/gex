@@ -142,6 +142,10 @@ pub fn manifest(
             )
         }
     };
+    // The libraries' function-tier units (`elf-unit`), the native build's
+    // own files, which the page runs unguarded as natively.
+    let units: Vec<&BuiltImage> = images.iter().filter(|i| i.kind == "elf-unit").collect();
+    let unit_entries = |i: &BuiltImage| i.module.trim_end_matches("c.wasm").to_string() + "c.entries";
     let (files, modes, dirs, mtimes) = files(dir)?;
     let int_args: &[u8] = if gex_abi::X86 { &[7, 6, 2, 1, 8, 9] } else { &[0, 1, 2, 3, 4, 5, 6, 7] };
     let exe_file = format!("build/{}", rootfs_rel(&project.program.exe)?.display());
@@ -150,6 +154,7 @@ pub fn manifest(
     let sizes: Vec<(String, u64)> = {
         let mut rels: Vec<String> = vec![SHIM.to_string(), module.clone(), exe_file.clone()];
         rels.extend(closure.iter().map(|c| c.to_string()));
+        rels.extend(units.iter().flat_map(|u| [u.module.clone(), unit_entries(u)]));
         rels.extend(files.iter().map(|(_, r)| r.clone()));
         rels.extend(repl.iter().filter(|r| !r.missing).map(|r| web_module(dir, &r.module)));
         rels.sort();
@@ -166,6 +171,19 @@ pub fn manifest(
         ("shim", json::s(SHIM)),
         ("module", json::s(&module)),
         ("closure", json::strs(closure)),
+        (
+            "units",
+            Json::Obj(
+                units
+                    .iter()
+                    .map(|u| (u.identity.clone(), obj(vec![("wasm", json::s(&u.module)), ("entries", json::s(unit_entries(u)))])))
+                    .collect(),
+            ),
+        ),
+        (
+            "elf_units",
+            json::strs(units.iter().map(|u| u.path.rsplit('/').next().unwrap_or(&u.path).to_string()).collect::<Vec<_>>()),
+        ),
         ("image_module", image_module),
         ("exe", json::s(&project.program.exe)),
         ("exe_file", json::s(exe_file)),
@@ -265,7 +283,15 @@ export async function launch(m, read, { args = null, write, jitFallback = false,
     // asynchronous writer (Node's stdout on a pipe) has sent it.
     write(fd, bytes) { write(fd, bytes.slice()); }
   }
+  // The libraries' function-tier units, by key (the build's `elf-unit`s):
+  // each process that maps one at its placed base runs it.
+  const units = {};
+  for (const [key, u] of Object.entries(m.units ?? {})) units[key] = { wasm: await read(u.wasm), entries: await read(u.entries) };
+  Out.prototype.loadUnit = (key) => units[key] ?? null;
+  if (m.elf_units?.length) Gex.elfUnits = m.elf_units.join(',');
   const gex = new Gex(new Out());
+  // 1: a unit where there is one; 4: the native (unguarded) flavour.
+  if (m.elf_units?.length) gex.useCgen(1 | 4);
   const files = {};
   for (const [guest, rel] of Object.entries(m.files)) files[guest] = await read(rel);
   // Each library as the page sends one: its metadata, the compiled module,

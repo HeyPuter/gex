@@ -119,7 +119,19 @@ fn trace() -> bool {
 }
 
 /// Where units live: `GEX_CGEN_CACHE`, else `<gex cache>/cgen`.
+/// Where units are, set by the program rather than `GEX_CGEN_CACHE`: an
+/// ejected project's build (`gex_eject`), which builds them and runs them.
+static CACHE_SET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// [`cache_root`] from now on (`None`: the environment's again).
+pub fn set_cache_root(dir: Option<std::path::PathBuf>) {
+    *CACHE_SET.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
 pub fn cache_root() -> Result<std::path::PathBuf> {
+    if let Some(d) = CACHE_SET.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(d);
+    }
     if let Some(d) = std::env::var_os("GEX_CGEN_CACHE") {
         return Ok(d.into());
     }
@@ -1059,13 +1071,9 @@ static UNIT_PAGES: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 /// `gone` (within `ranges`): pages no longer mapped executable. A unit there
 /// is dead whatever the bytes still hash to -- an unmapped object's bytes stay
 /// until the next mapping overwrites them, and that mapping retires nothing
-/// (the browser's `cgen::on_retire`). An ELF object whose code was there is
-/// placed again if it is mapped again.
+/// (the browser's `cgen::on_retire`); an ELF object whose code was there is
+/// placed again if it is mapped again ([`forget_gone`]).
 pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
-    ELF_SEEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(_, _, (lo, hi))| !gone.iter().any(|&(s, e)| s < *hi && *lo < e));
     let memory = memory.bytes();
     let guard = UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = guard.as_ref() else { return };
@@ -1813,18 +1821,85 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
     None
 }
 
-fn elf_wanted(path: &str) -> bool {
+/// Programs gex's loader placed whose files the guest cannot read back (a
+/// sysroot's /tmp is under the guest's own), by guest path.
+static PLACED_FILES: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
+
+pub(crate) fn note_placed_file(path: &str, bytes: &[u8]) {
+    PLACED_FILES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(path.to_string(), Arc::new(bytes.to_vec()));
+}
+
+fn placed_file(path: &str) -> Option<Vec<u8>> {
+    PLACED_FILES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(path).map(|b| b.to_vec())
+}
+
+/// The objects an ejected project ships units for (file names), set before
+/// it runs, in place of `GEX_ELF_UNITS`. Nothing is built for the next run:
+/// the project has every unit it will get.
+static ELF_SET: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Give the objects `names` their units (from [`cache_root`]) in this run.
+pub fn set_elf_units(names: Vec<String>) {
+    let _ = ELF_SET.set(names);
+}
+
+fn elf_list() -> Option<&'static Vec<String>> {
     static LIST: OnceLock<Option<Vec<String>>> = OnceLock::new();
-    let list = LIST.get_or_init(|| {
-        std::env::var("GEX_ELF_UNITS").ok().filter(|v| !v.is_empty() && v != "0").map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-    });
-    let Some(list) = list else { return false };
+    ELF_SET.get().or_else(|| {
+        LIST.get_or_init(|| {
+            std::env::var("GEX_ELF_UNITS").ok().filter(|v| !v.is_empty() && v != "0").map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        })
+        .as_ref()
+    })
+}
+
+/// Whether any ELF object gets a unit in this run (the runtime translator's
+/// machinery installs them, translation or not).
+pub fn elf_units_on() -> bool {
+    elf_list().is_some_and(|l| !l.is_empty())
+}
+
+pub(crate) fn elf_wanted(path: &str) -> bool {
+    let Some(list) = elf_list() else { return false };
     let name = path.rsplit('/').next().unwrap_or(path);
     list.iter().any(|n| n == "all" || n == name)
 }
 
-/// Objects already looked at in this host process, by path and bias.
-static ELF_SEEN: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new());
+/// An ELF object looked at in an address space (`JitShared::elf_units`).
+#[derive(Clone, Debug)]
+pub(crate) struct ElfPlaced {
+    pub path: String,
+    pub base: u64,
+    /// Its executable segments' span.
+    pub span: (u64, u64),
+    /// The entries of its installed unit; 0 when it has none.
+    pub entries: usize,
+}
+
+/// Objects whose code was in `gone` (no longer mapped executable): placed
+/// again if they are mapped again, since their units went with the pages.
+pub(crate) fn forget_gone(seen: &mut Vec<ElfPlaced>, gone: &[(u64, u64)]) {
+    seen.retain(|o| !gone.iter().any(|&(s, e)| s < o.span.1 && o.span.0 < e));
+}
+
+/// A process's last word on its ELF units (debug output, GEX_LOG): which
+/// objects ran on units, and how many of the blocks runtime translation
+/// compiled (`blocks`, in its address space, a fork's parent's included)
+/// fall in them.
+pub(crate) fn exit_line(pid: i32, seen: &[ElfPlaced], blocks: &[u64]) {
+    let units: Vec<&ElfPlaced> = seen.iter().filter(|o| o.entries != 0).collect();
+    if seen.is_empty() {
+        return;
+    }
+    let inside = blocks.iter().filter(|&&a| units.iter().any(|o| o.span.0 <= a && a < o.span.1)).count();
+    let entries: usize = units.iter().map(|o| o.entries).sum();
+    eprintln!(
+        "gex-elf: pid {pid}: {} of {} listed objects on units ({entries} entries); {inside} of {} runtime-translated blocks are in them",
+        units.len(),
+        seen.len(),
+        blocks.len()
+    );
+}
 
 /// After a syscall that mapped code: install the unit of each listed ELF
 /// object (`GEX_ELF_UNITS`), before ld.so runs any of it.
@@ -1833,14 +1908,19 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         if !elf_wanted(&m.path) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&m.path) else {
-            eprintln!("gex-elf: {}: not readable on the host; no unit", m.path);
+        // From the guest's namespace, so a sysroot is honoured (or the
+        // program's file as gex's loader read it, `note_placed_file`).
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)).or_else(|| placed_file(&m.path)) else {
+            eprintln!("gex-elf: {}: not readable; no unit", m.path);
             continue;
         };
         let Some(base) = elf_bias(&bytes, m.start, m.offset) else {
             continue;
         };
-        if ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(p, b, _)| *p == m.path && *b == base) {
+        let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) else {
+            return Ok(());
+        };
+        if shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.iter().any(|o| o.path == m.path && o.base == base) {
             continue;
         }
         let t0 = std::time::Instant::now();
@@ -1849,14 +1929,14 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let span = image.segments.iter().filter(|s| s.executable).fold((u64::MAX, 0u64), |(lo, hi), s| {
             (lo.min(s.vaddr), hi.max(s.vaddr + s.bytes.len() as u64))
         });
-        ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((m.path.clone(), base, span));
+        shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.push(ElfPlaced { path: m.path.clone(), base, span, entries: 0 });
         let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
         let key = unit_key(&image, &none);
         let cwasm_path = cache_root()?.join(&key).join("c.wasm");
         let Ok(cwasm) = std::fs::read(&cwasm_path) else {
             eprintln!("gex-elf: no function-tier unit for {} at {base:#x} (key {key}); it runs on the runtime translator", m.path);
             NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {base:#x} (key {key})", m.path));
-            if std::env::var("GEX_ELF_UNITS_BUILD").as_deref() != Ok("0") {
+            if ELF_SET.get().is_none() && std::env::var("GEX_ELF_UNITS_BUILD").as_deref() != Ok("0") {
                 spawn_elf_build(&m.path, base);
             }
             continue;
@@ -1900,12 +1980,16 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
-        // Once per object per process: debug output (GEX_LOG).
+        let n = entries.iter().filter(|&&a| a != 0).count();
+        if let Some(o) = shared.lock().unwrap_or_else(|e| e.into_inner()).elf_units.iter_mut().find(|o| o.path == m.path && o.base == base) {
+            o.entries = n;
+        }
+        // Once per object per address space: debug output (GEX_LOG).
         if crate::log_on() {
             eprintln!(
-                "gex-elf: function tier for {} at {base:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
+                "gex-elf: pid {}: function tier for {} at {base:#x}: {n} entries, {} MiB wasm, placed in {:.1}s",
+                caller.data_mut().with_kernel(|k| k.pid),
                 m.path,
-                entries.iter().filter(|&&a| a != 0).count(),
                 cwasm.len() >> 20,
                 t0.elapsed().as_secs_f64()
             );

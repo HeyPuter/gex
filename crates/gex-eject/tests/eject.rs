@@ -4,7 +4,7 @@
 
 use gex_eject::{build, eject, run};
 use gex_native::Exit;
-use gex_xlate::profile::{ObjectEntry, ProgramEntry, Session};
+use gex_xlate::profile::{FileEntry, ObjectEntry, ProgramEntry, Session};
 use std::path::{Path, PathBuf};
 
 const BASE: u64 = 0x40_0000;
@@ -225,6 +225,15 @@ fn eject_build_run_and_replace() {
     assert_eq!(files(&p), files(&p2), "two ejects of one session differ");
 
     build::build(&p).unwrap();
+    // GEX_EJECT_BUILD's view of it: the build's modules, and its memory
+    // whatever was learned; --mem64 asked of it is refused, naming --mem32.
+    let (aot, pins) = run::debug_build(&p).unwrap();
+    // With no replacements the program is a function-tier unit: no image module.
+    let built = std::fs::read_to_string(p.join("build/build.json")).unwrap();
+    assert!(aot.images.is_empty() && built.contains("\"elf-unit\"") && pins.is_empty(), "a static program's build: its unit, no pins");
+    assert!(!run::build_mem(None).unwrap().is_64() && !run::build_mem(Some(false)).unwrap().is_64());
+    let e = run::build_mem(Some(true)).unwrap_err().to_string();
+    assert!(e.contains("--mem32") && !e.contains('\n'), "{e}");
     let flags = run::RunFlags::default();
     // The session made no system calls, so the ejected runtime allows none:
     // its exit_group is refused, by name.
@@ -302,5 +311,114 @@ fn eject_build_run_and_replace() {
     let e = format!("{:#}", build::build(&p).unwrap_err());
     assert!(e.contains("changed since the eject"), "{e}");
 
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A file the session only looked at (stat, access, readlink) is an input
+/// too: a QML source Qt checks the time of and never opens, behind its
+/// cached compilation. Kept when it is there, a directory made; a failed
+/// look stays missing, and one at something gone since is not an input.
+#[test]
+fn eject_keeps_files_only_looked_at() {
+    // Not under /tmp: a project's /tmp is a fresh tmpfs, so nothing there is an input.
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gex-eject-stat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("rec")).unwrap();
+    std::fs::create_dir_all(tmp.join("in/ui")).unwrap();
+    let exe = tmp.join("prog");
+    let bytes = elf();
+    std::fs::write(&exe, &bytes).unwrap();
+    std::fs::write(tmp.join("in/ui/main.qml"), b"Item {}").unwrap();
+    let path = exe.to_string_lossy().into_owned();
+    let at = |rel: &str| tmp.join(rel).to_string_lossy().into_owned();
+    let looked = |p: String, ok: u64| FileEntry { path: p, stat: true, ok, failed: 1 - ok, ..Default::default() };
+    let mut session = Session {
+        isa: gex_abi::ARCH_NAME.into(),
+        argv: vec![path.clone()],
+        cwd: Some("/".into()),
+        objects: vec![ObjectEntry {
+            id: eject::sha256(&bytes),
+            path: path.clone(),
+            host_path: None,
+            size: bytes.len() as u64,
+            role: "exe".into(),
+        }],
+        programs: vec![ProgramEntry { pid: 1, exe: path.clone(), argv: vec![path.clone()], env: vec![] }],
+        processes: 1,
+        threads: 1,
+        ..Session::default()
+    };
+    for f in [
+        looked(at("in/ui/main.qml"), 1),
+        looked(at("in/ui"), 1),
+        looked(at("in/none.qml"), 0),
+        // There when the session looked, gone by the eject.
+        looked(at("in/gone.qml"), 1),
+        // A stat of `dir/..`: the directory is reached by its own path.
+        looked(at("in/ui/.."), 1),
+    ] {
+        session.files.insert(f.path.clone(), f);
+    }
+    // Through the session's JSON, as `gexc eject` reads it.
+    let text = session.to_json();
+    assert_eq!(Session::from_json(&text).unwrap().files, session.files, "the stat flag round-trips");
+    std::fs::write(tmp.join("rec/session.json"), text).unwrap();
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let p = tmp.join("p");
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
+    assert_eq!(std::fs::read(root("in/ui/main.qml")).unwrap(), b"Item {}");
+    assert!(root("in/ui").is_dir());
+    assert!(!root("in/none.qml").exists() && !root("in/gone.qml").exists());
+    let project = std::fs::read_to_string(p.join("gex-project.json")).unwrap();
+    assert!(project.contains("none.qml") && !project.contains("gone.qml"), "a failed look stays missing; a vanished one is nothing");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A project's directories keep the run's modification times, not the
+/// eject's: KDE's ksycoca is rebuilt when a directory it indexes looks newer
+/// than the database.
+#[test]
+fn eject_keeps_directory_times() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gex-eject-dirtime-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("rec")).unwrap();
+    std::fs::create_dir_all(tmp.join("in/apps")).unwrap();
+    let exe = tmp.join("prog");
+    let bytes = elf();
+    std::fs::write(&exe, &bytes).unwrap();
+    std::fs::write(tmp.join("in/apps/a.desktop"), b"[Desktop Entry]").unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for d in ["in/apps", "in"] {
+        std::fs::File::open(tmp.join(d)).unwrap().set_modified(old).unwrap();
+    }
+    let path = exe.to_string_lossy().into_owned();
+    let at = |rel: &str| tmp.join(rel).to_string_lossy().into_owned();
+    let mut session = Session {
+        isa: gex_abi::ARCH_NAME.into(),
+        argv: vec![path.clone()],
+        cwd: Some("/".into()),
+        objects: vec![ObjectEntry {
+            id: eject::sha256(&bytes),
+            path: path.clone(),
+            host_path: None,
+            size: bytes.len() as u64,
+            role: "exe".into(),
+        }],
+        programs: vec![ProgramEntry { pid: 1, exe: path.clone(), argv: vec![path.clone()], env: vec![] }],
+        processes: 1,
+        threads: 1,
+        ..Session::default()
+    };
+    let f = FileEntry { path: at("in/apps/a.desktop"), read: true, ok: 1, ..Default::default() };
+    session.files.insert(f.path.clone(), f);
+    std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let p = tmp.join("p");
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
+    for d in ["in/apps", "in"] {
+        assert_eq!(std::fs::metadata(root(d)).unwrap().modified().unwrap(), old, "{d} keeps the run's time");
+    }
     let _ = std::fs::remove_dir_all(&tmp);
 }

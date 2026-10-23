@@ -97,6 +97,10 @@ pub struct Placement {
     pub placed_bytes: u64,
     pub libraries: usize,
     pub library_bytes: u64,
+    /// The pin region the libraries are placed in instead, when they do not
+    /// all fit the window: bytes above `PLACE_TOP` (`gex_abi::set_pin_region`),
+    /// zero when the window holds them.
+    pub region: u64,
 }
 
 /// Place every object as the run will: executables at `PIE_BASE` (gex's
@@ -104,13 +108,17 @@ pub struct Placement {
 /// from `MMAP_BOTTOM` in the session's order, each at a base the run pins
 /// with `RunOptions::pins`. The same rule as `gexc build --closure`.
 ///
-/// When the libraries do not all fit below `PLACE_TOP`, the window takes
-/// the hottest that fit (by the blocks `profile` says each ran, then the
-/// session's order) and the rest are left unpinned.
+/// When the libraries do not all fit below `PLACE_TOP`, every one of them
+/// goes in a pin region of the project's own, reserved right above the window
+/// (`gex_abi::set_pin_region`), so each still has one base in every process
+/// and a unit built for it. The window itself is then left to whatever else
+/// a run maps.
 pub(crate) fn layout(
     dir: &Path,
     project: &Project,
-    profile: Option<&gex_xlate::profile::Profile>,
+    // What the session ran: it chose the window's libraries when they
+    // could not all have one; the pin region gives every one a base.
+    _profile: Option<&gex_xlate::profile::Profile>,
 ) -> Result<(Vec<Placed>, Placement)> {
     const SLACK: u64 = 0x10000;
     let round = |n: u64| (n + SLACK - 1) & !(SLACK - 1);
@@ -134,56 +142,34 @@ pub(crate) fn layout(
     let libs: Vec<usize> = (0..loaded.len()).filter(|&i| loaded[i].0.role == "library").collect();
     let window = gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM;
     let total: u64 = libs.iter().map(|&i| share(&loaded[i].2)).sum();
-    let heat = |i: usize| -> u64 {
-        profile
-            .and_then(|pr| pr.objects.get(&loaded[i].0.id))
-            .map_or(0, |op| op.blocks.values().map(|b| b.n).sum())
-    };
-    let fits = fit_window(
-        &libs.iter().map(|&i| (share(&loaded[i].2), heat(i))).collect::<Vec<_>>(),
-        window,
-    );
-    let mut pinned = vec![true; loaded.len()];
-    for (k, &i) in libs.iter().enumerate() {
-        pinned[i] = fits[k];
-    }
+    let in_region = total > window;
     let mut placement = Placement { libraries: libs.len(), library_bytes: total, ..Placement::default() };
-    let mut next = gex_abi::MMAP_BOTTOM;
+    let mut next = if in_region { gex_abi::PLACE_TOP } else { gex_abi::MMAP_BOTTOM };
+    // In path order, not the session's load order, so that a project
+    // recorded again keeps its bases and the units built for them.
+    let mut by_path = libs.clone();
+    by_path.sort_by(|&a, &b| loaded[a].0.path.cmp(&loaded[b].0.path));
+    let mut bases = HashMap::new();
+    for &i in &by_path {
+        let base = round(next);
+        next = base + share(&loaded[i].2);
+        placement.placed += 1;
+        placement.placed_bytes += share(&loaded[i].2);
+        bases.insert(i, base);
+    }
     let mut out = Vec::new();
     for (i, (o, bytes, image)) in loaded.into_iter().enumerate() {
-        let image = if o.role == "library" && pinned[i] {
-            let base = round(next);
-            next = base + share(&image);
-            placement.placed += 1;
-            placement.placed_bytes += share(&image);
+        let image = if let Some(&base) = bases.get(&i) {
             gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path))?
         } else {
             image
         };
-        out.push(Placed { obj: o.clone(), image, pinned: pinned[i] });
+        out.push(Placed { obj: o.clone(), image, pinned: true });
+    }
+    if in_region {
+        placement.region = next - gex_abi::PLACE_TOP;
     }
     Ok((out, placement))
-}
-
-/// Which libraries, given as (window share, blocks run) in the session's
-/// order, the window holds: all when they fit, else the hottest that fit
-/// (a tie by the session's order), each one that would overflow skipped for
-/// the next.
-fn fit_window(libs: &[(u64, u64)], window: u64) -> Vec<bool> {
-    if libs.iter().map(|l| l.0).sum::<u64>() <= window {
-        return vec![true; libs.len()];
-    }
-    let mut by_heat: Vec<usize> = (0..libs.len()).collect();
-    by_heat.sort_by_key(|&i| (std::cmp::Reverse(libs[i].1), i));
-    let mut fits = vec![false; libs.len()];
-    let mut used = 0;
-    for i in by_heat {
-        if used + libs[i].0 <= window {
-            used += libs[i].0;
-            fits[i] = true;
-        }
-    }
-    fits
 }
 
 /// The bytes of an image at `[addr, addr + len)`, if they are all loaded.
@@ -479,7 +465,7 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()>
             *count += 1;
         }
     }
-    Ok(())
+    crate::eject::keep_dir_mtime(to, &std::fs::metadata(from)?)
 }
 
 /// Everything translation needs, for the native and the web module sets.
@@ -496,7 +482,9 @@ impl Translation<'_> {
     /// Translate every object into `out` (relative to the project): the
     /// native set, or (`web`) the browser shim's. Returns the modules, the
     /// libraries' pins and the count of blocks ending in SIGILL.
-    fn translate(&self, out: &str, web: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
+    /// The programs' image modules (none when `programs` is false: they are
+    /// units, `units`), and the pins every run places the libraries at.
+    fn translate(&self, out: &str, web: bool, programs: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
         // The program's closure is numbered as one: its image owns the memory and
         // tables, and every other object's slots continue where the last one's
         // stopped. Other executables (programs the session exec'd) are images of
@@ -506,8 +494,10 @@ impl Translation<'_> {
             .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
             .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
         let mut order: Vec<usize> = vec![main];
-        // (a library the window left out is translated by the run, in each process)
-        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe" && self.placed[i].pinned));
+        // (a placed library, and the interpreter, is a unit of its own:
+        // `units`; one the window left out is translated by the run, in
+        // each process)
+        let dynamic = self.placed.iter().any(|p| p.obj.role != "exe");
         let others: Vec<usize> = (0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role == "exe").collect();
         let main_identity = gex_native::aot::image_identity(&self.placed[main].image);
 
@@ -515,7 +505,7 @@ impl Translation<'_> {
         let mut illegal = 0;
         let mut pins = Vec::new();
         let mut first_slot = 0u64;
-        for (n, &i) in order.iter().chain(others.iter()).enumerate() {
+        for (n, &i) in order.iter().chain(others.iter()).enumerate().filter(|_| programs) {
             let p = &self.placed[i];
             let o = &p.obj;
             let in_closure = n < order.len();
@@ -525,7 +515,7 @@ impl Translation<'_> {
             // the process starts from a seed module. An image module writing
             // its slots at instantiation does not mix with the pages the shim
             // numbers for itself.
-            let shared_image = web && order.len() > 1;
+            let shared_image = web && dynamic;
             let own = !shared_image && (n == 0 || !in_closure);
             let mut image = p.image.clone();
             gex_xlate::set_compat(image.class32);
@@ -604,7 +594,86 @@ impl Translation<'_> {
                 pins.push((o.path.clone(), image.bias));
             }
         }
+        pins.extend(self.placed.iter().filter(|p| p.obj.role == "library" && p.pinned).map(|p| (p.obj.path.clone(), p.image.bias)));
         Ok((images, pins, illegal))
+    }
+
+    /// The function-tier unit (`gexc cgen-image --elf`) of each placed
+    /// library and of the interpreter, into `out` (relative to the project).
+    /// A unit is keyed by its object as placed, not by any program, so every
+    /// process that maps the object at its base runs it. The native flavour
+    /// (no bounds guard), which the page runs as well.
+    fn units(&self, out: &str, programs: bool) -> Result<Vec<BuiltImage>> {
+        let cache = self.dir.join(out);
+        std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+        let jobs = std::env::var("GEX_ELF_UNITS_JOBS")
+            .ok()
+            .and_then(|j| j.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(8)));
+        let unguarded = gex_cgen::image::unguarded();
+        gex_native::pe_units::set_cache_root(Some(cache.clone()));
+        gex_cgen::image::set_unguarded(true);
+        // Several objects at once: much of a unit's time (recovering the
+        // functions, linking) is one thread's, and most objects are small.
+        let workers = std::env::var("GEX_ELF_UNITS_PAR")
+            .ok()
+            .and_then(|j| j.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / jobs))
+            .max(1);
+        // Programs too, at the base gex's loader gives them (PIE_BASE):
+        // one function tier for all of a Linux program's code.
+        let todo: Vec<&Placed> = self
+            .placed
+            .iter()
+            .filter(|p| (programs && p.obj.role == "exe") || (p.pinned && (p.obj.role == "library" || p.obj.role == "interp")))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let unit = |p: &Placed| -> Result<BuiltImage> {
+            let host = self.dir.join(rootfs_rel(&p.obj.path)?);
+            let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
+            let wasm = gex_native::pe_units::prepare_elf(&bytes, p.image.bias, jobs, false)
+                .with_context(|| format!("the function-tier unit of {} at {:#x}", p.obj.path, p.image.bias))?;
+            let key = wasm.parent().and_then(|d| d.file_name()).map(|k| k.to_string_lossy().into_owned()).unwrap_or_default();
+            let entries = gex_cgen::image::read_entries(&wasm)?.iter().filter(|&&a| a != 0).count() as u64;
+            Ok(BuiltImage {
+                kind: "elf-unit".to_string(),
+                identity: key.clone(),
+                base: p.image.bias,
+                module: format!("{out}/{key}/c.wasm"),
+                object: p.obj.id.clone(),
+                path: p.obj.path.clone(),
+                blocks: entries,
+                bytes: std::fs::metadata(&wasm)?.len(),
+            })
+        };
+        let built = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers.min(todo.len()))
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(p) = todo.get(i) else { break };
+                            let r = unit(p);
+                            let failed = r.is_err();
+                            done.push((i, r));
+                            if failed {
+                                // The others stop at their next object.
+                                next.store(todo.len(), std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        done
+                    })
+                })
+                .collect();
+            let mut all: Vec<(usize, Result<BuiltImage>)> = handles.into_iter().flat_map(|h| h.join().expect("a unit build panicked")).collect();
+            all.sort_by_key(|(i, _)| *i);
+            all.into_iter().map(|(_, r)| r).collect::<Result<Vec<_>>>()
+        });
+        gex_native::pe_units::set_cache_root(None);
+        gex_cgen::image::set_unguarded(unguarded);
+        built
     }
 }
 
@@ -639,16 +708,6 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     };
 
     let (placed, placement) = layout(dir, &project, profile.as_ref())?;
-    if placement.placed < placement.libraries && !config.jit_fallback {
-        bail!(
-            "the closure's {} libraries ({} MiB) do not fit the {} MiB placement window, which takes \
-             the {} hottest; the rest are translated as they run, so set \"jit_fallback\": true in {CONFIG_FILE}",
-            placement.libraries,
-            placement.library_bytes >> 20,
-            (gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM) >> 20,
-            placement.placed
-        );
-    }
     let (replacements, replaced) = bind_replacements(dir, &placed, &config)?;
 
     let out = dir.join("build");
@@ -688,7 +747,22 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
 
     let mut report = BuildReport { placement, ..BuildReport::default() };
     let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
-    let (images, pins, illegal) = t.translate("build/modules", false)?;
+    // The programs are function-tier units too, unless the user replaces
+    // functions in them: a replacement is made in an image module's
+    // translation (`intrinsics`), which a unit does not take.
+    let program_units = replacements.is_empty();
+    let (mut images, pins, illegal) = t.translate("build/modules", false, !program_units)?;
+    let units = t.units("build/cgen", program_units)?;
+    if !units.is_empty() && !config.jit_fallback {
+        // Recovery leaves a function it could not delimit to the runtime
+        // translator, which a run without it does not have.
+        eprintln!(
+            "gex-eject: warning: {} units (libraries, programs) leave what recovery missed to runtime translation; \
+             a run without \"jit_fallback\" stops at the first such function",
+            units.len()
+        );
+    }
+    images.extend(units);
     report.images = images;
     report.illegal_blocks = illegal;
 
@@ -717,7 +791,8 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                 for r in replacements.iter().filter(|r| !r.missing) {
                     crate::web::check_module(dir, &r.module, &r.export, r.abi)?;
                 }
-                let (images, _, _) = t.translate("build/web", true)?;
+                let (mut images, _, _) = t.translate("build/web", true, true)?;
+                images.extend(report.images.iter().filter(|i| i.kind == "elf-unit").cloned());
                 let spans: Vec<(String, u64, u64)> = placed
                     .iter()
                     .filter(|p| p.obj.role == "library" && p.pinned)
@@ -738,26 +813,70 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         images: report.images.clone(),
         replacements: replacements.clone(),
         pins,
+        pin_region: placement.region,
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     report.replacements = replacements;
     Ok(report)
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use super::fit_window;
+    use super::*;
 
+    /// A shared object of one `PT_LOAD` at zero, `memsz` long.
+    fn library(memsz: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 0x1000];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[6] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[52..54].copy_from_slice(&64u16.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let p = 64;
+        b[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
+        b[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+        b[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[p + 40..p + 48].copy_from_slice(&memsz.to_le_bytes());
+        b[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    /// The pin region's bases do not depend on the order the session
+    /// loaded the libraries in.
     #[test]
-    fn the_window_takes_the_hottest_libraries_that_fit() {
-        // all fit: all placed, whatever ran
-        assert_eq!(fit_window(&[(4, 0), (4, 9)], 8), vec![true, true]);
-        // the hottest first; one that would overflow is skipped for a smaller one
-        assert_eq!(fit_window(&[(4, 1), (6, 9), (3, 5), (2, 0)], 10), vec![false, true, true, false]);
-        assert_eq!(fit_window(&[(4, 1), (6, 9), (5, 5), (4, 0)], 10), vec![true, true, false, false]);
-        // no profile: the session's order
-        assert_eq!(fit_window(&[(4, 0), (4, 0), (4, 0)], 8), vec![true, true, false]);
+    fn pin_bases_follow_paths_not_load_order() {
+        let dir = std::env::temp_dir().join(format!("gex-eject-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = ["/lib/c.so", "/lib/a.so", "/lib/b.so"];
+        for (i, n) in names.iter().enumerate() {
+            let p = dir.join(rootfs_rel(n).unwrap());
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            // Together more than the window, so they go in the region.
+            std::fs::write(&p, library((30 + i as u64) << 20)).unwrap();
+        }
+        let project = |order: &[usize]| Project {
+            objects: order
+                .iter()
+                .map(|&i| Object { path: names[i].into(), role: "library".into(), ..Object::default() })
+                .collect(),
+            ..Project::default()
+        };
+        let bases = |order: &[usize]| {
+            let (placed, placement) = layout(&dir, &project(order), None).unwrap();
+            assert!(placement.region > 0, "three libraries of 30 MiB and more fit the window?");
+            let mut b: Vec<(String, u64)> = placed.iter().map(|p| (p.obj.path.clone(), p.image.bias)).collect();
+            b.sort();
+            b
+        };
+        let one = bases(&[0, 1, 2]);
+        assert_eq!(one, bases(&[2, 0, 1]));
+        assert_eq!(one[0], ("/lib/a.so".into(), gex_abi::PLACE_TOP), "the first path is placed first");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

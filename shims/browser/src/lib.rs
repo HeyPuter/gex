@@ -2506,6 +2506,14 @@ pub extern "C" fn gex_set_null_guard(on: u32) {
     gex_abi::set_null_guard(on != 0);
 }
 
+/// `?pinregion=BYTES`: the pin region an ejected project's libraries are
+/// placed in (`gex_abi::set_pin_region`), before this Worker takes anything
+/// from the arena.
+#[no_mangle]
+pub extern "C" fn gex_set_pin_region(bytes: u64) {
+    gex_abi::set_pin_region(bytes);
+}
+
 /// Turn on gex-wayland protocol tracing (buffers, commits, "produced no frame")
 /// -- the shim has no env, so `GEX_WL_TRACE` can't reach the compositor here.
 #[no_mangle]
@@ -2772,11 +2780,11 @@ fn arena_take(len: u64) -> Option<u64> {
         // received signal 9" and nothing about memory at all.
         let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
         if inherited != 0 {
-            gex_abi::ARENA_BOTTOM.max(inherited)
+            gex_abi::arena_bottom().max(inherited)
         } else {
             // Not forked: the memory is its own and nothing else is in it. Kept
             // as the floor rather than assumed, since the loader grows it.
-            gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
+            gex_abi::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
         }
     } else {
         cur
@@ -4645,8 +4653,8 @@ pub extern "C" fn gex_note_inherited(end: u64) {
 #[no_mangle]
 pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
     w3_note_reach(end, "an inherited region", start, end);
-    if winspace::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= winspace::arena_ceiling() {
-        let start = start.max(gex_abi::ARENA_BOTTOM);
+    if winspace::w3_compact() && end > gex_abi::arena_bottom() && end <= winspace::arena_ceiling() {
+        let start = start.max(gex_abi::arena_bottom());
         if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
             && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
         {
@@ -5682,6 +5690,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     } else {
         format!("/{}", args[0])
     };
+    // The program's own code, when it has a unit (a Linux eject's
+    // programs), announced as the interpreter is above.
+    if nt_abi.is_none() && crate::cgen::libprov::elf_listed(&kernel.exe_path) {
+        let maps = gex_kernel::CodeMap::of_placed(&kernel.exe_path, bytes, program.exe.bias);
+        kernel.mem.lock().log.new_code.extend(maps);
+    }
     kernel.argv = args.clone();
     kernel.envp = env.to_vec();
     // Process one links for itself and leaves the answer for whoever runs the
@@ -7844,7 +7858,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // posix_spawn's child running in its parent's Worker: not the calls
     // that would change the memory map it shares (vfork.rs).
     if vfork::active() {
-        vfork::check(this_nr);
+        vfork::check(this_nr, regs.a[0]);
     }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
@@ -10460,6 +10474,27 @@ fn note_exec(path: &str, argv: &[String]) {
     warn_line(&format!("[gex-info] pid {pid}: exec {path}{args}\n"));
 }
 
+/// After an `execve`: the program and its interpreter, which gex's loader
+/// placed, in the map's log of new code as their `mmap`s would have put them,
+/// so the syscall's return places their function-tier units. Only objects
+/// listed for units: everything else is left to dispatch, as before.
+fn announce_placed(h: &mut Host, p: &gex_ld::Program, path: &str) {
+    let mut objects = vec![(path.to_string(), p.exe.bias)];
+    if let (Some(i), Some(interp)) = (&p.exe.interp, &p.interp) {
+        objects.push((i.clone(), interp.bias));
+    }
+    for (file, bias) in objects {
+        if !crate::cgen::libprov::elf_listed(&file) {
+            continue;
+        }
+        let mut head = vec![0u8; 0x1000];
+        let Some(n) = h.kernel.read_file_at(&file, 0, &mut head) else { continue };
+        head.truncate(n);
+        let maps = gex_kernel::CodeMap::of_placed(&file, &head, bias);
+        h.kernel.mem.lock().log.new_code.extend(maps);
+    }
+}
+
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
     {
@@ -10531,12 +10566,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if winspace::w3_compact() {
         inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
     }
-    if inherited > gex_abi::ARENA_BOTTOM {
-        dead.push((gex_abi::ARENA_BOTTOM, inherited));
+    if inherited > gex_abi::arena_bottom() {
+        dead.push((gex_abi::arena_bottom(), inherited));
     }
     let dead: Option<Vec<(u64, u64)>> = dead
         .iter()
-        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::arena_bottom()), hi.min(gex_abi::MMAP_TOP)))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem.lock().renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
@@ -10583,7 +10618,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             // pages stalled the exec indefinitely -- a bulk fill over this shared
             // memory commits every page and crawls, where the live low layout
             // clears in a blink.
-            if start >= gex_abi::ARENA_BOTTOM {
+            if start >= gex_abi::arena_bottom() {
                 continue;
             }
             let (a, b) = (start as usize, (end as usize).min(live).min(data.len()));
@@ -10858,6 +10893,13 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // writes the same blocks into the same slots, and its compile is shared
     // by content key.
     h.jit.installed_mods.clear();
+    // The new program and its interpreter, placed by gex's loader rather than
+    // mapped by the guest, announced as their `mmap`s would have been: the
+    // syscall's return serves their units before the interpreter's first
+    // instruction.
+    if let (Some(p), None) = (&program, &restored) {
+        announce_placed(h, p, path);
+    }
 
     let ctx_addr = h.threads[cur()].ctx_addr();
     let c = ctx_addr as usize;
@@ -10998,6 +11040,36 @@ fn shared_slot(j: &Jit, page: u64, key: u64) -> Option<u32> {
         }
     }
     j.shared.get(&(page, key)).copied()
+}
+
+/// A base for `page`, which has none in this process: the one another
+/// process gave the same code, else a new one, published for the next.
+///
+/// A unit's bridges number every page its entries are on, and a library's
+/// unit is the same code at the same base in every process that maps it.
+/// Numbered afresh in each, a session of a few hundred libraries and a
+/// dozen processes spent the page's whole slot space in minutes. (x86-64's
+/// table numbers every page by identity itself.)
+pub(crate) fn number_by_identity(j: &mut Jit, page: u64) -> u32 {
+    if gex_abi::X86 || unsafe { k_present() } == 0 {
+        return j.page_table.base(page);
+    }
+    let Some((pid, key)) = with_px(|px| page_identity(px, page * gex_abi::DISPATCH_PAGE).map(|k| (px.pid, k))) else {
+        return j.page_table.base(page);
+    };
+    if let Some(base) = shared_slot(j, page, key) {
+        if tracing() {
+            trace_line(&format!("[gex] pid {pid}: unit page {page:#x} adopts base {base:#x}\n"));
+        }
+        j.page_table.assign(page, base);
+        return base;
+    }
+    let base = j.page_table.base(page);
+    if tracing() {
+        trace_line(&format!("[gex] pid {pid}: unit page {page:#x} numbered {base:#x}\n"));
+    }
+    record_shared_slot(j, pid, page, key, base);
+    base
 }
 
 /// Record it in both, first writer winning in each.
@@ -14890,6 +14962,13 @@ fn livelock_note(pc: u64) {
     if n != LIVELOCK_MISSES || !LIVE_SAID.with(|s| s.borrow_mut().insert(pc)) {
         return;
     }
+    // A unit's call-out returning through a miss every time (a qsort
+    // comparator in translated code, called from a library's unit) misses at
+    // the same return address as often as it is called, and each miss goes
+    // on: traffic, not a dispatch that does not converge.
+    if MISS_WAY_AT.with(|m| m.borrow().get(&pc).is_some_and(|&(w, _)| w == 3)) {
+        return;
+    }
     LIVELOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (wpc, _, _) = MISS_WAY.with(|c| c.get());
     let way = match MISS_WAY_AT.with(|m| m.borrow().get(&pc).copied()) {
@@ -15231,8 +15310,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
                 ));
             }
-            set_exit(128 + 11);
         })();
+        branch_fault(pc);
         trap();
     }
     // Which of this object's functions the backend serves itself, before either
@@ -15690,6 +15769,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         let mut keep: Vec<(u64, u32)> = Vec::new();
                         for (p, b) in d {
                             if !gex_abi::X86 {
+                                // The same check for a page this process can
+                                // name: an object another process had at the
+                                // same address (libXfixes where this process
+                                // has libvorbisfile) has its own base in the
+                                // identity map, and its blocks are not this
+                                // page's code. Unnamed pages are taken as before.
+                                // SAFETY: lookups in the kernel's memory, borrowing nothing here.
+                                let other = unsafe { k_present() } != 0
+                                    && page_identity(px, *p * gex_abi::DISPATCH_PAGE)
+                                        .is_some_and(|k| unsafe { k_slot_get(*p, k) } != *b);
+                                if other {
+                                    if tracing() {
+                                        trace_line(&format!(
+                                            "[gex] serve: page {p:#x} base {b:#x} is another object's here, entry dropped\n"
+                                        ));
+                                    }
+                                    continue;
+                                }
                                 j.page_table.assign(*p, *b);
                                 keep.push((*p, *b));
                                 continue;
@@ -16166,9 +16263,30 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             ));
         })();
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
-        set_exit(128 + 11);
+        branch_fault(pc);
     }
     trap();
+}
+
+/// A branch to `pc`, where there is nothing to run: SIGSEGV there, for the
+/// guest's handler if it has one, else the process dies of it, as on Linux.
+/// The whole process: a status set for this thread alone left the others
+/// running and its parent waiting.
+fn branch_fault(pc: u64) {
+    let c = my_ctx();
+    let mut gm = GuestMem::new(guest_bytes());
+    match sigs::fault(&mut gm, c, 11, pc, pc) {
+        gex_kernel::signal::Delivery::Resume(target) => {
+            if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+            }
+            set_resume(target);
+            set_resume_ctx(c);
+        }
+        _ => {
+            exit_here(-11, Some(pc));
+        }
+    }
 }
 
 

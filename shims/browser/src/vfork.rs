@@ -40,6 +40,14 @@
 //! A plain `fork` (and `vfork()`, which is `fork`) keeps the copy and the
 //! Worker of its own: its child runs the parent's code on the parent's stack
 //! and may do anything.
+//!
+//! A vfork child may itself spawn so (Qt's `startDetached`: its child's
+//! `vforkfd`; glibc's `posix_spawn` from a child), and that grandchild runs
+//! here too, nested: the child's state is kept aside as the parent's thread
+//! is ([`STACK`]), and comes back when the grandchild is done. So the
+//! grandchild writes the memory its parent reads, as glibc's `posix_spawn`
+//! has its child report a failed exec (`args->err`), where a copy of the
+//! memory would lose it.
 
 use super::*;
 use std::cell::Cell;
@@ -76,6 +84,29 @@ thread_local! {
     /// The staged exec's memory (`exec_target`): 1 a 64-bit one, 0 a 32-bit
     /// one, -1 the parent's (a page that runs one flavour).
     static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
+    /// The vfork children suspended here while one of theirs runs, the
+    /// innermost last.
+    static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+}
+
+/// How deep vfork children nest here: a spawn from a spawned child (Qt's
+/// `startDetached`) is two. A deeper one is copied as a fork.
+const DEPTH: usize = 4;
+
+/// A suspended vfork child: what [`PID`], [`CHILD`], [`FDS`], [`EXITED`],
+/// [`WHY`] and [`SAVED`] held for it.
+struct Frame {
+    pid: i32,
+    child: *mut Host,
+    fds: *const gex_kernel::file::FdTable,
+    exited: bool,
+    why: u32,
+    saved: Option<Saved>,
+}
+
+/// How many vfork children are here, running or suspended.
+fn depth() -> usize {
+    STACK.with(|s| s.borrow().len()) + active() as usize
 }
 
 struct Saved {
@@ -141,9 +172,10 @@ pub(crate) fn set_exited_here(v: bool) -> bool {
     true
 }
 
-/// Note whether the `clone` being served is a vfork.
+/// Note whether the `clone` being served is a vfork to run here: one a
+/// vfork child makes (`check` let it through) runs nested, up to [`DEPTH`].
 pub(crate) fn note_clone(vfork: bool) {
-    STAGED.with(|c| c.set(vfork));
+    STAGED.with(|c| c.set(vfork && depth() < DEPTH));
 }
 
 /// Whether the fork the last syscall staged is a vfork child to run here
@@ -152,7 +184,7 @@ pub(crate) fn note_clone(vfork: bool) {
 /// publish the child's exit in.
 #[no_mangle]
 pub extern "C" fn gex_vfork_ok() -> i32 {
-    if active() {
+    if depth() >= DEPTH {
         -1
     } else if !STAGED.with(|c| c.get()) {
         -2
@@ -199,6 +231,18 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     *CHILD_EXE.0.borrow_mut() = FORK_EXE.0.borrow().clone();
     *CHILD_STATE.0.borrow_mut() = FORK_STATE.0.borrow().clone();
     let fds = FORK_FDS.0.borrow().clone();
+    // A vfork child spawning: it waits, kept aside, as its parent does.
+    if active() {
+        let f = Frame {
+            pid: PID.with(|c| c.get()),
+            child: CHILD.with(|c| c.replace(std::ptr::null_mut())),
+            fds: FDS.with(|c| c.replace(std::ptr::null())),
+            exited: EXITED.with(|c| c.get()),
+            why: WHY.with(|c| c.get()),
+            saved: SAVED.with(|s| s.borrow_mut().take()),
+        };
+        STACK.with(|s| s.borrow_mut().push(f));
+    }
     SAVED.with(|s| *s.borrow_mut() = Some(Saved { ctx, ctx_addr, cur: cur(), resume }));
     // From here this Worker's process is the child: what `child_host` says
     // about "this process" without the kernel goes to this Worker alone.
@@ -232,11 +276,27 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     pc as i64
 }
 
-/// The child's syscall `nr` (canonical), before it is served: the memory
-/// map is the parent's too, so a call that would change it, and a further
-/// clone, end the child (as a crash: `posix_spawn`'s child makes none).
-pub(crate) fn check(nr: u64) {
+/// The child's syscall `nr` (canonical, first argument `a0`), before it is
+/// served: the memory map is the parent's too, so a call that would change
+/// it ends the child (as a crash: `posix_spawn`'s child makes none). So does
+/// a further clone, except a `CLONE_VM | CLONE_VFORK` one, which shares the
+/// map rather than changes it: Qt's `startDetached` spawns from its vfork
+/// child (`vforkfd`), and that grandchild runs here, nested (`note_clone`);
+/// and except a fork, whose child is a copy of the memory as this child
+/// sees it.
+pub(crate) fn check(nr: u64, a0: u64) {
     use gex_kernel::syscalls::nr::*;
+    const SPAWN: u64 = 0x100 | 0x4000; // CLONE_VM | CLONE_VFORK
+    let flags = match nr {
+        CLONE => a0,
+        CLONE3 => GuestMem::new(guest_bytes()).read_u64(a0).unwrap_or(0),
+        _ => 0,
+    };
+    // A spawn shares the map; a fork (no CLONE_VM) copies it, and its
+    // child gets a Worker of its own, as any fork's does.
+    if flags & SPAWN == SPAWN || (matches!(nr, CLONE | CLONE3) && flags & 0x100 == 0) {
+        return;
+    }
     let name = match nr {
         MMAP => "mmap",
         MUNMAP => "munmap",
@@ -248,7 +308,7 @@ pub(crate) fn check(nr: u64) {
         _ => return,
     };
     warn_line(&format!(
-        "[gex] pid {}: a vfork child called {name}, which would change its parent's memory map; ended",
+        "[gex] pid {}: a vfork child called {name} ({a0:#x}), which would change its parent's memory map; ended",
         PID.with(|c| c.get())
     ));
     WHY.with(|c| c.set(UNSUPPORTED));
@@ -546,9 +606,9 @@ pub extern "C" fn gex_vfork_exec_done() {
     EXEC_PARTS.with(|p| *p.borrow_mut() = Default::default());
 }
 
-/// The child is done: the Worker back to the parent's process and its
-/// calling thread, with that thread's register context, the child's kernel
-/// dropped (its descriptors were closed by its exit or its exec; a crashed
+/// The child is done: the Worker back to the parent's process (or to the
+/// vfork child it nested in, [`STACK`]) and its calling thread, with that
+/// thread's register context, the child's kernel dropped (its descriptors were closed by its exit or its exec; a crashed
 /// child's close here). The parent's `clone` then returns the child's pid,
 /// at the pc this returns (0 for none: a wasm32 program's `clone` returns
 /// by itself).
@@ -567,16 +627,25 @@ pub extern "C" fn gex_vfork_end() -> i64 {
         // borrowed; its descriptors are gone or go now.
         drop(unsafe { Box::from_raw(child) });
     }
-    PID.with(|c| c.set(0));
-    EXITED.with(|c| c.set(false));
-    WHY.with(|c| c.set(0));
+    let outer = STACK.with(|s| s.borrow_mut().pop());
+    PID.with(|c| c.set(outer.as_ref().map_or(0, |f| f.pid)));
+    EXITED.with(|c| c.set(outer.as_ref().is_some_and(|f| f.exited)));
+    WHY.with(|c| c.set(outer.as_ref().map_or(0, |f| f.why)));
     if !ctx.is_empty() {
         let mut gm = GuestMem::new(guest_bytes());
         let _ = gm.write(ctx_addr, &ctx);
     }
     CURRENT.with(|c| c.set(cur));
-    // The parent's thread again, from its thread table (no kernel lock).
-    crate::bind_free(cur);
+    if let Some(f) = outer {
+        // The vfork child that spawned, its process this Worker's again.
+        CHILD.with(|c| c.set(f.child));
+        FDS.with(|c| c.set(f.fds));
+        SAVED.with(|s| *s.borrow_mut() = f.saved);
+        with_child(publish_vfork_child);
+    } else {
+        // The parent's thread again, from its thread table (no kernel lock).
+        crate::bind_free(cur);
+    }
     // The caller goes on at the returned pc itself. Left in `RESUME`, that
     // pc was still there for the thread's next call that trapped without
     // setting one (a `read` the child's pipe kept waiting), and the thread

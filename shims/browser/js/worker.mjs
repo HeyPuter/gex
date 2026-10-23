@@ -687,6 +687,8 @@ async function handle(msg) {
   if (msg.w3Split) globalThis.GEX_W3_SPLIT = 1;
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
+  // `?pinregion=BYTES`: the pin region (gex_abi::set_pin_region).
+  if (msg.pinRegion) globalThis.GEX_PIN_REGION = msg.pinRegion;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;

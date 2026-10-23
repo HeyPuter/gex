@@ -784,6 +784,17 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     // keeps below its code space), and its memory64 flavour is the module's
     // own (docs/wine-native-x64.md §0.1).
     let wide = !program.compat() && !program.exe.is_wasm_program();
+    // GEX_EJECT_BUILD=DIR (debugging): an ejected project's modules and pins
+    // under an ordinary run with its own options (a display, binds), so a
+    // multi-process session can be timed with what `gexc eject build` made.
+    // Its memory is the build's, never a learned one.
+    if let Some(d) = std::env::var_os("GEX_EJECT_BUILD") {
+        let dir = std::path::PathBuf::from(d);
+        ra.mem64 = Some(gex_eject::run::build_mem(ra.mem64)?.is_64());
+        let (aot, pins) = gex_eject::run::debug_build(&dir).with_context(|| format!("GEX_EJECT_BUILD={}", dir.display()))?;
+        ra.opts.aot = Some(std::sync::Arc::new(aot));
+        ra.opts.pins.extend(pins);
+    }
     choose_mem(&mut ra, &bytes, wide)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;

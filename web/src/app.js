@@ -55,6 +55,7 @@ const PIECES = {
  *   args       the program's arguments (an array), instead of the recorded ones
  *   env        more environment, ['K=V', ...] or {K: V}; a name given replaces the build's
  *   cwd, exe   the working directory and program (a path in the bundle)
+ *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
  *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
@@ -749,6 +750,7 @@ async function begin(opts, base, at, state, meter) {
     env,
     args,
     cwd,
+    uid: opts.uid ?? b.uid,
     tty: false,
     gl: gl ? 'compositor' : null,
     glLazy,
@@ -977,6 +979,9 @@ export function setGlobals(get, b = {}) {
   // natively (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the
   // units are as without it; on, 2-8% slower in tier 1.
   if (get('nullguard') === '1') globalThis.GEX_NULL_GUARD = 1;
+  // pinregion=BYTES: address space above the placement window for the
+  // project's libraries, each at its build's base (gex_abi::set_pin_region).
+  if (get('pinregion')) globalThis.GEX_PIN_REGION = Number(get('pinregion'));
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));
@@ -987,7 +992,7 @@ export function setGlobals(get, b = {}) {
   const fjit = get('fjit');
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
   if (get('wasmdlls')) globalThis.GEX_WASM_DLLS = get('wasmdlls');
-  if (get('elfunits')) globalThis.GEX_ELF_UNITS = get('elfunits');
+  if (get('elfunits') && get('cgen') !== '0') globalThis.GEX_ELF_UNITS = get('elfunits');
   // provskip=export,...: exports no provider binds, as GEX_PROVIDER_SKIP natively (units built with the same skip).
   if (get('provskip')) globalThis.GEX_PROVIDER_SKIP = get('provskip');
   if (get('fjitlibs')) globalThis.GEX_FJIT_LIBS = get('fjitlibs');
@@ -997,7 +1002,9 @@ export function setGlobals(get, b = {}) {
   // cgen=1|2 (prefer|require units), the unguarded flavour unless unguarded=0.
   // icallcount=1: the counting flavour of units (16), whose run prints the
   // indirect-call profile (cgen.rs gex_icall_dump; GEX_CGEN_ICALL_COUNT=1 units).
-  if (get('cgen')) globalThis.GEX_CGEN = Number(get('cgen')) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
+  // cgen=0 is off: no unit of any kind, the ELF objects' among them.
+  const cgen = get('cgen');
+  if (cgen && cgen !== '0') globalThis.GEX_CGEN = Number(cgen) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
   if (get('cgenurl')) globalThis.GEX_CGEN_URL = get('cgenurl');
   if (get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (get('aot')) globalThis.GEX_AOT = 1;
@@ -1006,6 +1013,7 @@ export function setGlobals(get, b = {}) {
   if (get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   if (get('strace')) globalThis.GEX_STRACE = 1;
   if (get('stracepid')) globalThis.GEX_STRACE_PID = Number(get('stracepid'));
+  if (get('straceexe')) globalThis.GEX_STRACE_EXE = get('straceexe');
   if (get('liftmax')) globalThis.GEX_LIFT_MAX = Number(get('liftmax'));
   globalThis.GEX_UNIT_CACHE = get('unitcache') !== null ? Number(get('unitcache')) : 1;
   if (get('t1fold')) globalThis.GEX_T1_FOLD = Number(get('t1fold'));

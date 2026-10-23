@@ -23,11 +23,57 @@ pub struct RunFlags {
     pub display: Option<String>,
 }
 
+/// The guest memory every module `build` writes is for: the flavour a
+/// build runs in (`gexc eject build` never widens it).
+pub const BUILD_MEM: gex_abi::MemFlavor = gex_abi::MemFlavor::M32;
+
+/// The memory a run of a built project's modules gets: the build's, whatever
+/// a program's earlier runs taught gex (a learned 64-bit memory is not
+/// theirs). `requested` is the run's `--mem64`/`--mem32`, if any.
+pub fn build_mem(requested: Option<bool>) -> Result<gex_abi::MemFlavor> {
+    if requested == Some(true) && !BUILD_MEM.is_64() {
+        bail!("--mem64: the ejected project's modules are for a 32-bit memory; run with --mem32 (or without --mem64)");
+    }
+    Ok(BUILD_MEM)
+}
+
+/// A built project's modules and library pins, for an ordinary `gexc run`
+/// of the session it came from (`GEX_EJECT_BUILD`, a debugging aid): what
+/// they do not cover is translated as usual.
+pub fn debug_build(dir: &Path) -> Result<(Aot, Vec<(String, u64)>)> {
+    let manifest = BuildManifest::load(dir)?;
+    use_units(dir, &manifest);
+    Ok((aot(dir, &manifest), manifest.pins.clone()))
+}
+
+/// The libraries' function-tier units (`elf-unit`), for every process of the
+/// run that maps one at its base: from the project, and none built for
+/// another run.
+fn use_units(dir: &Path, manifest: &BuildManifest) {
+    // The libraries' own region above the placement window, when the build
+    // gave them one, reserved before anything maps.
+    gex_abi::set_pin_region(manifest.pin_region);
+    let names: Vec<String> = manifest
+        .images
+        .iter()
+        .filter(|i| i.kind == "elf-unit")
+        .map(|i| i.path.rsplit('/').next().unwrap_or(&i.path).to_string())
+        .collect();
+    if !names.is_empty() {
+        // The flavour `units` builds them in, whoever runs the project.
+        gex_cgen::image::set_unguarded(true);
+        gex_native::pe_units::set_cache_root(Some(dir.join("build/cgen")));
+        gex_native::pe_units::set_elf_units(names);
+    }
+}
+
 /// The runtime's view of a built project.
 pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
     let mut aot = Aot::new(format!("the ejected project {}", dir.display()));
     for i in &manifest.images {
-        if i.kind == "shared" {
+        if i.kind == "elf-unit" {
+            continue;
+        } else if i.kind == "shared" {
             aot.shared.entry(i.identity.clone()).or_default().push(dir.join(&i.module));
         } else {
             aot.images.insert(i.identity.clone(), dir.join(&i.module));
@@ -106,6 +152,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     } else {
         project.program.env.clone()
     };
+    use_units(dir, &manifest);
     let mut aot = aot(dir, &manifest);
     aot.syscalls = allowed_syscalls(dir, &config)?;
     aot.single_process = project.processes <= 1;

@@ -5,7 +5,9 @@
 # code was unmapped is retired, not revived by the next object's mapping
 # (pe_units::on_retire, ftab::on_retire; the browser's cgen::on_retire).
 # The interpreter has a unit too: gex's loader places it, and the kernel
-# announces it as the guest's own mmap would have (CodeMap::of_placed).
+# announces it as the guest's own mmap would have (CodeMap::of_placed), and
+# its unit is installed before ld.so's first instruction. The program has
+# one as well, at the base gex's loader gives it.
 #
 #   tests/elf-units-remap/run.sh [gexc]      (needs gcc; host glibc as the guest's)
 set -u
@@ -22,10 +24,12 @@ gcc -O1 -o "$W/main" "$HERE/main.c" -ldl || exit 1
 BASE=0x30000000
 printf '%s 0x10000 liba.so\n%s 0x10000 libb.so\n' $BASE $BASE > "$W/pins.txt"
 INTERP=$(readelf -lW "$W/main" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
-export GEX_CGEN_CACHE="$W/cgen" GEX_ELF_UNITS=liba.so,libb.so,${INTERP##*/} GEX_ELF_UNITS_BUILD=0
+export GEX_CGEN_CACHE="$W/cgen" GEX_ELF_UNITS=liba.so,libb.so,${INTERP##*/},main GEX_ELF_UNITS_BUILD=0
 for l in liba libb; do
 	"$GEXC" cgen-image --elf "$W/$l.so" --base $BASE --jobs 2 > "$W/$l.cgen.log" 2>&1 || { cat "$W/$l.cgen.log"; exit 1; }
 done
+# The program at gex_abi::PIE_BASE, where gex's loader puts it.
+"$GEXC" cgen-image --elf "$W/main" --base 0x1000000 --jobs 2 > "$W/main.cgen.log" 2>&1 || { cat "$W/main.cgen.log"; exit 1; }
 # At gex_abi::INTERP_BASE.
 "$GEXC" cgen-image --elf "$INTERP" --base 0x4a00000 --jobs 2 > "$W/interp.cgen.log" 2>&1 || { cat "$W/interp.cgen.log"; exit 1; }
 native=$("$W/main" "$W")
@@ -34,11 +38,24 @@ for flags in "" "--fjit"; do
 	gex=$(timeout 60 "$GEXC" run $flags --pin "$W/pins.txt" "$W/main" "$W" 2> "$W/err.txt")
 	placed=$(grep -c 'function tier for .*/lib[ab]\.so' "$W/err.txt")
 	interp=$(grep -c "function tier for $INTERP at 0x4a00000" "$W/err.txt")
-	if [ "$native" = "$gex" ] && [ "$placed" = 4 ] && [ "$interp" = 1 ]; then
+	prog=$(grep -c "function tier for $W/main at 0x1000000" "$W/err.txt")
+	if [ "$native" = "$gex" ] && [ "$placed" = 4 ] && [ "$interp" = 1 ] && [ "$prog" = 1 ]; then
 		echo "ok   elf-units-remap ${flags:-t1}"
 	else
-		echo "FAIL elf-units-remap ${flags:-t1} (library units placed $placed times, want 4; the interpreter's $interp, want 1)"
+		echo "FAIL elf-units-remap ${flags:-t1} (library units placed $placed times, want 4; the interpreter's $interp, want 1; the program's $prog, want 1)"
 		printf 'native:\n%s\ngex:\n%s\n' "$native" "$gex"; tail -20 "$W/err.txt"; fail=1
 	fi
 done
+# The interpreter's unit is in before its first instruction: ld.so's own
+# start (relocating itself, up to its first system call) runs on the unit,
+# not on the runtime translator. Its line comes before the first syscall's.
+timeout 60 "$GEXC" run --strace --pin "$W/pins.txt" "$W/main" "$W" > /dev/null 2> "$W/strace.txt"
+first_unit=$(grep -n "function tier for $INTERP at 0x4a00000" "$W/strace.txt" | head -1 | cut -d: -f1)
+first_sys=$(grep -n '^\[gex:1\] pc=' "$W/strace.txt" | head -1 | cut -d: -f1)
+if [ -n "$first_unit" ] && [ -n "$first_sys" ] && [ "$first_unit" -lt "$first_sys" ]; then
+	echo "ok   elf-units-remap interpreter unit before its first system call"
+else
+	echo "FAIL elf-units-remap interpreter unit before its first system call (unit line ${first_unit:-none}, first system call line ${first_sys:-none})"
+	head -6 "$W/strace.txt"; fail=1
+fi
 exit $fail

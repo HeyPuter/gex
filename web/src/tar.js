@@ -113,6 +113,9 @@ export function untar(buf, root = '') {
     } else if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
+      // its time too: a cache built over a directory (KDE's ksycoca) is
+      // stale when the directory looks newer
+      if (p) mtimes[p] = octal(b, off + 136, 12);
       keepXattrs(p);
       // A directory's mode, when it is not the VFS's 0755: a read-only one
       // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and

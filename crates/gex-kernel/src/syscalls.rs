@@ -3011,6 +3011,14 @@ impl PathIo<'_> {
         if let Some(res) = self.open_pty(&p, flags) {
             return res;
         }
+        // `/proc/self/fd/N` (and `/dev/stdin`, `/dev/fd/N`, which lead there)
+        // names the descriptor's file itself, as Linux's magic link does,
+        // not the name its link reads back.
+        if flags & oflags::O_PATH == 0 {
+            if let Some(n) = self.magic_fd(&p) {
+                return self.reopen_fd(n, flags, mode);
+            }
+        }
         // `O_TMPFILE` names a directory and asks for an unnamed file inside
         // it: made, opened, and unlinked at once, so the handle is the only
         // way to it. `O_PATH` opens the name, not the file, so it does not
@@ -3090,6 +3098,63 @@ impl PathIo<'_> {
             Some(tp) => OpenFile::tmpfile(handle, tp, self.view.get(), flags, readable, writable),
             None => OpenFile::new(handle, p, flags, readable, writable),
         };
+        self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// The descriptor a path names as Linux's magic links do: `/proc/self/fd/N`,
+    /// `/proc/thread-self/fd/N` and `/proc/<own pid>/fd/N`, `/dev/fd/N`, and
+    /// `/dev/stdin`, `/dev/stdout` and `/dev/stderr` (links to the first).
+    fn magic_fd(&self, p: &str) -> Option<i32> {
+        match p {
+            "/dev/stdin" => return Some(0),
+            "/dev/stdout" => return Some(1),
+            "/dev/stderr" => return Some(2),
+            _ => {}
+        }
+        let own = format!("/proc/{}/fd/", self.pid);
+        let n = ["/proc/self/fd/", "/proc/thread-self/fd/", own.as_str(), "/dev/fd/"]
+            .iter()
+            .find_map(|pre| p.strip_prefix(pre))?;
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        n.parse().ok()
+    }
+
+    /// `open` of descriptor `n`'s magic link ([`Self::magic_fd`]): a new open
+    /// file description of the same file, with its own offset and the flags
+    /// of this call. A pipe, a terminal or a device is the same object (a
+    /// pipe end only in its own direction); a file or directory is the same
+    /// one too, unless the call asks for more access than the descriptor has
+    /// or truncates, when it is opened again by its name. A socket cannot be
+    /// opened so (`ENXIO`, as Linux).
+    fn reopen_fd(&self, n: i32, flags: u64, mode: u32) -> SysResult {
+        let of = self.map.fds.get(n).map_err(|_| Errno::ENOENT)?;
+        let acc = flags & oflags::ACCMODE;
+        let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
+        let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
+        let within = (!readable || of.readable) && (!writable || of.writable);
+        let ft = of.handle.metadata()?.file_type;
+        let handle = match ft {
+            FileType::Socket => return Err(Errno::ENXIO),
+            FileType::Fifo if !within => return Err(Errno::ENXIO),
+            FileType::Regular | FileType::Directory if !within || flags & oflags::O_TRUNC != 0 => {
+                if flags & oflags::O_DIRECTORY != 0 && ft != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                self.ns.open(&of.path, flags & !(oflags::O_CREAT | oflags::O_EXCL), mode)?
+            }
+            _ => {
+                if flags & oflags::O_DIRECTORY != 0 && ft != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                if flags & (oflags::O_CREAT | oflags::O_EXCL) == oflags::O_CREAT | oflags::O_EXCL {
+                    return Err(Errno::EEXIST);
+                }
+                Arc::clone(&of.handle)
+            }
+        };
+        let file = OpenFile::new(handle, of.path.clone(), flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_TRUNC), readable, writable);
         self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
@@ -3966,14 +4031,28 @@ impl MapIo<'_> {
             let mut addr = addr;
             let mut pinned = None;
             if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
-                let mut mm = self.mem.lock();
-                if let Some((path, base)) = mm.log.armed_pin.take() {
-                    if path.rsplit('/').next() == name.rsplit('/').next() {
-                        mm.log.armed_place = None;
+                let mut placed = None;
+                {
+                    let mut mm = self.mem.lock();
+                    if let Some((path, base)) = mm.log.armed_pin.take() {
+                        if path.rsplit('/').next() == name.rsplit('/').next() {
+                            mm.log.armed_place = None;
+                            addr = base;
+                            pinned = Some((path, base));
+                        } else {
+                            mm.log.armed_pin = Some((path, base));
+                        }
+                    }
+                    // Or the placement armed at its open, as for a
+                    // reservation (below): every process is given the
+                    // address the first one got.
+                    if pinned.is_none() && mm.log.armed_place.as_deref() == Some(name.as_str()) {
+                        placed = mm.log.armed_place.take();
+                    }
+                }
+                if let Some(path) = placed {
+                    if let Some(base) = self.place.and_then(|p| p.place(&path, len_aligned)) {
                         addr = base;
-                        pinned = Some((path, base));
-                    } else {
-                        mm.log.armed_pin = Some((path, base));
                     }
                 }
             }
@@ -8522,7 +8601,9 @@ impl Kernel {
             retry_sigwait: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
-            pins: Default::default(),
+            // The layout a closure build assumed holds in every process of
+            // the run: a child that maps a pinned object gets its base.
+            pins: self.pins.clone(),
             // The placement outlives any one process: a child that maps the
             // same library must be given the same address its parent was.
             place: self.place.clone(),
@@ -11656,6 +11737,84 @@ mod tests {
         let mut b = s.as_bytes().to_vec();
         b.push(0);
         m.write(addr, &b).unwrap();
+    }
+
+    /// Open `path` (`openat` from the working directory) with `flags`.
+    fn open_at(k: &mut Kernel, m: &mut GuestMem<'_>, path: &str, flags: u64) -> i64 {
+        put_str(m, 0x20000, path);
+        set_args(m, k.ctx_addr, nr::OPENAT, &[(-100i64) as u64, 0x20000, flags, 0o644]);
+        k.syscall(m, 0);
+        ret(m, k.ctx_addr)
+    }
+
+    /// `/proc/self/fd/N` opens descriptor N's file, as Linux's magic link
+    /// does: a file is the same file with an offset of its own; a pipe the
+    /// same pipe; a socket not at all; and `/dev/stderr`, which links there,
+    /// the stdio stream itself, whatever name its link reads back.
+    #[test]
+    fn proc_fd_opens_the_descriptors_file() {
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        // A file: written through one descriptor, read from the start
+        // through the reopened one, whose offset is its own.
+        let fd = open_at(&mut k, &mut m, "/f.txt", oflags::O_CREAT | oflags::O_RDWR);
+        assert!(fd >= 0);
+        m.write(0x21000, b"payload").unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[fd as u64, 0x21000, 7]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 7);
+        let again = open_at(&mut k, &mut m, &format!("/proc/self/fd/{fd}"), oflags::O_RDONLY);
+        assert!(again >= 0 && again != fd, "{again}");
+        set_args(&mut m, k.ctx_addr, nr::READ, &[again as u64, 0x22000, 16]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 7);
+        assert_eq!(m.read(0x22000, 7).unwrap(), b"payload");
+        // More access than the descriptor has: opened again by name.
+        let ro = open_at(&mut k, &mut m, "/f.txt", oflags::O_RDONLY);
+        let own = format!("/proc/{}/fd/{ro}", k.pid);
+        let rw = open_at(&mut k, &mut m, &own, oflags::O_WRONLY | oflags::O_APPEND);
+        assert!(rw >= 0, "{rw}");
+        m.write(0x21000, b"!").unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[rw as u64, 0x21000, 1]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 1);
+
+        // A pipe: what goes into the reopened write end comes out of the
+        // read end.
+        set_args(&mut m, k.ctx_addr, nr::PIPE2, &[0x23000, 0]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 0);
+        let (r, w) = (m.read_u32(0x23000).unwrap() as i32, m.read_u32(0x23004).unwrap() as i32);
+        let w2 = open_at(&mut k, &mut m, &format!("/dev/fd/{w}"), oflags::O_WRONLY);
+        assert!(w2 >= 0, "{w2}");
+        set_args(&mut m, k.ctx_addr, nr::CLOSE, &[w as u64]);
+        k.syscall(&mut m, 0);
+        m.write(0x21000, b"via").unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[w2 as u64, 0x21000, 3]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 3);
+        set_args(&mut m, k.ctx_addr, nr::READ, &[r as u64, 0x22000, 16]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 3);
+        assert_eq!(m.read(0x22000, 3).unwrap(), b"via");
+        // The other direction of a pipe end: not here.
+        assert_eq!(open_at(&mut k, &mut m, &format!("/proc/self/fd/{r}"), oflags::O_WRONLY), -6);
+
+        // A socket: ENXIO, as Linux.
+        set_args(&mut m, k.ctx_addr, nr::SOCKETPAIR, &[1, 1, 0, 0x24000]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 0);
+        let sock = m.read_u32(0x24000).unwrap();
+        assert_eq!(open_at(&mut k, &mut m, &format!("/proc/self/fd/{sock}"), oflags::O_RDWR), -6);
+
+        // stdio, whose link reads back as `/dev/stderr`: the stream itself.
+        let err = OpenFile::new(Arc::new(crate::stdio::StdStream::new(crate::stdio::Stream::Err, false)), "/dev/stderr".into(), 0, false, true);
+        k.fds.install(2, err, false).unwrap();
+        let e2 = open_at(&mut k, &mut m, "/dev/stderr", oflags::O_WRONLY | oflags::O_APPEND);
+        assert!(e2 >= 0, "{e2}");
+        assert!(Arc::ptr_eq(&k.fds.get(e2 as i32).unwrap().handle, &k.fds.get(2).unwrap().handle));
+        // No such descriptor.
+        assert_eq!(open_at(&mut k, &mut m, "/proc/self/fd/99", oflags::O_RDONLY), -2);
     }
 
     #[test]

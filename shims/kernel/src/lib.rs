@@ -1536,6 +1536,11 @@ pub extern "C" fn k_place(key: u64, len: u64) -> u64 {
 pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
     let mut p = places().lock().unwrap_or_else(|e| e.into_inner());
     p.by_obj.insert(key, base);
+    // A pin in a project's region above the window leaves the window's
+    // counter alone: the window still places everything else.
+    if base >= PLACE_TOP {
+        return;
+    }
     let end = base
         .saturating_add(len.next_multiple_of(PLACE_ALIGN))
         .saturating_add(PLACE_ALIGN);

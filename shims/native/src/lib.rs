@@ -501,6 +501,10 @@ struct JitShared {
     /// The trampoline page's unit is published (`pe_units`): once per
     /// address space, with its first Windows image.
     trampolines: bool,
+    /// The ELF objects `pe_units::on_elf_maps` has looked at in this address
+    /// space: a fork shares them (its table has their units), an exec starts
+    /// empty, so every program that maps an object gets its unit.
+    elf_units: Vec<pe_units::ElfPlaced>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -920,10 +924,19 @@ fn run_program_with(
         // An ejected Windows program: no tier-1 module, only the root's
         // entry (`aot_only`).
         (gex_cache::compile(&engine, &aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
-    } else if let Some(aot) = &opts.aot {
+    } else if let Some(aot) = opts.aot.as_ref().filter(|a| {
+        // A program whose own code is a function-tier unit has no image
+        // module: it starts from the seed (a tier-1 module that translates
+        // nothing), and its units are in before its first instruction.
+        !(a.images.get(&aot::image_identity(image)).is_none()
+            && opts.args.first().is_some_and(|p| pe_units::elf_wanted(p)))
+    }) {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
         aot::image_module(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
+    } else if opts.aot.is_some() {
+        let seed = gex_xlate::seed_module(true);
+        (gex_cache::compile(&engine, &seed.wasm).context("compiling the seed of a program on its unit")?, seed.metadata())
     } else {
         match use_cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
@@ -1125,6 +1138,22 @@ fn run_program_with(
             kernel.mem.lock().log.new_code.extend(maps);
         }
     }
+    // The program itself, when it has a unit (GEX_ELF_UNITS names it): placed
+    // by gex's loader too, so announced the same way, and its unit is in
+    // before its first instruction (`run_thread_loop`).
+    if pe_units::elf_wanted(&kernel.exe_path) {
+        let path = kernel.exe_path.clone();
+        // From the host when the guest cannot read it back: a sysroot's /tmp
+        // is hidden under the guest's own (`TmpFs`).
+        let host = || match &opts.sysroot {
+            Some(r) => std::fs::read(r.join(path.trim_start_matches('/'))).ok(),
+            None => std::fs::read(&path).ok(),
+        };
+        if let Some(bytes) = kernel.read_file(&path).or_else(|| host().inspect(|b| pe_units::note_placed_file(&path, b))) {
+            let maps = gex_kernel::CodeMap::of_placed(&path, &bytes, image.bias);
+            kernel.mem.lock().log.new_code.extend(maps);
+        }
+    }
     // The first program (an exec says its own, `exec_program`).
     if fresh_process {
         note_exec(kernel.pid, opts.args.first().map_or("(program)", |a| a.as_str()), &opts.args);
@@ -1230,7 +1259,7 @@ fn run_program_with(
     // The machinery here installs a translated module into this store. The
     // miss handler is one user; static object recompilation is another.
     // `--no-jit` turns off the miss handler, not this.
-    if opts.jit || opts.recompile_objects || !aot_shared.is_empty() {
+    if opts.jit || opts.recompile_objects || !aot_shared.is_empty() || pe_units::elf_units_on() {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),
@@ -1248,6 +1277,7 @@ fn run_program_with(
                 wine_pe: None,
                 relocated: Default::default(),
                 trampolines: false,
+                elf_units: Vec::new(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1505,6 +1535,14 @@ fn run_program_with(
         };
         if opts.verbose {
             eprintln!("[gex] runtime translation: {blocks} blocks in {calls} compilations");
+        }
+        if log_on() {
+            // Runtime translations only (a unit's entries count as translated too).
+            let (units, blocks) = {
+                let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+                (sh.elf_units.clone(), sh.provider.keys().copied().collect::<Vec<u64>>())
+            };
+            pe_units::exit_line(store.data().kernel.lock().unwrap_or_else(|e| e.into_inner()).pid, &units, &blocks);
         }
         if let Some(dir) = &profile_dir {
             // Only addresses in the executable's own image are worth
@@ -2080,6 +2118,20 @@ fn run_thread_loop(
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
     store.data_mut().root_enter = Some(enter.clone());
+    // Units for code that is in place before the first instruction (the
+    // interpreter, which gex's loader places): installed now, not at the
+    // first syscall, or what runs before it -- ld.so relocating itself --
+    // goes to the runtime translator in every process. The maps stay
+    // pending for the first syscall's other consumers.
+    if store.data().jit.is_some() {
+        let pending: Vec<gex_kernel::CodeMap> = store.data_mut().with_kernel(|k| k.mem.lock().log.new_code.clone());
+        if !pending.is_empty() {
+            let place = wasmtime::Func::wrap(&mut *store, move |mut caller: Caller<'_, HostState>| -> wasmtime::Result<()> {
+                crate::host(pe_units::on_elf_maps(&mut caller, &pending))
+            });
+            place.call(&mut *store, &[], &mut [])?;
+        }
+    }
     let mut pc = entry;
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
     loop {
@@ -5690,7 +5742,13 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let gm = GuestMem::new(memory.bytes());
         let c = ctx as u32 as u64;
-        let target = if gex_abi::X86 { gm.read_u64(c + ctx::LAST_TARGET as u64) } else { gm.read_u64(c + ctx::PC as u64) }.unwrap_or(0);
+        // The dispatch's target, as the dispatcher recorded it. Not
+        // `ctx::PC`: after an indirect branch's safepoint that is the branch
+        // itself, to be re-executed (a callback's `ret` into a call-out's
+        // return), though dispatch goes on to the target. A64's inline
+        // dispatch records nothing, and leaves only the PC.
+        let at = if gex_abi::X86 || !gex_emit::tier1::inline_dispatch() { ctx::LAST_TARGET } else { ctx::PC };
+        let target = gm.read_u64(c + at as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
         let state = caller.data_mut();
         let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);
@@ -6065,8 +6123,8 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
 
 /// A branch to `pc`, which is not executable guest memory, in a process
 /// without the NT layer: the process's own fault hook takes it as an access
-/// violation, executing (Wine's ntdll.so); else it is a SIGSEGV. Always
-/// stops the guest call.
+/// violation, executing (Wine's ntdll.so); else it is a SIGSEGV, for the
+/// program's handler if it has one. Always stops the guest call.
 pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<i32> {
     // The process's own fault hook (Wine's ntdll.so, W3):
     // an access violation, executing (DEP).
@@ -6097,6 +6155,16 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
             internal: true,
         });
         return Err(StopExecution.into());
+    }
+    // The program's own SIGSEGV handler, at the branch's target.
+    if let Some(memory) = caller.data().memory.clone() {
+        let mut gm = GuestMem::new(memory.bytes());
+        let state = caller.data_mut();
+        if let gex_kernel::signal::Delivery::Resume(target) = state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, pc)) {
+            state.resume_cause = Some("SIGSEGV".into());
+            state.resume_at = Some(target);
+            return Err(StopExecution.into());
+        }
     }
     // A wild branch is nearly always a bad return address or
     // function pointer: say where the last indirect branch
@@ -6186,6 +6254,12 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         if let Some(child) = caller.data_mut().pending_spawn.take() {
             let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
             start_guest_thread(cx, child)?;
+        }
+        // A fork from the guest code a call-out runs (a function-tier
+        // unit's libc calling `fork`): made here, as the run loop makes it,
+        // for the guest goes on in this loop and may wait for the child.
+        if let Some(req) = caller.data_mut().pending_fork.take() {
+            fork_process(&*caller, req, false)?;
         }
         let e = match r {
             Ok(()) => break Err(anyhow!("guest code returned out of a call-out")),
@@ -6446,6 +6520,7 @@ fn retire_translations(
     pe_units::on_retire(&memory, ranges, &gone);
     pe_units::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    pe_units::forget_gone(&mut sh.elf_units, &gone);
     let mut pages = 0usize;
     for &(start, end) in ranges {
         sh.translated.retain(|a| *a < start || *a >= end);
