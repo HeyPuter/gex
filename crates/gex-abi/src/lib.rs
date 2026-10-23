@@ -647,6 +647,13 @@ pub const fn fcache_entry(a: u64) -> u64 {
 /// entry cannot name it), and a probe compares the whole target, so an
 /// entry never stands for another address with the same low bits.
 pub const FCACHE_TAG_BITS: u32 = 36;
+/// The probe cache entry layout a native module's inline probe reads
+/// (`gex_ftab_idx` in gex_abi.h): 1 the index above 32 address bits, 2 the
+/// index above [`FCACHE_TAG_BITS`]. The header records it in every module
+/// built with it (a `gex.abi` custom section, one little-endian u32 per
+/// object), and the browser host refuses a W3 module built for another
+/// (a module without the section is a version-1 one).
+pub const NATIVE_ABI: u32 = 2;
 /// The address part of a probe cache entry.
 pub const FCACHE_TAG_MASK: u64 = (1 << FCACHE_TAG_BITS) - 1;
 /// One past the largest index an entry holds (its other 28 bits).

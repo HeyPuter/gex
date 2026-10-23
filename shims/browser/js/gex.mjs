@@ -5916,6 +5916,10 @@ export class Gex {
     let hook = null;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
+    // A program the shim refused there (a W3 Wine built for another probe
+    // layout, cgen/wasmprog.rs): the process has ended, and its ELF container
+    // is not guest code to enter.
+    if (this.#shim.exports.gex_exited?.()) return this.#shim.exports.gex_exit_code();
     for (;;) {
       if (this.#cov.size && performance.now() - this.#covAt > 250) {
         this.#covAt = performance.now();

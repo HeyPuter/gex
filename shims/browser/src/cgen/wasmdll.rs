@@ -206,6 +206,13 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                 ));
             }
         }
+        // W3's PE module: refused when its inline probe reads another layout
+        // (gexrt's `gex_ftab_idx`; W64's wasm64 gexrt has no probe).
+        if !pe.is64 {
+            if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
+                return Err(e);
+            }
+        }
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
         // (an LLP64 module's above the images: see `crate::w64_pe_data`)
@@ -492,6 +499,11 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
         }
         Err(e) => {
             crate::warn_line(&format!("gex-w3: {path}: native wasm32 DLL: {e}\n"));
+            // A module built for another probe layout runs nothing: the
+            // process ends here, not at its first wrong call.
+            if e.contains(super::wasmprog::ABI_REFUSED) {
+                crate::exit_process(127);
+            }
             -1
         }
     }

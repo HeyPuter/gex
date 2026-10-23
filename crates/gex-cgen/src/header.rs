@@ -46,6 +46,20 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_FCACHE_MUL 0x{:x}u", gex_abi::FCACHE_MUL);
     let _ = writeln!(w, "#define GEX_FCACHE_TAG_BITS {}u", gex_abi::FCACHE_TAG_BITS);
     let _ = writeln!(w, "#define GEX_FTAB_RESOLVE {}u", gex_abi::ftab::RESOLVE);
+    // The probe layout, kept in every module built with this header (a
+    // `gex.abi` custom section; gex_abi::NATIVE_ABI): the browser host
+    // refuses a W3 module whose inline probe reads another.
+    let _ = writeln!(w, "#define GEX_NATIVE_ABI {}u", gex_abi::NATIVE_ABI);
+    // (file-scope asm: clang puts a global with a `.custom_section.` section
+    // in a data segment; the assembler's section is a custom section. It
+    // goes back to `.text` in the long form: a bare `.text` leaves later
+    // file-scope asm functions (gexrt's) in the custom section, a backend
+    // error.)
+    let _ = writeln!(
+        w,
+        "__asm__(\".section .custom_section.gex.abi,\\\"\\\",@\\n.int32 {}\\n.section .text,\\\"\\\",@\\n\");",
+        gex_abi::NATIVE_ABI
+    );
     let _ = writeln!(w);
 
     // The context. Every named offset, then the per-register helpers.

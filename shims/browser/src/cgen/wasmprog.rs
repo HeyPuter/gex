@@ -49,6 +49,79 @@ pub(super) fn is_lowered(wasm: &[u8]) -> bool {
     false
 }
 
+/// The start of [`abi_refusal`]'s message (a caller that ends the process
+/// for it tells it from its other errors by this).
+pub(crate) const ABI_REFUSED: &str = "built for gex's native ABI";
+
+/// The probe layout a native module was built for (`gex_abi::NATIVE_ABI`):
+/// its `gex.abi` custom section's value, one little-endian u32 per object
+/// that included gex_abi.h; 1 without the section (a header from before it).
+/// A walk of the section headers only, nothing inside them parsed. `Err` for
+/// bytes that are not a module, or objects that disagree.
+pub(crate) fn native_abi(wasm: &[u8]) -> Result<u32, String> {
+    fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
+        let (mut v, mut shift) = (0usize, 0);
+        loop {
+            let x = *b.get(*at)?;
+            *at += 1;
+            v |= ((x & 0x7f) as usize) << shift;
+            if x & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+    }
+    if wasm.get(..4) != Some(b"\0asm") {
+        return Err("not a wasm module".into());
+    }
+    let bad = || "a malformed section header".to_string();
+    let mut at = 8;
+    let mut found: Option<u32> = None;
+    while at < wasm.len() {
+        let id = wasm[at];
+        at += 1;
+        let size = leb(wasm, &mut at).ok_or_else(bad)?;
+        let end = at.checked_add(size).filter(|&e| e <= wasm.len()).ok_or_else(bad)?;
+        if id == 0 {
+            let mut p = at;
+            let n = leb(wasm, &mut p).ok_or_else(bad)?;
+            if wasm.get(p..p + n) == Some(b"gex.abi") {
+                for v in wasm[p + n..end].chunks(4) {
+                    let v = u32::from_le_bytes(<[u8; 4]>::try_from(v).map_err(|_| "a gex.abi section of odd length".to_string())?);
+                    match found {
+                        Some(f) if f != v => return Err(format!("its objects disagree (gex.abi {f} and {v})")),
+                        _ => found = Some(v),
+                    }
+                }
+            }
+        }
+        at = end;
+    }
+    Ok(found.unwrap_or(1))
+}
+
+/// Why a W3 native module (`what`: Wine's loader or PE module) cannot run
+/// here, or `None`: its inline probe (gexrt's `gex_ftab_idx`) reads the probe
+/// cache in the layout it was built for, and with another one every hit is
+/// a wrong function-table index (a "function signature mismatch" trap far
+/// from the cause). Once per module install, nothing per call.
+pub(crate) fn abi_refusal(wasm: &[u8], what: &str) -> Option<String> {
+    let have = match native_abi(wasm) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("{what}: its gex.abi section: {e}")),
+    };
+    (have != gex_abi::NATIVE_ABI).then(|| {
+        format!(
+            "{what} is {ABI_REFUSED} {have}, this gex's is {}: rebuild Wine against this gex \
+             (include/wine/gex/gex_abi.h, `gexc cgen-c --header`)",
+            gex_abi::NATIVE_ABI
+        )
+    })
+}
+
 pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
 /// The program to publish (entry, whether its data is fresh, the table base
 /// it must have: a fork's child's, the parent's).
@@ -231,6 +304,12 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         }
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
+    // W3's loader: refused when its inline probe reads another layout.
+    if flags & FLAG_GUEST_I386 != 0 {
+        if let Some(e) = abi_refusal(&wasm, &format!("Wine's loader {}", exe_path())) {
+            return Err(e);
+        }
+    }
     // Parsed once for everything below. Three parses and a name for every
     // slot of the element segment (`slot_names`) made publishing bash 1.38 ms
     // of every fork child's start; this is 0.85 ms (demo page).
