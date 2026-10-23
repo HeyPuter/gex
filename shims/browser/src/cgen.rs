@@ -2108,6 +2108,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         c.len() - 1
     });
     OPENED_SPAN.with(|s| s.set(span as i64));
+    OPENED_DEPTH.with(|s| s.set(depth as i32));
     CALLOUT_N.fetch_add(1, Ordering::Relaxed);
     // Opened (result -1): one that never closes was abandoned by a throw.
     CALLOUT_RING.with(|x| {
@@ -2252,6 +2253,15 @@ pub extern "C" fn gex_callout_span() -> i64 {
     OPENED_SPAN.with(|s| s.replace(-1))
 }
 
+/// The index in [`CALLOUTS`] of the call-out `gex_ftab_fallback` just
+/// opened, for JS's loop that runs it to speak of it in this list's terms
+/// (`gex_callout_hit`, `gex_callout_leave_ok`); -1 once read, or when the
+/// call-out came from elsewhere (it is in JS's list alone).
+#[no_mangle]
+pub extern "C" fn gex_callout_opened() -> i32 {
+    OPENED_DEPTH.with(|s| s.replace(-1))
+}
+
 static CALLOUT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CALLOUT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2263,6 +2273,8 @@ thread_local! {
     static CALLOUTS: std::cell::RefCell<Vec<(u64, u64, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// [`gex_callout_span`].
     static OPENED_SPAN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    /// [`gex_callout_opened`].
+    static OPENED_DEPTH: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
     /// NT user-mode callbacks in progress on this Worker (nt.rs).
     static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The call-out whose return a dispatch miss found (`returned`), or -1.
