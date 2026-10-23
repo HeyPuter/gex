@@ -38,6 +38,8 @@
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
 # The authattrs case: crypt32 verifies a signature over authenticated
 # attributes as encoded, not in DER order (authattrs.c).
+# The qpcmono case: the performance counter, monotonic across the PE and
+# Unix sides (qpcmono.c).
 # The dwrite case: DirectWrite's glyph bounds, alpha texture and outline
 # (dwrite.c), when the loader has dwrite's Unix side.
 # The display case (W64.4), when the loader has winewayland.drv's Unix side
@@ -404,6 +406,15 @@ elif x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	esac
 else
 	fail=$((fail + 1)); echo "FAIL x64/highdata (W64): x86_64-w64-mingw32-gcc"
+fi
+# The performance counter as one timeline across the PE side's reads and
+# the Unix side's (qpcmono.c): monotonic, and a Unix-timed wait, a Sleep and
+# the tick count agree with it.
+if x86_64-w64-mingw32-gcc -O1 -o "$w/qpcmono.exe" "$here/qpcmono.c"; then
+	check qpcmono 0 "$allok" "$w/qpcmono.exe"
+else
+	case " ${CASES:-qpcmono} " in *" qpcmono "*)
+		fail=$((fail + 1)); echo "FAIL x64/qpcmono ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # A skeleton's view unmapped and its addresses reused for the program's own
 # code (stalebind.c): the native bindings must not outlive the view. Only
