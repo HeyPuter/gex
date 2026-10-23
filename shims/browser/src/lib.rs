@@ -14519,12 +14519,21 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 // called from a unit cost most of a Plasma shell's start-up).
                 // So the pages of every block that module provides here are
                 // retired now, as a flushed page's are, and its blocks are
-                // translated again with the numbering as it is.
+                // translated again with the numbering as it is. Its blocks are
+                // the addresses whose slots name its range of `blocks` (its
+                // dense base, unique in the process); its id alone is not
+                // enough, since a module adopted from another process or
+                // restored from the translation cache carries an id that one
+                // of this process's own may have too.
+                let n = ours.unwrap_or(0);
                 let mut pages: std::collections::BTreeSet<u64> = j
                     .provider
-                    .iter()
-                    .filter(|&(_, &m)| m & 0xffff_ffff == stale_id)
-                    .map(|(&a, _)| gex_abi::dispatch_page(a))
+                    .keys()
+                    .filter(|&&a| {
+                        let d = dense::index(a);
+                        d >= stale_base && d < stale_base + n
+                    })
+                    .map(|&a| gex_abi::dispatch_page(a))
                     .collect();
                 pages.insert(gex_abi::dispatch_page(start));
                 if jit_diag() {
