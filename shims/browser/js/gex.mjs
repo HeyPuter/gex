@@ -4504,22 +4504,33 @@ export class Gex {
   #covHit(key, slots) {
     let h = this.#cov.get(key);
     if (!h) {
-      // One memory per Worker for every unit's map (each Memory reserves
-      // address space: one per unit ran a page out of it), at an offset per
-      // unit. (module (import "m" "m" (memory 1)) (import "m" "o" (global i32))
-      //   (func (export "hit") (param i32) local.get 0 global.get 0 i32.add
-      //   i32.const 1 i32.store8))
-      const wasm = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 1, 127, 0,
-        2, 15, 2, 1, 109, 1, 109, 2, 0, 1, 1, 109, 1, 111, 3, 127, 0, 3, 2, 1, 0, 7, 7, 1, 3, 104, 105, 116, 0, 0,
-        10, 14, 1, 12, 0, 32, 0, 35, 0, 106, 65, 1, 58, 0, 0, 11]);
+      // One memory per Worker for every unit's counts (each Memory reserves
+      // address space: one per unit ran a page out of it), a u32 per slot at
+      // an offset per unit. The first entry also calls `f` with the slot,
+      // which notes the time (the profile's first use). The count saturates.
+      // (module (import "m" "m" (memory 1)) (import "m" "o" (global i32))
+      //   (import "m" "f" (func $f (param i32)))
+      //   (func (export "hit") (param $s i32) (local $a i32) (local $c i32)
+      //     local.get $s global.get 0 i32.add i32.const 2 i32.shl local.tee $a
+      //     i32.load local.tee $c i32.eqz if local.get $s call $f end
+      //     local.get $a local.get $c i32.const 1 i32.add i32.const -1
+      //     local.get $c i32.const -1 i32.ne select i32.store))
+      const wasm = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 1, 127, 0, 2, 21, 3, 1, 109, 1, 109, 2, 0, 1,
+        1, 109, 1, 111, 3, 127, 0, 1, 109, 1, 102, 0, 0, 3, 2, 1, 0, 7, 7, 1, 3, 104, 105, 116, 0, 1, 10, 47, 1, 45, 1, 2,
+        127, 32, 0, 35, 0, 106, 65, 2, 116, 34, 1, 40, 2, 0, 34, 2, 69, 4, 64, 32, 0, 16, 0, 11, 32, 1, 32, 2, 65, 1, 106,
+        65, 127, 32, 2, 65, 127, 71, 27, 54, 2, 0, 11]);
       this.#covMod ??= new WebAssembly.Module(wasm);
       this.#covMem ??= new WebAssembly.Memory({ initial: 1 });
       const off = this.#covUsed;
       this.#covUsed += slots;
-      const need = Math.ceil(this.#covUsed / 65536) - this.#covMem.buffer.byteLength / 65536;
+      const need = Math.ceil((4 * this.#covUsed) / 65536) - this.#covMem.buffer.byteLength / 65536;
       if (need > 0) this.#covMem.grow(need);
-      const inst = new WebAssembly.Instance(this.#covMod, { m: { m: this.#covMem, o: new WebAssembly.Global({ value: 'i32' }, off) } });
-      h = { off, n: slots, hit: inst.exports.hit, said: new Uint8Array(slots) };
+      // First use, in ms of the epoch (performance.timeOrigin + now(), so
+      // every Worker's and the page's times compare).
+      const first = new Map();
+      const f = (slot) => { first.set(slot, Math.round(performance.timeOrigin + performance.now())); };
+      const inst = new WebAssembly.Instance(this.#covMod, { m: { m: this.#covMem, o: new WebAssembly.Global({ value: 'i32' }, off), f } });
+      h = { off, n: slots, hit: inst.exports.hit, said: new Uint8Array(slots), sent: new Uint32Array(slots), first };
       this.#cov.set(key, h);
       this.#covTimer ??= setInterval(() => this.covFlush(), 2000);
     }
@@ -4531,11 +4542,15 @@ export class Gex {
   #covUsed = 0;
 
   /** Say the slots instrumented units were entered at since the last time:
-   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-w3.mjs). */
+   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-w3.mjs), and
+   *  the profile, `[gex-prof] <key> <slot>:<first>:<calls>,...`: each slot
+   *  entered since, its first entry (ms of the epoch; empty once said) and
+   *  its entries since the last line (gexc units profile adds them up). */
   covFlush() {
     for (const [key, h] of this.#cov) {
-      const m = new Uint8Array(this.#covMem.buffer, h.off, h.n);
+      const m = new Uint32Array(this.#covMem.buffer, 4 * h.off, h.n);
       const runs = [];
+      const prof = [];
       let a = -1;
       for (let k = 0; k <= h.n; k++) {
         const fresh = k < h.n && m[k] && !h.said[k];
@@ -4545,8 +4560,15 @@ export class Gex {
           h.said.fill(1, a, k);
           a = -1;
         }
+        if (k < h.n && m[k] !== h.sent[k]) {
+          const t = h.first.get(k);
+          if (t !== undefined) h.first.delete(k);
+          prof.push(`${k}:${t ?? ''}:${(m[k] - h.sent[k]) >>> 0}`);
+          h.sent[k] = m[k];
+        }
       }
       if (runs.length) console.warn(`[gex-cov] ${key} ${runs.join(',')}`);
+      if (prof.length) console.warn(`[gex-prof] ${key} ${prof.join(',')}`);
     }
   }
 

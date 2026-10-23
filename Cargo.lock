@@ -645,6 +645,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-split",
+ "gex-units",
  "gex-xlate",
  "wasmparser 0.219.2",
 ]
@@ -825,6 +826,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-units"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-split",
+]
+
+[[package]]
 name = "gex-wayland"
 version = "0.0.1"
 
@@ -867,6 +876,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-split",
+ "gex-units",
  "gex-xlate",
  "libc",
 ]

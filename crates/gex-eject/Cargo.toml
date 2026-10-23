@@ -16,6 +16,7 @@ gex-native.workspace = true
 gex-kernel.workspace = true
 gex-cgen.workspace = true
 gex-split.workspace = true
+gex-units.workspace = true
 gex-ir.workspace = true
 gex-key.workspace = true
 anyhow = "1"

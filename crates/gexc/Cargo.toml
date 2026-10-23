@@ -13,6 +13,7 @@ path = "src/main.rs"
 libc = "0.2"
 gex-cgen.workspace = true
 gex-split.workspace = true
+gex-units.workspace = true
 gex-abi.workspace = true
 gex-ir.workspace = true
 gex-ld.workspace = true

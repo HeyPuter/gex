@@ -18,6 +18,7 @@ mod prof;
 mod eject;
 mod nt_run;
 mod pe_info;
+mod units;
 mod host_xattr;
 mod host_walk;
 
@@ -78,6 +79,7 @@ fn real_main() -> Result<ExitCode> {
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "units" => units::cmd_units(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
         // `eject run` runs the guest, as `run` does: on a thread with a
         // guest-sized stack, under GEX_PROF when asked.
@@ -151,6 +153,16 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+  gexc units profile OUT LOG...     instrumented runs' [gex-prof] lines (and
+                                   *.prof files) added up into a unit profile
+  gexc units select PROFILE CACHE OUT [--link-mbit N ...]
+                                   which slots to ship as unit code: the sweep
+                                   of download against fallback time, OUT the
+                                   least point's select.json
+  gexc units build CACHE SELECT OUT [--fallback jit|CLUSTERING] [--whole]
+                                   CACHE's units into the unit cache OUT, SELECT's
+                                   slots compiled, the rest on the fallback;
+                                   --preload PREFIX: the page's preload.json
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
