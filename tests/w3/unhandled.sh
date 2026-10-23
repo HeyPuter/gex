@@ -4,7 +4,7 @@
 # raised it and whatever native frames lie between, as on Windows. In the
 # page's runtime under Node (run-node.mjs) with the exe's unit (its faults
 # are delivered in place, under the native frames), without it (tier-1),
-# natively (gexc run). Natively and on tier-1
+# and with the function JIT; natively (gexc run). Natively and on tier-1
 # only cases 1-12: their guest calls from native code nest one call-out
 # each, and past the call-out depth cap such a nest does not come back.
 #
@@ -50,7 +50,7 @@ units > "$w/build.log" 2>&1 && GEX_CGEN_CACHE="$w/units-t1" "$gexc" cgen-image -
 pass=0 fail=0
 # LOST: how many exceptions reach the run loop with their handler's frame
 # gone (raised again with no handler): only those no code goes on after
-# (case 10's KUSER read). Any other is a fault
+# (case 10's KUSER read; the function JIT's int3 too). Any other is a fault
 # delivered from the run loop under native frames it dropped.
 verdict() { # NAME LOG CASES LOST
 	local got lost; got=$(grep -a '^case [0-9]* exit' "$2" | tr -d '\r' | head -n "$3")
@@ -84,5 +84,7 @@ if grep -q 'function tier for .*/unhandled.exe' "$w/page.log"; then verdict page
 else fail=$((fail + 1)); echo "FAIL page: unhandled.exe ran without its unit"; fi
 cache="$w/units-t1" page "$w/page-t1.log" 12
 verdict "page, tier-1" "$w/page-t1.log" 12 0
+cache="$w/units-t1" page "$w/page-fjit.log" 14 GEX_FJIT=1
+verdict "page, function JIT" "$w/page-fjit.log" 14 2
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

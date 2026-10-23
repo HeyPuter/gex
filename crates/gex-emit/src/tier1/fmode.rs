@@ -108,6 +108,12 @@ impl<'a> FnBody<'a> {
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
     }
 
+    /// Faults the function goes on after: their import's `pc` carries
+    /// `bit`, and the function leaves (returns 0) when the import returns.
+    pub fn resumable_faults(&mut self, bit: u64) {
+        self.e.resumable_pc = bit;
+    }
+
     /// The code, for the JIT's own control flow.
     pub fn f(&mut self) -> &mut FuncBody {
         &mut self.e.f

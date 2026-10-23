@@ -267,6 +267,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     }
 
     let mut b = FnBody::new(m.cx, f.entry, 4, &used, f.n_values);
+    b.resumable_faults(gex_cgen::RESUMABLE_PC);
     let sp0 = b.local(ValType::I64);
     let poll = b.local(ValType::I32);
     let hot = b.local(ValType::I32);
@@ -570,6 +571,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let entry_set = always(used_set).union(rlive[lp.header]).union(dirty[lp.header]).inter(used_set);
     let vin = valid_in(m, f, &in_loop, lp.header, entry_set, &rlive, &dirty, used_set);
     let mut b = FnBody::new(m.cx, f.blocks[lp.header].start, 5, &used, f.n_values);
+    b.resumable_faults(gex_cgen::RESUMABLE_PC);
     let poll = b.local(ValType::I32);
     let hot = b.local(ValType::I32);
     let lr = b.local(ValType::I32);
@@ -1434,10 +1436,13 @@ impl E<'_, '_> {
                 let il = self.m.cx.illegal;
                 let fb = self.b.f();
                 fb.local_get(0);
-                fb.i64_const(*pc as i64);
+                fb.i64_const((*pc | gex_cgen::RESUMABLE_PC) as i64);
                 fb.i32_const(*raw as i32);
                 fb.call(il);
-                fb.unreachable();
+                // The host raised the fault and returned with the handlers'
+                // state in the context: leave for it.
+                fb.i32_const(0);
+                fb.ret();
             }
         }
     }

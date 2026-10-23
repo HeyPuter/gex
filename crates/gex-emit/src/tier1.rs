@@ -735,6 +735,11 @@ struct Emitter<'a> {
     /// function uses has a local for its whole body, bound up front, and a
     /// clobbering host call reloads them all rather than forgetting them.
     func_regs: Option<Vec<GuestReg>>,
+    /// Function mode: OR-ed into a trap's pc (the fault import's `pc`) when
+    /// the code goes on after the import returns, by leaving the function
+    /// (returning 0: the caller goes on at the context's PC); 0 when the
+    /// host never returns from a fault.
+    resumable_pc: u64,
     /// Function mode: the local the next `def` leaves its value in (a
     /// register's, when a `WriteReg` of the value follows at once). Taken
     /// by `def`'s common tail; left set by a definition that has no local.
@@ -804,6 +809,7 @@ impl<'a> Emitter<'a> {
             region: None,
             region_writes: Default::default(),
             func_regs: None,
+            resumable_pc: 0,
             def_into: None,
             fp_result: false,
             value_fp: Vec::new(),
@@ -1815,11 +1821,18 @@ impl<'a> Emitter<'a> {
                 self.flush_conditional();
                 self.store_pc(*pc);
                 self.f.local_get(self.ctx_local);
-                self.f.i64_const(*pc as i64);
+                self.f.i64_const((*pc | self.resumable_pc) as i64);
                 self.f.i32_const(*code);
                 self.f.call(self.cx.breakpoint);
-                // The host raises the fault and never returns.
-                self.f.unreachable();
+                if self.resumable_pc != 0 {
+                    // The host raised the fault and returned with the
+                    // handlers' state in the context: leave for it.
+                    self.f.i32_const(0);
+                    self.f.ret();
+                } else {
+                    // The host raises the fault and never returns.
+                    self.f.unreachable();
+                }
                 self.f.end();
             }
             Stmt::VStore {
