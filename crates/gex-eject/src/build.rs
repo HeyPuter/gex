@@ -465,7 +465,7 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()>
             *count += 1;
         }
     }
-    Ok(())
+    crate::eject::keep_dir_mtime(to, &std::fs::metadata(from)?)
 }
 
 /// Everything translation needs, for the native and the web module sets.

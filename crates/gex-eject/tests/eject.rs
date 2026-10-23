@@ -374,3 +374,51 @@ fn eject_keeps_files_only_looked_at() {
     assert!(project.contains("none.qml") && !project.contains("gone.qml"), "a failed look stays missing; a vanished one is nothing");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A project's directories keep the run's modification times, not the
+/// eject's: KDE's ksycoca is rebuilt when a directory it indexes looks newer
+/// than the database.
+#[test]
+fn eject_keeps_directory_times() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gex-eject-dirtime-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("rec")).unwrap();
+    std::fs::create_dir_all(tmp.join("in/apps")).unwrap();
+    let exe = tmp.join("prog");
+    let bytes = elf();
+    std::fs::write(&exe, &bytes).unwrap();
+    std::fs::write(tmp.join("in/apps/a.desktop"), b"[Desktop Entry]").unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for d in ["in/apps", "in"] {
+        std::fs::File::open(tmp.join(d)).unwrap().set_modified(old).unwrap();
+    }
+    let path = exe.to_string_lossy().into_owned();
+    let at = |rel: &str| tmp.join(rel).to_string_lossy().into_owned();
+    let mut session = Session {
+        isa: gex_abi::ARCH_NAME.into(),
+        argv: vec![path.clone()],
+        cwd: Some("/".into()),
+        objects: vec![ObjectEntry {
+            id: eject::sha256(&bytes),
+            path: path.clone(),
+            host_path: None,
+            size: bytes.len() as u64,
+            role: "exe".into(),
+        }],
+        programs: vec![ProgramEntry { pid: 1, exe: path.clone(), argv: vec![path.clone()], env: vec![] }],
+        processes: 1,
+        threads: 1,
+        ..Session::default()
+    };
+    let f = FileEntry { path: at("in/apps/a.desktop"), read: true, ok: 1, ..Default::default() };
+    session.files.insert(f.path.clone(), f);
+    std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let p = tmp.join("p");
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
+    for d in ["in/apps", "in"] {
+        assert_eq!(std::fs::metadata(root(d)).unwrap().modified().unwrap(), old, "{d} keeps the run's time");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -104,6 +104,33 @@ pub fn keep_mtime(path: &Path, like: &std::fs::Metadata) -> Result<()> {
         .with_context(|| format!("setting the modification time of {}", path.display()))
 }
 
+/// Give the directory `path` the modification time of `like`. A program may
+/// compare a directory's time with a cache it made (KDE's ksycoca against
+/// the directories it indexes), so a copy made later must not look newer.
+pub fn keep_dir_mtime(path: &Path, like: &std::fs::Metadata) -> Result<()> {
+    let t = like.modified().context("reading a modification time")?;
+    std::fs::File::open(path)
+        .and_then(|f| f.set_modified(t))
+        .with_context(|| format!("setting the modification time of {}", path.display()))
+}
+
+/// Every directory under `root` that is also one of the run's (`host`'s,
+/// at the same relative path) takes that directory's modification time,
+/// `root` among them. Run once its files are all in place: adding one
+/// changes its directory's time.
+pub(crate) fn keep_dir_mtimes(root: &Path, host: &Path) -> Result<()> {
+    for e in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let e = e?;
+        if e.file_type()?.is_dir() {
+            keep_dir_mtimes(&e.path(), &host.join(e.file_name()))?;
+        }
+    }
+    match std::fs::metadata(host) {
+        Ok(m) if m.is_dir() => keep_dir_mtime(root, &m),
+        _ => Ok(()),
+    }
+}
+
 /// A guest path without `.` components or a trailing slash.
 fn normalize(p: &str) -> String {
     let parts: Vec<&str> = p.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
@@ -341,6 +368,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         let p = out.join(rootfs_rel(d)?);
         std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
     }
+    keep_dir_mtimes(&out.join("rootfs"), &host_path(sysroot, "/"))?;
 
     // The session itself, for the build (the profile seeds translation) and
     // for the reader.
