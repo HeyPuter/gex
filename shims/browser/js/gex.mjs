@@ -166,6 +166,14 @@ const tIdx = (v) => (m64() ? BigInt(v) : v);
  * memory needs the `slice` copy; it is only paid when the memory is shared.
  */
 const DECODER = new TextDecoder();
+/** Byte, word and DataView views of all of `buf`: what a door call reads a
+ *  client's request through. The word view's length is computed without
+ *  `>>> 2`, which wraps for a 64-bit memory past 4 GiB (a memory of 4 GiB +
+ *  64 KiB gave a view of 16384 words). */
+export function memoryViews(buf) {
+  return { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, Math.floor(buf.byteLength / 4)), dv: new DataView(buf) };
+}
+
 export function utf8(view) {
   return DECODER.decode(isShared(view.buffer) ? view.slice() : view);
 }
@@ -5531,7 +5539,7 @@ export class Gex {
     let g = this.#doorGv;
     if (!g || end > g.u8.length) {
       const buf = this.#memory.buffer;
-      g = this.#doorGv = { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, buf.byteLength >>> 2), dv: new DataView(buf) };
+      g = this.#doorGv = memoryViews(buf);
     }
     return g;
   }
