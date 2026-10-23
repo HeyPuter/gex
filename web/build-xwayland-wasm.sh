@@ -717,14 +717,17 @@ if '-sMODULARIZE=1' not in s:
     open(p, 'w').write(s)
 PATCH
 rm -rf "$OUT/build/xserver"
+# XRes, XINERAMA, DPMS and MIT-SCREEN-SAVER are left at the server's default
+# (built): a desktop's clients use them, and some without asking whether the
+# server has them, which xcb ends the connection for (Plasma's task manager
+# asks XRes for a window's pid).
 meson setup "$OUT/build/xserver" "$SRC/xserver" --cross-file "$OUT/emscripten.ini" \
     --prefix="$PREFIX" --buildtype=release -Ddefault_library=static \
     -Dglamor=false -Dxvfb=false -Dglx=false -Dxdmcp=false -Dxdm-auth-1=false \
     -Dsecure-rpc=false -Dipv6=false -Dinput_thread=false -Dsha1=libmd \
     -Ddri3=false -Ddrm=false -Dxwayland_ei=false -Dlisten_tcp=false \
     -Dlisten_local=false -Dxselinux=false -Dsystemd_notify=false -Ddocs=false \
-    -Ddevel-docs=false -Dlibdecor=false -Dxres=false -Dxinerama=false \
-    -Ddpms=false -Dscreensaver=false -Dxv=false -Dmitshm=false \
+    -Ddevel-docs=false -Dlibdecor=false -Dxv=false -Dmitshm=false \
     -Ddefault_font_path=built-ins -Dc_thread_count=0 \
     > "$OUT/log-xserver.txt" 2>&1 || { tail -20 "$OUT/log-xserver.txt"; exit 1; }
 strip_pthread "$OUT/build/xserver"
