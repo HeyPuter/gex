@@ -5668,6 +5668,8 @@ pub(crate) enum CalloutSignal {
 /// Call-outs nested deeper than this leave instead: each holds a host frame
 /// and a nested wasm call.
 const CALLOUT_MAX_DEPTH: usize = 32;
+/// The same for native Wine's guest calls, which cannot leave.
+const CALLOUT_MAX_DEPTH_NATIVE: usize = 400;
 
 /// How far above `sp_want` a safepoint must find the stack pointer to call
 /// a call-out's caller unwound (well past any argument popping), and how far
@@ -6211,7 +6213,16 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
 /// cannot be done, and the caller leaves as before. `need` is the caller's
 /// (`ftab::need_args` bounds a guest call from native Wine).
 fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64, need: u32) -> Result<i32> {
-    if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
+    // Native Wine's guest call (its return pad) cannot be left: its C caller
+    // would never run again and the guest's return to the pad find no
+    // call-out. Those nest as deep as the program's callbacks do.
+    let pad = ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
+    if pad && caller.data().callouts.len() >= CALLOUT_MAX_DEPTH_NATIVE {
+        eprintln!("gex: native Wine's guest calls nest deeper than {CALLOUT_MAX_DEPTH_NATIVE}: the process ends (stack overflow)");
+        caller.data_mut().exit = Some(Exit::Status(0xfd));
+        return Err(StopExecution.into());
+    }
+    if (!pad && caller.data().callouts.len() >= CALLOUT_MAX_DEPTH) || caller.data().jit.is_none() {
         if crate::stall::on() {
             crate::stall::callout(target, ret | 1 << 63, true);
         }
@@ -6221,7 +6232,6 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
-    let pad = ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
     let args = gex_abi::ftab::need_args(need).filter(|_| pad);
     let unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
     let span = args.unwrap_or(CALLOUT_UNWOUND);
