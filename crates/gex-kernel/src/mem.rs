@@ -586,6 +586,9 @@ impl MemoryMap {
         let mut fresh = MemoryMap::new(brk_start);
         std::mem::swap(&mut fresh.view, &mut self.view);
         std::mem::swap(&mut fresh.log, &mut self.log);
+        // The log goes on (the host has still to retire the old code), but
+        // not the old image's shared mappings: exec wrote them back already.
+        fresh.log.shared_maps.clear();
         *self = fresh;
         self.publish();
     }

@@ -7868,6 +7868,13 @@ impl SharedMaps {
         self.publish();
     }
 
+    /// None any more: an exec's new image maps nothing of the old one's.
+    pub fn clear(&mut self) {
+        self.list.clear();
+        self.recent.clear();
+        self.publish();
+    }
+
     /// A forked child's list: the same mappings, with their own view and
     /// their own copy of the page hashes.
     pub fn fork_copy(&self) -> SharedMaps {
@@ -14843,6 +14850,33 @@ mod tests {
         assert_eq!(m.read(0x07021004, 3).unwrap(), b"new", "the private copy has the shared mapping's writes");
         m.write(0x07021004, b"own").unwrap();
         assert_eq!(m.read(0x07011004, 3).unwrap(), b"new", "and its own writes stay its own");
+    }
+
+    /// An exec leaves no shared mapping behind. One that stayed on the list
+    /// was the old program's: the new one's mapping of the same file was
+    /// handed the old address (and saw whatever the new image had there), and
+    /// its exit wrote that memory into the file.
+    #[test]
+    fn an_exec_leaves_no_shared_mapping_behind() {
+        use crate::mem::{flags as mf, prot};
+        let (_, mut k) = setup();
+        let mut buf = vec![0u8; 0x0708_0000];
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let rw = (prot::READ | prot::WRITE) as u64;
+        m.write(0x20000, b"/x\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        m.write(0x21000, b"data").unwrap();
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PWRITE64, &[fd, 0x21000, 4, 0]), 4);
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07010000, 0x1000, rw, mf::SHARED | mf::FIXED, fd, 0]), 0x07010000);
+        assert_eq!(k.mem.lock().log.shared_maps.len(), 1);
+        k.mem.lock().renew(0);
+        assert_eq!(k.mem.lock().log.shared_maps.len(), 0);
+        // The new image's memory there, and its exit: the file keeps its bytes.
+        m.write(0x07010000, &[0u8; 4]).unwrap();
+        k.map_io().flush_all_shared(&m);
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PREAD64, &[fd, 0x22000, 4, 0]), 4);
+        assert_eq!(m.read(0x22000, 4).unwrap(), b"data");
     }
 
     /// A shared mapping unmapped and mapped again: the file unchanged, the
