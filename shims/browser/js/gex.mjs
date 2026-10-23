@@ -5715,16 +5715,33 @@ export class Gex {
     const e = this.#shim.exports;
     const p = BigInt.asUintN(64, BigInt(pc));
     if (!(p & (1n << 61n))) return e.gex_syscall(ctx, pc);
+    const sp0 = e.__stack_pointer.value;
     try {
       return e.gex_syscall(ctx, pc);
     } catch (err) {
       if (err?.gexHandoff || !e.gex_handoff()) throw err;
       err.gexHandoff = true;
       if (e.gex_exited?.()) throw err;
-      // gex_nr::NATIVE_LEFT: the call-out it is nested in decides.
+      // gex_nr::NATIVE_LEFT: the guest re-entered native code from above
+      // the innermost native entry. Only when the innermost loop is a native
+      // caller's call-out that the guest has left does it leave (its caller
+      // drops its frames, `#callOutSteps`). Otherwise gexrt's mark is stale
+      // or the frames it left were reached without a call-out (a function
+      // body called straight from native code): the call returns and the
+      // guest goes on nested, and gexrt's own checks drop the dead frames
+      // when the guest returns past them. Trapping on would drop every
+      // native frame down to the innermost loop, live ones included.
       if (e.gex_nt_native_left?.()) {
-        err.gexNativeLeft = true;
-        throw err;
+        const c = this.#callouts.at(-1);
+        const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_SP, true);
+        if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
+          err.gexNativeLeft = true;
+          throw err;
+        }
+        e.__stack_pointer.value = sp0;
+        e.gex_resume_pc();
+        e.gex_resume_ctx();
+        return;
       }
       const stop = p & ~(1n << 61n);
       const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
