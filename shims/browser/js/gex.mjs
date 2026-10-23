@@ -1691,6 +1691,31 @@ export class Gex {
         // A thread a direct entry's call staged (cgen.rs `w64_entry` asks
         // only when there is one).
         thread_start: () => this.#startThread(),
+        // A guest fault given to the process's fault hook in place (cgen.rs
+        // `fault_in_place`), its C frames below the guest's stack pointer
+        // as `#hookStack` puts them. A native __EXCEPT's longjmp out of the
+        // hook's dispatch passes through here to its own frame. 0: not here
+        // (the single-thread build: the staged fault then).
+        fault_call: (idx, ctx, code, addr, kind, sp) => {
+          if (single.on) return 0;
+          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+          const cur = spG.value;
+          const wide = typeof cur === 'bigint';
+          if (wide) {
+            const rsp = BigInt.asUintN(64, sp);
+            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+          } else {
+            const esp = Number(sp & 0xffffffffn);
+            spG.value = ((Math.min(Number(cur) >>> 0, esp) - 4096) & ~15) | 0;
+          }
+          try {
+            f(ctx, code, this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind);
+          } finally {
+            spG.value = cur;
+          }
+          return 1;
+        },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -4641,6 +4666,22 @@ export class Gex {
     return this.#provTag;
   }
 
+  /** A native `__TRY`'s longjmp that reached the outermost run loop, its
+   *  frame gone (cgen.rs `gex_handler_lost`): true when the shim raised the
+   *  exception again with no handler, a fault the loop delivers. */
+  #handlerLost(err, ctx) {
+    const e = this.#shim.exports;
+    if (!e.gex_handler_lost || typeof WebAssembly.Exception !== 'function' || !(err instanceof WebAssembly.Exception)) return false;
+    for (const inst of [this.#guest, ...(this.#cgen?.instances ?? [])]) {
+      const tag = inst?.exports?.__c_longjmp;
+      if (!(tag instanceof WebAssembly.Tag) || !err.is(tag)) continue;
+      const p = Number(err.getArg(tag, 0)) >>> 0;
+      const jmp = new DataView(this.#memory.buffer).getUint32(p, true);
+      return e.gex_handler_lost(ctx, jmp) === 1;
+    }
+    return false;
+  }
+
   /** What reached the run loop, for a crash report: an Error's message, a
    *  wasm exception by the export name of its tag in this Worker's modules
    *  (a C++ throw or a longjmp whose catching frame is not on this stack),
@@ -6110,8 +6151,8 @@ export class Gex {
         // process's death by SIGSEGV -- and the trap is a handoff after all.
         // Not when the shim says the trap was its own (in a syscall, or
         // translating): that stays a crash.
-        const guestFault = crashed && /memory access out of bounds/.test(err?.message ?? '') &&
-          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1;
+        const guestFault = crashed && ((/memory access out of bounds/.test(err?.message ?? '') &&
+          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1) || this.#handlerLost(err, ctx));
         if (crashed && !guestFault && this.#vfork.length && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
