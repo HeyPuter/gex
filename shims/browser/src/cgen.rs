@@ -1873,7 +1873,8 @@ pub extern "C" fn gex_ftab_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let addr = addr as u64;
-    if FCACHE_STATS.load(Ordering::Relaxed) {
+    let stats = FCACHE_STATS.load(Ordering::Relaxed);
+    if stats {
         fcache_stat(addr);
     }
     // Filler no function has (`STRAY_PC`): the fallback's.
@@ -1894,6 +1895,9 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
             patched && m.install(f.install).module < PROVIDER
         };
         if stale {
+            if stats {
+                fcache_why(W_STALE);
+            }
             m.retire(addr);
             return None;
         }
@@ -1903,6 +1907,9 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         // holds the retired body would find itself in the slot when the body
         // sees its page patched and leaves through the cache -- calling
         // itself forever (explorer's uxtheme.dll DllMain, reloaded).
+        if stats && f.idx >= ftab_safe_len() {
+            fcache_why(W_REFUSED);
+        }
         fcache_publish(mem, addr, f.idx);
         Some(f.idx)
     });
@@ -1917,6 +1924,12 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let served = hit.is_some();
     let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
+    if stats {
+        fcache_why(if served { W_SERVED } else if idx == gex_abi::ftab::FALLBACK { W_FALLBACK } else { W_JIT });
+        if !served && idx >= ftab_safe_len() {
+            fcache_why(W_REFUSED);
+        }
+    }
     if !served {
         fcache_publish(mem, addr, idx);
     }
@@ -1943,6 +1956,30 @@ pub extern "C" fn gex_set_fcache_stats(on: i32) {
     FCACHE_STATS.store(on != 0, Ordering::Relaxed);
 }
 
+// Why each miss happened, for the same line: at entry, the address's slot
+// held another address (a collision) or none; then whether a function
+// served it, the function JIT made one, or the fallback took it; stale
+// entries retired; and indices the cache refused for a Worker's short table
+// (`ftab_safe_len`: every call through such an index looks up again).
+const W_COLLISION: usize = 0;
+const W_EMPTY: usize = 1;
+const W_SERVED: usize = 2;
+const W_JIT: usize = 3;
+const W_FALLBACK: usize = 4;
+const W_STALE: usize = 5;
+const W_REFUSED: usize = 6;
+thread_local! {
+    static FCACHE_WHY: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
+}
+
+fn fcache_why(k: usize) {
+    FCACHE_WHY.with(|c| {
+        let mut v = c.get();
+        v[k] += 1;
+        c.set(v);
+    });
+}
+
 thread_local! {
     /// This Worker's misses since its last line: (since ns, above 4 GiB, by address).
     static FCACHE_MISSES: std::cell::RefCell<(u64, u64, std::collections::HashMap<u64, u64>)> = Default::default();
@@ -1956,6 +1993,13 @@ fn fcache_stat(addr: u64) {
             m.0 = now;
         }
         m.1 += (addr >> 32 != 0) as u64;
+        {
+            let mem = crate::guest_bytes();
+            let at = gex_abi::fcache_entry(addr) as usize;
+            let e = mem.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+            let other = e >> gex_abi::FCACHE_TAG_BITS != gex_abi::ftab::RESOLVE as u64 && e & gex_abi::FCACHE_TAG_MASK != addr & gex_abi::FCACHE_TAG_MASK;
+            fcache_why(if other { W_COLLISION } else { W_EMPTY });
+        }
         *m.2.entry(addr).or_insert(0) += 1;
         let secs = now.saturating_sub(m.0) as f64 / 1e9;
         if secs < 10.0 {
@@ -1965,12 +2009,17 @@ fn fcache_stat(addr: u64) {
         let mut top: Vec<(u64, u64)> = m.2.iter().map(|(a, c)| (*c, *a)).collect();
         top.sort_unstable_by(|a, b| b.cmp(a));
         let top: Vec<String> = top.iter().take(5).map(|(c, a)| format!("{a:#x} {c}")).collect();
+        let w = FCACHE_WHY.with(|c| c.replace([0; 7]));
         crate::warn_line(&format!(
-            "[gex] fcache: pid {} {n} probe misses in {secs:.1} s ({:.0}/s), {} above 4 GiB, {} addresses; most: {}\n",
+            "[gex] fcache: pid {} tid {} {n} probe misses in {secs:.1} s ({:.0}/s), {} above 4 GiB, {} addresses; slot held another {} none {}; served {} jit {} fallback {} stale {} refused {} (safe {} size {}); most: {}\n",
             crate::gex_my_pid(),
+            crate::my_tid(),
             n as f64 / secs,
             m.1,
             m.2.len(),
+            w[W_COLLISION], w[W_EMPTY], w[W_SERVED], w[W_JIT], w[W_FALLBACK], w[W_STALE], w[W_REFUSED],
+            ftab_safe_len(),
+            FTAB_SIZE.load(Ordering::Relaxed),
             top.join(", ")
         ));
         *m = (now, 0, Default::default());
