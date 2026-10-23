@@ -3706,11 +3706,16 @@ export class Gex {
     return this.#vforks;
   }
 
-  async #drainFork() {
+  /** The fork this thread staged, started (`#startFork`): its promise, or
+   *  null with none staged. No promise otherwise, since a call-out's loop
+   *  asks at every trap and may never reach the event loop. */
+  #drainFork() {
+    const pid = this.#shim.exports.gex_fork_pending?.();
+    return pid ? this.#startFork(pid) : null;
+  }
+
+  async #startFork(pid) {
     const e = this.#shim.exports;
-    if (!e.gex_fork_pending) return;
-    const pid = e.gex_fork_pending();
-    if (!pid) return;
     const child = {
       pid,
       pc: e.gex_fork_pc(),
@@ -5158,7 +5163,7 @@ export class Gex {
           if (ok > 0) this.#vforkChild();
           else if (ok !== -2) this.#vforkCopied(ok);
         }
-        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#startThread();
       }
     };
@@ -5711,7 +5716,7 @@ export class Gex {
     if (!Gex.wasmDlls) return e.gex_syscall;
     const staged = () => {
       if (e.gex_wasmprog_staged()) {
-        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#startThread();
       }
     };
@@ -5733,7 +5738,7 @@ export class Gex {
   #providerStaged = () => {
     const e = this.#shim.exports;
     if (e.gex_wasmprog_staged()) {
-      this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+      this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
       this.#startThread();
     }
   };
@@ -7282,7 +7287,7 @@ export class Gex {
           // unit's libc calling `fork`): its child is started from here, as
           // the run loop starts one, since the guest goes on in this loop and
           // may wait for it. The child's image is taken before this returns.
-          this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+          this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
           this.#startThread();
           // The fault hook as one of this loop's steps: on a stack that may
           // suspend in the single-thread build (`#driveAsync`).
