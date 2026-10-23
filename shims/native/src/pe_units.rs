@@ -1686,6 +1686,11 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
             if pairs.len() < had {
                 eprintln!("gex-nt: provider {} for {}: {} of {had} exports left unbound (no lifted twin in its unit)", prov.name, p.path, had - pairs.len());
             }
+            // A group cut into is left to the guest whole.
+            let dropped = gex_cgen::provider::whole_groups(&mut pairs, &gex_cgen::provider::group_addrs(prov, &pv.exports, p.base));
+            if dropped > 0 {
+                eprintln!("gex-nt: provider {} for {}: {dropped} exports of incomplete groups left unbound", prov.name, p.path);
+            }
         }
         if pairs.is_empty() {
             continue;

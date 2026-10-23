@@ -113,6 +113,9 @@ struct Provided {
     /// Falls back to lifted twins (`lifted`): bound only where its unit
     /// installed them.
     lifted: bool,
+    /// Its groups' guest addresses (`GEX_GROUP`, `provider::group_addrs`):
+    /// each binds whole or not at all.
+    groups: Vec<Vec<u64>>,
 }
 
 /// Stateful providers by library (lower case) and module file under the
@@ -751,7 +754,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 }
             }
             let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
-            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None, lifted: false });
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None, lifted: false, groups: Vec::new() });
         }
     }
     // A native wasm32 Wine DLL: its exports are Wine's PE module's, not the
@@ -765,6 +768,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             data: false,
             skeleton: Some(Arc::new(pe.clone())),
             lifted: false,
+            groups: Vec::new(),
         }];
     }
     let identity = match known {
@@ -828,11 +832,12 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, 
         .iter()
         .map(|p| Provided {
             file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
-            binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
+            binds: gex_cgen::provider::pe_binds(p, &exports).into_iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
             stateful: None,
             data: p.stateful,
             skeleton: None,
             lifted: p.lifted,
+            groups: gex_cgen::provider::group_addrs(p, &exports, base),
         })
         .filter(|p| !p.binds.is_empty())
         .collect();
@@ -847,11 +852,12 @@ fn trampoline_providers() -> Vec<Provided> {
         .iter()
         .map(|p| Provided {
             file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
-            binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), TRAMPOLINES + rva as u64))).collect(),
+            binds: gex_cgen::provider::pe_binds(p, &exports).into_iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), TRAMPOLINES + rva as u64))).collect(),
             stateful: None,
             data: p.stateful,
             skeleton: None,
             lifted: false,
+            groups: gex_cgen::provider::group_addrs(p, &exports, TRAMPOLINES),
         })
         .filter(|p| !p.binds.is_empty())
         .collect()
@@ -1225,10 +1231,10 @@ pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> 
 /// provider's module number (an install names `PROVIDER | number`), or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
-    let (file, mut binds, stateful, data) = {
+    let (file, mut binds, stateful, data, groups) = {
         let units = lock(&UNITS);
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
-        (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data)
+        (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data, p.groups.clone())
     };
     if lock(&UNITS).get(u as usize).and_then(|x| x.providers.get(i as usize)).is_some_and(|p| p.lifted) {
         // Only where its unit keeps the lifted twin it falls back to, as
@@ -1261,10 +1267,17 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
                     }
                 }
             }
-            binds
+            let mut pairs: Vec<(u64, u32)> = binds
                 .iter()
                 .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
-                .collect()
+                .collect();
+            // A group the filters above cut into (a lifted twin the unit
+            // lacks, a slot the module lacks) is left to the guest whole.
+            let dropped = gex_cgen::provider::whole_groups(&mut pairs, &groups);
+            if dropped > 0 {
+                crate::warn_line(&format!("gex-nt: provider {file}: {dropped} exports of incomplete groups left unbound\n"));
+            }
+            pairs
         }
         Some((exports, entry)) => {
             match stateful_pairs(&file, wasm, &names, exports, *entry) {

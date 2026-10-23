@@ -2635,7 +2635,13 @@ mod tests {
         let src = include_str!("../../../../gex-cgen/providers/nt_unixcall.c");
         let def = |name: &str| -> u64 {
             let l = src.lines().find(|l| l.starts_with(&format!("#define {name} "))).unwrap_or_else(|| panic!("no #define {name}"));
-            let v = l[format!("#define {name} ").len()..].split_whitespace().next().unwrap().trim_end_matches('u');
+            let rest = &l[format!("#define {name} ").len()..];
+            // A word of the KUSER page: `(GP_KUSER + 0x...u)`, provider.h's
+            // base, which is Windows' page in an NT-layer process.
+            if let Some(off) = rest.strip_prefix("(GP_KUSER + 0x").and_then(|r| r.split(')').next()) {
+                return gex_abi::KUSER_WINDOWS + u64::from_str_radix(off.trim_end_matches('u'), 16).unwrap();
+            }
+            let v = rest.split_whitespace().next().unwrap().trim_end_matches('u');
             if let Some(h) = v.strip_prefix("0x") { u64::from_str_radix(h, 16).unwrap() } else { v.parse().unwrap() }
         };
         assert_eq!(def("TR"), super::super::TRAMPOLINES);
