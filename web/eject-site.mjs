@@ -29,6 +29,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { extract, pack, pruneTree, splitTree, stripper, stripTree, walk } from './site-bundle.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const av = process.argv.slice(2);
@@ -115,14 +116,6 @@ function coldPack(dir, path) {
   head.writeUInt32LE(raw.length);
   writeFileSync(join(out, path, 'cold.idx'), Buffer.concat([head, zi]));
   rmSync(z, { recursive: true, force: true });
-}
-
-function walk(dir, fn, base = dir) {
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) walk(p, fn, base);
-    else if (e.isFile() || e.isSymbolicLink()) fn(p, relative(base, p));
-  }
 }
 
 /** How many pieces each class of the bundle's files (stable, the rest) is
@@ -492,13 +485,7 @@ function w3Site() {
   rmSync(work, { recursive: true, force: true });
   mkdirSync(work, { recursive: true });
   const strip = flag('--strip');
-  const stripped = (src) => {
-    if (!strip || !src.endsWith('.wasm')) return src;
-    const dst = join(work, 'strip', sha(readFileSync(src)));
-    mkdirSync(dirname(dst), { recursive: true });
-    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
-    return dst;
-  };
+  const stripped = stripper(work, strip);
   // The page as plain files: nothing between it and the server decodes, so
   // only what the page itself fetches and decodes (the bundle, the units:
   // app.js, pack.json) is packed. A host's own compression still applies.
@@ -550,47 +537,14 @@ function w3Site() {
   const piecesOn = flag('--pieces');
   let piecesIndex = null;
   if (strip || flag('--prune') || flag('--dedupe') || split || piecesOn) {
-    const x = join(work, 'tarx');
-    mkdirSync(x, { recursive: true });
-    execFileSync('tar', ['-xf', tar, '-C', x]);
-    // A read-only directory (a prefix's Start menu folders, which the shell
-    // reads desktop.ini names from only when read only) is made writable
-    // while files leave it, and packed with its own mode again.
-    const readOnly = [];
-    const unlock = (d) => {
-      for (const e of readdirSync(d, { withFileTypes: true })) {
-        if (!e.isDirectory()) continue;
-        const p = join(d, e.name);
-        const mode = statSync(p).mode & 0o7777;
-        if (!(mode & 0o200)) { readOnly.push([p, mode]); chmodSync(p, mode | 0o700); }
-        unlock(p);
-      }
-    };
-    unlock(x);
-    if (strip) walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
-    if (flag('--prune')) walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+    const tree = extract(tar, work);
+    const { x } = tree;
+    if (strip) stripTree(x, stripped);
+    if (flag('--prune')) pruneTree(x);
     if (split) {
       split.add(w3.exe); // the page reads the loader from the bundle itself
       const store = join(out, 'project/build/web/lazy');
-      mkdirSync(store, { recursive: true });
-      const lazy = [];
-      // A file with the same bytes as one the run read stays too: zstd's
-      // window stores it as a match, so it costs the download nothing, and a
-      // read the recording missed (Paint opens WinSxS's copy of gdiplus.dll
-      // in some runs) is not a lazy fetch of the whole raw file.
-      const kept = new Set();
-      walk(x, (p, rel) => { if (lstatSync(p).isFile() && split.has(`/${rel}`)) kept.add(sha(readFileSync(p))); });
-      walk(x, (p, rel) => {
-        const st = lstatSync(p);
-        if (!st.isFile() || split.has(`/${rel}`)) return;
-        const b = readFileSync(p);
-        const h = sha(b);
-        if (kept.has(h)) return;
-        if (!existsSync(join(store, h))) writeFileSync(join(store, h), b);
-        // Its time, for `mtimes=1` (wineboot compares wine.inf's with the prefix's).
-        lazy.push([`/${rel}`, st.size, h, Math.trunc(st.mtimeMs / 1000)]);
-        rmSync(p);
-      });
+      const lazy = splitTree(x, split, store);
       lazyFiles = lazy.length;
       lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
@@ -654,25 +608,8 @@ function w3Site() {
       }
     }
     tar = join(work, 'rootfs.tar');
-    const dirs = [];
-    const byHash = new Map();
     if (piecesOn) piecesIndex = pieces(x);
-    const all = (d, rel) => {
-      for (const e of readdirSync(d, { withFileTypes: true })) {
-        const r = rel ? `${rel}/${e.name}` : e.name;
-        const p = join(d, e.name);
-        if (e.isDirectory()) { dirs.push(r); all(p, r); continue; }
-        const k = flag('--dedupe') && e.isFile() ? sha(readFileSync(p)) : `path:${r}`;
-        if (!byHash.has(k)) byHash.set(k, []);
-        byHash.get(k).push(r);
-      }
-    };
-    all(x, '');
-    const list = join(work, 'tar-list');
-    writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
-    for (const [p, mode] of readOnly) chmodSync(p, mode);
-    execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
-    for (const [p, mode] of readOnly) chmodSync(p, mode | 0o700);
+    pack(tree, tar, work, flag('--dedupe'));
   }
   // What the split leaves in the bundle (the run's read set) is all the
   // download has of it; nt.json carries the rest's manifest by URL.
