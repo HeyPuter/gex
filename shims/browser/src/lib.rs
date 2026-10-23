@@ -6817,6 +6817,21 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     if pwatched(page) {
         pwatch_say(page, || format!("directory {entry:#x} by {who}"));
     }
+    if jit_diag() {
+        // A page given a second base while its first one's blocks are still
+        // in place: every translation made at the first now fails its page
+        // check there, and branches to it from inside its own module do so
+        // for good. The first few per process, with who did it.
+        static REBASED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let had = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
+        if had != 0 && had != entry && REBASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            warn_line(&format!(
+                "[gex] pid {} page {:#x} re-based {had:#x} -> {entry:#x} by {who}\n",
+                my_pid(),
+                page * gex_abi::DISPATCH_PAGE
+            ));
+        }
+    }
     let want = DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed);
     if want < 0 || want as u64 != page {
         return;
@@ -14392,7 +14407,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // Without it one function was translated over a hundred times a
         // second for minutes at a program's start-up.
         heal_dirs(start);
-        let again = with_jit_only(|j| {
+        let (again, elsewhere) = with_jit_only(|j| {
             // Dispatch at `start` no longer reaches the stale block: its slot
             // names a block outside the stale module's range of `blocks`. Then
             // the stale block was entered by a direct jump from a sibling in
@@ -14489,7 +14504,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 j.translated.remove(&start);
                 j.provider.remove(&start);
             }
-            again
+            (again, elsewhere)
         });
         if again {
             if jit_diag() {
@@ -14505,6 +14520,29 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 }
             }
             gex_dispatch_miss(_ctx, start as i64);
+        } else if elsewhere {
+            // Dispatch at `start` reaches another module's block (the
+            // directory and the slot map name it): the block's own dispatch,
+            // below the check, goes there, or misses and catches this Worker
+            // up if it has not instantiated that module. Resuming from
+            // JavaScript would cost a trap each time the stale block's
+            // siblings branch to it -- for a hot function such as `malloc`,
+            // most of a desktop's start-up.
+            if jit_diag() {
+                thread_local!(static STALE_ELSEWHERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+                let n = STALE_ELSEWHERE.with(|c| {
+                    c.set(c.get() + 1);
+                    c.get()
+                });
+                if n.is_power_of_two() && n >= 1024 {
+                    warn_line(&format!(
+                        "[gex] pid {} stale blocks dispatched on to a newer translation {n} times; this one {start:#x} ({}); {}\n",
+                        my_pid(),
+                        nt::describe(start),
+                        STALE_INFO.with(|c| c.borrow().clone())
+                    ));
+                }
+            }
         } else {
             // The newer translation is another Worker's, maybe not in this
             // Worker's tables yet; the block would dispatch to itself again,
