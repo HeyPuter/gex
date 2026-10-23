@@ -1165,6 +1165,8 @@ export class Gex {
       // `?pinregion=BYTES`: a project's libraries' region above the placement
       // window, before the first claim of arena (gex_abi::set_pin_region).
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
+      // `?sehreport=1`: crash reports name the SEH chain and a longjmp's jmp_buf.
+      if (globalThis.GEX_SEH_REPORT) this.#shim.exports.gex_set_seh_report?.(1);
       // Which memory flavours the page runs (docs/mem64.md §5): what an exec
       // may ask for (vfork.rs `gex_set_page_flavours`).
       if (globalThis.GEX_PAGE_FLAVOURS !== undefined) this.#shim.exports.gex_set_page_flavours?.(globalThis.GEX_PAGE_FLAVOURS | 0);
@@ -4692,7 +4694,19 @@ export class Gex {
       const mods = [['shim', this.#shim], ['guest', this.#guest], ...(this.#cgen?.instances ?? []).map((m, i) => [`unit ${i}`, m])];
       for (const [who, inst] of mods) {
         for (const [name, v] of Object.entries(inst?.exports ?? {})) {
-          if (v instanceof WebAssembly.Tag && err.is(v)) return `a wasm exception, tag ${name} of the ${who} module`;
+          if (v instanceof WebAssembly.Tag && err.is(v)) {
+            // A longjmp's payload (libgex/winecrt0 setjmp: `&jb->arg`, the
+            // jmp_buf and the value), for finding whose frame it wanted.
+            let arg = '';
+            if (name === '__c_longjmp' && globalThis.GEX_SEH_REPORT) {
+              try {
+                const p = Number(err.getArg(v, 0)) >>> 0;
+                const dv = new DataView(this.#memory.buffer);
+                arg = ` (jmp_buf 0x${dv.getUint32(p, true).toString(16)}, value ${dv.getInt32(p + 4, true)})`;
+              } catch {}
+            }
+            return `a wasm exception, tag ${name} of the ${who} module${arg}`;
+          }
         }
       }
       if (this.#provTag && err.is(this.#provTag)) return 'a wasm exception, the provider tag';

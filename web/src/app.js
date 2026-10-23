@@ -982,6 +982,8 @@ export function setGlobals(get, b = {}) {
   // pinregion=BYTES: address space above the placement window for the
   // project's libraries, each at its build's base (gex_abi::set_pin_region).
   if (get('pinregion')) globalThis.GEX_PIN_REGION = Number(get('pinregion'));
+  // sehreport=1: a crash report names the SEH chain and a longjmp's jmp_buf.
+  if (get('sehreport') === '1') globalThis.GEX_SEH_REPORT = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));

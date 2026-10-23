@@ -694,6 +694,8 @@ async function handle(msg) {
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
   // `?pinregion=BYTES`: the pin region (gex_abi::set_pin_region).
   if (msg.pinRegion) globalThis.GEX_PIN_REGION = msg.pinRegion;
+  // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
+  if (msg.sehReport) globalThis.GEX_SEH_REPORT = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;

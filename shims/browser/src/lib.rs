@@ -13916,6 +13916,19 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     trap();
 }
 
+/// `?sehreport=1` (`GEX_SEH_REPORT`): a crash report also names an i386
+/// thread's SEH chain, the Worker's last resumes and a longjmp's jmp_buf.
+static SEH_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn seh_report() -> bool {
+    SEH_REPORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_set_seh_report(on: i32) {
+    SEH_REPORT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // Whole-image units mark a fault they can go on after
@@ -18157,6 +18170,28 @@ pub extern "C" fn gex_dump_state() {
             let fs = gm.read_u64(c + ctx::FS_BASE as u64).unwrap_or(0);
             let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
             warn_line(&format!("gex:   fs_base={fs:#x} in {}  last_target={last:#x} in {}\n", where_is(fs), where_is(last)));
+            // An i386 thread's SEH chain (TEB+0, each record `next, handler`):
+            // a handler whose frame is no longer on this Worker's stack is
+            // where a longjmp out of it lands nowhere.
+            if !seh_report() {
+                return;
+            }
+            if fs != 0 && fs < 1 << 32 {
+                let w32 = |a: u64| gm.read_u64(a).map(|v| v as u32 as u64);
+                let mut rec = w32(fs).unwrap_or(u32::MAX as u64);
+                let mut chain = String::new();
+                for _ in 0..12 {
+                    if rec == u32::MAX as u64 || rec == 0 {
+                        break;
+                    }
+                    let h = w32(rec + 4).unwrap_or(0);
+                    chain.push_str(&format!(" {rec:#x}:{h:#x} ({})", where_is(h)));
+                    rec = w32(rec).unwrap_or(u32::MAX as u64);
+                }
+                warn_line(&format!("gex:   SEH chain (record:handler):{}\n", if chain.is_empty() { " empty" } else { &chain }));
+            }
+            let ring = RESUME_RING.with(|r| r.borrow().iter().map(|(l, v)| format!(" {v:#x}@{l}")).collect::<String>());
+            warn_line(&format!("gex:   this Worker's last resumes (pc@line):{ring}\n"));
             return;
         }
         for (name, a) in [

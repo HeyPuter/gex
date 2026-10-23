@@ -1096,6 +1096,8 @@ async function runProgramHere(
       nullGuard: globalThis.GEX_NULL_GUARD || undefined,
       // `?pinregion=BYTES`: an ejected project's libraries' region (gex_abi::set_pin_region).
       pinRegion: globalThis.GEX_PIN_REGION || undefined,
+      // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
+      sehReport: globalThis.GEX_SEH_REPORT || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
