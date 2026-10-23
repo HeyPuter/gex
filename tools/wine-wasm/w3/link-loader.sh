@@ -5,7 +5,7 @@
 # __wine_unix_call_funcs (and names it shares with another) renamed apart,
 # and a registry (dlreg.py) that musl's dlopen/dlsym answer from. The
 # libraries: crypt32, ws2_32, msv1_0, dnsapi, nsiproxy, secur32 (+ GnuTLS, when
-# the tree has it), win32u (+ FreeType),
+# the tree has it), win32u and dwrite (+ FreeType),
 # winewayland.drv (+ libwayland, xkbcommon), opengl32 (+ gex-gl's EGL),
 # wineoss.drv (OSSv4, against gex-kernel's /dev/dsp).
 #
@@ -74,12 +74,22 @@ w32defs="-D__wine_unix_lib_init=win32u___wine_unix_lib_init"
 for n in alloc_user_handle destroy_thread_windows free_user_handle get_virtual_screen_rect get_window_thread init_startup_info is_desktop_class is_message_class is_window_visible mirror_region send_notify_message shared_session; do
   w32defs="$w32defs -D$n=win32u_$n"
 done
-for f in $(grep -o "LOAD_FUNCPTR(FT_[A-Za-z_]*)" "$F/dlls/win32u/freetype.c" | sort -u | sed 's/LOAD_FUNCPTR(\(.*\))/\1/'); do reg="$reg libfreetype.so.6:func:$f"; done
+for f in $(grep -oh "LOAD_FUNCPTR(FT_[A-Za-z_]*)" "$F/dlls/win32u/freetype.c" "$F/dlls/dwrite/freetype.c" | sort -u | sed 's/LOAD_FUNCPTR(\(.*\))/\1/'); do
+  reg="$reg libfreetype.so.6:func:$f"
+done
 mkdir -p "$O/win32u"
 for c in $(sed -n "/^dlls\/win32u\/win32u.so:/,/^\t/p" Makefile | grep -o "dlls/win32u/[a-z_0-9/]*\.o" | sort -u); do
   rel=${c#dlls/win32u/}; compile "dlls/win32u/${rel%.o}.c" "$c" "$O/win32u/${rel//\//_}" "$w32defs"
 done
 reg="$reg win32u.so:func:__wine_unix_lib_init=win32u___wine_unix_lib_init"
+# dwrite.so: DirectWrite's glyph metrics, outlines and bitmaps, FreeType
+# through dlopen as win32u's. Without it every glyph run has empty bounds,
+# and Direct2D and DirectWrite draw no text at all.
+mkdir -p "$O/dwrite"
+for c in $(sed -n "/^dlls\/dwrite\/dwrite.so:/,/^\t/p" Makefile | grep -o "dlls/dwrite/[a-z_0-9]*\.o" | sort -u); do
+  b=$(basename "$c" .o); compile "dlls/dwrite/$b.c" "$c" "$O/dwrite/$b.o" "-D__wine_unix_call_funcs=dwrite__wine_unix_call_funcs"
+done
+reg="$reg dwrite.so:data:__wine_unix_call_funcs=dwrite__wine_unix_call_funcs"
 # winewayland.so, the display driver.
 wldefs="-D__wine_unix_call_funcs=winewayland__wine_unix_call_funcs -Dget_region_data=winewayland_get_region_data"
 mkdir -p "$O/winewayland"

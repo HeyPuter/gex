@@ -38,6 +38,8 @@
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
 # The authattrs case: crypt32 verifies a signature over authenticated
 # attributes as encoded, not in DER order (authattrs.c).
+# The dwrite case: DirectWrite's glyph bounds, alpha texture and outline
+# (dwrite.c), when the loader has dwrite's Unix side.
 # The display case (W64.4), when the loader has winewayland.drv's Unix side
 # (link-w64.sh with W64_DEPS) and the driver's PE side is there (native:
 # NATIVE= with W64_NATIVE_DLLS' winewayland.drv): window.exe under gexc's
@@ -283,6 +285,17 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/authattrs.exe" "$here/authattrs.c" -lcrypt3
 else
 	case " ${CASES:-authattrs} " in *" authattrs "*)
 		fail=$((fail + 1)); echo "FAIL x64/authattrs ($tag): x86_64-w64-mingw32-gcc" ;; esac
+fi
+# DirectWrite renders glyphs: a glyph run has a non-empty alpha texture with
+# ink and an outline (dwrite.c), from dwrite's Unix side (FreeType).
+if ! grep -q dwrite.so "$wine"; then
+	case " ${CASES:-dwrite} " in *" dwrite "*)
+		fail=$((fail + 1)); echo "FAIL x64/dwrite ($tag): the loader has no dwrite.so (link-w64.sh)" ;; esac
+elif x86_64-w64-mingw32-gcc -O1 -o "$w/dwrite.exe" "$here/dwrite.c" -ldwrite; then
+	check dwrite 0 "$allok" "$w/dwrite.exe"
+else
+	case " ${CASES:-dwrite} " in *" dwrite "*)
+		fail=$((fail + 1)); echo "FAIL x64/dwrite ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # slots_bound NAME RUN1 RUN2 LOADS: the dispatch slots RUN2 spent beyond RUN1
 # (the lowest count left that a process exit reported, GEX_TIME_JIT), per

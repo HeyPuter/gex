@@ -11,7 +11,7 @@
 # W3's w3/link-loader.sh), registered with dlreg.py, secur32 (+ GnuTLS) when
 # the tree was configured --with-gnutls, and, when the tree was
 # configured with them (W64.4, w64-deps.sh's libraries: W64_DEPS), win32u
-# (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
+# and dwrite (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
 # (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64); and wineoss.drv's
 # (audio: OSSv4 against gex-kernel's /dev/dsp, as W3's).
 # WINE_BUILD is a wasm64 build tree of the Wine fork (configure
@@ -103,7 +103,18 @@ if grep -q '^dlls/win32u/win32u.so:' Makefile; then
 	done
 	reg="$reg win32u.so:func:__wine_unix_lib_init=win32u___wine_unix_lib_init"
 	if grep -q 'SONAME_LIBFREETYPE' include/config.h; then
-		for f in $(grep -o "LOAD_FUNCPTR(FT_[A-Za-z_]*)" "$WF/dlls/win32u/freetype.c" | sort -u | sed 's/LOAD_FUNCPTR(\(.*\))/\1/'); do
+		# dwrite.so: DirectWrite's glyph metrics, outlines and bitmaps, FreeType
+		# through dlopen as win32u's. Without it every glyph run has empty
+		# bounds, and Direct2D and DirectWrite draw no text at all.
+		mkdir -p gexw64/dwrite
+		for c in $(unixobjs dwrite dwrite); do
+			b=$(basename "$c" .o)
+			compile "dlls/dwrite/$b.c" "$c" "gexw64/dwrite/$b.o" "-D__wine_unix_call_funcs=dwrite__wine_unix_call_funcs \
+				-D__wine_unix_call_wow64_funcs=dwrite__wine_unix_call_wow64_funcs"
+		done
+		reg="$reg dwrite.so:data:__wine_unix_call_funcs=dwrite__wine_unix_call_funcs"
+		for f in $(grep -oh "LOAD_FUNCPTR(FT_[A-Za-z_]*)" "$WF/dlls/win32u/freetype.c" "$WF/dlls/dwrite/freetype.c" | sort -u |
+				sed 's/LOAD_FUNCPTR(\(.*\))/\1/'); do
 			reg="$reg libfreetype.so.6:func:$f"
 		done
 		libs="$libs $W64_DEPS/lib/libfreetype.a"
