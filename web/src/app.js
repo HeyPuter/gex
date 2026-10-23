@@ -992,7 +992,7 @@ export function setGlobals(get, b = {}) {
   const fjit = get('fjit');
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
   if (get('wasmdlls')) globalThis.GEX_WASM_DLLS = get('wasmdlls');
-  if (get('elfunits')) globalThis.GEX_ELF_UNITS = get('elfunits');
+  if (get('elfunits') && get('cgen') !== '0') globalThis.GEX_ELF_UNITS = get('elfunits');
   // provskip=export,...: exports no provider binds, as GEX_PROVIDER_SKIP natively (units built with the same skip).
   if (get('provskip')) globalThis.GEX_PROVIDER_SKIP = get('provskip');
   if (get('fjitlibs')) globalThis.GEX_FJIT_LIBS = get('fjitlibs');
@@ -1002,7 +1002,9 @@ export function setGlobals(get, b = {}) {
   // cgen=1|2 (prefer|require units), the unguarded flavour unless unguarded=0.
   // icallcount=1: the counting flavour of units (16), whose run prints the
   // indirect-call profile (cgen.rs gex_icall_dump; GEX_CGEN_ICALL_COUNT=1 units).
-  if (get('cgen')) globalThis.GEX_CGEN = Number(get('cgen')) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
+  // cgen=0 is off: no unit of any kind, the ELF objects' among them.
+  const cgen = get('cgen');
+  if (cgen && cgen !== '0') globalThis.GEX_CGEN = Number(cgen) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
   if (get('cgenurl')) globalThis.GEX_CGEN_URL = get('cgenurl');
   if (get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (get('aot')) globalThis.GEX_AOT = 1;
