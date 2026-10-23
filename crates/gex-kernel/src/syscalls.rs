@@ -192,6 +192,11 @@ pub mod nr {
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
     pub const MSYNC: u64 = 227;
+    pub const MLOCK: u64 = 228;
+    pub const MUNLOCK: u64 = 229;
+    pub const MLOCKALL: u64 = 230;
+    pub const MUNLOCKALL: u64 = 231;
+    pub const MLOCK2: u64 = 284;
     pub const WAIT4: u64 = 260;
     pub const WAITID: u64 = 95;
     pub const PRLIMIT64: u64 = 261;
@@ -5210,6 +5215,11 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
             | nr::GETGROUPS
             | nr::SETGROUPS
             | nr::GETPPID
+            | nr::MLOCK
+            | nr::MUNLOCK
+            | nr::MLOCKALL
+            | nr::MUNLOCKALL
+            | nr::MLOCK2
     ) || (n == nr::ARCH_PRCTL && gex_abi::X86)
         || (n == nr::NOOP_OK && (gex_abi::X86 || compat))
 }
@@ -5893,6 +5903,9 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         nr::GETPPID => Ok(procs.ppid(io.pid) as u64),
         nr::ARCH_PRCTL => arch_prctl(m, ctx_addr, a[0], a[1]),
         nr::NOOP_OK => Ok(0),
+        // Memory is never paged out, so every page is as resident as a
+        // locked one: locking and unlocking have nothing to do.
+        nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MLOCK2 => Ok(0),
         _ => unreachable!("is_quiet admitted a call quiet_call does not make"),
     }
 }
@@ -10960,6 +10973,11 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::ALARM => "alarm",
         nr::ARCH_PRCTL => "arch_prctl",
         nr::NOOP_OK => "advisory-noop",
+        nr::MLOCK => "mlock",
+        nr::MUNLOCK => "munlock",
+        nr::MLOCKALL => "mlockall",
+        nr::MUNLOCKALL => "munlockall",
+        nr::MLOCK2 => "mlock2",
         nr::GETCWD => "getcwd",
         nr::DUP => "dup",
         nr::DUP3 => "dup3",
@@ -11895,6 +11913,22 @@ mod tests {
                 set_args(&mut m, at, nr::CLOSE, &[f]);
                 k.syscall(&mut m, 0);
             }
+        }
+    }
+
+    /// `mlock` and its kin succeed and change nothing: KSharedDataCache
+    /// checks a file-backed cache's mapping with `mlock` and gives the file
+    /// up when it fails.
+    #[test]
+    fn locking_memory_succeeds() {
+        for n in [nr::MLOCK, nr::MUNLOCK, nr::MLOCKALL, nr::MUNLOCKALL, nr::MLOCK2] {
+            let (mut buf, mut k) = setup();
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            set_args(&mut m, at, n, &[0x10000, 4096, 0, 0, 0, 0]);
+            assert!(is_quiet(n, false), "{n}");
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
+            assert_eq!(ret(&m, at), 0, "{n}");
         }
     }
 
