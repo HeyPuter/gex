@@ -5905,6 +5905,10 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         nr::NOOP_OK => Ok(0),
         // Memory is never paged out, so every page is as resident as a
         // locked one: locking and unlocking have nothing to do.
+        // Flags Linux does not know are EINVAL: MCL_CURRENT, MCL_FUTURE and
+        // MCL_ONFAULT for mlockall (at least one), MLOCK_ONFAULT for mlock2.
+        nr::MLOCKALL if a[0] == 0 || a[0] & !7 != 0 => Err(Errno::EINVAL),
+        nr::MLOCK2 if a[2] & !1 != 0 => Err(Errno::EINVAL),
         nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MLOCK2 => Ok(0),
         _ => unreachable!("is_quiet admitted a call quiet_call does not make"),
     }
@@ -11925,10 +11929,20 @@ mod tests {
             let (mut buf, mut k) = setup();
             let at = k.ctx_addr;
             let mut m = GuestMem::new(&mut buf);
-            set_args(&mut m, at, n, &[0x10000, 4096, 0, 0, 0, 0]);
+            let first = if n == nr::MLOCKALL { 1 } else { 0x10000 };
+            set_args(&mut m, at, n, &[first, 4096, 0, 0, 0, 0]);
             assert!(is_quiet(n, false), "{n}");
             assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
             assert_eq!(ret(&m, at), 0, "{n}");
+        }
+        // flags it does not know
+        for (n, args) in [(nr::MLOCKALL, [0u64, 0, 0, 0, 0, 0]), (nr::MLOCKALL, [8, 0, 0, 0, 0, 0]), (nr::MLOCK2, [0x10000, 4096, 2, 0, 0, 0])] {
+            let (mut buf, mut k) = setup();
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            set_args(&mut m, at, n, &args);
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
+            assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64), "{n} {args:?}");
         }
     }
 
