@@ -1094,6 +1094,8 @@ async function runProgramHere(
       w3Split: globalThis.GEX_W3_SPLIT || undefined,
       // `?nullguard=1`: the null guard, a debugging opt-in (gex_abi::null_guard).
       nullGuard: globalThis.GEX_NULL_GUARD || undefined,
+      // `?pinregion=BYTES`: an ejected project's libraries' region (gex_abi::set_pin_region).
+      pinRegion: globalThis.GEX_PIN_REGION || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for

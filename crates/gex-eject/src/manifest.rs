@@ -89,6 +89,9 @@ pub struct BuildManifest {
     pub replacements: Vec<BuiltReplacement>,
     /// Where each library must be placed, by guest path: `RunOptions::pins`.
     pub pins: Vec<(String, u64)>,
+    /// The pin region the pins lie in, bytes above `PLACE_TOP`
+    /// (`gex_abi::set_pin_region`); zero when they are all in the window.
+    pub pin_region: u64,
 }
 
 /// The hash of everything a build is made from that a user can change
@@ -175,6 +178,7 @@ impl BuildManifest {
                         .collect(),
                 ),
             ),
+            ("pin_region", json::s(format!("{:#x}", self.pin_region))),
         ]))
     }
 
@@ -230,11 +234,17 @@ impl BuildManifest {
         for p in arr("pins")? {
             pins.push((str_field(&p, "path", what)?, hex(&p, "base")?));
         }
+        // Absent from a build with every library in the window.
+        let pin_region = match crate::json::opt_str(&v, "pin_region") {
+            Some(_) => hex(&v, "pin_region")?,
+            None => 0,
+        };
         Ok(BuildManifest {
             inputs: str_field(&v, "inputs", what)?,
             images,
             replacements,
             pins,
+            pin_region,
         })
     }
 

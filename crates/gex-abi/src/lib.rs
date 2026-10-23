@@ -269,11 +269,36 @@ pub const PLACE_WINDOW: u64 = 64 << 20;
 pub const PLACE_TOP: u64 = PLACE_BOTTOM + PLACE_WINDOW;
 
 /// Lowest address the growing arena -- guest mappings and the runtime's own
-/// heap alike -- will hand out.
+/// heap alike -- will hand out, when no pin region is reserved.
 ///
 /// Above the placement window, because the two must never overlap and only
 /// this one can be made to move.
 pub const ARENA_BOTTOM: u64 = PLACE_TOP;
+
+/// The size of the pin region: address space reserved right above the
+/// placement window for one project's libraries, each at the fixed base its
+/// build gave it (an ejected Linux program whose libraries do not fit the
+/// window). Zero, the default, reserves nothing.
+static PIN_REGION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reserve the pin region, rounded up to 64 KiB. Set once per process before
+/// anything is taken from the arena (the host does it before its first
+/// allocation); it only grows.
+pub fn set_pin_region(bytes: u64) {
+    let bytes = bytes.min(MMAP_TOP - PLACE_TOP).next_multiple_of(0x1_0000);
+    PIN_REGION.fetch_max(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// One past the top of the pin region (`PLACE_TOP` when there is none).
+pub fn pin_region_top() -> u64 {
+    PLACE_TOP + PIN_REGION.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lowest address the growing arena hands out: above the placement window
+/// and the pin region.
+pub fn arena_bottom() -> u64 {
+    pin_region_top()
+}
 
 // ---------------------------------------------------------------------------
 // Thread context (PLAN §4)

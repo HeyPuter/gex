@@ -2506,6 +2506,14 @@ pub extern "C" fn gex_set_null_guard(on: u32) {
     gex_abi::set_null_guard(on != 0);
 }
 
+/// `?pinregion=BYTES`: the pin region an ejected project's libraries are
+/// placed in (`gex_abi::set_pin_region`), before this Worker takes anything
+/// from the arena.
+#[no_mangle]
+pub extern "C" fn gex_set_pin_region(bytes: u64) {
+    gex_abi::set_pin_region(bytes);
+}
+
 /// Turn on gex-wayland protocol tracing (buffers, commits, "produced no frame")
 /// -- the shim has no env, so `GEX_WL_TRACE` can't reach the compositor here.
 #[no_mangle]
@@ -2772,11 +2780,11 @@ fn arena_take(len: u64) -> Option<u64> {
         // received signal 9" and nothing about memory at all.
         let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
         if inherited != 0 {
-            gex_abi::ARENA_BOTTOM.max(inherited)
+            gex_abi::arena_bottom().max(inherited)
         } else {
             // Not forked: the memory is its own and nothing else is in it. Kept
             // as the floor rather than assumed, since the loader grows it.
-            gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
+            gex_abi::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
         }
     } else {
         cur
@@ -4645,8 +4653,8 @@ pub extern "C" fn gex_note_inherited(end: u64) {
 #[no_mangle]
 pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
     w3_note_reach(end, "an inherited region", start, end);
-    if winspace::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= winspace::arena_ceiling() {
-        let start = start.max(gex_abi::ARENA_BOTTOM);
+    if winspace::w3_compact() && end > gex_abi::arena_bottom() && end <= winspace::arena_ceiling() {
+        let start = start.max(gex_abi::arena_bottom());
         if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
             && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
         {
@@ -10558,12 +10566,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if winspace::w3_compact() {
         inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
     }
-    if inherited > gex_abi::ARENA_BOTTOM {
-        dead.push((gex_abi::ARENA_BOTTOM, inherited));
+    if inherited > gex_abi::arena_bottom() {
+        dead.push((gex_abi::arena_bottom(), inherited));
     }
     let dead: Option<Vec<(u64, u64)>> = dead
         .iter()
-        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::arena_bottom()), hi.min(gex_abi::MMAP_TOP)))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem.lock().renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
@@ -10610,7 +10618,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             // pages stalled the exec indefinitely -- a bulk fill over this shared
             // memory commits every page and crawls, where the live low layout
             // clears in a blink.
-            if start >= gex_abi::ARENA_BOTTOM {
+            if start >= gex_abi::arena_bottom() {
                 continue;
             }
             let (a, b) = (start as usize, (end as usize).min(live).min(data.len()));

@@ -97,6 +97,10 @@ pub struct Placement {
     pub placed_bytes: u64,
     pub libraries: usize,
     pub library_bytes: u64,
+    /// The pin region the libraries are placed in instead, when they do not
+    /// all fit the window: bytes above `PLACE_TOP` (`gex_abi::set_pin_region`),
+    /// zero when the window holds them.
+    pub region: u64,
 }
 
 /// Place every object as the run will: executables at `PIE_BASE` (gex's
@@ -104,13 +108,17 @@ pub struct Placement {
 /// from `MMAP_BOTTOM` in the session's order, each at a base the run pins
 /// with `RunOptions::pins`. The same rule as `gexc build --closure`.
 ///
-/// When the libraries do not all fit below `PLACE_TOP`, the window takes
-/// the hottest that fit (by the blocks `profile` says each ran, then the
-/// session's order) and the rest are left unpinned.
+/// When the libraries do not all fit below `PLACE_TOP`, every one of them
+/// goes in a pin region of the project's own, reserved right above the window
+/// (`gex_abi::set_pin_region`), so each still has one base in every process
+/// and a unit built for it. The window itself is then left to whatever else
+/// a run maps.
 pub(crate) fn layout(
     dir: &Path,
     project: &Project,
-    profile: Option<&gex_xlate::profile::Profile>,
+    // What the session ran: it chose the window's libraries when they
+    // could not all have one; the pin region gives every one a base.
+    _profile: Option<&gex_xlate::profile::Profile>,
 ) -> Result<(Vec<Placed>, Placement)> {
     const SLACK: u64 = 0x10000;
     let round = |n: u64| (n + SLACK - 1) & !(SLACK - 1);
@@ -134,24 +142,12 @@ pub(crate) fn layout(
     let libs: Vec<usize> = (0..loaded.len()).filter(|&i| loaded[i].0.role == "library").collect();
     let window = gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM;
     let total: u64 = libs.iter().map(|&i| share(&loaded[i].2)).sum();
-    let heat = |i: usize| -> u64 {
-        profile
-            .and_then(|pr| pr.objects.get(&loaded[i].0.id))
-            .map_or(0, |op| op.blocks.values().map(|b| b.n).sum())
-    };
-    let fits = fit_window(
-        &libs.iter().map(|&i| (share(&loaded[i].2), heat(i))).collect::<Vec<_>>(),
-        window,
-    );
-    let mut pinned = vec![true; loaded.len()];
-    for (k, &i) in libs.iter().enumerate() {
-        pinned[i] = fits[k];
-    }
+    let in_region = total > window;
     let mut placement = Placement { libraries: libs.len(), library_bytes: total, ..Placement::default() };
-    let mut next = gex_abi::MMAP_BOTTOM;
+    let mut next = if in_region { gex_abi::PLACE_TOP } else { gex_abi::MMAP_BOTTOM };
     let mut out = Vec::new();
-    for (i, (o, bytes, image)) in loaded.into_iter().enumerate() {
-        let image = if o.role == "library" && pinned[i] {
+    for (o, bytes, image) in loaded {
+        let image = if o.role == "library" {
             let base = round(next);
             next = base + share(&image);
             placement.placed += 1;
@@ -160,30 +156,12 @@ pub(crate) fn layout(
         } else {
             image
         };
-        out.push(Placed { obj: o.clone(), image, pinned: pinned[i] });
+        out.push(Placed { obj: o.clone(), image, pinned: true });
+    }
+    if in_region {
+        placement.region = next - gex_abi::PLACE_TOP;
     }
     Ok((out, placement))
-}
-
-/// Which libraries, given as (window share, blocks run) in the session's
-/// order, the window holds: all when they fit, else the hottest that fit
-/// (a tie by the session's order), each one that would overflow skipped for
-/// the next.
-fn fit_window(libs: &[(u64, u64)], window: u64) -> Vec<bool> {
-    if libs.iter().map(|l| l.0).sum::<u64>() <= window {
-        return vec![true; libs.len()];
-    }
-    let mut by_heat: Vec<usize> = (0..libs.len()).collect();
-    by_heat.sort_by_key(|&i| (std::cmp::Reverse(libs[i].1), i));
-    let mut fits = vec![false; libs.len()];
-    let mut used = 0;
-    for i in by_heat {
-        if used + libs[i].0 <= window {
-            used += libs[i].0;
-            fits[i] = true;
-        }
-    }
-    fits
 }
 
 /// The bytes of an image at `[addr, addr + len)`, if they are all loaded.
@@ -688,16 +666,6 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     };
 
     let (placed, placement) = layout(dir, &project, profile.as_ref())?;
-    if placement.placed < placement.libraries && !config.jit_fallback {
-        bail!(
-            "the closure's {} libraries ({} MiB) do not fit the {} MiB placement window, which takes \
-             the {} hottest; the rest are translated as they run, so set \"jit_fallback\": true in {CONFIG_FILE}",
-            placement.libraries,
-            placement.library_bytes >> 20,
-            (gex_abi::PLACE_TOP - gex_abi::MMAP_BOTTOM) >> 20,
-            placement.placed
-        );
-    }
     let (replacements, replaced) = bind_replacements(dir, &placed, &config)?;
 
     let out = dir.join("build");
@@ -803,26 +771,9 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         images: report.images.clone(),
         replacements: replacements.clone(),
         pins,
+        pin_region: placement.region,
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     report.replacements = replacements;
     Ok(report)
-}
-
-
-
-#[cfg(test)]
-mod tests {
-    use super::fit_window;
-
-    #[test]
-    fn the_window_takes_the_hottest_libraries_that_fit() {
-        // all fit: all placed, whatever ran
-        assert_eq!(fit_window(&[(4, 0), (4, 9)], 8), vec![true, true]);
-        // the hottest first; one that would overflow is skipped for a smaller one
-        assert_eq!(fit_window(&[(4, 1), (6, 9), (3, 5), (2, 0)], 10), vec![false, true, true, false]);
-        assert_eq!(fit_window(&[(4, 1), (6, 9), (5, 5), (4, 0)], 10), vec![true, true, false, false]);
-        // no profile: the session's order
-        assert_eq!(fit_window(&[(4, 0), (4, 0), (4, 0)], 8), vec![true, true, false]);
-    }
 }

@@ -50,6 +50,9 @@ pub fn debug_build(dir: &Path) -> Result<(Aot, Vec<(String, u64)>)> {
 /// run that maps one at its base: from the project, and none built for
 /// another run.
 fn use_units(dir: &Path, manifest: &BuildManifest) {
+    // The libraries' own region above the placement window, when the build
+    // gave them one, reserved before anything maps.
+    gex_abi::set_pin_region(manifest.pin_region);
     let names: Vec<String> = manifest
         .images
         .iter()

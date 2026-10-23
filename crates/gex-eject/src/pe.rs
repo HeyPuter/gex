@@ -533,6 +533,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         images: images_out,
         replacements: Vec::new(),
         pins: Vec::new(),
+        pin_region: 0,
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     Ok(report)

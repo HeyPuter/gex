@@ -97,7 +97,7 @@ mod imp {
         }
         ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
         let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
-        let host_hi = taken.max(gex_abi::ARENA_BOTTOM).min(NT_HEAP_BASE);
+        let host_hi = taken.max(gex_abi::arena_bottom()).min(NT_HEAP_BASE);
         crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
         WINDOWS_LO.store(host_hi, Ordering::Relaxed);
         Ok(host_hi)

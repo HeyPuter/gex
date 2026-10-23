@@ -823,7 +823,7 @@ impl MemoryMap {
         if self.take.is_none() {
             return Ok(());
         }
-        let floor = gex_abi::ARENA_BOTTOM;
+        let floor = gex_abi::arena_bottom();
         let ours = |m: &Self| end <= floor || m.in_arena(start.max(floor), end);
         if ours(self) {
             // Below the floor the memory may still need growing (the
@@ -934,8 +934,8 @@ impl MemoryMap {
             mib(anon),
             mib(none),
             mib(arena),
-            mib(MMAP_TOP - gex_abi::ARENA_BOTTOM),
-            gex_abi::ARENA_BOTTOM,
+            mib(MMAP_TOP - gex_abi::arena_bottom()),
+            gex_abi::arena_bottom(),
             MMAP_TOP,
             MMAP_BOTTOM,
             MMAP_TOP,

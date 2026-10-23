@@ -1162,6 +1162,9 @@ export class Gex {
       if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
       // `?nullguard=1` before anything is translated (gex_abi::null_guard).
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
+      // `?pinregion=BYTES`: a project's libraries' region above the placement
+      // window, before the first claim of arena (gex_abi::set_pin_region).
+      if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
       // Which memory flavours the page runs (docs/mem64.md §5): what an exec
       // may ask for (vfork.rs `gex_set_page_flavours`).
       if (globalThis.GEX_PAGE_FLAVOURS !== undefined) this.#shim.exports.gex_set_page_flavours?.(globalThis.GEX_PAGE_FLAVOURS | 0);
