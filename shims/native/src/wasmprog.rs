@@ -97,6 +97,13 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
         .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
         .to_vec();
+    // W3's loader: refused when its inline probe reads another layout.
+    if flags(program) & FLAG_GUEST_I386 != 0 {
+        let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
+        if let Some(e) = gex_cgen::header::abi_refusal(&wasm, &format!("Wine's loader {path}")) {
+            bail!("{e}");
+        }
+    }
     // A program linked against shared libraries.
     if let Some(info) = crate::dylink::wanted(&wasm) {
         let path = store.data_mut().with_kernel(|k| k.exe_path.clone());

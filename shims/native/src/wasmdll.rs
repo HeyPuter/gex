@@ -44,6 +44,11 @@ pub(crate) fn install(
         .get(at..at + wasm_sec.vsize as usize)
         .ok_or_else(|| anyhow!("{path}: .wasm outside memory"))?
         .to_vec();
+    if !pe.is64 {
+        if let Some(e) = gex_cgen::header::abi_refusal(&wasm, &format!("Wine's DLL {path}")) {
+            bail!("{e}");
+        }
+    }
     let (size, align) = crate::libprov::dylink_memory(&wasm)?;
     let data = base + data_sec.rva as u64;
     if data & ((1u64 << align) - 1) != 0 || (size as u64) > data_sec.vsize as u64 {
@@ -231,7 +236,9 @@ struct ParsedModule {
     module: wasmtime::Module,
 }
 
-fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::time::Instant) -> Result<Arc<ParsedModule>> {
+/// `probe`: a W3 module, whose inline probe (gexrt's `gex_ftab_idx`) reads
+/// the probe cache, refused when it was built for another layout.
+fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::time::Instant, probe: bool) -> Result<Arc<ParsedModule>> {
     type Memo = Vec<((std::path::PathBuf, u64, Option<std::time::SystemTime>), wasmtime::Engine, Arc<ParsedModule>)>;
     static MEMO: Mutex<Memo> = Mutex::new(Vec::new());
     let md = std::fs::metadata(file).with_context(|| format!("reading Wine's PE module {}", file.display()))?;
@@ -240,6 +247,11 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
         return Ok(Arc::clone(pm));
     }
     let wasm = std::fs::read(file).with_context(|| format!("reading Wine's PE module {}", file.display()))?;
+    if probe {
+        if let Some(e) = gex_cgen::header::abi_refusal(&wasm, &format!("Wine's PE module {}", file.display())) {
+            bail!("{e}");
+        }
+    }
     let (size, align) = crate::libprov::dylink_memory(&wasm)?;
     let names = gex_cgen::provider::slot_names(&wasm)?;
     let mut slots = std::collections::HashMap::new();
@@ -374,7 +386,7 @@ fn install_shared(
             // a twin install's memory64 module, beside it (docs/mem64.md §5)
             let twin = std::path::Path::new(path).with_file_name(format!("{module_name}.m64"));
             let file = if gex_abi::mem64() && twin.is_file() { twin } else { file };
-            let pm = parsed_module(&file, engine, t0)?;
+            let pm = parsed_module(&file, engine, t0, !pe.is64)?;
             let (size, align) = (pm.size, pm.align);
             let a = 1u64 << align;
             // (an LLP64 module's above the images: a PE32+ export's RVA is
