@@ -141,9 +141,11 @@ pub(crate) fn set_exited_here(v: bool) -> bool {
     true
 }
 
-/// Note whether the `clone` being served is a vfork.
+/// Note whether the `clone` being served is a vfork to run here. One a
+/// vfork child makes (`check` let it through) is copied as a fork: this
+/// Worker runs one child at a time.
 pub(crate) fn note_clone(vfork: bool) {
-    STAGED.with(|c| c.set(vfork));
+    STAGED.with(|c| c.set(vfork && !active()));
 }
 
 /// Whether the fork the last syscall staged is a vfork child to run here
@@ -232,11 +234,24 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     pc as i64
 }
 
-/// The child's syscall `nr` (canonical), before it is served: the memory
-/// map is the parent's too, so a call that would change it, and a further
-/// clone, end the child (as a crash: `posix_spawn`'s child makes none).
-pub(crate) fn check(nr: u64) {
+/// The child's syscall `nr` (canonical, first argument `a0`), before it is
+/// served: the memory map is the parent's too, so a call that would change
+/// it ends the child (as a crash: `posix_spawn`'s child makes none). So does
+/// a further clone, except a `CLONE_VM | CLONE_VFORK` one, which shares the
+/// map rather than changes it: Qt's `startDetached` spawns from its vfork
+/// child (`vforkfd`), and that grandchild is copied as a forked one
+/// (`note_clone`).
+pub(crate) fn check(nr: u64, a0: u64) {
     use gex_kernel::syscalls::nr::*;
+    const SPAWN: u64 = 0x100 | 0x4000; // CLONE_VM | CLONE_VFORK
+    let flags = match nr {
+        CLONE => a0,
+        CLONE3 => GuestMem::new(guest_bytes()).read_u64(a0).unwrap_or(0),
+        _ => 0,
+    };
+    if flags & SPAWN == SPAWN {
+        return;
+    }
     let name = match nr {
         MMAP => "mmap",
         MUNMAP => "munmap",

@@ -7858,7 +7858,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // posix_spawn's child running in its parent's Worker: not the calls
     // that would change the memory map it shares (vfork.rs).
     if vfork::active() {
-        vfork::check(this_nr);
+        vfork::check(this_nr, regs.a[0]);
     }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
