@@ -47,8 +47,8 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_FCACHE_TAG_BITS {}u", gex_abi::FCACHE_TAG_BITS);
     let _ = writeln!(w, "#define GEX_FTAB_RESOLVE {}u", gex_abi::ftab::RESOLVE);
     // The probe layout, kept in every module built with this header (a
-    // `gex.abi` custom section; gex_abi::NATIVE_ABI): the browser host
-    // refuses a W3 module whose inline probe reads another.
+    // `gex.abi` custom section; gex_abi::NATIVE_ABI): the host
+    // refuses a W3 module whose inline probe reads another ([`abi_refusal`]).
     let _ = writeln!(w, "#define GEX_NATIVE_ABI {}u", gex_abi::NATIVE_ABI);
     // (file-scope asm: clang puts a global with a `.custom_section.` section
     // in a data segment; the assembler's section is a custom section. It
@@ -508,5 +508,110 @@ mod tests {
         let h = super::header();
         assert!(h.contains(&format!("#define GEX_CTX_PC {}u", gex_abi::ctx::PC)));
         assert!(h.contains("gexc_dispatch"));
+    }
+}
+
+/// The start of [`abi_refusal`]'s message (a caller that ends the process
+/// for it tells it from its other errors by this).
+pub const ABI_REFUSED: &str = "built for gex's native ABI";
+
+/// The probe layout a native module was built for (`gex_abi::NATIVE_ABI`):
+/// its `gex.abi` custom section's value, one little-endian u32 per object
+/// that included gex_abi.h; 1 without the section (a header from before it).
+/// A walk of the section headers only, nothing inside them parsed. `Err` for
+/// bytes that are not a module, or objects that disagree.
+pub fn native_abi(wasm: &[u8]) -> Result<u32, String> {
+    fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
+        let (mut v, mut shift) = (0usize, 0);
+        loop {
+            let x = *b.get(*at)?;
+            *at += 1;
+            v |= ((x & 0x7f) as usize) << shift;
+            if x & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+    }
+    if wasm.get(..4) != Some(b"\0asm") {
+        return Err("not a wasm module".into());
+    }
+    let bad = || "a malformed section header".to_string();
+    let mut at = 8;
+    let mut found: Option<u32> = None;
+    while at < wasm.len() {
+        let id = wasm[at];
+        at += 1;
+        let size = leb(wasm, &mut at).ok_or_else(bad)?;
+        let end = at.checked_add(size).filter(|&e| e <= wasm.len()).ok_or_else(bad)?;
+        if id == 0 {
+            let mut p = at;
+            let n = leb(wasm, &mut p).ok_or_else(bad)?;
+            if wasm.get(p..p + n) == Some(b"gex.abi") {
+                for v in wasm[p + n..end].chunks(4) {
+                    let v = u32::from_le_bytes(<[u8; 4]>::try_from(v).map_err(|_| "a gex.abi section of odd length".to_string())?);
+                    match found {
+                        Some(f) if f != v => return Err(format!("its objects disagree (gex.abi {f} and {v})")),
+                        _ => found = Some(v),
+                    }
+                }
+            }
+        }
+        at = end;
+    }
+    Ok(found.unwrap_or(1))
+}
+
+/// Why a W3 native module (`what`: Wine's loader or PE module) cannot run
+/// here, or `None`: its inline probe (gexrt's `gex_ftab_idx`) reads the probe
+/// cache in the layout it was built for, and with another one every hit is
+/// a wrong function-table index (a "function signature mismatch" trap far
+/// from the cause). Once per module install, nothing per call.
+pub fn abi_refusal(wasm: &[u8], what: &str) -> Option<String> {
+    let have = match native_abi(wasm) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("{what}: its gex.abi section: {e}")),
+    };
+    (have != gex_abi::NATIVE_ABI).then(|| {
+        format!(
+            "{what} is {ABI_REFUSED} {have}, this gex's is {}: rebuild Wine against this gex \
+             (include/wine/gex/gex_abi.h, `gexc cgen-c --header`)",
+            gex_abi::NATIVE_ABI
+        )
+    })
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    fn module(sections: &[&[u32]]) -> Vec<u8> {
+        let mut m = b"\0asm\x01\0\0\0".to_vec();
+        for vals in sections {
+            let mut body = vec![7u8];
+            body.extend_from_slice(b"gex.abi");
+            for v in *vals {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            m.push(0);
+            m.push(body.len() as u8);
+            m.extend_from_slice(&body);
+        }
+        m
+    }
+
+    #[test]
+    fn a_module_is_refused_unless_its_marker_is_this_gexs() {
+        assert_eq!(native_abi(&module(&[])), Ok(1));
+        assert_eq!(native_abi(&module(&[&[gex_abi::NATIVE_ABI, gex_abi::NATIVE_ABI]])), Ok(gex_abi::NATIVE_ABI));
+        assert!(native_abi(&module(&[&[2], &[3]])).is_err());
+        assert!(native_abi(b"ELF").is_err());
+        assert!(abi_refusal(&module(&[&[gex_abi::NATIVE_ABI]]), "m").is_none());
+        let e = abi_refusal(&module(&[]), "m").unwrap();
+        assert!(e.starts_with("m is built for gex's native ABI 1, this gex's is"), "{e}");
+        assert!(abi_refusal(&module(&[&[gex_abi::NATIVE_ABI + 1]]), "m").unwrap().contains(ABI_REFUSED));
     }
 }

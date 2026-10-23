@@ -32,7 +32,9 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("gexc: {e:#}");
-            ExitCode::from(1)
+            // A W3 module built for another probe layout: the loader's own
+            // status for an image it cannot run, as a refused child's.
+            ExitCode::from(if format!("{e:#}").contains(gex_cgen::header::ABI_REFUSED) { 127 } else { 1 })
         }
     }
 }
