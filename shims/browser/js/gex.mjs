@@ -5497,7 +5497,10 @@ export class Gex {
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
-    const replyData = cdv.getUint32(req + (lp64 ? 72 : 68), true);
+    // reply_data is set only for a request with a reply buffer: with
+    // reply_size 0 it is whatever the client's stack held, so it is read
+    // only then (a stale one made #doorGuest rebuild its views per call).
+    const replyData = replyMax ? cdv.getUint32(req + (lp64 ? 72 : 68), true) : 0;
     const data0 = lp64 ? 80 : 72, entry = lp64 ? 16 : 8;
     const a = d.area;
     // The door buffer's place and size never change: read once per door.
