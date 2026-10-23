@@ -2,7 +2,7 @@
 // A W3 program as a static site on gex's own page (nt.html), with no eject:
 //
 //   node web/page-site.mjs OUT --tar BUNDLE.tar --units DIR --params FILE
-//        [--strip] [--prune] [--dedupe] [--split] [--level N] [--param K=V]...
+//        [--strip] [--prune] [--dedupe] [--split] [--boot-units FILE] [--level N] [--param K=V]...
 //
 // - The page: web/nt.html and the app library, built with vite into OUT as
 //   gex builds its page (every feature in: translation, the function JIT);
@@ -17,7 +17,12 @@
 //   one).
 // - The units, DIR (a unit cache: `gexc units build ... --preload /units`),
 //   at /units, with its preload.json: the page fetches and compiles them while
-//   it loads, and no unit is a synchronous fetch.
+//   it loads, and no unit is a synchronous fetch. --boot-units FILE (guest
+//   paths, one a line: the images whose units the program loads before it is
+//   up, a shell's taskbar) keeps those units in the boot's download and puts
+//   the recording's other units in the background fill, /fill.bin, which the
+//   page downloads while the guest runs and compiles a unit of when a process
+//   first maps it (web/site-bundle.mjs `buildFill`, as web/eject-site.mjs's).
 // - index.html: nt.html with the program's query, FILE's (a JSON object of
 //   nt.html parameters, or a recording, w3-session.json, whose page's query
 //   it takes), less what the site decides (tar, cgen, cgenurl, preload,
@@ -32,19 +37,19 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extract, pack, pruneTree, splitTree, stripper, stripTree, walk } from './site-bundle.mjs';
+import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const web = dirname(fileURLToPath(import.meta.url));
 const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const valued = ['--tar', '--units', '--params', '--level', '--param'];
+const valued = ['--tar', '--units', '--params', '--level', '--param', '--boot-units'];
 const [outArg] = av.filter((a, i) => !a.startsWith('--') && !valued.includes(av[i - 1]));
 const out = outArg && resolve(outArg);
 const tarIn = opt('--tar'), unitsIn = opt('--units'), paramsIn = opt('--params');
 if (!out || !tarIn || !unitsIn || !paramsIn) {
-  console.error('usage: node web/page-site.mjs OUT --tar BUNDLE.tar --units DIR --params FILE [--strip] [--prune] [--dedupe] [--level N] [--param K=V]...');
+  console.error('usage: node web/page-site.mjs OUT --tar BUNDLE.tar --units DIR --params FILE [--strip] [--prune] [--dedupe] [--split] [--boot-units FILE] [--level N] [--param K=V]...');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -126,17 +131,41 @@ if (!existsSync(join(unitsIn, 'preload.json'))) {
   console.error(`page-site: ${unitsIn} has no preload.json (gexc units build ... --preload /units)`);
   process.exit(1);
 }
+// --boot-units: the units the boot does not need go to the fill, not /units.
+let fillNote = '';
+let inFill = new Set();
+if (opt('--boot-units')) {
+  if (!Array.isArray(recording.units)) {
+    console.error(`page-site: --boot-units needs a recording with units as --params (${paramsIn})`);
+    process.exit(1);
+  }
+  const boot = new Set(readPathList(opt('--boot-units')).map(unitGuest));
+  const fl = buildFill({ boot, units: recording.units, unitDir: unitsIn, lazyUrl: (h) => `/lazy/${h}` });
+  if (fl.files.length) {
+    inFill = fl.keys;
+    writeFileSync(join(work, 'fill.bin'), fl.bytes);
+    place(join(work, 'fill.bin'), 'fill.bin');
+    writeFileSync(join(out, 'fill.json'), JSON.stringify({ url: '/fill.bin', size: fl.bytes.length, files: fl.files, demand: fl.demand }));
+    fillNote = `; the fill: ${fl.keys.size} units, ${(fl.bytes.length / 1048576).toFixed(1)} MiB`;
+  }
+}
+const fillKey = (rel) => inFill.has(rel.split('/')[0]);
+mkdirSync(join(out, 'units'), { recursive: true });
 walk(unitsIn, (p, rel) => {
-  if (rel === 'preload.json') copyFileSync(p, join(out, 'units/preload.json'));
-  else place(p, `units/${rel}`);
+  if (rel === 'preload.json') {
+    // A preload item is [NAME, URL]: `cgen:KEY` or `file:KEY/FILE`, URL /units/KEY/...
+    const list = JSON.parse(readFileSync(p, 'utf8')).filter(([, url]) => !fillKey(String(url).replace(/^\/units\//, '')));
+    writeFileSync(join(out, 'units/preload.json'), JSON.stringify(list));
+  } else if (!fillKey(rel)) place(p, `units/${rel}`);
 });
 
 // The launch.
 const build = sha(JSON.stringify(files)).slice(0, 12);
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
 const params = recording.format === 'gex-w3-session' ? Object.fromEntries(new URL(recording.url).searchParams) : { ...recording };
-for (const k of ['tar', 'cgen', 'cgenurl', 'preload', 'pack', 'lazy']) delete params[k];
+for (const k of ['tar', 'cgen', 'cgenurl', 'preload', 'pack', 'lazy', 'fill']) delete params[k];
 if (lazyNote) params.lazy = '/lazy.json';
+if (fillNote) params.fill = '/fill.json';
 Object.assign(params, { tar: '/bundle.tar', cgen: '1', cgenurl: '/units', preload: '/units/preload.json', pack: `/pack.json?v=${build}` });
 for (const kv of opts('--param')) { const [k, ...v] = kv.split('='); params[k] = v.join('='); }
 const query = new URLSearchParams(params).toString();
@@ -147,4 +176,4 @@ writeFileSync(join(out, '_headers'), '/*\n  Cross-Origin-Opener-Policy: same-ori
 rmSync(work, { recursive: true, force: true });
 const z = Object.values(files).reduce((a, f) => a + f.zsize, 0);
 const units = Object.entries(files).filter(([p]) => p.startsWith('/units/')).reduce((a, [, f]) => a + f.zsize, 0);
-console.log(`page-site: ${out}: ${(z / 1048576).toFixed(1)} MiB packed (units ${(units / 1048576).toFixed(1)} MiB), build ${build}${lazyNote}`);
+console.log(`page-site: ${out}: ${(z / 1048576).toFixed(1)} MiB packed (units ${(units / 1048576).toFixed(1)} MiB), build ${build}${lazyNote}${fillNote}`);
