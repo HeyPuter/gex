@@ -8962,7 +8962,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     // `child_stack` if `clone` named one. The `FORK` slots below are what the
     // host reads (via `gex_fork_pending`) to build the Worker, which then calls
     // `gex_adopt_child` to become the process.
-    stage_fork_fds(h, pid);
+    stage_fork_fds(h, pid, true);
     // The working directory is per-process state the child must inherit: its
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
@@ -9092,7 +9092,11 @@ pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
 /// reopened pipe ends belong to: opened under the parent's pid instead, the
 /// kernel credits the parent, and a crashed child releases no ends, so the
 /// reader waits forever on an end-of-file the dead child's end holds shut.
-fn stage_fork_fds(h: &Host, child: i32) {
+/// `maps`: and the shared file mappings, for a fork's child (a copy of this
+/// memory). Not for an exec's new program, which maps nothing of this one:
+/// adopted, a mapping there was another program's memory, handed to its
+/// mmap of the same file and written over the file at its exit.
+pub(crate) fn stage_fork_fds(h: &Host, child: i32, maps: bool) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
         let Some(name) = carry_name(&file, child) else {
@@ -9110,7 +9114,7 @@ fn stage_fork_fds(h: &Host, child: i32) {
     // And the shared file mappings, `m <mapping> <name>`: the child's
     // stores to them are the file's too, written back at its exit
     // (`adopt_fds_text`; a line no descriptor number starts).
-    let maps: Vec<_> = h.kernel.mem.lock().log.shared_maps.iter().cloned().collect();
+    let maps: Vec<_> = if maps { h.kernel.mem.lock().log.shared_maps.iter().cloned().collect() } else { Vec::new() };
     for s in &maps {
         if let Some(name) = carry_name(&s.file, child) {
             out.push_str(&format!("m {} {}\n", gex_kernel::syscalls::SharedMaps::carry(s), name));

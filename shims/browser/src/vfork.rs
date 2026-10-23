@@ -230,7 +230,10 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     *CWD.0.borrow_mut() = FORK_CWD.0.borrow().clone();
     *CHILD_EXE.0.borrow_mut() = FORK_EXE.0.borrow().clone();
     *CHILD_STATE.0.borrow_mut() = FORK_STATE.0.borrow().clone();
-    let fds = FORK_FDS.0.borrow().clone();
+    // Not the shared mappings `do_fork` described with them (`m` lines):
+    // the memory is the parent's, and its map has them already. Adopted, each
+    // was there twice, the second writable, written back at the child's exec.
+    let fds: String = FORK_FDS.0.borrow().lines().filter(|l| !l.starts_with("m ")).flat_map(|l| [l, "\n"]).collect();
     // A vfork child spawning: it waits, kept aside, as its parent does.
     if active() {
         let f = Frame {
@@ -356,7 +359,7 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
         cmd.extend_from_slice(s.as_bytes());
         cmd.push(0);
     }
-    stage_fork_fds(h, pid);
+    stage_fork_fds(h, pid, false);
     let fds = std::mem::take(&mut *FORK_FDS.0.borrow_mut()).into_bytes();
     let cwd = h.kernel.caller_cwd().into_bytes();
     let state = state_bytes(&h.kernel, true);
