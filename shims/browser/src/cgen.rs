@@ -57,12 +57,80 @@ static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 /// Whether `PENDING` may hold something (set after a push, cleared before a
 /// drain takes it).
 static ANY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// How many units wait for their bytes (`WANTED`'s length), readable without
-/// its lock.
-static WANTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// ---- Where each unit is: wanted, claimed, published, installed ----
+//
+// One byte of flags per unit (an index into `UNITS`), changed with atomic
+// ors and ands: what `WANTED` (a queue), `CLAIMED` and `INSTALLED` (sets),
+// each under a mutex, were. Every system call's serve asks for the oldest
+// wanted unit; with none, that is two loads.
 
-fn lock_free_wanted_empty() -> bool {
-    WANTED_N.load(Ordering::Acquire) == 0
+/// Placed for an image and waiting for its bytes from JS.
+const U_WANTED: u8 = 1;
+/// A Worker has started publishing it: the others only install.
+const U_CLAIMED: u8 = 2;
+/// Published (also in `PUBLISHED`, in order).
+const U_PUBLISHED: u8 = 4;
+/// Published and installed by some Worker: its directory entries are written.
+const U_INSTALLED: u8 = 8;
+/// Units with flags; one past it has none.
+const U_MAX: usize = 1 << 16;
+static U_STATE: [std::sync::atomic::AtomicU8; U_MAX] = [const { std::sync::atomic::AtomicU8::new(0) }; U_MAX];
+/// One past the highest unit ever wanted (the scan's end).
+static U_HIGH: AtomicUsize = AtomicUsize::new(0);
+/// No unit below this is wanted (the scan's start). A unit is wanted once,
+/// when placed, and never again after it stops being: the cursor only rises.
+static U_LOW: AtomicUsize = AtomicUsize::new(0);
+
+fn u_state(u: usize) -> u8 {
+    U_STATE.get(u).map_or(0, |s| s.load(Ordering::Acquire))
+}
+
+/// Unit `u`, just placed, waits for its bytes.
+fn u_want(u: usize) {
+    let Some(s) = U_STATE.get(u) else {
+        crate::warn_line(&format!("gex-cgen: unit {u}: past {U_MAX} units; tier-1\n"));
+        return;
+    };
+    s.fetch_or(U_WANTED, Ordering::AcqRel);
+    U_HIGH.fetch_max(u + 1, Ordering::AcqRel);
+}
+
+/// Unit `u` waits no longer (published, held, or missing).
+fn u_unwant(u: usize) {
+    if let Some(s) = U_STATE.get(u) {
+        s.fetch_and(!U_WANTED, Ordering::AcqRel);
+    }
+}
+
+/// The oldest wanted unit `skip` lets through, moving the cursor past the
+/// ones no longer wanted.
+fn u_oldest(skip: impl Fn(u8) -> bool) -> Option<usize> {
+    let high = U_HIGH.load(Ordering::Acquire);
+    let mut low = U_LOW.load(Ordering::Acquire);
+    let mut found = None;
+    let mut u = low;
+    while u < high {
+        let st = u_state(u);
+        if st & U_WANTED != 0 {
+            if !skip(st) {
+                found = Some(u);
+                break;
+            }
+        } else if u == low {
+            // Not wanted, and nothing wanted below it: the cursor moves on.
+            match U_LOW.compare_exchange(low, u + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => low = u + 1,
+                Err(now) => low = now.max(low),
+            }
+        }
+        u += 1;
+    }
+    found
+}
+
+/// Whether any unit is wanted.
+fn wanted_any() -> bool {
+    u_oldest(|_| false).is_some()
 }
 
 /// A unit placed for an image: wanted until JS brings its bytes, then
@@ -195,32 +263,27 @@ fn known(base: u64, path: &str) -> Option<(String, String)> {
 }
 
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
-/// Units waiting for their bytes, oldest first (indices into `UNITS`).
-static WANTED: Mutex<std::collections::VecDeque<usize>> = Mutex::new(std::collections::VecDeque::new());
 /// Published units, in publish order: what every Worker installs.
 static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Units a Worker has started publishing. `gex_cgen_wanted` hands the queue's
-/// front to every Worker that asks until it is published, so two threads of a
-/// process can load and publish the same unit; the second publish found every
-/// page numbered already and replaced the unit's `dirs` with nothing, and
-/// whichever install read them after that wrote no directory entry at all
-/// (a startup livelock: one DLL placed
-/// twice). The first claim publishes; the others only install.
-static CLAIMED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+// Claims ([`U_CLAIMED`]): `gex_cgen_wanted` hands the oldest wanted unit to
+// every Worker that asks until it is published, so two threads of a process
+// can load and publish the same unit; the second publish found every page
+// numbered already and replaced the unit's `dirs` with nothing, and whichever
+// install read them after that wrote no directory entry at all (a startup
+// livelock: one DLL placed twice). The first claim publishes; the others
+// only install.
 /// Publishes refused because another Worker had claimed the unit.
 pub(crate) static TWICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Units published and then installed by some Worker: their pages' directory
-/// entries are written (`write_dirs`).
-static INSTALLED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 
-/// Whether `page` is a unit's whose publish has begun (`CLAIMED`) and whose
-/// install has not written its directory yet: a thread running the unit's
-/// code meanwhile finds the page numbered and its entry not yet written.
+/// Whether `page` is a unit's whose publish has begun ([`U_CLAIMED`]) and
+/// whose install has not written its directory yet: a thread running the
+/// unit's code meanwhile finds the page numbered and its entry not yet written.
 pub(crate) fn in_install_window(page: u64) -> bool {
-    let claimed: Vec<u32> = lock(&CLAIMED).iter().copied().collect();
-    let installed = lock(&INSTALLED).clone();
     let units = lock(&UNITS);
-    claimed.iter().filter(|u| !installed.contains(u)).any(|&u| units.get(u as usize).is_some_and(|x| x.pages.iter().any(|&(p, _)| p == page)))
+    units.iter().enumerate().any(|(u, x)| {
+        let st = u_state(u);
+        st & U_CLAIMED != 0 && st & U_INSTALLED == 0 && x.pages.iter().any(|&(p, _)| p == page)
+    })
 }
 /// The pages installed units cover, hashed as built (`on_retire`).
 static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
@@ -233,7 +296,70 @@ fn ftab<R>(f: impl FnOnce(&mut FuncMap) -> R) -> R {
     let m = g.get_or_insert_with(FuncMap::new);
     let r = f(m);
     FTAB_SIZE.store(m.size(), SeqCst);
+    log_publish(m);
     r
+}
+
+// ---- The table's log, for every Worker to replay, read without the lock ----
+//
+// `FuncMap`'s log is append-only. Each change made under `FTAB` copies its
+// new events here, into segments that never move (segment k holds 1024 << k
+// events), and then publishes the length: a Worker asking how far the log
+// goes, every system call, and reading the events it lacks takes no lock.
+
+const LOG_SEG0: usize = 1024;
+static LOG_SEGS: [std::sync::atomic::AtomicPtr<AtomicU64>; 32] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 32];
+/// How many events `LOG_SEGS` holds, published after they are written.
+static LOG_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Event `i`'s segment and the index in it.
+fn log_at(i: usize) -> (usize, usize) {
+    let k = (usize::BITS - 1 - (i / LOG_SEG0 + 1).leading_zeros()) as usize;
+    (k, i - LOG_SEG0 * ((1 << k) - 1))
+}
+
+/// The events `m` has past the published length, copied and published.
+/// Under `FTAB` (writers are serialized by it).
+fn log_publish(m: &FuncMap) {
+    let have = LOG_LEN.load(Ordering::Relaxed);
+    let new = m.log_from(have);
+    if new.is_empty() {
+        return;
+    }
+    for (j, e) in new.iter().enumerate() {
+        let (k, at) = log_at(have + j);
+        let mut seg = LOG_SEGS[k].load(Ordering::Acquire);
+        if seg.is_null() {
+            let b: Box<[AtomicU64]> = (0..LOG_SEG0 << k).map(|_| AtomicU64::new(0)).collect();
+            seg = Box::into_raw(b) as *mut AtomicU64;
+            LOG_SEGS[k].store(seg, Ordering::Release);
+        }
+        let v = match e {
+            Event::Install(n) => (1u64 << 32) | *n as u64,
+            Event::Retire(idx) => (2u64 << 32) | *idx as u64,
+        };
+        // SAFETY: segment k holds `LOG_SEG0 << k` events and `at` is below
+        // that (`log_at`); it is never freed.
+        unsafe { (*seg.add(at)).store(v, Ordering::Relaxed) };
+    }
+    LOG_LEN.store(have + new.len(), Ordering::Release);
+}
+
+/// How many events the log has (published).
+fn log_len() -> usize {
+    LOG_LEN.load(Ordering::Acquire)
+}
+
+/// Event `i`, as `gex_ftab_event` gives it; 0 past the end.
+fn log_event(i: usize) -> u64 {
+    if i >= log_len() {
+        return 0;
+    }
+    let (k, at) = log_at(i);
+    let seg = LOG_SEGS[k].load(Ordering::Acquire);
+    // SAFETY: as in `log_publish`; published before the length was.
+    unsafe { (*seg.add(at)).load(Ordering::Relaxed) }
 }
 
 /// [`FuncMap::size`] as of the last change, read without the lock: what a
@@ -511,7 +637,7 @@ pub(crate) fn drain() -> bool {
         return false;
     }
     // Every syscall asks: an atomic load when nothing was mapped (no lock).
-    if !ANY_PENDING.load(Ordering::Acquire) && lock_free_wanted_empty() {
+    if !ANY_PENDING.load(Ordering::Acquire) && !wanted_any() {
         return false;
     }
     ANY_PENDING.store(false, Ordering::Release);
@@ -536,7 +662,7 @@ pub(crate) fn drain() -> bool {
         let wine = is_wine(&p.path);
         place(&image, &p.path, p.base, wine, Some(&p.pe));
     }
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
@@ -558,7 +684,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
     }
     w3_forget(base, pe.image_size as u64);
     place(&image, path, base, true, Some(pe));
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// Whether an image Wine's loader mapped at `base` can wait for its first
@@ -685,7 +811,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         return false;
     }
     place(&image, &d.path, d.base, true, Some(&pe));
-    !lock(&WANTED).is_empty()
+    wanted_any()
 }
 
 /// A whole file, parsed as a PE image.
@@ -785,11 +911,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         slots: 0,
         providers,
     });
-    {
-        let mut w = lock(&WANTED);
-        w.push_back(units.len() - 1);
-        WANTED_N.store(w.len(), Ordering::Release);
-    }
+    u_want(units.len() - 1);
 }
 
 /// The key of the unit for `image` (the native host's `pe_units::unit_key`:
@@ -920,11 +1042,9 @@ fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
 #[no_mangle]
 pub extern "C" fn gex_cgen_wanted() -> i32 {
     drain();
-    // Not one another Worker is publishing (`CLAIMED`): it leaves the queue
+    // Not one another Worker is publishing (claimed): it stops being wanted
     // when that publish ends.
-    let w = lock(&WANTED);
-    let claimed = lock(&CLAIMED);
-    w.iter().find(|&&u| !claimed.contains(&(u as u32))).map_or(-1, |&u| u as i32)
+    u_oldest(|st| st & U_CLAIMED != 0).map_or(-1, |u| u as i32)
 }
 
 /// `v` into a buffer of the shim's heap (above the guest's limit).
@@ -994,9 +1114,7 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
 /// image (not a Wine DLL) without one is refused: returns 1, and JS stops.
 #[no_mangle]
 pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
-    let mut wanted = lock(&WANTED);
-    wanted.retain(|&w| w != u as usize);
-    WANTED_N.store(wanted.len(), Ordering::Release);
+    u_unwant(u as usize);
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     if MODE.load(Ordering::Relaxed) == 2 && !x.wine {
@@ -1038,7 +1156,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 /// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
-    if !lock(&CLAIMED).insert(u) {
+    let claimed = U_STATE.get(u as usize).map_or(U_CLAIMED, |s| s.fetch_or(U_CLAIMED, Ordering::AcqRel));
+    if claimed & U_CLAIMED != 0 {
         TWICE.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
@@ -1075,12 +1194,11 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             }
         }
     }
-    {
-        let mut w = lock(&WANTED);
-        w.retain(|&x| x != u as usize);
-        WANTED_N.store(w.len(), Ordering::Release);
-    }
     lock(&PUBLISHED).push(u as usize);
+    if let Some(s) = U_STATE.get(u as usize) {
+        s.fetch_or(U_PUBLISHED, Ordering::AcqRel);
+    }
+    u_unwant(u as usize);
     0
 }
 
@@ -1115,9 +1233,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
 /// their code runs, so no member runs before it.
 #[no_mangle]
 pub extern "C" fn gex_cgen_hold(u: u32) {
-    let mut w = lock(&WANTED);
-    w.retain(|&x| x != u as usize);
-    WANTED_N.store(w.len(), Ordering::Release);
+    u_unwant(u as usize);
 }
 
 /// A link group's module as a unit of its own: key `groups/<key>` (the
@@ -1698,7 +1814,7 @@ pub extern "C" fn gex_cgen_have(n: u32) {
 /// Whether this Worker has the function table's log still to replay: a miss
 /// at a unit's entry is then a catch-up, not a translation.
 pub(crate) fn behind() -> bool {
-    on() && (HAVE.with(|c| c.get()) as usize) < ftab(|m| m.log_len())
+    on() && (HAVE.with(|c| c.get()) as usize) < log_len()
 }
 
 /// [`behind`], for `gex.lookup`'s JS half.
@@ -1710,18 +1826,14 @@ pub extern "C" fn gex_ftab_behind() -> i32 {
 /// How many events the function table's log has.
 #[no_mangle]
 pub extern "C" fn gex_ftab_log_len() -> u32 {
-    ftab(|m| m.log_len() as u32)
+    log_len() as u32
 }
 
 /// Event `i` of the log: an install as `1 << 32 | install`, a retirement as
 /// `2 << 32 | index`; 0 past the end.
 #[no_mangle]
 pub extern "C" fn gex_ftab_event(i: u32) -> i64 {
-    ftab(|m| match m.log_from(i as usize).first() {
-        Some(Event::Install(n)) => (1i64 << 32) | *n as i64,
-        Some(Event::Retire(idx)) => (2i64 << 32) | *idx as i64,
-        None => 0,
-    })
+    log_event(i as usize) as i64
 }
 
 /// Install `n`'s table range starts here.
@@ -1748,6 +1860,9 @@ pub extern "C" fn gex_ftab_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let addr = addr as u64;
+    if FCACHE_STATS.load(Ordering::Relaxed) {
+        fcache_stat(addr);
+    }
     // Filler no function has (`STRAY_PC`): the fallback's.
     if addr == STRAY_PC {
         return gex_abi::ftab::FALLBACK as i32;
@@ -1802,6 +1917,51 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         });
     }
     idx as i32
+}
+
+/// `?fcachestats=1` (GEX_FCACHE_STATS=1): the probe cache's misses (every
+/// `gex.lookup` is one), said by each Worker at most every 10 s, with how
+/// many were above 4 GiB and the addresses that missed most. A debugging
+/// opt-in: nothing is counted with it off.
+static FCACHE_STATS: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_fcache_stats(on: i32) {
+    FCACHE_STATS.store(on != 0, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// This Worker's misses since its last line: (since ns, above 4 GiB, by address).
+    static FCACHE_MISSES: std::cell::RefCell<(u64, u64, std::collections::HashMap<u64, u64>)> = Default::default();
+}
+
+fn fcache_stat(addr: u64) {
+    FCACHE_MISSES.with(|m| {
+        let mut m = m.borrow_mut();
+        let now = crate::now_ns();
+        if m.0 == 0 {
+            m.0 = now;
+        }
+        m.1 += (addr >> 32 != 0) as u64;
+        *m.2.entry(addr).or_insert(0) += 1;
+        let secs = now.saturating_sub(m.0) as f64 / 1e9;
+        if secs < 10.0 {
+            return;
+        }
+        let n: u64 = m.2.values().sum();
+        let mut top: Vec<(u64, u64)> = m.2.iter().map(|(a, c)| (*c, *a)).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        let top: Vec<String> = top.iter().take(5).map(|(c, a)| format!("{a:#x} {c}")).collect();
+        crate::warn_line(&format!(
+            "[gex] fcache: pid {} {n} probe misses in {secs:.1} s ({:.0}/s), {} above 4 GiB, {} addresses; most: {}\n",
+            crate::gex_my_pid(),
+            n as f64 / secs,
+            m.1,
+            m.2.len(),
+            top.join(", ")
+        ));
+        *m = (now, 0, Default::default());
+    });
 }
 
 /// The table's index 1: code no function body holds, under the `F_body`
@@ -2374,8 +2534,10 @@ pub extern "C" fn gex_cgen_installed(u: u32) {
     write_dirs(dirs);
     // A Worker that lost the claim installs too, possibly before the
     // claimant's publish has set `dirs`: only after the publish is it done.
-    if lock(&PUBLISHED).contains(&(u as usize)) {
-        lock(&INSTALLED).insert(u);
+    if let Some(s) = U_STATE.get(u as usize) {
+        if s.load(Ordering::Acquire) & U_PUBLISHED != 0 {
+            s.fetch_or(U_INSTALLED, Ordering::AcqRel);
+        }
     }
 }
 

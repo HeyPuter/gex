@@ -67,7 +67,72 @@ struct Bind {
     slots: u64,
 }
 
-static BINDS: Mutex<Vec<Bind>> = Mutex::new(Vec::new());
+// `BINDS`: every late binding, in order, read by every Worker with no lock.
+// A binding is boxed once and never changes; its index is reserved with a
+// fetch_add, its pointer stored in a segment that never moves (segment k
+// holds 64 << k), and the published length moves over every stored one in
+// order (any writer moves it), so a Worker never sees a gap.
+const BIND_SEG0: usize = 64;
+static BIND_SEGS: [std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicPtr<Bind>>; 32] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 32];
+static BINDS_RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BINDS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn bind_at(i: usize) -> (usize, usize) {
+    let k = (usize::BITS - 1 - (i / BIND_SEG0 + 1).leading_zeros()) as usize;
+    (k, i - BIND_SEG0 * ((1 << k) - 1))
+}
+
+/// Binding `i`'s slot, its segment made if `make` (a writer's).
+fn bind_slot(i: usize, make: bool) -> Option<&'static std::sync::atomic::AtomicPtr<Bind>> {
+    use std::sync::atomic::{AtomicPtr, Ordering::AcqRel, Ordering::Acquire};
+    let (k, at) = bind_at(i);
+    let mut seg = BIND_SEGS.get(k)?.load(Acquire);
+    if seg.is_null() {
+        if !make {
+            return None;
+        }
+        let b: Box<[AtomicPtr<Bind>]> = (0..BIND_SEG0 << k).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect();
+        let fresh = Box::into_raw(b) as *mut AtomicPtr<Bind>;
+        seg = match BIND_SEGS[k].compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+            Ok(_) => fresh,
+            Err(other) => {
+                // SAFETY: ours, never shared: the other writer's is used.
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(fresh, BIND_SEG0 << k)) });
+                other
+            }
+        };
+    }
+    // SAFETY: segment k holds `BIND_SEG0 << k` slots, `at` is below that,
+    // and segments are never freed.
+    Some(unsafe { &*seg.add(at) })
+}
+
+fn binds_push(b: Bind) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    let i = BINDS_RESERVED.fetch_add(1, AcqRel);
+    let Some(slot) = bind_slot(i, true) else { return };
+    slot.store(Box::into_raw(Box::new(b)), Release);
+    // Publish every stored binding in order, this one or another writer's.
+    loop {
+        let l = BINDS_LEN.load(Acquire);
+        if l >= BINDS_RESERVED.load(Acquire) || bind_slot(l, false).is_none_or(|s| s.load(Acquire).is_null()) {
+            break;
+        }
+        let _ = BINDS_LEN.compare_exchange(l, l + 1, AcqRel, Acquire);
+    }
+}
+
+/// Binding `i`, published.
+fn binds_get(i: usize) -> Option<&'static Bind> {
+    use std::sync::atomic::Ordering::Acquire;
+    if i >= BINDS_LEN.load(Acquire) {
+        return None;
+    }
+    let p = bind_slot(i, false)?.load(Acquire);
+    // SAFETY: a published binding is boxed once and never freed or changed.
+    (!p.is_null()).then(|| unsafe { &*p })
+}
 
 pub(super) fn is_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
     pe.sections.iter().any(|s| s.name == ".wasmref")
@@ -139,6 +204,13 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                     if m64 { 32 } else { 64 },
                     if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: w64-dist.sh W64_TWIN=1)" }
                 ));
+            }
+        }
+        // W3's PE module: refused when its inline probe reads another layout
+        // (gexrt's `gex_ftab_idx`; W64's wasm64 gexrt has no probe).
+        if !pe.is64 {
+            if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
+                return Err(e);
             }
         }
         let (size, align) = dylink_memory(&wasm)?;
@@ -427,6 +499,11 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
         }
         Err(e) => {
             crate::warn_line(&format!("gex-w3: {path}: native wasm32 DLL: {e}\n"));
+            // A module built for another probe layout runs nothing: the
+            // process ends here, not at its first wrong call.
+            if e.contains(super::wasmprog::ABI_REFUSED) {
+                crate::exit_process(127);
+            }
             -1
         }
     }
@@ -470,7 +547,7 @@ pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
     let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
     clear(&addrs);
     let (regs, dirs, slots) = bridges(&addrs);
-    lock(&BINDS).push(Bind { regs, dirs, slots });
+    binds_push(Bind { regs, dirs, slots });
 }
 
 /// Provider module `number`'s bytes when it is Wine's PE module or a
@@ -563,14 +640,13 @@ pub extern "C" fn gex_wasmdll_installed() {
 /// How many late bindings there are: a Worker writes each one's bridges.
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_binds_len() -> u32 {
-    lock(&BINDS).len() as u32
+    BINDS_LEN.load(std::sync::atomic::Ordering::Acquire) as u32
 }
 
 /// Binding `i`'s bridges, `[table, slot]` flattened, as `gex_cgen_regs`.
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_bind_regs(i: u32, buf: u32, cap: u32) -> u32 {
-    let b = lock(&BINDS);
-    let Some(x) = b.get(i as usize) else { return 0 };
+    let Some(x) = binds_get(i as usize) else { return 0 };
     let n = x.regs.len().min(cap as usize);
     put_u32s(&x.regs[..n], buf);
     x.regs.len() as u32
@@ -578,14 +654,14 @@ pub extern "C" fn gex_wasmdll_bind_regs(i: u32, buf: u32, cap: u32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_bind_slots(i: u32) -> u32 {
-    lock(&BINDS).get(i as usize).map_or(0, |x| x.slots.min(u32::MAX as u64) as u32)
+    binds_get(i as usize).map_or(0, |x| x.slots.min(u32::MAX as u64) as u32)
 }
 
 /// A Worker wrote binding `i`'s bridges: the directory for the pages it
 /// numbered (idempotent).
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_bind_done(i: u32) {
-    let dirs = lock(&BINDS).get(i as usize).map(|x| x.dirs.clone()).unwrap_or_default();
+    let dirs = binds_get(i as usize).map(|x| x.dirs.clone()).unwrap_or_default();
     write_dirs(dirs);
 }
 

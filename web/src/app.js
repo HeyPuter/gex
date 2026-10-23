@@ -964,6 +964,8 @@ export function setGlobals(get, b = {}) {
   globalThis.GEX_ARCH = b.arch === 'aarch64' ? 'aarch64' : 'x86';
   if (get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
+  // fcachestats=1: the function probe cache's misses, every 10 s (cgen.rs `fcache_stat`).
+  if (get('fcachestats')) globalThis.GEX_FCACHE_STATS = 1;
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).

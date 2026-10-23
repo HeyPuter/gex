@@ -42,8 +42,10 @@ pub const UNIT_INPUTS: &str = env!("GEX_CGEN_UNIT_INPUTS");
 
 /// What a unit embeds from outside gex-cgen and gex-abi (gex-emit's FMA
 /// constants, in `gex_abi.h`), which the unit key does not hash: bump it
-/// whenever [`unit_abi_fingerprint`] changes (its test says when).
-pub const UNIT_ABI_VERSION: u32 = 1;
+/// whenever [`unit_abi_fingerprint`] changes (its test says when). 2: the
+/// probe cache's wide entries (`gex_abi::FCACHE_TAG_BITS`), which every
+/// unit's inline probe reads.
+pub const UNIT_ABI_VERSION: u32 = 2;
 
 /// The identity of an image's recovery (`gex_key::recovery_key` with
 /// [`RECOVERY_INPUTS`]): where the recovery is cached.
@@ -932,7 +934,7 @@ mod abi_tests {
     fn unit_abi_version_pins_the_embedded_constants() {
         assert_eq!(
             (super::UNIT_ABI_VERSION, super::unit_abi_fingerprint().as_str()),
-            (1, "fma 134217729.0 523 1523")
+            (2, "fma 134217729.0 523 1523")
         );
     }
 }

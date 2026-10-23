@@ -1069,6 +1069,7 @@ async function handle(msg) {
     if (msg.phases || msg.opts?.phases) gex.shim.exports.gex_set_phases?.(msg.phases || msg.opts.phases);
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
+    if (msg.fcacheStats) gex.shim.exports.gex_set_fcache_stats?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }

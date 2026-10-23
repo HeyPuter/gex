@@ -1081,6 +1081,7 @@ async function runProgramHere(
       // `?doorstats=1`: wineserver door call counts every 10 s (docs/wineserver-kernel.md).
       // (a number past 1: the line's period in ms)
       doorStats: globalThis.GEX_DOOR_STATS || undefined,
+      fcacheStats: globalThis.GEX_FCACHE_STATS || undefined,
       // `?timescale=N&fixedtime=S` (benchmarks only): the monotonic clocks
       // N times real speed, the wall clock starting at Unix time S, as
       // pewasm's PEWASM_TIME_SCALE and PEWASM_FIXED_TIME.

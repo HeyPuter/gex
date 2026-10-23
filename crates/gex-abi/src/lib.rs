@@ -613,11 +613,13 @@ pub const BODY_LIMIT: u64 = BODY_LIMITS;
 
 /// The function table's probe cache (docs/merge-plan.md §9.8): guest address
 /// → [`ftab`] index, direct-mapped, shared by every thread of the process.
-/// Entry `fcache_slot(a)` is one `u64`: the address's low 32 bits in the low
-/// half (guest code is below 4 GiB), the index in the high half. Generated
-/// code probes it inline on an indirect transfer; a miss (or a stale entry)
-/// is index 0, the resolve stub, which asks the host (`gex.lookup`) and
-/// writes the entry. All zero at start: address 0 maps to the resolve stub.
+/// Entry `fcache_slot(a)` is one `u64`: the address's low
+/// [`FCACHE_TAG_BITS`] bits (all of it, for code below 64 GiB: a memory64
+/// process's images sit near the top of its 16 GiB) and the index above
+/// them. Generated code probes it inline on an indirect transfer; a miss (or
+/// a stale entry) is index 0, the resolve stub, which asks the host
+/// (`gex.lookup`) and writes the entry. All zero at start: address 0 maps to
+/// the resolve stub.
 pub const FCACHE: u64 = PATCHED_PAGES - FCACHE_BYTES;
 /// `log2` of the probe cache's entries.
 pub const FCACHE_BITS: u32 = 15;
@@ -640,10 +642,39 @@ pub const fn fcache_entry(a: u64) -> u64 {
     FCACHE + 8 * fcache_slot(a)
 }
 
-/// A probe cache entry for `a` at index `idx`.
+/// The address bits a probe cache entry holds, below its index: the whole
+/// address of code below 64 GiB. A target at or past that never hits (the
+/// entry cannot name it), and a probe compares the whole target, so an
+/// entry never stands for another address with the same low bits.
+pub const FCACHE_TAG_BITS: u32 = 36;
+/// The probe cache entry layout a native module's inline probe reads
+/// (`gex_ftab_idx` in gex_abi.h): 1 the index above 32 address bits, 2 the
+/// index above [`FCACHE_TAG_BITS`]. The header records it in every module
+/// built with it (a `gex.abi` custom section, one little-endian u32 per
+/// object), and the browser host refuses a W3 module built for another
+/// (a module without the section is a version-1 one).
+pub const NATIVE_ABI: u32 = 2;
+/// The address part of a probe cache entry.
+pub const FCACHE_TAG_MASK: u64 = (1 << FCACHE_TAG_BITS) - 1;
+/// One past the largest index an entry holds (its other 28 bits).
+pub const FCACHE_IDX_LIMIT: u64 = 1 << (64 - FCACHE_TAG_BITS);
+
+/// A probe cache entry for `a` at index `idx`; `None` for an address or
+/// index an entry cannot hold (the slot is then left to miss).
 #[inline]
-pub const fn fcache_pack(a: u64, idx: u32) -> u64 {
-    (a & 0xffff_ffff) | ((idx as u64) << 32)
+pub const fn fcache_pack(a: u64, idx: u32) -> Option<u64> {
+    if a > FCACHE_TAG_MASK || idx as u64 >= FCACHE_IDX_LIMIT {
+        return None;
+    }
+    Some(a | ((idx as u64) << FCACHE_TAG_BITS))
+}
+
+/// The index probe cache entry `e` holds for target `t`, or the resolve stub
+/// ([`ftab::RESOLVE`]) when it holds another address: what every emitter's
+/// inline probe computes.
+#[inline]
+pub const fn fcache_probe(e: u64, t: u64) -> u32 {
+    if e & FCACHE_TAG_MASK == t { (e >> FCACHE_TAG_BITS) as u32 } else { ftab::RESOLVE }
 }
 
 /// Where the thread contexts must end: the runtime's fixed words

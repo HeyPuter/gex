@@ -621,12 +621,12 @@ fn probe_const(fb: &mut gex_emit::wasm::FuncBody, t: u64, e: u32) {
     fb.addr_const(0);
     fb.load(0x29, 3, gex_abi::fcache_entry(t) as u32); // i64.load
     fb.local_tee(e);
-    fb.i64_const(32);
+    fb.i64_const(gex_abi::FCACHE_TAG_BITS as i64);
     fb.byte(0x88); // i64.shr_u
     fb.byte(0xa7); // i32.wrap_i64
     fb.i32_const(gex_abi::ftab::RESOLVE as i32);
     fb.local_get(e);
-    fb.i64_const(0xffff_ffff);
+    fb.i64_const(gex_abi::FCACHE_TAG_MASK as i64);
     fb.byte(0x83); // i64.and
     fb.i64_const(t as i64);
     fb.byte(0x51); // i64.eq
@@ -1177,12 +1177,12 @@ impl E<'_, '_> {
                 fb.addr_i32();
                 fb.load(0x29, 3, gex_abi::FCACHE as u32); // i64.load
                 fb.local_tee(e);
-                fb.i64_const(32);
+                fb.i64_const(gex_abi::FCACHE_TAG_BITS as i64);
                 fb.byte(0x88); // i64.shr_u
                 fb.byte(0xa7); // i32.wrap_i64
                 fb.i32_const(gex_abi::ftab::RESOLVE as i32);
                 fb.local_get(e);
-                fb.i64_const(0xffff_ffff);
+                fb.i64_const(gex_abi::FCACHE_TAG_MASK as i64);
                 fb.byte(0x83); // i64.and
                 self.b.push_operand(o);
                 let fb = self.b.f();
