@@ -616,7 +616,9 @@ pub fn jit(wasm: &[u8], hot: &HashSet<u32>) -> Result<(Vec<u8>, Vec<u64>)> {
         bail!("gex.funcs has {} addresses for {} slots", addrs.len(), u.slots.len());
     }
     let n = u.slots.len() as u32;
-    let keep = |k: u32| hot.contains(&k) || addrs[k as usize] == 0 || addrs[k as usize] >> 63 != 0 || addrs[k as usize] > u32::MAX as u64;
+    // Code the probe cache cannot tag (at or above 64 GiB) stays compiled:
+    // its stub would ask the host on every call.
+    let keep = |k: u32| hot.contains(&k) || addrs[k as usize] == 0 || addrs[k as usize] >> 63 != 0 || addrs[k as usize] > gex_abi::FCACHE_TAG_MASK;
     let of: Vec<Option<u32>> = (0..n).map(|k| if keep(k) { None } else { Some(0) }).collect();
     let owned: Vec<u32> = (0..n).filter(|&k| keep(k)).collect();
     let module = build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: false, jit: true })?;
