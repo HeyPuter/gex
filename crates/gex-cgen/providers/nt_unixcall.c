@@ -28,19 +28,19 @@
 #define UNIX_CALL_NR 0x7f000001u /* gex_kernel::win::nr::UNIX_CALL */
 
 /* gex_kernel::nt::opengl: the fast path's words and the ring's shape. */
-#define GL_FAST_RING 0x7ffe0fe0u
-#define GL_FAST_TAIL 0x7ffe0fe4u
+#define GL_FAST_RING (GP_KUSER + 0xfe0u)
+#define GL_FAST_TAIL (GP_KUSER + 0xfe4u)
 #define TAIL_BUSY 0x80000000u
 /* The client arrays' flags (bit = array index) and, at ARRAYS_TEX_SHIFT,
  * the client active texture unit: the layer's `arrays[i].enabled`, which
  * it reads back before a draw. */
-#define GL_FAST_ARRAYS 0x7ffe0fe8u
+#define GL_FAST_ARRAYS (GP_KUSER + 0xfe8u)
 #define ARRAYS_TEX_SHIFT 16
 /* The array state the layer shares with the provider (gex_kernel::nt::
  * opengl::GL_FAST_STATE and the FS_ words): GL_ARRAY_BUFFER's binding,
  * whether a generic attribute reads client memory, then per fixed array
  * size, type, stride, pointer, buffer. 0 without one (x64, or no fast path). */
-#define GL_FAST_STATE 0x7ffe0fecu
+#define GL_FAST_STATE (GP_KUSER + 0xfecu)
 #define FS_ARRAY_BUFFER 0u
 #define FS_ATTRIB_CLIENT 4u
 #define FS_ARRAYS 16u
@@ -297,6 +297,12 @@ GEX_INLINE int draw_arrays(uint32_t params) {
 
 static GEX_PROVIDER(p_unix_call) {
     (void)need;
+#ifndef GEX_KUSER_GUARD
+    /* The fast path is the NT layer's: only its opengl publishes the ring
+     * at GL_FAST_RING. Under W3's fold GL goes through Wine's opengl32 Unix
+     * side, nothing publishes these words, and Windows' old page they were
+     * in is not there: every call is the trampoline's own work below, which
+     * is what a ring of 0 always made it. */
     if (gp_arg(ctx, 0) == GL_HANDLE && gp_arg(ctx, 1) == 0) {
         uint32_t code = gp_arg(ctx, 2), params = gp_arg(ctx, 3), op = 0, n = 0;
         switch (code) {
@@ -339,6 +345,7 @@ static GEX_PROVIDER(p_unix_call) {
             return gp_return_eax(ctx, ret, 16, 0);
         }
     }
+#endif
     /* The trampoline: its inner call's return address pushed, the syscall
      * made at its `int 0x80` (a call that does not come straight back
      * leaves from inside gex_syscall, the guest at TR_RET with this very

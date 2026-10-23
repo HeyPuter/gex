@@ -32,6 +32,20 @@
  * reads these lines from the source; in C it is nothing. */
 #define GEX_GROUP(exports)
 
+/* KUSER_SHARED_DATA's page as a process of this build has it, the one name a
+ * provider uses for it (provider.rs rejects a raw address of Windows' page
+ * in a provider's source): W3's, where its Wine maps the page and its units
+ * fold constant accesses to (GEX_W3_KUSER, from gex_abi.h; GEX_KUSER_GUARD
+ * is defined only then), else Windows' own (gex_abi::KUSER_WINDOWS, checked
+ * by provider.rs's tests). Words past the structure that gex's NT layer
+ * keeps there (the yield park, the GL fast path) exist only in a process of
+ * that layer: under the fold, code using them is compiled out. */
+#ifdef GEX_KUSER_GUARD
+#define GP_KUSER GEX_W3_KUSER
+#else
+#define GP_KUSER 0x7ffe0000u
+#endif
+
 /* i386 registers in the context (64-bit slots, upper half zero). */
 #define R_EAX 0
 #define R_ECX 1

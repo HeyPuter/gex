@@ -61,10 +61,14 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 }
 
 /// Everything [`image_key`] takes besides the image (the format, the unit
-/// and recovery inputs, the flavour), hashed: two gexc builds give every
-/// image the same key exactly when they print the same id. `gexc cgen-image
-/// --inputs` prints it, for a cache of frozen units that must be rebuilt
-/// when a gex change moves the keys (tools/units-for.sh).
+/// and recovery inputs, the flavour), hashed, and the export providers'
+/// fingerprints, which an image with providers adds to its key (`-p...`):
+/// two gexc builds give every image the same key exactly when they print
+/// the same id. `gexc cgen-image --inputs` prints it, for a cache of frozen
+/// units that must be rebuilt when a gex change moves the keys
+/// (tools/units-for.sh). Without the providers' part, a provider's change
+/// moved its images' keys and kept the id, and a cached set gave those
+/// images no unit.
 pub fn inputs_id() -> String {
     let mut h = gex_key::sha256::Sha256::new();
     h.update(FORMAT.as_bytes());
@@ -72,6 +76,8 @@ pub fn inputs_id() -> String {
     h.update(unit_inputs().as_bytes());
     h.update(&UNIT_ABI_VERSION.to_le_bytes());
     h.update(RECOVERY_INPUTS.as_bytes());
+    h.update(b"\0providers:");
+    h.update(crate::provider::fingerprint(&crate::provider::all()).as_bytes());
     gex_key::sha256::hex(&h.finish())[..16].to_string()
 }
 

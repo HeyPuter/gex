@@ -20,6 +20,15 @@ static void gp_wait_ns(uint32_t a, uint32_t v, int64_t ns) {
     (void)__builtin_wasm_memory_atomic_wait32((int *)GEX_P(a), (int)v, ns);
 }
 
+#ifdef GEX_KUSER_GUARD
+/* W3 (KUSER_SHARED_DATA folded, provider.h GP_KUSER): Wine's own
+ * SwitchToThread is a host yield, and nothing parks on the NT layer's yield
+ * word, which is in Windows' old KUSER page, a page a W3 process does not
+ * have: its memory need not reach it, and an access there trapped out of
+ * bounds (Noita: the first notify, unlock or wait that kicked ended the
+ * thread inside the provider, reported at the export's address). */
+static void yield_kick(void) {}
+#else
 /* The NT yield park's generation word (gex_kernel::nt::sync::YIELD_GEN, in
  * KUSER_SHARED_DATA's page past the structure). A thread spinning in
  * SwitchToThread/Sleep(0) parks on it; bumping it and notifying wakes the
@@ -27,17 +36,18 @@ static void gp_wait_ns(uint32_t a, uint32_t v, int64_t ns) {
  * blocks (this thread went idle: the work a spinner waits for may be done)
  * and when a wake signals a waiter. A host with no parked thread just sees
  * the word change. */
-#define YIELD_GEN 0x7ffe0ff0u
+#define YIELD_GEN (GP_KUSER + 0xff0u)
 /* How many threads are parked on it (gex_kernel::nt::sync::YIELD_PARKED): a
  * notify with nobody parked is a host futex call for nothing, and kicks come
  * with every notify and contended unlock. */
-#define YIELD_PARKED 0x7ffe0ff4u
+#define YIELD_PARKED (GP_KUSER + 0xff4u)
 static void yield_kick(void) {
     __atomic_fetch_add(GA(YIELD_GEN), 1u, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(GA(YIELD_PARKED), __ATOMIC_SEQ_CST)) {
         gp_wake(YIELD_GEN, 0x7fffffffu);
     }
 }
+#endif
 
 /* ---- critical_section: word 0 = owner (thread + 1), word 1 = waiters; not recursive ---- */
 
@@ -274,6 +284,12 @@ static GEX_PROVIDER(schedule_task) {
     GEX_C64(GEX_CTX_LAST_TARGET) = proc;
     GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(proc))(ctx, depth, need, ret);
 }
+
+/* Each class binds whole or not at all (provider::pe_binds): an object one
+ * implementation made must never reach the other's. A condition variable's
+ * wait takes a critical_section, so the two classes are one group. */
+GEX_GROUP("??0critical_section@Concurrency@@QAE@XZ,??1critical_section@Concurrency@@QAE@XZ,?lock@critical_section@Concurrency@@QAEXXZ,?try_lock@critical_section@Concurrency@@QAE_NXZ,?try_lock_for@critical_section@Concurrency@@QAE_NI@Z,?unlock@critical_section@Concurrency@@QAEXXZ,??0_Condition_variable@details@Concurrency@@QAE@XZ,??1_Condition_variable@details@Concurrency@@QAE@XZ,?wait@_Condition_variable@details@Concurrency@@QAEXAAVcritical_section@3@@Z,?wait_for@_Condition_variable@details@Concurrency@@QAE_NAAVcritical_section@3@I@Z,?notify_one@_Condition_variable@details@Concurrency@@QAEXXZ,?notify_all@_Condition_variable@details@Concurrency@@QAEXXZ")
+GEX_GROUP("??0event@Concurrency@@QAE@XZ,??1event@Concurrency@@QAE@XZ,?set@event@Concurrency@@QAEXXZ,?reset@event@Concurrency@@QAEXXZ,?wait@event@Concurrency@@QAEII@Z")
 
 GEX_PROVIDE(cs_ctor, "??0critical_section@Concurrency@@QAE@XZ")
 GEX_PROVIDE(nop_dtor, "??1critical_section@Concurrency@@QAE@XZ")

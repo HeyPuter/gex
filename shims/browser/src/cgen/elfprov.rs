@@ -152,6 +152,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
                 data: p.stateful,
                 skeleton: None,
                 lifted: false,
+                groups: Vec::new(),
             });
         }
         if !addrs.is_empty() && !lock(&BOUND).iter().any(|b| b.path == m.path && b.start == m.start) {

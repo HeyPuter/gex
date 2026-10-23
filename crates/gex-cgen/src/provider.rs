@@ -255,7 +255,18 @@ pub fn enabled() -> bool {
     std::env::var("GEX_PROVIDERS").map_or(true, |v| v != "0")
 }
 
+/// Whether `text` names an address in Windows' KUSER_SHARED_DATA page
+/// (0x7ffe0000..0x7ffe1000) as a raw number: a provider says provider.h's
+/// `GP_KUSER` instead, which is W3's page under its fold. A raw one is the
+/// old page, which a W3 process does not have (an access there traps).
+fn raw_kuser(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(&format!("0x{:x}", gex_abi::KUSER_WINDOWS >> 16))
+}
+
 fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
+    if raw_kuser(text) {
+        bail!("provider {name}: a raw KUSER_SHARED_DATA address (0x7ffe...); use provider.h's GP_KUSER");
+    }
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
@@ -371,7 +382,7 @@ pub fn fingerprint(providers: &[Provider]) -> String {
 pub fn stubs(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) -> Vec<u64> {
     let mut v: Vec<u64> = providers
         .iter()
-        .flat_map(|p| p.binds.iter())
+        .flat_map(|p| pe_binds(p, exports))
         .filter_map(|(_, e)| exports.get(e).map(|&rva| base + rva as u64))
         .collect();
     v.sort_unstable();
@@ -386,7 +397,7 @@ pub fn twins(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) 
     let mut v: Vec<u64> = providers
         .iter()
         .filter(|p| p.lifted)
-        .flat_map(|p| p.binds.iter())
+        .flat_map(|p| pe_binds(p, exports))
         .filter_map(|(_, e)| exports.get(e).map(|&rva| (base + rva as u64) | gex_abi::ftab::TWIN))
         .collect();
     v.sort_unstable();
@@ -508,7 +519,7 @@ pub fn slot_names(wasm: &[u8]) -> Result<Vec<Option<String>>> {
 /// does not have is skipped (said under `verbose`).
 pub fn bindings(p: &Provider, slots: &[Option<String>], exports: &HashMap<String, u32>, base: u64, verbose: bool) -> Vec<(u64, u32)> {
     let mut out = Vec::new();
-    for (f, e) in &p.binds {
+    for (f, e) in pe_binds(p, exports) {
         let Some(k) = slots.iter().position(|s| s.as_deref() == Some(f.as_str())) else {
             if verbose {
                 eprintln!("[provider] {}: {f} is not in the module's table", p.name);
@@ -521,7 +532,51 @@ pub fn bindings(p: &Provider, slots: &[Option<String>], exports: &HashMap<String
             None => {}
         }
     }
+    let dropped = whole_groups(&mut out, &group_addrs(p, exports, base));
+    if dropped > 0 && verbose {
+        eprintln!("[provider] {}: {dropped} bindings of incomplete groups left to the guest", p.name);
+    }
     out
+}
+
+/// `p`'s bindings an image with `exports` (name -> RVA) can take: those
+/// whose export it has, less every group (`GEX_GROUP`) it cannot take whole
+/// -- one of the group's exports missing from the image, or not bound by
+/// `p`. A group binds whole or not at all: an object the provider made must
+/// never reach the guest's own code for the same class, or the other way
+/// round (as [`elf_bindings`] does for an ELF library).
+pub fn pe_binds<'a>(p: &'a Provider, exports: &HashMap<String, u32>) -> Vec<&'a (String, String)> {
+    let mut v: Vec<&(String, String)> = p.binds.iter().filter(|(_, e)| exports.contains_key(e)).collect();
+    for g in &p.groups {
+        if !g.iter().all(|e| exports.contains_key(e) && p.binds.iter().any(|(_, x)| x == e)) {
+            v.retain(|(_, e)| !g.contains(e));
+        }
+    }
+    v
+}
+
+/// The guest addresses of each of `p`'s groups in an image with `exports`
+/// at `base` (the groups [`pe_binds`] keeps), for [`whole_groups`].
+pub fn group_addrs(p: &Provider, exports: &HashMap<String, u32>, base: u64) -> Vec<Vec<u64>> {
+    p.groups
+        .iter()
+        .filter(|g| g.iter().all(|e| exports.contains_key(e) && p.binds.iter().any(|(_, x)| x == e)))
+        .map(|g| g.iter().map(|e| base + exports[e] as u64).collect())
+        .collect()
+}
+
+/// Take out of `pairs` (guest address, slot) every group of `groups` (each
+/// its guest addresses) that is not in it whole, after a later filter (a
+/// slot the module lacks, a lifted twin the unit lacks) dropped part of it.
+/// Returns how many bindings went.
+pub fn whole_groups(pairs: &mut Vec<(u64, u32)>, groups: &[Vec<u64>]) -> usize {
+    let had = pairs.len();
+    for g in groups {
+        if !g.iter().all(|a| pairs.iter().any(|&(x, _)| x == *a)) {
+            pairs.retain(|(x, _)| !g.contains(x));
+        }
+    }
+    had - pairs.len()
 }
 
 /// An ELF library's bindings for `p` (docs/elf-providers.md §2): (guest
@@ -584,6 +639,46 @@ mod tests {
         let b = super::elf_bindings(&p, &ex, 0x1000, false);
         let want: Vec<(u64, String)> = vec![(0x1100, "gexp__ifunc".into()), (0x1101, "p_memcpy".into()), (0x1200, "p_strlen".into())];
         assert_eq!(b, want, "free is missing, so the malloc group binds nothing");
+    }
+
+    /// A PE image's provider binds a group whole or not at all: in the
+    /// image's exports, and after a later filter drops part of it.
+    #[test]
+    fn pe_groups_bind_whole() {
+        let p = super::parse(
+            "t",
+            "/* PROVIDES t.dll i386\nGEX_GROUP(\"ctor,wait,notify\")\nGEX_PROVIDE(p_ctor, \"ctor\")\nGEX_PROVIDE(p_wait, \"wait\")\nGEX_PROVIDE(p_notify, \"notify\")\nGEX_PROVIDE(p_one, \"one\")\n",
+        )
+        .unwrap();
+        let slots: Vec<Option<String>> = ["p_ctor", "p_wait", "p_notify", "p_one"].iter().map(|s| Some(s.to_string())).collect();
+        let all: super::HashMap<String, u32> = [("ctor", 0x10), ("wait", 0x20), ("notify", 0x30), ("one", 0x40)].iter().map(|&(n, r)| (n.to_string(), r)).collect();
+        assert_eq!(super::bindings(&p, &slots, &all, 0x1000, false).len(), 4);
+        assert_eq!(super::stubs(std::slice::from_ref(&p), &all, 0x1000), vec![0x1010, 0x1020, 0x1030, 0x1040]);
+        // notify missing from the image: none of the group, the rest bound.
+        let mut part = all.clone();
+        part.remove("notify");
+        assert_eq!(super::bindings(&p, &slots, &part, 0x1000, false), vec![(0x1040, 3)]);
+        assert_eq!(super::stubs(std::slice::from_ref(&p), &part, 0x1000), vec![0x1040]);
+        // A slot the module lacks drops its whole group.
+        let short: Vec<Option<String>> = ["p_ctor", "p_notify", "p_one"].iter().map(|s| Some(s.to_string())).collect();
+        assert_eq!(super::bindings(&p, &short, &all, 0x1000, false), vec![(0x1040, 2)]);
+        // A later filter dropping one member drops the rest of its group.
+        let mut pairs = vec![(0x1010, 0), (0x1030, 2), (0x1040, 3)];
+        assert_eq!(super::whole_groups(&mut pairs, &super::group_addrs(&p, &all, 0x1000)), 2);
+        assert_eq!(pairs, vec![(0x1040, 3)]);
+    }
+
+    /// provider.h's KUSER base is gex-abi's (Windows' page; W3's under the
+    /// fold, by GEX_W3_KUSER), and no provider source names the page by a
+    /// raw address (`raw_kuser`; `every_source_parses` holds every built-in
+    /// to it).
+    #[test]
+    fn kuser_base_is_gex_abi() {
+        assert!(super::PRELUDE.contains(&format!("#define GP_KUSER 0x{:x}u\n", gex_abi::KUSER_WINDOWS)));
+        assert!(super::PRELUDE.contains("#define GP_KUSER GEX_W3_KUSER\n"));
+        assert!(super::raw_kuser("#define X 0x7FFE0FF0u"));
+        assert!(!super::raw_kuser("#define X (GP_KUSER + 0xff0u)"));
+        assert!(super::parse("t", "/* PROVIDES t.dll i386\nGEX_PROVIDE(p, \"e\")\n#define W 0x7ffe0fe0u\n").is_err());
     }
 
     #[test]
