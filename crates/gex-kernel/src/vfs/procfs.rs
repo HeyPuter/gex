@@ -28,8 +28,11 @@ pub trait ProcSource: Send + Sync {
     fn fd_link(&self, fd: i32) -> Option<String> {
         self.fds().into_iter().find(|&(f, _)| f == fd).map(|(_, t)| t)
     }
-    fn stat(&self) -> String;
-    fn status(&self) -> String;
+    /// `stat` for task `tid` of this process (its pid for the process
+    /// itself), one of `threads`.
+    fn stat(&self, tid: i32, threads: usize) -> String;
+    /// `status` for task `tid`, as [`Self::stat`].
+    fn status(&self, tid: i32, threads: usize) -> String;
     /// Every process on the system, this one included, for `/proc/<pid>`
     /// and the listing of `/proc` (what `ps` and `htop` read). Empty where
     /// the kernel knows only this process.
@@ -52,8 +55,10 @@ pub trait ProcSource: Send + Sync {
 /// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and
 /// `htop` parse it strictly -- by position after the `)` -- and a short line
 /// is a process they skip (htop listed none) or a fatal error (`ps`: "fatal
-/// library error, reap").
-pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>) -> String {
+/// library error, reap"). `id` is the task's: the pid for a process, a
+/// thread's id in its `task/<tid>/stat`; `threads` counts the process's.
+#[allow(clippy::too_many_arguments)]
+pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize) -> String {
     let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
     // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
@@ -63,18 +68,19 @@ pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i
     // guest_time cguest_time start_data end_data start_brk arg_start arg_end
     // env_start env_end exit_code
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 \
+        "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0 \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
-/// `/proc/<pid>/status`, the fields programs look for.
-pub fn status_text(pid: i32, comm: &str, state: char, ppid: i32) -> String {
+/// `/proc/<pid>/status`, the fields programs look for: task `id` of process
+/// `tgid`, which has `threads`.
+pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize) -> String {
     let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
     format!(
-        "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\n\
+        "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
          PPid:\t{ppid}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n\
-         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t1\nvoluntary_ctxt_switches:\t0\n\
+         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t{threads}\nvoluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n"
     )
 }
@@ -137,24 +143,45 @@ impl ProcFs {
     }
 
     /// Rewrite a `<pid>/…` path to `self/…` so both spellings share one
-    /// implementation, as they do on Linux for the current process. A
-    /// thread's directory (`<pid>/task/<tid>/…`) is its process's: every
-    /// process here has the one thread `/proc` reports.
-    fn canonical(&self, path: &str) -> String {
-        let path = untask(path);
-        // `/proc/<tid>`: the thread's process's directory.
+    /// implementation, as they do on Linux for the current process, and say
+    /// which task it is about: 0 for the process (its first thread), or a
+    /// thread's id. A thread's files are under `<pid>/task/<tid>`, and under
+    /// `/proc/<tid>` too, which Linux serves though it does not list it;
+    /// `ENOENT` for a `task/<tid>` that is not one of the process's.
+    fn canonical(&self, path: &str) -> Result<(String, i32), Errno> {
         let (first, rest) = path.split_at(path.find('/').unwrap_or(path.len()));
-        let path = match first.parse::<i32>().ok().and_then(|id| Some(id).zip(self.source.task_owner(id))) {
-            Some((id, owner)) if owner != id => format!("{owner}{rest}"),
-            _ => path,
+        let mut tid = 0;
+        let mut path = match first.parse::<i32>().ok().and_then(|id| Some(id).zip(self.source.task_owner(id))) {
+            Some((id, owner)) if owner != id => {
+                tid = id;
+                format!("{owner}{rest}")
+            }
+            _ => path.to_string(),
         };
         let pid = self.source.pid().to_string();
-        match path.strip_prefix(&pid) {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-                format!("self{rest}")
-            }
-            _ => path,
+        if let Some(rest) = path.strip_prefix(&pid).filter(|r| r.is_empty() || r.starts_with('/')) {
+            path = format!("self{rest}");
         }
+        let parts: Vec<&str> = path.splitn(4, '/').collect();
+        if parts.len() >= 3 && parts[1] == "task" {
+            let t: i32 = parts[2].parse().map_err(|_| Errno::ENOENT)?;
+            if !self.tasks_of(parts[0]).contains(&t) {
+                return Err(Errno::ENOENT);
+            }
+            tid = t;
+            path = match parts.get(3) {
+                Some(r) => format!("{}/{r}", parts[0]),
+                None => parts[0].to_string(),
+            };
+        }
+        Ok((path, tid))
+    }
+
+    /// The tasks of `self` or of process `<pid>`: its first thread, then the
+    /// others. Just the first where the table does not list it.
+    fn tasks_of(&self, who: &str) -> Vec<i32> {
+        let pid = if who == "self" { self.source.pid() } else { who.parse().unwrap_or(0) };
+        self.source.others().into_iter().find(|e| e.pid == pid).map_or_else(|| vec![pid], |e| e.tasks())
     }
 
     /// Another process's `/proc/<pid>/…`: its entry and the rest of the path.
@@ -165,12 +192,13 @@ impl ProcFs {
         Some((e, rest.to_string()))
     }
 
-    fn generate_other(&self, e: &crate::proc::ProcEntry, rest: &str) -> Option<Vec<u8>> {
+    fn generate_other(&self, e: &crate::proc::ProcEntry, rest: &str, tid: i32) -> Option<Vec<u8>> {
         let comm = e.comm();
         let state = if e.zombie { 'Z' } else { 'S' };
+        let (id, threads) = (if tid != 0 { tid } else { e.pid }, e.tasks().len());
         Some(match rest {
-            "stat" => stat_line(e.pid, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid)).into_bytes(),
-            "status" => status_text(e.pid, &comm, state, e.ppid).into_bytes(),
+            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads).into_bytes(),
+            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads).into_bytes(),
             "statm" => b"0 0 0 0 0 0 0\n".to_vec(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
@@ -180,14 +208,15 @@ impl ProcFs {
         })
     }
 
-    fn generate(&self, path: &str) -> Option<Vec<u8>> {
+    fn generate(&self, path: &str, tid: i32) -> Option<Vec<u8>> {
         let s = &self.source;
+        let id = if tid != 0 { tid } else { s.pid() };
         Some(match path {
             "self/maps" => s.maps().into_bytes(),
             "self/cmdline" => s.cmdline(),
             "self/environ" => s.environ(),
-            "self/stat" => s.stat().into_bytes(),
-            "self/status" => s.status().into_bytes(),
+            "self/stat" => s.stat(id, self.tasks_of("self").len()).into_bytes(),
+            "self/status" => s.status(id, self.tasks_of("self").len()).into_bytes(),
             "self/statm" => b"0 0 0 0 0 0 0\n".to_vec(),
             "loadavg" => {
                 let n = s.others().len().max(1);
@@ -243,19 +272,21 @@ impl FileSystem for ProcFs {
         if super::writes(flags) && self.metadata(path).is_ok_and(|md| md.file_type == FileType::Directory) {
             return Err(Errno::EISDIR);
         }
-        let path = self.canonical(path);
-        if let Some(data) = self.generate(&path) {
+        let (path, tid) = self.canonical(path)?;
+        if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
         }
         if let Some((e, rest)) = self.other(&path) {
-            if let Some(data) = self.generate_other(&e, &rest) {
+            if let Some(data) = self.generate_other(&e, &rest, tid) {
                 return Ok(Arc::new(Generated { data }));
             }
             let mut out = base_entries();
             let names: &[&str] = match rest.as_str() {
                 "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task"],
                 "task" => {
-                    out.push(DirEntry { name: e.pid.to_string(), file_type: FileType::Directory, ino: 1 });
+                    for t in e.tasks() {
+                        out.push(DirEntry { name: t.to_string(), file_type: FileType::Directory, ino: 1 });
+                    }
                     &[]
                 }
                 _ => return Err(Errno::ENOENT),
@@ -268,7 +299,9 @@ impl FileSystem for ProcFs {
         }
         if path == "self/task" {
             let mut out = base_entries();
-            out.push(DirEntry { name: self.source.pid().to_string(), file_type: FileType::Directory, ino: 1 });
+            for t in self.tasks_of("self") {
+                out.push(DirEntry { name: t.to_string(), file_type: FileType::Directory, ino: 1 });
+            }
             return Ok(Arc::new(GenDir { entries: out }));
         }
         let entries = match path.as_str() {
@@ -322,8 +355,8 @@ impl FileSystem for ProcFs {
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        let path = self.canonical(path);
-        if self.generate(&path).is_some() {
+        let (path, tid) = self.canonical(path)?;
+        if self.generate(&path, tid).is_some() {
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: 0,
@@ -338,7 +371,7 @@ impl FileSystem for ProcFs {
         if let Some((e, rest)) = self.other(&path) {
             return match rest.as_str() {
                 "" | "task" => Ok(Metadata::dir()),
-                r if self.generate_other(&e, r).is_some() => Ok(Metadata {
+                r if self.generate_other(&e, r, tid).is_some() => Ok(Metadata {
                     file_type: FileType::Regular,
                     size: 0,
                     mode: 0o444,
@@ -368,7 +401,7 @@ impl FileSystem for ProcFs {
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
-        let path = self.canonical(path);
+        let (path, _) = self.canonical(path)?;
         match path.as_str() {
             "self/exe" => Ok(self.source.exe()),
             "self/cwd" => Ok(self.source.cwd()),
@@ -382,21 +415,6 @@ impl FileSystem for ProcFs {
             }
         }
     }
-}
-
-/// `<pid>/task/<tid>/rest` -> `<pid>/rest`, and `<pid>/task/<tid>` ->
-/// `<pid>`: a thread's directory is its process's.
-fn untask(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 3 && parts[1] == "task" && parts[2].parse::<i32>().is_ok() {
-        let mut out = parts[0].to_string();
-        for p in &parts[3..] {
-            out.push('/');
-            out.push_str(p);
-        }
-        return out;
-    }
-    path.to_string()
 }
 
 fn base_entries() -> Vec<DirEntry> {
@@ -441,22 +459,30 @@ mod tests {
         fn fds(&self) -> Vec<(i32, String)> {
             vec![(0, "/dev/tty".into()), (3, "/tmp/x".into())]
         }
-        fn stat(&self) -> String {
-            "42 (prog) R 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0\n".into()
+        fn stat(&self, tid: i32, threads: usize) -> String {
+            stat_line(tid, "prog", 'R', 7, 42, 1, None, threads)
         }
-        fn status(&self) -> String {
-            "Name:\tprog\nPid:\t42\n".into()
+        fn status(&self, tid: i32, threads: usize) -> String {
+            status_text(tid, 42, "prog", 'R', 7, threads)
+        }
+        fn task_owner(&self, id: i32) -> Option<i32> {
+            self.others().into_iter().find(|e| e.tasks().contains(&id)).map(|e| e.pid)
         }
         fn others(&self) -> Vec<crate::proc::ProcEntry> {
-            let e = |pid, ppid, info: &[u8]| crate::proc::ProcEntry {
+            let e = |pid, ppid, info: &[u8], tids: &[i32]| crate::proc::ProcEntry {
                 pid,
                 ppid,
                 pgid: pid,
                 sid: 1,
                 zombie: false,
                 info: info.to_vec(),
+                tids: tids.to_vec(),
             };
-            vec![e(1, 0, b"bash\n/bin/bash\0/etc/session\0"), e(7, 1, b"xterm\nxterm\0-e\0bash\0"), e(42, 7, b"prog\n")]
+            vec![
+                e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]),
+                e(7, 1, b"xterm\nxterm\0-e\0bash\0", &[8, 9]),
+                e(42, 7, b"prog\n", &[43]),
+            ]
         }
     }
 
@@ -485,10 +511,10 @@ mod tests {
         assert_eq!(read(&f, "7/cmdline"), "xterm\0-e\0bash\0");
         assert_eq!(read(&f, "1/comm"), "bash\n");
         assert!(read(&f, "1/status").contains("PPid:\t0\n"));
-        // A thread's directory is its process's.
+        // Its first thread's directory is the process's.
         assert_eq!(read(&f, "7/task/7/stat"), stat);
         let task: Vec<String> = f.open("7/task", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
-        assert!(task.contains(&"7".to_string()));
+        assert_eq!(task, [".", "..", "7", "8", "9"]);
         assert!(f.metadata("7").unwrap().file_type == FileType::Directory);
         assert_eq!(f.open("99/stat", 0, 0).err().map(|_| ()), Some(()));
     }
@@ -497,9 +523,38 @@ mod tests {
     fn this_process_keeps_its_own_view() {
         // Its own pid is `self`, served from its own state, not the table's.
         assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
-        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None).split_whitespace().count(), 52);
-        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7))).split_whitespace().map(String::from).collect();
+        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1).split_whitespace().count(), 52);
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1).split_whitespace().map(String::from).collect();
         assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
+    }
+
+    #[test]
+    fn each_thread_is_a_task() {
+        let f = fs();
+        let field = |s: String, i: usize| s.split_whitespace().nth(i).unwrap().to_string();
+        // Another process's threads: each its own stat and status, all
+        // counting the process's three.
+        let t = read(&f, "7/task/9/stat");
+        assert!(t.starts_with("9 (xterm) S 1 7 1 "), "{t}");
+        assert_eq!(field(t, 19), "3");
+        let st = read(&f, "7/task/8/status");
+        assert!(st.contains("Tgid:\t7\n") && st.contains("Pid:\t8\n") && st.contains("Threads:\t3\n"), "{st}");
+        assert!(read(&f, "7/status").contains("Pid:\t7\n"));
+        // `/proc/<tid>` is the thread's, though `/proc` does not list it.
+        assert!(read(&f, "8/status").contains("Pid:\t8\n"));
+        let root: Vec<String> = f.open("", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(!root.contains(&"8".to_string()));
+        // Not a thread of that process.
+        assert_eq!(f.open("7/task/43/stat", 0, 0).err(), Some(Errno::ENOENT));
+        assert_eq!(f.metadata("1/task/8").err(), Some(Errno::ENOENT));
+        // This process's own, from its own state.
+        let task: Vec<String> = f.open("self/task", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(task, [".", "..", "42", "43"]);
+        assert_eq!(field(read(&f, "self/stat"), 19), "2");
+        assert!(read(&f, "self/task/43/stat").starts_with("43 (prog) "));
+        assert!(read(&f, "43/status").contains("Pid:\t43\n"));
+        assert!(read(&f, "self/status").contains("Threads:\t2\n"));
+        assert_eq!(read(&f, "self/task/43/cmdline"), "/bin/prog\0arg\0");
     }
 
     fn fs() -> ProcFs {

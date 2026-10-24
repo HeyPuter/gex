@@ -96,6 +96,8 @@ pub struct ProcEntry {
     /// What the process published: its name, a newline, then its command
     /// line (NUL-separated arguments). Empty until it has said.
     pub info: Vec<u8>,
+    /// Its threads besides the first (whose id is the pid), in order.
+    pub tids: Vec<i32>,
 }
 
 impl ProcEntry {
@@ -108,6 +110,10 @@ impl ProcEntry {
         }
         name.chars().take(15).collect()
     }
+    /// Every task of the process: the first thread, then the others.
+    pub fn tasks(&self) -> Vec<i32> {
+        std::iter::once(self.pid).chain(self.tids.iter().copied()).collect()
+    }
     /// `/proc/<pid>/cmdline`.
     pub fn cmdline(&self) -> &[u8] {
         match self.info.iter().position(|&b| b == b'\n') {
@@ -118,12 +124,16 @@ impl ProcEntry {
 }
 
 /// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
-/// sid, zombie), the info's length, the info, padded to four bytes.
+/// sid, zombie), the thread count and the info's length, the thread ids, the
+/// info, padded to four bytes.
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
-        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.info.len() as i32] {
+        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32] {
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        for t in &e.tids {
+            out.extend_from_slice(&t.to_le_bytes());
         }
         out.extend_from_slice(&e.info);
         while out.len() % 4 != 0 {
@@ -136,9 +146,10 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
 pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let mut out = Vec::new();
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
-    while b.len() >= 24 {
-        let n = word(b, 5).max(0) as usize;
-        if b.len() < 24 + n {
+    while b.len() >= 28 {
+        let (t, n) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize);
+        let at = 28 + 4 * t;
+        if b.len() < at + n {
             break;
         }
         out.push(ProcEntry {
@@ -147,9 +158,10 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
             pgid: word(b, 2),
             sid: word(b, 3),
             zombie: word(b, 4) != 0,
-            info: b[24..24 + n].to_vec(),
+            tids: (0..t).map(|i| word(b, 7 + i)).collect(),
+            info: b[at..at + n].to_vec(),
         });
-        b = &b[(24 + n + 3) & !3..];
+        b = &b[(at + n + 3) & !3..];
     }
     out
 }
@@ -417,16 +429,21 @@ impl ProcTable {
             }
             return Vec::new();
         }
-        self.lock()
-            .procs
+        let t = self.lock();
+        t.procs
             .iter()
-            .map(|p| ProcEntry {
-                pid: p.pid,
-                ppid: p.ppid,
-                pgid: p.pgid,
-                sid: p.sid,
-                zombie: p.child.status.lock().map(|s| s.is_some()).unwrap_or(false),
-                info: p.info.clone(),
+            .map(|p| {
+                let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
+                tids.sort_unstable();
+                ProcEntry {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    pgid: p.pgid,
+                    sid: p.sid,
+                    zombie: p.child.status.lock().map(|s| s.is_some()).unwrap_or(false),
+                    info: p.info.clone(),
+                    tids,
+                }
             })
             .collect()
     }
@@ -1004,6 +1021,14 @@ mod tests {
         assert_eq!(mine.comm(), "sh");
         assert_eq!(mine.cmdline(), b"/bin/sh\0-c\0x\0");
         assert_eq!(decode_entries(&encode_entries(&e)), e);
+        // with its threads, in order
+        let (t2, t1) = (t.new_tid(a), t.new_tid(a));
+        let e = t.entries();
+        let mine = e.iter().find(|e| e.pid == a).unwrap();
+        assert_eq!(mine.tasks(), vec![a, t2.min(t1), t2.max(t1)]);
+        assert_eq!(decode_entries(&encode_entries(&e)), e);
+        t.end_tid(t2);
+        assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().tids, vec![t1]);
         t.exit(a, 0);
         assert!(t.entries().iter().find(|e| e.pid == a).unwrap().zombie);
     }

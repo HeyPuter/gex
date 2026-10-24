@@ -145,11 +145,11 @@ impl ProcSource for KernelProcSource {
         let canon = l.vfs.upgrade().map_or_else(|| path.clone(), |v| v.get().canonical(&path));
         Some(crate::pty::link_name(&canon))
     }
-    fn stat(&self) -> String {
+    fn stat(&self, tid: i32, threads: usize) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, pgid, sid) = relations(&l);
         let tty = tty_of(l.ptys, sid);
-        crate::vfs::procfs::stat_line(l.pid, &comm(&l.exe), 'R', ppid, pgid, sid, tty)
+        crate::vfs::procfs::stat_line(tid, &comm(&l.exe), 'R', ppid, pgid, sid, tty, threads)
     }
     fn others(&self) -> Vec<crate::proc::ProcEntry> {
         self.0.get().map(|l| l.procs.entries()).unwrap_or_default()
@@ -160,7 +160,7 @@ impl ProcSource for KernelProcSource {
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
-    fn status(&self) -> String {
+    fn status(&self, tid: i32, threads: usize) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);
         // (no peak is kept: the peaks are the current sizes)
@@ -169,10 +169,10 @@ impl ProcSource for KernelProcSource {
         format!(
             "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
-             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t1\n",
+             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n",
             l.exe.rsplit('/').next().unwrap_or("gex"),
             l.pid,
-            l.pid,
+            tid,
             ppid
         )
     }
