@@ -467,7 +467,9 @@ fi
 # second restores it and lifts next to nothing of the DLL (under 5% of the
 # first run's blocks), and a run that loads the DLL at another base (so
 # relocated differently) gets none of the first base's translations (at least
-# half the blocks again).
+# half the blocks again). Each process saves the cache as it exits, after its
+# exit is published, so a "[gex] xcache ... saved" line may come between any
+# two of the program's lines.
 if [ -n "$page" ] && case " ${CASES:-xcache} " in *" xcache "*) true ;; *) false ;; esac; then
 	if x86_64-w64-mingw32-gcc -O1 -o "$w/xcload.exe" "$here/xcload.c" &&
 		python3 "$here/dllcycle-gen.py" 1000 "$w/xcbig.c" &&
@@ -478,7 +480,7 @@ if [ -n "$page" ] && case " ${CASES:-xcache} " in *" xcache "*) true ;; *) false
 		export GEX_XCACHE=nt-x64 GEX_XCACHE_DIR=$w/xcdir GEX_XCACHE_MIN=0 GEX_TIME_JIT=1
 		CASES=xcache-save EXTRA="$w/xcbig.dll" check xcache-save 0 "$any$got$tail" "$w/xcload.exe" xcbig.dll
 		CASES=xcache-restore EXTRA="$w/xcbig.dll" check xcache-restore 0 "$any$got$tail" "$w/xcload.exe" xcbig.dll
-		CASES=xcache-moved EXTRA="$w/xcbig.dll" check xcache-moved 0 "${any}first base=[0-9A-Fa-f]+$nl$got$tail" "$w/xcload.exe" xcbig.dll move
+		CASES=xcache-moved EXTRA="$w/xcbig.dll" check xcache-moved 0 "${any}first base=[0-9A-Fa-f]+$nl$any$got$tail" "$w/xcload.exe" xcbig.dll move
 		unset GEX_XCACHE GEX_XCACHE_DIR GEX_XCACHE_MIN GEX_TIME_JIT
 		# The blocks a run lifted in the DLL: its process's objects at the
 		# address it printed (each object as name=blocks@first..last).
