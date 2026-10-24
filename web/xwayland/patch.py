@@ -189,6 +189,41 @@ XkbDDXOpenConfigFile(const char *mapName, char *fileNameRtrn, int fileNameRtrnLe
     print('  ddxLoad.c: keymap comes from the embedded .xkm')
 
 
+def patch_repeat(src):
+    """The page's keyboard repeats keys, not the server's timer."""
+    p = f'{src}/xkb/ddxCtrls.c'
+    s = open(p).read()
+    if 'GEX_PAGE_REPEATS' in s:
+        return
+    # The server repeats a held key from a timer it checks before it reads
+    # input (os/WaitFor.c: check_timers, then poll). Busy past the repeat
+    # delay -- drawing a terminal's first character took longer than 600 ms
+    # -- it repeated keys whose release had already come: "ls" typed as
+    # "llls". A browser repeats a held key itself, as the system's settings
+    # say, and stops at the release whenever the page reads it; the
+    # compositor passes each repeat on as a press of a key already down,
+    # which the server makes a repeat event of, as with a keyboard that
+    # repeats in hardware (XkbDDXUsesSoftRepeat 0).
+    old = """int
+XkbDDXUsesSoftRepeat(DeviceIntPtr pXDev)
+{
+    return 1;
+}"""
+    assert old in s, 'ddxCtrls.c: no XkbDDXUsesSoftRepeat to patch'
+    s = s.replace(old, """/* GEX_PAGE_REPEATS: the page's keyboard repeats (web/xwayland/patch.py). */
+int
+XkbDDXUsesSoftRepeat(DeviceIntPtr pXDev)
+{
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
+    return 1;
+#endif
+}""")
+    open(p, 'w').write(s)
+    print('  ddxCtrls.c: the page repeats keys')
+
+
 def patch_noop_casts(src):
     """Typed no-ops, because wasm checks what a function pointer is.
 
@@ -306,6 +341,7 @@ def main():
     patch_ospoll(xserver)
     patch_shm(xserver)
     patch_xkb(xserver)
+    patch_repeat(xserver)
     patch_noop_casts(xserver)
     patch_input(xserver)
     patch_meson(xserver)
