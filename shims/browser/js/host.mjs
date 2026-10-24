@@ -103,6 +103,21 @@ const STACK_KEY = Symbol('gex.stackKey');
 const READY = Symbol('gex.ready');
 /// A process Worker's listeners (`#spawn`), taken off when it is given back.
 const LISTENING = Symbol('gex.listening');
+
+/**
+ * Which processes and threads (`pid` or `pid:tid`) a named Worker has run,
+ * in order, as `globalThis.__gexWorkers` (Worker name -> keys): a pooled
+ * Worker is named before it has a process, and a profiler or trace lists its
+ * thread only by that name. A Worker without a name is not recorded.
+ */
+function workerRan(w, key) {
+  const name = w?.gexName;
+  if (!name) return;
+  const m = (globalThis.__gexWorkers ??= new Map());
+  const ran = m.get(name);
+  if (ran) ran.push(String(key));
+  else m.set(name, [String(key)]);
+}
 /// How many processes a Worker has run after its first (`#giveBack`).
 const REUSES = Symbol('gex.reuses');
 /** How many processes one Worker runs before it is ended anyway, so a leak
@@ -511,6 +526,7 @@ export class ProcessHost {
       // the other flavour starts in a Worker of its own.
       const w = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker(msg.kind === 'adopt' && !!msg.child?.exec);
       this.#workers.set(pid, w);
+      workerRan(w, pid);
       if (pid === 1) this.#first = w;
       const onEvent = (e) => this.#onMessage(pid, w, e.data, resolve, reject);
       const onMsg = (m) => this.#onMessage(pid, w, m, resolve, reject);
@@ -1093,6 +1109,7 @@ export class ProcessHost {
         // (61 of them before Paint's window, 13.5 s in all).
         const w2 = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker();
         this.#workers.set(key, w2);
+        workerRan(w2, key);
         // Keyed by the thread, so its end stops the right Worker and frees the
         // right kernel stack.
         const deliver = (mm) => this.#onMessage(key, w2, mm, () => {}, () => {});

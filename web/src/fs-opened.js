@@ -20,7 +20,7 @@ export function openedFiles(spec) {
 
 function askOnce(spec) {
   if (!spec?.module || !spec?.memory) return Promise.reject(new Error('no global kernel (no SharedArrayBuffer)'));
-  const worker = new Worker(new URL('./fs-opened-worker.js', import.meta.url), { type: 'module' });
+  const worker = new Worker(new URL('./fs-opened-worker.js', import.meta.url), { type: 'module', name: 'fs-opened' });
   return new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
       worker.terminate();

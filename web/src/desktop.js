@@ -164,7 +164,7 @@ const overlayWaiters = [];
 
 function overlay() {
   if (overlayWorker) return overlayWorker;
-  overlayWorker = new Worker(new URL('./overlay-worker.js', import.meta.url), { type: 'module' });
+  overlayWorker = new Worker(new URL('./overlay-worker.js', import.meta.url), { type: 'module', name: 'overlay' });
   overlayWorker.onmessage = (e) => {
     const m = e.data;
     if (m.progress) {

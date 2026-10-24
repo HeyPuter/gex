@@ -32,7 +32,7 @@ export function persist(dbName, root, spec, { every = 30000, onSync = null } = {
     console.warn('[persist] no global kernel (no SharedArrayBuffer): saves will not outlive the page');
     return null;
   }
-  const worker = new Worker(new URL('./persist-worker.js', import.meta.url), { type: 'module' });
+  const worker = new Worker(new URL('./persist-worker.js', import.meta.url), { type: 'module', name: 'persist' });
   let seq = 0;
   let busy = false;
   const waiters = new Map();
