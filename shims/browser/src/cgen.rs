@@ -1304,17 +1304,22 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
             seen.insert((t, gex_abi::dispatch_index(a, base) as u32));
         }
         let mut regs = Vec::with_capacity(2 * seen.len());
-        // A dense table's slot gets an index in `blocks` of its own, which
-        // JS writes the bridge at (as table `gex_emit::dense::TABLE_INDEX`).
-        // One index per slot for good: bridged again (`elfprov::rebridge`,
-        // a second publish over the same pages), it gets the one it had,
-        // which every Worker that wrote the bridge there still holds.
+        // A dense table's slot gets an arm of an entry in `blocks`, which JS
+        // writes the bridge at (as table `gex_emit::dense::TABLE_INDEX`),
+        // shared with other bridged slots (`gex_emit::dense::bridge_words`).
+        // One word per slot for good: bridged again (`elfprov::rebridge`, a
+        // second publish over the same pages), it gets the one it had, whose
+        // entry every Worker that wrote the bridge there still holds.
         let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::map(t as usize).is_some()).collect();
         let entries: Vec<u32> = dense.iter().map(|&(t, slot)| gex_abi::dispatch_entry(t as usize, slot)).collect();
-        let indices = gex_emit::dense::bridge_indices(&mut j.bridge_dense, &entries, crate::dense::alloc);
-        for (&entry, &d) in entries.iter().zip(&indices) {
-            crate::dense::set_slot(entry, d);
-            regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, d]);
+        let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, &mut j.bridge_group, &entries, crate::dense::alloc);
+        let mut filled = std::collections::BTreeSet::new();
+        for (&entry, &w) in entries.iter().zip(&words) {
+            crate::dense::set_slot_word(entry, w);
+            // Each entry once: its arms all run the bridge.
+            if filled.insert(gex_emit::dense::index_of(w)) {
+                regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, gex_emit::dense::index_of(w)]);
+            }
         }
         for (t, slot) in seen {
             if crate::dense::map(t as usize).is_none() {

@@ -421,20 +421,37 @@ pub fn dispatch_body(block_ty: u32, entry_ty: u32, first: u32, blocks: u32) -> V
     f.finish()
 }
 
-/// The `blocks` indices for bridging `entries` (dispatch slots, `table << 24
-/// | slot`), each slot keeping the index it was first given (`given`): a slot
-/// bridged again gets the same one, so re-bridging numbers nothing.
-/// `alloc(n)` hands out `n` fresh consecutive indices and is called at most
-/// once, only for slots never bridged before.
-pub fn bridge_indices(given: &mut std::collections::HashMap<u32, u32>, entries: &[u32], alloc: impl FnOnce(u32) -> u32) -> Vec<u32> {
-    let fresh = entries.iter().filter(|e| !given.contains_key(e)).collect::<std::collections::BTreeSet<_>>().len() as u32;
-    let mut next = if fresh == 0 { 0 } else { alloc(fresh) };
+/// The slot map words (`index << 8 | arm`) for bridging `entries`
+/// (dispatch slots, `table << 24 | slot`), each slot keeping the word it was
+/// first given (`given`): a slot bridged again gets the same one, so
+/// re-bridging numbers nothing.
+///
+/// Every bridge is the same function, which finds its target in the
+/// context (`ctx::LAST_TARGET`), not in its index, so bridges share
+/// `blocks` entries: [`ARMS`] slots to an entry, one arm each (`group`, the
+/// entry being filled and its next arm, kept across calls). Given an entry
+/// per slot, a process with units for a desktop's libraries numbered about
+/// 1.8 million entries, and each of its Workers' `blocks` held them all, in
+/// the renderer's range every isolate shares. An arm of its own still sets
+/// each slot apart where dispatch is watched (a call-out's return), so a
+/// watch on one bridged return is not hit by every other bridge.
+/// `alloc(1)` hands out a fresh index, called once per [`ARMS`] new slots.
+pub fn bridge_words(
+    given: &mut std::collections::HashMap<u32, u32>,
+    group: &mut (u32, u32),
+    entries: &[u32],
+    mut alloc: impl FnMut(u32) -> u32,
+) -> Vec<u32> {
     entries
         .iter()
         .map(|&e| {
             *given.entry(e).or_insert_with(|| {
-                next += 1;
-                next - 1
+                if group.0 == 0 || group.1 >= ARMS {
+                    *group = (alloc(1), 0);
+                }
+                let w = group.0 << 8 | group.1;
+                group.1 += 1;
+                w
             })
         })
         .collect()
@@ -493,9 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn bridging_a_slot_again_keeps_its_index() {
+    fn bridging_a_slot_again_keeps_its_word() {
         use std::collections::HashMap;
         let mut given = HashMap::new();
+        let mut group = (0, 0);
         let mut next = 100u32;
         let mut calls = 0;
         let mut alloc = |n: u32| {
@@ -504,16 +522,38 @@ mod tests {
             next += n;
             b
         };
-        let first = bridge_indices(&mut given, &[7, 9], &mut alloc);
-        assert_eq!(first, vec![100, 101]);
-        // The same slots again (a re-bridge): the same indices, nothing numbered.
+        let first = bridge_words(&mut given, &mut group, &[7, 9], &mut alloc);
+        assert_eq!(first, vec![100 << 8, 100 << 8 | 1]);
+        // The same slots again (a re-bridge): the same words, nothing numbered.
         for _ in 0..1000 {
-            assert_eq!(bridge_indices(&mut given, &[9, 7], &mut alloc), vec![101, 100]);
+            assert_eq!(bridge_words(&mut given, &mut group, &[9, 7], &mut alloc), vec![100 << 8 | 1, 100 << 8]);
         }
-        // One new slot beside an old one: only the new one is numbered.
-        assert_eq!(bridge_indices(&mut given, &[7, 12], &mut alloc), vec![100, 102]);
+        // One new slot beside an old one: only the new one takes an arm.
+        assert_eq!(bridge_words(&mut given, &mut group, &[7, 12], &mut alloc), vec![100 << 8, 100 << 8 | 2]);
         drop(alloc);
-        assert_eq!(calls, 2);
-        assert_eq!(next, 103, "the dense size grew past the slots bridged");
+        assert_eq!(calls, 1);
+        assert_eq!(next, 101, "one entry for the slots bridged");
+    }
+
+    #[test]
+    fn bridges_share_an_entry_until_its_arms_run_out() {
+        use std::collections::HashMap;
+        let mut given = HashMap::new();
+        let mut group = (0, 0);
+        let mut next = 5u32;
+        let slots: Vec<u32> = (0..ARMS * 2 + 3).collect();
+        let words = bridge_words(&mut given, &mut group, &slots, |n| {
+            let b = next;
+            next += n;
+            b
+        });
+        // Three entries for 2 * ARMS + 3 slots, each slot an arm of its own.
+        assert_eq!(next, 8);
+        let distinct: std::collections::BTreeSet<u32> = words.iter().copied().collect();
+        assert_eq!(distinct.len(), slots.len());
+        assert_eq!(words[0], 5 << 8);
+        assert_eq!(words[ARMS as usize - 1], 5 << 8 | (ARMS - 1));
+        assert_eq!(words[ARMS as usize], 6 << 8);
+        assert_eq!(*words.last().unwrap(), 7 << 8 | 2);
     }
 }

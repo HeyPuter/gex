@@ -8747,7 +8747,8 @@ export class Gex {
   }
 
   /** `GEX_LOG=bridges`: the unit-entry addresses this Worker entered
-   *  through a bridge, and the bridges it wrote into its tables. */
+   *  through a bridge, and the bridge entries it wrote into its tables (a
+   *  `blocks` entry serves many bridged slots). */
   #bridgeCount = null;
 
   /** `real` (the runtime module's unit bridge), counting the distinct
@@ -8761,7 +8762,7 @@ export class Gex {
     const c = { bridged: 0 };
     this.#bridgeCount = c;
     const say = () => {
-      console.error(`[bridges] ${this.#whoFills()}: entered ${seen.size} of ${c.bridged} bridged; new ${fresh.map((pc) => pc.toString(16)).join(',')}`);
+      console.error(`[bridges] ${this.#whoFills()}: entered ${seen.size} addresses, ${c.bridged} bridge entries written; new ${fresh.map((pc) => pc.toString(16)).join(',')}`);
       fresh = [];
       said = performance.now();
     };
