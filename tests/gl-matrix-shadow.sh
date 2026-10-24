@@ -15,10 +15,6 @@ cc -O2 -Wall -Wextra -o "$WORK/probe" "$SOURCE" -lEGL -lGL -lm
 EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 "$WORK/probe" > "$WORK/native.log"
 grep -q '^DONE' "$WORK/native.log"
 GEX_CC=${GEX_CC:-cc} "$ROOT/guest/gl/build.sh" "$WORK/guest-gl" >/dev/null
-# One library under its three names, as a program that links libEGL and libGL
-# both should find it: two copies would be two GL states, and the one the
-# GL calls go to would never see the context made.
-for n in libGL.so.1 libEGL.so.1; do ln -f "$WORK/guest-gl/libGLESv2.so.2" "$WORK/guest-gl/$n"; done
 for mode in on check off; do
     case $mode in
         on) env=GEXGL_SHADOW=on ;;
