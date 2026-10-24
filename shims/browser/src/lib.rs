@@ -7644,14 +7644,29 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
-    gex_kernel::phase::begin();
-    syscall_entry(ctx, pc);
-    gex_kernel::phase::mark(16);
-    cgen::ftab_resume();
-    if gex_kernel::unix::take_host_sent() {
-        pump_compositor();
+    let mut pc = pc;
+    loop {
+        gex_kernel::phase::begin();
+        syscall_entry(ctx, pc);
+        gex_kernel::phase::mark(16);
+        cgen::ftab_resume();
+        if gex_kernel::unix::take_host_sent() {
+            pump_compositor();
+        }
+        phases_end();
+        // A call to make again (`syscall_entry`'s end) is made again here, in
+        // this frame: however often its wait ends and it must be made again,
+        // the stack does not grow.
+        match MAKE_AGAIN.with(|c| c.take()) {
+            Some(again) => pc = again,
+            None => return,
+        }
     }
-    phases_end();
+}
+
+thread_local! {
+    /// The call `syscall_entry` left to be made again ([`gex_syscall`]).
+    static MAKE_AGAIN: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Which call [`gex_set_phases`] measures: its canonical number.
@@ -8617,8 +8632,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // A call to make again (`finish_wait`: a priority-inheritance lock still
     // held, a stream another thread got to first, an `accept` or `recvmsg`
     // whose wait is over) from a provider or a wasm32 program: it has no
-    // instruction to go back to, so the call is made again here, outside
-    // the host lock.
+    // instruction to go back to, so `gex_syscall` makes the call again,
+    // outside the host lock.
     let provider = IN_PROVIDER.with(|c| c.get());
     if stop != 0
         && (provider || frames_stay())
@@ -8628,7 +8643,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
         set_resume_none();
         set_resume_ctx_none();
         let pc = if provider { pc as u64 | PROVIDER_SYSCALL } else { pc as u64 };
-        return gex_syscall(ctx, pc as i64);
+        MAKE_AGAIN.with(|c| c.set(Some(pc as i64)));
+        return;
     }
     if stop != 0 {
         trap();
