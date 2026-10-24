@@ -56,6 +56,7 @@ pub mod raw {
     pub const SETUID16: u64 = 23;
     pub const GETUID16: u64 = 24;
     pub const ALARM: u64 = 27;
+    pub const PAUSE: u64 = 29;
     pub const ACCESS: u64 = 33;
     pub const SYNC: u64 = 36;
     pub const KILL: u64 = 37;
@@ -388,18 +389,20 @@ pub fn canonical_number(raw: u64) -> u64 {
     let mut a = [0u64; 6];
     let mut scratch = [0u8; 256];
     let mut m = GuestMem::new(&mut scratch);
-    translate(raw & 0xffff_ffff, &mut a, &mut m, 0, 0).0
+    translate(raw & 0xffff_ffff, &mut a, &mut m, 0, 0, 0).0
 }
 
 /// Translate an i386 call into the canonical one. `scratch` is the thread's
 /// 64-byte scratch area in its context (the same one [`crate::x86`] uses);
-/// `ctx_addr` is the context itself, for `set_thread_area`.
+/// `ctx_addr` is the context itself, for `set_thread_area`; `blocked` the
+/// calling thread's signal mask.
 pub fn translate(
     n: u64,
     a: &mut [u64; 6],
     m: &mut GuestMem<'_>,
     scratch: u64,
     ctx_addr: u64,
+    blocked: u64,
 ) -> (u64, Post) {
     use raw as x;
     let mut post = Post::None;
@@ -553,6 +556,12 @@ pub fn translate(
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
         x::ALARM => nr::ALARM,
+        x::PAUSE => {
+            // pause() is rt_sigsuspend with the current mask.
+            let _ = m.write_u64(scratch, blocked);
+            *a = [scratch, 8, 0, 0, 0, 0];
+            nr::RT_SIGSUSPEND
+        }
         x::ACCESS => {
             *a = [AT_FDCWD, a[0], a[1], 0, 0, 0];
             nr::FACCESSAT
@@ -1141,7 +1150,7 @@ mod tests {
 
     fn tr(n: u64, mut a: [u64; 6], buf: &mut [u8]) -> (u64, [u64; 6]) {
         let mut m = GuestMem::new(buf);
-        let (n, _) = translate(n, &mut a, &mut m, SCRATCH, 0x1000);
+        let (n, _) = translate(n, &mut a, &mut m, SCRATCH, 0x1000, 0);
         (n, a)
     }
 
@@ -1201,7 +1210,7 @@ mod tests {
         let (n, a, post) = {
             let mut m = GuestMem::new(&mut buf);
             let mut a = [5, 0x3000, 0, 0, 0, 0];
-            let (n, post) = translate(raw::TIMERFD_GETTIME, &mut a, &mut m, SCRATCH, 0x1000);
+            let (n, post) = translate(raw::TIMERFD_GETTIME, &mut a, &mut m, SCRATCH, 0x1000, 0);
             (n, a, post)
         };
         assert_eq!((n, a[1]), (nr::TIMERFD_GETTIME, SCRATCH));
@@ -1212,6 +1221,20 @@ mod tests {
         assert_eq!(post.finish(&mut m, 0), 0);
         let words: Vec<u32> = (0..4).map(|i| m.read_u32(0x3000 + i * 4).unwrap()).collect();
         assert_eq!(words, vec![1, 2, 3, 4]);
+    }
+
+    /// pause() waits as rt_sigsuspend with the caller's own mask, the 8-byte
+    /// set in the scratch area.
+    #[test]
+    fn pause_is_sigsuspend_with_the_current_mask() {
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        let mut a = [7; 6];
+        let (n, _) = translate(raw::PAUSE, &mut a, &mut m, SCRATCH, 0x1000, 0x1234);
+        assert_eq!(n, nr::RT_SIGSUSPEND);
+        assert_eq!(a, [SCRATCH, 8, 0, 0, 0, 0]);
+        assert_eq!(m.read_u64(SCRATCH).unwrap(), 0x1234);
+        assert_eq!(canonical_number(raw::PAUSE), nr::RT_SIGSUSPEND);
     }
 
     /// Every i386 number maps without arguments, and the calls a host sorts by

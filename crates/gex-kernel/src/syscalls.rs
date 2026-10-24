@@ -6540,7 +6540,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) || is_lifecycle_end(n) || is_thread_clone(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
-            let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
+            let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr, f.signals.blocked());
             post = p;
             t
         } else if gex_abi::X86 {
@@ -8883,6 +8883,7 @@ impl Kernel {
                 m,
                 self.ctx_addr + ctx::COMPAT_SCRATCH as u64,
                 self.ctx_addr,
+                self.signals.blocked(),
             );
             post = p;
             self.sigreturn_legacy = (raw & 0xffff_ffff) == crate::i386::raw::SIGRETURN;

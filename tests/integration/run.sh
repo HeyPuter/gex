@@ -566,6 +566,9 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/threads" "$HERE/programs/threads.c" -lpthread
 # Exits while other threads are mid-work, including two parked on a futex.
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
+# pause, sigsuspend, and ppoll, poll, pselect and select on no descriptors
+# block until a second thread's signal ends them with EINTR.
+"$CC" -static -no-pie -O2 -o "$WORK/sig-pause" "$HERE/programs/sig-pause.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/background" "$HERE/programs/background.c"
 "$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
@@ -761,6 +764,7 @@ browser "signal-all" "$WORK/signals" all
 # thread-local storage, and a main that calls exit_group while others spin.
 browser --shared "threads" "$WORK/threads"
 browser --shared "thread-exit-race" "$WORK/exitrace"
+browser --shared "sig-pause" "$WORK/sig-pause"
 if [ -n "$CPP" ]; then
     browser "cpp" "$WORK/cpp"
 fi
@@ -774,6 +778,7 @@ if [ -n "$CPP" ] && [ -f "$WORK/dyn-cpp" ]; then
     browser_dynamic "cpp" "$WORK/dyn-cpp"
 fi
 compare "threads" "$WORK/threads"
+compare "sig-pause" "$WORK/sig-pause"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"
 # A child that is still running while its parent works. The browser host used
