@@ -5556,18 +5556,19 @@ pub struct ThreadEnd<'a> {
 }
 
 impl ThreadEnd<'_> {
-    /// End thread `tid`, its context at `ctx_addr`: its fs_struct, the word
-    /// its exit clears (zeroed and woken: `pthread_join` waits on it), its
-    /// signal state and its id.
+    /// End thread `tid`, its context at `ctx_addr`: its fs_struct, its
+    /// signal state, its id, and the word its exit clears (zeroed and woken:
+    /// `pthread_join` waits on it). The id goes first, so a thread that has
+    /// joined it no longer finds it in `/proc`.
     pub fn end(&self, m: &mut GuestMem<'_>, ctx_addr: u64, tid: i32) {
         self.thread_fs.set(ctx_addr, None);
+        self.threads.remove(tid);
+        self.procs.end_tid(tid);
         let addr = self.thread.clear_child_tid();
         if addr != 0 {
             let _ = m.write_u32(addr, 0);
             self.futexes.wake(addr, u32::MAX);
         }
-        self.threads.remove(tid);
-        self.procs.end_tid(tid);
     }
 }
 
