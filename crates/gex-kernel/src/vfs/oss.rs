@@ -113,6 +113,12 @@ impl Stream {
         self.rate as u64 * self.frame_bytes()
     }
 
+    /// Whether a writer waiting for room is ready: a fragment is free (a
+    /// writer woken for less would write a frame or two and wait again).
+    fn fragment_free(&self) -> bool {
+        self.queued + self.fragsize <= self.bufsize()
+    }
+
     /// Play what the player has played since the last look, or (no player
     /// taking this stream's frames) what the time since then has.
     fn drain(&mut self) {
@@ -435,7 +441,7 @@ impl FileHandle for OssHandle {
     fn poll_writable(&self) -> bool {
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
-        s.queued < s.bufsize()
+        s.fragment_free()
     }
 
     fn poll_readable(&self) -> bool {
@@ -461,7 +467,7 @@ impl FileHandle for OssHandle {
             // A reader of the loopback: looked at again each quantum.
             return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
         }
-        if s.queued < s.bufsize() {
+        if s.fragment_free() {
             // Room now: a writer is ready.
             return None;
         }
@@ -469,8 +475,10 @@ impl FileHandle for OssHandle {
             // The player takes a quantum at a time.
             return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
         }
+        // By the clock: when a fragment's worth has played.
+        let need = s.queued - (s.bufsize() - s.fragsize);
         let bps = s.bytes_per_second().max(1);
-        Some((1_000_000_000 / bps).max(1))
+        Some(((need as u128 * 1_000_000_000).div_ceil(bps as u128) as u64).max(1))
     }
 
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
@@ -638,10 +646,12 @@ mod tests {
         assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
         // Full, with the clock held (a loaded machine may let the 21 us a
         // frame plays in pass between two calls): no room, and a waiter
-        // looks again as soon as any will have played.
+        // looks again once a fragment (2 KiB, 10.7 ms) will have played,
+        // not a frame: woken for a frame, it would write one and wait again.
         let at = std::mem::replace(&mut h.stream.lock().unwrap().at, u64::MAX);
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
-        assert!(h.ready_in_ns().is_some_and(|ns| ns <= 1_000_000));
+        assert!(!h.poll_writable());
+        assert!(h.ready_in_ns().is_some_and(|ns| (10_600_000..=10_700_000).contains(&ns)), "{:?}", h.ready_in_ns());
         h.stream.lock().unwrap().at = at;
         std::thread::sleep(std::time::Duration::from_millis(60));
         let n = h.write_at(0, &vec![0u8; 100_000]).unwrap();
