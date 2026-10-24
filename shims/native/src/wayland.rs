@@ -30,9 +30,16 @@ struct Session {
     owner: Option<i32>,
     socket: Arc<UnixSocket>,
     client: Client,
-    /// Descriptors received over `SCM_RIGHTS`, in arrival order: the protocol
-    /// refers to one by arrival index, not the client's descriptor number.
-    fds: Vec<Arc<OpenFile>>,
+    /// Descriptors received over `SCM_RIGHTS`, by arrival index (the
+    /// protocol refers to one by that, not the client's descriptor number),
+    /// and the next index. Held only while the compositor may still need
+    /// one: a client makes a pool, and so a descriptor, per buffer.
+    fds: HashMap<u32, Arc<OpenFile>>,
+    next_fd: u32,
+    /// Indices that have arrived and that nothing has used yet: a message
+    /// can arrive in pieces, so a descriptor whose `create_pool` is still in
+    /// flight is not one the compositor is done with.
+    fresh: Vec<u32>,
     /// Event bytes the client's socket had no room for yet, and how many have
     /// gone. Usually empty (events are small), but a dropped tail does not fail
     /// -- it desyncs the stream and leaves the client waiting forever.
@@ -55,8 +62,6 @@ pub struct Wayland {
 #[derive(Default)]
 struct Inner {
     sessions: Mutex<Vec<Session>>,
-    /// Frames committed since the host last collected them.
-    frames: Mutex<Vec<Frame>>,
     size: Mutex<(i32, i32)>,
     /// Where to write each frame, and how many have been written.
     out: Mutex<Option<String>>,
@@ -392,11 +397,6 @@ impl Wayland {
         }
     }
 
-    /// Everything committed since the last call.
-    pub fn take_frames(&self) -> Vec<Frame> {
-        std::mem::take(&mut self.inner.frames.lock().unwrap())
-    }
-
     pub fn client_count(&self) -> usize {
         self.inner.sessions.lock().unwrap().len()
     }
@@ -445,9 +445,13 @@ impl Wayland {
                     // Nothing more waiting.
                     Err(_) => break,
                 };
-                let first = s.fds.len();
-                s.fds.extend(s.socket.take_received());
-                let tokens: Vec<u32> = (first..s.fds.len()).map(|i| i as u32).collect();
+                let mut tokens = Vec::new();
+                for file in s.socket.take_received() {
+                    s.fds.insert(s.next_fd, file);
+                    tokens.push(s.next_fd);
+                    s.next_fd += 1;
+                }
+                s.fresh.extend_from_slice(&tokens);
                 let view = PoolView {
                     kernel,
                     mem,
@@ -459,6 +463,7 @@ impl Wayland {
                 }
             }
             s.rbuf = buf;
+            s.release_unused();
             if !due.is_empty() {
                 eprintln!("[gex] input: {}", s.client.describe_input());
             }
@@ -537,7 +542,6 @@ impl Wayland {
             // One screen per batch of commits, not one per surface.
             self.save(&produced);
             self.note_screen();
-            self.inner.frames.lock().unwrap().extend(produced);
         }
     }
 }
@@ -791,7 +795,9 @@ impl HostListener for Wayland {
             owner: PROCESS.with(|p| p.get()),
             socket: peer,
             client,
-            fds: Vec::new(),
+            fds: HashMap::new(),
+            next_fd: 0,
+            fresh: Vec::new(),
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),
@@ -799,16 +805,32 @@ impl HostListener for Wayland {
     }
 }
 
+impl Session {
+    /// Drop every descriptor the compositor has finished with: no pool, no
+    /// buffer and no surface on screen names it, and it is not one still
+    /// waiting for the message that uses it.
+    fn release_unused(&mut self) {
+        if self.fds.is_empty() {
+            return;
+        }
+        let used = self.client.fds_in_use();
+        let fresh = std::mem::take(&mut self.fresh);
+        self.fresh = fresh.into_iter().filter(|t| !used.contains(t)).collect();
+        let fresh = &self.fresh;
+        self.fds.retain(|t, _| used.contains(t) || fresh.contains(t));
+    }
+}
+
 /// Resolves a descriptor the client sent to the pixels behind it.
 struct PoolView<'a, 'm> {
     kernel: &'a Kernel,
     mem: &'a GuestMem<'m>,
-    fds: &'a [Arc<OpenFile>],
+    fds: &'a HashMap<u32, Arc<OpenFile>>,
 }
 
 impl Buffers for PoolView<'_, '_> {
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
-        let file = self.fds.get(fd as usize)?;
+        let file = self.fds.get(&fd)?;
         // The client mapped this shared, so the live pixels are in the guest's
         // memory; the file's own bytes are what was there before it drew (zero).
         let map = self
