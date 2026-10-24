@@ -59,3 +59,24 @@ else
 	echo "FAIL bridge-share (rc=$rc$([ $rc = 124 ] && echo ': hung'), units placed $placed times, ${entered:-no} addresses entered)"
 	printf 'want:\n%s\ngot:\n%s\n' "$want" "$got"; grep -a 'trap\|rror' "$w/run.err" | head -5; exit 1
 fi
+
+# Units off, a native wasm32 program: its module goes in through the function
+# table's log all the same. An exec from a second thread keeps that thread's
+# Worker, and its `blocks` already holds the entry the new program's bridges
+# take arms of, so dispatch reaches the bridge (and `gex.lookup`) before any
+# miss: lookup must catch the Worker up on the log, or the slot resolves to
+# `resolve` for ever (cgen.rs `behind`). The hang was intermittent, so a few
+# runs. Needs GEX_WASM_SYSROOT (tools/wine-wasm/build-sysroot.sh).
+if [ -z "${GEX_WASM_SYSROOT:-}" ]; then
+	echo "skip bridge-share exec (GEX_WASM_SYSROOT unset)"; exit 0
+fi
+"$root/tools/wine-wasm/wcc" -O2 -o "$w/execthreads" "$root/tests/wasm32/execthreads.c" || exit 1
+for i in 1 2 3; do
+	got=$(cd "$w" && env -u GEX_CGEN_CACHE -u GEX_ELF_UNITS GEX_LOG=off timeout "${TMO:-120}" node "$root/shims/browser/js/run-node.mjs" \
+		--file /t/execthreads="$w/execthreads" --cwd /t --argv0 ./execthreads "$seed" "$w/execthreads" 2> "$w/exec$i.err" < /dev/null)
+	rc=$?
+	if [ $rc != 0 ] || ! grep -q 'exec from a second thread: 4 of 4' <<< "$got"; then
+		echo "FAIL bridge-share exec (run $i, rc=$rc$([ $rc = 124 ] && echo ': hung'))"; printf '%s\n' "$got"; exit 1
+	fi
+done
+echo "ok   bridge-share exec (exec from a second thread with units off, 3 runs)"
