@@ -1152,6 +1152,17 @@ pub fn translate(
 /// `recvfrom` without an address, `accept` is `accept4` without flags. An
 /// unknown call, or arguments that cannot be read, is `ENOSYS`.
 fn socketcall(a: &mut [u64; 6], m: &mut GuestMem<'_>, scratch: u64, ctx_addr: u64) -> (u64, Post) {
+    let Some((n, v)) = socketcall_unpacked(m, a) else {
+        return (UNKNOWN, Post::None);
+    };
+    *a = v;
+    translate(n, a, m, scratch, ctx_addr)
+}
+
+/// The call a `socketcall(call, args)` makes: its own i386 number and its
+/// arguments, read from `args`; `None` for an unknown call or arguments
+/// that cannot be read. The lock-free path classes the call by these.
+pub fn socketcall_unpacked(m: &GuestMem<'_>, a: &[u64; 6]) -> Option<(u64, [u64; 6])> {
     use raw as x;
     // Indexed by the call (linux/net.h SYS_SOCKET = 1 ... SYS_SENDMMSG = 20):
     // the i386 number it is, and how many arguments it takes.
@@ -1178,23 +1189,16 @@ fn socketcall(a: &mut [u64; 6], m: &mut GuestMem<'_>, scratch: u64, ctx_addr: u6
         (x::RECVMMSG, 5),
         (x::SENDMMSG, 4),
     ];
-    let call = (a[0] & 0xffff_ffff) as usize;
-    let Some(&(n, count)) = CALLS.get(call) else {
-        return (UNKNOWN, Post::None);
-    };
+    let &(n, count) = CALLS.get((a[0] & 0xffff_ffff) as usize)?;
     if n == UNKNOWN {
-        return (UNKNOWN, Post::None);
+        return None;
     }
     let p = a[1] & 0xffff_ffff;
     let mut v = [0u64; 6];
     for (i, w) in v.iter_mut().enumerate().take(count) {
-        match m.read_u32(p + 4 * i as u64) {
-            Ok(x) => *w = x as u64,
-            Err(_) => return (UNKNOWN, Post::None),
-        }
+        *w = m.read_u32(p + 4 * i as u64).ok()? as u64;
     }
-    *a = v;
-    translate(n, a, m, scratch, ctx_addr)
+    Some((n, v))
 }
 
 /// The i386 program's argument registers: `ebx, ecx, edx, esi, edi, ebp`,

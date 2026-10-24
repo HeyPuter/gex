@@ -6483,7 +6483,21 @@ pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
 /// context and ABI).
 pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<FreeCall> {
     let CallRegs { raw, mut a } = regs;
-    let Some(n) = free_number(raw, compat) else { return nosys_call(raw, compat) };
+    // i386's `socketcall` is classed as the call it makes, with that call's
+    // arguments; `raw` stays the number the guest used, which a restart
+    // makes again.
+    let inner = if compat && raw == crate::i386::raw::SOCKETCALL {
+        match crate::i386::socketcall_unpacked(m, &a) {
+            Some((n, v)) => {
+                a = v;
+                n
+            }
+            None => return nosys_call(raw, compat),
+        }
+    } else {
+        raw
+    };
+    let Some(n) = free_number(inner, compat) else { return nosys_call(raw, compat) };
     // A `clone` that makes a process (no `CLONE_THREAD`) is the host's, and
     // so are `fork` and `vfork`, which are `clone` canonically: only the
     // ABI's own `clone` and `clone3` carry their flags in the first argument.
@@ -12379,6 +12393,41 @@ mod tests {
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
         assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
+    }
+
+    /// i386's `socketcall`, as Debian's i386 glibc makes every socket call,
+    /// on the lock-free path: classed as the call it makes, which is made.
+    #[test]
+    fn an_i386_socketcall_is_made_without_the_lock() {
+        if !gex_abi::X86 {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        k.compat = true;
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        // socketcall(SYS_SOCKETPAIR, {AF_UNIX, SOCK_STREAM, 0, sv}).
+        let (args_at, sv_at) = (0x31000u64, 0x31100u64);
+        for (i, w) in [1u32, 1, 0, sv_at as u32].iter().enumerate() {
+            m.write_u32(args_at + 4 * i as u64, *w).unwrap();
+        }
+        m.write_u64(sv_at, !0).unwrap();
+        m.write_u64(at + ctx::x(0) as u64, crate::i386::raw::SOCKETCALL).unwrap();
+        for (slot, v) in crate::i386::ARG_SLOTS.into_iter().zip([8, args_at, 0, 0, 0, 0]) {
+            m.write_u64(at + slot as u64, v).unwrap();
+        }
+        let call = free_class(&m, at, true).expect("in the class");
+        assert_eq!(call.number(), nr::SOCKETPAIR);
+        assert_eq!(call.args(), [1, 1, 0]);
+        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+        assert!(matches!(free_call(&f, &mut m, at, call), FreeOutcome::Done(_)));
+        assert_eq!(m.read_u64(at + ctx::x(0) as u64).unwrap() as u32, 0);
+        let (a, b) = (m.read_u32(sv_at).unwrap(), m.read_u32(sv_at + 4).unwrap());
+        assert!(a < 1024 && b < 1024 && a != b, "socketpair gave {a} and {b}");
+        // An unknown call is ENOSYS, as the full call answers it.
+        m.write_u64(at + crate::i386::ARG_SLOTS[0] as u64, 99).unwrap();
+        assert_eq!(free_class(&m, at, true).map(|c| c.number()), Some(NOSYS));
     }
 
     /// [`only_the_process_calls_take_the_locked_path`] for an i386 process
