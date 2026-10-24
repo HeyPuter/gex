@@ -263,6 +263,13 @@ if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/wineway
 		for t in glcompat glfast; do GL=1 WL=- check $t 0 "$allok" $t.exe; done
 		GL=1 WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255:100" \
 			check glwindow 0 "shown${nl}frames [0-9]+${nl}bye" glwindow.exe 3
+		# glbig: a window taller than the screen keeps its GDI strip while
+		# its GL child presents. Its window surface is cropped to the
+		# screen, smaller than the window; the last of the window's own
+		# frames (the GL child's 590x370 ones aside) has the strip's 300x26
+		# red.
+		GL=1 FRAME_SKIP=590x370 FRAME_LAST=1 WL="200,30,30:5000" \
+			check glbig 0 "shown${nl}frames [0-9]+${nl}bye" glbig.exe 3
 	fi
 fi
 # Audio: waveOut and an mmdevapi stream each play 100 ms (audio.c) through
