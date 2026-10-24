@@ -13290,9 +13290,12 @@ fn dying_frames() -> String {
         reg(30),
         object_off_at(reg(30)),
     );
+    // Bounded: at most 24 frames, each above the last and within 8 MiB
+    // above sp, every read checked (`GuestMem::read_u64`), so a corrupt
+    // chain ends the walk rather than faulting the report.
     let mut fp = reg(29);
     for _ in 0..24 {
-        if fp == 0 || fp & 7 != 0 {
+        if fp == 0 || fp & 7 != 0 || fp < sp || fp - sp > 8 << 20 {
             break;
         }
         let ret = gm.read_u64(fp + 8).unwrap_or(0);
