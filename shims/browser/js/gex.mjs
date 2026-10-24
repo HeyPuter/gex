@@ -5317,7 +5317,12 @@ export class Gex {
   #progSpAt() {
     // The single-thread build calls no entry function (`entry_call` is 0):
     // nothing to put back, and its fibers share the global.
-    return single.on ? undefined : this.#wasmprogSp?.value;
+    if (single.on) return undefined;
+    // 0: the program had not set it yet (its start sets it, inside the
+    // loop's entry). Put back, that would undo the program's own setting,
+    // and a fault hook's frames would then go below address 0.
+    const v = this.#wasmprogSp?.value;
+    return v ? v : undefined;
   }
   #progSpBack(v) {
     const g = this.#wasmprogSp;
