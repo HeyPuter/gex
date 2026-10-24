@@ -1775,7 +1775,8 @@ export class Gex {
             spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
           } else {
             const esp = Number(sp & 0xffffffffn);
-            spG.value = ((Math.min(Number(cur) >>> 0, esp) - 4096) & ~15) | 0;
+            const c32 = Number(cur) >>> 0;
+            spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
           }
           try {
             f(ctx, code, this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind);
@@ -7633,7 +7634,9 @@ export class Gex {
       spG.value = (low - 4096n) & ~15n;
     } else {
       const esp = this.#dv().getUint32(ctx + CTX_SP, true);
-      const low = Math.min(Number(cur) >>> 0, esp);
+      const c32 = Number(cur) >>> 0;
+      // 0: the program has not set it yet, as for an i64 one.
+      const low = c32 !== 0 && c32 < esp ? c32 : esp;
       spG.value = ((low - 4096) & ~15) | 0;
     }
     return { spG, cur };
