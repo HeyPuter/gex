@@ -7,7 +7,11 @@
 #            debugger and when one attaches (the server writes it with
 #            process_vm_writev);
 #   winedbg  the system debugger attaching to a process whose exception
-#            nothing handles.
+#            nothing handles;
+#   remotestart  threads started in another process: a native function's
+#            value refused, a guest address run, a debugger's break-ins
+#            (whose start is ntdll's export) reaching it, and a fault
+#            the debugger sees first (first chance) and passes on.
 # The page has no process_vm_readv/writev (ENOSYS): there only vmpeer, whose
 # copies the target process makes itself.
 # A write over code compiled into a unit is not seen by that unit, so vmpeer's
@@ -28,7 +32,7 @@ gexc=$(realpath -m "${3:-$root/target/x86/release/gexc}")
 [ -x "$gexc" ] || { echo "FAIL: no $gexc"; exit 1; }
 w=${WORK:-$root/target/w3-procvm}
 rm -rf "$w"; mkdir -p "$w"
-for p in vmpeer dbgflag; do i686-w64-mingw32-gcc -O1 -o "$w/$p.exe" "$here/$p.c" || exit 1; done
+for p in vmpeer dbgflag remotestart; do i686-w64-mingw32-gcc -O1 -o "$w/$p.exe" "$here/$p.c" || exit 1; done
 pass=0 fail=0
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1"; shift; for l in "$@"; do echo "  $l"; done; }
@@ -55,8 +59,11 @@ native "$w/dbgflag.log" 300 'C:\dbgflag.exe'
 if grep -q '^dbgflag done, 0 failed' "$w/dbgflag.log"; then ok "native, dbgflag"
 else bad "native, dbgflag" "$(grep -E '^FAIL|Assertion' "$w/dbgflag.log" | head -3 | tr '\n' ';')"; fi
 native "$w/winedbg.log" 180 'C:\vmpeer.exe' crash
-if grep -q '^WineDbg attached to pid' "$w/winedbg.log" && ! grep -q "Can't attach" "$w/winedbg.log"; then ok "native, winedbg attaches"
-else bad "native, winedbg attaches" "$(grep -E "attach|starting debugger" "$w/winedbg.log" | head -3 | tr '\n' ';')"; fi
+if grep -q '^WineDbg attached to pid' "$w/winedbg.log" && ! grep -q "Can't attach\|gex failed" "$w/winedbg.log"; then ok "native, winedbg attaches"
+else bad "native, winedbg attaches" "$(grep -E "attach|starting debugger|gex failed" "$w/winedbg.log" | head -3 | tr '\n' ';')"; fi
+native "$w/remotestart.log" 180 'C:\remotestart.exe'
+if grep -q '^remotestart done, 0 failed' "$w/remotestart.log"; then ok "native, remotestart"
+else bad "native, remotestart" "$(grep -E '^FAIL|gex failed' "$w/remotestart.log" | head -4 | tr '\n' ';')"; fi
 for f in gex_browser.x86.shared.wasm seed.x86.shared.wasm; do
 	[ -f "$root/web/public/gex/$f" ] || { echo "skip page: no web/public/gex/$f"; echo "$pass passed, $fail failed"; exit $((fail > 0)); }
 done
