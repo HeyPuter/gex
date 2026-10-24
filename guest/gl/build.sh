@@ -114,7 +114,7 @@ ALIASES="$HERE/gl-aliases-generated.inc"
 [ -f "$ALIASES" ] || : > "$ALIASES"
 link_guest_gl() {
     $CC -shared -fPIC -O2 -Wall -o "$OUT/libGLESv2.so.2" \
-        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl
+        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl -lm
 }
 link_guest_gl
 if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \

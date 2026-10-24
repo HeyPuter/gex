@@ -344,6 +344,8 @@ static int fbq_invalidates(uint32_t opcode) {
     }
 }
 
+#include "gexgl-shadow.inc"
+
 /* Hand everything recorded so far to the host without waiting for it to
    run: GEX_GL_SUBMIT_ASYNC (shims/native/src/gl.rs, shims/browser/src/gl.rs)
    copies the batch and returns, and the next submit of either kind waits for
@@ -482,6 +484,7 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
         }
     }
     if ((fbq_count || fbq_known) && fbq_invalidates(opcode)) fbq_forget();
+    shadow_opcode(opcode);
     uint32_t *at = (uint32_t *)(cmds + ring->tail);
     at[0] = opcode;
     at[1] = (uint32_t)len;
@@ -615,10 +618,12 @@ void glScissor(int x, int y, int w, int h) { CMD4(GEXGL_SCISSOR, x, y, w, h); }
 static int gexgl_debug_cap(unsigned cap, int on);
 void glEnable(unsigned cap) {
     if (gexgl_debug_cap(cap, 1)) return;
+    shadow_enable(cap, 1);
     CMD1(GEXGL_ENABLE, cap);
 }
 void glDisable(unsigned cap) {
     if (gexgl_debug_cap(cap, 0)) return;
+    shadow_enable(cap, 0);
     CMD1(GEXGL_DISABLE, cap);
 }
 void glBlendFunc(unsigned s, unsigned d) { CMD2(GEXGL_BLEND_FUNC, s, d); }
@@ -3705,6 +3710,7 @@ static uint64_t gexgen_call(uint32_t opcode, const char *plan, const uint64_t *v
             fprintf(stderr, "gexgl: generated %u (%s)\n", (unsigned)opcode, plan);
         }
     }
+    shadow_generated(opcode, v);
     struct gexgen_tok toks[GEXGEN_MAX_PARAMS + 1];
     toks[0].kind = 'v';
     size_t bytes[GEXGEN_MAX_PARAMS];
@@ -4033,6 +4039,7 @@ static void context_create(void) {
     }
     host_context_made = 1;
     egl_contexts_live++;
+    shadow_context_made();
     uint32_t *p = begin(GEXGL_CONTEXT_CREATE, 4, 0);
     if (!p) return;
     p[0] = egl_api == 0x30A2u ? 1u /* desktop */ : 0u /* ES */;
@@ -4563,6 +4570,9 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
     egl_contexts_live = 0;
     host_context_made = 0;
     egl_current_context = NULL;
+    shadow_report();
+    shadow_forget_matrices();
+    shadow_forget_enables();
     CMD0(GEXGL_CONTEXT_DESTROY);
     flush();
     return EGL_TRUE;
@@ -4853,23 +4863,36 @@ static void put_double(uint32_t *at, double value) {
 
 static void put_float(uint32_t *at, float value) { memcpy(at, &value, 4); }
 
-void glMatrixMode(unsigned mode) { CMD1(GEXGL_MATRIX_MODE, mode); }
-void glLoadIdentity(void) { CMD0(GEXGL_LOAD_IDENTITY); }
-void glPushMatrix(void) { CMD0(GEXGL_PUSH_MATRIX); }
-void glPopMatrix(void) { CMD0(GEXGL_POP_MATRIX); }
-void glBegin(unsigned mode) { CMD1(GEXGL_BEGIN, mode); }
-void glEnd(void) { CMD0(GEXGL_END); }
+void glMatrixMode(unsigned mode) { shadow_matrix_mode(mode); CMD1(GEXGL_MATRIX_MODE, mode); }
+void glLoadIdentity(void) {
+    float m[16];
+    shadow_identity(m);
+    shadow_load(m);
+    CMD0(GEXGL_LOAD_IDENTITY);
+}
+void glPushMatrix(void) { shadow_push(); CMD0(GEXGL_PUSH_MATRIX); }
+void glPopMatrix(void) { shadow_pop(); CMD0(GEXGL_POP_MATRIX); }
+void glBegin(unsigned mode) {
+    if (!shadow.listing || shadow.listing == 2) shadow.in_begin = 1;
+    CMD1(GEXGL_BEGIN, mode);
+}
+void glEnd(void) {
+    if (!shadow.listing || shadow.listing == 2) shadow.in_begin = 0;
+    CMD0(GEXGL_END);
+}
 void glShadeModel(unsigned mode) { CMD1(GEXGL_SHADE_MODEL, mode); }
-void glEndList(void) { CMD0(GEXGL_END_LIST); }
-void glCallList(unsigned list) { CMD1(GEXGL_CALL_LIST, list); }
+void glEndList(void) { shadow_end_list(); CMD0(GEXGL_END_LIST); }
+void glCallList(unsigned list) { shadow_call_lists(); CMD1(GEXGL_CALL_LIST, list); }
 void glDeleteLists(unsigned list, int range) {
     CMD2(GEXGL_DELETE_LISTS, list, (unsigned)range);
 }
 void glNewList(unsigned list, unsigned mode) {
+    shadow_new_list(mode);
     CMD2(GEXGL_NEW_LIST, list, mode);
 }
 
 void glTranslatef(float x, float y, float z) {
+    { const float v[3] = { x, y, z }; shadow_translate(v); }
     uint32_t *p = begin(GEXGL_TRANSLATEF, 3, 0); if (!p) return;
     put_float(&p[0], x); put_float(&p[1], y); put_float(&p[2], z);
 }
@@ -4880,6 +4903,7 @@ void glTranslated(double x, double y, double z) {
     glTranslatef((float)x, (float)y, (float)z);
 }
 void glRotatef(float angle, float x, float y, float z) {
+    { const float v[4] = { angle, x, y, z }; shadow_rotate(v); }
     uint32_t *p = begin(GEXGL_ROTATEF, 4, 0); if (!p) return;
     put_float(&p[0], angle); put_float(&p[1], x);
     put_float(&p[2], y); put_float(&p[3], z);
@@ -4893,6 +4917,7 @@ void glNormal3f(float x, float y, float z) {
     put_float(&p[0], x); put_float(&p[1], y); put_float(&p[2], z);
 }
 void glFrustum(double l, double r, double b, double t, double n, double f) {
+    { const double v[6] = { l, r, b, t, n, f }; shadow_frustum(v); }
     uint32_t *p = begin(GEXGL_FRUSTUM, 12, 0); if (!p) return;
     put_double(&p[0], l); put_double(&p[2], r); put_double(&p[4], b);
     put_double(&p[6], t); put_double(&p[8], n); put_double(&p[10], f);
