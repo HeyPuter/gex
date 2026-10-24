@@ -385,7 +385,7 @@ elif x86_64-w64-mingw32-gcc -O1 -o "$w/asiohost.exe" "$here/asiohost.c" -lole32 
 	# builtin only through its file in the prefix, as wineboot installs it)
 	was=$(declare -p GEX_AUDIO_PLAYER GEX_AUDIO_LOOP 2>/dev/null)
 	[ -n "$page" ] && export GEX_AUDIO_PLAYER="${GEX_AUDIO_PLAYER:-1}" GEX_AUDIO_LOOP=1
-	EXTRA="$dist/lib/wine/x86_64-windows/gexasio.dll" check asio 0 "asio driver gex audio${nl}asio rate [0-9]+ buffer 256 \\(min 64 max 2048\\) inputs $inputs outputs 2 latency in [0-9]+ out [0-9]+${nl}asio switches [0-9]+ want [0-9]+ \\(first after [0-9]+ ms\\), position ok, time info steady$rt" "$w/asiohost.exe"
+	EXTRA="$dist/lib/wine/x86_64-windows/gexasio.dll" check asio 0 "asio driver gex audio${nl}asio rate [0-9]+ buffer 512 \\(min 64 max 2048\\) inputs $inputs outputs 2 latency in [0-9]+ out [0-9]+${nl}asio switches [0-9]+ want [0-9]+ \\(first after [0-9]+ ms\\), position ok, time info steady$rt" "$w/asiohost.exe"
 	unset GEX_AUDIO_PLAYER GEX_AUDIO_LOOP; eval "$was"
 else
 	fail=$((fail + 1)); echo "FAIL x64/asio ($tag): x86_64-w64-mingw32-gcc"
