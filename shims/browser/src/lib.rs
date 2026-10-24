@@ -3629,13 +3629,16 @@ struct Jit {
     reuse_noident: u64,
     /// Modules installed from the shared store instead of being lifted.
     reuse_served: u64,
-    /// The index in `blocks` each dense slot's bridge was given
-    /// (`cgen::bridges`, by `table << 24 | slot`): a slot bridged again gets
-    /// the same one. A fresh index per bridge numbered a 64-bit game's re-bridge
-    /// churn (8 Workers, each missing at an index its siblings wrote) at
-    /// ~8,000 a second, and every Worker's `blocks` grew with it until the
-    /// renderer ran out of V8 heap.
+    /// The slot map word (`blocks` index and arm) each dense slot's bridge
+    /// was given (`cgen::bridges`, by `table << 24 | slot`): a slot bridged
+    /// again gets the same one. A fresh index per bridge numbered a 64-bit
+    /// game's re-bridge churn (8 Workers, each missing at an index its
+    /// siblings wrote) at ~8,000 a second, and every Worker's `blocks` grew
+    /// with it until the renderer ran out of V8 heap.
     bridge_dense: std::collections::HashMap<u32, u32>,
+    /// The `blocks` entry new bridges take arms of, and its next arm
+    /// (`gex_emit::dense::bridge_words`).
+    bridge_group: (u32, u32),
     /// Translation units the system-wide store accepted, and units it turned
     /// away. A unit it refuses can never be shared, however well the identity
     /// of its pages matches.
@@ -10225,6 +10228,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         reuse_noident: 0,
         reuse_served: 0,
         bridge_dense: Default::default(),
+        bridge_group: (0, 0),
         store_ok: 0,
         store_full: 0,
         intrinsics: Default::default(),

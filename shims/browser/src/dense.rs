@@ -343,13 +343,13 @@ pub(crate) fn alloc(n: u32) -> u32 {
     }
 }
 
-/// Point one slot (`table << 24 | slot`) at index `d`, which holds one
-/// function for it (a bridge, as arm 0 of its entry).
-pub(crate) fn set_slot(entry: u32, d: u32) {
+/// Point one slot (`table << 24 | slot`) at slot map word `w` (`index << 8
+/// | arm`): a bridge's arm of an entry bridges share.
+pub(crate) fn set_slot_word(entry: u32, w: u32) {
     let Some(m) = map(gex_abi::dispatch_entry_table(entry)) else { return };
     let slot = gex_abi::dispatch_entry_base(entry) as u64;
     if slot < dense::MAP_SLOTS {
-        word(m + 4 * slot).store(d << 8, Ordering::Release);
+        word(m + 4 * slot).store(w, Ordering::Release);
     }
 }
 
