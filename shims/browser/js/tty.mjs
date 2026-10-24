@@ -243,7 +243,7 @@ class RemoteTty {
   #waiting = new Map();
 
   static async open(spec) {
-    const w = new Worker(new URL('./tty-worker.mjs', import.meta.url), { type: 'module' });
+    const w = new Worker(new URL('./tty-worker.mjs', import.meta.url), { type: 'module', name: 'tty' });
     const t = new RemoteTty(w);
     const ok = await t.#call('open', { module: spec.module, memory: spec.memory }).catch((e) => {
       console.warn(`[gex] no shared terminal: ${e?.message ?? e}`);

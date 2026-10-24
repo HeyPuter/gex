@@ -466,10 +466,18 @@ async function guestWorkerFactory() {
   // The single-thread build: a process is a fiber of this realm.
   if (single.on) return () => new FiberWorker();
   if (typeof Worker === 'function') {
-    const make = () =>
-      new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
+    // A guest Worker is made for the pool before it has a process, so its
+    // name (what a profiler or trace lists its thread by) is a serial; the
+    // host records which processes and threads each one ran (`gexName`).
+    let serial = 0;
+    const named = (w, name) => ((w.gexName = name), w);
+    const make = () => {
+      const name = `gex-w${++serial}`;
+      return named(new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
         type: 'module',
-      });
+        name,
+      }), name);
+    };
     // The module graph fetched once, each Worker started from it
     // (worker-graph.js); `?workergraph=0` loads each by URL.
     const url = pageParams().get('workergraph') === '0' ? null : workerUrlOf(make);
@@ -477,7 +485,11 @@ async function guestWorkerFactory() {
       workerGraphBytes.net += net;
       workerGraphBytes.cached += cached;
     }) : null;
-    return blob ? () => new Worker(blob, { type: 'module' }) : make;
+    if (!blob) return make;
+    return () => {
+      const name = `gex-w${++serial}`;
+      return named(new Worker(blob, { type: 'module', name }), name);
+    };
   }
   const { Worker: NodeWorker } = await import('node:worker_threads');
   const where = ['..', '..', 'shims', 'browser', 'js', 'worker.mjs'].join('/');
@@ -542,7 +554,7 @@ async function runInSystemWorker(term, opts) {
   if ((wl && !canvas) || (gl && !glHere) || (hostX && !xHere)) {
     term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && !xHere && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
   }
-  const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
+  const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module', name: 'system' });
   globalThis.__gexSystemWorker = w;
   const ready = new Promise((resolve, reject) => {
     w.addEventListener('message', (e) => { if (e.data?.kind === 'ready') resolve(); });
@@ -938,7 +950,7 @@ async function runProgramHere(
         }),
         terminate() {},
       };
-    } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
+    } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module', name: 'xwayland' });
     // Waited for below: a guest that starts before the display is listening
     // gets "Can't open display" and dies, and the display here is a name in the
     // global kernel that only exists once the server has bound it.

@@ -614,7 +614,7 @@ async function begin(opts, base, at, state, meter) {
     // whose every await waited behind a chunk (running to pid 1 ready took
     // 110-160 ms beside it, 53-69 ms before the fill).
     const z = await packedEntry(at(fl.url), fetcher);
-    const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module' });
+    const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module', name: 'fill' });
     const failed = (e) => {
       Atomics.store(counter, 0, -1);
       Atomics.notify(counter, 0);

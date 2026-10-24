@@ -125,7 +125,7 @@ export class Compositor {
     this.#stats = typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(16) : new ArrayBuffer(16);
     const worker = makeWorker
       ? makeWorker()
-      : new Worker(new URL('./compositor-worker.js', import.meta.url), { type: 'module' });
+      : new Worker(new URL('./compositor-worker.js', import.meta.url), { type: 'module', name: 'compositor' });
     this.#worker = worker;
     const ready = new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {
