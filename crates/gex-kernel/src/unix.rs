@@ -26,9 +26,10 @@ pub const SOCK_BUF: usize = 256 * 1024;
 #[derive(Debug, Default)]
 struct Stream {
     bytes: VecDeque<u8>,
-    /// Descriptors in flight, each tagged with the absolute byte offset it was
-    /// sent at (from connection start, so draining `bytes` does not disturb it).
-    fds: VecDeque<(u64, Arc<OpenFile>)>,
+    /// Descriptors in flight, each tagged with the absolute byte offsets of
+    /// the write that carried it, start and end (from connection start, so
+    /// draining `bytes` does not disturb them).
+    fds: VecDeque<(u64, u64, Arc<OpenFile>)>,
     /// Total bytes ever written to this direction.
     written: u64,
     /// Total bytes ever read from it.
@@ -95,7 +96,7 @@ impl Pipe {
         // Attach at the first byte of this write, as Linux does.
         let at = s.written;
         for fd in fds {
-            s.fds.push_back((at, fd));
+            s.fds.push_back((at, at + n as u64, fd));
         }
         s.bytes.extend(&buf[..n]);
         s.written += n as u64;
@@ -107,42 +108,53 @@ impl Pipe {
         Ok(n as u64)
     }
 
-    /// Read bytes, and the descriptors that belong to them.
-    ///
-    /// `max_fds` is the room the caller left; the rest stay queued, as Linux
-    /// does with a short control buffer.
-    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
+    /// Read bytes, and the descriptors that belong to them, as Linux reads a
+    /// stream socket: bytes of several writes run together, but a read that
+    /// reaches a write carrying descriptors ends with that write, so one
+    /// read never holds two writes' descriptors. Of those, `max_fds` (the
+    /// room the caller's control buffer has) are handed over and the rest
+    /// closed; the third value says some were (`MSG_CTRUNC`).
+    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
             // Empty buffer means end-of-file or nothing yet: a stream socket
             // never carries descriptors without bytes.
-            return if s.closed { Ok((0, Vec::new())) } else { Err(Errno::EAGAIN) };
+            return if s.closed { Ok((0, Vec::new(), false)) } else { Err(Errno::EAGAIN) };
         }
-        let n = buf.len().min(s.bytes.len());
+        let mut n = buf.len().min(s.bytes.len());
+        // The first write with descriptors this read reaches: the read
+        // goes no further than its end.
+        let group = s.fds.front().map(|&(at, end, _)| (at, end)).filter(|&(at, _)| at < s.read + n as u64);
+        if let Some((_, end)) = group {
+            n = n.min((end - s.read) as usize);
+        }
         for (i, slot) in buf[..n].iter_mut().enumerate() {
             *slot = s.bytes[i];
         }
         if peek {
             // A peek must not consume descriptors, or the next real read hands
             // out the same reference again.
-            return Ok((n as u64, Vec::new()));
+            return Ok((n as u64, Vec::new(), false));
         }
         s.bytes.drain(..n);
-        let upto = s.read + n as u64;
-        s.read = upto;
+        s.read += n as u64;
         let mut out = Vec::new();
-        while out.len() < max_fds {
-            match s.fds.front() {
-                Some(&(at, _)) if at < upto => {
-                    out.push(s.fds.pop_front().unwrap().1);
+        let mut cut = false;
+        if let Some((at, _)) = group {
+            while s.fds.front().is_some_and(|f| f.0 == at) {
+                let (_, _, file) = s.fds.pop_front().unwrap();
+                if out.len() < max_fds {
+                    out.push(file);
+                } else {
+                    // Closed: this was the last reference the socket held.
+                    cut = true;
                 }
-                _ => break,
             }
         }
         drop(s);
         // Room, for a writer parked on a full buffer.
         self.notify_writer();
-        Ok((n as u64, out))
+        Ok((n as u64, out, cut))
     }
 
     fn readable(&self) -> bool {
@@ -392,7 +404,7 @@ impl UnixSocket {
         let Role::Connected { rx, .. } = &*role else {
             return Err(Errno::ENOTCONN);
         };
-        let (n, fds) = rx.recv(buf, max_fds, peek)?;
+        let (n, fds, _) = rx.recv(buf, max_fds, peek)?;
         if !fds.is_empty() {
             self.pending_recv.lock().unwrap().extend(fds);
         }
@@ -405,6 +417,12 @@ impl UnixSocket {
     /// descriptors, which [`Self::recv`] then [`Self::take_received`] could
     /// swap.
     pub fn recv_with(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
+        self.recv_msg(buf, max_fds, peek).map(|(n, fds, _)| (n, fds))
+    }
+
+    /// [`Self::recv_with`], also saying whether descriptors that did not
+    /// fit in `max_fds` were closed (`recvmsg`'s `MSG_CTRUNC`).
+    pub fn recv_msg(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
         let role = self.role.lock().unwrap();
         let Role::Connected { rx, .. } = &*role else {
             return Err(Errno::ENOTCONN);
@@ -936,6 +954,47 @@ mod tests {
         assert_eq!(b.send(b"hi").unwrap(), 2);
         assert_eq!(a.recv(&mut buf, 0, false).unwrap(), 2);
         assert_eq!(&buf[..2], b"hi");
+    }
+
+    /// Descriptors past the room a read leaves are closed and the read says
+    /// so (`MSG_CTRUNC`), as Linux does; none stay queued for a later read.
+    #[test]
+    fn descriptors_without_room_are_closed_not_kept() {
+        let (a, b) = UnixSocket::pair();
+        let files: Vec<Arc<OpenFile>> = (0..3).map(|_| open_file(UnixSocket::pair().0)).collect();
+        let weak: Vec<_> = files.iter().map(Arc::downgrade).collect();
+        a.send_with(b"AB", files).unwrap();
+        let mut buf = [0u8; 8];
+        let (n, got, cut) = b.recv_msg(&mut buf, 1, false).unwrap();
+        assert_eq!((n, got.len(), cut), (2, 1, true));
+        assert!(weak[1].upgrade().is_none() && weak[2].upgrade().is_none(), "the two without room were kept");
+        // A plain read (no room at all) closes what came with its bytes too.
+        let lone = open_file(UnixSocket::pair().0);
+        let w = Arc::downgrade(&lone);
+        a.send_with(b"CD", vec![lone]).unwrap();
+        assert_eq!(b.recv(&mut buf, 0, false).unwrap(), 2);
+        assert!(w.upgrade().is_none());
+        a.send(b"EF").unwrap();
+        let (_, got, cut) = b.recv_msg(&mut buf, 4, false).unwrap();
+        assert!(got.is_empty() && !cut, "a later read got an earlier write's descriptors");
+    }
+
+    /// A read runs plain writes together but ends with the first write that
+    /// carries descriptors, so two writes' descriptors never share a read.
+    #[test]
+    fn a_read_ends_with_the_write_that_carries_descriptors() {
+        let (a, b) = UnixSocket::pair();
+        a.send(b"AB").unwrap();
+        a.send_with(b"CD", vec![open_file(UnixSocket::pair().0)]).unwrap();
+        a.send_with(b"EF", vec![open_file(UnixSocket::pair().0)]).unwrap();
+        a.send(b"GH").unwrap();
+        let mut buf = [0u8; 16];
+        let (n, got, _) = b.recv_msg(&mut buf, 4, false).unwrap();
+        assert_eq!((&buf[..n as usize], got.len()), (&b"ABCD"[..], 1));
+        let (n, got, _) = b.recv_msg(&mut buf, 4, false).unwrap();
+        assert_eq!((&buf[..n as usize], got.len()), (&b"EF"[..], 1));
+        let (n, got, _) = b.recv_msg(&mut buf, 4, false).unwrap();
+        assert_eq!((&buf[..n as usize], got.len()), (&b"GH"[..], 0));
     }
 
     #[test]
