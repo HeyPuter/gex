@@ -6055,14 +6055,14 @@ export class Gex {
    *  entries. */
   #cgenUnit(u, key, path, t0) {
     const e = this.#shim.exports;
-    const got = this.#env.loadUnit?.(key) ?? null;
-    // How long after its image was mapped this unit is served (cgen.rs
+    // How long after its image was mapped (and its unit wanted) this unit's
+    // serve starts, and how long its load takes (cgen.rs
     // `gex_cgen_mapped_age_us`): whether a unit arriving mid-run is placed
     // promptly.
-    if (logOn('placelat')) {
-      const us = Number(e.gex_cgen_mapped_age_us?.(u, 0) ?? -1n);
-      const want = Number(e.gex_cgen_mapped_age_us?.(u, 1) ?? -1n);
-      if (us >= 0) console.warn(`[placelat] ${path} ${(us / 1000).toFixed(1)} ms mapped, ${(want / 1000).toFixed(1)} ms wanted`);
+    const lat = logOn('placelat') ? [Number(e.gex_cgen_mapped_age_us?.(u, 0) ?? -1n), Number(e.gex_cgen_mapped_age_us?.(u, 1) ?? -1n), performance.now()] : null;
+    const got = this.#env.loadUnit?.(key) ?? null;
+    if (lat && lat[0] >= 0) {
+      console.warn(`[placelat] ${path} ${(lat[0] / 1000).toFixed(1)} ms mapped, ${(lat[1] / 1000).toFixed(1)} ms wanted, load ${(performance.now() - lat[2]).toFixed(1)} ms`);
     }
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
