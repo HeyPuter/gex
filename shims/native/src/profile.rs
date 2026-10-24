@@ -812,6 +812,7 @@ mod tests {
         };
         let image = image(base, bytes);
         let _one = ONE_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::TEST_DECODE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let dir = test_dir();
         let opts = crate::RunOptions {
             args: vec!["/nonexistent/prog".into()],
@@ -931,6 +932,7 @@ mod tests {
             (code.iter().flat_map(|w| w.to_le_bytes()).collect(), 136)
         };
         let _one = ONE_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::TEST_DECODE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let dir = test_dir();
         let opts = crate::RunOptions {
             args: vec!["/nonexistent/prog".into()],

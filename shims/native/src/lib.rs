@@ -33,6 +33,12 @@ pub(crate) mod ftab;
 pub(crate) mod door;
 pub mod wayland;
 
+/// The decoder's mode (`gex_xlate::set_compat`) is one setting per process,
+/// and running an image sets it: a test that sets it or runs an image holds
+/// this for as long as it decodes.
+#[cfg(test)]
+pub(crate) static TEST_DECODE_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
 
 /// A host function's result for wasmtime 49 (its own error type): the

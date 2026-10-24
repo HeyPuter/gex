@@ -2184,6 +2184,7 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
 mod region_tests {
     #[test]
     fn a_32_bit_region_reads_an_absolute_slot() {
+        let _mode = crate::TEST_DECODE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let (mut image, _) = gex_kernel::win::trampoline_input(true);
         let at = image.segments[0].vaddr;
         let slot = (at + 0x100) as u32;
