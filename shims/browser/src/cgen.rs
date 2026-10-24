@@ -1864,6 +1864,12 @@ pub extern "C" fn gex_ftab_install_base(n: u32) -> u32 {
     ftab(|m| m.installs().get(n as usize).map_or(0, |i| i.base))
 }
 
+/// And is this long (the indices its element segment fills).
+#[no_mangle]
+pub extern "C" fn gex_ftab_install_len(n: u32) -> u32 {
+    ftab(|m| m.installs().get(n as usize).map_or(0, |i| i.len))
+}
+
 /// And holds this unit (the index the other `gex_cgen_*` calls take).
 #[no_mangle]
 pub extern "C" fn gex_ftab_install_unit(n: u32) -> u32 {
@@ -2828,6 +2834,16 @@ pub(crate) fn leaves() -> u64 {
 /// lands there (HK: libxcb where libdbus had been, both with units) clears
 /// the bits for its own unit and every address it does not define runs the
 /// old object's functions.
+/// TEST(gex_test_keep_probe): a retirement leaves the probe cache's entries
+/// for the retired functions, as a Worker racing it may find them, so a
+/// call reaches the retired index without asking `lookup`.
+static TEST_KEEP_PROBE: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_keep_probe(on: i32) {
+    TEST_KEEP_PROBE.store(on != 0, Ordering::Relaxed);
+}
+
 pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
     libprov::forget_gone(gone);
@@ -2846,10 +2862,13 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     // slot, to itself, forever: explorer's uxtheme.dll, unloaded and loaded
     // again at its base, hung its DllMain with the loader lock held.
     let memory = crate::guest_bytes();
+    let keep = TEST_KEEP_PROBE.load(Ordering::Relaxed);
     ftab(|m| {
         for &(start, end) in ranges {
             for (a, _) in m.range(start, end).collect::<Vec<_>>() {
-                gex_kernel::ftab::fcache_clear(memory, a);
+                if !keep {
+                    gex_kernel::ftab::fcache_clear(memory, a);
+                }
             }
         }
         for &(start, end) in gone {
