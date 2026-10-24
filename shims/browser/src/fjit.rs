@@ -339,7 +339,9 @@ fn mid_function(addr: u64) -> bool {
     let mid = i > 0 && fdes[i - 1].0 < x && x < fdes[i - 1].1;
     if mid {
         let n = MID_DECLINED.fetch_add(1, Ordering::Relaxed);
-        if n < 32 || (n + 1).is_power_of_two() {
+        // Routine (a start the JIT declines; the fallback runs it), so only
+        // with each translation traced: `fjit=2`.
+        if TRACE.load(Ordering::Relaxed) && (n < 32 || (n + 1).is_power_of_two()) {
             let name = path.rsplit('/').next().unwrap_or(&path);
             crate::warn_line(&format!("[fjit] {addr:#x} ({name} +{x:#x}) is inside a function: left to the fallback ({} so far)\n", n + 1));
         }
