@@ -2149,9 +2149,17 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // A stateful provider's guest call (its return address in the provider's
     // code page) cannot be left: its frames would be lost. Those nest as deep
     // as the program's calls between guest and provider do (Unity: icall ->
-    // runtime_invoke -> icall ...).
-    let limit = if libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
+    // runtime_invoke -> icall ...). Nor can native Wine's (its return pad):
+    // left, its C caller never runs again, and the guest's return to the pad
+    // finds no call-out (a callback that calls back in: qsort's comparator
+    // sorting).
+    let pad = ret as u64 == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
+    let limit = if pad || libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
     if CALLOUTS.with(|c| c.borrow().len()) >= limit {
+        if pad {
+            crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {limit}: the process ends (stack overflow)\n"));
+            crate::nt::end_process(0xc000_00fd);
+        }
         if limit == CALLOUT_MAX_DEPTH_PROVIDER {
             crate::warn_line(&format!("gex: a provider's guest calls nest deeper than {limit}\n"));
         }
@@ -2290,7 +2298,8 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 /// `gex_set_callout(2)`: say every stateful provider's guest call.
 static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The same for a stateful provider's guest calls, which cannot leave.
+/// The same for a stateful provider's or native Wine's guest calls, which
+/// cannot leave.
 const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
 
 /// How far above a call-out's `sp_want` its return may come back (what a
