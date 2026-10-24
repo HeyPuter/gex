@@ -408,7 +408,7 @@ pub fn translate(
 ) -> (u64, Post) {
     use raw as x;
     if n == x::SOCKETCALL {
-        return socketcall(a, m, scratch, ctx_addr);
+        return socketcall(a, m, scratch, ctx_addr, blocked);
     }
     let mut post = Post::None;
     let n = match n {
@@ -1151,12 +1151,12 @@ pub fn translate(
 /// translated as its own i386 number. `send` and `recv` are `sendto` and
 /// `recvfrom` without an address, `accept` is `accept4` without flags. An
 /// unknown call, or arguments that cannot be read, is `ENOSYS`.
-fn socketcall(a: &mut [u64; 6], m: &mut GuestMem<'_>, scratch: u64, ctx_addr: u64) -> (u64, Post) {
+fn socketcall(a: &mut [u64; 6], m: &mut GuestMem<'_>, scratch: u64, ctx_addr: u64, blocked: u64) -> (u64, Post) {
     let Some((n, v)) = socketcall_unpacked(m, a) else {
         return (UNKNOWN, Post::None);
     };
     *a = v;
-    translate(n, a, m, scratch, ctx_addr)
+    translate(n, a, m, scratch, ctx_addr, blocked)
 }
 
 /// The call a `socketcall(call, args)` makes: its own i386 number and its
