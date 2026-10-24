@@ -13290,6 +13290,19 @@ fn dying_frames() -> String {
         reg(30),
         object_off_at(reg(30)),
     );
+    // What x0 points at (a method's `this`): its mapping and first words,
+    // with those of the object its first word points at (a d-pointer). A
+    // freed glibc chunk shows its tcache link and key there.
+    let words = |a: u64| (0..4u64).map(|i| format!(" {:#x}", gm.read_u64(a + i * 8).unwrap_or(0))).collect::<String>();
+    let x0 = reg(0);
+    let d = gm.read_u64(x0).unwrap_or(0);
+    out.push_str(&format!(
+        "\n    [x0] {}:{} [[x0]] {}:{}",
+        object_off_at(x0),
+        words(x0.wrapping_sub(16)),
+        object_off_at(d),
+        words(d.wrapping_sub(16)),
+    ));
     // Bounded: at most 24 frames, each above the last and within 8 MiB
     // above sp, every read checked (`GuestMem::read_u64`), so a corrupt
     // chain ends the walk rather than faulting the report.
