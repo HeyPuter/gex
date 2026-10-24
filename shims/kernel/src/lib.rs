@@ -3180,6 +3180,19 @@ pub extern "C" fn k_fs_add(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::P
     0
 }
 
+/// More of a file [`k_fs_add`] put in, `len` bytes at `offset`
+/// (`TmpFs::add_file_part`): a large file sent in parts. Seeding, not a write
+/// of the program's, so a persist snapshot does not take the file.
+#[no_mangle]
+pub extern "C" fn k_fs_add_part(path: gex_kmem::PAddr, path_len: u32, offset: u64, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let p = path_of(path, path_len);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    as_unit(rootfs().add_file_part(&p, offset, &buf))
+}
+
 /// A file in the shared root whose bytes are fetched from `url` as they are
 /// read (`TmpFs::add_lazy`): a game's data served to a page without
 /// bundling it. A path the bundle already has is left alone.
