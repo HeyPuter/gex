@@ -27,6 +27,9 @@ const m64 = () => !!globalThis.GEX_MEM64;
  *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
 const FTAB_SPARE_THREADED = 8192;
+// GEX_UNITS_EAGER (a test's A/B): every Worker instantiates each unit when it
+// catches up, as before units were deferred (`#cgenDefer`).
+const UNITS_EAGER = !!(globalThis.GEX_UNITS_EAGER ?? globalThis.process?.env?.GEX_UNITS_EAGER);
 /** Tests only (tests/w3/ftabstale.sh): both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
@@ -1662,12 +1665,19 @@ export class Gex {
         // code it calls) can block.
         ftab_call: single.on
           ? new WebAssembly.Suspending((idx, ctx, depth, need, ret) => {
+            if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
             const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
             return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
           })
-          : (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+          : (idx, ctx, depth, need, ret) => {
+            if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
+            return this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret);
+          },
         // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
-        ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
+        ftab_call_vi: (idx, arg) => {
+          if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
+          this.#cgen.ftab.get(tIdx(idx >>> 0))(arg);
+        },
         // W64: a unit's call to Wine's system or Unix call entry, run by
         // Wine's direct entry as the fault hook runs the `ud2` (cgen.rs
         // `w64_entry`): its C frames below the guest's, then the units a
@@ -4166,6 +4176,9 @@ export class Gex {
       // A translation the function JIT just published: in this Worker's
       // table before `resolve` calls it.
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
+      // A unit this Worker has deferred: instantiated now, before `resolve`
+      // tail-calls into its slot.
+      if (this.#unitsDeferred.length) this.#unitWant(Number(idx));
       return idx;
     };
     const gex = {
@@ -4242,7 +4255,7 @@ export class Gex {
   /** Install unit `u` into this Worker: instantiate it with `__table_base` =
    *  `base` (its element segment fills that range of the function table),
    *  then point tier-1's dispatch slots for its entries at the bridge. */
-  #cgenInstall(u, base) {
+  #cgenInstall(u, base, deferred = false) {
     const e = this.#shim.exports;
     const st = this.#cgenStore();
     // An export provider's module (`PROVIDER | number`, cgen.rs) installs as
@@ -4435,6 +4448,23 @@ export class Gex {
       const bytes = new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0);
       this.#provSigs.push({ base, sigs: elementSignatures(bytes) });
     }
+    // A deferred unit's bridges were written when it was deferred.
+    const bridges = deferred ? 0 : this.#cgenBridges(regsOf, tables);
+    st.instances.push(inst);
+    // The first Worker to install a JIT module writes the directory for the
+    // pages it numbered (idempotent).
+    if (jit >= 0) e.gex_fjit_installed(jit);
+    // What each Worker pays to install a unit (instantiation fills its slots).
+    const ms = performance.now() - tInst;
+    if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${bridges} bridges)`);
+    return bridges;
+  }
+
+  /** Point tier-1's dispatch slots for a module's entries at the bridge
+   *  (`regsOf`: its `[table, slot]` pairs, cgen.rs `bridges`); how many. */
+  #cgenBridges(regsOf, tables) {
+    const e = this.#shim.exports;
+    const st = this.#cgen;
     const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
@@ -4444,8 +4474,8 @@ export class Gex {
     } finally {
       e.gex_free?.(buf, 4 * Math.max(1, n));
     }
-    // Table 8 (`gex_emit::dense::TABLE_INDEX`) is `blocks`: a dense slot's
-    // bridge has an index there of its own.
+    // Table 8 (`gex_emit::dense::TABLE_INDEX`) is `blocks`: bridged slots
+    // share entries there (cgen.rs `bridges`).
     const blocks = this.#guest.exports.blocks;
     if (blocks) this.#growBlocks();
     for (let j = 0; j + 1 < regs.length; j += 2) {
@@ -4453,14 +4483,62 @@ export class Gex {
       else tables[regs[j]].set(regs[j + 1], st.bridge);
     }
     if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
-    st.instances.push(inst);
-    // The first Worker to install a JIT module writes the directory for the
-    // pages it numbered (idempotent).
-    if (jit >= 0) e.gex_fjit_installed(jit);
-    // What each Worker pays to install a unit (instantiation fills its slots).
-    const ms = performance.now() - tInst;
-    if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
-    return regs.length / 2;
+    return regs.length >>> 1;
+  }
+
+  /** The units this Worker's catch-up deferred (`#cgenDefer`), by base: each
+   *  `{ u, base, end, retired }`, its install's range `[base, end)` of the
+   *  function table still holding `resolve`, and the slots retired
+   *  meanwhile. */
+  #unitsDeferred = [];
+
+  /** Units are instantiated in a Worker when it first calls one, not when
+   *  it catches up: a process with units for a desktop's 400 libraries
+   *  instantiated every one in each of its threads' Workers, ~320 instances
+   *  and their tables per thread, in the one renderer every Worker shares.
+   *  A deferred unit's slots hold `resolve`, which asks `lookup` for the
+   *  index (`#unitWant` instantiates it there) and calls it; tier-1 reaches
+   *  it through its bridges, written at once. Not in the single-thread
+   *  build, nor for providers or function-JIT modules. */
+  #cgenDefer(u, base, len) {
+    const e = this.#shim.exports;
+    const tables = this.#growTables(e.gex_cgen_slots(u) >>> 0, 'cgen');
+    this.#cgenBridges((b, c) => e.gex_cgen_regs(u, b, c), tables);
+    const end = base + len;
+    // Slots another unit had and gave up: that unit is gone from here.
+    const d = this.#unitsDeferred.filter((x) => x.end <= base || x.base >= end);
+    let i = d.length;
+    while (i > 0 && d[i - 1].base > base) i--;
+    d.splice(i, 0, { u, base, end, retired: null });
+    this.#unitsDeferred = d;
+  }
+
+  /** Instantiate the deferred unit holding function-table index `idx`, if
+   *  one does: off the list first, so a call it makes while it starts finds
+   *  it in or instantiates another. */
+  #unitWant(idx) {
+    const d = this.#unitsDeferred;
+    let lo = 0, hi = d.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (d[mid].end <= idx) lo = mid + 1;
+      else hi = mid;
+    }
+    const x = d[lo];
+    if (!x || idx < x.base) return;
+    d.splice(lo, 1);
+    if (logOn('unit')) console.error(`[unit] ${this.#whoFills()}: unit at ${x.base} instantiated at its first call (${d.length} still deferred)`);
+    this.#cgenInstall(x.u, x.base, true);
+    // Its element segment filled every slot; those retired since go back.
+    if (x.retired) for (const r of x.retired) this.#cgen.ftab.set(tIdx(r), this.#cgen.resolve);
+  }
+
+  /** A retired function-table slot of a deferred unit: kept so, when the
+   *  unit is instantiated. */
+  #unitRetired(idx) {
+    for (const x of this.#unitsDeferred) {
+      if (idx >= x.base && idx < x.end) (x.retired ??= new Set()).add(idx);
+    }
   }
 
   /** Each module's imports, as `module.name`. */
@@ -5070,9 +5148,18 @@ export class Gex {
       // A provider of a program an execve replaced (`FuncMap::kill_module`) is skipped.
       if (kind === 1) {
         const u = e.gex_ftab_install_unit(v) >>> 0;
-        if (u !== 0xffffffff) this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
+        // Plain units deferred (`#cgenDefer`); providers and JIT modules now.
+        if (u !== 0xffffffff) {
+          if (u < 0x40000000 && !single.on && !UNITS_EAGER && e.gex_ftab_install_len) {
+            this.#cgenDefer(u, e.gex_ftab_install_base(v) >>> 0, e.gex_ftab_install_len(v) >>> 0);
+          }
+          else this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
+        }
       }
-      else if (kind === 2) st.ftab.set(tIdx(v), st.resolve);
+      else if (kind === 2) {
+        st.ftab.set(tIdx(v), st.resolve);
+        if (this.#unitsDeferred.length) this.#unitRetired(v);
+      }
       st.have++;
       e.gex_cgen_have(st.have);
     }
