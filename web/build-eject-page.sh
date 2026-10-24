@@ -55,6 +55,11 @@ for d in xwayland xwayland-st; do
     if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
     elif [ "$d" = xwayland ]; then echo "build-eject-page: no web/public/gex/$d (web/build-xwayland-wasm.sh): the build runs no X11 programs" >&2; fi
 done
+# The compositor bridge also zstd'd: the X server's Worker asks for
+# gexhostwl.wasm.zst first (hostx.js moduleBytes), 15 MB down to under 3.
+for w in "$OUT"/gex/xwayland*/gexhostwl.wasm; do
+    if [ -f "$w" ]; then zstd -q -f -19 "$w" -o "$w.zst"; fi
+done
 # Mesa's cold part, when the build split one off (web/mesa-split.py).
 rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
 [ ! -f "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" ] ||

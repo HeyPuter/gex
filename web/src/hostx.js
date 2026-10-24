@@ -27,6 +27,7 @@
 // turn left to do it in.
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
+import { isZstd, unzstd } from './zfetch.js';
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
@@ -56,9 +57,28 @@ function base() {
   return new URL(`file://${process.cwd()}/`).href;
 }
 
-/** The bytes of a module, from a URL or a path. */
-async function moduleBytes(url) {
-  if (/^https?:/.test(url)) return (await fetch(url)).arrayBuffer();
+/**
+ * The bytes of a module, from a URL or a path. Over HTTP a `.wasm` is asked for
+ * as `NAME.wasm.zst` first (the compositor bridge is 15 MB as it is, under 3
+ * zstd'd), decoded with the page's zstd decoder; a site that ships only the
+ * plain file answers that with a 404 (or its index page), and the plain file
+ * is fetched.
+ */
+export async function moduleBytes(url) {
+  if (/^https?:/.test(url)) {
+    if (/\.wasm$/.test(new URL(url).pathname)) {
+      try {
+        const res = await fetch(`${url}.zst`);
+        if (res.ok) {
+          const z = new Uint8Array(await res.arrayBuffer());
+          if (isZstd(z)) return unzstd(z);
+        }
+      } catch {
+        // No .zst: the plain file below.
+      }
+    }
+    return (await fetch(url)).arrayBuffer();
+  }
   const { readFile } = await import('node:fs/promises');
   const { fileURLToPath } = await import('node:url');
   return (await readFile(url.startsWith('file:') ? fileURLToPath(url) : url)).buffer;
