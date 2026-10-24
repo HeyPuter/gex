@@ -4,8 +4,11 @@
 // - `restore(db, root)`, before the program starts: the files stored last
 //   time, to lay over the bundle's.
 // - `persist(db, root, spec)`, once it runs: a Worker (persist-worker.js)
-//   snapshots `root` from the global kernel's filesystem every 30 s, when the
-//   page is hidden and when it is left, storing what changed.
+//   snapshots `root` from the global kernel's filesystem about a second
+//   after the program finishes a change under it (a close after a write, a
+//   rename, an unlink), and also every 30 s, when the page is hidden and
+//   when it is left, storing what changed. A reload does not wait for the
+//   last of these, so the first is what keeps a save.
 //
 // What a snapshot sees is whatever the program has written so far; a save
 // half-written at the instant of a snapshot is stored half-written, and the
@@ -39,6 +42,10 @@ export function persist(dbName, root, spec, { every = 30000, onSync = null } = {
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.error && !('synced' in m)) console.warn(`[persist] ${m.error}`);
+    if (m.auto) {
+      if ((m.wrote || m.removed) && logOn('debug')) console.log(`[persist] after a save: stored ${m.wrote} file(s) (${m.bytes} bytes), removed ${m.removed}; ${m.files} under ${root}`);
+      onSync?.(m);
+    }
     if ('synced' in m) {
       busy = false;
       if (m.error) console.warn(`[persist] snapshot failed: ${m.error}`);

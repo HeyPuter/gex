@@ -2898,6 +2898,21 @@ pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
     b.len() as i32
 }
 
+/// Count the changes the program finishes under the directory at `path` (a
+/// page's persist root): `k_fs_saves` then moves at each, and the persist
+/// store snapshots soon after (`tmpfs::watch`). One directory, the first set.
+#[no_mangle]
+pub extern "C" fn k_fs_watch(path: gex_kmem::PAddr, path_len: u32) {
+    with_path(path, path_len, false, gex_kernel::vfs::tmpfs::watch);
+}
+
+/// How many changes the program has finished under the watched directory
+/// (`k_fs_watch`), wrapping: one load, asked on a timer.
+#[no_mangle]
+pub extern "C" fn k_fs_saves() -> u32 {
+    gex_kernel::vfs::tmpfs::SAVES.load(core::sync::atomic::Ordering::Relaxed) as u32
+}
+
 /// A path's metadata, without opening it -- which matters for a symlink and
 /// for anything an open would refuse.
 #[no_mangle]
