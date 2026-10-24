@@ -129,10 +129,6 @@ const GIVEN_BACK_MAX = 2;
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
 const RECYCLE_COUNT = 4;
-/** A test switch (tests/spawn-release): whether a running fork child's
- *  record, its parent's modules with it, can be collected once the child's
- *  Worker has it. Node only, with `--expose-gc`. */
-const TEST_FORK_RECORDS = !!globalThis.process?.env?.GEX_TEST_FORK_RECORDS;
 const RECYCLE_BYTES = 768 << 20;
 
 /** How far a fork record's image reaches: what its child's memory grows to. */
@@ -358,19 +354,6 @@ export class ProcessHost {
   /// first touch was most of the cost of copying a fork's image in. Kept
   /// newest last, up to RECYCLE_COUNT and RECYCLE_BYTES.
   #recycled = [];
-  /** TEST_FORK_RECORDS: each fork child's record, weakly, by pid. */
-  #forkRecords = new Map();
-  /** TEST_FORK_RECORDS: said a moment after the child's Worker has its
-   *  record. A scope of its own, so the timer holds nothing of the caller's. */
-  #checkForkRecord(pid) {
-    const record = this.#forkRecords.get(pid);
-    if (!record) return;
-    this.#forkRecords.delete(pid);
-    setTimeout(() => {
-      globalThis.gc?.();
-      console.error(`[test] pid ${pid}: fork record ${record.deref() ? 'kept' : 'released'} while it runs`);
-    }, 500);
-  }
   #warmMade = 0;
   #warmUsed = 0;
   #stackOf = new Map();
@@ -540,14 +523,6 @@ export class ProcessHost {
       w.on?.('error', fail);
       w[LISTENING] = { onEvent, onMsg, fail };
       this.#pending.set(pid, { ...msg, pid });
-      const kind = msg.kind;
-      // The listeners above live as long as the process and share this
-      // scope: holding `msg` here kept a fork's whole record (every module
-      // its parent had, with their metadata) on this thread for the child's
-      // life, and a child's record names its parent's modules too -- some
-      // twenty thousand modules on a desktop's page. `#pending` has it until
-      // the Worker is ready.
-      msg = null;
       // `#pending` pins the whole fork record (image bytes included) until the
       // child reports ready. A child that never starts leaves ~19 MB pinned.
       // See task 145.
@@ -563,7 +538,7 @@ export class ProcessHost {
       // One line per process, to `debug`: a process that never starts leaves
       // no other trace -- the fork is logged by the parent, the exit by the
       // child. #137.
-      narrate(`[host] pid ${pid}: worker taken, ${kind} held for ready`);
+      narrate(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
       // And now whatever it said while it was still in the pool.
       const held = w[EARLY];
       if (held) {
@@ -912,7 +887,6 @@ export class ProcessHost {
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
           const tSent = performance.now();
-          if (TEST_FORK_RECORDS) this.#checkForkRecord(pid);
           this.#streamClosure(w, closure);
           if (this.#extra?.debugExit) {
             this.#onOutput(
@@ -1063,18 +1037,13 @@ export class ProcessHost {
           else this.#flavourOf.delete(m.child.pid);
         }
         this.#onFork(m.child, pid);
-        if (TEST_FORK_RECORDS) this.#forkRecords.set(m.child.pid, new WeakRef(m.child));
-        // Started and let run -- nobody waits for a child. The handler below
-        // outlives this call by the child's whole life, so it holds the pid
-        // alone, and the message is let go (see `#spawn`).
-        const child = m.child.pid;
-        this.#spawn(child, { kind: 'adopt', child: m.child }).catch((e) => {
-          this.#onOutput(2, `gex: process ${child} failed: ${e.message}\n`, pid);
+        // Started and let run -- nobody waits for a child.
+        this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).catch((e) => {
+          this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
           // As an event too: this is caught, so no `error` fires and a harness
           // may miss the line above. See task 146.
-          crashed(`pid ${child}: ${e.message}`);
+          crashed(`pid ${m.child.pid}: ${e.message}`);
         });
-        m = null;
         break;
       }
       case 'execAway': {
