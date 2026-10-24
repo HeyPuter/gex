@@ -202,8 +202,7 @@ def patch_repeat(src):
     # "llls". A browser repeats a held key itself, as the system's settings
     # say, and stops at the release whenever the page reads it; the
     # compositor passes each repeat on as a press of a key already down,
-    # which the server makes a repeat event of, as with a keyboard that
-    # repeats in hardware (XkbDDXUsesSoftRepeat 0).
+    # which is made a repeat event below (XkbDDXUsesSoftRepeat 0: no timer).
     old = """int
 XkbDDXUsesSoftRepeat(DeviceIntPtr pXDev)
 {
@@ -222,6 +221,69 @@ XkbDDXUsesSoftRepeat(DeviceIntPtr pXDev)
 }""")
     open(p, 'w').write(s)
     print('  ddxCtrls.c: the page repeats keys')
+
+
+def patch_repeat_press(src):
+    """The press of a key that is down repeats it (patch_repeat)."""
+    # The press of a key already down is that repeat: queued as XKB's own
+    # repeats are (key_repeat set), since XKB drops a second plain press of
+    # a key it has down. The dix makes none for a key that does not repeat
+    # or with autorepeat off.
+    p = f'{src}/hw/xwayland/xwayland-input.c'
+    s = open(p).read()
+    if 'GEX_PAGE_REPEATS' in s:
+        return
+    old = """    end = (uint32_t *) ((char *) xwl_seat->keys.data + xwl_seat->keys.size);
+    for (k = xwl_seat->keys.data; k < end; k++) {
+        if (*k == key)
+            *k = *--end;
+    }
+    xwl_seat->keys.size = (char *) end - (char *) xwl_seat->keys.data;
+    if (state) {
+        k = wl_array_add(&xwl_seat->keys, sizeof *k);
+        *k = key;
+    }
+
+    QueueKeyboardEvents(xwl_seat->keyboard,
+                        state ? KeyPress : KeyRelease, key + 8);
+"""
+    assert old in s, 'xwayland-input.c: keyboard_handle_key did not match'
+    s = s.replace(old, """    int down = 0;
+
+    end = (uint32_t *) ((char *) xwl_seat->keys.data + xwl_seat->keys.size);
+    for (k = xwl_seat->keys.data; k < end; k++) {
+        if (*k == key) {
+            *k = *--end;
+            down = 1;
+        }
+    }
+    xwl_seat->keys.size = (char *) end - (char *) xwl_seat->keys.data;
+    if (state) {
+        k = wl_array_add(&xwl_seat->keys, sizeof *k);
+        *k = key;
+    }
+
+#ifdef __EMSCRIPTEN__
+    /* GEX_PAGE_REPEATS (web/xwayland/patch.py): a press of a key already
+     * down is the page's repeat of it */
+    if (state && down) {
+        int i, n = GetKeyboardEvents(InputEventList, xwl_seat->keyboard, KeyPress, key + 8);
+
+        for (i = 0; i < n; i++) {
+            if (InputEventList[i].any.type == ET_KeyPress)
+                InputEventList[i].device_event.key_repeat = TRUE;
+            mieqEnqueue(xwl_seat->keyboard, &InputEventList[i]);
+        }
+        return;
+    }
+#endif
+    QueueKeyboardEvents(xwl_seat->keyboard,
+                        state ? KeyPress : KeyRelease, key + 8);
+""")
+    if '#include <eventstr.h>' not in s:
+        s = s.replace('#include <inpututils.h>\n', '#include <inpututils.h>\n#include <eventstr.h>\n', 1)
+    open(p, 'w').write(s)
+    print('  xwayland-input.c: a press of a key that is down repeats it')
 
 
 def patch_noop_casts(src):
@@ -342,6 +404,7 @@ def main():
     patch_shm(xserver)
     patch_xkb(xserver)
     patch_repeat(xserver)
+    patch_repeat_press(xserver)
     patch_noop_casts(xserver)
     patch_input(xserver)
     patch_meson(xserver)
