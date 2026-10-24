@@ -13280,10 +13280,11 @@ fn killed(signal: i32, at: u64) -> i32 {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
     } else {
     warn_line(&format!(
-        "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
-         last calls (this thread):{}\n  address space:{}\n  futexes:{}",
+        "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  stderr: {}\n  threads:{}\n  \
+         this thread:{}\n  last calls (this thread):{}\n  address space:{}\n  futexes:{}",
         pid,
         signal,
+        object_off_at(at),
         last_stderr(),
         // Every thread, not only the one that died. Two threads
         // sharing a register context would clobber each other and
@@ -13303,12 +13304,69 @@ fn killed(signal: i32, at: u64) -> i32 {
                 )
             })
             .collect::<String>(),
+        dying_frames(),
         sys_recent(),
         mem_recent(),
         ftx_recent(),
     ));
     }
     exit_process(-signal)
+}
+
+/// The dying thread's registers that say where it was -- the first
+/// arguments, x8, the frame and link registers, sp -- and its callers by
+/// the frame-pointer chain (`[x29]` the caller's x29, `[x29+8]` its return
+/// address), each as object+offset: a fault's pc alone is the block it was
+/// in, not who called it with what.
+fn dying_frames() -> String {
+    if gex_abi::X86 {
+        return String::new();
+    }
+    let ctx_addr = ctx_addr_get();
+    let gm = GuestMem::new(guest_bytes());
+    let reg = |i: u8| gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
+    let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+    let mut out = format!(
+        " x0={:#x} x1={:#x} x2={:#x} x8={:#x} x19={:#x} x29={:#x} x30={:#x} {} sp={sp:#x}",
+        reg(0),
+        reg(1),
+        reg(2),
+        reg(8),
+        reg(19),
+        reg(29),
+        reg(30),
+        object_off_at(reg(30)),
+    );
+    // What x0 points at (a method's `this`): its mapping and first words,
+    // with those of the object its first word points at (a d-pointer). A
+    // freed glibc chunk shows its tcache link and key there.
+    let words = |a: u64| (0..4u64).map(|i| format!(" {:#x}", gm.read_u64(a + i * 8).unwrap_or(0))).collect::<String>();
+    let x0 = reg(0);
+    let d = gm.read_u64(x0).unwrap_or(0);
+    out.push_str(&format!(
+        "\n    [x0] {}:{} [[x0]] {}:{}",
+        object_off_at(x0),
+        words(x0.wrapping_sub(16)),
+        object_off_at(d),
+        words(d.wrapping_sub(16)),
+    ));
+    // Bounded: at most 24 frames, each above the last and within 8 MiB
+    // above sp, every read checked (`GuestMem::read_u64`), so a corrupt
+    // chain ends the walk rather than faulting the report.
+    let mut fp = reg(29);
+    for _ in 0..24 {
+        if fp == 0 || fp & 7 != 0 || fp < sp || fp - sp > 8 << 20 {
+            break;
+        }
+        let ret = gm.read_u64(fp + 8).unwrap_or(0);
+        out.push_str(&format!("\n    #fp {ret:#x} {}", object_off_at(ret)));
+        let next = gm.read_u64(fp).unwrap_or(0);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    out
 }
 
 /// End this Worker's process (`exit_process`), from outside the kernel: a
