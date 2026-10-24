@@ -191,7 +191,9 @@ pub mod raw {
     pub const SET_THREAD_AREA: u64 = 243;
     pub const GET_THREAD_AREA: u64 = 244;
     pub const EXIT_GROUP: u64 = 252;
+    pub const EPOLL_CREATE: u64 = 254;
     pub const EPOLL_CTL: u64 = 255;
+    pub const EPOLL_WAIT: u64 = 256;
     pub const SET_TID_ADDRESS: u64 = 258;
     pub const CLOCK_GETTIME: u64 = 265;
     pub const CLOCK_GETRES: u64 = 266;
@@ -402,6 +404,9 @@ pub fn translate(
     ctx_addr: u64,
 ) -> (u64, Post) {
     use raw as x;
+    if n == x::SOCKETCALL {
+        return socketcall(a, m, scratch, ctx_addr);
+    }
     let mut post = Post::None;
     let n = match n {
         x::EXIT => nr::EXIT,
@@ -898,6 +903,16 @@ pub fn translate(
             nr::PSELECT6
         }
         x::EPOLL_CREATE1 => nr::EPOLL_CREATE1,
+        // epoll_create(size): the size is only checked to be positive.
+        x::EPOLL_CREATE => {
+            *a = [0; 6];
+            nr::EPOLL_CREATE1
+        }
+        // epoll_wait is epoll_pwait with no mask (the X server's ospoll).
+        x::EPOLL_WAIT => {
+            *a = [sext(a[0]), a[1], a[2], sext(a[3]), 0, 8];
+            nr::EPOLL_PWAIT
+        }
         x::EPOLL_CTL => {
             a[0] = sext(a[0]);
             a[2] = sext(a[2]);
@@ -1098,9 +1113,8 @@ pub fn translate(
             a[0] = sext(a[0]);
             nr::RECVMMSG
         }
-        // recvmmsg's timeout is a 32-bit timespec here; socketcall
-        // multiplexes calls glibc no longer makes through it.
-        x::RECVMMSG | x::SOCKETCALL => UNKNOWN,
+        // recvmmsg's timeout is a 32-bit timespec here.
+        x::RECVMMSG => UNKNOWN,
         x::REBOOT => nr::REBOOT,
         // statfs64(path, size, buf) / fstatfs64(fd, size, buf): the 64-bit
         // layout (musl's `struct statfs`), written in its 32-bit form under
@@ -1120,6 +1134,58 @@ pub fn translate(
         _ => UNKNOWN,
     };
     (n, post)
+}
+
+/// `socketcall(call, args)`: the socket calls multiplexed through one
+/// number, as a glibc built for kernels older than 4.3 makes all of them.
+/// `args` points at the call's arguments, 32-bit words; each call is then
+/// translated as its own i386 number. `send` and `recv` are `sendto` and
+/// `recvfrom` without an address, `accept` is `accept4` without flags. An
+/// unknown call, or arguments that cannot be read, is `ENOSYS`.
+fn socketcall(a: &mut [u64; 6], m: &mut GuestMem<'_>, scratch: u64, ctx_addr: u64) -> (u64, Post) {
+    use raw as x;
+    // Indexed by the call (linux/net.h SYS_SOCKET = 1 ... SYS_SENDMMSG = 20):
+    // the i386 number it is, and how many arguments it takes.
+    const CALLS: [(u64, usize); 21] = [
+        (UNKNOWN, 0),
+        (x::SOCKET, 3),
+        (x::BIND, 3),
+        (x::CONNECT, 3),
+        (x::LISTEN, 2),
+        (x::ACCEPT4, 3),
+        (x::GETSOCKNAME, 3),
+        (x::GETPEERNAME, 3),
+        (x::SOCKETPAIR, 4),
+        (x::SENDTO, 4),
+        (x::RECVFROM, 4),
+        (x::SENDTO, 6),
+        (x::RECVFROM, 6),
+        (x::SHUTDOWN, 2),
+        (x::SETSOCKOPT, 5),
+        (x::GETSOCKOPT, 5),
+        (x::SENDMSG, 3),
+        (x::RECVMSG, 3),
+        (x::ACCEPT4, 4),
+        (x::RECVMMSG, 5),
+        (x::SENDMMSG, 4),
+    ];
+    let call = (a[0] & 0xffff_ffff) as usize;
+    let Some(&(n, count)) = CALLS.get(call) else {
+        return (UNKNOWN, Post::None);
+    };
+    if n == UNKNOWN {
+        return (UNKNOWN, Post::None);
+    }
+    let p = a[1] & 0xffff_ffff;
+    let mut v = [0u64; 6];
+    for (i, w) in v.iter_mut().enumerate().take(count) {
+        match m.read_u32(p + 4 * i as u64) {
+            Ok(x) => *w = x as u64,
+            Err(_) => return (UNKNOWN, Post::None),
+        }
+    }
+    *a = v;
+    translate(n, a, m, scratch, ctx_addr)
 }
 
 /// The i386 program's argument registers: `ebx, ecx, edx, esi, edi, ebp`,
@@ -1217,6 +1283,39 @@ mod tests {
     /// Every i386 number maps without arguments, and the calls a host sorts by
     /// number map to the canonical ones it lists.
     #[test]
+    fn socketcall_is_the_call_it_multiplexes() {
+        let mut buf = vec![0u8; 0x4000];
+        let at = 0x3000u64;
+        let put = |buf: &mut [u8], words: &[u32]| {
+            for (i, w) in words.iter().enumerate() {
+                buf[at as usize + 4 * i..at as usize + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        // connect(-1 as a 32-bit word, addr, len): the descriptor sign-extended.
+        put(&mut buf, &[0xffff_ffff, 0x1234, 16]);
+        let (n, a) = tr(raw::SOCKETCALL, [3, at, 0, 0, 0, 0], &mut buf);
+        assert_eq!(n, nr::CONNECT);
+        assert_eq!(a[..3], [u64::MAX, 0x1234, 16]);
+        // send: sendto with no address.
+        put(&mut buf, &[5, 0x2000, 7, 0x40, 0xdead, 0xbeef]);
+        let (n, a) = tr(raw::SOCKETCALL, [9, at, 0, 0, 0, 0], &mut buf);
+        assert_eq!(n, nr::SENDTO);
+        assert_eq!(a, [5, 0x2000, 7, 0x40, 0, 0]);
+        // accept: accept4 with no flags.
+        put(&mut buf, &[4, 0x2000, 0x2100, 0x80000]);
+        let (n, a) = tr(raw::SOCKETCALL, [5, at, 0, 0, 0, 0], &mut buf);
+        assert_eq!(n, nr::ACCEPT4);
+        assert_eq!(a[..4], [4, 0x2000, 0x2100, 0]);
+        // socketpair keeps all four.
+        put(&mut buf, &[1, 1, 0, 0x2000]);
+        assert_eq!(tr(raw::SOCKETCALL, [8, at, 0, 0, 0, 0], &mut buf), (nr::SOCKETPAIR, [1, 1, 0, 0x2000, 0, 0]));
+        // An unknown call, and arguments out of memory.
+        assert_eq!(tr(raw::SOCKETCALL, [0, at, 0, 0, 0, 0], &mut buf).0, UNKNOWN);
+        assert_eq!(tr(raw::SOCKETCALL, [21, at, 0, 0, 0, 0], &mut buf).0, UNKNOWN);
+        assert_eq!(tr(raw::SOCKETCALL, [1, 0x10_0000, 0, 0, 0, 0], &mut buf).0, UNKNOWN);
+    }
+
+    #[test]
     fn canonical_number_needs_no_arguments() {
         for raw in 0..512 {
             let _ = canonical_number(raw);
@@ -1227,5 +1326,7 @@ mod tests {
         assert_eq!(canonical_number(raw::SCHED_YIELD), nr::SCHED_YIELD);
         assert_eq!(canonical_number(raw::READ), nr::READ);
         assert_eq!(canonical_number(raw::OPEN), nr::OPENAT);
+        assert_eq!(canonical_number(raw::EPOLL_WAIT), nr::EPOLL_PWAIT);
+        assert_eq!(canonical_number(raw::EPOLL_CREATE), nr::EPOLL_CREATE1);
     }
 }

@@ -6158,7 +6158,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
             x::POLL | x::PPOLL | x::PPOLL_TIME64 => nr::PPOLL,
             x::NEWSELECT | x::PSELECT6 | x::PSELECT6_TIME64 => nr::PSELECT6,
-            x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
+            x::EPOLL_WAIT | x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
             x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
             x::FUTEX | x::FUTEX_TIME64 => nr::FUTEX,
             x::NANOSLEEP => nr::NANOSLEEP,
