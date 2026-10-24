@@ -48,7 +48,7 @@ echo "== assembling a root filesystem"
 rm -rf "$WORK/root"
 mkdir -p "$WORK/root/lib" "$WORK/root/usr/lib" "$WORK/include"
 cp "$MUSL" "$WORK/root/lib/ld-musl-aarch64.so.1"
-cp "$WORK/driver/libGLESv2.so.2" "$WORK/driver/libEGL.so.1" "$WORK/root/usr/lib/"
+cp --preserve=links "$WORK/driver/libGLESv2.so.2" "$WORK/driver/libEGL.so.1" "$WORK/root/usr/lib/"
 cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/include/" 2>/dev/null || true
 
 echo "== building the gears for aarch64"

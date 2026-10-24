@@ -39,7 +39,7 @@ cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/include/"
 # A sysroot with just the loader and that driver, so the guest resolves its
 # libraries the way it would in a real root rather than against the host's.
 cp "$TOOLCHAIN/aarch64-linux-musl/lib/libc.so" "$WORK/root/lib/ld-musl-aarch64.so.1"
-cp "$WORK/driver/libGLESv2.so.2" "$WORK/driver/libEGL.so.1" "$WORK/root/lib/"
+cp --preserve=links "$WORK/driver/libGLESv2.so.2" "$WORK/driver/libEGL.so.1" "$WORK/root/lib/"
 
 "$CC" -O2 -w -o "$WORK/root/gears" "$ROOT/tests/integration/programs/gles-gears.c" \
     -I "$WORK/include" -L "$WORK/driver" -lEGL -lGLESv2 -lm

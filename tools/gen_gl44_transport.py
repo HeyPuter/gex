@@ -108,6 +108,15 @@ PROGRAM_QUERY_COMMANDS = (PROGRAM_INTERFACE_QUERIES | PROGRAM_NAMED_QUERIES |
 # remote implementation from writing four values into an application buffer
 # that is only one scalar wide. The vector cases use the numeric core enums so
 # the generated guest library remains independent of host GL headers.
+# Queries the guest library can answer from state it keeps itself
+# (guest/gl/gexgl-shadow.inc): the function that answers, and the one that
+# keeps the host's answer when it has to ask.
+GUEST_ANSWERED = {
+    "glGetFloatv": ("gexgl_shadow_get_float", "gexgl_shadow_seed_float"),
+    "glGetDoublev": ("gexgl_shadow_get_double", "gexgl_shadow_seed_double"),
+    "glIsEnabled": ("gexgl_shadow_is_enabled", "gexgl_shadow_seed_enabled"),
+}
+
 RESOURCE_OUTPUT_QUERIES = {
     "glGetBooleanv": "state",
     "glGetDoublev": "state",
@@ -1082,8 +1091,11 @@ void {name}(unsigned target, long offset, long size, void *data) {{
         # then memcpy up to 4096 elements into the caller's array. Asking
         # first makes the nested request strictly complete before this one
         # starts.
-        lines = [f"void {name}({', '.join(declarations)}) {{",
-                 f"    const size_t expected = (size_t){components} * sizeof(*{output['name']});",
+        answered = GUEST_ANSWERED.get(name)
+        lines = [f"void {name}({', '.join(declarations)}) {{"]
+        if answered:
+            lines.append(f"    if ({answered[0]}({', '.join(p['name'] for p in scalar_params)}, {output['name']})) return;")
+        lines += [f"    const size_t expected = (size_t){components} * sizeof(*{output['name']});",
                  f"    uint32_t *packet = begin({opcode}, {words}, 0);",
                  "    if (!packet) return;",
                  "    size_t at = 0;"]
@@ -1094,10 +1106,16 @@ void {name}(unsigned target, long offset, long size, void *data) {{
                 raise RuntimeError(f"{name}: query scalar {param_name} is not one wire word")
             lines.append(f"    packet[at++] = {encode.format(name=param_name)};")
         lines += ["    flush();",
-                  "    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);",
-                  f"    if ({output['name']} && source && reply_len == expected)",
-                  f"        memcpy({output['name']}, source, expected);",
-                  "}", ""]
+                  "    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);"]
+        if answered:
+            lines += [f"    if ({output['name']} && source && reply_len == expected) {{",
+                      f"        memcpy({output['name']}, source, expected);",
+                      f"        {answered[1]}({', '.join(p['name'] for p in scalar_params)}, {output['name']});",
+                      "    }"]
+        else:
+            lines += [f"    if ({output['name']} && source && reply_len == expected)",
+                      f"        memcpy({output['name']}, source, expected);"]
+        lines += ["}", ""]
         return "\n".join(lines)
     params = command["params"]
     def declaration_for(param: dict) -> str:
@@ -1118,6 +1136,11 @@ void {name}(unsigned target, long offset, long size, void *data) {{
         tail = "blob_len"
     return_type = TYPE_INFO[command["return_type"]][0] if command["name"] in RETURN_COMMANDS else "void"
     lines = [f"{return_type} {command['name']}({declaration}) {{"]
+    answered = GUEST_ANSWERED.get(command["name"])
+    if answered:
+        if pointer or len(scalar_params) != 1 or command["name"] not in RETURN_COMMANDS:
+            raise RuntimeError(f"{command['name']}: a guest-answered return takes one scalar")
+        lines += [f"    {{ {return_type} kept; if ({answered[0]}({scalar_params[0]['name']}, &kept)) return kept; }}"]
     if pointer and command["name"] not in OPAQUE_OFFSET_COMMANDS:
         if command["name"] in BLOB_COMMANDS:
             lines.append("    int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */")
@@ -1166,7 +1189,10 @@ void {name}(unsigned target, long offset, long size, void *data) {{
                   f"    put_blob(packet + at, {pointer['name']}, blob_len);"]
     elif pointer:
         lines.append(f"    put_blob(packet + at, {pointer['name']}, blob_len);")
-    if command["name"] in RETURN_COMMANDS:
+    if command["name"] in RETURN_COMMANDS and answered:
+        lines += ["    flush();", f"    {return_type} got = ({return_type})reply_u32();",
+                  f"    {answered[1]}({scalar_params[0]['name']}, got);", "    return got;"]
+    elif command["name"] in RETURN_COMMANDS:
         lines += ["    flush();", f"    return ({return_type})reply_u32();"]
     lines += ["}", ""]
     return "\n".join(lines)

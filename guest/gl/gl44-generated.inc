@@ -947,6 +947,7 @@ void glGetDoublei_v(unsigned target, unsigned index, double *data) {
         memcpy(data, source, expected);
 }
 void glGetDoublev(unsigned pname, double *data) {
+    if (gexgl_shadow_get_double(pname, data)) return;
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
     uint32_t *packet = begin(1197, 1, 0);
     if (!packet) return;
@@ -954,8 +955,10 @@ void glGetDoublev(unsigned pname, double *data) {
     packet[at++] = (uint32_t)(pname);
     flush();
     uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
-    if (data && source && reply_len == expected)
+    if (data && source && reply_len == expected) {
         memcpy(data, source, expected);
+        gexgl_shadow_seed_double(pname, data);
+    }
 }
 void glGetFloati_v(unsigned target, unsigned index, float *data) {
     const size_t expected = (size_t)gexgl_state_query_components(target) * sizeof(*data);
@@ -970,6 +973,7 @@ void glGetFloati_v(unsigned target, unsigned index, float *data) {
         memcpy(data, source, expected);
 }
 void glGetFloatv(unsigned pname, float *data) {
+    if (gexgl_shadow_get_float(pname, data)) return;
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
     uint32_t *packet = begin(1200, 1, 0);
     if (!packet) return;
@@ -977,8 +981,10 @@ void glGetFloatv(unsigned pname, float *data) {
     packet[at++] = (uint32_t)(pname);
     flush();
     uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
-    if (data && source && reply_len == expected)
+    if (data && source && reply_len == expected) {
         memcpy(data, source, expected);
+        gexgl_shadow_seed_float(pname, data);
+    }
 }
 int glGetFragDataIndex(unsigned program, const char *name) {
     if (!name) return -1;
@@ -1586,12 +1592,15 @@ unsigned char glIsBuffer(unsigned buffer) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsEnabled(unsigned cap) {
+    { unsigned char kept; if (gexgl_shadow_is_enabled(cap, &kept)) return kept; }
     uint32_t *packet = begin(1278, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(cap);
     flush();
-    return (unsigned char)reply_u32();
+    unsigned char got = (unsigned char)reply_u32();
+    gexgl_shadow_seed_enabled(cap, got);
+    return got;
 }
 unsigned char glIsEnabledi(unsigned target, unsigned index) {
     uint32_t *packet = begin(1279, 2, 0);

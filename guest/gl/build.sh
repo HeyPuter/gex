@@ -114,7 +114,7 @@ ALIASES="$HERE/gl-aliases-generated.inc"
 [ -f "$ALIASES" ] || : > "$ALIASES"
 link_guest_gl() {
     $CC -shared -fPIC -O2 -Wall -o "$OUT/libGLESv2.so.2" \
-        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl
+        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl -lm
 }
 link_guest_gl
 if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \
@@ -124,12 +124,19 @@ if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \
 fi
 # EGL is the same object under its own name, so a loader that opens either
 # finds every symbol it needs.
-cp "$OUT/libGLESv2.so.2" "$OUT/libEGL.so.1"
 # And libGL.so.1, the same object again: GLX is how a traditional X program
 # asks for a context, and without this file that whole class of application
-# cannot start. It is a separate soname rather than a symlink because a loader
-# that opens both must see two libraries, not one.
-cp "$OUT/libGLESv2.so.2" "$OUT/libGL.so.1"
+# cannot start.
+#
+# Both are hard links to the one file, not copies: a program that links libGL
+# and libEGL (SDL does, for one) gets a single library and so a single GL
+# state -- one ring to the host, one context, one set of what the library
+# keeps. Two copies would be two of each, and the GL calls would go to the
+# copy the context was never made on. The dynamic loader takes a second name
+# of a file it has loaded as that file (same device and inode), so each name
+# still resolves.
+ln -f "$OUT/libGLESv2.so.2" "$OUT/libEGL.so.1"
+ln -f "$OUT/libGLESv2.so.2" "$OUT/libGL.so.1"
 ln -sf libGL.so.1 "$OUT/libGL.so"
 ln -sf libGLESv2.so.2 "$OUT/libGLESv2.so"
 ln -sf libEGL.so.1 "$OUT/libEGL.so"
