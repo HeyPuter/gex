@@ -23,6 +23,11 @@
 # made it about 170 ms. tests/audio/dsp-mix.c plays two streams at once and
 # reads the loopback: mixed, RMS 0.25 (one stream alone would be 0.177).
 #
+# tests/audio/dsp-mmap.c plays through a mapped DMA buffer, as Quake-engine
+# games set one up (caps with mmap, the buffer mapped, the trigger, the
+# output pointer): a 441 Hz tone at half amplitude, mixed ahead of the
+# pointer, must reach the ring (RMS 0.354, 22050 Hz).
+#
 # Needs gcc and the page's x86-64 shared build (`GEX_ARCH=x86 GEX_MEM64=1
 # shims/browser/build.sh`, or without GEX_MEM64; SEED= picks one). A missing piece is a
 # skip, not a pass. The single-thread (SP) flavour has no ring yet.
@@ -98,5 +103,20 @@ if [ $st = 0 ] && [ -n "$rms" ] && awk -v r="$rms" 'BEGIN { exit !(r > 0.23 && r
 else
     echo "FAIL dsp-mix (page): exit $st, RMS ${rms:-none} (want 0.25)"
     head -5 "$WORK/mix" "$WORK/mix.err"
+    exit 1
+fi
+mm="$WORK/dsp-mmap"
+gcc -O1 -static -o "$mm" tests/audio/dsp-mmap.c -lm || exit 1
+env GEX_ARCH=x86 GEX_MEM64=$m64 GEX_SHARED=1 GEX_AUDIO_PLAYER=1 GEX_AUDIO_TAP=1 timeout 120 node $jspi shims/browser/js/run-node.mjs "$SEED" "$mm" \
+    </dev/null >"$WORK/mm" 2>"$WORK/mm.err"
+st=$?
+tap=$(grep '^\[audio\]' "$WORK/mm.err")
+if [ $st = 0 ] && grep -qx 'dsp-mmap ok' "$WORK/mm" && echo "$tap" | awk '
+    { for (i = 2; i < NF; i += 2) v[$i] = $(i + 1) }
+    END { exit !(v["written"] > 0 && v["rate"] == 22050 && v["rms"] > 0.32 && v["rms"] < 0.39 && v["hz"] > 420 && v["hz"] < 460) }'; then
+    echo "ok   dsp-mmap (page): $tap"
+else
+    echo "FAIL dsp-mmap (page): exit $st; $(head -1 "$WORK/mm"); ${tap:-no tap}"
+    head -5 "$WORK/mm.err"
     exit 1
 fi

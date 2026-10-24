@@ -37,6 +37,7 @@ const SNDCTL_AUDIOINFO_EX: u32 = 0xc49c_580d;
 const SNDCTL_DSP_RESET: u32 = 0x0000_5000;
 const SNDCTL_DSP_SYNC: u32 = 0x0000_5001;
 const SNDCTL_DSP_SPEED: u32 = 0xc004_5002;
+const SNDCTL_DSP_STEREO: u32 = 0xc004_5003;
 const SNDCTL_DSP_SETFMT: u32 = 0xc004_5005;
 const SNDCTL_DSP_CHANNELS: u32 = 0xc004_5006;
 const SNDCTL_DSP_SETFRAGMENT: u32 = 0xc004_500a;
@@ -68,6 +69,7 @@ const PCM_CAP_OUTPUT: u32 = 0x0002_0000;
 const PCM_CAP_INPUT: u32 = 0x0001_0000;
 const PCM_CAP_DUPLEX: u32 = 0x0000_0100;
 const PCM_CAP_TRIGGER: u32 = 0x0000_1000;
+const PCM_CAP_MMAP: u32 = 0x0000_2000;
 
 /// The playback buffer unless a program asks for another
 /// (`SNDCTL_DSP_SETFRAGMENT`): 16 fragments of 2 KiB (about 190 ms of
@@ -93,6 +95,15 @@ struct Stream {
     /// fragments played when `SNDCTL_DSP_GETOPTR` last said.
     written: u64,
     optr_blocks: u64,
+    /// The buffer a program mapped (`mmap` of the device), its guest address
+    /// and length, and whether its output is triggered on: then the device
+    /// plays the mapping as a ring, and the output pointer says where.
+    map: Option<(u64, u64)>,
+    triggered: bool,
+    /// Bytes of the mapping handed to the player since the trigger went on,
+    /// and when it did (`tmpfs::now_ns`).
+    fed: u64,
+    on_at: u64,
     /// When `queued` was last brought up to date, in nanoseconds of the
     /// host's clock (`tmpfs::now_ns`: the browser has no `std::time`).
     at: u64,
@@ -139,6 +150,49 @@ impl Stream {
             self.queued = self.queued.saturating_sub(played);
             self.at = now;
         }
+    }
+}
+
+/// How far ahead of what it has played the device keeps the player fed from
+/// a mapped buffer: less than a game mixes ahead of the pointer (Quake's
+/// engines a tenth of a second), more than a frame takes.
+const MAP_LEAD_MS: u64 = 40;
+
+impl Stream {
+    /// A mapped, triggered buffer played up to now: what the player has
+    /// played of it (or, with no player taking it, what the time since the
+    /// trigger has), the player fed [`MAP_LEAD_MS`] beyond that from the
+    /// ring; the bytes played. Bytes the clock passed before they could be
+    /// fed are skipped, not played late.
+    fn play_map(&mut self, m: &mut crate::GuestMem<'_>, id: u32) -> u64 {
+        let Some((start, len)) = self.map else { return 0 };
+        let fb = self.frame_bytes().max(1);
+        let ring = len / fb * fb;
+        if !self.triggered || ring == 0 {
+            return self.fed;
+        }
+        let now = super::tmpfs::now_ns();
+        let played = match AUDIO_PENDING.get().and_then(|f| f(id, (now / 1_000_000) as u32)) {
+            Some(pending) => self.fed - (pending as u64 * fb).min(self.fed),
+            None => {
+                let t = (now.saturating_sub(self.on_at) as u128 * self.bytes_per_second() as u128 / 1_000_000_000) as u64;
+                let t = t / fb * fb;
+                self.fed = self.fed.max(t);
+                t
+            }
+        };
+        let lead = (self.bytes_per_second() * MAP_LEAD_MS / 1000 / fb * fb).min(ring / 2);
+        let target = played + lead;
+        while self.fed < target {
+            let at = self.fed % ring;
+            let n = (target - self.fed).min(ring - at);
+            if let Some(out) = AUDIO_OUT.get() {
+                let Ok(pcm) = m.read(start + at, n as usize) else { break };
+                out(id, pcm, self.format, self.rate, self.channels, (now / 1_000_000) as u32);
+            }
+            self.fed += n;
+        }
+        played
     }
 }
 
@@ -288,6 +342,10 @@ impl OssHandle {
                 queued: 0,
                 written: 0,
                 optr_blocks: 0,
+                map: None,
+                triggered: false,
+                fed: 0,
+                on_at: 0,
                 at: super::tmpfs::now_ns(),
                 id: 0,
                 played_by_player: false,
@@ -318,7 +376,7 @@ impl OssHandle {
     /// Output, and input when the host can loop the player back.
     fn caps(&self) -> u32 {
         let input = if AUDIO_CAPTURE.get().is_some() { PCM_CAP_INPUT | PCM_CAP_DUPLEX } else { 0 };
-        PCM_CAP_OUTPUT | PCM_CAP_TRIGGER | input
+        PCM_CAP_OUTPUT | PCM_CAP_TRIGGER | PCM_CAP_MMAP | input
     }
 }
 
@@ -386,6 +444,18 @@ impl OssHandle {
 }
 
 impl FileHandle for OssHandle {
+    /// `/dev/dsp`'s mapping is its playback buffer.
+    fn maps_own_memory(&self) -> bool {
+        self.node == OssNode::Dsp
+    }
+
+    fn mapped(&self, start: u64, len: u64) {
+        let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        s.map = Some((start, len));
+        s.triggered = false;
+        s.fed = 0;
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.node != OssNode::Dsp {
             return Err(Errno::EINVAL);
@@ -535,6 +605,15 @@ impl FileHandle for OssHandle {
                     s.channels as i32
                 })
             }
+            // 0 mono, 1 stereo: the older form of the channel count.
+            SNDCTL_DSP_STEREO => {
+                let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                int(m, &mut |v| {
+                    s.drain();
+                    s.channels = if v != 0 { 2 } else { 1 };
+                    s.channels as i32 - 1
+                })
+            }
             SNDCTL_DSP_GETFMTS => m.write_u32(arg, FORMATS).map(|_| 0),
             SNDCTL_DSP_GETCAPS => m.write_u32(arg, self.caps()).map(|_| 0),
             // 0xMMMMSSSS: up to MMMM fragments of 2^SSSS bytes, as OSS has
@@ -592,22 +671,43 @@ impl FileHandle for OssHandle {
             // count_info: bytes played since the open, fragments played since
             // the last ask, and where in the buffer playing is (what ALSA's
             // OSS plugin, and so SDL's ALSA output, reads as the pointer).
+            // A mapped buffer: where in the mapping playing is.
             SNDCTL_DSP_GETOPTR => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-                s.drain();
-                let played = s.written - s.queued.min(s.written);
+                let (played, ring) = match s.map {
+                    Some((_, len)) => (s.play_map(m, self.id), len / s.frame_bytes().max(1) * s.frame_bytes().max(1)),
+                    None => {
+                        s.drain();
+                        (s.written - s.queued.min(s.written), s.bufsize())
+                    }
+                };
                 let blocks = played / s.fragsize.max(1);
                 let mut b = [0u8; 12];
                 put_i32(&mut b, 0, played as u32 as i32);
                 put_i32(&mut b, 4, (blocks - s.optr_blocks.min(blocks)) as i32);
-                put_i32(&mut b, 8, (played % s.bufsize().max(1)) as i32);
+                put_i32(&mut b, 8, (played % ring.max(1)) as i32);
                 s.optr_blocks = blocks;
                 m.write(arg, &b).map(|_| 0)
             }
-            // Output plays as soon as it is written: the trigger is always on
-            // (capture has none to start either).
-            SNDCTL_DSP_SETTRIGGER => m.read_u32(arg).map(|_| 0),
-            SNDCTL_DSP_GETTRIGGER => m.write_u32(arg, PCM_ENABLE_OUTPUT).map(|_| 0),
+            // Written output plays as soon as it is written: for it the trigger
+            // is always on (capture has none to start either). A mapped
+            // buffer plays from the trigger's going on, from its start.
+            SNDCTL_DSP_SETTRIGGER => m.read_u32(arg).map(|v| {
+                let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                let on = v & PCM_ENABLE_OUTPUT != 0;
+                if on && !s.triggered {
+                    s.fed = 0;
+                    s.optr_blocks = 0;
+                    s.on_at = super::tmpfs::now_ns();
+                }
+                s.triggered = on;
+                0
+            }),
+            SNDCTL_DSP_GETTRIGGER => {
+                let s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                let on = s.map.is_none() || s.triggered;
+                m.write_u32(arg, if on { PCM_ENABLE_OUTPUT } else { 0 }).map(|_| 0)
+            }
             SNDCTL_DSP_RESET | SNDCTL_DSP_SYNC => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
                 // What a reset drops was never played; what a sync waits
@@ -657,6 +757,40 @@ mod tests {
         assert_eq!(out[0][0], -1.0);
     }
     use std::time::Instant;
+
+    #[test]
+    fn a_mapped_buffer_plays_from_the_trigger() {
+        // Quake's engines: caps with mmap, the buffer mapped, the trigger off
+        // and on, then the output pointer as where playing is.
+        let h = OssHandle::new(OssNode::Dsp);
+        let mut buf = vec![0u8; 64];
+        let mut m = crate::GuestMem::new(&mut buf);
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_GETCAPS as u64, 0), Some(Ok(0)));
+        assert_ne!(m.read_u32(0).unwrap() & PCM_CAP_MMAP, 0);
+        assert!(h.maps_own_memory());
+        h.mapped(0x10_0000, BUFSIZE);
+        m.write_u32(0, AFMT_S16_LE).unwrap();
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_SETFMT as u64, 0), Some(Ok(0)));
+        m.write_u32(0, 1).unwrap();
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_STEREO as u64, 0), Some(Ok(0)));
+        assert_eq!(m.read_u32(0).unwrap(), 1);
+        let optr = |m: &mut crate::GuestMem<'_>| {
+            assert_eq!(h.ioctl(m, SNDCTL_DSP_GETOPTR as u64, 16), Some(Ok(0)));
+            (m.read_u32(16).unwrap(), m.read_u32(24).unwrap())
+        };
+        // Not triggered: it stands still.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(optr(&mut m), (0, 0));
+        m.write_u32(0, PCM_ENABLE_OUTPUT).unwrap();
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_SETTRIGGER as u64, 0), Some(Ok(0)));
+        // 8 kHz stereo 16-bit: 32000 bytes a second, so the 32 KiB ring
+        // wraps after about a second.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let (bytes, ptr) = optr(&mut m);
+        assert!((36_000..60_000).contains(&bytes), "{bytes} bytes played in 1.2 s");
+        assert_eq!(ptr as u64, bytes as u64 % BUFSIZE);
+        assert_eq!(ptr % 4, 0, "the pointer is on a frame");
+    }
 
     #[test]
     fn the_output_pointer_counts_what_was_played() {

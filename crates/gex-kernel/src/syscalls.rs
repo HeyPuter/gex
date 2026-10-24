@@ -4031,6 +4031,11 @@ impl MapIo<'_> {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
+            if file.handle.maps_own_memory() {
+                let start = self.mem.lock().mmap(addr, len, prot_bits, flags | mflags::ANONYMOUS, &name)?;
+                file.handle.mapped(start, len);
+                return Ok(start);
+            }
             // A loader that maps an object's first segment straight from the
             // file, spanning the whole object (glibc 2.35 and later), rather
             // than reserving anonymous memory first: that mapping takes the

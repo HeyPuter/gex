@@ -516,6 +516,19 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether a mapping of this file is the device's own memory (an OSS
+    /// DMA buffer) rather than a copy of its contents: fresh zeroed pages,
+    /// never read from the file or written back to it, whose place the
+    /// device is told ([`FileHandle::mapped`]).
+    fn maps_own_memory(&self) -> bool {
+        false
+    }
+
+    /// Where a mapping of the device's own memory landed, and its length.
+    fn mapped(&self, start: u64, len: u64) {
+        let _ = (start, len);
+    }
+
     /// How many bytes a write can take now, when bounded. `None` means it is
     /// not (file, terminal, socket). A pipe is bounded, and a blocking write
     /// larger than its free space is carried to completion by the syscall layer.
