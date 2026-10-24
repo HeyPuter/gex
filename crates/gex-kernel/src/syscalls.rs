@@ -2053,9 +2053,8 @@ impl FdIo<'_> {
         let iovlen = self.msg_rd(m, msg, 3)?;
         let control = self.msg_rd(m, msg, 4)?;
         let controllen = self.msg_rd(m, msg, 5)?;
-        // How many descriptors the caller left room for. A reader that offers
-        // no room leaves them queued for the next call rather than losing
-        // them, which is what Wayland's two-stage read depends on.
+        // How many descriptors the caller left room for: the rest of a
+        // write's are closed (`MSG_CTRUNC`).
         let room = if control != 0 && controllen >= self.cmsg_hdr() {
             ((controllen - self.cmsg_hdr()) / 4) as usize
         } else {
@@ -2095,6 +2094,7 @@ impl FdIo<'_> {
             }
         }
         let mut received = Vec::new();
+        let mut cut = false;
         let total = if want == 0 {
             0
         } else {
@@ -2102,8 +2102,9 @@ impl FdIo<'_> {
             let n = match &unix_sock {
                 // The bytes and their descriptors in one step (`recv_with`).
                 Some(sock) => {
-                    let (n, fds) = sock.recv_with(&mut tmp, room, peek)?;
+                    let (n, fds, c) = sock.recv_msg(&mut tmp, room, peek)?;
                     received = fds;
+                    cut = c;
                     n
                 }
                 None if peek => match self.socket_of(fd) {
@@ -2136,10 +2137,14 @@ impl FdIo<'_> {
                 self.write_sockaddr(m, ip, port, name, namelen_at)?;
             }
         }
+        let given = !received.is_empty();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
-        // msg_flags (int): nothing truncated
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
+        // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
+        // of room.
+        const MSG_CTRUNC: u32 = 0x8;
+        let flags = if cut || (given && written == 0) { MSG_CTRUNC } else { 0 };
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, flags)?;
         Ok(total)
     }
 
