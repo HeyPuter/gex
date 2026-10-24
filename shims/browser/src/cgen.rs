@@ -51,6 +51,8 @@ struct Pending {
     path: String,
     base: u64,
     pe: Arc<gex_ld::pe::PeImage>,
+    /// When it was mapped (`host_now_ns`), for `GEX_LOG=placelat`.
+    at_ns: u64,
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
@@ -517,6 +519,20 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether this Worker's JS has anything to serve (`#cgenServe`): a unit
+/// placed or wanted, the function table's log to replay, Wine's PE
+/// module's late bindings, a provider-only unit or re-bridge, a program
+/// staged. Atomics and this Worker's own counters only: asked after every
+/// direct entry's call ([`w64_entry`]), which goes to JS only when one is.
+pub(crate) fn serve_wanted() -> bool {
+    ANY_PENDING.load(Ordering::Acquire)
+        || wanted_any()
+        || (HAVE.with(|c| c.get()) as usize) < log_len()
+        || wasmdll::behind()
+        || elfprov::waiting()
+        || wasmprog::staged_any()
+}
+
 /// Whether units are on.
 pub(crate) fn on() -> bool {
     MODE.load(Ordering::Relaxed) != 0
@@ -585,7 +601,7 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     static HOOK: OnceLock<()> = OnceLock::new();
     if HOOK.set(()).is_ok() {
         gex_kernel::nt::section::set_image_mapped_hook(|m| {
-            lock(&PENDING).push(Pending { path: m.path.to_string(), base: m.base, pe: Arc::clone(m.pe) });
+            lock(&PENDING).push(Pending { path: m.path.to_string(), base: m.base, pe: Arc::clone(m.pe), at_ns: crate::host_now_ns() });
             ANY_PENDING.store(true, Ordering::Release);
         });
     }
@@ -655,6 +671,7 @@ pub(crate) fn drain() -> bool {
         }
     }
     for p in pending {
+        PLACING_AT.with(|c| c.set(p.at_ns));
         let (image, _) = match gex_xlate::func::pe_input(&p.pe, p.base) {
             Ok(x) => x,
             Err(e) => {
@@ -682,10 +699,11 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
     w3_trampolines(!pe.is64);
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
     if !w3_matches(&image, base, pe, true) {
-        w3_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())) });
+        w3_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
         return false;
     }
     w3_forget(base, pe.image_size as u64);
+    PLACING_AT.with(|c| c.set(crate::host_now_ns()));
     place(&image, path, base, true, Some(pe));
     wanted_any()
 }
@@ -706,7 +724,7 @@ pub(crate) fn w3_may_defer(_path: &str, _base: u64) -> bool {
 /// Leave the image open as `file`, `size` bytes mapped at `base`, for its
 /// first miss ([`w3_miss`] reads and places it then).
 pub(crate) fn w3_defer_unread(path: &str, base: u64, size: u64, file: Arc<dyn gex_kernel::vfs::FileHandle>) {
-    w3_defer(Deferred { path: path.to_string(), base, size, src: Src::File(file) });
+    w3_defer(Deferred { path: path.to_string(), base, size, src: Src::File(file), at_ns: crate::host_now_ns() });
 }
 
 /// Where a deferred image's PE comes from: parsed at its mapping (its code
@@ -721,6 +739,8 @@ struct Deferred {
     base: u64,
     size: u64,
     src: Src,
+    /// When it was mapped (`host_now_ns`), for `GEX_LOG=placelat`.
+    at_ns: u64,
 }
 
 /// Images [`w3_mapped`] and [`w3_defer_unread`] left for their first miss.
@@ -813,6 +833,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
         return false;
     }
+    PLACING_AT.with(|c| c.set(d.at_ns));
     place(&image, &d.path, d.base, true, Some(&pe));
     wanted_any()
 }
@@ -915,7 +936,37 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         slots: 0,
         providers,
     });
+    let at = PLACING_AT.with(|c| c.replace(0));
+    if at != 0 {
+        lock(&MAPPED_AT).push((units.len() - 1, at, crate::host_now_ns()));
+    }
     u_want(units.len() - 1);
+}
+
+thread_local! {
+    /// The mapping time of the image `drain` is placing (0: none).
+    static PLACING_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Each placed image's unit, its mapping time and when it was wanted
+/// (unit, `host_now_ns` twice).
+static MAPPED_AT: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
+
+/// `GEX_LOG=placelat`: how long ago unit `u`'s image was mapped (`want`: was
+/// wanted, at the mapping or a deferred image's first miss), in us (-1: not
+/// known), asked as JS serves it.
+#[no_mangle]
+pub extern "C" fn gex_cgen_mapped_age_us(u: u32, want: i32) -> i64 {
+    let at = lock(&MAPPED_AT).iter().rev().find(|e| e.0 == u as usize).map(|e| if want != 0 { e.2 } else { e.1 });
+    at.map_or(-1, |t| (crate::host_now_ns().saturating_sub(t) / 1000) as i64)
+}
+
+/// `GEX_LOG=serveall`: serve after every direct entry's call, as before
+/// [`serve_wanted`] (A/B runs of how promptly units are placed).
+static SERVE_ALWAYS: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_serve_always(on: i32) {
+    SERVE_ALWAYS.store(on != 0, Ordering::Relaxed);
 }
 
 /// The key of the unit for `image` (the native host's `pe_units::unit_key`:
@@ -2222,6 +2273,9 @@ extern "C" {
     /// `sp` is the guest's stack pointer, as the call left it (the hook's
     /// C frames go below it), read here so the host need not.
     fn entry_call(idx: i32, ctx: i32, sp: i64) -> i32;
+    /// Serve what [`serve_wanted`] says waits (`#cgenServe`): the units
+    /// placed, the function table's log, the bindings, a staged program.
+    fn cgen_serve();
     /// Start the thread the call staged (`#startThread`), after
     /// `entry_call`: called only when one is staged.
     fn thread_start();
@@ -2937,6 +2991,12 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     // SAFETY: a host import taking scalars; nothing here holds a lock.
     if unsafe { entry_call(idx as i32, c as i32, sp as i64) } == 0 {
         return None;
+    }
+    // What the call mapped or staged (an image's unit, a binding), before
+    // the guest goes on, as the `ud2` route's trap served it.
+    if serve_wanted() || SERVE_ALWAYS.load(Ordering::Relaxed) {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen_serve() };
     }
     // A thread the call made (NtCreateThreadEx's clone): started as the
     // fault hook's return would, before anything below may trap out.

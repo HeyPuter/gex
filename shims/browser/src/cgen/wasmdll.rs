@@ -123,6 +123,16 @@ fn binds_push(b: Bind) {
     }
 }
 
+thread_local! {
+    /// How many bindings this Worker's JS has read (`gex_wasmdll_bind_regs`).
+    static SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bindings this Worker has still to write the bridges of.
+pub(crate) fn behind() -> bool {
+    SEEN.with(|c| c.get()) < BINDS_LEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Binding `i`, published.
 fn binds_get(i: usize) -> Option<&'static Bind> {
     use std::sync::atomic::Ordering::Acquire;
@@ -647,6 +657,7 @@ pub extern "C" fn gex_wasmdll_binds_len() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_bind_regs(i: u32, buf: u32, cap: u32) -> u32 {
     let Some(x) = binds_get(i as usize) else { return 0 };
+    SEEN.with(|c| c.set(c.get().max(i as usize + 1)));
     let n = x.regs.len().min(cap as usize);
     put_u32s(&x.regs[..n], buf);
     x.regs.len() as u32

@@ -101,7 +101,9 @@ function importedArities(bytes) {
 /**
  * What the glue supplies under `gex_env`, and with how many parameters. Read
  * from source, not by loading it -- building an instance is what this checks.
- * Entries are matched as `name: (args) => ...`.
+ * Entries are matched as `name: (args) => ...`, or as `name: single.on ?
+ * (args) => ... : wasm` (a wasm function in the threaded build: its arity is
+ * the arrow's).
  */
 function suppliedArities(source) {
   // Either spelling: the inline `gex_env: { ... }` or the `#hostImports()`
@@ -127,7 +129,7 @@ function suppliedArities(source) {
   // `name: (a, b) => ...` and `name: () => ...`, at any indentation, and the
   // single-thread build's `name: single.on ? new WebAssembly.Suspending((a, b)
   // => ...) : (a, b) => ...`, read by its first arrow (both take the same).
-  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:single\.on\s*\?\s*new WebAssembly\.Suspending\(\s*)?\(([^)]*)\)\s*=>/g)) {
+  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:single\.on\s*\?\s*(?:new WebAssembly\.Suspending\(\s*)?)?\(([^)]*)\)\s*=>/g)) {
     const params = m[2].trim();
     out.set(m[1], params ? params.split(',').length : 0);
   }
