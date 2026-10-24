@@ -28,6 +28,13 @@ mod host_walk;
 const INTERP_BASE: u64 = gex_abi::INTERP_BASE;
 
 fn main() -> ExitCode {
+    // Every guest thread is a host thread, and glibc gives threads arenas
+    // of their own, up to eight per core, each keeping what was freed in
+    // it. A few shared arenas, unless the environment chose.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
+    }
     match real_main() {
         Ok(code) => code,
         Err(e) => {

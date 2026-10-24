@@ -23,6 +23,19 @@ pub fn threads() -> usize {
     })
 }
 
+/// Items each thread is given at least: below that a helper costs more to
+/// start than its share of the work (a block's lift is microseconds, a
+/// thread's start and its allocator arena more), so a small batch runs on
+/// fewer threads, and one under twice this on the caller alone.
+#[cfg(feature = "parallel")]
+const PER_THREAD: usize = 64;
+
+/// How many threads a batch of `n` items runs on, the caller's included.
+#[cfg(feature = "parallel")]
+fn width(n: usize) -> usize {
+    threads().min(n / PER_THREAD).max(1)
+}
+
 /// Helper threads running now, across every caller in the process. One
 /// budget of [`threads`] for them all: each translating guest thread asked
 /// for `threads()` of its own, so a program with 125 threads could ask for
@@ -116,10 +129,8 @@ where
     R: Send,
     F: Fn(&T) -> R + Sync,
 {
-    // Below this the threads cost more than the work does.
-    const MIN_PARALLEL: usize = 64;
-    let threads = threads();
-    if threads < 2 || items.len() < MIN_PARALLEL {
+    let threads = width(items.len());
+    if threads < 2 {
         return items.iter().map(f).collect();
     }
 
@@ -156,9 +167,8 @@ where
     R: Send + Default + Clone,
     F: Fn(usize, &mut T) -> R + Sync,
 {
-    const MIN_PARALLEL: usize = 64;
-    let threads = threads();
-    if threads < 2 || items.len() < MIN_PARALLEL {
+    let threads = width(items.len());
+    if threads < 2 {
         return items.iter_mut().enumerate().map(|(i, t)| f(i, t)).collect();
     }
 
@@ -252,6 +262,17 @@ mod tests {
         }
         super::REFUSE_SPAWN.store(false, Ordering::Relaxed);
         assert!(super::PEAK.load(Ordering::Relaxed) <= super::threads());
+    }
+
+    /// A batch too small to share runs on the caller alone, and one big
+    /// enough on every thread there is, never more.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_batch_runs_as_wide_as_its_size_warrants() {
+        assert_eq!(super::width(0), 1);
+        assert_eq!(super::width(2 * super::PER_THREAD - 1), 1);
+        assert_eq!(super::width(1 << 30), super::threads());
+        assert!(super::width(4 * super::PER_THREAD) <= 4);
     }
 
     /// A list too short to be worth threads still comes back complete.
