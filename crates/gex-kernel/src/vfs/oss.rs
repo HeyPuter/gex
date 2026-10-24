@@ -45,6 +45,10 @@ const SNDCTL_DSP_GETOSPACE: u32 = 0x8010_500c;
 const SNDCTL_DSP_GETISPACE: u32 = 0x8010_500d;
 const SNDCTL_DSP_GETCAPS: u32 = 0x8004_500f;
 const SNDCTL_DSP_GETODELAY: u32 = 0x8004_5017;
+const SNDCTL_DSP_GETTRIGGER: u32 = 0x8004_5010;
+const SNDCTL_DSP_SETTRIGGER: u32 = 0x4004_5010;
+const SNDCTL_DSP_GETOPTR: u32 = 0x800c_5012;
+const PCM_ENABLE_OUTPUT: u32 = 2;
 /// gex's own: `_IOR('P', 0xe0, int[5])`, what the device knows of the
 /// player behind it ([`OssHandle::ioctl`]).
 pub const SNDCTL_DSP_GEX_INFO: u32 = 0x8014_50e0;
@@ -85,6 +89,10 @@ struct Stream {
     channels: u32,
     /// Bytes written and not yet played.
     queued: u64,
+    /// Bytes written since the open (less what a reset dropped), and the
+    /// fragments played when `SNDCTL_DSP_GETOPTR` last said.
+    written: u64,
+    optr_blocks: u64,
     /// When `queued` was last brought up to date, in nanoseconds of the
     /// host's clock (`tmpfs::now_ns`: the browser has no `std::time`).
     at: u64,
@@ -278,6 +286,8 @@ impl OssHandle {
                 rate: 8000,
                 channels: 1,
                 queued: 0,
+                written: 0,
+                optr_blocks: 0,
                 at: super::tmpfs::now_ns(),
                 id: 0,
                 played_by_player: false,
@@ -408,6 +418,7 @@ impl FileHandle for OssHandle {
             }
         }
         s.queued += n;
+        s.written += n;
         if let Some(out) = AUDIO_OUT.get() {
             out(self.id, &buf[..n as usize], s.format, s.rate, s.channels, (s.at / 1_000_000) as u32);
         }
@@ -578,8 +589,32 @@ impl FileHandle for OssHandle {
                 s.drain();
                 m.write_u32(arg, s.queued as u32).map(|_| 0)
             }
+            // count_info: bytes played since the open, fragments played since
+            // the last ask, and where in the buffer playing is (what ALSA's
+            // OSS plugin, and so SDL's ALSA output, reads as the pointer).
+            SNDCTL_DSP_GETOPTR => {
+                let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                s.drain();
+                let played = s.written - s.queued.min(s.written);
+                let blocks = played / s.fragsize.max(1);
+                let mut b = [0u8; 12];
+                put_i32(&mut b, 0, played as u32 as i32);
+                put_i32(&mut b, 4, (blocks - s.optr_blocks.min(blocks)) as i32);
+                put_i32(&mut b, 8, (played % s.bufsize().max(1)) as i32);
+                s.optr_blocks = blocks;
+                m.write(arg, &b).map(|_| 0)
+            }
+            // Output plays as soon as it is written: the trigger is always on
+            // (capture has none to start either).
+            SNDCTL_DSP_SETTRIGGER => m.read_u32(arg).map(|_| 0),
+            SNDCTL_DSP_GETTRIGGER => m.write_u32(arg, PCM_ENABLE_OUTPUT).map(|_| 0),
             SNDCTL_DSP_RESET | SNDCTL_DSP_SYNC => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                // What a reset drops was never played; what a sync waits
+                // for was.
+                if request == SNDCTL_DSP_RESET {
+                    s.written -= s.queued.min(s.written);
+                }
                 s.queued = 0;
                 s.capture = None;
                 s.at = super::tmpfs::now_ns();
@@ -622,6 +657,36 @@ mod tests {
         assert_eq!(out[0][0], -1.0);
     }
     use std::time::Instant;
+
+    #[test]
+    fn the_output_pointer_counts_what_was_played() {
+        // ALSA's OSS plugin: the trigger set, then GETOPTR as its pointer.
+        let h = OssHandle::new(OssNode::Dsp);
+        let mut buf = vec![0u8; 64];
+        let mut m = crate::GuestMem::new(&mut buf);
+        m.write_u32(0, AFMT_S16_LE).unwrap();
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_SETFMT as u64, 0), Some(Ok(0)));
+        m.write_u32(0, PCM_ENABLE_OUTPUT).unwrap();
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_SETTRIGGER as u64, 0), Some(Ok(0)));
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_GETTRIGGER as u64, 0), Some(Ok(0)));
+        assert_eq!(m.read_u32(0).unwrap(), PCM_ENABLE_OUTPUT);
+        let optr = |m: &mut crate::GuestMem<'_>| {
+            assert_eq!(h.ioctl(m, SNDCTL_DSP_GETOPTR as u64, 16), Some(Ok(0)));
+            (m.read_u32(16).unwrap(), m.read_u32(20).unwrap(), m.read_u32(24).unwrap())
+        };
+        assert_eq!(optr(&mut m), (0, 0, 0));
+        // 8 kHz mono 16-bit: 16000 bytes a second. Written, then a reset
+        // drops what was not played: the pointer never counts it.
+        assert_eq!(h.write_at(0, &vec![0u8; 3 * FRAGSIZE as usize]).unwrap(), 3 * FRAGSIZE);
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        let (bytes, blocks, ptr) = optr(&mut m);
+        assert_eq!(bytes as u64, 3 * FRAGSIZE, "all played after 450 ms (3 * 2048 bytes is 384 ms)");
+        assert_eq!((blocks, ptr), (3, bytes % BUFSIZE as u32));
+        assert_eq!(optr(&mut m).1, 0, "blocks count from the last ask");
+        assert_eq!(h.write_at(0, &vec![0u8; 8000]).unwrap(), 8000);
+        assert_eq!(h.ioctl(&mut m, SNDCTL_DSP_RESET as u64, 0), Some(Ok(0)));
+        assert!((optr(&mut m).0 as u64) < 3 * FRAGSIZE + 8000);
+    }
 
     #[test]
     fn the_buffer_drains_with_the_clock() {
