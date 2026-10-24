@@ -16,6 +16,29 @@ use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuar
 /// length says. For the memory census.
 pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The directory a page keeps (its persist store's root, `watch`), without
+/// its leading `/`, and how many times the program has finished a change
+/// under it: a close after a write (or a create or truncation), a rename
+/// into or out of it, an unlink. The store snapshots soon after the count moves
+/// (web/src/persist-worker.js), so a save outlives the page without waiting
+/// for a timer. Unset, nothing is counted.
+static WATCHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+pub static SAVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count changes finished under `root` ([`SAVES`]); the first root set stays.
+pub fn watch(root: &str) {
+    let _ = WATCHED.set(root.trim_matches('/').to_string());
+}
+
+/// A change to `path` (a tmpfs path, no leading `/`) finished: counted when
+/// it is under the watched directory.
+fn saved(path: &str) {
+    let Some(w) = WATCHED.get() else { return };
+    if path.starts_with(w.as_str()) && (w.is_empty() || path.len() == w.len() || path.as_bytes()[w.len()] == b'/') {
+        SAVES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn note_capacity(before: usize, after: usize) {
     if after >= before {
         TMPFS_BYTES.fetch_add((after - before) as u64, core::sync::atomic::Ordering::Relaxed);
@@ -535,7 +558,13 @@ impl TmpFs {
             let dir = matches!(self.inner.read().unwrap().nodes.get(from), Some(Node::Dir));
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
                 Err(Errno::EAGAIN) => continue,
-                r => return r,
+                r => {
+                    if r.is_ok() {
+                        saved(from);
+                        saved(to);
+                    }
+                    return r;
+                }
             }
         }
     }
@@ -898,6 +927,27 @@ struct TmpHandle {
     /// through a rename of the directory or of one above it, as a Linux
     /// descriptor follows its dentry (`Inner::dir_now`).
     dir: Option<u64>,
+    /// Whether this handle wrote or truncated: its close is then a change
+    /// finished ([`saved`]).
+    wrote: core::sync::atomic::AtomicBool,
+}
+
+impl TmpHandle {
+    fn note_write(&self) {
+        if !self.wrote.load(Ordering::Relaxed) {
+            self.wrote.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for TmpHandle {
+    fn drop(&mut self) {
+        // By the name it was opened by: a drop takes no lock. A save is
+        // closed before it is renamed into place, and the rename is counted.
+        if self.wrote.load(Ordering::Relaxed) {
+            saved(&self.path);
+        }
+    }
 }
 
 impl TmpHandle {
@@ -980,6 +1030,7 @@ impl FileHandle for TmpHandle {
         file.changed();
         drop(data);
         file.touch();
+        self.note_write();
         Ok(buf.len() as u64)
     }
 
@@ -1113,6 +1164,7 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EINVAL);
         };
         file.materialize()?;
+        self.note_write();
         {
             let mut data = file.data.lock().unwrap();
             let was = data.capacity();
@@ -1179,6 +1231,7 @@ impl FileSystem for TmpFs {
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
         let mut dir = None;
+        let mut wrote = false;
         let file = {
             let mut inner = self.inner.lock().unwrap();
             match inner.nodes.get(&path) {
@@ -1208,6 +1261,7 @@ impl FileSystem for TmpFs {
                                 f.changed();
                             }
                             f.touch();
+                            wrote = true;
                         }
                     }
                     match inner.nodes.get(&path) {
@@ -1232,6 +1286,7 @@ impl FileSystem for TmpFs {
                     inner.set_ino(path.clone(), ino);
                     let f = Arc::new(FileNode::new(Vec::new(), ino));
                     f.mark_written();
+                    wrote = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
                     Some(f)
                 }
@@ -1242,6 +1297,7 @@ impl FileSystem for TmpFs {
             path,
             file,
             dir,
+            wrote: core::sync::atomic::AtomicBool::new(wrote),
         }))
     }
 
@@ -1356,6 +1412,7 @@ impl FileSystem for TmpFs {
                 inner.nodes.remove(path);
                 inner.drop_ino(path);
                 inner.mtimes.remove(path);
+                saved(path);
                 Ok(())
             }
             None => Err(Errno::ENOENT),
@@ -2069,6 +2126,45 @@ mod lazy_tests {
         assert_eq!(fs.add_file_part("p/none", 0, b"x"), Err(Errno::ENOENT));
         fs.open("p/big", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
         assert_eq!(fs.written(), ["/p/big"].map(String::from).to_vec());
+    }
+
+    /// A change the program finishes under the watched directory moves
+    /// `SAVES`: a close after a write, a create or a truncation, a rename
+    /// into or out of it, an unlink. A read, an open alone, and anything
+    /// outside it do not. (The only test that sets the watch.)
+    #[test]
+    fn saves_count_finished_changes_under_the_watched_directory() {
+        watch("/watched-saves/");
+        let fs = TmpFs::new();
+        fs.mkdir("watched-saves", 0o755).unwrap();
+        fs.mkdir("watched-savesx", 0o755).unwrap();
+        fs.add_file("watched-saves/old", b"seed".to_vec());
+        fs.add_file("other", b"seed".to_vec());
+        let n = || SAVES.load(Ordering::Relaxed);
+        let mut buf = [0u8; 4];
+        let at = n();
+        fs.open("watched-saves/old", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        drop(fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap());
+        fs.open("other", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
+        fs.open("watched-savesx/f", oflags::O_CREAT | oflags::O_RDWR, 0o644).unwrap().write_at(0, b"x").unwrap();
+        assert_eq!(n(), at);
+        let h = fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap();
+        h.write_at(0, b"x").unwrap();
+        assert_eq!(n(), at, "counted at the close, not the write");
+        drop(h);
+        assert_eq!(n(), at + 1);
+        drop(fs.open("watched-saves/tmp", oflags::O_CREAT | oflags::O_WRONLY, 0o644).unwrap());
+        assert_eq!(n(), at + 2);
+        drop(fs.open("watched-saves/old", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap());
+        assert_eq!(n(), at + 3);
+        FileSystem::rename(&fs, "other", "watched-saves/in").unwrap();
+        assert_eq!(n(), at + 4);
+        FileSystem::rename(&fs, "watched-saves/tmp", "outside").unwrap();
+        assert_eq!(n(), at + 5);
+        FileSystem::unlink(&fs, "watched-saves/in").unwrap();
+        assert_eq!(n(), at + 6);
+        FileSystem::unlink(&fs, "outside").unwrap();
+        assert_eq!(n(), at + 6);
     }
 
     /// Requests of `/data/r`, each `(offset, len)`.

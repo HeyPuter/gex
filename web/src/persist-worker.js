@@ -5,7 +5,8 @@
 //
 // Message in:  { spec: { module, memory }, root, db }   once, then
 //              { sync: id }                            per snapshot.
-// Message out: { synced: id, wrote, removed, files, bytes } or { error }.
+// Message out: { synced: id, wrote, removed, files, bytes } or { error };
+//              { auto: true, ... } for a snapshot of its own (`follow`).
 
 import { openDb, txDone } from './persist-db.js';
 import { pick } from './persist-pick.js';
@@ -210,6 +211,37 @@ async function sync() {
 }
 
 let queue = Promise.resolve();
+
+// A snapshot of its own after the program finishes a change under the root
+// (the kernel's `k_fs_saves`: a close after a write, a rename, an unlink):
+// QUIET_MS after the last one, or FOLLOW_MAX_MS after the first unsnapshotted
+// one, whichever is sooner. Asked every POLL_MS, one load each.
+const POLL_MS = 250;
+const QUIET_MS = 1000;
+const FOLLOW_MAX_MS = 5000;
+function follow() {
+  if (!k.k_fs_saves || !k.k_fs_watch) return;
+  const n = putPath(root || '/');
+  k.k_fs_watch(BigInt(SCRATCH), n);
+  let seen = k.k_fs_saves();
+  let first = 0;
+  let last = 0;
+  setInterval(() => {
+    const now = performance.now();
+    const c = k.k_fs_saves();
+    if (c !== seen) {
+      seen = c;
+      last = now;
+      first ||= now;
+    }
+    if (!first || (now - last < QUIET_MS && now - first < FOLLOW_MAX_MS)) return;
+    first = 0;
+    queue = queue
+      .then(() => sync())
+      .then((r) => self.postMessage({ auto: true, ...r }))
+      .catch((err) => self.postMessage({ error: `snapshot after a save: ${err?.stack ?? err}` }));
+  }, POLL_MS);
+}
 self.onmessage = (e) => {
   const m = e.data;
   if (m.spec) {
@@ -235,6 +267,7 @@ self.onmessage = (e) => {
         kernelThread(k, helperStackTop(k, 'persist'));
       }
       db = await openDb(dbName);
+      follow();
     }).catch((err) => self.postMessage({ error: String(err?.stack ?? err) }));
     return;
   }
