@@ -190,7 +190,9 @@ pub mod raw {
     pub const SET_THREAD_AREA: u64 = 243;
     pub const GET_THREAD_AREA: u64 = 244;
     pub const EXIT_GROUP: u64 = 252;
+    pub const EPOLL_CREATE: u64 = 254;
     pub const EPOLL_CTL: u64 = 255;
+    pub const EPOLL_WAIT: u64 = 256;
     pub const SET_TID_ADDRESS: u64 = 258;
     pub const CLOCK_GETTIME: u64 = 265;
     pub const CLOCK_GETRES: u64 = 266;
@@ -898,6 +900,16 @@ pub fn translate(
             nr::PSELECT6
         }
         x::EPOLL_CREATE1 => nr::EPOLL_CREATE1,
+        // epoll_create(size): the size is only checked to be positive.
+        x::EPOLL_CREATE => {
+            *a = [0; 6];
+            nr::EPOLL_CREATE1
+        }
+        // epoll_wait is epoll_pwait with no mask (the X server's ospoll).
+        x::EPOLL_WAIT => {
+            *a = [sext(a[0]), a[1], a[2], sext(a[3]), 0, 8];
+            nr::EPOLL_PWAIT
+        }
         x::EPOLL_CTL => {
             a[0] = sext(a[0]);
             a[2] = sext(a[2]);
@@ -1306,5 +1318,7 @@ mod tests {
         assert_eq!(canonical_number(raw::SCHED_YIELD), nr::SCHED_YIELD);
         assert_eq!(canonical_number(raw::READ), nr::READ);
         assert_eq!(canonical_number(raw::OPEN), nr::OPENAT);
+        assert_eq!(canonical_number(raw::EPOLL_WAIT), nr::EPOLL_PWAIT);
+        assert_eq!(canonical_number(raw::EPOLL_CREATE), nr::EPOLL_CREATE1);
     }
 }
