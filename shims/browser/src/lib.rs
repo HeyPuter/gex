@@ -348,7 +348,6 @@ extern "C" {
     fn k_fs_close(handle: i32);
     fn k_fs_dup(handle: i32) -> i32;
     fn k_fs_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
-    fn k_fs_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_write_now(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32;
     fn k_fs_open_now(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32;
     fn k_fs_fchmod(handle: i32, mode: u32) -> i32;
@@ -377,6 +376,7 @@ extern "C" {
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_add_part(path: gex_kernel::PAddr, path_len: u32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_lazy(path: gex_kernel::PAddr, path_len: u32, url: gex_kernel::PAddr, url_len: u32, size: u64) -> i32;
     /// The system-wide map from a page of a mapped object to the dispatch slots
     /// its code was translated into; zero means nobody has. In the kernel so
@@ -5862,24 +5862,11 @@ pub extern "C" fn gex_add_file_part(path: u32, path_len: u32, offset: u64, data:
         if unsafe { k_fs_populated() } != 0 {
             return;
         }
-        // SAFETY: scalars and pointers into this module's memory, which the
-        // kernel copies from.
-        unsafe {
-            let h = k_fs_open(gex_kernel::PAddr::from(path), path_len, 1 /* O_WRONLY */, 0o644);
-            if h < 0 {
-                warn_line(&format!("gex_add_file_part: cannot reopen a staged file ({h})\n"));
-                return;
-            }
-            let mut done = 0u32;
-            while done < data_len {
-                let n = k_fs_write(h, offset + done as u64, gex_kernel::PAddr::from(data + done), data_len - done);
-                if n <= 0 {
-                    warn_line("gex_add_file_part: a staged write failed\n");
-                    break;
-                }
-                done += n as u32;
-            }
-            k_fs_close(h);
+        // Seeding, as the first part was (`k_fs_add`): the kernel does not
+        // count it as the program's write. SAFETY: scalars and pointers into
+        // this module's memory, which the kernel copies from.
+        if unsafe { k_fs_add_part(gex_kernel::PAddr::from(path), path_len, offset, gex_kernel::PAddr::from(data), data_len) } < 0 {
+            warn_line("gex_add_file_part: a staged part failed\n");
         }
         return;
     }

@@ -633,6 +633,29 @@ impl TmpFs {
         );
     }
 
+    /// Bytes of a seeded file ([`TmpFs::add_file`]) at `offset`, for a seeding
+    /// that sends a large file in parts: the file grows to hold them and
+    /// stays as seeded, not made or changed by the program
+    /// ([`TmpFs::written`]). ENOENT when no file is at `path`.
+    pub fn add_file_part(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), Errno> {
+        let path = path.trim_start_matches('/');
+        let f = match self.inner.lock().unwrap().nodes.get(path) {
+            Some(Node::File(f)) => Arc::clone(f),
+            _ => return Err(Errno::ENOENT),
+        };
+        let mut data = f.data.lock().unwrap();
+        let start = offset as usize;
+        let end = start + bytes.len();
+        if end > data.len() {
+            let was = data.capacity();
+            reserve(&mut data, end)?;
+            data.resize(end, 0);
+            note_capacity(was, data.capacity());
+        }
+        data[start..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
     /// A file of `size` bytes whose contents are fetched from `url` as they
     /// are read (`set_lazy_fetch`). A path already present is left alone:
     /// a bundled copy wins.
@@ -1999,6 +2022,23 @@ mod lazy_tests {
             fs.written(),
             ["/a/cut", "/a/new", "/a/there", "/a/wrote", "/e/in"].map(String::from).to_vec()
         );
+    }
+
+    /// A file seeded in parts (`add_file`, then `add_file_part`) holds its
+    /// bytes and is not listed as written: only the program's changes are.
+    #[test]
+    fn a_file_seeded_in_parts_is_not_written() {
+        let fs = TmpFs::new();
+        fs.add_file("p/big", b"ab".to_vec());
+        fs.add_file_part("/p/big", 2, b"cd").unwrap();
+        fs.add_file_part("p/big", 6, b"ef").unwrap();
+        assert!(fs.written().is_empty(), "{:?}", fs.written());
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.open("p/big", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap(), 8);
+        assert_eq!(&buf, b"abcd\0\0ef");
+        assert_eq!(fs.add_file_part("p/none", 0, b"x"), Err(Errno::ENOENT));
+        fs.open("p/big", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
+        assert_eq!(fs.written(), ["/p/big"].map(String::from).to_vec());
     }
 
     /// Requests of `/data/r`, each `(offset, len)`.
