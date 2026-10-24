@@ -60,6 +60,20 @@ else
 	printf 'want:\n%s\ngot:\n%s\n' "$want" "$got"; grep -a 'trap\|rror' "$w/run.err" | head -5; exit 1
 fi
 
+# A call-out watching one arm of a shared entry, then a publish naming that
+# entry (its sibling arms take the bridge): the watch must stay on, or the
+# guest returning there runs the bridge and the call-out never ends. Driven
+# from JS (Gex.testBridgeWatch), since an ELF unit's call-out returns
+# mid-function, never through a bridged arm.
+fails=$(GEX_TEST_BRIDGE_WATCH=1 node --input-type=module -e "
+const { Gex } = await import('$root/shims/browser/js/gex.mjs');
+for (const f of Gex.testBridgeWatch()) console.log(f);" 2>&1)
+if [ $? = 0 ] && [ -z "$fails" ]; then
+	echo "ok   bridge-share watch (a call-out's watch outlives publishes into its entry)"
+else
+	echo "FAIL bridge-share watch"; printf '%s\n' "$fails"; exit 1
+fi
+
 # Units off, a native wasm32 program: its module goes in through the function
 # table's log all the same. An exec from a second thread keeps that thread's
 # Worker, and its `blocks` already holds the entry the new program's bridges

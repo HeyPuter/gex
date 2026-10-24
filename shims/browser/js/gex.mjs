@@ -4448,10 +4448,7 @@ export class Gex {
     // bridge has an index there of its own.
     const blocks = this.#guest.exports.blocks;
     if (blocks) this.#growBlocks();
-    for (let j = 0; j + 1 < regs.length; j += 2) {
-      if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
-      else tables[regs[j]].set(regs[j + 1], st.bridge);
-    }
+    this.#writeBridges(tables, blocks, regs, st.bridge);
     if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
     st.instances.push(inst);
     // The first Worker to install a JIT module writes the directory for the
@@ -5101,10 +5098,7 @@ export class Gex {
         e.gex_free?.(buf, 4 * Math.max(1, n));
       }
       const st = this.#cgenStore();
-      for (let j = 0; j + 1 < regs.length; j += 2) {
-        if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
-        else tables[regs[j]].set(regs[j + 1], st.bridge);
-      }
+      this.#writeBridges(tables, blocks, regs, st.bridge);
       if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       e.gex_wasmdll_bind_done(i);
       this.#wasmdllHave++;
@@ -5905,10 +5899,7 @@ export class Gex {
         const tables = this.#growTables(e.gex_elfprov_rebridge_need() >>> 0, 'elfprov');
         const blocks = this.#guest.exports.blocks;
         if (blocks) this.#growBlocks();
-        for (let j = 0; j + 1 < regs.length; j += 2) {
-          if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
-          else tables[regs[j]].set(regs[j + 1], st.bridge);
-        }
+        this.#writeBridges(tables, blocks, regs, st.bridge);
         if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       }
     }
@@ -8804,6 +8795,15 @@ export class Gex {
    *  the next `#armCallouts` ran the bridge rather than the watch stub, and
    *  the call-out never saw its return. So an entry holding the bridge is
    *  left as it is, and a watched one keeps its watches around the bridge. */
+  /** Write the bridge at each (table, index) pair of `regs`, table
+   *  `TABLE_NAMES.length` being `blocks`. */
+  #writeBridges(tables, blocks, regs, bridge) {
+    for (let j = 0; j + 1 < regs.length; j += 2) {
+      if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], bridge);
+      else tables[regs[j]].set(regs[j + 1], bridge);
+    }
+  }
+
   #setBridgeEntry(blocks, i, bridge) {
     const be = this.#entryOf(bridge);
     const now = blocks.get(i);
@@ -8819,6 +8819,51 @@ export class Gex {
       return;
     }
     blocks.set(i, be);
+  }
+
+  /** Under GEX_TEST_BRIDGE_WATCH (read once, at load), `Gex.testBridgeWatch()`:
+   *  a call-out's watch on one arm of a `blocks` entry, then publishes that
+   *  write the entry its sibling arms bridge through, the same bridge and a
+   *  new one. The watch must outlive both, and the sibling arms run the
+   *  bridge last written. Returns the checks that failed (tests/bridge-share). */
+  static {
+    if (globalThis.process?.env?.GEX_TEST_BRIDGE_WATCH) {
+      Gex.testBridgeWatch = () => {
+        const g = new Gex();
+        const blocks = new WebAssembly.Table({ element: 'anyfunc', initial: 4 });
+        g.#entries = true;
+        g.#guest = { exports: { blocks } };
+        const ran = [];
+        // (module (type (func (param i32))) (import "w" "f" (func (type 0)))
+        //   (func (export "b") (type 0) local.get 0 call 0))
+        const mod = new WebAssembly.Module(new Uint8Array([
+          0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 1, 127, 0, 2, 7, 1, 1, 119, 1, 102, 0, 0,
+          3, 2, 1, 0, 7, 5, 1, 1, 98, 0, 1, 10, 8, 1, 6, 0, 32, 0, 16, 0, 11,
+        ]));
+        const bridge = (tag) => new WebAssembly.Instance(mod, { w: { f: (ctx) => ran.push(`${tag}:${ctx}`) } }).exports.b;
+        const one = bridge('one'), two = bridge('two');
+        const at = 2, T = TABLE_NAMES.length;
+        const fails = [];
+        const check = (what, ok) => { if (!ok) fails.push(what); };
+        const sibling = (want) => {
+          ran.length = 0;
+          blocks.get(at)(7, 2);
+          check(`a sibling arm runs ${want} (ran ${ran.join(',') || 'nothing'})`, ran.join() === `${want}:7`);
+        };
+        g.#writeBridges([], blocks, [T, at], one);
+        g.#refSet(T, (at << 8) | 1, g.#watch());
+        check('the arm is watched', g.#refGet(T, (at << 8) | 1) === g.#watch());
+        g.#writeBridges([], blocks, [T, at, T, at], one);
+        check('the watch outlives a publish of the same bridge', g.#refGet(T, (at << 8) | 1) === g.#watch());
+        sibling('one');
+        g.#writeBridges([], blocks, [T, at], two);
+        check('the watch outlives a publish of a new bridge', g.#refGet(T, (at << 8) | 1) === g.#watch());
+        sibling('two');
+        g.#refSet(T, (at << 8) | 1, g.#entryOf(two));
+        check('the watch comes off', !g.#entryWatch.has(at) && blocks.get(at) === g.#entryOf(two));
+        return fails;
+      };
+    }
   }
 
   /** Grow this Worker's `blocks` to every index the process has numbered
