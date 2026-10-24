@@ -6882,6 +6882,15 @@ pub extern "C" fn gex_table_need(i: u32) -> u32 {
     }
 }
 
+/// `gex_test_fork_rebase(1)` (GEX_TEST_FORK_REBASE): see
+/// `gex_add_lazy_module`. A test switch, off in every real run.
+static TEST_FORK_REBASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_fork_rebase(on: i32) {
+    TEST_FORK_REBASE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register a module a forked child inherited, without instantiating it. A
 /// separate list from `gex_add_closure_module` because a runtime-translated
 /// unit covers whatever the old program mapped, so `execve` must drop it (a
@@ -6900,8 +6909,39 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
     // The JIT lock alone: the page table and `LAZY_OWNER` are its.
     with_jit_only(|j| {
         let mut gm = GuestMem::new(guest_bytes());
+        // TEST(gex_test_fork_rebase): the module's pages as a parent that
+        // moved them after translating them leaves them: each at a new base,
+        // nothing in its slots yet.
+        if TEST_FORK_REBASE.load(std::sync::atomic::Ordering::Relaxed) {
+            for (page, base) in &meta.dir_entries {
+                if gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0) == *base {
+                    j.page_table.forget(*page);
+                    let fresh = j.page_table.base(*page);
+                    dir_note(*page, fresh, "test-fork-rebase");
+                    let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, fresh);
+                    j.page_table.forget(*page);
+                }
+            }
+        }
         let mut owner = LAZY_OWNER.0.borrow_mut();
         for (page, base) in &meta.dir_entries {
+            // What this process's directory already names wins: it came
+            // with the fork (the parent's directory as it was then) or was
+            // written here since, and is current. A module's entries are
+            // what it allocated when it was translated, and the parent may
+            // have moved the page after (to the base a unit another process
+            // built has there). Written back, the older base stranded every
+            // translation made at the newer one -- libc's malloc and calloc,
+            // in every child of a desktop session -- since the parent's
+            // modules are replayed in the order they were made, not in the
+            // order its directory last changed.
+            let had = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
+            if had != 0 && had != *base {
+                if j.page_table.lookup(*page).is_none() {
+                    j.page_table.assign(*page, had);
+                }
+                continue;
+            }
             j.page_table.assign(*page, *base);
             dir_note(*page, *base, "register-module");
             let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, *base);

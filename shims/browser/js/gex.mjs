@@ -2171,6 +2171,7 @@ export class Gex {
     // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
     // left numbered with no directory entry.
     if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
+    if (globalThis.GEX_TEST_FORK_REBASE || globalThis.process?.env?.GEX_TEST_FORK_REBASE) e.gex_test_fork_rebase?.(1);
     // Another (tests/x86-programs/dense-holes.c): stale words past a
     // module's last block.
     if (globalThis.process?.env?.GEX_TEST_DENSE_HOLES) e.gex_test_dense_holes?.(1);
@@ -3166,6 +3167,8 @@ export class Gex {
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
+    // The test switch `load` sets, for a child: it is this instance's.
+    if (globalThis.GEX_TEST_FORK_REBASE || globalThis.process?.env?.GEX_TEST_FORK_REBASE) e.gex_test_fork_rebase?.(1);
     // Before the kernel is built, not after: the metadata is what the child's
     // dispatch table starts from, and `gex_adopt_child` reads it as it builds.
     this.#setMetadata(guestWasm);
