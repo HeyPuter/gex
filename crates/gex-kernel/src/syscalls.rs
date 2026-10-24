@@ -4431,6 +4431,24 @@ impl NetIo<'_> {
                 Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
                 None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
             },
+            // A unix stream socket: the name it connected to (an accepted
+            // end's peer is unnamed: the family alone).
+            nr::GETPEERNAME if matches!(socket_family_type(io, fd), Ok((1, _))) => {
+                let peer = match io.unix_of(fd) {
+                    Ok(sock) => sock.peer_name()?,
+                    Err(_) => {
+                        let r = io.remote_unix_of(fd)?;
+                        if r.listening {
+                            return Err(Errno::ENOTCONN);
+                        }
+                        r.peer.clone()
+                    }
+                };
+                match peer {
+                    Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
+                    None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                }
+            }
             nr::GETPEERNAME => {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
                 io.write_sockaddr(m, ip, port, a[1], a[2])
@@ -4449,8 +4467,19 @@ impl NetIo<'_> {
                 Ok((1, 2)) if io.dgram_of(fd)?.name().is_some() => {
                     Kernel::write_sockaddr_un(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap()).map(|_| 0)
                 }
-                // AF_UNIX
-                Ok((1, _)) => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                // A unix stream socket: its name (bound, listening, or its
+                // listener's when accepted), else unnamed. A listener in the
+                // global kernel has the name it was bound to.
+                Ok((1, _)) => {
+                    let name = match io.unix_of(fd) {
+                        Ok(sock) => sock.local_name(),
+                        Err(_) => io.remote_unix_of(fd).ok().filter(|r| r.listening).and_then(|r| r.peer.clone()),
+                    };
+                    match name {
+                        Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
+                        None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                    }
+                }
                 _ => {
                     let (ip, port) = io
                         .socket_of(fd)
@@ -10758,10 +10787,9 @@ impl Kernel {
         let bytes = m.read(addr, (len as usize).min(110))?;
         let path = &bytes[2..];
         if path.first() == Some(&0) {
-            let end = path.len();
-            let name = &path[1..end];
-            let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
-            return Ok(format!("\0{}", String::from_utf8_lossy(name)));
+            // An abstract name is every byte the length gives, NULs and
+            // all: Linux's, which getsockname gives back as it was bound.
+            return Ok(format!("\0{}", String::from_utf8_lossy(&path[1..])));
         }
         let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
         Ok(String::from_utf8_lossy(&path[..end]).into_owned())
@@ -10778,11 +10806,13 @@ impl Kernel {
     ) -> Result<(), Errno> {
         const AF_UNIX: u16 = 1;
         let abstract_name = path.starts_with('\0');
+        // sun_path's 108 bytes: all an abstract name's, or a path and its NUL.
+        let max = if abstract_name { 108 } else { 107 };
         if addr != 0 {
             let mut buf = vec![0u8; 110];
             buf[..2].copy_from_slice(&AF_UNIX.to_le_bytes());
             let raw = path.as_bytes();
-            let n = raw.len().min(107);
+            let n = raw.len().min(max);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
             let whole = 2 + n + usize::from(!abstract_name);
             let room = if len_out != 0 { m.read_u32(len_out)? as usize } else { whole };
@@ -10791,7 +10821,7 @@ impl Kernel {
         // An abstract name's length is exactly its bytes (no terminating NUL:
         // the name may hold NULs), as Linux reports it; a path's counts one.
         if len_out != 0 {
-            m.write_u32(len_out, (2 + path.len().min(107) + usize::from(!abstract_name)) as u32)?;
+            m.write_u32(len_out, (2 + path.len().min(max) + usize::from(!abstract_name)) as u32)?;
         }
         Ok(())
     }
@@ -12260,9 +12290,14 @@ mod tests {
             set_args(&mut m, at, nr::SOCKET, &[10, SOCK_STREAM, 0]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EAFNOSUPPORT.0 as i64));
+            // A socketpair's peer is unnamed: the family alone, as Linux has it.
+            m.write_u32(0x20300, 110).unwrap();
             set_args(&mut m, at, nr::GETPEERNAME, &[p0, 0x20310, 0x20300]);
             call(&mut m, &mut k);
-            assert_eq!(ret(&m, at), -(Errno::ENOTSOCK.0 as i64));
+            assert_eq!((ret(&m, at), m.read_u32(0x20300).unwrap()), (0, 2));
+            set_args(&mut m, at, nr::GETPEERNAME, &[0x20000, 0x20310, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
             set_args(&mut m, at, nr::SETSOCKOPT, &[999, 1, 2, 0x20500, 4]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
