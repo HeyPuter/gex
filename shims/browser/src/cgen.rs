@@ -1830,9 +1830,13 @@ pub extern "C" fn gex_cgen_have(n: u32) {
 }
 
 /// Whether this Worker has the function table's log still to replay: a miss
-/// at a unit's entry is then a catch-up, not a translation.
+/// at a unit's entry is then a catch-up, not a translation. Whether or not
+/// units are on: a wasm32 program's module is installed through the log
+/// with them off, and a bridge whose `blocks` entry a Worker already holds
+/// (bridges share entries) reaches `gex.lookup` before any miss, which
+/// catches up only when this says so.
 pub(crate) fn behind() -> bool {
-    on() && (HAVE.with(|c| c.get()) as usize) < log_len()
+    (HAVE.with(|c| c.get()) as usize) < log_len()
 }
 
 /// [`behind`], for `gex.lookup`'s JS half.
