@@ -1031,9 +1031,118 @@ pub fn to_int_op(sig: u64, se: u16, cw: u16, bits: u8, trunc: bool) -> (u64, u32
     (v, sw_bits(&env))
 }
 
+/// The f80 value as an `f64`, when it is one exactly and normal (or zero).
+#[inline]
+fn exact_f64(a: F80) -> Option<f64> {
+    let e = (a.se & 0x7fff) as i32;
+    let neg = ((a.se & 0x8000) as u64) << 48;
+    if a.sig == 0 {
+        return if e == 0 {
+            Some(f64::from_bits(neg))
+        } else {
+            None
+        };
+    }
+    let de = e - 16383 + 1023;
+    if a.sig >> 63 == 0 || a.sig & 0x7ff != 0 || de < 1 || de > 2046 {
+        return None;
+    }
+    Some(f64::from_bits(
+        neg | (de as u64) << 52 | (a.sig >> 11) & ((1 << 52) - 1),
+    ))
+}
+
+/// An `f64` that is zero or normal, as f80.
+#[inline]
+fn f64_to_f80(r: f64) -> Option<F80> {
+    let b = r.to_bits();
+    let s = ((b >> 48) & 0x8000) as u16;
+    let de = ((b >> 52) & 0x7ff) as u16;
+    let m = b & ((1 << 52) - 1);
+    if de == 0 {
+        return if m == 0 {
+            Some(F80 { sig: 0, se: s })
+        } else {
+            None
+        };
+    }
+    if de == 0x7ff {
+        return None;
+    }
+    Some(F80 {
+        sig: 1 << 63 | m << 11,
+        se: s | (de + 16383 - 1023),
+    })
+}
+
+/// How many bits the odd part of an `f64`'s significand takes (0 for zero).
+#[inline]
+fn odd_bits(v: f64) -> u32 {
+    let b = v.to_bits();
+    if b << 1 == 0 {
+        return 0;
+    }
+    let m = (b & ((1 << 52) - 1)) | 1 << 52;
+    let o = m >> m.trailing_zeros();
+    64 - o.leading_zeros()
+}
+
+/// `arith_op` for operands and a result that are all exact `f64`s: then the
+/// extended result is that exact value whatever the precision control (53
+/// or 64 bits) and no exception is raised, so `f64` arithmetic gives it bit
+/// for bit. Round-to-nearest only (the sign of an exact zero sum depends on
+/// the rounding mode). `None` when it cannot prove the result exact.
+#[inline]
+pub fn arith_exact(k: u8, a: F80, b: F80, cw: u16) -> Option<F80> {
+    if cw & 0x0c00 != 0 || cw & 0x0300 == 0 {
+        return None;
+    }
+    let x = exact_f64(a)?;
+    let y = exact_f64(b)?;
+    let r = match k {
+        0 | 1 => {
+            let y = if k == 1 { -y } else { y };
+            let s = x + y;
+            let bb = s - x;
+            let err = (x - (s - bb)) + (y - bb);
+            if err != 0.0 {
+                return None;
+            }
+            s
+        }
+        2 => {
+            let p = x * y;
+            // A product that underflowed to zero is not exact.
+            if odd_bits(x) + odd_bits(y) > 53 || p == 0.0 && x != 0.0 && y != 0.0 {
+                return None;
+            }
+            p
+        }
+        _ => {
+            if y == 0.0 || x == 0.0 {
+                return None;
+            }
+            let q = x / y;
+            if odd_bits(q) + odd_bits(y) > 53 || q * y != x {
+                return None;
+            }
+            q
+        }
+    };
+    f64_to_f80(r)
+}
+
 /// The arithmetic `X87Op::Arith` names: 0 add, 1 subtract, 2 multiply,
 /// 3 divide.
 pub fn arith_op(k: u8, a: F80, b: F80, cw: u16) -> (F80, u32) {
+    if let Some(r) = arith_exact(k, a, b, cw) {
+        return (r, 0);
+    }
+    arith_ext(k, a, b, cw)
+}
+
+/// `arith_op` in extended arithmetic throughout, never through `f64`.
+pub fn arith_ext(k: u8, a: F80, b: F80, cw: u16) -> (F80, u32) {
     let mut env = Env::from_cw(cw);
     let r = match k {
         0 => add(&mut env, a, b, false),

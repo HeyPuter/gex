@@ -540,3 +540,47 @@ fn precision_control_rounds_to_53_and_24_bits() {
     assert_eq!(env.flags & UE, 0);
 }
 
+/// An operand that is often an exact `f64` (a single or double widened, a
+/// small integer, a power of two), and otherwise any [`Rng::f80`].
+fn f64ish(rng: &mut Rng) -> F80 {
+    match rng.next() % 5 {
+        0 => from_f64(f32::from_bits(rng.next() as u32) as f64),
+        1 => from_f64(f32::from_bits(
+            (rng.next() as u32 & 0x80ff_ffff)
+                | 0x3c00_0000 + ((rng.next() % 0x0800) as u32) * 0x800,
+        ) as f64),
+        2 => from_f64((rng.next() % 4096) as f64 - 2048.0),
+        3 => from_f64(f64::from_bits(rng.next())),
+        _ => rng.f80(),
+    }
+}
+
+#[test]
+fn arith_through_f64_is_bit_exact() {
+    let n: [fn(F80, F80, u16) -> (F80, u16); 4] = [n_add, n_sub, n_mul, n_div];
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let (mut hits, mut bad) = ([0u32; 4], 0);
+    for i in 0..800_000u32 {
+        let k = (i % 4) as u8;
+        let (mut a, b, cw) = (f64ish(&mut rng), f64ish(&mut rng), rng.cw());
+        if k == 3 && rng.next() % 2 == 0 {
+            // A dividend the divisor divides, more often than chance.
+            a = from_f64(to_f64(b) * ((rng.next() % 64) as f64 - 32.0));
+        }
+        let Some(r) = arith_exact(k, a, b, cw) else {
+            continue;
+        };
+        hits[k as usize] += 1;
+        let ext = arith_ext(k, a, b, cw);
+        let (want, wsw) = n[k as usize](a, b, cw);
+        if ext != (r, 0) || want != r || wsw & SW_BITS != 0 {
+            bad += 1;
+            if bad < 12 {
+                eprintln!("op {k} cw={cw:04x} a={a:x?} b={b:x?}: f64 {r:x?}, extended {ext:x?}, hardware {want:x?} sw {:04x}", wsw & SW_BITS);
+            }
+        }
+    }
+    assert_eq!(bad, 0, "{bad} mismatches");
+    // Each operation took the short path often enough to mean something.
+    assert!(hits.iter().all(|&h| h > 2000), "hits {hits:?}");
+}
