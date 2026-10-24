@@ -4555,7 +4555,8 @@ export class Gex {
     const blocks = this.#guest.exports.blocks;
     if (blocks) this.#growBlocks();
     for (let j = 0; j + 1 < regs.length; j += 2) {
-      (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
+      if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
+      else tables[regs[j]].set(regs[j + 1], st.bridge);
     }
     if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
     return regs.length >>> 1;
@@ -5264,7 +5265,8 @@ export class Gex {
       }
       const st = this.#cgenStore();
       for (let j = 0; j + 1 < regs.length; j += 2) {
-        (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
+        if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
+        else tables[regs[j]].set(regs[j + 1], st.bridge);
       }
       if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       e.gex_wasmdll_bind_done(i);
@@ -6112,7 +6114,8 @@ export class Gex {
         const blocks = this.#guest.exports.blocks;
         if (blocks) this.#growBlocks();
         for (let j = 0; j + 1 < regs.length; j += 2) {
-          (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], regs[j] === TABLE_NAMES.length ? this.#entryOf(st.bridge) : st.bridge);
+          if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], st.bridge);
+          else tables[regs[j]].set(regs[j + 1], st.bridge);
         }
         if (this.#bridgeCount) this.#bridgeCount.bridged += regs.length >>> 1;
       }
@@ -9020,6 +9023,31 @@ export class Gex {
       this.#entryWrapped.add(w);
     }
     return w;
+  }
+
+  /** Write the bridge at `blocks` entry `i`. Bridged slots share entries
+   *  (`gex_emit::dense::bridge_words`), and a publish names every entry its
+   *  slots take arms of, ones this Worker already holds the bridge in among
+   *  them. Rewriting such an entry dropped the watch a call-out keeps on a
+   *  sibling arm (`#refSet`'s wrappers): the guest returning there before
+   *  the next `#armCallouts` ran the bridge rather than the watch stub, and
+   *  the call-out never saw its return. So an entry holding the bridge is
+   *  left as it is, and a watched one keeps its watches around the bridge. */
+  #setBridgeEntry(blocks, i, bridge) {
+    const be = this.#entryOf(bridge);
+    const now = blocks.get(i);
+    if (now === be) return;
+    const w = this.#entryWatch.get(i);
+    if (w && w.fn === now) {
+      if (w.orig === be) return;
+      w.orig = be;
+      let fn = be;
+      for (const a of w.arms) fn = this.#watchArm(fn, a);
+      w.fn = fn;
+      blocks.set(i, fn);
+      return;
+    }
+    blocks.set(i, be);
   }
 
   /** Grow this Worker's `blocks` to every index the process has numbered
