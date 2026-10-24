@@ -76,6 +76,23 @@ const SHIM_INFIX = ARCH_INFIX + (MEM64 ? '.m64' : '');
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
 if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
 if (process.env.GEX_DENSE_DEBUG) globalThis.GEX_DENSE_DEBUG = 1;
+// GEX_TEST_MEMORIES=ADDR (tests/spawn-release; with GEX_MEMORIES=1 and
+// node --expose-gc): twice a second, after a collection, the 32-bit word at
+// ADDR in each memory `__gexMemories` holds, as a page leg reads a game's
+// frame counter; and at exit how many it still holds.
+if (process.env.GEX_TEST_MEMORIES) {
+  const at = Number(process.env.GEX_TEST_MEMORIES);
+  setInterval(() => {
+    globalThis.gc?.();
+    const all = globalThis.__gexMemories;
+    if (!all?.size) console.error('[test] memories: none');
+    for (const [pid, mem] of all ?? []) {
+      const v = mem.buffer.byteLength >= at + 4 ? new DataView(mem.buffer).getUint32(at, true) : -1;
+      console.error(`[test] memories: pid ${pid} word ${v}`);
+    }
+  }, 500).unref();
+  process.on('exit', () => console.error(`[test] memories at exit: ${globalThis.__gexMemories?.size ?? 0}`));
+}
 
 // Options come first and are named, so a guest argument that happens to
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.

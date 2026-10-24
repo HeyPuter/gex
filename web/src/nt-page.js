@@ -34,7 +34,7 @@ async function main() {
     ? [Math.max(640, document.documentElement.clientWidth), Math.max(480, document.documentElement.clientHeight)]
     : (q.get('size') || '1024x768').split('x').map(Number);
   const switches = Object.fromEntries(q);
-  for (const k of ['tar', 'exe', 'args', 'argv', 'env', 'cwd', 'size', 'persist', 'persistdb', 'lazy', 'preload', 'pack', 'zstd', 'mtimes', 'gl', 'glbackend', 'hostx', 'provsrc', 'stateful']) delete switches[k];
+  for (const k of ['tar', 'exe', 'args', 'argv', 'env', 'cwd', 'size', 'persist', 'persistdb', 'lazy', 'preload', 'pack', 'zstd', 'mtimes', 'gl', 'glbackend', 'hostx', 'provsrc', 'stateful', 'memories']) delete switches[k];
   // `provsrc=url,...`: provider sources from outside gex (GEX_PROVIDER_DIRS
   // natively), each named by its file's stem.
   const providerSources = q.get('provsrc')
