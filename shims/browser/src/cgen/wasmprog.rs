@@ -70,6 +70,11 @@ fn put_staged(v: Option<Staged>) {
     }
 }
 
+/// A program is staged for JS to publish (`gex_wasmprog_serve`).
+pub(crate) fn staged_any() -> bool {
+    !STAGED.load(Ordering::Acquire).is_null()
+}
+
 fn take_staged() -> Option<Staged> {
     if STAGED.load(Ordering::Acquire).is_null() {
         return None;

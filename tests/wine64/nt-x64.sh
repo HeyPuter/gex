@@ -233,6 +233,9 @@ check seh-traps 0 "$allok" seh.exe traps
 # procs entered from NtUser* calls (user callbacks), messages between threads
 [ -n "$page" ] && NULLDRV=1 check user_win_nd 0 "$allok" user_win.exe
 [ -n "$page" ] && NULLDRV=1 check wndproc_seh 0 "$allok" wndproc_seh.exe
+# Two levels of calls into Wine (W64's direct entry), traps out of the inner
+# level only, many rounds: each level puts Wine's stack pointer back
+[ -n "$page" ] && NULLDRV=1 check nestsp 0 "$allok" nestsp.exe
 # A window proc's uncaught exception ends the user callback that entered it,
 # or unwinds into a same-thread SendMessage's sender (USER on the null driver)
 NULLDRV=1 check wndproc_uncaught 0 "$allok" wndproc_uncaught.exe

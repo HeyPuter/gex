@@ -376,6 +376,76 @@ const ENTRY_WATCH = new Uint8Array([
 ]);
 let entryWrapMod = null, entryWatchMod = null;
 
+// W64's direct entry in wasm, so a unit's system or Unix call into Wine
+// (cgen.rs `w64_entry`) costs no JS. The shim imports `entry_call` from the
+// trampoline, made with the shim; it tail-calls slot 0 of its `hook`
+// table, the entry function once the Worker has made it (`#entryFn`, when
+// both the function table and Wine's stack pointer exist) and the
+// trampoline's own `slow` (to JS, which makes it) until then.
+// (module (type $e (func (param i32 i32 i64) (result i32)))
+//   (import "e" "hook" (table 1 funcref)) (import "e" "slow" (func $slow (type $e)))
+//   (elem (i32.const 0) func $s)
+//   (func $s (export "slow") (type $e) local.get 0 local.get 1 local.get 2 return_call $slow)
+//   (func (export "entry_call") (type $e)
+//     local.get 0 local.get 1 local.get 2 i32.const 0 return_call_indirect (type $e) 0))
+const ENTRY_TRAMP = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 8, 1, 96, 3, 127, 127, 126, 1, 127,
+  2, 21, 2, 1, 101, 4, 104, 111, 111, 107, 1, 112, 0, 1, 1, 101, 4, 115, 108, 111, 119, 0, 0,
+  3, 3, 2, 0, 0,
+  7, 21, 2, 4, 115, 108, 111, 119, 0, 1, 10, 101, 110, 116, 114, 121, 95, 99, 97, 108, 108, 0, 2,
+  9, 7, 1, 0, 65, 0, 11, 1, 1,
+  10, 26, 2, 10, 0, 32, 0, 32, 1, 32, 2, 18, 0, 11, 13, 0, 32, 0, 32, 1, 32, 2, 65, 0, 19, 0, 0, 11,
+]);
+let entryTrampMod = null;
+/** The entry function's module, for a 64-bit function table (`t64`) and an
+ *  i64 stack pointer (`s64`), compiled once each.
+ *  (module (type $vi (func (param i32))) (type $e (func (param i32 i32 i64) (result i32)))
+ *    (import "e" "t" (table T 0 funcref)) (import "e" "sp" (global $sp (mut S)))
+ *    (func (export "entry") (type $e) (local $cur S)
+ *      ;; Wine's C frames below the guest's stack pointer, as `fault_call`'s:
+ *      ;; sp = (min(cur, rsp) - 4096) & ~15 (cur 0: rsp, for an i64 one)
+ *      global.get $sp local.set $cur  ...  global.set $sp
+ *      try (call_indirect (type $vi) (local.get 1) (local.get 0))
+ *      catch_all (global.set $sp (local.get $cur)) rethrow 0 end
+ *      (global.set $sp (local.get $cur)) i32.const 1))
+ *  The saved stack pointer is this call's local, so each nesting level
+ *  restores its own. A trap (`unreachable`: the shim's trap out) is not
+ *  caught here: the JS loop that catches it puts the pointer back
+ *  (`#progSpAt`). */
+const entryFnMods = new Map();
+function entryFnModule(t64, s64) {
+  const k = (t64 ? 2 : 0) | (s64 ? 1 : 0);
+  let m = entryFnMods.get(k);
+  if (m) return m;
+  const S = s64 ? 0x7e : 0x7f;
+  const head = s64
+    // local.get cur, local.get rsp, cur != 0 && cur <u rsp, select; - 4096; & -16
+    ? [0x20, 3, 0x20, 2, 0x20, 3, 0x50, 0x45, 0x20, 3, 0x20, 2, 0x54, 0x71, 0x1b, 0x42, 0x80, 0x20, 0x7d, 0x42, 0x70, 0x83]
+    // min_u(cur, esp) - 4096 & -16, esp the low half of rsp
+    : [0x20, 3, 0x20, 2, 0xa7, 0x20, 3, 0x20, 2, 0xa7, 0x49, 0x1b, 0x41, 0x80, 0x20, 0x6b, 0x41, 0x70, 0x71];
+  const body = [
+    1, 1, S,
+    0x23, 0, 0x21, 3,
+    ...head, 0x24, 0,
+    0x06, 0x40, 0x20, 1, 0x20, 0, ...(t64 ? [0xad] : []), 0x11, 0, 0,
+    0x19, 0x20, 3, 0x24, 0, 0x09, 0, 0x0b,
+    0x20, 3, 0x24, 0, 0x41, 1, 0x0b,
+  ];
+  const sec = (id, b) => [id, b.length, ...b];
+  const bytes = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    ...sec(1, [2, 96, 1, 127, 0, 96, 3, 127, 127, 126, 1, 127]),
+    ...sec(2, [2, 1, 101, 1, 116, 1, 112, t64 ? 4 : 0, 0, 1, 101, 2, 115, 112, 3, S, 1]),
+    ...sec(3, [1, 1]),
+    ...sec(7, [1, 5, 101, 110, 116, 114, 121, 0, 0]),
+    ...sec(10, [1, body.length, ...body]),
+  ]);
+  m = new WebAssembly.Module(bytes);
+  entryFnMods.set(k, m);
+  return m;
+}
+
 function growTable(table, delta, init, which) {
   const to = table.length + delta;
   if (to > (1 << 20)) console.warn(`[gex] dispatch table ${which} grows ${table.length} -> ${to} entries`);
@@ -1691,26 +1761,14 @@ export class Gex {
         // the hook's frames go below it as `#hookStack` puts them, without
         // touching the memory here (its buffer and a DataView per call
         // were most of this glue's cost).
-        entry_call: (idx, ctx, sp) => {
-          if (single.on) return 0;
-          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
-          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
-          const cur = spG.value;
-          if (typeof cur === 'bigint') {
-            const rsp = BigInt.asUintN(64, sp);
-            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
-          } else {
-            const esp = Number(sp & 0xffffffffn);
-            spG.value = ((Math.min(Number(cur) >>> 0, esp) - 4096) & ~15) | 0;
-          }
-          try {
-            f(ctx);
-          } finally {
-            spG.value = cur;
-          }
-          this.#cgenServe();
-          return 1;
-        },
+        // In wasm (`entryFnModule`): the shim calls the trampoline's export,
+        // which goes on to this Worker's entry function, made on the first
+        // call. 0 in the single-thread build (a blocking call needs a
+        // promising frame).
+        entry_call: single.on ? (idx, ctx, sp) => 0 : this.#entryTramp(),
+        // The units and bindings the shim says are waiting, after a direct
+        // entry's call (cgen.rs `w64_entry`, only when there are some).
+        cgen_serve: () => this.#cgenServe(),
         // A thread a direct entry's call staged (cgen.rs `w64_entry` asks
         // only when there is one).
         thread_start: () => this.#startThread(),
@@ -1881,6 +1939,9 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+    // `GEX_LOG=serveall`: units served after every direct entry's call, as
+    // before cgen.rs `serve_wanted` (A/B runs).
+    if (logOn('serveall')) this.#shim.exports.gex_cgen_serve_always?.(1);
     // For gex-eject's W3 recorder: code a unit's image ran translated.
     if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
@@ -2484,6 +2545,7 @@ export class Gex {
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      if (logOn('serveall')) this.#shim.exports.gex_cgen_serve_always?.(1);
       if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
@@ -4206,6 +4268,7 @@ export class Gex {
     const ri = new WebAssembly.Instance(rm, { gex });
     const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map() };
+    this.#entryReset();
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
@@ -4295,7 +4358,10 @@ export class Gex {
       this.#wasmprogWide = m64() || progLowered;
       // `entry_call` takes the cached global as it is: one of the other
       // width is made again here, as `#wasmprogStack` would.
-      if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== this.#wasmprogWide) this.#wasmprogSp = null;
+      if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== this.#wasmprogWide) {
+        this.#wasmprogSp = null;
+        this.#entryReset();
+      }
     }
     // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
     // (`wasm:`), not its path: the page keeps those for every process
@@ -5222,10 +5288,47 @@ export class Gex {
   /** This Worker's `__stack_pointer` for wasm32 programs: one global the
    *  program and its shared libraries share (one C stack per thread). */
   #wasmprogSp = null;
+  /** W64's direct entry (`entry_call`): the trampoline's hook table, its
+   *  slot 0 the entry function or the trampoline's `slow` export. */
+  #entryHook = null;
+  #entrySlowFn = null;
+  #entryTramp() {
+    entryTrampMod ??= new WebAssembly.Module(ENTRY_TRAMP);
+    const hook = new WebAssembly.Table({ element: 'anyfunc', initial: 1 });
+    const t = new WebAssembly.Instance(entryTrampMod, { e: { hook, slow: (idx, ctx, sp) => this.#entrySlow(idx, ctx, sp) } });
+    this.#entryHook = hook;
+    this.#entrySlowFn = t.exports.slow;
+    return t.exports.entry_call;
+  }
+  /** The first call since the function table or Wine's stack pointer
+   *  changed: the entry function over them, in the hook, then called. */
+  #entrySlow(idx, ctx, sp) {
+    const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+    const f = new WebAssembly.Instance(entryFnModule(m64(), typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
+    this.#entryHook.set(0, f);
+    return f(idx, ctx, sp);
+  }
+  /** The entry function is made again at its next call. */
+  #entryReset() {
+    if (this.#entryHook) this.#entryHook.set(0, this.#entrySlowFn);
+  }
+  /** Wine's stack pointer as a loop that catches traps found it, and put back
+   *  there: the entry function's own restore does not run for a trap. */
+  #progSpAt() {
+    // The single-thread build calls no entry function (`entry_call` is 0):
+    // nothing to put back, and its fibers share the global.
+    return single.on ? undefined : this.#wasmprogSp?.value;
+  }
+  #progSpBack(v) {
+    const g = this.#wasmprogSp;
+    if (g && v !== undefined && typeof g.value === typeof v) g.value = v;
+  }
+
   #wasmprogStack() {
     // i64 in a 64-bit memory's process and for a lowered (LP64) program
     const wide = m64() || this.#wasmprogWide;
     if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== wide) this.#wasmprogSp = null;
+    if (!this.#wasmprogSp) this.#entryReset();
     return (this.#wasmprogSp ??= new WebAssembly.Global(wide ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, wide ? 0n : 0));
   }
   /** This Worker's program has an i64 stack pointer (`#cgenInstall`). */
@@ -5924,6 +6027,7 @@ export class Gex {
     const p = BigInt.asUintN(64, BigInt(pc));
     if (!(p & (1n << 61n))) return e.gex_syscall(ctx, pc);
     const sp0 = e.__stack_pointer.value;
+    const psp0 = this.#progSpAt();
     try {
       return e.gex_syscall(ctx, pc);
     } catch (err) {
@@ -5947,6 +6051,7 @@ export class Gex {
           throw err;
         }
         e.__stack_pointer.value = sp0;
+        this.#progSpBack(psp0);
         e.gex_resume_pc();
         e.gex_resume_ctx();
         return;
@@ -5955,6 +6060,7 @@ export class Gex {
       const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
       const rc = e.gex_resume_ctx() >>> 0;
       if (next !== stop || (rc && rc !== (ctx >>> 0))) throw err;
+      this.#progSpBack(psp0);
       if (e.gex_jit_pending_len() >>> 0) {
         const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
         if (need) this.#growTables(need, 'call-out');
@@ -6045,7 +6151,15 @@ export class Gex {
    *  entries. */
   #cgenUnit(u, key, path, t0) {
     const e = this.#shim.exports;
+    // How long after its image was mapped (and its unit wanted) this unit's
+    // serve starts, and how long its load takes (cgen.rs
+    // `gex_cgen_mapped_age_us`): whether a unit arriving mid-run is placed
+    // promptly.
+    const lat = logOn('placelat') ? [Number(e.gex_cgen_mapped_age_us?.(u, 0) ?? -1n), Number(e.gex_cgen_mapped_age_us?.(u, 1) ?? -1n), performance.now()] : null;
     const got = this.#env.loadUnit?.(key) ?? null;
+    if (lat && lat[0] >= 0) {
+      console.warn(`[placelat] ${path} ${(lat[0] / 1000).toFixed(1)} ms mapped, ${(lat[1] / 1000).toFixed(1)} ms wanted, load ${(performance.now() - lat[2]).toFixed(1)} ms`);
+    }
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
     if (logOn('record')) console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
@@ -6208,6 +6322,8 @@ export class Gex {
     // layout, cgen/wasmprog.rs): the process has ended, and its ELF container
     // is not guest code to enter.
     if (this.#shim.exports.gex_exited?.()) return this.#shim.exports.gex_exit_code();
+    // Wine's stack pointer as each entry found it (`#progSpBack`).
+    let psp;
     for (;;) {
       if (this.#cov.size && performance.now() - this.#covAt > 250) {
         this.#covAt = performance.now();
@@ -6230,6 +6346,7 @@ export class Gex {
           );
         }
         this.#shim.exports.gex_callout_leave_ok?.(0);
+        psp = this.#progSpAt();
         // The fault hook first (staged at the last trap): the guest goes on
         // where it leaves the context.
         if (hook) {
@@ -6281,6 +6398,7 @@ export class Gex {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
           this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+          this.#progSpBack(psp);
           ({ pc, ctx } = this.#vforkLeave(err));
           continue;
         }
@@ -6438,6 +6556,7 @@ export class Gex {
         // bytes each. Nothing is live below here, so reset it exactly -- left
         // alone it slid into the guest's stack and overwrote saved registers.
         this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+        this.#progSpBack(psp);
         const e = this.#shim.exports;
         // A trap that reached the run loop with a provider's guest call
         // still open abandoned the provider's frames (see provider_try).
@@ -6942,6 +7061,7 @@ export class Gex {
     // nested guest abandons only the frames above here, so the shadow stack
     // goes back to exactly this, never to the Worker's base.
     const sp = e.__stack_pointer.value;
+    const psp = this.#progSpAt();
     pc = pc < 0n ? pc + (1n << 64n) : pc;
     let bypass = null;
     for (;;) {
@@ -6960,6 +7080,7 @@ export class Gex {
         return 0;
       } catch (err) {
         e.__stack_pointer.value = sp;
+        this.#progSpBack(psp);
         // A call-out's watched entry reached inside the callback: what the
         // entry held runs (`#watchHit` never ends a call-out from here).
         const sig = this.#calloutSignal;
@@ -7329,6 +7450,7 @@ export class Gex {
   *#callOutSteps(ctx, target, ret, spWant, suspendable) {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
+    const psp0 = this.#progSpAt();
     const me = this.#callouts.length;
     // `ri`: this call-out's index in the shim's list (cgen.rs `CALLOUTS`),
     // which `gex_callout_hit`, `gex_callout_leave_ok` and
@@ -7383,6 +7505,7 @@ export class Gex {
           return 0;
         } catch (err) {
           e.__stack_pointer.value = sp0;
+          this.#progSpBack(psp0);
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;
           // A call-out ended here was the trap's whole business: the resume
@@ -7617,6 +7740,7 @@ export class Gex {
   #excDispatch(ctx, target, level) {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
+    const psp0 = this.#progSpAt();
     this.#nest.push('exc');
     if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] nested dispatch depth ${level} at ${BigInt.asUintN(64, target).toString(16)}`);
     let pc = BigInt.asUintN(64, target);
@@ -7638,6 +7762,7 @@ export class Gex {
           return 0;
         } catch (err) {
           e.__stack_pointer.value = sp0;
+          this.#progSpBack(psp0);
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;
           if (sig?.kind === 'bypass' && sig.f) {

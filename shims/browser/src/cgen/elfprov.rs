@@ -43,6 +43,12 @@ thread_local! {
 fn queue<R>(f: impl FnOnce(&mut VecDeque<usize>) -> R) -> R {
     QUEUE.with(|q| f(&mut q.borrow_mut()))
 }
+/// Provider-only units or re-bridges wait for this Worker's JS (a new
+/// process's rescan is asked for where its guest first runs).
+pub(crate) fn waiting() -> bool {
+    QUEUE.with(|q| !q.borrow().is_empty()) || REBRIDGE.with(|v| !v.borrow().is_empty())
+}
+
 /// The process the state above is for: a forked child's shim may start
 /// with its parent's copy, which describes the parent's table.
 static PID: AtomicI32 = AtomicI32::new(0);
