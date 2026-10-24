@@ -12,8 +12,9 @@
 # copies the target process makes itself.
 # A write over code compiled into a unit is not seen by that unit, so vmpeer's
 # code patch is checked on translated code only (no units here).
-# vmpeer sometimes hangs in the target's own copy (with or without
-# process_vm): a leg that times out with no check failed says "known".
+# "vmpeer quick" makes its first access while the child is still starting
+# (no settling sleep), when the target's copy, run in its SIGUSR1 handler,
+# may interrupt the child's own malloc: five runs natively, one in the page.
 #
 #   tests/w3/procvm.sh DIST PREFIX [gexc]
 #
@@ -41,11 +42,15 @@ native() { # LOG TIMEOUT EXE [ARGS]
 }
 vmpeer() { # NAME LOG
 	if grep -q '^vmpeer done, 0 failed' "$2" && grep -q '^child exit 55' "$2"; then ok "$1"
-	elif ! grep -q '^FAIL\|^vmpeer done' "$2"; then echo "known $1: hung after '$(grep '^ok' "$2" | tail -1 | cut -c6-)'"
+	elif ! grep -q '^FAIL\|^vmpeer done' "$2"; then bad "$1" "hung after '$(grep '^ok' "$2" | tail -1 | cut -c6-)'"
 	else bad "$1" "$(grep -E '^(FAIL|child exit)' "$2" | head -4 | tr '\n' ';')"; fi
 }
 native "$w/vmpeer.log" 150 'C:\vmpeer.exe'
 vmpeer "native, vmpeer" "$w/vmpeer.log"
+for i in 1 2 3 4 5; do
+	native "$w/quick-$i.log" 90 'C:\vmpeer.exe' quick
+	vmpeer "native, vmpeer quick $i" "$w/quick-$i.log"
+done
 native "$w/dbgflag.log" 300 'C:\dbgflag.exe'
 if grep -q '^dbgflag done, 0 failed' "$w/dbgflag.log"; then ok "native, dbgflag"
 else bad "native, dbgflag" "$(grep -E '^FAIL|Assertion' "$w/dbgflag.log" | head -3 | tr '\n' ';')"; fi
@@ -62,5 +67,12 @@ rm -rf "$w/pfx-page" "$w/t"; cp -a "$prefix" "$w/pfx-page"; mkdir -p "$w/t"
 	--cwd /t --argv0 /w3/lib/wine/i386-unix/wine web/public/gex/seed.x86.shared.wasm \
 	"$dist/lib/wine/i386-unix/wine" /t/vmpeer.exe) 2>&1 | tr -d '\r' > "$w/page.log"
 vmpeer "page, vmpeer" "$w/page.log"
+rm -rf "$w/pfx-page"; cp -a "$prefix" "$w/pfx-page"
+(cd "$root" && env GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 200 node --max-old-space-size=8192 \
+	shims/browser/js/run-node.mjs --dir /w3="$dist" --dir /pfx="$w/pfx-page" --dir /t="$w/t" \
+	--file "/t/vmpeer.exe=$w/vmpeer.exe" --env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all \
+	--cwd /t --argv0 /w3/lib/wine/i386-unix/wine web/public/gex/seed.x86.shared.wasm \
+	"$dist/lib/wine/i386-unix/wine" /t/vmpeer.exe quick) 2>&1 | tr -d '\r' > "$w/page-quick.log"
+vmpeer "page, vmpeer quick" "$w/page-quick.log"
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
