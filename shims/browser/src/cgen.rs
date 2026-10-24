@@ -1864,6 +1864,12 @@ pub extern "C" fn gex_ftab_install_base(n: u32) -> u32 {
     ftab(|m| m.installs().get(n as usize).map_or(0, |i| i.base))
 }
 
+/// And is this long (the indices its element segment fills).
+#[no_mangle]
+pub extern "C" fn gex_ftab_install_len(n: u32) -> u32 {
+    ftab(|m| m.installs().get(n as usize).map_or(0, |i| i.len))
+}
+
 /// And holds this unit (the index the other `gex_cgen_*` calls take).
 #[no_mangle]
 pub extern "C" fn gex_ftab_install_unit(n: u32) -> u32 {
