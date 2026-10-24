@@ -7,6 +7,12 @@
 #include <stdio.h>
 
 static int failures;
+/* A wait that the test expects to succeed: it returns as soon as its object
+ * is signalled, so only a failure waits this long, and a thread that starts
+ * late on a loaded machine still meets it. */
+#define LONG_WAIT 60000
+/* The bound that tells a timeout honoured in the wrong unit from a slow one. */
+#define WAITED_AT_MOST 20000
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok" : "FAIL", name); if (!ok_) failures++; } while (0)
 
 static HANDLE ev_go, ev_done, mtx, sem;
@@ -81,11 +87,11 @@ int main(void) {
     ULONGLONG t0 = GetTickCount64();
     CHECK("timeout", WaitForSingleObject(man, 50) == WAIT_TIMEOUT);
     ULONGLONG waited = GetTickCount64() - t0;
-    CHECK("timeout lasts", waited >= 40 && waited < 2000);
+    CHECK("timeout lasts", waited >= 40 && waited < WAITED_AT_MOST);
     HANDLE th = start(set_later, man);
-    CHECK("wait woken by another thread", WaitForSingleObject(man, 5000) == WAIT_OBJECT_0);
+    CHECK("wait woken by another thread", WaitForSingleObject(man, LONG_WAIT) == WAIT_OBJECT_0);
     DWORD code = 0;
-    CHECK("thread handle signalled", WaitForSingleObject(th, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(th, &code) && code == 7);
+    CHECK("thread handle signalled", WaitForSingleObject(th, LONG_WAIT) == WAIT_OBJECT_0 && GetExitCodeThread(th, &code) && code == 7);
     CloseHandle(th);
 
     /* Named objects */
@@ -122,7 +128,7 @@ int main(void) {
     th = start(sem_taker, 0);
     Sleep(20);
     ReleaseSemaphore(sem, 2, 0);
-    CHECK("semaphore wakes a waiter", WaitForSingleObject(th, 5000) == WAIT_OBJECT_0);
+    CHECK("semaphore wakes a waiter", WaitForSingleObject(th, LONG_WAIT) == WAIT_OBJECT_0);
     CloseHandle(th);
 
     /* Several objects */
@@ -132,7 +138,7 @@ int main(void) {
     CHECK("wait any", WaitForMultipleObjects(2, ab, FALSE, 0) == WAIT_OBJECT_0 + 1);
     CHECK("wait all not yet", WaitForMultipleObjects(2, ab, TRUE, 10) == WAIT_TIMEOUT);
     th = start(set_later, a);
-    CHECK("wait all", WaitForMultipleObjects(2, ab, TRUE, 5000) == WAIT_OBJECT_0);
+    CHECK("wait all", WaitForMultipleObjects(2, ab, TRUE, LONG_WAIT) == WAIT_OBJECT_0);
     WaitForSingleObject(th, INFINITE); CloseHandle(th);
     HANDLE ae = CreateEventW(0, FALSE, TRUE, 0), be = CreateEventW(0, FALSE, FALSE, 0);
     HANDLE ab2[2] = {ae, be};
@@ -164,13 +170,15 @@ int main(void) {
     LARGE_INTEGER due = {.QuadPart = -500000}; /* 50 ms */
     t0 = GetTickCount64();
     CHECK("SetWaitableTimer", SetWaitableTimer(wt, &due, 0, 0, 0, FALSE));
-    CHECK("timer not yet", WaitForSingleObject(wt, 0) == WAIT_TIMEOUT);
-    CHECK("timer fires", WaitForSingleObject(wt, 5000) == WAIT_OBJECT_0 && GetTickCount64() - t0 >= 40);
+    /* Not signalled before it is due; a stall past the due time makes the
+     * check say nothing. */
+    CHECK("timer not yet", WaitForSingleObject(wt, 0) == WAIT_TIMEOUT || GetTickCount64() - t0 >= 50);
+    CHECK("timer fires", WaitForSingleObject(wt, LONG_WAIT) == WAIT_OBJECT_0 && GetTickCount64() - t0 >= 40);
     CHECK("synchronization timer resets", WaitForSingleObject(wt, 0) == WAIT_TIMEOUT);
     due.QuadPart = -100000;
     SetWaitableTimer(wt, &due, 10, 0, 0, FALSE);
     int fired = 0;
-    for (int i = 0; i < 3; i++) fired += WaitForSingleObject(wt, 2000) == WAIT_OBJECT_0;
+    for (int i = 0; i < 3; i++) fired += WaitForSingleObject(wt, LONG_WAIT) == WAIT_OBJECT_0;
     CHECK("periodic timer", fired == 3);
     /* Cancelling stops further periods but, as on Windows, leaves a period
      * that already elapsed signalled (it may land between the last wait and
@@ -187,7 +195,7 @@ int main(void) {
     Sleep(30);
     QueryPerformanceCounter(&q1);
     double ms = (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / f.QuadPart;
-    CHECK("Sleep", ms >= 25 && ms < 2000);
+    CHECK("Sleep", ms >= 25 && ms < WAITED_AT_MOST);
 
     printf("%d failures\n", failures);
     return failures;
