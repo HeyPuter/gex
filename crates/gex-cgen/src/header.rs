@@ -134,6 +134,7 @@ pub fn header() -> String {
         "gex_x87",
         "int ctx, int32_t op, int64_t a_sig, int32_t a_se, int64_t b_sig, int32_t b_se, int32_t cw",
     );
+    decl(w, imports::MX, "int64_t", "gex_mx", "int ctx, int32_t code, int64_t a, int64_t b, int32_t mx");
     let _ = writeln!(
         w,
         "/* Tail-called with ctx.LAST_TARGET holding the target; the splice replaces\n   \
@@ -157,12 +158,16 @@ pub fn header() -> String {
         }
     }
     w.push_str(X87_HELPERS);
+    w.push_str(MX_HELPERS);
     w.push_str("#endif\n");
     h
 }
 
 /// The x87 helpers, `Stmt::X87`'s lowering (see `emit.rs`).
 const X87_HELPERS: &str = include_str!("../runtime/x87.h");
+
+/// The MXCSR slow path's helpers, `Expr::Mx`'s lowering (see `emit.rs`).
+const MX_HELPERS: &str = include_str!("../runtime/mx.h");
 
 const BODY_TYPES: &str = r#"
 /* Unaligned, alias-everything views of guest memory: a guest access is a

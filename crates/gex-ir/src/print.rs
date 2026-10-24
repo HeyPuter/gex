@@ -180,6 +180,7 @@ fn expr(e: &Expr) -> String {
             dst_wide,
             a,
         } => format!("fcvt.{kind:?} {}->{} {a:?}", fw(*src_wide), fw(*dst_wide)),
+        Expr::Mx { mx, e } => format!("mx({mx:?}) {}", expr(e)),
     }
 }
 

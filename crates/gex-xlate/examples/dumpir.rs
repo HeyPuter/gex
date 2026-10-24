@@ -29,6 +29,7 @@ fn main() {
         dispatch_miss: 7,
         safepoint: 8,
         x87: 9,
+        mx: 10,
         block_ty: 0,
         entry_ty: 0,
         blocks: &blocks,

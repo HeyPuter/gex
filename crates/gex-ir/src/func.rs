@@ -723,74 +723,8 @@ pub fn for_each_def(s: &Stmt, mut f: impl FnMut(Value)) {
 
 /// Mutable access to every value a statement reads.
 pub fn for_each_use_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
-    use crate::Expr::*;
     match s {
-        Stmt::Def { expr, .. } => match expr {
-            ConstI32(_) | ConstI64(_) | ReadReg(_) | VConst(_) => {}
-            Bin { a, b, .. } | Cmp { a, b, .. } => {
-                f(a);
-                f(b);
-            }
-            Un { a, .. } | Wrap(a) | Extend { a, .. } | ExtendBits { a, .. } => f(a),
-            Select { cond, a, b, .. } => {
-                f(cond);
-                f(a);
-                f(b);
-            }
-            Load { addr, .. } | VLoad { addr, .. } => f(addr),
-            Rmw { addr, val, .. } => {
-                f(addr);
-                f(val);
-            }
-            CmpXchg {
-                addr,
-                expected,
-                replacement,
-                ..
-            } => {
-                f(addr);
-                f(expected);
-                f(replacement);
-            }
-            HostCall { args, .. } => args.iter_mut().for_each(f),
-            VSplat { a, .. }
-            | VExtract { a, .. }
-            | VUn { a, .. }
-            | VBitmask { a, .. }
-            | VLaneUn { a, .. } => f(a),
-            VLaneBin { a, b, .. } | VShuffle { a, b, .. } | VBin { a, b, .. } => {
-                f(a);
-                f(b);
-            }
-            VShift { a, amount, .. } => {
-                f(a);
-                f(amount);
-            }
-            VSwizzle { a, idx } => {
-                f(a);
-                f(idx);
-            }
-            VBitSelect { mask, a, b } => {
-                f(mask);
-                f(a);
-                f(b);
-            }
-            VCvt { a, b, .. } => {
-                f(a);
-                if let Some(b) = b {
-                    f(b);
-                }
-            }
-            VReplace { a, val, .. } => {
-                f(a);
-                f(val);
-            }
-            FpBin { a, b, .. } | FpCmp { a, b, .. } => {
-                f(a);
-                f(b);
-            }
-            FpUn { a, .. } | FpCvt { a, .. } => f(a),
-        },
+        Stmt::Def { expr, .. } => expr_uses_mut(expr, &mut f),
         Stmt::WriteReg { val, .. } => f(val),
         Stmt::Store { addr, val, .. } | Stmt::VStore { addr, val, .. } => {
             f(addr);
@@ -1302,6 +1236,81 @@ impl Summary {
             may_leave_pending: false,
             unknown_callee: false,
             reads_return_address: false,
+        }
+    }
+}
+
+/// Mutable access to every value an expression reads.
+fn expr_uses_mut(expr: &mut crate::Expr, f: &mut impl FnMut(&mut Value)) {
+    use crate::Expr::*;
+    match expr {
+        ConstI32(_) | ConstI64(_) | ReadReg(_) | VConst(_) => {}
+        Bin { a, b, .. } | Cmp { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        Un { a, .. } | Wrap(a) | Extend { a, .. } | ExtendBits { a, .. } => f(a),
+        Select { cond, a, b, .. } => {
+            f(cond);
+            f(a);
+            f(b);
+        }
+        Load { addr, .. } | VLoad { addr, .. } => f(addr),
+        Rmw { addr, val, .. } => {
+            f(addr);
+            f(val);
+        }
+        CmpXchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            f(addr);
+            f(expected);
+            f(replacement);
+        }
+        HostCall { args, .. } => args.iter_mut().for_each(f),
+        VSplat { a, .. }
+        | VExtract { a, .. }
+        | VUn { a, .. }
+        | VBitmask { a, .. }
+        | VLaneUn { a, .. } => f(a),
+        VLaneBin { a, b, .. } | VShuffle { a, b, .. } | VBin { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        VShift { a, amount, .. } => {
+            f(a);
+            f(amount);
+        }
+        VSwizzle { a, idx } => {
+            f(a);
+            f(idx);
+        }
+        VBitSelect { mask, a, b } => {
+            f(mask);
+            f(a);
+            f(b);
+        }
+        VCvt { a, b, .. } => {
+            f(a);
+            if let Some(b) = b {
+                f(b);
+            }
+        }
+        VReplace { a, val, .. } => {
+            f(a);
+            f(val);
+        }
+        FpBin { a, b, .. } | FpCmp { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        FpUn { a, .. } | FpCvt { a, .. } => f(a),
+        Mx { mx, e } => {
+            f(mx);
+            expr_uses_mut(e, f);
         }
     }
 }

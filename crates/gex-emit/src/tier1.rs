@@ -91,6 +91,13 @@ mod simd {
     pub const I32X4_EXTADD_PAIRWISE_I16X8_S: u32 = 0x7e;
     pub const I32X4_EXTADD_PAIRWISE_I16X8_U: u32 = 0x7f;
     pub const V128_AND: u32 = 0x4e;
+    pub const V128_ANY_TRUE: u32 = 0x53;
+    pub const I32X4_EQ: u32 = 0x37;
+    pub const I32X4_SHR_U: u32 = 0xad;
+    pub const I32X4_SUB: u32 = 0xb1;
+    pub const I64X2_EQ: u32 = 0xd6;
+    pub const I64X2_SHR_U: u32 = 0xcd;
+    pub const I64X2_SUB: u32 = 0xd1;
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
     pub const V128_XOR: u32 = 0x51;
@@ -171,6 +178,8 @@ pub struct Context<'a> {
     pub fma: u32,
     /// Import index of `gex.x87`.
     pub x87: u32,
+    /// Import index of `gex.mx`.
+    pub mx: u32,
     /// Import index of `gex.sysreg_write`.
     pub sysreg_write: u32,
     /// Import index of `gex.cache_op`.
@@ -3064,6 +3073,10 @@ impl<'a> Emitter<'a> {
                 self.f.simd_lane(sub, *lane as u8);
             }
 
+            Expr::Mx { mx, e } => {
+                self.emit_mx(dst, *mx, e);
+                return;
+            }
             Expr::FpBin { op, double, a, b } => {
                 self.push_fp(*a, *double);
                 self.push_fp(*b, *double);
@@ -3129,6 +3142,160 @@ impl<'a> Emitter<'a> {
         let local = self.def_into.take().unwrap_or_else(|| self.alloc(ty));
         self.f.local_set(local);
         self.value_local[idx] = Some(local);
+    }
+
+    /// An [`Expr::Mx`]: `e`'s own lowering, kept when `mx` has none of
+    /// [`MX_SPECIAL`]'s bits; and kept as well under FTZ or DAZ alone
+    /// (rounding to nearest) when no float operand or result is a denormal
+    /// or the smallest normal (one a tiny result may have rounded to), as
+    /// then neither flush has anything to do. Otherwise the pure `mx`
+    /// import, once for a scalar and once per lane ([`MxPlan`]). Either
+    /// way the result is left in one integer-typed local.
+    fn emit_mx(&mut self, dst: Value, mx: Value, e: &Expr) {
+        use code::*;
+        let idx = dst.0 as usize;
+        let ty = e.ty();
+        let res = self.def_into.take().unwrap_or_else(|| self.alloc(ty));
+        self.def(dst, e);
+        self.push(dst);
+        self.f.local_set(res);
+        let plan = MxPlan::of(e);
+        self.push(mx);
+        self.f.i32_const(MX_SPECIAL as i32);
+        self.f.byte(I32_AND);
+        self.f.if_void();
+        self.push(mx);
+        self.f.i32_const(0x6000);
+        self.f.byte(I32_AND);
+        let w = |t: Ty| if t == Ty::I64 { 8 } else { 4 };
+        let (a, b, in_bytes, out_bytes) = match plan {
+            MxPlan::Scalar { a, b, in_ty, .. } => (a, b, w(in_ty), w(ty)),
+            MxPlan::Lanes { a, b, in_bytes, out_bytes, .. } => (a, b, in_bytes, out_bytes),
+        };
+        let lanes = ty == Ty::V128;
+        if plan.float_operands() {
+            for v in [Some(a), b].into_iter().flatten() {
+                self.push(v);
+                self.emit_tiny_check(lanes, in_bytes);
+                self.f.byte(I32_OR);
+            }
+        }
+        self.f.local_get(res);
+        self.emit_tiny_check(lanes, out_bytes);
+        self.f.byte(I32_OR);
+        self.f.if_void();
+        // The import's operand: an integer of `in_bytes` (from lane `lane`
+        // of a vector), as an i64.
+        let operand = |this: &mut Self, v: Value, lane: Option<(u32, u32)>, in_ty: Ty| {
+            this.push(v);
+            match lane {
+                Some((k, 4)) => {
+                    this.f.simd_lane(simd::I32X4_EXTRACT_LANE, k as u8);
+                    this.f.byte(I64_EXTEND_I32_U);
+                }
+                Some((k, _)) => this.f.simd_lane(simd::I64X2_EXTRACT_LANE, k as u8),
+                None if in_ty == Ty::I32 => this.f.byte(I64_EXTEND_I32_U),
+                None => {}
+            }
+        };
+        match plan {
+            MxPlan::Scalar { code, a, b, in_ty } => {
+                self.f.local_get(self.ctx_local);
+                self.f.i32_const(code as i32);
+                operand(self, a, None, in_ty);
+                match b {
+                    Some(b) => operand(self, b, None, in_ty),
+                    None => self.f.i64_const(0),
+                }
+                self.push(mx);
+                self.f.call(self.cx.mx);
+                if ty == Ty::I32 {
+                    self.f.byte(I32_WRAP_I64);
+                }
+                self.f.local_set(res);
+            }
+            MxPlan::Lanes { code, a, b, n, in_bytes, out_bytes } => {
+                self.f.v128_const(&[0; 16]);
+                self.f.local_set(res);
+                for k in 0..n {
+                    self.f.local_get(res);
+                    self.f.local_get(self.ctx_local);
+                    self.f.i32_const(code as i32);
+                    operand(self, a, Some((k, in_bytes)), Ty::I64);
+                    match b {
+                        Some(b) => operand(self, b, Some((k, in_bytes)), Ty::I64),
+                        None => self.f.i64_const(0),
+                    }
+                    self.push(mx);
+                    self.f.call(self.cx.mx);
+                    if out_bytes == 4 {
+                        self.f.byte(I32_WRAP_I64);
+                        self.f.simd_lane(simd::I32X4_REPLACE_LANE, k as u8);
+                    } else {
+                        self.f.simd_lane(simd::I64X2_REPLACE_LANE, k as u8);
+                    }
+                    self.f.local_set(res);
+                }
+            }
+        }
+        self.f.end();
+        self.f.end();
+        self.value_ty[idx] = ty;
+        if let Some(f) = self.value_fp.get_mut(idx) {
+            *f = None;
+        }
+        self.value_const[idx] = None;
+        self.value_local[idx] = Some(res);
+    }
+
+    /// Replace the float bits on the stack (a scalar of `bytes`, or a vector
+    /// of `bytes`-wide lanes) with an i32, nonzero when it (a lane) is a
+    /// denormal or the smallest normal: `(|x| - 1) >> fraction bits == 0`.
+    fn emit_tiny_check(&mut self, lanes: bool, bytes: u32) {
+        use code::*;
+        let frac = if bytes == 8 { 52 } else { 23 };
+        let mut abs = [0xffu8; 16];
+        let mut one = [0u8; 16];
+        for k in 0..16 / bytes as usize {
+            abs[k * bytes as usize + bytes as usize - 1] = 0x7f;
+            one[k * bytes as usize] = 1;
+        }
+        match (lanes, bytes) {
+            (false, 8) => {
+                self.f.i64_const(i64::MAX);
+                self.f.byte(I64_AND);
+                self.f.i64_const(1);
+                self.f.byte(I64_SUB);
+                self.f.i64_const(frac);
+                self.f.byte(I64_SHR_U);
+                self.f.byte(I64_EQZ);
+            }
+            (false, _) => {
+                self.f.i32_const(i32::MAX);
+                self.f.byte(I32_AND);
+                self.f.i32_const(1);
+                self.f.byte(I32_SUB);
+                self.f.i32_const(frac as i32);
+                self.f.byte(I32_SHR_U);
+                self.f.byte(I32_EQZ);
+            }
+            (true, _) => {
+                let (sub, shr, eq) = if bytes == 8 {
+                    (simd::I64X2_SUB, simd::I64X2_SHR_U, simd::I64X2_EQ)
+                } else {
+                    (simd::I32X4_SUB, simd::I32X4_SHR_U, simd::I32X4_EQ)
+                };
+                self.f.v128_const(&abs);
+                self.f.simd(simd::V128_AND);
+                self.f.v128_const(&one);
+                self.f.simd(sub);
+                self.f.i32_const(frac as i32);
+                self.f.simd(shr);
+                self.f.v128_const(&[0; 16]);
+                self.f.simd(eq);
+                self.f.simd(simd::V128_ANY_TRUE);
+            }
+        }
     }
 
     /// Reinterpret the integer bit pattern on top of the stack as a float.

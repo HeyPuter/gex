@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod sse;
+
 /// Status-word exception flags, in their status-word bit positions (and the
 /// control word's mask bits, which sit at the same positions).
 pub const IE: u16 = 1 << 0;
@@ -111,6 +113,14 @@ pub struct Env {
     pub flags: u16,
     /// `C1`: set when the result was rounded up in magnitude.
     pub c1: bool,
+    /// The format results are rounded into: extended for the x87, single
+    /// or double for SSE ([`sse`]), whose results have their format's
+    /// exponent range as well as its precision.
+    fmt: Fmt,
+    /// The last rounding's result was tiny (below the format's smallest
+    /// normal after rounding, exponent unbounded), exact or not: what SSE's
+    /// FTZ flushes.
+    tiny: bool,
 }
 
 impl Env {
@@ -131,12 +141,14 @@ impl Env {
             },
             flags: 0,
             c1: false,
+            fmt: EXT,
+            tiny: false,
         }
     }
 }
 
 /// A floating-point format results are rounded into.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Fmt {
     /// Significand bits, integer bit included.
     bits: u32,
@@ -241,6 +253,7 @@ fn round_pack(env: &mut Env, sign: bool, e: i32, sig: u128, prec: u32, f: Fmt) -
     // Tininess is detected after rounding: a result that rounds up to the
     // smallest normal (at `prec` bits, exponent unbounded) is not tiny.
     let tiny = e < f.emin && !(e == f.emin - 1 && rounds_to_carry(env, sign, sig, prec));
+    env.tiny = tiny;
     // Bits of `sig` below the kept part.
     let drop = (127 - (e - lsb)) as u32;
     let (kept, rem, half) = if drop >= 129 {
@@ -312,12 +325,29 @@ fn rounds_to_carry(env: &Env, sign: bool, sig: u128, prec: u32) -> bool {
     }
 }
 
-/// Round to an extended-format result at precision `prec`.
+/// Round to an extended-format result at precision `prec`; under SSE
+/// ([`Env::fmt`] single or double) to that format, its value carried
+/// exactly in an extended one.
 fn round_ext(env: &mut Env, sign: bool, e: i32, sig: u128, prec: u32) -> F80 {
-    let (be, m) = round_pack(env, sign, e, sig, prec, EXT);
+    let f = env.fmt;
+    let (be, m) = round_pack(env, sign, e, sig, prec.min(f.bits), f);
+    let s = if sign { 0x8000 } else { 0 };
+    if f.bits == EXT.bits {
+        return F80 { sig: m, se: be as u16 | s };
+    }
+    if be == (2 * f.emax + 1) as u32 {
+        return F80::inf(sign);
+    }
+    if m == 0 {
+        return F80::zero(sign);
+    }
+    // A denormal of the format: its integer bit's weight is 2^emin.
+    let (e, m) = if be == 0 { (f.emin, m) } else { (be as i32 - f.emax, m) };
+    let lz = m.leading_zeros() as i32;
+    let e = e - (f.bits as i32 - 1) + (63 - lz);
     F80 {
-        sig: m,
-        se: be as u16 | if sign { 0x8000 } else { 0 },
+        sig: m << lz,
+        se: (e + 16383) as u16 | s,
     }
 }
 

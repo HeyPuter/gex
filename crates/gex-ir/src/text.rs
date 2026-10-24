@@ -411,6 +411,7 @@ pub fn expr(e: &Expr) -> String {
             fw(*dst_wide),
             v(*a)
         ),
+        Expr::Mx { mx, e } => format!("mx {} {}", v(*mx), expr(e)),
     }
 }
 
@@ -989,6 +990,14 @@ fn parse_expr(k: &mut Toks) -> Result<Expr, String> {
                 dst_wide,
                 a: k.val()?,
             }
+        }
+        "mx" => {
+            let mx = k.val()?;
+            let e = parse_expr(k)?;
+            if !e.mx_able() {
+                return Err(k.err("mx: not an operation MXCSR rounds".to_string()));
+            }
+            Expr::Mx { mx, e: Box::new(e) }
         }
         other => return Err(k.err(format!("unknown expression `{other}`"))),
     })

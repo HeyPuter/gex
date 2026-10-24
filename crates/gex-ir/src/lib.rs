@@ -472,6 +472,108 @@ pub enum Expr {
         dst_wide: bool,
         a: Value,
     },
+    /// `e` computed as x86's SSE computes it under the `I32` MXCSR value
+    /// `mx`: rounded by its rounding control (bits 13-14) instead of to
+    /// nearest, a denormal operand read as a zero of its sign under DAZ
+    /// (bit 6), a denormal result written as one under FTZ (bit 15). With
+    /// none of those bits set ([`MX_SPECIAL`]) it is `e` exactly, so a
+    /// backend lowers it as `e` behind that one test.
+    ///
+    /// `e` is one of [`Expr::mx_able`]'s: a float add, subtract, multiply,
+    /// divide or square root, a round to nearest (an integer value, the
+    /// rounding of a conversion to integer), a conversion to a float, as
+    /// scalars (`FpBin`, `FpUn`, `FpCvt`) or lanes (`VLaneBin`, `VLaneUn`,
+    /// `VCvt`). Its operands are this expression's.
+    Mx { mx: Value, e: Box<Expr> },
+}
+
+/// The MXCSR bits [`Expr::Mx`] honours: rounding control, FTZ, DAZ.
+pub const MX_SPECIAL: u32 = 0xe040;
+
+/// How an [`Expr::Mx`]'s operation is computed off its fast path: by
+/// `gex_f80::sse::op` with `code`, on raw bits, once for a scalar or once
+/// per lane.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MxPlan {
+    /// `a` (and `b`), each an integer of `in_ty` holding a float's bits or
+    /// a conversion's integer; the result is the expression's type.
+    Scalar { code: u32, a: Value, b: Option<Value>, in_ty: Ty },
+    /// Lanes `0..n` of `a` (and `b`), `in_bytes` wide, each to lane `k`,
+    /// `out_bytes` wide, of a zero vector.
+    Lanes { code: u32, a: Value, b: Option<Value>, n: u32, in_bytes: u32, out_bytes: u32 },
+}
+
+impl MxPlan {
+    /// The plan of [`Expr::mx_able`] `e`.
+    pub fn of(e: &Expr) -> MxPlan {
+        use gex_f80::sse::*;
+        let bin = |op: u32| match op {
+            0 => ADD,
+            1 => SUB,
+            2 => MUL,
+            _ => DIV,
+        };
+        let wide = |d: bool| if d { DOUBLE } else { 0 };
+        let int_ty = |d: bool| if d { Ty::I64 } else { Ty::I32 };
+        match *e {
+            Expr::FpBin { op, double, a, b } => MxPlan::Scalar {
+                code: bin(op as u32) | wide(double),
+                a,
+                b: Some(b),
+                in_ty: int_ty(double),
+            },
+            Expr::FpUn { op, double, a } => MxPlan::Scalar {
+                code: if op == FpUnOp::Sqrt { SQRT } else { RINT } | wide(double),
+                a,
+                b: None,
+                in_ty: int_ty(double),
+            },
+            Expr::FpCvt { kind: FpConvert::IntToFp { .. }, src_wide, dst_wide, a } => MxPlan::Scalar {
+                code: if src_wide { FROM_I64 } else { FROM_I32 } | wide(dst_wide),
+                a,
+                b: None,
+                in_ty: int_ty(src_wide),
+            },
+            Expr::FpCvt { src_wide, a, .. } => MxPlan::Scalar {
+                code: if src_wide { NARROW } else { WIDEN | DOUBLE },
+                a,
+                b: None,
+                in_ty: int_ty(src_wide),
+            },
+            Expr::VLaneBin { op, lane, a, b } => {
+                let d = lane == VLane::F64;
+                let k = match op {
+                    VLaneBinOp::Add => ADD,
+                    VLaneBinOp::Sub => SUB,
+                    VLaneBinOp::Mul => MUL,
+                    _ => DIV,
+                };
+                let lb = lane.bytes();
+                MxPlan::Lanes { code: k | wide(d), a, b: Some(b), n: 16 / lb, in_bytes: lb, out_bytes: lb }
+            }
+            Expr::VLaneUn { op, lane, a } => {
+                let d = lane == VLane::F64;
+                let lb = lane.bytes();
+                let k = if op == VLaneUnOp::Sqrt { SQRT } else { RINT };
+                MxPlan::Lanes { code: k | wide(d), a, b: None, n: 16 / lb, in_bytes: lb, out_bytes: lb }
+            }
+            Expr::VCvt { op: VCvtOp::DemoteF64, a, .. } => {
+                MxPlan::Lanes { code: NARROW, a, b: None, n: 2, in_bytes: 8, out_bytes: 4 }
+            }
+            Expr::VCvt { op: VCvtOp::PromoteF32, a, .. } => {
+                MxPlan::Lanes { code: WIDEN | DOUBLE, a, b: None, n: 2, in_bytes: 4, out_bytes: 8 }
+            }
+            Expr::VCvt { a, .. } => MxPlan::Lanes { code: FROM_I32, a, b: None, n: 4, in_bytes: 4, out_bytes: 4 },
+            _ => panic!("MxPlan::of: {e:?} is not an operation MXCSR rounds"),
+        }
+    }
+
+    /// The operands are floats (DAZ reads them), not a conversion's integers.
+    pub fn float_operands(&self) -> bool {
+        use gex_f80::sse::*;
+        let (MxPlan::Scalar { code, .. } | MxPlan::Lanes { code, .. }) = *self;
+        !matches!(code & 0xf, FROM_I32 | FROM_I64)
+    }
 }
 
 /// Scalar floating-point operations.
@@ -716,6 +818,25 @@ impl Expr {
                     Ty::I32
                 }
             }
+            Expr::Mx { ref e, .. } => e.ty(),
+        }
+    }
+
+    /// Whether `self` may be the operation of an [`Expr::Mx`].
+    pub fn mx_able(&self) -> bool {
+        match self {
+            Expr::FpBin { op, .. } => matches!(op, FpBinOp::Add | FpBinOp::Sub | FpBinOp::Mul | FpBinOp::Div),
+            Expr::FpUn { op, .. } => matches!(op, FpUnOp::Sqrt | FpUnOp::RoundNearest),
+            Expr::FpCvt { kind, .. } => matches!(kind, FpConvert::IntToFp { signed: true } | FpConvert::FpToFp),
+            Expr::VLaneBin { op, lane, .. } => {
+                lane.is_float() && matches!(op, VLaneBinOp::Add | VLaneBinOp::Sub | VLaneBinOp::Mul | VLaneBinOp::Div)
+            }
+            Expr::VLaneUn { op, lane, .. } => lane.is_float() && matches!(op, VLaneUnOp::Sqrt | VLaneUnOp::Nearest),
+            Expr::VCvt { op, from, .. } => matches!(
+                (op, from),
+                (VCvtOp::DemoteF64, VLane::F64) | (VCvtOp::PromoteF32, VLane::F32) | (VCvtOp::IntToFp { signed: true }, VLane::I32)
+            ),
+            _ => false,
         }
     }
 
@@ -793,6 +914,10 @@ impl Expr {
                 f(*b);
             }
             Expr::FpUn { a, .. } | Expr::FpCvt { a, .. } => f(*a),
+            Expr::Mx { mx, e } => {
+                f(*mx);
+                e.for_each_use(f);
+            }
         }
     }
 }

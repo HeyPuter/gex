@@ -940,6 +940,14 @@ pub mod imports {
     /// `ctx::X87_TMP + 12`.
     pub const X87: &str = "x87";
 
+    /// An SSE operation under a non-default MXCSR (`gex_ir::Expr::Mx`'s
+    /// slow path: a rounding control other than to nearest, FTZ or DAZ),
+    /// computed exactly (`gex_f80::sse::op`). Pure, as [`X87`] is.
+    /// Signature `(ctx: i32, code: i32, a: i64, b: i64, mxcsr: i32) -> i64`:
+    /// `code` is `gex_f80::sse`'s, the operands and the result raw bits
+    /// (a single's or an `i32`'s zero-extended).
+    pub const MX: &str = "mx";
+
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.
     pub const SAFEPOINT: &str = "safepoint";
