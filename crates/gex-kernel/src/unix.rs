@@ -189,6 +189,8 @@ enum Role {
         tx: Arc<Pipe>,
         /// The path this end connected to, for `getpeername`.
         peer: Option<String>,
+        /// The listener's name, on the end `accept` gave out: `getsockname`.
+        local: Option<String>,
     },
 }
 
@@ -269,6 +271,7 @@ impl UnixSocket {
             rx: Arc::clone(&b2a),
             tx: Arc::clone(&a2b),
             peer: None,
+            local: None,
         };
         let b = UnixSocket::new(true);
         b.adopt(&a2b, &b2a);
@@ -276,6 +279,7 @@ impl UnixSocket {
             rx: a2b,
             tx: b2a,
             peer: None,
+            local: None,
         };
         (Arc::new(a), Arc::new(b))
     }
@@ -308,6 +312,25 @@ impl UnixSocket {
         }
     }
 
+    /// The name this end connected to, for `getpeername`: None for an
+    /// accepted end (its peer is unnamed); ENOTCONN when not connected.
+    pub fn peer_name(&self) -> Result<Option<String>, Errno> {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { peer, .. } => Ok(peer.clone()),
+            _ => Err(Errno::ENOTCONN),
+        }
+    }
+
+    /// This end's own name, for `getsockname`: the one it is bound to or
+    /// listening on, or (an accepted end) its listener's. None when unnamed.
+    pub fn local_name(&self) -> Option<String> {
+        match &*self.role.lock().unwrap() {
+            Role::Bound(p) | Role::Listening { path: p, .. } => Some(p.clone()),
+            Role::Connected { local, .. } => local.clone(),
+            Role::Fresh => None,
+        }
+    }
+
     pub fn listen(&self) -> SysResult {
         let mut role = self.role.lock().unwrap();
         match &*role {
@@ -335,6 +358,9 @@ impl UnixSocket {
             let Role::Listening { backlog, .. } = &*role else {
                 return Err(Errno::ECONNREFUSED);
             };
+            if let Role::Connected { local, .. } = &mut *theirs.role.lock().unwrap() {
+                *local = Some(path.to_string());
+            }
             backlog.lock().unwrap().push_back(theirs);
         }
         // A connection is waiting for `accept`.
@@ -351,6 +377,7 @@ impl UnixSocket {
             rx,
             tx,
             peer: Some(path.to_string()),
+            local: None,
         };
         Ok(0)
     }
@@ -643,7 +670,7 @@ impl SocketNames {
             *client.role.lock().unwrap() = match taken {
                 Role::Connected { rx, tx, .. } => {
                     client.adopt(&rx, &tx);
-                    Role::Connected { rx, tx, peer: Some(path.to_string()) }
+                    Role::Connected { rx, tx, peer: Some(path.to_string()), local: None }
                 }
                 _ => unreachable!("pair() makes connected sockets"),
             };
