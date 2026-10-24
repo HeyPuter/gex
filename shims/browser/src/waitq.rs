@@ -113,21 +113,12 @@ pub(crate) fn publish_timer() {
 /// The queues a wait registers on, and when it becomes ready by the clock.
 fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64, page: bool) -> (Vec<u32>, Option<u64>) {
     let mut qs = vec![proc_queue()];
-    let mut soonest = match waiting {
-        Waiting::Sleep(at) => Some(*at),
-        Waiting::Futex { deadline, .. } | Waiting::Net(deadline) | Waiting::Pi { deadline, .. } | Waiting::SigWait(deadline) => *deadline,
-        _ => None,
-    };
     let mut handle = |h: &Arc<dyn gex_kernel::vfs::FileHandle>, qs: &mut Vec<u32>| {
         let q = h.wait_queue();
         if q == 0 && !page && h.ready_in_ns().is_none() {
             unqueued(h);
         }
         qs.push(q);
-        if let Some(d) = h.ready_in_ns() {
-            let at = now.saturating_add(d);
-            soonest = Some(soonest.map_or(at, |s| s.min(at)));
-        }
     };
     match waiting {
         Waiting::Futex { parked, .. } => qs.push(unsafe { k_futex_queue(parked.addr()) }),
@@ -137,16 +128,8 @@ fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u
             if let Some(gex_kernel::BlockOp::Poll { fds, report, .. }) = blocked_on {
                 match report {
                     // The set's own queue, chained onto every descriptor it
-                    // watches; a timerfd in the set still bounds the park.
-                    gex_kernel::syscalls::PollReport::Epoll { set, .. } => {
-                        qs.push(set.queue_id());
-                        for p in fds {
-                            if let Some(d) = p.handle.as_ref().and_then(|h| h.ready_in_ns()) {
-                                let at = now.saturating_add(d);
-                                soonest = Some(soonest.map_or(at, |s| s.min(at)));
-                            }
-                        }
-                    }
+                    // watches.
+                    gex_kernel::syscalls::PollReport::Epoll { set, .. } => qs.push(set.queue_id()),
                     _ => {
                         for p in fds {
                             if let Some(h) = &p.handle {
@@ -162,7 +145,40 @@ fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u
     qs.retain(|&q| q != 0);
     qs.sort_unstable();
     qs.dedup();
-    (qs, soonest)
+    (qs, soonest_of(waiting, blocked_on, now))
+}
+
+/// When a wait becomes ready by the clock alone: its own deadline, or the
+/// soonest a descriptor it waits on says it may be (a timerfd's expiry, a
+/// device that drains by the clock or a player); a timerfd in an epoll set
+/// still bounds the wait. A descriptor's answer holds only from `now`: one
+/// that is not ready when it said it might be is asked again.
+fn soonest_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64) -> Option<u64> {
+    let mut soonest = match waiting {
+        Waiting::Sleep(at) => Some(*at),
+        Waiting::Futex { deadline, .. } | Waiting::Net(deadline) | Waiting::Pi { deadline, .. } | Waiting::SigWait(deadline) => *deadline,
+        _ => None,
+    };
+    let mut clock = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        if let Some(d) = h.ready_in_ns() {
+            let at = now.saturating_add(d);
+            soonest = Some(soonest.map_or(at, |s| s.min(at)));
+        }
+    };
+    match waiting {
+        Waiting::Read(h) | Waiting::Write(h) | Waiting::Accept(h) => clock(h),
+        Waiting::Net(_) => {
+            if let Some(gex_kernel::BlockOp::Poll { fds, .. }) = blocked_on {
+                for p in fds {
+                    if let Some(h) = &p.handle {
+                        clock(h);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    soonest
 }
 
 /// A wait on a descriptor with no queue and no clock: nothing will notify
@@ -325,10 +341,14 @@ pub(crate) enum Turn {
 /// takes. A deadlock candidate is looked at again (`DEADLOCK_CONFIRM`).
 pub(crate) fn park_ns(now: u64) -> Option<u64> {
     let (soonest, all_blocked) = WAIT.with(|w| {
-        w.borrow()
-            .as_ref()
-            .filter(|m| m.thread == cur())
-            .map_or((None, false), |m| (m.soonest, m.all_blocked))
+        let mut w = w.borrow_mut();
+        let Some(m) = w.as_mut().filter(|m| m.thread == cur()) else { return (None, false) };
+        // Past the clock it registered with and still not ready (the turn
+        // that parks found it so): when the clock says now.
+        if m.soonest.is_some_and(|s| s <= now) {
+            m.soonest = soonest_of(&m.waiting, &m.blocked_on, now);
+        }
+        (m.soonest, m.all_blocked)
     });
     let timer = TIMER_AT.load(std::sync::atomic::Ordering::Relaxed);
     let timer = (timer != u64::MAX).then_some(timer);
