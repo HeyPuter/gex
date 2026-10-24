@@ -27,6 +27,9 @@ const m64 = () => !!globalThis.GEX_MEM64;
  *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
 const FTAB_SPARE_THREADED = 8192;
+// GEX_TEST_KEEP_PROBE (tests/lazy-units): a retirement leaves the probe
+// cache's entries (cgen.rs `gex_test_keep_probe`).
+const TEST_KEEP_PROBE = !!(globalThis.process?.env?.GEX_TEST_KEEP_PROBE);
 // GEX_UNITS_EAGER (a test's A/B): every Worker instantiates each unit when it
 // catches up, as before units were deferred (`#cgenDefer`).
 const UNITS_EAGER = !!(globalThis.GEX_UNITS_EAGER ?? globalThis.process?.env?.GEX_UNITS_EAGER);
@@ -2217,6 +2220,7 @@ export class Gex {
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
+    if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
     // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
     // left numbered with no directory entry.
@@ -3075,6 +3079,7 @@ export class Gex {
     e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
     this.#dense = !!o.dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     e.gex_set_dense?.(denseArg(o, this.#dense));
+    if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
     this.#opts = o;
     syncSlotShift(e);
@@ -3288,6 +3293,7 @@ export class Gex {
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     e.gex_set_dense?.(denseArg(child.opts, this.#dense));
+    if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
