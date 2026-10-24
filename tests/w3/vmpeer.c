@@ -3,7 +3,8 @@
  * the child's exit code says what it saw: 0x50 for the written marker,
  * plus what its code at peek returns (7 as built, 5 once patched).
  * "vmpeer crash": an illegal instruction nothing handles, for the
- * system's debugger to attach to. */
+ * system's debugger to attach to. "vmpeer quick": the same checks with no
+ * settling sleep, made while the child is still starting. */
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
@@ -61,7 +62,7 @@ int main(int argc, char **argv)
         printf("FAIL spawn %lu\n", GetLastError());
         return 1;
     }
-    Sleep(1000);
+    if (argc < 2 || strcmp(argv[1], "quick")) Sleep(1000);
     memset(got, 0, sizeof(got));
     check(ReadProcessMemory(pi.hProcess, (void *)shared_buf, got, sizeof(got), &n) && n == sizeof(got) &&
               !strcmp(got, "vmpeer child data"), "read a global");
