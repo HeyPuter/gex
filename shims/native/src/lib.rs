@@ -1800,9 +1800,7 @@ fn perform_block(
             uaddr,
             val,
             deadline,
-            // The native host closes the check/sleep race with the queue lock
-            // (below), so it does not use the kernel's pre-snapshotted place.
-            parked: _,
+            parked,
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
@@ -1818,7 +1816,14 @@ fn perform_block(
                     Some(d) => time_left(d, start.elapsed()).ok_or(Errno::ETIMEDOUT)?.min(slice),
                     None => slice,
                 };
-                match table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()) {
+                // From the kernel's place on the queue, taken before it
+                // checked the word: a wake landing between two slices is a
+                // wake, not the next slice's EAGAIN on the changed word.
+                let r = match &parked {
+                    Some(p) => p.wait(val, left, &|| mem.read_u32(uaddr).ok()),
+                    None => table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()),
+                };
+                match r {
                     Err(Errno::ETIMEDOUT) => {
                         if deadline.is_some_and(|d| start.elapsed() >= d) {
                             return Err(Errno::ETIMEDOUT);
