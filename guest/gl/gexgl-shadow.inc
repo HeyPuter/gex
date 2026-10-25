@@ -21,8 +21,6 @@
  * it every time too and says on stderr whenever the answer kept here differs.
  */
 
-#include <math.h>
-
 /* i386's x87 keeps float arithmetic at 80 bits; the host rounds every step
    to float, so the arithmetic here does too. (Which is also why what comes
    in from outside this file comes by pointer: a float argument would be
@@ -214,13 +212,122 @@ static void shadow_pop(void) {
     if (*d > 0) --*d; /* at 0, GL_STACK_UNDERFLOW: no change */
 }
 
+/* sinf and cosf, here rather than from libm: this library is loaded into
+   roots that carry libc and nothing else. These are musl's (FreeBSD's),
+   step for step, and round as musl's do on every float they take. Only
+   musl's medium reduction is here; past |x| ~ 2^28 pi/2 the caller forgets
+   the matrix instead. */
+static float shadow_sindf(double x) {
+    const double S1 = -0x15555554cbac77.0p-55, S2 = 0x111110896efbb2.0p-59,
+                 S3 = -0x1a00f9e2cae774.0p-65, S4 = 0x16cd878c3b46a7.0p-71;
+    double z = x * x, w = z * z, r = S3 + z * S4, s = z * x;
+    return (x + s * (S1 + z * S2)) + s * w * r;
+}
+
+static float shadow_cosdf(double x) {
+    const double C0 = -0x1ffffffd0c5e81.0p-54, C1 = 0x155553e1053a42.0p-57,
+                 C2 = -0x16c087e80f1e27.0p-62, C3 = 0x199342e0ee5069.0p-68;
+    double z = x * x, w = z * z, r = C2 + z * C3;
+    return ((1.0 + z * C0) + w * C1) + (w * z) * r;
+}
+
+/* 0 for an argument too large for the medium reduction. */
+static int shadow_rem_pio2f(float x, double *y, int *n) {
+    const double toint = 1.5 / 0x1p-52, pio4 = 0x1.921fb6p-1,
+                 invpio2 = 6.36619772367581382433e-01,
+                 pio2_1 = 1.57079631090164184570e+00,
+                 pio2_1t = 1.58932547735281966916e-08;
+    union { float f; uint32_t i; } u = {x};
+    if ((u.i & 0x7fffffff) >= 0x4dc90fdb) return 0;
+    double fn = (double)x * invpio2 + toint - toint;
+    *n = (int32_t)fn;
+    *y = x - fn * pio2_1 - fn * pio2_1t;
+    if (*y < -pio4) {
+        --*n; fn--;
+        *y = x - fn * pio2_1 - fn * pio2_1t;
+    } else if (*y > pio4) {
+        ++*n; fn++;
+        *y = x - fn * pio2_1 - fn * pio2_1t;
+    }
+    return 1;
+}
+
+static int shadow_sinf(float x, float *out) {
+    const double p1 = 1 * 1.57079632679489661923, p2 = 2 * 1.57079632679489661923,
+                 p3 = 3 * 1.57079632679489661923, p4 = 4 * 1.57079632679489661923;
+    union { float f; uint32_t i; } u = {x};
+    uint32_t ix = u.i & 0x7fffffff;
+    int sign = u.i >> 31, n;
+    double y;
+    if (ix <= 0x3f490fda) { *out = ix < 0x39800000 ? x : shadow_sindf(x); return 1; }
+    if (ix <= 0x407b53d1) {
+        if (ix <= 0x4016cbe3)
+            *out = sign ? -shadow_cosdf(x + p1) : shadow_cosdf(x - p1);
+        else
+            *out = shadow_sindf(sign ? -(x + p2) : -(x - p2));
+        return 1;
+    }
+    if (ix <= 0x40e231d5) {
+        if (ix <= 0x40afeddf)
+            *out = sign ? shadow_cosdf(x + p3) : -shadow_cosdf(x - p3);
+        else
+            *out = shadow_sindf(sign ? x + p4 : x - p4);
+        return 1;
+    }
+    if (ix >= 0x7f800000) { *out = x - x; return 1; }
+    if (!shadow_rem_pio2f(x, &y, &n)) return 0;
+    switch (n & 3) {
+    case 0: *out = shadow_sindf(y); break;
+    case 1: *out = shadow_cosdf(y); break;
+    case 2: *out = shadow_sindf(-y); break;
+    default: *out = -shadow_cosdf(y); break;
+    }
+    return 1;
+}
+
+static int shadow_cosf(float x, float *out) {
+    const double p1 = 1 * 1.57079632679489661923, p2 = 2 * 1.57079632679489661923,
+                 p3 = 3 * 1.57079632679489661923, p4 = 4 * 1.57079632679489661923;
+    union { float f; uint32_t i; } u = {x};
+    uint32_t ix = u.i & 0x7fffffff;
+    int sign = u.i >> 31, n;
+    double y;
+    if (ix <= 0x3f490fda) { *out = ix < 0x39800000 ? 1.0f : shadow_cosdf(x); return 1; }
+    if (ix <= 0x407b53d1) {
+        if (ix > 0x4016cbe3)
+            *out = -shadow_cosdf(sign ? x + p2 : x - p2);
+        else
+            *out = sign ? shadow_sindf(x + p1) : shadow_sindf(p1 - x);
+        return 1;
+    }
+    if (ix <= 0x40e231d5) {
+        if (ix > 0x40afeddf)
+            *out = shadow_cosdf(sign ? x + p4 : x - p4);
+        else
+            *out = sign ? shadow_sindf(-x - p3) : shadow_sindf(x - p3);
+        return 1;
+    }
+    if (ix >= 0x7f800000) { *out = x - x; return 1; }
+    if (!shadow_rem_pio2f(x, &y, &n)) return 0;
+    switch (n & 3) {
+    case 0: *out = shadow_cosdf(y); break;
+    case 1: *out = shadow_sindf(-y); break;
+    case 2: *out = -shadow_cosdf(y); break;
+    default: *out = shadow_sindf(y); break;
+    }
+    return 1;
+}
+
 static void shadow_rotate(const float *axyz) {
     float angle = axyz[0], x = axyz[1], y = axyz[2], z = axyz[3];
     struct shadow_matrix *t = shadow_changing();
     if (!t || angle == 0.0f) return;
-    float m[16];
-    const float s = sinf(angle * M_PI / 180.0);
-    const float c = cosf(angle * M_PI / 180.0);
+    float m[16], s, c;
+    const float radians = angle * 3.14159265358979323846 / 180.0;
+    if (!shadow_sinf(radians, &s) || !shadow_cosf(radians, &c)) {
+        t->known = 0;
+        return;
+    }
     int optimized = 0;
     shadow_identity(m);
 #define SM(row, col) m[col * 4 + row]
@@ -250,7 +357,7 @@ static void shadow_rotate(const float *axyz) {
         }
     }
     if (!optimized) {
-        const float mag = sqrtf(x * x + y * y + z * z);
+        const float mag = __builtin_sqrtf(x * x + y * y + z * z);
         if (mag <= 1.0e-4f) return;
         x /= mag;
         y /= mag;
