@@ -109,6 +109,96 @@ impl Drop for WorkDir {
     }
 }
 
+/// The address space each clang may take, in MiB: past it clang fails, and
+/// the unit's largest function is left to tier-1 ([`OutOfMemory`]). Default
+/// [`DEFAULT_CLANG_MEM_MB`]; `GEX_CGEN_CLANG_MEM_MB` or [`set_clang_mem_mb`]
+/// (gexc's `--clang-mem-mb`); 0, no limit.
+pub const DEFAULT_CLANG_MEM_MB: u64 = 8192;
+
+/// `u64::MAX`: not set.
+static CLANG_MEM_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub fn set_clang_mem_mb(mb: u64) {
+    CLANG_MEM_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn clang_mem_mb() -> u64 {
+    match CLANG_MEM_MB.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => {
+            static ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *ENV.get_or_init(|| {
+                std::env::var("GEX_CGEN_CLANG_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CLANG_MEM_MB)
+            })
+        }
+        n => n,
+    }
+}
+
+/// A clang that ran out of the memory [`clang_mem_mb`] gives it, on `src`.
+#[derive(Debug)]
+pub struct OutOfMemory {
+    pub src: PathBuf,
+}
+
+impl std::fmt::Display for OutOfMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clang ran out of its {} MiB on {}", clang_mem_mb(), self.src.display())
+    }
+}
+
+impl std::error::Error for OutOfMemory {}
+
+/// A clang for one source, under [`clang_mem_mb`]'s limit.
+fn clang_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(clang());
+    #[cfg(unix)]
+    {
+        let mb = clang_mem_mb();
+        if mb != 0 {
+            use std::os::unix::process::CommandExt;
+            let bytes = mb.saturating_mul(1 << 20) as libc::rlim_t;
+            // SAFETY: setrlimit is async-signal-safe; it is all the child
+            // does between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let lim = libc::rlimit { rlim_cur: bytes, rlim_max: bytes };
+                    if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    cmd
+}
+
+/// [`run`] for a clang on `src`: a failure that is clang running out of
+/// memory under its limit is an [`OutOfMemory`].
+fn run_clang(cmd: &mut Command, src: &Path) -> Result<()> {
+    let what = format!("clang on {}", src.display());
+    let out = cmd
+        .output()
+        .with_context(|| format!("running {what} ({:?}); is it installed?", cmd.get_program()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    #[cfg(unix)]
+    let signalled = std::os::unix::process::ExitStatusExt::signal(&out.status).is_some();
+    #[cfg(not(unix))]
+    let signalled = false;
+    let oom = ["out of memory", "Allocation failed", "bad_alloc", "Cannot allocate memory"]
+        .iter()
+        .any(|m| err.contains(m));
+    if clang_mem_mb() != 0 && (oom || signalled) {
+        return Err(anyhow::Error::new(OutOfMemory { src: src.to_path_buf() }));
+    }
+    let lines: Vec<&str> = err.lines().take(60).collect();
+    bail!("{what} failed ({}):\n{}", out.status, lines.join("\n"));
+}
+
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
     let out = cmd
         .output()
@@ -168,13 +258,16 @@ pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
 /// killed build leaves no truncated object in a cache).
 pub fn compile_one(dir: &Path, src: &Path, obj: &Path, pch: Option<&Path>) -> Result<()> {
     let tmp = obj.with_extension(format!("o.tmp-{}", std::process::id()));
-    let mut cmd = Command::new(clang());
+    let mut cmd = clang_command();
     cmd.args(cflags()).args(IMAGE_CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
     if let Some(p) = pch {
         cmd.arg("-include-pch").arg(p);
     }
     cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
-    run(&mut cmd, &format!("clang on {}", src.display()))?;
+    if let Err(e) = run_clang(&mut cmd, src) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, obj)?;
     Ok(())
 }
@@ -191,7 +284,7 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 if i >= sources.len() {
                     return;
                 }
-                let mut cmd = Command::new(clang());
+                let mut cmd = clang_command();
                 cmd.args(cflags())
                     .args(extra_cflags())
                     .arg("-I")
@@ -200,7 +293,7 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
                     .arg(&sources[i])
                     .arg("-o")
                     .arg(&objs[i]);
-                if let Err(e) = run(&mut cmd, &format!("clang on {}", sources[i].display())) {
+                if let Err(e) = run_clang(&mut cmd, &sources[i]) {
                     errors.lock().unwrap().push(e);
                 }
             });
