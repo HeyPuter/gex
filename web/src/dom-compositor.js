@@ -676,8 +676,11 @@ export class DomDesktop {
     if (!s.addr) return;
     if (s.serial === win.serial) return;
     const prev = win.serial;
-    win.serial = s.serial;
     const mem = this.#memoryOf(s.token);
+    // A commit is only taken once it is painted: a process's memory can reach
+    // the page after its first publish, and an idle client commits no more,
+    // so a commit taken without the memory would leave its window blank.
+    if (mem) win.serial = s.serial;
     // Damage is a hint about what changed, not a promise that the rest is
     // already right. Paint the whole surface when there is nothing to go on:
     // the first frame, a commit that named no damage at all -- Xwayland does
