@@ -3325,11 +3325,29 @@ pub(crate) struct ThreadCell {
     /// before it replaces the image (`exec_waits`), as Linux's de_thread
     /// waits for the other threads to die.
     halted: std::sync::atomic::AtomicBool,
+    /// Raised (1) by another thread's `fork` while it copies the process's
+    /// memory ([`gex_fork_hold`]): this thread runs no guest code until it
+    /// falls, parking where it would go back to guest code ([`enter_guest`]).
+    hold: std::sync::atomic::AtomicI32,
+    /// Set by the thread itself while it is parked at a [`ThreadCell::hold`].
+    held: std::sync::atomic::AtomicBool,
+    /// Set by the thread itself while it is out of guest code: in a call, a
+    /// dispatch miss or a safepoint, or stopped for its Worker's run loop,
+    /// and before it first runs. A fork does not wait for it: it parks at
+    /// its return to guest code.
+    out: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadCell {
     fn new(run: Run) -> ThreadCell {
-        ThreadCell { run: Mutex::new(run), gone: Default::default(), halted: Default::default() }
+        ThreadCell {
+            run: Mutex::new(run),
+            gone: Default::default(),
+            halted: Default::default(),
+            hold: Default::default(),
+            held: Default::default(),
+            out: std::sync::atomic::AtomicBool::new(true),
+        }
     }
 
     fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Run>> {
@@ -7674,6 +7692,7 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    leave_guest();
     let mut pc = pc;
     loop {
         gex_kernel::phase::begin();
@@ -7689,7 +7708,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // the stack does not grow.
         match MAKE_AGAIN.with(|c| c.take()) {
             Some(again) => pc = again,
-            None => return,
+            None => {
+                enter_guest();
+                return;
+            }
         }
     }
 }
@@ -9921,6 +9943,97 @@ pub(crate) fn stop_gone() {
     set_resume_ctx_none();
 }
 
+/// This Worker's thread leaves guest code ([`ThreadCell::out`]).
+pub(crate) fn leave_guest() {
+    MY_RUN.with(|c| {
+        if let Some(t) = c.borrow().as_ref() {
+            t.out.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+/// The longest a thread stays parked at a fork's hold: past it, the fork that
+/// raised it is taken to have ended without saying so.
+const HOLD_MAX_NS: u64 = 10_000_000_000;
+
+/// This Worker's thread goes back to guest code: first, while another
+/// thread's fork copies the memory ([`ThreadCell::hold`]), it parks.
+pub(crate) fn enter_guest() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let held = MY_RUN.with(|c| {
+        let b = c.borrow();
+        let t = b.as_ref()?;
+        t.out.store(false, SeqCst);
+        (t.hold.load(SeqCst) != 0).then(|| t.clone())
+    });
+    let Some(t) = held else { return };
+    t.held.store(true, SeqCst);
+    let until = now_ns() + HOLD_MAX_NS;
+    while t.hold.load(SeqCst) != 0 && now_ns() < until {
+        // Only a build of shared memories has threads to hold.
+        #[cfg(feature = "shared-memory")]
+        unsafe {
+            warch::memory_atomic_wait32(t.hold.as_ptr(), 1, 100_000_000)
+        };
+    }
+    t.held.store(false, SeqCst);
+}
+
+thread_local! {
+    /// The threads this Worker's fork holds ([`gex_fork_hold`]) until it has
+    /// copied the memory ([`gex_fork_taken`]).
+    static HOLDING: RefCell<Vec<Arc<ThreadCell>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Before the host copies the memory for the fork this thread staged
+/// (`#processImage`): the process's other threads stop running guest code,
+/// so the child's memory is the memory of one moment, as Linux's fork copies
+/// it. Copied a region at a time while they ran, a child's memory had pieces
+/// from different moments: libc's lists of threads and stacks as no thread
+/// ever left them, which the child walks after fork. Each other thread is
+/// told to hold and is waited for until it is out of guest code (it parks
+/// at its return to it) or parked at the hold; one that never gets there is
+/// given up on after `EXEC_WAIT_MAX_NS`. [`gex_fork_taken`] lets them go.
+#[no_mangle]
+pub extern "C" fn gex_fork_hold() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let me = cur();
+    let cells: Vec<Arc<ThreadCell>> =
+        with_exec_lock(|h| h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| t.state_arc()).collect());
+    for c in &cells {
+        c.hold.store(1, SeqCst);
+    }
+    let until = now_ns() + EXEC_WAIT_MAX_NS;
+    let nap = std::sync::atomic::AtomicI32::new(0);
+    while cells.iter().any(|c| !c.out.load(SeqCst) && !c.held.load(SeqCst) && !c.halted.load(SeqCst)) && now_ns() < until {
+        #[cfg(feature = "shared-memory")]
+        unsafe {
+            warch::memory_atomic_wait32(nap.as_ptr(), 0, 50_000)
+        };
+    }
+    HOLDING.with(|h| h.borrow_mut().extend(cells));
+}
+
+/// The memory for the fork is copied: the threads [`gex_fork_hold`] held go
+/// on. Again at [`gex_fork_taken`], for a host that copied without saying.
+#[no_mangle]
+pub extern "C" fn gex_fork_release() {
+    fork_release();
+}
+
+fn fork_release() {
+    use std::sync::atomic::Ordering::SeqCst;
+    HOLDING.with(|h| {
+        for c in h.borrow_mut().drain(..) {
+            c.hold.store(0, SeqCst);
+            #[cfg(feature = "shared-memory")]
+            unsafe {
+                warch::memory_atomic_notify(c.hold.as_ptr(), u32::MAX)
+            };
+        }
+    });
+}
+
 /// [`thread_gone`], for the host: a process Worker whose thread is gone must
 /// not end the process, which runs on in another Worker.
 #[no_mangle]
@@ -10154,7 +10267,9 @@ pub(crate) fn bind_free(i: usize) {
 /// Kept so a host built against the older shape still links; the claim in
 /// `gex_fork_pending` has already cleared the record.
 #[no_mangle]
-pub extern "C" fn gex_fork_taken() {}
+pub extern "C" fn gex_fork_taken() {
+    fork_release();
+}
 
 /// Become the forked child, in a Worker holding a copy of the parent's memory.
 /// The host copied every mapped region in, so image, stack and heap are here;
@@ -13908,7 +14023,12 @@ pub extern "C" fn gex_handoff() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn gex_resume_pc() -> i64 {
-    RESUME.with(|c| c.take()).unwrap_or(0) as i64
+    let pc = RESUME.with(|c| c.take()).unwrap_or(0);
+    // The host enters guest code at it.
+    if pc != 0 {
+        enter_guest();
+    }
+    pc as i64
 }
 
 /// The context to re-enter with, which changes when the scheduler switches
@@ -14823,6 +14943,12 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
 /// preemption is the engine's job now; see the end of this function.)
 #[no_mangle]
 pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
+    leave_guest();
+    safepoint(ctx, pc);
+    enter_guest();
+}
+
+fn safepoint(ctx: i32, pc: i64) {
     fjit::watch_check(pc as u64, "safepoint");
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
@@ -15287,7 +15413,14 @@ pub extern "C" fn gex_my_pid() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
+pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
+    leave_guest();
+    let r = dispatch_miss(ctx, pc);
+    enter_guest();
+    r
+}
+
+fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     // A thread another thread's `execve` took the process from, which got
     // here before a safepoint or syscall stopped it: the code it was running
