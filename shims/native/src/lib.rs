@@ -2722,14 +2722,18 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     Ok(())
 }
 
-/// A child ended by a signal says so, once, as a shell would: a process
-/// gone with no word otherwise (one whose own crash handler does not catch
-/// the signal) leaves only its absence. Not the signals a session ends its
-/// processes with.
+/// A child ended by a crash signal says so, once, as a shell would: one no
+/// crash handler catches otherwise leaves only its absence. A gex limitation
+/// delivered as a signal is said whatever the signal. The rest (a pipeline's
+/// SIGPIPE, the SIGTERM a session ends its processes with) only under
+/// `GEX_LOG_CHILD_SIGNALS=1`. gex itself never ends a process with SIGKILL,
+/// so a SIGKILL is another process's doing and is said.
 fn say_killed(pid: i32, exit: &Exit) {
     let Exit::Signal { signal, pc, detail, internal } = exit else { return };
-    // SIGHUP, SIGINT, SIGTERM.
-    if !internal && matches!(signal, 1 | 2 | 15) {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var("GEX_LOG_CHILD_SIGNALS").is_ok_and(|v| v == "1"));
+    // SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGSYS.
+    if !internal && !all && !matches!(signal, 4 | 5 | 6 | 7 | 8 | 9 | 11 | 31) {
         return;
     }
     let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
