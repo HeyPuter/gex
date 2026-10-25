@@ -540,7 +540,9 @@ function pageGlobals() {
 async function runInSystemWorker(term, opts) {
   // `onFilesLoaded` and `onSystem` are functions, which cannot cross to the
   // Worker (nt.html passes `onSystem`: its every run failed to start here).
-  const { network, onNetEvent, onFilesLoaded, onDesktop, onSystem, transfer, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // So is `glSource` (app.js `mesaSource`), and it names the threaded Mesa's
+  // files besides: the system Worker fetches the single-thread one (st/).
+  const { network, onNetEvent, onFilesLoaded, onDesktop, onSystem, transfer, wl, wlInput, gl, hostX, preModules, closure, glSource, ...rest } = opts;
   // Said once, so a person (and tests/single/run.sh) can tell which build ran.
   term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system
