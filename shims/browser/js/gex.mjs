@@ -3865,8 +3865,11 @@ export class Gex {
       image: (() => {
         const t0 = performance.now();
         // The process's other threads out of guest code while the memory is
-        // copied, so the child's is one moment's (`gex_fork_hold`).
-        e.gex_fork_hold?.();
+        // copied, so the child's is one moment's (`gex_fork_hold`). Not in
+        // the single-thread build: its threads are fibers on this thread, so
+        // none runs during the copy, and its memory has no wait to hold one
+        // with (one parked at a safepoint is not "out", and was waited for).
+        if (!single.on) e.gex_fork_hold?.();
         let img;
         try {
           img = this.#processImage();
