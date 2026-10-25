@@ -2463,6 +2463,13 @@ fn exp_trap_callouts() -> bool {
 }
 pub(crate) static TRAP_CALLOUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The guest stack pointer's byte offset in a thread's context, for JS's
+/// call-out loops: their checks of where a return comes back read it.
+#[no_mangle]
+pub extern "C" fn gex_ctx_sp() -> i32 {
+    gex_abi::ctx::x(sp_index()) as i32
+}
+
 pub(crate) fn sp_index() -> u8 {
     if gex_abi::X86 {
         4

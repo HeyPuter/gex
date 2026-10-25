@@ -301,8 +301,10 @@ const DENSE_FIRST_TABLE = 4;
 const TABLE_STEP = 1 << 20;
 /** `gex_abi::ctx::LAST_TARGET`. */
 const CTX_LAST_TARGET = 44 * 8;
-/** `gex_abi::ctx::PC`, and x86's `rsp` (`ctx::x(4)`). */
+/** `gex_abi::ctx::PC`. */
 const CTX_PC = 32 * 8;
+/** x86's `rsp` (`ctx::x(4)`): the stack pointer's place in the context
+ *  where the shim does not say (`gex_ctx_sp`); aarch64's is `ctx::x(31)`. */
 const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
@@ -6049,7 +6051,7 @@ export class Gex {
       // native frame down to the innermost loop, live ones included.
       if (e.gex_nt_native_left?.()) {
         const c = this.#callouts.at(-1);
-        const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_SP, true);
+        const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + this.#ctxSp(), true);
         if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
           err.gexNativeLeft = true;
           throw err;
@@ -7238,7 +7240,7 @@ export class Gex {
   #watchHit(ctx) {
     const dv = new DataView(this.#memory.buffer);
     const target = dv.getBigUint64(ctx + CTX_LAST_TARGET, true);
-    const sp = dv.getBigUint64(ctx + CTX_SP, true);
+    const sp = dv.getBigUint64(ctx + this.#ctxSp(), true);
     let i = -1;
     // Only a call-out with no NT callback nested inside it: an outer one's
     // return reached from inside a callback is not that call-out's (its
@@ -7549,7 +7551,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -7611,7 +7613,7 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
-          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
           // Native Wine's return pad, reached with nobody's watch or miss
           // taking it (cgen.rs `native_return_stray`): the guest went on
           // past this call-out to a native caller's return (an exception
@@ -7652,12 +7654,20 @@ export class Gex {
       e.gex_callout_unwind?.(me);
       if (globalThis.GEX_CALLOUT_TRACE) {
         const dv = new DataView(this.#memory.buffer);
-        console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + CTX_SP, true).toString(16)} want ${c.spWant.toString(16)}`);
+        console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + this.#ctxSp(), true).toString(16)} want ${c.spWant.toString(16)}`);
       }
     }
   }
 
   #calloutsMade = 0;
+
+  /** The guest stack pointer's byte offset in a thread's context, which
+   *  differs by guest architecture. */
+  #ctxSpAt = -1;
+  #ctxSp() {
+    if (this.#ctxSpAt < 0) this.#ctxSpAt = this.#shim.exports.gex_ctx_sp?.() ?? CTX_SP;
+    return this.#ctxSpAt;
+  }
 
   /**
    * A guest fault the shim staged (`gex_fault_take`: a W3 process's branch
@@ -7721,11 +7731,11 @@ export class Gex {
     // its low 32 bits put the hook's frames, and the exception record it
     // writes, over whatever lives there, the runtime's own heap included.
     if (typeof cur === 'bigint') {
-      const rsp = this.#dv().getBigUint64(ctx + CTX_SP, true);
+      const rsp = this.#dv().getBigUint64(ctx + this.#ctxSp(), true);
       const low = cur !== 0n && cur < rsp ? cur : rsp;
       spG.value = (low - 4096n) & ~15n;
     } else {
-      const esp = this.#dv().getUint32(ctx + CTX_SP, true);
+      const esp = this.#dv().getUint32(ctx + this.#ctxSp(), true);
       const c32 = Number(cur) >>> 0;
       // 0: the program has not set it yet, as for an i64 one.
       const low = c32 !== 0 && c32 < esp ? c32 : esp;
