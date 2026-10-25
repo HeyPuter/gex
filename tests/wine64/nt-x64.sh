@@ -38,6 +38,8 @@
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
 # The authattrs case: crypt32 verifies a signature over authenticated
 # attributes as encoded, not in DER order (authattrs.c).
+# The seqrace case: win32u's session reads against another thread's writes
+# (seqrace.c).
 # The qpcmono case: the performance counter, monotonic across the PE and
 # Unix sides (qpcmono.c).
 # The dwrite case: DirectWrite's glyph bounds, alpha texture and outline
@@ -425,6 +427,24 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/qpcmono.exe" "$here/qpcmono.c"; then
 else
 	case " ${CASES:-qpcmono} " in *" qpcmono "*)
 		fail=$((fail + 1)); echo "FAIL x64/qpcmono ($tag): x86_64-w64-mingw32-gcc" ;; esac
+fi
+# win32u's session reads while another thread writes the object (seqrace.c):
+# a window's extra bytes, a queue's posted messages (GetQueueStatus, an empty
+# PeekMessage) and two attached threads' key state, never stale or torn.
+if x86_64-w64-mingw32-gcc -O1 -o "$w/seqrace.exe" "$here/seqrace.c"; then
+	# 2000 writes a case on the page and without the door, where every read
+	# is a server request; 20000 otherwise.
+	sw=20000; { [ -n "$page" ] || [ "$door" = 0 ]; } && sw=2000
+	# SP page: the queue and input cases only (mask 6). Known bug, open: in
+	# SP a process that kept a window for a few seconds (no other threads
+	# needed) prints its last line and then never exits; base Wine (1b13)
+	# hangs the same way. A window made and destroyed at once, or 15 s with
+	# no window, exits.
+	sm=7; [ "${page:-}" = sp ] && sm=6
+	check seqrace 0 "$allok" "$w/seqrace.exe" $sw $sm
+else
+	case " ${CASES:-seqrace} " in *" seqrace "*)
+		fail=$((fail + 1)); echo "FAIL x64/seqrace ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # A skeleton's view unmapped and its addresses reused for the program's own
 # code (stalebind.c): the native bindings must not outlive the view. Only

@@ -417,8 +417,25 @@ pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u3
     let n = size.min(len - off) as usize;
     let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let from = (base + off) as usize;
+    if let Some(us) = session_copy_delay() {
+        // GEX_SESSION_COPY_DELAY_US (debug): every 8th copy of a thread holds
+        // the bytes it read that long before writing them, as a copy whose
+        // thread is preempted midway would (tests/wine64/seqrace.c)
+        thread_local!(static COPIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        if COPIES.with(|c| { c.set(c.get().wrapping_add(1)); c.get() % 8 == 0 }) {
+            let v = s.mem.bytes()[from..from + n].to_vec();
+            std::thread::sleep(std::time::Duration::from_micros(us));
+            cm.bytes()[dst as usize..dst as usize + n].copy_from_slice(&v);
+            return Ok(n as i32);
+        }
+    }
     cm.bytes()[dst as usize..dst as usize + n].copy_from_slice(&s.mem.bytes()[from..from + n]);
     Ok(n as i32)
+}
+
+fn session_copy_delay() -> Option<u64> {
+    static D: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("GEX_SESSION_COPY_DELAY_US").ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0))
 }
 
 /// `gex.usd_copy(dst, size)` / `gex.usd_publish(src, size)`: the server's
