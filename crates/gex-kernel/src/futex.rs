@@ -82,6 +82,31 @@ impl Parked {
     pub fn woken(&self) -> bool {
         *self.queue.generation.lock().unwrap() != self.at
     }
+
+    /// Block until something wakes this address after the park, for up to
+    /// `timeout`, while the word (`read`, under the queue's lock) still
+    /// holds `expected`: `Ok` once woken, `EAGAIN` when the word changed
+    /// with no wake, `ETIMEDOUT` on expiry. Called again after a timeout it
+    /// still counts from the park, so a waiter sleeping in slices loses no
+    /// wake that lands between two of them (it would read the changed word
+    /// and say `EAGAIN` where it was woken).
+    pub fn wait(&self, expected: u32, timeout: Duration, read: &dyn Fn() -> Option<u32>) -> Result<(), Errno> {
+        let gen = self.queue.generation.lock().unwrap();
+        if *gen != self.at {
+            return Ok(());
+        }
+        match read() {
+            None => return Err(Errno::EFAULT),
+            Some(v) if v != expected => return Err(Errno::EAGAIN),
+            _ => {}
+        }
+        let (gen, _) = self.queue.ready.wait_timeout_while(gen, timeout, |g| *g == self.at).unwrap();
+        if *gen != self.at {
+            Ok(())
+        } else {
+            Err(Errno::ETIMEDOUT)
+        }
+    }
 }
 
 /// How many shards a table's queues are split over: a wait and a wake on
@@ -324,6 +349,24 @@ mod tests {
         t.gc();
         t.wake(0x1000, 1);
         assert!(p.woken());
+    }
+
+    /// A wake that lands while a parked waiter is between two of its
+    /// timed slices still wakes it: the next slice says woken, not the
+    /// changed word's `EAGAIN`.
+    #[test]
+    fn a_wake_between_slices_is_not_lost() {
+        let t = FutexTable::new();
+        let word = AtomicU32::new(0);
+        let read = || Some(word.load(Ordering::SeqCst));
+        let p = t.park(0x1000);
+        assert_eq!(p.wait(0, Duration::from_millis(1), &read), Err(Errno::ETIMEDOUT));
+        word.store(1, Ordering::SeqCst);
+        t.wake(0x1000, 1);
+        assert_eq!(p.wait(0, Duration::from_millis(1), &read), Ok(()));
+        // Changed with no wake: EAGAIN.
+        let q = t.park(0x1000);
+        assert_eq!(q.wait(0, Duration::from_millis(1), &read), Err(Errno::EAGAIN));
     }
 
     #[test]
