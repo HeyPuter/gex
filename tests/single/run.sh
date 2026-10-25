@@ -6,6 +6,8 @@
 #     leg) served without COOP/COEP. That page has no SharedArrayBuffer, so it
 #     must run the single build. Each demo must pass, and the terminal must
 #     say it was the single build, so a silent fallback cannot pass.
+#  3. tests/single/app-gl.mjs: GL through app.js (nt.html, single=1), which
+#     the demo page does not use; its Mesa is web/public/gex/st/.
 #
 #   tests/single/run.sh [gexc]          # demos: SP_DEMOS (default busybox native-debian gears)
 #
@@ -32,4 +34,11 @@ for d in ${SP_DEMOS:-busybox native-debian gears}; do
 		fail=1
 	fi
 done
+(cd "$root" && node tests/single/app-gl.mjs) > "$out/app-gl.txt" 2>&1; rc=$?
+if [ $rc = 0 ]; then echo "ok   single-page app-gl"
+else
+	echo "FAIL single-page app-gl (rc=$rc; $out/app-gl.txt)"
+	grep -a '^FAIL' "$out/app-gl.txt" | head -3
+	fail=1
+fi
 exit $fail
