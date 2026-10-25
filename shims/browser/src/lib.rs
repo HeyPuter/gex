@@ -9992,26 +9992,47 @@ thread_local! {
 /// from different moments: libc's lists of threads and stacks as no thread
 /// ever left them, which the child walks after fork. Each other thread is
 /// told to hold and is waited for until it is out of guest code (it parks
-/// at its return to it) or parked at the hold; one that never gets there is
-/// given up on after `EXEC_WAIT_MAX_NS`. [`gex_fork_taken`] lets them go.
+/// at its return to it) or parked at the hold. One running guest code is
+/// brought to its next back-edge's safepoint, as a signal for it is: its
+/// safepoint counter is run out. One that never gets there (lost in a host
+/// call) is given up on after `EXEC_WAIT_MAX_NS`, and said so: that child's
+/// memory may be torn. [`gex_fork_taken`] lets them go.
 #[no_mangle]
 pub extern "C" fn gex_fork_hold() {
     use std::sync::atomic::Ordering::SeqCst;
     let me = cur();
-    let cells: Vec<Arc<ThreadCell>> =
-        with_exec_lock(|h| h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| t.state_arc()).collect());
-    for c in &cells {
+    let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {
+        h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| (t.state_arc(), t.ctx_addr())).collect()
+    });
+    let mem = guest_bytes();
+    for (c, at) in &cells {
         c.hold.store(1, SeqCst);
+        // Run the counter out. A store of the thread's own countdown racing
+        // this one puts it back at most `SAFEPOINT_INTERVAL` back-edges away.
+        let at = (*at as usize).wrapping_add(ctx::SAFEPOINT_COUNTER);
+        if let Some(w) = mem.get_mut(at..at + 4) {
+            // SAFETY: an aligned word of the guest's context, in linear memory.
+            unsafe { (*(w.as_mut_ptr() as *const std::sync::atomic::AtomicI32)).store(0, SeqCst) };
+        }
     }
+    let stopped = |c: &ThreadCell| c.out.load(SeqCst) || c.held.load(SeqCst) || c.halted.load(SeqCst);
     let until = now_ns() + EXEC_WAIT_MAX_NS;
     let nap = std::sync::atomic::AtomicI32::new(0);
-    while cells.iter().any(|c| !c.out.load(SeqCst) && !c.held.load(SeqCst) && !c.halted.load(SeqCst)) && now_ns() < until {
+    while cells.iter().any(|(c, _)| !stopped(c)) && now_ns() < until {
         #[cfg(feature = "shared-memory")]
         unsafe {
             warch::memory_atomic_wait32(nap.as_ptr(), 0, 50_000)
         };
     }
-    HOLDING.with(|h| h.borrow_mut().extend(cells));
+    let running = cells.iter().filter(|(c, _)| !stopped(c)).count();
+    if running != 0 {
+        warn_line(&format!(
+            "[gex] pid {}: fork copied memory with {running} thread(s) still running guest code after {} ms; the child's memory may be torn",
+            MY_PID.load(std::sync::atomic::Ordering::Relaxed),
+            EXEC_WAIT_MAX_NS / 1_000_000
+        ));
+    }
+    HOLDING.with(|h| h.borrow_mut().extend(cells.into_iter().map(|(c, _)| c)));
 }
 
 /// The memory for the fork is copied: the threads [`gex_fork_hold`] held go
