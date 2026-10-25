@@ -113,8 +113,10 @@ ALIASES="$HERE/gl-aliases-generated.inc"
     'static const char *const gexgl_claimable_extensions[] = {0};' > "$INCLUDE"
 [ -f "$ALIASES" ] || : > "$ALIASES"
 link_guest_gl() {
-    $CC -shared -fPIC -O2 -Wall -o "$OUT/libGLESv2.so.2" \
-        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl -lm
+    # -fno-math-errno makes sqrtf one instruction rather than a libm call:
+    # the library needs nothing but libc.
+    $CC -shared -fPIC -O2 -Wall -fno-math-errno -o "$OUT/libGLESv2.so.2" \
+        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl
 }
 link_guest_gl
 if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \
