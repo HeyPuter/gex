@@ -36,6 +36,6 @@ guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
     Generated from the Khronos OpenGL API registry (gl.xml), Copyright
     The Khronos Group Inc. Apache-2.0.
 
-web/tint/dawn-tint-emscripten.patch, tools/unity-dotnet/mono/patches/
-    Changes to Dawn/Tint and .NET's Mono runtime. Each
-    patch is under the licence of the project it applies to.
+web/tint/dawn-tint-emscripten.patch
+    Changes to Dawn/Tint, under the licence of the project it applies
+    to.

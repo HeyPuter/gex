@@ -1,14 +1,15 @@
 #!/bin/bash
 # Build upstream Mono as a gex stateful provider.
 #
-# The runtime is r58Playz/dotnet-runtime, branch wasm-jspi-jit-10.0.3 (dotnet/runtime v10.0.3 plus
-# a runtime wasm JIT for Mono), at the commit below, with patches/ applied. Its CoreLib differs
-# from upstream's (Reflection.Emit), so CoreLib is built from the same tree.
+# The runtime is gex's fork of dotnet/runtime (runtime.pin: its repository and commit): v10.0.3,
+# r58Playz/dotnet-runtime's runtime wasm JIT for Mono, and gex's changes on branch gex. Its CoreLib
+# differs from upstream's (Reflection.Emit), so CoreLib is built from the same tree.
+# MONO_REPO overrides the pinned repository (a URL or a local clone); MONO_COMMIT the commit.
 #
 #   build.sh OUT [step...]
 #
 # Steps (default: src sysroot runtime native corelib provider):
-#   src       clone the fork at COMMIT into OUT/src and apply patches/
+#   src       the fork at MONO_COMMIT in OUT/src
 #   sysroot   the wasm64 musl sysroot (tools/unity-dotnet/sysroot, musl from MUSL_SRC)
 #   runtime   Mono for wasm64 under gex: clang + musl, Linux as far as Mono can tell (HOST_GEX),
 #             interpreter only, coop suspend -> OUT/obj
@@ -27,11 +28,10 @@
 # Builds at nice 19 with JOBS (default 12) jobs.
 set -euo pipefail
 
-FORK=https://github.com/r58Playz/dotnet-runtime.git
-BRANCH=wasm-jspi-jit-10.0.3
-COMMIT=6812ea26ff228b8f4c132a7bad0b6a24c5653c2e
-
 HERE=$(cd "$(dirname "$0")" && pwd)
+pin() { sed -n "s/^$1=//p" "$HERE/runtime.pin"; }
+MONO_REPO=${MONO_REPO:-$(pin MONO_REPO)}
+MONO_COMMIT=${MONO_COMMIT:-$(pin MONO_COMMIT)}
 UD=$(cd "$HERE/.." && pwd)
 OUT=$(realpath -m "$1"); shift
 STEPS=${*:-src sysroot runtime native corelib formatters provider}
@@ -45,13 +45,11 @@ TOOLCHAIN="-DCMAKE_TOOLCHAIN_FILE=$HERE/toolchain-gex-wasm64.cmake -DGEX_SYSROOT
 mkdir -p "$OUT"
 
 step_src() {
-	if [ ! -d "$OUT/src/.git" ]; then
-		git clone -q --branch $BRANCH --shallow-since=2026-09-01 $FORK "$OUT/src"
-	fi
+	[ -n "$MONO_REPO" ] || { echo "build.sh: set MONO_REPO to the dotnet/runtime fork (a URL or a local clone)" >&2; exit 1; }
+	[ -d "$OUT/src/.git" ] || git init -q "$OUT/src"
 	cd "$OUT/src"
-	git checkout -q $COMMIT
-	git checkout -q -- .
-	for p in "$HERE"/patches/*.patch; do git apply "$p"; done
+	git cat-file -e "$MONO_COMMIT^{commit}" 2>/dev/null || git fetch -q --depth 1 "$MONO_REPO" "$MONO_COMMIT"
+	git checkout -q -f "$MONO_COMMIT"
 }
 
 step_sysroot() {
