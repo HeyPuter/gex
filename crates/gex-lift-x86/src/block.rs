@@ -130,6 +130,30 @@ mod tests {
         assert_eq!(strops(&b), 0, "{}", print::block(&b));
     }
 
+    /// SSE is lifted under MXCSR only for a program that asks
+    /// (`gex_ir::mxcsr_exact`): without it, `addps`, `mulsd`, `sqrtps` and
+    /// `cvtpd2ps` are their operations alone, with no `Expr::Mx` and no
+    /// read of MXCSR, as if MXCSR did not exist; with it, each is one.
+    #[test]
+    fn sse_is_under_mxcsr_only_when_asked() {
+        let mxs = |b: &Block| {
+            b.stmts.iter().filter(|s| matches!(s, Stmt::Def { expr: Expr::Mx { .. }, .. })).count()
+        };
+        let reads = |b: &Block| {
+            b.stmts.iter().filter(|s| matches!(s, Stmt::Def { expr: Expr::ReadReg(GuestReg::Mxcsr), .. })).count()
+        };
+        // addps xmm0, xmm1 ; mulsd xmm2, xmm1 ; sqrtps xmm3, xmm1 ; cvtpd2ps xmm4, xmm1 ; ret
+        let code = &[0x0f, 0x58, 0xc1, 0xf2, 0x0f, 0x59, 0xd1, 0x0f, 0x51, 0xd9, 0x66, 0x0f, 0x5a, 0xe1, 0xc3];
+        if !gex_ir::mxcsr_exact() {
+            let b = lift_block(bytes(0x1000, code), 0x1000, BlockLimits::default());
+            assert_eq!((mxs(&b), reads(&b)), (0, 0), "{}", print::block(&b));
+        }
+        gex_ir::set_mxcsr_exact(true);
+        let b = lift_block(bytes(0x1000, code), 0x1000, BlockLimits::default());
+        gex_ir::set_mxcsr_exact(false);
+        assert_eq!(mxs(&b), 4, "{}", print::block(&b));
+    }
+
     /// `fpatan` (d9 f3) is handed to the host rather than raising SIGILL:
     /// i386 musl's `atan2` is this one instruction.
     #[test]

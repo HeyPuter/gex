@@ -59,7 +59,9 @@ fn host_imports(m: &mut Module) -> Imports {
         vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
         vec![ValType::I64],
     ));
-    let t_mx = m.func_type(FuncType::new(vec![p, ValType::I32, ValType::I64, ValType::I64, ValType::I32], vec![ValType::I64]));
+    // The MXCSR import only under `gex_ir::mxcsr_exact` (tier-1's `ModuleBuilder`).
+    let t_mx = gex_ir::mxcsr_exact()
+        .then(|| m.func_type(FuncType::new(vec![p, ValType::I32, ValType::I64, ValType::I64, ValType::I32], vec![ValType::I64])));
     let im = IMPORT_MODULE;
     let out = Imports {
         syscall: m.import_func(im, imports::SYSCALL, t_syscall),
@@ -72,7 +74,7 @@ fn host_imports(m: &mut Module) -> Imports {
         safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
         fma: m.import_func(im, imports::FMA, t_fma),
         x87: m.import_func(im, imports::X87, t_x87),
-        mx: m.import_func(im, imports::MX, t_mx),
+        mx: t_mx.map_or(u32::MAX, |t| m.import_func(im, imports::MX, t)),
         dispatch: m.import_func(gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::DISPATCH_NAME, block_ty),
         block_ty,
     };
@@ -387,11 +389,13 @@ pub fn build_runtime(
     let mut funcs: Vec<Function> = funcs.to_vec();
     loop {
         let loops: Vec<Vec<Loop>> = funcs.iter().map(|f| if outline { cf::outer_loops(f) } else { Vec::new() }).collect();
-        // Imports: tier-1's eleven host functions, in `host_imports`' order.
-        const N_IMPORTS: u32 = 11;
+        // Imports: tier-1's host functions, in `host_imports`' order: ten,
+        // and the MXCSR one under `gex_ir::mxcsr_exact`.
+        let mx_on = gex_ir::mxcsr_exact();
+        let n_imports: u32 = 10 + mx_on as u32;
         let (block_ty, t_syscall, t_miss, t_pc_i32, t_sysreg_read, t_pc_i32_i64, t_fma, t_x87, body_ty, loop_ty, t_mx) =
             (0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-        let mut next = N_IMPORTS;
+        let mut next = n_imports;
         let mut bodies: HashMap<u64, u32> = HashMap::new();
         let mut lfns: HashMap<(u64, usize), u32> = HashMap::new();
         let mut order: Vec<(u32, u32)> = Vec::new(); // (function index, type)
@@ -419,7 +423,7 @@ pub fn build_runtime(
             safepoint: 7,
             fma: 8,
             x87: 9,
-            mx: 10,
+            mx: if mx_on { 10 } else { u32::MAX },
             block_ty,
             entry_ty: 0,
             blocks: &no_blocks,
@@ -472,7 +476,9 @@ pub fn build_runtime(
         types.ty().function([i32_, i32_, i64_, i32_, i64_, i32_, i32_], [i64_]);
         types.ty().function([i32_, i32_, i32_, i64_], [i32_]);
         types.ty().function([i32_, i32_, i32_, i64_, i64_], [i32_]);
-        types.ty().function([i32_, i32_, i64_, i64_, i32_], [i64_]);
+        if mx_on {
+            types.ty().function([i32_, i32_, i64_, i64_, i32_], [i64_]);
+        }
         m.section(&types);
         let mut imports = ImportSection::new();
         let im = gex_abi::IMPORT_MODULE;
@@ -487,9 +493,11 @@ pub fn build_runtime(
             (imports::SAFEPOINT, t_syscall),
             (imports::FMA, t_fma),
             (imports::X87, t_x87),
-            (imports::MX, t_mx),
         ] {
             imports.import(im, name, EntityType::Function(ty));
+        }
+        if mx_on {
+            imports.import(im, imports::MX, EntityType::Function(t_mx));
         }
         imports.import(
             im,

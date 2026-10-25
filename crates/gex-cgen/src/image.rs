@@ -102,6 +102,9 @@ fn unit_inputs() -> String {
     // The null guard, a debugging opt-in: named only when on, so the
     // units of a build without it keep their keys.
     let base = if gex_emit::tier1::null_guard_on() { format!("{base}:nullguard:{:x}", gex_abi::NULL_GUARD) } else { base };
+    // SSE under MXCSR (`gex_ir::mxcsr_exact`), a per-program opt-in, the
+    // same way: the units with it and without it never mix.
+    let base = if gex_ir::mxcsr_exact() { format!("{base}:mxcsr") } else { base };
     // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {

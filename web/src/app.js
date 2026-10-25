@@ -981,6 +981,10 @@ export function setGlobals(get, b = {}) {
   // natively (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the
   // units are as without it; on, 2-8% slower in tier 1.
   if (get('nullguard') === '1') globalThis.GEX_NULL_GUARD = 1;
+  // mxcsr=1: SSE honours MXCSR's rounding control in every tier
+  // (gex_ir::mxcsr_exact), for a program that needs it. Off, SSE rounds to
+  // nearest, and tier 1 and the units are as without it.
+  if (get('mxcsr') === '1') globalThis.GEX_MXCSR = 1;
   // pinregion=BYTES: address space above the placement window for the
   // project's libraries, each at its build's base (gex_abi::set_pin_region).
   if (get('pinregion')) globalThis.GEX_PIN_REGION = Number(get('pinregion'));

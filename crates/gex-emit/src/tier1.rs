@@ -91,13 +91,6 @@ mod simd {
     pub const I32X4_EXTADD_PAIRWISE_I16X8_S: u32 = 0x7e;
     pub const I32X4_EXTADD_PAIRWISE_I16X8_U: u32 = 0x7f;
     pub const V128_AND: u32 = 0x4e;
-    pub const V128_ANY_TRUE: u32 = 0x53;
-    pub const I32X4_EQ: u32 = 0x37;
-    pub const I32X4_SHR_U: u32 = 0xad;
-    pub const I32X4_SUB: u32 = 0xb1;
-    pub const I64X2_EQ: u32 = 0xd6;
-    pub const I64X2_SHR_U: u32 = 0xcd;
-    pub const I64X2_SUB: u32 = 0xd1;
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
     pub const V128_XOR: u32 = 0x51;
@@ -258,11 +251,13 @@ fn t1_fold() -> bool {
 }
 
 /// The emitter switches that change tier-1's bytes without showing in the
-/// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD):
+/// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD,
+/// GEX_NULL_GUARD, GEX_MXCSR):
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
 pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
+        | (gex_ir::mxcsr_exact() as u8) << 4
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -3144,11 +3139,8 @@ impl<'a> Emitter<'a> {
         self.value_local[idx] = Some(local);
     }
 
-    /// An [`Expr::Mx`]: `e`'s own lowering, kept when `mx` has none of
-    /// [`MX_SPECIAL`]'s bits; and kept as well under FTZ or DAZ alone
-    /// (rounding to nearest) when no float operand or result is a denormal
-    /// or the smallest normal (one a tiny result may have rounded to), as
-    /// then neither flush has anything to do. Otherwise the pure `mx`
+    /// An [`Expr::Mx`]: `e`'s own lowering, kept when `mx`'s rounding
+    /// control ([`MX_SPECIAL`]) is to nearest; otherwise the pure `mx`
     /// import, once for a scalar and once per lane ([`MxPlan`]). Either
     /// way the result is left in one integer-typed local.
     fn emit_mx(&mut self, dst: Value, mx: Value, e: &Expr) {
@@ -3163,26 +3155,6 @@ impl<'a> Emitter<'a> {
         self.push(mx);
         self.f.i32_const(MX_SPECIAL as i32);
         self.f.byte(I32_AND);
-        self.f.if_void();
-        self.push(mx);
-        self.f.i32_const(0x6000);
-        self.f.byte(I32_AND);
-        let w = |t: Ty| if t == Ty::I64 { 8 } else { 4 };
-        let (a, b, in_bytes, out_bytes) = match plan {
-            MxPlan::Scalar { a, b, in_ty, .. } => (a, b, w(in_ty), w(ty)),
-            MxPlan::Lanes { a, b, in_bytes, out_bytes, .. } => (a, b, in_bytes, out_bytes),
-        };
-        let lanes = ty == Ty::V128;
-        if plan.float_operands() {
-            for v in [Some(a), b].into_iter().flatten() {
-                self.push(v);
-                self.emit_tiny_check(lanes, in_bytes);
-                self.f.byte(I32_OR);
-            }
-        }
-        self.f.local_get(res);
-        self.emit_tiny_check(lanes, out_bytes);
-        self.f.byte(I32_OR);
         self.f.if_void();
         // The import's operand: an integer of `in_bytes` (from lane `lane`
         // of a vector), as an i64.
@@ -3239,63 +3211,12 @@ impl<'a> Emitter<'a> {
             }
         }
         self.f.end();
-        self.f.end();
         self.value_ty[idx] = ty;
         if let Some(f) = self.value_fp.get_mut(idx) {
             *f = None;
         }
         self.value_const[idx] = None;
         self.value_local[idx] = Some(res);
-    }
-
-    /// Replace the float bits on the stack (a scalar of `bytes`, or a vector
-    /// of `bytes`-wide lanes) with an i32, nonzero when it (a lane) is a
-    /// denormal or the smallest normal: `(|x| - 1) >> fraction bits == 0`.
-    fn emit_tiny_check(&mut self, lanes: bool, bytes: u32) {
-        use code::*;
-        let frac = if bytes == 8 { 52 } else { 23 };
-        let mut abs = [0xffu8; 16];
-        let mut one = [0u8; 16];
-        for k in 0..16 / bytes as usize {
-            abs[k * bytes as usize + bytes as usize - 1] = 0x7f;
-            one[k * bytes as usize] = 1;
-        }
-        match (lanes, bytes) {
-            (false, 8) => {
-                self.f.i64_const(i64::MAX);
-                self.f.byte(I64_AND);
-                self.f.i64_const(1);
-                self.f.byte(I64_SUB);
-                self.f.i64_const(frac);
-                self.f.byte(I64_SHR_U);
-                self.f.byte(I64_EQZ);
-            }
-            (false, _) => {
-                self.f.i32_const(i32::MAX);
-                self.f.byte(I32_AND);
-                self.f.i32_const(1);
-                self.f.byte(I32_SUB);
-                self.f.i32_const(frac as i32);
-                self.f.byte(I32_SHR_U);
-                self.f.byte(I32_EQZ);
-            }
-            (true, _) => {
-                let (sub, shr, eq) = if bytes == 8 {
-                    (simd::I64X2_SUB, simd::I64X2_SHR_U, simd::I64X2_EQ)
-                } else {
-                    (simd::I32X4_SUB, simd::I32X4_SHR_U, simd::I32X4_EQ)
-                };
-                self.f.v128_const(&abs);
-                self.f.simd(simd::V128_AND);
-                self.f.v128_const(&one);
-                self.f.simd(sub);
-                self.f.i32_const(frac as i32);
-                self.f.simd(shr);
-                self.f.v128_const(&[0; 16]);
-                self.f.simd(eq);
-                self.f.simd(simd::V128_ANY_TRUE);
-            }
-        }
     }
 
     /// Reinterpret the integer bit pattern on top of the stack as a float.

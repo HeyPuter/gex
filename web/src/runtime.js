@@ -134,7 +134,8 @@ function xcacheName() {
     // `tso=arm` names one switch value for two flavours: the host's is named too.
     + (flag('tso') === 'arm' && tso() ? '&tsohost=1' : '')
     // Named only when on: the cache of a page without it keeps its name.
-    + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '');
+    + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '')
+    + (globalThis.GEX_MXCSR ? '&mxcsr=1' : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
   return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
 }
@@ -1106,6 +1107,8 @@ async function runProgramHere(
       w3Split: globalThis.GEX_W3_SPLIT || undefined,
       // `?nullguard=1`: the null guard, a debugging opt-in (gex_abi::null_guard).
       nullGuard: globalThis.GEX_NULL_GUARD || undefined,
+      // `?mxcsr=1`: SSE under MXCSR, a per-program opt-in (gex_ir::mxcsr_exact).
+      mxcsr: globalThis.GEX_MXCSR || undefined,
       // `?pinregion=BYTES`: an ejected project's libraries' region (gex_abi::set_pin_region).
       pinRegion: globalThis.GEX_PIN_REGION || undefined,
       // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).

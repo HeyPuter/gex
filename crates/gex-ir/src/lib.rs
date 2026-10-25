@@ -39,6 +39,25 @@ pub fn take_kuser_folds() -> u64 {
     KUSER_FOLDS.with(|c| c.replace(0))
 }
 
+static MXCSR_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SSE under the guest's MXCSR rounding control, a per-program opt-in: set
+/// before anything is translated (the page's `?mxcsr=1`, GEX_MXCSR=1
+/// natively). On, an SSE operation MXCSR rounds is lifted as [`Expr::Mx`]
+/// and rounds as the rounding control says in every tier. Off, it is the
+/// operation alone, rounded to nearest, and every tier's output and every
+/// key are as if MXCSR did not exist. FTZ and DAZ are honoured in neither.
+pub fn set_mxcsr_exact(on: bool) {
+    MXCSR_EXACT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether SSE is lifted under MXCSR ([`set_mxcsr_exact`]).
+pub fn mxcsr_exact() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_MXCSR").is_some_and(|v| v != "0"))
+        || MXCSR_EXACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Value(pub u32);
 
@@ -473,11 +492,11 @@ pub enum Expr {
         a: Value,
     },
     /// `e` computed as x86's SSE computes it under the `I32` MXCSR value
-    /// `mx`: rounded by its rounding control (bits 13-14) instead of to
-    /// nearest, a denormal operand read as a zero of its sign under DAZ
-    /// (bit 6), a denormal result written as one under FTZ (bit 15). With
-    /// none of those bits set ([`MX_SPECIAL`]) it is `e` exactly, so a
-    /// backend lowers it as `e` behind that one test.
+    /// `mx`'s rounding control (bits 13-14, [`MX_SPECIAL`]) instead of to
+    /// nearest. FTZ and DAZ are not honoured: denormals are kept, as wasm
+    /// keeps them. With the rounding to nearest it is `e` exactly, so a
+    /// backend lowers it as `e` behind that one test (for a run of them,
+    /// one test for the run).
     ///
     /// `e` is one of [`Expr::mx_able`]'s: a float add, subtract, multiply,
     /// divide or square root, a round to nearest (an integer value, the
@@ -487,8 +506,9 @@ pub enum Expr {
     Mx { mx: Value, e: Box<Expr> },
 }
 
-/// The MXCSR bits [`Expr::Mx`] honours: rounding control, FTZ, DAZ.
-pub const MX_SPECIAL: u32 = 0xe040;
+/// The MXCSR bits [`Expr::Mx`] honours: the rounding control. The exact
+/// import (`gex_abi::imports::MX`) is given only these.
+pub const MX_SPECIAL: u32 = 0x6000;
 
 /// How an [`Expr::Mx`]'s operation is computed off its fast path: by
 /// `gex_f80::sse::op` with `code`, on raw bits, once for a scalar or once
@@ -566,13 +586,6 @@ impl MxPlan {
             Expr::VCvt { a, .. } => MxPlan::Lanes { code: FROM_I32, a, b: None, n: 4, in_bytes: 4, out_bytes: 4 },
             _ => panic!("MxPlan::of: {e:?} is not an operation MXCSR rounds"),
         }
-    }
-
-    /// The operands are floats (DAZ reads them), not a conversion's integers.
-    pub fn float_operands(&self) -> bool {
-        use gex_f80::sse::*;
-        let (MxPlan::Scalar { code, .. } | MxPlan::Lanes { code, .. }) = *self;
-        !matches!(code & 0xf, FROM_I32 | FROM_I64)
     }
 }
 

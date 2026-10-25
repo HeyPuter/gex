@@ -257,6 +257,26 @@ pub(crate) struct Emitter<'a> {
     /// (`GuestReg::CtxAddr`: the x87 stack, `EFLAGS_SYS`), whose accesses
     /// the null guard leaves out: the context is below it.
     value_ctx: Vec<bool>,
+    /// How an `Expr::Mx` is lowered here ([`Emitter::stmts`]).
+    mx_mode: MxMode,
+    /// Values are declared before their definitions: a definition assigns.
+    predeclared: bool,
+}
+
+/// The most `Expr::Mx`s under one test of the rounding control
+/// ([`Emitter::stmts`]).
+const MX_RUN: usize = 32;
+
+/// How [`Emitter::def`] lowers an `Expr::Mx`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum MxMode {
+    /// The operation's own C, then the exact call when the rounding control
+    /// is not to nearest: one test per operation.
+    Each,
+    /// The operation's own C: the run's test found rounding to nearest.
+    Own,
+    /// The exact call: the run's test found another rounding.
+    Exact,
 }
 
 impl<'a> Emitter<'a> {
@@ -280,6 +300,8 @@ impl<'a> Emitter<'a> {
             value_zext: vec![false; n],
             value_disp: vec![None; n],
             value_ctx: vec![false; n],
+            mx_mode: MxMode::Each,
+            predeclared: false,
         }
     }
 
@@ -322,9 +344,7 @@ impl<'a> Emitter<'a> {
         if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
             self.target_check();
         }
-        for s in &block.stmts {
-            self.stmt(s)?;
-        }
+        self.stmts(&block.stmts, |e, k| e.stmt(&block.stmts[k]))?;
         self.terminator()
     }
 
@@ -1246,7 +1266,7 @@ impl<'a> Emitter<'a> {
                     } else {
                         format!("gex_fmaf({a}, {b}, {c})")
                     };
-                    self.line(format!("const {} {d} = ({}){e};", cty(*ty), cty(*ty)));
+                    self.line(format!("{} = ({}){e};", self.decl(*ty, &d), cty(*ty)));
                     return Ok(());
                 }
             }
@@ -1254,52 +1274,98 @@ impl<'a> Emitter<'a> {
             if func.clobbers_guest_state() {
                 self.flush();
             }
-            self.line(format!("const {} {d} = ({}){call};", cty(*ty), cty(*ty)));
+            self.line(format!("{} = ({}){call};", self.decl(*ty, &d), cty(*ty)));
             if func.clobbers_guest_state() {
                 self.invalidate();
             }
             return Ok(());
         }
         if let Expr::Mx { mx, e } = expr {
-            // `e`'s own C, then the exact import when the bits ask for it:
-            // a rounding other than to nearest, or FTZ or DAZ with a float
-            // operand or the result denormal or the smallest normal (see
-            // `runtime/mx.h`).
-            let fast = self.rhs(idx, e)?;
-            let m = self.v(*mx);
-            let plan = MxPlan::of(e);
-            let w = |t: Ty| if t == Ty::I64 { 8 } else { 4 };
-            let (a, b, in_bytes, out_bytes) = match plan {
-                MxPlan::Scalar { a, b, in_ty, .. } => (a, b, w(in_ty), w(ty)),
-                MxPlan::Lanes { a, b, in_bytes, out_bytes, .. } => (a, b, in_bytes, out_bytes),
-            };
-            let tiny = |v: String, bytes: u32| {
-                if ty == Ty::V128 {
-                    format!("gex_mx_tiny_v({v}, {bytes})")
-                } else if bytes == 8 {
-                    format!("gex_mx_tiny64((uint64_t){v})")
-                } else {
-                    format!("gex_mx_tiny32((uint32_t){v})")
+            match self.mx_mode {
+                MxMode::Own => {
+                    let own = self.rhs(idx, e)?;
+                    self.line(format!("{} = {own};", self.decl(ty, &d)));
                 }
-            };
-            let mut redo = format!("((uint32_t){m} & 0x6000u) != 0");
-            if plan.float_operands() {
-                for v in [Some(a), b].into_iter().flatten() {
-                    redo += &format!(" || {}", tiny(self.v(v), in_bytes));
+                MxMode::Exact => {
+                    let exact = self.mx_exact(*mx, e);
+                    self.line(format!("{} = {exact};", self.decl(ty, &d)));
+                }
+                MxMode::Each => {
+                    let own = self.rhs(idx, e)?;
+                    let m = self.v(*mx);
+                    let exact = self.mx_exact(*mx, e);
+                    let decl = if self.predeclared { String::new() } else { format!("{} ", cty(ty)) };
+                    self.line(format!("{decl}{d} = {own};"));
+                    self.line(format!(
+                        "if (__builtin_expect(((uint32_t){m} & 0x{:x}u) != 0, 0)) {d} = {exact};",
+                        MX_SPECIAL
+                    ));
                 }
             }
-            redo += &format!(" || {}", tiny(d.clone(), out_bytes));
-            let slow = self.mx_slow(*mx, e);
-            self.line(format!("{} {d} = {fast};", cty(ty)));
-            self.line(format!(
-                "if (__builtin_expect(((uint32_t){m} & 0x{:x}u) != 0, 0) && ({redo})) {d} = {slow};",
-                MX_SPECIAL
-            ));
             return Ok(());
         }
         let rhs = self.rhs(idx, expr)?;
-        self.line(format!("const {} {d} = {rhs};", cty(ty)));
+        self.line(format!("{} = {rhs};", self.decl(ty, &d)));
         Ok(())
+    }
+
+    /// The left of a definition of `d`: a declaration, or the name alone
+    /// when it was declared ahead ([`Emitter::stmts`]).
+    fn decl(&self, ty: Ty, d: &str) -> String {
+        if self.predeclared {
+            d.to_string()
+        } else {
+            format!("const {} {d}", cty(ty))
+        }
+    }
+
+    /// A block's statements, each through `one`. Its `Expr::Mx`s go in runs
+    /// of up to [`MX_RUN`], each from its first to its last: a run tests
+    /// MXCSR's rounding control once and is emitted twice, with the
+    /// operations' own C (taken when it is to nearest) and with their exact
+    /// calls. A run's values are declared ahead, so both copies define them
+    /// for what follows (the registers' locals are the function's). Short
+    /// runs keep clang's work per basic block near what the block alone
+    /// costs. A block that writes MXCSR or makes a host call (which may
+    /// change it) tests each operation instead.
+    pub(crate) fn stmts(&mut self, stmts: &[Stmt], mut one: impl FnMut(&mut Self, usize) -> Result<()>) -> Result<()> {
+        let mxs: Vec<usize> =
+            stmts.iter().enumerate().filter(|(_, s)| matches!(s, Stmt::Def { expr: Expr::Mx { .. }, .. })).map(|(k, _)| k).collect();
+        let once = !mxs.is_empty()
+            && !stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::WriteReg { reg: GuestReg::Mxcsr, .. } | Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. }
+                )
+            });
+        if !once {
+            return (0..stmts.len()).try_for_each(|k| one(self, k));
+        }
+        let m = self.reg(GuestReg::Mxcsr);
+        let mut next = 0;
+        for chunk in mxs.chunks(MX_RUN) {
+            let run = chunk[0]..chunk[chunk.len() - 1] + 1;
+            (next..run.start).try_for_each(|k| one(self, k))?;
+            for s in &stmts[run.clone()] {
+                if let Stmt::Def { dst, expr } = s {
+                    self.line(format!("{} {};", cty(expr.ty()), self.v(*dst)));
+                }
+            }
+            let regs = self.regs.clone();
+            self.predeclared = true;
+            self.line(format!("if (__builtin_expect(((uint32_t){m} & 0x{:x}u) != 0, 0)) {{", MX_SPECIAL));
+            self.mx_mode = MxMode::Exact;
+            run.clone().try_for_each(|k| one(self, k))?;
+            self.line("} else {");
+            self.regs = regs;
+            self.mx_mode = MxMode::Own;
+            run.clone().try_for_each(|k| one(self, k))?;
+            self.line("}");
+            self.mx_mode = MxMode::Each;
+            self.predeclared = false;
+            next = run.end;
+        }
+        (next..stmts.len()).try_for_each(|k| one(self, k))
     }
 
     /// The C expression of `expr`, defining value `idx`.
@@ -1703,13 +1769,14 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// [`Expr::Mx`]'s slow path: the `mx` import through `runtime/mx.h`.
-    fn mx_slow(&self, mx: Value, e: &Expr) -> String {
+    /// [`Expr::Mx`] computed exactly: `gex_mx_s` or `gex_mx_v`
+    /// (`runtime/mx.h`).
+    fn mx_exact(&self, mx: Value, e: &Expr) -> String {
         let m = self.v(mx);
         match MxPlan::of(e) {
             MxPlan::Scalar { code, a, b, .. } => {
                 let b = b.map_or("0".to_string(), |b| format!("(uint64_t){}", self.v(b)));
-                let r = format!("gex_mx_scalar(ctx, {code}, (uint64_t){}, {b}, (uint32_t){m})", self.v(a));
+                let r = format!("gex_mx_s(ctx, {code}, (uint64_t){}, {b}, (uint32_t){m})", self.v(a));
                 if e.ty() == Ty::I32 {
                     format!("(uint32_t){r}")
                 } else {
@@ -1717,8 +1784,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             MxPlan::Lanes { code, a, b, n, in_bytes, out_bytes } => {
+                let f = n | if in_bytes == 8 { 16 } else { 0 } | if out_bytes == 8 { 32 } else { 0 };
                 let b = b.map_or("wasm_i64x2_const(0, 0)".to_string(), |b| self.v(b));
-                format!("gex_mx_lanes(ctx, {code}, {}, {b}, {n}, {in_bytes}, {out_bytes}, (uint32_t){m})", self.v(a))
+                format!("gex_mx_v(ctx, {code}, {}, {b}, {f}u, (uint32_t){m})", self.v(a))
             }
         }
     }

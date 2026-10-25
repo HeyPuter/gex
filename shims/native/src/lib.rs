@@ -5001,9 +5001,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         })()) },
     )?;
 
-    // An SSE operation under a non-default MXCSR (`gex_abi::imports::MX`).
+    // An SSE operation under a rounding control other than to nearest
+    // (`gex_abi::imports::MX`); MXCSR's other bits ignored.
     linker.func_wrap(m, imports::MX, |_ctx: i32, code: i32, a: i64, b: i64, mx: i32| -> i64 {
-        gex_kernel::f80::sse::op(code as u32, a as u64, b as u64, mx as u32) as i64
+        gex_kernel::f80::sse::op(code as u32, a as u64, b as u64, mx as u32 & gex_ir::MX_SPECIAL) as i64
     })?;
 
     // The counting flavor's table-call note (`gex_cgen::image::icall_count`):
