@@ -2679,7 +2679,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
-                Ok(exit) => (exit.code(), exit.wait_status()),
+                Ok(exit) => {
+                    say_killed(pid, &exit);
+                    (exit.code(), exit.wait_status())
+                }
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
                     // A process that dies takes its threads and descriptors
@@ -2717,6 +2720,25 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         })
         .context("spawning a child process")?;
     Ok(())
+}
+
+/// A child ended by a crash signal says so, once, as a shell would: one no
+/// crash handler catches otherwise leaves only its absence. A gex limitation
+/// delivered as a signal is said whatever the signal. The rest (a pipeline's
+/// SIGPIPE, the SIGTERM a session ends its processes with) only under
+/// `GEX_LOG_CHILD_SIGNALS=1`. gex itself never ends a process with SIGKILL,
+/// so a SIGKILL is another process's doing and is said.
+fn say_killed(pid: i32, exit: &Exit) {
+    let Exit::Signal { signal, pc, detail, internal } = exit else { return };
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var("GEX_LOG_CHILD_SIGNALS").is_ok_and(|v| v == "1"));
+    // SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGSYS.
+    if !internal && !all && !matches!(signal, 4 | 5 | 6 | 7 | 8 | 9 | 11 | 31) {
+        return;
+    }
+    let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
+    let whose = if *internal { " (gex cannot run it)" } else { "" };
+    eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{whose}{detail}");
 }
 
 /// Run a child process to completion in this host thread.
