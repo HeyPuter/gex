@@ -13956,6 +13956,13 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
     }
 }
 
+/// An SSE operation under a non-default MXCSR (`gex_abi::imports::MX`):
+/// exact, pure.
+#[no_mangle]
+pub extern "C" fn gex_mx(_ctx: i32, code: i32, a: i64, b: i64, mx: i32) -> i64 {
+    gex_kernel::f80::sse::op(code as u32, a as u64, b as u64, mx as u32) as i64
+}
+
 /// An x87 operation the inline fast path left to the host (see
 /// `gex_abi::imports::X87`): the first result returned, an extended
 /// result's sign and exponent left at `ctx::X87_TMP + 8` and the

@@ -2267,6 +2267,7 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      mx: e.gex_mx,
       // A counting unit's table calls (cgen.rs `gex_icall_note`).
       icall_note: e.gex_icall_note,
     };
@@ -2479,6 +2480,7 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      mx: e.gex_mx,
       // A counting unit's table calls (cgen.rs `gex_icall_note`).
       icall_note: e.gex_icall_note,
     };

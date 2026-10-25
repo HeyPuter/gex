@@ -39,6 +39,7 @@ struct Imports {
     safepoint: u32,
     fma: u32,
     x87: u32,
+    mx: u32,
     dispatch: u32,
     block_ty: u32,
 }
@@ -58,6 +59,7 @@ fn host_imports(m: &mut Module) -> Imports {
         vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
         vec![ValType::I64],
     ));
+    let t_mx = m.func_type(FuncType::new(vec![p, ValType::I32, ValType::I64, ValType::I64, ValType::I32], vec![ValType::I64]));
     let im = IMPORT_MODULE;
     let out = Imports {
         syscall: m.import_func(im, imports::SYSCALL, t_syscall),
@@ -70,6 +72,7 @@ fn host_imports(m: &mut Module) -> Imports {
         safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
         fma: m.import_func(im, imports::FMA, t_fma),
         x87: m.import_func(im, imports::X87, t_x87),
+        mx: m.import_func(im, imports::MX, t_mx),
         dispatch: m.import_func(gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::DISPATCH_NAME, block_ty),
         block_ty,
     };
@@ -124,6 +127,7 @@ pub fn build_module(
         safepoint: im.safepoint,
         fma: im.fma,
         x87: im.x87,
+        mx: im.mx,
         block_ty: im.block_ty,
         entry_ty: 0,
         blocks: &no_blocks,
@@ -383,10 +387,10 @@ pub fn build_runtime(
     let mut funcs: Vec<Function> = funcs.to_vec();
     loop {
         let loops: Vec<Vec<Loop>> = funcs.iter().map(|f| if outline { cf::outer_loops(f) } else { Vec::new() }).collect();
-        // Imports: tier-1's ten host functions, in `host_imports`' order.
-        const N_IMPORTS: u32 = 10;
-        let (block_ty, t_syscall, t_miss, t_pc_i32, t_sysreg_read, t_pc_i32_i64, t_fma, t_x87, body_ty, loop_ty) =
-            (0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        // Imports: tier-1's eleven host functions, in `host_imports`' order.
+        const N_IMPORTS: u32 = 11;
+        let (block_ty, t_syscall, t_miss, t_pc_i32, t_sysreg_read, t_pc_i32_i64, t_fma, t_x87, body_ty, loop_ty, t_mx) =
+            (0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
         let mut next = N_IMPORTS;
         let mut bodies: HashMap<u64, u32> = HashMap::new();
         let mut lfns: HashMap<(u64, usize), u32> = HashMap::new();
@@ -415,6 +419,7 @@ pub fn build_runtime(
             safepoint: 7,
             fma: 8,
             x87: 9,
+            mx: 10,
             block_ty,
             entry_ty: 0,
             blocks: &no_blocks,
@@ -467,6 +472,7 @@ pub fn build_runtime(
         types.ty().function([i32_, i32_, i64_, i32_, i64_, i32_, i32_], [i64_]);
         types.ty().function([i32_, i32_, i32_, i64_], [i32_]);
         types.ty().function([i32_, i32_, i32_, i64_, i64_], [i32_]);
+        types.ty().function([i32_, i32_, i64_, i64_, i32_], [i64_]);
         m.section(&types);
         let mut imports = ImportSection::new();
         let im = gex_abi::IMPORT_MODULE;
@@ -481,6 +487,7 @@ pub fn build_runtime(
             (imports::SAFEPOINT, t_syscall),
             (imports::FMA, t_fma),
             (imports::X87, t_x87),
+            (imports::MX, t_mx),
         ] {
             imports.import(im, name, EntityType::Function(ty));
         }

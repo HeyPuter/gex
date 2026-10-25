@@ -220,7 +220,11 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # sig-pause: pause, sigsuspend, and ppoll, poll, pselect and select on no
 # descriptors block until a second thread's signal ends them with EINTR
 # (i386's pause is a call of its own).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause"}
+# fp-modes: SSE arithmetic, square roots, roundings and conversions under
+# each MXCSR rounding mode with FTZ and DAZ (wasm rounds only to nearest:
+# the other modes take the exact slow path), and x87 arithmetic and stores
+# under each rounding and precision control; under the function JIT too.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -231,7 +235,7 @@ for src in "$HERE"/*.c; do
     # *smc*: self-modifying code, under the function JIT as well (which
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
-    case $name in *smc* | copy-loop | null-access | sig-regs-threads) tiers="t1 fjit" ;; esac
+    case $name in *smc* | copy-loop | null-access | sig-regs-threads | fp-modes) tiers="t1 fjit" ;; esac
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac

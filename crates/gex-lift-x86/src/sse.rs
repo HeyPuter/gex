@@ -134,12 +134,36 @@ impl<'a> Lifter<'a> {
         })
     }
 
+    /// A float lane operation; one MXCSR rounds (arithmetic, see
+    /// [`Self::mx`]) under the guest's MXCSR.
     fn vbin(&mut self, op: VLaneBinOp, lane: VLane, a: Value, b: Value) -> Value {
-        self.b.def(Expr::VLaneBin { op, lane, a, b })
+        self.mx(Expr::VLaneBin { op, lane, a, b })
     }
 
+    /// A lane operation, under MXCSR when it is a square root. (A round to
+    /// nearest is under MXCSR only when the instruction says so:
+    /// [`Self::vun_mx`].)
     fn vun(&mut self, op: VLaneUnOp, lane: VLane, a: Value) -> Value {
+        if op == VLaneUnOp::Sqrt {
+            return self.mx(Expr::VLaneUn { op, lane, a });
+        }
         self.b.def(Expr::VLaneUn { op, lane, a })
+    }
+
+    /// A lane operation under the guest's MXCSR.
+    fn vun_mx(&mut self, op: VLaneUnOp, lane: VLane, a: Value) -> Value {
+        self.mx(Expr::VLaneUn { op, lane, a })
+    }
+
+    /// `e` as SSE computes it: under the guest's MXCSR (its rounding
+    /// control, FTZ and DAZ) when it is an operation MXCSR controls
+    /// ([`Expr::mx_able`]), else as it is.
+    fn mx(&mut self, e: Expr) -> Value {
+        if !e.mx_able() {
+            return self.b.def(e);
+        }
+        let mx = self.b.read(GuestReg::Mxcsr);
+        self.b.def(Expr::Mx { mx, e: Box::new(e) })
     }
 
     fn vbit(&mut self, op: VBinOp, a: Value, b: Value) -> Value {
@@ -192,7 +216,7 @@ impl<'a> Lifter<'a> {
     }
 
     fn fbin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {
-        self.b.def(Expr::FpBin { op, double, a, b })
+        self.mx(Expr::FpBin { op, double, a, b })
     }
 
     fn fcmp(&mut self, op: FpCmpOp, double: bool, a: Value, b: Value) -> Value {
@@ -337,7 +361,7 @@ impl<'a> Lifter<'a> {
         let x = if truncate {
             x
         } else {
-            self.b.def(Expr::FpUn {
+            self.mx(Expr::FpUn {
                 op: FpUnOp::RoundNearest,
                 double: src_double,
                 a: x,
@@ -617,7 +641,7 @@ impl<'a> Lifter<'a> {
             self.wr_x(i.op0(), r);
         } else {
             // cvtpi2ps: the low two floats; the upper two are kept.
-            let c = self.b.def(Expr::VCvt {
+            let c = self.mx(Expr::VCvt {
                 op: VCvtOp::IntToFp { signed: true },
                 from: VLane::I32,
                 a: s,
@@ -799,7 +823,7 @@ impl<'a> Lifter<'a> {
                     let dv = self.rd_x(i.op0());
                     let a = self.rd_scalar_src(i.op1(), lane);
                     let r = match i.op {
-                        Op::Sqrtp => self.b.def(Expr::FpUn {
+                        Op::Sqrtp => self.mx(Expr::FpUn {
                             op: FpUnOp::Sqrt,
                             double,
                             a,
@@ -921,15 +945,18 @@ impl<'a> Lifter<'a> {
             Op::Roundp => {
                 let Operand::Imm(imm) = i.op2() else { return self.illegal() };
                 let (vop, sop) = Self::round_op(imm);
+                // Bit 2: MXCSR's rounding control decides.
+                let by_mx = imm & 4 != 0;
                 if i.scalar {
                     let dv = self.rd_x(i.op0());
                     let a = self.rd_scalar_src(i.op1(), lane);
-                    let r = self.b.def(Expr::FpUn { op: sop, double, a });
+                    let e = Expr::FpUn { op: sop, double, a };
+                    let r = if by_mx { self.mx(e) } else { self.b.def(e) };
                     let r = self.with_scalar(dv, lane, r);
                     self.wr_x(i.op0(), r);
                 } else {
                     let a = self.rd_x(i.op1());
-                    let r = self.vun(vop, vl, a);
+                    let r = if by_mx { self.vun_mx(vop, vl, a) } else { self.vun(vop, vl, a) };
                     self.wr_x(i.op0(), r);
                 }
             }
@@ -988,7 +1015,7 @@ impl<'a> Lifter<'a> {
             Op::Cvtsi2s => {
                 let w = i.width;
                 let v = self.rd(i.op1(), w);
-                let f = self.b.def(Expr::FpCvt {
+                let f = self.mx(Expr::FpCvt {
                     kind: FpConvert::IntToFp { signed: true },
                     src_wide: w == Width::Q,
                     dst_wide: double,
@@ -1007,7 +1034,7 @@ impl<'a> Lifter<'a> {
             Op::Cvts2s => {
                 // lane is the SOURCE type.
                 let x = self.rd_scalar_src(i.op1(), lane);
-                let r = self.b.def(Expr::FpCvt {
+                let r = self.mx(Expr::FpCvt {
                     kind: FpConvert::FpToFp,
                     src_wide: double,
                     dst_wide: !double,
@@ -1020,7 +1047,7 @@ impl<'a> Lifter<'a> {
             }
             Op::Cvtp2p => {
                 let s = self.rd_x_n(i.op1(), if double { 16 } else { 8 });
-                let r = self.b.def(Expr::VCvt {
+                let r = self.mx(Expr::VCvt {
                     op: if double { VCvtOp::DemoteF64 } else { VCvtOp::PromoteF32 },
                     from: vl,
                     a: s,
@@ -1042,7 +1069,7 @@ impl<'a> Lifter<'a> {
                     self.wr_x(i.op0(), r);
                 } else {
                     let s = self.rd_x(i.op1());
-                    let r = self.b.def(Expr::VCvt {
+                    let r = self.mx(Expr::VCvt {
                         op: VCvtOp::IntToFp { signed: true },
                         from: VLane::I32,
                         a: s,
@@ -1056,7 +1083,7 @@ impl<'a> Lifter<'a> {
                 let s = if truncate {
                     s
                 } else {
-                    self.vun(VLaneUnOp::Nearest, vl, s)
+                    self.vun_mx(VLaneUnOp::Nearest, vl, s)
                 };
                 let r = self.b.def(Expr::VCvt {
                     op: VCvtOp::FpToIntSat { signed: true },

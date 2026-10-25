@@ -4996,6 +4996,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         })()) },
     )?;
 
+    // An SSE operation under a non-default MXCSR (`gex_abi::imports::MX`).
+    linker.func_wrap(m, imports::MX, |_ctx: i32, code: i32, a: i64, b: i64, mx: i32| -> i64 {
+        gex_kernel::f80::sse::op(code as u32, a as u64, b as u64, mx as u32) as i64
+    })?;
+
     // The counting flavor's table-call note (`gex_cgen::image::icall_count`):
     // natively a debugging run only, so nothing is tallied.
     linker.func_wrap(m, imports::ICALL_NOTE, |_ctx: i32, _ret: i64, _target: i64| {})?;

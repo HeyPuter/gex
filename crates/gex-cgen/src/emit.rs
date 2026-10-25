@@ -1237,7 +1237,74 @@ impl<'a> Emitter<'a> {
             *c = is_ctx;
         }
         self.note_disp(idx, expr);
-        let rhs: String = match expr {
+        if let Expr::HostCall { func, args, ty } = expr {
+            if *func == HostFunc::Fma && args.len() == 4 {
+                if let Some(dbl) = self.value_const[args[3].0 as usize] {
+                    let (a, b, c) = (self.v(args[0]), self.v(args[1]), self.v(args[2]));
+                    let e = if dbl != 0 {
+                        format!("gex_fma64(ctx, {a}, {b}, {c}, 1)")
+                    } else {
+                        format!("gex_fmaf({a}, {b}, {c})")
+                    };
+                    self.line(format!("const {} {d} = ({}){e};", cty(*ty), cty(*ty)));
+                    return Ok(());
+                }
+            }
+            let call = self.host_call_expr(*func, args)?;
+            if func.clobbers_guest_state() {
+                self.flush();
+            }
+            self.line(format!("const {} {d} = ({}){call};", cty(*ty), cty(*ty)));
+            if func.clobbers_guest_state() {
+                self.invalidate();
+            }
+            return Ok(());
+        }
+        if let Expr::Mx { mx, e } = expr {
+            // `e`'s own C, then the exact import when the bits ask for it:
+            // a rounding other than to nearest, or FTZ or DAZ with a float
+            // operand or the result denormal or the smallest normal (see
+            // `runtime/mx.h`).
+            let fast = self.rhs(idx, e)?;
+            let m = self.v(*mx);
+            let plan = MxPlan::of(e);
+            let w = |t: Ty| if t == Ty::I64 { 8 } else { 4 };
+            let (a, b, in_bytes, out_bytes) = match plan {
+                MxPlan::Scalar { a, b, in_ty, .. } => (a, b, w(in_ty), w(ty)),
+                MxPlan::Lanes { a, b, in_bytes, out_bytes, .. } => (a, b, in_bytes, out_bytes),
+            };
+            let tiny = |v: String, bytes: u32| {
+                if ty == Ty::V128 {
+                    format!("gex_mx_tiny_v({v}, {bytes})")
+                } else if bytes == 8 {
+                    format!("gex_mx_tiny64((uint64_t){v})")
+                } else {
+                    format!("gex_mx_tiny32((uint32_t){v})")
+                }
+            };
+            let mut redo = format!("((uint32_t){m} & 0x6000u) != 0");
+            if plan.float_operands() {
+                for v in [Some(a), b].into_iter().flatten() {
+                    redo += &format!(" || {}", tiny(self.v(v), in_bytes));
+                }
+            }
+            redo += &format!(" || {}", tiny(d.clone(), out_bytes));
+            let slow = self.mx_slow(*mx, e);
+            self.line(format!("{} {d} = {fast};", cty(ty)));
+            self.line(format!(
+                "if (__builtin_expect(((uint32_t){m} & 0x{:x}u) != 0, 0) && ({redo})) {d} = {slow};",
+                MX_SPECIAL
+            ));
+            return Ok(());
+        }
+        let rhs = self.rhs(idx, expr)?;
+        self.line(format!("const {} {d} = {rhs};", cty(ty)));
+        Ok(())
+    }
+
+    /// The C expression of `expr`, defining value `idx`.
+    fn rhs(&mut self, idx: usize, expr: &Expr) -> Result<String> {
+        Ok(match expr {
             Expr::ConstI32(c) => {
                 self.value_const[idx] = Some(*c as u64);
                 format!("0x{c:x}u")
@@ -1422,29 +1489,7 @@ impl<'a> Emitter<'a> {
                     &format!("(uint64_t)({nt}){r}"),
                 )
             }
-            Expr::HostCall { func, args, ty } => {
-                if *func == HostFunc::Fma && args.len() == 4 {
-                    if let Some(dbl) = self.value_const[args[3].0 as usize] {
-                        let (a, b, c) = (self.v(args[0]), self.v(args[1]), self.v(args[2]));
-                        let e = if dbl != 0 {
-                            format!("gex_fma64(ctx, {a}, {b}, {c}, 1)")
-                        } else {
-                            format!("gex_fmaf({a}, {b}, {c})")
-                        };
-                        self.line(format!("const {} {d} = ({}){e};", cty(*ty), cty(*ty)));
-                        return Ok(());
-                    }
-                }
-                let call = self.host_call_expr(*func, args)?;
-                if func.clobbers_guest_state() {
-                    self.flush();
-                }
-                self.line(format!("const {} {d} = ({}){call};", cty(*ty), cty(*ty)));
-                if func.clobbers_guest_state() {
-                    self.invalidate();
-                }
-                return Ok(());
-            }
+            Expr::HostCall { .. } => unreachable!("a host call is emitted by `def`"),
             Expr::VLoad {
                 addr,
                 offset,
@@ -1654,9 +1699,28 @@ impl<'a> Emitter<'a> {
                 dst_wide,
                 a,
             } => self.fp_convert(*kind, *src_wide, *dst_wide, *a),
-        };
-        self.line(format!("const {} {d} = {rhs};", cty(ty)));
-        Ok(())
+            Expr::Mx { .. } => unreachable!("def lowers Mx"),
+        })
+    }
+
+    /// [`Expr::Mx`]'s slow path: the `mx` import through `runtime/mx.h`.
+    fn mx_slow(&self, mx: Value, e: &Expr) -> String {
+        let m = self.v(mx);
+        match MxPlan::of(e) {
+            MxPlan::Scalar { code, a, b, .. } => {
+                let b = b.map_or("0".to_string(), |b| format!("(uint64_t){}", self.v(b)));
+                let r = format!("gex_mx_scalar(ctx, {code}, (uint64_t){}, {b}, (uint32_t){m})", self.v(a));
+                if e.ty() == Ty::I32 {
+                    format!("(uint32_t){r}")
+                } else {
+                    r
+                }
+            }
+            MxPlan::Lanes { code, a, b, n, in_bytes, out_bytes } => {
+                let b = b.map_or("wasm_i64x2_const(0, 0)".to_string(), |b| self.v(b));
+                format!("gex_mx_lanes(ctx, {code}, {}, {b}, {n}, {in_bytes}, {out_bytes}, (uint32_t){m})", self.v(a))
+            }
+        }
     }
 
     /// A value's bit pattern as a C float of the given precision.

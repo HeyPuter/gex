@@ -230,6 +230,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
                                     | Expr::FpUn { .. }
                                     | Expr::FpCmp { .. }
                                     | Expr::FpCvt { .. }
+                                    | Expr::Mx { .. }
                                     | Expr::HostCall { .. }
                                     | Expr::Rmw { .. }
                                     | Expr::CmpXchg { .. }
