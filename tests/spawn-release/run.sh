@@ -33,3 +33,32 @@ else
 	echo "FAIL spawn-release browser: $out; records released: $released, kept: $kept"; grep -a '\[test\]' "$w/browser.err" | tail -3
 	exit 1
 fi
+
+# A page leg's view of a game's memory (peek.c): `?memories=1` (here
+# GEX_MEMORIES=1) registers a threaded process's memory for the harness, and
+# with the fork record let go that registry is all that must keep it. Read
+# after a collection twice a second (GEX_TEST_MEMORIES), the child's counter
+# must be there and climbing while it runs, and let go once it has exited;
+# without the switch nothing is registered.
+"$cc" -O1 -static -no-pie -o "$w/peek" "$here/peek.c" -lpthread || exit 1
+at=0x$("${cc%gcc}nm" "$w/peek" | awk '/ counter$/ {print $1}')
+peek() { # LOG [env...]
+	log=$1; shift
+	(cd "$w" && env "$@" GEX_TEST_MEMORIES="$at" GEX_SHARED=1 timeout 120 node --expose-gc "$root/shims/browser/js/run-node.mjs" \
+		--file "$w/peek=$w/peek" "$seed" "$w/peek" 2> "$log" | grep -av '^\[gex\]')
+}
+out=$(peek "$w/peek.err" GEX_MEMORIES=1)
+words=$(grep -a '\[test\] memories: pid' "$w/peek.err" | sed 's/.* word //')
+climbs=$(awk 'NR > 1 && $1 > p {n++} {p = $1} END {print n + 0}' <<< "$words")
+left=$(grep -a '\[test\] memories at exit' "$w/peek.err" | sed 's/.*: //')
+if [ "$out" = "child counted 200
+child ok" ] && [ "$climbs" -ge 3 ] && [ "$left" = 0 ]; then
+	echo "ok   spawn-release memories (the counter read $climbs times higher while the child ran, then let go)"
+else
+	echo "FAIL spawn-release memories: $out; readings climbed $climbs times; held at exit: ${left:-?}"; exit 1
+fi
+out=$(peek "$w/peek-off.err")
+if grep -aq '\[test\] memories: pid' "$w/peek-off.err"; then
+	echo "FAIL spawn-release memories: registered without the switch"; exit 1
+fi
+echo "ok   spawn-release memories off (nothing registered)"

@@ -38,6 +38,16 @@ function inform(text) {
   console.info(text);
 }
 
+// `?memories=1` (or GEX_MEMORIES), read once at load: a test harness's view
+// of each threaded process's memory by pid, `globalThis.__gexMemories`, what
+// it reads a guest word from while the process's own Workers are busy in
+// wasm (a game's frame counter). Held until the process ends; off, nothing
+// is registered and nothing is kept.
+const MEMORIES = !!(globalThis.GEX_MEMORIES || globalThis.process?.env?.GEX_MEMORIES || (typeof location !== 'undefined' && new URLSearchParams(location.search).get('memories') === '1'));
+function forgetMemory(pid) {
+  if (MEMORIES) globalThis.__gexMemories?.delete(Number(String(pid).split(':')[0]));
+}
+
 // A library or image loaded for the first time this session, said once
 // rather than once per process (each Wine process maps the same dozen DLLs).
 // Every Worker says what it installs on the 'gex-fetch' channel
@@ -1095,13 +1105,8 @@ export class ProcessHost {
         // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
-        // Each process's memory by pid (a thread's Worker is keyed `pid:tid`), weakly (an exited process's memory
-        // is not kept): what a harness reads a guest word from while the
-        // process's own Workers are busy in wasm (e.g. a game's
-        // frame counter). A threaded process registers here.
-        if (typeof WeakRef === 'function' && m.thread.memory) {
-          (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
-        }
+        // A threaded process's memory, for a harness (`MEMORIES`).
+        if (MEMORIES && m.thread.memory) (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), m.thread.memory);
         if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, taking a Worker (t=${Date.now()})`);
         // From the warm pool, as a process's: a fresh Worker was ~100 ms of
         // script load and shim instantiation before the thread could start,
@@ -1215,6 +1220,7 @@ export class ProcessHost {
           const proc = Number(String(pid).split(':')[0]);
           const c = this.#carried.get(proc);
           this.#onExit(m, proc);
+          forgetMemory(proc);
           this.#release(pid, w);
           if (c?.resolve) {
             this.#carried.delete(proc);
@@ -1341,10 +1347,12 @@ export class ProcessHost {
         }
         // Before the release: releasing terminates the Worker.
         this.#onExit(m, pid);
+        forgetMemory(pid);
         this.#release(pid, w, !!m.giveBack);
         resolve(m.status);
         break;
       case 'threw':
+        if (!String(pid).includes(':')) forgetMemory(pid);
         this.#release(pid, w);
         // Here as well as in the Worker: only this side knows which process
         // fell over, and a child's promise often has nobody awaiting it.
