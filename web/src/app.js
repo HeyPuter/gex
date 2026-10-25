@@ -19,7 +19,7 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
-import { makeControl as lazyCacheControl } from '../../shims/browser/js/lazy-cache.mjs';
+import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browser/js/lazy-cache.mjs';
 import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
@@ -651,6 +651,7 @@ async function begin(opts, base, at, state, meter) {
   // shared memory (the SP build reads lazy files from the network) and a
   // Cache Storage that holds (`?lazycache=0` turns it off).
   let lazyCache = null;
+  const lazyVersions = Object.fromEntries(lazy.map(([path, size, url]) => [url, lazyVersion(size, lazyMtimes[path])]));
   if (lazy.length && typeof SharedArrayBuffer === 'function' && sw.lazycache !== '0') {
     const k = await globalKernel();
     if (k?.memory) {
@@ -669,7 +670,7 @@ async function begin(opts, base, at, state, meter) {
         };
         w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
         setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
-        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE });
+        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE, versions: lazyVersions });
       });
       if (ready.ok) {
         lc.on = true;
@@ -690,7 +691,7 @@ async function begin(opts, base, at, state, meter) {
     ...(preList ?? []).map(([, u]) => u),
     ...lazy.map(([, , u]) => u),
     ...(fl ? [fl.url] : []),
-  ]).catch(() => {});
+  ], lazyVersions).catch(() => {});
   pruneFiles(fetcher).catch(() => {});
   // No fill to wait for: the boot's downloads are done.
   if (!fl) prefetchMesa('fetched');
@@ -1088,15 +1089,20 @@ async function pieceFetch(href, f, init) {
   return { res, cached: false, key: u.href, cache };
 }
 /** Pieces of older builds: whatever the cache holds that this build does not
- *  name (`keep`, URL paths) goes once the program runs. */
-async function prunePieces(f, keep) {
+ *  name (`keep`, URL paths) goes once the program runs, and so do lazy file
+ *  chunks of a version other than `versions` names for their path. */
+async function prunePieces(f, keep, versions = {}) {
   const cache = await f.pieces?.();
   if (!cache) return;
   try {
     const want = new Set(keep.map((k) => new URL(k, location.href).pathname));
     for (const r of await cache.keys()) {
-      const path = new URL(r.url).pathname;
-      if (!want.has(path) && !want.has(path.replace(/\.zst$/, ''))) await cache.delete(r);
+      const u = new URL(r.url);
+      const path = u.pathname;
+      // A lazy file's chunks of another version than the list's (the file
+      // changed under its URL) go too.
+      const stale = u.searchParams.has('c') && versions[path] !== undefined && u.searchParams.get('v') !== versions[path];
+      if (stale || (!want.has(path) && !want.has(path.replace(/\.zst$/, '')))) await cache.delete(r);
     }
   } catch { /* kept */ }
 }
