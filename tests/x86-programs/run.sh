@@ -221,9 +221,12 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # descriptors block until a second thread's signal ends them with EINTR
 # (i386's pause is a call of its own).
 # fp-modes: SSE arithmetic, square roots, roundings and conversions under
-# each MXCSR rounding mode with FTZ and DAZ (wasm rounds only to nearest:
-# the other modes take the exact slow path), and x87 arithmetic and stores
-# under each rounding and precision control; under the function JIT too.
+# each MXCSR rounding mode (wasm rounds only to nearest: the other modes take
+# the exact slow path), and x87 arithmetic and stores
+# under each rounding and precision control; under the function JIT and in
+# the function tier's C too.
+# SSE under MXCSR's rounding control is a per-program opt-in (GEX_MXCSR=1,
+# the page's ?mxcsr=1).
 PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs dense-lazy dense-holes spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
@@ -235,7 +238,9 @@ for src in "$HERE"/*.c; do
     # *smc*: self-modifying code, under the function JIT as well (which
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
-    case $name in *smc* | copy-loop | null-access | sig-regs-threads | fp-modes) tiers="t1 fjit" ;; esac
+    case $name in *smc* | copy-loop | null-access | sig-regs-threads) tiers="t1 fjit" ;; esac
+    # fp-modes: the function tier's C as well.
+    case $name in fp-modes) tiers="t1 fjit cgen" ;; esac
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
@@ -246,6 +251,7 @@ for src in "$HERE"/*.c; do
         case " ${TIERS:-$tier} " in *" $tier "*) ;; *) continue ;; esac
         flags=$gexflags
         [ $tier = fjit ] && flags="$flags --fjit"
+        [ $tier = cgen ] && flags="$flags --cgen"
         extra=""
         [ "$target" = x86-linux-musl ] && extra="-Wl,--image-base=0x1000000"
         bin="$WORK/$name-$target"
@@ -279,6 +285,8 @@ for src in "$HERE"/*.c; do
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
         # null-access needs the null guard, a debug opt-in (gex_abi::null_guard).
         [ $name = null-access ] && envs="GEX_NULL_GUARD=1"
+        # fp-modes needs SSE under MXCSR, a per-program opt-in (gex_ir::mxcsr_exact).
+        [ $name = fp-modes ] && envs="GEX_MXCSR=1"
         # mem64-net reaches the host: the page gets a network of real TCP sockets.
         [ $name = mem64-net ] && envs="GEX_NETWORK=1"
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"

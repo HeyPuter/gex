@@ -1696,7 +1696,8 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// Emit a block's statements, telling the emitter where each resumable
 /// fault statement (`int3`'s `HostCall`) carries on.
 fn block_stmts(e: &mut Emitter<'_>, b: &FBlock) -> Result<()> {
-    for (k, s) in b.stmts.iter().enumerate() {
+    e.stmts(&b.stmts, |e, k| {
+        let s = &b.stmts[k];
         e.fault_next = match s {
             Stmt::HostCall { func: HostFunc::Breakpoint | HostFunc::Illegal, .. } if e.fault_exit.is_some() => {
                 let pc = b.pcs[k];
@@ -1704,8 +1705,8 @@ fn block_stmts(e: &mut Emitter<'_>, b: &FBlock) -> Result<()> {
             }
             _ => None,
         };
-        e.stmt(s)?;
-    }
+        e.stmt(s)
+    })?;
     e.fault_next = None;
     Ok(())
 }
@@ -2712,6 +2713,79 @@ b2 0x4007..0x4008 insts [4007]:
         assert!(c.contains("int l_1000_0(") && c.contains("int ll_1000_0("), "both outline the loop, apart:\n{c}");
         // And clang takes it (a redefinition is an error).
         let dir = std::env::temp_dir().join(format!("gex-cgen-leafloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
+        std::fs::write(dir.join("u.c"), &c).unwrap();
+        crate::toolchain::compile_one(&dir, &dir.join("u.c"), &dir.join("u.o"), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// `0x5000`: one block of `n` SSE operations, vectors of each lane
+    /// shape and scalars, each on the last's result; under MXCSR
+    /// (`Expr::Mx`, as the lifter makes them under `gex_ir::mxcsr_exact`)
+    /// when `mx`, else the operations alone (as it makes them without).
+    fn sse_heavy(n: usize, mx: bool) -> String {
+        let mut b = String::from("  @5000 v0 = read mxcsr\n  @5000 v1 = read q0\n  @5000 v2 = read q1\n  @5000 v3 = read x0\n  @5000 v4 = read x1\n");
+        let (mut q, mut x, mut v) = (1, 3, 5);
+        for k in 0..n {
+            let e = match k % 6 {
+                0 => format!("vlanebin Add F32 v{q} v2"),
+                1 => format!("vlanebin Mul F64 v{q} v2"),
+                2 => format!("vlaneun Sqrt F32 v{q}"),
+                3 => format!("vcvt DemoteF64 F64 v{q} -"),
+                4 => format!("fbin Div f64 v{x} v4"),
+                _ => format!("fun Sqrt f64 v{x}"),
+            };
+            let e = if mx { format!("mx v0 {e}") } else { e };
+            b += &format!("  @5000 v{v} = {e}\n");
+            if k % 6 < 4 {
+                q = v;
+            } else {
+                x = v;
+            }
+            v += 1;
+        }
+        b += &format!("  @5000 write q0 v{q}\n  @5000 write x0 v{x}\n  @5000 return v{x}\n");
+        format!("func 0x5000 - entries [] form memory values {v}\nb0 0x5000..0x5001 insts [5000]:\n{b}")
+    }
+
+    /// The function tier's C of `sse_heavy(n, mx)`'s function.
+    fn sse_heavy_c(n: usize, mx: bool) -> (String, String) {
+        let f = gex_ir::text::parse(&sse_heavy(n, mx)).unwrap();
+        let known: HashSet<u64> = [0x5000].into_iter().collect();
+        let mut unit = FnUnit::new();
+        unit.add(&f, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        let c = unit.source();
+        let body = c[c.find(&format!("{}(", body_name(0x5000))).unwrap()..].to_string();
+        (c, body)
+    }
+
+    /// Without MXCSR, an SSE operation's C is the operation's own and
+    /// nothing else. Under it, a block's run of up to 32 of them tests the
+    /// rounding control once and is the operations' own C or their exact calls, out
+    /// of line in `runtime/mx.h` (an operation is one call however many
+    /// lanes): no more than twice the C. A test and an inline slow path
+    /// per operation was twice the C as well, but as thousands of branches
+    /// in one function, which took clang over 32 GB.
+    #[test]
+    fn sse_operations_under_mxcsr_test_once_a_block() {
+        if !gex_abi::X86 {
+            return; // MXCSR is x86's
+        }
+        let n = 600;
+        let (_, plain) = sse_heavy_c(n, false);
+        assert!(!plain.contains("gex_mx"), "no MXCSR without it");
+        let (c, body) = sse_heavy_c(n, true);
+        let exact = body.matches("gex_mx_s(").count() + body.matches("gex_mx_v(").count();
+        assert_eq!(exact, n, "one out-of-line exact call per operation");
+        for inline in ["gex_mx(", "replace_lane", "extract_lane"] {
+            assert!(!body.contains(inline), "`{inline}` is out of line, not in the function");
+        }
+        let tests = |c: &str| c.matches("__builtin_expect").count();
+        assert_eq!(tests(&body), tests(&plain) + n.div_ceil(32), "one rounding-control test for each run of 32");
+        let (with, without) = (body.len(), plain.len());
+        assert!(with < 2 * without + 64 * n, "{with} bytes of C under MXCSR, {without} without");
+        eprintln!("{with} bytes of C under MXCSR, {without} without ({n} operations)");
+        let dir = std::env::temp_dir().join(format!("gex-cgen-mx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
         std::fs::write(dir.join("u.c"), &c).unwrap();

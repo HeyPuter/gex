@@ -741,10 +741,16 @@ impl ModuleBuilder {
             vec![ValType::I64],
         ));
 
-        let t_mx = m.func_type(FuncType::new(
-            vec![p, ValType::I32, ValType::I64, ValType::I64, ValType::I32],
-            vec![ValType::I64],
-        ));
+        // The MXCSR import only for a program lifted under MXCSR
+        // (`gex_ir::mxcsr_exact`): without it, the module is as if it did
+        // not exist, and nothing calls it.
+        let mx_on = gex_ir::mxcsr_exact();
+        let t_mx = mx_on.then(|| {
+            m.func_type(FuncType::new(
+                vec![p, ValType::I32, ValType::I64, ValType::I64, ValType::I32],
+                vec![ValType::I64],
+            ))
+        });
 
         let im = IMPORT_MODULE;
         let imports = Imports {
@@ -758,7 +764,7 @@ impl ModuleBuilder {
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
             fma: m.import_func(im, imports::FMA, t_fma),
             x87: m.import_func(im, imports::X87, t_x87),
-            mx: m.import_func(im, imports::MX, t_mx),
+            mx: t_mx.map_or(u32::MAX, |t| m.import_func(im, imports::MX, t)),
         };
 
         // The memory is the host's and shared, so every guest thread acts on

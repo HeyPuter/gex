@@ -155,11 +155,12 @@ impl<'a> Lifter<'a> {
         self.mx(Expr::VLaneUn { op, lane, a })
     }
 
-    /// `e` as SSE computes it: under the guest's MXCSR (its rounding
-    /// control, FTZ and DAZ) when it is an operation MXCSR controls
-    /// ([`Expr::mx_able`]), else as it is.
+    /// `e` as SSE computes it: under the guest's MXCSR rounding control
+    /// when it is an operation MXCSR rounds
+    /// ([`Expr::mx_able`]) and the program asked for it
+    /// ([`gex_ir::mxcsr_exact`]), else as it is.
     fn mx(&mut self, e: Expr) -> Value {
-        if !e.mx_able() {
+        if !e.mx_able() || !gex_ir::mxcsr_exact() {
             return self.b.def(e);
         }
         let mx = self.b.read(GuestReg::Mxcsr);

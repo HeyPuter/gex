@@ -428,6 +428,8 @@ const host = new ProcessHost({
     w3Split: !!process.env.GEX_W3_SPLIT,
     // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
     nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
+    // GEX_MXCSR=1: as the page's ?mxcsr=1 (gex_ir::mxcsr_exact).
+    mxcsr: process.env.GEX_MXCSR === '1' || undefined,
     // GEX_PIN_REGION=BYTES: as the page's ?pinregion= (gex_abi::set_pin_region).
     pinRegion: process.env.GEX_PIN_REGION ? Number(process.env.GEX_PIN_REGION) : undefined,
     // GEX_SEH_REPORT=1: as the page's ?sehreport=1.

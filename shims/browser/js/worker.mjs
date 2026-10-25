@@ -692,6 +692,8 @@ async function handle(msg) {
   if (msg.w3Split) globalThis.GEX_W3_SPLIT = 1;
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
+  // `?mxcsr=1`: SSE under MXCSR (gex_ir::mxcsr_exact), a per-program opt-in.
+  if (msg.mxcsr) globalThis.GEX_MXCSR = 1;
   // `?pinregion=BYTES`: the pin region (gex_abi::set_pin_region).
   if (msg.pinRegion) globalThis.GEX_PIN_REGION = msg.pinRegion;
   // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).

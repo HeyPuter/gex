@@ -1248,6 +1248,8 @@ export class Gex {
       if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
       // `?nullguard=1` before anything is translated (gex_abi::null_guard).
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
+      // `?mxcsr=1` before anything is translated: SSE under MXCSR (gex_ir::mxcsr_exact).
+      if (globalThis.GEX_MXCSR) this.#shim.exports.gex_set_mxcsr_exact?.(1);
       // `?pinregion=BYTES`: a project's libraries' region above the placement
       // window, before the first claim of arena (gex_abi::set_pin_region).
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
