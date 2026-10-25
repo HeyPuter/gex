@@ -9028,58 +9028,66 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     // The calling thread's (its fs_struct's, which a fork copies).
-    *FORK_CWD.0.borrow_mut() = h.kernel.caller_cwd();
+    FORK_CWD.with(|c| *c.borrow_mut() = h.kernel.caller_cwd());
     // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
     // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
     // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
     // which a child inherits and keeps across its `execve`.
-    *FORK_STATE.0.borrow_mut() = state_bytes(&h.kernel, false);
-    *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
+    FORK_STATE.with(|c| *c.borrow_mut() = state_bytes(&h.kernel, false));
+    let exe = std::iter::once(h.kernel.exe_path.as_str())
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join("\0");
-    FORK[1].store(start.unwrap_or(pc + gex_abi::SYSCALL_INST_BYTES), std::sync::atomic::Ordering::Relaxed);
-    FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
-    FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
-    FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    FORK[5].store(h.kernel.mem.lock().brk_current(), std::sync::atomic::Ordering::Relaxed);
-    // Only the forking thread's Worker may claim it (`gex_fork_pending`).
-    FORK_BY.store(cur() as u64 + 1, std::sync::atomic::Ordering::Relaxed);
-    // Last, because it is what the host tests: the rest must be readable by
-    // the time a non-zero pid appears.
-    FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
+    FORK_EXE.with(|c| *c.borrow_mut() = exe);
+    let brk = h.kernel.mem.lock().brk_current();
+    FORK.with(|f| {
+        f.set([
+            pid as u64,
+            start.unwrap_or(pc + gex_abi::SYSCALL_INST_BYTES),
+            ctx_addr,
+            child_stack,
+            tls.unwrap_or(0),
+            brk,
+        ])
+    });
 }
 
-/// The child's descriptor table, as text, staged for the host to carry.
-///
-/// An `Arc<OpenFile>` is a pointer into a heap the child's Worker never saw, so
-/// the child is sent a *description* of each descriptor and rebuilds it. Only
-/// what can be rebuilt travels (a shared-root file or a global-kernel pipe, an
-/// id or path meaning the same in any process); a device node or host socket is
-/// left closed rather than silently replaced.
-///
-/// One line per descriptor:
-///
-///     <fd> <cloexec> <flags> <offset> <path>
-///
-/// Space-separated, path last, since a guest path may hold anything but newline.
-static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
-/// The parent's working directory at `fork`, staged for the child to inherit.
-static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
-/// The parent's exe path then its argv, NUL-separated, staged at `fork`.
-static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
-/// The parent's signal state, umask and limits at `fork` (`state_bytes`),
-/// staged for the child to inherit.
-static FORK_STATE: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+thread_local! {
+    /// The child's descriptor table, as text, staged for the host to carry.
+    ///
+    /// An `Arc<OpenFile>` is a pointer into a heap the child's Worker never saw, so
+    /// the child is sent a *description* of each descriptor and rebuilds it. Only
+    /// what can be rebuilt travels (a shared-root file or a global-kernel pipe, an
+    /// id or path meaning the same in any process); a device node or host socket is
+    /// left closed rather than silently replaced.
+    ///
+    /// One line per descriptor:
+    ///
+    ///     <fd> <cloexec> <flags> <offset> <path>
+    ///
+    /// Space-separated, path last, since a guest path may hold anything but newline.
+    ///
+    /// These, like `FORK`, are the forking Worker's own: only it starts the
+    /// child, and a fork another thread of the process made meanwhile, on its own
+    /// Worker, stages its child there.
+    pub(crate) static FORK_FDS: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The parent's working directory at `fork`, staged for the child to inherit.
+    pub(crate) static FORK_CWD: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The parent's exe path then its argv, NUL-separated, staged at `fork`.
+    pub(crate) static FORK_EXE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The parent's signal state, umask and limits at `fork` (`state_bytes`),
+    /// staged for the child to inherit.
+    pub(crate) static FORK_STATE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fork_state_ptr() -> u32 {
-    FORK_STATE.0.borrow().as_ptr() as u32
+    FORK_STATE.with(|c| c.borrow().as_ptr() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_fork_state_len() -> u32 {
-    FORK_STATE.0.borrow().len() as u32
+    FORK_STATE.with(|c| c.borrow().len() as u32)
 }
 
 /// The child's side of `gex_fork_state_*`, before `gex_adopt_child`.
@@ -9131,12 +9139,12 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
 
 #[no_mangle]
 pub extern "C" fn gex_fork_exe_ptr() -> u32 {
-    FORK_EXE.0.borrow().as_ptr() as u32
+    FORK_EXE.with(|c| c.borrow().as_ptr() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_fork_exe_len() -> u32 {
-    FORK_EXE.0.borrow().len() as u32
+    FORK_EXE.with(|c| c.borrow().len() as u32)
 }
 
 /// The child's side of `gex_fork_exe_*`, before `gex_adopt_child`.
@@ -9181,7 +9189,7 @@ pub(crate) fn stage_fork_fds(h: &Host, child: i32, maps: bool) {
             out.push_str(&format!("m {} {}\n", gex_kernel::syscalls::SharedMaps::carry(s), name));
         }
     }
-    *FORK_FDS.0.borrow_mut() = out;
+    FORK_FDS.with(|c| *c.borrow_mut() = out);
 }
 
 /// The name a descriptor travels to another process by -- a fork's child, or
@@ -9287,23 +9295,23 @@ fn pty_ref(path: &str) -> Option<(i32, bool)> {
 /// Where the child's descriptor table is staged, and how long it is.
 #[no_mangle]
 pub extern "C" fn gex_fork_fds_ptr() -> u32 {
-    FORK_FDS.0.borrow().as_ptr() as u32
+    FORK_FDS.with(|c| c.borrow().as_ptr() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_fork_fds_len() -> u32 {
-    FORK_FDS.0.borrow().len() as u32
+    FORK_FDS.with(|c| c.borrow().len() as u32)
 }
 
 /// The parent's working directory, staged at `fork` for the child to adopt.
 #[no_mangle]
 pub extern "C" fn gex_fork_cwd_ptr() -> u32 {
-    FORK_CWD.0.borrow().as_ptr() as u32
+    FORK_CWD.with(|c| c.borrow().as_ptr() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_fork_cwd_len() -> u32 {
-    FORK_CWD.0.borrow().len() as u32
+    FORK_CWD.with(|c| c.borrow().len() as u32)
 }
 
 /// Rebuild the descriptors the parent had, in the child.
@@ -9649,45 +9657,40 @@ pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
     }
 }
 
-/// A child `fork` has made that the host has not built a Worker for: pid, entry
-/// pc, context address, child stack, TLS. Plain words, not a queue: the host
-/// drains this before the parent runs again, so there is only ever one.
-static FORK: [std::sync::atomic::AtomicU64; 6] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+thread_local! {
+    /// A child `fork` has made that the host has not built a Worker for: pid, entry
+    /// pc, context address, child stack, TLS, break. Plain words, not a queue: the
+    /// host drains this before the parent runs again, so there is only ever one.
+    /// The forking Worker's own (as are `FORK_FDS` and the rest): only it starts
+    /// the child, and a fork another thread of the process makes meanwhile is
+    /// staged on that thread's Worker. Shared, the second fork's words replaced
+    /// the first's before its Worker drained them; and a vfork child running in
+    /// its parent's Worker (its thread numbered 0) staged its fork where the
+    /// process's first thread's Worker claimed it, and copied the memory while
+    /// the parent ran on, the grandchild starting on its parent's later context.
+    static FORK: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
 
-/// The thread (index + 1) whose `fork` is in `FORK`.
-static FORK_BY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whether this Worker has a fork staged (`FORK`).
+pub(crate) fn fork_staged() -> bool {
+    FORK.with(|f| f.get()[0]) != 0
+}
 
-/// The pid of a child needing a Worker, or zero -- and claiming it, so a `fork`
-/// several Workers can see is not started twice (see `gex_thread_pending`).
+/// The pid of a child this Worker's thread forked that needs a Worker, or
+/// zero -- and claiming it, so it is not started twice.
 ///
-/// Only on the Worker running the thread that forked: the child is a copy of
-/// memory as `fork` left it, and only that Worker copies it before the parent
-/// runs on (synchronously after a wasm32 program's syscall, before the run
-/// loop resumes tier-1's). A sibling thread's Worker that drained it instead
-/// copied memory while the parent ran on -- for a wasm32 program, after
-/// `__gex_fork` had unmapped the record the child starts on, so the child
-/// read its thread pointer from a zero page and trapped (the aarch64 browser
-/// flake in tests/wasm32 fork: "vfork child exit 137" with a parked thread
-/// in the parent, 6 in 750 vforks; tests/wasm32/vforkthreads).
+/// The child is a copy of memory as `fork` left it, and only the forking
+/// Worker copies it before the parent runs on (synchronously after a wasm32
+/// program's syscall, before the run loop resumes tier-1's). A sibling
+/// thread's Worker that drained it instead copied memory while the parent ran
+/// on (tests/wasm32/vforkthreads).
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
-    if FORK[0].load(std::sync::atomic::Ordering::Acquire) == 0
-        || FORK_BY.load(std::sync::atomic::Ordering::Relaxed) != cur() as u64 + 1
-    {
-        return 0;
+    let f = FORK.with(|f| f.replace([0; 6]));
+    if f[0] != 0 {
+        CLAIMED_FORK.with(|c| c.set([f[1], f[2], f[3], f[4], f[5]]));
     }
-    let pid = FORK[0].swap(0, std::sync::atomic::Ordering::AcqRel) as i32;
-    if pid != 0 {
-        CLAIMED_FORK.with(|c| {
-            let mut v = [0u64; 5];
-            for (i, slot) in v.iter_mut().enumerate() {
-                *slot = FORK[i + 1].load(std::sync::atomic::Ordering::Relaxed);
-            }
-            c.set(v);
-        });
-    }
-    pid
+    f[0] as i32
 }
 
 /// The four words that go with a claimed pid, plus the break.
