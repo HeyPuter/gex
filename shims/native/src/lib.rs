@@ -2679,7 +2679,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
-                Ok(exit) => (exit.code(), exit.wait_status()),
+                Ok(exit) => {
+                    say_killed(pid, &exit);
+                    (exit.code(), exit.wait_status())
+                }
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
                     // A process that dies takes its threads and descriptors
@@ -2717,6 +2720,21 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         })
         .context("spawning a child process")?;
     Ok(())
+}
+
+/// A child ended by a signal says so, once, as a shell would: a process
+/// gone with no word otherwise (one whose own crash handler does not catch
+/// the signal) leaves only its absence. Not the signals a session ends its
+/// processes with.
+fn say_killed(pid: i32, exit: &Exit) {
+    let Exit::Signal { signal, pc, detail, internal } = exit else { return };
+    // SIGHUP, SIGINT, SIGTERM.
+    if !internal && matches!(signal, 1 | 2 | 15) {
+        return;
+    }
+    let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
+    let whose = if *internal { " (gex cannot run it)" } else { "" };
+    eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{whose}{detail}");
 }
 
 /// Run a child process to completion in this host thread.
