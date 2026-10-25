@@ -2317,6 +2317,12 @@ pub fn non_flags() -> RegSet {
 /// trap-free subtree, which has no depth guard of its own.
 pub const TRAPFREE_RESERVE: u32 = 64 << 10;
 
+/// The guest instructions `f` was lifted from (its blocks' own, not the
+/// synthetic ones').
+pub fn guest_insns(f: &Function) -> usize {
+    f.blocks.iter().filter(|b| !b.synthetic).map(|b| b.insts.len()).sum()
+}
+
 /// The trap-free functions, with the stack estimate of their whole subtree.
 ///
 /// Trap-free: once called, the function returns to its caller without

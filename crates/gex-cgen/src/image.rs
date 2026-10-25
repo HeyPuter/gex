@@ -96,6 +96,7 @@ fn unit_inputs() -> String {
     let base = if unguarded() { format!("{base}:unguarded") } else { base };
     let base = if narrow_stores() { base } else { format!("{base}:widest") };
     let base = if icall_count() { format!("{base}:icallcount") } else { base };
+    let base = if max_insns() != DEFAULT_MAX_INSNS { format!("{base}:maxinsns{}", max_insns()) } else { base };
     // W3's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units read
     // the page where W3's Wine maps it and check every other address.
     let base = if gex_abi::kuser_fold() { format!("{base}:w3kuser") } else { base };
@@ -153,6 +154,52 @@ pub fn set_unguarded(on: bool) {
 
 pub fn unguarded() -> bool {
     UNGUARDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The most guest instructions a function may have and still go to clang:
+/// clang's memory grows faster than a function's size, and unevenly (one of
+/// 40,000 instructions took 67 GB, another of 37,000 under 3 GB), so a
+/// larger one stays out of the unit and runs on tier-1 or the fjit. 0: no
+/// limit.
+pub const DEFAULT_MAX_INSNS: u32 = 30_000;
+
+/// `u32::MAX`: not set, so `GEX_CGEN_MAX_INSNS` or the default.
+static MAX_INSNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set [`max_insns`] (gexc's `--max-insns`), before the first key is computed.
+pub fn set_max_insns(n: u32) {
+    MAX_INSNS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`DEFAULT_MAX_INSNS`] unless set ([`set_max_insns`], `GEX_CGEN_MAX_INSNS`).
+/// Another limit is in the unit key.
+pub fn max_insns() -> u32 {
+    match MAX_INSNS.load(std::sync::atomic::Ordering::Relaxed) {
+        u32::MAX => {
+            static ENV: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *ENV.get_or_init(|| {
+                std::env::var("GEX_CGEN_MAX_INSNS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_INSNS)
+            })
+        }
+        n => n,
+    }
+}
+
+/// Of `funcs`, the ones over [`max_insns`], with their sizes.
+pub fn oversized<'a>(funcs: impl IntoIterator<Item = &'a Function>) -> Vec<(u64, usize)> {
+    let max = max_insns() as usize;
+    if max == 0 {
+        return Vec::new();
+    }
+    funcs.into_iter().map(|f| (f.entry, func::guest_insns(f))).filter(|&(_, n)| n > max).collect()
+}
+
+/// The build log's line for [`oversized`] functions left out.
+pub fn say_oversized(big: &[(u64, usize)]) {
+    if !big.is_empty() {
+        let list: Vec<String> = big.iter().map(|(a, n)| format!("{a:#x} ({n})")).collect();
+        eprintln!("[cgen] left to tier-1 (over {} instructions): {}", max_insns(), list.join(", "));
+    }
 }
 
 /// What a unit's C takes from gex-abi: the generated header, and every value
@@ -549,14 +596,16 @@ pub fn build_group_module(
     icall_hints: &HashMap<u64, u64>,
     providers: &GroupProviders,
 ) -> Result<ImageStats> {
-    let rec = read_recoveries(recoveries)?;
+    let mut rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
+    let big = leave_oversized(&mut rec, recoveries, stubs)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
     // (its callers would not have written everything back).
     // Export providers' addresses start as stubs (`crate::provider`).
     let mut skip: HashSet<u64> = stubs.clone();
+    skip.extend(big);
     loop {
         let stats = emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers)?;
         let cwasm = std::fs::read(out)?;
@@ -600,6 +649,46 @@ pub fn build_group_module(
         skip.extend(more);
         let _ = std::fs::remove_file(out);
     }
+}
+
+/// The functions of `recoveries` over [`max_insns`], which become stubs
+/// that leave for tier-1 (said in the build log). A stub must not be
+/// trap-free, so none of them is, nor (transitively) a trap-free caller of
+/// one: such a caller would not have written everything back. Not an export
+/// provider's stub (`stubs`), which is one already.
+fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64>) -> Result<Vec<u64>> {
+    if max_insns() == 0 {
+        return Ok(Vec::new());
+    }
+    let mut big = Vec::new();
+    // Callee -> its trap-free direct callers.
+    let mut callers: HashMap<u64, Vec<u64>> = HashMap::new();
+    for recovery in recoveries {
+        let mut gir = GirReader::open(recovery)?;
+        while let Some(f) = gir.next()? {
+            if !stubs.contains(&f.entry) {
+                big.extend(oversized([&f]));
+            }
+            if rec.trapfree.contains_key(&f.entry) {
+                for b in &f.blocks {
+                    if let gex_ir::func::FTerm::Call { callee: gex_ir::func::Callee::Direct(t), .. } = &b.term {
+                        callers.entry(*t).or_default().push(f.entry);
+                    }
+                }
+            }
+        }
+    }
+    say_oversized(&big);
+    let mut work: Vec<u64> = big.iter().map(|&(a, _)| a).collect();
+    while let Some(a) = work.pop() {
+        rec.trapfree.remove(&a);
+        for &c in callers.get(&a).into_iter().flatten() {
+            if rec.trapfree.contains_key(&c) {
+                work.push(c);
+            }
+        }
+    }
+    Ok(big.into_iter().map(|(a, _)| a).collect())
 }
 
 #[allow(clippy::too_many_arguments)]

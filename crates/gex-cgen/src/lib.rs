@@ -200,6 +200,11 @@ fn build_functions(
     // stack (which the splice cannot give it) is
     // dropped -- it stays tier-1 -- and the rest are built again.
     let mut dropped: HashSet<u64> = HashSet::new();
+    // Too big for clang's memory: tier-1's, as a function `select` refuses.
+    let big = image::oversized(&funcs);
+    image::say_oversized(&big);
+    let big: HashSet<u64> = big.into_iter().map(|(a, _)| a).collect();
+    funcs.retain(|f| !big.contains(&f.entry));
     let (cwasm, dir, entries) = loop {
         let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
         let trapfree = func::trap_free(&funcs, &sums);

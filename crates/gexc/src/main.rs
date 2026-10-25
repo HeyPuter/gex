@@ -183,7 +183,7 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64] [--w3-kuser] [--entries FILE]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--mem64] [--w3-kuser] [--entries FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
@@ -2560,6 +2560,13 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             "--jobs" => {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
+            }
+            // `--max-insns N`: a function of more guest instructions stays
+            // out of the unit (tier-1's); 0, no limit. Also
+            // GEX_CGEN_MAX_INSNS, for every build. Another key.
+            "--max-insns" => {
+                i += 1;
+                gex_cgen::image::set_max_insns(args.get(i).context("--max-insns needs a number")?.parse()?);
             }
             // `--entries FILE`: hex addresses, one per line, the unit has no
             // entry for and a run without translation resumes at (a call's
