@@ -38,6 +38,8 @@
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
 # The authattrs case: crypt32 verifies a signature over authenticated
 # attributes as encoded, not in DER order (authattrs.c).
+# The unixctx case: another thread's context, with its SSE state, while the
+# thread is inside a Unix call and while it runs guest code (unixctx.c).
 # The qpcmono case: the performance counter, monotonic across the PE and
 # Unix sides (qpcmono.c).
 # The dwrite case: DirectWrite's glyph bounds, alpha texture and outline
@@ -425,6 +427,16 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/qpcmono.exe" "$here/qpcmono.c"; then
 else
 	case " ${CASES:-qpcmono} " in *" qpcmono "*)
 		fail=$((fail + 1)); echo "FAIL x64/qpcmono ($tag): x86_64-w64-mingw32-gcc" ;; esac
+fi
+# Another thread's context taken while the thread is inside a Unix call, and
+# while it runs guest code (unixctx.c): its xmm6-xmm15 as the thread has them,
+# though the Unix call's frame leaves the x87/SSE state in gex's context until
+# something reads it, and a SetThreadContext's xmm15 reaching the thread.
+if x86_64-w64-mingw32-gcc -O1 -o "$w/unixctx.exe" "$here/unixctx.c" -lws2_32; then
+	check unixctx 0 "$allok" "$w/unixctx.exe"
+else
+	case " ${CASES:-unixctx} " in *" unixctx "*)
+		fail=$((fail + 1)); echo "FAIL x64/unixctx ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # A skeleton's view unmapped and its addresses reused for the program's own
 # code (stalebind.c): the native bindings must not outlive the view. Only
