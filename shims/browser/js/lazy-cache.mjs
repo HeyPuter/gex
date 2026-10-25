@@ -7,9 +7,12 @@
 // cache lacks (a ranged request, as the reader would have made) and keeps
 // it, and writes the bytes straight into the kernel's memory, where the
 // reader wanted them. Kept by chunk (CHUNK, the kernel's LAZY_CHUNK), under
-// the file's URL (a lazy file's URL is its bytes' hash: eject-site.mjs) and
-// the chunk's number, so a later visit, after any rebuild, has every chunk
-// any visit read.
+// the file's URL, its version and the chunk's number (chunkKey), so a later
+// visit, after any rebuild, has every chunk any visit read of the same
+// bytes. An eject site's lazy file URL is its bytes' hash (eject-site.mjs);
+// other lists name files by path, and the version -- the list's size and
+// mtime -- is what tells a file changed under the same URL from the one
+// kept.
 //
 // The slots: `ctl`, an Int32Array on a SharedArrayBuffer of SLOTS * SLOT
 // bytes after a header of HEAD bytes. ctl[0] counts requests (the owner
@@ -28,6 +31,18 @@ export const HEAD = 64;
 export const SLOT = 1056;
 export const URL_MAX = SLOT - 32;
 export const FREE = 0, ASKED = 1, WRITING = 2, DONE = 3, GIVEN_UP = 4, TAKEN = 5;
+
+/** A lazy file's version from its list entry: size, and mtime when the
+ *  list has one. */
+export function lazyVersion(size, mtime) {
+  return mtime === undefined ? `${size}` : `${size}.${mtime}`;
+}
+
+/** The cache key of chunk `k` of `url` (absolute) at `version` (none: the
+ *  URL alone names the bytes). */
+export function chunkKey(url, version, k) {
+  return version ? `${url}?v=${encodeURIComponent(version)}&c=${k}` : `${url}?c=${k}`;
+}
 
 /** The control buffer the page makes and hands to the owner and to every
  *  Worker. */

@@ -5,11 +5,12 @@
 // writes the bytes into the kernel's memory. No service worker.
 //
 // In: { ctl: SharedArrayBuffer, memory: the kernel's WebAssembly.Memory,
-//       cache: the Cache Storage name }
+//       cache: the Cache Storage name, versions: { URL path: version } of
+//       the lazy files (lazy-cache.mjs lazyVersion) }
 // Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
 //      now and then (bytes from the network, from the cache, since the last).
 
-import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP } from '../../shims/browser/js/lazy-cache.mjs';
+import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP, chunkKey } from '../../shims/browser/js/lazy-cache.mjs';
 
 let net = 0, kept = 0, posted = 0;
 const report = () => {
@@ -21,7 +22,12 @@ const report = () => {
 };
 setInterval(() => { posted = 0; report(); }, 1000);
 
-const keyOf = (url, k) => `${url}?c=${k}`;
+let versions = {};
+const keyOf = (url, k) => {
+  let path = url;
+  try { path = new URL(url).pathname; } catch { /* a path already */ }
+  return chunkKey(url, versions[path], k);
+};
 
 /** The bytes of `url` from `from`, `len` of them: each chunk from the cache,
  *  the missing ones fetched in runs and kept. */
@@ -79,6 +85,7 @@ self.onmessage = async ({ data: m }) => {
   const ctl = new Int32Array(m.ctl);
   const raw = new Uint8Array(m.ctl);
   const memory = m.memory;
+  versions = m.versions ?? {};
   let cache = null;
   try {
     cache = await caches.open(m.cache);
