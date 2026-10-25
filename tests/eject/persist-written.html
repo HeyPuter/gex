@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>persist-written</title>
 <!-- tests/eject/persist-written.sh: /save kept in IndexedDB; ?visit=N is the
-     probe's argument. After the probe exits the page takes a snapshot. -->
+     probe's argument. After the probe exits the page takes a snapshot; the
+     status names what every snapshot of the visit stored. -->
 <style>html, body { margin: 0; background: #0b0b0d; color: #ddd; font: 14px/1.4 system-ui, sans-serif; }</style>
 </head>
 <body>
@@ -36,6 +37,9 @@ try {
   st.textContent = 'running';
   const code = await app.exited;
   const r = await globalThis.__ntPersist?.();
+  // What the visit stored: the worker's own snapshot soon after the probe's
+  // save may already have stored it, leaving this last one nothing to do.
+  if (r) r.wrote = app.state.persistedWrote ?? r.wrote;
   st.textContent = `exited (${code}) synced ${JSON.stringify(r)}`;
 } catch (e) {
   st.textContent = 'failed: ' + (e?.message ?? e);
