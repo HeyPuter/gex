@@ -3868,7 +3868,15 @@ export class Gex {
       windowsSpace: e.gex_windows_space?.() ?? 0,
       image: (() => {
         const t0 = performance.now();
-        const img = this.#processImage();
+        // The process's other threads out of guest code while the memory is
+        // copied, so the child's is one moment's (`gex_fork_hold`).
+        e.gex_fork_hold?.();
+        let img;
+        try {
+          img = this.#processImage();
+        } finally {
+          e.gex_fork_release?.();
+        }
         this.#imageMs = performance.now() - t0;
         this.#imageBytes = img.reduce((n, r) => n + imageLen(r), 0);
         this.#imageRegions = img.length;
