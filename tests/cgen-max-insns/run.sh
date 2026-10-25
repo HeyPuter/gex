@@ -6,8 +6,12 @@
 # is small. Three builds, each run against the host:
 #  - `--max-insns 1000`: big() and flat() are left out before clang runs;
 #  - no limits: the unit takes them;
-#  - `--clang-mem-mb 300`: clang runs out of memory on their units, and the
+#  - `--clang-mem-mb M`: clang runs out of memory on their units, and the
 #    retry leaves each unit's largest function out until the rest compiles.
+#    M is found here, stepping up from a floor: the least limit clang
+#    starts under that still has it run out on big()'s or flat()'s unit
+#    (what it needs depends on the clang build). With no such limit the
+#    case is skipped, and said so.
 # The unit holds small() every time.
 #
 # Not checked: that flat()'s trap-free caller writes everything back before
@@ -59,10 +63,28 @@ printf '%s 0x10000 libbig.so\n' $BASE > "$W/pins.txt"
 at() { printf '%#x' $(( BASE + 0x$(nm "$W/libbig.so" | awk -v s=$1 '$3 == s { print $1 }') )); }
 bigat=$(at big) flatat=$(at flat)
 native=$("$W/main")
+# The retry's limit: the first, stepping up, at which the build succeeds
+# and says clang ran out on big()'s or flat()'s unit.
+mem=
+for m in 150 200 250 300 350 400 450 500 600 700 800; do
+	GEX_CGEN_CACHE="$W/probe-$m" GEX_CGEN_MAX_INSNS=0 "$GEXC" cgen-image --elf "$W/libbig.so" --base $BASE --max-insns 0 --clang-mem-mb $m --jobs 2 > "$W/probe-$m.log" 2>&1 || continue
+	# Built: clang started. Whether it also ran out decides; a larger
+	# limit would only run out less.
+	grep "clang ran out of its $m MiB): " "$W/probe-$m.log" | grep -q "$bigat (\|$flatat (" && mem=$m
+	break
+done
+rm -rf "$W"/probe-*/
 fail=0
+retry="0 $mem clang ran out of its $mem MiB"
+if [ -n "$mem" ]; then
+	echo "cgen-max-insns: the retry case runs clang under $mem MiB"
+else
+	retry=
+	echo "skip cgen-max-insns retry case: no clang memory limit both starts clang and makes it run out on big()'s or flat()'s unit"
+fi
 # Each case: its options, and the build-log line naming big() or flat() it
 # must have ("" for none).
-for case in "1000 8192 over 1000 instructions" "0 0 " "0 300 clang ran out of its 300 MiB"; do
+for case in "1000 8192 over 1000 instructions" "0 0 " ${retry:+"$retry"}; do
 	set -- $case
 	max=$1 mem=$2; shift 2; line="$*"
 	# The run looks for the unit under the key the same limit gives.
@@ -79,6 +101,6 @@ for case in "1000 8192 over 1000 instructions" "0 0 " "0 300 clang ran out of it
 		fail=1
 	fi
 done
-[ $fail = 0 ] && echo "ok   cgen-max-insns (big() and flat() on tier-1 under 1000 instructions and after clang ran out of 300 MiB, in the unit with no limit; runs agree)"
+[ $fail = 0 ] && echo "ok   cgen-max-insns (big() and flat() on tier-1 under 1000 instructions${mem:+ and after clang ran out of $mem MiB}, in the unit with no limit; runs agree)"
 [ -z "${WORK:-}" ] && rm -rf "$W"
 exit $fail
