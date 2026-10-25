@@ -991,13 +991,28 @@ fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
         v[..n].copy_from_slice(b);
         Some(u64::from_le_bytes(v))
     };
-    if bytes.get(0..4)? != b"\x7fELF" || *bytes.get(4)? != 2 {
+    if bytes.get(0..4)? != b"\x7fELF" {
         return None;
     }
-    let (phoff, phentsize, phnum) = (rd(0x20, 8)? as usize, rd(0x36, 2)? as usize, rd(0x38, 2)? as usize);
+    // ELFCLASS64, or ELFCLASS32 (an i386 object): the header and program
+    // header fields at their own offsets and widths.
+    let wide = match *bytes.get(4)? {
+        2 => true,
+        1 => false,
+        _ => return None,
+    };
+    let (phoff, phentsize, phnum) = if wide {
+        (rd(0x20, 8)? as usize, rd(0x36, 2)? as usize, rd(0x38, 2)? as usize)
+    } else {
+        (rd(0x1c, 4)? as usize, rd(0x2a, 2)? as usize, rd(0x2c, 2)? as usize)
+    };
     for i in 0..phnum {
         let ph = phoff + i * phentsize;
-        let (ty, flags, off, vaddr) = (rd(ph, 4)?, rd(ph + 4, 4)?, rd(ph + 8, 8)?, rd(ph + 16, 8)?);
+        let (ty, flags, off, vaddr) = if wide {
+            (rd(ph, 4)?, rd(ph + 4, 4)?, rd(ph + 8, 8)?, rd(ph + 16, 8)?)
+        } else {
+            (rd(ph, 4)?, rd(ph + 24, 4)?, rd(ph + 4, 4)?, rd(ph + 8, 4)?)
+        };
         if ty == 1 && flags & 1 != 0 && off & !0xfff == offset {
             return Some(start.wrapping_sub(vaddr & !0xfff));
         }
