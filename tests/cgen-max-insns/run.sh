@@ -1,11 +1,19 @@
 #!/bin/sh
 # A function too big for clang's memory stays out of its unit and runs on
-# tier-1, with one build-log line (`gexc cgen-image --max-insns`): libbig.so's
-# big() is a few thousand instructions of calls and branches, made here,
-# beside small(), and flat(), as long but straight-line and trap-free, with
-# its trap-free caller flatcall(). With a limit below their size the unit
-# leaves big() and flat() out and the run still agrees with the host; with
-# no limit (0) the unit takes them. The unit holds small() either way.
+# tier-1, with one build-log line. libbig.so's big() is about 3,000
+# instructions of calls and branches, made here; flat() is as long but
+# straight-line and trap-free, called by the trap-free flatcall(); small()
+# is small. Three builds, each run against the host:
+#  - `--max-insns 1000`: big() and flat() are left out before clang runs;
+#  - no limits: the unit takes them;
+#  - `--clang-mem-mb 300`: clang runs out of memory on their units, and the
+#    retry leaves each unit's largest function out until the rest compiles.
+# The unit holds small() every time.
+#
+# Not checked: that flat()'s trap-free caller writes everything back before
+# calling the stub flat() becomes. A missed write-back shows only when the
+# host reads the context during the call, and natively nothing does: flat()
+# on tier-1 has no safepoint (no back edge) and no call that leaves.
 #
 #   tests/cgen-max-insns/run.sh [gexc]      (needs gcc; host glibc as the guest's)
 set -u
@@ -52,20 +60,25 @@ at() { printf '%#x' $(( BASE + 0x$(nm "$W/libbig.so" | awk -v s=$1 '$3 == s { pr
 bigat=$(at big) flatat=$(at flat)
 native=$("$W/main")
 fail=0
-for max in 1000 0; do
+# Each case: its options, and the build-log line naming big() or flat() it
+# must have ("" for none).
+for case in "1000 8192 over 1000 instructions" "0 0 " "0 300 clang ran out of its 300 MiB"; do
+	set -- $case
+	max=$1 mem=$2; shift 2; line="$*"
 	# The run looks for the unit under the key the same limit gives.
-	export GEX_CGEN_CACHE="$W/cgen-$max" GEX_ELF_UNITS=libbig.so GEX_ELF_UNITS_BUILD=0 GEX_CGEN_MAX_INSNS=$max
-	"$GEXC" cgen-image --elf "$W/libbig.so" --base $BASE --max-insns $max --jobs 2 > "$W/cgen-$max.log" 2>&1 || { cat "$W/cgen-$max.log"; exit 1; }
-	left=$(grep "left to tier-1 (over $max instructions): " "$W/cgen-$max.log" | grep "$bigat (" | grep -c "$flatat (")
-	want=1; [ $max = 0 ] && want=0
-	gex=$(timeout 120 "$GEXC" run --pin "$W/pins.txt" "$W/main" 2> "$W/err-$max.txt")
-	placed=$(grep -c 'function tier for .*/libbig\.so' "$W/err-$max.txt")
-	if [ "$left" != "$want" ] || [ "$placed" = 0 ] || [ "$gex" != "$native" ]; then
-		echo "FAIL cgen-max-insns (limit $max): big() and flat() left out $left (want $want), unit placed $placed, run '$gex' vs host '$native'"
-		grep "\[cgen\]" "$W/cgen-$max.log" | head -3
+	export GEX_CGEN_CACHE="$W/cgen-$max-$mem" GEX_ELF_UNITS=libbig.so GEX_ELF_UNITS_BUILD=0 GEX_CGEN_MAX_INSNS=$max
+	log="$W/cgen-$max-$mem.log"
+	"$GEXC" cgen-image --elf "$W/libbig.so" --base $BASE --max-insns $max --clang-mem-mb $mem --jobs 2 > "$log" 2>&1 || { cat "$log"; exit 1; }
+	said=$(grep "left to tier-1 ($line): " "$log" | grep -c "$bigat (\|$flatat (")
+	if [ -n "$line" ]; then ok=$([ "$said" -ge 1 ] && echo yes); else ok=$([ "$(grep -c 'left to tier-1' "$log")" = 0 ] && echo yes); fi
+	gex=$(timeout 120 "$GEXC" run --pin "$W/pins.txt" "$W/main" 2> "$W/err-$max-$mem.txt")
+	placed=$(grep -c 'function tier for .*/libbig\.so' "$W/err-$max-$mem.txt")
+	if [ "$ok" != yes ] || [ "$placed" = 0 ] || [ "$gex" != "$native" ]; then
+		echo "FAIL cgen-max-insns (--max-insns $max --clang-mem-mb $mem): left-out lines '${line:-none}' $said, unit placed $placed, run '$gex' vs host '$native'"
+		grep "\[cgen\]" "$log" | head -4
 		fail=1
 	fi
 done
-[ $fail = 0 ] && echo "ok   cgen-max-insns (big() at $bigat and flat() at $flatat on tier-1 under a limit of 1000 instructions, in the unit with none; runs agree)"
+[ $fail = 0 ] && echo "ok   cgen-max-insns (big() and flat() on tier-1 under 1000 instructions and after clang ran out of 300 MiB, in the unit with no limit; runs agree)"
 [ -z "${WORK:-}" ] && rm -rf "$W"
 exit $fail

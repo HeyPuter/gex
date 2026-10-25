@@ -603,6 +603,7 @@ dependencies = [
  "gex-ir",
  "gex-key",
  "gex-ld",
+ "libc",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
 ]

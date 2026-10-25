@@ -14,3 +14,6 @@ gex-ld.workspace = true
 anyhow = "1"
 wasmparser = "0.219.2"
 wasm-encoder = { version = "0.219.2", features = ["wasmparser"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

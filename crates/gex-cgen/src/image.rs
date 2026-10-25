@@ -598,7 +598,7 @@ pub fn build_group_module(
 ) -> Result<ImageStats> {
     let mut rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
-    let big = leave_oversized(&mut rec, recoveries, stubs)?;
+    let (big, callers) = leave_oversized(&mut rec, recoveries, stubs)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
@@ -607,7 +607,29 @@ pub fn build_group_module(
     let mut skip: HashSet<u64> = stubs.clone();
     skip.extend(big);
     loop {
-        let stats = emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers)?;
+        // A unit clang ran out of memory on: its largest function goes to
+        // tier-1 (its lifted twin is dropped), and the units build again.
+        let stats = match emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers) {
+            Err(e) if e.downcast_ref::<UnitOutOfMemory>().is_some() => {
+                let o = e.downcast::<UnitOutOfMemory>().expect("checked");
+                eprintln!(
+                    "[cgen] left to tier-1 (clang ran out of its {} MiB): {:#x} ({}){}",
+                    toolchain::clang_mem_mb(),
+                    o.entry,
+                    o.insns,
+                    if o.twin { ", its lifted twin" } else { "" }
+                );
+                if o.twin {
+                    skip.remove(&(o.entry | gex_abi::ftab::TWIN));
+                } else {
+                    untrap(&mut rec, &callers, o.entry);
+                    skip.insert(o.entry);
+                }
+                let _ = std::fs::remove_file(out);
+                continue;
+            }
+            r => r?,
+        };
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -651,18 +673,16 @@ pub fn build_group_module(
     }
 }
 
+/// Callee -> its trap-free direct callers.
+type TrapfreeCallers = HashMap<u64, Vec<u64>>;
+
 /// The functions of `recoveries` over [`max_insns`], which become stubs
-/// that leave for tier-1 (said in the build log). A stub must not be
-/// trap-free, so none of them is, nor (transitively) a trap-free caller of
-/// one: such a caller would not have written everything back. Not an export
-/// provider's stub (`stubs`), which is one already.
-fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64>) -> Result<Vec<u64>> {
-    if max_insns() == 0 {
-        return Ok(Vec::new());
-    }
+/// that leave for tier-1 (said in the build log), and the trap-free callers
+/// of every function, for [`untrap`]. Not an export provider's stub
+/// (`stubs`), which is one already.
+fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64>) -> Result<(Vec<u64>, TrapfreeCallers)> {
     let mut big = Vec::new();
-    // Callee -> its trap-free direct callers.
-    let mut callers: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut callers: TrapfreeCallers = HashMap::new();
     for recovery in recoveries {
         let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
@@ -679,7 +699,17 @@ fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64
         }
     }
     say_oversized(&big);
-    let mut work: Vec<u64> = big.iter().map(|&(a, _)| a).collect();
+    for &(a, _) in &big {
+        untrap(rec, &callers, a);
+    }
+    Ok((big.into_iter().map(|(a, _)| a).collect(), callers))
+}
+
+/// `a` becomes a stub that leaves for tier-1, which must not be trap-free:
+/// neither it nor (transitively) a trap-free caller of it is, as such a
+/// caller would not have written everything back.
+fn untrap(rec: &mut Recovery, callers: &TrapfreeCallers, a: u64) {
+    let mut work = vec![a];
     while let Some(a) = work.pop() {
         rec.trapfree.remove(&a);
         for &c in callers.get(&a).into_iter().flatten() {
@@ -688,8 +718,25 @@ fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64
             }
         }
     }
-    Ok(big.into_iter().map(|(a, _)| a).collect())
 }
+
+/// From [`emit_and_link`]: clang ran out of memory on a unit
+/// ([`toolchain::OutOfMemory`]), whose largest function is `entry`, of
+/// `insns` instructions (its lifted twin when `twin`).
+#[derive(Debug)]
+struct UnitOutOfMemory {
+    entry: u64,
+    insns: usize,
+    twin: bool,
+}
+
+impl std::fmt::Display for UnitOutOfMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clang ran out of memory on the unit holding {:#x}", self.entry)
+    }
+}
+
+impl std::error::Error for UnitOutOfMemory {}
 
 #[allow(clippy::too_many_arguments)]
 fn emit_and_link(
@@ -753,6 +800,9 @@ fn emit_and_link(
     // Units go to a bounded queue of `jobs` compilers: emission waits when it
     // is full, so the C in flight stays at about `jobs` units.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, PathBuf)>(jobs);
+    // Each unit source's largest function, for an out-of-memory clang:
+    // (entry, instructions, a lifted twin).
+    let largest: std::sync::Mutex<HashMap<PathBuf, (u64, usize, bool)>> = Default::default();
     let rx = std::sync::Mutex::new(rx);
     let errors = std::sync::Mutex::new(Vec::new());
     let mut objs: Vec<PathBuf> = Vec::new();
@@ -762,12 +812,16 @@ fn emit_and_link(
                 let job = rx.lock().unwrap().recv();
                 let Ok((src, obj)) = job else { return };
                 if let Err(e) = toolchain::compile_one(work, &src, &obj, Some(&pch)) {
+                    let e = match (e.downcast_ref::<toolchain::OutOfMemory>(), largest.lock().unwrap().get(&src)) {
+                        (Some(_), Some(&(entry, insns, twin))) => anyhow::Error::new(UnitOutOfMemory { entry, insns, twin }),
+                        _ => e,
+                    };
                     errors.lock().unwrap().push(e);
                 }
                 let _ = std::fs::remove_file(&src);
             });
         }
-        let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats, twin: Option<u64>| -> Result<()> {
+        let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats, twin: Option<u64>, big: &mut Option<(u64, usize, bool)>| -> Result<()> {
             unit.add_leaf_copies(&known, &rec.sums, &rec.trapfree)?;
             let src_text = match twin {
                 Some(e) => twin_source(&unit.source(), e),
@@ -781,6 +835,9 @@ fn emit_and_link(
             } else {
                 let src = work.join(format!("unit{k:06}.c"));
                 std::fs::write(&src, &src_text)?;
+                if let Some(b) = big.take() {
+                    largest.lock().unwrap().insert(src.clone(), b);
+                }
                 stats.compiled += 1;
                 tx.send((src, obj.clone())).map_err(|_| anyhow!("the compilers stopped"))?;
             }
@@ -789,9 +846,12 @@ fn emit_and_link(
             stats.devirt += unit.stats.calls_devirt;
             stats.leaf_copies += unit.stats.calls_leaf_copy;
             *unit = new_unit();
+            *big = None;
             Ok(())
         };
         let mut unit = new_unit();
+        // The unit's largest function so far.
+        let mut big: Option<(u64, usize, bool)> = None;
         let mut k = 0usize;
         for recovery in recoveries {
         let mut gir = GirReader::open(recovery)?;
@@ -805,7 +865,7 @@ fn emit_and_link(
                 tu.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
                 tu.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the lifted twin of {:#x}", f.entry))?;
-                emit(&mut tu, k, &mut objs, &mut stats, Some(f.entry))?;
+                emit(&mut tu, k, &mut objs, &mut stats, Some(f.entry), &mut Some((f.entry, func::guest_insns(&f), true)))?;
                 k += 1;
                 stats.twins += 1;
             }
@@ -818,9 +878,13 @@ fn emit_and_link(
                 unit.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
                 unit.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
+                let n = func::guest_insns(&f);
+                if big.is_none_or(|(_, m, _)| n > m) {
+                    big = Some((f.entry, n, false));
+                }
             }
             if unit.len() >= UNIT_BYTES {
-                emit(&mut unit, k, &mut objs, &mut stats, None)?;
+                emit(&mut unit, k, &mut objs, &mut stats, None, &mut big)?;
                 k += 1;
             }
             if !errors.lock().unwrap().is_empty() {
@@ -832,7 +896,7 @@ fn emit_and_link(
         // served by Wine's PE module) still gets its unit, an empty one, so
         // the link has an input and hosts find the image covered.
         if unit.len() > 0 || (objs.is_empty() && providers.sources.is_empty()) {
-            emit(&mut unit, k, &mut objs, &mut stats, None)?;
+            emit(&mut unit, k, &mut objs, &mut stats, None, &mut big)?;
         }
         // The providers' own translation units, cached by their C as units are.
         if !providers.sources.is_empty() {

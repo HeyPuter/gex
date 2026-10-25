@@ -212,7 +212,12 @@ fn build_functions(
         let per = funcs.len().div_ceil(jobs * 4).max(16);
         let mut units = Vec::new();
         let mut stats = func::FnStats::default();
+        // Each unit's largest function, for a clang out of memory.
+        let mut largest: HashMap<String, (u64, usize)> = HashMap::new();
         for (k, chunk) in funcs.chunks(per).enumerate() {
+            if let Some(f) = chunk.iter().max_by_key(|f| func::guest_insns(f)) {
+                largest.insert(format!("unit{k:04}.c"), (f.entry, func::guest_insns(f)));
+            }
             let mut u = func::FnUnit::new();
             u.set_class32(class32);
             u.ret_pops = func::ret_pops(chunk, class32, read);
@@ -249,7 +254,20 @@ fn build_functions(
         let entries: Vec<u64> = funcs.iter().map(|f| f.entry).collect();
         units.push(("call_known.c".into(), func::call_known_source(&entries)));
         let exports: Vec<String> = entries.iter().map(|a| func::entry_name(*a)).collect();
-        let (cwasm, dir) = compile_and_link(units, &exports)?;
+        let (cwasm, dir) = match compile_and_link(units, &exports) {
+            // That unit's largest function goes to tier-1, and the units
+            // build again.
+            Err(e) if e.downcast_ref::<toolchain::OutOfMemory>().is_some() => {
+                let o = e.downcast::<toolchain::OutOfMemory>().expect("checked");
+                let name = o.src.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                let Some(&(a, n)) = largest.get(&name) else { return Err(o.into()) };
+                eprintln!("[cgen] left to tier-1 (clang ran out of its {} MiB): {a:#x} ({n})", toolchain::clang_mem_mb());
+                dropped.insert(a);
+                funcs.retain(|f| f.entry != a);
+                continue;
+            }
+            r => r?,
+        };
         let users = splice::unspliceable_users(&cwasm)?;
         if !users.is_empty() && std::env::var_os("GEX_CGEN_NODROP").is_some() {
             anyhow::bail!("GEX_CGEN_NODROP: unspliceable C functions {users:?}");

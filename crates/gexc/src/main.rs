@@ -183,7 +183,7 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--mem64] [--w3-kuser] [--entries FILE]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--w3-kuser] [--entries FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
@@ -2567,6 +2567,13 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             "--max-insns" => {
                 i += 1;
                 gex_cgen::image::set_max_insns(args.get(i).context("--max-insns needs a number")?.parse()?);
+            }
+            // `--clang-mem-mb N`: the address space each clang may take; a
+            // unit it runs out on leaves its largest function to tier-1 and
+            // builds again. 0, no limit. Also GEX_CGEN_CLANG_MEM_MB.
+            "--clang-mem-mb" => {
+                i += 1;
+                gex_cgen::toolchain::set_clang_mem_mb(args.get(i).context("--clang-mem-mb needs a number")?.parse()?);
             }
             // `--entries FILE`: hex addresses, one per line, the unit has no
             // entry for and a run without translation resumes at (a call's
