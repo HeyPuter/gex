@@ -28,6 +28,9 @@
 #   WINE32_DL_SEED directories with the pinned tarballs already downloaded
 #   GEXC       an x86 gexc, for the prefix install (default: this tree's
 #              target/x86/release/gexc; cargo build --release -p gexc --features x86)
+#   WINE32_MINGW_CC  the compiler for the prefix install's console launcher
+#              (wine32/launch.c; default clang --target=i686-w64-mingw32
+#              -fuse-ld=lld, which needs MinGW-w64's i686 headers and libraries)
 #   WINE32_JOBS    parallel jobs (default 12); everything runs under nice -n 19
 
 WINE32 := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -80,7 +83,7 @@ TOOLS := $(C)/tools-$(WINE_BID)
 BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
 
 # The dist: everything above plus these scripts (stage, link, rebase).
-TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/wine32/*.sh)),8)
+TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/wine32/*.sh $(WINE32)/wine32/*.c)),8)
 # WINE32_TLS=0: the loader without GnuTLS (crypt32's and schannel's dlopen of it
 # then fails, as on a host without it), 1.8 MB less wasm, for a site that
 # never speaks https. The Wine build is the same either way.

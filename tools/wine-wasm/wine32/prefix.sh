@@ -3,8 +3,8 @@
 #
 #   wine32/prefix.sh install BAREPFX DIST GEXC OUT
 #       Wine's full install into a copy of the bare staged prefix: under GEXC,
-#       a console launcher (tests/nt/bin/x86/childcon.exe) runs
-#       `wineboot.exe -u`, whose children run wine.inf's PreInstall and
+#       a console launcher (wine32/launch.c, built here with clang's
+#       i686-w64-mingw32 target: WINE32_MINGW_CC) runs `wineboot.exe -u`, whose children run wine.inf's PreInstall and
 #       DefaultInstall (Mono and Gecko off, as in any unattended prefix);
 #       then Wine's reg.exe turns winedbg's crash dialog off, so a crash a
 #       debugger attaches to ends with its text report rather than a dialog
@@ -17,14 +17,15 @@
 #       (wayland: games; null: tests without a compositor) with
 #       EmulateModeset (games set display modes; Wayland cannot).
 set -eu
-here=$(cd "$(dirname "$0")" && pwd); T=$(cd "$here/.." && pwd); R=$(cd "$T/../.." && pwd)
+here=$(cd "$(dirname "$0")" && pwd); T=$(cd "$here/.." && pwd)
 case $1 in
 install)
   bare=$(realpath "$2") dist=$(realpath "$3") gexc=$(realpath "$4") out=$(realpath -m "$5")
   rm -rf "$out.tmp" && cp -a "$bare" "$out.tmp"
   printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win32\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="null"\n\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' > "$out.tmp/user.reg"
   stat -c %Y "$dist/share/wine/wine.inf" > "$out.tmp/.update-timestamp"
-  cp "$R/tests/nt/bin/x86/childcon.exe" "$out.tmp/drive_c/launch.exe"
+  ${WINE32_MINGW_CC:-clang --target=i686-w64-mingw32 -fuse-ld=lld} -O2 -s -Wl,--no-insert-timestamp \
+    -o "$out.tmp/drive_c/launch.exe" "$here/launch.c" || { echo "wine32/prefix: launch.c failed to build" >&2; exit 1; }
   log=$out.log
   (cd "$out.tmp/drive_c" && timeout -k 10 "${WINE32_INSTALL_TIMEOUT:-3600}" "$gexc" run --env WINEPREFIX="$out.tmp" \
     --env WINEDEBUG=+wineboot --env WINEDLLOVERRIDES=mscoree,mshtml= \
