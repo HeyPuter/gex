@@ -2,13 +2,17 @@
  * GL context, the scene drawn (fixed function) into a texture-rectangle
  * framebuffer object, that blitted to the window's framebuffer, swap.
  *
- *   sdl-fbo-blit [MODE] [FRAMES]
+ *   sdl-fbo-blit [MODE] [FRAMES] [WINDOW]
  *
  * MODE: clear  -- glClear of the window only (the floor)
  *       fbo    -- clear + quad into the FBO, blit to 0 (Half-Life's path)
  *       info   -- print GL_VERSION, GL_RENDERER and every extension, exit
+ * WINDOW: window (default), fullscreen (SDL_WINDOW_FULLSCREEN, as Half-Life
+ *         opens by default) or desktop (SDL_WINDOW_FULLSCREEN_DESKTOP); a
+ *         fullscreen window draws at its drawable size, read every frame.
  * Prints "frame N" every 60 frames and reads back the window's centre pixel
- * after the first frame ("centre r g b").
+ * after the first frame and the 121st ("centre r g b"), the second once a
+ * fullscreen window has its size.
  */
 #include <SDL2/SDL.h>
 #include <stdio.h>
@@ -59,9 +63,11 @@ int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IONBF, 0);
     const char *mode = argc > 1 ? argv[1] : "fbo";
     int frames = argc > 2 ? atoi(argv[2]) : 1 << 30;
-    const int w = 800, h = 600;
+    const char *how = argc > 3 ? argv[3] : "window";
+    Uint32 fs = !strcmp(how, "fullscreen") ? SDL_WINDOW_FULLSCREEN : !strcmp(how, "desktop") ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+    int w = 800, h = 600;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { printf("SDL_Init: %s\n", SDL_GetError()); return 1; }
-    SDL_Window *win = SDL_CreateWindow("sdl-fbo-blit", 0, 0, w, h, SDL_WINDOW_OPENGL);
+    SDL_Window *win = SDL_CreateWindow("sdl-fbo-blit", 0, 0, w, h, SDL_WINDOW_OPENGL | fs);
     if (!win) { printf("window: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { printf("context: %s\n", SDL_GetError()); return 1; }
@@ -94,7 +100,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "fbo")) {
         p_glGenTextures(1, &tex);
         p_glBindTexture(GL_TEXTURE_RECTANGLE, tex);
-        p_glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        p_glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA8, 2048, 2048, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
         p_glGenFramebuffers(1, &fbo);
         p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, tex, 0);
@@ -103,6 +109,12 @@ int main(int argc, char **argv) {
     for (int f = 0; f < frames; f++) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) if (e.type == SDL_QUIT) return 0;
+        if (fs) {
+            int dw = 0, dh = 0;
+            SDL_GL_GetDrawableSize(win, &dw, &dh);
+            if (dw != w || dh != h) printf("drawable %dx%d at frame %d\n", dw, dh, f);
+            if (dw > 0 && dh > 0 && dw <= 2048 && dh <= 2048) w = dw, h = dh;
+        }
         p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         p_glViewport(0, 0, w, h);
         p_glClearColor(0.1f, 0.2f, 0.6f, 1);
@@ -118,7 +130,7 @@ int main(int argc, char **argv) {
             p_glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
             p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
-        if (f == 0) {
+        if (f == 0 || f == 120) {
             unsigned char px[4] = {0};
             p_glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
             printf("centre %d %d %d error 0x%x\n", px[0], px[1], px[2], p_glGetError());
