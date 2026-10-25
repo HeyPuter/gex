@@ -697,7 +697,9 @@ async function begin(opts, base, at, state, meter) {
   if (keep) {
     const p = persist(keep.db, keep.dir, await globalKernel(), {
       every: Number(sw.persistms || 30000),
-      onSync: (m) => { state.persisted = m; },
+      // `persistedWrote`: the files every snapshot of this visit stored,
+      // the ones it took of its own after a save included.
+      onSync: (m) => { state.persisted = m; state.persistedWrote = (state.persistedWrote ?? 0) + (m.wrote ?? 0); },
     });
     globalThis.__ntPersist = () => p?.sync();
   }
