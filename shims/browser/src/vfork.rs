@@ -194,7 +194,7 @@ pub extern "C" fn gex_vfork_ok() -> i32 {
         -5
     } else if unsafe { k_present() } == 0 {
         -6
-    } else if FORK[0].load(Acquire) == 0 || FORK_BY.load(Relaxed) != cur() as u64 + 1 {
+    } else if !crate::fork_staged() {
         -7
     } else {
         1
@@ -227,13 +227,13 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     let mem = crate::sigs::proc_home().mm().clone();
     // What `adoptProcess` stages before `gex_adopt_child`, from what
     // `do_fork` staged.
-    *CWD.0.borrow_mut() = FORK_CWD.0.borrow().clone();
-    *CHILD_EXE.0.borrow_mut() = FORK_EXE.0.borrow().clone();
-    *CHILD_STATE.0.borrow_mut() = FORK_STATE.0.borrow().clone();
+    *CWD.0.borrow_mut() = FORK_CWD.with(|c| c.borrow().clone());
+    *CHILD_EXE.0.borrow_mut() = FORK_EXE.with(|c| c.borrow().clone());
+    *CHILD_STATE.0.borrow_mut() = FORK_STATE.with(|c| c.borrow().clone());
     // Not the shared mappings `do_fork` described with them (`m` lines):
     // the memory is the parent's, and its map has them already. Adopted, each
     // was there twice, the second writable, written back at the child's exec.
-    let fds: String = FORK_FDS.0.borrow().lines().filter(|l| !l.starts_with("m ")).flat_map(|l| [l, "\n"]).collect();
+    let fds: String = FORK_FDS.with(|c| c.borrow().lines().filter(|l| !l.starts_with("m ")).flat_map(|l| [l, "\n"]).collect());
     // A vfork child spawning: it waits, kept aside, as its parent does.
     if active() {
         let f = Frame {
@@ -360,7 +360,7 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
         cmd.push(0);
     }
     stage_fork_fds(h, pid, false);
-    let fds = std::mem::take(&mut *FORK_FDS.0.borrow_mut()).into_bytes();
+    let fds = FORK_FDS.with(|c| std::mem::take(&mut *c.borrow_mut())).into_bytes();
     let cwd = h.kernel.caller_cwd().into_bytes();
     let state = state_bytes(&h.kernel, true);
     let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };

@@ -3820,7 +3820,7 @@ export class Gex {
     vforkTrace(`[vfork] not here: ${why}`);
     if (this.#vforkCopiedSaid) return;
     this.#vforkCopiedSaid = true;
-    const reason = { [-1]: 'vfork children nest too deep here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'another thread staged the fork' }[why] ?? `code ${why}`;
+    const reason = { [-1]: 'vfork children nest too deep here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'no fork staged on this Worker' }[why] ?? `code ${why}`;
     console.error(`[gex] pid ${this.wlToken()}: a CLONE_VM|CLONE_VFORK child is copied, not run in place (${reason}); said once per Worker`);
   }
 
