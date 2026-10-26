@@ -1,6 +1,6 @@
 //! Tier-1 code generation: one wasm function per guest basic block.
 //!
-//! The shape is PLAN §2.4: every block is a function with the uniform
+//! The shape: every block is a function with the uniform
 //! signature `(ctx: i32) -> ()`; direct successors are reached with
 //! `return_call`, computed ones with `return_call_indirect` through the
 //! PC-indexed dispatch table. Guest stack depth therefore never shows up as
@@ -11,7 +11,7 @@
 //!
 //! * **Guest registers are cached in wasm locals** for the length of the
 //!   block. A register is loaded from the context at most once and stored
-//!   back at most once, at the block's exit (PLAN §5.4.2).
+//!   back at most once, at the block's exit.
 //! * **Value locals are recycled** using last-use information, so a long
 //!   block needs a handful of locals rather than one per SSA value.
 
@@ -678,8 +678,8 @@ struct Emitter<'a> {
     block_start: u64,
     /// Scratch for address computation.
     scratch_i64: u32,
-    /// Two addresses for a bulk memory op under a memory64 guest memory
-    /// (docs/mem64.md), whose addresses are i64 and so cannot borrow the
+    /// Two addresses for a bulk memory op under a memory64 guest memory,
+    /// whose addresses are i64 and so cannot borrow the
     /// i32 scratches the wasm32 path uses. Zero, and never declared, unless
     /// the memory is 64-bit: a wasm32 function keeps exactly its locals.
     scratch_addr: (u32, u32),
@@ -1370,7 +1370,7 @@ impl<'a> Emitter<'a> {
             .map(|(r, c)| (*r, c.local))
             .collect();
         // Deterministic output makes translated modules reproducible, which
-        // the content-addressed cache (PLAN §10) depends on.
+        // the content-addressed cache depends on.
         dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
         let before = self.f.code.len();
 
@@ -1485,7 +1485,7 @@ impl<'a> Emitter<'a> {
     /// Emit the 32-bit linear-memory address for `addr + offset`, returning
     /// the static offset the access should carry.
     ///
-    /// Guest VA equals linear-memory offset (PLAN §2.3), so this is a
+    /// Guest VA equals linear-memory offset, so this is a
     /// truncation plus one guard: an effective address that does not fit in
     /// 32 bits is steered to an address inside the unmapped top page, which
     /// makes the access trap and become SIGSEGV rather than silently aliasing
@@ -1518,7 +1518,7 @@ impl<'a> Emitter<'a> {
         // nothing, and the engine traps any bulk address past the end.
         let on = null_guard_on();
         let null_guard = on && biased && !self.is_ctx(addr);
-        // A memory64 guest memory (docs/mem64.md) takes the guest address
+        // A memory64 guest memory takes the guest address
         // as it stands: past the end of the memory, the engine's own check
         // traps, which is the SIGSEGV the guard below exists to produce. The
         // static offset follows the same rule as the guarded path.
@@ -1687,7 +1687,7 @@ impl<'a> Emitter<'a> {
     }
 
     /// Push the context as a memory address: the `ctx` parameter (an i32 in
-    /// every ABI), widened for a memory64 guest memory (docs/mem64.md). Pass
+    /// every ABI), widened for a memory64 guest memory. Pass
     /// `ctx_local` itself to calls.
     fn ctx_base(&mut self) {
         self.f.local_get(self.ctx_local);
@@ -5072,7 +5072,7 @@ impl<'a> Emitter<'a> {
     /// A backward direct branch is the cheap, sound approximation of a loop:
     /// no program can spin without reaching a poll, while straight-line code,
     /// forward branches and calls pay nothing (syscalls are delivery points
-    /// already). PLAN §5.6.
+    /// already).
     fn emit_safepoint(&mut self, pc: u64) {
         let before = self.f.code.len();
         self.emit_safepoint_inner(pc);

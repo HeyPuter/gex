@@ -32,7 +32,7 @@ pub fn const_value(block: &Block, v: Value) -> Option<u64> {
 /// Makes dynamically linked code discoverable: a PLT `br x17` becomes a
 /// constant once the GOT slot it loads is read. Reading a slot that later
 /// changes only wastes a translation; the dispatch table decides the real
-/// target (PLAN §6.1).
+/// target.
 pub fn const_fold_with_memory(block: &mut Block, read: &dyn Fn(u64, u32) -> Option<u64>) {
     let mut known: Vec<Option<u64>> = vec![None; block.n_values as usize];
     for stmt in &mut block.stmts {
@@ -438,7 +438,7 @@ pub fn dce(block: &mut Block) {
     });
 }
 
-/// Statistics used by the perf work in PLAN §13.
+/// Statistics for performance work.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
     pub stmts: usize,

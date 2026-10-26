@@ -1,5 +1,5 @@
 //! Dense block tables: tier-1 dispatch without a table slot per four bytes
-//! of guest code (the browser; docs/merge-plan.md §9.2, "tables index
+//! of guest code (the browser, "tables index
 //! functions, not 4-byte slots").
 //!
 //! The page directory and the slot numbering stay as they are: a page's

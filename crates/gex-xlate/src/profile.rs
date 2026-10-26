@@ -36,7 +36,7 @@
 //! Both files are JSON, versioned by a `format` and a `version` field; a
 //! reader rejects a version it does not know. Numbers are decimal and
 //! unsigned. See [`Profile::to_json`] and [`Session::to_json`] for the exact
-//! shapes; `docs/profile-format.md` describes them for humans.
+//! shapes.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

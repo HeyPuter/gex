@@ -1,4 +1,4 @@
-//! The function JIT at run time (docs/merge-plan.md §9.8): what
+//! The function JIT at run time: what
 //! the function table's host asks for on a lookup miss (`gex_kernel::ftab`'s
 //! `Translator`, installed by `gexc run --fjit`).
 //!
@@ -123,7 +123,7 @@ impl Jit {
     /// functions translated, read-only ranges) described the code that was
     /// there, and a `dlclose` and a later `dlopen` put another library at
     /// the same addresses. Kept, the old library's starts split the new
-    /// one's functions where it had none: HK's SDL loads libdbus, unloads
+    /// one's functions where it had none: one game's SDL loads libdbus, unloads
     /// it, and maps libxcb over it; a libdbus start ended libxcb's
     /// `_xcb_in_read_block` before its `cmovle` as a tail call, flags dead,
     /// and it read the X setup reply out of an empty queue.

@@ -1,5 +1,5 @@
 //! Function mode: tier-1's statement lowering for whole functions, for the
-//! function JIT (`gex-fjit`, docs/merge-plan.md §9.8).
+//! function JIT (`gex-fjit`).
 //!
 //! The JIT owns the control flow -- structured `block`/`loop`/`br` over the
 //! function's blocks, calls, the `F_body` ABI. Everything inside a block

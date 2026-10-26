@@ -376,7 +376,7 @@ pub enum BarrierKind {
     /// Data synchronization barrier.
     Dsb,
     /// Instruction synchronization barrier — also our translation-invalidation
-    /// hook for self-modifying guest code (PLAN §6.2).
+    /// hook for self-modifying guest code.
     Isb,
     /// Speculation barrier.
     Sb,
@@ -1482,7 +1482,7 @@ pub enum SysMaintOp {
     /// `dc cvau`/`civac`/… — data cache clean, a no-op for a coherent host.
     DcClean,
     /// `ic ivau`/`iallu` — instruction cache invalidate. Our translation
-    /// invalidation hook (PLAN §6.2).
+    /// invalidation hook.
     IcInvalidate,
     /// Everything else (`at`, `tlbi`, …) — no-op.
     Other,

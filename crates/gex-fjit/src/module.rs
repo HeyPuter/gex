@@ -220,7 +220,7 @@ pub fn build_module(
     Ok((wasm, roots.into_iter().map(|(a, _)| a).collect()))
 }
 
-/// `e_F(ctx)`: the nest root (function-tier.md §7). x86 first checks that
+/// `e_F(ctx)`: the nest root. x86 first checks that
 /// dispatch meant this entry (a slot covers four bytes), as tier-1's blocks
 /// do; then the body, with no caller to predict, and dispatch on `ctx::PC`.
 fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
@@ -364,7 +364,7 @@ fn bucket(a: u64, bits: u32) -> usize {
     (((t >> gex_abi::INST_ALIGN_SHIFT) ^ (t >> (gex_abi::INST_ALIGN_SHIFT + bits))) & ((1u32 << bits) - 1)) as usize
 }
 
-/// The module of a run-time translation (docs/merge-plan.md §9.8.1): `funcs`
+/// The module of a run-time translation: `funcs`
 /// (memory form, prepared), installed in the process's function table. It
 /// imports the guest memory, `gex.ftab`, `env.__table_base` and tier-1's
 /// host functions; one active element segment puts each function's body at
@@ -503,7 +503,7 @@ pub fn build_runtime(
             im,
             exports::MEMORY,
             // A memory64 guest memory, and so a table64 `ftab` and an i64
-            // `__table_base`, as wasm64 units have (docs/mem64.md §4).
+            // `__table_base`, as wasm64 units have.
             EntityType::Memory(if gex_abi::mem64() {
                 MemoryType { minimum: 0, maximum: Some(gex_abi::LIMIT64_PAGES), memory64: true, shared: true, page_size_log2: None }
             } else {

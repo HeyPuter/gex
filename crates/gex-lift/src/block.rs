@@ -8,7 +8,7 @@ use gex_isa::decode;
 #[derive(Copy, Clone, Debug)]
 pub struct BlockLimits {
     /// Stop and fall through after this many instructions, so no single wasm
-    /// function grows pathologically large (PLAN §9).
+    /// function grows pathologically large.
     pub max_insts: usize,
 }
 
@@ -22,7 +22,7 @@ impl Default for BlockLimits {
 ///
 /// `fetch` returns the instruction word at a guest address, or `None` when it
 /// is not backed by translatable memory; an unfetchable address ends the block
-/// with [`Term::Illegal`] rather than failing the build (PLAN §6.1).
+/// with [`Term::Illegal`] rather than failing the build.
 pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockLimits) -> Block {
     let mut builder = Builder::new(start);
     let mut pc = start;

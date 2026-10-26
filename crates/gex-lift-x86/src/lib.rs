@@ -23,7 +23,7 @@ mod block;
 
 /// A byte-copy loop at `start`, `l: movsb; cmp r32, edi (either order);
 /// jne l` (compilers' and hand-written memcpy tails; 40% of the loop
-/// iterations in Undertale's image loading under Wine): the register `r`
+/// iterations in one game's image loading under Wine): the register `r`
 /// it compares `edi` with, for [`Lifter::lift_copy_loop`]. Drivers try it
 /// at a block's start, where the loop's own branch lands.
 pub fn copy_loop(fetch: &dyn Fn(u64, &mut [u8; 16]) -> usize, start: u64) -> Option<u8> {
@@ -1207,7 +1207,7 @@ impl<'a> Lifter<'a> {
                 // cmpxchg8b: edx:eax against [m], replaced with ecx:ebx -- one
                 // 64-bit atomic compare-exchange. It has to be: a lock-free
                 // list's head is a pointer and a counter swapped together
-                // (Windows' SLIST_HEADER, Noita's job queues), and the two
+                // (Windows' SLIST_HEADER, a game's job queues), and the two
                 // halves loaded and stored separately -- stored back even when
                 // unequal -- lose other threads' pushes and pops and hand out
                 // torn pointers.

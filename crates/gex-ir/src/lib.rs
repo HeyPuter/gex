@@ -268,7 +268,7 @@ impl MemSz {
 /// Memory ordering attached to a load, store or read-modify-write.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Order {
-    /// Plain access. Guest data races stay data races (PLAN §5.8).
+    /// Plain access. Guest data races stay data races.
     Relaxed,
     /// Used for every *ordered* guest access: seq-cst is stronger than
     /// AArch64 acquire/release, so it is always a correct over-approximation.

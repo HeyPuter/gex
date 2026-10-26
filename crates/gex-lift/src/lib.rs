@@ -1,12 +1,12 @@
 //! `gex-lift` — AArch64 instruction semantics, expressed in GIR.
 //!
 //! One function per instruction family, hand-written against the Arm ARM
-//! pseudocode (PLAN §5.3). The lifter's contract:
+//! pseudocode. The lifter's contract:
 //!
 //! * **Total.** Every [`Inst`] either lifts to GIR or ends the block with
 //!   [`Term::Illegal`]. Nothing is silently skipped, so an instruction gex
 //!   cannot execute becomes a precise SIGILL at run time rather than a wrong
-//!   answer (PLAN §6.1).
+//!   answer.
 //! * **Exact.** Where the architecture and wasm disagree — division by zero,
 //!   `INT_MIN / -1`, shift-amount masking — the lifter inserts the guard, so
 //!   the backend never has to know.
@@ -114,7 +114,7 @@ fn order_of(o: IsaOrder) -> Order {
     match o {
         IsaOrder::None => Order::Relaxed,
         // Acquire and release both map to seq-cst, which is stronger than
-        // either and therefore always sound (PLAN §5.8).
+        // either and therefore always sound.
         IsaOrder::Acquire | IsaOrder::Release => Order::SeqCst,
     }
 }
@@ -995,7 +995,7 @@ impl<'a> Lifter<'a> {
                 match kind {
                     // ISB is the architecture's promise that previously
                     // written code is now visible: our translation
-                    // invalidation hook (PLAN §6.2).
+                    // invalidation hook.
                     BarrierKind::Isb => {
                         let pcv = self.b.const_i64(pc);
                         let code = self.b.const_i32(gex_abi::cache_op::ISB as u32);
@@ -1367,7 +1367,7 @@ impl<'a> Lifter<'a> {
             } => {
                 // AArch64 fuses this (one rounding); wasm has no FMA and
                 // rounding the product first is enough to break musl's `pow`,
-                // which is built on it. So the host's FMA is called (PLAN §5.7).
+                // which is built on it. So the host's FMA is called.
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
                 let b = self.rd_fp(vm, sz);
@@ -2863,7 +2863,7 @@ impl<'a> Lifter<'a> {
                 let prod = self.vmul(lane, a, b);
                 let add = matches!(op, VOp3::Mla | VOp3::FMla);
                 // The floating-point forms are fused on hardware; wasm has no
-                // vector FMA, so the product is rounded first (PLAN §5.7).
+                // vector FMA, so the product is rounded first.
                 let r = self.b.def(Expr::VLaneBin {
                     op: if add {
                         VLaneBinOp::Add
@@ -3088,7 +3088,7 @@ impl<'a> Lifter<'a> {
             VOp2::FrintM => Some(VLaneUnOp::Floor),
             VOp2::FrintZ => Some(VLaneUnOp::Trunc),
             // Ties to even for FRINTN, and for FRINTX/FRINTI (the FPCR mode,
-            // not tracked; PLAN §5.7). FRINTA is built below.
+            // not tracked). FRINTA is built below.
             VOp2::FrintN | VOp2::FrintX | VOp2::FrintI => Some(VLaneUnOp::Nearest),
             _ => None,
         };
@@ -4806,7 +4806,7 @@ impl<'a> Lifter<'a> {
                 }
             }
             // FPCR/FPSR writes go to the host so the fidelity policy
-            // (PLAN §5.7) can notice a non-default rounding mode.
+            // can notice a non-default rounding mode.
             other => {
                 let pcv = self.b.const_i64(pc);
                 let id = self.b.const_i32(sysreg_code(other) as u32);

@@ -2,7 +2,7 @@
 //!
 //! The module's shape is fixed by the runtime ABI in `gex-abi`:
 //!
-//! * one linear memory that *is* the guest address space (PLAN §2.3);
+//! * one linear memory that *is* the guest address space;
 //! * one funcref table indexed by `(pc - text_base) >> 2`, every slot filled
 //!   — translated blocks where we have them, a miss stub everywhere else, so
 //!   a branch to an untranslated address produces a precise diagnostic
@@ -1352,8 +1352,9 @@ impl ModuleBuilder {
     /// `(ctx) -> ()`: the slot every untranslated address points at.
     ///
     /// It reads the PC the branching code recorded in the context, hands it
-    /// to the host, and tail-calls whatever slot the host returns. In M0 the
-    /// host always raises an error; from M3 it translates and patches.
+    /// to the host, and tail-calls whatever slot the host returns. With no
+    /// translator the host raises an error; with one it translates and
+    /// patches.
     /// A function for a dispatch slot that several blocks start in: compare
     /// `ctx::LAST_TARGET` (what the dispatcher recorded) with each block's
     /// address and tail-call the match; anything else is a miss.
@@ -1420,7 +1421,7 @@ impl ModuleBuilder {
         let mut f = FuncBody::new(2);
         // Record the entry PC so a miss inside `enter` reports it correctly,
         // and the exact target: for a shared slot's trampoline (x86-64), and
-        // for the function table's bridge (merge-plan §9.8.1), which serves
+        // for the function table's bridge, which serves
         // the address dispatch was asked for (`LAST_TARGET`) on any guest.
         f.local_get(0);
         f.addr_i32();

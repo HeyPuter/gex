@@ -26,7 +26,7 @@
 //! cannot be resolved is left [`FTerm::Unresolved`].
 //!
 //! Recovery never decides correctness: every address the function tier does
-//! not own stays tier-1's (merge plan §4.1.3). What it decides is how much of
+//! not own stays tier-1's. What it decides is how much of
 //! the program the function tier sees whole.
 
 use crate::arch::{self, BlockLimits, FetchBuf, Lifted};
@@ -211,8 +211,8 @@ pub struct Code<'a> {
 #[repr(u8)]
 enum Src<'a> {
     Image { image: &'a Image, view: CodeView<'a> },
-    /// Guest memory at run time (the function JIT, docs/merge-plan.md
-    /// §9.8): what is executable now, read as it is now.
+    /// Guest memory at run time (the function JIT): what
+    /// is executable now, read as it is now.
     Memory { mem: &'a [u8], exec: &'a dyn Fn(u64) -> bool, readonly: &'a dyn Fn(u64, u64) -> bool },
 }
 
@@ -965,7 +965,7 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
 }
 
 /// Recover the function at `start` alone, from code read as it is now (the
-/// function JIT at run time, docs/merge-plan.md §9.8): discovery, then its
+/// function JIT at run time): discovery, then its
 /// jump tables, rediscovered until both stand. `starts` are the function
 /// entries known so far, which bound it (a jump to one is a tail call); the
 /// call targets it makes are added. `noreturn` are callees known not to
@@ -1062,7 +1062,7 @@ pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds),
     // (they usually sit in a read-only section) they made every `jmp [slot]`
     // thunk a one-entry jump table into the middle of the hint table, which
     // decodes as garbage and never returns -- so every call through a thunk
-    // (noita.exe's memset, memcpy...) was taken not to return, and its
+    // (a game's memset, memcpy...) was taken not to return, and its
     // continuation was left out of the function. Recovered with the slots
     // zeroed, a thunk's target is unknown: an indirect tail call.
     {

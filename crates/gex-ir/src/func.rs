@@ -1,7 +1,7 @@
 //! Function-level GIR: a whole guest function as a CFG of lifted blocks.
 //!
 //! Tier-1 works on one [`Block`](crate::Block) at a time. The function tier
-//! (the C backend, merge plan §6 M2) works on whole guest functions, and this
+//! (the C backend) works on whole guest functions, and this
 //! module is the form it consumes. A [`Function`] is:
 //!
 //! * a set of [`FBlock`]s indexed by [`BlockId`], block 0 being the primary
@@ -292,8 +292,8 @@ impl FTerm {
 
     /// True when control can leave the function here (to a callee, the
     /// caller, the kernel, or anywhere). A backend makes guest-visible state
-    /// architecturally correct before every such terminator (merge plan
-    /// §4.1.1), except where call-graph summaries prove it unnecessary.
+    /// architecturally correct before every such terminator,
+    /// except where call-graph summaries prove it unnecessary.
     pub fn leaves(&self) -> bool {
         !matches!(self, FTerm::Jump(_) | FTerm::Branch { .. })
             && !matches!(self, FTerm::Switch { table, .. } if table.complete)
@@ -1174,15 +1174,15 @@ pub struct Summary {
     pub output_sources: RegSet,
     /// Some path returns to the caller.
     pub may_return: bool,
-    /// May reach an event that needs every function-tier frame unwound
-    /// (merge plan §4.2): `fork`, `clone`, `execve`, a signal raised
+    /// May reach an event that needs every function-tier frame unwound:
+    /// `fork`, `clone`, `execve`, a signal raised
     /// synchronously, a stack switch (`longjmp`, `setcontext`), or code the
     /// analysis could not see.
     pub may_unwind: bool,
     /// May transfer control somewhere other than its return address: an
     /// unresolved indirect jump, a return through a value not proved to be
     /// the return address, or a callee that may. A caller checks after the
-    /// call (merge plan §4.2, "returns are checked").
+    /// call ("returns are checked").
     pub may_leave_pending: bool,
     /// Some call or jump in the call tree goes to code the analysis does not
     /// know. Everything above is then "everything" for that path.

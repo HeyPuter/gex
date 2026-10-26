@@ -2,8 +2,8 @@
 //!
 //! Ties the decoder, lifter and backend together and drives *code discovery*.
 //!
-//! Discovery is a best-effort search, never a correctness requirement
-//! (PLAN §6.1): everything it misses ends up in an untranslated dispatch slot
+//! Discovery is a best-effort search, never a correctness requirement:
+//! everything it misses ends up in an untranslated dispatch slot
 //! and is reported precisely at run time instead of silently misexecuting.
 //! The more it finds ahead of time, the less work is left for the runtime
 //! translator.
@@ -200,10 +200,10 @@ pub struct Options {
     /// slots and overwrite one another.
     pub first_slot: u64,
     /// Build the function tier: every block also as C, compiled by clang and
-    /// spliced into the tier-1 module (`gex-cgen`, docs/function-tier.md).
+    /// spliced into the tier-1 module (`gex-cgen`).
     /// Needs the `cgen` feature; runtime translation stays tier-1.
     pub cgen: bool,
-    /// The function JIT (`gex-fjit`, docs/merge-plan.md §9.8): every
+    /// The function JIT (`gex-fjit`): every
     /// recovered function emitted as wasm directly, no clang, and spliced
     /// into the tier-1 module as `cgen` is. Needs the `fjit` feature.
     pub fjit: bool,
@@ -479,7 +479,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,
     // which keeps the emitted module byte-identical across runs and therefore
-    // usable as a content-addressed cache key (PLAN §10).
+    // usable as a content-addressed cache key.
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut collected: Vec<Block> = Vec::new();
@@ -1574,7 +1574,7 @@ fn lift_one(
     pass::optimize(&mut block);
     // Self-modifying code with no flush instruction to announce it.
     // TEST(GEX_TEST_LIFT_DELAY_US): widen the window between decoding a
-    // JIT-code block and fixing its guard, for tests/x86-programs/smc-race.
+    // JIT-code block and fixing its guard (a test-only switch).
     if snapshot.is_some() {
         static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let d = *DELAY.get_or_init(|| std::env::var("GEX_TEST_LIFT_DELAY_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0));

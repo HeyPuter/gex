@@ -1,12 +1,12 @@
 //! A minimal WebAssembly binary writer.
 //!
 //! Written by hand rather than pulled from a crate for two reasons: the
-//! translator has to run *inside* wasm as `gex-jit` (PLAN §2.1), where a lean
+//! translator has to run *inside* wasm as `gex-jit`, where a lean
 //! dependency-free encoder keeps the shipped module small; and tier-1 codegen
 //! is a hot loop where we want to control byte emission directly.
 //!
-//! Covers the MVP plus the three proposals gex depends on: tail calls
-//! (PLAN §2.4), threads/atomics (PLAN §5.8) and reference types for the
+//! Covers the MVP plus the three proposals gex depends on: tail calls,
+//! threads/atomics and reference types for the
 //! dispatch table.
 use std::collections::HashMap;
 
@@ -348,7 +348,7 @@ impl FuncBody {
     }
 
     /// Push the constant guest address `a` as the memory's index type: i32
-    /// for a wasm32 guest memory, i64 for a memory64 one (docs/mem64.md).
+    /// for a wasm32 guest memory, i64 for a memory64 one.
     pub fn addr_const(&mut self, a: u64) {
         if gex_abi::mem64() {
             self.i64_const(a as i64);
@@ -357,7 +357,7 @@ impl FuncBody {
         }
     }
 
-    /// Address arithmetic in the memory's index type (docs/mem64.md). For
+    /// Address arithmetic in the memory's index type. For
     /// a wasm32 memory each emits exactly the i32 instruction tier-1 always
     /// has, so wasm32 modules are unchanged.
     ///
@@ -404,7 +404,7 @@ impl FuncBody {
 
     /// Make the i32 function-table index on top of the stack `gex.ftab`'s
     /// index type: a memory64 process's `ftab` is a table64, as clang's
-    /// wasm64 units import it (docs/mem64.md §4).
+    /// wasm64 units import it.
     pub fn ftab_index(&mut self) {
         if gex_abi::mem64() {
             self.byte(0xad); // i64.extend_i32_u
@@ -867,7 +867,7 @@ impl Module {
     }
 
     /// Import the guest memory: shared, and a memory64 one of
-    /// [`gex_abi::LIMIT64_PAGES`] in an M64 process (docs/mem64.md), else
+    /// [`gex_abi::LIMIT64_PAGES`] in an M64 process, else
     /// `min..max` pages of wasm32.
     pub fn import_guest_memory(&mut self, module: &str, name: &str, min: u64, max: u64) {
         let mem64 = gex_abi::mem64();
