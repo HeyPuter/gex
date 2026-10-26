@@ -6,7 +6,7 @@ dh_makeshlibs and dpkg-shlibdeps, libtool):
 
   -f   the file format line (elf32-wasm32)
   -p   the dynamic section: NEEDED and RUNPATH (dylink.0) and SONAME (the
-       module name)
+       module name) (a program in its ELF container: the module it holds)
   -T   the dynamic symbols: exports defined, env imports *UND*
   -w and -R are accepted (no relocation records), -x is -fpT
 
@@ -29,6 +29,20 @@ def name(w, p):
     return w[p:p + n].decode('utf-8', 'replace'), p + n
 
 
+def contained(w):
+    """The wasm module in a gexcc program's ELF container (right after the
+    program headers, to the end of the first segment), or None."""
+    i = w.find(b'\0asm\x01\0\0\0', 0, 4096)
+    if i < 0:
+        return None
+    rd = lambda a, n: int.from_bytes(w[a:a + n], 'little')
+    if w[4] == 2:  # ELF64
+        end = rd(rd(32, 8) + 32, 8)
+    else:
+        end = rd(rd(28, 4) + 16, 4)
+    return w[i:end] if i < end <= len(w) else None
+
+
 def describe(path):
     """(soname, needed, runpath, defined [(name, kind)], undefined [name])
     of a side module, or None for anything else."""
@@ -36,7 +50,9 @@ def describe(path):
         w = open(path, 'rb').read()
     except OSError:
         return None
-    if w[:4] != b'\0asm':
+    if w[:4] == b'\x7fELF':
+        w = contained(w)
+    if w is None or w[:4] != b'\0asm':
         return None
     soname, needed, runpath, defined, undefined, dylink = None, [], [], [], [], False
     p = 8
