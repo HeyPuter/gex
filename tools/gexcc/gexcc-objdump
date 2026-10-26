@@ -5,7 +5,8 @@ describes an ELF shared object, for the tools that read that (Debian's
 dh_makeshlibs and dpkg-shlibdeps, libtool):
 
   -f   the file format line (elf32-wasm32)
-  -p   the dynamic section: NEEDED (dylink.0) and SONAME (the module name)
+  -p   the dynamic section: NEEDED and RUNPATH (dylink.0) and SONAME (the
+       module name)
   -T   the dynamic symbols: exports defined, env imports *UND*
   -w and -R are accepted (no relocation records), -x is -fpT
 
@@ -29,15 +30,15 @@ def name(w, p):
 
 
 def describe(path):
-    """(soname, needed, defined [(name, kind)], undefined [name]) of a side
-    module, or None for anything else."""
+    """(soname, needed, runpath, defined [(name, kind)], undefined [name])
+    of a side module, or None for anything else."""
     try:
         w = open(path, 'rb').read()
     except OSError:
         return None
     if w[:4] != b'\0asm':
         return None
-    soname, needed, defined, undefined, dylink = None, [], [], [], False
+    soname, needed, runpath, defined, undefined, dylink = None, [], [], [], [], False
     p = 8
     while p < len(w):
         sid = w[p]; n, q = leb(w, p + 1); end = q + n
@@ -51,6 +52,10 @@ def describe(path):
                         cnt, r = leb(w, q)
                         for _ in range(cnt):
                             lib, r = name(w, r); needed.append(lib)
+                    elif kind == 5:  # WASM_DYLINK_RUNTIME_PATH
+                        cnt, r = leb(w, q)
+                        for _ in range(cnt):
+                            d, r = name(w, r); runpath.append(d)
                     q = sub_end
             elif nm == 'name' and w[q] == 0:  # module name
                 _, r = leb(w, q + 1)
@@ -87,7 +92,7 @@ def describe(path):
         p = end
     if not dylink:
         return None
-    return soname or os.path.basename(path), needed, defined, sorted(set(undefined))
+    return soname or os.path.basename(path), needed, runpath, defined, sorted(set(undefined))
 
 
 def main():
@@ -106,7 +111,7 @@ def main():
     if 'x' in flags:
         flags |= set('fpT')
     out = []
-    for f, (soname, needed, defined, undefined) in zip(files, descs):
+    for f, (soname, needed, runpath, defined, undefined) in zip(files, descs):
         out.append('\n%s:     file format elf32-wasm32\n' % f)
         if 'f' in flags:
             out.append('architecture: wasm32, flags 0x00000150:\nHAS_SYMS, DYNAMIC, D_PAGED\nstart address 0x00000000\n')
@@ -114,6 +119,8 @@ def main():
             out.append('Dynamic Section:')
             out += ['  NEEDED               %s' % n for n in needed]
             out.append('  SONAME               %s' % soname)
+            if runpath:
+                out.append('  RUNPATH              %s' % ':'.join(runpath))
             out.append('')
         if 'T' in flags:
             out.append('DYNAMIC SYMBOL TABLE:')

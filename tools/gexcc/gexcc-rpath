@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""The run path of a gexcc module, which is in its dylink.0 section
+(WASM_DYLINK_RUNTIME_PATH), not in an ELF dynamic section. Works on a side
+module and on a program in its ELF container.
+
+  gexcc-rpath FILE              print the run path, its directories joined
+                                with ':' (an empty line: it has none)
+  gexcc-rpath --set PATH FILE   replace it with PATH (':'-separated; empty
+                                removes it), in place
+
+A build system's install step rewrites an ELF's run path in place, from the
+build tree's directories to the installed ones (meson's depfixer); this is
+that step for a gexcc module. As there, the new run path must not be longer
+than the old: the file keeps its size and every section but dylink.0 keeps
+its offset (a container's segments are laid out around the module), the
+bytes saved going to an unnamed custom section right after dylink.0.
+
+Exit status 2: FILE is not a gexcc module.
+"""
+import sys
+
+RUNTIME_PATH = 5
+
+
+def leb(w, p):
+    r = sh = 0
+    while True:
+        x = w[p]; p += 1
+        r |= (x & 0x7f) << sh; sh += 7
+        if not x & 0x80:
+            return r, p
+
+
+def enc(v, width=0):
+    """v as unsigned LEB128, padded to `width` bytes if given."""
+    out = bytearray()
+    while True:
+        b = v & 0x7f; v >>= 7
+        if v or len(out) + 1 < width:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def string(s):
+    b = s.encode()
+    return enc(len(b)) + b
+
+
+def module(w):
+    """(start, end) of the wasm module in FILE's bytes, or None."""
+    if w[:4] == b'\0asm':
+        return 0, len(w)
+    if w[:4] != b'\x7fELF':
+        return None
+    i = w.find(b'\0asm\x01\0\0\0', 0, 4096)
+    if i < 0:
+        return None
+    rd = lambda a, n: int.from_bytes(w[a:a + n], 'little')
+    end = rd(rd(32, 8) + 32, 8) if w[4] == 2 else rd(rd(28, 4) + 16, 4)
+    return (i, end) if i < end <= len(w) else None
+
+
+def dylink(w, m0):
+    """(section start, section end, [(kind, payload)]) of the module's
+    dylink.0 section, which is its first."""
+    p = m0 + 8
+    if w[p] != 0:
+        return None
+    n, q = leb(w, p + 1)
+    end = q + n
+    ln, q = leb(w, q)
+    if w[q:q + ln] != b'dylink.0':
+        return None
+    q += ln
+    subs = []
+    while q < end:
+        kind = w[q]
+        sl, q = leb(w, q + 1)
+        subs.append((kind, bytes(w[q:q + sl])))
+        q += sl
+    return p, end, subs
+
+
+def paths(payload):
+    cnt, q = leb(payload, 0)
+    out = []
+    for _ in range(cnt):
+        n, q = leb(payload, q)
+        out.append(payload[q:q + n].decode())
+        q += n
+    return out
+
+
+def main():
+    a = sys.argv[1:]
+    new = None
+    if len(a) == 3 and a[0] == '--set':
+        new, a = a[1], a[2:]
+    if len(a) != 1:
+        sys.exit(__doc__.split('\n\n')[1])
+    f = a[0]
+    w = bytearray(open(f, 'rb').read())
+    m = module(w)
+    d = m and dylink(w, m[0])
+    if not d:
+        print(f'gexcc-rpath: {f}: not a gexcc module', file=sys.stderr)
+        sys.exit(2)
+    p0, p1, subs = d
+    old = [x for k, s in subs if k == RUNTIME_PATH for x in paths(s)]
+    if new is None:
+        print(':'.join(old))
+        return
+    dirs = [x for x in new.split(':') if x]
+    if dirs == old:
+        return
+    body = string('dylink.0')
+    for k, s in subs:
+        if k != RUNTIME_PATH:
+            body += bytes([k]) + enc(len(s)) + s
+    if dirs:
+        s = enc(len(dirs)) + b''.join(string(x) for x in dirs)
+        body += bytes([RUNTIME_PATH]) + enc(len(s)) + s
+    sec = b'\0' + enc(len(body)) + body
+    room = (p1 - p0) - len(sec)
+    if room < 0:
+        sys.exit(f'gexcc-rpath: {f}: the new run path is longer than the old one '
+                 f'({":".join(dirs)!r} over {":".join(old)!r})')
+    if room <= 5 - len(enc(len(body))):
+        # few bytes over: the section's size takes them, as a longer LEB128
+        sec = b'\0' + enc(len(body), len(enc(len(body))) + room) + body
+    else:
+        # an unnamed custom section of `room` bytes: id, size, empty name
+        width = 1 if room - 2 < 0x80 else 5
+        n = room - 1 - width
+        sec += b'\0' + enc(n, width) + b'\0' + bytes(n - 1)
+    assert len(sec) == p1 - p0
+    w[p0:p1] = sec
+    with open(f, 'r+b') as o:
+        o.write(w)
+
+
+main()

@@ -123,6 +123,8 @@ chmod +x "$B/$TRIPLE-objcopy"
 # object (Debian's dh_makeshlibs and dpkg-shlibdeps read SONAME and NEEDED)
 cp "$HERE/gexcc-objdump" "$B/gexcc-objdump"
 ln -sf gexcc-objdump "$B/$TRIPLE-objdump"
+# a module's run path (dylink.0), rewritten at install as an ELF's is
+cp "$HERE/gexcc-rpath" "$B/gexcc-rpath"
 for t in gexcc-ar gexcc-ranlib gexcc-nm; do
   printf '#!/bin/sh\nexec llvm-%s "$@"\n' "${t#gexcc-}" > "$B/$t"; chmod +x "$B/$t"
 done
