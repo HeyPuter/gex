@@ -271,6 +271,13 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+# A Debian package's build: the build machine's tools' CMake packages too
+# (extra-cmake-modules, /usr/share/ECM, is one, not the target's), after the
+# sysroot's; the build machine's own libraries' are under its multiarch
+# directory, which is not searched
+if(DEFINED ENV{DEB_HOST_ARCH})
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+endif()
 set(CMAKE_CROSSCOMPILING_EMULATOR "$B/gexcc-run")
 set(PKG_CONFIG_EXECUTABLE "$B/$TRIPLE-pkg-config" CACHE FILEPATH "")
 # Static libraries unless GEXCC_SHARED (wasm side modules)
