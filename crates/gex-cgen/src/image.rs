@@ -1,5 +1,5 @@
-//! Whole-image function-tier builds with bounded memory (docs/function-tier.md
-//! §11): what 32-bit Wine installs for a PE image, and what `gex-eject`
+//! Whole-image function-tier builds with bounded memory: what
+//! 32-bit Wine installs for a PE image, and what `gex-eject`
 //! needs for whole programs.
 //!
 //! Two stages, so the expensive one runs once:
@@ -106,7 +106,7 @@ fn unit_inputs() -> String {
     // SSE under MXCSR (`gex_ir::mxcsr_exact`), a per-program opt-in, the
     // same way: the units with it and without it never mix.
     let base = if gex_ir::mxcsr_exact() { format!("{base}:mxcsr") } else { base };
-    // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
+    // So is the guest memory: a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {
         format!("{base}:mem64")
@@ -116,7 +116,7 @@ fn unit_inputs() -> String {
 }
 
 /// Store an i386 program's general-purpose registers to the low 32 bits of
-/// their 64-bit context slots (3-4% of the wasm of Noita's large hot
+/// their 64-bit context slots (3-4% of the wasm of one game's large hot
 /// functions). Exact because every other writer of those slots
 /// zero-extends (the host's syscall results, signal frames;
 /// GEX_CHECK_I386_HIGH=1 checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`
@@ -148,7 +148,7 @@ pub fn icall_count() -> bool {
 /// guest accesses: `Emitter::unguarded`), for a host whose guest memory is
 /// the whole linear memory, so out-of-range accesses trap by themselves --
 /// natively. The browser keeps host data above a lower guard limit and
-/// keeps the guarded flavor (docs/noita-perf.md). Set before the
+/// keeps the guarded flavor. Set before the
 /// first key is computed.
 pub fn set_unguarded(on: bool) {
     UNGUARDED.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -572,8 +572,8 @@ pub fn build_c_module(
     build_group_module(&[recovery], work, objects, out, jobs, read, stubs, icall_hints, &GroupProviders::default())
 }
 
-/// Export providers compiled into a link group's module (docs/eject-pe.md
-/// §6a G2): their translation units (name, C), and the guest addresses
+/// Export providers compiled into a link group's module: their
+/// translation units (name, C), and the guest addresses
 /// they serve with the C symbol each one calls.
 #[derive(Default)]
 pub struct GroupProviders {
@@ -583,7 +583,7 @@ pub struct GroupProviders {
 
 /// [`build_c_module`] over several images' recoveries at once: one module
 /// holding every member's functions, whose calls between members are direct
-/// (a link group, docs/eject-pe.md §6a). The members' addresses must not
+/// (a link group). The members' addresses must not
 /// overlap (images at fixed bases); `read`, `stubs` and `icall_hints` cover
 /// them all.
 #[allow(clippy::too_many_arguments)]

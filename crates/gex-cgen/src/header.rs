@@ -198,7 +198,7 @@ typedef uint64_t __attribute__((may_alias)) gex_a64;
 
 "#;
 
-/// [`BODY_HELPERS`] for a memory64 guest memory (docs/mem64.md): the guard
+/// [`BODY_HELPERS`] for a memory64 guest memory: the guard
 /// helpers pass the 64-bit guest address through (the engine's own check
 /// traps past the end, as tier-1's M64 code relies on), and the misaligned
 /// lock takes a 64-bit address. The wasm32 text is untouched, so wasm32
@@ -403,7 +403,7 @@ GEX_INLINE uint64_t gex_fma64(int ctx, uint64_t ab, uint64_t bb_, uint64_t cb, u
     return (uint64_t)gex_fma(ctx, (int64_t)ab, (int64_t)bb_, (int64_t)cb, (int32_t)dbl);
 }
 
-/* The function table (docs/merge-plan.md §9.8.1). A unit is linked
+/* The function table. A unit is linked
    position-independent, so its function pointers are indices into the
    process's table, and a call through one is `call_indirect` on it. The
    index for a guest address comes from the probe cache: the entry's low

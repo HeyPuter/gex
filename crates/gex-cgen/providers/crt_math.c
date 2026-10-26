@@ -57,8 +57,8 @@ static double sqrt_rc(double x, uint32_t rc) {
     }
     return d > 0 ? next_down(r) : r; /* down, and toward zero (r > 0) */
 }
-/* The error cases, as each library has them (tests/providers crtmath, run
- * against Microsoft's msvcr120 and Wine's builds):
+/* The error cases, as each library has them (as a test run
+ * against Microsoft's msvcr120 and Wine's builds sees them):
  * - a NaN argument comes back quieted with its payload; Microsoft's floor,
  *   ceil, modf and sqrt (both entries) set errno = EDOM for it, Wine's x87
  *   sqrt does too, its floor, ceil and modf do not, and its

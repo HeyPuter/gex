@@ -19,7 +19,7 @@
  * rounds it twice), and an x87-ABI call with an x87 register that is not
  * an exact double (Wine's wrapper stores every register as a double).
  * Microsoft's msvcr120 has other algorithms: Wine's build only
- * (`wineonly`). tests/providers crtmath checks both paths. */
+ * (`wineonly`). A test checks both paths. */
 
 /* ---- musl, in doubles (no tables: a provider module has no data) ---- */
 

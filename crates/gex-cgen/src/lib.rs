@@ -281,7 +281,7 @@ fn build_functions(
                 Some(a) => more.push(a),
                 None => anyhow::bail!(
                     "C function {n} uses clang's shadow stack and belongs to no \
-                     guest function; the function tier cannot splice it (docs/function-tier.md §4)"
+                     guest function; the function tier cannot splice it"
                 ),
             }
         }

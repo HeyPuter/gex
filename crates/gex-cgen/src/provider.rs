@@ -1,4 +1,4 @@
-//! Export providers (docs/merge-plan.md §9.9.1): native wasm in place of a
+//! Export providers: native wasm in place of a
 //! guest library's exports.
 //!
 //! A provider source (`providers/*.c`) names its libraries on its first line
@@ -23,7 +23,7 @@
 //!   provider, written against Wine's internals).
 //! * `buildid=<hex>[,<hex>...]` (ELF): only for those builds of the
 //!   library, for a provider that depends on a layout outside the library's
-//!   versioned ABI (docs/elf-providers.md §2).
+//!   versioned ABI.
 //!
 //! An ELF provider (`/* PROVIDES libc.so.6 x86_64`) names exports by
 //! versioned symbol (`memcpy@@GLIBC_2.14`; a bare name is the default
@@ -411,8 +411,8 @@ pub fn group_symbol(p: &Provider, f: &str) -> String {
     format!("gexg_{}_{f}", p.name)
 }
 
-/// `p`'s source as one translation unit of a link group's module
-/// (docs/eject-pe.md §6a G2): no `GEX_PROVIDE` exports (the group's own
+/// `p`'s source as one translation unit of a link group's module:
+/// no `GEX_PROVIDE` exports (the group's own
 /// bodies at the exports' addresses call in), and each bound function
 /// reachable from the group's units as [`group_symbol`].
 pub fn group_source(p: &Provider) -> String {
@@ -579,7 +579,7 @@ pub fn whole_groups(pairs: &mut Vec<(u64, u32)>, groups: &[Vec<u64>]) -> usize {
     had - pairs.len()
 }
 
-/// An ELF library's bindings for `p` (docs/elf-providers.md §2): (guest
+/// An ELF library's bindings for `p`: (guest
 /// address, C function) for each export of `exports`
 /// (`gex_ld::elf::Image::exports_by_version`: name -> (unbiased value,
 /// IFUNC)) the source binds, the library loaded at `bias`. An IFUNC binds its

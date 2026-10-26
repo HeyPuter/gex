@@ -3,15 +3,14 @@
 //! Registers and flags are C locals across the whole function: loaded on entry, written back wherever control can leave, reloaded
 //! after anything that can change guest state. Nothing stays in a local
 //! across a call, so the host's trap-out is a correct unwind with no landing
-//! pads (`docs/function-tier.md` §5). Each function `F` becomes
+//! pads. Each function `F` becomes
 //!
 //! * `f_<F>(ctx)`, its body: a guest `ret`, or any exit to code the function
 //!   tier does not own, writes back, sets `ctx::PC` and *returns*;
 //! * `e_<F>(ctx)`, its dispatch entry and nest root: `f_<F>(ctx)` and then a
-//!   tail call into dispatch on `ctx::PC` (§7).
+//!   tail call into dispatch on `ctx::PC`.
 //!
-//! C callers call `f_<G>` and apply the return check (§4.2 of the merge
-//! plan): the context's PC must be the return address and SP back where it
+//! C callers call `f_<G>` and apply the return check: the context's PC must be the return address and SP back where it
 //! was; anything else leaves by returning too.
 
 use crate::emit::{self, reg_name, Emitter, FnRegs};
@@ -46,7 +45,7 @@ fn patched_test(entry: u64) -> String {
     }
 }
 
-/// The export the body table holds for `entry` (docs/function-tier.md §11):
+/// The export the body table holds for `entry`:
 /// its body, checked against `ctx::PC`, since an x86 slot covers four bytes.
 pub fn checked_body_name(entry: u64) -> String {
     format!("ib_{entry:x}")
@@ -61,9 +60,8 @@ pub fn body_name(entry: u64) -> String {
 /// callable while others are borrowed.
 fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, in_loop: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
     // A small caller's copy only at a call in an outlined loop function
-    // (`in_loop`), where V8 runs out of inlining budget (0x724580's
-    // l_724580_0 calling 0x70b110); everywhere it grew noita.exe's unit by
-    // 42% (165 -> 234 MiB) for a gain only the loop showed
+    // (`in_loop`), where V8 runs out of inlining budget; everywhere
+    // it grew one game's unit by 42% (165 -> 234 MiB) for a gain only the loop showed
     // (`GEX_CGEN_EXP=SMALLCALLSALL` restores that; both are opt-in, see
     // `is_small_copyable`). Inside a copy, only a
     // leaf's copy (no chains of calling copies): a small caller's copy keeps
@@ -97,9 +95,9 @@ fn makes_no_calls(f: &Function) -> bool {
 pub fn is_small_copyable(f: &Function) -> bool {
     const LEAF_INSTS: usize = 32;
     // Also a small function making at most two calls that return to it
-    // (noita.exe 0x70b110, 0x70b050: a load and a virtual call): V8 never
-    // inlines those into 0x724580's outlined loop (726 wire bytes each, and
-    // the loop's 26 KB leaves it no inlining budget), where TurboFan
+    // (a load and a virtual call, say): V8 never inlines those into an
+    // outlined loop (726 wire bytes each, and a 26 KB loop leaves it no
+    // inlining budget), where TurboFan
     // would. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
     // outlined loops; `SMALLCALLSALL`: everywhere; not in the unit key): the
     // page A/B runs found 2-3% less
@@ -213,7 +211,7 @@ pub fn zf_calls(functions: &[Function], read: &dyn Fn(u64) -> Option<u8>) -> Has
     out
 }
 
-/// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
+/// The recursion-depth guard. `depth` is an
 /// estimate, in bytes, of the engine stack the C frames below this one in
 /// the nest use; a function whose own frame would take it past this budget
 /// leaves for its own entry instead of running, which unwinds the nest and
@@ -268,7 +266,7 @@ pub fn exp(name: &str) -> bool {
 }
 
 /// Deliberate miscompilations, `GEX_CGEN_MUTATE=a,b`, each disabling one
-/// safety condition so a test can show it is needed (merge plan §5.3).
+/// safety condition so a test can show it is needed.
 pub fn mutate(name: &str) -> bool {
     std::env::var("GEX_CGEN_MUTATE")
         .map(|v| v.split(',').any(|x| x == name))
@@ -350,7 +348,7 @@ pub struct FnUnit {
     /// A unit for `standalone::standalone`: everything `static`, and no
     /// dispatch roots (`e_<F>`), so nothing imports `gexc.dispatch`.
     standalone: bool,
-    /// A whole-image unit's (docs/merge-plan.md §9.8.1): calls to anything
+    /// A whole-image unit's: calls to anything
     /// the unit does not hold go through the process's function table, and
     /// there are no dispatch roots or body-table entries.
     pub ftab: bool,
@@ -571,7 +569,7 @@ impl FnUnit {
     }
 
     /// A body for `entry` that an export provider compiled into the same
-    /// module serves (a link group's provider, docs/eject-pe.md §6a G2): a
+    /// module serves (a link group's provider): a
     /// tail call of the provider's C function `sym`, an F_body. In the
     /// element segment as any body, so direct calls and the table reach it.
     pub fn add_provider_body(&mut self, entry: u64, sym: &str) {
@@ -602,8 +600,8 @@ impl FnUnit {
     /// A leaf copy called through `fl_` (`callee_name`) is a separate C
     /// function to clang: the caller writes back what the leaf reads, the
     /// leaf what the caller reloads, and clang cannot forward any of it
-    /// past a guest store (both are linear memory to it). noita.exe's
-    /// worker functions call such leaves (0x70b200: seven virtual getters).
+    /// past a guest store (both are linear memory to it). Worker
+    /// functions call such leaves (seven virtual getters, say).
     ///
     /// The copies are synthetic blocks whose `start` is the call's
     /// instruction, so the address heuristics (a back-edge polls) see them
@@ -815,7 +813,7 @@ impl FnUnit {
         }
         let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
         // Set when a poll expires anywhere: the next outermost back-edge
-        // hands the loop over (§7.2), wherever the hot inner loop is.
+        // hands the loop over, wherever the hot inner loop is.
         let _ = writeln!(fhead, "  int hot = 0; (void)hot;");
         // Its code rewritten since the unit was installed (Detours): what
         // the table now has for the entry runs instead, under the same
@@ -854,8 +852,8 @@ impl FnUnit {
         // expects when it goes to `ret` with SP back here (plus the popped
         // return address on x86-64).
         e.line(format!("const uint64_t sp0 = {};", reg_name(sp_reg())));
-        // Outermost loops become functions of their own (`outer_loops`,
-        // docs/function-tier.md §7.2), emitted before this one.
+        // Outermost loops become functions of their own (`outer_loops`),
+        // emitted before this one.
         let loops = if outline_loops() { outer_loops(f) } else { Vec::new() };
         for (k, lp) in loops.iter().enumerate() {
             self.stats.loops_outlined += 1;
@@ -1021,8 +1019,8 @@ impl FnUnit {
                     if lp.body.contains(&i) && !to.synthetic && to.start <= b.start {
                         // An outermost loop's back-edge in the body itself: the
                         // first 1024 trips run here; a loop that keeps going
-                        // moves to its loop function, a fresh call per chunk
-                        // (§7.2), and the body resumes where it leaves.
+                        // moves to its loop function, a fresh call per chunk,
+                        // and the body resumes where it leaves.
                         // A poll that expired anywhere in the loop (an inner
                         // loop's, usually) set `hot`; this edge's own counts
                         // too.
@@ -1383,7 +1381,7 @@ impl FnUnit {
                     Callee::Direct(t) => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
                         // Not ours: the host runs it and comes back at the
-                        // return (§7.3); if it cannot, the rest of this
+                        // return; if it cannot, the rest of this
                         // function runs in tier-1.
                         e.store_pc(&format!("0x{t:x}ull"));
                         e.line("  return 0;");
@@ -1685,7 +1683,7 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// the stack test only keeps a deeper activation from taking what an outer
 /// one is waiting for. Only call continuations: they reload after the call
 /// anyway, while making every block a join point with all registers
-/// reloaded nearly doubled the largest bodies (noita.exe's 0xdc14c0, 414 to
+/// reloaded nearly doubled the largest bodies (one from 414 to
 /// 720 KB of wasm) and put them past Cranelift's limits.
 /// Emit a block's statements, telling the emitter where each resumable
 /// fault statement (`int3`'s `HostCall`) carries on.
@@ -1976,7 +1974,7 @@ pub fn live_writebacks() -> bool {
 /// out and tier-1 returning into the continuation). Registers the ABI does
 /// not preserve across calls can be stale in the context when a callee
 /// `longjmp`s to an earlier call's continuation in the same frame; C and
-/// the ABIs leave them undefined there (docs/function-tier.md §5).
+/// the ABIs leave them undefined there.
 pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
     live_in_with(f, sums, &HashSet::new())
 }
@@ -2122,8 +2120,7 @@ fn wb_bisect() -> bool {
 }
 static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The functions that need no recursion-depth guard (function-tier.md
-/// §7.1): not recursive, their whole call tree known (no indirect call, no
+/// The functions that need no recursion-depth guard: not recursive, their whole call tree known (no indirect call, no
 /// unknown code, so nothing can re-enter them), and the tree's stack fits in
 /// the reserve every guarded function keeps below the budget, as a
 /// trap-free tree must. The guard stays where a call chain can grow
@@ -2183,7 +2180,7 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
 /// through one switch over every continuation of the body: the switch
 /// jumps into loops, which made the control flow irreducible, and clang's
 /// wasm backend then dispatched every iteration of those loops through a
-/// label variable (noita.exe 0x724580: 10,845 instructions with the
+/// label variable (one function: 10,845 instructions with the
 /// switch, 9,186 without). Lost: resuming at a different continuation of
 /// the same frame, which now leaves (correct, slower).
 /// `GEX_CGEN_EXP=CENTRALRESUME` restores the switch (not in the unit key:
@@ -2197,7 +2194,7 @@ pub fn leaf_copies() -> bool {
 
 /// Calls to small call-free leaves are inlined into the caller's GIR
 /// (`FnUnit::inline_leaf_calls`) in i386 units, instead of calling the
-/// leaf's copy. On by default (i1: faster in the page, docs/noita-perf.md);
+/// leaf's copy. On by default (faster in the page);
 /// `GEX_CGEN_EXP=NOINLINELEAVES` turns it off (not in the unit key: use a
 /// private cache).
 pub fn inline_leaves() -> bool {
@@ -2443,12 +2440,12 @@ pub struct Loop {
     pub body: BTreeSet<usize>,
     pub exits: BTreeSet<usize>,
     /// It contains an inner loop: a poll that expires there marks the
-    /// outer loop hot, and its back-edge hands over (§7.2).
+    /// outer loop hot, and its back-edge hands over.
     pub nested: bool,
 }
 
-/// The outermost natural loops of `f`, for outlining (docs/function-tier.md
-/// §7.2): V8 never replaces a running frame's baseline code, so a loop that
+/// The outermost natural loops of `f`, for outlining: V8
+/// never replaces a running frame's baseline code, so a loop that
 /// runs for the whole of one call of a function called once (a `main`)
 /// would never reach optimised code. Outlined, each chunk of iterations is a
 /// new call. None when the CFG has a backward edge that is not a natural

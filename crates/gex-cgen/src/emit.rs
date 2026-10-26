@@ -1,6 +1,6 @@
 //! GIR block → C function, with tier-1's semantics statement for statement.
 //!
-//! Phase A of the function tier (`docs/function-tier.md`): every block is one
+//! Phase A of the function tier: every block is one
 //! C function `void b_<addr>(int ctx)`, the uniform signature. The register
 //! cache, the write-backs, the safepoints and the dispatch follow
 //! `gex_emit::tier1` exactly; only the code generator differs. Where tier-1
@@ -627,7 +627,7 @@ impl<'a> Emitter<'a> {
         self.line(format!("GEX_C64({}u) = {pc};", ctx::PC));
     }
 
-    // -- addressing (tier-1's `emit_address`; see docs/function-tier.md §3) --
+    // -- addressing (tier-1's `emit_address`) --
 
     /// A `char *` expression for a scalar or vector access at `addr + offset`.
     /// An x86 locked access at any alignment (tier-1's
@@ -647,7 +647,7 @@ impl<'a> Emitter<'a> {
             MemSz::B8 => 8,
         };
         // GEX_CGEN_MUTATE=aligned-atomics: natural-alignment atomics only, as
-        // before; tests/x86-programs/locked-misaligned.c then traps.
+        // before; a misaligned locked access then traps.
         if !gex_abi::X86 || bytes == 1 || crate::func::mutate("aligned-atomics") {
             return aligned;
         }
@@ -734,7 +734,7 @@ impl<'a> Emitter<'a> {
                 format!("(GEX_P((uint32_t)({a})) + {offset}u)")
             };
         }
-        // A memory64 guest memory (docs/mem64.md): the guest address as it
+        // A memory64 guest memory: the guest address as it
         // stands, as tier-1 does; the engine's check traps past the end.
         if gex_abi::mem64() {
             if let Some(c) = self.value_const[addr.0 as usize] {
@@ -764,7 +764,7 @@ impl<'a> Emitter<'a> {
         // other address against the old page (`gex_k`), whose failure is the
         // named fault, an access violation. An unguarded one does not: that
         // check on every access made units half as big again (advapi32
-        // 1.31 -> 2.01 MB) and Paint's start slower, and in 32-bit Wine's compact
+        // 1.31 -> 2.01 MB) and a program's start slower, and in 32-bit Wine's compact
         // space an address there is past the memory's end, so the engine's
         // own bounds check traps it (unnamed) as it would any other.
         if gex_abi::kuser_fold() && (self.value_const[addr.0 as usize].is_some() || !(no_guard() || self.unguarded())) {
@@ -1855,7 +1855,7 @@ impl<'a> Emitter<'a> {
             // Four 32x32 products of the halves are how the lifter spells
             // `umulh`; LLVM recognises them and forms an i128 multiply, which
             // wasm32 lowers to `__multi3` returning through the shadow stack
-            // (which generated code must never touch, §4 of the note). An empty
+            // (which generated code must never touch). An empty
             // asm on one operand hides the idiom, at the cost of nothing else.
             BinOp::Mul
                 if w && self.value_half[av.0 as usize] && self.value_half[bv.0 as usize] =>
@@ -2128,7 +2128,7 @@ pub fn clobbers(s: &Stmt) -> bool {
 }
 
 /// The C types of a bulk operation's addresses and length: 32-bit for a
-/// wasm32 guest memory, 64-bit for memory64 (docs/mem64.md).
+/// wasm32 guest memory, 64-bit for memory64.
 fn addr_c() -> (&'static str, &'static str) {
     if gex_abi::mem64() {
         ("uint64_t", "uint64_t")

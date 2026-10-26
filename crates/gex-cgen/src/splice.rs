@@ -177,7 +177,7 @@ fn scan(
         let op = ops.read()?;
         let bad = |what: &str| -> anyhow::Error {
             anyhow!(
-                "C function {} {what}; the function tier cannot splice it (docs/function-tier.md)",
+                "C function {} {what}; the function tier cannot splice it",
                 name(f)
             )
         };

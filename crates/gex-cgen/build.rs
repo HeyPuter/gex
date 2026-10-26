@@ -1,5 +1,5 @@
 //! Two hashes of the sources a function-tier unit depends on (gex_native::
-//! pe_units keys its caches on them; docs/function-tier.md §11):
+//! pe_units keys its caches on them):
 //!
 //! * `GEX_CGEN_RECOVERY_INPUTS`: what decides an image's recovery (its GIR
 //!   and summaries) -- the IR, the lifters and decoders, gex-xlate's recovery
