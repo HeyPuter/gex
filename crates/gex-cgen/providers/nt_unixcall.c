@@ -11,7 +11,7 @@
  * command the layer writes for them (gex_kernel::nt::opengl's `hot_one`).
  *
  * The ring is the layer's: it publishes the ring's address at GL_FAST_RING
- * once the device is open (0 before, and with GEX_NT_GL_FAST=0), and the
+ * once the device is open (0 before), and the
  * tail at GL_FAST_TAIL, whose top bit is the ring's lock (the layer holds it
  * while it writes a command or submits). Anything else -- another library,
  * another GL function, no ring yet, the lock held, a full ring -- is the
@@ -298,8 +298,8 @@ GEX_INLINE int draw_arrays(uint32_t params) {
 static GEX_PROVIDER(p_unix_call) {
     (void)need;
 #ifndef GEX_KUSER_GUARD
-    /* The fast path is the NT layer's: only its opengl publishes the ring
-     * at GL_FAST_RING. Under W3's fold GL goes through Wine's opengl32 Unix
+    /* Nothing publishes the ring at GL_FAST_RING any more. Under 32-bit
+     * Wine's fold GL goes through Wine's opengl32 Unix
      * side, nothing publishes these words, and Windows' old page they were
      * in is not there: every call is the trampoline's own work below, which
      * is what a ring of 0 always made it. */
@@ -314,7 +314,7 @@ static GEX_PROVIDER(p_unix_call) {
         case FN_glUniform1i: op = OP_UNIFORM_1I, n = 2; break;
         case FN_glUniform2f: op = OP_UNIFORM_2F, n = 3; break;
         /* The next most frequent in Noita's frame after the seven above
-         * (GEX_NT_GL_STATS: 39, 8, 9, 12 and 14 a frame), all commands
+         * (39, 8, 9, 12 and 14 a frame), all commands
          * with no layer state, as the layer's `hot_one` writes them. */
         case FN_glBlendFunc: op = OP_BLEND_FUNC, n = 2; break;
         case FN_glBlendFuncSeparate: op = OP_BLEND_FUNC_SEPARATE, n = 4; break;

@@ -342,7 +342,7 @@ preinit (void)
 		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
 		/* An address-taken scalar argument (ldarga, common in marshalling helpers, which otherwise run on the
 		 * interpreter) is homed in the frame instead of refusing the method. Upstream ships it off only
-		 * because its first user did not need it (bd265537e); T.ArgAddr tests it. */
+		 * because its first user did not need it; T.ArgAddr tests it. */
 		setenv ("MONO_WASM_JIT_LDADDR_ARG", "1", 0);
 		/* the 64-bit worker-local vcall PIC (way loop unrolled): four receivers per site */
 		setenv ("MONO_WASM_JIT_VCALL_WAYS", "4", 0);

@@ -21,9 +21,9 @@ static void gp_wait_ns(uint32_t a, uint32_t v, int64_t ns) {
 }
 
 #ifdef GEX_KUSER_GUARD
-/* W3 (KUSER_SHARED_DATA folded, provider.h GP_KUSER): Wine's own
- * SwitchToThread is a host yield, and nothing parks on the NT layer's yield
- * word, which is in Windows' old KUSER page, a page a W3 process does not
+/* 32-bit Wine (KUSER_SHARED_DATA folded, provider.h GP_KUSER): Wine's own
+ * SwitchToThread is a host yield, and nothing parks on the old yield word,
+ * which is in Windows' old KUSER page, a page a 32-bit Wine process does not
  * have: its memory need not reach it, and an access there trapped out of
  * bounds (Noita: the first notify, unlock or wait that kicked ended the
  * thread inside the provider, reported at the export's address). */
