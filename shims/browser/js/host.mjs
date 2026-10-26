@@ -248,6 +248,7 @@ export class ProcessHost {
   // compiled here, off the guest's threads (`prefetchUnit`), by key, with
   // the processes that asked for it meanwhile.
   #cgenFetching = new Map();
+  #unitModule = null;
   // The unit cache's small files (a unit's entries, its indirect-call
   // profile, a provider's metadata) and the ones it does not have (null),
   // by path, as some Worker of the page read them: handed to every Worker
@@ -466,8 +467,13 @@ export class ProcessHost {
     // The other memory flavour's `{ shim, guest, kernel }` (`#other`), or
     // an async function that fetches it.
     other = null,
+    // `(url) => Promise<WebAssembly.Module>`: how a unit `prefetchUnit` names
+    // is fetched and compiled, when not with fetch and WebAssembly.compile
+    // here (a compressed one, decoded elsewhere).
+    unitModule = null,
   }) {
     this.#other = other;
+    this.#unitModule = unitModule;
     this.#makeWorker = makeWorker;
     this.#shim = shim;
     this.#guest = guest;
@@ -1084,9 +1090,9 @@ export class ProcessHost {
         this.#cgenFetching.set(m.key, new Set([proc]));
         const t0 = performance.now();
         const timed = logNamed('unitstall');
-        fetch(m.url)
+        (this.#unitModule ? this.#unitModule(m.url) : fetch(m.url)
           .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.arrayBuffer(); })
-          .then((b) => WebAssembly.compile(b))
+          .then((b) => WebAssembly.compile(b)))
           .then((mod) => {
             if (timed) console.warn(`[unit-pf] ${m.key.slice(0, 16)}: compiled ahead in ${Math.round(performance.now() - t0)} ms`);
             // A Worker's own compile may have come in first: that one, then.
@@ -1394,7 +1400,7 @@ export class ProcessHost {
               (m.workerRuns > 1 ? `, on a given-back worker (its process ${m.workerRuns})` : '') +
               (m.forkCopied
                 ? `, fork copied ${Math.round(m.forkCopied / 1048576)} MiB`
-                  + (m.forkZeros ? ` (${Math.round(m.forkZeros / 1048576)} MiB of it zero, left alone)` : '')
+                  + (m.forkZeros ? `, left ${Math.round(m.forkZeros / 1048576)} MiB of zeros alone` : '')
                   + (m.forkSkipped ? ` and skipped ${Math.round(m.forkSkipped / 1048576)}` : '')
                 : '') +
               `, ${m.millis}ms translating ${m.blocks} blocks` +

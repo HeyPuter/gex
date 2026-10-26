@@ -88,6 +88,36 @@ function checkWasm(url, res, bytes) {
   );
 }
 
+/** `(url) => Promise<WebAssembly.Module>` for a compressed unit: fetched,
+ *  decoded (`zstd`, the decoder module's URL) and compiled by one Worker
+ *  (unit-worker.js), started at the first. */
+function unitModuleWorker(zstd) {
+  let w = null;
+  let n = 0;
+  const waiting = new Map();
+  const fail = (error) => {
+    for (const p of waiting.values()) p.reject(new Error(error));
+    waiting.clear();
+  };
+  return (url) => {
+    if (!w) {
+      w = new Worker(new URL('./unit-worker.js', import.meta.url), { type: 'module', name: 'units' });
+      w.onmessage = ({ data: { id, mod, error } }) => {
+        const p = waiting.get(id);
+        waiting.delete(id);
+        if (mod) p?.resolve(mod);
+        else p?.reject(new Error(error));
+      };
+      w.onerror = (e) => fail(`the units' Worker: ${e?.message ?? 'did not start'}`);
+    }
+    const id = ++n;
+    return new Promise((resolve, reject) => {
+      waiting.set(id, { resolve, reject });
+      w.postMessage({ id, url, zstd });
+    });
+  };
+}
+
 async function fetchBytes(url, onProgress) {
   // Revalidated, never taken from cache on faith: the shim and seed have fixed
   // URLs with no content hash, so a browser would keep serving a broken build
@@ -1012,6 +1042,9 @@ async function runProgramHere(
 
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,
+    // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
+    // Worker of its own, off this thread.
+    unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : null,
     shim: shimBytes,
     // The closure's image module in place of the seed: it holds the program's
     // own text, already lifted.
@@ -1128,7 +1161,7 @@ async function runProgramHere(
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
       // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-      cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD) }
+      cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined }
         : flag('providers') === '0' ? undefined
         : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a

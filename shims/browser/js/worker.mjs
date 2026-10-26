@@ -485,16 +485,19 @@ async function handle(msg) {
   // `closed` (an ejected page's units archive): the page fetched every unit
   // file there is, so a file not among them is a miss, not a request.
   const preClosed = (msg.preModules ?? []).some(([k]) => k === 'closed');
-  // A zstd decoder for a split unit's cold clusters (gex_split), made
-  // before the guest runs: its loads are synchronous.
+  // A zstd decoder for a split unit's cold clusters (gex_split) and for
+  // units served compressed (`cgen.zst`), made before the guest runs: their
+  // loads are synchronous.
   let zstd = null;
   if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
     try {
+      const t0 = logNamed('unitstall') ? performance.now() : -1;
       const { ZSTDDecoder } = await import(msg.cgen.zstd);
       zstd = new ZSTDDecoder();
       await zstd.init();
+      if (t0 >= 0) console.warn(`[unitzstd] decoder ready in ${(performance.now() - t0).toFixed(1)} ms`);
     } catch (err) {
-      console.error(`[gex] no zstd decoder for cold clusters (${msg.cgen.zstd}): ${err?.message ?? err}`);
+      console.error(`[gex] no zstd decoder for units (${msg.cgen.zstd}): ${err?.message ?? err}`);
       zstd = null;
     }
   }
@@ -622,7 +625,7 @@ async function handle(msg) {
       const c = msg.cgen;
       if (!c?.url || preClosed || preFiles.has(`${key}/c.wasm`)) return;
       let url;
-      try { url = new URL(`${c.url}/${key}/c.wasm`, globalThis.location?.href).href; } catch { return; }
+      try { url = new URL(`${c.url}/${key}/c.wasm${c.zst ? '.zst' : ''}`, globalThis.location?.href).href; } catch { return; }
       port.post({ kind: 'prefetchUnit', key, url });
     }
     loadUnit(key) {
@@ -705,8 +708,10 @@ async function handle(msg) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
           return fs ? new Uint8Array(fs.readFileSync(`${c.root}/${rel}`)) : null;
         }
+        // A unit's module, served compressed (`c.zst`): decoded here.
+        const packed = c.zst && zstd && rel.endsWith('/c.wasm');
         const x = new XMLHttpRequest();
-        x.open('GET', `${c.url}/${rel}`, false);
+        x.open('GET', `${c.url}/${rel}${packed ? '.zst' : ''}`, false);
         x.responseType = 'arraybuffer';
         const done = noteFetch(`unit:${rel}`, 0, this.owner);
         const tx = logNamed('unitstall') ? performance.now() : -1;
@@ -716,7 +721,13 @@ async function handle(msg) {
           done(x.response?.byteLength ?? 0);
         }
         if (tx >= 0) console.warn(`[unitxhr] ${workerGex?.who?.pid ?? '?'}: ${rel} ${x.status} ${(performance.now() - tx).toFixed(1)} ms`);
-        const got = x.status === 200 ? new Uint8Array(x.response) : null;
+        // A unit with no compressed copy: its plain one.
+        if (packed && x.status === 404) {
+          x.open('GET', `${c.url}/${rel}`, false);
+          x.send();
+        }
+        const unpack = packed && x.responseURL?.endsWith('.zst');
+        const got = x.status !== 200 ? null : unpack ? zstd.decode(new Uint8Array(x.response)) : new Uint8Array(x.response);
         // Small files, and the absent, to the page for the Workers to come
         // (a forked child places every unit its parent had): not the
         // module's bytes, which the page holds compiled.

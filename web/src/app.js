@@ -368,7 +368,8 @@ async function begin(opts, base, at, state, meter) {
   setGlobals((k) => sq.get(k), b);
   // A unit split by function (gex_cgen::split): its Workers decode the cold
   // clusters they fetch with the same zstd decoder.
-  if (sq.get('cold')) globalThis.GEX_CGEN_ZSTD = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
+  // A unit served compressed (cgenzst=1) is decoded with it too.
+  if (sq.get('cold') || sq.get('cgenzst') === '1') globalThis.GEX_CGEN_ZSTD = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
 
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
@@ -1015,6 +1016,8 @@ export function setGlobals(get, b = {}) {
   const cgen = get('cgen');
   if (cgen && cgen !== '0') globalThis.GEX_CGEN = Number(cgen) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
   if (get('cgenurl')) globalThis.GEX_CGEN_URL = get('cgenurl');
+  // cgenzst=1: each unit's module is served as KEY/c.wasm.zst, decoded before it is compiled.
+  if (get('cgenzst') === '1') globalThis.GEX_CGEN_ZST = 1;
   if (get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (get('aot')) globalThis.GEX_AOT = 1;
   if (get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
@@ -1309,7 +1312,9 @@ async function preloadUnits(list, f, at) {
           // 2.8 times its size of the renderer's code space even if nothing
           // mapped it.
           const demand = new Set(opt?.demand ?? []);
-          const tar = (await fetchShared(href, f)).buffer;
+          // An open archive's files stay views of it, in one shared buffer:
+          // a start message then carries one buffer, not one per file.
+          const tar = (await fetchShared(href, f, { shared: !!opt?.open })).buffer;
           const t = untar(tar);
           const mods = [];
           for (const [p, bytes] of Object.entries(t.files)) {
@@ -1321,18 +1326,24 @@ async function preloadUnits(list, f, at) {
               }));
               continue;
             }
+            if (opt?.open) {
+              out.push([`file:${rel}`, bytes]);
+              continue;
+            }
             // Shared where there is a SharedArrayBuffer (the SP build has none).
             const s = new Uint8Array(typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(bytes.byteLength) : new ArrayBuffer(bytes.byteLength));
             s.set(bytes);
             out.push([`file:${rel}`, s]);
           }
           out.push(...await Promise.all(mods));
-          closed = true;
+          // `open`: the archive holds some of the units' files (their entries,
+          // say), and a Worker asks the server for the rest.
+          if (!opt?.open) closed = true;
           // Everything in it is compiled (V8 keeps its own copy of each
           // module's bytes) or copied out: the archive itself goes now. Left
           // to the collector it stayed until the next full collection, the
           // shell's 361 MiB for minutes.
-          if (!(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
+          if (!opt?.open && !(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
           continue;
         }
         if (name.startsWith('file:')) {
