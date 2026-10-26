@@ -369,7 +369,16 @@ async function begin(opts, base, at, state, meter) {
   // A unit split by function (gex_cgen::split): its Workers decode the cold
   // clusters they fetch with the same zstd decoder.
   // A unit served compressed (cgenzst=1) is decoded with it too.
-  if (sq.get('cold') || sq.get('cgenzst') === '1') globalThis.GEX_CGEN_ZSTD = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
+  if (sq.get('cold') || sq.get('cgenzst') === '1') {
+    const src = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
+    globalThis.GEX_CGEN_ZSTD = src;
+    // Fetched once, here: every Worker imports it from memory, not with a
+    // request of its own at its start.
+    try {
+      const r = await fetch(src);
+      if (r.ok) globalThis.GEX_CGEN_ZSTD = URL.createObjectURL(new Blob([await r.text()], { type: 'text/javascript' }));
+    } catch { /* the URL, then */ }
+  }
 
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
@@ -1313,8 +1322,10 @@ async function preloadUnits(list, f, at) {
           // mapped it.
           const demand = new Set(opt?.demand ?? []);
           // An open archive's files stay views of it, in one shared buffer:
-          // a start message then carries one buffer, not one per file.
-          const tar = (await fetchShared(href, f, { shared: !!opt?.open })).buffer;
+          // a start message then carries one buffer, not one per file. One
+          // of modules only (`modules`) is let go once they are compiled.
+          const keep = !!opt?.open && !opt?.modules;
+          const tar = (await fetchShared(href, f, { shared: keep })).buffer;
           const t = untar(tar);
           const mods = [];
           for (const [p, bytes] of Object.entries(t.files)) {
@@ -1326,7 +1337,7 @@ async function preloadUnits(list, f, at) {
               }));
               continue;
             }
-            if (opt?.open) {
+            if (keep) {
               out.push([`file:${rel}`, bytes]);
               continue;
             }
@@ -1343,7 +1354,7 @@ async function preloadUnits(list, f, at) {
           // module's bytes) or copied out: the archive itself goes now. Left
           // to the collector it stayed until the next full collection, the
           // shell's 361 MiB for minutes.
-          if (!opt?.open && !(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
+          if (!keep && !(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
           continue;
         }
         if (name.startsWith('file:')) {
