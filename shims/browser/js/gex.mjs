@@ -4228,9 +4228,14 @@ export class Gex {
   #cgenModule(key, got = null) {
     const name = `cgen:${key}`;
     let mod = this.#sharedModules.get(name);
-    if (mod) return mod;
+    if (mod) {
+      this.#unitGot.delete(key);
+      return mod;
+    }
     const tl = performance.now();
-    got ??= this.#env.loadUnit?.(key) ?? null;
+    // The bytes alone: the entries were published with the unit.
+    got ??= this.#unitGot.get(key) ?? { wasm: this.#env.loadFile?.(`${key}/c.wasm`) ?? null };
+    this.#unitGot.delete(key);
     if (!got?.wasm) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
@@ -4620,7 +4625,11 @@ export class Gex {
     if (!x || idx < x.base) return;
     d.splice(lo, 1);
     if (logOn('unit')) console.error(`[unit] ${this.#whoFills()}: unit at ${x.base} instantiated at its first call (${d.length} still deferred)`);
+    const timed = logNamed('unitstall');
+    const t0 = timed ? performance.now() : 0;
+    const had = timed && this.#sharedModules.has(`cgen:${this.#cgenStr(this.#shim.exports.gex_cgen_key, x.u)}`);
     this.#cgenInstall(x.u, x.base, true);
+    if (timed) console.warn(`[unitstall] ${this.#whoFills()}: ${(performance.now() - t0).toFixed(1)} ms ${had ? 'had' : 'compiled'}`);
     // Its element segment filled every slot; those retired since go back.
     if (x.retired) for (const r of x.retired) this.#cgen.ftab.set(tIdx(r), this.#cgen.resolve);
   }
@@ -5236,6 +5245,8 @@ export class Gex {
       return;
     }
     this.#cgenGrow();
+    const timed = logNamed('unitstall');
+    const t0 = timed ? performance.now() : 0, from = st.have;
     while (st.have < len) {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
       const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
@@ -5258,6 +5269,7 @@ export class Gex {
       e.gex_cgen_have(st.have);
     }
     this.#dlSize.value = size;
+    if (timed && st.have - from > 16) console.warn(`[unitcatch] ${this.#whoFills()}${this.#forkChild ? ' (fork child)' : ''}: ${st.have - from} events in ${(performance.now() - t0).toFixed(1)} ms`);
     this.#wasmdllCatchUp();
   }
 
@@ -6254,7 +6266,9 @@ export class Gex {
     // `gex_cgen_mapped_age_us`): whether a unit arriving mid-run is placed
     // promptly.
     const lat = logOn('placelat') ? [Number(e.gex_cgen_mapped_age_us?.(u, 0) ?? -1n), Number(e.gex_cgen_mapped_age_us?.(u, 1) ?? -1n), performance.now()] : null;
+    const tp = logNamed('unitstall') ? performance.now() : -1;
     const got = this.#env.loadUnit?.(key) ?? null;
+    const tl = tp >= 0 ? performance.now() : -1;
     if (lat && lat[0] >= 0) {
       console.warn(`[placelat] ${path} ${(lat[0] / 1000).toFixed(1)} ms mapped, ${(lat[1] / 1000).toFixed(1)} ms wanted, load ${(performance.now() - lat[2]).toFixed(1)} ms`);
     }
@@ -6280,12 +6294,25 @@ export class Gex {
     this.#cgenProviders(u);
     if (logOn('unit')) console.error(`gex-nt: pid ${e.gex_my_pid?.() ?? '?'}: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
+    if (tp >= 0) console.warn(`[unitpub] ${this.#whoFills()}${this.#forkChild ? ' (fork child)' : ''}: ${path.split('/').pop()} ${(performance.now() - tp).toFixed(1)} ms (load ${(tl - tp).toFixed(1)})`);
   }
 
-  /** Publish unit `u`'s module (`got`, under `key`) and install it here. */
+  /** A unit this Worker published and left to its first call (`#cgenPublish`),
+   *  by key: its files as loaded, the module's bytes fetched when wanted. */
+  #unitGot = new Map();
+
+  /** Publish unit `u`'s entries (`got`, under `key`) and install it here. A
+   *  unit catch-up defers (`#cgenDefer`) is compiled at its first call, or
+   *  before, by the host (`prefetchUnit`), for every Worker of the page;
+   *  the rest now. */
   #cgenPublish(u, key, path, got) {
     const e = this.#shim.exports;
-    this.#cgenModule(key, got);
+    if (u < 0x40000000 && !single.on && !UNITS_EAGER && e.gex_ftab_install_len) {
+      if (!this.#sharedModules.has(`cgen:${key}`)) {
+        this.#unitGot.set(key, got);
+        this.#env.prefetchUnit?.(key);
+      }
+    } else this.#cgenModule(key, got);
     const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
     const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
     this.#bytes().set(ent, gp);
@@ -8772,7 +8799,9 @@ export class Gex {
    *  (`wasm:`) is relayed at any size: the page keeps those for the
    *  processes that run it next. `?relayall=1` relays every module. */
   #offerModule(key, mod, bytes) {
-    if (!(bytes >= RELAY_MIN_BYTES) && !globalThis.GEX_RELAY_ALL && !String(key).startsWith('wasm:')) {
+    // Units go to the page whatever their size: the host keeps them for every
+    // process, and a Worker without one fetches its bytes as well.
+    if (!(bytes >= RELAY_MIN_BYTES) && !globalThis.GEX_RELAY_ALL && !/^(wasm|cgen|cold):/.test(String(key))) {
       this.#relaySkipped++;
       return;
     }

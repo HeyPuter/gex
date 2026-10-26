@@ -68,6 +68,14 @@ import {
   takesPointer,
 } from '@gex/wl-bridge.mjs';
 import { pageParams } from './page-env.js';
+import { logNamed } from '@gex/log.mjs';
+
+/** `GEX_LOG=win` (only when named): a line when a toplevel appears, first
+ *  shows pixels (its first buffer painted, or its GL frame shown) and is
+ *  retitled, for a harness timing a window's arrival. Nothing per frame. */
+function winNote(win, what) {
+  if (win.role === ROLE_TOPLEVEL && logNamed('win')) console.log(`[win] ${what} ${win.key} ${win.width}x${win.height} "${win.title ?? ''}"`);
+}
 
 /** `KeyboardEvent.code` -> Linux evdev keycode, which is what Wayland carries. */
 const EVDEV = {
@@ -275,7 +283,7 @@ class DomWindow {
 
   /** Draw one damaged rectangle out of the guest's memory, or all of it. */
   paint(mem, s, full = false) {
-    this.paints++;
+    if (this.paints++ === 0) winNote(this, 'painted');
     const { x, y, w, h } = clampDamage(s, this.canvas.width, this.canvas.height, full);
     if (w <= 0 || h <= 0) return;
     // The descriptor and the memory can disagree -- a client's bad buffer, or
@@ -586,6 +594,7 @@ export class DomDesktop {
         this.#attach(win);
         if (s.role === ROLE_CURSOR) this.#cursor = win;
         else this.onwindow?.(win);
+        winNote(win, 'new');
         // Not a placed one: its client says when it has the keyboard
         // (`activate`), as in the scene compositor. A Start menu may show
         // the user's picture as a placed toplevel of its own; it took the
@@ -627,6 +636,7 @@ export class DomDesktop {
     if (s.title !== win.title) {
       win.title = s.title;
       win.onretitle?.(s.title);
+      winNote(win, 'title');
     }
     if (s.width !== win.width || s.height !== win.height) {
       win.width = s.width;
@@ -820,6 +830,7 @@ export class DomDesktop {
         if (!win.showGlCanvas(found.frame)) continue;
         device.surfaceCanvas?.(found.frame, true);
         this.#glWindows++;
+        if (!win.glShown) { win.glShown = true; winNote(win, 'gl'); }
       }
       win.placeGl();
     }

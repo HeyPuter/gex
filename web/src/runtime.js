@@ -13,6 +13,7 @@ import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { logNamed } from '../../shims/browser/js/log.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
@@ -966,7 +967,8 @@ async function runProgramHere(
         term.writeln(m.text);
         // `?hostxcount=1`: to the console too, timed, for a harness.
         if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
-      } else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
+      } else if (m.kind === 'win') console.log(`[win] ${m.text}`);
+      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
       else if (m.kind === 'ready') listening(true);
       else if (m.kind === 'failed') {
         term.writeln(`gex: the X server failed: ${m.why}`);
@@ -995,6 +997,8 @@ async function runProgramHere(
       trace: globalThis.GEX_HOSTX_TRACE || undefined,
       wlTrace: flag('wltrace') ? 1 : undefined,
       count: flag('hostxcount') ? 1 : undefined,
+      // GEX_LOG=win: a line as a client's named window is first mapped.
+      win: logNamed('win') ? 1 : undefined,
     });
     // Two modules and a kernel to instantiate; a slow machine takes a few
     // seconds. A run that goes ahead without the display is worse than one that

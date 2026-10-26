@@ -179,10 +179,14 @@ export class HostX {
    * Where a picture stops between a client drawing and the page composing it.
    */
   #count = null;
+  /** `win` (GEX_LOG=win): each guest connection's requests, read for the
+   *  first MapWindow of a window its client named (WM_CLASS), by fd. */
+  #maps = null;
 
   async start(msg) {
     this.#channel = msg.wlChannel;
     this.#trace = msg.trace | 0;
+    if (msg.win) this.#maps = new Map();
     if (msg.count) this.#count = { at: Date.now(), n: new Map(), polls: 0 };
     this.#token = msg.token;
     const size = outputSize(msg.wlChannel);
@@ -411,6 +415,61 @@ export class HostX {
     this.#seq = k.k_ws_seq(this.#slot);
   }
 
+  /** A guest connection's request bytes `got` (fd `fd`), for `#maps`: whole
+   *  requests are read, a partial one waits for the rest. */
+  #readMaps(fd, got) {
+    const c = this.#maps.get(fd);
+    if (!c) return;
+    const b = new Uint8Array(c.buf.length + got.length);
+    b.set(c.buf);
+    b.set(got, c.buf.length);
+    const v = new DataView(b.buffer);
+    let at = 0;
+    for (;;) {
+      const left = b.length - at;
+      if (c.setup) {
+        if (left < 12) break;
+        c.le = b[at] === 0x6c;
+        const n = v.getUint16(at + 6, c.le), d = v.getUint16(at + 8, c.le);
+        const size = 12 + ((n + 3) & ~3) + ((d + 3) & ~3);
+        if (left < size) break;
+        at += size;
+        c.setup = false;
+        continue;
+      }
+      if (left < 4) break;
+      let words = v.getUint16(at + 2, c.le), head = 4;
+      if (words === 0) {
+        // BIG-REQUESTS: the length is the next word.
+        if (left < 8) break;
+        words = v.getUint32(at + 4, c.le);
+        head = 8;
+      }
+      const size = words * 4;
+      if (size < head || left < size) break;
+      const op = b[at];
+      if (op === 18 && size >= head + 20) {
+        // ChangeProperty of WM_CLASS (atom 67): the instance name.
+        const win = v.getUint32(at + head, c.le), prop = v.getUint32(at + head + 4, c.le);
+        const units = v.getUint32(at + head + 16, c.le), fmt = b[at + head + 12];
+        if (prop === 67 && fmt === 8) {
+          const data = b.subarray(at + head + 20, Math.min(at + size, at + head + 20 + units));
+          const nul = data.indexOf(0);
+          c.named.set(win, new TextDecoder().decode(nul < 0 ? data : data.subarray(0, nul)));
+        }
+      } else if (op === 8 && size >= head + 4) {
+        // MapWindow
+        const win = v.getUint32(at + head, c.le);
+        if (c.named.has(win) && !c.mapped.has(win)) {
+          c.mapped.add(win);
+          this.emit({ kind: 'win', text: `map 0x${win.toString(16)} "${c.named.get(win)}"` });
+        }
+      }
+      at += size;
+    }
+    c.buf = b.slice(at);
+  }
+
   /** Register on kernel socket `id`'s queue, for as long as it is held. */
   #watch(id) {
     this.#k.k_wq_add(this.#k.k_sock_queue(id), this.#slot);
@@ -527,6 +586,7 @@ export class HostX {
         self.#watch(id);
         const client = self.#reserve({ kind: 'kernel', id });
         self.log(`[hostx] a guest connected to the X display (fd ${client})`);
+        self.#maps?.set(client, { setup: true, big: false, buf: new Uint8Array(0), named: new Map(), mapped: new Set() });
         return client;
       },
 
@@ -542,6 +602,7 @@ export class HostX {
         // through its mapping and the compositor is still reading them. So
         // closing it is one reference fewer, not a free (see `#pools`).
         self.#fds.delete(fd);
+        self.#maps?.delete(fd);
         const pool = self.#pools.get(fd);
         if (pool) {
           self.#pools.delete(fd);
@@ -637,6 +698,7 @@ export class HostX {
         if (ep.kind === 'kernel') {
           const n = self.#k.k_sock_read(ep.id, BigInt(buf), len);
           if (self.#count && n > 0) self.#bump(`in${fd}`, n);
+          if (self.#maps && n > 0) self.#readMaps(fd, self.#x.HEAPU8.subarray(buf, buf + n));
           return n;
         }
         if (ep.kind === 'wl' || ep.kind === 'wm') {

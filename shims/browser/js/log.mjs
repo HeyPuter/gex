@@ -11,6 +11,11 @@
 //   GEX_LOG=debug        the narration (Worker hand-offs, fork costs, the shim's lines)
 //   GEX_LOG=record       the `[gex-record]` lines (tools/eject/record-wine32.mjs)
 //   GEX_LOG=unit         a line per function-tier unit placed in a process
+//   GEX_LOG=unitstall    timed lines for unit installs: each first call, catch-up,
+//                        publish, sync fetch, and the page's compiles ahead
+//                        (only when named)
+//   GEX_LOG=win          a line when a toplevel appears, first shows pixels and
+//                        is retitled, in the page's desktop (only when named)
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)
 //   GEX_LOG=a,b          several of those

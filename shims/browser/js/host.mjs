@@ -25,7 +25,7 @@ function narrate(text) {
  */
 import { single } from './single.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
-import { logOn, logQuiet } from './log.mjs';
+import { logNamed, logOn, logQuiet } from './log.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
  *  console's info level. */
@@ -147,6 +147,8 @@ const RECYCLE_BYTES = 768 << 20;
 
 /** How far a fork record's image reaches: what its child's memory grows to. */
 function imageExtent(child) {
+  // Said by a record whose image travels apart (worker.mjs `FORK_BULK`).
+  if (child?.extent !== undefined) return child.extent;
   let n = 0;
   for (const r of child?.image ?? []) {
     n = Math.max(n, r.end ?? 0, r.at + (r.len ?? r.bytes?.byteLength ?? 0));
@@ -158,6 +160,10 @@ function imageExtent(child) {
  *  code is larger still; python3.13 alone is 24 MiB of wasm). */
 const PAGE_MODULES = 64;
 const PAGE_MODULE_BYTES = 192 << 20;
+/** The most unit modules the page keeps compiled for its Workers (`#cgenModules`). */
+const UNIT_PAGE_MODULES = 4096;
+/** The most unit-cache files the page keeps for its Workers (`#unitFiles`). */
+const UNIT_FILES = 16384;
 /** The most wasm the page-wide unit cache (`#unitModules`) keeps compiled. */
 const UNIT_MODULE_BYTES = 256 << 20;
 /** The most wasm one process's relay cache (`#moduleCache`) keeps: a pc
@@ -232,6 +238,44 @@ export class ProcessHost {
   // same bytes again. Most recent first out, to UNIT_MODULE_BYTES of wasm.
   #unitModules = new Map();
   #unitBytes = 0;
+  // Function-tier units (`cgen:KEY`) and their cold clusters (`cold:KEY:C`),
+  // compiled, for every process of the page: a unit's key is its content's,
+  // so the Module one process compiled is the one every other would. Handed
+  // to the pool as it comes in and to each Worker that starts; the oldest
+  // go past UNIT_PAGE_MODULES.
+  #cgenModules = new Map();
+  // Units a Worker published and nobody has compiled yet: fetched and
+  // compiled here, off the guest's threads (`prefetchUnit`), by key, with
+  // the processes that asked for it meanwhile.
+  #cgenFetching = new Map();
+  // The unit cache's small files (a unit's entries, its indirect-call
+  // profile, a provider's metadata) and the ones it does not have (null),
+  // by path, as some Worker of the page read them: handed to every Worker
+  // that starts, which then asks the server for none of them. Bytes in
+  // shared memory, so a start message carries references.
+  #unitFiles = new Map();
+  // `#unitFiles` in one shared buffer and an index (path, offset, length;
+  // -1 for a file the cache lacks), made again when a file has come since:
+  // what a start message carries, one buffer rather than one per file.
+  #unitPack = null;
+  #unitFilePack() {
+    if (!this.#unitFiles.size || typeof SharedArrayBuffer !== 'function') return undefined;
+    if (this.#unitPack?.n === this.#unitFiles.size) return this.#unitPack.pack;
+    let total = 0;
+    for (const b of this.#unitFiles.values()) total += b?.byteLength ?? 0;
+    const buf = new SharedArrayBuffer(Math.max(1, total));
+    const u8 = new Uint8Array(buf);
+    const index = [];
+    let at = 0;
+    for (const [rel, b] of this.#unitFiles) {
+      if (!b) { index.push([rel, 0, -1]); continue; }
+      u8.set(b, at);
+      index.push([rel, at, b.byteLength]);
+      at += b.byteLength;
+    }
+    this.#unitPack = { n: this.#unitFiles.size, pack: { buf, index } };
+    return this.#unitPack.pack;
+  }
   /** `?filltime=1`: at most once a minute, how many modules the relay
    *  holds on this thread, and how many it has been handed. */
   #relayCensus() {
@@ -253,7 +297,7 @@ export class ProcessHost {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
     // And the page's translation units (empty unless `extra.unitCache`),
     // less those the Worker was given while it waited in the pool.
-    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries()];
+    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries()];
     const had = w?.[POOLED];
     return [...own, ...(had ? page.filter(([k]) => !had.has(k)) : page)];
   }
@@ -263,7 +307,7 @@ export class ProcessHost {
    *  demo after a few commands; 2.5 ms to clone in, 1.1 ms more in transit
    *  and 0.7 ms to register, of every child's start). */
   #poolModules(w) {
-    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries()];
+    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries()];
     w[POOLED] = new Set(entries.map(([k]) => k));
     if (entries.length) w.postMessage({ kind: 'pooledModules', entries });
   }
@@ -329,6 +373,24 @@ export class ProcessHost {
     return this.#stacks.area + slice * this.#stacks.size;
   }
 
+  /** Unit module `key`, compiled for process `proc` (by its Worker `from`,
+   *  or here): kept for the page, handed to that process's other Workers
+   *  and the pool now, and to every Worker that starts. Not to the rest:
+   *  a post per module per Worker of the page held up this thread, which
+   *  every fork's hand-off waits on, for a second at a time. */
+  #cgenShare(key, mod, from, proc) {
+    if (this.#cgenModules.has(key)) return;
+    this.#cgenModules.set(key, mod);
+    this.#cgenToProc(key, mod, proc, from);
+    this.#poolModule(key, mod);
+    while (this.#cgenModules.size > UNIT_PAGE_MODULES) this.#cgenModules.delete(this.#cgenModules.keys().next().value);
+  }
+  /** Unit module `key` to process `proc`'s live Workers but `from`. */
+  #cgenToProc(key, mod, proc, from = null) {
+    for (const [k, other] of this.#workers) {
+      if (other !== from && String(k).split(':')[0] === proc) other.postMessage({ kind: 'sharedModule', key, mod });
+    }
+  }
   /** A module the page just kept, to the Workers waiting in the pool. */
   #poolModule(key, mod) {
     for (const w of this.#warm) {
@@ -888,6 +950,7 @@ export class ProcessHost {
           // runs while they arrive -- the miss path forgives a module not yet
           // landed and asks again when it shows up.
           const { closure, ...extra } = this.#extra;
+          const tPost = logNamed('unitstall') ? performance.now() : -1;
           w.postMessage({
             ...extra,
             // How many to wait for. The Worker installs them before it runs
@@ -909,15 +972,18 @@ export class ProcessHost {
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
             sharedModules: this.#sharedFor(pid, msg.kind === 'thread', w),
+            unitFiles: this.#unitFilePack(),
             // the wineserver's door, if one is up (`doorPublish`)
             door: this.#door ?? undefined,
+            memories: MEMORIES || undefined,
             // A fork child's memory: an exited process's, zeroed, if one fits.
             recycledMemory: msg.kind === 'adopt' && msg.child && !msg.child.exec && !this.#foreign(pid)
               ? this.#takeMemory(imageExtent(msg.child))
               : undefined,
           // `transfer`: buffers the caller gives up (the page's bundle), moved
           // rather than copied, and freed by the Worker once loaded.
-          }, [...forkTransfer(msg.child), ...(msg.transfer ?? [])]);
+          }, [...forkTransfer(msg.child), ...(msg.child?.bulk ? [msg.child.bulk] : []), ...(msg.bulk ? [msg.bulk] : []), ...(msg.transfer ?? [])]);
+          if (tPost >= 0) console.warn(`[host-post] ${pid} ${msg.kind}: ${(performance.now() - tPost).toFixed(1)} ms`);
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
           const tSent = performance.now();
@@ -995,6 +1061,45 @@ export class ProcessHost {
         }
         break;
       }
+      case 'unitFile': {
+        if (typeof m.rel === 'string' && !this.#unitFiles.has(m.rel) && this.#unitFiles.size < UNIT_FILES) {
+          this.#unitFiles.set(m.rel, m.bytes ?? null);
+        }
+        break;
+      }
+      case 'prefetchUnit': {
+        // A unit a Worker published, its Module not yet compiled anywhere:
+        // compiled here while the process runs on, to be every Worker's
+        // before its first call there (`Gex#unitWant` compiles it itself
+        // when this has not arrived).
+        const name = `cgen:${m.key}`;
+        const proc = String(pid).split(':')[0];
+        if (typeof m.key !== 'string' || typeof m.url !== 'string') break;
+        // Kept or on its way: to the asking process, which started before
+        // the page had it and so was not handed it.
+        const kept = this.#cgenModules.get(name);
+        if (kept) { this.#cgenToProc(name, kept, proc); break; }
+        const asking = this.#cgenFetching.get(m.key);
+        if (asking) { asking.add(proc); break; }
+        this.#cgenFetching.set(m.key, new Set([proc]));
+        const t0 = performance.now();
+        const timed = logNamed('unitstall');
+        fetch(m.url)
+          .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.arrayBuffer(); })
+          .then((b) => WebAssembly.compile(b))
+          .then((mod) => {
+            if (timed) console.warn(`[unit-pf] ${m.key.slice(0, 16)}: compiled ahead in ${Math.round(performance.now() - t0)} ms`);
+            // A Worker's own compile may have come in first: that one, then.
+            const had = this.#cgenModules.get(name);
+            if (!had) this.#cgenShare(name, mod, null, proc);
+            for (const other of this.#cgenFetching.get(m.key) ?? []) {
+              if (had || other !== proc) this.#cgenToProc(name, had ?? mod, other);
+            }
+          })
+          .catch((err) => { if (timed) console.warn(`[unit-pf] ${m.key.slice(0, 16)}: ${err?.message ?? err}`); })
+          .finally(() => this.#cgenFetching.delete(m.key));
+        break;
+      }
       case 'compiledModule': {
         // A Worker compiled a module with content key `m.key`. Remember it for this process
         // and relay it to the process's other live Workers so none recompiles
@@ -1004,6 +1109,10 @@ export class ProcessHost {
         let cache = this.#moduleCache.get(proc);
         if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
         if (this.#extra?.fillTime) this.#relayCensus();
+        if (typeof m.key === 'string' && (m.key.startsWith('cgen:') || m.key.startsWith('cold:'))) {
+          this.#cgenShare(m.key, m.mod, w, String(pid).split(':')[0]);
+          break;
+        }
         if (typeof m.key === 'string' && m.key.startsWith('wasm:')) {
           this.#pageModules.delete(m.key);
           this.#pageModules.set(m.key, m.mod);
@@ -1174,6 +1283,7 @@ export class ProcessHost {
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
             // references, not a byte copy. See `#moduleCache`.
             sharedModules: this.#sharedFor(pid, true),
+            unitFiles: this.#unitFilePack(),
             door: this.#door ?? undefined,
           }),
           );

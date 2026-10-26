@@ -68,6 +68,34 @@ function forkTransfer(child) {
   return out;
 }
 
+/// The fork record's bulk: what the parent hands its child (modules, memory
+/// image, maps) and the host never reads. In a browser it goes from the
+/// parent's Worker to the child's over a channel of its own (`bulk`), so the
+/// page's thread deserializes none of it: a module or memory arriving there
+/// counts against its isolate's external memory, and at a fork's thousands of
+/// modules that ran one full collection after another on the thread every
+/// process waits on. The single-thread build and Node keep the one message.
+const FORK_BULK = ['modules', 'image', 'vmaBlob', 'pages', 'shared'];
+const forkDirect = () => !single.on && typeof MessageChannel === 'function' && typeof WorkerGlobalScope !== 'undefined';
+/** How far a record's image reaches (host.mjs `imageExtent`), said in the
+ *  record that travels without it. */
+function forkExtent(child) {
+  let n = 0;
+  for (const r of child?.image ?? []) n = Math.max(n, r.end ?? 0, r.at + (r.len ?? r.bytes?.byteLength ?? 0));
+  return n;
+}
+/** A fork record's bulk, when it came apart from the record: awaited from
+ *  the parent's Worker and put back. */
+async function forkBulkIn(child) {
+  const p = child?.bulk;
+  if (!p) return;
+  delete child.bulk;
+  const bulk = await new Promise((res) => {
+    p.onmessage = (e) => res(e.data);
+  });
+  p.close();
+  Object.assign(child, bulk);
+}
 
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
@@ -77,7 +105,7 @@ import { setLazyCache } from './lazy-cache.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
-import { setLog } from './log.mjs';
+import { logNamed, setLog } from './log.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -160,6 +188,11 @@ const port = {
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// The unit cache's small files the page's Workers read before this one
+/// started (host.mjs `#unitFiles`), by path; null for one the cache lacks.
+const unitFiles = new Map();
+/// The largest unit-cache file a Worker shares with the page that way.
+const UNIT_FILE_MAX = 4 << 20;
 // Which guest thread this Worker runs, asked for by a profiler or
 // debugger (`Runtime.evaluate` in the Worker's session): a pooled Worker is
 // made before it has a process, so its name cannot say. Read when asked,
@@ -295,6 +328,10 @@ function closureModules(n) {
 async function handle(msg) {
   // GEX_LOG from the page (`extra.log`): a Worker sees neither its globals nor its query.
   setLog(msg?.log);
+  if (msg?.unitFiles?.buf) {
+    const { buf, index } = msg.unitFiles;
+    for (const [rel, off, len] of index) if (!unitFiles.has(rel)) unitFiles.set(rel, len < 0 ? null : new Uint8Array(buf, off, len));
+  }
   if (msg?.kind === 'closureMeta') {
     // Registration only: which library owns which page. The compiled module
     // for each is asked for when a branch lands in it.
@@ -388,6 +425,8 @@ async function handle(msg) {
     return;
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
+  if (msg.kind === 'adopt') await forkBulkIn(msg.child);
+  if (msg.kind === 'thread') await forkBulkIn(msg);
 
   // How many traps a forked child takes before installing its parent's
   // modules. Carried in the start message, not read off a global: the page's
@@ -518,6 +557,16 @@ async function handle(msg) {
     }
     // The guest forked. Handed up: only the host makes Workers.
     async spawnProcess(child) {
+      if (forkDirect()) {
+        const ch = new MessageChannel();
+        const bulk = {};
+        for (const k of FORK_BULK) bulk[k] = child[k];
+        const head = { ...child, extent: forkExtent(child), bulk: ch.port2 };
+        for (const k of FORK_BULK) delete head[k];
+        ch.port1.postMessage(bulk, forkTransfer(bulk));
+        port.post({ kind: 'fork', child: head }, [ch.port2]);
+        return;
+      }
       port.post({ kind: 'fork', child }, forkTransfer(child));
     }
     // A thread carries the memory itself, not a copy: a shared
@@ -525,6 +574,14 @@ async function handle(msg) {
     // is on this process's address space.
     async spawnThread(thread) {
       recyclable = false;
+      // The memory to the thread's Worker directly, as a fork's bulk (unless
+      // a harness keeps every memory on the page, `?memories=1`).
+      if (forkDirect() && !msg.memories && thread.memory) {
+        const ch = new MessageChannel();
+        ch.port1.postMessage({ memory: thread.memory });
+        port.post({ kind: 'thread', thread: { ...thread, memory: undefined, bulk: ch.port2 } }, [ch.port2]);
+        return;
+      }
       port.post({ kind: 'thread', thread });
     }
     // A module this Worker just compiled, up to the host to relay to the sibling
@@ -558,6 +615,16 @@ async function handle(msg) {
       noteStatus(status);
     }
     owner = '';
+    // A unit this Worker published, compiled by the host off the guest's
+    // threads and handed to every Worker (host.mjs `prefetchUnit`): from the
+    // page's server only, not the page's own preloaded files.
+    prefetchUnit(key) {
+      const c = msg.cgen;
+      if (!c?.url || preClosed || preFiles.has(`${key}/c.wasm`)) return;
+      let url;
+      try { url = new URL(`${c.url}/${key}/c.wasm`, globalThis.location?.href).href; } catch { return; }
+      port.post({ kind: 'prefetchUnit', key, url });
+    }
     loadUnit(key) {
       // The entries now; the module's bytes only if this Worker compiles it
       // (most get the Module from a sibling: see `Gex#cgenModule`). Fetching
@@ -629,6 +696,10 @@ async function handle(msg) {
       const late = fillFile(`unit:${rel}`);
       if (late) return late;
       if (preClosed) return null;
+      if (unitFiles.has(rel)) {
+        const b = unitFiles.get(rel);
+        return b ? b.slice() : null;
+      }
       try {
         if (c.root) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
@@ -638,12 +709,27 @@ async function handle(msg) {
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
         const done = noteFetch(`unit:${rel}`, 0, this.owner);
+        const tx = logNamed('unitstall') ? performance.now() : -1;
         try {
           x.send();
         } finally {
           done(x.response?.byteLength ?? 0);
         }
-        return x.status === 200 ? new Uint8Array(x.response) : null;
+        if (tx >= 0) console.warn(`[unitxhr] ${workerGex?.who?.pid ?? '?'}: ${rel} ${x.status} ${(performance.now() - tx).toFixed(1)} ms`);
+        const got = x.status === 200 ? new Uint8Array(x.response) : null;
+        // Small files, and the absent, to the page for the Workers to come
+        // (a forked child places every unit its parent had): not the
+        // module's bytes, which the page holds compiled.
+        if ((got === null ? x.status === 404 : got.byteLength <= UNIT_FILE_MAX) && !rel.endsWith('/c.wasm') && typeof SharedArrayBuffer === 'function') {
+          let bytes = null;
+          if (got) {
+            bytes = new Uint8Array(new SharedArrayBuffer(got.byteLength));
+            bytes.set(got);
+          }
+          unitFiles.set(rel, bytes);
+          port.post({ kind: 'unitFile', rel, bytes });
+        }
+        return got;
       } catch {
         return null;
       }
