@@ -96,6 +96,9 @@ pub struct Info {
     pub global_init: Vec<Option<u32>>,
     /// The fork summary (`gex.forkreach`), if the module has one.
     pub forkreach: Option<ForkReach>,
+    /// [`Info::slots`], made once: the loader asks for it at every symbol it
+    /// binds (a large C++ library binds tens of thousands).
+    slots: std::sync::OnceLock<(u32, HashMap<u32, u32>)>,
 }
 
 /// A library's fork summary (`gex.forkreach`).
@@ -281,7 +284,12 @@ impl Info {
     /// `__table_base`) of every exported function. Element segment
     /// positions first; every exported function not in it gets a slot
     /// after them, in export-name order (the same in every process).
-    pub fn slots(&self) -> (u32, HashMap<u32, u32>) {
+    pub fn slots(&self) -> (u32, &HashMap<u32, u32>) {
+        let (len, at) = self.slots.get_or_init(|| self.make_slots());
+        (*len, at)
+    }
+
+    fn make_slots(&self) -> (u32, HashMap<u32, u32>) {
         let mut at: HashMap<u32, u32> = HashMap::new();
         for (k, &f) in self.elem.iter().enumerate() {
             at.entry(f).or_insert(k as u32);
