@@ -44,7 +44,7 @@ pub const DISPATCH_SHIFT: u32 = 2;
 pub const SYSCALL_INST_BYTES: u64 = if X86 { 2 } else { 4 };
 
 // ---------------------------------------------------------------------------
-// Guest address space (PLAN §7.1)
+// Guest address space
 // ---------------------------------------------------------------------------
 
 /// Wasm page size.
@@ -70,7 +70,7 @@ pub const GUEST_MEM_INITIAL_PAGES: u64 = GUEST_MEM_INITIAL_BYTES / WASM_PAGE;
 /// Highest guest address that can ever be valid.
 pub const GUEST_LIMIT: u64 = GUEST_MEM_BYTES;
 
-/// Which guest memory a process has (docs/mem64.md). `M32` is the default
+/// Which guest memory a process has. `M32` is the default
 /// and every program that fits keeps it: a 4 GiB wasm32 memory with gex's
 /// bounds guard. `M64` is a 64-bit (memory64) memory of [`LIMIT64`] bytes for
 /// a 64-bit guest that needs more address space: the same layout below
@@ -98,8 +98,8 @@ impl MemFlavor {
 
 static MEM64: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Set the guest memory every translation in this host process targets
-/// (docs/mem64.md §3). Natively a gexc process's guests share one flavour; a
+/// Set the guest memory every translation in this host process targets.
+/// Natively a gexc process's guests share one flavour; a
 /// browser shim's is fixed by its build. Set before anything is translated.
 pub fn set_mem_flavor(f: MemFlavor) {
     MEM64.store(f.is_64() || cfg!(target_arch = "wasm64"), core::sync::atomic::Ordering::Relaxed);
@@ -129,7 +129,7 @@ pub const LIMIT64: u64 = 16 << 30;
 /// Wasm pages in [`LIMIT64`].
 pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 
-/// An M64 process's dense per-page tables (docs/mem64.md §3): its dispatch
+/// An M64 process's dense per-page tables: its dispatch
 /// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
 /// anywhere in the memory (a W^X JIT's high pages made executable), and its
 /// [`PATCHED_PAGES`] bits after it. At the bottom of the high region, below
@@ -149,7 +149,7 @@ pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0
 /// The bottom of an M64 process's high arena: non-executable data (Linux
 /// `mmap` without `PROT_EXEC`, NT allocations without an executable
 /// protection) goes here, above everything a wasm32 process has and above
-/// the M64 tables (docs/mem64.md §3).
+/// the M64 tables.
 pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
 
 /// The dispatch directory of this process's memory flavour: the low region's
@@ -301,7 +301,7 @@ pub fn arena_bottom() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Thread context (PLAN §4)
+// Thread context
 // ---------------------------------------------------------------------------
 
 /// Byte offsets within the per-thread guest context structure, which lives in
@@ -501,7 +501,7 @@ pub mod ctx {
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch (PLAN §5.6)
+// Dispatch
 // ---------------------------------------------------------------------------
 
 /// Bytes of guest text one dispatch-directory entry covers.
@@ -636,7 +636,7 @@ pub const BODY_LIMITS: u64 = RESERVED_END - 320;
 /// first.
 pub const BODY_LIMIT: u64 = BODY_LIMITS;
 
-/// The function table's probe cache (docs/merge-plan.md §9.8): guest address
+/// The function table's probe cache: guest address
 /// → [`ftab`] index, direct-mapped, shared by every thread of the process.
 /// Entry `fcache_slot(a)` is one `u64`: the address's low
 /// [`FCACHE_TAG_BITS`] bits (all of it, for code below 64 GiB: a memory64
@@ -707,11 +707,11 @@ pub const fn fcache_probe(e: u64, t: u64) -> u32 {
 pub const CTX_LIMIT: u64 = FCACHE;
 
 /// One `u32` per code page that changes whenever the page's code may have
-/// (merge-plan §9.8, per-function page checks): a function translated at run
+/// (per-function page checks): a function translated at run
 /// time records the value of every page it covers and compares them on
 /// entry; on a mismatch it re-enters through the resolve stub with
 /// `ctx::LAST_TARGET` = its entry, and the host translates it again. Until
-/// tier-1's dispatch slots go (§9.4 step 6) this *is* the dispatch directory:
+/// tier-1's dispatch slots go, this *is* the dispatch directory:
 /// a page retired is zeroed there and numbered afresh, never with an old
 /// value, and the host numbers every page it hands a translator
 /// (`page_gen`), so an entry of zero never belongs to a translation. Units
@@ -719,7 +719,7 @@ pub const CTX_LIMIT: u64 = FCACHE;
 /// fixed at build time, so "changed since install" is the question).
 pub const PAGE_GEN: u64 = DISPATCH_DIR;
 
-/// The function table (docs/merge-plan.md §9.8): one `funcref` table per
+/// The function table: one `funcref` table per
 /// process -- per store natively, per Worker in the browser, numbered alike
 /// in all of them -- holding only `F_body` functions:
 ///
@@ -730,7 +730,7 @@ pub const PAGE_GEN: u64 = DISPATCH_DIR;
 /// 1: the predicted return happened (the guest returned to `ret` with the
 /// stack pointer back); 0: the function left with all state written back
 /// and `ctx::PC` set. The callee does the return check; `depth` is the
-/// recursion guard's estimate (docs/function-tier.md §7.1).
+/// recursion guard's estimate.
 ///
 /// Every call through the table first stores the target in
 /// `ctx::LAST_TARGET`, so any slot a thread's table has not filled yet --
@@ -841,11 +841,11 @@ pub mod imports {
 
     /// An indirect branch to an address with no translation.
     /// Signature `(ctx: i32, pc: i64) -> i32`, returning the dispatch-table
-    /// index to re-enter. In M0 this always traps; from M3 it drives gex-jit.
+    /// index to re-enter. With no translator this traps; with one it drives
+    /// gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
 
-    /// The function tier calling code it does not hold (docs/function-tier.md
-    /// §7.3). Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
+    /// The function tier calling code it does not hold. Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
     /// i32`: everything is written back and `ctx::PC = target`; the host runs
     /// the guest from there until it returns to `ret` with the stack pointer
     /// back at `sp_want` (or above it by what a callee popped) and returns 1,
@@ -1155,7 +1155,7 @@ pub const DCZID_BLOCK_BYTES: u64 = 64;
 
 /// `CTR_EL0` value reported to the guest: 64-byte I- and D-cache lines,
 /// with the "instruction cache is not coherent" behaviour that makes guests
-/// emit the `IC IVAU` sequences gex relies on for SMC detection (PLAN §6.2).
+/// emit the `IC IVAU` sequences gex relies on for SMC detection.
 pub const CTR_EL0: u64 = 0x8444_c004;
 
 /// `CNTFRQ_EL0`: virtual counter frequency in Hz. 1 GHz keeps the guest's

@@ -1,4 +1,4 @@
-//! Loading a dynamically linked program (PLAN §6.4 *cooperative mode*).
+//! Loading a dynamically linked program (*cooperative mode*).
 //!
 //! Places the executable and its own interpreter and enters the interpreter,
 //! letting it run translated. This is what musl needs (its loader state has no

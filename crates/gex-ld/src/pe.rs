@@ -522,9 +522,8 @@ pub fn is_pe(bytes: &[u8]) -> bool {
 const COMIMAGE_FLAGS_ILONLY: u32 = 0x1;
 const COMIMAGE_FLAGS_NATIVE_ENTRYPOINT: u32 = 0x10;
 
-/// A mixed-mode (C++/CLI) image loaded as native code, with no CLR: Hades'
-/// BasecampBugReporter.Native.dll, whose exports only call into managed
-/// code. Its managed entries return 0 ([`PeImage::map`]).
+/// A mixed-mode (C++/CLI) image loaded as native code, with no CLR: a game's
+/// bug-reporter DLL, say, whose exports only call into managed code. Its managed entries return 0 ([`PeImage::map`]).
 #[derive(Clone, Debug)]
 pub struct ClrMixed {
     /// The native entry point (`COMIMAGE_FLAGS_NATIVE_ENTRYPOINT`), run as
@@ -662,7 +661,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         if *rva != 0 && (*rva as u64 >= bound || *size as u64 > bound - *rva as u64) {
             // The certificate table is never mapped, and Windows' loader
             // does not look at it. Shipped executables whose signature was
-            // cut off after signing (Undertale's) still point past the
+            // cut off after signing still point past the
             // file's end: such an image has no certificate table.
             if i == dir::SECURITY {
                 (*rva, *size) = (0, 0);

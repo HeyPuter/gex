@@ -260,8 +260,7 @@ impl Image {
     /// The defined, non-TLS dynamic symbols in `[lo, hi)` (unbiased) by every
     /// name a binding may use: `name@@VER`, `name@VER`, and the bare `name`
     /// for the default version (or an unversioned object), each with its
-    /// unbiased value and whether it is an IFUNC. For export providers
-    /// (docs/elf-providers.md).
+    /// unbiased value and whether it is an IFUNC. For export providers.
     pub fn exports_by_version(&self, lo: u64, hi: u64) -> std::collections::HashMap<String, (u64, bool)> {
         let mut m = std::collections::HashMap::new();
         for y in self.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value >= lo && y.value < hi) {
@@ -1089,7 +1088,7 @@ fn read_cstr(image: &Image, vaddr: u64) -> String {
 /// Apply the relocations a static-PIE image needs before its own code runs.
 ///
 /// Only `R_AARCH64_RELATIVE`; `IRELATIVE` resolvers are guest code and are
-/// deferred to startup (PLAN §6.4). Applying `RELATIVE` twice is harmless (it
+/// deferred to startup. Applying `RELATIVE` twice is harmless (it
 /// writes an absolute value), so an image that also self-relocates stays
 /// correct. Reads go through the *placed* segments, not the file.
 fn apply_relative_relocations(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {

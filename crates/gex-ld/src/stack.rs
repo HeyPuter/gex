@@ -44,8 +44,8 @@ pub mod auxv {
 /// The hardware capabilities gex advertises.
 ///
 /// Deterministic by design: because every gex process sees the same value,
-/// `gexc` can pre-run ifunc resolvers at build time and prebind the winner
-/// (PLAN §6.4). The set is ARMv8.0 plus the extensions the lifter implements.
+/// `gexc` can pre-run ifunc resolvers at build time and prebind the winner.
+/// The set is ARMv8.0 plus the extensions the lifter implements.
 pub const HWCAP: u64 = if gex_abi::X86 {
     // x86-64: the CPUID.1:EDX feature word. FPU, TSC, CX8, CMOV, CLFSH, MMX,
     // FXSR, SSE, SSE2 -- the baseline every x86-64 has, and what the `cpuid`
