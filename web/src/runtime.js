@@ -118,6 +118,13 @@ function unitModuleWorker(zstd) {
   };
 }
 
+/** `fetchUnit`, but a unit the fill brings (`late`: key to its Module's
+ *  promise) from there: one download of it, not two. */
+function lateFirst(late, fetchUnit) {
+  if (!late?.size) return fetchUnit;
+  return (url) => late.get(url.split('/').at(-2)) ?? fetchUnit(url);
+}
+
 async function fetchBytes(url, onProgress) {
   // Revalidated, never taken from cache on faith: the shim and seed have fixed
   // URLs with no content hash, so a browser would keep serving a broken build
@@ -784,6 +791,8 @@ async function runProgramHere(
     // page compiles its units while the bundle downloads), as [name, Module]
     // pairs every Worker takes instead of fetching and compiling its own.
     preModules = null,
+    // Units arriving in the fill, by key: each its Module's promise (app.js).
+    lateUnits = null,
     // Called once the system is up and before pid 1 starts, with what an
     // embedder needs to act on the running system from outside the guest:
     // the process host (kernel stack slices), the global kernel, the shared
@@ -1044,7 +1053,8 @@ async function runProgramHere(
     makeWorker: makeGuestWorker,
     // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
     // Worker of its own, off this thread.
-    unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : null,
+    unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
+      ? lateFirst(lateUnits, unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD))) : null,
     shim: shimBytes,
     // The closure's image module in place of the seed: it holds the program's
     // own text, already lifted.

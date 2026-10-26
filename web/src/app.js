@@ -600,6 +600,7 @@ async function begin(opts, base, at, state, meter) {
   // The fill: its buffer and counter made now, every Worker given them; its
   // download started now, after the boot's, so it does not share their link.
   let fill = null;
+  const lateUnits = new Map();
   const fl = fillList ? await fillList : null;
   if (fl && typeof SharedArrayBuffer === 'function') {
     const buf = new SharedArrayBuffer(fl.size);
@@ -613,7 +614,19 @@ async function begin(opts, base, at, state, meter) {
     // (worker.mjs `loadFile`).
     const late = fl.files.filter(([p]) => p.startsWith('unit:'));
     let lateN = 0;
+    // Each late unit's Module, promised now: what the host hands a process
+    // that maps one before it is in (runtime.js `lateFirst`).
+    for (const [p] of late) {
+      const m = /^unit:([^/]+)\/c\.wasm$/.exec(p);
+      if (!m || (fl.demand ?? []).includes(m[1])) continue;
+      let resolve, reject;
+      const pr = new Promise((y, n) => { resolve = y; reject = n; });
+      pr.catch(() => {});
+      lateUnits.set(m[1], Object.assign(pr, { resolve, reject }));
+    }
     const add = (entry) => {
+      const k = entry[0].startsWith('cgen:') ? entry[0].slice(5) : null;
+      if (k) lateUnits.get(k)?.resolve(entry[1]);
       if (!preModules) return;
       // Before `closed`, which a Worker reads as the end of the list.
       const c = preModules.findIndex(([k]) => k === 'closed');
@@ -626,6 +639,7 @@ async function begin(opts, base, at, state, meter) {
     const z = await packedEntry(at(fl.url), fetcher);
     const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module', name: 'fill' });
     const failed = (e) => {
+      for (const p of lateUnits.values()) p.reject(new Error(`the fill failed: ${e}`));
       Atomics.store(counter, 0, -1);
       Atomics.notify(counter, 0);
       say(`[app] the fill failed: ${e}\n`);
@@ -778,6 +792,7 @@ async function begin(opts, base, at, state, meter) {
     hostX: !!b.hostx && opts.hostx !== false
       && ((opts.hostx === 'rootful' || (b.hostxRootful && opts.hostx === undefined)) ? 'rootful' : true),
     preModules,
+    lateUnits,
     fill,
     lazyCache,
     identities: b.identities ?? null,
