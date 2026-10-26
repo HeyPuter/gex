@@ -1981,6 +1981,7 @@ export class Gex {
       straceExe: opts.straceExe,
       tty: opts.tty, uid: opts.uid, gid: opts.gid,
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
+      dlChecked: opts.dlChecked,
       jitDiag: opts.jitDiag,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
@@ -3181,6 +3182,7 @@ export class Gex {
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
+    if (o.dlChecked) e.gex_set_dl_checked?.(1);
     if (o.jitDiag) e.gex_set_jit_diag?.(1);
     if (o.checkSp) e.gex_set_check_sp?.(1);
     if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
@@ -3356,6 +3358,8 @@ export class Gex {
     if (child.compat) e.gex_set_compat?.(1);
     if (child.wasm32) {
       if (child.wasm32Link && e.gex_wasmprog_adopt_link) {
+        // Before the link: adopting it may instantiate the modules.
+        if (child.dlTls?.length) this.#dlTlsKept = new Map(child.dlTls);
         const b = new TextEncoder().encode(child.wasm32Link);
         const p = e.gex_alloc(b.length) >>> 0;
         this.#bytes().set(b, p);
@@ -3864,6 +3868,9 @@ export class Gex {
       wasm32Base: e.gex_wasmprog_base?.() ?? 0,
       // And its shared libraries: where each module's data and table range are.
       wasm32Link: this.#wasmprogLink(),
+      // And this thread's blocks for its `dlopen`ed modules' thread-local
+      // data, which the child's copy of memory holds (`#dlTlsInit`).
+      dlTls: this.#dlTlsFork(),
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
@@ -4289,7 +4296,7 @@ export class Gex {
     if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
     const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
-    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map() };
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map() };
     this.#entryReset();
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
@@ -4539,6 +4546,7 @@ export class Gex {
         st.ftab.set(tIdx(slot), f);
       }
       st.dyl.set(prov, inst);
+      if (this.#wasmprogTls) this.#dlTlsInit(prov, inst, st, this.#wasmprogTls);
     }
     // A wasm64 provider's slots' function types, for its JIT's `provider_jit_table` SIG.
     if (libprov && !this.#provSigs.some((x) => x.base === base)) {
@@ -5228,6 +5236,8 @@ export class Gex {
   #cgenCatchUp() {
     const e = this.#shim.exports;
     if (!e.gex_ftab_log_len) return;
+    // before the log's length: every slot below it is published by then
+    const size = e.gex_ftab_size() >>> 0;
     const len = e.gex_ftab_log_len() >>> 0;
     if (!len && !this.#cgen) return;
     const st = this.#cgenStore();
@@ -5257,6 +5267,7 @@ export class Gex {
       st.have++;
       e.gex_cgen_have(st.have);
     }
+    this.#dlSize.value = size;
     this.#wasmdllCatchUp();
   }
 
@@ -5383,6 +5394,7 @@ export class Gex {
     }
     this.#wasmprogBindText = text;
     const extra = [];
+    this.#wasmprogTls = null;
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
     for (const line of text.split('\n')) {
       if (!line) continue;
@@ -5420,9 +5432,70 @@ export class Gex {
         case 'X':
           extra.push([Number(f[1]), f[2]]);
           break;
+        case 'T':
+          this.#wasmprogTls = [Number(f[1]), Number(f[2])];
+          break;
       }
     }
     return extra;
+  }
+
+  /** The last binding list's `T size align` (a `dlopen`ed module's
+   *  thread-local block), or null. */
+  #wasmprogTls = null;
+  /** A fork's child: its forking thread's blocks, by link-map index
+   *  (`#dlTlsFork`), which this, its first thread, keeps. */
+  #dlTlsKept = null;
+  /** This Worker's chunks for those blocks: [address, length], the last
+   *  one's next free byte. */
+  #dlTlsChunks = [];
+  /** The last `gex_wasmprog_dl_gen` this Worker caught up with. */
+  #dlGen = 0;
+  /** `gex.dl_size`: the function-table slots this Worker has caught up
+   *  with (`#cgenCatchUp`), for modules built with GEX_DL_CHECKED_CALLS. */
+  #dlSize = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+  #dlTlsNext = 0;
+
+  /** Module `prov`'s (just instantiated as `inst`) thread-local block in
+   *  this Worker's thread (cgen/dylink.rs `T`): the forking thread's in a
+   *  fork's child, otherwise a fresh one with the module's initial image. */
+  #dlTlsInit(prov, inst, st, [size, align]) {
+    const e = this.#shim.exports;
+    const idx = this.#dlTlsKept ? e.gex_wasmprog_link_index(prov) : -1;
+    const kept = idx >= 0 ? this.#dlTlsKept.get(idx) : undefined;
+    if (kept !== undefined) {
+      this.#dlTlsKept.delete(idx);
+      inst.exports.__gex_set_tls_base(kept);
+      st.dlTls.set(prov, kept);
+      return;
+    }
+    align = Math.max(align, 8);
+    const last = this.#dlTlsChunks.at(-1);
+    let at = (this.#dlTlsNext + align - 1) & -align;
+    if (!last || at + size > last[0] + last[1]) {
+      const len = Math.max(0x4000, size + align);
+      const chunk = e.gex_wasmprog_tls_chunk(len) >>> 0;
+      if (!chunk) throw new Error(`wasm32 module ${prov}: no memory for its thread-local block`);
+      this.#dlTlsChunks.push([chunk, len]);
+      at = (chunk + align - 1) & -align;
+    }
+    this.#dlTlsNext = at + size;
+    inst.exports.__wasm_init_tls(at);
+    st.dlTls.set(prov, at);
+  }
+
+  /** This thread's blocks for a fork's child: [link-map index, address]. */
+  #dlTlsFork() {
+    const e = this.#shim.exports, m = this.#cgen?.dlTls;
+    if (!m?.size || !e.gex_wasmprog_link_index) return [];
+    return [...m].map(([prov, at]) => [e.gex_wasmprog_link_index(prov), at]).filter(([i]) => i >= 0);
+  }
+
+  /** This Worker's thread ended, its process goes on: its blocks go. */
+  freeThreadTls() {
+    const e = this.#shim?.exports;
+    for (const [at, len] of this.#dlTlsChunks) e?.gex_wasmprog_tls_free?.(at, len);
+    this.#dlTlsChunks = [];
   }
 
   /** What a native wasm32 program imports from `gex` (cgen/wasmprog.rs):
@@ -5460,9 +5533,24 @@ export class Gex {
     const sync = (ctx, pc) => {
       e.gex_syscall(ctx, pc);
       staged();
+      // a library another thread has `dlopen`ed since: in this Worker's
+      // table before the program goes on (cgen/dylink.rs `DL_GEN`)
+      const g = e.gex_wasmprog_dl_gen?.();
+      if (g !== undefined && g !== this.#dlGen) {
+        this.#dlGen = g;
+        this.#cgenCatchUp();
+      }
     };
     return {
       syscall: single.on ? this.#suspendingSyscall(sync, staged) : sync,
+      // a module built with GEX_DL_CHECKED_CALLS (cgen/dylink.rs `checked`):
+      // the slots this Worker's table has caught up with, and the catch-up
+      // its guard calls at an index past them
+      dl_size: this.#dlSize,
+      dl_stale: () => {
+        this.#dlGen = e.gex_wasmprog_dl_gen?.() ?? this.#dlGen;
+        this.#cgenCatchUp();
+      },
       asyncify,
       fork_point: (rec) => {
         const st = asyncify(0, 0);

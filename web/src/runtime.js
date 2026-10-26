@@ -1164,6 +1164,8 @@ async function runProgramHere(
       // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
       fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
+      // `?dlchecked=1`: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
+      dlChecked: flag('dlchecked') ? 1 : undefined,
       // `?jitdiag=1`: retire counts by page and call, and the watch on a page that keeps translating.
       jitDiag: flag('jitdiag') ? 1 : undefined,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.

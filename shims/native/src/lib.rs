@@ -365,6 +365,10 @@ struct SpawnContext {
     prof_proc: Option<Arc<profile::ProcProf>>,
     /// The NT process, for a Windows program's threads. See `nt`.
     nt: Option<Arc<gex_kernel::nt::Process>>,
+    /// A fork's child: the forking thread's blocks for `dlopen`ed modules'
+    /// thread-local data, by module, which its first thread keeps
+    /// (`dylink::thread_tls` takes each as it instantiates the module).
+    fork_dl_tls: Mutex<std::collections::HashMap<u32, u32>>,
 }
 
 /// Tier-1 counters for `GEX_NT_STATS`: translations published, units
@@ -1405,6 +1409,7 @@ fn run_program_with(
         limits: xlate.limits,
         prof_proc: prof_proc.clone(),
         nt: store.data().nt.clone(),
+        fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
     });
     note_live_process(&spawn);
     store.data_mut().spawn = Some(Arc::clone(&spawn));
@@ -2657,6 +2662,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         prof_proc: profile::fork_process(&cx.prof_proc),
         // Windows has no fork: only a Linux process gets here.
         nt: None,
+        fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
     });
     note_live_process(&child_cx);
     let status = {
@@ -3198,6 +3204,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     libprov::guest_stop().forget(thread.tid as u32);
+    if matches!(stopped, Stopped::Exited(_)) && store.data().thread_only && !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
+        crate::dylink::free_thread_tls(store.data_mut());
+    }
     profile::harvest(&mut store)?;
     match stopped {
         Stopped::Exec(req) => {
@@ -4044,7 +4053,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSCALL,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { let r = (|| -> anyhow::Result<()> {
             if caller.data().nt.is_some() {
                 let r = nt::syscall_import(&mut caller, pc as u64);
                 check_i386_high(&caller, "an NT syscall");
@@ -4423,7 +4432,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
             }
-        })()) },
+        })();
+        // and a library another thread has `dlopen`ed since is in this
+        // thread's table before it goes on (`dylink::sync`)
+        crate::host(r.and_then(|()| crate::dylink::sync(&mut caller))) },
     )?;
 
     linker.func_wrap(
@@ -6890,6 +6902,11 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             }
             wasmtime::Trap::IntegerDivisionByZero => {
                 "integer division by zero escaped the lifter's guard".to_string()
+            }
+            wasmtime::Trap::BadSignature | wasmtime::Trap::TableOutOfBounds | wasmtime::Trap::IndirectCallToNull
+                if crate::dylink::behind(store.data()) =>
+            {
+                format!("wasm trap: {trap}: called a function from a dlopen this thread had not caught up with (handed over with no system call since)")
             }
             other => format!("wasm trap: {other}"),
         };

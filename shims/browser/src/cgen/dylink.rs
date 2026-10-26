@@ -21,7 +21,10 @@
 //!                           instantiated after this one);
 //!   `M mod name message`    a function that throws `message`;
 //! then `X slot export` per table slot past the element segment to fill
-//! with an export after instantiation.
+//! with an export after instantiation, and, for a `dlopen`ed module with
+//! thread-local data, `T size align`: each Worker gives it a block of its
+//! own as it instantiates it (`__wasm_init_tls`), libc's registry having
+//! laid out only the blocks of the modules the program started with.
 //!
 //! A fork's child gets the link map as text (`gex_wasmprog_link`, put back
 //! with `gex_wasmprog_adopt_link`): it reads the same files and publishes
@@ -38,6 +41,9 @@ struct DyProc {
     module_of: Vec<u32>,
     ldpath: Vec<String>,
     origin: String,
+    /// How many of the modules the program started with: libc's registry
+    /// gives those their thread-local blocks, gex the ones `dlopen` added.
+    startup: usize,
 }
 
 static DYPROC: Mutex<Option<DyProc>> = Mutex::new(None);
@@ -46,14 +52,46 @@ static BINDS: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
 /// The modules the last `dlopen` loaded, in initialisation order, for JS
 /// to run their constructors once it has instantiated them.
 static DL_NEW: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Bumped by every `dlopen` once its modules are published: a Worker that
+/// has not seen the latest number catches up after its next system call
+/// (`gex_wasmprog_dl_gen`), so a function pointer another thread got from
+/// `dlsym` and handed over is in its table by the time it can call it.
+static DL_GEN: AtomicU32 = AtomicU32::new(0);
 /// A fork child's link map (`gex_wasmprog_adopt_link`).
 static ADOPT: Mutex<Option<String>> = Mutex::new(None);
 /// libc's registry to fill once the modules are instantiated (their data
 /// initialised): the init order and libc's index.
 static REGISTRY: Mutex<Option<(Vec<usize>, usize)>> = Mutex::new(None);
 
+/// A library's bytes as loaded: guarded when [`gex_set_dl_checked`] is on.
 fn read(path: &str) -> Option<Vec<u8>> {
-    crate::sigs::proc_home().read_file(path)
+    crate::sigs::proc_home().read_file(path).map(checked)
+}
+
+/// `GEX_DL_CHECKED_CALLS` (the page's `dlchecked=1`): every wasm32 module
+/// of a program linked against shared libraries gets its indirect calls
+/// guarded (`gex_dylink::checked_calls`), so a function pointer from a
+/// `dlopen` that reached a Worker with no system call between is caught up
+/// with before the call; JS gives the guard `gex.dl_stale` and
+/// `gex.dl_size`. Off, nothing is rewritten and nothing costs.
+static CHECKED: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_dl_checked(on: i32) {
+    CHECKED.store(on != 0, Ordering::Relaxed);
+}
+
+fn checked(b: Vec<u8>) -> Vec<u8> {
+    if !CHECKED.load(Ordering::Relaxed) || !b.starts_with(b"\0asm") {
+        return b;
+    }
+    match gex_dylink::checked_calls(&b) {
+        Ok(out) => out,
+        Err(e) => {
+            crate::warn_line(&format!("gex: GEX_DL_CHECKED_CALLS: {e:#}; that module is left unguarded\n"));
+            b
+        }
+    }
 }
 
 fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Vec<u8>>, String> {
@@ -142,6 +180,9 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
         for (s, n) in m.info.extra_slots() {
             text.push_str(&format!("X\t{}\t{n}\n", m.table_base + s));
         }
+        if let Some((size, align)) = dl_tls(m, i >= p.startup)? {
+            text.push_str(&format!("T\t{size}\t{align}\n"));
+        }
         let number = {
             let mut provs = lock(&PROVIDERS);
             provs.push(ProviderModule { file: format!("wasmprog:{}", m.path), regs, dirs, slots, memory_base: m.memory_base as u64 });
@@ -168,9 +209,31 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
     Ok((order, libc_number))
 }
 
+/// A module's thread-local block when `dlopen` loaded it (`dlopened`), as
+/// the native host's `dylink::dl_tls`.
+fn dl_tls(m: &Loaded, dlopened: bool) -> Result<Option<(u32, u32)>, String> {
+    let size = m.info.value("__tls_size");
+    if !dlopened || size == 0 {
+        return Ok(None);
+    }
+    for f in ["__wasm_init_tls", "__gex_set_tls_base"] {
+        if m.info.exports.get(f).is_none_or(|e| e.kind != Kind::Func) {
+            return Err(format!("{}: has thread-local data but does not export {f} (link it with a newer gexcc)", m.path));
+        }
+    }
+    Ok(Some((size, m.info.value("__tls_align").max(1))))
+}
+
 /// A fresh program that names libraries: load them, publish every module,
 /// fill libc's registry. Returns libc's provider module.
 pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thread_entry: u64) -> Result<u32, String> {
+    let (wasm, info) = if CHECKED.load(Ordering::Relaxed) {
+        let w = checked(wasm);
+        let i = Info::parse(&w).map_err(|e| format!("{e:#}"))?;
+        (w, i)
+    } else {
+        (wasm, info)
+    };
     let path = exe_path();
     // The environment as published at the load or exec (no kernel lock).
     let env = crate::sigs::proc_home().envp();
@@ -185,9 +248,11 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
         module_of: Vec::new(),
         ldpath,
         origin,
+        startup: usize::MAX,
     };
     let mut bytes = vec![wasm];
     bytes.extend(find_needed(&mut p, 0)?);
+    p.startup = p.link.mods.len();
     let (order, libc) = publish(&mut p, 0, bytes, true, false, Some((entry, thread_entry)))?;
     let libc = libc.ok_or("no libc")?;
     let li = p.module_of.iter().position(|&n| n == libc).unwrap();
@@ -228,6 +293,7 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
         module_of: vec![number],
         ldpath: Vec::new(),
         origin: String::new(),
+        startup: 1,
     });
 }
 
@@ -246,12 +312,17 @@ pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32,
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    let mut p = DyProc { link: Link::default(), module_of: Vec::new(), ldpath, origin };
+    let startup = lines
+        .next()
+        .and_then(|l| l.strip_prefix("startup\t"))
+        .and_then(|n| n.parse().ok())
+        .ok_or("link map: no startup count")?;
+    let mut p = DyProc { link: Link::default(), module_of: Vec::new(), ldpath, origin, startup };
     let mut bytes = Vec::new();
     for (k, l) in lines.enumerate() {
         let f: Vec<&str> = l.splitn(4, '\t').collect();
         let [mb, tb, name, path] = f[..] else { return Err(format!("link map: bad line {l:?}")) };
-        let b = if k == 0 { wasm.clone() } else { read(path).ok_or_else(|| format!("{path}: gone since the fork"))? };
+        let b = if k == 0 { checked(wasm.clone()) } else { read(path).ok_or_else(|| format!("{path}: gone since the fork"))? };
         let info = Info::parse(&b).map_err(|e| format!("{path}: {e:#}"))?;
         let num = |s: &str| s.parse::<u32>().map_err(|_| format!("link map: bad number {s:?}"));
         p.link.mods.push(Loaded { name: name.to_string(), path: path.to_string(), info, memory_base: num(mb)?, table_base: num(tb)? });
@@ -290,7 +361,7 @@ pub extern "C" fn gex_wasmprog_binds(number: u32, buf: u32, cap: u32) -> u32 {
 pub extern "C" fn gex_wasmprog_link(buf: u32, cap: u32) -> u32 {
     let g = lock(&DYPROC);
     let Some(p) = g.as_ref().filter(|p| !p.link.mods[0].info.needed.is_empty()) else { return 0 };
-    let mut t = format!("origin\t{}\nldpath\t{}\n", p.origin, p.ldpath.join(":"));
+    let mut t = format!("origin\t{}\nldpath\t{}\nstartup\t{}\n", p.origin, p.ldpath.join(":"), p.startup);
     for m in &p.link.mods {
         t.push_str(&format!("{}\t{}\t{}\t{}\n", m.memory_base, m.table_base, m.name, m.path));
     }
@@ -325,17 +396,13 @@ fn dlopen(path: &str) -> Result<u32, String> {
         return Err(format!("{found}: not a wasm shared library"));
     }
     // on failure the link map is as it was
-    let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o };
+    let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o, startup: p.startup };
     let from = q.link.mods.len();
     q.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
     let mut all = vec![b];
     all.extend(find_needed(&mut q, from)?);
-    for m in &q.link.mods[from..] {
-        if m.info.value("__tls_size") != 0 {
-            return Err(format!("{}: thread-local data in a dlopen'd library is not supported yet", m.path));
-        }
-    }
     let (order, _) = publish(&mut q, from, all, true, false, None)?;
+    DL_GEN.fetch_add(1, Ordering::Release);
     *lock(&DL_NEW) = order.iter().map(|&i| q.module_of[i]).collect();
     *p = q;
     Ok(HANDLE_BASE + from as u32 * 16)
@@ -375,4 +442,33 @@ pub extern "C" fn gex_wasmprog_dl_new(k: u32) -> i32 {
 pub extern "C" fn gex_wasmprog_dlsym(handle: u32, name: u64) -> u32 {
     let Some(name) = guest_str(name) else { return 0 };
     lock(&DYPROC).as_ref().map_or(0, |p| p.link.dlsym(handle, &name))
+}
+
+/// Guest pages for a Worker's thread-local blocks of `dlopen`ed modules
+/// (JS bump-allocates them); 0 when mapping fails.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_tls_chunk(len: u32) -> u32 {
+    match linux_alloc(len as u64, "[dlopen tls]") {
+        Ok(a) if a + len as u64 <= u32::MAX as u64 => a as u32,
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+/// A Worker's thread ended (not its process): its chunks go.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_tls_free(at: u32, len: u32) {
+    let _ = crate::sigs::proc_home().mm().lock().unmap(at as u64, (len as u64 + 0xfff) & !0xfff);
+}
+
+/// Provider module `number`'s place in the link map (the same in a fork's
+/// child, whose module numbers are its own), or -1.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_link_index(number: u32) -> i32 {
+    lock(&DYPROC).as_ref().and_then(|p| p.module_of.iter().position(|&n| n == number)).map_or(-1, |i| i as i32)
+}
+
+/// [`DL_GEN`], for a Worker to compare after a system call.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_dl_gen() -> u32 {
+    DL_GEN.load(Ordering::Acquire)
 }

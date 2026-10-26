@@ -1112,6 +1112,7 @@ async function handle(msg) {
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.vforkTrace ?? msg.opts?.vforkTrace) globalThis.GEX_VFORK_TRACE = 1;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.dlChecked ?? msg.opts?.dlChecked) ex.gex_set_dl_checked?.(1);
     if (msg.jitDiag) ex.gex_set_jit_diag?.(1);
     if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));
@@ -1176,6 +1177,11 @@ async function handle(msg) {
     const carries = msg.kind === 'thread' && !gone && !ex.gex_thread_gone?.()
       && (ex.gex_exec_gen?.() ?? 0) !== execGen;
     const thread = (msg.kind === 'thread' && !carries) || !!ex.gex_thread_gone?.();
+    // A thread's end, its process going on as the same program: the
+    // thread-local blocks its Worker made for `dlopen`ed modules go with it
+    // (after an `execve` the addresses are the new program's).
+    if (msg.kind === 'thread' && !gone && !carries && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
+      && (ex.gex_exec_gen?.() ?? 0) === execGen) gex.freeThreadTls?.();
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
       // Who sent the last signal anywhere (the global kernel's record): a

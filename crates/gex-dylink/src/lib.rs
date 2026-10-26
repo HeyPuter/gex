@@ -636,6 +636,162 @@ pub fn fpcast_post(wasm: &[u8]) -> Result<Vec<u8>> {
     Ok(module.finish())
 }
 
+/// The imports [`checked_calls`] adds: `gex.dl_stale(index)`, a function
+/// the guard calls with an index this thread's table has not caught up
+/// with, and `gex.dl_size`, a mutable i32 global: how many slots it has.
+pub const DL_STALE: &str = "dl_stale";
+pub const DL_SIZE: &str = "dl_size";
+
+/// Guard every indirect call through table 0 (`call_indirect`,
+/// `return_call_indirect`): an index at or past `gex.dl_size` calls the
+/// host's `gex.dl_stale(index)` first, then the call goes ahead as before.
+/// The host catches the caller's thread up with the function table (and
+/// raises `dl_size`), so a function pointer from a `dlopen` that reached
+/// this thread with no system call between (a lock-free handoff) is in the
+/// table by the time it is called.
+///
+/// An opt-in check (a global read and a compare per indirect call); without
+/// it such a call traps. Returns the module unchanged when it has no
+/// indirect call.
+pub fn checked_calls(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Error as RError, Reencode};
+    // the defined functions' parameter counts, the types' count, the
+    // imported functions' count, and whether anything calls indirectly
+    let (mut params, mut fsig, mut ntypes, mut nfi, mut ngi, mut any, mut imports) = (Vec::new(), Vec::new(), 0u32, 0u32, 0u32, false, false);
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            wasmparser::Payload::TypeSection(r) => {
+                for g in r {
+                    for t in g?.into_types() {
+                        ntypes += 1;
+                        params.push(match &t.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(f) => f.params().len() as u32,
+                            _ => 0,
+                        });
+                    }
+                }
+            }
+            wasmparser::Payload::ImportSection(r) => {
+                imports = true;
+                for i in r {
+                    match i?.ty {
+                        wasmparser::TypeRef::Func(_) => nfi += 1,
+                        wasmparser::TypeRef::Global(_) => ngi += 1,
+                        _ => {}
+                    }
+                }
+            }
+            wasmparser::Payload::TableSection(r) => {
+                for t in r {
+                    if t?.ty.table64 {
+                        bail!("checked calls: a 64-bit table");
+                    }
+                }
+            }
+            wasmparser::Payload::FunctionSection(r) => {
+                for f in r {
+                    fsig.push(f?);
+                }
+            }
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                let mut ops = body.get_operators_reader()?;
+                while !ops.eof() {
+                    if let wasmparser::Operator::CallIndirect { table_index: 0, .. } | wasmparser::Operator::ReturnCallIndirect { table_index: 0, .. } = ops.read()? {
+                        any = true;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !any {
+        return Ok(wasm.to_vec());
+    }
+    struct R {
+        nfi: u32,
+        ngi: u32,
+        ty: u32,
+        params: Vec<u32>,
+        fsig: Vec<u32>,
+        body: usize,
+    }
+    impl Reencode for R {
+        type Error = std::convert::Infallible;
+        fn function_index(&mut self, f: u32) -> u32 {
+            if f >= self.nfi { f + 1 } else { f }
+        }
+        fn global_index(&mut self, g: u32) -> u32 {
+            if g >= self.ngi { g + 1 } else { g }
+        }
+        fn parse_type_section(
+            &mut self,
+            types: &mut wasm_encoder::TypeSection,
+            section: wasmparser::TypeSectionReader<'_>,
+        ) -> Result<(), RError<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_type_section(self, types, section)?;
+            types.ty().function([wasm_encoder::ValType::I32], []);
+            Ok(())
+        }
+        fn parse_import_section(
+            &mut self,
+            imports: &mut wasm_encoder::ImportSection,
+            section: wasmparser::ImportSectionReader<'_>,
+        ) -> Result<(), RError<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_import_section(self, imports, section)?;
+            imports.import("gex", DL_STALE, wasm_encoder::EntityType::Function(self.ty));
+            let size = wasm_encoder::GlobalType { val_type: wasm_encoder::ValType::I32, mutable: true, shared: false };
+            imports.import("gex", DL_SIZE, wasm_encoder::EntityType::Global(size));
+            Ok(())
+        }
+        fn parse_function_body(
+            &mut self,
+            code: &mut wasm_encoder::CodeSection,
+            func: wasmparser::FunctionBody<'_>,
+        ) -> Result<(), RError<Self::Error>> {
+            use wasm_encoder::Instruction as I;
+            let mut locals = Vec::new();
+            let mut tmp = self.params[self.fsig[self.body] as usize];
+            self.body += 1;
+            for pair in func.get_locals_reader()? {
+                let (n, t) = pair?;
+                tmp += n;
+                locals.push((n, self.val_type(t)?));
+            }
+            locals.push((1, wasm_encoder::ValType::I32));
+            let mut f = wasm_encoder::Function::new(locals);
+            let mut ops = func.get_operators_reader()?;
+            while !ops.eof() {
+                let op = ops.read()?;
+                if let wasmparser::Operator::CallIndirect { table_index: 0, .. } | wasmparser::Operator::ReturnCallIndirect { table_index: 0, .. } = op {
+                    f.instruction(&I::LocalTee(tmp));
+                    f.instruction(&I::GlobalGet(self.ngi));
+                    f.instruction(&I::I32GeU);
+                    f.instruction(&I::If(wasm_encoder::BlockType::Empty));
+                    f.instruction(&I::LocalGet(tmp));
+                    f.instruction(&I::Call(self.nfi));
+                    f.instruction(&I::End);
+                    f.instruction(&I::LocalGet(tmp));
+                }
+                f.instruction(&self.instruction(op)?);
+            }
+            code.function(&f);
+            Ok(())
+        }
+    }
+    if params.is_empty() || !imports {
+        bail!("checked calls: a module with no types or no imports");
+    }
+    let mut r = R { nfi, ngi, ty: ntypes, params, fsig, body: 0 };
+    let mut module = wasm_encoder::Module::new();
+    r.parse_core_module(&mut module, wasmparser::Parser::new(0), wasm).map_err(|e| anyhow!("checked calls: {e:?}"))?;
+    let out = module.finish();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&out)
+        .context("checked calls: the rewritten module does not validate")?;
+    Ok(out)
+}
+
 /// Add (or replace) a custom section at the end of a module.
 pub fn set_custom_section(wasm: &[u8], name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = wasm[..8].to_vec();

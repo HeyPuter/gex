@@ -28,6 +28,11 @@ pub(crate) struct Binds {
     pub imports: Vec<(String, String, NBind)>,
     /// Slots after the element segment: (table index, export) to fill.
     pub extra: Vec<(u32, String)>,
+    /// A `dlopen`ed module's thread-local block (size, alignment), which
+    /// each store gives it as it instantiates the module ([`thread_tls`]).
+    /// None for the modules a program starts with: libc's registry lays
+    /// theirs out in every thread's TLS area.
+    pub tls: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +153,7 @@ fn publish(
     let mut done: HashSet<usize> = (0..from).collect();
     for &i in &order {
         let m = &p.link.mods[i];
+        let tls = dl_tls(m, from)?;
         let binds = p.link.bind(i, &done)?;
         done.insert(i);
         let imports = m
@@ -171,7 +177,7 @@ fn publish(
         let pairs = pairs_of(i, m, &at);
         let module = p.module_of[i];
         s.ftab.stateful.insert(module, crate::libprov::Extras { memory_base: m.memory_base as u64 });
-        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra }));
+        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra, tls }));
         s.ftab.modules.push(modules[i - from].clone());
         let (n, ok) = s.ftab.map.publish_at(m.table_base, len, module, gex_kernel::ftab::Tier::Unit, &pairs);
         if !ok {
@@ -197,6 +203,13 @@ pub(crate) fn install_program(
     thread_entry: u64,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
+    let (wasm, info) = if checked_calls() {
+        let w = checked(wasm);
+        let i = Info::parse(&w)?;
+        (w, i)
+    } else {
+        (wasm, info)
+    };
     let env = initial_env(store, memory);
     let ldpath: Vec<String> = env
         .iter()
@@ -213,7 +226,7 @@ pub(crate) fn install_program(
     let libs = {
         let state = store.data_mut();
         let (o, lp) = (p.origin.clone(), p.ldpath.clone());
-        p.link.needed_of(0, |name, rp| gex_dylink::search(name, rp, &o, &lp, |f| state.with_kernel(|k| k.read_file(f))))?
+        p.link.needed_of(0, |name, rp| gex_dylink::search(name, rp, &o, &lp, |f| state.with_kernel(|k| k.read_file(f)).map(checked)))?
     };
     let mut bytes = vec![wasm];
     for (name, path, b, info) in libs {
@@ -246,6 +259,22 @@ pub(crate) fn install_program(
     Ok(())
 }
 
+/// A module's thread-local block when [`publish`]ed by `dlopen` (`from`
+/// past the program's own modules): libc's registry does not have it, so
+/// every store gives it one as it instantiates it.
+fn dl_tls(m: &Loaded, from: usize) -> Result<Option<(u32, u32)>> {
+    let size = m.info.value("__tls_size");
+    if from == 0 || size == 0 {
+        return Ok(None);
+    }
+    for f in ["__wasm_init_tls", "__gex_set_tls_base"] {
+        if m.info.exports.get(f).is_none_or(|e| e.kind != Kind::Func) {
+            bail!("{}: has thread-local data but does not export {f} (link it with a newer gexcc)", m.path);
+        }
+    }
+    Ok(Some((size, m.info.value("__tls_align").max(1))))
+}
+
 fn trace(p: &DyProcess, order: &[usize], what: &str, t0: std::time::Instant) {
     if std::env::var_os("GEX_WASM_TRACE").is_none() {
         return;
@@ -258,6 +287,97 @@ fn trace(p: &DyProcess, order: &[usize], what: &str, t0: std::time::Instant) {
 }
 
 use gex_dylink::HANDLE_BASE;
+
+/// Bumped by every `dlopen` once its modules are published: a thread that
+/// has not seen the latest number catches up at its next system call's
+/// return ([`sync`]), so a function pointer another thread got from
+/// `dlsym` and handed over (a futex, a pipe, a socket) is in its table by
+/// the time it can call it.
+///
+/// A known gap: a pointer handed over lock-free, with no system call on the
+/// receiving side before the call (gexcc's loop polls come only every so
+/// many back-edges), can reach a slot this thread has not caught up with.
+/// That call traps and the trap says so ([`behind`]); a trap cannot be
+/// retried, a wasm32 program's frames being gone by then.
+/// `GEX_DL_CHECKED_CALLS=1` ([`checked_calls`]) closes it at the cost of a
+/// compare per indirect call.
+static DL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After a system call: catch up with the function table when a `dlopen`
+/// has published modules since this store last did.
+pub(crate) fn sync(caller: &mut Caller<'_, HostState>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let gen = DL_GEN.load(Ordering::Acquire);
+    let Some(st) = caller.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) else { return Ok(()) };
+    if st.dl_seen == gen {
+        return Ok(());
+    }
+    st.dl_seen = gen;
+    crate::ftab::catch_up(&mut *caller)
+}
+
+/// `GEX_DL_CHECKED_CALLS=1`: every wasm32 module of a program linked
+/// against shared libraries gets its indirect calls guarded
+/// ([`gex_dylink::checked_calls`]), so even a function pointer from a
+/// `dlopen` that reached a thread with no system call between is caught up
+/// with before the call. Off, nothing is rewritten and nothing costs.
+pub(crate) fn checked_calls() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_DL_CHECKED_CALLS").is_ok_and(|v| v == "1"))
+}
+
+/// A module's bytes as loaded: guarded when [`checked_calls`] is on.
+fn checked(b: Vec<u8>) -> Vec<u8> {
+    if !checked_calls() || !b.starts_with(b"\0asm") {
+        return b;
+    }
+    match gex_dylink::checked_calls(&b) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("gex: GEX_DL_CHECKED_CALLS: {e:#}; that module is left unguarded");
+            b
+        }
+    }
+}
+
+/// The imports of a module [`checked`] guarded, in this store: the
+/// catch-up its guard calls, and the slot count it compares with.
+pub(crate) fn define_checked(c: &mut wasmtime::StoreContextMut<'_, HostState>, l: &mut wasmtime::Linker<HostState>) -> Result<()> {
+    let size = match c.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|st| st.dl_size) {
+        Some(g) => g,
+        None => {
+            let sh = shared_of(&*c)?;
+            let n = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size();
+            let g = wasmtime::Global::new(&mut *c, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var), Val::I32(n as i32))?;
+            if let Some(st) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+                st.dl_size = Some(g);
+            }
+            g
+        }
+    };
+    l.define(&mut *c, gex_abi::IMPORT_MODULE, gex_dylink::DL_SIZE, size)?;
+    let stale = wasmtime::Func::wrap(&mut *c, |mut caller: Caller<'_, HostState>, _index: i32| -> wasmtime::Result<()> {
+        crate::host((|| -> Result<()> {
+            let gen = DL_GEN.load(std::sync::atomic::Ordering::Acquire);
+            crate::ftab::catch_up(&mut caller)?;
+            if let Some(st) = caller.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+                st.dl_seen = gen;
+            }
+            Ok(())
+        })())
+    });
+    l.define(&mut *c, gex_abi::IMPORT_MODULE, gex_dylink::DL_STALE, stale)?;
+    Ok(())
+}
+
+/// Whether this store's table is behind a `dlopen` it has not caught up
+/// with: a call through a slot that is not there yet (out of the table's
+/// bounds, or holding `resolve`) is then a function pointer that reached
+/// this thread with no system call between the `dlopen` and the call.
+pub(crate) fn behind(state: &HostState) -> bool {
+    let gen = DL_GEN.load(std::sync::atomic::Ordering::Acquire);
+    state.jit.as_ref().and_then(|j| j.ftab.as_ref()).is_some_and(|st| st.dl_seen != gen)
+}
 
 /// `gex.dlopen(path)`: load a library and what it needs into the process,
 /// run their constructors; its handle. Other threads see the new modules
@@ -277,7 +397,7 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     let (found, bytes) = {
         let state = caller.data_mut();
         let (o, lp) = (p.origin.clone(), p.ldpath.clone());
-        gex_dylink::search(path, &[], &o, &lp, |f| state.with_kernel(|k| k.read_file(f)))?
+        gex_dylink::search(path, &[], &o, &lp, |f| state.with_kernel(|k| k.read_file(f)).map(checked))?
     };
     let info = Info::parse(&bytes).with_context(|| format!("{found}: not a wasm shared library"))?;
     if !info.dylink {
@@ -289,20 +409,20 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     let libs = {
         let state = caller.data_mut();
         let (o, lp) = (p.origin.clone(), p.ldpath.clone());
-        p.link.needed_of(from, |name, rp| gex_dylink::search(name, rp, &o, &lp, |f| state.with_kernel(|k| k.read_file(f))))?
+        p.link.needed_of(from, |name, rp| gex_dylink::search(name, rp, &o, &lp, |f| state.with_kernel(|k| k.read_file(f)).map(checked)))?
     };
     for (name, path, b, info) in libs {
         p.link.mods.push(Loaded { name, path, info, memory_base: 0, table_base: 0 });
         all.push(b);
     }
-    for m in &p.link.mods[from..] {
-        if m.info.value("__tls_size") != 0 {
-            bail!("{}: thread-local data in a dlopen'd library is not supported yet", m.path);
-        }
-    }
     let engine = caller.engine().clone();
     let order = publish(caller.data_mut(), &engine, &shared, &mut p, from, all, |_, _, _| Vec::new())?;
+    DL_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let gen = DL_GEN.load(std::sync::atomic::Ordering::Acquire);
     crate::ftab::catch_up(&mut *caller)?;
+    if let Some(st) = caller.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+        st.dl_seen = gen;
+    }
     // constructors, in order, in this thread
     for &i in &order {
         let module = p.module_of[i];
@@ -471,7 +591,72 @@ pub(crate) fn after_instantiate(
     if let Some(s) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.dyl.insert(module, *inst);
     }
+    if let Some((size, align)) = dy.tls {
+        thread_tls(&mut c, module, inst, size, align).with_context(|| format!("{}: its thread-local block", dy.path))?;
+    }
     Ok(())
+}
+
+/// A `dlopen`ed module's thread-local block in this store's thread: a fork
+/// child's first thread keeps the one its parent's thread had (the copy of
+/// it is in the child's memory, as libc's own blocks are); any other thread
+/// gets a fresh one with the module's initial image (`__wasm_init_tls`).
+fn thread_tls(c: &mut wasmtime::StoreContextMut<'_, HostState>, module: u32, inst: &wasmtime::Instance, size: u32, align: u32) -> Result<()> {
+    let kept = c.data().spawn.as_ref().and_then(|cx| cx.fork_dl_tls.lock().unwrap_or_else(|e| e.into_inner()).remove(&module));
+    let (block, init) = match kept {
+        Some(b) => (b, "__gex_set_tls_base"),
+        None => (tls_block(c.data_mut(), size, align)?, "__wasm_init_tls"),
+    };
+    let f = inst.get_typed_func::<i32, ()>(&mut *c, init)?;
+    f.call(&mut *c, block as i32)?;
+    if let Some(s) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+        s.dl_tls.insert(module, block);
+    }
+    Ok(())
+}
+
+/// TLS_CHUNK bytes at a time, per store, freed when its thread ends
+/// ([`free_thread_tls`]).
+const TLS_CHUNK: u64 = 0x10000;
+
+/// `size` bytes at `align` for a thread-local block, from this store's chunks.
+fn tls_block(state: &mut HostState, size: u32, align: u32) -> Result<u32> {
+    let (size, align) = (size as u64, (align as u64).max(8));
+    let fits = |a: &(u64, u64)| ((a.0 + align - 1) & !(align - 1)) + size <= a.1;
+    let arena = state.jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|s| s.dl_tls_arena).unwrap_or((0, 0));
+    let arena = if fits(&arena) {
+        arena
+    } else {
+        let len = (size + align).max(TLS_CHUNK);
+        let at = crate::libprov::alloc(state, len, "[dlopen tls]")?;
+        if let Some(s) = state.jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+            s.dl_tls_chunks.push((at, (len + 0xfff) & !0xfff));
+        }
+        (at, at + len)
+    };
+    let block = (arena.0 + align - 1) & !(align - 1);
+    if block + size > u32::MAX as u64 {
+        bail!("mapped above 4 GiB");
+    }
+    if let Some(s) = state.jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+        s.dl_tls_arena = (block + size, arena.1);
+    }
+    Ok(block as u32)
+}
+
+/// A thread is ending (not its process): unmap the thread-local blocks its
+/// store made for `dlopen`ed modules.
+pub(crate) fn free_thread_tls(state: &mut HostState) {
+    let chunks = state.jit.as_mut().and_then(|j| j.ftab.as_mut()).map(|s| std::mem::take(&mut s.dl_tls_chunks)).unwrap_or_default();
+    for (at, len) in chunks {
+        let _ = state.with_kernel(|k| k.mem.lock().unmap(at, len));
+    }
+}
+
+/// This store's `dlopen`ed modules' thread-local blocks, for a fork's child
+/// (its `SpawnContext::fork_dl_tls`).
+pub(crate) fn fork_tls(state: &HostState) -> HashMap<u32, u32> {
+    state.jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|s| s.dl_tls.clone()).unwrap_or_default()
 }
 
 /// This store's asyncify state and data globals, made on first use.

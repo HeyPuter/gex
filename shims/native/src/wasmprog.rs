@@ -168,7 +168,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
                 (m, name, nb)
             })
             .collect();
-        s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports, extra }));
+        s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports, extra, tls: None }));
         s.ftab.dyproc = Some(crate::dylink::DyProcess {
             link: gex_dylink::Link {
                 mods: vec![gex_dylink::Loaded { name: path.clone(), path, info, memory_base: mem_base as u32, table_base: inst.base }],
