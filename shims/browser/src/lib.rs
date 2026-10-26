@@ -12565,8 +12565,10 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
     .unwrap_or_else(|| "pid ?: the kernel is held".to_string());
     let b = text.as_bytes();
     let n = (b.len() as u32).min(max);
-    let mut gm = GuestMem::new(guest_bytes());
-    let _ = gm.write(out as u64, &b[..n as usize]);
+    // `out` is this module's own heap (`gex_alloc`), which may lie above the
+    // guest's slice that `GuestMem` checks against.
+    // SAFETY: the caller allocated `max` bytes at `out`.
+    unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), out as usize as *mut u8, n as usize) };
     n
 }
 
