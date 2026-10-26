@@ -1,4 +1,4 @@
-//! ELF export providers (docs/elf-providers.md): native wasm in place of
+//! ELF export providers: native wasm in place of
 //! some of a Linux library's exports (glibc's `memcpy`...), the rest of the
 //! library still translated.
 //!
@@ -84,7 +84,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let id = gex_ld::elf::build_id(&bytes);
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         // A stateful provider is a wasm32 module with its data in the guest's
-        // memory: not under a 64-bit guest memory (docs/mem64.md).
+        // memory: not under a 64-bit guest memory.
         for p in provs.iter().filter(|p| p.class32 == image.class32 && !(p.stateful && gex_abi::mem64())) {
             if !p.build_ids.is_empty() && !id.as_ref().is_some_and(|i| p.build_ids.contains(i)) {
                 if trace {

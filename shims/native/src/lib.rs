@@ -139,7 +139,7 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
-    /// A native wasm32 busybox (docs/wine-native.md §5.1) presented as
+    /// A native wasm32 busybox presented as
     /// `/bin/sh` and the common coreutils in `/bin` and `/usr/bin`, so a
     /// script's shell and tools run natively instead of being translated.
     pub busybox: Option<std::path::PathBuf>,
@@ -186,7 +186,7 @@ pub struct RunOptions {
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
-    /// Reuse compiled modules across runs (PLAN §10).
+    /// Reuse compiled modules across runs.
     pub cache: bool,
     /// Guest directory to start in. Without one the guest inherits the host's
     /// working directory, or `/` when a sysroot is mounted.
@@ -198,7 +198,7 @@ pub struct RunOptions {
     /// `aot`). With it, an image is never translated: its module comes from
     /// the project, or the run fails.
     pub aot: Option<Arc<aot::Aot>>,
-    /// The guest memory (docs/mem64.md): wasm32 unless this process needs
+    /// The guest memory: wasm32 unless this process needs
     /// more address space.
     pub mem: gex_abi::MemFlavor,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
@@ -401,7 +401,7 @@ pub(crate) mod jit_stats {
     }
 }
 
-/// Runtime translation state belonging to one store (PLAN §6.2, M3).
+/// Runtime translation state belonging to one store.
 ///
 /// A wasm table belongs to its store, so each guest thread has its own and
 /// fills it from the same modules. `replayed` is how far through the shared
@@ -671,7 +671,7 @@ pub(crate) fn ppm_every() -> u32 {
 }
 
 /// The guest memory's type: 4 GiB of wasm32, or for a 64-bit guest memory
-/// (docs/mem64.md) all of `LIMIT64` at once, which natively is only a
+/// all of `LIMIT64` at once, which natively is only a
 /// reservation, so the high arena never needs the memory to grow.
 pub fn guest_memory_type() -> wasmtime::MemoryType {
     if gex_abi::mem64() {
@@ -694,12 +694,12 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
     config.shared_memory(true);
     // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
-    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
-    // A 64-bit guest memory (docs/mem64.md).
+    // A 64-bit guest memory.
     if gex_abi::mem64() {
         config.wasm_memory64(true);
     }
@@ -768,19 +768,19 @@ fn new_engine() -> Result<Engine> {
     // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
     // them, for debugging.
     config.wasm_backtrace(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
-    // Tail calls are load-bearing: the whole block-per-function design in
-    // PLAN §2.4 depends on them.
+    // Tail calls are load-bearing: the whole block-per-function design
+    // depends on them.
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
     config.shared_memory(true);
     // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
-    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
-    // A 64-bit guest memory (docs/mem64.md): a shared memory is a static
+    // A 64-bit guest memory: a shared memory is a static
     // allocation, so the reservation has to hold all of it. Only then: a
     // wasm32 process keeps the engine it always had.
     if gex_abi::mem64() {
@@ -2308,7 +2308,7 @@ fn take_runner() -> bool {
         // A promise given back (or its holder gone) ends the wait unused.
         let Ok((cx, child)) = rx.recv() else { return };
         // Named by its guest tid, as a thread spawned for it is (per-thread
-        // CPU by name, tests/games/thread-cpu.sh).
+        // CPU by name).
         let _ = std::fs::write("/proc/thread-self/comm", format!("gex-tid-{}", child.tid));
         guest_thread_body(cx, child);
     });
@@ -2545,7 +2545,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let low = gex_abi::DISPATCH_DIR_END as usize;
         dst[..low].copy_from_slice(&src[..low]);
         // An M64 memory's directory and patched bits are its dense tables
-        // above 4 GiB instead (docs/mem64.md §3).
+        // above 4 GiB instead.
         if gex_abi::mem64() {
             let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::HIGH_TABLES_END as usize);
             dst[a..b].copy_from_slice(&src[a..b]);
@@ -3917,7 +3917,7 @@ fn place_image(
         });
     }
 
-    // Then the stack. Determinism by default (PLAN §11) means a fixed
+    // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
     let layout = build_initial_stack(
         image,
@@ -4044,7 +4044,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            // Profiling: count the call against its function (S6).
+            // Profiling: count the call against its function.
             profile::syscall_enter(&mut caller, &GuestMem::new(memory.bytes()), pc as u64);
             let dump_bt = DUMP_AT.filter(|&at| DUMP_START.elapsed().as_secs_f64() >= at).and_then(|_| {
                 let tid = caller.data().thread.tid;
@@ -4181,7 +4181,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // the guest's retry stops at the syscall entry's check. The
                 // ender's `wake_everything` misses a thread that passed that
                 // check but had not yet queued on the futex: the old main
-                // thread of tests/wasm32/execthreads.c, in `pthread_join` on
+                // thread of a test program, in `pthread_join` on
                 // the exec'ing thread's tid word, which never changes, slept
                 // on and the process never ended (1 run in 15-200 hung).
                 let stopping = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.stopping));
@@ -5823,7 +5823,7 @@ pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::
 }
 
 /// Guest fault hooks, by process (its kernel's address): a native wasm32
-/// program that runs x86 code (Wine's ntdll.so, docs/wine-native.md §4.0)
+/// program that runs x86 code (Wine's ntdll.so)
 /// registers `void hook(int ctx, unsigned code, unsigned addr)`
 /// (`gex.fault_hook`), and a fault in its x86 code -- a memory access past
 /// the guest's memory, an illegal instruction, int3, a divide error -- is
@@ -6148,7 +6148,7 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
     Err(StopExecution.into())
 }
 
-/// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
+/// `gex.call_out`: run the guest from `target`
 /// until it returns to `ret` with the stack pointer at `sp_want` (or what a
 /// callee popped above it), then let the C caller carry on (1); 0 when that
 /// cannot be done, and the caller leaves as before. `need` is the caller's
@@ -6423,7 +6423,7 @@ fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
 /// another's call put there: a thread that frees code, or makes it writable,
 /// can find the log already emptied by a neighbour that is still forgetting
 /// those pages, and must not run on until that is done -- it would reuse the
-/// address (`VirtualAlloc` after `VirtualFree`, tests/wine32/vmreuse) and branch
+/// address (`VirtualAlloc` after `VirtualFree`) and branch
 /// into the old translation, which the dispatch directory still answers for.
 /// Raised before the take is visible to anyone else (under the kernel lock,
 /// or before swapping [`gex_kernel::CODE_EVENTS`]), lowered once forgotten.
@@ -6740,7 +6740,7 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         let detail = match trap {
             // The guard in tier-1 codegen steers a too-large effective
             // address into the unmapped top page, so this is exactly a guest
-            // wild pointer (PLAN §7.2).
+            // wild pointer.
             wasmtime::Trap::MemoryOutOfBounds => {
                 "guest memory access out of bounds (SIGSEGV)".to_string()
             }

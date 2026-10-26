@@ -1,4 +1,4 @@
-//! The AOT-only runtime (docs/eject-pe.md §3.1): what an ejected project
+//! The AOT-only runtime: what an ejected project
 //! runs by default. No guest code is translated at run time -- no tier-1, no
 //! function JIT, no interpreter. Every guest function that runs is a wasm
 //! function some module built ahead of time installed in the function table
@@ -9,7 +9,7 @@
 //!
 //! * has no tier-1 module. Its base module ([`base_module`]) is a few
 //!   instructions: `enter(ctx, pc)` stores the pc and calls the function
-//!   table runtime's `root` (§9.8.1), bound per store by [`bind_root`]; its
+//!   table runtime's `root`, bound per store by [`bind_root`]; its
 //!   dispatch table is empty and nothing ever fills it;
 //! * installs no run-time translator (`gex_kernel::ftab::set_translator` is
 //!   never called), so `gex.lookup` serves only what is installed and
@@ -23,7 +23,7 @@
 //!   process's units call it on their leave path only, and are answered
 //!   "leave": the root then looks the address up, and a miss stops the run.
 //!
-//! E7 (a runtime without the translator in it) deletes the code this mode
+//! A runtime without the translator in it would delete the code this mode
 //! never reaches.
 
 use super::*;

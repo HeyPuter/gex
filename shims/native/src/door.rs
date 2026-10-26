@@ -420,7 +420,7 @@ pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u3
     if let Some(us) = session_copy_delay() {
         // GEX_SESSION_COPY_DELAY_US (debug): every 8th copy of a thread holds
         // the bytes it read that long before writing them, as a copy whose
-        // thread is preempted midway would (tests/wine64/seqrace.c)
+        // thread is preempted midway would
         thread_local!(static COPIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
         if COPIES.with(|c| { c.set(c.get().wrapping_add(1)); c.get() % 8 == 0 }) {
             let v = s.mem.bytes()[from..from + n].to_vec();

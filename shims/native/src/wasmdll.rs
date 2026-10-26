@@ -1,4 +1,4 @@
-//! Native Wine DLLs on wasm32 (docs/wine-native.md §3.2): a DLL
+//! Native Wine DLLs on wasm32: a DLL
 //! whose code is a wasm module, behind a PE skeleton that winebuild
 //! (`CPU_WASM32`) wrote. The skeleton maps like any PE; gex binds the
 //! module's entry adapters at its export addresses. Its sections:
@@ -87,7 +87,7 @@ pub(crate) fn install(
     Ok(Some(n))
 }
 
-/// Wine's PE side as one module (pelink.py, docs/wine-native.md §3.14): the
+/// Wine's PE side as one module (pelink.py): the
 /// install, where its data is, its slots by name and its data exports'
 /// offsets.
 pub(crate) struct WinePe {
@@ -383,7 +383,7 @@ fn install_shared(
         None => {
             let t0 = std::time::Instant::now();
             let file = std::path::Path::new(path).with_file_name(&module_name);
-            // a twin install's memory64 module, beside it (docs/mem64.md §5)
+            // a twin install's memory64 module, beside it
             let twin = std::path::Path::new(path).with_file_name(format!("{module_name}.m64"));
             let file = if gex_abi::mem64() && twin.is_file() { twin } else { file };
             let pm = parsed_module(&file, engine, t0, !pe.is64)?;

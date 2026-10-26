@@ -1,4 +1,4 @@
-//! Stateful export providers (docs/eject-pe.md §5.1): a library of native
+//! Stateful export providers: a library of native
 //! wasm in place of a guest DLL's exports, with data, a C stack and a heap of
 //! its own -- what gex-cgen's built-in providers (no data, no stack) cannot
 //! be. A Lua (PUC Lua 5.1 in place of LuaJIT's lua51.dll) is one.
@@ -230,7 +230,7 @@ const REVERSE_FIRST: u64 = 0x1000;
 const REVERSE_STRIDE: u64 = 16;
 
 /// The guest addresses a provider binds (its code region): low, where code
-/// lives in a 64-bit guest memory (docs/mem64.md), and read-only.
+/// lives in a 64-bit guest memory, and read-only.
 fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
     use gex_kernel::mem::prot;
     map_anon(state, 0, CODE_PAGE, prot::READ, 0, true, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
@@ -430,8 +430,7 @@ pub(crate) fn replaced(start: u64, end: u64) -> bool {
 
 /// The host functions stateful providers import.
 pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
-    // A wasm64 provider's pointers and table indices are i64 (docs/unity-
-    // dotnet.md): one process is one flavour, so the same names take the
+    // A wasm64 provider's pointers and table indices are i64: one process is one flavour, so the same names take the
     // wider types.
     if gex_abi::mem64() {
         return register64(linker);
@@ -457,7 +456,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { 0 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
-    // performance counter, docs/wine-overhead.md F2).
+    // performance counter).
     linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;
     linker.func_wrap(IMPORT_MODULE, "provider_time", |_caller: Caller<'_, HostState>, which: i32| -> f64 {
@@ -504,7 +503,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
         crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
     })?;
-    // Door calls into the wineserver (docs/wineserver-kernel.md, `door`).
+    // Door calls into the wineserver (`door`).
     linker.func_wrap(IMPORT_MODULE, "door_publish", |mut caller: Caller<'_, HostState>, area: i32| -> wasmtime::Result<()> {
         crate::host(crate::door::publish(&mut caller, area as u32))
     })?;
@@ -684,7 +683,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
-    // performance counter, docs/wine-overhead.md F2).
+    // performance counter).
     linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
@@ -788,7 +787,7 @@ static ELF_INSTALLED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 /// After a Linux syscall that mapped executable code (`MapLog::new_code`):
 /// a shared object one of this process's stateful providers serves gets
 /// its exports bound to the provider, before anything can call them
-/// (docs/unity-dotnet.md: Unity's `libmonobdwgc-2.0.so`). The library's
+/// (Unity's `libmonobdwgc-2.0.so`, say). The library's
 /// dynamic symbols say where each export is; its own code never runs.
 pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kernel::CodeMap]) -> Result<()> {
     if LIBS.get().is_none_or(|v| v.is_empty()) {
@@ -883,7 +882,7 @@ fn guest_sym(state: &mut HostState, name: &str) -> Option<u64> {
 }
 
 /// Stopping a process's guest threads for a stateful provider's garbage
-/// collector (docs/unity-dotnet.md): the threads running guest code are
+/// collector: the threads running guest code are
 /// GC-safe to the runtime but still run; they stop at their next safepoint
 /// or syscall, with their registers written back, as Boehm stopped them.
 /// Each thread registers a word in the provider's memory saying whether it

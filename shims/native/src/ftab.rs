@@ -1,4 +1,4 @@
-//! The function table, native half (docs/merge-plan.md §9.8.1).
+//! The function table, native half.
 //!
 //! A wasmtime table belongs to one store, so each guest thread has its own
 //! `gex.ftab`, numbered alike from the process's [`gex_kernel::ftab::FuncMap`]
@@ -8,7 +8,7 @@
 //! `resolve`. A store behind the log is never wrong: every slot it has not
 //! filled holds `resolve`, which asks `gex.lookup`, which catches up first.
 //!
-//! While tier-1 is the fallback (§9.4 step 3), it and the table meet in two
+//! While tier-1 is the fallback, it and the table meet in two
 //! places: index 1 runs tier-1 under the `F_body` contract (the call-out),
 //! and the dispatch slot of every address a function serves holds the
 //! runtime module's `bridge`, which calls it and dispatches on what it left
@@ -88,9 +88,8 @@ pub(crate) struct Store {
     /// The stack pointer this thread's stateful providers share
     /// (`libprov::stack`), made at the first one's instantiation.
     pub provider_sp: Option<wasmtime::Global>,
-    /// The i64 stack pointer of this thread's lowered LP64 modules (64-bit Wine,
-    /// docs/wine-native-x64.md §1.1: built for wasm64, run in this 32-bit
-    /// memory), on a stack of its own (`libprov::stack64`).
+    /// The i64 stack pointer of this thread's lowered LP64 modules (64-bit Wine:
+    /// built for wasm64, run in this 32-bit memory), on a stack of its own (`libprov::stack64`).
     pub provider_sp64: Option<wasmtime::Global>,
     /// The lowest address of that stack (`libprov::STACK` bytes).
     pub provider_stack_lo: u64,
@@ -311,7 +310,7 @@ fn instantiate(
     let mut l = linker;
     l.allow_shadowing(true);
     // The PIC globals are pointer-sized: i64 for a wasm64 module beside a
-    // 64-bit guest memory (docs/mem64.md).
+    // 64-bit guest memory.
     let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: u64, m: wasmtime::Mutability| {
         if gex_abi::mem64() {
             wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as i64))
@@ -320,7 +319,7 @@ fn instantiate(
         }
     };
     // A module built for wasm64 and lowered to this 32-bit memory (64-bit Wine's
-    // LP64 Wine, docs/wine-native-x64.md §1.1) keeps i64 PIC globals, and
+    // LP64 Wine) keeps i64 PIC globals, and
     // takes an i32 copy of the table base for its element segment.
     let lowered = !gex_abi::mem64() && module.imports().any(|imp| {
         imp.module() == f::PIC_MODULE

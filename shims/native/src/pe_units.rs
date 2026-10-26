@@ -39,7 +39,7 @@ pub enum Mode {
     Default,
     /// `--cgen`: every program image (not Wine's) must have a unit.
     Require,
-    /// An ejected project (docs/eject-pe.md): every image, Wine's included,
+    /// An ejected project: every image, Wine's included,
     /// has a unit built for its base ahead of time; nothing is ever built at
     /// run time, and an image without one stops the run.
     Aot,
@@ -269,7 +269,7 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
 /// Functions recovery found in the image at `base` that its unit (`unit`,
 /// its `c.wasm`) has no entry for, its providers' stubs aside: those
 /// gex-cgen left to tier-1 (clang wanted a shadow stack), which a runtime
-/// with no translation cannot run (docs/eject-pe.md §3.4).
+/// with no translation cannot run.
 pub fn left_out(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path) -> Result<Vec<u64>> {
     let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
     let summaries = cache_root()?.join("recovery").join(recovery_key(&image)).join("summaries");
@@ -334,7 +334,7 @@ pub(crate) fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(st
     Ok((path, gex_cgen::provider::slot_names(&wasm)?))
 }
 
-/// Region entries (docs/eject-pe.md §3.3): functions entered at interior
+/// Region entries: functions entered at interior
 /// addresses of an image -- a call continuation or a handler's resume point
 /// inside another function, where control can arrive once the frames that
 /// were running it are gone -- each running the rest of its code under the
@@ -621,7 +621,7 @@ fn resolve_iats(m: &GroupMember<'_>, members: &[GroupMember<'_>]) -> HashMap<u64
     out
 }
 
-/// A link group (docs/eject-pe.md §6a): every member's functions in one
+/// A link group: every member's functions in one
 /// module, calls between members direct. Each member's recovery is its
 /// unit's (built if missing: [`prepare_pe`]). An IAT call (`call [slot]`,
 /// `FF 15 disp32` before its return address) whose slot binds a member's
@@ -636,7 +636,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
     let mut stubs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut hints: HashMap<u64, u64> = HashMap::new();
     let mut images = Vec::new();
-    // G2 (docs/eject-pe.md §6a): the members' stateless providers compiled
+    // The members' stateless providers compiled
     // into the group, their addresses served by bodies of its own.
     let with_providers = std::env::var("GEX_GROUP_PROVIDERS").is_ok_and(|v| v == "1");
     // ThinLTO across the group.
@@ -834,7 +834,7 @@ struct Placed {
     pages: Vec<(u64, u64)>,
 }
 
-/// A native wasm32 Wine DLL's skeleton (docs/wine-native.md §3.13, §3.14):
+/// A native wasm32 Wine DLL's skeleton:
 /// no x86 code of its own (its exports' bytes are `ud2` stubs bound to the
 /// module), so no unit is wanted or built for it.
 pub fn is_wasm_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
@@ -1383,7 +1383,7 @@ fn with_groups<R>(f: impl FnOnce(&mut Vec<GroupState>) -> R) -> R {
 
 /// Publish a placed unit -- or, for a link group's member, hold it until
 /// every member is placed, then publish the group's module in place of the
-/// members' units (docs/eject-pe.md §6a). Wine maps an exe's static imports
+/// members' units. Wine maps an exe's static imports
 /// before any of their code runs, so the group is in before a member runs.
 #[allow(clippy::too_many_arguments)]
 fn install_placed(
@@ -1549,7 +1549,7 @@ fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
 }
 
 // ---------------------------------------------------------------------------
-// Linux shared objects (docs/unity-dotnet.md §12)
+// Linux shared objects
 // ---------------------------------------------------------------------------
 //
 // A Linux program's libraries are mapped by ld.so out of guest code, so they
@@ -1812,7 +1812,7 @@ fn spawn_elf_build(path: &str, base: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Wine's own PE loader (32-bit Wine; docs/wine-native.md §3.17)
+// Wine's own PE loader (32-bit Wine)
 // ---------------------------------------------------------------------------
 //
 // Under 32-bit Wine's ntdll.so maps every image itself and tells gex
@@ -1964,9 +1964,9 @@ fn wine32_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) ->
         let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
         install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;
     }
-    // Its export providers, bound after its unit as an NT image's are (and
-    // as the page binds a 32-bit Wine image's, cgen.rs `place`): Wine's msvcp120
-    // `_Thrd_current`, docs/wine-overhead.md F1.
+    // Its export providers, bound after its unit (as the page
+    // binds a 32-bit Wine image's, cgen.rs `place`): Wine's msvcp120
+    // `_Thrd_current`.
     install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
     crate::ftab::catch_up(&mut *caller)?;
     replay_registry(caller)?;

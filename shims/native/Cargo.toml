@@ -38,7 +38,7 @@ default = ["translate"]
 compile = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "gex-cache/compile"]
 # gex's run-time translation: tier-1, the function JIT, unit builds. Off,
 # the runtime runs only code compiled ahead of time (`aot_only`): an
-# ejected project's runtime (docs/eject-pe.md §7, E7).
+# ejected project's runtime.
 translate = ["compile"]
 # Host an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
