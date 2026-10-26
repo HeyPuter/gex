@@ -37,9 +37,7 @@
  * in a provider's source): 32-bit Wine's, where its Wine maps the page and its units
  * fold constant accesses to (GEX_W3_KUSER, from gex_abi.h; GEX_KUSER_GUARD
  * is defined only then), else Windows' own (gex_abi::KUSER_WINDOWS, checked
- * by provider.rs's tests). Words past the structure that gex once kept there
- * (the yield park, the GL fast path) do not exist under the fold, so code
- * using them is compiled out. */
+ * by provider.rs's tests). */
 #ifdef GEX_KUSER_GUARD
 #define GP_KUSER GEX_W3_KUSER
 #else

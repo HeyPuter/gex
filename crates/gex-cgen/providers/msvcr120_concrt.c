@@ -20,35 +20,6 @@ static void gp_wait_ns(uint32_t a, uint32_t v, int64_t ns) {
     (void)__builtin_wasm_memory_atomic_wait32((int *)GEX_P(a), (int)v, ns);
 }
 
-#ifdef GEX_KUSER_GUARD
-/* 32-bit Wine (KUSER_SHARED_DATA folded, provider.h GP_KUSER): Wine's own
- * SwitchToThread is a host yield, and nothing parks on the old yield word,
- * which is in Windows' old KUSER page, a page a 32-bit Wine process does not
- * have: its memory need not reach it, and an access there trapped out of
- * bounds (Noita: the first notify, unlock or wait that kicked ended the
- * thread inside the provider, reported at the export's address). */
-static void yield_kick(void) {}
-#else
-/* The NT yield park's generation word (gex_kernel::nt::sync::YIELD_GEN, in
- * KUSER_SHARED_DATA's page past the structure). A thread spinning in
- * SwitchToThread/Sleep(0) parks on it; bumping it and notifying wakes the
- * spinner, which re-checks what it waits for. Kicked when a wait here first
- * blocks (this thread went idle: the work a spinner waits for may be done)
- * and when a wake signals a waiter. A host with no parked thread just sees
- * the word change. */
-#define YIELD_GEN (GP_KUSER + 0xff0u)
-/* How many threads are parked on it (gex_kernel::nt::sync::YIELD_PARKED): a
- * notify with nobody parked is a host futex call for nothing, and kicks come
- * with every notify and contended unlock. */
-#define YIELD_PARKED (GP_KUSER + 0xff4u)
-static void yield_kick(void) {
-    __atomic_fetch_add(GA(YIELD_GEN), 1u, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(GA(YIELD_PARKED), __ATOMIC_SEQ_CST)) {
-        gp_wake(YIELD_GEN, 0x7fffffffu);
-    }
-}
-#endif
-
 /* ---- critical_section: word 0 = owner (thread + 1), word 1 = waiters; not recursive ---- */
 
 static int cs_try(int ctx, uint32_t cs) {
@@ -73,9 +44,6 @@ static int cs_lock(int ctx, uint32_t cs, uint32_t limit_ms, uint64_t pc) {
         if (pc) {
             gp_poll(ctx, pc);
         }
-        if (!waited) {
-            yield_kick();
-        }
         __atomic_fetch_add(GA(cs + 4), 1u, __ATOMIC_SEQ_CST);
         gp_wait(cs, held, 1);
         __atomic_fetch_sub(GA(cs + 4), 1u, __ATOMIC_SEQ_CST);
@@ -86,7 +54,6 @@ static void cs_unlock(uint32_t cs) {
     __atomic_store_n(GA(cs), 0u, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(GA(cs + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(cs, 1);
-        yield_kick();
     }
 }
 
@@ -147,7 +114,6 @@ static GEX_PROVIDER(event_set) {
     if (__atomic_load_n(GA(e + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(e, 0x7fffffffu);
     }
-    yield_kick();
     return gp_return(ctx, ret, 0);
 }
 /* ?reset@event@Concurrency@@QAEXXZ */
@@ -163,9 +129,6 @@ static GEX_PROVIDER(event_wait) {
     uint32_t e = gp_reg(ctx, R_ECX), timeout = gp_arg(ctx, 0), waited = 0;
     while (!__atomic_load_n(GA(e), __ATOMIC_SEQ_CST) && timeout && (timeout == 0xffffffffu || waited < timeout)) {
         gp_poll(ctx, pc);
-        if (!waited) {
-            yield_kick();
-        }
         __atomic_fetch_add(GA(e + 4), 1u, __ATOMIC_SEQ_CST);
         gp_wait(e, 0, 1);
         __atomic_fetch_sub(GA(e + 4), 1u, __ATOMIC_SEQ_CST);
@@ -203,7 +166,6 @@ static int cond_wait(int ctx, uint32_t c, uint32_t cs, uint32_t timeout) {
     cs_unlock(cs);
     int signaled = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST) != gen;
     if (!signaled && timeout) {
-        yield_kick();
         __atomic_fetch_add(GA(c + 4), 1u, __ATOMIC_SEQ_CST);
         do {
             gp_wait_ns(c, gen, timeout == 0xffffffffu ? -1 : (int64_t)timeout * 1000000);
@@ -234,7 +196,6 @@ static GEX_PROVIDER(cond_notify) {
     if (__atomic_load_n(GA(c + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(c, 0x7fffffffu);
     }
-    yield_kick();
     return gp_return(ctx, ret, 0);
 }
 
@@ -250,9 +211,6 @@ static GEX_PROVIDER(wait_ms) {
     uint64_t pc = GP_SELF_PC();
     for (uint32_t ms = gp_arg(ctx, 0), k = 0; k < ms; ++k) {
         gp_poll(ctx, pc);
-        if (!k) {
-            yield_kick();
-        }
         gp_sleep(ctx, 1);
     }
     return gp_return(ctx, ret, 0);
