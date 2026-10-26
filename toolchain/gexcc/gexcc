@@ -670,9 +670,13 @@ def expand(items, seen):
             # libc and its parts are linked last, after libgex, whose
             # definitions (dlopen, dlsym) must win over musl's weak stubs:
             # an -lc mid-line would pull those first
-            if nm in LIBC_NAMES:
-                continue
             p = resolve(nm)
+            # (unless the name is a library of its own outside libc's
+            # directory: libxcrypt's libcrypt, with crypt_gensalt, which
+            # musl's crypt does not have, beside musl's empty libcrypt.a)
+            if nm in LIBC_NAMES and (p is None or os.path.dirname(p) == os.path.abspath(LIB)
+                                     or os.path.getsize(p) <= len(AR_MAGIC)):
+                continue
             if p is None:
                 if CXX and nm in ('stdc++', 'c++', 'c++abi', 'supc++'):
                     continue
