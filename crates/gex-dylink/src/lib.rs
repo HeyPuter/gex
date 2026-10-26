@@ -895,8 +895,9 @@ impl Link {
     /// The program's libraries, breadth first from its `NEEDED`: for each,
     /// `find(soname, runpath)` gives its path and bytes (searching the run
     /// path, `LD_LIBRARY_PATH` and [`DEFAULT_DIRS`] is the caller's, through
-    /// [`search`]). Libraries already in the link map (by soname) are not
-    /// loaded again.
+    /// [`search`]). The run path is the needing object's, with `$ORIGIN`
+    /// already its directory (as `ld.so` has it), not the program's.
+    /// Libraries already in the link map (by soname) are not loaded again.
     pub fn needed_of(
         &self,
         first: usize,
@@ -906,7 +907,7 @@ impl Link {
         let mut out = Vec::new();
         let mut q: VecDeque<(Vec<String>, Vec<String>)> = self.mods[first..]
             .iter()
-            .map(|m| (m.info.needed.clone(), m.info.runpath.clone()))
+            .map(|m| (m.info.needed.clone(), origin_expanded(&m.info.runpath, &m.path)))
             .collect();
         while let Some((needed, rp)) = q.pop_front() {
             for n in needed {
@@ -919,7 +920,7 @@ impl Link {
                 if !info.dylink {
                     bail!("{path}: not a wasm shared library (no dylink.0)");
                 }
-                q.push_back((info.needed.clone(), info.runpath.clone()));
+                q.push_back((info.needed.clone(), origin_expanded(&info.runpath, &path)));
                 out.push((n, path, bytes, info));
             }
         }
@@ -1196,9 +1197,15 @@ impl Link {
     }
 }
 
+/// `runpath` with `$ORIGIN` as the directory of the object at `path`.
+fn origin_expanded(runpath: &[String], path: &str) -> Vec<String> {
+    let dir = path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d }).unwrap_or(".");
+    runpath.iter().map(|r| r.replace("${ORIGIN}", dir).replace("$ORIGIN", dir)).collect()
+}
+
 /// Search for library `name` (a soname, or a path when it has a `/`): the
-/// run path (`$ORIGIN` is the program's directory), `ld_library_path`,
-/// then [`DEFAULT_DIRS`]. `read` gives a file's bytes.
+/// run path (`$ORIGIN` left in it is `origin`, the program's directory),
+/// `ld_library_path`, then [`DEFAULT_DIRS`]. `read` gives a file's bytes.
 pub fn search(
     name: &str,
     runpath: &[String],
