@@ -2824,7 +2824,7 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case CLIENT_ACTIVE_TEXTURE: glClientActiveTexture(a.u32()); break;
-    /* { slot, op, n, n words, bytes }: a client-memory array, as a native
+    /* { slot, op, n, n words, bytes }: a client-memory array, as pewasm's
      * GL takes them -- a pointer into memory, which st/mesa uploads with its
      * stream uploader. The guest used to copy each one into a buffer of its
      * own with glBufferData before every draw, and a buffer the pending batch
