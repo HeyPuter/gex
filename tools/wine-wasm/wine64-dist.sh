@@ -1,13 +1,13 @@
 #!/bin/bash
-# A 64-bit Wine install and a win64 prefix for it (docs/wine-native-x64.md §5),
+# A 64-bit Wine install and a win64 prefix for it,
 # built from a Wine tree with the 64-bit Wine work (Wine branch w64/main):
 #
 #   tools/wine-wasm/wine64-dist.sh WINE CACHE
 #
 # prints WINE64_DIST=..., WINE64_PREFIX=..., and WINE64_TOOLS=... and WINE64_SRC=...
 # (the native tools build and the Wine tree: the native PE side's case),
-# for tests/wine64/nt-x64.sh, WINE64_NTDLL=... (the native PE ntdll) and
-# WINE64_NATIVE=... (the native PE core: nt-x64.sh's NATIVE=).
+# for a test, WINE64_NTDLL=... (the native PE ntdll) and
+# WINE64_NATIVE=... (the native PE core).
 # Each step is cached in CACHE by what it depends on, and skipped when done:
 #   tools-TP    Wine's build tools, native (widl and winebuild know wasm64);
 #               TP: tools/, include/, libs/, nls/ and the configure inputs
@@ -92,7 +92,7 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 S=$( { echo "$DH"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
-# WINE64_MEM64=1: the memory64 flavour (docs/wine-native-x64.md §0.1): the Unix
+# WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
 # ?mem64=1). The server stays the wasm32 one.
@@ -146,8 +146,8 @@ pfx_make() {
 }
 log "win64 prefix ($P)"; step pfx64-$P pfx_make
 
-# The session 32-bit Wine's prefixes have (wine32-session.reg, docs/wine-native.md
-# §3.17): the 64-bit loader has no Unix side for MountMgr, winebus,
+# The session 32-bit Wine's prefixes have (wine32-session.reg):
+# the 64-bit loader has no Unix side for MountMgr, winebus,
 # wineusb or winebth either, so services.exe started a winedevice for each
 # only to see DriverEntry fail (c0000135), one after another, before
 # wineboot let the program start (a 64-bit Wine game
@@ -244,7 +244,7 @@ if [ "$M64" != 0 ]; then
 	exit 0
 fi
 log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
-# WINE64_TWIN=1: a twin install (docs/mem64.md §5, per program): the default
+# WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as
 # x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's wine; one PE side, one
 # prefix). An exec of the loader that asks for a 64-bit memory (GEX_MEM64=1)

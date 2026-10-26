@@ -1,6 +1,6 @@
 #!/bin/bash
-# Link wineserver as its own wasm32 program, the server of door calls
-# (docs/wineserver-kernel.md): every object under server/ compiled from a
+# Link wineserver as its own wasm32 program, the server of door calls:
+# every object under server/ compiled from a
 # door-enabled Wine source tree (server/door.c, server/wasm32_door.h), with
 # the compile commands of a configured 32-bit Wine (wasm32) Wine build tree, which is
 # only read (make -n), never built or written.

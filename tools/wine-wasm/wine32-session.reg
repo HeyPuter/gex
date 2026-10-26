@@ -1,6 +1,6 @@
 REGEDIT4
 
-; Every 32-bit Wine prefix's session (docs/wine-native.md §3.17): stage-native.sh
+; Every 32-bit Wine prefix's session: stage-native.sh
 ; applies it to a staged prefix that has a registry, and a prefix that
 ; wineboot installs afresh takes it after the install with
 ; `reg-apply.py PFX/system.reg wine32-session.reg`.

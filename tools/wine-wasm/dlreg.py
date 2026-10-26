@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The dlopen registry for a closed-world wasm32 program (musl wasm32's
-dlopen, docs/wine-native.md §3.12): which libraries are linked in and
+dlopen): which libraries are linked in and
 where each one's exported symbols are.
 
     dlreg.py LIB:KIND:NAME=LINKNAME ... > registry.c

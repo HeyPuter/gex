@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Link Wine's PE side as one wasm module (docs/wine-native.md §3.14).
+"""Link Wine's PE side as one wasm module.
 
     pelink.py WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
@@ -19,13 +19,13 @@ written by winegcc and winebuild for wasm32. This:
 Whatever stays undefined is listed (OUT.wasm.undefined) and left an import.
 
 A wasm64 build tree (HOST_ARCH = wasm64, or --wasm64 before the arguments:
-WINE64's LLP64 PE side, docs/wine-native-x64.md) links with wasm-ld -mwasm64,
+WINE64's LLP64 PE side) links with wasm-ld -mwasm64,
 compiles its generated C with wcc64 -D_WIN32, takes compiler-rt from
 GEX_WASM64_SYSROOT and lowers the module to wasm32 (--memory64-lowering), as
 wcc64 does a DLL's own side module. A tree configured with CC="wcc64
 -mgex-memory64" (wine64-dist.sh WINE64_MEM64=1), or --memory64 after --wasm64:
-the memory64 flavour, for a process with a 64-bit memory (docs/mem64.md
-§5), compiled the same way, linked for a 16 GiB memory and not lowered."""
+the memory64 flavour, for a process with a 64-bit memory, compiled the
+same way, linked for a 16 GiB memory and not lowered."""
 import os
 import re
 import subprocess

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The wasm32 sysroot Wine's Unix side builds against (docs/wine-native.md §3.2):
+# The wasm32 sysroot Wine's Unix side builds against:
 # musl with the gex `wasm32` arch (fork: wt/musl-wasm, branch gex-wasm32) and
 # compiler-rt's builtins, both built with the system clang.
 #
@@ -29,7 +29,7 @@ if [ -n "${GEX_WASM_LEGACY_EH:-}" ]; then
   WASM_CFLAGS=$(printf '%s' "$WASM_CFLAGS" | sed 's/-wasm-use-legacy-eh=false/-wasm-use-legacy-eh=true/')
 fi
 # GEX_WASM_EXTRA_CFLAGS (gexcc: -fvisibility=default, so the same objects
-# make libc.so, docs/gexcc.md §7.4): appended to every compile here.
+# make libc.so): appended to every compile here.
 WASM_CFLAGS="$WASM_CFLAGS${GEX_WASM_EXTRA_CFLAGS:+ $GEX_WASM_EXTRA_CFLAGS}"
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
@@ -54,7 +54,7 @@ fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
 # libgex: what gex's wasm32 programs need beyond the libc and is gex's
-# protocol rather than musl's (docs/wine-native.md §3.11.2): the setjmp
+# protocol rather than musl's: the setjmp
 # runtime, dlopen over the linked registry, signal frames, vfork. wcc links
 # it before libc.
 mkdir -p "$OUT/libgex-build"

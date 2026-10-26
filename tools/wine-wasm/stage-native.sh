@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# A Wine prefix whose DLLs are native wasm32 (docs/wine-native.md §3.14,
-# §3.15): the staged x86 prefix, with the named DLLs replaced by
+# A Wine prefix whose DLLs are native wasm32: the staged x86 prefix, with the named DLLs replaced by
 # skeletons over one module of Wine's PE side (pelink.py), beside them in
 # syswow64.
 #

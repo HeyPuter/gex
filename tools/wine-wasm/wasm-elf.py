@@ -5,7 +5,7 @@ in the ELF32 i386 container gexc runs (shims/native/src/wasmprog.rs).
     wasm-elf.py IN.wasm OUT [--guest-i386] [--elf64 [--guest-x86-64]]
                 [--host-stub BLOB [--runner GEXC]]
 
---elf64 (64-bit Wine, docs/wine-native-x64.md §1.1): an ELF64 x86-64 container for a
+--elf64 (64-bit Wine): an ELF64 x86-64 container for a
 program built LP64 and lowered to wasm32 (tools/wine-wasm/wcc64): gex runs it
 with the x86-64 Linux ABI. --guest-x86-64: it runs x86-64 Windows code (the
 64-bit Wine loader). The segments and the header are the same.

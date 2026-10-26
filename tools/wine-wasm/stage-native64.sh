@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 64-bit Wine's native PE DLLs (docs/wine-native-x64.md): the named DLLs of a
+# 64-bit Wine's native PE DLLs: the named DLLs of a
 # wasm64 Wine build linked as one module (pelink.py, lowered to wasm32),
 # with a PE32+ skeleton per DLL that names it (winebuild --wasm-shared).
 #
@@ -8,8 +8,7 @@
 # WINE_BUILD is a wasm64 build tree of the Wine fork (wine64-dist.sh's b64:
 # winegcc there leaves each DLL's relocatable object and export list),
 # WINE_SRC its source. OUTDIR gets winepe.wasm and the skeletons, to go in
-# place of a 64-bit Wine install's lib/wine/x86_64-windows DLLs (tests/wine64/
-# nt-x64.sh NATIVE=OUTDIR); every DLL not named stays x86-64 code.
+# place of a 64-bit Wine install's lib/wine/x86_64-windows DLLs; every DLL not named stays x86-64 code.
 # GEX_WASM64_SYSROOT must be set (build-sysroot64.sh).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)

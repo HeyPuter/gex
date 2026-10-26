@@ -6,7 +6,7 @@
  * it throws. A setjmp call that was not lowered (code compiled without the
  * flag) cannot work and returns 0; longjmp always throws.
  *
- * Kept out of musl (docs/wine-native.md §3.11.2): musl's generic
+ * Kept out of musl: musl's generic
  * setjmp.c, longjmp.c and sigsetjmp.c are empty, so libc defines none of
  * these and wcc links this library with every program. siglongjmp is
  * musl's (it calls longjmp). */

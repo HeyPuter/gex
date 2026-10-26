@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# The page's 32-bit Wine prefix template (docs/wine-native.md §3.17): an
+# The page's 32-bit Wine prefix template: an
 # installed 32-bit Wine prefix (wineboot -u leaves system32's programs and drivers
 # and the registry), with the 32-bit Wine session (wine32-session.reg, or the files
 # named) applied offline and the install marked current for DIST's
 # wine.inf, so wineboot --init does not update it again in the page. 64-bit Wine's
-# win64 prefix (wine64-dist.sh's) makes its template the same way
-# (docs/wine-native-x64.md).
+# win64 prefix (wine64-dist.sh's) makes its template the same way.
 #
 #   tools/wine-wasm/page-prefix.sh INSTALLED_PFX DIST OUT [FILE.reg...]
 #

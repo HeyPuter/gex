@@ -1,7 +1,7 @@
 REGEDIT4
 
-; A lean 32-bit Wine session for one-shot console programs (docs/wine-native.md
-; §3.17): wineboot --init starts only what a console program needs. The
+; A lean 32-bit Wine session for one-shot console programs:
+; wineboot --init starts only what a console program needs. The
 ; Event Log (svchost), NDIS, the NSI proxy and Plug and Play become
 ; demand-start; MountMgr (drives) stays. This takes
 ; `wine cmd /c echo` from 8.3-8.5 s to 6.2-6.7 s (5 processes instead

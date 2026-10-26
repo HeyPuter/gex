@@ -1,7 +1,7 @@
 /* libgex: dlopen, dlsym and dlclose over a registry linked into the
  * program, and gex's loader for wasm32 shared libraries.
  *
- * gex runs a closed world (docs/wine-native.md §3.12): every library a
+ * gex runs a closed world: every library a
  * program will dlopen -- Wine's Unix libraries -- is linked into it at
  * build time, each with its exported symbols renamed apart, and the link
  * adds a registry (tools/wine-wasm/dlreg.py) naming each library and its
@@ -9,7 +9,7 @@
  * finds a symbol in it, or in every library for RTLD_DEFAULT. Nothing is
  * loaded at run time, so dlclose does nothing.
  *
- * Kept out of musl (§3.11.2): a static musl's dlopen and __dlsym are weak
+ * Kept out of musl: a static musl's dlopen and __dlsym are weak
  * stubs, and wcc links this library before libc, so these replace them.
  * dlclose is defined here, next to dlopen, so that libc's (which reports
  * every handle invalid in a static libc) is never pulled in. Errors go
@@ -37,13 +37,13 @@ static const char *base(const char *p)
 }
 
 /* gex's loader (shims' dylink): a wasm32 shared library loaded into the
- * process, for a program linked against shared libraries (docs/gexcc.md
- * 7.6). Handles from it are GEX_DL_HANDLE and above; 0 with a message in
+ * process, for a program linked against shared libraries.
+ * Handles from it are GEX_DL_HANDLE and above; 0 with a message in
  * err when it cannot. A static program's loader has no link map and says
  * so. */
 /* a pointer as the address gex's imports take: 32-bit on wasm32 and on
  * wasm64 lowered to wasm32 (every address below 4 GiB); 64-bit in a
- * memory64 flavour (GEX_MEMORY64, docs/wine-native-x64.md §0.1) */
+ * memory64 flavour (GEX_MEMORY64) */
 #ifdef GEX_MEMORY64
 typedef unsigned long long gex_addr_t;
 #define GEX_ADDR(p) ((gex_addr_t)(unsigned long)(p))

@@ -1,6 +1,6 @@
 #!/bin/bash
 # The Unix libraries the 32-bit Wine loader links in, static wasm32 builds (versions
-# and sha256s in wine32.pins; docs/wine-native.md §3.12):
+# and sha256s in wine32.pins):
 #   FreeType (win32u), libwayland-client/-egl, libxml2, libxkbcommon and
 #   libxkbregistry (winewayland.drv), a libffi stand-in (wine32/ffi: the one
 #   ffi_call libwayland makes, all-i32 arguments), gex-gl's EGL headers and

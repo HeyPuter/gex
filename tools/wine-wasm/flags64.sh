@@ -1,4 +1,4 @@
-# 64-bit Wine (docs/wine-native-x64.md §1.1): clang's flags for LP64 code that runs as
+# 64-bit Wine: clang's flags for LP64 code that runs as
 # a gex native program after lowering to wasm32 (wcc64): wasm64 with Linux's
 # predefined macros (clang has no wasm64 Linux triple), x86-64's signed char
 # and layouts, position-independent, shared memory; setjmp lowered onto wasm

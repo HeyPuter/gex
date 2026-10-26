@@ -1,6 +1,6 @@
 #!/bin/bash
-# The Unix libraries 64-bit Wine's loader links for a display (docs/wine-native-x64.md
-# §5): wine32/deps.sh's, built LP64 for wasm64 (wcc64, lowered with the
+# The Unix libraries 64-bit Wine's loader links for a display:
+# wine32/deps.sh's, built LP64 for wasm64 (wcc64, lowered with the
 # program) at wine32.pins' versions:
 #   FreeType (win32u), libwayland-client/-egl, libxml2, libxkbcommon and
 #   libxkbregistry (winewayland.drv), and ffi64/, the libffi stand-in for

@@ -1418,14 +1418,14 @@ void note_surface_to_backend(unsigned uid) { (void)uid; }
  * The shared `#gex-gl` canvas holds one frame, so the page used to copy it
  * into each window's 2D canvas with `drawImage`. That read of a WebGPU
  * canvas through 2D came back fully transparent on Chromium on Linux
- * -- a red clear included -- so Solitaire counted every frame
+ * -- a red clear included -- so a card game counted every frame
  * presented and showed none. A page that can give the window a canvas
  * names it `#gex-gl-<uid>` (`gex_gl_surface_canvas`), and the frame is
  * copied there texture to texture: on the GPU all the way, nothing read
  * back, and one frame per window rather than whichever presented last.
  *
  * `reshow` is a frame owed to a canvas that arrived after the frame did:
- * a client that draws only when something changes (Solitaire) would
+ * a client that draws only when something changes (a card game) would
  * otherwise leave its new canvas empty until the next click. */
 struct window_canvas {
     WGPUSurface surface = nullptr;
@@ -1888,7 +1888,7 @@ void gexgen_missing(const char* name) {
  * st/mesa caps the GLSL version at the GL version the driver earns (4.00
  * on gex_wgpu today), while applications ask for what their content was
  * written for: Unity's HLSLcc emits "#version 410" for a geometry stage
- * (Muck's grass) and up to "#version 460" where the host offers it. Refused,
+ * (a game's grass) and up to "#version 460" where the host offers it. Refused,
  * the program fails to link and the draw goes ahead with whatever program
  * was bound -- a field of grass becomes its input points. Most of what
  * 4.10-4.60 add to the language is also available as extensions this
@@ -2829,7 +2829,7 @@ bool one(uint32_t op, Reader& a) {
      * stream uploader. The guest used to copy each one into a buffer of its
      * own with glBufferData before every draw, and a buffer the pending batch
      * already reads cannot be rewritten in place: every such upload became a
-     * staged copy that split the render pass (Noita: 142 a frame, 52 passes
+     * staged copy that split the render pass (one game: 142 a frame, 52 passes
      * for 47 draws). `op` is the pointer command (glVertexPointer's,
      * glVertexAttribPointer's, ...) and the words are its arguments before
      * the pointer, which becomes the bytes' address here; it runs with no

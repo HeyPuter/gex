@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""W0(b) prototype of winebuild's wasm32 output (docs/wine-native.md §3.2,
-§3.3): from a DLL's .spec file and its compiled wasm code, generate
+"""A prototype of winebuild's wasm32 output: from a DLL's .spec file and its
+compiled wasm code, generate
 
   * the entry adapters: one gex F_body per export, `gexp_<name>`, which
     reads the i386 caller's arguments from the guest stack, calls the

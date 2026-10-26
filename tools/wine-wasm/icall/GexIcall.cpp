@@ -1,7 +1,7 @@
-// The ICALL pass (docs/wine-native.md §3.3): native Wine code calling
+// The ICALL pass: native Wine code calling
 // through a function pointer may be calling application (guest x86) code.
 //
-// Every indirect call becomes the select form measured in W0(c):
+// Every indirect call becomes the select form, the fastest one measured:
 //
 //   gexw_set_icall_target(p)
 //   callee = p < 0x3f0000 ? p : __gexw_exit.<sig>
@@ -28,7 +28,7 @@
 // gex binds each thunk at its function's table index as a guest address,
 // so a guest call or jump to that index runs the native function.
 //
-// On wasm64 (64-bit Wine, docs/wine-native-x64.md §1.2: LLP64 lowered to wasm32) the
+// On wasm64 (64-bit Wine: LLP64 lowered to wasm32) the
 // guest is x86-64 and there is one calling convention, Win64's: the exit
 // stubs lay the arguments out as 8-byte slots (__gexw_guest_call64 puts the
 // first four in RCX, RDX, R8, R9 and XMM0-3 alike, and every slot on the

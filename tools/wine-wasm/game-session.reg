@@ -9,7 +9,7 @@ REGEDIT4
 ;   desktop process comes up beside the services instead of when the game
 ;   makes its first window and waits for it (win32u's get_desktop_window).
 ;   A program that starts explorer itself still does so: "explorer /desktop"
-;   finds the desktop up and exits 0, as on demand. 64-bit Wine Dicey Dungeons:
+;   finds the desktop up and exits 0, as on demand. A 64-bit Wine game:
 ;   explorer at about 6-8 s instead of about 27 s, first window 32.4 s
 ;   mean against 34.6 s (7 runs each, 300 s timed).
 ;   winemenubuilder's entry stays.

@@ -1,6 +1,5 @@
 #!/bin/bash
-# The PE side of a 32-bit Wine dist, and the bare prefix it is staged through
-# (docs/wine-native.md §3.14-3.15):
+# The PE side of a 32-bit Wine dist, and the bare prefix it is staged through:
 #
 #   wine32/stage.sh BUILD SRC DIST BAREPFX
 #

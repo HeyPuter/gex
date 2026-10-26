@@ -1,5 +1,5 @@
 /* libgex: running the signal frames gex-kernel's wasm32 personality leaves
- * at a syscall's return (docs/wine-native.md §3.11.2, "Signals").
+ * at a syscall's return ("Signals").
  *
  * musl's wasm32 syscall stub (arch/wasm32/syscall_arch.h) calls this when
  * the context's PC changed across the syscall. The frame is i386's: ESP

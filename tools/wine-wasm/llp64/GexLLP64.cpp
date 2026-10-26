@@ -6,7 +6,7 @@
 //   intmax_t and int64_t are long long; wint_t is unsigned short.
 // The predefined macros are computed before plugins run, so llp64.h
 // (mkmacros.sh, force-included) redefines them as x86_64 MSVC's. Use with
-// -mms-bitfields and -fshort-wchar. tests/wine64/layout.sh checks the result.
+// -mms-bitfields and -fshort-wchar. A layout test checks the result.
 //
 //   clang --target=wasm64-unknown-unknown -fplugin=GexLLP64.so -include llp64.h ...
 #include "clang/AST/ASTConsumer.h"

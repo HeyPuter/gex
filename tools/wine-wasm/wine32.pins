@@ -1,4 +1,4 @@
-# wine32 (Wine's own Unix side as wasm32 on gex, docs/wine-native.md) pins.
+# wine32 (Wine's own Unix side as wasm32 on gex) pins.
 # tools/wine-wasm/Makefile includes this file; it is the only place the
 # sources the wine32 dist is built from are named. Change a pin here and `make`
 # rebuilds what depends on it (outputs are keyed by these values).
@@ -48,8 +48,8 @@ GNUTLS_SHA256    := 69e113d802d1670c4d5ac1b99040b1f2d5c7c05daec5003813c049b51848
 CACERT_URL       := https://curl.se/ca/cacert-2026-08-13.pem
 CACERT_SHA256    := f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9
 
-# Wine Mono, the .NET runtime mscoree loads for .NET programs (Celeste and
-# TowerFall: XNA through Wine Mono's FNA). The version is the one this Wine's
+# Wine Mono, the .NET runtime mscoree loads for .NET programs (XNA
+# games, through Wine Mono's FNA). The version is the one this Wine's
 # mscoree asks for (WINE_MONO_VERSION in dlls/mscoree/mscoree_private.h); the
 # dist carries it at share/wine/mono/wine-mono-VERSION, where mscoree finds
 # it through WINEDATADIR (wine32/mono.sh). WINE32_MONO=0 leaves it out.

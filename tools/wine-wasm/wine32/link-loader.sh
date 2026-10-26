@@ -1,7 +1,7 @@
 #!/bin/bash
 # Link 32-bit Wine's wine loader: loader/main.o, ntdll's Unix side and every Unix
-# library a PE module calls, in one wasm32 program (a closed world,
-# docs/wine-native.md §3.12): each library's objects compiled again with its
+# library a PE module calls, in one wasm32 program (a closed world):
+# each library's objects compiled again with its
 # __wine_unix_call_funcs (and names it shares with another) renamed apart,
 # and a registry (dlreg.py) that musl's dlopen/dlsym answer from. The
 # libraries: crypt32, ws2_32, msv1_0, dnsapi, nsiproxy, secur32 (+ GnuTLS, when

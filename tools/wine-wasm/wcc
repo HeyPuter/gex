@@ -27,7 +27,7 @@ if os.path.basename(sys.argv[0]).endswith('++'):
 
 args = sys.argv[1:]
 # Wine's PE-side code (-D_WIN32) gets the ICALL pass: its indirect calls may
-# reach guest code (docs/wine-native.md §3.3).
+# reach guest code.
 plugin = os.path.join(sysroot, 'lib', 'GexIcall.so')
 if '-D_WIN32' in args and os.path.exists(plugin) and not os.environ.get('GEX_WASM_NO_ICALL'):
     CC += ['-fpass-plugin=' + plugin]

@@ -258,9 +258,9 @@ static void flush(void) {
 /* Framebuffer state queries answered here.
  *
  * Unity asks glGetIntegerv(GL_SAMPLES) and glGetIntegerv(GL_READ_BUFFER)
- * four times each a frame (Muck's menu), and every query is a submit: the
+ * four times each a frame (a game's menu), and every query is a submit: the
  * batch so far runs and the guest waits for it. In the page that is a round
- * trip to the compositor's Worker each, and Muck's render thread spent
+ * trip to the compositor's Worker each, and that game's render thread spent
  * nearly half its time in them. The answers depend only on which
  * framebuffers are bound and on their attachments and read/draw buffers, so
  * the first answer for a binding is kept until a command that could change
@@ -1124,8 +1124,8 @@ void *glMapBufferRange(unsigned target, long offset, long length,
    never flushed either: writes to it simply become visible to later GL
    commands. wined3d allocates the buffers of a Direct3D device out of 64 MiB
    chunks mapped exactly so, and for one that is not D3DUSAGE_DYNAMIC it never
-   names a range -- so nothing it wrote there reached the host: Solitaire
-   drew its felt (a dynamic buffer, explicitly flushed) and no cards.
+   names a range -- so nothing it wrote there reached the host: a card
+   game drew its felt (a dynamic buffer, explicitly flushed) and no cards.
 
    Each mapping's 4 KiB blocks are hashed and compared against `sent` and the changed
    runs are uploaded, by name through GL_COPY_WRITE_BUFFER (no draw reads that
@@ -1141,7 +1141,7 @@ void *glMapBufferRange(unsigned target, long offset, long length,
    that come after the point, so until one is recorded the scan can wait.
    Points with nothing between them are then one scan, not one each. wined3d
    ends every frame with a swap and a glFenceSync straight after it, which
-   was two 64 MiB scans a frame (Solitaire, GEXGL_PERSIST_TRACE) and is now
+   was two 64 MiB scans a frame (a card game, GEXGL_PERSIST_TRACE) and is now
    one. */
 static void persistent_send(struct buffer_object_state *o, size_t start, size_t end) {
     glBindBuffer(0x8F37u, o->name);
@@ -1309,7 +1309,7 @@ unsigned char glUnmapBuffer(unsigned target) {
 /* A flush of a persistent write mapping sends only the 4 KiB blocks in its
    range that differ from what the host last had (`sent`): wined3d flushes a
    Direct3D buffer's whole range at each unmap, whatever the application
-   wrote -- Hades, a 2 MB index buffer and 400 KB vertex ranges several
+   wrote -- one game, a 2 MB index buffer and 400 KB vertex ranges several
    times a frame, all of it sent each time. A block the host already has is
    left. Not after a command other than glBufferData/glBufferSubData may have
    changed the buffer since the map began (host_wrote): what the host has is
@@ -1328,7 +1328,7 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
        reader needs (persistent_settle_range at the draw, copy or upload that
        reads them; persistent_fallback for a reader of unknown range): its
        flush has nothing to add. wined3d flushes a Direct3D buffer's whole
-       range at each unmap -- Hades, tens of MiB a flush in play, of which a
+       range at each unmap -- one game, tens of MiB a flush in play, of which a
        few KiB changed -- so hashing the flushed range here cost more than
        the readers' own ranges ever do. Unless the host's copy may have
        changed under the map: then the flushed range goes whole, below. */
@@ -1444,8 +1444,8 @@ void glDeleteProgram(unsigned p) { CMD1(GEXGL_DELETE_PROGRAM, p); }
 /* GL_ARB_shader_objects' one delete for both kinds of object. Shaders and
    programs take their names from one counter here (take_name), so a name is
    one or the other, and the host says which. Without it the extension was
-   withheld (gen_gl_extensions.py claims only what is exported), and Baba Is
-   You, which requires the extension by name, refused to start ("OpenGL
+   withheld (gen_gl_extensions.py claims only what is exported), and a game
+   which requires the extension by name, refused to start ("OpenGL
    extension 'GL_ARB_shader_objects' not supported."). */
 unsigned char glIsProgram(unsigned program);
 void glDeleteObjectARB(unsigned obj) {
@@ -1917,7 +1917,7 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
    (glNormalPointer: the compat profile's planned opcode, which the host
    decodes like the generated commands). Before the normal array was kept,
    GL_NORMAL_ARRAY reached the host enabled with no pointer and the host's GL
-   read normals from address 0 (Retrocycles' display lists: SIGSEGV in the
+   read normals from address 0 (a game's display lists: SIGSEGV in the
    host driver). */
 #define GEXGL_FF_TEX_UNITS 4
 #define GEXGL_FF_NORMAL (2 + GEXGL_FF_TEX_UNITS)
@@ -1950,7 +1950,7 @@ static void gexgl_upload_ff_arrays(size_t vertices);
    scratch buffer of ours with glBufferData before every draw made every one
    of them a rewrite of a buffer the pending batch already read, which a
    batched WebGPU backend can only do as a staged copy that ends the render
-   pass: Noita, through Wine, drew 56 times a frame from client memory and
+   pass: one game, through Wine, drew 56 times a frame from client memory and
    paid ~140 copies and a render pass per draw for it (handing the same
    arrays to Mesa directly: 15 passes, no copies). GEXGL_CLIENT_ARRAYS=buffer keeps the scratch
    buffers, for A/B runs. */
@@ -2156,8 +2156,8 @@ void glNormalPointer(unsigned type, int stride, const void *pointer) {
 /* The secondary colour and fog coordinate arrays likewise (GL 1.4; the EXT
    spellings are gl-aliases-generated.inc's). Missing, they kept
    GL_EXT_secondary_color unclaimed, and wined3d, which assumes it on GL 1.4,
-   called a null glSecondaryColorPointerEXT in its caps probe (Undertale,
-   Katana ZERO). */
+   called a null glSecondaryColorPointerEXT in its caps probe (two
+   games). */
 void glSecondaryColorPointer(int size, unsigned type, int stride, const void *pointer) {
     ff_record(GEXGL_FF_SECONDARY, size, type, stride, pointer);
 }
@@ -2985,7 +2985,7 @@ unsigned glGetError(void) {
  * Why it exists: wined3d checks every GL call with glGetError
  * (checkGLcall) whenever Wine's d3d ERR channel is on, which is the
  * default, unless the context has ARB_debug_output. Through this transport
- * each check is a synchronous round trip: Undertale's wined3d thread made
+ * each check is a synchronous round trip: one game's wined3d thread made
  * 93 a frame, 98% of all its submits, and spent 15.6
  * ms a frame waiting on them. Its capability probes call glGetError
  * directly and still get exact answers. */
@@ -4211,7 +4211,7 @@ static int gexgl_x11_window_size(void *win, int *width, int *height) {
  * top-level; a program may draw GL into a child of one. SDL 1.2 does: its GL
  * drawable is `SDL_Window`, a child of the `WMwindow` the window manager
  * sees, so a frame attached to the child's id matched no window and the page
- * showed black (Retrocycles). The frame belongs to the top-level window. */
+ * showed black. The frame belongs to the top-level window. */
 static unsigned long gexgl_x11_toplevel(void *win) {
     void *display = gexgl_x11_client_display();
     void *xlib = gexgl_x11_symbol_source();
@@ -4635,7 +4635,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     /* Paced, the frame still goes without waiting: the pacing is against the
        frames shown as of the swap before, which the host has finished by
        now, so one frame more is in flight than with a waited swap. Waiting
-       here made the host's whole frame a stall in the guest's: Noita's main
+       here made the host's whole frame a stall in the guest's: one game's main
        thread spent 13% of its time in this round trip. */
     uint32_t shown;
     uint32_t in_flight;

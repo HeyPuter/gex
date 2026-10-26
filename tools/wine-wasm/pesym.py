@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Symbol surgery on wasm relocatable objects, for linking Wine's whole PE
-side as one module (docs/wine-native.md §3.14).
+side as one module.
 
   pesym.py dll IN.o OUT.o DLLNAME EXPORTS [ALIASES]
       One DLL's relocatable object (`wasm-ld -r` of its objects): every

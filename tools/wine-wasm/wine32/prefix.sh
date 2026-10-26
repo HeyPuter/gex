@@ -1,5 +1,5 @@
 #!/bin/bash
-# 32-bit Wine prefixes (docs/wine-native.md §3.17):
+# 32-bit Wine prefixes:
 #
 #   wine32/prefix.sh install BAREPFX DIST GEXC OUT
 #       Wine's full install into a copy of the bare staged prefix: under GEXC,

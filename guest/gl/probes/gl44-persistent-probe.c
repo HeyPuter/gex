@@ -2,7 +2,7 @@
  * with ARB_buffer_storage is a 512 KiB buffer mapped persistent and coherent
  * for the life of the context. gex_wgpu hands such a mapping to the device at
  * every submit, by comparing it with what it last sent and sending the 4 KiB
- * blocks that changed; before that it sent all 512 KiB at every submit (Muck
+ * blocks that changed; before that it sent all 512 KiB at every submit (a game
  * at GL 4.4+: 46 times a frame, whether or not anything was drawn through it).
  * Cases, in a compatibility context, each read back with glReadPixels:
  *   flushed     one glBegin/glEnd quad per column, a glFlush (a submit) after each

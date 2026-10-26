@@ -1629,7 +1629,7 @@ impl Client {
                         // says so: no damage, no change. Taking it as a full
                         // reattach re-uploaded the whole buffer on every
                         // commit that only moved a subsurface or set a
-                        // viewport -- Noita through winewayland commits its
+                        // viewport -- a game through winewayland commits its
                         // toplevel twice a frame for its GL subsurface, and
                         // each one was all 4 MiB of the window again.
                         let attached = state.pending_buffer.is_some();
@@ -1692,7 +1692,7 @@ impl Client {
             // buffer again but does not release it again. Wine's
             // winewayland counts releases, and fourteen for one attach
             // freed a buffer still in its queue, which it then destroyed a
-            // second time (Katana ZERO and Undertale on 32-bit Wine: libwayland's
+            // second time (two games on 32-bit Wine: libwayland's
             // `proxy->refcount > 0` assertion at the first swap-chain resize).
             if state.pending_buffer.is_some() {
                 let w = Writer::new(buffer_id, 0);
@@ -1713,7 +1713,7 @@ impl Client {
             // that loses it repaints itself as inactive, and following that
             // repaint handed the keyboard back, so two of Wine's windows
             // passed it between them for ever, each repaint making the other
-            // repaint (tests/w3/spawnwin.sh's native leg, older winewayland).
+            // repaint (with an older winewayland).
             let maps = state.committed_buffer.is_none() || self.focus_surface.is_none();
             if matches!(state.role, Role::Toplevel | Role::Popup) && !state.placement.placed && maps {
                 self.focus_surface = Some(surface);
@@ -2865,7 +2865,7 @@ impl Client {
     ///
     /// Focus follows the last surface that committed a buffer, and a window
     /// whose pixels are all the host's GL never commits one: an X11 GL game
-    /// (Baba Is You) drew for minutes and scripted keys had nowhere to go.
+    /// drew for minutes and scripted keys had nowhere to go.
     /// The newest toplevel -- an `xdg_toplevel`, or an X11 window -- takes
     /// focus then.
     pub fn focus_fallback(&mut self) {

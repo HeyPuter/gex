@@ -11,7 +11,7 @@ Prints the reaching functions but the ROOTs (fork's driver and what is
 above it), comma-separated, for asyncify-onlylist. Exits 1 when the module
 cannot be analysed this way (a name asyncify's list cannot carry).
 
-For shared libraries and programs linked against them (docs/gexcc.md 7.5):
+For shared libraries and programs linked against them:
 --also names more imports that may fork (other modules' functions their
 gex.forkreach summaries say may, or whose provider is unknown); --indirect
 makes every indirect call reach (the callee may be another module's);

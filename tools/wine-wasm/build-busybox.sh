@@ -1,5 +1,5 @@
 #!/bin/sh
-# busybox as a native wasm32 program (docs/wine-native.md §5.1): sh (hush)
+# busybox as a native wasm32 program: sh (hush)
 # and the common coreutils in one binary, for `gexc run --busybox`.
 #
 #   tools/wine-wasm/build-busybox.sh OUT_DIR [VERSION]   (GEX_WASM_SYSROOT set)

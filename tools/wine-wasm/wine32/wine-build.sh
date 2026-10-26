@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wine's build trees for 32-bit Wine (docs/wine-native.md §3.2, §3.13):
+# Wine's build trees for 32-bit Wine:
 #
 #   wine32/wine-build.sh tools SRC TOOLS
 #       the host tools (winebuild, widl, wrc, winegcc, ...) the cross build

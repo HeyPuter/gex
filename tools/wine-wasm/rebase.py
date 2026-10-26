@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed preferred bases for 32-bit Wine's i386 Wine DLLs (docs/wine-overhead.md §7).
+"""Fixed preferred bases for 32-bit Wine's i386 Wine DLLs.
 
 Every Wine builtin is linked at ImageBase 0x10000000 with DYNAMIC_BASE.
 For such an image Wine's server picks the address (server/mapping.c
@@ -8,7 +8,7 @@ at [0x60000000, 0x7c000000), in the order DLLs are first mapped by any
 process, freed when the last mapping closes. So a DLL's base depends on
 what every process loaded before it: a winepe.wasm relink that changes the
 eagerly loaded set moves the rest, and helper processes' concurrent loads
-move them run to run (Noita's msvcp120 at 0x78a10000 one run, 0x78540000
+move them run to run (a game's msvcp120 at 0x78a10000 one run, 0x78540000
 the next, same build). Function-tier units are keyed by image and base, so
 a moved DLL silently runs tier-1.
 

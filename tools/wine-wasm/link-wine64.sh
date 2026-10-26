@@ -2,7 +2,7 @@
 # Link 64-bit Wine's loader: 64-bit native Wine's Unix side (loader/main.o and
 # ntdll's Unix objects, LP64 wasm64 lowered to wasm32) as one closed-world
 # program, the ELF64 container gexc runs, flagged as running x86-64 Windows
-# code (docs/wine-native-x64.md §5). The PE side is Wine's x86_64
+# code. The PE side is Wine's x86_64
 # DLLs, translated.
 #
 #   tools/wine-wasm/link-wine64.sh WINE_BUILD OUT   (GEX_WASM64_SYSROOT set)
@@ -22,7 +22,7 @@ J=${JOBS:-6}
 HERE=$(cd "$(dirname "$0")" && pwd)
 [ $# -eq 2 ] || { sed -n 2,12p "$0" >&2; exit 2; }
 B=$(cd "$1" && pwd) OUT=$2
-# WINE64_MEM64=1: the memory64 flavour (docs/wine-native-x64.md §0.1), for a
+# WINE64_MEM64=1: the memory64 flavour, for a
 # tree configured with CC="wcc64 -mgex-memory64".
 M64=; [ "${WINE64_MEM64:-0}" = 0 ] || M64=-mgex-memory64
 : "${GEX_WASM64_SYSROOT:?set GEX_WASM64_SYSROOT (tools/wine-wasm/build-sysroot64.sh)}"
