@@ -33,7 +33,7 @@ pub struct BuildReport {
     /// A Windows program's build (`pe`).
     pub pe: Option<crate::pe::PeReport>,
     /// A 32-bit Wine page's build.
-    pub w3: Option<crate::w3::W3Report>,
+    pub w3: Option<crate::wine32::Wine32Report>,
     /// The libraries the placement window holds, of the closure's.
     pub placement: Placement,
 }
@@ -684,8 +684,8 @@ impl Translation<'_> {
 }
 
 pub fn build(dir: &Path) -> Result<BuildReport> {
-    if crate::w3::is_project(dir) {
-        return Ok(BuildReport { w3: Some(crate::w3::build(dir)?), ..BuildReport::default() });
+    if crate::wine32::is_project(dir) {
+        return Ok(BuildReport { w3: Some(crate::wine32::build(dir)?), ..BuildReport::default() });
     }
     let project = Project::load(dir)?;
     if project.isa != gex_abi::ARCH_NAME {
@@ -695,8 +695,8 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     if !config.features_off.is_empty() {
         crate::features::check(&config.features_off)?;
         bail!(
-            "user/eject.json: features are switched off ({}), and only a W3 page's build \
-             (docs/eject.md, \"W3 pages\") can leave them out so far",
+            "user/eject.json: features are switched off ({}), and only a wine32 page's build \
+             (docs/eject.md, \"wine32 pages\") can leave them out so far",
             config.features_off.join(", ")
         );
     }

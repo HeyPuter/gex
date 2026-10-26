@@ -380,7 +380,7 @@ pub fn note_nt(setup: &crate::nt::NtSetup, gl: bool) {
     let Some(rec) = recorder() else {
         return;
     };
-    let mut settings: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("GEX_NT_")).map(|(k, v)| format!("{k}={v}")).collect();
+    let mut settings: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("GEX_WIN_")).map(|(k, v)| format!("{k}={v}")).collect();
     settings.sort();
     let cfg = &setup.cfg;
     let nt = gp::NtSession {

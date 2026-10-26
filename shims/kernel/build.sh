@@ -86,7 +86,7 @@ RUSTFLAGS="-C link-arg=--import-memory \
 # (docs/mem64.md step 6), each Worker giving its own as the one of its type
 # and an empty memory as the other (lazy-fetch.mjs `processMemories`). Two
 # builds, one per flavour, laid their statics out 16 bytes apart and could
-# not share one kernel memory: in a page whose processes differ (W64's
+# not share one kernel memory: in a page whose processes differ (64-bit Wine's
 # wasm32 server beside a 64-bit memory's loader, or the X server under
 # `?mem64=1`), the second to start read the first's state wrong. Minimum 0
 # for both: the empty one has no pages.

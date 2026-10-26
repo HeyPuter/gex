@@ -1,6 +1,6 @@
 REGEDIT4
 
-; A lean W3 session for one-shot console programs (docs/wine-native.md
+; A lean 32-bit Wine session for one-shot console programs (docs/wine-native.md
 ; §3.17): wineboot --init starts only what a console program needs. The
 ; Event Log (svchost), NDIS, the NSI proxy and Plug and Play become
 ; demand-start; MountMgr (drives) stays. On edger this takes

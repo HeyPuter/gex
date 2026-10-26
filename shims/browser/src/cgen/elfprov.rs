@@ -279,7 +279,7 @@ use gex_kernel::ftab::REBRIDGE_LIMIT;
 /// back (JS writes it before the guest goes on, `#cgenServe`) and the
 /// dispatch is retried. False when it is not a provided address.
 pub(crate) fn rebridge(pc: u64) -> bool {
-    // Any provider's address, a W3 builtin's export included: retiring its
+    // Any provider's address, a 32-bit Wine builtin's export included: retiring its
     // page (a hook written beside it) forgot its bridge (`provider_serves`).
     if !(provided(pc) || super::provider_serves(pc)) || super::index_of(pc).is_none() {
         return false;
@@ -310,8 +310,8 @@ pub(crate) fn rebridge(pc: u64) -> bool {
             }
         };
         // Never for a native Wine DLL's skeleton: its code is `ud2` stubs,
-        // and tier-1 there raised c000001d (W64's rpcss and services in the
-        // page). W64 only: on W3 a skeleton address
+        // and tier-1 there raised c000001d (64-bit Wine's rpcss and services in the
+        // page). 64-bit Wine only: on 32-bit Wine a skeleton address
         // rebridged for ever hung a desktop shell's boot.
         if gex_kernel::ftab::rebridge_gives_up(pc, n) && !(super::wasmprog::guest_x86_64() && super::wasmdll::in_skeleton(pc)) {
             let vma = crate::sigs::proc_home().mm().lock().vmas().iter().find(|v| pc >= v.start && pc < v.end).map(|v| format!(" ({:#x}..{:#x} {})", v.start, v.end, v.name)).unwrap_or_default();

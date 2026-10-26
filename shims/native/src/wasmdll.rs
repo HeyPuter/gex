@@ -103,7 +103,7 @@ pub(crate) struct WinePe {
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     /// The entry thunks are bound (`bind_entry_thunks`, once).
     entries_bound: std::sync::atomic::AtomicBool,
-    /// An LLP64 module (W64, its skeletons PE32+): pointers in its data are
+    /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16.
     ptr64: bool,
     /// The DLLs whose skeleton has been mapped: a later mapping of one (an
@@ -236,7 +236,7 @@ struct ParsedModule {
     module: wasmtime::Module,
 }
 
-/// `probe`: a W3 module, whose inline probe (gexrt's `gex_ftab_idx`) reads
+/// `probe`: a 32-bit Wine module, whose inline probe (gexrt's `gex_ftab_idx`) reads
 /// the probe cache, refused when it was built for another layout.
 fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::time::Instant, probe: bool) -> Result<Arc<ParsedModule>> {
     type Memo = Vec<((std::path::PathBuf, u64, Option<std::time::SystemTime>), wasmtime::Engine, Arc<ParsedModule>)>;
@@ -455,7 +455,7 @@ fn install_shared(
     // The variables below are the loaded DLL's, written at its first
     // mapping only. Written again at a later one (wineboot's install maps
     // DLLs as image views), they pointed winecrt0 at the view, and under
-    // native Wine's own Unix side (W3) reset ntdll's __wine_unixlib_handle,
+    // native Wine's own Unix side (32-bit Wine) reset ntdll's __wine_unixlib_handle,
     // which load_ntdll_functions had set, to gex-kernel's handle: every
     // later Unix call of ntdll's went through a table at address 1.
     let first_mapping = wp.mapped.lock().unwrap_or_else(|e| e.into_inner()).insert(dll.clone());
@@ -465,7 +465,7 @@ fn install_shared(
         let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
         wp.pending.lock().unwrap_or_else(|e| e.into_inner()).push((wp.data + *off as u64, bytes));
     }
-    // (W64's ntdll has Wine's own Unix side, whose load_ntdll_functions
+    // (64-bit Wine's ntdll has Wine's own Unix side, whose load_ntdll_functions
     // sets them: gex-kernel's are i386 trampolines)
     if first_mapping && dll == "ntdll.dll" && !wp.ptr64 {
         let mut pending = wp.pending.lock().unwrap_or_else(|e| e.into_inner());

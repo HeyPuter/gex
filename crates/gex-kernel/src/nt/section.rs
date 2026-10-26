@@ -214,7 +214,7 @@ pub const LAYOUT_FILE: &str = "gex-layout";
 pub const LAYOUT_VERSION: &str = "gex-layout 1";
 
 /// Layout images that could not get their base (the range was taken), for
-/// `GEX_NT_STATS`.
+/// `GEX_WIN_STATS`.
 pub static LAYOUT_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Layout {
@@ -481,7 +481,7 @@ pub fn map_image(
         base,
         ImageView { base, size, pe: Arc::clone(img), path: path.to_string(), nt_path: nt_path.to_vec() },
     );
-    if std::env::var_os("GEX_NT_TRACE_IMAGES").is_some() {
+    if std::env::var_os("GEX_WIN_TRACE_IMAGES").is_some() {
         crate::nt_log!("gex-nt: image {path} at {base:#x}+{size:#x}");
     }
     g.zero(base, size as usize)?;

@@ -346,7 +346,7 @@ example, `user/index.html`, once and never again:
 
 Nothing about the page is special: any page that imports `app.mjs` and
 gives `start()` an element runs the program
-(`tests/eject/w3-shell-min.html` is a hand-written one, with its own box,
+(`tests/eject/wine32-shell-min.html` is a hand-written one, with its own box,
 arguments and `onExit`).
 
 **`start(options)`** resolves once the program runs, with
@@ -503,7 +503,7 @@ keep, and a standalone site around the project's page:
 ```sh
 # 1. record: run the page to its window (headless Chromium); --boot-units-out
 #    also lists the images whose units it used shortly after the window
-node tools/eject/record-w3.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
+node tools/eject/record-wine32.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
   --boot-units-out rec/boot-units.txt
 # 2. eject: the bundle, the units it used, the runtime, a build step
 gexc eject rec --out app-project --web-src web --unit-cache UNITS --features -compositor
@@ -512,7 +512,7 @@ app-project/build.sh
 # 4. the static site
 node web/eject-site.mjs app-project site --strip --prune --dedupe \
   --pieces --boot-units rec/boot-units.txt
-node tests/eject/w3-page.mjs site      # check: the site reaches the program's window
+node tests/eject/wine32-page.mjs site      # check: the site reaches the program's window
 ```
 
 - **The recording** is how the page was started (exe, arguments,
@@ -614,7 +614,7 @@ is lifted in the page.
 
 - **Coverage.** Build with `"cold": "instrument"`. Every guest function of
   every unit then reports itself on entry. Record that site with
-  `record-w3.mjs URL OUT --serve SITE --coverage-into REC/w3-session.json`,
+  `record-wine32.mjs URL OUT --serve SITE --coverage-into REC/wine32-session.json`,
   which adds the run's functions to the recording the project is ejected
   from. Runs add up: record the paths users take. Then eject again
   (`user/` is kept) and set the clustering.

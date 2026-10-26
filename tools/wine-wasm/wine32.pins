@@ -1,0 +1,58 @@
+# wine32 (Wine's own Unix side as wasm32 on gex, docs/wine-native.md) pins.
+# tools/wine-wasm/Makefile includes this file; it is the only place the
+# sources the wine32 dist is built from are named. Change a pin here and `make`
+# rebuilds what depends on it (outputs are keyed by these values).
+
+# The Wine fork: branch mw/wasm32-w3-next (46cb13f5e51 plus Unix-call user callbacks on the program's stack).
+WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
+WINE_COMMIT := 47870386bfd527407e99f09efb779c9b50fc247f
+
+# The musl fork the wasm32 sysroot is built from (build-sysroot.sh):
+# branch mw/gex-wasm32-slim.
+MUSL_REPO   := https://github.com/MercuryWorkshop/musl-wasm.git
+MUSL_COMMIT := fa2fd28eea0ce272daed4dd2df44379be4300788
+
+# The i386 PE DLLs that are not built as wasm32 skeletons come from the
+# host's Wine release, staged and checked against tools/nt-wine-11.15.manifest
+# by tools/nt-stage-wine.sh (GEX_WINE_PREFIX, default ~/.cache/gex/wine-11.15).
+WINE_X86_VERSION := 11.15
+
+# Unix libraries linked into the wine32 loader (static wasm32 builds, wine32/deps.sh).
+# NAME_URL / NAME_SHA256: tarball and its sha256 (checked on every fetch).
+FREETYPE_VERSION := 2.13.3
+FREETYPE_URL     := https://downloads.sourceforge.net/project/freetype/freetype2/2.13.3/freetype-2.13.3.tar.xz
+FREETYPE_SHA256  := 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289
+WAYLAND_VERSION  := 1.23.1
+WAYLAND_URL      := https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.23.1/downloads/wayland-1.23.1.tar.xz
+WAYLAND_SHA256   := 864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed
+LIBXML2_VERSION  := 2.12.9
+LIBXML2_URL      := https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.9.tar.xz
+LIBXML2_SHA256   := 59912db536ab56a3996489ea0299768c7bcffe57169f0235e7f962a91f483590
+XKBCOMMON_VERSION := 1.7.0
+XKBCOMMON_URL    := https://xkbcommon.org/download/libxkbcommon-1.7.0.tar.xz
+XKBCOMMON_SHA256 := 65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247
+# libxkbcommon builds with meson; this wheel runs from its directory (no install).
+MESON_VERSION    := 1.5.2
+MESON_URL        := https://files.pythonhosted.org/packages/py3/m/meson/meson-1.5.2-py3-none-any.whl
+MESON_SHA256     := 77706e2368a00d789c097632ccf4fc39251fba56d03e1e1b262559a3c7a08f5b
+
+# TLS (schannel's and crypt32's GnuTLS): GnuTLS with its included libtasn1
+# and libunistring over nettle with mini-gmp (no GMP), and Mozilla's CA
+# bundle as curl.se publishes it (sha256 as in its .sha256 file).
+NETTLE_VERSION   := 3.10.1
+NETTLE_URL       := https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
+NETTLE_SHA256    := b0fcdd7fc0cdea6e80dcf1dd85ba794af0d5b4a57e26397eee3bc193272d9132
+GNUTLS_VERSION   := 3.8.9
+GNUTLS_URL       := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.tar.xz
+GNUTLS_SHA256    := 69e113d802d1670c4d5ac1b99040b1f2d5c7c05daec5003813c049b5184820ed
+CACERT_URL       := https://curl.se/ca/cacert-2026-08-13.pem
+CACERT_SHA256    := f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9
+
+# Wine Mono, the .NET runtime mscoree loads for .NET programs (Celeste and
+# TowerFall: XNA through Wine Mono's FNA). The version is the one this Wine's
+# mscoree asks for (WINE_MONO_VERSION in dlls/mscoree/mscoree_private.h); the
+# dist carries it at share/wine/mono/wine-mono-VERSION, where mscoree finds
+# it through WINEDATADIR (wine32/mono.sh). WINE32_MONO=0 leaves it out.
+WINE_MONO_VERSION := 11.2.0
+WINE_MONO_URL     := https://dl.winehq.org/wine/wine-mono/11.2.0/wine-mono-11.2.0-x86.tar.xz
+WINE_MONO_SHA256  := c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06

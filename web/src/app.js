@@ -67,7 +67,7 @@ const PIECES = {
  *   compositor, gl, translation, hostx, mem64
  *              true asks for a runtime piece; an error if the build left it out.
  *              compositor: false draws windows straight into the page.
- *   glLazy     start Mesa at the first GL request instead of at boot (a W3
+ *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
@@ -118,7 +118,7 @@ export async function start(opts = {}) {
  * and then 'exited' or 'failed' (with `error`). `at` holds each phase's
  * start, and `elapsed` the time at the call, in ms since start().
  *
- * From 'boot' on, what the program has reached (a W3 build's units, as each
+ * From 'boot' on, what the program has reached (a 32-bit Wine build's units, as each
  * process installs them: shims/browser/js/fetch-note.mjs `noteStatus`):
  *   boot   {units: {done, total}, programs: {done, total}, program, image}:
  *          the build's units installed so far (distinct images) of all it
@@ -567,7 +567,7 @@ async function begin(opts, base, at, state, meter) {
   const args = [exe, ...(opts.args ?? b.argv ?? [])];
   const env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
-  if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
+  if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
   // A zoneinfo name (':' = a file under /usr/share/zoneinfo, which Wine also
@@ -579,7 +579,7 @@ async function begin(opts, base, at, state, meter) {
   }
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
-  // How it was started (gex-eject's W3 recorder keeps this).
+  // How it was started (gex-eject's 32-bit Wine recorder keeps this).
   state.session = { exe, argv: args.slice(1), env, cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
@@ -857,7 +857,7 @@ function mergeEnv(base = [], more = null) {
 }
 
 /**
- * The build's launch file (gex-eject: a W3 page's, kind "w3", or an NT-layer
+ * The build's launch file (gex-eject: a 32-bit Wine page's, kind "w3", or an NT-layer
  * program's) as the options `start` reads. Site paths in it (`/project/...`)
  * are under `at`'s base.
  */
@@ -975,9 +975,9 @@ export function setGlobals(get, b = {}) {
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
   if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
-  // w3split=1: W3 processes take the NT layer's 2 GiB split (the shim's heap above
+  // winesplit=1: 32-bit Wine processes take the NT layer's 2 GiB split (the shim's heap above
   // 2 GiB), not the compact space: for a game that needs all of Windows' 2 GiB.
-  if (get('w3split')) globalThis.GEX_W3_SPLIT = 1;
+  if (get('winesplit')) globalThis.GEX_WINE32_SPLIT = 1;
   // nullguard=1: guest accesses below 64 KiB fault, as a null pointer's do
   // natively (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the
   // units are as without it; on, 2-8% slower in tier 1.
@@ -996,7 +996,7 @@ export function setGlobals(get, b = {}) {
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));
   if (get('fixedtime')) globalThis.GEX_FIXED_TIME = Number(get('fixedtime'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
-  // The function JIT: off by default (it doubles a W3 program's start-up;
+  // The function JIT: off by default (it doubles a 32-bit Wine program's start-up;
   // nt-page.js said why).
   const fjit = get('fjit');
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;

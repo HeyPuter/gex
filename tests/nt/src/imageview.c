@@ -1,6 +1,6 @@
 /* A loaded DLL mapped again as an image (an image section of its file,
  * as wineboot's install maps ntdll): the second mapping
- * must not disturb the loaded one. Under native Wine (W3) gex used to
+ * must not disturb the loaded one. Under native Wine (32-bit Wine) gex used to
  * write the loaded DLL's variables again at each mapping, which reset
  * ntdll's Unix-call handle, and ntdll's next Unix call (its debug output
  * here) went through a table at address 1.

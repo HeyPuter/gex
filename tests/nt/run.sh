@@ -1,6 +1,6 @@
 #!/bin/bash
 # The NT layer's gate (docs/nt-layer.md, stream S12): Windows console
-# programs run through Wine 11.15's PE DLLs on gex, with GEX_NT_STRICT=1, so
+# programs run through Wine 11.15's PE DLLs on gex, with GEX_WIN_STRICT=1, so
 # any call the NT layer does not implement ends the run.
 #
 #   tests/nt/run.sh [path/to/gexc]      (default target/release/gexc)
@@ -17,14 +17,14 @@ fx=$root/crates/gex-ld/tests/pe/bin
 [ -x "$gexc" ] || { echo "no gexc at $gexc" >&2; exit 2; }
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 [ -f "$prefix/.wine-version" ] || { echo "no staged Wine prefix at $prefix; run tools/nt-stage-wine.sh" >&2; exit 2; }
-export GEX_NT_STRICT=1
+export GEX_WIN_STRICT=1
 # GEXC_RUN_FLAGS: flags for every `gexc run` (the gate runs the suite with
 # --no-cgen and with --cgen). Units go to a cache of the checkout's own unless
 # GEX_CGEN_CACHE says otherwise, so a test run never fills the user's; under
 # --cgen a test program without one gets it built before it runs.
 flags=${GEXC_RUN_FLAGS:-}
 export GEX_CGEN_CACHE=${GEX_CGEN_CACHE:-$root/target/nt-test-cgen}
-case " $flags " in *" --cgen "*) export GEX_NT_CGEN_SYNC=1 ;; esac
+case " $flags " in *" --cgen "*) export GEX_WIN_CGEN_SYNC=1 ;; esac
 
 # icall.exe's indirect-call profile, as tools/icall-hints.py writes one
 # (x86: its three call sites and their dominant targets), so under --cgen its
@@ -101,12 +101,12 @@ for arch in x64 x86; do
     [ $arch = x64 ] && check $arch/lownull-cmpxchg16b 0 "$allok" "$b/lownull.exe" cmpxchg16b
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     # KUSER_SHARED_DATA by constant address (the tick count, the interrupt
-    # time, the OS version; absolute, with a base, with an index). Under W3
+    # time, the OS version; absolute, with a base, with an index). Under 32-bit Wine
     # the page is at gex_abi::W3_KUSER and the translator folds these; a
     # pointer into Windows' page computed at run time is then an access
     # violation gex names ("KUSER access not folded"), never a read or a hang.
     check $arch/kuser 0 "$allok" "$b/kuser.exe" const
-    if [ -n "${GEX_NT_W3:-}" ]; then
+    if [ -n "${GEX_WIN_WINE32:-}" ]; then
         check $arch/kuser-pointer 0 "ok pointer read at 0x7ffe026c: exception 0xc0000005, read 0, address 0x7ffe026c${nl}0 failures" "$b/kuser.exe" pointer
     else
         check $arch/kuser-pointer 3 "read [0-9]+ at 0x7ffe026c" "$b/kuser.exe" pointer
@@ -122,26 +122,26 @@ for arch in x64 x86; do
     # A loaded DLL mapped again as an image section: the loaded one keeps
     # working (ntdll's Unix calls after the view).
     check $arch/imageview 0 "ok ntdll mapped twice as an image view" "$b/imageview.exe"
-    # Audio out through winmm and mmdevapi: native Wine (W3) only, whose
-    # OSS driver plays into gex's /dev/dsp. GEX_NT_W3_INSTALLED=1 runs it:
+    # Audio out through winmm and mmdevapi: native Wine (32-bit Wine) only, whose
+    # OSS driver plays into gex's /dev/dsp. GEX_WIN_WINE32_INSTALLED=1 runs it:
     # the prefix needs wineboot's install (mmdevapi's COM classes).
-    [ -n "${GEX_NT_W3_INSTALLED:-}" ] && check $arch/audio 0 "${allok}" "$b/audio.exe"
-    # Winsock over loopback (TCP, UDP, select, WSAEventSelect): W3 only.
-    [ -n "${GEX_NT_W3:-}" ] && check $arch/sockets 0 "${allok}" "$b/sockets.exe"
+    [ -n "${GEX_WIN_WINE32_INSTALLED:-}" ] && check $arch/audio 0 "${allok}" "$b/audio.exe"
+    # Winsock over loopback (TCP, UDP, select, WSAEventSelect): 32-bit Wine only.
+    [ -n "${GEX_WIN_WINE32:-}" ] && check $arch/sockets 0 "${allok}" "$b/sockets.exe"
     # The same as a child process (CreateProcess, waited for): native Wine
-    # (W3) only, where a child reads the session through requests; the NT
-    # layer has no child processes. GEX_NT_CHILDREN=1 runs it.
-    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childgui 0 "${allok}${nl}child exit 0" "$b/childgui.exe"
+    # (32-bit Wine) only, where a child reads the session through requests; the NT
+    # layer has no child processes. GEX_WIN_CHILDREN=1 runs it.
+    [ -n "${GEX_WIN_CHILDREN:-}" ] && check $arch/childgui 0 "${allok}${nl}child exit 0" "$b/childgui.exe"
     # And from a console launcher: the child hosts the desktop.
-    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childcon 0 "${allok}${nl}child exit 0" "$b/childcon.exe"
+    [ -n "${GEX_WIN_CHILDREN:-}" ] && check $arch/childcon 0 "${allok}${nl}child exit 0" "$b/childcon.exe"
     # Children one after another, each a new address space.
-    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
+    [ -n "${GEX_WIN_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
     # A child that dies in native code releases its parent.
-    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
+    [ -n "${GEX_WIN_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
     # A window made in a DllMain (the loader lock held) before the process
-    # has a desktop: under W3 the desktop process starts meanwhile. W3
+    # has a desktop: under 32-bit Wine the desktop process starts meanwhile. 32-bit Wine
     # only (the NT layer lacks NtAreMappedFilesTheSame; it is legacy).
-    [ -n "${GEX_NT_W3:-}" ] && check $arch/attachwin 0 "${allok}" "$b/attachwin.exe"
+    [ -n "${GEX_WIN_WINE32:-}" ] && check $arch/attachwin 0 "${allok}" "$b/attachwin.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
@@ -156,9 +156,9 @@ for arch in x64 x86; do
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
     # A section mapped several times in one process, at the same offset and
-    # inside, unmapped in turn. W3 only (the legacy NT layer loses the
+    # inside, unmapped in turn. 32-bit Wine only (the legacy NT layer loses the
     # section's pages once every view is unmapped).
-    [ -n "${GEX_NT_W3:-}" ] && check $arch/secalias 0 "$allok" "$b/secalias.exe"
+    [ -n "${GEX_WIN_WINE32:-}" ] && check $arch/secalias 0 "$allok" "$b/secalias.exe"
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll
     # with its header as linked.
     check $arch/fixedbase 0 "$allok" "$b/fixedbase.exe"

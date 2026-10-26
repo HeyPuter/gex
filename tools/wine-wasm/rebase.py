@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed preferred bases for W3's i386 Wine DLLs (docs/wine-overhead.md §7).
+"""Fixed preferred bases for 32-bit Wine's i386 Wine DLLs (docs/wine-overhead.md §7).
 
 Every Wine builtin is linked at ImageBase 0x10000000 with DYNAMIC_BASE.
 For such an image Wine's server picks the address (server/mapping.c
@@ -13,7 +13,7 @@ the next, same build). Function-tier units are keyed by image and base, so
 a moved DLL silently runs tier-1.
 
 This gives each DLL its own preferred base from a checked-in table
-(w3-bases.txt) and rewrites the DLL's header and relocations to it at stage
+(wine32-bases.txt) and rewrites the DLL's header and relocations to it at stage
 time, with DYNAMIC_BASE cleared, so the server leaves it out of its pool
 and Wine's loader maps it at that base whenever the range is free, whatever
 else loaded first.
@@ -40,7 +40,7 @@ line (and so its range).
                                        --fixed, also report a program's own
                                        fixed-base images that overlap a slot
 
-DIR is a W3 dist's lib/wine/i386-windows (or a W3 prefix's
+DIR is a 32-bit Wine dist's lib/wine/i386-windows (or a 32-bit Wine prefix's
 system32/syswow64). The check fails when two slots overlap, when a DLL in
 DIR is missing from the table or outgrew its slot, or when a DLL in DIR is
 not at its table base with DYNAMIC_BASE cleared (apply not run). A rebased
@@ -64,8 +64,8 @@ FLOOR = 0x20000000
 GRANULE = 0x10000
 EXTS = {"dll", "drv", "sys", "ocx", "acm", "cpl", "ax", "ds", "msstyles", "tlb"}
 HEADER = f"""\
-# W3's i386 Wine DLLs: preferred bases (tools/wine-wasm/rebase.py). APPEND-ONLY:
-# `rebase.py table DIR w3-bases.txt` adds new or grown DLLs; never re-pack or
+# 32-bit Wine's i386 Wine DLLs: preferred bases (tools/wine-wasm/rebase.py). APPEND-ONLY:
+# `rebase.py table DIR wine32-bases.txt` adds new or grown DLLs; never re-pack or
 # reorder (each slot keys the function-tier units built for it).
 # BASE SLOT NAME (keep: no relocations, left at its linked base)
 """

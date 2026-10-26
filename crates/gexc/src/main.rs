@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("gexc: {e:#}");
-            // A W3 module built for another probe layout: the loader's own
+            // A 32-bit Wine module built for another probe layout: the loader's own
             // status for an image it cannot run, as a refused child's.
             ExitCode::from(if format!("{e:#}").contains(gex_cgen::header::ABI_REFUSED) { 127 } else { 1 })
         }
@@ -183,15 +183,15 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--w3-kuser] [--entries FILE]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--wine32-kuser] [--entries FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
-                                   is the peak. --w3-kuser: a W3 unit (Wine as
+                                   is the peak. --wine32-kuser: a wine32 unit (Wine as
                                    wasm32): KUSER_SHARED_DATA's constant
-                                   addresses folded to W3's page. --entries:
+                                   addresses folded to wine32's page. --entries:
                                    region entries too, at the hex addresses
                                    in FILE (resumes a run without translation
                                    makes inside the image's functions)
@@ -789,7 +789,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
     }
     // A native wasm program's container is not a 64-bit guest whose memory
-    // gex chooses: W64's LP64 program is lowered to wasm32 (its x86-64 code
+    // gex chooses: 64-bit Wine's LP64 program is lowered to wasm32 (its x86-64 code
     // keeps below its code space), and its memory64 flavour is the module's
     // own (docs/wine-native-x64.md §0.1).
     let wide = !program.compat() && !program.exe.is_wasm_program();
@@ -2288,7 +2288,7 @@ fn cmd_hotset(args: &[String]) -> Result<()> {
 }
 
 /// The DLLs `gexc cgen-prefix` compiles by default: what Noita and tests/nt
-/// map, measured (`GEX_NT_TRACE_IMAGES=1`).
+/// map, measured (`GEX_WIN_TRACE_IMAGES=1`).
 const CGEN_CORE: &str = include_str!("../../../tools/nt-cgen-core.txt");
 
 /// `gexc cgen-prefix`: see the usage text.
@@ -2586,10 +2586,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             // A unit for a 64-bit guest memory (docs/mem64.md): another
             // key, other code.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
-            // A W3 unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
+            // A 32-bit Wine unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
             // gex_abi::W3_KUSER): constant accesses to Windows' page folded
             // there, every other address checked. Another key.
-            "--w3-kuser" => gex_abi::set_kuser_fold(true),
+            "--wine32-kuser" => gex_abi::set_kuser_fold(true),
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),

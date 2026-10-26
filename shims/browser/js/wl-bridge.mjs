@@ -344,7 +344,7 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
-  // A test's record of what the page sent (tests/eject/w3-page.mjs's drag).
+  // A test's record of what the page sent (tests/eject/wine32-page.mjs's drag).
   globalThis.__gexEvLog?.push([kind, a1, b1, performance.now()]);
   // A mark for traces (`console.timeStamp` costs nothing unless tracing).
   console.timeStamp(`gex:ev ${kind} b${block}`);

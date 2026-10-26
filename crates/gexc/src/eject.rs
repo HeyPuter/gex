@@ -10,11 +10,11 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (docs/eject.md)
-  gexc eject <w3-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
-                                   the same for a W3 page (Wine as wasm32)
-                                   recorded by tools/eject/record-w3.mjs: its
+  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
+                                   the same for a wine32 page (Wine as wasm32)
+                                   recorded by tools/eject/record-wine32.mjs: its
                                    bundle, units and runtime, and the features
-                                   the build keeps (docs/eject.md, \"W3 pages\")
+                                   the build keeps (docs/eject.md, \"wine32 pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
   gexc eject override <project> <object> <symbol|0xoffset> [--size N]
@@ -205,16 +205,16 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let record = record.context("gexc eject <record-dir> --out <project>")?;
             let out = out.context("gexc eject: where to? (--out <project>)")?;
             let runtime = std::env::current_exe().context("finding this gexc to copy into the project")?;
-            if gex_eject::w3::is_recording(&record) {
-                let web_src = web_src.context("a W3 recording needs --web-src <gex>/web (the page's source and the built runtime)")?;
-                let s = gex_eject::w3::eject(
+            if gex_eject::wine32::is_recording(&record) {
+                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/web (the page's source and the built runtime)")?;
+                let s = gex_eject::wine32::eject(
                     &record,
                     &out,
                     &runtime,
-                    &gex_eject::w3::W3Options { web_src, unit_cache, features_off },
+                    &gex_eject::wine32::Wine32Options { web_src, unit_cache, features_off },
                 )?;
                 eprintln!(
-                    "{}: a W3 page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
+                    "{}: a wine32 page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
                     out.display(),
                     s.processes,
                     s.units,
@@ -234,7 +234,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 return Ok(None);
             }
             if web_src.is_some() || !features_off.is_empty() {
-                bail!("--web-src and --features are for a W3 recording (w3-session.json)");
+                bail!("--web-src and --features are for a wine32 recording (wine32-session.json)");
             }
             let s = gex_eject::eject::eject(
                 &record,
@@ -276,7 +276,7 @@ fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
     if let Some(w) = &r.w3 {
         eprintln!(
-            "{}: W3 page built: {} page files, {} units; features off: {}",
+            "{}: wine32 page built: {} page files, {} units; features off: {}",
             dir.display(),
             w.page_files,
             w.units,

@@ -115,7 +115,7 @@ static ON: OnceLock<()> = OnceLock::new();
 static PLACING: Mutex<()> = Mutex::new(());
 
 fn trace() -> bool {
-    std::env::var_os("GEX_TRACE").is_some() || std::env::var_os("GEX_NT_CGEN_TRACE").is_some()
+    std::env::var_os("GEX_TRACE").is_some() || std::env::var_os("GEX_WIN_CGEN_TRACE").is_some()
 }
 
 /// Where units live: `GEX_CGEN_CACHE`, else `<gex cache>/cgen`.
@@ -892,7 +892,7 @@ struct Prepared {
 }
 
 /// [`Prepared`] for `p`, remembered for the host process by path, base and
-/// a hash of the file: under W3 every Wine process maps the same images at
+/// a hash of the file: under 32-bit Wine every Wine process maps the same images at
 /// the same bases, and the unit key (a SHA-256 of the relocated image) was
 /// a fifth of a session boot's CPU.
 fn prepared(p: &Pending) -> Result<Arc<Prepared>> {
@@ -1258,7 +1258,7 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
 /// [`publish_trampolines`] for a wine32 or wine64 process, with its first
 /// image: the page is in memory from the start (`run_program_with`), and
 /// Wine's unix calls and syscalls all go through it.
-fn w3_trampolines(caller: &mut Caller<'_, HostState>, class32: bool) -> Result<()> {
+fn wine32_trampolines(caller: &mut Caller<'_, HostState>, class32: bool) -> Result<()> {
     if caller.data().jit.is_none() {
         return Ok(());
     }
@@ -1269,7 +1269,7 @@ fn w3_trampolines(caller: &mut Caller<'_, HostState>, class32: bool) -> Result<(
             replay_registry(caller)?;
         }
         Ok(false) => {}
-        Err(e) => eprintln!("gex-w3: the trampoline page's unit: {e:#}; it runs on tier-1"),
+        Err(e) => eprintln!("gex-wine32: the trampoline page's unit: {e:#}; it runs on tier-1"),
     }
     Ok(())
 }
@@ -1295,10 +1295,10 @@ fn largest_body(wasm: &[u8]) -> usize {
 /// staging (`GEX_CGEN_PRECOMPILE=1`), never at run time: Cranelift's
 /// register allocation on d3dx9_43's 828 KB function takes about ten minutes
 /// (wined3d's 444 KB one, seconds: size alone is a rough guide).
-/// `GEX_W3_UNIT_MAX_BODY` (bytes) overrides.
+/// `GEX_WINE32_UNIT_MAX_BODY` (bytes) overrides.
 fn max_runtime_body() -> usize {
     static M: OnceLock<usize> = OnceLock::new();
-    *M.get_or_init(|| std::env::var("GEX_W3_UNIT_MAX_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(640 << 10))
+    *M.get_or_init(|| std::env::var("GEX_WINE32_UNIT_MAX_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(640 << 10))
 }
 
 /// Queue the unit at `path` (`wasm` its bytes) for [`precompile_unit`] on
@@ -1319,7 +1319,7 @@ fn compile_later(path: std::path::PathBuf, wasm: &[u8]) {
     let body = largest_body(wasm);
     if body > max_runtime_body() {
         eprintln!(
-            "gex-w3: the unit {} has a {} KiB function; not compiled at run time (compile it at staging: \
+            "gex-wine32: the unit {} has a {} KiB function; not compiled at run time (compile it at staging: \
              gexc cgen-image with GEX_CGEN_PRECOMPILE=1)",
             path.display(),
             body >> 10
@@ -1342,8 +1342,8 @@ fn compile_later(path: std::path::PathBuf, wasm: &[u8]) {
             };
             let t0 = std::time::Instant::now();
             match precompile_unit(&p) {
-                Ok(()) => eprintln!("gex-w3: compiled the unit {} in {:.1}s (for the next process)", p.display(), t0.elapsed().as_secs_f64()),
-                Err(e) => eprintln!("gex-w3: compiling the unit {}: {e:#}", p.display()),
+                Ok(()) => eprintln!("gex-wine32: compiled the unit {} in {:.1}s (for the next process)", p.display(), t0.elapsed().as_secs_f64()),
+                Err(e) => eprintln!("gex-wine32: compiling the unit {}: {e:#}", p.display()),
             }
         });
     }
@@ -1402,11 +1402,11 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     }
 }
 
-/// `GEX_NT_CGEN_SYNC=1` (tests/nt under --cgen): a program image mapped
+/// `GEX_WIN_CGEN_SYNC=1` (tests/nt under --cgen): a program image mapped
 /// without a unit has one built there and then, and installed, rather than
 /// running on tier-1 or failing.
 fn sync_build() -> bool {
-    std::env::var_os("GEX_NT_CGEN_SYNC").is_some()
+    std::env::var_os("GEX_WIN_CGEN_SYNC").is_some()
 }
 
 /// Build `p`'s unit now (the child `gexc cgen-image`), waiting for it.
@@ -1418,7 +1418,7 @@ fn build_now(p: &Pending) -> Result<()> {
     Ok(())
 }
 
-/// A unit for `p`: placed if built; built first under `GEX_NT_CGEN_SYNC`.
+/// A unit for `p`: placed if built; built first under `GEX_WIN_CGEN_SYNC`.
 fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
     if let Some(pl) = place(p, memory, true)? {
         return Ok(Some(pl));
@@ -1436,7 +1436,7 @@ fn is_wine(p: &Pending) -> bool {
 }
 
 /// An image mapped with no unit for its base. `--cgen` refuses a program
-/// image; otherwise it runs on tier-1 and, unless `GEX_NT_CGEN_BUILD` says
+/// image; otherwise it runs on tier-1 and, unless `GEX_WIN_CGEN_BUILD` says
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
@@ -1452,7 +1452,7 @@ fn missing(p: Pending) -> Result<()> {
             p.base
         );
     }
-    // Always said, and kept for GEX_NT_STATS: an image on tier-1 because its
+    // Always said, and kept for GEX_WIN_STATS: an image on tier-1 because its
     // unit is missing (a base its unit was not built for, a stale key) is
     // otherwise only visible as a lower AOT share.
     let key = gex_xlate::func::pe_input(&p.pe, p.base)
@@ -1474,7 +1474,7 @@ fn missing(p: Pending) -> Result<()> {
     // Wine's DLLs get theirs at staging, at their layout bases (`gexc
     // cgen-prefix`); one placed anywhere else is not built for.
     let build = !is_wine(&p)
-        && match std::env::var("GEX_NT_CGEN_BUILD").as_deref() {
+        && match std::env::var("GEX_WIN_CGEN_BUILD").as_deref() {
         Err(_) | Ok("1") => true,
         Ok("0") => false,
         Ok(list) => {
@@ -1500,7 +1500,7 @@ fn missing(p: Pending) -> Result<()> {
 /// Images mapped with no unit for their base, as `missing` reported them.
 static NO_UNIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// GEX_NT_STATS's "no unit" line: every image running on tier-1 for want of
+/// GEX_WIN_STATS's "no unit" line: every image running on tier-1 for want of
 /// a unit, or `None` when there are none.
 pub(crate) fn no_unit_line() -> Option<String> {
     let v = NO_UNIT.lock().unwrap_or_else(|e| e.into_inner());
@@ -2032,10 +2032,10 @@ fn spawn_elf_build(path: &str, base: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Wine's own PE loader (stream W, W3; docs/wine-native.md §3.17)
+// Wine's own PE loader (stream W, 32-bit Wine; docs/wine-native.md §3.17)
 // ---------------------------------------------------------------------------
 //
-// Under W3 Wine's ntdll.so maps every image itself and tells gex
+// Under 32-bit Wine's ntdll.so maps every image itself and tells gex
 // (`gex.image_mapped`, after its relocations); there is no NT layer and no
 // section hook. Its i386 DLLs (ole32, rpcrt4, advapi32, combase, the
 // programs...) were tier-1, and tier-1's units are not reusable across
@@ -2045,20 +2045,20 @@ fn spawn_elf_build(path: &str, base: u64) {
 // An image with a unit built for its bytes at its base (`gexc cgen-image
 // PATH --pe-base BASE`) gets it here, as the NT layer's images do, and its
 // compiled code comes from the module cache in every later process.
-// Wine's own images only, by default (`GEX_W3_UNITS=all`: the program's
-// too; `=0`: none); `GEX_W3_UNITS_BUILD=1` builds a missing
+// Wine's own images only, by default (`GEX_WINE32_UNITS=all`: the program's
+// too; `=0`: none); `GEX_WINE32_UNITS_BUILD=1` builds a missing
 // unit in the background for the next run (off by default: Wine's DLLs get
-// theirs at staging, `$W/cgen-w3.sh`).
+// theirs at staging, `$W/cgen-wine32.sh`).
 
 /// The unit for an i386 image Wine's PE loader mapped at `base`, installed
 /// if one was built. Never fatal: an image whose mapped code differs from
 /// its unit's (or with none) stays on tier-1.
-pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: gex_ld::pe::PeImage) -> Result<()> {
+pub(crate) fn wine32_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: gex_ld::pe::PeImage) -> Result<()> {
     // 0: none; all: every image; otherwise Wine's own (its dll directory).
     // A program's images are not the default: a game's exe with its unit
     // has been seen never to reach its first frame.
     static WHICH: OnceLock<u8> = OnceLock::new();
-    let which = *WHICH.get_or_init(|| match std::env::var("GEX_W3_UNITS").as_deref() {
+    let which = *WHICH.get_or_init(|| match std::env::var("GEX_WINE32_UNITS").as_deref() {
         Ok("0") => 0,
         Ok("all") => 2,
         _ => 1,
@@ -2067,28 +2067,28 @@ pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64
     // ejected project's eject.json "providers"): bound in its place, with
     // no unit (none of its code runs), wherever it lives.
     if !crate::libprov::for_dll(&pe.exports.dll_name).is_empty() {
-        return w3_stateful(caller, path, base, &pe);
+        return wine32_stateful(caller, path, base, &pe);
     }
     if which == 0 || mode() == Mode::Off {
         return Ok(());
     }
-    w3_trampolines(caller, !pe.is64)?;
+    wine32_trampolines(caller, !pe.is64)?;
     if (which == 1 && !path.contains("/lib/wine/")) || is_wasm_skeleton(&pe) {
         return Ok(());
     }
-    // `GEX_W3_UNITS_SKIP=a.dll,b.dll`: those stay on tier-1 (bisecting).
+    // `GEX_WINE32_UNITS_SKIP=a.dll,b.dll`: those stay on tier-1 (bisecting).
     static SKIP: OnceLock<Vec<String>> = OnceLock::new();
-    let skip = SKIP.get_or_init(|| std::env::var("GEX_W3_UNITS_SKIP").unwrap_or_default().split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect());
+    let skip = SKIP.get_or_init(|| std::env::var("GEX_WINE32_UNITS_SKIP").unwrap_or_default().split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect());
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     if skip.contains(&name) {
         return Ok(());
     }
     let p = Pending { path: path.to_string(), base, pe: Arc::new(pe) };
-    w3_place(caller, p, true)
+    wine32_place(caller, p, true)
 }
 
 /// Bind the stateful providers of the image at `base` (`libprov`).
-fn w3_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<()> {
+fn wine32_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<()> {
     let (shared, engine) = {
         let Some(jit) = caller.data().jit.as_ref() else { return Ok(()) };
         (Arc::clone(&jit.shared), jit.engine.clone())
@@ -2102,8 +2102,8 @@ fn w3_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: &g
     }
     for lp in crate::libprov::for_dll(&pe.exports.dll_name) {
         let n = crate::libprov::install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, base, pe.entry_rva)?;
-        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
-            eprintln!("gex-w3: provider {} for {path}: {n} exports", lp.name);
+        if trace() || std::env::var_os("GEX_WINE32_TRACE").is_some() {
+            eprintln!("gex-wine32: provider {} for {path}: {n} exports", lp.name);
         }
     }
     crate::ftab::catch_up(&mut *caller)?;
@@ -2111,15 +2111,15 @@ fn w3_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: &g
     Ok(())
 }
 
-/// Images [`w3_image`] left for their first miss, by the process (its
+/// Images [`wine32_image`] left for their first miss, by the process (its
 /// `JitShared`) that mapped them.
-static W3_DEFERRED: Mutex<Vec<(usize, Pending)>> = Mutex::new(Vec::new());
+static WINE32_DEFERRED: Mutex<Vec<(usize, Pending)>> = Mutex::new(Vec::new());
 
-/// A tier-1 miss at `pc`: if it is inside an image [`w3_image`] deferred,
+/// A tier-1 miss at `pc`: if it is inside an image [`wine32_image`] deferred,
 /// place that image's unit now.
-pub(crate) fn w3_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
+pub(crate) fn wine32_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
     let p = {
-        let mut d = W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = WINE32_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
         if d.is_empty() {
             return Ok(());
         }
@@ -2129,13 +2129,13 @@ pub(crate) fn w3_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()>
         };
         d.swap_remove(i).1
     };
-    w3_place(caller, p, false)
+    wine32_place(caller, p, false)
 }
 
 /// Place `p`'s unit. `at_map`: Wine has only just mapped it, and an image
 /// it must move is relocated later (ntdll's PE side, `perform_relocations`),
 /// so a mismatch then defers it to its first miss rather than refusing it.
-fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Result<()> {
+fn wine32_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Result<()> {
     let (path, base) = (p.path.clone(), p.base);
     let t0 = std::time::Instant::now();
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
@@ -2143,25 +2143,25 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
         Ok(pl) => pl,
         Err(_) if at_map => {
             let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);
-            W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((owner, p));
+            WINE32_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((owner, p));
             return Ok(());
         }
         Err(e) => {
-            eprintln!("gex-w3: {e:#}; it runs on tier-1");
+            eprintln!("gex-wine32: {e:#}; it runs on tier-1");
             return Ok(());
         }
     };
     let Some(pl) = placed else {
-        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
+        if trace() || std::env::var_os("GEX_WINE32_TRACE").is_some() {
             let key = gex_xlate::func::pe_input(&p.pe, base)
                 .map(|(image, _)| unit_key(&image, &provided(&p.pe, base)))
                 .unwrap_or_else(|e| format!("(not placeable: {e})"));
-            eprintln!("gex-w3: {path} at {base:#x}: no function-tier unit (key {key}), tier-1");
+            eprintln!("gex-wine32: {path} at {base:#x}: no function-tier unit (key {key}), tier-1");
         }
-        if std::env::var("GEX_W3_UNITS_BUILD").as_deref() == Ok("1") {
+        if std::env::var("GEX_WINE32_UNITS_BUILD").as_deref() == Ok("1") {
             match spawn_build(&p) {
                 Ok(child) => drop(child),
-                Err(e) => eprintln!("gex-w3: could not start building the function tier for {path}: {e}"),
+                Err(e) => eprintln!("gex-wine32: could not start building the function tier for {path}: {e}"),
             }
         }
         return Ok(());
@@ -2176,8 +2176,8 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     // ten minutes; a game never reached a frame).
     if cache.is_some() && !pl.path.with_extension("cwasm").exists() {
         compile_later(pl.path.clone(), &pl.cwasm);
-        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
-            eprintln!("gex-w3: {path} at {base:#x}: its unit is compiling in the background; tier-1 this time");
+        if trace() || std::env::var_os("GEX_WINE32_TRACE").is_some() {
+            eprintln!("gex-wine32: {path} at {base:#x}: its unit is compiling in the background; tier-1 this time");
         }
         return Ok(());
     }
@@ -2186,7 +2186,7 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
         install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;
     }
     // Its export providers, bound after its unit as an NT image's are (and
-    // as the page binds a W3 image's, cgen.rs `place`): Wine's msvcp120
+    // as the page binds a 32-bit Wine image's, cgen.rs `place`): Wine's msvcp120
     // `_Thrd_current`, docs/wine-overhead.md F1.
     install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
     crate::ftab::catch_up(&mut *caller)?;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""clang for W64's LP64 programs (docs/wine-native-x64.md §1.1).
+"""clang for 64-bit Wine's LP64 programs (docs/wine-native-x64.md §1.1).
 
 Like wcc, for code with x86-64 Linux's LP64 layout: compiles for wasm64
 (flags64.sh) against GEX_WASM64_SYSROOT (build-sysroot64.sh), links a
@@ -10,7 +10,7 @@ container gexc runs (wasm-elf.py --elf64). The module stays beside it as
 OUT.wasm (OUT.64.wasm is the module before lowering).
 
 -Wl,--gex-guest-x86-64 marks a program that runs x86-64 Windows code (the
-W64 loader). No fork (programs spawn by clone/vfork).
+64-bit Wine loader). No fork (programs spawn by clone/vfork).
 
 Wine's PE side (-D_WIN32, docs/wine-native-x64.md §1.2) compiles with
 Windows x64's data model (the GexLLP64 plugin and its llp64.h,

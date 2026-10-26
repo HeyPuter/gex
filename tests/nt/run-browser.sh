@@ -1,7 +1,7 @@
 #!/bin/bash
 # The NT layer's gate in the browser runtime (docs/nt-layer.md §10.2): the
 # same cases as tests/nt/run.sh, each run by shims/browser/js/run-node.mjs --
-# the shim and glue a page loads, under Node -- with GEX_NT_STRICT=1.
+# the shim and glue a page loads, under Node -- with GEX_WIN_STRICT=1.
 #
 #   tests/nt/run-browser.sh [--cgen|--cgen-prefer]   (ONLY=<regex> picks cases, ARCHES="x64")
 #
@@ -42,7 +42,7 @@ check() {
     local dlls=()
     for d in "$(dirname "$exe")"/*.dll; do [ -f "$d" ] && dlls+=(--file "/t/$(basename "$d")=$d"); done
     out=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs "${nodeflags[@]}" \
-        --dir /wine=$prefix --file /t/$base=$exe "${dlls[@]}" --argv0 /t/$base --cwd /t --env GEX_NT_STRICT=1 \
+        --dir /wine=$prefix --file /t/$base=$exe "${dlls[@]}" --argv0 /t/$base --cwd /t --env GEX_WIN_STRICT=1 \
         web/public/gex/seed.x86.shared.wasm "$exe" "$@" 2>"$err" | grep -v '^\[host\]'; echo "exit=${PIPESTATUS[0]}")
     code=${out##*exit=}
     out=${out%$'\n'exit=*}
@@ -106,7 +106,7 @@ fi
 if [ -z "$only" ] || [[ arena-selfcheck =~ $only ]]; then
     selfcheck=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs "${nodeflags[@]}" \
         --dir /wine=$prefix --file /t/hello_args.exe=$root/tests/nt/bin/x86/hello_args.exe --argv0 /t/hello_args.exe \
-        --cwd /t --env GEX_NT_ARENA_SELFTEST=1 web/public/gex/seed.x86.shared.wasm \
+        --cwd /t --env GEX_WIN_ARENA_SELFTEST=1 web/public/gex/seed.x86.shared.wasm \
         "$root/tests/nt/bin/x86/hello_args.exe" 2>&1 | grep "arena self-check")
     if [[ "$selfcheck" == *"arena self-check: ok"* ]]; then
         pass=$((pass + 1)); echo "ok   arena-selfcheck"

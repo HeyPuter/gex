@@ -242,7 +242,7 @@ class DomWindow {
     c.style.display = hidden ? 'none' : 'block';
     if (hidden) return;
     // The same stacking as the window: a page that stacks its windows by
-    // `z-index` (the W3 shell does) would otherwise put this canvas under
+    // `z-index` (the 32-bit Wine shell does) would otherwise put this canvas under
     // the very window it belongs to. Equal z-index and later in the
     // document is above it.
     const z = under.style.zIndex || getComputedStyle(under).zIndex;
@@ -653,7 +653,7 @@ export class DomDesktop {
     if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
       win.relX = s.relX;
       win.relY = s.relY;
-      // A test's record (tests/eject/w3-page.mjs's drag), beside wl-bridge's.
+      // A test's record (tests/eject/wine32-page.mjs's drag), beside wl-bridge's.
       globalThis.__gexEvLog?.push(['place', s.relX, s.relY, performance.now()]);
       win.onplace?.(s.relX, s.relY, win.parent);
     }

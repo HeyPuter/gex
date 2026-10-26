@@ -257,8 +257,8 @@ pub fn enabled() -> bool {
 
 /// Whether `text` names an address in Windows' KUSER_SHARED_DATA page
 /// (0x7ffe0000..0x7ffe1000) as a raw number: a provider says provider.h's
-/// `GP_KUSER` instead, which is W3's page under its fold. A raw one is the
-/// old page, which a W3 process does not have (an access there traps).
+/// `GP_KUSER` instead, which is 32-bit Wine's page under its fold. A raw one is the
+/// old page, which a 32-bit Wine process does not have (an access there traps).
 fn raw_kuser(text: &str) -> bool {
     text.to_ascii_lowercase().contains(&format!("0x{:x}", gex_abi::KUSER_WINDOWS >> 16))
 }
@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(pairs, vec![(0x1040, 3)]);
     }
 
-    /// provider.h's KUSER base is gex-abi's (Windows' page; W3's under the
+    /// provider.h's KUSER base is gex-abi's (Windows' page; 32-bit Wine's under the
     /// fold, by GEX_W3_KUSER), and no provider source names the page by a
     /// raw address (`raw_kuser`; `every_source_parses` holds every built-in
     /// to it).

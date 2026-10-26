@@ -1014,7 +1014,7 @@ async function runProgramHere(
     guest: closure?.image ?? seedBytes,
     kernel,
     // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
-    // needs it (host.mjs `#other`: W64's wineserver, a wasm32 module).
+    // needs it (host.mjs `#other`: 64-bit Wine's wineserver, a wasm32 module).
     // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
     // program an exec asks one for (docs/mem64.md §5: its GEX_MEM64=1, or its
     // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
@@ -1105,8 +1105,8 @@ async function runProgramHere(
       calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,
       // `?straytrap=1`: native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
       strayTrap: globalThis.GEX_STRAY_TRAP || undefined,
-      // `?w3split=1`: W3's address space split at 2 GiB (nt::w3_space), in every process.
-      w3Split: globalThis.GEX_W3_SPLIT || undefined,
+      // `?winesplit=1`: 32-bit Wine's address space split at 2 GiB (nt::wine32_space), in every process.
+      wine32Split: globalThis.GEX_WINE32_SPLIT || undefined,
       // `?nullguard=1`: the null guard, a debugging opt-in (gex_abi::null_guard).
       nullGuard: globalThis.GEX_NULL_GUARD || undefined,
       // `?mxcsr=1`: SSE under MXCSR, a per-program opt-in (gex_ir::mxcsr_exact).

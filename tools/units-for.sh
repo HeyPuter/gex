@@ -73,7 +73,7 @@ if [ ! -f "$U/.complete" ]; then
 	mv "$U.new" "$U" && touch "$U/.complete"
 	echo "units: built $n images for inputs $K in $(( $(date +%s) - t0 )) s ($nohints without an indirect-call profile, $nocode with no code; log $log)" >&2
 fi
-# The i386 trampoline page's unit, which no image in units.list is: a W3
+# The i386 trampoline page's unit, which no image in units.list is: a 32-bit Wine
 # page with units places it with its first image and wants it. Added to a set
 # built before it was (cached: a no-op once there).
 if ! GEX_CGEN_CACHE="$U" GEX_CGEN_ICALL_COUNT=0 systemd-run --user --scope -q -p TasksMax=4096 -p MemoryMax=32G nice -n 19 "$G" cgen-image --nt-trampolines32 > "$U.tramp.log" 2>&1; then

@@ -1,8 +1,8 @@
 #!/bin/sh
-# W64's LP64 sysroot (docs/wine-native-x64.md §1.1): what Wine's Unix side for
+# 64-bit Wine's LP64 sysroot (docs/wine-native-x64.md §1.1): what Wine's Unix side for
 # x64 programs builds against, for wcc64. musl with the gex `wasm64` arch (the
 # x86-64 Linux syscall ABI through gex.syscall(ctx); fork: wt/musl-wasm64,
-# branch w64/wasm64, from U's gex-wasm64), libgex (setjmp runtime, dlopen
+# branch wine64/wasm64, from U's gex-wasm64), libgex (setjmp runtime, dlopen
 # registry, x86-64 signal frames), compiler-rt's builtins and the host's x86
 # UAPI headers (their 64-bit branches are x86-64's). Compiled for wasm64; wcc64
 # lowers every program to wasm32 at link time.

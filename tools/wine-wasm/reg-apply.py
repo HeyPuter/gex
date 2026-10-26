@@ -3,7 +3,7 @@
 
     tools/wine-wasm/reg-apply.py PFX/system.reg FILE.reg...
 
-Handles what the W3 session files use: `[-HKEY_LOCAL_MACHINE\\KEY]` deletes
+Handles what the 32-bit Wine session files use: `[-HKEY_LOCAL_MACHINE\\KEY]` deletes
 KEY and its subkeys, `[HKEY_LOCAL_MACHINE\\KEY]` followed by `"Name"=dword:N`
 or `"Name"="str"` sets values in an existing key. CurrentControlSet is
 ControlSet001, as Wine's system.reg stores it. A key to set that is missing

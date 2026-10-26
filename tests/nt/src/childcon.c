@@ -2,7 +2,7 @@
  * process, waited for, its exit code passed on. Unlike childgui, it makes no
  * user32 call itself, so the child is the first process with a desktop and
  * hosts the desktop thread (docs/wine-native.md: child sessions). Under
- * native Wine on gex (W3) the child reads the session through wineserver
+ * native Wine on gex (32-bit Wine) the child reads the session through wineserver
  * requests. Its stdout is inherited.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fuse-ld=lld */
 #include <windows.h>

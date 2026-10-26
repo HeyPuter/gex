@@ -1,5 +1,5 @@
 /* A window made in a DllMain, the loader lock held, before the process has
- * a desktop: under native Wine on gex (W3) the desktop is a thread of the
+ * a desktop: under native Wine on gex (32-bit Wine) the desktop is a thread of the
  * process, which needed the lock its creator held: explorer is a process
  * of its own again (docs/wine-native.md).
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fuse-ld=lld */

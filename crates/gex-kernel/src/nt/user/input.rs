@@ -7,7 +7,7 @@
 //! thread that owns the focus (keys) or the window under the cursor (mouse),
 //! as wineserver does. A thread's synchronous key state (GetKeyState) follows
 //! the messages it retrieves. The display side's input ring will feed the
-//! same two functions; until it exists, `GEX_NT_INPUT` scripts input by frame
+//! same two functions; until it exists, `GEX_WIN_INPUT` scripts input by frame
 //! number (see [`script_tick`]), which also serves deterministic tests.
 
 use super::kbdus;
@@ -548,7 +548,7 @@ pub fn retrieved(u: &mut User, tid: u32, hw: &HwMsg) {
 
 // ------------------------------------------------------------ scripted input
 
-/// Parse `GEX_NT_INPUT`: `frame:action[;frame:action...]`, with actions
+/// Parse `GEX_WIN_INPUT`: `frame:action[;frame:action...]`, with actions
 /// `click:x,y` (a left press and, two frames later, its release),
 /// `rclick:x,y`, `move:x,y`, `down:x,y`, `up:x,y`, `key:VK` (press and
 /// release two frames later; VK in hex or decimal), `keydown:VK`, `keyup:VK`.
@@ -565,7 +565,7 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
     for item in s.split(';').filter(|x| !x.trim().is_empty()) {
         let mut parts = item.splitn(3, ':');
         let (Some(f), Some(a)) = (parts.next().and_then(num), parts.next()) else {
-            crate::nt_log!("gex-nt: GEX_NT_INPUT: cannot read {item:?}");
+            crate::nt_log!("gex-nt: GEX_WIN_INPUT: cannot read {item:?}");
             continue;
         };
         let arg = parts.next().unwrap_or("");
@@ -592,7 +592,7 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
             }
             ("keydown", _, Some(k)) => out.push((f, Action::KeyDown(k as u8))),
             ("keyup", _, Some(k)) => out.push((f, Action::KeyUp(k as u8))),
-            _ => crate::nt_log!("gex-nt: GEX_NT_INPUT: cannot read {item:?}"),
+            _ => crate::nt_log!("gex-nt: GEX_WIN_INPUT: cannot read {item:?}"),
         }
     }
     out
@@ -603,7 +603,7 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
 pub fn script_tick(c: &mut Call<'_>, frame: u64, hwnd: u32) {
     let due: Vec<Action> = {
         let unread = c.p.user.lock().unwrap().input.script.is_none();
-        let setting = if unread { c.p.setting("GEX_NT_INPUT") } else { None };
+        let setting = if unread { c.p.setting("GEX_WIN_INPUT") } else { None };
         let mut u = c.p.user.lock().unwrap();
         let script = u.input.script.get_or_insert_with(|| setting.map(|s| parse_script(&s)).unwrap_or_default());
         let due = script.iter().filter(|(f, _)| *f == frame).map(|(_, a)| *a).collect();

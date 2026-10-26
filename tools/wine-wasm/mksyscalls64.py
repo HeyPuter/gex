@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Write dlls/ntdll/syscall_wasm64.c for a W64 Wine tree (stdout).
+"""Write dlls/ntdll/syscall_wasm64.c for a 64-bit Wine tree (stdout).
 
     tools/wine-wasm/mksyscalls64.py WINE_SRC > WINE_SRC/dlls/ntdll/syscall_wasm64.c
 
-Native PE ntdll on wasm64 (docs/wine-native-x64.md, W64.2) defines each NT
+Native PE ntdll on wasm64 (docs/wine-native-x64.md) defines each NT
 system call as a C function that hands its arguments, as 64-bit words, to
 gexrt64's __gexw_syscall64. wasm links a call to a function only at its
 exact type (NtWaitForSingleObject is (i64, i32, i64) -> i32), so every stub
@@ -116,7 +116,7 @@ def main():
 
 
 HEAD = '''/*
- * NT system call stubs for native Wine on wasm64 under gex (W64): each
+ * NT system call stubs for native Wine on wasm64 under gex (wine64): each
  * hands its arguments, as 64-bit words, to gexrt64's __gexw_syscall64,
  * which sets up the program's state as Wine's x86-64 stubs leave it and
  * calls the Unix side's dispatcher (docs/wine-native-x64.md in the gex

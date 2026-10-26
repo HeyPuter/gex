@@ -538,7 +538,7 @@ fn yield_mode(spec: Option<&str>) -> Y {
     }
 }
 
-/// Set the yield policy (a `GEX_NT_YIELD` value) for a host whose process
+/// Set the yield policy (a `GEX_WIN_YIELD` value) for a host whose process
 /// environment is not `std::env` (the browser's page settings). Before the
 /// first yield.
 pub fn set_yield_policy(spec: &str) {
@@ -547,7 +547,7 @@ pub fn set_yield_policy(spec: &str) {
 
 /// The guest's own yield (`SwitchToThread`, `Sleep(0)`).
 ///
-/// Default (`GEX_NT_YIELD=wake[:PARK_US[:STREAK]]`, 50 and 2): a host
+/// Default (`GEX_WIN_YIELD=wake[:PARK_US[:STREAK]]`, 50 and 2): a host
 /// `sched_yield`, as before -- until a thread yields more than STREAK times
 /// back to back (no other syscall between them; no clock is read, which in
 /// a browser Worker costs as much as a cheap syscall), i.e. it is spinning
@@ -558,12 +558,12 @@ pub fn set_yield_policy(spec: &str) {
 /// when what it waits for is already done (pewasm's host-generation wake).
 /// The bound keeps a loop waiting on something nothing kicks moving.
 ///
-/// `GEX_NT_YIELD=os`: always `sched_yield` (which on Linux only lets another
+/// `GEX_WIN_YIELD=os`: always `sched_yield` (which on Linux only lets another
 /// task on the same CPU's runqueue run). `spin`: nothing but a pause, as in
 /// pewasm, whose emscripten `sched_yield` yields to no one. `sleep:N`: a
 /// sleep of N µs.
 fn guest_yield(c: &mut Call<'_>) {
-    let m = *YIELD_MODE.get_or_init(|| yield_mode(std::env::var("GEX_NT_YIELD").ok().as_deref()));
+    let m = *YIELD_MODE.get_or_init(|| yield_mode(std::env::var("GEX_WIN_YIELD").ok().as_deref()));
     match m {
         Y::Os => std::thread::yield_now(),
         Y::Spin => std::hint::spin_loop(),

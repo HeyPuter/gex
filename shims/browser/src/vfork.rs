@@ -435,7 +435,7 @@ pub(crate) fn exec_target(h: &Host, path: &str) -> bool {
 /// An exec of the caller's own command line (its arguments after the
 /// first, the same) keeps the caller's memory flavour unless the exec asks
 /// otherwise (docs/mem64.md §5): it is the same program started again, as
-/// W64's first Wine process starts the program it was given as a process
+/// 64-bit Wine's first Wine process starts the program it was given as a process
 /// of its own. Any other child is the page's flavour unless it asks.
 pub(crate) fn exec_relaunch(h: &mut Host, argv: &[String]) {
     if h.kernel.exec_mem64.is_none() && page_flavours() & 3 != 0 && argv.len() > 1 && argv.get(1..) == h.kernel.argv.get(1..) {
@@ -445,8 +445,8 @@ pub(crate) fn exec_relaunch(h: &mut Host, argv: &[String]) {
 
 /// The program an exec of `path` runs instead (docs/mem64.md §5): of a
 /// program and its memory64 twin `<path>.m64` side by side, the one of the
-/// memory the exec wants (`exec_mem64`, else the page's). W64's loader in a
-/// twin dist (w64-dist.sh W64_TWIN=1) is the case: an exec of `wine` that
+/// memory the exec wants (`exec_mem64`, else the page's). 64-bit Wine's loader in a
+/// twin dist (wine64-dist.sh WINE64_TWIN=1) is the case: an exec of `wine` that
 /// asked for a 64-bit memory runs `wine.m64`, and the 64-bit Wine's own
 /// children, which Wine starts from its loader (`/proc/self/exe`, so
 /// `wine.m64`), go back to `wine` unless they ask too.
@@ -483,7 +483,7 @@ pub(crate) enum Need {
 }
 
 /// What memory the program at `path` needs (docs/mem64.md §5): a 32-bit
-/// ELF (an i386 program, or a wasm32 container such as W64's wineserver,
+/// ELF (an i386 program, or a wasm32 container such as 64-bit Wine's wineserver,
 /// docs/wine-native-x64.md §4) a 32-bit one, a gex wasm container what its
 /// module's memory import is, and a 64-bit ELF, translated, either. Not an
 /// ELF (a script) or unreadable: either.

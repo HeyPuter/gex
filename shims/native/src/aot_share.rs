@@ -1,4 +1,4 @@
-//! The "AOT share" line of `GEX_NT_STATS`: where the
+//! The "AOT share" line of `GEX_WIN_STATS`: where the
 //! process's CPU samples land, by the kind of code they hit.
 //!
 //! Every compiled module is registered here with its code range and kind

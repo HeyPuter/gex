@@ -1,7 +1,7 @@
 /* A call through a null function pointer, caught: Windows 7's comctl32 does
  * this whenever an Edit control is made without lpk.dll (it calls
  * LpkEditControl's table) and relies on the access violation being caught.
- * The page must deliver the fault to Wine as natively (W3: a branch to
+ * The page must deliver the fault to Wine as natively (32-bit Wine: a branch to
  * non-executable memory goes to ntdll.so's fault hook). */
 #include <windows.h>
 #include <stdio.h>

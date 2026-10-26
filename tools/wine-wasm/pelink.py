@@ -19,11 +19,11 @@ written by winegcc and winebuild for wasm32. This:
 Whatever stays undefined is listed (OUT.wasm.undefined) and left an import.
 
 A wasm64 build tree (HOST_ARCH = wasm64, or --wasm64 before the arguments:
-W64's LLP64 PE side, docs/wine-native-x64.md) links with wasm-ld -mwasm64,
+WINE64's LLP64 PE side, docs/wine-native-x64.md) links with wasm-ld -mwasm64,
 compiles its generated C with wcc64 -D_WIN32, takes compiler-rt from
 GEX_WASM64_SYSROOT and lowers the module to wasm32 (--memory64-lowering), as
 wcc64 does a DLL's own side module. A tree configured with CC="wcc64
--mgex-memory64" (w64-dist.sh W64_MEM64=1), or --memory64 after --wasm64:
+-mgex-memory64" (wine64-dist.sh WINE64_MEM64=1), or --memory64 after --wasm64:
 the memory64 flavour, for a process with a 64-bit memory (docs/mem64.md
 §5), compiled the same way, linked for a 16 GiB memory and not lowered."""
 import os
@@ -36,14 +36,14 @@ here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
 DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
-W64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
+WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
 M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 
 
 def cc(*args):
     """The compiler for pelink's generated C: wcc, or for wasm64 wcc64 with
     Windows x64's data model (all of it is PE-side code there)."""
-    if W64:
+    if WINE64:
         return [os.path.join(here, 'wcc64'), '-D_WIN32'] + (['-mgex-memory64'] if M64 else []) + \
             [a for a in args if a != '-D_WIN32']
     return [os.path.join(here, 'wcc')] + list(args)
@@ -143,9 +143,9 @@ def spec_functions(spec):
 
 
 def main():
-    global W64, M64
+    global WINE64, M64
     if sys.argv[1] == '--wasm64':
-        W64 = True
+        WINE64 = True
         del sys.argv[1]
         if sys.argv[1] == '--memory64':
             M64 = True
@@ -170,8 +170,8 @@ def main():
     build, src, out = sys.argv[1:4]
     global SRC
     SRC = src
-    W64 = W64 or makefile_var(os.path.join(build, 'Makefile'), 'HOST_ARCH') == ['wasm64']
-    M64 = M64 or (W64 and '-mgex-memory64' in (makefile_var(os.path.join(build, 'Makefile'), 'CC') or []))
+    WINE64 = WINE64 or makefile_var(os.path.join(build, 'Makefile'), 'HOST_ARCH') == ['wasm64']
+    M64 = M64 or (WINE64 and '-mgex-memory64' in (makefile_var(os.path.join(build, 'Makefile'), 'CC') or []))
     only = set(sys.argv[4:])
     # An IMPORTS entry names an import library, which is the module's base
     # name unless its Makefile says otherwise (IMPORTLIB = ntoskrnl for
@@ -221,8 +221,8 @@ def main():
             DELAY[mod] = [modname(i.lstrip('-')) for i in makefile_var(mk, 'DELAYIMPORTS')]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
-    if W64 and only - {d[0] for d in dlls}:
-        # (W64 names its set, stage-native64.sh: each one is wanted)
+    if WINE64 and only - {d[0] for d in dlls}:
+        # (WINE64 names its set, stage-native64.sh: each one is wanted)
         sys.exit('no objects for ' + ' '.join(sorted(only - {d[0] for d in dlls})) + ' (make their wasm64-windows DLLs first)')
     # every DLL the build has an export list for, native or not: what an
     # import the linked DLLs leave undefined is found in (guest imports)
@@ -462,7 +462,7 @@ def link(dlls, out, gexrt, others=None):
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
                     # (x64 has one convention)
-                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] and not W64 else ''
+                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] and not WINE64 else ''
                     r, ps = sig.split(':')
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
@@ -520,16 +520,16 @@ def link(dlls, out, gexrt, others=None):
         # gexrt's bounds of the entry-thunk pairs (gexw_entries)
         f.write('--export-if-defined=__gexw_entries\n')
         f.write('--export-if-defined=__gexw_entries_decl\n')
-    cmd = ['wasm-ld'] + (['-mwasm64'] if W64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
+    cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
            '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
            '--unresolved-symbols=import-dynamic', '-o', out,
            f'@{rsp}'] + objs + [gexrt]
     # compiler-rt's builtins (__multi3 and the like), from the toolchain's
     # sysroot (tools/wine-wasm/build-sysroot.sh, build-sysroot64.sh)
-    sysroot = os.environ.get('GEX_WASM64_SYSROOT' if W64 else 'GEX_WASM_SYSROOT')
+    sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')
     if sysroot:
-        cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if W64 else 'wasm32')))
-    elif W64:
+        cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if WINE64 else 'wasm32')))
+    elif WINE64:
         sys.exit('pelink: set GEX_WASM64_SYSROOT')
     subprocess.check_call(cmd)
     # What nothing defines (an export whose code is i386 assembly, say): a
@@ -573,7 +573,7 @@ def link(dlls, out, gexrt, others=None):
     # only, so the module is translated, as wcc's own links are.
     opt = os.path.join(sysroot or '', 'binaryen', 'bin', 'wasm-opt')
     opt = os.environ.get('GEX_WASM_OPT') or opt
-    if W64:
+    if WINE64:
         # lowered to wasm32 (wcc64's side modules: the one place an address
         # becomes a memory index), optimised as they are; the memory64
         # flavour left as it is, as wcc64 -mgex-memory64 leaves them

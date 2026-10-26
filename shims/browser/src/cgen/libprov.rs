@@ -407,7 +407,7 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
 
 /// The publishing Worker instantiated provider module `number` (its data is
 /// relocated): when it is a replaced library's, bind the entry thunks of its
-/// GexA64Icall pass (item3/a64icall): `__gexa_entries` is the bounds of its
+/// GexA64Icall pass (native-libs/a64icall): `__gexa_entries` is the bounds of its
 /// {function, thunk} pairs (i64 table indices), and each thunk is bound at
 /// its function's index as a guest address, so the guest's call through a
 /// function pointer the library gave it (a vfs method) runs the function.

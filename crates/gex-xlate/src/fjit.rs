@@ -440,7 +440,7 @@ impl Jit {
         out
     }
 
-    /// What the JIT has done, for `GEX_FJIT_STATS` and `GEX_NT_STATS`.
+    /// What the JIT has done, for `GEX_FJIT_STATS` and `GEX_WIN_STATS`.
     pub fn stats(&self) -> String {
         let line = self.lock().line();
         format!("{line}; {}", self.lock_line())

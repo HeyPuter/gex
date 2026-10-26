@@ -88,7 +88,7 @@ pub fn start() {
                 libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
             }
             // `GEX_PROF_SHARE=1`: the AOT-share line (which tier the samples
-            // hit) every 10 s on stderr, for guests with no GEX_NT_STATS
+            // hit) every 10 s on stderr, for guests with no GEX_WIN_STATS
             // (Linux programs).
             let share = std::env::var_os("GEX_PROF_SHARE").is_some_and(|v| v != "0");
             loop {

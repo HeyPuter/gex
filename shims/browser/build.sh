@@ -231,7 +231,7 @@ echo "  seed: rebuilt from this emitter"
 # shared memory only; its memory is a memory64 of LIMIT64 (16 GiB). The
 # layout below 4 GiB is the wasm32 one. Artefacts get `.m64` after the arch.
 if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
-    M64OUT=target/w64$TSUF/wasm64-unknown-unknown/release/gex_browser.wasm
+    M64OUT=target/wine64$TSUF/wasm64-unknown-unknown/release/gex_browser.wasm
     LINK64=$(echo "$LINK" | sed "s/--max-memory=$GUEST_BYTES/--max-memory=$((16 << 30))/")
     if RUSTFLAGS="$LINK64 \
         -C link-arg=--shared-memory \
@@ -239,7 +239,7 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
         -Zcrate-attr=feature(simd_wasm64)" \
         cargo +nightly build -p gex-browser --target wasm64-unknown-unknown \
           --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
-          --target-dir target/w64$TSUF 2>&1 | grep -E "^error" -A5; then
+          --target-dir target/wine64$TSUF 2>&1 | grep -E "^error" -A5; then
         echo "shims/browser: the wasm64 build FAILED"; exit 1
     fi
     cp "$M64OUT" "$PUB/gex_browser$INFIX.m64.shared.wasm"

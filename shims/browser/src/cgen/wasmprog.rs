@@ -30,7 +30,7 @@ pub(super) struct Prog {
     pub key: Option<(u64, u64)>,
     /// The file the bytes are from, for the system-wide key cache.
     pub path: String,
-    /// Built LP64 for wasm64 and lowered to wasm32 (W64,
+    /// Built LP64 for wasm64 and lowered to wasm32 (64-bit Wine,
     /// docs/wine-native-x64.md): its base and stack-pointer globals are i64.
     pub lowered: bool,
 }
@@ -90,28 +90,28 @@ pub(super) static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic
 
 pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
-/// Header flag (offset 36): the program runs i386 code (Wine, W3).
+/// Header flag (offset 36): the program runs i386 code (Wine, 32-bit Wine).
 const FLAG_GUEST_I386: u32 = 1;
-/// Header flag: the program runs x86-64 code (64-bit native Wine, W64). It
-/// shares W3's address-space split and trampoline page.
+/// Header flag: the program runs x86-64 code (64-bit native Wine, 64-bit Wine). It
+/// shares 32-bit Wine's address-space split and trampoline page.
 const FLAG_GUEST_X86_64: u32 = 2;
 /// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
 /// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
-/// the process folds Windows' constant addresses there (`winspace::w3_kuser`).
-const FLAG_KUSER_W3: u32 = 4;
+/// the process folds Windows' constant addresses there (`winspace::wine32_kuser`).
+const FLAG_KUSER_WINE32: u32 = 4;
 
-/// The running program's header has [`FLAG_GUEST_X86_64`] (W64), set at
+/// The running program's header has [`FLAG_GUEST_X86_64`] (64-bit Wine), set at
 /// every publish (a fork's child has its parent's, in its copy of memory).
 static GUEST_X86_64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether this process runs 64-bit native Wine (W64): what only W64 has
-/// been tested on stays off W3 (X's 1016m boot hang).
+/// Whether this process runs 64-bit native Wine: what only 64-bit Wine has
+/// been tested on stays off 32-bit Wine (X's 1016m boot hang).
 pub(crate) fn guest_x86_64() -> bool {
     GUEST_X86_64.load(Ordering::Relaxed)
 }
 
-/// [`guest_x86_64`], for the host: W64's fault hook takes a 64-bit address
-/// (Wine's `__wine_gex_fault`, signal_wasm64.c), W3's a 32-bit one.
+/// [`guest_x86_64`], for the host: 64-bit Wine's fault hook takes a 64-bit address
+/// (Wine's `__wine_gex_fault`, signal_wasm64.c), 32-bit Wine's a 32-bit one.
 #[no_mangle]
 pub extern "C" fn gex_guest_x86_64() -> i32 {
     guest_x86_64() as i32
@@ -201,7 +201,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     }
     let (wasm_at, wasm_len, mem_base, thread_entry) = (w(12), w(16), w(20), w(32));
     // The header's flags (offset 36; a version-1 header without them is 0):
-    // Wine's loader (W3) runs i386 code, so as natively (shims/native
+    // Wine's loader (32-bit Wine) runs i386 code, so as natively (shims/native
     // lib.rs) the process leaves Windows' fixed addresses free -- no mapping
     // above KUSER_SHARED_DATA unless asked for there -- and gets the NT
     // trampoline page native Wine's gexrt sends the guest to. Once per fresh
@@ -214,31 +214,31 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
             dst.copy_from_slice(&page);
         }
-        // W3's compact address space (`winspace::w3_windows_space`): nothing
+        // 32-bit Wine's compact address space (`winspace::wine32_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
-        // Or the NT layer's split, for a site that asks (`?w3split=1`), and
-        // always for a 64-bit (W64) process: the compact space ends at 2 GiB,
+        // Or the NT layer's split, for a site that asks (`?winesplit=1`), and
+        // always for a 64-bit (64-bit Wine) process: the compact space ends at 2 GiB,
         // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
         // memory at 2 GiB with it).
         if flags & FLAG_GUEST_X86_64 != 0 {
-            crate::winspace::set_w3_split(true);
+            crate::winspace::set_wine_split(true);
         }
-        let lo = crate::winspace::w3_space().map_err(|e| format!("W3: {e}"))?;
-        if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
-            crate::winspace::w3_kuser();
+        let lo = crate::winspace::wine32_space().map_err(|e| format!("wine32: {e}"))?;
+        if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_WINE32 != 0 {
+            crate::winspace::wine32_kuser();
         }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
-            crate::w3_address_space(&mut mm, lo);
+            crate::wine32_address_space(&mut mm, lo);
             if flags & FLAG_GUEST_X86_64 != 0 {
-                crate::w64_reserve_pe_data(&mut mm);
+                crate::wine64_reserve_pe_data(&mut mm);
             }
             mm.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
         }
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
-    // W3's loader: refused when its inline probe reads another layout.
+    // 32-bit Wine's loader: refused when its inline probe reads another layout.
     if flags & FLAG_GUEST_I386 != 0 {
         if let Some(e) = abi_refusal(&wasm, &format!("Wine's loader {}", exe_path())) {
             return Err(e);

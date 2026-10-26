@@ -2,7 +2,7 @@
  * (the fiber's parameter, GetFiberData, GetCurrentFiber), state kept across
  * switches on each fiber's own stack, fiber-local storage with its
  * callback at DeleteFiber, and ConvertFiberToThread. On native Wine
- * (gex W64) a switch is the guest's whole register state, saved and
+ * (gex 64-bit Wine) a switch is the guest's whole register state, saved and
  * loaded by kernelbase. */
 #include <windows.h>
 #include <stdio.h>

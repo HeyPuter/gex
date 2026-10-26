@@ -1,8 +1,8 @@
 /* Audio output through winmm (waveOut over mmdevapi): a device exists, a
  * stream opens, and a buffer is played at its own rate (0.4 s of 44.1 kHz
- * stereo takes at least 0.3 s to come back done). Native Wine (W3) only,
+ * stereo takes at least 0.3 s to come back done). Native Wine (32-bit Wine) only,
  * where mmdevapi's OSS driver plays into gex's /dev/dsp (a null output):
- * GEX_NT_W3=1 runs it.
+ * GEX_WIN_WINE32=1 runs it.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fuse-ld=lld */
 #include <windows.h>
 #include <mmsystem.h>

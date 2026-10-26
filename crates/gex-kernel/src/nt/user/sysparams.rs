@@ -33,15 +33,15 @@ impl Mode {
         Mode { width: (v & 0xff_ffff) as i32, height: (v >> 24 & 0xff_ffff) as i32, bpp: (v >> 48) as u32 }
     }
 
-    /// The mode at start: [`Mode::DEFAULT`], or `GEX_NT_DESKTOP=WxH` (one of
+    /// The mode at start: [`Mode::DEFAULT`], or `GEX_WIN_DESKTOP=WxH` (one of
     /// the sizes on offer). A smaller desktop is a smaller DirectDraw
     /// primary surface, which wined3d moves between texture and memory
     /// whole (Peggle, windowed, reads back and re-uploads it twice a frame).
     pub fn startup() -> Mode {
-        *STARTUP.get_or_init(|| std::env::var("GEX_NT_DESKTOP").ok().and_then(|v| Mode::parse(&v)).unwrap_or(Mode::DEFAULT))
+        *STARTUP.get_or_init(|| std::env::var("GEX_WIN_DESKTOP").ok().and_then(|v| Mode::parse(&v)).unwrap_or(Mode::DEFAULT))
     }
 
-    /// Set the mode at start from a `GEX_NT_DESKTOP` value (`WxH`), for a
+    /// Set the mode at start from a `GEX_WIN_DESKTOP` value (`WxH`), for a
     /// host whose settings are not `std::env` (the browser's page). Before
     /// the process starts; false when the size is not one on offer.
     pub fn set_startup(spec: &str) -> bool {

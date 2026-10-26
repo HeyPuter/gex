@@ -12,7 +12,7 @@
 # ~/.cache/gex/wine-11.15), so the DLLs not named stay i386 code. Its
 # layout pins are dropped: they are for the x86 DLLs. GEX_WASM_SYSROOT must
 # be set (tools/wine-wasm/build-sysroot.sh). Every i386 DLL in syswow64 ends
-# at its fixed base from w3-bases.txt (rebase.py): a W3 dist's
+# at its fixed base from wine32-bases.txt (rebase.py): a 32-bit Wine dist's
 # lib/wine/i386-windows takes its DLLs from here, never from the x86 prefix.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -34,11 +34,11 @@ mkdir -p "$out"
 # prefix every other prefix links to.
 cp -rs "$x86/." "$out/"
 rm -f "$out/gex-layout"
-# A staged prefix that carries an installed registry gets the W3 session
-# (w3-session.reg: no services that need Unix sides W3 lacks). One with no
+# A staged prefix that carries an installed registry gets the 32-bit Wine session
+# (wine32-session.reg: no services that need Unix sides 32-bit Wine lacks). One with no
 # registry yet gets it after wineboot's install makes one:
-# `reg-apply.py PFX/system.reg w3-session.reg`.
-[ ! -f "$out/system.reg" ] || python3 "$here/reg-apply.py" "$out/system.reg" "$here/w3-session.reg"
+# `reg-apply.py PFX/system.reg wine32-session.reg`.
+[ ! -f "$out/system.reg" ] || python3 "$here/reg-apply.py" "$out/system.reg" "$here/wine32-session.reg"
 find "$out" -type l ! -iregex '.*\.\(dll\|exe\|drv\|sys\|ocx\|acm\|cpl\|ax\|tlb\|nls\|ttf\|ttc\|fon\|mui\|so\|wasm\|dll16\|exe16\|drv16\|vxd\)' -print0 |
     while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
 sys=$out/drive_c/windows/syswow64
@@ -67,9 +67,9 @@ for dll in "$@"; do
     "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
         --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
-# Every i386 DLL at its fixed base (rebase.py, w3-bases.txt), so a DLL's
+# Every i386 DLL at its fixed base (rebase.py, wine32-bases.txt), so a DLL's
 # function-tier unit matches wherever and whenever a process loads it. A DLL
 # missing from the table fails the stage: add it (rebase.py table).
-python3 "$here/rebase.py" apply "$sys" "$here/w3-bases.txt" > "$tmp/rebase.log" 2>&1 ||
+python3 "$here/rebase.py" apply "$sys" "$here/wine32-bases.txt" > "$tmp/rebase.log" 2>&1 ||
     { echo "stage-native: rebase.py: $(head -3 "$tmp/rebase.log" | tr '\n' ' ')" >&2; exit 1; }
 echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module), $(tail -1 "$tmp/rebase.log" | sed 's/^rebase.py: //')"

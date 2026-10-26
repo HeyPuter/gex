@@ -33,7 +33,7 @@ const TEST_KEEP_PROBE = !!(globalThis.process?.env?.GEX_TEST_KEEP_PROBE);
 // GEX_UNITS_EAGER (a test's A/B): every Worker instantiates each unit when it
 // catches up, as before units were deferred (`#cgenDefer`).
 const UNITS_EAGER = !!(globalThis.GEX_UNITS_EAGER ?? globalThis.process?.env?.GEX_UNITS_EAGER);
-/** Tests only (tests/w3/ftabstale.sh): both rooms this small, so one unit's
+/** Tests only (tests/wine32/ftabstale.sh): both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
 const LIMIT64_BYTES = 16 * 2 ** 30;
@@ -43,7 +43,7 @@ const RELAY_MIN_BYTES = 256 * 1024;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
- *  memory64 program's (W64's memory64 flavour, GEX_MEMORY64, i64 at its
+ *  memory64 program's (64-bit Wine's memory64 flavour, GEX_MEMORY64, i64 at its
  *  imports), a Number from a 32-bit or lowered one's. As a Number, and for
  *  a shim export taking a 64-bit address, as a BigInt. */
 const addrNum = (v) => (typeof v === 'bigint' ? Number(v) : v >>> 0);
@@ -378,8 +378,8 @@ const ENTRY_WATCH = new Uint8Array([
 ]);
 let entryWrapMod = null, entryWatchMod = null;
 
-// W64's direct entry in wasm, so a unit's system or Unix call into Wine
-// (cgen.rs `w64_entry`) costs no JS. The shim imports `entry_call` from the
+// 64-bit Wine's direct entry in wasm, so a unit's system or Unix call into Wine
+// (cgen.rs `wine64_entry`) costs no JS. The shim imports `entry_call` from the
 // trampoline, made with the shim; it tail-calls slot 0 of its `hook`
 // table, the entry function once the Worker has made it (`#entryFn`, when
 // both the function table and Wine's stack pointer exist) and the
@@ -514,7 +514,7 @@ function narrateAlways(text) {
   // Synchronously where there is a file descriptor to write to. A node
   // Worker's `process.stderr` is flushed by its event loop. A Worker parked
   // in wasm on its wait slot until its process ends never turns that loop, so
-  // the lines were lost when it was terminated: item3's "libsqlite3.so.0
+  // the lines were lost when it was terminated: native-libs's "libsqlite3.so.0
   // replaced by" lines were all lost after the first child process.
   const fs = typeof process !== 'undefined' ? process.getBuiltinModule?.('fs') : null;
   if (fs?.writeSync) {
@@ -676,14 +676,14 @@ function slotsNeeded(meta) {
 
 /**
  * Whether `elf` is a wasm32 program flagged as running i386 code (native
- * Wine's loader, W3): its GEXWASM header sits 0x40 bytes before the entry
+ * Wine's loader, 32-bit Wine): its GEXWASM header sits 0x40 bytes before the entry
  * point (cgen/wasmprog.rs), with the flags at offset 36.
  */
 /** clang's names for a C main (see the PE module's instantiation). */
 const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
 
-function w3ProgramFlags(elf) {
-  // ELF32 (W3, i386 Wine) or ELF64 (W64, x86-64 Wine: wasm-elf.py --elf64)
+function wine32ProgramFlags(elf) {
+  // ELF32 (32-bit Wine, i386 Wine) or ELF64 (64-bit Wine, x86-64 Wine: wasm-elf.py --elf64)
   if (!(elf instanceof Uint8Array) || elf.length < 64 || elf[0] !== 0x7f || (elf[4] !== 1 && elf[4] !== 2)) return false;
   const e64 = elf[4] === 2;
   const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
@@ -1077,11 +1077,11 @@ export class Gex {
   #forkCopied = 0;
   #forkSkipped = 0;
   #forkZeros = 0;
-  /** A W3 process's Windows address-space line: a forked child's from its
+  /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
-  /** A W64 program being loaded: its space is the NT layer's split. */
-  #w64Split = false;
+  /** A 64-bit Wine program being loaded: its space is the NT layer's split. */
+  #wine64Split = false;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -1245,11 +1245,11 @@ export class Gex {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
-      // A W3 process says so before anything claims arena -- this stack is
-      // the first claim: the NT layer's split at its parent's line, or W3's
+      // A 32-bit Wine process says so before anything claims arena -- this stack is
+      // the first claim: the NT layer's split at its parent's line, or 32-bit Wine's
       // compact space (nothing grown; inherited regions become islands).
-      // `?w3split=1` before the space is taken: the split, not the compact one.
-      if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
+      // `?winesplit=1` before the space is taken: the split, not the compact one.
+      if (globalThis.GEX_WINE32_SPLIT || this.#wine64Split) this.#shim.exports.gex_set_wine_split?.(1);
       // `?nullguard=1` before anything is translated (gex_abi::null_guard).
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
       // `?mxcsr=1` before anything is translated: SSE under MXCSR (gex_ir::mxcsr_exact).
@@ -1270,7 +1270,7 @@ export class Gex {
         this.#shim.exports.gex_worker_slots_reset?.();
         // Where its inherited mappings end, before the claim below picks its
         // arena floor (`gex_note_inherited`).
-        // With its start where the shim takes it: a W3 child keeps the
+        // With its start where the shim takes it: a 32-bit Wine child keeps the
         // regions as islands its arena steps over (`gex_note_inherited_range`).
         const e = this.#shim.exports;
         for (const [at, end] of this.#inheritedEnds) {
@@ -1754,14 +1754,14 @@ export class Gex {
             if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
             return this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret);
           },
-        // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
+        // 32-bit Wine: ntdll.so's handler for a guest's Unix call (cgen.rs).
         ftab_call_vi: (idx, arg) => {
           if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
           this.#cgen.ftab.get(tIdx(idx >>> 0))(arg);
         },
-        // W64: a unit's call to Wine's system or Unix call entry, run by
+        // 64-bit Wine: a unit's call to Wine's system or Unix call entry, run by
         // Wine's direct entry as the fault hook runs the `ud2` (cgen.rs
-        // `w64_entry`): its C frames below the guest's, then the units a
+        // `wine64_entry`): its C frames below the guest's, then the units a
         // hook's return serves (a thread the call made: `thread_start`,
         // below, which the shim calls). 0: not here (the
         // single-thread build: a blocking call needs a promising frame).
@@ -1775,9 +1775,9 @@ export class Gex {
         // promising frame).
         entry_call: single.on ? (idx, ctx, sp) => 0 : this.#entryTramp(),
         // The units and bindings the shim says are waiting, after a direct
-        // entry's call (cgen.rs `w64_entry`, only when there are some).
+        // entry's call (cgen.rs `wine64_entry`, only when there are some).
         cgen_serve: () => this.#cgenServe(),
-        // A thread a direct entry's call staged (cgen.rs `w64_entry` asks
+        // A thread a direct entry's call staged (cgen.rs `wine64_entry` asks
         // only when there is one).
         thread_start: () => this.#startThread(),
         // A guest fault given to the process's fault hook in place (cgen.rs
@@ -1900,14 +1900,14 @@ export class Gex {
    * pass through to, so whatever the program needs to read is bundled here.
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
-    // A W3 program (native Wine's loader) splits the memory with Windows
+    // A 32-bit Wine program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
     // Windows DLLs load (0x10000000).
-    // A 64-bit one (W64) the NT layer's split: W3's compact space ends at
+    // A 64-bit one (64-bit Wine) the NT layer's split: 32-bit Wine's compact space ends at
     // 2 GiB, and a 64-bit Wine maps past it.
-    const w3 = w3ProgramFlags(elf);
+    const w3 = wine32ProgramFlags(elf);
     if (w3) this.#windowsSpace = -1;
-    this.#w64Split = (w3 & 2) !== 0;
+    this.#wine64Split = (w3 & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
@@ -1951,7 +1951,7 @@ export class Gex {
     // `GEX_LOG=serveall`: units served after every direct entry's call, as
     // before cgen.rs `serve_wanted` (A/B runs).
     if (logOn('serveall')) this.#shim.exports.gex_cgen_serve_always?.(1);
-    // For gex-eject's W3 recorder: code a unit's image ran translated.
+    // For gex-eject's 32-bit Wine recorder: code a unit's image ran translated.
     if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
@@ -2631,7 +2631,7 @@ export class Gex {
     // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
     // left out); runs are `dense`, written without a scan.
     const u8 = this.#bytes();
-    // Division, not `>> 2` or `& ~3`: those are int32 operations, and a W3
+    // Division, not `>> 2` or `& ~3`: those are int32 operations, and a 32-bit Wine
     // process's memory reaches past 2 GiB (Wine's Windows address space), where
     // they turn negative -- `b & ~3` then started the tail loop near -2^31, and
     // a fork (Wine starting wineserver) scanned for hours.
@@ -3874,7 +3874,7 @@ export class Gex {
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
-      // A W3 process's Windows address space starts here (0: none); the
+      // A 32-bit Wine process's Windows address space starts here (0: none); the
       // child splits its memory at the same line before its heap takes any.
       windowsSpace: e.gex_windows_space?.() ?? 0,
       image: (() => {
@@ -4374,10 +4374,10 @@ export class Gex {
     // One built for wasm64 and lowered to this 32-bit memory (an LP64 wasm
     // library under an aarch64 program, docs/gexcc.md §7.8): its globals
     // stay i64, with an i32 copy of the table base for its element segment.
-    // A wasm32 program built LP64 for wasm64 and lowered the same way (W64,
+    // A wasm32 program built LP64 for wasm64 and lowered the same way (64-bit Wine,
     // docs/wine-native-x64.md), told apart by its __memory_base import's type.
     const progLowered = wasmprog && !!e.gex_cgen_pmod_lowered?.(prov);
-    // Wine's PE module in a W64 process (the native PE core, winepe.wasm,
+    // Wine's PE module in a 64-bit Wine process (the native PE core, winepe.wasm,
     // W64.2): built LP64 and lowered as its program was, so i64 globals and
     // stack pointer. A Worker installs its program before any PE module.
     const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
@@ -4413,7 +4413,7 @@ export class Gex {
       pbytes = pcopy();
       pkey = `wasm:${moduleContentKey(pbytes)}`;
     }
-    // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) collects: the
+    // What gex-eject's 32-bit Wine recorder (tools/eject/record-wine32.mjs) collects: the
     // native wasm32 modules a session ran.
     if (wasmdll) {
       const file = this.#cgenStr(e.gex_cgen_pmod_file, prov);
@@ -4458,7 +4458,7 @@ export class Gex {
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
         // clang's three names for a C main: Wine's crt_main references all
-        // of them weakly and a position-independent module (W3's PE module)
+        // of them weakly and a position-independent module (32-bit Wine's PE module)
         // keeps the undefined ones as imports. Null through `GOT.func`, as a
         // static link leaves them, and a trap behind the null check.
         ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
@@ -4477,7 +4477,7 @@ export class Gex {
           // A provider's fallback to the lifted body (provider.h gp_lifted).
           ftab_twin: e.gex_ftab_twin,
           provider_alloc_top: e.gex_provider_alloc_top,
-          // Wine's Unix side (W3.1): its system-call dispatcher and fault
+          // Wine's Unix side : its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults
           // is still to come).
           unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, addrNum(idx)) ?? 0,
@@ -4488,13 +4488,13 @@ export class Gex {
           // A memory64 program's context address is an i64 (Wine's
           // gex_addr_t); the shim's export takes the i32 every context is.
           ...(wasmprog && m64() ? { sysreg_write: (ctx, pc, reg, v) => this.#imports.sysreg_write(addrNum(ctx), pc, reg, v) } : {}),
-          // W3.7: Wine's Unix side runs the program's code nested
+          // Wine's Unix side runs the program's code nested
           // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
           // that never returns for a thread's loop), and reports each image
           // it maps (natively for unit placement; the page's units path
           // takes it once `gex_image_mapped` exists).
           // In the single-thread build on a stack that may suspend, as the
-          // function tier's call_out: W64's system calls are faults served
+          // function tier's call_out: 64-bit Wine's system calls are faults served
           // inside this loop (`#callOutSteps`), and they block.
           call_out: single.on
             ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
@@ -4505,7 +4505,7 @@ export class Gex {
             const number = e.gex_image_mapped?.(addrBig(base), fd) ?? -1;
             if (number === -1) return;
             // An i386 image with a function-tier unit to fetch (cgen.rs
-            // `w3_mapped`): served here, before Wine's loader goes on. (-2
+            // `wine32_mapped`): served here, before Wine's loader goes on. (-2
             // is a later skeleton bound into the install.)
             if (number === -3) {
               this.#cgenServe();
@@ -4779,7 +4779,7 @@ export class Gex {
   #covUsed = 0;
 
   /** Say the slots instrumented units were entered at since the last time:
-   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-w3.mjs), and
+   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-wine32.mjs), and
    *  the profile, `[gex-prof] <key> <slot>:<first>:<calls>,...`: each slot
    *  entered since, its first entry (ms of the epoch; empty once said) and
    *  its entries since the last line (gexc units profile adds them up). */
@@ -5317,7 +5317,7 @@ export class Gex {
   /** This Worker's `__stack_pointer` for wasm32 programs: one global the
    *  program and its shared libraries share (one C stack per thread). */
   #wasmprogSp = null;
-  /** W64's direct entry (`entry_call`): the trampoline's hook table, its
+  /** 64-bit Wine's direct entry (`entry_call`): the trampoline's hook table, its
    *  slot 0 the entry function or the trampoline's `slow` export. */
   #entryHook = null;
   #entrySlowFn = null;
@@ -5574,7 +5574,7 @@ export class Gex {
       // Door calls into the wineserver (docs/wineserver-kernel.md).
       door_publish: (area) => this.#doorPublish(area >>> 0),
       door_call: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, false),
-      // A 64-bit client's (W64's lowered LP64 ntdll.so): the request's
+      // A 64-bit client's (64-bit Wine's lowered LP64 ntdll.so): the request's
       // gather list at LP64 offsets (`#doorRun`, shims/native's door::req_layout).
       door_call_lp64: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, true),
       // A Worker the door was broadcast to while it ran (it takes no
@@ -5591,7 +5591,7 @@ export class Gex {
       // process's start and written by the first boot's fill (§6.2).
       usd_copy: (dst, size) => this.#usdMove(addrNum(dst), size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(addrNum(src), size >>> 0, true),
-      // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
+      // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
       // The server's own (the pump): a thread's wait pipe, which door calls
@@ -5868,10 +5868,10 @@ export class Gex {
   /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
    *  1 use the pipes, 2 the thread died in the request. The hot path is kept
    *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
-   *  it stays optimised: every server request of a W3 process comes here
+   *  it stays optimised: every server request of a 32-bit Wine process comes here
    *  (docs/wine-overhead.md). */
   #doorCall(req, pid, tid, lp64) {
-    // A 64-bit memory's client (W64's memory64 flavour) takes the door too:
+    // A 64-bit memory's client (64-bit Wine's memory64 flavour) takes the door too:
     // the server's instance here touches only the server's own wasm32
     // memory, and the request is copied in and out at full 64-bit
     // addresses (`#doorRun`'s `wide`).
@@ -6269,7 +6269,7 @@ export class Gex {
     if (lat && lat[0] >= 0) {
       console.warn(`[placelat] ${path} ${(lat[0] / 1000).toFixed(1)} ms mapped, ${(lat[1] / 1000).toFixed(1)} ms wanted, load ${(performance.now() - lat[2]).toFixed(1)} ms`);
     }
-    // For gex-eject's W3 recorder: which image each unit is, and which images
+    // For gex-eject's 32-bit Wine recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
     if (logOn('record')) console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
     if (logOn('record') && e.gex_cgen_base) console.warn(`[gex-record] base ${key} 0x${BigInt.asUintN(64, BigInt(e.gex_cgen_base(u))).toString(16)}`);
@@ -6380,7 +6380,7 @@ export class Gex {
   wlOutput(w, h, scale = 1) {
     // Kept, and given again to every shim instance this process makes: a
     // fresh instance (a fork child's, an exec's) starts at the default
-    // 640x480, and W3 starts every Windows program by fork and exec.
+    // 640x480, and 32-bit Wine starts every Windows program by fork and exec.
     this.#wlOut = [w | 0, h | 0];
     this.#wlScale = Math.max(1, scale | 0);
     this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
@@ -6419,7 +6419,7 @@ export class Gex {
     // Which thread's registers to enter with. The first thread unless a thread
     // in its own Worker says otherwise, or it runs the main thread's registers.
     let ctx = startCtx;
-    // When the last trap came out, for GEX_NT_STATS' time split: what the
+    // When the last trap came out, for GEX_WIN_STATS' time split: what the
     // glue costs between a trap and the guest again.
     let trappedAt = 0;
     // A fault for the process's hook, taken at the last trap (`#faultTake`):
@@ -6427,7 +6427,7 @@ export class Gex {
     let hook = null;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
-    // A program the shim refused there (a W3 Wine built for another probe
+    // A program the shim refused there (a 32-bit Wine built for another probe
     // layout, cgen/wasmprog.rs): the process has ended, and its ELF container
     // is not guest code to enter.
     if (this.#shim.exports.gex_exited?.()) return this.#shim.exports.gex_exit_code();
@@ -6748,9 +6748,9 @@ export class Gex {
         this.#where = 'drainThread';
         await this.#drainThread();
         this.#where = 'resume';
-        // A guest fault the shim staged for the process's hook (W3): run
+        // A guest fault the shim staged for the process's hook (32-bit Wine): run
         // at the next entry, inside the trap handling below, since the hook
-        // can end the thread or the process as any guest code can (W64:
+        // can end the thread or the process as any guest code can (64-bit Wine:
         // every system call is one, signal_wasm64.c's `ud2` entry, and a
         // thread the server stops dies inside it).
         const ft = this.#faultTake(ctx);
@@ -7646,7 +7646,7 @@ export class Gex {
               }
             }
             // The guest's own access out of bounds (a null pointer's): its
-            // fault, staged for the hook below (W3) or its SIGSEGV, as the
+            // fault, staged for the hook below (32-bit Wine) or its SIGSEGV, as the
             // run loop does and natively's call-out loop.
             if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1)) throw err;
           }
@@ -7775,7 +7775,7 @@ export class Gex {
   }
 
   /**
-   * A guest fault the shim staged (`gex_fault_take`: a W3 process's branch
+   * A guest fault the shim staged (`gex_fault_take`: a 32-bit Wine process's branch
    * to non-executable memory) given to the process's fault hook, Wine's
    * ntdll.so, as shims/native's `deliver_guest_fault_kind` does: the hook
    * builds the guest's exception frame and points the context at the
@@ -7818,8 +7818,8 @@ export class Gex {
     const f = this.#cgenStore().ftab.get(tIdx(hook));
     if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
     const { spG, cur } = this.#hookStack(ctx);
-    // W64's hook (signal_wasm64.c) takes the address as a 64-bit integer
-    // (above 4 GiB in a 64-bit memory), W3's (signal_wasm32.c) as 32 bits.
+    // 64-bit Wine's hook (signal_wasm64.c) takes the address as a 64-bit integer
+    // (above 4 GiB in a 64-bit memory), 32-bit Wine's (signal_wasm32.c) as 32 bits.
     const wide = e.gex_guest_x86_64?.() === 1;
     return { f, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }

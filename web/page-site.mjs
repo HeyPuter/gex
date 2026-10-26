@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// A W3 program as a static site on gex's own page (nt.html), with no eject:
+// A 32-bit Wine program as a static site on gex's own page (nt.html), with no eject:
 //
 //   node web/page-site.mjs OUT --tar BUNDLE.tar --units DIR --params FILE
 //        [--strip] [--prune] [--dedupe] [--split] [--boot-units FILE] [--level N] [--param K=V]...
@@ -8,7 +8,7 @@
 //   gex builds its page (every feature in: translation, the function JIT);
 //   the x86 runtime (shim, kernel, seed) under gex/; the zstd decoder under
 //   vendor/.
-// - The bundle, BUNDLE.tar (a W3 prefix and dist, as a recording's), at
+// - The bundle, BUNDLE.tar (a 32-bit Wine prefix and dist, as a recording's), at
 //   /bundle.tar. --strip takes the debug sections out of its .wasm, --prune
 //   leaves out what the browser never reads (.cwasm, static archives),
 //   --dedupe orders it by content so zstd's window stores a second copy as a
@@ -24,7 +24,7 @@
 //   page downloads while the guest runs and compiles a unit of when a process
 //   first maps it (web/site-bundle.mjs `buildFill`, as web/eject-site.mjs's).
 // - index.html: nt.html with the program's query, FILE's (a JSON object of
-//   nt.html parameters, or a recording, w3-session.json, whose page's query
+//   nt.html parameters, or a recording, wine32-session.json, whose page's query
 //   it takes), less what the site decides (tar, cgen, cgenurl, preload,
 //   pack), plus each --param.
 // - pack.json: every file over 64 KiB (the units' over 4 KiB) is FILE.zst

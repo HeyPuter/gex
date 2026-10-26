@@ -1,4 +1,4 @@
-// A W3 program's bundle as a site ships it, for every site builder (web/eject-site.mjs,
+// A 32-bit Wine program's bundle as a site ships it, for every site builder (web/eject-site.mjs,
 // web/page-site.mjs): the tar extracted, its .wasm stripped, what the browser never
 // reads pruned, the bundle split (the files the recorded run opened stay in it, the
 // rest become lazy files the page reads from the host when a guest first opens one),

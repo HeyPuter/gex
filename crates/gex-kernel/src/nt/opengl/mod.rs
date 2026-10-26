@@ -46,7 +46,7 @@ const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 /// itself, with no syscall. It needs the ring's address and its tail where
 /// guest code reads them: two words at the end of KUSER_SHARED_DATA's page,
 /// past the yield park's. [`GL_FAST_RING`] is 0 until the ring exists, and
-/// stays 0 with `GEX_NT_GL_FAST=0` (every call then takes the syscall).
+/// stays 0 with `GEX_WIN_GL_FAST=0` (every call then takes the syscall).
 pub const GL_FAST_RING: u64 = super::USD + 0xfe0;
 /// The ring's tail: the bytes of commands queued. [`TAIL_BUSY`] is its
 /// lock: whoever sets it (the provider for one command, the layer for a
@@ -75,7 +75,7 @@ pub const FS_ATTRIB_CLIENT: u64 = 4;
 pub const FS_ARRAYS: u64 = 16;
 pub const FS_ARRAY_WORDS: u64 = 5;
 
-/// Whether the fast path is offered: the host sets it from `GEX_NT_GL_FAST`
+/// Whether the fast path is offered: the host sets it from `GEX_WIN_GL_FAST`
 /// (default on; `0` for A/B runs) before the program starts.
 pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -84,7 +84,7 @@ fn fast_path() -> bool {
 }
 
 /// Whether glEnable/DisableClientState take the fast path too: the host
-/// clears it for `GEX_NT_GL_FAST=nocs` (A/B runs). Off, the layer keeps an
+/// clears it for `GEX_WIN_GL_FAST=nocs` (A/B runs). Off, the layer keeps an
 /// invalid client texture unit in [`GL_FAST_ARRAYS`], which the provider
 /// leaves to the layer.
 pub static FAST_CLIENT_STATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -615,10 +615,10 @@ fn flush_async(c: &mut Call<'_>) -> R<()> {
 }
 
 /// Whether GL calls are timed by function, for [`take_stats`] (a host's
-/// GEX_NT_GL_STATS): two clock reads and a lock per call, so off by default.
+/// GEX_WIN_GL_STATS): two clock reads and a lock per call, so off by default.
 pub static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// What the program's GL cost since the last call, for GEX_NT_GL_STATS:
+/// What the program's GL cost since the last call, for GEX_WIN_GL_STATS:
 /// frames, submits (round trips to the host GL, their time and bytes) and the
 /// GL functions by time spent in them (their submits included), the top
 /// `n`. Resets the counters.
@@ -1050,7 +1050,7 @@ fn finish_swap(c: &mut Call<'_>, hdc: u32, hwnd: u32) -> R<bool> {
         c.p.presents.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         s.frame
     };
-    // Scripted input (GEX_NT_INPUT) is timed by frames.
+    // Scripted input (GEX_WIN_INPUT) is timed by frames.
     super::user::input::script_tick(c, frame, hwnd);
     // The next frame is drawn at the window's size.
     fit_surface(c, hdc)?;
@@ -1126,7 +1126,7 @@ fn send_client_array(c: &mut Call<'_>, slot: u32, opcode: u32, words: &[u32], da
 }
 
 /// Whether client arrays go as `op::CLIENT_ARRAY` (default) or through
-/// scratch buffers (`GEX_NT_GL_CLIENT_ARRAYS=buffer`, for A/B runs).
+/// scratch buffers (`GEX_WIN_GL_CLIENT_ARRAYS=buffer`, for A/B runs).
 pub static CLIENT_ARRAY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Copy `bytes` of client memory at `pointer` into scratch buffer `*scratch`

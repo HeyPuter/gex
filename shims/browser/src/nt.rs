@@ -157,7 +157,7 @@ mod imp {
         PROCESS.get().is_some()
     }
 
-    /// `GEX_NT_TIME_SCALE`, as natively.
+    /// `GEX_WIN_TIME_SCALE`, as natively.
     static TIME_SCALE: AtomicU64 = AtomicU64::new(0);
     static MONO_START: AtomicU64 = AtomicU64::new(0);
 
@@ -185,7 +185,7 @@ mod imp {
         }
     }
 
-    /// `GEX_NT_FIXED_TIME=<unix seconds>`, as natively (54cb7124): the
+    /// `GEX_WIN_FIXED_TIME=<unix seconds>`, as natively (54cb7124): the
     /// guest's wall clock starts there and advances with real time, so a
     /// program seeding from the date (Noita's world) sees the same value
     /// every run. 0 for the page's own clock.
@@ -216,7 +216,7 @@ mod imp {
     /// registers are already in context slot 0).
     ///
     /// `env` is the page's environment list: `GEX_WINE_PREFIX` (default
-    /// `/wine`), `GEX_NT_TRACE`, `GEX_NT_STRICT` and `GEX_NT_TIME_SCALE` are
+    /// `/wine`), `GEX_WIN_TRACE`, `GEX_WIN_STRICT` and `GEX_WIN_TIME_SCALE` are
     /// for this layer, and everything else overrides the Windows environment.
     pub(crate) fn boot(k: &mut Kernel, abi: nt::Abi, args: &[String], env: &[String]) -> Result<u64, String> {
         nt::set_log(log);
@@ -231,10 +231,10 @@ mod imp {
             env.iter().find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
         };
         let flag = |name: &str| var(name).is_some_and(|v| !v.is_empty() && v != "0");
-        STATS.store(flag("GEX_NT_STATS"), Ordering::Relaxed);
-        // GEX_NT_PEEK=<hex>[*]: a guest word reported on the stats line, read
+        STATS.store(flag("GEX_WIN_STATS"), Ordering::Relaxed);
+        // GEX_WIN_PEEK=<hex>[*]: a guest word reported on the stats line, read
         // through a pointer with `*` (as natively).
-        if let Some(v) = var("GEX_NT_PEEK") {
+        if let Some(v) = var("GEX_WIN_PEEK") {
             let (a, deref) = match v.strip_suffix('*') {
                 Some(a) => (a, true),
                 None => (v.as_str(), false),
@@ -243,88 +243,88 @@ mod imp {
                 PEEK.store(a << 1 | deref as u64, Ordering::Relaxed);
             }
         }
-        if flag("GEX_NT_MAP") || flag("GEX_NT_TRACE") {
+        if flag("GEX_WIN_MAP") || flag("GEX_WIN_TRACE") {
             crate::memmap::print();
         }
-        TRACE_FOREIGN.store(flag("GEX_NT_TRACE") || flag("GEX_NT_FOREIGN_TRACE"), Ordering::Relaxed);
-        if flag("GEX_NT_ARENA_SELFTEST") {
+        TRACE_FOREIGN.store(flag("GEX_WIN_TRACE") || flag("GEX_WIN_FOREIGN_TRACE"), Ordering::Relaxed);
+        if flag("GEX_WIN_ARENA_SELFTEST") {
             // Through the guest's stderr, not the console: a Worker's console
             // output can be lost when the run ends, and tests/nt reads this.
             let line = format!("gex-nt: arena self-check: {}\n", crate::arena_selftest());
             unsafe { crate::write(2, line.as_ptr() as usize, line.len() as u32) };
         }
-        NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
-        GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
-        GL_STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
-        nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
-        nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
-        nt::opengl::FAST_CLIENT_STATE.store(var("GEX_NT_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
-        nt::opengl::CLIENT_ARRAY_OP.store(var("GEX_NT_GL_CLIENT_ARRAYS").as_deref() != Some("buffer"), Ordering::Relaxed);
-        TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
-        crate::cgen::TRAP_CALLOUTS.store(flag("GEX_NT_CALLOUT_TRAP"), Ordering::Relaxed);
-        if let Some(k) = var("GEX_NT_TICK_EVERY").and_then(|v| v.parse().ok()) {
+        NO_RETIRE.store(flag("GEX_WIN_NO_RETIRE"), Ordering::Relaxed);
+        GL_READBACK.store(flag("GEX_WIN_GL_READBACK"), Ordering::Relaxed);
+        GL_STATS.store(flag("GEX_WIN_GL_STATS"), Ordering::Relaxed);
+        nt::opengl::STATS.store(flag("GEX_WIN_GL_STATS"), Ordering::Relaxed);
+        nt::opengl::FAST.store(var("GEX_WIN_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
+        nt::opengl::FAST_CLIENT_STATE.store(var("GEX_WIN_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
+        nt::opengl::CLIENT_ARRAY_OP.store(var("GEX_WIN_GL_CLIENT_ARRAYS").as_deref() != Some("buffer"), Ordering::Relaxed);
+        TRAP_PRINT.store(flag("GEX_WIN_TRAP_PRINT"), Ordering::Relaxed);
+        crate::cgen::TRAP_CALLOUTS.store(flag("GEX_WIN_CALLOUT_TRAP"), Ordering::Relaxed);
+        if let Some(k) = var("GEX_WIN_TICK_EVERY").and_then(|v| v.parse().ok()) {
             TICK_EVERY.store(k, Ordering::Relaxed);
         }
-        if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
+        if let Some(n) = var("GEX_WIN_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
-        if let Some(a) = var("GEX_NT_WATCH_ALLOC").and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        if let Some(a) = var("GEX_WIN_WATCH_ALLOC").and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             crate::WATCH_ALLOC.store(a, Ordering::Relaxed);
         }
         // A Windows process owns the low 2 GiB and the shim's heap is above
         // it, in the same memory: a guest access above is made a fault, as an
         // unallocated address is on Windows, rather than a write into the
-        // runtime (natively it would land in nothing). GEX_NT_GUARD_2G=0 to
+        // runtime (natively it would land in nothing). GEX_WIN_GUARD_2G=0 to
         // compare.
-        if var("GEX_NT_GUARD_2G").as_deref() != Some("0") {
+        if var("GEX_WIN_GUARD_2G").as_deref() != Some("0") {
             gex_xlate::set_guard_limit(crate::winspace::NT_HEAP_BASE);
         }
         // The yield policy and the desktop size, as natively from the
-        // environment (GEX_NT_YIELD=wake[:us[:streak]]|os|spin|sleep:N,
-        // GEX_NT_DESKTOP=WxH).
-        if let Some(v) = var("GEX_NT_YIELD") {
+        // environment (GEX_WIN_YIELD=wake[:us[:streak]]|os|spin|sleep:N,
+        // GEX_WIN_DESKTOP=WxH).
+        if let Some(v) = var("GEX_WIN_YIELD") {
             nt::sync::set_yield_policy(&v);
         }
-        if let Some(v) = var("GEX_NT_DESKTOP") {
+        if let Some(v) = var("GEX_WIN_DESKTOP") {
             if !nt::user::sysparams::Mode::set_startup(&v) {
-                warn_line(&format!("gex-nt: GEX_NT_DESKTOP={v}: not a size on offer\n"));
+                warn_line(&format!("gex-nt: GEX_WIN_DESKTOP={v}: not a size on offer\n"));
             }
         }
         // Nor may a fixed-address allocation or view reach it (a request at
         // 2 GiB or above succeeded and handed the guest the shim's heap).
         nt::vm::set_user_limit(crate::winspace::NT_HEAP_BASE);
-        SLOT_LOG.store(flag("GEX_NT_SLOT_LOG"), Ordering::Relaxed);
-        VERIFY_REGISTRY.store(flag("GEX_NT_VERIFY_REGISTRY"), Ordering::Relaxed);
-        RETIRE_LOG.store(flag("GEX_NT_RETIRE_LOG"), Ordering::Relaxed);
-        // GEX_NT_TRAP_PCS=<hex>,<hex>: block entries that note the thread's
+        SLOT_LOG.store(flag("GEX_WIN_SLOT_LOG"), Ordering::Relaxed);
+        VERIFY_REGISTRY.store(flag("GEX_WIN_VERIFY_REGISTRY"), Ordering::Relaxed);
+        RETIRE_LOG.store(flag("GEX_WIN_RETIRE_LOG"), Ordering::Relaxed);
+        // GEX_WIN_TRAP_PCS=<hex>,<hex>: block entries that note the thread's
         // registers in its ring, for an execute fault's report.
-        if let Some(v) = var("GEX_NT_TRAP_PCS") {
+        if let Some(v) = var("GEX_WIN_TRAP_PCS") {
             for a in v.split(['+', ' ', ';']) {
                 if let Ok(a) = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16) {
                     gex_xlate::add_trap_pc(a);
                 }
             }
         }
-        if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
+        if let Some(s) = var("GEX_WIN_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
         }
-        if var("GEX_NT_EXC_TRACE").is_some() {
+        if var("GEX_WIN_EXC_TRACE").is_some() {
             crate::gex_set_exc_trace(1);
         }
-        if var("GEX_NT_EXC_NEST").as_deref() == Some("0") {
+        if var("GEX_WIN_EXC_NEST").as_deref() == Some("0") {
             NO_EXC_NEST.store(true, Ordering::Relaxed);
         }
-        if let Some(t) = var("GEX_NT_FIXED_TIME").and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
+        if let Some(t) = var("GEX_WIN_FIXED_TIME").and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
             FIXED_ORIGIN.store(unsafe { mono_ns() } as u64, Ordering::Relaxed);
             FIXED_TIME.store(t, Ordering::Relaxed);
         }
         // An ejected project's stateful providers (docs/eject-pe.md §5.1).
-        crate::cgen::ENTRY_LOG.store(flag("GEX_NT_ENTRY_LOG"), Ordering::Relaxed);
-        crate::RESUME_LOG.store(flag("GEX_NT_RESUME_LOG"), Ordering::Relaxed);
-        if let Some(v) = var("GEX_NT_STATEFUL") {
+        crate::cgen::ENTRY_LOG.store(flag("GEX_WIN_ENTRY_LOG"), Ordering::Relaxed);
+        crate::RESUME_LOG.store(flag("GEX_WIN_RESUME_LOG"), Ordering::Relaxed);
+        if let Some(v) = var("GEX_WIN_STATEFUL") {
             crate::cgen::set_stateful(&v);
         }
-        if let Some(v) = var("GEX_NT_IDENTITIES") {
+        if let Some(v) = var("GEX_WIN_IDENTITIES") {
             crate::cgen::set_identities(&v);
         }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
@@ -354,8 +354,8 @@ mod imp {
             cmdline: String::new(),
             env: wenv,
             cwd: nt::boot::dos_path(&prefix, &cwd),
-            trace: flag("GEX_NT_TRACE"),
-            strict: flag("GEX_NT_STRICT"),
+            trace: flag("GEX_WIN_TRACE"),
+            strict: flag("GEX_WIN_STRICT"),
             settings,
         };
         let p = Arc::new(nt::Process::new(abi, nt::thread::nt_pid(k.pid), cfg, clocks(), Arc::clone(&k.futexes)));
@@ -388,11 +388,11 @@ mod imp {
         gl: std::sync::Mutex<std::collections::BTreeMap<u32, (i32, i32, i32, i32)>>,
     }
 
-    /// GEX_NT_GL_READBACK: read each GL frame back into the window's surface
+    /// GEX_WIN_GL_READBACK: read each GL frame back into the window's surface
     /// instead of handing it to the compositor (the old path, for comparing).
     static GL_READBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// GEX_NT_GL_STATS: every ten seconds, the program's GL by function
+    /// GEX_WIN_GL_STATS: every ten seconds, the program's GL by function
     /// (`nt::opengl::take_stats`).
     static GL_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -526,10 +526,10 @@ mod imp {
         }
     }
 
-    /// `GEX_NT_STATS`: once a (real) second, the native shim's
+    /// `GEX_WIN_STATS`: once a (real) second, the native shim's
     /// `gex-nt: stats t=<ms> presents=<n>` line, on the console.
     static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    /// `GEX_NT_PEEK`'s address shifted up one, with the dereference flag in
+    /// `GEX_WIN_PEEK`'s address shifted up one, with the dereference flag in
     /// bit 0; zero for none.
     static PEEK: AtomicU64 = AtomicU64::new(0);
 
@@ -576,7 +576,7 @@ mod imp {
                 EXC_ESCAPED.load(Ordering::Relaxed),
                 crate::fjit::counts()
             ));
-            // The yield park (GEX_NT_YIELD=wake): parks by how they ended
+            // The yield park (GEX_WIN_YIELD=wake): parks by how they ended
             // (woken by a kick, the word had moved, timed out) and kicks by
             // whether they woke anyone, since the last report.
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
@@ -616,7 +616,7 @@ mod imp {
     /// millisecond. Natively a thread does this; here every NT syscall and
     /// every safepoint does, which is as often as anything can look.
     /// Each thread can read the clock (a JS call) on only one call in
-    /// [`TICK_EVERY`] (`GEX_NT_TICK_EVERY`); the reads are 0.2 ms of every
+    /// [`TICK_EVERY`] (`GEX_WIN_TICK_EVERY`); the reads are 0.2 ms of every
     /// world frame on Noita's main thread (cs1), but sampling them changed
     /// nothing measurable (s1), so the default reads on every call.
     pub(crate) fn tick() {
@@ -654,7 +654,7 @@ mod imp {
     }
 
     /// How many of a thread's [`tick`]s read the clock: one in this many
-    /// (`GEX_NT_TICK_EVERY`, default 1: every one). 8 measured no faster in
+    /// (`GEX_WIN_TICK_EVERY`, default 1: every one). 8 measured no faster in
     /// the page (s1, docs/noita-perf.md: 64.1 vs 64.05 world fps).
     static TICK_EVERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -685,7 +685,7 @@ mod imp {
 
     /// Whether an exception the syscall returning to `next_pc` raises is
     /// dispatched nested, as natively: with function bodies about (units on),
-    /// when the syscall returns through a `ret`. `GEX_NT_EXC_NEST=0` (a page
+    /// when the syscall returns through a `ret`. `GEX_WIN_EXC_NEST=0` (a page
     /// setting) turns it off.
     fn nest_exceptions(next_pc: u64) -> bool {
         if !crate::cgen::on() || NO_EXC_NEST.load(Ordering::Relaxed) {
@@ -924,7 +924,7 @@ mod imp {
 
     /// gexrt's `gex_nr::NATIVE_LEFT`, if that is the call (native Wine's
     /// mark already stripped from `pc`), from an NT process or from Wine's
-    /// own Unix side (W3): the guest re-enters native code from above the
+    /// own Unix side (32-bit Wine): the guest re-enters native code from above the
     /// innermost native entry, and JS's call-out decides whether its caller
     /// is gone (`#nativeSyscall` passes this on, `gex_nt_native_left`).
     /// EAX: the function to call again from `jmp eax` (gexrt left it in
@@ -1123,7 +1123,7 @@ mod imp {
             nt::Outcome::Exit(code) => {
                 static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if code == 0xc000_0002 && !ONCE.swap(true, Ordering::Relaxed) {
-                    // GEX_NT_STRICT's end: what the thread that hit it was
+                    // GEX_WIN_STRICT's end: what the thread that hit it was
                     // doing (the first to end; the others follow it).
                     warn_line(&format!("gex-nt: this thread's last calls: {}\n", ring_report(ctx_addr)));
                     warn_line(&format!("gex-nt: this thread's last trap pcs: {}\n", trap_report(ctx_addr)));
@@ -1182,20 +1182,20 @@ mod imp {
     /// directory entries go back to the miss stub, so the next branch there
     /// (from any Worker) lifts what is there now into fresh slots. The old
     /// slots are left behind, unreachable.
-    /// GEX_NT_NO_RETIRE: keep translations of code that went away (a
+    /// GEX_WIN_NO_RETIRE: keep translations of code that went away (a
     /// diagnostic: stale code runs).
     static NO_RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// GEX_NT_TRACE: look for memory grown outside the arena around every NT
+    /// GEX_WIN_TRACE: look for memory grown outside the arena around every NT
     /// call, so the first foreign grow is caught near whoever did it.
     static TRACE_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// GEX_NT_VERIFY_REGISTRY: once a second, check every kept translation
+    /// GEX_WIN_VERIFY_REGISTRY: once a second, check every kept translation
     /// against the hashes taken when it was kept (a stray write into the
     /// shim's heap).
     static VERIFY_REGISTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// GEX_NT_SLOT_LOG: name the first few hundred slot conflicts (a block
+    /// GEX_WIN_SLOT_LOG: name the first few hundred slot conflicts (a block
     /// entered for a neighbour sharing its dispatch slot).
     static SLOT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1203,7 +1203,7 @@ mod imp {
         SLOT_LOG.load(Ordering::Relaxed)
     }
 
-    /// GEX_NT_RETIRE_LOG: name each retired range, the first few hundred.
+    /// GEX_WIN_RETIRE_LOG: name each retired range, the first few hundred.
     static RETIRE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn note_retire(ranges: &[(u64, u64)]) {
@@ -1247,7 +1247,7 @@ mod imp {
         e[1].store(b, Ordering::Relaxed);
     }
 
-    /// GEX_NT_STATS' per-thread time split: nanoseconds in NT calls (0),
+    /// GEX_WIN_STATS' per-thread time split: nanoseconds in NT calls (0),
     /// in waits (1), waiting on the page's GL host (2), in the glue's run
     /// loop between traps (3), and waiting for the previous unwaited GL batch
     /// (4, `GEX_GL_SUBMIT_ASYNC`: the frame before's Mesa time the guest did
@@ -1297,7 +1297,7 @@ mod imp {
         w.get(nr as usize).copied().unwrap_or(false)
     }
 
-    /// NT syscalls by number since the last report (GEX_NT_STATS' `calls`
+    /// NT syscalls by number since the last report (GEX_WIN_STATS' `calls`
     /// line): which calls a frame makes.
     static SYSCALLS: [AtomicU64; 0x2000] = [const { AtomicU64::new(0) }; 0x2000];
 
@@ -1356,7 +1356,7 @@ mod imp {
         }
     }
 
-    /// GEX_NT_TRAP_PCS' notes: per thread, the last few block entries with
+    /// GEX_WIN_TRAP_PCS' notes: per thread, the last few block entries with
     /// esp, ebp, eax, ecx, esi, edi and [esp].
     const TRING: usize = 16;
     struct TRing {

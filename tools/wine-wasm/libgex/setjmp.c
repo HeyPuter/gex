@@ -13,7 +13,7 @@
 #include <setjmp.h>
 #include <stdint.h>
 
-/* The tag carries a pointer: i64 on wasm64 (W64's LP64 programs, lowered
+/* The tag carries a pointer: i64 on wasm64 (64-bit Wine's LP64 programs, lowered
  * to wasm32 after linking: the tag keeps its type). */
 __asm__(
 #ifdef __wasm64__

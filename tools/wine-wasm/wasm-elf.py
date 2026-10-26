@@ -5,10 +5,10 @@ in the ELF32 i386 container gexc runs (shims/native/src/wasmprog.rs).
     wasm-elf.py IN.wasm OUT [--guest-i386] [--elf64 [--guest-x86-64]]
                 [--host-stub BLOB [--runner GEXC]]
 
---elf64 (W64, docs/wine-native-x64.md §1.1): an ELF64 x86-64 container for a
+--elf64 (64-bit Wine, docs/wine-native-x64.md §1.1): an ELF64 x86-64 container for a
 program built LP64 and lowered to wasm32 (tools/wine-wasm/wcc64): gex runs it
 with the x86-64 Linux ABI. --guest-x86-64: it runs x86-64 Windows code (the
-W64 loader). The segments and the header are the same.
+64-bit Wine loader). The segments and the header are the same.
 
 Segments:
   R    at BASE:          ELF header, program headers, then the wasm module
@@ -78,10 +78,10 @@ def custom_section(w, want):
     return None
 
 
-# Where W3's Wine maps KUSER_SHARED_DATA (gex_abi::W3_KUSER). Wine's ntdll
+# Where 32-bit Wine maps KUSER_SHARED_DATA (gex_abi::W3_KUSER). Wine's ntdll
 # names its address in a custom section, gex_kuser (include/wine/kuser.h's
 # WINE_USER_SHARED_DATA, 4 bytes little-endian); a loader that does sets the
-# header's FLAG_KUSER_W3 (4), and gex folds i386 code's constant accesses to
+# header's FLAG_KUSER_WINE32 (4), and gex folds i386 code's constant accesses to
 # Windows' page (0x7ffe0000) there. A loader without the section keeps
 # Windows' address and gex folds nothing.
 W3_KUSER = 0x04ff0000
@@ -105,7 +105,7 @@ def main():
                 runner = v
     args = [a for a in argl if not a.startswith('--')]
     src, dst = args[0], args[1]
-    # --guest-i386: the program runs i386 code (Wine's loader, W3): gex
+    # --guest-i386: the program runs i386 code (Wine's loader, 32-bit Wine): gex
     # translates i386 in its process and leaves Windows' addresses free.
     flags = 1 if '--guest-i386' in sys.argv[1:] else 0
     elf64 = '--elf64' in sys.argv[1:]

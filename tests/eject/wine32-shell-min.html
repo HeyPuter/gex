@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A hand-written page</title>
+<style>
+  body { margin: 0; background: #222; }
+  header { height: 40px; color: #ccc; font: 14px sans-serif; padding: 10px; box-sizing: border-box; }
+  #stage { width: 1100px; height: 700px; margin-left: 30px; }
+</style>
+</head>
+<body>
+<header>gex-eject: a page of its own, not the example (tests/eject/wine32-page.mjs --shell)</header>
+<div id="stage"></div>
+<script type="module">
+  // The second 32-bit Wine leg's page: another container (a box, not the body), its
+  // own size ('fit' to that box), the arguments given rather than recorded,
+  // more environment, and an onExit of its own. wine32-page.mjs reads
+  // globalThis.app and globalThis.exitedWith.
+  import { start } from './app.mjs';
+  globalThis.exitedWith = null;
+  try {
+    globalThis.app = await start({
+      container: document.getElementById('stage'),
+      size: 'fit',
+      args: ['C:\\winlogon.exe', 'C:\\windows\\system32\\mspaint.exe'],
+      env: { GEX_WIN_STATS: '1' },
+      onExit: (status) => { globalThis.exitedWith = status; document.title = `exited ${status}`; },
+    });
+  } catch (e) {
+    document.querySelector('header').textContent = String(e?.message ?? e);
+    globalThis.startError = String(e?.message ?? e);
+  }
+</script>
+</body>
+</html>

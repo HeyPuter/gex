@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# The page's W3 prefix template (docs/wine-native.md §3.17, W3.7): an
-# installed W3 prefix (wineboot -u leaves system32's programs and drivers
-# and the registry), with the W3 session (w3-session.reg, or the files
+# The page's 32-bit Wine prefix template (docs/wine-native.md §3.17): an
+# installed 32-bit Wine prefix (wineboot -u leaves system32's programs and drivers
+# and the registry), with the 32-bit Wine session (wine32-session.reg, or the files
 # named) applied offline and the install marked current for DIST's
-# wine.inf, so wineboot --init does not update it again in the page. W64's
-# win64 prefix (w64-dist.sh's) makes its template the same way
-# (docs/wine-native-x64.md, W64.5).
+# wine.inf, so wineboot --init does not update it again in the page. 64-bit Wine's
+# win64 prefix (wine64-dist.sh's) makes its template the same way
+# (docs/wine-native-x64.md).
 #
 #   tools/wine-wasm/page-prefix.sh INSTALLED_PFX DIST OUT [FILE.reg...]
 #
@@ -27,14 +27,14 @@ tar -C "$src" --exclude=./dosdevices -h --xattrs --xattrs-include='user.*' -cf -
     tar -C "$out" --xattrs --xattrs-include='user.*' -xpf -
 mkdir -p "$out/dosdevices"
 ln -s ../drive_c "$out/dosdevices/c:" && ln -s / "$out/dosdevices/z:"
-regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/w3-session.reg")
+regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/wine32-session.reg")
 python3 "$here/reg-apply.py" "$out/system.reg" "${regs[@]}"
 stat -c %Y "$dist/share/wine/wine.inf" > "$out/.update-timestamp"
 if [ -n "${GRAPHICS:-}" ]; then
     if [ -f "$out/user.reg" ] && grep -q '^"Graphics"=' "$out/user.reg"; then
         sed -i "s/^\"Graphics\"=.*/\"Graphics\"=\"$GRAPHICS\"/" "$out/user.reg"
     else
-        # the prefix's own architecture (win32 for W3, win64 for W64)
+        # the prefix's own architecture (win32 for 32-bit Wine, win64 for 64-bit Wine)
         arch=$(sed -n 's/^#arch=//p' "$out/system.reg" | head -1)
         printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=%s\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' "${arch:-win32}" "$GRAPHICS" >> "$out/user.reg"
     fi

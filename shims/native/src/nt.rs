@@ -29,7 +29,7 @@ pub struct NtSetup {
     pub display_out: Option<String>,
 }
 
-/// `GEX_NT_TIME_SCALE`: how much faster than real time the guest's
+/// `GEX_WIN_TIME_SCALE`: how much faster than real time the guest's
 /// monotonic clocks run (the counterpart of PEWASM_TIME_SCALE). Every
 /// monotonic source (QueryPerformanceCounter, the tick count and interrupt
 /// time in KUSER_SHARED_DATA, wait timeouts) reads `mono_ns`, so they agree;
@@ -37,7 +37,7 @@ pub struct NtSetup {
 fn time_scale() -> f64 {
     static SCALE: OnceLock<f64> = OnceLock::new();
     *SCALE.get_or_init(|| {
-        std::env::var("GEX_NT_TIME_SCALE").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(1.0)
+        std::env::var("GEX_WIN_TIME_SCALE").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(1.0)
     })
 }
 
@@ -52,7 +52,7 @@ fn mono_ns() -> u64 {
     }
 }
 
-/// The guest's wall clock. `GEX_NT_FIXED_TIME=<unix seconds>` (the
+/// The guest's wall clock. `GEX_WIN_FIXED_TIME=<unix seconds>` (the
 /// counterpart of PEWASM_FIXED_TIME) starts it at that instant and advances
 /// it with real time, so a program that reads the date sees the same day
 /// every run. A program that seeds its own RNG from elsewhere still differs
@@ -60,7 +60,7 @@ fn mono_ns() -> u64 {
 fn wall() -> (u64, u32) {
     static FIXED: OnceLock<Option<(u64, Instant)>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
-        std::env::var("GEX_NT_FIXED_TIME").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| (s, Instant::now()))
+        std::env::var("GEX_WIN_FIXED_TIME").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| (s, Instant::now()))
     });
     let d = match fixed {
         Some((start, origin)) => std::time::Duration::from_secs(*start) + origin.elapsed(),
@@ -122,13 +122,13 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
     Ok(pc)
 }
 
-/// How long without a frame before the hang dump: `GEX_NT_HANG_SECS`, default
+/// How long without a frame before the hang dump: `GEX_WIN_HANG_SECS`, default
 /// 300 (Noita's world load holds one frame for over a minute).
 fn hang_after() -> Duration {
-    Duration::from_secs(std::env::var("GEX_NT_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300))
+    Duration::from_secs(std::env::var("GEX_WIN_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300))
 }
 
-/// GEX_NT_STATS, once, when no frame has been presented for a while: every
+/// GEX_WIN_STATS, once, when no frame has been presented for a while: every
 /// guest thread's pc, stack pointer and state, and the image addresses on the
 /// top of its stack (return addresses, mostly), so a hang says where each
 /// thread is.
@@ -176,7 +176,7 @@ fn layout_misses() -> u64 {
 /// visible top-level windows at their screen positions, cropped to their
 /// bounding box, into `PREFIX-NNNNN.ppm`. A file is what a test compares and
 /// what works with no screen. There is no native input source: input is
-/// `GEX_NT_INPUT`'s.
+/// `GEX_WIN_INPUT`'s.
 struct NullDisplay;
 
 impl nt::display::NtDisplay for NullDisplay {
@@ -268,14 +268,14 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// process exists, so a guest polling `GetTickCount` without syscalls sees
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, sampler: Option<Arc<Sampler>>) {
-    let stats = std::env::var_os("GEX_NT_STATS").is_some();
-    // GEX_NT_GL_STATS=1: the program's GL by function, with the 60 s report.
-    let gl_stats = std::env::var("GEX_NT_GL_STATS").as_deref() == Ok("1");
+    let stats = std::env::var_os("GEX_WIN_STATS").is_some();
+    // GEX_WIN_GL_STATS=1: the program's GL by function, with the 60 s report.
+    let gl_stats = std::env::var("GEX_WIN_GL_STATS").as_deref() == Ok("1");
     nt::opengl::STATS.store(gl_stats, std::sync::atomic::Ordering::Relaxed);
-    nt::opengl::FAST.store(std::env::var("GEX_NT_GL_FAST").map_or(true, |v| v != "0"), std::sync::atomic::Ordering::Relaxed);
-    nt::opengl::FAST_CLIENT_STATE.store(std::env::var("GEX_NT_GL_FAST").map_or(true, |v| v != "nocs"), std::sync::atomic::Ordering::Relaxed);
-    nt::opengl::CLIENT_ARRAY_OP.store(std::env::var("GEX_NT_GL_CLIENT_ARRAYS").map_or(true, |v| v != "buffer"), std::sync::atomic::Ordering::Relaxed);
-    let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
+    nt::opengl::FAST.store(std::env::var("GEX_WIN_GL_FAST").map_or(true, |v| v != "0"), std::sync::atomic::Ordering::Relaxed);
+    nt::opengl::FAST_CLIENT_STATE.store(std::env::var("GEX_WIN_GL_FAST").map_or(true, |v| v != "nocs"), std::sync::atomic::Ordering::Relaxed);
+    nt::opengl::CLIENT_ARRAY_OP.store(std::env::var("GEX_WIN_GL_CLIENT_ARRAYS").map_or(true, |v| v != "buffer"), std::sync::atomic::Ordering::Relaxed);
+    let peek = std::env::var("GEX_WIN_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
             Some(a) => (a, true),
             None => (v.as_str(), false),
@@ -283,10 +283,10 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
         let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16).ok()?;
         Some((addr, deref))
     });
-    // GEX_NT_HANG_DUMP=S: every S seconds, each thread's last safepoint pc,
+    // GEX_WIN_HANG_DUMP=S: every S seconds, each thread's last safepoint pc,
     // last indirect branch and context registers (`dump_threads`), for a
     // console program that hangs (the frame-based dump below needs frames).
-    let dump_every = std::env::var("GEX_NT_HANG_DUMP").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs);
+    let dump_every = std::env::var("GEX_WIN_HANG_DUMP").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs);
     let mut next_dump = dump_every;
     let start = Instant::now();
     let mut next_stats = Duration::from_secs(1);
@@ -302,7 +302,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         dump_threads(&p, &mut GuestMem::new(memory.bytes()));
                     }
                 }
-                // GEX_NT_STATS: once a (real) second, for benchmark harnesses.
+                // GEX_WIN_STATS: once a (real) second, for benchmark harnesses.
                 if stats && start.elapsed() >= next_stats {
                     next_stats += Duration::from_secs(1);
                     let presents = p.presents.load(std::sync::atomic::Ordering::Relaxed);
@@ -428,7 +428,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
     });
 }
 
-/// GEX_NT_HANG_DUMP's report: every thread's last safepoint pc, last
+/// GEX_WIN_HANG_DUMP's report: every thread's last safepoint pc, last
 /// indirect branch, registers and the top of its stack.
 fn dump_threads(p: &nt::Process, gm: &mut GuestMem<'_>) {
     let threads: Vec<Arc<nt::Thread>> = p.threads.read().unwrap().by_tid.values().cloned().collect();
@@ -511,7 +511,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         if let Some(n) = SYSCALLS.get(i) {
             // 1 in 64: who made it, the first return address outside
             // Wine's core DLLs on the guest's frame-pointer chain.
-            // GEX_NT_SYSCALL_SITES=1 only: the walk and its lock cost the
+            // GEX_WIN_SYSCALL_SITES=1 only: the walk and its lock cost the
             // measured run itself.
             if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 && sites_on() {
                 let site = syscall_site(&p, &memory, ctx_addr);
@@ -636,16 +636,16 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     }
 }
 
-/// NT syscalls by number (GEX_NT_STATS): ntdll's table and win32u's
+/// NT syscalls by number (GEX_WIN_STATS): ntdll's table and win32u's
 /// (0x1000 up).
 const UNIX_CALL_SLOT: usize = 0x1fff;
 fn sites_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GEX_NT_SYSCALL_SITES").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("GEX_WIN_SYSCALL_SITES").as_deref() == Ok("1"))
 }
 
-/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS with
-/// GEX_NT_SYSCALL_SITES=1).
+/// Sampled syscalls by (number, thread, guest site) (GEX_WIN_STATS with
+/// GEX_WIN_SYSCALL_SITES=1).
 static SYSCALL_SITES: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, u64), u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -676,7 +676,7 @@ fn syscall_site(p: &nt::Process, memory: &gex_mem::GuestMemory, ctx_addr: u64) -
 }
 static SYSCALLS: [std::sync::atomic::AtomicU64; 0x2000] = [const { std::sync::atomic::AtomicU64::new(0) }; 0x2000];
 
-/// Exceptions dispatched nested and escaped back (GEX_NT_STATS).
+/// Exceptions dispatched nested and escaped back (GEX_WIN_STATS).
 pub(crate) static EXC_NESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static EXC_ESCAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -687,16 +687,16 @@ const EXC_MAX_DEPTH: usize = 8;
 /// dispatched nested (`raise_nested`) rather than by unwinding every wasm
 /// frame of the thread. Only with function bodies about (tier-1 alone has no
 /// frames to keep), and only when the syscall returns through a `ret`, which
-/// is how the dispatch gets back (`GEX_NT_EXC_NEST=0` turns it off).
+/// is how the dispatch gets back (`GEX_WIN_EXC_NEST=0` turns it off).
 fn nest_exceptions(mem: &[u8], next_pc: u64) -> bool {
     nest_on() && matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
 }
 
 /// Nested dispatch at all: with function bodies about, unless
-/// `GEX_NT_EXC_NEST=0`.
+/// `GEX_WIN_EXC_NEST=0`.
 fn nest_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) && super::pe_units::mode() != super::pe_units::Mode::Off
+    *ON.get_or_init(|| std::env::var("GEX_WIN_EXC_NEST").as_deref() != Ok("0")) && super::pe_units::mode() != super::pe_units::Mode::Off
 }
 
 /// Has control left the innermost nested exception dispatch on this thread

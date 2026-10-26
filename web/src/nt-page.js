@@ -45,7 +45,7 @@ async function main() {
     }))).join('\0')
     : null;
   const exe = q.get('exe') || '/t/window.exe';
-  // Comma-separated, but a comma inside a value stays (GEX_NT_INPUT's
+  // Comma-separated, but a comma inside a value stays (GEX_WIN_INPUT's
   // `700:click:960,850`): a variable starts where NAME= does.
   const env = (q.get('env') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean);
   const app = await start({

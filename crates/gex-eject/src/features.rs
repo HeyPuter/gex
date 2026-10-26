@@ -38,7 +38,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "multiprocess",
         about: "more than one guest process (fork, exec, a process per Worker)",
-        fixed: Some("a W3 program is Wine, whose wineserver, services and the program itself \
+        fixed: Some("a wine32 program is Wine, whose wineserver, services and the program itself \
                      are separate processes"),
     },
     Feature {

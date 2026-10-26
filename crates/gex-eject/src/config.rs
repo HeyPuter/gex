@@ -105,24 +105,24 @@ pub struct Config {
     /// The features `"features"` names `true`: kept by choice, where a
     /// build's default would leave one out (a wine32 page's `"translation"`).
     pub features_on: Vec<String>,
-    /// W3 pages: `"bundle": "split"` ships only the files the recorded run
+    /// 32-bit Wine pages: `"bundle": "split"` ships only the files the recorded run
     /// opened in the site's bundle and serves the rest as lazy files, read
     /// from the host when a guest first reads them; `"whole"` (the default
     /// for a config without the setting) ships everything.
     pub bundle_split: bool,
-    /// W3 pages: `"cold"`, how the units' code the recording never ran is
+    /// 32-bit Wine pages: `"cold"`, how the units' code the recording never ran is
     /// split off (gex_split): a clustering (`"chunk:256"`, `"graph:64"`,
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
     /// default for a config without the setting. `"instrument"` builds
     /// units that report the functions a run calls, for a recording of the
-    /// site to take its coverage from (tools/eject/record-w3.mjs). Each unit keeps the
+    /// site to take its coverage from (tools/eject/record-wine32.mjs). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (docs/eject.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the
     /// guest's code on first call (gex_split::jit). `"tier1"`: the same
     /// units, with the function JIT off, so the rest runs on tier 1.
     pub cold: Option<String>,
-    /// W3 pages: which functions the build may leave out of the units. A
+    /// 32-bit Wine pages: which functions the build may leave out of the units. A
     /// pruned function that runs traps, naming its address.
     ///
     /// * `"fanout"`: the ones no execution can reach, proved across all the
@@ -132,12 +132,12 @@ pub struct Config {
     ///   site ships, and so much weaker.
     /// * `"none"` (the default): keep every function.
     pub prune: Option<String>,
-    /// W3 pages: `"resources": "trim"` zeroes, in the site's bundle, the
+    /// 32-bit Wine pages: `"resources": "trim"` zeroes, in the site's bundle, the
     /// resources no lookup the site makes can return (crate::rsrc);
     /// `"whole"`, the default for a config without the setting, ships them
     /// as they are.
     pub resources_trim: bool,
-    /// W3 pages: `"services": {"Name": "demand", ...}`, each Windows
+    /// 32-bit Wine pages: `"services": {"Name": "demand", ...}`, each Windows
     /// service's start type in the site's prefix (`boot`, `system`, `auto`,
     /// `demand`, `disabled`), set in the bundle's `system.reg` at build.
     /// A service a site never uses but the prefix starts with Wine (or on a

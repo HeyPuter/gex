@@ -78,8 +78,8 @@ pub fn run(ra: &RunArgs, bytes: &[u8]) -> Result<Exit> {
         cmdline: String::new(),
         env: environment(&ra.opts.env),
         cwd: nt::boot::dos_path(&prefix, &cwd),
-        trace: ra.opts.trace || flag("GEX_NT_TRACE"),
-        strict: flag("GEX_NT_STRICT"),
+        trace: ra.opts.trace || flag("GEX_WIN_TRACE"),
+        strict: flag("GEX_WIN_STRICT"),
         // Read from the process environment (Process::setting).
         settings: Vec::new(),
     };

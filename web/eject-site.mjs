@@ -8,7 +8,7 @@
 //   index.html     the project's page (user/index.html, the user's), which
 //                  imports app.mjs and calls its start()
 //   app.mjs, assets/, gex/, vendor/   the app library (runtime/web/page, or
-//                  a W3 build's build/web/page), runtime and Mesa, plain files
+//                  a 32-bit Wine build's build/web/page), runtime and Mesa, plain files
 //   project/build/web/nt.json, project/build/web/rootfs.tar.zst, and the
 //                  units the browser loads (project/build/units/...)
 //   pack.json      every packed file: size, compressed size; the build id
@@ -37,12 +37,12 @@ const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
 const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
-// A W3 page's site (below): --strip takes the debug sections out of every
+// A 32-bit Wine page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
 // next to each other in the tar so zstd's window stores the second as a match.
 // --pieces: the bundle's file bytes and the units in content-addressed
-// pieces (`pieces` in w3Site), which the page keeps in its own cache, so a
+// pieces (`pieces` in wine32Site), which the page keeps in its own cache, so a
 // visit after a rebuild fetches only the pieces that changed; --stable-from
 // DIR (repeatable: the Windows image the program's files came from, a game's
 // own directory) keeps the files whose bytes are DIR's in pieces of their
@@ -52,9 +52,9 @@ if (!project || !out) {
   process.exit(2);
 }
 const level = opt('--level', '19');
-// A W3 page's project (gexc eject of a tools/eject/record-w3.mjs recording):
-// build/web/w3.json instead of nt.json. See `w3Site` below.
-const w3 = existsSync(join(project, 'build/web/w3.json')) ? JSON.parse(readFileSync(join(project, 'build/web/w3.json'), 'utf8')) : null;
+// A 32-bit Wine page's project (gexc eject of a tools/eject/record-wine32.mjs recording):
+// build/web/wine32.json instead of nt.json. See `wine32Site` below.
+const w3 = existsSync(join(project, 'build/web/wine32.json')) ? JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8')) : null;
 const nt = w3 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
 const title = opt('--title', w3 ? (w3.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
@@ -124,7 +124,7 @@ function coldPack(dir, path) {
 const PIECES = 16;
 
 if (w3) {
-  w3Site();
+  wine32Site();
   process.exit(0);
 }
 
@@ -207,11 +207,11 @@ if (drops.length || overlays.length) {
 place(tar, 'project/build/web/rootfs.tar');
 
 // How to start: the recorded settings, less the benchmark's.
-const bench = /^(GEX_NT_INPUT|GEX_NT_TIME_SCALE|GEX_NT_FIXED_TIME)=/;
+const bench = /^(GEX_WIN_INPUT|GEX_WIN_TIME_SCALE|GEX_WIN_FIXED_TIME)=/;
 let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.test(s));
-// --input SCRIPT: GEX_NT_INPUT instead of the recorded one (a benchmark's
+// --input SCRIPT: GEX_WIN_INPUT instead of the recorded one (a benchmark's
 // clicks, by presented frame).
-if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
+if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_WIN_INPUT=')), `GEX_WIN_INPUT=${opt('--input', null)}`];
 // --args 'A B': the program's arguments instead of the recorded ones ('' for none).
 const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
 // Direct present for a GL program (the page composites again whenever a
@@ -476,10 +476,10 @@ function pieces(x) {
   return index;
 }
 
-/** The site of a W3 page's project: its page (built with the project's
+/** The site of a 32-bit Wine page's project: its page (built with the project's
  *  features, as plain files), its bundle and units (packed, decoded by the
  *  page), the launcher and the hosting files. No service worker. */
-function w3Site() {
+function wine32Site() {
   const web = join(project, 'build/web');
   const work = `${out.replace(/\/+$/, '')}.work`;
   rmSync(work, { recursive: true, force: true });
@@ -623,7 +623,7 @@ function w3Site() {
       groupsU.get(g).push(u);
     }
     const unitTars = [];
-    // Stateful providers (user/eject.json "providers", w3.json `stateful`):
+    // Stateful providers (user/eject.json "providers", wine32.json `stateful`):
     // files of the unit cache, in the first archive, with the provider
     // modules and the region entries.
     const statefulFiles = existsSync(join(web, 'units', 'stateful')) ? readdirSync(join(web, 'units', 'stateful')).map((f) => `stateful/${f}`) : [];
@@ -712,7 +712,7 @@ function w3Site() {
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
   writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
-  console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
+  console.log(`${out}: wine32 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
 }
 console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);

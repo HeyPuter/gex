@@ -181,7 +181,7 @@ export class ProcessHost {
   /// The other memory flavour's runtime, `{ shim, guest, kernel }` (a
   /// kernel module, on the same kernel memory), for a page whose processes
   /// do not all have one kind of memory: in a 64-bit memory's page
-  /// (`?mem64=1`), a program that is a wasm32 module (W64's wineserver,
+  /// (`?mem64=1`), a program that is a wasm32 module (64-bit Wine's wineserver,
   /// docs/wine-native-x64.md §4) or a 32-bit ELF runs in a 32-bit memory.
   /// What a process gets: the exec record says (`mem64`, vfork.rs
   /// `exec_memory`), a fork child has its parent's, and anything else the

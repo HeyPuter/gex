@@ -1038,7 +1038,7 @@ pub struct NtSession {
     pub env: Vec<String>,
     /// The DOS working directory.
     pub cwd: String,
-    /// The `GEX_NT_*` settings in effect, `NAME=value`.
+    /// The `GEX_WIN_*` settings in effect, `NAME=value`.
     pub settings: Vec<String>,
     /// Whether the run had a GL device (`gexc run --gl`).
     pub gl: bool,

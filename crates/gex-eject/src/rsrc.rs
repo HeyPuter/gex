@@ -1,4 +1,4 @@
-//! Resource trimming (`"resources": "trim"` in a W3 project's
+//! Resource trimming (`"resources": "trim"` in a 32-bit Wine project's
 //! user/eject.json): the bytes of each PE's resources that no lookup the
 //! site's Wine makes can return are zeroed in the bundle, so the download
 //! carries nothing for them. No size or offset in a file changes; a
@@ -431,15 +431,15 @@ pub fn site(env: &[String], tar: &crate::reach::Tar, prefix: &str) -> Site {
 }
 
 /// The flavors a unit's key may name that are the page's, not this gexc's:
-/// `unguarded` (mode bit 4, `gex_cgen_set_mode`) and W3's KUSER_SHARED_DATA
-/// fold (`gexc cgen-image --w3-kuser`, which the runtime turns on for a W3
+/// `unguarded` (mode bit 4, `gex_cgen_set_mode`) and 32-bit Wine's KUSER_SHARED_DATA
+/// fold (`gexc cgen-image --wine32-kuser`, which the runtime turns on for a 32-bit Wine
 /// Wine that maps it low). [`key_with`] for each; callers keep the one that
 /// gives the recorded key.
 pub(crate) const FLAVORS: [(bool, bool); 4] = [(true, false), (false, false), (true, true), (false, true)];
 
-/// The hash of `gex_cgen::image::abi_fingerprint` with W3's KUSER fold on
+/// The hash of `gex_cgen::image::abi_fingerprint` with 32-bit Wine's KUSER fold on
 /// or off: the C header a unit is built against has the fold's helpers only
-/// with it on (`gexc cgen-image --w3-kuser`), so the two flavors' keys differ
+/// with it on (`gexc cgen-image --wine32-kuser`), so the two flavors' keys differ
 /// there as well as in their `:w3kuser`. Each is computed once, with the
 /// process's fold set for the call and put back.
 fn abi_hash(kuser: bool) -> String {

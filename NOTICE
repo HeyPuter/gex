@@ -20,7 +20,7 @@ crates/gex-cgen/providers/dlmalloc.inc
     dlmalloc by Doug Lea, released to the public domain (CC0), with
     Emscripten's changes (Copyright the Emscripten authors, MIT licence).
 
-tools/wine-wasm/w3/oss/sys/soundcard.h
+tools/wine-wasm/wine32/oss/sys/soundcard.h
     FreeBSD's sys/soundcard.h (OSSv4 API), Copyright Hannu Savolainen,
     4Front Technologies, Luigi Rizzo and others. BSD-2-Clause (in the file).
 

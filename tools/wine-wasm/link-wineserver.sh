@@ -2,21 +2,21 @@
 # Link wineserver as its own wasm32 program, the server of door calls
 # (docs/wineserver-kernel.md): every object under server/ compiled from a
 # door-enabled Wine source tree (server/door.c, server/wasm32_door.h), with
-# the compile commands of a configured W3 (wasm32) Wine build tree, which is
+# the compile commands of a configured 32-bit Wine (wasm32) Wine build tree, which is
 # only read (make -n), never built or written.
 #
 #   tools/wine-wasm/link-wineserver.sh BUILD SRC OBJ DIST
 #
-# BUILD  configured W3 Wine build tree (its Makefile names server/wineserver)
+# BUILD  configured 32-bit Wine build tree (its Makefile names server/wineserver)
 # SRC    Wine source with the door server (e.g. Wine branch wskern/wine)
 # OBJ    directory for the server objects (reused: rebuilt when older than the
 #        source or any server header)
-# DIST   W3 install; writes DIST/lib/wine/i386-unix/wineserver(.wasm)
-# Env: GEX_WASM_SYSROOT (the W3 sysroot), JOBS (default 6).
+# DIST   32-bit Wine install; writes DIST/lib/wine/i386-unix/wineserver(.wasm)
+# Env: GEX_WASM_SYSROOT (the 32-bit Wine sysroot), JOBS (default 6).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 B=$(realpath "${1:?BUILD}"); F=$(realpath "${2:?SRC}"); O=$(realpath -m "${3:?OBJ}"); DIST=$(realpath -m "${4:?DIST}")
-: "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT to the W3 sysroot}"
+: "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT to the wine32 sysroot}"
 [ -f "$F/server/door.c" ] || { echo "link-wineserver: $F has no server/door.c" >&2; exit 1; }
 mkdir -p "$O"; cd "$B" || exit 1
 # The source tree BUILD was configured against: make -n's paths name it.
@@ -28,8 +28,8 @@ tmpl=$(compile_cmd "$WF/server/atom.c" server/atom.o)
 [ -n "$tmpl" ] || { echo "link-wineserver: no compile command for server/atom.o in $B" >&2; exit 1; }
 # The sources are SRC's own (server/Makefile.in SOURCES), not BUILD's: the
 # server speaks SRC's protocol, and BUILD may be a Wine whose server has
-# files SRC's has not (W3's LPC ports, server/lpc.c, for the W64 dist built
-# over a W3 tree) or lacks some of SRC's. door.c is added for trees whose
+# files SRC's has not (32-bit Wine's LPC ports, server/lpc.c, for the 64-bit Wine dist built
+# over a 32-bit Wine tree) or lacks some of SRC's. door.c is added for trees whose
 # Makefile.in does not name it yet.
 srcs=$( { sed -n '/^SOURCES *=/,/^[^\t]/p' "$F/server/Makefile.in" | sed -n 's/^[[:space:]]*\([a-z_0-9]*\)\.c[[:space:]\\]*$/\1/p'; echo door; } | sort -u)
 [ -n "$srcs" ] || { echo "link-wineserver: no SOURCES in $F/server/Makefile.in" >&2; exit 1; }

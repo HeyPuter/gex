@@ -467,7 +467,7 @@ fn zero_bits_limit(_c: &Call<'_>, zero_bits: u64) -> u64 {
 }
 
 /// Core of NtAllocateVirtualMemory(Ex).
-/// [`allocate_inner`], traced under `GEX_NT_TRACE`: what was asked (address,
+/// [`allocate_inner`], traced under `GEX_WIN_TRACE`: what was asked (address,
 /// size, type, protection) and what was given, which is how a program's
 /// reservation pattern is read off a run.
 fn allocate(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, prot: u32) -> R {

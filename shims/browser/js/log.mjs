@@ -9,7 +9,7 @@
 //
 //   GEX_LOG=1 (or all)   everything, as before
 //   GEX_LOG=debug        the narration (Worker hand-offs, fork costs, the shim's lines)
-//   GEX_LOG=record       the `[gex-record]` lines (tools/eject/record-w3.mjs)
+//   GEX_LOG=record       the `[gex-record]` lines (tools/eject/record-wine32.mjs)
 //   GEX_LOG=unit         a line per function-tier unit placed in a process
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)

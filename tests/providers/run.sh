@@ -25,7 +25,7 @@ fail=0
 for exe in "$work"/*.exe; do
     n=$(basename "$exe" .exe)
     for pv in 0 1; do
-        (cd "$work" && GEX_PROVIDERS=$pv GEX_NT_STRICT=1 timeout 600 "$gexc" run --no-cgen --wine-prefix "$prefix" "$n.exe" \
+        (cd "$work" && GEX_PROVIDERS=$pv GEX_WIN_STRICT=1 timeout 600 "$gexc" run --no-cgen --wine-prefix "$prefix" "$n.exe" \
             > "$work/$n.$pv.out" 2> "$work/$n.$pv.err")
         echo "exit=$?" >> "$work/$n.$pv.out"
     done
@@ -65,7 +65,7 @@ done
 if [ -f "$work/crtmath.0.out" ]; then
     cg=$work/cg
     run_u() {
-        (cd "$work" && GEX_CGEN_CACHE=$cg GEX_NT_CGEN_BUILD=0 GEX_PROVIDERS=1 GEX_NT_STRICT=1 timeout 600 "$gexc" run --wine-prefix "$prefix" crtmath.exe \
+        (cd "$work" && GEX_CGEN_CACHE=$cg GEX_WIN_CGEN_BUILD=0 GEX_PROVIDERS=1 GEX_WIN_STRICT=1 timeout 600 "$gexc" run --wine-prefix "$prefix" crtmath.exe \
             > "$work/crtmath.$1.out" 2> "$work/crtmath.$1.err")
         echo "exit=$?" >> "$work/crtmath.$1.out"
     }

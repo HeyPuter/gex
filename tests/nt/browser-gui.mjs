@@ -7,7 +7,7 @@
 //
 // --gl runs glwindow.exe instead: the same picture drawn with OpenGL in a
 // captioned window's client area (the GL frame drawn by the compositor, or
-// read back with GEX_NT_GL_READBACK=1 in GEX_NT_PAGE_ENV).
+// read back with GEX_WIN_GL_READBACK=1 in GEX_WIN_PAGE_ENV).
 //
 // Needs: the x86 shared shim, seed and kernel in web/public/gex
 // (GEX_ARCH=x86 shims/browser/build.sh), web/node_modules (vite), a staged
@@ -43,9 +43,9 @@ async function main() {
   const exe = join(HERE, 'bin', arch, `${name}.exe`);
   const tar = bundle(`${name}-${arch}`, arch, { [`t/${name}.exe`]: exe }, [exe]);
   const t0 = Date.now();
-  const env = [...(gl ? ['gl=1&glbackend=wgpu'] : []), ...(process.env.GEX_NT_PAGE_ENV ? [`env=${process.env.GEX_NT_PAGE_ENV}`] : [])];
+  const env = [...(gl ? ['gl=1&glbackend=wgpu'] : []), ...(process.env.GEX_WIN_PAGE_ENV ? [`env=${process.env.GEX_WIN_PAGE_ENV}`] : [])];
   const { browser, page, evaluate: eval_, until, shot } = await openPage(
-    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/${name}.exe&args=120&size=800x600${env.map((e) => `&${e}`).join('')}${process.env.GEX_NT_PAGE_FLAGS ?? ''}`, { shotDir });
+    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/${name}.exe&args=120&size=800x600${env.map((e) => `&${e}`).join('')}${process.env.GEX_WIN_PAGE_FLAGS ?? ''}`, { shotDir });
   await until((s) => /shown/.test(s.out), 300000, '"shown"');
   check('the program starts and paints', true, `${((Date.now() - t0) / 1000).toFixed(1)} s`);
   await sleep(1500);

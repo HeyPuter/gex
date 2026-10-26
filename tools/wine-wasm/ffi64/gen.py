@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ffi64/ffi.c's call table (W64's libwayland, LP64 wasm64; w64-deps.sh writes it
+"""ffi64/ffi.c's call table (64-bit Wine's libwayland, LP64 wasm64; wine64-deps.sh writes it
 as ffi64.inc). A Wayland listener's arguments are i32 (ints,
 fixeds, fds) or i64 (pointers), and a call_indirect must match the callee's
 type exactly: one case per pattern, keyed by the argument count and a mask

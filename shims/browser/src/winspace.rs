@@ -1,7 +1,7 @@
 //! A Windows program's address space in a page: Wine's views and the
 //! shim's own heap in one wasm memory.
 //!
-//! Two layouts. The compact one ([`w3_windows_space`]) leaves the arena as
+//! Two layouts. The compact one ([`wine32_windows_space`]) leaves the arena as
 //! a Linux process's and keeps an island for executables and pinned DLLs;
 //! the split ([`split_windows_space`]) grows the memory to 2 GiB at start
 //! and moves the shim's heap above it. Only the shared-memory build runs a
@@ -22,28 +22,28 @@ mod stub {
         0
     }
 
-    pub(crate) fn w3_windows_space() -> u64 {
+    pub(crate) fn wine32_windows_space() -> u64 {
         0
     }
 
-    pub(crate) fn set_w3_split(_on: bool) {}
+    pub(crate) fn set_wine_split(_on: bool) {}
 
-    pub(crate) fn w3_split() -> bool {
+    pub(crate) fn wine32_split() -> bool {
         false
     }
 
-    pub(crate) fn w3_space() -> Result<u64, String> {
-        Ok(w3_windows_space())
+    pub(crate) fn wine32_space() -> Result<u64, String> {
+        Ok(wine32_windows_space())
     }
 
-    pub(crate) fn w3_compact() -> bool {
+    pub(crate) fn wine32_compact() -> bool {
         false
     }
 
     /// No exe slot to keep without the NT layer.
-    pub(crate) const W3_ISLAND: (u64, u64) = (0, 0);
+    pub(crate) const WINE32_ISLAND: (u64, u64) = (0, 0);
 
-    pub(crate) fn w3_kuser() {}
+    pub(crate) fn wine32_kuser() {}
 
     pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
         Err("a Windows address space needs the shared-memory build".into())
@@ -82,10 +82,10 @@ mod imp {
     /// heap climbs above 2 GiB, where no Windows address is. Returns where
     /// the space the host left starts (it ends at 2 GiB).
     ///
-    /// Native Wine (W3) does not take this: see [`w3_windows_space`].
+    /// Native Wine (32-bit Wine) does not take this: see [`wine32_windows_space`].
     pub(crate) fn split_windows_space() -> Result<u64, String> {
         nt::set_log(log);
-        // Split already (an `execve` in a W3 process, or a fork's child):
+        // Split already (an `execve` in a 32-bit Wine process, or a fork's child):
         // the same line again. The heap is above it by now, so measuring
         // afresh would put the line at 2 GiB and leave no space at all.
         let lo = WINDOWS_LO.load(Ordering::Relaxed);
@@ -103,7 +103,7 @@ mod imp {
         Ok(host_hi)
     }
 
-    /// A native Wine process (W3): marked as Windows-hosting, and nothing
+    /// A native Wine process (32-bit Wine): marked as Windows-hosting, and nothing
     /// grown or claimed. Wine's own allocator takes its views from the
     /// kernel's arena bottom-up, through the same cursor as the shim's heap,
     /// as any Linux process's mappings do, so the memory reaches only as
@@ -111,46 +111,46 @@ mod imp {
     /// towards the tab's data segment, RLIMIT_DATA, whether touched or not).
     /// What Windows pins high (KUSER_SHARED_DATA, an image at its preferred
     /// base) still grows it, when it is mapped. Returns the arena's floor,
-    /// [`W3_COMPACT_LO`], which only says "W3" to the kernel and to a forked
+    /// [`WINE32_COMPACT_LO`], which only says "32-bit Wine" to the kernel and to a forked
     /// child.
-    pub(crate) fn w3_windows_space() -> u64 {
+    pub(crate) fn wine32_windows_space() -> u64 {
         nt::set_log(log);
         let lo = WINDOWS_LO.load(Ordering::Relaxed);
         if lo != 0 {
             return lo;
         }
-        W3_COMPACT.store(true, Ordering::Relaxed);
-        WINDOWS_LO.store(W3_COMPACT_LO, Ordering::Relaxed);
+        WINE32_COMPACT.store(true, Ordering::Relaxed);
+        WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
         keep_exe_slot();
-        W3_COMPACT_LO
+        WINE32_COMPACT_LO
     }
 
-    /// `?w3split=1` (a site that asks): W3 takes the NT layer's split
+    /// `?winesplit=1` (a site that asks): 32-bit Wine takes the NT layer's split
     /// instead of the compact space, as it did before it (9c5fc4fd): the
     /// memory grown to 2 GiB at start and the shim's heap above it, so
     /// everything below 2 GiB is Wine's. Costs the tab 2 GiB of data segment
     /// per process; for a game whose views and the heap do not fit together
     /// under 2 GiB (one needed 1.5 GiB of guest mappings and 164 MiB of heap).
-    static W3_SPLIT: AtomicBool = AtomicBool::new(false);
+    static WINE32_SPLIT: AtomicBool = AtomicBool::new(false);
 
-    pub(crate) fn set_w3_split(on: bool) {
-        W3_SPLIT.store(on, Ordering::Relaxed);
+    pub(crate) fn set_wine_split(on: bool) {
+        WINE32_SPLIT.store(on, Ordering::Relaxed);
     }
 
-    /// Whether this is a W3 process that took the split (`?w3split=1`):
+    /// Whether this is a 32-bit Wine process that took the split (`?winesplit=1`):
     /// everything below 2 GiB is Wine's, the shim's heap above it.
-    pub(crate) fn w3_split() -> bool {
-        W3_SPLIT.load(Ordering::Relaxed) && !W3_COMPACT.load(Ordering::Relaxed) && WINDOWS_LO.load(Ordering::Relaxed) != 0
+    pub(crate) fn wine32_split() -> bool {
+        WINE32_SPLIT.load(Ordering::Relaxed) && !WINE32_COMPACT.load(Ordering::Relaxed) && WINDOWS_LO.load(Ordering::Relaxed) != 0
     }
 
-    /// A W3 process's address space: the compact one, or the split when the
-    /// site asked (`set_w3_split`). Where the Windows space starts (the
-    /// split's line, or [`W3_COMPACT_LO`]).
-    pub(crate) fn w3_space() -> Result<u64, String> {
-        if W3_SPLIT.load(Ordering::Relaxed) {
-            split_windows_space().map(|lo| lo & !W3_KUSER_BIT)
+    /// A 32-bit Wine process's address space: the compact one, or the split when the
+    /// site asked (`set_wine_split`). Where the Windows space starts (the
+    /// split's line, or [`WINE32_COMPACT_LO`]).
+    pub(crate) fn wine32_space() -> Result<u64, String> {
+        if WINE32_SPLIT.load(Ordering::Relaxed) {
+            split_windows_space().map(|lo| lo & !WINE32_KUSER_BIT)
         } else {
-            Ok(w3_windows_space())
+            Ok(wine32_windows_space())
         }
     }
 
@@ -171,46 +171,46 @@ mod imp {
         // pinned DLL misses its unit: said once, it is a rare, costly event).
         if !crate::memmap::claim_island(EXE_SLOT, DLL_BAND_END, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)") {
             warn_line(&format!(
-                "gex: W3: the exe slot and DLL band [{EXE_SLOT:#x}, {DLL_BAND_END:#x}) are not kept (arena cursor {:#x}); pinned images will relocate\n",
+                "gex: wine32: the exe slot and DLL band [{EXE_SLOT:#x}, {DLL_BAND_END:#x}) are not kept (arena cursor {:#x}); pinned images will relocate\n",
                 ARENA_NEXT.load(Ordering::Acquire)
             ));
         }
     }
     const EXE_SLOT: u64 = 0x1000_0000;
     /// [`keep_exe_slot`]'s island, `[EXE_SLOT, DLL_BAND_END)`: where only a
-    /// mapping that names its address goes (`w3_address_space`).
-    pub(crate) const W3_ISLAND: (u64, u64) = (EXE_SLOT, DLL_BAND_END);
+    /// mapping that names its address goes (`wine32_address_space`).
+    pub(crate) const WINE32_ISLAND: (u64, u64) = (EXE_SLOT, DLL_BAND_END);
     /// The pinned DLLs' band, [0x11000000, 0x20000000): soju's dll-bases.py
     /// lays them out from its start and asserts they end below its end.
     const DLL_BAND: u64 = 0x1100_0000;
     const DLL_BAND_END: u64 = 0x2000_0000;
     const _: () = assert!(EXE_SLOT + (16 << 20) == DLL_BAND && DLL_BAND < DLL_BAND_END);
 
-    /// What a W3 process's `windows_space` says: no line (1 is never one, a
+    /// What a 32-bit Wine process's `windows_space` says: no line (1 is never one, a
     /// split's line being page-aligned), only "Windows lives here".
-    pub(crate) const W3_COMPACT_LO: u64 = 1;
+    pub(crate) const WINE32_COMPACT_LO: u64 = 1;
 
-    /// With [`W3_COMPACT_LO`]: this W3 Wine maps KUSER_SHARED_DATA at
-    /// `gex_abi::W3_KUSER` (its header's `FLAG_KUSER_W3`), so a forked child
+    /// With [`WINE32_COMPACT_LO`]: this 32-bit Wine maps KUSER_SHARED_DATA at
+    /// `gex_abi::W3_KUSER` (its header's `FLAG_KUSER_WINE32`), so a forked child
     /// folds as its parent did.
-    const W3_KUSER_BIT: u64 = 2;
+    const WINE32_KUSER_BIT: u64 = 2;
 
-    /// This process's Wine has KUSER_SHARED_DATA at W3's address: fold
+    /// This process's Wine has KUSER_SHARED_DATA at 32-bit Wine's address: fold
     /// Windows' constant addresses to it in everything translated from now
     /// on, and fault by name on any other access to the old page and above
     /// (`gex_abi::KUSER_GUARD`).
-    pub(crate) fn w3_kuser() {
+    pub(crate) fn wine32_kuser() {
         gex_abi::set_kuser_fold(true);
         gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
-        WINDOWS_LO.fetch_or(W3_KUSER_BIT, Ordering::Relaxed);
+        WINDOWS_LO.fetch_or(WINE32_KUSER_BIT, Ordering::Relaxed);
     }
 
-    /// Whether this process's Windows address space is W3's compact one
-    /// (no split; see [`w3_windows_space`]).
-    static W3_COMPACT: AtomicBool = AtomicBool::new(false);
+    /// Whether this process's Windows address space is 32-bit Wine's compact one
+    /// (no split; see [`wine32_windows_space`]).
+    static WINE32_COMPACT: AtomicBool = AtomicBool::new(false);
 
-    pub(crate) fn w3_compact() -> bool {
-        W3_COMPACT.load(Ordering::Relaxed)
+    pub(crate) fn wine32_compact() -> bool {
+        WINE32_COMPACT.load(Ordering::Relaxed)
     }
 
     /// Where this process's Windows address space starts, or 0 when it has
@@ -223,23 +223,23 @@ mod imp {
 
     /// A forked child's half of the parent's split, before the child's heap
     /// takes its first span: the NT layer's split at the parent's line, or
-    /// W3's compact space (the child's memory already covers what the
+    /// 32-bit Wine's compact space (the child's memory already covers what the
     /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
         nt::set_log(log);
-        if lo & !W3_KUSER_BIT == W3_COMPACT_LO {
-            W3_COMPACT.store(true, Ordering::Relaxed);
-            WINDOWS_LO.store(W3_COMPACT_LO, Ordering::Relaxed);
+        if lo & !WINE32_KUSER_BIT == WINE32_COMPACT_LO {
+            WINE32_COMPACT.store(true, Ordering::Relaxed);
+            WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
             keep_exe_slot();
-            if lo & W3_KUSER_BIT != 0 {
-                w3_kuser();
+            if lo & WINE32_KUSER_BIT != 0 {
+                wine32_kuser();
             }
             return Ok(());
         }
-        // A split's line, with W3's KUSER bit when the parent is a W3 process
-        // that took the split (`?w3split=1`) and folds KUSER_SHARED_DATA.
-        let kuser = lo & W3_KUSER_BIT != 0;
-        let lo = lo & !W3_KUSER_BIT;
+        // A split's line, with 32-bit Wine's KUSER bit when the parent is a 32-bit Wine process
+        // that took the split (`?winesplit=1`) and folds KUSER_SHARED_DATA.
+        let kuser = lo & WINE32_KUSER_BIT != 0;
+        let lo = lo & !WINE32_KUSER_BIT;
         if !grow_memory_to(NT_HEAP_BASE) {
             return Err("the engine will not grow this memory to 2 GiB".into());
         }
@@ -248,7 +248,7 @@ mod imp {
         crate::memmap::claim(crate::memmap::Kind::Guest, 0, lo, NT_HEAP_BASE, "Windows address space");
         WINDOWS_LO.store(lo, Ordering::Relaxed);
         if kuser {
-            w3_kuser();
+            wine32_kuser();
         }
         Ok(())
     }

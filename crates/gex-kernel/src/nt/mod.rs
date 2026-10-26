@@ -13,7 +13,7 @@
 //!
 //! Every syscall this layer does not implement is reported on stderr with its
 //! name each time it is called, and returns `STATUS_NOT_IMPLEMENTED`
-//! (`GEX_NT_STRICT=1` ends the process instead). A call that is implemented
+//! (`GEX_WIN_STRICT=1` ends the process instead). A call that is implemented
 //! for some arguments and not others reports the unsupported case the same
 //! way.
 
@@ -449,7 +449,7 @@ pub struct Process {
     pub gdi: Mutex<gdi::Gdi>,
     /// opengl32's Unix side: contexts and the GL command ring.
     pub gl: Mutex<opengl::State>,
-    /// SwapBuffers calls so far (GEX_NT_STATS).
+    /// SwapBuffers calls so far (GEX_WIN_STATS).
     pub presents: AtomicU64,
     /// Where top-level windows are shown, if anywhere (§6a.1).
     pub display_host: Mutex<Option<Arc<dyn display::NtDisplay>>>,
@@ -501,7 +501,7 @@ pub const USD: u64 = 0x7ffe_0000;
 pub use crate::win::nr as gex_nr;
 
 impl Process {
-    /// A gex setting (`GEX_NT_INPUT` and the like): the host's environment,
+    /// A gex setting (`GEX_WIN_INPUT` and the like): the host's environment,
     /// or else what the host passed in `Config::settings`. A page has no
     /// environment of its own, only what it gives the program.
     pub fn setting(&self, name: &str) -> Option<String> {
@@ -608,7 +608,7 @@ impl Process {
     pub fn unimplemented(&self, what: &str) -> Status {
         crate::nt_log!("gex-nt: unimplemented: {what}");
         if self.cfg.strict {
-            crate::nt_log!("gex-nt: GEX_NT_STRICT is set; ending the process");
+            crate::nt_log!("gex-nt: GEX_WIN_STRICT is set; ending the process");
             UNIMPLEMENTED_STRICT.store(true, Ordering::Relaxed);
         }
         Status(st::NOT_IMPLEMENTED)
@@ -870,7 +870,7 @@ pub fn hardware_exception(
         return Outcome::Exit(code);
     };
     let abi = p.abi;
-    if p.cfg.trace || std::env::var_os("GEX_NT_TRACE_EXC").is_some() {
+    if p.cfg.trace || std::env::var_os("GEX_WIN_TRACE_EXC").is_some() {
         let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
         crate::nt_log!(
             "[nt:{:x}] exception {code:#010x} {info:x?} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",

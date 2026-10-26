@@ -126,10 +126,10 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
     Ok(g)
 }
 
-/// This store's i64 stack pointer for lowered LP64 modules (W64: built for
+/// This store's i64 stack pointer for lowered LP64 modules (64-bit Wine: built for
 /// wasm64, run in a 32-bit memory; `ftab::instantiate`), with a stack of its
-/// own beside [`stack`]'s, made on first use. A W64 thread's loader and
-/// Wine's PE module share it, as W3's share [`stack`].
+/// own beside [`stack`]'s, made on first use. A 64-bit Wine thread's loader and
+/// Wine's PE module share it, as 32-bit Wine's share [`stack`].
 pub(crate) fn stack64(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result<wasmtime::Global> {
     if let Some(g) = cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp64.clone()) {
         return Ok(g);
@@ -203,10 +203,10 @@ fn map_anon(state: &mut HostState, addr: u64, len: u64, prot_bits: u32, extra: u
     state.with_kernel(|k| k.mem.mmap_anon(&mut gm, addr, len, prot_bits, extra, low, name))
 }
 
-/// Data a 64-bit skeleton's export table points at (W64, Wine's PE module:
+/// Data a 64-bit skeleton's export table points at (64-bit Wine, Wine's PE module:
 /// wasmdll::install_shared): above every image, so the RVA from any
-/// skeleton's base is positive. W64's images stay in its code space, below
-/// 2 GiB (Wine's w64_code_space_limit); its data may use the whole 4 GiB.
+/// skeleton's base is positive. 64-bit Wine's images stay in its code space, below
+/// 2 GiB (Wine's wine64_code_space_limit); its data may use the whole 4 GiB.
 /// Top-down from 4 GiB, the first free range.
 pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     use gex_kernel::mem::{flags, prot};
@@ -374,7 +374,7 @@ pub(crate) fn relocate_once(cx: &mut wasmtime::StoreContextMut<'_, HostState>, i
 
 /// `gex.provider_try` calls (a Lua protected call each: lua_pcall,
 /// lua_resume, lua_close's finalizers, the parser) and the throws they
-/// caught, for GEX_NT_STATS.
+/// caught, for GEX_WIN_STATS.
 pub static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -465,7 +465,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         caller.data().nt.as_ref().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
-    // `clock_gettime(clk)` in nanoseconds, no kernel lock (W3's PE ntdll's
+    // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter, docs/wine-overhead.md F2).
     linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;
@@ -510,7 +510,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok(())
     })()) })?;
-    // Wine's system-call dispatcher on its Unix side (W3.1): ntdll.so
+    // Wine's system-call dispatcher on its Unix side : ntdll.so
     // registers it (op 0), and the PE side's gexrt asks for it (op 1; 0
     // while there is none, and the NT layer takes the call).
     linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
@@ -523,7 +523,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "door_call", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::call(&mut caller, req as u32, pid, tid, false))
     })?;
-    // A 64-bit client's (W64's lowered LP64 ntdll.so): the same call, the
+    // A 64-bit client's (64-bit Wine's lowered LP64 ntdll.so): the same call, the
     // request's gather list at LP64 offsets (`door::req_layout`).
     linker.func_wrap(IMPORT_MODULE, "door_call_lp64", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::call(&mut caller, req as u32, pid, tid, true))
@@ -552,13 +552,13 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
     })?;
-    // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
+    // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
     // address against it at start; the browser's `gex_kuser_address`).
     linker.func_wrap(IMPORT_MODULE, "kuser_address", || -> i32 {
         (if gex_abi::kuser_fold() { gex_abi::W3_KUSER } else { gex_abi::KUSER_WINDOWS }) as i32
     })?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
-    // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
+    // Wine's ntdll.so mapped a PE image : a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
     // does (`wasmdll`). The image is named by the descriptor it was mapped
     // from.
@@ -568,25 +568,25 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::note_library(&path);
         let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&path)) else { return Ok(()) };
         let Ok(pe) = gex_ld::pe::parse(&bytes) else { return Ok(()) };
-        crate::note_w3_image(base, pe.image_size as u64, &path);
+        crate::note_wine32_image(base, pe.image_size as u64, &path);
         let (shared, engine) = {
             let Some(jit) = caller.data().jit.as_ref() else { return Ok(()) };
             (Arc::clone(&jit.shared), jit.engine.clone())
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         if let Some(n) = crate::wasmdll::install(&pe, &path, base, caller.data_mut(), &shared, &engine, &memory)? {
-            if std::env::var_os("GEX_W3_TRACE").is_some() {
-                eprintln!("gex-w3: native module for {path} at {base:#x}: {n} entries");
+            if std::env::var_os("GEX_WINE32_TRACE").is_some() {
+                eprintln!("gex-wine32: native module for {path} at {base:#x}: {n} entries");
             }
             crate::ftab::catch_up(&mut caller)?;
             crate::wasmdll::apply_pending(&shared, &memory);
         } else {
             // An i386 image: its function-tier unit, if one was built.
-            crate::pe_units::w3_image(&mut caller, &path, base, pe)?;
+            crate::pe_units::wine32_image(&mut caller, &path, base, pe)?;
         }
         Ok(())
     })()) })?;
-    // Code in `[addr, addr + len)` changed (W3: Wine's
+    // Code in `[addr, addr + len)` changed (32-bit Wine: Wine's
     // NtFlushInstructionCache): its translations are retired.
     linker.func_wrap(IMPORT_MODULE, "code_changed", |mut caller: Caller<'_, HostState>, addr: i32, len: i32| {
         let (addr, len) = (addr as u32 as u64, len as u32 as u64);
@@ -599,7 +599,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         gex_kernel::note_code_change();
     })?;
     // The function-table index of a named function of Wine's PE module
-    // (W3.3: win32u.so starts explorer's desktop thread by
+    // (win32u.so starts explorer's desktop thread by
     // `explorer.exe!gexp_desktop_thread`); 0 when there is none.
     linker.func_wrap(IMPORT_MODULE, "wine_pe_slot", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
         let Some(m) = caller.data().memory.as_ref() else { return 0 };
@@ -613,11 +613,11 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             None => 0,
         }
     })?;
-    // A native wasm32 program's signal hook (W3.1, `crate::SIGNAL_HOOKS`).
+    // A native wasm32 program's signal hook (`crate::SIGNAL_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_signal_hook(caller.data(), idx as u32);
     })?;
-    // A native wasm32 program's guest fault hook (W3.1, `crate::FAULT_HOOKS`).
+    // A native wasm32 program's guest fault hook (`crate::FAULT_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "fault_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_fault_hook(caller.data(), idx as u32);
     })?;
@@ -696,7 +696,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         cx.throw(exn)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
-    // `clock_gettime(clk)` in nanoseconds, no kernel lock (W3's PE ntdll's
+    // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter, docs/wine-overhead.md F2).
     linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;

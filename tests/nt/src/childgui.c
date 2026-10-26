@@ -1,5 +1,5 @@
 /* A launcher: a GUI test (user_win.exe, beside this one) as a child process,
- * waited for, its exit code passed on. Under native Wine on gex (W3) the
+ * waited for, its exit code passed on. Under native Wine on gex (32-bit Wine) the
  * child cannot map the session's shared memory and reads it through
  * wineserver requests (docs/wine-native.md). Its stdout is inherited.
  * As a GUI launcher is, this one is a user32 program that has the desktop

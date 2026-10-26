@@ -3,8 +3,8 @@
  * native modules' data relocated (gex once skipped it, keyed by the
  * memory's host address: a child then saw ntdll's lists as small offsets).
  * Each child registers a DLL notification and loads a DLL (ntdll's loader
- * lists and the notification list are relocated data). Native Wine (W3)
- * only: GEX_NT_CHILDREN=1 runs it.
+ * lists and the notification list are relocated data). Native Wine (32-bit Wine)
+ * only: GEX_WIN_CHILDREN=1 runs it.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>

@@ -1,4 +1,4 @@
-/* W64's stand-in for the part of libffi libwayland uses (w3/ffi's, for
+/* 64-bit Wine's stand-in for the part of libffi libwayland uses (wine32/ffi's, for
  * LP64 wasm64): ffi_call of a void function whose arguments are 32-bit
  * (ints, fixeds, fds) or 64-bit (pointers). A call_indirect must match the
  * callee's type exactly, so the call is made by argument count and the mask

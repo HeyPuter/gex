@@ -88,7 +88,7 @@ pub(crate) struct Store {
     /// The stack pointer this thread's stateful providers share
     /// (`libprov::stack`), made at the first one's instantiation.
     pub provider_sp: Option<wasmtime::Global>,
-    /// The i64 stack pointer of this thread's lowered LP64 modules (W64,
+    /// The i64 stack pointer of this thread's lowered LP64 modules (64-bit Wine,
     /// docs/wine-native-x64.md §1.1: built for wasm64, run in this 32-bit
     /// memory), on a stack of its own (`libprov::stack64`).
     pub provider_sp64: Option<wasmtime::Global>,
@@ -118,12 +118,12 @@ pub(crate) struct Store {
     replayed: usize,
 }
 
-/// `GEX_NT_STATS` counters: host lookups, run-time translations, lookups
+/// `GEX_WIN_STATS` counters: host lookups, run-time translations, lookups
 /// answered with the fallback, stale functions found on a lookup.
-/// Whether `GEX_NT_STATS` is set (read once).
+/// Whether `GEX_WIN_STATS` is set (read once).
 pub(crate) fn stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GEX_NT_STATS").is_some())
+    *ON.get_or_init(|| std::env::var_os("GEX_WIN_STATS").is_some())
 }
 
 pub(crate) mod stats {
@@ -359,7 +359,7 @@ fn instantiate(
             wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v as u32 as i32))
         }
     };
-    // A module built for wasm64 and lowered to this 32-bit memory (W64's
+    // A module built for wasm64 and lowered to this 32-bit memory (64-bit Wine's
     // LP64 Wine, docs/wine-native-x64.md §1.1) keeps i64 PIC globals, and
     // takes an i32 copy of the table base for its element segment.
     let lowered = !gex_abi::mem64() && module.imports().any(|imp| {
@@ -663,7 +663,7 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 /// there is answered by [`serve`] (a bridge), so tier-1 must not lift the
 /// bytes at it. Its discovery follows `call [iat]` into other images, and a
 /// retirement forgets the bridges of a page's providers while keeping the
-/// providers (a Detours hook in a W3 builtin's skeleton): lifted, the
+/// providers (a Detours hook in a 32-bit Wine builtin's skeleton): lifted, the
 /// untouched exports beside the hook ran their `ud2` stubs
 /// (c000001d).
 pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64) -> bool {

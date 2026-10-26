@@ -28,7 +28,7 @@
 // gex binds each thunk at its function's table index as a guest address,
 // so a guest call or jump to that index runs the native function.
 //
-// On wasm64 (W64, docs/wine-native-x64.md §1.2: LLP64 lowered to wasm32) the
+// On wasm64 (64-bit Wine, docs/wine-native-x64.md §1.2: LLP64 lowered to wasm32) the
 // guest is x86-64 and there is one calling convention, Win64's: the exit
 // stubs lay the arguments out as 8-byte slots (__gexw_guest_call64 puts the
 // first four in RCX, RDX, R8, R9 and XMM0-3 alike, and every slot on the
@@ -109,7 +109,7 @@ std::string sig64(Function &F, const DataLayout &DL) {
 static bool smallStruct(uint64_t n) { return n == 1 || n == 2 || n == 4 || n == 8; }
 
 struct GexIcall : PassInfoMixin<GexIcall> {
-  bool W64 = false;
+  bool Wasm64 = false;
 
   Function *getTarget(Module &M, const char *name, FunctionType *FT) {
     return cast<Function>(M.getOrInsertFunction(name, FT).getCallee());
@@ -136,7 +136,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     F->addFnAttr("gexw-no-icall");
     BasicBlock *BB = BasicBlock::Create(C, "entry", F);
     IRBuilder<> B(BB);
-    if (W64) {
+    if (Wasm64) {
       exitStub64(M, CB, F, B);
       return F;
     }
@@ -331,7 +331,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     Type *Ptr = PointerType::get(C, 0);
     FunctionType *FT = F.getFunctionType();
     if (FT->isVarArg()) return nullptr;
-    if (W64) return entryThunk64(M, F);
+    if (Wasm64) return entryThunk64(M, F);
     FunctionType *BodyT = FunctionType::get(I32, {I32, I32, I32, I64}, false);
     std::string base = "__gexe." + F.getName().str();
     Function *Body = Function::Create(BodyT, GlobalValue::InternalLinkage, base + ".body", M);
@@ -591,11 +591,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     LLVMContext &C = M.getContext();
-    W64 = Triple(M.getTargetTriple()).getArch() == Triple::wasm64;
+    Wasm64 = Triple(M.getTargetTriple()).getArch() == Triple::wasm64;
     Type *I32 = Type::getInt32Ty(C);
     // the pointer-sized integer a function pointer is compared as
-    Type *IP = W64 ? Type::getInt64Ty(C) : I32;
-    if (W64) emitSigs(M);
+    Type *IP = Wasm64 ? Type::getInt64Ty(C) : I32;
+    if (Wasm64) emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
     unsigned done = 0, varargs = 0;

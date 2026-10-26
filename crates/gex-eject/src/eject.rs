@@ -35,7 +35,7 @@ pub const GENERATED: &[&str] = &[
     "app.mjs",
     "index.html",
     ".gitignore",
-    // A W3 page's (w3.rs).
+    // A 32-bit Wine page's (wine32.rs).
     "bundle",
     "units",
 ];

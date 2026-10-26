@@ -689,8 +689,8 @@ async function handle(msg) {
   if (msg.identities) Gex.identities = msg.identities;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
-  // `?w3split=1`: a W3 process takes the NT layer's split, not the compact space.
-  if (msg.w3Split) globalThis.GEX_W3_SPLIT = 1;
+  // `?winesplit=1`: a 32-bit Wine process takes the NT layer's split, not the compact space.
+  if (msg.wine32Split) globalThis.GEX_WINE32_SPLIT = 1;
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
   // `?mxcsr=1`: SSE under MXCSR (gex_ir::mxcsr_exact), a per-program opt-in.
@@ -996,7 +996,7 @@ async function handle(msg) {
       // On the forking thread's registers, which the child's kernel keeps
       // where the parent had them (`gex_adopt_child`): `run`'s default is the
       // first thread's. A fork from any other thread entered with the first
-      // thread's registers -- for W3, Wine's spawn from services.exe's RPC
+      // thread's registers -- for 32-bit Wine, Wine's spawn from services.exe's RPC
       // thread started the child's `__gex_thread_start` on that thread's
       // stack, read a stack word as `clone_start`'s table index and trapped
       // ("table index is out of bounds", rpcss and every service child).

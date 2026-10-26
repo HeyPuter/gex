@@ -1,12 +1,12 @@
 /* KUSER_SHARED_DATA read the way Windows programs read it: by constant
  * address at 0x7ffe0000 (GetTickCount inlined, the interrupt time, the OS
  * version), in every addressing form that carries an absolute displacement.
- * Under W3 (Wine as wasm32) the page is elsewhere (gex_abi::W3_KUSER) and
+ * Under 32-bit Wine (Wine as wasm32) the page is elsewhere (gex_abi::W3_KUSER) and
  * the translator folds these accesses to it; elsewhere they read the page
  * where it is.
  *
  *   kuser const      the constant reads, checked against the APIs
- *   kuser pointer    a pointer into the page computed at run time: under W3
+ *   kuser pointer    a pointer into the page computed at run time: under 32-bit Wine
  *                    an access violation (gex says "KUSER access not folded"),
  *                    which a vectored handler reports; elsewhere a plain read
  *
@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
         expected_addr = runtime_kuser + 0x26c;
         AddVectoredExceptionHandler(1, handler);
         ULONG v = *(volatile ULONG *)expected_addr;
-        /* Reached where the page is really at 0x7ffe0000 (not W3). */
+        /* Reached where the page is really at 0x7ffe0000 (not 32-bit Wine). */
         printf("read %lu at %#zx\n", (unsigned long)v, (size_t)expected_addr);
         return 3;
     }

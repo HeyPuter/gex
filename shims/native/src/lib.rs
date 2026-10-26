@@ -254,7 +254,7 @@ struct HostState {
     pub(crate) thread_only: bool,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
-    /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
+    /// Why `resume_at` was set (GEX_WIN_STATS only; `note_resume`).
     pub(crate) resume_cause: Option<String>,
     /// The function tier's call-outs in progress on this thread, innermost
     /// last (`call_out`).
@@ -371,7 +371,7 @@ struct SpawnContext {
     fork_dl_tls: Mutex<std::collections::HashMap<u32, u32>>,
 }
 
-/// Tier-1 counters for `GEX_NT_STATS`: translations published, units
+/// Tier-1 counters for `GEX_WIN_STATS`: translations published, units
 /// installed into stores, pages retired, the slot high-water mark, and the
 /// dispatch-table entries grown across every store.
 pub(crate) mod jit_stats {
@@ -592,7 +592,7 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 }
 
 /// [`cache_key`], remembered for this host process: every Wine process under
-/// W3 execs the same 5.7 MB program, and its SHA-256 was 0.36-0.58 s of each
+/// 32-bit Wine execs the same 5.7 MB program, and its SHA-256 was 0.36-0.58 s of each
 /// child's start (with the other processes' threads busy). The memo
 /// is keyed by a 128-bit SipHash of the same fields, a few ms.
 fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
@@ -685,7 +685,7 @@ fn x87_stats(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) {
 }
 
 /// `GEX_PPM_EVERY=N`: `--wayland-out` writes every Nth frame only, each
-/// named by its real index (so `GEX_NT_INPUT`'s frame numbers still line up
+/// named by its real index (so `GEX_WIN_INPUT`'s frame numbers still line up
 /// and the newest name is the frame count). A long run otherwise writes a
 /// frame at every present, 6 MB each at 1920x1080.
 pub(crate) fn ppm_every() -> u32 {
@@ -761,7 +761,7 @@ struct Inherited {
 /// for a run (an ejected project's `.cwasm`) must be compiled by an engine
 /// configured exactly so.
 ///
-/// One per host process (per memory flavor): every Wine process under W3
+/// One per host process (per memory flavor): every Wine process under 32-bit Wine
 /// runs the same programs and modules, and with an engine per `execve` none
 /// of them could be reused across processes (`gex_cache`'s memo is per
 /// engine), so each child loaded the 42 MB Wine PE module and the program
@@ -854,7 +854,7 @@ fn run_program_with(
     // alone: it is an i386 ELF (and its kernel speaks the i386 ABI, below),
     // but an x86-64 shell that runs it goes on translating its own code
     // after the wait.
-    // ...unless it hosts i386 code itself (Wine's loader, W3: the header's
+    // ...unless it hosts i386 code itself (Wine's loader, 32-bit Wine: the header's
     // FLAG_GUEST_I386), which is then the process's to translate.
     if !wasmprog::is_wasm32(program) || wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
         gex_xlate::set_compat(program.compat());
@@ -1351,16 +1351,16 @@ fn run_program_with(
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
     if nt_setup.is_none() {
-        // W3's i386 Wine and W64's x86-64 Wine (FLAG_GUEST_X86_64) alike:
+        // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
         // Windows' fixed addresses left free, and the trampoline page (its
-        // x86-64 entries and the native return pad serve W64)
+        // x86-64 entries and the native return pad serve 64-bit Wine)
         if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
             store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
-            // An i386 Wine with KUSER_SHARED_DATA at W3's address: Windows'
+            // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
             // constant addresses folded there, the old page and above a
             // named fault (`gex_abi::KUSER_GUARD`).
             let f = wasmprog::flags(program);
-            if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_W3 != 0 {
+            if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_WINE32 != 0 {
                 gex_abi::set_kuser_fold(true);
                 gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
             }
@@ -2409,7 +2409,7 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
 /// (`MemoryMap::clean`, the caller's), the pages the host never gave the
 /// parent (`/proc/self/pagemap` says neither present nor swapped) without
 /// reading them, and the present pages that read as zero without writing
-/// them. Wine under W3 reserves ~2.5 GiB of address space, almost none of
+/// them. Wine under 32-bit Wine reserves ~2.5 GiB of address space, almost none of
 /// it touched, and copying it whole was 2-3 s of every fork -- twice per Wine
 /// child, whose `spawn_process` forks and forks again.
 struct SparseCopy {
@@ -3327,7 +3327,7 @@ fn mount_filesystems(
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
     }
-    // Audio (W3.5): OSS's /dev/dsp and /dev/mixer, a null output, for
+    // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
@@ -4059,7 +4059,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 check_i386_high(&caller, "an NT syscall");
                 return r;
             }
-            // A Unix call from guest code under Wine's own Unix side (W3).
+            // A Unix call from guest code under Wine's own Unix side (32-bit Wine).
             if pc as u64 & nt::NATIVE_SYSCALL == 0 {
                 if let Some(memory) = caller.data().memory.clone() {
                     let ctx_addr = caller.data().thread.ctx_addr;
@@ -4070,7 +4070,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 }
             }
-            // gexrt's NATIVE_LEFT under Wine's own Unix side (W3), which
+            // gexrt's NATIVE_LEFT under Wine's own Unix side (32-bit Wine), which
             // has no NT layer to take it: as `nt::syscall_import` does, the
             // innermost native call-out the guest has left is abandoned.
             if pc as u64 & nt::NATIVE_SYSCALL != 0 {
@@ -4582,13 +4582,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::BREAKPOINT,
         |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
-            // W3 with KUSER_SHARED_DATA folded: an access at or above the old
+            // 32-bit Wine with KUSER_SHARED_DATA folded: an access at or above the old
             // page through a pointer the translator could not fold. Named,
             // then an access violation for Wine's handler (SIGSEGV without
             // one); never a read there.
             if imm == gex_abi::imports::BRK_KUSER_UNFOLDED {
                 let (pc, addr) = gex_abi::kuser_miss_unpack(pc);
-                let name = match w3_image_at(pc) {
+                let name = match wine32_image_at(pc) {
                     Some((n, off)) => format!("{n} +{off:#x}"),
                     None => caller.data_mut().with_kernel(|k| {
                         k.mem.lock().vma_at(pc).map(|v| {
@@ -5079,7 +5079,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD
                         && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
                 };
-                // A call-out that never returns (ret 0: Wine's W3 thread loop,
+                // A call-out that never returns (ret 0: Wine's 32-bit Wine thread loop,
                 // `gex_call_out(ctx, pc, 0, 0)`) has no caller frame to
                 // unwind past. Its sp_want of 0 made every safepoint abandon
                 // it: a whole trap-out and re-entry per safepoint on every
@@ -5201,9 +5201,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         return Ok(true);
     }
 
-    // W3: an image Wine relocated gets its function-tier unit at its first
-    // miss (`pe_units::w3_image`).
-    pe_units::w3_miss(caller, pc)?;
+    // 32-bit Wine: an image Wine relocated gets its function-tier unit at its first
+    // miss (`pe_units::wine32_image`).
+    pe_units::wine32_miss(caller, pc)?;
     // A function the table holds, or the run-time translator can make,
     // serves this address: tier-1 reaches it through the bridge.
     if ftab::serve(caller, pc)? {
@@ -5248,7 +5248,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // rather than copied: a copy of the set (half a million entries for
     // a large game) per miss was 0.7% of tier-1's CPU in memcpy alone.
     // An address a function serves counts too: a miss there gets its bridge
-    // (`ftab::serves`), and its bytes may be no code at all (a W3 builtin's
+    // (`ftab::serves`), and its bytes may be no code at all (a 32-bit Wine builtin's
     // `ud2` stub).
     let known = |a: u64| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -5295,11 +5295,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         )
     };
     jit_stats::note(pc);
-    // W3's KUSER_SHARED_DATA folds (`gex_abi::fold_kuser`), by object: the
+    // 32-bit Wine's KUSER_SHARED_DATA folds (`gex_abi::fold_kuser`), by object: the
     // translator's line for them, as the browser's.
     let folds = gex_ir::take_kuser_folds();
     if folds != 0 {
-        let name = match w3_image_at(pc) {
+        let name = match wine32_image_at(pc) {
             Some((n, _)) => n,
             None => caller.data_mut().with_kernel(|k| {
                 k.mem.lock().vma_at(pc).map(|v| {
@@ -5684,7 +5684,7 @@ fn install_unit(
     Ok(())
 }
 
-/// Blocks tier-1 has translated, by guest page, for GEX_NT_STATS's split
+/// Blocks tier-1 has translated, by guest page, for GEX_WIN_STATS's split
 /// by image.
 static TIER1_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
 
@@ -6000,7 +6000,7 @@ pub(crate) fn set_fault_hook(state: &HostState, idx: u32) {
     v.push((key, idx));
 }
 
-/// A native wasm32 program's signal hook (W3.1), by process: the function
+/// A native wasm32 program's signal hook , by process: the function
 /// that runs the signal frames gex-kernel leaves on the guest's stack
 /// (libgex's `__gex_signal_frames(ctx, pc)`, which calls the program's wasm
 /// handlers), for a signal that arrives while the thread runs guest code.
@@ -6019,8 +6019,8 @@ pub(crate) fn set_signal_hook(state: &HostState, idx: u32) {
 }
 
 /// The C stack pointer of the process's native Wine (a stateful provider's):
-/// the i64 one of W64's lowered LP64 modules where there is one, else
-/// W3's i32 one (`libprov::stack`, `libprov::stack64`).
+/// the i64 one of 64-bit Wine's lowered LP64 modules where there is one, else
+/// 32-bit Wine's i32 one (`libprov::stack`, `libprov::stack64`).
 fn native_sp(d: &HostState) -> Option<wasmtime::Global> {
     let s = d.jit.as_ref().and_then(|j| j.ftab.as_ref())?;
     s.provider_sp64.clone().or_else(|| s.provider_sp.clone())
@@ -6072,7 +6072,7 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
     Ok(true)
 }
 
-/// Wine's Unix-side system-call dispatcher, by process (W3.1): op 0 sets
+/// Wine's Unix-side system-call dispatcher, by process : op 0 sets
 /// it, op 1 returns it (0 for none).
 static UNIX_DISPATCHERS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
@@ -6109,10 +6109,10 @@ pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
     v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d)
 }
 
-/// Wine's `__wine_unix_call_dispatcher` (W3), by process.
+/// Wine's `__wine_unix_call_dispatcher` (32-bit Wine), by process.
 static NATIVE_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
-/// Wine's handler for a Unix call from guest code (W3), by process.
+/// Wine's handler for a Unix call from guest code (32-bit Wine), by process.
 static GUEST_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 /// A guest's Unix call (`int 0x80` with EAX = UNIX_CALL, from the
@@ -6172,7 +6172,7 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
     }
     let f = crate::ftab::table_func(caller, hook)?;
-    // W64's hook (signal_wasm64.c) takes the address as 64 bits, W3's
+    // 64-bit Wine's hook (signal_wasm64.c) takes the address as 64 bits, 32-bit Wine's
     // (signal_wasm32.c) as 32.
     let wide = f.typed::<(i32, i32, i64, i32), ()>(&*caller).ok();
     let narrow = if wide.is_none() {
@@ -6216,19 +6216,19 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
 /// violation, executing (Wine's ntdll.so); else it is a SIGSEGV, for the
 /// program's handler if it has one. Always stops the guest call.
 pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<i32> {
-    // The process's own fault hook (Wine's ntdll.so, W3):
+    // The process's own fault hook (Wine's ntdll.so, 32-bit Wine):
     // an access violation, executing (DEP).
-    if std::env::var_os("GEX_W3_TRACE").is_some() {
+    if std::env::var_os("GEX_WINE32_TRACE").is_some() {
         if let Some(memory) = caller.data().memory.clone() {
             let gm = GuestMem::new(memory.bytes());
             let base = caller.data().thread.ctx_addr;
             let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
             let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
             let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
-            eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
+            eprintln!("gex-wine32: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
             let bt = wasmtime::WasmBacktrace::force_capture(&*caller);
             for fr in bt.frames().iter().take(24) {
-                eprintln!("gex-w3:   {}", fr.func_name().unwrap_or("?"));
+                eprintln!("gex-wine32:   {}", fr.func_name().unwrap_or("?"));
             }
         }
     }
@@ -6325,7 +6325,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let span = args.unwrap_or(CALLOUT_UNWOUND);
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
-    // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
+    // translate it first (32-bit Wine: the trampoline page's NATIVE_RETURN_PAD, which
     // no unit covers without the NT layer). A call-out that never returns
     // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
     // An AOT-only process translates nothing (`aot_only`).
@@ -6334,8 +6334,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(1);
         if page < gex_abi::dispatch_max_pages() && entry(&memory) == 0 {
             translate_and_install(caller, ret)?;
-            if entry(&memory) == 0 && std::env::var_os("GEX_W3_TRACE").is_some() {
-                eprintln!("gex-w3: call-out return {ret:#x}: its page has still no dispatch entry");
+            if entry(&memory) == 0 && std::env::var_os("GEX_WINE32_TRACE").is_some() {
+                eprintln!("gex-wine32: call-out return {ret:#x}: its page has still no dispatch entry");
             }
         }
     }
@@ -6399,7 +6399,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
         }
-        // A wild guest access under a process with a fault hook (W3.1):
+        // A wild guest access under a process with a fault hook :
         // delivered, and the guest goes on where the hook says. The
         // translated code cannot say which instruction faulted: PC is where
         // the context last had it (the block's start, at best).
@@ -6470,7 +6470,7 @@ fn trace_callout_abort(
     );
 }
 
-/// Call-outs started and abandoned (GEX_NT_STATS).
+/// Call-outs started and abandoned (GEX_WIN_STATS).
 pub(crate) static CALLOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static CALLOUT_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6576,7 +6576,7 @@ fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
 /// another's call put there: a thread that frees code, or makes it writable,
 /// can find the log already emptied by a neighbour that is still forgetting
 /// those pages, and must not run on until that is done -- it would reuse the
-/// address (`VirtualAlloc` after `VirtualFree`, tests/w3/vmreuse) and branch
+/// address (`VirtualAlloc` after `VirtualFree`, tests/wine32/vmreuse) and branch
 /// into the old translation, which the dispatch directory still answers for.
 /// Raised before the take is visible to anyone else (under the kernel lock,
 /// or before swapping [`gex_kernel::CODE_EVENTS`]), lowered once forgotten.
@@ -6918,7 +6918,7 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
 }
 
 /// Record a taken resume's cause (set with `resume_at`) and target, under
-/// GEX_NT_STATS; `taker` names the loop that took it when no cause was set.
+/// GEX_WIN_STATS; `taker` names the loop that took it when no cause was set.
 pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
     if state.nt.is_some() && profile::active() {
         profile::note_nt_entry(target);
@@ -7005,18 +7005,18 @@ fn fault_context(gm: &GuestMem<'_>, ctx: i32, pc: u64) {
 /// The PE images Wine mapped in this process (`gex.image_mapped`): base,
 /// end and file name. Wine maps an image into anonymous memory, so the
 /// memory map has no name for its code; the KUSER lines name it from here.
-static W3_IMAGES: std::sync::Mutex<Vec<(u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
+static WINE32_IMAGES: std::sync::Mutex<Vec<(u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
 
-pub(crate) fn note_w3_image(base: u64, size: u64, path: &str) {
+pub(crate) fn note_wine32_image(base: u64, size: u64, path: &str) {
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
-    let mut g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     // A range mapped again (an image unloaded, another in its place).
     g.retain(|&(b, e, _)| e <= base || base + size <= b);
     g.push((base, base + size, name));
 }
 
-/// The W3 image holding `pc` and the offset into it.
-fn w3_image_at(pc: u64) -> Option<(String, u64)> {
-    let g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+/// The 32-bit Wine image holding `pc` and the offset into it.
+fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
+    let g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
 }

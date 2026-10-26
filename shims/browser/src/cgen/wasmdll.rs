@@ -49,11 +49,11 @@ struct WinePe {
     installed: bool,
     /// The DLLs whose skeleton has been mapped. A later mapping of one (an
     /// image view: wineboot's install maps DLLs so) binds its exports but
-    /// writes none of the variables, which are the loaded DLL's -- under W3
+    /// writes none of the variables, which are the loaded DLL's -- under 32-bit Wine
     /// rewriting them reset ntdll's `__wine_unixlib_handle`, which Wine's
     /// own loader had set (as the native host found).
     mapped: std::collections::HashSet<String>,
-    /// An LLP64 module (W64, its skeletons PE32+): pointers in its data are
+    /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16 (as natively).
     ptr64: bool,
 }
@@ -191,7 +191,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             Some((dir, _)) => format!("{dir}/{module_name}"),
             None => module_name.clone(),
         };
-        // A twin install (w64-dist.sh W64_TWIN=1, docs/mem64.md §5): a
+        // A twin install (wine64-dist.sh WINE64_TWIN=1, docs/mem64.md §5): a
         // process with a 64-bit memory loads the memory64 build's module,
         // beside the other as `<module>.m64`, under the same skeletons.
         let ns = crate::sigs::proc_home().ns();
@@ -212,12 +212,12 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                     "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
                     if m64 { 64 } else { 32 },
                     if m64 { 32 } else { 64 },
-                    if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: w64-dist.sh W64_TWIN=1)" }
+                    if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: wine64-dist.sh WINE64_TWIN=1)" }
                 ));
             }
         }
-        // W3's PE module: refused when its inline probe reads another layout
-        // (gexrt's `gex_ftab_idx`; W64's wasm64 gexrt has no probe).
+        // 32-bit Wine's PE module: refused when its inline probe reads another layout
+        // (gexrt's `gex_ftab_idx`; 64-bit Wine's wasm64 gexrt has no probe).
         if !pe.is64 {
             if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
                 return Err(e);
@@ -225,7 +225,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
-        // (an LLP64 module's above the images: see `crate::w64_pe_data`)
+        // (an LLP64 module's above the images: see `crate::wine64_pe_data`)
         let data = if pe.is64 {
             alloc_pe_data_window((size as u64).max(16) + a, "[wine PE data]")?
         } else {
@@ -303,7 +303,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             dst.copy_from_slice(&bytes);
         }
     }
-    // (W64's ntdll has Wine's own Unix side, which sets them: these are
+    // (64-bit Wine's ntdll has Wine's own Unix side, which sets them: these are
     // gex-kernel's i386 trampolines)
     if first_mapping && dll == "ntdll.dll" && !wp.ptr64 {
         for (name, bytes) in ntdll_variables() {
@@ -336,13 +336,13 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 /// import thunk's `jmp [iat]`, its slot read-only once Wine's loader filled
 /// it, resolves to a one-case jump table whose target is the stub, and the
 /// thunk's translation then ran the `ud2` (imm32's call of user32's
-/// `User32InitializeImmEntryTable`: SIGILL in every W3 page process with
+/// `User32InitializeImmEntryTable`: SIGILL in every 32-bit Wine page process with
 /// `?fjit=1`).
 static SKELETON_CODE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Unmapped ranges (`super::on_retire`'s `gone`): a skeleton mapped there
 /// is gone, and so are its exports' bindings. Kept, they sent the code
-/// that next landed at those addresses to Wine's PE module: W64's wineboot
+/// that next landed at those addresses to Wine's PE module: 64-bit Wine's wineboot
 /// maps DLLs as image views and unmaps them, and two pages of anonymous
 /// code later at 0x7fc11000 called a native export until the rebridge
 /// guard gave up.
@@ -459,14 +459,14 @@ fn pe_head(b: &[u8]) -> Option<(u64, bool)> {
     Some((size, skeleton))
 }
 
-/// `gex.image_mapped(base, fd)` (W3, docs/wine-native.md §3.17): Wine's
+/// `gex.image_mapped(base, fd)` (32-bit Wine, docs/wine-native.md §3.17): Wine's
 /// own PE loader mapped the image open at `fd` at `base`, relocated. A
 /// native DLL's skeleton gets Wine's PE module bound at its exports, as the
 /// native host's `image_mapped` does. The module number when this is the
 /// first skeleton (the host instantiates it, then `gex_cgen_pmod_installed`
 /// and `gex_wasmdll_installed`), -2 when bound into the install (bridges
 /// to write), -3 for an i386 image with a function-tier unit to serve
-/// (`super::w3_mapped`), -1 for anything else (an i386 image stays on
+/// (`super::wine32_mapped`), -1 for anything else (an i386 image stays on
 /// tier-1). `base` is 64-bit for a memory64 program's (JS widens a 32-bit
 /// one's).
 #[no_mangle]
@@ -481,22 +481,22 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     // An x86 image (not a skeleton): left unread for its first miss, which
     // a resource-only map or an import scan never has. Its headers say
     // which.
-    if super::w3_may_defer(&path, base) {
+    if super::wine32_may_defer(&path, base) {
         let mut head = vec![0u8; 4096];
         let n = file.read_at(0, &mut head).unwrap_or(0) as usize;
         head.truncate(n);
         if let Some((size, false)) = pe_head(&head) {
-            crate::note_w3_image(base, size, &path);
-            super::w3_defer_unread(&path, base, size, file);
+            crate::note_wine32_image(base, size, &path);
+            super::wine32_defer_unread(&path, base, size, file);
             return -1;
         }
     }
     let Some(pe) = super::read_pe(&*file) else { return -1 };
-    crate::note_w3_image(base, pe.image_size as u64, &path);
+    crate::note_wine32_image(base, pe.image_size as u64, &path);
     if !is_skeleton(&pe) {
         // An i386 image (the program's, a game's DLL): its function-tier
         // unit, when units are on; -3 tells JS to serve it.
-        return if super::w3_mapped(&path, base, &pe) { -3 } else { -1 };
+        return if super::wine32_mapped(&path, base, &pe) { -3 } else { -1 };
     }
     match publish(&path, base, &pe) {
         Ok(n) => {
@@ -508,7 +508,7 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
             n
         }
         Err(e) => {
-            crate::warn_line(&format!("gex-w3: {path}: native wasm32 DLL: {e}\n"));
+            crate::warn_line(&format!("gex-wine32: {path}: native wasm32 DLL: {e}\n"));
             // A module built for another probe layout runs nothing: the
             // process ends here, not at its first wrong call.
             if e.contains(super::wasmprog::ABI_REFUSED) {
@@ -519,14 +519,14 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
-/// A PE32+ core's data, at the top of [`crate::w64_pe_data`] (reserved at
+/// A PE32+ core's data, at the top of [`crate::wine64_pe_data`] (reserved at
 /// the x86-64 split), zeroed.
 fn alloc_pe_data_window(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
-    let (lo, hi) = crate::w64_pe_data();
+    let (lo, hi) = crate::wine64_pe_data();
     let len = (size + 0xffff) & !0xffff;
     if len > hi - lo {
-        return Err(format!("{name}: {len:#x} bytes do not fit the W64 PE data window"));
+        return Err(format!("{name}: {len:#x} bytes do not fit the wine64 PE data window"));
     }
     let at = hi - len;
     let a = crate::sigs::proc_home()
@@ -615,7 +615,7 @@ pub extern "C" fn gex_wasmdll_installed() {
         let at = data + off as u64;
         // An LLP64 module's pointers are 8 bytes. A lowered one's values are
         // below 4 GiB; the memory64 core's data window is at the top of 16
-        // GiB (`w64_pe_data`), so the whole pointer is read -- its low half
+        // GiB (`wine64_pe_data`), so the whole pointer is read -- its low half
         // pointed elsewhere, no thunk was bound, and a fiber's start
         // (`start_fiber`'s table index as its Rip) faulted as a guest pc.
         let ptr = |a: u64| if w == 8 { gm.read_u64(a).unwrap_or(0) } else { gm.read_u32(a).unwrap_or(0) as u64 };
@@ -778,7 +778,7 @@ pub(super) fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, Stri
     Ok(out)
 }
 
-/// `gex.wine_pe_slot(name)` (W3): the function-table index of a named
+/// `gex.wine_pe_slot(name)` (32-bit Wine): the function-table index of a named
 /// function of Wine's PE module (win32u.so starts explorer's desktop thread
 /// by it), or 0 when the module is not installed or has no such function.
 #[no_mangle]
@@ -795,7 +795,7 @@ pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
     ftab(|m| m.install(install).base) + k
 }
 
-/// `gex.code_changed(addr, len)` (W3: Wine's NtFlushInstructionCache): the
+/// `gex.code_changed(addr, len)` (32-bit Wine: Wine's NtFlushInstructionCache): the
 /// translations of `[addr, addr + len)` are retired, as natively.
 #[no_mangle]
 pub extern "C" fn gex_code_changed(addr: u64, len: u32) {

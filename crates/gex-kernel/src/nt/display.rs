@@ -7,7 +7,7 @@
 //! compositor; the browser's writes the compositor's scene records), and the
 //! surfaces it publishes are guest memory it reads in place. Without one,
 //! windows are drawn but shown nowhere, and input is only what
-//! `GEX_NT_INPUT` scripts.
+//! `GEX_WIN_INPUT` scripts.
 
 use super::gdi::{self, Obj};
 use super::user::{self, input, window};

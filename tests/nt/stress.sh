@@ -12,7 +12,7 @@
 #
 # GEXC: the gexc to run natively (default target/release/gexc; it must be an
 # x86 build, which a first run of hello_args.exe checks). Native runs set
-# GEX_NT_HANG_DUMP=60, so a hang's output says where every
+# GEX_WIN_HANG_DUMP=60, so a hang's output says where every
 # thread is (its last safepoint pc, last indirect branch, registers; a pc that
 # does not move between reports is a thread that is stuck). --browser runs the
 # browser shim under Node (shims/browser/js/run-node.mjs, as run-browser.sh).
@@ -39,7 +39,7 @@ if [ $browser = 0 ]; then
     # An AArch64 build fails every run the same way, which reads like a hang
     # report of 0 passed; say what it is instead.
     hello=$root/tests/nt/bin/$arch/hello_args.exe
-    (cd "$(dirname "$hello")" && GEX_NT_STRICT=1 timeout 120 "$gexc" run hello_args.exe a "b c" >/dev/null 2>&1)
+    (cd "$(dirname "$hello")" && GEX_WIN_STRICT=1 timeout 120 "$gexc" run hello_args.exe a "b c" >/dev/null 2>&1)
     r=$?
     [ $r = 42 ] || { echo "$gexc could not run $hello (exit $r, want 42): not an x86 build (cargo build --features x86)?" >&2; exit 2; }
 else
@@ -50,17 +50,17 @@ fi
 pids=()
 for _ in $(seq 1 "$hogs"); do taskset -c "$cores" sh -c 'while :; do :; done' & pids+=($!); done
 trap 'kill "${pids[@]}" 2>/dev/null' EXIT
-export GEX_NT_STRICT=1
+export GEX_WIN_STRICT=1
 ok=0 bad=0
 for i in $(seq 1 "$n"); do
     log=$out/$arch-${exe%.exe}-$i.txt
     start=$(date +%s)
     if [ $browser = 1 ]; then
         (cd "$root" && GEX_ARCH=x86 GEX_SHARED=1 timeout "$to" taskset -c "$cores" node shims/browser/js/run-node.mjs \
-            --dir /wine="$prefix" --file "/t/$exe=$path" --argv0 "/t/$exe" --cwd /t --env GEX_NT_STRICT=1 \
+            --dir /wine="$prefix" --file "/t/$exe=$path" --argv0 "/t/$exe" --cwd /t --env GEX_WIN_STRICT=1 \
             web/public/gex/seed.x86.shared.wasm "$path" "$@") > "$log" 2>&1
     else
-        (cd "$(dirname "$path")" && GEX_NT_HANG_DUMP=${GEX_NT_HANG_DUMP:-60} timeout "$to" taskset -c "$cores" \
+        (cd "$(dirname "$path")" && GEX_WIN_HANG_DUMP=${GEX_WIN_HANG_DUMP:-60} timeout "$to" taskset -c "$cores" \
             "$gexc" run "$@" "$exe") > "$log" 2>&1
     fi
     r=$?

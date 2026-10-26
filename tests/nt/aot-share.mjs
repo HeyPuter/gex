@@ -1,5 +1,5 @@
 // The "AOT share" of a browser run (docs/noita-perf.md; the native host's
-// GEX_NT_STATS line, shims/native/src/aot_share.rs), from V8 CPU profiles of
+// GEX_WIN_STATS line, shims/native/src/aot_share.rs), from V8 CPU profiles of
 // the guest's Workers: each sample's own frame, classified by the module it
 // is in, as V8 names it in `wasm://wasm/<module name>-<hash>`:
 //

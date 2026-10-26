@@ -444,7 +444,7 @@ pub fn set_guard_limit(limit: u64) {
 
 fn guard_limit() -> u64 {
     let g = GUARD_LIMIT.load(Ordering::Relaxed);
-    // W3 with KUSER_SHARED_DATA folded: the old page and above fault by name.
+    // 32-bit Wine with KUSER_SHARED_DATA folded: the old page and above fault by name.
     if gex_abi::kuser_fold() {
         g.min(gex_abi::KUSER_GUARD)
     } else {
@@ -1558,13 +1558,13 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let mut ea = c.wrapping_add(offset as u64);
-            // W3: Windows' KUSER_SHARED_DATA page is W3's (`gex_abi::W3_KUSER`).
+            // 32-bit Wine: Windows' KUSER_SHARED_DATA page is 32-bit Wine's (`gex_abi::W3_KUSER`).
             if let Some(f) = gex_abi::fold_kuser(ea) {
                 gex_ir::note_kuser_fold();
                 ea = f;
             }
             // Below the null guard: the poisoned address, as past the end
-            // (W3 with folding on: the named fault, as for a pointer).
+            // (32-bit Wine with folding on: the named fault, as for a pointer).
             if null_guard && ea < gex_abi::NULL_GUARD {
                 if gex_abi::kuser_fold() {
                     self.f.i64_const(ea as i64);
@@ -1744,7 +1744,7 @@ impl<'a> Emitter<'a> {
 
     fn guard_to_i32_inner(&mut self, floor: u64) {
         let t = self.scratch_i64;
-        // W3 with KUSER_SHARED_DATA folded: an address at or above the old
+        // 32-bit Wine with KUSER_SHARED_DATA folded: an address at or above the old
         // page is a pointer the translator could not fold. A branch to the
         // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation),
         // where the select would steer to a bare trap. The context holds

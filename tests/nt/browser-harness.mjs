@@ -16,8 +16,8 @@ export const ROOT = join(HERE, '..', '..');
 export const WEB = join(ROOT, 'web');
 export const PREFIX = process.env.GEX_WINE_PREFIX || join(process.env.HOME, '.cache/gex/wine-11.15');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
-const VITE_PORT = Number(process.env.GEX_NT_VITE_PORT || 5199);
-const CHROME_PORT = Number(process.env.GEX_NT_CHROME_PORT || 9339);
+const VITE_PORT = Number(process.env.GEX_WIN_VITE_PORT || 5199);
+const CHROME_PORT = Number(process.env.GEX_WIN_CHROME_PORT || 9339);
 export const STATE = join(process.env.TMPDIR || '/tmp', `gex-nt-browser-${process.getuid?.() ?? 0}`);
 mkdirSync(STATE, { recursive: true });
 
@@ -216,12 +216,12 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     '--enable-unsafe-webgpu',
     ...(soft ? ['--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader'] : ['--use-angle=vulkan', '--enable-features=Vulkan']),
     '--ozone-platform=headless', `--ozone-override-screen-size=${width},${height}`, `--window-size=${width},${height}`,
-    ...(process.env.GEX_NT_CHROME_FLAGS ? process.env.GEX_NT_CHROME_FLAGS.split(' ') : []),
+    ...(process.env.GEX_WIN_CHROME_FLAGS ? process.env.GEX_WIN_CHROME_FLAGS.split(' ') : []),
     '--enable-logging=stderr', '--disable-hang-monitor', '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`, `--user-data-dir=${join(STATE, 'profile')}`, 'about:blank',
   ], { detached: true, stdio: ['ignore',
-    // V8's traces (GEX_NT_CHROME_FLAGS=--js-flags=--trace-wasm-inlining) print to stdout.
-    process.env.GEX_NT_CHROME_STDOUT ? openSync(process.env.GEX_NT_CHROME_STDOUT, 'w') : 'ignore',
+    // V8's traces (GEX_WIN_CHROME_FLAGS=--js-flags=--trace-wasm-inlining) print to stdout.
+    process.env.GEX_WIN_CHROME_STDOUT ? openSync(process.env.GEX_WIN_CHROME_STDOUT, 'w') : 'ignore',
     openSync(join(STATE, 'chrome.log'), 'w')] });
   children.push(chrome);
   let ws = null;
@@ -247,10 +247,10 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     const wanted = p.type === 'error'
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
       : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
-    // GEX_NT_BROWSER_KEEP=REGEX: also any line it matches (Mesa's compile
+    // GEX_WIN_BROWSER_KEEP=REGEX: also any line it matches (Mesa's compile
     // and link notes, say), without the verbose flood.
-    keepRe ??= process.env.GEX_NT_BROWSER_KEEP ? new RegExp(process.env.GEX_NT_BROWSER_KEEP) : false;
-    if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE || (keepRe && keepRe.test(text))) && printed++ < Number(process.env.GEX_NT_BROWSER_MAX_LINES || 20000)) {
+    keepRe ??= process.env.GEX_WIN_BROWSER_KEEP ? new RegExp(process.env.GEX_WIN_BROWSER_KEEP) : false;
+    if ((wanted || process.env.GEX_WIN_BROWSER_VERBOSE || (keepRe && keepRe.test(text))) && printed++ < Number(process.env.GEX_WIN_BROWSER_MAX_LINES || 20000)) {
       log(`console[${sid?.slice(0, 6)} @${((Date.now() - T0) / 1000).toFixed(1)}s] ${text.slice(0, 4000)}`);
     }
   });
@@ -308,10 +308,10 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   // SwiftShader's WebGPU loses its device when the NT host hands the
   // compositor GL frames directly (the canvas present path), so with the
   // software adapter a Windows program's frames are read back instead.
-  if (soft && !/GEX_NT_GL_READBACK/.test(query)) {
+  if (soft && !/GEX_WIN_GL_READBACK/.test(query)) {
     query = /(^|&)env=/.test(query)
-      ? query.replace(/((?:^|&)env=)/, '$1GEX_NT_GL_READBACK=1,')
-      : `${query}&env=GEX_NT_GL_READBACK=1`;
+      ? query.replace(/((?:^|&)env=)/, '$1GEX_WIN_GL_READBACK=1,')
+      : `${query}&env=GEX_WIN_GL_READBACK=1`;
   }
   const url = `http://127.0.0.1:${VITE_PORT}/nt.html?${query}`;
   log(`open ${url}`);
@@ -323,11 +323,11 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     // Workers that start during the window (a game's threads) are profiled
     // from when they attach.
     const sids = [];
-    // GEX_NT_PROFILE_US: the sampling interval (default 250 us). GEX_NT_PROFILE_FIRST=N: only the
+    // GEX_WIN_PROFILE_US: the sampling interval (default 250 us). GEX_WIN_PROFILE_FIRST=N: only the
     // first N matching Workers (a game's main Worker is the first), none that attach later --
     // sampling thirty Workers at once stalls a game's frames.
-    const interval = Number(process.env.GEX_NT_PROFILE_US || 250);
-    const first = Number(process.env.GEX_NT_PROFILE_FIRST || 0);
+    const interval = Number(process.env.GEX_WIN_PROFILE_US || 250);
+    const first = Number(process.env.GEX_WIN_PROFILE_FIRST || 0);
     const start = async () => {
       let picked = [...targets].filter(([, u]) => u.includes(match)).map(([x]) => x);
       if (first) {

@@ -189,7 +189,7 @@ struct Provided {
 }
 
 /// Stateful providers by library (lower case) and module file under the
-/// unit cache: `GEX_NT_STATEFUL=<dll>=<file>[,...]`, an ejected project's
+/// unit cache: `GEX_WIN_STATEFUL=<dll>=<file>[,...]`, an ejected project's
 /// (the native `libprov`).
 static STATEFUL: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
@@ -224,7 +224,7 @@ struct ProviderModule {
     slots: u64,
     /// A stateful provider's data (`__memory_base`), 0 for a stateless one.
     /// Above 4 GiB only for Wine's PE module in a 64-bit memory (its data
-    /// window is the top of the 16 GiB: `crate::w64_pe_data`).
+    /// window is the top of the 16 GiB: `crate::wine64_pe_data`).
     memory_base: u64,
 }
 
@@ -235,7 +235,7 @@ static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
 const PROVIDER: u32 = 1 << 31;
 
 /// An ejected build's image keys and identities, by (base, path)
-/// (GEX_NT_IDENTITIES, written by `gexc eject`: `base:key:identity:path`
+/// (GEX_WIN_IDENTITIES, written by `gexc eject`: `base:key:identity:path`
 /// joined by `;`). Taken instead of hashing every byte of every image at
 /// start-up (~1 s of the page's main thread); the mapped code is still
 /// compared with the image byte for byte below, and an image not listed is
@@ -253,9 +253,9 @@ pub(crate) fn set_identities(spec: &str) {
     *lock(&KNOWN) = Some(m);
 }
 
-/// The page's identities (`base:key:identity:path;...`, a W3 site's
+/// The page's identities (`base:key:identity:path;...`, a 32-bit Wine site's
 /// `identities`, written by its build from the units it made), before the
-/// program starts: as GEX_NT_IDENTITIES for an NT page.
+/// program starts: as GEX_WIN_IDENTITIES for an NT page.
 #[no_mangle]
 pub extern "C" fn gex_cgen_identities(ptr: u32, len: u32) {
     // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
@@ -382,7 +382,7 @@ static FTAB_SIZE: AtomicU32 = AtomicU32::new(0);
 // another thread installed a large unit read the new index as a hit and
 // called past its table's end ("table index is out of bounds":
 // a DllMain through winepe,
-// tests/w3/ftabstale.sh). So every Worker that may be running guest
+// tests/wine32/ftabstale.sh). So every Worker that may be running guest
 // code says how long its table is, and an index goes into the cache only
 // when every one of their tables holds it; otherwise the cache slot stays
 // resolve and the call comes through `lookup`, which catches the caller up.
@@ -523,7 +523,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// placed or wanted, the function table's log to replay, Wine's PE
 /// module's late bindings, a provider-only unit or re-bridge, a program
 /// staged. Atomics and this Worker's own counters only: asked after every
-/// direct entry's call ([`w64_entry`]), which goes to JS only when one is.
+/// direct entry's call ([`wine64_entry`]), which goes to JS only when one is.
 pub(crate) fn serve_wanted() -> bool {
     ANY_PENDING.load(Ordering::Acquire)
         || wanted_any()
@@ -685,46 +685,46 @@ pub(crate) fn drain() -> bool {
     wanted_any()
 }
 
-/// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
+/// 32-bit Wine (Wine's own Unix side): an i386 image Wine's loader mapped
 /// (`gex.image_mapped`, not a wasm32 skeleton), placed as the NT layer's
-/// are (the native host's `pe_units::w3_image` with `GEX_W3_UNITS=all`).
+/// are (the native host's `pe_units::wine32_image` with `GEX_WINE32_UNITS=all`).
 /// Never fatal: an image with no unit stays on tier-1, and one whose mapped
 /// code is not yet its bytes (Wine relocates a moved image after mapping it)
-/// waits for its first miss ([`w3_miss`]), as natively. Returns whether a
+/// waits for its first miss ([`wine32_miss`]), as natively. Returns whether a
 /// unit now waits for JavaScript.
-pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
+pub(crate) fn wine32_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
     if !on() {
         return false;
     }
-    w3_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64);
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
-    if !w3_matches(&image, base, pe, true) {
-        w3_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
+    if !wine32_matches(&image, base, pe, true) {
+        wine32_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
         return false;
     }
-    w3_forget(base, pe.image_size as u64);
+    wine32_forget(base, pe.image_size as u64);
     PLACING_AT.with(|c| c.set(crate::host_now_ns()));
     place(&image, path, base, true, Some(pe));
     wanted_any()
 }
 
 /// Whether an image Wine's loader mapped at `base` can wait for its first
-/// miss unread ([`w3_defer_unread`]): whenever units are on. An image that
+/// miss unread ([`wine32_defer_unread`]): whenever units are on. An image that
 /// never runs is then never read, hashed or placed: a resource DLL (22 MB
 /// of ehres.dll mapped three times by the shell for icons, 20 tzres.dll
 /// maps for time zone names), each KnownDll wineboot maps for its imports
-/// (40 of them, 3.8 s of a W64 program's start), the game's exe in the
+/// (40 of them, 3.8 s of a 64-bit Wine program's start), the game's exe in the
 /// first process, which only hands it to start.exe (its 261 MiB unit
 /// fetched, compiled and placed for nothing). One that runs is placed at
 /// its first miss, as a relocated image's is.
-pub(crate) fn w3_may_defer(_path: &str, _base: u64) -> bool {
+pub(crate) fn wine32_may_defer(_path: &str, _base: u64) -> bool {
     on()
 }
 
 /// Leave the image open as `file`, `size` bytes mapped at `base`, for its
-/// first miss ([`w3_miss`] reads and places it then).
-pub(crate) fn w3_defer_unread(path: &str, base: u64, size: u64, file: Arc<dyn gex_kernel::vfs::FileHandle>) {
-    w3_defer(Deferred { path: path.to_string(), base, size, src: Src::File(file), at_ns: crate::host_now_ns() });
+/// first miss ([`wine32_miss`] reads and places it then).
+pub(crate) fn wine32_defer_unread(path: &str, base: u64, size: u64, file: Arc<dyn gex_kernel::vfs::FileHandle>) {
+    wine32_defer(Deferred { path: path.to_string(), base, size, src: Src::File(file), at_ns: crate::host_now_ns() });
 }
 
 /// Where a deferred image's PE comes from: parsed at its mapping (its code
@@ -743,37 +743,37 @@ struct Deferred {
     at_ns: u64,
 }
 
-/// Images [`w3_mapped`] and [`w3_defer_unread`] left for their first miss.
-static W3_DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
-static W3_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Images [`wine32_mapped`] and [`wine32_defer_unread`] left for their first miss.
+static WINE32_DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+static WINE32_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn w3_defer(d: Deferred) {
-    let mut v = lock(&W3_DEFERRED);
+fn wine32_defer(d: Deferred) {
+    let mut v = lock(&WINE32_DEFERRED);
     // An image mapped where an unmapped one waited (ehres.dll's three maps
     // at one base): the old entry would claim the new image's misses.
     v.retain(|o| o.base + o.size <= d.base || o.base >= d.base + d.size);
     v.push(d);
-    W3_ANY_DEFERRED.store(true, Ordering::Release);
+    WINE32_ANY_DEFERRED.store(true, Ordering::Release);
 }
 
 /// Drop deferred images overlapping `[base, base + size)` (one placed there now).
-fn w3_forget(base: u64, size: u64) {
-    if !W3_ANY_DEFERRED.load(Ordering::Acquire) {
+fn wine32_forget(base: u64, size: u64) {
+    if !WINE32_ANY_DEFERRED.load(Ordering::Acquire) {
         return;
     }
-    let mut v = lock(&W3_DEFERRED);
+    let mut v = lock(&WINE32_DEFERRED);
     v.retain(|o| o.base + o.size <= base || o.base >= base + size);
     if v.is_empty() {
-        W3_ANY_DEFERRED.store(false, Ordering::Release);
+        WINE32_ANY_DEFERRED.store(false, Ordering::Release);
     }
 }
 
 /// The trampoline page's unit (and, for i386, its unix-call provider:
-/// [`place`]) for a W3 process, with the first image it places: the page is
+/// [`place`]) for a 32-bit Wine process, with the first image it places: the page is
 /// in memory from the start, and Wine's unix calls and syscalls all go
 /// through it. Once per address space; a page that is not the one the unit
 /// was built from keeps to the other tiers ([`place`] says so).
-fn w3_trampolines(class32: bool) {
+fn wine32_trampolines(class32: bool) {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -790,7 +790,7 @@ fn w3_trampolines(class32: bool) {
 /// the loader has filled them (and put back the protection it lifts to do
 /// it, which retires the page and the unit's functions on it) the unit must
 /// wait for the image's first miss.
-fn w3_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at_map: bool) -> bool {
+fn wine32_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at_map: bool) -> bool {
     let memory = crate::guest_bytes();
     let mask = if at_map { None } else { Some(pe) };
     image.segments.iter().filter(|s| s.executable).all(|seg| {
@@ -801,19 +801,19 @@ fn w3_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at_map
     })
 }
 
-/// A tier-1 miss at `pc`: if it is inside an image [`w3_mapped`] deferred,
+/// A tier-1 miss at `pc`: if it is inside an image [`wine32_mapped`] deferred,
 /// place that image's unit now (an image whose code still differs stays on
 /// tier-1). Returns whether a unit now waits for JavaScript.
-pub(crate) fn w3_miss(pc: u64) -> bool {
-    if !W3_ANY_DEFERRED.load(Ordering::Acquire) {
+pub(crate) fn wine32_miss(pc: u64) -> bool {
+    if !WINE32_ANY_DEFERRED.load(Ordering::Acquire) {
         return false;
     }
     let d = {
-        let mut d = lock(&W3_DEFERRED);
+        let mut d = lock(&WINE32_DEFERRED);
         let Some(i) = d.iter().position(|p| pc >= p.base && pc < p.base + p.size) else { return false };
         let p = d.swap_remove(i);
         if d.is_empty() {
-            W3_ANY_DEFERRED.store(false, Ordering::Release);
+            WINE32_ANY_DEFERRED.store(false, Ordering::Release);
         }
         p
     };
@@ -822,15 +822,15 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         Src::File(f) => match read_pe(&*f) {
             Some(pe) => Arc::new(pe),
             None => {
-                crate::warn_line(&format!("gex-w3: {} at {:#x}: reading the image at its first miss failed; tier-1\n", d.path, d.base));
+                crate::warn_line(&format!("gex-wine32: {} at {:#x}: reading the image at its first miss failed; tier-1\n", d.path, d.base));
                 return false;
             }
         },
     };
-    w3_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64);
     let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
-    if !w3_matches(&image, d.base, &pe, false) {
-        crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
+    if !wine32_matches(&image, d.base, &pe, false) {
+        crate::warn_line(&format!("gex-wine32: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
         return false;
     }
     PLACING_AT.with(|c| c.set(d.at_ns));
@@ -1127,7 +1127,7 @@ pub extern "C" fn gex_cgen_key(u: u32, buf: u32, cap: u32) -> u32 {
 }
 
 /// Whether code a published unit's image runs translated is reported
-/// (`gex_cgen_set_record`): gex-eject's W3 recorder, whose AOT-only project
+/// (`gex_cgen_set_record`): gex-eject's 32-bit Wine recorder, whose AOT-only project
 /// would have no code there.
 static RECORD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1568,7 +1568,7 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
     // Read as zero, as the kernel's anonymous `mmap` makes it: the range may
     // hold what a forked parent left there before this process's `execve`
-    // (W3: Wine's PE module's data in the grandchild of a process that had
+    // (32-bit Wine: Wine's PE module's data in the grandchild of a process that had
     // it at the same address, whose stale bss cached another process's
     // function-table indices).
     let mut gm = GuestMem::new(crate::guest_bytes());
@@ -1612,11 +1612,11 @@ pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
 /// bottom up, as the native `libprov::stack`).
 #[no_mangle]
 pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
-    // W3 with the split (`?w3split=1`): the guest's 2 GiB are Wine's and a
+    // 32-bit Wine with the split (`?winesplit=1`): the guest's 2 GiB are Wine's and a
     // game may fill them (one with its units left no room for a Worker's
     // stack), while only wasm code runs on this one. It comes from the shim's
     // heap, above 2 GiB, zeroed, and lives as long as the process.
-    if crate::winspace::w3_split() && crate::nt::process().is_none() {
+    if crate::winspace::wine32_split() && crate::nt::process().is_none() {
         let layout = std::alloc::Layout::from_size_align(size as usize, 4096).expect("provider stack layout");
         // SAFETY: a non-zero size; the block is never freed (the process's stack).
         let p = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -1630,7 +1630,7 @@ pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
 }
 
 /// `gex.clock_ns(clk)`: `clock_gettime(clk)` in nanoseconds, the value the
-/// system call gives, with no kernel and no lock (W3's PE ntdll reads its
+/// system call gives, with no kernel and no lock (32-bit Wine's PE ntdll reads its
 /// performance counter with it, docs/wine-overhead.md F2).
 #[no_mangle]
 pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
@@ -1701,7 +1701,7 @@ pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
     1
 }
 
-/// GEX_NT_ENTRY_LOG: print each pc entered inside a unit's pages without an
+/// GEX_WIN_ENTRY_LOG: print each pc entered inside a unit's pages without an
 /// entry there, once (`gex-nt: web entry <pc>`), for an ejected project's
 /// training run.
 pub(crate) static ENTRY_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1711,7 +1711,7 @@ pub(crate) fn knows(pc: u64) -> bool {
     ftab(|m| m.get(pc).is_some())
 }
 
-/// Whether this is an ejected project's training run (`GEX_NT_ENTRY_LOG`).
+/// Whether this is an ejected project's training run (`GEX_WIN_ENTRY_LOG`).
 pub(crate) fn entry_log() -> bool {
     ENTRY_LOG.load(Ordering::Relaxed)
 }
@@ -1734,7 +1734,7 @@ pub(crate) fn note_web_entry(pc: u64) {
     }
 }
 
-/// `gex.provider_try` calls and the throws they caught (GEX_NT_STATS).
+/// `gex.provider_try` calls and the throws they caught (GEX_WIN_STATS).
 pub(crate) static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1827,7 +1827,7 @@ pub(crate) fn unit_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
 }
 
-/// Whether a provider's function serves `addr` (a W3 builtin's export, an
+/// Whether a provider's function serves `addr` (a 32-bit Wine builtin's export, an
 /// export provider): native code in place of the bytes there, which may be
 /// no code at all (a skeleton's `ud2` stub). A retirement of its page
 /// forgets the bridge and keeps the binding, so tier-1 must neither lift it
@@ -2142,10 +2142,10 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
                 return gex_ftab_fallback(ctx, _depth, _need, ret);
             }
         }
-        // The first call into a W3 image left unplaced at its mapping
-        // (`w3_miss`; native Wine calls a DLL's entry point straight after
+        // The first call into a 32-bit Wine image left unplaced at its mapping
+        // (`wine32_miss`; native Wine calls a DLL's entry point straight after
         // mapping it): its unit is placed now and served below.
-        let placed = w3_miss(t);
+        let placed = wine32_miss(t);
         // Published by another Worker and not yet installed here (or just
         // placed): catch up, then call it, as the lookup would have (leaving
         // would lose the frames that called here).
@@ -2166,7 +2166,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     }
     // 64-bit native Wine's system and Unix calls (a call to its entry page):
     // its direct entry, here, in place of a call-out that runs the `ud2`.
-    if let Some(r) = w64_entry(&gm, c, t, ret as u64) {
+    if let Some(r) = wine64_entry(&gm, c, t, ret as u64) {
         return r;
     }
     if !crate::jit_on() {
@@ -2287,10 +2287,10 @@ extern "C" {
     /// Call function-table entry `idx` as a function body (AOT-only: one
     /// this Worker has just installed).
     fn ftab_call(idx: i32, ctx: i32, depth: i32, need: i32, ret: i64) -> i32;
-    /// Call function-table entry `idx`, a `void(int)` (W3: ntdll.so's
+    /// Call function-table entry `idx`, a `void(int)` (32-bit Wine: ntdll.so's
     /// handler for a guest's Unix call, given the thread's context).
     pub(crate) fn ftab_call_vi(idx: i32, arg: i32);
-    /// W64: call Wine's direct entry `idx` (a `void(int)`) for a unit's
+    /// 64-bit Wine: call Wine's direct entry `idx` (a `void(int)`) for a unit's
     /// call to its system or Unix call entry, as the fault hook is called
     /// for the `ud2` there: 1; 0 when this build cannot (the `ud2` then).
     /// `sp` is the guest's stack pointer, as the call left it (the hook's
@@ -2457,7 +2457,7 @@ pub(crate) fn may_leave() -> bool {
         && !exp_trap_callouts()
 }
 
-/// `GEX_NT_CALLOUT_TRAP=1`: call-outs leave by trapping, as before (A/B).
+/// `GEX_WIN_CALLOUT_TRAP=1`: call-outs leave by trapping, as before (A/B).
 fn exp_trap_callouts() -> bool {
     TRAP_CALLOUTS.load(Ordering::Relaxed)
 }
@@ -2908,7 +2908,7 @@ pub extern "C" fn gex_test_keep_probe(on: i32) {
 pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
     libprov::forget_gone(gone);
-    // W64 only: on W3 it hung a desktop shell's boot (explorer
+    // 64-bit Wine only: on 32-bit Wine it hung a desktop shell's boot (explorer
     // went quiet after loading a DLL).
     if wasmprog::guest_x86_64() {
         wasmdll::forget_gone(gone);
@@ -2987,7 +2987,7 @@ fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     }
 }
 
-/// Wine's Unix-side entry points (W3.1, as the native
+/// Wine's Unix-side entry points (as the native
 /// `crate::unix_dispatcher`), function-table indices of the process's
 /// ntdll.so, each set by an even op and read by the odd one after it (0 for
 /// none): 0/1 its system-call switch, 2/3 its handler for a guest's Unix
@@ -3007,7 +3007,7 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
 }
 
 /// A call to 64-bit native Wine's system or Unix call entry
-/// (`crate::W64_SYSCALL_ENTRY`, `W64_UNIX_CALL_ENTRY`) from code no
+/// (`crate::WINE64_SYSCALL_ENTRY`, `WINE64_UNIX_CALL_ENTRY`) from code no
 /// nested dispatch need run: Wine's direct entry for it
 /// (`gex.unix_dispatcher` op 0 or 4) takes the registers as the call left
 /// them, its return address at `[sp]`, and returns as the `ud2` route does,
@@ -3017,14 +3017,14 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
 /// before, unless the target is one of the two, Wine has registered that
 /// entry, the entry page holds Wine's pointer, and the call's return
 /// address is `ret`.
-fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
+fn wine64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     let slot = match t {
-        crate::W64_SYSCALL_ENTRY => 0,
-        crate::W64_UNIX_CALL_ENTRY => 2,
+        crate::WINE64_SYSCALL_ENTRY => 0,
+        crate::WINE64_UNIX_CALL_ENTRY => 2,
         _ => return None,
     };
     let idx = UNIX_DISPATCHERS[slot].load(Ordering::Relaxed);
-    if idx == 0 || gm.read_u64(crate::W64_ENTRY_PAGE).ok()? != crate::W64_SYSCALL_ENTRY {
+    if idx == 0 || gm.read_u64(crate::WINE64_ENTRY_PAGE).ok()? != crate::WINE64_SYSCALL_ENTRY {
         return None;
     }
     let sp_at = c + gex_abi::ctx::x(sp_index()) as u64;
@@ -3069,24 +3069,24 @@ fn w64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
 /// The `ud2` at 64-bit native Wine's system or Unix call entry reached by
 /// translated code (a call from code no unit holds, opengl32's and win32u's
 /// stubs among them): Wine's direct entry runs the call here, as
-/// [`w64_entry`] does for a unit's, in place of a trap out to the fault
+/// [`wine64_entry`] does for a unit's, in place of a trap out to the fault
 /// hook. True when it ran and the thread goes on at the context's PC (the
 /// caller dispatches there); false, and the `ud2` route as before, when it
 /// could not. A call that left another thread's context to resume with
-/// traps out ([`w64_entry`]), the way the fault hook's return would leave.
-pub(crate) fn w64_entry_illegal(c: u64, pc: u64) -> bool {
+/// traps out ([`wine64_entry`]), the way the fault hook's return would leave.
+pub(crate) fn wine64_entry_illegal(c: u64, pc: u64) -> bool {
     let gm = GuestMem::new(crate::guest_bytes());
     let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
     let Ok(ret) = gm.read_u64(sp) else { return false };
-    w64_entry(&gm, c, pc, ret).is_some()
+    wine64_entry(&gm, c, pc, ret).is_some()
 }
 
-/// The process's handler for a guest's Unix call (W3), or 0.
+/// The process's handler for a guest's Unix call (32-bit Wine), or 0.
 pub(crate) fn guest_unix_call_hook() -> u32 {
     UNIX_DISPATCHERS[1].load(Ordering::Relaxed)
 }
 
-/// A native wasm32 program's guest fault hook (W3.1). The page delivers a
+/// A native wasm32 program's guest fault hook . The page delivers a
 /// branch to non-executable memory to it (`gex_fault_take`), as natively.
 static FAULT_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -3217,8 +3217,8 @@ pub extern "C" fn gex_fault_take(out: u32) -> u32 {
     fault_hook()
 }
 
-/// A native wasm32 program's signal hook (W3.1). Recorded, as the fault
-/// hook is; the page does not run signal frames through it yet (W3.7).
+/// A native wasm32 program's signal hook . Recorded, as the fault
+/// hook is; the page does not run signal frames through it yet .
 static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[no_mangle]

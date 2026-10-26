@@ -341,7 +341,7 @@ function readClosure() {
 
 // With GEX_MEM64, the 32-bit memory's runtime too, for a process whose
 // program cannot run in a 64-bit one (host.mjs `#other`: a wasm32 module,
-// such as W64's wineserver, or a 32-bit ELF). Optional, as the kernel.
+// such as 64-bit Wine's wineserver, or a 32-bit ELF). Optional, as the kernel.
 let other = null;
 if (MEM64 && SHARED && kernel) {
   try {
@@ -424,8 +424,8 @@ const host = new ProcessHost({
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
     // GEX_STRAY_TRAP=1: as the page's ?straytrap=1 (cgen.rs STRAY_TRAP).
     strayTrap: !!process.env.GEX_STRAY_TRAP,
-    // GEX_W3_SPLIT=1: as the page's ?w3split=1 (winspace::w3_space).
-    w3Split: !!process.env.GEX_W3_SPLIT,
+    // GEX_WINE32_SPLIT=1: as the page's ?winesplit=1 (winspace::wine32_space).
+    wine32Split: !!process.env.GEX_WINE32_SPLIT,
     // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
     nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
     // GEX_MXCSR=1: as the page's ?mxcsr=1 (gex_ir::mxcsr_exact).

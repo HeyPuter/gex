@@ -1,5 +1,5 @@
 # The Wine DLLs `gexc cgen-prefix` compiles, in syswow64 and system32: what
-# Noita (into gameplay) and tests/nt map, measured with GEX_NT_TRACE_IMAGES=1.
+# Noita (into gameplay) and tests/nt map, measured with GEX_WIN_TRACE_IMAGES=1.
 # tests/nt
 ntdll.dll
 kernelbase.dll

@@ -1,7 +1,7 @@
 /* Two levels of system calls into Wine, each running a user callback, with
  * traps out of the inner level only: an exception raised and caught there,
  * a processor trap caught there (ud2), and new code there (a translation the
- * dispatch misses). Under W64 a unit's call into Wine runs on Wine's own
+ * dispatch misses). Under 64-bit Wine a unit's call into Wine runs on Wine's own
  * stack below the guest's (gex's direct entry), and each level puts Wine's
  * stack pointer back as it found it; the inner level's traps are caught by
  * its own loop, which must leave the outer level's frames as they were. Many
