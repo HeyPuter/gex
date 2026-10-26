@@ -231,6 +231,16 @@ fn eject_build_run_and_replace() {
     // With no replacements the program is a function-tier unit: no image module.
     let built = std::fs::read_to_string(p.join("build/build.json")).unwrap();
     assert!(aot.images.is_empty() && built.contains("\"elf-unit\"") && pins.is_empty(), "a static program's build: its unit, no pins");
+    // Its unit carries the object's identity as placed, the one a page
+    // would compute (so it can skip the hash), and a second build of the
+    // same session moves neither that nor the unit's key.
+    let unit = |m: build::BuildManifest| m.images.into_iter().find(|i| i.kind == "elf-unit").expect("an elf-unit");
+    let u = unit(build::BuildManifest::load(&p).unwrap());
+    let placed = gex_native::pe_units::elf_image(&bytes, u.base).unwrap();
+    assert_eq!(u.image, gex_key::image_identity(&placed).trim_start_matches("image:"), "the unit's image identity");
+    build::build(&p2).unwrap();
+    let u2 = unit(build::BuildManifest::load(&p2).unwrap());
+    assert_eq!((&u.identity, &u.image, u.base), (&u2.identity, &u2.image, u2.base), "a rebuild moved the unit's key or identity");
     assert!(!run::build_mem(None).unwrap().is_64() && !run::build_mem(Some(false)).unwrap().is_64());
     let e = run::build_mem(Some(true)).unwrap_err().to_string();
     assert!(e.contains("--mem32") && !e.contains('\n'), "{e}");
