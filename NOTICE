@@ -35,3 +35,7 @@ guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
 web/tint/dawn-tint-emscripten.patch
     Changes to Dawn/Tint, under the licence of the project it applies
     to.
+
+tools/gexcc/patches/libcxx-*.patch
+    Changes to LLVM's libc++, under the licence of the project they apply
+    to (Apache-2.0 WITH LLVM-exception).
