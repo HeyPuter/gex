@@ -250,7 +250,11 @@ for a in args:
         print(f); sys.exit(0)
     if a == '-print-libgcc-file-name':
         print(SYSROOT + '/lib/libclang_rt.builtins-wasm32.a'); sys.exit(0)
-    if a == '-print-search-dirs':
+    # GCC's spelling too, and with input files (meson asks with a test
+    # file and -c): the answer, and nothing compiled, as GCC does. Meson takes
+    # a library directory named here as a system one, so a library found in
+    # the multiarch directory gets no run path.
+    if a in ('-print-search-dirs', '--print-search-dirs'):
         print('programs: =%s\nlibraries: =%s' % (os.path.dirname(me), ':'.join(LIBDIRS))); sys.exit(0)
     if a.startswith('-print-prog-name='):
         t = a.split('=', 1)[1]
