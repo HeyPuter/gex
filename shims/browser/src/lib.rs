@@ -1852,7 +1852,7 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     // (shims/native). 32-bit Wine's wineoss.drv is a pure Unix library linked into
     // the loader; without the device its test_connect says Unavailable,
     // mmdevapi picks no driver and a program finds no audio device
-    // (waveOutGetNumDevs 0; tests/wine32/audio.sh).
+    // (waveOutGetNumDevs 0).
     devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
@@ -3865,7 +3865,7 @@ pub extern "C" fn gex_panic_reporting() -> u32 {
     PANIC_REPORTING.with(|r| r.get()) as u32
 }
 
-/// TEST (run-node GEX_DEBUG_PANIC, tests/browser-panic.sh): panic on purpose,
+/// TEST (run-node GEX_DEBUG_PANIC, a test-only switch): panic on purpose,
 /// to check that the report reaches the console. 1 a plain panic, 2 one that
 /// panics again inside the hook, 3 one with a 4 KiB message. Only a caller
 /// that asks runs it.
@@ -5664,8 +5664,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         args[0].clone()
     } else if args[0].contains('/') {
         // `./prog` names a path from the working directory, as execve's
-        // argument would (tests/gexcc/longargs: `--argv0 ./longargs
-        // --cwd /t` re-execs `/proc/self/exe`, which was `/longargs`).
+        // argument would (`--argv0 ./prog --cwd /t` re-execs
+        // `/proc/self/exe`, which was `/prog`).
         kernel.vfs.absolute(&args[0])
     } else {
         format!("/{}", args[0])
@@ -9057,7 +9057,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     // The calling thread's (its fs_struct's, which a fork copies).
     FORK_CWD.with(|c| *c.borrow_mut() = h.kernel.caller_cwd());
     // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
-    // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    // (a program may re-exec `/proc/self/exe` from a child).
     // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
     // which a child inherits and keeps across its `execve`.
     FORK_STATE.with(|c| *c.borrow_mut() = state_bytes(&h.kernel, false));
@@ -9710,7 +9710,7 @@ pub(crate) fn fork_staged() -> bool {
 /// Worker copies it before the parent runs on (synchronously after a wasm32
 /// program's syscall, before the run loop resumes tier-1's). A sibling
 /// thread's Worker that drained it instead copied memory while the parent ran
-/// on (tests/wasm32/vforkthreads).
+/// on.
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
     let f = FORK.with(|f| f.replace([0; 6]));
@@ -13279,8 +13279,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
     // `schedule` skips the pump for a first turn made here. Without it the
     // request sat in the socket until some thread of the process next took a
     // full turn: a destroyed menu stayed drawn, and took clicks, for 2-10 s,
-    // and a lone client blocked on its first reply never got one
-    // (tests/browser-wl-unmap.sh).
+    // and a lone client blocked on its first reply never got one.
     pump_compositor();
     let pick = pick_mine(&run);
     FIRST_PICK.with(|c| *c.borrow_mut() = Some(pick));
@@ -17036,7 +17035,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             // TEST(gex_test_unpublished_retire): the retired page numbered
             // again at once and its entry left unwritten, as a publisher
             // that numbered pages and has not installed (or never will)
-            // leaves them (tests/x86-programs/page-cross-entry.c).
+            // leaves them.
             if TEST_UNPUBLISHED.load(Ordering::Relaxed) {
                 // As a publisher numbers it: from what the page is now, not
                 // from the identities the last translation saw (the code

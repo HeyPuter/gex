@@ -75,7 +75,7 @@ const SHIM_INFIX = ARCH_INFIX + (MEM64 ? '.m64' : '');
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
 if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
 if (process.env.GEX_DENSE_DEBUG) globalThis.GEX_DENSE_DEBUG = 1;
-// GEX_TEST_MEMORIES=ADDR (tests/spawn-release; with GEX_MEMORIES=1 and
+// GEX_TEST_MEMORIES=ADDR (a test-only switch; with GEX_MEMORIES=1 and
 // node --expose-gc): twice a second, after a collection, the 32-bit word at
 // ADDR in each memory `__gexMemories` holds, as a page leg reads a game's
 // frame counter; and at exit how many it still holds.
@@ -283,7 +283,7 @@ try {
     // filesystem belongs to the kernel), so this ceiling is the largest rootfs
     // a run can have -- at one gigabyte a full Debian arm64 image did not fit
     // (#91). `maximum` reserves address space, not pages, so raising it is free.
-    // GEX_KERNEL_MAX_MIB (a test switch, tests/browser-oom.sh): a smaller
+    // GEX_KERNEL_MAX_MIB (a test-only switch): a smaller
     // ceiling, so the kernel's memory runs out the way an engine's does.
     memory: new WebAssembly.Memory({ initial: 2048, maximum: process.env.GEX_KERNEL_MAX_MIB ? Math.max(2048, Math.min(65536, Number(process.env.GEX_KERNEL_MAX_MIB) * 16)) : 65536, shared: true }),
     // Made once for every Worker (lazy-fetch.mjs `spareMemories`).
@@ -434,7 +434,7 @@ const host = new ProcessHost({
     // GEX_SEH_REPORT=1: as the page's ?sehreport=1.
     sehReport: process.env.GEX_SEH_REPORT === '1' || undefined,
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
-    // its start (tests/browser-stack-tripwire.sh).
+    // its start (a test-only switch).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
@@ -527,7 +527,7 @@ const host = new ProcessHost({
     // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
     spGuard: !!process.env.GEX_SP_GUARD,
     // TEST: GEX_DEBUG_PANIC=plain|nested|long makes the shim panic on purpose
-    // before the guest runs (tests/browser-panic.sh).
+    // before the guest runs.
     debugPanic: { plain: 1, nested: 2, long: 3 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
     // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
     // dumps the live registers (x30 = caller) and continues. Aimed at
@@ -608,7 +608,7 @@ const host = new ProcessHost({
     }
     // GEX_TIME_GUEST prints how long the guest itself ran, not how long the
     // process took: a third of the total is V8 compiling the module, which
-    // buries a codegen A/B. `tests/ab.sh --metric` reads this line.
+    // buries a codegen A/B. A/B scripts read this line.
     if (process.env.GEX_TIME_GUEST) {
       process.stderr.write(`[gex] guest ran in ${m.guestMillis}ms\n`);
     }
@@ -685,7 +685,7 @@ function audioTap() {
 // GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that plays
 // every slot at SPEED times its rate (1: real time), publishing read
 // positions and a heartbeat as the worklet does, so the OSS device paces
-// its writers to it (tests/browser-audio.sh's dsp-pace). It plays at a
+// its writers to it. It plays at a
 // context rate of GEX_AUDIO_RATE (48000), quanta of 128 frames, and with
 // GEX_AUDIO_LOOP=1 mixes the slots (nearest frame) into the capture ring,
 // as `?audioloop=1` does: the round trip (dsp-impulse).

@@ -139,7 +139,7 @@ const GIVEN_BACK_MAX = 2;
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
 const RECYCLE_COUNT = 4;
-/** A test switch (tests/spawn-release): whether a running fork child's
+/** A test-only switch: whether a running fork child's
  *  record, its parent's modules with it, can be collected once the child's
  *  Worker has it. Node only, with `--expose-gc`. */
 const TEST_FORK_RECORDS = !!globalThis.process?.env?.GEX_TEST_FORK_RECORDS;

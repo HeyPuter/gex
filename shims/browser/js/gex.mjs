@@ -27,13 +27,13 @@ const m64 = () => !!globalThis.GEX_MEM64;
  *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
 const FTAB_SPARE_THREADED = 8192;
-// GEX_TEST_KEEP_PROBE (tests/lazy-units): a retirement leaves the probe
+// GEX_TEST_KEEP_PROBE (a test-only switch): a retirement leaves the probe
 // cache's entries (cgen.rs `gex_test_keep_probe`).
 const TEST_KEEP_PROBE = !!(globalThis.process?.env?.GEX_TEST_KEEP_PROBE);
 // GEX_UNITS_EAGER (a test's A/B): every Worker instantiates each unit when it
 // catches up, as before units were deferred (`#cgenDefer`).
 const UNITS_EAGER = !!(globalThis.GEX_UNITS_EAGER ?? globalThis.process?.env?.GEX_UNITS_EAGER);
-/** Tests only (tests/wine32/ftabstale.sh): both rooms this small, so one unit's
+/** A test-only switch: both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
 const LIMIT64_BYTES = 16 * 2 ** 30;
@@ -1293,7 +1293,7 @@ export class Gex {
       }
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
       // A test's: this Worker's stack guard broken, as an overrun leaves it,
-      // for the tripwire at its next syscall (tests/browser-stack-tripwire.sh).
+      // for the tripwire at its next syscall.
       if (globalThis.GEX_TEST_BREAK_STACK_GUARD) this.#shim.exports.gex_test_break_stack_guard?.();
     }
     return this.#stackTop;
@@ -2285,14 +2285,14 @@ export class Gex {
     e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
-    // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
+    // A test-only switch: a retired page
     // left numbered with no directory entry.
     if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
     if (globalThis.GEX_TEST_FORK_REBASE || globalThis.process?.env?.GEX_TEST_FORK_REBASE) e.gex_test_fork_rebase?.(1);
-    // Another (tests/x86-programs/dense-holes.c): stale words past a
+    // Another test-only switch: stale words past a
     // module's last block.
     if (globalThis.process?.env?.GEX_TEST_DENSE_HOLES) e.gex_test_dense_holes?.(1);
-    // Another (tests/x86-programs/served-entries.c): served modules are
+    // Another test-only switch: served modules are
     // installed one at a time, as when the merger declines them.
     if (globalThis.GEX_TEST_SERVE_UNMERGED || globalThis.process?.env?.GEX_TEST_SERVE_UNMERGED) e.gex_test_serve_unmerged?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
@@ -3133,7 +3133,7 @@ export class Gex {
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool
-    // (tests/browser-spawn.sh counts these).
+    // (a test counts these).
     vforkTrace(`[pool] pid ${child.pid}: ${pooled ? 'pooled runtime' : 'new runtime'}`);
     const e = this.#shim.exports;
     this.#setMetadata(guestWasm);
@@ -7831,7 +7831,7 @@ export class Gex {
     if (Math.floor((off + bytes.length) / 2 ** step) !== Math.floor(off / 2 ** step)) {
       const line = `[gex] module store at ${((off + bytes.length) / 1048576).toFixed(0)} MiB; registry bytes in the shim heap: ${e.gex_registry_mib?.(0) ?? '?'} MiB`;
       // Traced under Node, straight to fd 2: a Worker's console output can be
-      // lost when the process exits soon after (tests/browser-registry.sh).
+      // lost when the process exits soon after.
       const fs = trace ? globalThis.process?.getBuiltinModule?.('fs') : null;
       if (fs) fs.writeSync(2, `${line}\n`);
       // A size report, not an error (a console error fails a page test).
@@ -8947,7 +8947,7 @@ export class Gex {
    *  a call-out's watch on one arm of a `blocks` entry, then publishes that
    *  write the entry its sibling arms bridge through, the same bridge and a
    *  new one. The watch must outlive both, and the sibling arms run the
-   *  bridge last written. Returns the checks that failed (tests/bridge-share). */
+   *  bridge last written. Returns the checks that failed (a test's). */
   static {
     if (globalThis.process?.env?.GEX_TEST_BRIDGE_WATCH) {
       Gex.testBridgeWatch = () => {

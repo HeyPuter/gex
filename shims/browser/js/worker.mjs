@@ -717,7 +717,7 @@ async function handle(msg) {
     && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
   // Made for an exec'd child and taken by something else: its memory is
   // dropped unused, and stays committed until this Worker's isolate collects
-  // (host.mjs `#preattach`; tests/browser-spawn.sh counts these).
+  // (host.mjs `#preattach`; a test counts these).
   if (preattached && !pre) vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: a runtime made ahead was left unused (${msg.kind})`);
   preattached = null;
   // A runtime made in the pool that does not fit the process it was made
@@ -862,7 +862,7 @@ async function handle(msg) {
         }
         const windows = recs.filter((s) => s.role === wlb.ROLE_TOPLEVEL && s.w > 0);
         // GEX_WL_STUB_LOG: every publish, on the guest's clock (hostNowNs's
-        // base), for tests/browser-wl-unmap.sh.
+        // base), for a test.
         if (stubLog) {
           console.error(`[wlstub] publish t=${(performance.timeOrigin + performance.now()).toFixed(1)} surfaces=${recs.length} windows=${windows.length}`);
         } else if (count === 1 || count % 60 === 0) {
@@ -872,7 +872,7 @@ async function handle(msg) {
           );
         }
         // GEX_WL_STUB_SUM: each window's pixels as the compositor reads them,
-        // summed, for tests/browser-wl-mem64.sh (a pool above 4 GiB).
+        // summed, for a test (a pool above 4 GiB).
         if (stubSum) {
           const px = new Uint8Array(memory.buffer);
           for (const s of windows) {
@@ -955,7 +955,7 @@ async function handle(msg) {
     }
     gex.useNetwork(net);
   }
-  // A Worker given back after an earlier process (tests/browser-reuse.sh
+  // A Worker given back after an earlier process (a test
   // counts these).
   if (runs > 1 && msg.kind !== 'thread') {
     vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: given-back worker, its process ${runs}`);
@@ -1124,7 +1124,7 @@ async function handle(msg) {
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
-    // TEST (GEX_DEBUG_PANIC, tests/browser-panic.sh): the shim panics on purpose.
+    // TEST (GEX_DEBUG_PANIC, a test-only switch): the shim panics on purpose.
     if (msg.debugPanic) {
       try {
         ex.gex_debug_panic?.(msg.debugPanic);

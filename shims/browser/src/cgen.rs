@@ -367,8 +367,7 @@ static FTAB_SIZE: AtomicU32 = AtomicU32::new(0);
 // (`#cgenGrow`, with room over), so a thread that last caught up before
 // another thread installed a large unit read the new index as a hit and
 // called past its table's end ("table index is out of bounds":
-// a DllMain through winepe,
-// tests/wine32/ftabstale.sh). So every Worker that may be running guest
+// a DllMain through winepe). So every Worker that may be running guest
 // code says how long its table is, and an index goes into the cache only
 // when every one of their tables holds it; otherwise the cache slot stays
 // resolve and the call comes through `lookup`, which catches the caller up.
