@@ -1,4 +1,4 @@
-/* item 3's zstd test program: an arm64 Linux program on Debian's
+/* The native zstd library's test program: an arm64 Linux program on Debian's
  * libzstd.so.1 -- translated by gex, or replaced by the LP64 wasm build of
  * the same zstd (build-zstd.sh). No libc of its own, as zt.c.
  *

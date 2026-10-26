@@ -975,7 +975,7 @@ export function setGlobals(get, b = {}) {
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
   if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
-  // winesplit=1: 32-bit Wine processes take the NT layer's 2 GiB split (the shim's heap above
+  // winesplit=1: 32-bit Wine processes take the 2 GiB split (the shim's heap above
   // 2 GiB), not the compact space: for a game that needs all of Windows' 2 GiB.
   if (get('winesplit')) globalThis.GEX_WINE32_SPLIT = 1;
   // nullguard=1: guest accesses below 64 KiB fault, as a null pointer's do

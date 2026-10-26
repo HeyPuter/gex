@@ -629,8 +629,8 @@ pub(crate) fn drain() -> bool {
 }
 
 /// 32-bit Wine (Wine's own Unix side): an i386 image Wine's loader mapped
-/// (`gex.image_mapped`, not a wasm32 skeleton), placed as the NT layer's
-/// are (the native host's `pe_units::wine32_image` with `GEX_WINE32_UNITS=all`).
+/// (`gex.image_mapped`, not a wasm32 skeleton), placed as native
+/// images are (the native host's `pe_units::wine32_image` with `GEX_WINE32_UNITS=all`).
 /// Never fatal: an image with no unit stays on tier-1, and one whose mapped
 /// code is not yet its bytes (Wine relocates a moved image after mapping it)
 /// waits for its first miss ([`wine32_miss`]), as natively. Returns whether a
@@ -1281,7 +1281,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // install writes their directory entries. Only the fresh ones used to
         // be listed, so a second publish over the same pages (two threads
         // placing one image) listed none, and an install that read that list
-        // wrote no entry at all (scratch/P/stall85: Paint's start-up spun on
+        // wrote no entry at all (Paint's start-up spun on
         // a block whose next page had no entry).
         let mut pages: std::collections::BTreeMap<u64, u32> = Default::default();
         for &a in addrs {

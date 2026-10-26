@@ -1,4 +1,4 @@
-//! Native Wine DLLs on wasm32 (stream W, docs/wine-native.md §3.2): a DLL
+//! Native Wine DLLs on wasm32 (docs/wine-native.md §3.2): a DLL
 //! whose code is a wasm module, behind a PE skeleton that winebuild
 //! (`CPU_WASM32`) wrote. The skeleton maps like any PE; gex binds the
 //! module's entry adapters at its export addresses. Its sections:

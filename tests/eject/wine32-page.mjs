@@ -84,7 +84,7 @@ if (off.includes('compositor')) {
 // can load: in the boot archive all Workers get at start (preload.json
 // `tar:N`) or in the background fill (`unit:KEY/c.wasm`, eject-site.mjs
 // --late), which every Worker also holds from its start; never in a list
-// only Workers started later are given (PF's E7b: units-late.tar, and a
+// only Workers started later are given (units-late.tar once did, and a
 // Worker of winlogon trapped "published but cannot be loaded here").
 {
   const preP = join(site, 'project/build/web/units/preload.json');

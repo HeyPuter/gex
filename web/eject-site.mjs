@@ -54,9 +54,9 @@ if (!project || !out) {
 const level = opt('--level', '19');
 // A 32-bit Wine page's project (gexc eject of a tools/eject/record-wine32.mjs recording):
 // build/web/wine32.json instead of nt.json. See `wine32Site` below.
-const w3 = existsSync(join(project, 'build/web/wine32.json')) ? JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8')) : null;
-const nt = w3 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
-const title = opt('--title', w3 ? (w3.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
+const wine32 = existsSync(join(project, 'build/web/wine32.json')) ? JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8')) : null;
+const nt = wine32 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
+const title = opt('--title', wine32 ? (wine32.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -123,7 +123,7 @@ function coldPack(dir, path) {
  *  so a changed file changes its own piece and no other. */
 const PIECES = 16;
 
-if (w3) {
+if (wine32) {
   wine32Site();
   process.exit(0);
 }
@@ -513,7 +513,7 @@ function wine32Site() {
   // stay in the bundle; every other file is a lazy file (app.js `lazy`),
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
-  const split = w3.bundle?.split ? new Set(w3.bundle.read ?? []) : null;
+  const split = wine32.bundle?.split ? new Set(wine32.bundle.read ?? []) : null;
   // --late FILE: see the fill below.
   const late = opt('--late', null) ? readPathList(opt('--late', null)) : [];
   if (split) for (const p of late) split.delete(p);
@@ -537,14 +537,14 @@ function wine32Site() {
     if (strip) stripTree(x, stripped);
     if (flag('--prune')) pruneTree(x);
     if (split) {
-      split.add(w3.exe); // the page reads the loader from the bundle itself
+      split.add(wine32.exe); // the page reads the loader from the bundle itself
       const store = join(out, 'project/build/web/lazy');
       const lazy = splitTree(x, split, store);
       lazyFiles = lazy.length;
       lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
-      w3.params = { ...(w3.params ?? {}), lazy: '/project/build/web/lazy.json' };
+      wine32.params = { ...(wine32.params ?? {}), lazy: '/project/build/web/lazy.json' };
       // --late FILE (guest paths, one a line, in the order wanted): files of
       // the run's read set that left the bundle above for the background fill,
       // fill.bin (packed): each lazy file's bytes once, in that order, which
@@ -554,7 +554,7 @@ function wine32Site() {
       // the page compiles it from the fill, and a Worker started before
       // that reads it there (app.js, worker.mjs `loadFile`).
       if (late.length || bootUnitsList) {
-        const fl = buildFill({ late, lazy, store, boot: bootUnitsList, units: w3.units ?? [], unitDir: join(web, 'units'), lazyUrl: (h) => `/project/build/web/lazy/${h}` });
+        const fl = buildFill({ late, lazy, store, boot: bootUnitsList, units: wine32.units ?? [], unitDir: join(web, 'units'), lazyUrl: (h) => `/project/build/web/lazy/${h}` });
         lateKeys = fl.keys;
         fillDemand.push(...fl.demand);
         if (bootUnitsList) console.log(`eject-site: --boot-units: ${fillDemand.length} units in the fill, compiled when first mapped`);
@@ -567,7 +567,7 @@ function wine32Site() {
         const fillSite = piecesOn ? `project/build/web/pieces/f${sha(fillBytes).slice(0, 32)}.bin` : 'project/build/web/fill.bin';
         place(fb, fillSite);
         writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: `/${fillSite}`, size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
-        w3.params.fill = '/project/build/web/fill.json';
+        wine32.params.fill = '/project/build/web/fill.json';
         console.log(`eject-site: the fill: ${fl.lateFiles} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
       }
     }
@@ -577,11 +577,11 @@ function wine32Site() {
   }
   // What the split leaves in the bundle (the run's read set) is all the
   // download has of it; nt.json carries the rest's manifest by URL.
-  if (w3.bundle) w3.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
+  if (wine32.bundle) wine32.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
   place(tar, 'project/build/web/rootfs.tar');
   if (piecesIndex) {
     writeFileSync(join(out, 'project/build/web/pieces.json'), JSON.stringify(piecesIndex));
-    w3.params = { ...(w3.params ?? {}), pieces: '/project/build/web/pieces.json' };
+    wine32.params = { ...(wine32.params ?? {}), pieces: '/project/build/web/pieces.json' };
   }
   // The units. Whole units (no "cold" split, the default): one archive,
   // units.tar, every unit's c.wasm and c.entries, packed as one zstd file.
@@ -590,7 +590,7 @@ function wine32Site() {
   // of anything the archive does not hold is a miss, not a request
   // (preload.json `tar:N`, N the number of modules in it).
   const preload = [];
-  const coldUnits = w3.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
+  const coldUnits = wine32.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
   // The provider modules the units bind (gexc eject: units/providers/),
   // which the Workers read as unit-cache files.
   const providers = existsSync(join(web, 'units', 'providers'))
@@ -603,7 +603,7 @@ function wine32Site() {
     : [];
   if (!coldUnits) {
     // --late: the late files' units travel in the fill (above), not here.
-    const bootUnits = w3.units.filter((u) => !lateKeys.has(u.key));
+    const bootUnits = wine32.units.filter((u) => !lateKeys.has(u.key));
     // One archive (units.tar), or with --pieces one per group of units, by
     // their image's path (as the bundle's pieces) and its class (a stable
     // file's units apart from the rest's), each named by its bytes: a unit
@@ -643,7 +643,7 @@ function wine32Site() {
       firstGroup = false;
     }
     if (piecesOn) console.log(`eject-site: unit pieces: ${unitTars.length} (${bootUnits.filter(stableU).length} of ${bootUnits.length} units stable)`);
-    if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${w3.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
+    if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${wine32.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
     // Only the units the recording used by its title are compiled with the
     // page. The rest, first used after it (`at`, the recorder's seconds) or
@@ -654,17 +654,17 @@ function wine32Site() {
     // shell's bundled programs' units, 170 MiB that no process mapped at start-up,
     // were 640 MiB of the renderer's VmData. A recording that timed no unit
     // (an older recorder) has every unit compiled with the page.
-    const title = typeof w3.title_seconds === 'number' ? w3.title_seconds : null;
+    const title = typeof wine32.title_seconds === 'number' ? wine32.title_seconds : null;
     const timed = title !== null && bootUnits.some((u) => typeof u.at === 'number');
     const demand = timed ? bootUnits.filter((u) => !(typeof u.at === 'number' && u.at <= title)).map((u) => u.key) : [];
-    if (demand.length) console.log(`eject-site: ${demand.length} units compiled when first mapped (${w3.units.filter((u) => demand.includes(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
+    if (demand.length) console.log(`eject-site: ${demand.length} units compiled when first mapped (${wine32.units.filter((u) => demand.includes(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     const demandSet = new Set(demand);
     writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(unitTars.map(([url, us, nr]) => {
       const d = us.filter((u) => demandSet.has(u.key)).map((u) => u.key);
       return [`tar:${us.length - d.length + nr}`, url, ...(d.length || nr ? [{ ...(d.length ? { demand: d } : {}), ...(nr ? { regions: nr } : {}) }] : [])];
     })));
   }
-  for (const u of coldUnits ? w3.units : []) {
+  for (const u of coldUnits ? wine32.units : []) {
     const d = join(web, 'units', u.key);
     place(join(d, 'c.wasm'), `project/build/web/units/${u.key}/c.wasm`);
     place(join(d, 'c.entries'), `project/build/web/units/${u.key}/c.entries`);
@@ -690,14 +690,14 @@ function wine32Site() {
   }
   preload.sort((a, b) => b[2] - a[2]);
   if (coldUnits) writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
-  writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
+  writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(wine32, null, 2));
   // The page (the user's). No service worker: the host sends the isolation
   // headers (COOP/COEP), and the library decodes what is packed.
   page();
   const smallHash = createHash('sha256');
   // The lazy store is named by its content (lazy.json's hashes).
   walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/')) return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
-  const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
+  const build = sha(JSON.stringify(files) + JSON.stringify(wine32) + smallHash.digest('hex')).slice(0, 12);
   writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
   writeHosting();
   noTestPage();
@@ -711,8 +711,8 @@ function wine32Site() {
     if (rel.endsWith('/cold.bin')) cold += statSync(p).size;
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
-  console.log(`${out}: wine32 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
+  console.log(`${out}: wine32 build ${build}; features off: ${wine32.features_off.join(', ') || 'none'}; ${wine32.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
 }
 console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);

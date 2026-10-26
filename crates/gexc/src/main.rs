@@ -411,7 +411,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--cgen" => cgen = true,
             "--fjit" => fjit = true,
             "--fjit-image" => fjit_image = true,
-            // Once the NT layer's tier-1-only switch; accepted, and no-op.
+            // Accepted for old scripts; a no-op.
             "--no-cgen" => {}
             "--no-cache" => opts.cache = false,
             "--mem64" => mem64 = Some(true),
@@ -512,8 +512,7 @@ fn read_addr_list(path: &str) -> Result<Vec<u64>> {
 }
 
 /// `gexc build` on a PE image (an exe or DLL): placed at `pe_base` (its
-/// preferred base by default) and translated as one image module, the way
-/// the NT layer would map it -- tier-1, or the function tier with `--cgen`.
+/// preferred base by default) and translated as one image module -- tier-1, or the function tier with `--cgen`.
 #[allow(clippy::too_many_arguments)]
 fn build_pe_image(
     path: &str,
@@ -596,8 +595,8 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
 /// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
 /// has a wasm32 memory.
 /// Native wasm libraries in place of guest ones, as stateful providers
-/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` (stream W, docs/
-/// wine-native.md W0(b)) binds each module's `gexp_<export>` functions at
+/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` (docs/
+/// wine-native.md) binds each module's `gexp_<export>` functions at
 /// that DLL's exports when it maps. A Linux shared object is named by its
 /// file name (`libmonobdwgc-2.0.so=mono.wasm`, docs/unity-dotnet.md).
 fn set_wasm_libs() -> Result<()> {

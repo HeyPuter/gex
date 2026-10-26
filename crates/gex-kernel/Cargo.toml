@@ -12,8 +12,6 @@ gex-atomic.workspace = true
 gex-f80.workspace = true
 # PE parsing and mapping for the NT personality.
 gex-ld.workspace = true
-# The GL wire protocol, for the NT layer's opengl32 (not the host renderer).
-gex-gl.workspace = true
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.

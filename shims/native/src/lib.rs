@@ -1309,7 +1309,7 @@ fn run_program_with(
         }
     }
 
-    // A native wasm32 program (stream W): its module, not its x86 bytes,
+    // A native wasm32 program: its module, not its x86 bytes,
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
     // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
@@ -1325,7 +1325,7 @@ fn run_program_with(
             gex_abi::set_kuser_fold(true);
             gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
         }
-        // The NT layer's trampoline page, which native Wine's gexrt
+        // The trampoline page (`gex_kernel::win`), which native Wine's gexrt
         // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
         // wrappers): the same bytes at the same address.
         use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
@@ -4010,8 +4010,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 }
             }
-            // gexrt's NATIVE_LEFT under Wine's own Unix side (32-bit Wine), which
-            // has no NT layer to take it: as `nt::syscall_import` does, the
+            // gexrt's NATIVE_LEFT under Wine's own Unix side (32-bit Wine): the
             // innermost native call-out the guest has left is abandoned.
             if pc as u64 & NATIVE_SYSCALL != 0 {
                 if let Some(memory) = caller.data().memory.clone() {
@@ -4259,7 +4258,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     note_library(&m.path);
                 }
             }
-            // A library a stateful provider replaces (stream U): bound before
+            // A library a stateful provider replaces: bound before
             // the loader can call into it.
             libprov::on_linux_maps(&mut caller, &mapped)?;
             // Libraries some of whose exports a provider serves (glibc's
@@ -5824,8 +5823,8 @@ pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::
 }
 
 /// Guest fault hooks, by process (its kernel's address): a native wasm32
-/// program that runs x86 code (Wine's ntdll.so, docs/wine-native.md §4.0
-/// W3.1) registers `void hook(int ctx, unsigned code, unsigned addr)`
+/// program that runs x86 code (Wine's ntdll.so, docs/wine-native.md §4.0)
+/// registers `void hook(int ctx, unsigned code, unsigned addr)`
 /// (`gex.fault_hook`), and a fault in its x86 code -- a memory access past
 /// the guest's memory, an illegal instruction, int3, a divide error -- is
 /// delivered to it instead of ending the process: the context holds the
@@ -6066,8 +6065,7 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     Ok(true)
 }
 
-/// A branch to `pc`, which is not executable guest memory, in a process
-/// without the NT layer: the process's own fault hook takes it as an access
+/// A branch to `pc`, which is not executable guest memory: the process's own fault hook takes it as an access
 /// violation, executing (Wine's ntdll.so); else it is a SIGSEGV, for the
 /// program's handler if it has one. Always stops the guest call.
 pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<i32> {
@@ -6181,7 +6179,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
     // translate it first (32-bit Wine: the trampoline page's NATIVE_RETURN_PAD, which
-    // no unit covers without the NT layer). A call-out that never returns
+    // no unit covers). A call-out that never returns
     // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
     // An AOT-only process translates nothing (`aot_only`).
     if ret != 0 && !crate::aot_only::enabled() {

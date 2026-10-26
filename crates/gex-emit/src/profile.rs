@@ -1,4 +1,4 @@
-//! Profiling instrumentation for tier-1 code (`GEX_PROFILE`, merge stream S6).
+//! Profiling instrumentation for tier-1 code (`GEX_PROFILE`).
 //!
 //! Off by default. Off means **byte-identical** modules: nothing in this file
 //! is consulted by the emitter unless [`set_enabled`] turned it on before the

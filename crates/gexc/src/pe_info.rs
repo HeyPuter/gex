@@ -21,8 +21,7 @@ pub const USAGE: &str = "\
                                    --no-pack         keep a relocatable image
                                                      at its preferred base
                                                      when it fits (the default
-                                                     packs everything low, as
-                                                     the NT layer does)
+                                                     packs everything low)
                                    --base NAME=ADDR  pin a module's base
                                    --brief           counts, not symbol lists
                                    (`gexc closure` on a PE image does this too)";

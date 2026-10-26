@@ -96,7 +96,7 @@ pub fn build_lock() -> Result<BuildLock> {
     }
 }
 
-/// An image the NT layer mapped, waiting for the host.
+/// An image Wine's loader mapped, waiting for the host.
 #[derive(Clone)]
 struct Pending {
     path: String,
@@ -200,7 +200,7 @@ pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
 /// Say where the image's indirect-call profile was looked for and how many
 /// hints it gave (`gexc cgen-image`). A unit built without one has no
 /// devirtualised calls, so its hot virtual calls stay table calls that no
-/// engine inlines (the browser units of 2026-10-04 were all built so). When
+/// engine inlines. When
 /// it is missing, each cache in `GEX_CGEN_ICALL_FROM` (colon-separated
 /// cache roots) is checked for the same identity's file, and one found is
 /// named, loudly.
@@ -639,7 +639,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
     // G2 (docs/eject-pe.md §6a): the members' stateless providers compiled
     // into the group, their addresses served by bodies of its own.
     let with_providers = std::env::var("GEX_GROUP_PROVIDERS").is_ok_and(|v| v == "1");
-    // G3: ThinLTO across the group.
+    // ThinLTO across the group.
     let lto = std::env::var("GEX_GROUP_LTO").is_ok_and(|v| v == "1");
     let mut gp = gex_cgen::image::GroupProviders::default();
     for m in members {
@@ -1112,7 +1112,7 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     }
 }
 
-/// The NT layer's trampoline page (`gex_kernel::win::trampoline_input`:
+/// The trampoline page (`gex_kernel::win::trampoline_input`:
 /// the unix-call and syscall dispatchers every Wine DLL calls through, Wine's
 /// opengl32 once per GL call) as a recovery input. Fixed bytes at a fixed
 /// address, so its unit is built once per gex build and installed at boot
@@ -1507,7 +1507,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
             eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
         }
     }
-    // A native wasm32 Wine DLL (stream W): its module, at its skeleton's
+    // A native wasm32 Wine DLL: its module, at its skeleton's
     // exports (`wasmdll`).
     if let Some(n) = crate::wasmdll::install(&p.pe, &p.path, p.base, state, shared, engine, memory)? {
         crate::note_library(&p.path);
@@ -1549,13 +1549,13 @@ fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
 }
 
 // ---------------------------------------------------------------------------
-// Linux shared objects (stream U; docs/unity-dotnet.md §12)
+// Linux shared objects (docs/unity-dotnet.md §12)
 // ---------------------------------------------------------------------------
 //
 // A Linux program's libraries are mapped by ld.so out of guest code, so they
 // arrive through the runtime translator. `GEX_ELF_UNITS=name.so,...` (file
 // names, or `all`) gives each listed object its function-tier unit at the base
-// it was mapped at, as the NT layer's images get theirs: the whole object
+// it was mapped at, as Wine's PE images get theirs: the whole object
 // recovered (`gex_xlate::func::recover`, with its `.eh_frame` and symbols), as
 // C, linked once (`gexc cgen-image --elf SO --base HEX`). A unit is keyed by
 // the object's relocated bytes at that base, so the object must land at the
@@ -1812,18 +1812,17 @@ fn spawn_elf_build(path: &str, base: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Wine's own PE loader (stream W, 32-bit Wine; docs/wine-native.md §3.17)
+// Wine's own PE loader (32-bit Wine; docs/wine-native.md §3.17)
 // ---------------------------------------------------------------------------
 //
 // Under 32-bit Wine's ntdll.so maps every image itself and tells gex
-// (`gex.image_mapped`, after its relocations); there is no NT layer and no
-// section hook. Its i386 DLLs (ole32, rpcrt4, advapi32, combase, the
+// (`gex.image_mapped`, after its relocations); there is no section hook. Its i386 DLLs (ole32, rpcrt4, advapi32, combase, the
 // programs...) were tier-1, and tier-1's units are not reusable across
 // processes (each holds the page-table bases and the "already translated"
 // set of the process that made it), so every Wine process recompiled
 // megabytes of them: about 30 s of compile wall time per session boot.
 // An image with a unit built for its bytes at its base (`gexc cgen-image
-// PATH --pe-base BASE`) gets it here, as the NT layer's images do, and its
+// PATH --pe-base BASE`) gets it here, and its
 // compiled code comes from the module cache in every later process.
 // Wine's own images only, by default (`GEX_WINE32_UNITS=all`: the program's
 // too; `=0`: none); `GEX_WINE32_UNITS_BUILD=1` builds a missing

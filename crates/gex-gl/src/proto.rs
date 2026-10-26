@@ -426,7 +426,7 @@ pub mod op {
     /// The host keeps the bytes (one copy per `slot`, until that slot's next
     /// CLIENT_ARRAY) and runs pointer command `op` with the `n` argument
     /// words and the bytes' address as its pointer, with no
-    /// GL_ARRAY_BUFFER bound. How the NT layer passes glVertexPointer-style
+    /// GL_ARRAY_BUFFER bound. How a guest passes glVertexPointer-style
     /// client arrays: GL then uploads them the way it uploads any user
     /// array, instead of the guest rewriting a buffer of its own before each
     /// draw (which a batched backend has to stage and copy).

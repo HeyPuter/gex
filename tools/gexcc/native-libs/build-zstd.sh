@@ -1,5 +1,5 @@
 #!/bin/bash
-# item 3 for zstd: Debian's libzstd as an LP64 wasm library that replaces
+# A native library for zstd: Debian's libzstd as an LP64 wasm library that replaces
 # libzstd.so.1 under an aarch64 program, as build.sh does zlib (gen.py's
 # adapters, rt.c, the lowering), and its test program zstt.
 #

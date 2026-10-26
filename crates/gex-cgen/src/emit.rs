@@ -759,12 +759,12 @@ impl<'a> Emitter<'a> {
                 format!("GEX_P({a} + (uint64_t){offset}ll)")
             };
         }
-        // W3 with KUSER_SHARED_DATA folded (tier-1's `emit_address`): a
-        // constant in Windows' page names W3's. A guarded unit checks every
+        // 32-bit Wine with KUSER_SHARED_DATA folded (tier-1's `emit_address`):
+        // a constant in Windows' page names 32-bit Wine's. A guarded unit checks every
         // other address against the old page (`gex_k`), whose failure is the
         // named fault, an access violation. An unguarded one does not: that
         // check on every access made units half as big again (advapi32
-        // 1.31 -> 2.01 MB) and Paint's start slower, and in W3's compact
+        // 1.31 -> 2.01 MB) and Paint's start slower, and in 32-bit Wine's compact
         // space an address there is past the memory's end, so the engine's
         // own bounds check traps it (unnamed) as it would any other.
         if gex_abi::kuser_fold() && (self.value_const[addr.0 as usize].is_some() || !(no_guard() || self.unguarded())) {

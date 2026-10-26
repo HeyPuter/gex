@@ -1080,7 +1080,7 @@ export class Gex {
   /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
-  /** A 64-bit Wine program being loaded: its space is the NT layer's split. */
+  /** A 64-bit Wine program being loaded: its space is the 2 GiB split. */
   #wine64Split = false;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
@@ -1246,7 +1246,7 @@ export class Gex {
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
       // A 32-bit Wine process says so before anything claims arena -- this stack is
-      // the first claim: the NT layer's split at its parent's line, or 32-bit Wine's
+      // the first claim: the 2 GiB split at its parent's line, or 32-bit Wine's
       // compact space (nothing grown; inherited regions become islands).
       // `?winesplit=1` before the space is taken: the split, not the compact one.
       if (globalThis.GEX_WINE32_SPLIT || this.#wine64Split) this.#shim.exports.gex_set_wine_split?.(1);
@@ -1894,7 +1894,7 @@ export class Gex {
     // A 32-bit Wine program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
     // Windows DLLs load (0x10000000).
-    // A 64-bit one (64-bit Wine) the NT layer's split: 32-bit Wine's compact space ends at
+    // A 64-bit one (64-bit Wine) the 2 GiB split: 32-bit Wine's compact space ends at
     // 2 GiB, and a 64-bit Wine maps past it.
     const w3 = wine32ProgramFlags(elf);
     if (w3) this.#windowsSpace = -1;
@@ -4367,8 +4367,8 @@ export class Gex {
     // A wasm32 program built LP64 for wasm64 and lowered the same way (64-bit Wine,
     // docs/wine-native-x64.md), told apart by its __memory_base import's type.
     const progLowered = wasmprog && !!e.gex_cgen_pmod_lowered?.(prov);
-    // Wine's PE module in a 64-bit Wine process (the native PE core, winepe.wasm,
-    // W64.2): built LP64 and lowered as its program was, so i64 globals and
+    // Wine's PE module in a 64-bit Wine process (the native PE core,
+    // winepe.wasm): built LP64 and lowered as its program was, so i64 globals and
     // stack pointer. A Worker installs its program before any PE module.
     const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
     const lowered = (libprov || progLowered || dllLowered) && !m64();

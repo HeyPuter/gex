@@ -371,8 +371,8 @@ impl<'a> Lifter<'a> {
                 Some(s) => self.b.bin(BinOp::Add, Ty::I64, s, p),
             });
         }
-        // W3 (`gex_abi::fold_kuser`): a displacement into Windows'
-        // KUSER_SHARED_DATA page names W3's page instead, in every form that
+        // 32-bit Wine (`gex_abi::fold_kuser`): a displacement into Windows'
+        // KUSER_SHARED_DATA page names Wine's page instead, in every form that
         // has one (absolute, with a base, an index or both); not through a
         // segment, and not for `lea`. An address the emitter sees as a
         // constant (a pointer loaded in the same block) is folded there;

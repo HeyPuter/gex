@@ -1,5 +1,4 @@
-//! Guest-level execution profiles and the session manifest (merge plan M3,
-//! stream S6).
+//! Guest-level execution profiles and the session manifest.
 //!
 //! A **profile** says how often code ran: exact block and function entry
 //! counts, the hottest targets of each indirect branch, returns that did not
@@ -1016,48 +1015,6 @@ pub struct Session {
     pub threads: u64,
     /// `status N` or `signal N`.
     pub exit: Option<String>,
-    /// A Windows program's run (the NT layer), when it was one.
-    pub nt: Option<NtSession>,
-}
-
-/// What a Windows program's run needs besides a Linux one's: how the NT
-/// layer was set up, and where Wine's loader placed each image (the NT
-/// allocator is deterministic, so a replay with the same inputs places them
-/// the same way, which is what code translated ahead of time relies on).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NtSession {
-    /// `p32` (a PE32 program, i386 compatibility mode) or `p64`.
-    pub abi: String,
-    /// Guest path of the staged Wine prefix (`drive_c`, `nls`).
-    pub prefix: String,
-    /// The program's guest path, its DOS path, and its arguments.
-    pub exe: String,
-    pub image_path: String,
-    pub args: Vec<String>,
-    /// The Windows environment the process started with, `NAME=value`.
-    pub env: Vec<String>,
-    /// The DOS working directory.
-    pub cwd: String,
-    /// The `GEX_WIN_*` settings in effect, `NAME=value`.
-    pub settings: Vec<String>,
-    /// Whether the run had a GL device (`gexc run --gl`).
-    pub gl: bool,
-    /// Every image mapped, in mapping order: `(object id, guest path, base,
-    /// preferred base)`.
-    pub images: Vec<NtImage>,
-    /// Addresses inside images that had function-tier units where code ran
-    /// without one: tier-1 entries after a unit left, resumes, fallback
-    /// calls. Code built ahead of time must have a function there.
-    pub entries: Vec<u64>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NtImage {
-    pub id: String,
-    pub path: String,
-    pub base: u64,
-    pub preferred: u64,
-    pub size: u64,
 }
 
 impl Session {
@@ -1157,43 +1114,6 @@ impl Session {
             );
         }
         let _ = write!(s, "],\n\"exit\":{}", opt(&self.exit));
-        if let Some(nt) = &self.nt {
-            let _ = write!(
-                s,
-                ",\n\"nt\":{{\"abi\":{},\"prefix\":{},\"exe\":{},\"image_path\":{},\"args\":{},\n\"env\":{},\n\"cwd\":{},\"settings\":{},\"gl\":{},\n\"images\":[",
-                jstr(&nt.abi),
-                jstr(&nt.prefix),
-                jstr(&nt.exe),
-                jstr(&nt.image_path),
-                strs(&nt.args),
-                strs(&nt.env),
-                jstr(&nt.cwd),
-                strs(&nt.settings),
-                nt.gl
-            );
-            for (i, m) in nt.images.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                let _ = write!(
-                    s,
-                    "\n{{\"id\":{},\"path\":{},\"base\":{},\"preferred\":{},\"size\":{}}}",
-                    jstr(&m.id),
-                    jstr(&m.path),
-                    m.base,
-                    m.preferred,
-                    m.size
-                );
-            }
-            s.push_str("],\n\"entries\":[");
-            for (i, a) in nt.entries.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                let _ = write!(s, "{a}");
-            }
-            s.push_str("]}");
-        }
         s.push_str("}\n");
         s
     }
@@ -1248,32 +1168,6 @@ impl Session {
         for c in v.get("syscalls").and_then(Json::as_arr).unwrap_or(&[]) {
             let nr = c.get("nr").and_then(Json::as_u64).ok_or("syscall nr")?;
             s.syscalls.insert(nr, c.get("n").and_then(Json::as_u64).unwrap_or(0));
-        }
-        if let Some(nt) = v.get("nt").filter(|n| !matches!(n, Json::Null)) {
-            let num = |k: &str, o: &Json| o.get(k).and_then(Json::as_u64).unwrap_or(0);
-            let mut images = Vec::new();
-            for m in nt.get("images").and_then(Json::as_arr).unwrap_or(&[]) {
-                images.push(NtImage {
-                    id: ostr("id", m).ok_or("nt image id")?,
-                    path: ostr("path", m).unwrap_or_default(),
-                    base: num("base", m),
-                    preferred: num("preferred", m),
-                    size: num("size", m),
-                });
-            }
-            s.nt = Some(NtSession {
-                abi: ostr("abi", nt).unwrap_or_default(),
-                prefix: ostr("prefix", nt).unwrap_or_default(),
-                exe: ostr("exe", nt).unwrap_or_default(),
-                image_path: ostr("image_path", nt).unwrap_or_default(),
-                args: strs("args", nt),
-                env: strs("env", nt),
-                cwd: ostr("cwd", nt).unwrap_or_default(),
-                settings: strs("settings", nt),
-                gl: nt.get("gl").and_then(Json::as_bool).unwrap_or(false),
-                images,
-                entries: nt.get("entries").and_then(Json::as_arr).unwrap_or(&[]).iter().filter_map(Json::as_u64).collect(),
-            });
         }
         for f in v.get("files").and_then(Json::as_arr).unwrap_or(&[]) {
             let path = ostr("path", f).ok_or("file path")?;

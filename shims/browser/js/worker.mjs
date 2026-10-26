@@ -401,7 +401,7 @@ async function handle(msg) {
     globalThis.__gexMarkedConsole = true;
     // Under Node, straight to fd 2: a Worker's console is a stream its event
     // loop drains to the parent, so a process that parks in the shim (wait
-    // queues, d26f0d41: no park bound brings it back to JS) and then exits
+    // queues: no park bound brings it back to JS) and then exits
     // lost every line it logged meanwhile -- unitcache-fork's GEX_DENSE_DEBUG
     // adopts among them.
     const fs = globalThis.process?.getBuiltinModule?.('fs');
@@ -689,7 +689,7 @@ async function handle(msg) {
   if (msg.identities) Gex.identities = msg.identities;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
-  // `?winesplit=1`: a 32-bit Wine process takes the NT layer's split, not the compact space.
+  // `?winesplit=1`: a 32-bit Wine process takes the 2 GiB split, not the compact space.
   if (msg.wine32Split) globalThis.GEX_WINE32_SPLIT = 1;
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;

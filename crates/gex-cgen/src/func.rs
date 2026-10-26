@@ -102,7 +102,7 @@ pub fn is_small_copyable(f: &Function) -> bool {
     // the loop's 26 KB leaves it no inlining budget), where TurboFan
     // would. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
     // outlined loops; `SMALLCALLSALL`: everywhere; not in the unit key): the
-    // page ABBAs on edger (docs/noita-perf.md, i3b/i3c) found 2-3% less
+    // page A/B runs found 2-3% less
     // time in 0x724580's family and no world-fps change beyond noise, so
     // the default copies leaves only.
     let calls_ok = exp("SMALLCALLS") || exp("SMALLCALLSALL");
@@ -188,7 +188,7 @@ pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Opt
 /// The calls in `functions` that read the ZF their caller set: MSVC's
 /// stack checks, `cmp esi, esp` (3B F4 or 39 E6) right before `call
 /// __chkesp` / `call [__imp___chkesp]` / `call _RTC_CheckEsp`, whose `jne`
-/// reports a corrupt stack on a stale ZF (debug builds; stream W's games).
+/// reports a corrupt stack on a stale ZF (debug builds of games).
 /// No ABI passes anything in the flags otherwise (`flags_abi`). By the
 /// call's pc. Empty off x86.
 pub fn zf_calls(functions: &[Function], read: &dyn Fn(u64) -> Option<u8>) -> HashSet<u64> {
@@ -2292,8 +2292,8 @@ pub fn devirt_carry() -> bool {
 /// What a call to a callee without a summary (indirect, outside the unit,
 /// or unsummarised) reads of the caller's registers under `flags_abi`:
 /// everything but the flags, and ZF at a stack check (`zf`, [`zf_calls`]).
-/// `GEX_CGEN_EXP=ZFCALLS` gives every such call ZF (priced on edger at
-/// -2.7%, gl2 in docs/noita-perf.md).
+/// `GEX_CGEN_EXP=ZFCALLS` gives every such call ZF (2.7% slower in the
+/// page).
 pub fn call_reads(zf: bool) -> RegSet {
     if zf || exp("ZFCALLS") {
         non_flags().union(RegSet::of(&[GuestReg::Z]))
@@ -2676,7 +2676,7 @@ b2 0x4007..0x4008 insts [4007]:
         assert!(!body.contains("ft == 0x3000ull"), "the fallback is not devirtualised again:\n{body}");
         // The copies' returns: each compares the popped address with its own
         // continuation and goes on there; anything else leaves through the
-        // shared exit, a table call on the popped address (5563fda1).
+        // shared exit, a table call on the popped address.
         assert!(body.contains("== v") && body.contains("= 0x4005ull;") && body.contains("= 0x4007ull;"), "{body}");
         assert!(body.contains("GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(ft))(ctx, depth, need, ret);"), "{body}");
         assert!(!body.contains("case 0x4005ull:"), "no per-ret switch any more:\n{body}");

@@ -1,5 +1,5 @@
 //! PE32 and PE32+ images: parsing, placement, base relocation, and binding a
-//! program's imports across its DLL closure (merge plan M6, stream S5).
+//! program's imports across its DLL closure.
 //!
 //! Two layers:
 //!
@@ -32,22 +32,21 @@
 //! low packing even when its preferred base would fit. Linear memory has to
 //! exist up to the highest touched address, so a DLL that prefers 0x6xxx_xxxx
 //! would cost every process ~1.7 GiB; packing avoids that at the price of
-//! relocating. It is also what the NT layer does when Wine's loader maps an
-//! image (docs/nt-layer.md §1.2), so the two agree. `pack: false` honours
+//! relocating. `pack: false` honours
 //! preferred bases that fit.
 //!
 //! # Placeholder imports
 //!
 //! System DLLs ([`is_system_dll`]: kernel32, ntdll, user32, msvcrt, the
-//! `api-ms-win-*` API sets, ...) are never loaded from disk, and there is no
-//! NT layer yet, so an import from one cannot be bound to code. Each distinct
+//! `api-ms-win-*` API sets, ...) are never loaded from disk, so an import
+//! from one cannot be bound to code here. Each distinct
 //! `(dll, name-or-ordinal)` pair instead gets one entry in a
 //! [`PlaceholderTable`], and every IAT slot importing it is filled with that
 //! entry's address. The same happens, with a different [`PlaceholderReason`],
 //! for an import whose (non-system) DLL was not found, or whose DLL does not
 //! export the symbol.
 //!
-//! The format, which the NT-layer stream (S12) fills in later:
+//! The format:
 //!
 //! - **Range:** `[PLACEHOLDER_BASE, PLACEHOLDER_END)` = `[0x30_0000,
 //!   0x40_0000)`, the 1 MiB between the end of the dispatch directory
@@ -56,8 +55,8 @@
 //!   reaches the host's dispatch-miss path the same way the kernel's
 //!   `SIGRETURN_TRAMPOLINE` does.
 //! - **Entries:** entry `i` is at `PLACEHOLDER_BASE + i * PLACEHOLDER_STRIDE`
-//!   (16 bytes each, so at most 65,536). 16 bytes is room for a small stub
-//!   should the NT layer ever want to write real code there; each entry also
+//!   (16 bytes each, so at most 65,536). 16 bytes is room for a small stub;
+//!   each entry also
 //!   owns its own dispatch slot on both guest ISAs.
 //! - **Table:** [`PlaceholderTable::entries`], indexed by `i`: the DLL name
 //!   (lower-cased, `.dll` appended when an import or forwarder omitted it),
@@ -68,11 +67,8 @@
 //!   [`PlaceholderTable::lookup`] maps an address back to its entry and
 //!   [`Placeholder::label`] gives the `DLL!name` / `DLL!#ordinal` string a
 //!   loud failure should print.
-//! - **Filling it later:** the NT layer either rewrites the IAT slots listed
-//!   for an entry with a real address, or leaves them and makes the
-//!   dispatch-miss handler route a jump to the entry's address to the native
-//!   implementation. Until then, executing a placeholder must fail with the
-//!   entry's label. A *data* import read through a placeholder reads the
+//! - **Executing one:** a placeholder is never bound here, so executing
+//!   one must fail with the entry's label. A *data* import read through a placeholder reads the
 //!   (unbacked) placeholder range, not the data.
 //!
 //! # Delay imports
@@ -82,7 +78,7 @@
 //! through `LoadLibrary`/`GetProcAddress`. The loader still reports, for each
 //! one, where it *would* resolve: a loaded image's export or a placeholder.
 //! Delay-loaded DLLs that are found on disk join the closure, marked
-//! [`Reason::Delay`], so the NT layer's `LoadLibrary` finds them translated.
+//! [`Reason::Delay`], so a run-time `LoadLibrary` finds them translated.
 
 use crate::elf::Segment;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -614,7 +610,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     }
     // A native-subsystem image (a driver: Wine's mountmgr.sys, ntoskrnl.exe's
     // own) parses like any other; it is a program's loader that refuses to
-    // start one (nt/boot.rs). Under W3 Wine's winedevice.exe loads them, and
+    // start one. Under 32-bit Wine, winedevice.exe loads them, and
     // their units are built and placed from this parse.
     match subsystem {
         10..=13 => return Err(PeError::unsupported(format!("EFI images (subsystem {subsystem})"))),
@@ -1564,8 +1560,8 @@ impl Placer<'_> {
 // System DLLs
 // ---------------------------------------------------------------------------
 
-/// DLLs provided by the operating system, which gex will provide natively
-/// (the NT layer) and so never loads from disk. Lower-case, with `.dll`.
+/// DLLs provided by the operating system (Wine's, at run time), which this
+/// loader never loads from disk. Lower-case, with `.dll`.
 pub const SYSTEM_DLLS: &[&str] = &[
     "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll", "gdiplus.dll",
     "win32u.dll", "advapi32.dll", "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "msvcp_win.dll",
@@ -1609,7 +1605,7 @@ pub fn normalize_dll(name: &str) -> String {
 /// Why an import is a placeholder rather than an address in a loaded image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaceholderReason {
-    /// A system DLL, to be provided by the NT layer.
+    /// A system DLL, provided at run time.
     System,
     /// A non-system DLL not found in any search directory.
     MissingDll,
@@ -1838,8 +1834,8 @@ pub struct PeOptions {
     /// Searched after the executable's own directory, in order.
     pub search_dirs: Vec<String>,
     pub layout: PeLayout,
-    /// System DLLs to load from disk after all (e.g. Wine's PE builds, once
-    /// the NT layer exists), lower-case with `.dll`.
+    /// System DLLs to load from disk after all (e.g. Wine's PE builds),
+    /// lower-case with `.dll`.
     pub native_dlls: HashSet<String>,
     /// Extra DLLs to load (as `LoadLibrary` would at run time), by path.
     pub extra_dlls: Vec<String>,

@@ -105,7 +105,7 @@ const FLAG_KUSER_WINE32: u32 = 4;
 static GUEST_X86_64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this process runs 64-bit native Wine: what only 64-bit Wine has
-/// been tested on stays off 32-bit Wine (X's 1016m boot hang).
+/// been tested on stays off 32-bit Wine (it hung the shell's boot there).
 pub(crate) fn guest_x86_64() -> bool {
     GUEST_X86_64.load(Ordering::Relaxed)
 }
@@ -217,7 +217,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // 32-bit Wine's compact address space (`winspace::wine32_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
-        // Or the NT layer's split, for a site that asks (`?winesplit=1`), and
+        // Or the 2 GiB split, for a site that asks (`?winesplit=1`), and
         // always for a 64-bit (64-bit Wine) process: the compact space ends at 2 GiB,
         // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
         // memory at 2 GiB with it).

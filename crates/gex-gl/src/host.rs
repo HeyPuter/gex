@@ -1878,7 +1878,7 @@ mod tests {
     /// One host GL test at a time: they share the native decoder's name
     /// tables (gexgl_native_name/gexgl_native_object, process-wide), so two
     /// running in parallel mapped each other's framebuffer names and the
-    /// parallel workspace run flaked (3 runs in 15 on master ac269692).
+    /// parallel workspace run flaked (3 runs in 15).
     fn gl_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())

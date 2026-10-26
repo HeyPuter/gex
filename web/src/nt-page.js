@@ -1,4 +1,4 @@
-// A Windows program on gex's NT layer in a page (docs/nt-layer.md §10.2):
+// A Windows program under Wine in a page (docs/nt-layer.md §10.2):
 // the bundle is a tar (a staged Wine prefix under /wine plus the program),
 // the program's windows are toplevels in the page's compositor, and its GL
 // (opengl32 → /dev/gex-gl) runs on Mesa in the compositor's worker.

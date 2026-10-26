@@ -1,5 +1,5 @@
 //! Whole-image function-tier builds with bounded memory (docs/function-tier.md
-//! §11): what the NT layer installs for a PE image, and what `gex-eject`
+//! §11): what 32-bit Wine installs for a PE image, and what `gex-eject`
 //! needs for whole programs.
 //!
 //! Two stages, so the expensive one runs once:
@@ -97,8 +97,8 @@ fn unit_inputs() -> String {
     let base = if narrow_stores() { base } else { format!("{base}:widest") };
     let base = if icall_count() { format!("{base}:icallcount") } else { base };
     let base = if max_insns() != DEFAULT_MAX_INSNS { format!("{base}:maxinsns{}", max_insns()) } else { base };
-    // W3's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units read
-    // the page where W3's Wine maps it and check every other address.
+    // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units
+    // read the page where 32-bit Wine maps it and check every other address.
     let base = if gex_abi::kuser_fold() { format!("{base}:w3kuser") } else { base };
     // The null guard, a debugging opt-in: named only when on, so the
     // units of a build without it keep their keys.
@@ -117,10 +117,9 @@ fn unit_inputs() -> String {
 
 /// Store an i386 program's general-purpose registers to the low 32 bits of
 /// their 64-bit context slots (3-4% of the wasm of Noita's large hot
-/// functions). Exact because every
-/// other writer of those slots zero-extends (efcb8bfc: the host's syscall
-/// results, signal frames, the NT layer's contexts; GEX_CHECK_I386_HIGH=1
-/// checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`
+/// functions). Exact because every other writer of those slots
+/// zero-extends (the host's syscall results, signal frames;
+/// GEX_CHECK_I386_HIGH=1 checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`
 /// turns it off. In the unit key.
 pub fn narrow_stores() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -148,8 +147,8 @@ pub fn icall_count() -> bool {
 /// Build and look up the unguarded flavor of i386 units (no bounds guard on
 /// guest accesses: `Emitter::unguarded`), for a host whose guest memory is
 /// the whole linear memory, so out-of-range accesses trap by themselves --
-/// natively. The browser's NT layer keeps host data above a lower guard
-/// limit and keeps the guarded flavor (docs/noita-perf.md). Set before the
+/// natively. The browser keeps host data above a lower guard limit and
+/// keeps the guarded flavor (docs/noita-perf.md). Set before the
 /// first key is computed.
 pub fn set_unguarded(on: bool) {
     UNGUARDED.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -219,7 +218,7 @@ pub fn abi_fingerprint() -> String {
         ("INST_ALIGN", gex_abi::INST_ALIGN),
         ("DISPATCH_PAGE", gex_abi::DISPATCH_PAGE),
         ("SYSCALL_INST_BYTES", gex_abi::SYSCALL_INST_BYTES),
-        // W3's KUSER_SHARED_DATA fold (`gex_abi::fold_kuser`, `:w3kuser` units).
+        // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::fold_kuser`, `:w3kuser` units).
         ("KUSER_WINDOWS", gex_abi::KUSER_WINDOWS),
         ("KUSER_WINDOWS_END", gex_abi::KUSER_WINDOWS_END),
         ("W3_KUSER", gex_abi::W3_KUSER),

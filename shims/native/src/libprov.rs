@@ -500,7 +500,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     })()) })?;
     // Wine's system-call dispatcher on its Unix side : ntdll.so
     // registers it (op 0), and the PE side's gexrt asks for it (op 1; 0
-    // while there is none, and the NT layer takes the call).
+    // while there is none).
     linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
         crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
     })?;
@@ -547,8 +547,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     })?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image : a native DLL's skeleton gets
-    // Wine's PE module bound at its exports, as the NT layer's image map
-    // does (`wasmdll`). The image is named by the descriptor it was mapped
+    // Wine's PE module bound at its exports (`wasmdll`). The image is named by the descriptor it was mapped
     // from.
     linker.func_wrap(IMPORT_MODULE, "image_mapped", |mut caller: Caller<'_, HostState>, base: i32, fd: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let base = base as u32 as u64;
@@ -654,7 +653,7 @@ fn asyncify(caller: &mut Caller<'_, HostState>, op: i32, arg: i32) -> Result<i32
 }
 
 /// [`register`] for a 64-bit guest memory: the same functions with i64
-/// addresses, sizes and function-table indices (stream U, additive).
+/// addresses, sizes and function-table indices.
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     crate::wasmjit::register64(linker)?;
     linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {

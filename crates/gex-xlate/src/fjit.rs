@@ -1,4 +1,4 @@
-//! The function JIT at run time (docs/merge-plan.md §9.8, stream F): what
+//! The function JIT at run time (docs/merge-plan.md §9.8): what
 //! the function table's host asks for on a lookup miss (`gex_kernel::ftab`'s
 //! `Translator`, installed by `gexc run --fjit`).
 //!

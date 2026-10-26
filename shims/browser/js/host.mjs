@@ -162,7 +162,7 @@ const PAGE_MODULE_BYTES = 192 << 20;
 const UNIT_MODULE_BYTES = 256 << 20;
 /** The most wasm one process's relay cache (`#moduleCache`) keeps: a pc
  *  translated again and again (a dispatch that does not converge; Paint's
- *  startup stall, scratch/P/stall85) made a fresh key each time, and an
+ *  startup stall) made a fresh key each time, and an
  *  unbounded cache held every one, 10 GiB of renderer within minutes. Past
  *  it the oldest are dropped from the cache (Workers that installed them
  *  keep theirs; a thread started later compiles what it needs). */

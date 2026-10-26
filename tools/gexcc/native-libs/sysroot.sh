@@ -1,5 +1,5 @@
 #!/bin/sh
-# The LP64 libc item 3's libraries build against: musl
+# The LP64 libc the native libraries build against: musl
 # with the gex `wasm64a64` arch (branch gex-wasm64-a64, from gex-wasm64):
 # wasm64 code with aarch64's LP64 layout and
 # kernel ABI, aarch64 Linux syscalls through gex.syscall(ctx) on the

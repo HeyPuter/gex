@@ -9608,7 +9608,7 @@ pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
 
 /// The kernel's half of a 32-bit Wine process's address space: no mapping above
 /// KUSER_SHARED_DATA unless asked for there, and the i386 code kept off
-/// whatever is above 2 GiB. With the NT layer's split (`lo` its line), what
+/// whatever is above 2 GiB. With the 2 GiB split (`lo` its line), what
 /// the host left below 2 GiB is the process's own arena; with 32-bit Wine's compact
 /// space (`winspace::wine32_windows_space`) the arena grows on demand, shared with
 /// the shim's heap, as for any process.
@@ -9625,7 +9625,7 @@ pub(crate) fn wine32_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64
     // directory and its stack (its image and break are above, in the
     // placement window): where a Windows executable's 0x400000 is.
     mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
-    // An access there faults, as in the NT layer.
+    // An access there faults, as on Windows.
     gex_xlate::set_guard_limit(0x8000_0000);
     // The exe slot and pinned DLL band: once a fixed mapping has made them
     // arena, a bottom-up anonymous mmap (Wine's 64 MiB heaps) took their
@@ -9669,7 +9669,7 @@ pub extern "C" fn gex_split_windows_space() -> u32 {
     }
 }
 
-/// `?winesplit=1`: this process's 32-bit Wine address space is the NT layer's split, not
+/// `?winesplit=1`: this process's 32-bit Wine address space is the 2 GiB split, not
 /// the compact space (`winspace::wine32_space`). Set before the space is taken.
 #[no_mangle]
 pub extern "C" fn gex_set_wine_split(on: u32) {
@@ -13905,8 +13905,8 @@ fn trap() -> ! {
 ///   the end of a syscall that has already gone.
 ///
 /// Scopes that do outlive a trap are left alone: the ones JS sets back
-/// when it catches one (`CB_DEPTH`, `GUEST_CALLS`, the call-out stack, the
-/// NT layer's exception levels), and the ones a trap hands to the next
+/// when it catches one (`CB_DEPTH`, `GUEST_CALLS`, and the call-out
+/// stack), and the ones a trap hands to the next
 /// entry (`NATIVE_LEFT`, `NO_LEAVE`, the resume point). Those this shim
 /// can end itself, `trap` ends.
 fn check_scopes_at_trap() {
@@ -14682,7 +14682,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             // restored module) or none says no, and the block is translated
             // again, bounded below. The id, compiled in, repeats across
             // processes and runs; it only picks between translating again and
-            // the bound (gate 1019f: a module restored from the translation
+            // the bound (a gate run: a module restored from the translation
             // cache had the id of one of the process's own, `elsewhere` read
             // that one's range, and the block resumed from JavaScript for
             // ever).
@@ -16627,7 +16627,7 @@ fn branch_fault(pc: u64) {
 }
 
 
-/// The browser half of the native in-place redispatch (65f9a719): instead
+/// The browser half of the native in-place redispatch: instead
 /// of trapping out of every wasm frame of the thread (unit frames included)
 /// to resume at `pc`, have JS install what the miss needs synchronously and
 /// let the miss stub dispatch again. At most a few times in a row at one
@@ -16825,7 +16825,7 @@ fn retire_unmapped_code_in(h: &mut Host) {
 /// a retired address, and drains the log before it returns, either finds
 /// them still there and retires them itself, or waits for whoever took
 /// them to have retired them. A call that makes code executable (`mmap`,
-/// `mprotect`, the NT layer's) always drains, so no thread runs new code
+/// `mprotect`) always drains, so no thread runs new code
 /// at an address whose old translations are still in place, whichever
 /// path, locked or not, unmapped it (docs/kernel-locking.md §4.3, L12b).
 pub(crate) fn take_logged(

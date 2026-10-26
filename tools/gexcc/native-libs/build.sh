@@ -1,5 +1,5 @@
 #!/bin/bash
-# item 3: Debian's zlib as an LP64 wasm library that
+# A native library: Debian's zlib as an LP64 wasm library that
 # replaces libz.so.1 under an aarch64 program. Compiled for wasm64 (LP64:
 # long, pointers and size_t 64-bit, as aarch64's), linked position-
 # independent with adapters for each export (gen.py) and a runtime (lib.sh:

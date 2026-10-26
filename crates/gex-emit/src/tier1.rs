@@ -1590,8 +1590,7 @@ impl<'a> Emitter<'a> {
         }
         // An address zero-extended from 32 bits is below 2^32: past the
         // memory, it traps by itself, as the guard would make it -- when
-        // nothing but guest memory lies below the guard limit (natively; the
-        // browser's NT layer keeps its heap above a lower one). The static
+        // nothing but guest memory lies below the guard limit. The static
         // offset is no different from the guarded case.
         if self.value_u32.get(addr.0 as usize).copied().unwrap_or(false) && guard_limit() >= GUEST_LIMIT && !Self::no_guard() {
             let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };

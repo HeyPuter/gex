@@ -48,7 +48,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_FTAB_RESOLVE {}u", gex_abi::ftab::RESOLVE);
     // The probe layout, kept in every module built with this header (a
     // `gex.abi` custom section; gex_abi::NATIVE_ABI): the host
-    // refuses a W3 module whose inline probe reads another ([`abi_refusal`]).
+    // refuses a 32-bit Wine module whose inline probe reads another ([`abi_refusal`]).
     let _ = writeln!(w, "#define GEX_NATIVE_ABI {}u", gex_abi::NATIVE_ABI);
     // (file-scope asm: clang puts a global with a `.custom_section.` section
     // in a data segment; the assembler's section is a custom section. It
@@ -238,7 +238,7 @@ fn mem64_helpers() -> String {
     s
 }
 
-/// W3 with KUSER_SHARED_DATA folded (`gex_abi::kuser_fold`): tier-1's
+/// 32-bit Wine with KUSER_SHARED_DATA folded (`gex_abi::kuser_fold`): tier-1's
 /// guard against the old page (`guard_to_i32`). The address names the block
 /// it is in, for the host's diagnostic and the access violation.
 const KUSER_HELPERS: &str = r#"
@@ -570,7 +570,7 @@ pub fn native_abi(wasm: &[u8]) -> Result<u32, String> {
     Ok(found.unwrap_or(1))
 }
 
-/// Why a W3 native module (`what`: Wine's loader or PE module) cannot run
+/// Why a 32-bit Wine native module (`what`: Wine's loader or PE module) cannot run
 /// here, or `None`: its inline probe (gexrt's `gex_ftab_idx`) reads the probe
 /// cache in the layout it was built for, and with another one every hit is
 /// a wrong function-table index (a "function signature mismatch" trap far

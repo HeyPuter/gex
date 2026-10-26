@@ -331,38 +331,6 @@ fn note_mappings(st: &mut RecState, kernel: &gex_kernel::Kernel, proc: &ProcProf
         st.profile.note_path(&fid.id, path);
         pl.add(v.start, v.end, &fid.id, bias);
     }
-    for (s, e, id, bias) in PE_PLACED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        pl.add(*s, *e, id, *bias);
-    }
-}
-
-/// PE images the NT layer mapped (`note_pe`), as placements `(start, end,
-/// object, bias)`: added to the process's at every harvest (an NT run is one
-/// process).
-static PE_PLACED: Mutex<Vec<(u64, u64, String, u64)>> = Mutex::new(Vec::new());
-
-/// A PE image the NT layer mapped at `base`, from the host file `path`: its
-/// code is named by the file and its link-time addresses (the address less
-/// `base - preferred base`), as an ELF object's are.
-pub fn note_pe(path: &str, base: u64, pe: &gex_ld::pe::PeImage) {
-    let Some(rec) = recorder() else {
-        return;
-    };
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("gex: profile: cannot read {path} ({e}); its code is recorded as anonymous");
-            return;
-        }
-    };
-    let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
-    let fid = register(&mut st, path, &bytes, "library", Some(path.to_string()));
-    st.profile.note_path(&fid.id, path);
-    let bias = base.wrapping_sub(pe.preferred_base);
-    PE_PLACED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((base, base + pe.image_size as u64, fid.id, bias));
 }
 
 /// Code was just mapped: name it now, while the mapping is there (a later

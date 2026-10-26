@@ -722,7 +722,6 @@ dependencies = [
  "gex-abi",
  "gex-atomic",
  "gex-f80",
- "gex-gl",
  "gex-ld",
 ]
 

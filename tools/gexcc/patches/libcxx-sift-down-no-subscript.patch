@@ -1,8 +1,8 @@
 libc++'s heap algorithms reach elements through *(it + n), not it[n]: iterator
 adaptors written against libstdc++ (Qt's QTaggedIterator) have no operator[].
 
---- a/libcxx/include/__algorithm/sift_down.h	2026-10-23 09:14:14.347402961 -0400
-+++ b/libcxx/include/__algorithm/sift_down.h	2026-10-23 09:14:14.354402975 -0400
+--- a/libcxx/include/__algorithm/sift_down.h
++++ b/libcxx/include/__algorithm/sift_down.h
 @@ -45,21 +45,21 @@
  
    if _LIBCPP_CONSTEXPR (__assume_both_children) {

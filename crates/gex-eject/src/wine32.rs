@@ -1,7 +1,7 @@
 //! Ejecting a 32-bit Wine page: a Windows program on Wine as native wasm32, recorded
 //! in the browser (docs/eject.md, "32-bit Wine pages").
 //!
-//! A 32-bit Wine program is not one process on the NT layer (`pe.rs`) but Wine: the
+//! A 32-bit Wine program is not one process but Wine: the
 //! wineserver, services, the program and its helpers are each a guest
 //! process running `wine` (a native wasm32 program) with Wine's PE side
 //! (`winepe.wasm`) loading the Windows images, whose code is function-tier

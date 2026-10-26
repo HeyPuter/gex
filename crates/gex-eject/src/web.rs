@@ -633,7 +633,7 @@ mod tests {
     use super::{EJECT_MJS, GEX_MJS, GEX_MJS_DEPS};
 
     /// Every module a Linux program's vendored runtime imports (`'./x.mjs'`)
-    /// is vendored too, as pe.rs checks the NT layer's: lazy-fetch.mjs's
+    /// is vendored too: lazy-fetch.mjs's
     /// import of fetch-note.mjs, missed, failed every Linux page's load.
     #[test]
     fn the_linux_web_runtime_vendors_every_module_it_imports() {

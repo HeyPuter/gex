@@ -93,7 +93,7 @@ static BY_OBJECT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `?fjitlibs=dumpmod=ADDR`: print (base64, in 3,000-character lines: the page console cuts
 /// a line at about 4,000) every JIT module
 /// whose functions include guest address ADDR, with its root, to rebuild the
-/// page's translation offline (scratch/unity/fjitrepro).
+/// page's translation offline.
 static DUMP_MOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static DUMP_OBJ: Mutex<Option<(String, u64)>> = Mutex::new(None);

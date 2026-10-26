@@ -1,5 +1,5 @@
 #!/bin/bash
-# item 3 for sqlite: Debian's libsqlite3 as an LP64 wasm library that
+# A native library for sqlite: Debian's libsqlite3 as an LP64 wasm library that
 # replaces libsqlite3.so.0 under an aarch64 program (the sqlite3 shell),
 # built from the amalgamation with Debian's options, on the LP64 libc.
 #

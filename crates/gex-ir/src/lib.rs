@@ -19,7 +19,7 @@ thread_local! {
     static KUSER_FOLDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Count one access moved from Windows' KUSER_SHARED_DATA address to W3's
+/// Count one access moved from Windows' KUSER_SHARED_DATA address to 32-bit Wine's
 /// (`gex_abi::fold_kuser`), by the lifter or an emitter, on this thread.
 pub fn note_kuser_fold() {
     KUSER_FOLDS.with(|c| c.set(c.get() + 1));

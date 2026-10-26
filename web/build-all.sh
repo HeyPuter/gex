@@ -89,7 +89,7 @@ fi
 # What a Mesa build reads, as xwl_key does for Xwayland: the Mesa checkout (its commit and any
 # uncommitted change), the build script, the toolchain, and gex's own sources that the build
 # compiles or includes (web/mesa, guest/gl: every file outside third_party/mesa in
-# its ninja deps). ninja alone rebuilt and relinked gex-wgpu-replay every gate round (2-4 min a
+# its ninja deps). ninja alone rebuilt and relinked gex-wgpu-replay on every build (2-4 min a
 # flavour, 15-40 min under load) because a merge touched those files' mtimes, not their content.
 mesa_key() { # mesa_key <mt|st>
     {

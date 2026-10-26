@@ -622,7 +622,7 @@ pub const PATCHED_PAGES_BYTES: u64 = DISPATCH_MAX_PAGES / 8;
 
 /// Function-tier nest exits (a nest root handing control to dispatch), a
 /// plain `u64` counter bumped without atomics: a statistic, for
-/// `GEX_NT_STATS`'s leaves per second.
+/// a statistic of leaves per second.
 pub const NEST_EXITS: u64 = RESERVED_END - 256;
 
 /// How many slots each of the function tier's body tables has in every store
@@ -676,7 +676,7 @@ pub const FCACHE_TAG_BITS: u32 = 36;
 /// (`gex_ftab_idx` in gex_abi.h): 1 the index above 32 address bits, 2 the
 /// index above [`FCACHE_TAG_BITS`]. The header records it in every module
 /// built with it (a `gex.abi` custom section, one little-endian u32 per
-/// object), and the browser host refuses a W3 module built for another
+/// object), and the browser host refuses a 32-bit Wine module built for another
 /// (a module without the section is a version-1 one).
 pub const NATIVE_ABI: u32 = 2;
 /// The address part of a probe cache entry.
@@ -899,7 +899,7 @@ pub mod imports {
     pub const BRK_X87_EXCEPTION: i32 = -7;
 
     /// Not a `brk`: an access at or above [`super::KUSER_GUARD`] while
-    /// KUSER_SHARED_DATA folding is on (W3): a run-time pointer into
+    /// KUSER_SHARED_DATA folding is on (32-bit Wine): a run-time pointer into
     /// Windows' old KUSER page, which the translator could not fold. `pc`
     /// is [`super::kuser_miss_pack`]'s (block pc and address). The host says
     /// "KUSER access not folded at pc X (module+off)" and raises an access
@@ -1035,7 +1035,7 @@ pub mod cache_op {
     /// block then dispatches.
     pub const PAGE_STALE: i32 = 12;
     /// Not a cache operation: a function-tier nest root handed control to
-    /// dispatch at `addr` (one exit in 4096, for GEX_NT_STATS's exit sites).
+    /// dispatch at `addr` (one exit in 4096, a statistic of exit sites).
     pub const NEST_EXIT_SAMPLE: i32 = 13;
     /// Not a cache operation: the function table's bridge in tier-1's
     /// dispatch slot for `addr` called a function that left for `addr`
@@ -1072,7 +1072,7 @@ static NULL_GUARD_ON: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 
 /// Turn the null guard ([`NULL_GUARD`]) on or off, before anything is
 /// translated. A debugging switch: off by default, since it costs 2-8% in
-/// tier 1 (scratch/KC/ab-45.txt) and a guest that reads through a null
+/// tier 1 and a guest that reads through a null
 /// pointer is broken anyway.
 pub fn set_null_guard(on: bool) {
     NULL_GUARD_ON.store(on, core::sync::atomic::Ordering::Relaxed);
@@ -1098,9 +1098,9 @@ pub const KUSER_WINDOWS_END: u64 = KUSER_WINDOWS + 0x1000;
 /// returns. The host masks it off.
 pub const ILLEGAL_RETURNS_PC: u64 = 1 << 61;
 
-/// Where W3's Wine maps KUSER_SHARED_DATA instead (wasm32): the top of the
+/// Where 32-bit Wine maps KUSER_SHARED_DATA instead (wasm32): the top of the
 /// low space it reserves below the wasm32 program's stack (`STACK_TOP -
-/// STACK_SIZE`), so that a W3 process's memory need not reach 2 GiB. Wine's
+/// STACK_SIZE`), so that a 32-bit Wine process's memory need not reach 2 GiB. Wine's
 /// `include/wine/kuser.h` says the same address (its ntdll checks it against
 /// `GEX_W3_KUSER`). i386 code's constant accesses to [`KUSER_WINDOWS`] are
 /// folded to it ([`fold_kuser`]); any other access to the old page faults.
@@ -1109,7 +1109,7 @@ pub const W3_KUSER: u64 = 0x04ff_0000;
 static KUSER_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Fold KUSER_SHARED_DATA's constant addresses in everything translated from
-/// now on (a W3 host, or `gexc cgen-image` for W3 units). In the unit key.
+/// now on (a 32-bit Wine host, or `gexc cgen-image` for wine32 units). In the unit key.
 pub fn set_kuser_fold(on: bool) {
     KUSER_FOLD.store(on, core::sync::atomic::Ordering::Relaxed);
 }
@@ -1120,7 +1120,7 @@ pub fn kuser_fold() -> bool {
 }
 
 /// A constant effective address in Windows' KUSER_SHARED_DATA page, moved to
-/// W3's ([`W3_KUSER`]) when folding is on; `None` for any other address.
+/// 32-bit Wine's ([`W3_KUSER`]) when folding is on; `None` for any other address.
 pub fn fold_kuser(ea: u64) -> Option<u64> {
     (kuser_fold() && (KUSER_WINDOWS..KUSER_WINDOWS_END).contains(&ea)).then(|| ea - KUSER_WINDOWS + W3_KUSER)
 }
@@ -1130,7 +1130,7 @@ pub fn fold_kuser(ea: u64) -> Option<u64> {
 /// into the old page computed at run time -- and becomes
 /// [`imports::BRK_KUSER_UNFOLDED`]: a named diagnostic and an access
 /// violation, never a read of whatever is mapped there and never a bare
-/// trap. Nothing of a W3 process is mapped this high (its `mmap` top).
+/// trap. Nothing of a 32-bit Wine process is mapped this high (its `mmap` top).
 pub const KUSER_GUARD: u64 = KUSER_WINDOWS;
 
 /// [`imports::BRK_KUSER_UNFOLDED`]'s `pc` argument: the block's guest pc in

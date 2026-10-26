@@ -40,7 +40,7 @@ mod stub {
         false
     }
 
-    /// No exe slot to keep without the NT layer.
+    /// No exe slot to keep in this build.
     pub(crate) const WINE32_ISLAND: (u64, u64) = (0, 0);
 
     pub(crate) fn wine32_kuser() {}
@@ -68,7 +68,7 @@ mod imp {
     /// Windows user address space and above.
     pub(crate) const NT_HEAP_BASE: u64 = 0x8000_0000;
 
-    /// The NT layer's Windows address space: everything below 2 GiB is
+    /// The 2 GiB split Windows address space: everything below 2 GiB is
     /// Windows', so the memory is grown to all of it now -- KUSER_SHARED_DATA
     /// at 0x7ffe0000, the PEB and TEBs top-down reach its top at once --
     /// rather than allocation by allocation. The shim's own stack and data
@@ -118,8 +118,8 @@ mod imp {
         WINE32_COMPACT_LO
     }
 
-    /// `?winesplit=1` (a site that asks): 32-bit Wine takes the NT layer's split
-    /// instead of the compact space, as it did before it (9c5fc4fd): the
+    /// `?winesplit=1` (a site that asks): 32-bit Wine takes the 2 GiB split
+    /// instead of the compact space, as it did before that existed: the
     /// memory grown to 2 GiB at start and the shim's heap above it, so
     /// everything below 2 GiB is Wine's. Costs the tab 2 GiB of data segment
     /// per process; for a game whose views and the heap do not fit together
@@ -215,7 +215,7 @@ mod imp {
     }
 
     /// A forked child's half of the parent's split, before the child's heap
-    /// takes its first span: the NT layer's split at the parent's line, or
+    /// takes its first span: the 2 GiB split at the parent's line, or
     /// 32-bit Wine's compact space (the child's memory already covers what the
     /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
