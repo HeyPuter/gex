@@ -1460,10 +1460,17 @@ fn recover_seeded(
         }
 
         // Weak starts: interior entries of the functions covering them, or
-        // functions of their own when nothing does. Only once the rest has
-        // settled: a jump-table case is uncovered until its table resolves,
-        // and an absolute table's entries are data pointers to it.
-        if !changed {
+        // functions of their own when nothing does. Once the rest has
+        // settled (a jump-table case is uncovered until its table resolves,
+        // and an absolute table's entries are data pointers to it), or in
+        // the pass's last round when it does not settle: a large image's
+        // tables can keep changing round after round, and the weak starts
+        // (an x86-64 image's vtable entries among them) would otherwise
+        // never be placed. What that round promotes gets one more round,
+        // to be discovered.
+        let last_round = rounds - pass_rounds == opts.max_rounds;
+        let mut promoted = false;
+        if !changed || last_round {
             let covered = coverage_index(&functions);
             let case_targets = switch_cases(&functions);
             let guessed = guessed_cases(&functions);
@@ -1490,11 +1497,17 @@ fn recover_seeded(
                 }
                 // A pointer to it is relocated and a virtual call's tail
                 // reaches it (`one_case_guess`): a function, whoever's
-                // blocks it also is.
+                // blocks it also is. A PE32+ relocated pointer into code
+                // that another function's blocks cover (a direct tail jump
+                // to it puts it in the jumper's) stays that function's
+                // interior entry: as a function of its own, the jumper's
+                // flow into it would become a call through the table. Calls
+                // through the pointer reach it as a region entry, which the
+                // unit build makes for a PE32+ image's interior entries.
                 if typed && guessed.contains(&w) && !starts[&w].has(Source::Orphan) {
                     if plausible_start(&code, w, typed) {
                         starts.get_mut(&w).unwrap().add(Source::Orphan);
-                        changed = true;
+                        promoted = true;
                     }
                     continue;
                 }
@@ -1516,14 +1529,14 @@ fn recover_seeded(
                         if demoted.contains(&w) {
                             pinned.insert(w);
                         }
-                        changed = true;
+                        promoted = true;
                     }
                     continue;
                 }
                 for o in owners {
                     if leaders.entry(o).or_default().insert(w) {
                         entries.entry(o).or_default().push(w);
-                        changed = true;
+                        promoted = true;
                     }
                 }
             }
@@ -1532,8 +1545,9 @@ fn recover_seeded(
                 v.dedup();
             }
         }
+        changed |= promoted;
 
-        if !changed || rounds - pass_rounds >= opts.max_rounds {
+        if !changed || (rounds - pass_rounds >= opts.max_rounds && !(last_round && promoted)) {
             break;
         }
     }

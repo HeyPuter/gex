@@ -263,7 +263,28 @@ pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
 pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
     let pv = provided(pe, base);
-    prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)
+    let fresh = !cache_root()?.join(unit_key(&image, &pv)).join("c.wasm").exists();
+    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)?;
+    if fresh {
+        prepare_own_regions(pe, base, &out, jobs, verbose)?;
+    }
+    Ok(out)
+}
+
+/// The region entries of the image's own interior entries, beside its unit
+/// at `unit` ([`prepare_regions`] with nothing more): made with the unit,
+/// so that mapping an image whose unit is built reads no recovery.
+fn prepare_own_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path, jobs: usize, verbose: bool) -> Result<()> {
+    #[cfg(feature = "translate")]
+    {
+        let failed = prepare_regions(pe, base, unit, &[], jobs)?;
+        if verbose && !failed.is_empty() {
+            eprintln!("[regions] {base:#x}: {} interior entries without a region entry", failed.len());
+        }
+    }
+    #[cfg(not(feature = "translate"))]
+    let _ = (pe, base, unit, jobs, verbose);
+    Ok(())
 }
 
 /// Functions recovery found in the image at `base` that its unit (`unit`,
@@ -296,7 +317,12 @@ pub fn prepare_pe_seeded(pe: &gex_ld::pe::PeImage, base: u64, extra: &[u64], job
         }
     }
     let pv = provided(pe, base);
-    prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)
+    let fresh = !cache_root()?.join(unit_key(&image, &pv)).join("c.wasm").exists();
+    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)?;
+    if fresh {
+        prepare_own_regions(pe, base, &out, jobs, verbose)?;
+    }
+    Ok(out)
 }
 
 /// The recovery directory of a PE image at `base` (what [`prepare_pe`]
@@ -348,14 +374,57 @@ fn regions_dir(unit: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// Build the region module for the image at `base` (whose unit is `unit`):
-/// one function per address of `pcs` the unit has no entry for. Returns the
-/// addresses it could not make a function of. Rebuilt only when `pcs`
-/// change.
+/// one function per address the unit has no entry for, of `pcs`, of those
+/// an earlier call recorded (the module only grows), and of the image's
+/// own interior entries ([`interior_entries`]). Returns the addresses it
+/// could not make a function of. Rebuilt only when that set changes.
 #[cfg(feature = "translate")]
 pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path, pcs: &[u64], jobs: usize) -> Result<Vec<u64>> {
     let pv = provided(pe, base);
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
-    regions_from(&image, &seeds.starts, &pv.stubs, base, unit, pcs, jobs)
+    let mut all = pcs.to_vec();
+    if let Some(dir) = regions_dir(unit) {
+        all.extend(recorded_pcs(&dir));
+    }
+    all.extend(interior_entries(&cache_root()?.join("recovery").join(recovery_key(&image)), image.class32));
+    regions_from(&image, &seeds.starts, &pv.stubs, base, unit, &all, jobs)
+}
+
+/// The addresses a region module was built for (its `pcs.txt`), none when
+/// there is no module.
+fn recorded_pcs(dir: &std::path::Path) -> Vec<u64> {
+    let Ok(text) = std::fs::read_to_string(dir.join("pcs.txt")) else { return Vec::new() };
+    text.lines().skip(1).filter_map(|l| u64::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok()).collect()
+}
+
+/// A PE32+ image's interior entries, from its recovery at `recovery`
+/// (`Function::entries` in `functions.gir`): addresses inside a function
+/// that are reached from outside it, a relocated pointer to code another
+/// function's blocks cover among them. The unit has no entry there, so a
+/// call through such a pointer would leave the unit; each gets a region
+/// entry instead, and the function covering it keeps its own flow into it.
+/// None for a PE32 image, where every absolute address is relocated
+/// (jump-table cases and labels included).
+fn interior_entries(recovery: &std::path::Path, class32: bool) -> Vec<u64> {
+    if class32 {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(recovery.join("functions.gir")) else { return Vec::new() };
+    let mut out: Vec<u64> = text
+        .lines()
+        .filter(|l| l.starts_with("func "))
+        .filter_map(|l| {
+            let at = l.find(" entries [")? + " entries [".len();
+            let end = at + l[at..].find(']')?;
+            Some(l[at..end].to_string())
+        })
+        .flat_map(|list| {
+            list.split(',').filter_map(|w| u64::from_str_radix(w.trim().trim_start_matches("0x"), 16).ok()).collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The NT trampoline page's region entries (at its unit `unit`): where a
@@ -1994,5 +2063,58 @@ mod region_tests {
         let wrong = slot as u64 + at + 6;
         assert!(ir.contains(&format!("({slot})")), "no load of {slot:#x}: {ir}");
         assert!(!ir.contains(&format!("({wrong})")), "the slot was read relative to the next instruction");
+    }
+
+    /// A PE32+ relocated pointer into code a tail jump covers is read back
+    /// from the written recovery as an interior entry, and a PE32 image
+    /// has none.
+    #[test]
+    fn a_covered_pe32_plus_code_pointer_is_read_back_as_an_interior_entry() {
+        let _mode = crate::TEST_DECODE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+        gex_xlate::set_compat(false);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/gex-xlate/tests/pe/vtail64.exe");
+        let bytes = std::fs::read(path).unwrap();
+        let pe = gex_ld::pe::parse(&bytes).unwrap();
+        let (image, extra) = gex_xlate::func::pe_input(&pe, pe.preferred_base).unwrap();
+        let prog = gex_xlate::func::recover_pe(&image, &extra, &Default::default());
+        let sums = gex_xlate::summary::analyze(&prog).map;
+        let funcs = gex_cgen::select(prog.functions.into_values().collect(), &Default::default(), &Default::default()).unwrap();
+        let dir = std::env::temp_dir().join(format!("gex-interior-test-{}", std::process::id()));
+        let recovery = dir.join("recovery");
+        gex_cgen::image::write_recovery(&recovery, &funcs, &sums, false).unwrap();
+        let got = super::interior_entries(&recovery, false);
+        let none = super::interior_entries(&recovery, true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, vec![0x140001010], "interior entries: {got:x?}");
+        assert!(none.is_empty());
+    }
+
+    /// Building a PE32+ unit builds its interior entries' region module
+    /// with it, and a later region build given no addresses (an ejected
+    /// project with none recorded) keeps them.
+    #[test]
+    fn a_pe32_plus_unit_gets_its_interior_entries_as_regions() {
+        let _mode = crate::TEST_DECODE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+        gex_xlate::set_compat(false);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/gex-xlate/tests/pe/vtail64.exe");
+        let bytes = std::fs::read(path).unwrap();
+        let pe = gex_ld::pe::parse(&bytes).unwrap();
+        let dir = std::env::temp_dir().join(format!("gex-unit-regions-test-{}", std::process::id()));
+        super::set_cache_root(Some(dir.clone()));
+        let run = || -> anyhow::Result<(Vec<u64>, Vec<u64>, Vec<u64>)> {
+            let unit = super::prepare_pe(&pe, pe.preferred_base, 2, false)?;
+            anyhow::ensure!(super::region_module(&unit).is_some(), "no region module beside {}", unit.display());
+            let built = super::recorded_pcs(&super::regions_dir(&unit).unwrap());
+            let failed = super::prepare_regions(&pe, pe.preferred_base, &unit, &[], 2)?;
+            anyhow::ensure!(super::region_module(&unit).is_some(), "the region module went away");
+            Ok((built, super::recorded_pcs(&super::regions_dir(&unit).unwrap()), failed))
+        };
+        let r = run();
+        super::set_cache_root(None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (built, kept, failed) = r.unwrap();
+        assert!(built.contains(&0x140001010), "region entries: {built:x?}");
+        assert_eq!(kept, built);
+        assert!(failed.is_empty(), "failed: {failed:x?}");
     }
 }
