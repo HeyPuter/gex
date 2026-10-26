@@ -7,9 +7,8 @@ import { requestGexDevice } from './gpu-device.js';
 // decoder -- here the ring goes to gex's wire decoder compiled against
 // st/mesa, so the GL semantics are Mesa's rather than hand-written.
 //
-// `tests/mesa-wgpu-replay.sh` exercises the same module against a recorded
-// trace and compares it with softpipe; this is the live path, for running real
-// guest programs and the CTS.
+// The same module also replays a recorded trace, to compare with softpipe;
+// this is the live path, for running real guest programs and the CTS.
 
 import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';

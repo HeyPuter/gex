@@ -28,10 +28,6 @@ web/eject-site/vendor/zstddec-stream.mjs
     zstddec, Copyright (c) 2020 Don McCurdy. MIT licence
     (web/eject-site/vendor/zstddec-LICENSE).
 
-web/public/gl_cts/
-    Test data from the Khronos OpenGL / OpenGL ES Conformance Test Suite
-    (VK-GL-CTS), Copyright The Khronos Group Inc. Apache-2.0.
-
 guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
     Generated from the Khronos OpenGL API registry (gl.xml), Copyright
     The Khronos Group Inc. Apache-2.0.
