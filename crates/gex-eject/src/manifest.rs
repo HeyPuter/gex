@@ -55,6 +55,10 @@ pub struct BuiltImage {
     pub path: String,
     pub blocks: u64,
     pub bytes: u64,
+    /// An `elf-unit`'s object as placed, `gex_key::image_identity` without
+    /// `image:`: with `identity` (its key), what the page takes instead of
+    /// hashing the object in every process that maps it. Empty otherwise.
+    pub image: String,
 }
 
 /// One bound replacement.
@@ -141,6 +145,7 @@ impl BuildManifest {
                                 ("path", json::s(&i.path)),
                                 ("blocks", json::n(i.blocks)),
                                 ("bytes", json::n(i.bytes)),
+                                ("image", json::s(&i.image)),
                             ])
                         })
                         .collect(),
@@ -212,6 +217,8 @@ impl BuildManifest {
                 path: str_field(&i, "path", what)?,
                 blocks: num(&i, "blocks")?,
                 bytes: num(&i, "bytes")?,
+                // absent from a build before it
+                image: crate::json::opt_str(&i, "image").unwrap_or_default(),
             });
         }
         let mut replacements = Vec::new();

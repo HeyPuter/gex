@@ -478,6 +478,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             path: m.path.clone(),
             blocks: entries.len() as u64,
             bytes: std::fs::metadata(&p)?.len(),
+            image: String::new(),
         });
     }
     // Stateful providers, from their sources.

@@ -587,6 +587,7 @@ impl Translation<'_> {
                     path: o.path.clone(),
                     blocks: if part == 0 { stats.blocks as u64 } else { 0 },
                     bytes: module.wasm.len() as u64,
+                    image: String::new(),
                 });
             }
             illegal += stats.illegal_blocks;
@@ -635,6 +636,10 @@ impl Translation<'_> {
                 .with_context(|| format!("the function-tier unit of {} at {:#x}", p.obj.path, p.image.bias))?;
             let key = wasm.parent().and_then(|d| d.file_name()).map(|k| k.to_string_lossy().into_owned()).unwrap_or_default();
             let entries = gex_cgen::image::read_entries(&wasm)?.iter().filter(|&&a| a != 0).count() as u64;
+            // the object as the page loads it at its base (libprov's
+            // placement), so the page need not hash it in every process
+            let image = gex_native::pe_units::elf_image(&bytes, p.image.bias)?;
+            let image = gex_key::image_identity(&image).trim_start_matches("image:").to_string();
             Ok(BuiltImage {
                 kind: "elf-unit".to_string(),
                 identity: key.clone(),
@@ -644,6 +649,7 @@ impl Translation<'_> {
                 path: p.obj.path.clone(),
                 blocks: entries,
                 bytes: std::fs::metadata(&wasm)?.len(),
+                image,
             })
         };
         let built = std::thread::scope(|s| {
