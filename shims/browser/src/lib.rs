@@ -26,8 +26,8 @@
 
 #[cfg(target_arch = "wasm32")]
 use core::arch::wasm32 as warch;
-// The memory64 build (docs/mem64.md step 6): an x86-64 guest with a 64-bit
-// memory, for the Unity games on .NET (docs/unity-dotnet.md P5).
+// The memory64 build: an x86-64 guest with a 64-bit
+// memory, for the Unity games on .NET.
 #[cfg(target_arch = "wasm64")]
 use core::arch::wasm64 as warch;
 
@@ -79,7 +79,7 @@ extern "C" {
     /// `performance.now()`, in milliseconds: the clock's hot path. An f64,
     /// not an i64: an i64 import result is a BigInt per call, most of a
     /// clock read's cost (Chrome: about 650 ns of a 757 ns
-    /// QueryPerformanceCounter, docs/wine-overhead.md F2).
+    /// QueryPerformanceCounter).
     fn perf_now() -> f64;
     /// The epoch `now` counts from in this Worker, in ns (`ORIGIN_NS`):
     /// `now() == clock_origin() + round(perf_now() * 1e6)`. Read once per
@@ -424,7 +424,7 @@ extern "C" {
     fn k_mod_claim_object(obj: u64, id: u32);
     fn k_obj_translating(obj: u64, pid: u32) -> u32;
     fn k_obj_translated(obj: u64, produced: u32);
-    /// The translation cache across page loads (docs/gexcc.md §8).
+    /// The translation cache across page loads.
     fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64) -> i32;
     /// A wasm32 program's content key by its file, system-wide
     /// (`cgen/wasmprog.rs` `known_key`): 1 and the key's two lanes at `out`, or 0.
@@ -807,8 +807,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
         return None;
     }
     // Every waitable object's queue lives in the global kernel, where a
-    // waiter in another process can be on it (docs/kernel-locking.md §5.2
-    // step 2). Before anything that makes one.
+    // waiter in another process can be on it. Before anything that makes one.
     gex_kernel::wait::set_hooks(gex_kernel::wait::Hooks {
         new: || unsafe { k_wq_new() },
         free: |id| unsafe { k_wq_free(id) },
@@ -2507,8 +2506,8 @@ pub extern "C" fn gex_set_wl_trace(on: i32) {
 /// handler so the common OOB/"trapped inside" crash (not just guest SIGABRT)
 /// names all threads. TWO threads with the SAME `ctx=` is issue #126: two
 /// Workers on one register context, which clobbers stacks and looks like
-/// corruption anywhere. Reads the thread table, which needs no kernel lock
-/// (L23), so it answers even when a crash left the kernel held.
+/// corruption anywhere. Reads the thread table, which needs no kernel lock,
+/// so it answers even when a crash left the kernel held.
 #[no_mangle]
 pub extern "C" fn gex_dump_threads() {
     if let Some(home) = sigs::home() {
@@ -2537,7 +2536,7 @@ pub extern "C" fn gex_dump_threads() {
 /// thread, joined) is done, not stuck.
 #[no_mangle]
 pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
-    // The thread table, without the kernel lock (L23).
+    // The thread table, without the kernel lock.
     sigs::home().is_some_and(|home| {
         home.table().iter().any(|(_, t)| t.ctx_addr() == ctx as u64 && matches!(t.run().waiting, Waiting::Exited))
     }) as i32
@@ -2905,7 +2904,7 @@ fn arena_take(len: u64) -> Option<u64> {
 /// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
 /// `None` when the memory would not grow.
 fn arena_back(start: u64, end: u64) -> Option<u64> {
-    // The high arena of a 64-bit memory (docs/mem64.md §3): the memory grows
+    // The high arena of a 64-bit memory: the memory grows
     // to cover it (V8 commits lazily), but the low arena's cursor -- which
     // this module's heap also takes from, and whose addresses cross to JS as
     // u32 -- stays below 4 GiB.
@@ -3244,7 +3243,7 @@ enum Waiting {
 /// One guest thread. Its registers live in its context in guest memory, so
 /// switching to it is a call to the guest entry with a different context
 /// pointer; there is no wasm stack to save.
-/// A process's threads (docs/kernel-locking.md §3.7, L23): each one's tid,
+/// A process's threads: each one's tid,
 /// context and run state, added and read from any Worker without the kernel
 /// lock. A thread's index is its own for its life (`cur()`).
 pub(crate) type Threads = gex_atomic::threads::ThreadTable<ThreadCell>;
@@ -3260,7 +3259,7 @@ fn threads_of(t: ThreadState, pc: u64, waiting: Waiting) -> Arc<Threads> {
 pub(crate) trait ThreadSlot {
     fn kstate(&self) -> ThreadState;
     /// Where it stands: its own Worker's, which changes it without the
-    /// kernel lock (docs/kernel-locking.md §3.7).
+    /// kernel lock.
     fn run(&self) -> std::sync::MutexGuard<'_, Run>;
     /// Its [`ThreadCell::gone`].
     fn gone(&self) -> &std::sync::atomic::AtomicBool;
@@ -3419,8 +3418,8 @@ fn note_module_dense(j: &mut Jit, module_id: u64) {
     }
 }
 
-/// A process's translation state, behind its own lock (docs/kernel-locking.md
-/// §4.3, step L13) rather than inside the `Host` the kernel lock guards.
+/// A process's translation state, behind its own lock, rather
+/// than inside the `Host` the kernel lock guards.
 ///
 /// One per process: it lives in the process's memory, so the Workers of the
 /// process share it, a vfork child running in a Worker of its parent
@@ -3492,7 +3491,7 @@ fn jit_give() {
 /// `Host::jit`: the process's JIT state, under its own lock. A kernel call
 /// that touches it takes the lock on the first touch and keeps it until it
 /// gives the kernel lock back, in that order: the kernel lock, then the JIT
-/// lock, then the memory map's (§4.3). A path outside the kernel takes the
+/// lock, then the memory map's. A path outside the kernel takes the
 /// JIT lock alone (`with_jit_only`).
 struct JitHere;
 
@@ -3602,7 +3601,7 @@ struct Jit {
     /// The runtime modules with blocks on each page (their dense bases), and
     /// per module its block count and how many of those pages are still
     /// live. A module none of whose pages is left cannot be reached: an
-    /// unloaded image's (FL's plugin scan loads and unloads dozens, and every
+    /// unloaded image's (a plugin host's scan loads and unloads dozens, and every
     /// Worker's `blocks` kept each one's instance and code until the tab ran
     /// out of memory). It joins `dense_dead`. A module with a block on a page
     /// not in `base_pages` is not tracked, and lives.
@@ -3754,8 +3753,7 @@ const GUEST_LIMIT: u64 = WINE32_SPLIT_TOP;
 /// The wasm32 slice's end, and the top of the NT split's Windows space in
 /// either shim (`wine32_address_space`).
 const WINE32_SPLIT_TOP: u64 = 0x7fff_0000;
-/// A wasm64 shim's slice may span the whole memory64, high arena included
-/// (docs/mem64.md step 6).
+/// A wasm64 shim's slice may span the whole memory64, high arena included.
 #[cfg(target_arch = "wasm64")]
 const GUEST_LIMIT: u64 = gex_abi::LIMIT64;
 
@@ -3934,10 +3932,9 @@ fn set_host(host: Host) {
 }
 
 /// The host of a process this Worker alone has: a fork child's or an exec
-/// child's, between its adoption and its first guest instruction (F, L25c),
+/// child's, between its adoption and its first guest instruction,
 /// before any other Worker of it exists. Its fields are written directly,
-/// with no lock: nothing else can reach them yet (docs/kernel-locking.md
-/// §3.12 F).
+/// with no lock: nothing else can reach them yet.
 fn with_own_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     #[cfg(not(feature = "shared-memory"))]
     let r = HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: an adoption before its process")));
@@ -4516,7 +4513,7 @@ pub extern "C" fn gex_worker_init() -> u32 {
             }
             memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
         }
-        // An M64 memory's dense directory (docs/mem64.md §3) is read by every
+        // An M64 memory's dense directory is read by every
         // dispatch, so the memory covers it from the start (V8 commits
         // lazily: untouched pages of it cost nothing).
         if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
@@ -4810,7 +4807,7 @@ pub extern "C" fn gex_klock_holder() -> u32 {
 }
 
 /// The exec lock, held for one call into `with_exec_lock`: what is left of the
-/// kernel lock (docs/kernel-locking.md §3.12). Only the process calls take it
+/// kernel lock. Only the process calls take it
 /// -- `execve`, and `clone`, `clone3`, `fork` and `vfork` making a process,
 /// and the dynamic linker's `SNAP_SYSCALL` that keeps a linked image -- which
 /// replace, copy or record the whole `Host` (its image, its memory map, its JIT
@@ -4833,7 +4830,7 @@ impl ExecLock {
             return ExecLock;
         }
         // Outermost of the locks that nest: not under the JIT state's or
-        // the memory map's (docs/kernel-locking.md §4.3).
+        // the memory map's.
         gex_kernel::sync::rank_take(gex_kernel::sync::rank::KERNEL);
         let mut spins: u32 = 0;
         loop {
@@ -4887,7 +4884,7 @@ impl Drop for ExecLock {
         if d > 1 {
             return;
         }
-        // The JIT lock, if the call took it, before the kernel lock (§4.3).
+        // The JIT lock, if the call took it, before the kernel lock.
         jit_give();
         KLOCK.store(0, std::sync::atomic::Ordering::Release);
         gex_kernel::sync::rank_give(gex_kernel::sync::rank::KERNEL);
@@ -4898,8 +4895,7 @@ impl Drop for ExecLock {
     }
 }
 
-/// The JIT's own state while a translation runs outside `ExecLock`
-/// (docs/kernel-locking.md, step 5).
+/// The JIT's own state while a translation runs outside `ExecLock`.
 ///
 /// A dispatch miss lifts with the kernel lock let go: the translator takes the
 /// page table, the translated set and the intrinsics out of `Host::jit`, marks
@@ -5019,8 +5015,7 @@ fn jit_wait() {
 /// For anything that reads or changes the JIT's page table, translated set,
 /// intrinsics or closure maps: they may be out with a translator (`jitout`),
 /// and they are under the JIT's lock alone, not the kernel's
-/// (docs/kernel-locking.md §4.3; the kernel-lock form, `with_jit`, went with
-/// its last caller in L16). Inside a kernel call it uses the
+/// (there is no kernel-lock form). Inside a kernel call it uses the
 /// JIT lock the call holds or takes it under the kernel lock; outside one,
 /// it waits for a translation in flight with the JIT lock given back. `f`
 /// may not enter the kernel: the kernel lock ranks above the JIT lock.
@@ -5056,7 +5051,7 @@ fn with_jit_only<R>(f: impl FnOnce(&mut Jit) -> R) -> R {
 
 /// What translation reads of its process besides the JIT state: the
 /// memory map (its own lock, ranked under the JIT's), the namespace and the
-/// pid (docs/kernel-locking.md §3.6, L16). From the kernel while a kernel
+/// pid. From the kernel while a kernel
 /// call has it (`Px::of`), else from the process's published `Home`
 /// (`with_px`), with no kernel lock.
 pub(crate) struct Px<'a> {
@@ -5262,7 +5257,7 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
         return -1;
     }
     let count = u32at(&mut p);
-    // The map locks itself (no kernel lock, L25c).
+    // The map locks itself (no kernel lock).
     let mm = sigs::proc_home().mm();
     {
         for _ in 0..count {
@@ -6389,7 +6384,7 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
     // `gex_page_table`, `gex_lib_lazy`). Unlocked, that read-vs-write races the
     // BTreeMaps' structure -- the true-parallelism stack smash. Those readers
     // lock the same way. The maps are translation state, so the lock is the
-    // JIT's, not the kernel's (docs/kernel-locking.md §3.6, L16); it nests.
+    // JIT's, not the kernel's; it nests.
     with_jit_only(|_| {
         let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
         let program = std::str::from_utf8(shim_slice(prog, prog_len))
@@ -6831,7 +6826,7 @@ pub extern "C" fn gex_page_base(page: u32) -> u32 {
 /// and the run translates into 4..7, so a single total would grow 0..3 hugely.
 #[no_mangle]
 pub extern "C" fn gex_table_need(i: u32) -> u32 {
-    // Without the lock (docs/kernel-locking.md, step 4): the per-table marks
+    // Without the lock: the per-table marks
     // are atomics the page table shares with every clone, published once per
     // table (`regview`). JS asks this once per table per install.
     match regview::table_need(i as usize) {
@@ -7322,8 +7317,8 @@ fn wait_needs_page(r: &Run) -> bool {
 /// `gex_syscall` calls `schedule`, and `schedule` picks the thread up,
 /// finishes the operation and says where to carry on. This only waits, on
 /// this Worker's wait slot, which the turn that found nothing to run
-/// registered on the queue of everything the thread waits for
-/// (docs/kernel-locking.md §5.2 step 2): until one of them is notified or
+/// registered on the queue of everything the thread waits for:
+/// until one of them is notified or
 /// the thread's own deadline. A wait only the page ends is not waited for
 /// here: the stack goes back.
 fn park_until_ready() {
@@ -7372,7 +7367,7 @@ pub extern "C" fn gex_wake() -> i32 {
     let n = WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 4096 {
         // Without the kernel lock: the thread table and each run state lock
-        // themselves (L23).
+        // themselves.
         let census = sigs::home().map(|home| {
             let mut out = String::new();
             // One process per Worker, so this Worker's threads are all there is
@@ -7638,10 +7633,10 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
 /// syscall); a redirect or exit traps out to JS, the way the native host
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 /// On the way back this Worker's function table is grown if another Worker
-/// allocated past it meanwhile (`cgen::ftab_resume`, X's B16), and the
+/// allocated past it meanwhile (`cgen::ftab_resume`), and the
 /// compositor pumped if the call wrote to (or closed) its socket: a client
 /// that keeps running reaches no scheduler turn, and its requests waited
-/// for one (X's B2: Wine's destroyed context menu stayed on top, catching
+/// for one (Wine's destroyed context menu stayed on top, catching
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
@@ -8240,7 +8235,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         }
         // An exec that asked for a 64-bit memory of a program that has a
         // memory64 twin beside it (`<path>.m64`, 64-bit Wine's loader in a twin dist):
-        // the twin runs (vfork.rs `exec_route`, docs/mem64.md §5).
+        // the twin runs (vfork.rs `exec_route`).
         let outcome = match outcome {
             SyscallOutcome::Exec { path, argv, envp } => {
                 vfork::exec_relaunch(h, &argv);
@@ -8546,8 +8541,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
             }
         }
     }
-    // Whatever that call changed notified the queues of what it changed
-    // (docs/kernel-locking.md §5.2 step 2): nobody is woken here.
+    // Whatever that call changed notified the queues of what it changed:
+    // nobody is woken here.
     let _ = this_nr;
     // Objects the guest just mapped (`mapped`, taken in the locked section),
     // recompiled in bulk before it can branch in: queued below, after the
@@ -8556,8 +8551,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // so every branch still finds the miss stub; JS picks the queue up at the
     // next miss.
     //
-    // Libraries some of whose exports a provider serves (glibc's mem*,
-    // docs/elf-providers.md): JS binds them before the guest goes on, as the
+    // Libraries some of whose exports a provider serves (glibc's mem*):
+    // JS binds them before the guest goes on, as the
     // native host does after the same syscall.
     let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
         set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
@@ -8768,7 +8763,7 @@ fn clock_constants(compat: bool, started: u128) {
 }
 
 
-/// The clocks, with no kernel lock (docs/kernel-locking.md §5.2 step 1):
+/// The clocks, with no kernel lock:
 /// `clock_gettime`, `clock_getres`, `gettimeofday`, `getrusage` and
 /// `sched_yield` are answered here, always, from the clock and the process's
 /// constants (`gex_kernel::syscalls::clock_call`, `EFAULT` included). They
@@ -8838,7 +8833,7 @@ fn clock_syscall(ctx: i32) -> bool {
 }
 
 /// After a `kill`, `tkill` or `tgkill` of signal `sig` from the thread whose
-/// context is at `ctx_addr`, with the kernel lock or without it (L22d).
+/// context is at `ctx_addr`, with the kernel lock or without it.
 ///
 /// A signal for a thread of this process is raised on that thread's own
 /// pending word, which its safepoints read (`sigs`); the thread may be
@@ -8910,8 +8905,8 @@ fn ident_syscall(gm: &mut GuestMem<'_>, at: u64, compat: bool) -> bool {
     ids.pid != 0 && gex_kernel::syscalls::ident_call(gm, at, compat, &ids, home.creds())
 }
 
-/// This process's descriptor table, which needs no kernel lock
-/// (docs/kernel-locking.md §3.4): `h.kernel.fds` of the installed host
+/// This process's descriptor table, which needs no kernel lock:
+/// `h.kernel.fds` of the installed host
 /// (`set_host`). The table stays where it is for the life of
 /// the process -- it is closed (`close_all`), never replaced -- so the
 /// pointer holds until the next `set_host`, which runs before any thread of
@@ -9307,7 +9302,7 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
 /// The global kernel's id of the pipe end descriptor `fd` is, or -1: the
 /// wineserver's door kick pipe, which a door call in another process
-/// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
+/// writes (gex.mjs `#doorPublish`).
 #[no_mangle]
 pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
     fds_free().and_then(|fds| fds.get(fd).ok()).and_then(|f| pipe_id(&f.path)).unwrap_or(-1)
@@ -9363,7 +9358,7 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
 /// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
 fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
-    // No kernel lock (L25c): the names resolve in the process's published
+    // No kernel lock: the names resolve in the process's published
     // namespace, and the descriptor table locks itself.
     let home = sigs::proc_home();
     let ns = home.ns();
@@ -9578,7 +9573,7 @@ pub(crate) const WINE64_ENTRY_PAGE: u64 = gex_abi::KUSER_WINDOWS_END;
 pub(crate) const WINE64_SYSCALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x10;
 pub(crate) const WINE64_UNIX_CALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x20;
 
-/// In a 64-bit memory (a twin install's 64-bit process, docs/mem64.md §5)
+/// In a 64-bit memory (a twin install's 64-bit process)
 /// Wine places its images top down from the top of the 16 GiB, far above
 /// [`WINE64_PE_DATA`]: the window is the top of that space instead (below a
 /// 64 KiB guard), above every image and within 4 GiB of the first ones.
@@ -10114,7 +10109,7 @@ pub(crate) fn thread_staged() -> bool {
 // cannot start it. That is a loud failure rather than a quiet one, which is
 // the trade -- see `gex_thread_stage` and the host's side of it.
 
-/// A thread `clone` has made, by either path (L25b): into the thread table,
+/// A thread `clone` has made, by either path: into the thread table,
 /// staged for the host to give a Worker of its own, and the creator on
 /// after its `clone` (whose answer, the tid, is in its context). No kernel
 /// lock: the table claims a slot with an atomic add, the registry backfill
@@ -10262,7 +10257,7 @@ pub extern "C" fn gex_thread_taken() {}
 #[no_mangle]
 pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     phase(9);
-    // No kernel lock (L25b): the thread table and the signal states lock
+    // No kernel lock: the thread table and the signal states lock
     // themselves, and the binding is this Worker's own.
     let Some(home) = sigs::home() else { return 0 };
     let table = home.table();
@@ -10282,7 +10277,7 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     pc as i64
 }
 
-/// [`bind_mine`] with no kernel lock (L25b, L25c): thread `i` of this
+/// [`bind_mine`] with no kernel lock: thread `i` of this
 /// Worker's process, from its thread table and its signal states.
 pub(crate) fn bind_free(i: usize) {
     let Some(home) = sigs::home() else { return };
@@ -10535,7 +10530,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
 /// child's own image.
 #[no_mangle]
 pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
-    // The map locks itself (no kernel lock, L25c).
+    // The map locks itself (no kernel lock).
     sigs::proc_home().mm().lock().insert(start as u64, end as u64, prot as u32, "[forked]");
 }
 
@@ -11863,7 +11858,7 @@ fn object_identity(p: &Px<'_>, addr: u64) -> Option<u64> {
 /// The memory flavour in a code identity ([`object_identity`],
 /// [`page_identity`]): a 64-bit memory's translations import an i64 memory,
 /// so a 32-bit process of the same program must not be served them, in a
-/// page that runs both (docs/mem64.md §5). Nothing is added for a 32-bit
+/// page that runs both. Nothing is added for a 32-bit
 /// memory, whose keys stay as they were.
 fn flavour_salt(h: &mut impl std::hash::Hasher) {
     if gex_abi::mem64() {
@@ -12132,8 +12127,7 @@ fn shared_module_at(
     }
 }
 
-// `?xcache=`: tie each identity key to its file for the kernel's saved store
-// (docs/gexcc.md §8).
+// `?xcache=`: tie each identity key to its file for the kernel's saved store.
 thread_local! {
     /// Keys this Worker has told the kernel about, each path's size and mtime
     /// (`u64::MAX`: no such file here), and whether this load keeps a cache
@@ -12325,7 +12319,7 @@ impl Drop for NowScope {
 /// What a scheduler turn that found nothing to run saw, under the one lock
 /// it took to decide: everything the idle path then acts on, so that a pass
 /// of a waiting Worker's loop takes the kernel's lock once rather than seven
-/// times (docs/kernel-locking.md, step 3).
+/// times.
 struct IdleLook {
     /// What the page must supply, as `paused()` bits (see `idle_why`).
     why: u8,
@@ -12585,7 +12579,7 @@ fn report_idle(why: u8) {
         return;
     }
     // Without the kernel lock: the thread table, each run state, the map
-    // and the descriptor table lock themselves (L23).
+    // and the descriptor table lock themselves.
     let census = sigs::home().map(|home| {
         let mut out = String::new();
         let table = fds_free();
@@ -12814,8 +12808,8 @@ fn schedule_turn() -> i32 {
     // A turn of a wait this Worker already registered asks only its own
     // thread, from what that wait was, without the kernel lock: a parked
     // thread woken by something it does not wait for, or by nothing, looks
-    // and parks again (docs/kernel-locking.md §5.2 step 2); one whose wait
-    // is over finishes its call and runs (§3.7).
+    // and parks again; one whose wait
+    // is over finishes its call and runs.
     match if first { waitq::Turn::Full } else { waitq::idle_turn() } {
         waitq::Turn::Idle(why, ends_by_itself) => {
             if why != 0 {
@@ -12945,7 +12939,7 @@ fn deadlock_confirmed() -> bool {
 /// symptom into something to look up. The process ends (`set_exit`), which
 /// is the kernel's.
 fn report_deadlock() {
-    // Who is parked where, without the kernel lock (L23); the end is the
+    // Who is parked where, without the kernel lock; the end is the
     // kernel's.
     let who = sigs::home().map(|home| {
         let mut s = String::new();
@@ -13074,8 +13068,8 @@ fn finish_mine(signalled: bool) -> i32 {
 
 /// A call of the lock-free class (`gex_kernel::syscalls::free_class`:
 /// `read`, `write`, their vectored and positioned forms, `lseek`,
-/// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included
-/// (docs/kernel-locking.md step 9); `None` for any other call, decided by
+/// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included;
+/// `None` for any other call, decided by
 /// its number before anything is done. `gex_syscall`'s stop value.
 ///
 /// `compat` is whether the process has the i386 ABI, `regs` the call as the
@@ -13110,7 +13104,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
         // the JIT lock, so no thread runs or translates what it took away
         // between the two, and an address it frees cannot be mapped again
         // with new code until its translations are gone (as one kernel-lock
-        // section made them; docs/kernel-locking.md §4.3, L12b). Its mapped
+        // section made them). Its mapped
         // code is queued below, as the locked section's is.
         with_jit_only(|_| {
             let o = sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64);
@@ -13170,7 +13164,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
             exit_here(-(signal as i32), Some(at))
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
-        // `exit` from one of several threads (L25a): this thread is over;
+        // `exit` from one of several threads: this thread is over;
         // the last one out of the thread table ends the process.
         FreeOutcome::ThreadExit => {
             if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
@@ -13235,10 +13229,10 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A `recvmsg` on a blocking socket: until it is readable, then made
         // again (`Owed::reissue`).
         gex_kernel::BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
-        // A blocking `connect` (L18), as the kernel's park: until the
+        // A blocking `connect`, as the kernel's park: until the
         // connection is up, refused or gone (`wait_ready`'s `Net`).
         gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
-        // `rt_sigsuspend` (L22d), as the kernel's park: until a signal it
+        // `rt_sigsuspend`, as the kernel's park: until a signal it
         // can see arrives (another process's notifies this process's wait
         // queue, a thread's of its own `waitq::wake_process`, a timer's is
         // the wait's deadline), or at once if one already can be.
@@ -13253,7 +13247,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         gex_kernel::BlockOp::SigWait { timeout, .. } => {
             Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
         }
-        // `wait4` (L25a), as the kernel's park: `WNOHANG` answers on the
+        // `wait4`, as the kernel's park: `WNOHANG` answers on the
         // first turn; anything else waits for the child, which may not have
         // started yet.
         gex_kernel::BlockOp::WaitChild { nohang, .. } => {
@@ -13284,8 +13278,8 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
     // the turn a Wayland client's wait makes after it wrote a request, and
     // `schedule` skips the pump for a first turn made here. Without it the
     // request sat in the socket until some thread of the process next took a
-    // full turn: a destroyed menu stayed drawn, and took clicks, for 2-10 s
-    // (X's B2), and a lone client blocked on its first reply never got one
+    // full turn: a destroyed menu stayed drawn, and took clicks, for 2-10 s,
+    // and a lone client blocked on its first reply never got one
     // (tests/browser-wl-unmap.sh).
     pump_compositor();
     let pick = pick_mine(&run);
@@ -13296,8 +13290,8 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
 /// One turn of `schedule` for this Worker's thread: finish its parked call
 /// if the wait is over, or register the wait and say why nothing runs. No
 /// kernel lock: its run state, its signals and its wait slot are its own,
-/// and what the call owes was taken from the kernel when it parked
-/// (docs/kernel-locking.md §3.7). The first turn of a class call's park
+/// and what the call owes was taken from the kernel when it parked.
+/// The first turn of a class call's park
 /// ([`park_free`]) and every turn with no registered wait to ask.
 fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
     loop {
@@ -13861,14 +13855,14 @@ fn trap() -> ! {
     // count below agree. Left, the count was zeroed while the guard stayed.
     if jit_holds() {
         warn_line(&format!(
-            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}, taken at {}; given back (docs/kernel-locking.md §4.1)\n",
+            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}, taken at {}; given back\n",
             LAST_SYSCALL.with(|c| c.get()) as i32,
             JIT_TAKER.with(|t| t.get()).map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line())),
         ));
         jit_give();
     }
     // A kernel lock guard alive here never drops: a trap does not unwind, so
-    // the lock would stay taken for good (docs/kernel-locking.md §4.1). Lock
+    // the lock would stay taken for good. Lock
     // regions are leaf computations; one that reaches a trap is a bug.
     if let Err(n) = gex_kernel::sync::check_trap_out() {
         warn_line(&format!("[gex] trapped out to JS holding {n} kernel lock guard(s)\n"));
@@ -13894,7 +13888,7 @@ fn trap() -> ! {
 }
 
 /// The shim's own scopes, checked where it traps out, as the kernel's lock
-/// guards are (`check_trap_out`, docs/kernel-locking.md §4.1). None may be
+/// guards are (`check_trap_out`). None may be
 /// open here: a trap runs no `Drop`, so each would stay open on this Worker
 /// for good.
 ///
@@ -13917,7 +13911,7 @@ fn check_scopes_at_trap() {
     let defer = gl::DEFER.with(|d| d.get());
     if kernel || defer {
         warn_line(&format!(
-            "[gex] BUG: trapped out to JS with{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
+            "[gex] BUG: trapped out to JS with{}{} still open, in syscall {}\n",
             if kernel { " the kernel" } else { "" },
             if defer { " a GL deferral" } else { "" },
             LAST_SYSCALL.with(|c| c.get()) as i32,
@@ -14257,7 +14251,7 @@ pub extern "C" fn gex_compat() -> i32 {
 pub extern "C" fn gex_set_compat(on: i32) {
     // Once per process, at a child's adoption in its own Worker, before any
     // of its threads run: the process is this Worker's alone, and its
-    // fields are written directly (L25c). A thread's Worker never calls it
+    // fields are written directly. A thread's Worker never calls it
     // (what it sets is shared).
     with_own_host(|h| {
         h.kernel.compat = on != 0;
@@ -15024,7 +15018,7 @@ fn safepoint(ctx: i32, pc: i64) {
             };
             top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             top.truncate(3);
-            // The threads and the map without the kernel lock (L23), the
+            // The threads and the map without the kernel lock, the
             // block count from the JIT state alone.
             let blocks = with_jit_only(|j| j.blocks);
             let (census, whose) = sigs::home().map(|home| {
@@ -15134,7 +15128,7 @@ fn safepoint(ctx: i32, pc: i64) {
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
 /// A pc that comes to translation again and again is a retranslation
-/// livelock (S3 found natively that a page retired between a translation and
+/// livelock (natively, a page retired between a translation and
 /// its publish came back without its directory entry): say what dispatch
 /// sees there, once per pc, the 64th time.
 thread_local! {
@@ -16511,7 +16505,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         note_blocks(&mut j.by_object, whose, pc, stats.blocks as u64);
         // `GEX_DISCOVER_SKIP` bit 8: what discovery lifted and why, one
         // `address why depth object` line a block, read at exit
-        // (`gex_dl_text`, run-node's GEX_DL_FILE; docs/jit-guest.md).
+        // (`gex_dl_text`, run-node's GEX_DL_FILE).
         let dlog = gex_xlate::take_discover_log();
         if !dlog.is_empty() {
             let mut t = DL_TEXT.lock().unwrap_or_else(|e| e.into_inner());
@@ -16827,7 +16821,7 @@ fn retire_unmapped_code_in(h: &mut Host) {
 /// them to have retired them. A call that makes code executable (`mmap`,
 /// `mprotect`) always drains, so no thread runs new code
 /// at an address whose old translations are still in place, whichever
-/// path, locked or not, unmapped it (docs/kernel-locking.md §4.3, L12b).
+/// path, locked or not, unmapped it.
 pub(crate) fn take_logged(
     mm: &gex_kernel::mem::Mm,
     mapped: bool,
@@ -16846,7 +16840,7 @@ pub(crate) fn take_logged(
 /// in the map's log: its retired code retired, as `retire_unmapped_code_in`
 /// does under the lock, and the code it mapped, for the caller to queue.
 /// The JIT lock for the retire, the mm lock for the log and the map: no
-/// kernel lock (docs/kernel-locking.md §4.3, L12b).
+/// kernel lock.
 fn map_drain() -> Vec<gex_kernel::CodeMap> {
     let Some(home) = sigs::home() else { return Vec::new() };
     let mm = home.mm();
@@ -17147,7 +17141,7 @@ fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
     if unsafe { RECOMPILE_OBJECTS } == 0 || mapped.is_empty() {
         return;
     }
-    // The JIT state's own lock alone (docs/kernel-locking.md, L12c).
+    // The JIT state's own lock alone.
     with_jit_only(|j| j.candidates.extend(mapped.into_iter().map(|m| (m, 0))));
 }
 
@@ -17285,7 +17279,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // could reach V8's 10M-slot table ceiling. By whole pages, the identity
     // map's key; an object every page of which is answered is skipped.
     //
-    // No kernel lock anywhere here (docs/kernel-locking.md §3.6, L16): the map
+    // No kernel lock anywhere here: the map
     // and the identities come from the process's published `Home` (`with_px`),
     // the slots and pages from the JIT state under its own lock.
     let (adopted, pages) = with_px(|px| with_jit_only(|j| {
@@ -17578,7 +17572,7 @@ fn note_intrinsics(addr: u64) {
         return;
     }
     // The map first, the JIT state after it and not under it (ExecLock, JIT,
-    // mm: docs/kernel-locking.md §4.3), neither under the kernel lock.
+    // mm), neither under the kernel lock.
     let Some((path, start)) = ({
         let mm = sigs::proc_home().mm().lock();
         mm.vmas()
@@ -17943,7 +17937,7 @@ fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>,
 }
 
 fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
-    // Through the process's published namespace, not the kernel (L16).
+    // Through the process's published namespace, not the kernel.
     let Some(bytes) = sigs::proc_home().read_file(&map.path) else {
         return Vec::new();
     };
@@ -18581,7 +18575,7 @@ fn set_exit(code: i32) {
     waitq::wake_process();
 }
 
-/// How a process ended, decided once and read with no lock (L24): the
+/// How a process ended, decided once and read with no lock: the
 /// status the Worker reports (`gex_exit_code`), and whether a thread has
 /// claimed the end (`exit_process`). One per process, in its `Home`.
 pub(crate) struct ExitState {
@@ -18872,7 +18866,7 @@ pub extern "C" fn gex_module_len(i: u32) -> u32 {
 }
 
 /// The translation registry and the dispatch tables' lengths as a reader
-/// holding no lock sees them (docs/kernel-locking.md, step 4).
+/// holding no lock sees them.
 ///
 /// JS asks about them all the time -- each table's need at every install,
 /// each module's pointer, length, place and key while a Worker catches up --

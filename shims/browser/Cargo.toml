@@ -40,7 +40,7 @@ shared-memory = ["dep:spinning_top"]
 # mode with no symptom of its own: what the page sees is a fault at whatever
 # the guest touched next.
 heap-counters = ["talc/counters"]
-# The lock-order check (docs/kernel-locking.md §4.3) in this release build:
+# The lock-order check in this release build:
 # a panic naming the ranks held when a lock is taken out of order.
 lock-ranks = ["gex-kernel/lock-ranks"]
 # The phase marks (`gex_kernel::phase`, read with `GEX_PHASES=1`): a

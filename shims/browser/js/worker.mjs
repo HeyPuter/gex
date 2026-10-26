@@ -361,7 +361,7 @@ async function handle(msg) {
     // every m64 Worker's runtime failed to instantiate).
     const mem64 = !!msg.mem64;
     // Either way: a Worker the pool took back may have run the other
-    // flavour's process last (a 64-bit program's, docs/mem64.md §5).
+    // flavour's process last (a 64-bit program's).
     if (mem64) globalThis.GEX_MEM64 = 1;
     else delete globalThis.GEX_MEM64;
     if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
@@ -539,7 +539,7 @@ async function handle(msg) {
     dropModules(keys) {
       port.post({ kind: 'droppedModules', keys });
     }
-    // The wineserver published its door (docs/wineserver-kernel.md): up to
+    // The wineserver published its door: up to
     // the host, which hands it to every Worker of the session.
     publishDoor(door) {
       recyclable = false;
@@ -675,7 +675,7 @@ async function handle(msg) {
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
   if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
-  // A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim's process.
+  // A 64-bit guest memory: the wasm64 shim's process.
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
   else delete globalThis.GEX_MEM64;
   // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
@@ -1212,8 +1212,8 @@ async function handle(msg) {
     // `?fjit=`: what the function JIT did, and how often its lock was held.
     if (!thread) ex.gex_fjit_report?.();
     if (!thread) ex.gex_process_gone?.(134);
-    // `?xcache=`: what this process added to the store, kept for the next load
-    // (docs/gexcc.md §8). After the exit is published, so a parent's wait does
+    // `?xcache=`: what this process added to the store, kept for the next load.
+    // After the exit is published, so a parent's wait does
     // not wait for it.
     const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
     const xcacheMin = msg.xcacheMin ?? msg.opts?.xcacheMin ?? msg.child?.opts?.xcacheMin;

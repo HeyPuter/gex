@@ -307,7 +307,7 @@ fn mid_function(addr: u64) -> bool {
         None => {
             let bytes = home.read_file(&path).unwrap_or_default();
             // Not the PLT's: one FDE covers all of `.plt`, whose stubs are
-            // each an entry (hp9 left them to the fallback, and died).
+            // each an entry (left to the fallback, they died).
             let plt: Vec<(u64, u64)> = gex_xlate::ehframe::sections(&bytes)
                 .into_iter()
                 .filter(|s| s.name.starts_with(".plt"))

@@ -1,4 +1,4 @@
-//! ELF export providers in the browser (docs/elf-providers.md; the native
+//! ELF export providers in the browser (the native
 //! host is shims/native/src/elfprov.rs): a library a provider names
 //! (`/* PROVIDES libc.so.6 x86_64`) gets its exports bound in the function
 //! table when it maps, by `gex_cgen::provider::elf_bindings`, before the
@@ -67,7 +67,7 @@ pub extern "C" fn gex_elfprov_off() {
 }
 
 /// Every address `provided` holds, at once (the function JIT asks of each
-/// byte it fetches; three locks a byte cost HK's start-up 2.3 s, hp14).
+/// byte it fetches; three locks a byte cost one game's start-up 2.3 s).
 pub(crate) fn provided_set() -> std::collections::HashSet<u64> {
     let mut s: std::collections::HashSet<u64> = lock(&BOUND).iter().flat_map(|b| b.addrs.iter().copied()).collect();
     s.extend(super::libprov::bound_addrs());
@@ -113,7 +113,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
     if let Some(u) = super::libprov::maps(mapped) {
         queue(|q| q.push_back(u));
     }
-    // Function-tier units for listed shared objects (libprov.rs, B4).
+    // Function-tier units for listed shared objects (libprov.rs).
     let unit = super::libprov::elf_unit_maps(mapped);
     if !on() {
         return unit || queue(|q| !q.is_empty());

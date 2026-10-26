@@ -53,7 +53,7 @@ function providerSources(dirs) {
   }
   return out.join('\0') || undefined;
 }
-// GEX_SINGLE=1: the single-thread build (docs/single-thread.md) -- every
+// GEX_SINGLE=1: the single-thread build -- every
 // process and thread a fiber on this thread, no SharedArrayBuffer, the shared
 // build's binaries on plain memories. Before anything is compiled.
 const SINGLE = !!process.env.GEX_SINGLE;
@@ -66,8 +66,7 @@ if (SINGLE) {
 const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
 if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
 // `GEX_MEM64=1` (with GEX_ARCH=x86 and GEX_SHARED=1): a 64-bit guest memory,
-// the `.m64` shim and seed built by `GEX_MEM64=1 shims/browser/build.sh`
-// (docs/mem64.md step 6).
+// the `.m64` shim and seed built by `GEX_MEM64=1 shims/browser/build.sh`.
 const MEM64 = !!process.env.GEX_MEM64;
 if (MEM64) globalThis.GEX_MEM64 = 1;
 const SHIM_INFIX = ARCH_INFIX + (MEM64 ? '.m64' : '');
@@ -356,7 +355,7 @@ if (MEM64 && SHARED && kernel) {
   }
 } else if (SHARED && !SINGLE && kernel && ARCH_INFIX) {
   // Without it, the 64-bit memory's runtime, for a program an exec asks one
-  // for (docs/mem64.md §5: GEX_MEM64=1 in the exec's environment, or the
+  // for (GEX_MEM64=1 in the exec's environment, or the
   // image's user.gex.mem64 record). Read only then.
   other = async () => ({
     shim: readFileSync(new URL(`gex_browser${ARCH_INFIX}.m64.shared.wasm`, PUB)),
@@ -459,7 +458,7 @@ const host = new ProcessHost({
     log: process.env.GEX_LOG || undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
-    // runs (docs/gexcc.md §8), saved under that name.
+    // runs, saved under that name.
     xcache: process.env.GEX_XCACHE || undefined,
     // GEX_XCACHE_MIN=bytes: save when the store grew by this much (default 1 MiB).
     xcacheMin: process.env.GEX_XCACHE_MIN ? Number(process.env.GEX_XCACHE_MIN) : undefined,
@@ -521,7 +520,7 @@ const host = new ProcessHost({
     // GEX_COHERENT_LOADS emits guest scalar loads/stores as atomic-when-aligned
     // so shared reads stay coherent under true parallelism (V8 can't hoist a
     // plain wasm load across a guest fence). Tests whether the GTK startup race
-    // is plain-load coherence at the PLAN 5.8 boundary. Default off.
+    // is plain-load coherence at guest fences. Default off.
     coherentLoads: !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
     // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
     // into the MAIN thread's stack (it would smash a canary the main thread only

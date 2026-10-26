@@ -242,8 +242,8 @@ pub fn pump_wanted() -> bool {
     device.is_some_and(|d| d.needs_pump())
 }
 
-/// What the pump needs of its process, read without the kernel lock
-/// (docs/kernel-locking.md §3.10): the shared mappings' published view (a
+/// What the pump needs of its process, read without the kernel lock:
+/// the shared mappings' published view (a
 /// client's pool), the program (whether it is the X server whose windows
 /// this compositor manages), and how to reach that server's socket. Set
 /// under the lock where they change: a process's start, a fork's child, a

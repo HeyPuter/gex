@@ -78,7 +78,7 @@ FEATURES=""
 EXTRA=""
 [ -n "$ARCH_FEAT" ] && EXTRA=",$ARCH_FEAT"
 [ -n "${GEX_HEAP_COUNTERS:-}" ] && { FEATURES="--features heap-counters${ARCH_FEAT:+,$ARCH_FEAT}"; EXTRA="$EXTRA,heap-counters"; }
-# GEX_LOCK_RANKS=1: check the lock order (docs/kernel-locking.md §4.3) in this
+# GEX_LOCK_RANKS=1: check the lock order in this
 # release build. A test build, not a shipping one.
 [ -n "${GEX_LOCK_RANKS:-}" ] && { FEATURES="${FEATURES:---features }${FEATURES:+,}lock-ranks"; EXTRA="$EXTRA,lock-ranks"; }
 # GEX_PHASE_MARKS=1: a syscall's time by phase (gex_kernel::phase), read with
@@ -225,8 +225,8 @@ $GEXC seed -o web/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
 $GEXC seed -o web/public/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
-# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory (docs/mem64.md
-# step 6; the Unity games on .NET, docs/unity-dotnet.md P5), x86-64 guests
+# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory (the Unity
+# games on .NET), x86-64 guests
 # only. Same source, target wasm64-unknown-unknown (nightly, build-std),
 # shared memory only; its memory is a memory64 of LIMIT64 (16 GiB). The
 # layout below 4 GiB is the wasm32 one. Artefacts get `.m64` after the arch.

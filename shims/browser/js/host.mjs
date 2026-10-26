@@ -161,8 +161,8 @@ const PAGE_MODULE_BYTES = 192 << 20;
 /** The most wasm the page-wide unit cache (`#unitModules`) keeps compiled. */
 const UNIT_MODULE_BYTES = 256 << 20;
 /** The most wasm one process's relay cache (`#moduleCache`) keeps: a pc
- *  translated again and again (a dispatch that does not converge; Paint's
- *  startup stall) made a fresh key each time, and an
+ *  translated again and again (a dispatch that does not
+ *  converge) made a fresh key each time, and an
  *  unbounded cache held every one, 10 GiB of renderer within minutes. Past
  *  it the oldest are dropped from the cache (Workers that installed them
  *  keep theirs; a thread started later compiles what it needs). */
@@ -181,8 +181,8 @@ export class ProcessHost {
   /// The other memory flavour's runtime, `{ shim, guest, kernel }` (a
   /// kernel module, on the same kernel memory), for a page whose processes
   /// do not all have one kind of memory: in a 64-bit memory's page
-  /// (`?mem64=1`), a program that is a wasm32 module (64-bit Wine's wineserver,
-  /// docs/wine-native-x64.md §4) or a 32-bit ELF runs in a 32-bit memory.
+  /// (`?mem64=1`), a program that is a wasm32 module (64-bit Wine's
+  /// wineserver) or a 32-bit ELF runs in a 32-bit memory.
   /// What a process gets: the exec record says (`mem64`, vfork.rs
   /// `exec_memory`), a fork child has its parent's, and anything else the
   /// page's. As the X server's (runtime.js), which takes the wasm32 kernel.
@@ -439,8 +439,7 @@ export class ProcessHost {
 
   /** The page's memory flavours, for the shim (vfork.rs
    *  `gex_set_page_flavours`): bit 0 its own is a 64-bit memory, bit 1 it
-   *  runs the other too (`#other`), so that an exec may ask for that one
-   *  (docs/mem64.md §5). */
+   *  runs the other too (`#other`), so that an exec may ask for that one. */
   #pageFlavours() {
     return (this.#extra?.mem64 ? 1 : 0) | (this.#other && this.#kernel ? 2 : 0);
   }
@@ -775,7 +774,7 @@ export class ProcessHost {
   }
 
   /** Whether the Worker `key` is inside a wineserver door call: it holds
-   *  the door lock (docs/wineserver-kernel.md §4.2). */
+   *  the door lock. */
   #inDoor(key) {
     const d = this.#door;
     if (!d) return false;
@@ -938,7 +937,7 @@ export class ProcessHost {
         break;
       }
       case 'doorPublish': {
-        // The wineserver's door (docs/wineserver-kernel.md): every Worker of
+        // The wineserver's door: every Worker of
         // the session, now and later, gets the server's memory and module.
         this.#door = m.door;
         narrate(`[host] wineserver pid ${m.door?.pid} published its door`);
@@ -1111,7 +1110,7 @@ export class ProcessHost {
         // From the warm pool, as a process's: a fresh Worker was ~100 ms of
         // script load and shim instantiation before the thread could start,
         // and a starting Wine process makes its threads one after another
-        // (61 of them before Paint's window, 13.5 s in all).
+        // (61 of them before one program's first window, 13.5 s in all).
         const w2 = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker();
         this.#workers.set(key, w2);
         workerRan(w2, key);

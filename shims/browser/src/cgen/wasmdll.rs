@@ -1,5 +1,4 @@
-//! Native wasm32 Wine DLLs in the browser (docs/wine-native.md §3.14,
-//! §3.15): the native host's `wasmdll`, shared mode. Wine's PE side is one
+//! Native wasm32 Wine DLLs in the browser: the native host's `wasmdll`, shared mode. Wine's PE side is one
 //! module (pelink.py) behind a skeleton per DLL (a `.wasmref` section names
 //! it). The first skeleton to map installs it as a stateful provider (its
 //! data from the NT allocator, `PROVIDER | number` in the function table);
@@ -191,7 +190,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             Some((dir, _)) => format!("{dir}/{module_name}"),
             None => module_name.clone(),
         };
-        // A twin install (wine64-dist.sh WINE64_TWIN=1, docs/mem64.md §5): a
+        // A twin install (wine64-dist.sh WINE64_TWIN=1): a
         // process with a 64-bit memory loads the memory64 build's module,
         // beside the other as `<module>.m64`, under the same skeletons.
         let ns = crate::sigs::proc_home().ns();
@@ -459,7 +458,7 @@ fn pe_head(b: &[u8]) -> Option<(u64, bool)> {
     Some((size, skeleton))
 }
 
-/// `gex.image_mapped(base, fd)` (32-bit Wine, docs/wine-native.md §3.17): Wine's
+/// `gex.image_mapped(base, fd)` (32-bit Wine): Wine's
 /// own PE loader mapped the image open at `fd` at `base`, relocated. A
 /// native DLL's skeleton gets Wine's PE module bound at its exports, as the
 /// native host's `image_mapped` does. The module number when this is the

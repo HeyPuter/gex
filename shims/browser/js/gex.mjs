@@ -7,7 +7,7 @@
 // `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 const GUEST_BYTES = 0xffff0000;
 
-// A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim and seed, a
+// A 64-bit guest memory: the wasm64 shim and seed, a
 // memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
@@ -309,7 +309,7 @@ const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
 /** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
- *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
+ *  `NATIVE_UNWOUND`. */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
 const NATIVE_UNWOUND = 512n;
 /** Where a native caller's `run_until` goes after a stray return to its
@@ -1259,7 +1259,7 @@ export class Gex {
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
       // `?sehreport=1`: crash reports name the SEH chain and a longjmp's jmp_buf.
       if (globalThis.GEX_SEH_REPORT) this.#shim.exports.gex_set_seh_report?.(1);
-      // Which memory flavours the page runs (docs/mem64.md §5): what an exec
+      // Which memory flavours the page runs: what an exec
       // may ask for (vfork.rs `gex_set_page_flavours`).
       if (globalThis.GEX_PAGE_FLAVOURS !== undefined) this.#shim.exports.gex_set_page_flavours?.(globalThis.GEX_PAGE_FLAVOURS | 0);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
@@ -1367,7 +1367,7 @@ export class Gex {
 
   /** A DataView of the memory, rebuilt as `#bytes` is: for `#hookStack`,
    *  which every direct system call entry runs (a new view each call was
-   *  4.7% of Hades's render thread samples). */
+   *  4.7% of a game's render thread samples). */
   #dv() {
     const buf = this.#memory.buffer;
     if (!this.#dview || this.#dview.buffer !== buf || this.#dview.byteLength !== buf.byteLength) {
@@ -2224,8 +2224,8 @@ export class Gex {
     }
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
-    // `?xcache=`: the store the last load saved, laid in before anything runs
-    // (docs/gexcc.md §8). After `gex_load`, which unpacked the bundle the
+    // `?xcache=`: the store the last load saved, laid in before anything runs.
+    // After `gex_load`, which unpacked the bundle the
     // saved paths are checked against.
     if (opts.xcache) await this.#xcacheRestore(String(opts.xcache));
     if (globalThis.GEX_DEBUG_EXIT) {
@@ -2903,7 +2903,7 @@ export class Gex {
   /** The global kernel's exports, or null. */
   get kernel() { return this.#kernel; }
 
-  /** The saved store, into the kernel and checked (docs/gexcc.md §8). */
+  /** The saved store, into the kernel and checked. */
   async #xcacheRestore(name) {
     const e = this.#shim.exports;
     const k = this.#kernel;
@@ -2926,7 +2926,7 @@ export class Gex {
 
   /**
    * Save the kernel's store for the next load if it grew by `minBytes` since
-   * the last save (docs/gexcc.md §8). The kernel lets one save run at a time.
+   * the last save. The kernel lets one save run at a time.
    */
   async xcacheSave(name, minBytes = 1 << 20) {
     const k = this.#kernel;
@@ -4204,7 +4204,7 @@ export class Gex {
     this.#shim?.exports.gex_elfprov_off?.();
   }
   #noElfProviders = false;
-  /** This Worker's half of the function table (docs/merge-plan.md §9.8.1):
+  /** This Worker's half of the function table:
    *  its `gex.ftab`, the runtime module's `resolve` and `bridge`, and how far
    *  through the table's log it is. Made at the first unit. */
   #cgen = null;
@@ -4318,7 +4318,7 @@ export class Gex {
 
   /** Before guest code runs again from here: this Worker counted for the
    *  probe cache's indices, and its function table grown if another Worker
-   *  allocated past its end meanwhile (cgen.rs `ftab_resume`, X's B16). */
+   *  allocated past its end meanwhile (cgen.rs `ftab_resume`). */
   #cgenGrowIfShort() {
     const st = this.#cgen;
     const e = this.#shim.exports;
@@ -4362,10 +4362,10 @@ export class Gex {
     // A replaced Linux library's wasm64 provider (cgen/libprov.rs): the 64-bit provider_* imports.
     const libprov = wasmdll && !!e.gex_cgen_pmod_libprov?.(prov);
     // One built for wasm64 and lowered to this 32-bit memory (an LP64 wasm
-    // library under an aarch64 program, docs/gexcc.md §7.8): its globals
+    // library under an aarch64 program): its globals
     // stay i64, with an i32 copy of the table base for its element segment.
-    // A wasm32 program built LP64 for wasm64 and lowered the same way (64-bit Wine,
-    // docs/wine-native-x64.md), told apart by its __memory_base import's type.
+    // A wasm32 program built LP64 for wasm64 and lowered the same way (64-bit Wine),
+    // told apart by its __memory_base import's type.
     const progLowered = wasmprog && !!e.gex_cgen_pmod_lowered?.(prov);
     // Wine's PE module in a 64-bit Wine process (the native PE core,
     // winepe.wasm): built LP64 and lowered as its program was, so i64 globals and
@@ -4419,7 +4419,7 @@ export class Gex {
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
-    // A stateful provider (docs/eject-pe.md §5.1): its data in the guest's
+    // A stateful provider: its data in the guest's
     // memory, this Worker's provider stack, and the provider_* imports.
     // (above 4 GiB for Wine's PE module in a 64-bit memory: the upper half)
     const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) + (e.gex_cgen_pmod_memory_base_hi?.(prov) >>> 0) * 2 ** 32 : 0;
@@ -4895,7 +4895,7 @@ export class Gex {
   }
 
   /** What a replaced Linux library's wasm64 provider imports from `gex` (the native
-   *  `libprov::register64`; docs/unity-dotnet.md P5 B1). Pointers and table indices
+   *  `libprov::register64`). Pointers and table indices
    *  are i64 (BigInt). */
   #providerImports64() {
     const e = this.#shim.exports;
@@ -5119,7 +5119,7 @@ export class Gex {
     return mod;
   }
 
-  /** Bind unit `u`'s export providers (§9.9), after the unit, whether or
+  /** Bind unit `u`'s export providers, after the unit, whether or
    *  not it had one: each provider's module from the unit cache, published
    *  by the shim at its exports' addresses. */
   #cgenProviders(u) {
@@ -5166,8 +5166,8 @@ export class Gex {
     }
   }
 
-  /** An ejected project's region entries for unit `u` (docs/eject-pe.md
-   *  §3.3): `<cache>/regions/<key>/`, published after the unit as a unit of
+  /** An ejected project's region entries for unit `u`:
+   *  `<cache>/regions/<key>/`, published after the unit as a unit of
    *  their own, when the build made them. */
   #cgenRegions(u, path) {
     const e = this.#shim.exports;
@@ -5561,7 +5561,7 @@ export class Gex {
         return h | 0;
       },
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,
-      // Door calls into the wineserver (docs/wineserver-kernel.md).
+      // Door calls into the wineserver.
       door_publish: (area) => this.#doorPublish(area >>> 0),
       door_call: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, false),
       // A 64-bit client's (64-bit Wine's lowered LP64 ntdll.so): the request's
@@ -5572,27 +5572,27 @@ export class Gex {
       // the door (loader.c `wineserver_relaunch`). None in the SP build.
       door_missing: () => (this.#door || single.on ? 0 : 1),
       // The session mapping, a block of the server's memory (area +128,
-      // +132), copied from directly by win32u (docs/wineserver-kernel.md
-      // §6.1): the bytes copied, or -1 with no door session; the session's
+      // +132), copied from directly by win32u: the
+      // bytes copied, or -1 with no door session; the session's
       // size for a size of 0.
       session_copy: (dst, off, size) => this.#sessionCopy(addrNum(dst), off >>> 0, size >>> 0),
       session_seq: (off) => this.#sessionSeq(off >>> 0),
       // The server's user shared data page (area +140), copied at a
-      // process's start and written by the first boot's fill (§6.2).
+      // process's start and written by the first boot's fill.
       usd_copy: (dst, size) => this.#usdMove(addrNum(dst), size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(addrNum(src), size >>> 0, true),
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
       // The server's own (the pump): a thread's wait pipe, which door calls
-      // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
+      // write in place. Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
       wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, addrBig(buf), len >>> 0) ?? -38,
       wake_close: () => {},
     };
   }
 
-  // -- door calls (docs/wineserver-kernel.md) ------------------------------
+  // -- door calls ------------------------------
   //
   // The wineserver is its own process. When it is up it publishes its door
   // area; the host hands the server's memory and module to every Worker.
@@ -5858,8 +5858,7 @@ export class Gex {
   /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
    *  1 use the pipes, 2 the thread died in the request. The hot path is kept
    *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
-   *  it stays optimised: every server request of a 32-bit Wine process comes here
-   *  (docs/wine-overhead.md). */
+   *  it stays optimised: every server request of a 32-bit Wine process comes here. */
   #doorCall(req, pid, tid, lp64) {
     // A 64-bit memory's client (64-bit Wine's memory64 flavour) takes the door too:
     // the server's instance here touches only the server's own wasm32
@@ -6231,7 +6230,7 @@ export class Gex {
       }
       const key = this.#cgenStr(e.gex_cgen_key, u);
       const path = this.#cgenStr(e.gex_cgen_path, u);
-      // A link group's member (docs/eject-pe.md §6a): held until every
+      // A link group's member: held until every
       // member is placed, then the group's module stands for them all.
       const grp = e.gex_cgen_group ? this.#cgenGroupOf(key) : null;
       if (grp) {
@@ -7136,7 +7135,7 @@ export class Gex {
    *  'callout~' for one that may suspend). */
   #nest = [];
 
-  // --- The single-thread build (single.mjs, docs/single-thread.md) ---------
+  // --- The single-thread build (single.mjs) ---------
   //
   // Every guest thread is a fiber of one realm, its guest on a JSPI stack. A
   // blocking call suspends that stack (`k_ws_park`, below) where the default
@@ -7372,7 +7371,7 @@ export class Gex {
    * The single-thread build's call-out: the same loop, with the guest on a
    * stack of its own (`WebAssembly.promising`), so guest code the call-out
    * runs can block -- the import that asked is a `Suspending`, and the
-   * whole fiber waits (docs/single-thread.md §7).
+   * whole fiber waits.
    */
   #callOutAsync(ctx, target, ret, spWant) {
     return this.#driveAsync(this.#callOutSteps(ctx, target, ret, spWant, true));
@@ -7500,7 +7499,7 @@ export class Gex {
           // the miss path set at its return (`cgen::returned`) is spent, and
           // left in place it is where the run loop next goes -- the next
           // time this thread blocks with nothing else to run, it "resumed"
-          // at the provider's return address (HK under ?fjit, docs §12 34).
+          // at the provider's return address (under ?fjit).
           // (Only this one's: an outer call-out's hit returns through the
           // frames between, which leave as before.)
           const ended = (v) => {
@@ -7789,8 +7788,8 @@ export class Gex {
   }
   #rowMemo = null;
 
-  /** With `scratch`, the copy is a view of this Worker's one scratch buffer
-   * , good until the next such call: for a caller that
+  /** With `scratch`, the copy is a view of this Worker's one scratch buffer,
+   * good until the next such call: for a caller that
    *  compiles and installs it without yielding. */
   #registryBytes(i, scratch = false) {
     const { ptr, len, ext } = this.#registryRow(i);
@@ -8099,7 +8098,7 @@ export class Gex {
       }
     }
     // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
-    // looking at what a translation is made of (docs/jit-guest.md).
+    // looking at what a translation is made of.
     if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
       try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${globalThis.process.env.GEX_DUMP_WASM}/u-${this.#shim.exports.gex_my_pid?.() ?? 0}-${moduleContentKey(bytes).replaceAll(':', '-')}.wasm`, bytes); } catch {}
     }

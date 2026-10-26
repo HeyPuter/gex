@@ -1,4 +1,4 @@
-//! Waiting, the Linux way (docs/kernel-locking.md §5.2 step 2).
+//! Waiting, the Linux way.
 //!
 //! A Worker runs one guest thread, and the thread owns one *wait slot*: a
 //! word in the global kernel's memory (`k_ws_*`), found from the Worker's

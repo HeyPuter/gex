@@ -142,7 +142,7 @@ const B_ACK = 4;
 /** Where the process's wait queue is in the global kernel's memory
  * (`gex_proc_queue_addr`), or zero, and where the wait slots' words start
  * (`gex_slots_addr`): what the compositor notifies after putting an event in
- * this block's ring (docs/kernel-locking.md §5.2 step 2). */
+ * this block's ring. */
 const B_WAKE = 5;
 const B_SLOTS = 6;
 const B_WORDS = 8;
@@ -162,7 +162,7 @@ const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
 /** The shared arena a compositor and its guests share. */
 export function makeWlChannel() {
   // A plain buffer in the single-thread build, where the compositor and every
-  // guest are one realm (docs/single-thread.md).
+  // guest are one realm.
   const Buf = typeof SharedArrayBuffer === 'function' ? SharedArrayBuffer : ArrayBuffer;
   return { arena: new Buf(TOTAL_WORDS * 4) };
 }

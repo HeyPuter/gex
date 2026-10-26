@@ -1,6 +1,5 @@
 //! The function tier's whole-image units (format `gex-cgen-image 3`) and the
-//! function table in the browser: the shim's half (docs/browser-units-plan.md,
-//! docs/merge-plan.md §9.8.1).
+//! function table in the browser: the shim's half.
 //!
 //! What stays here is small: which images were mapped, which unit each one
 //! wants (its key, `gex_cgen::image::image_key`, the same function the native
@@ -139,7 +138,7 @@ struct Unit {
     dirs: Vec<(u64, u32)>,
     /// What the dispatch table must hold.
     slots: u64,
-    /// The image's export providers (`gex_cgen::provider`, §9.9): each one's
+    /// The image's export providers (`gex_cgen::provider`): each one's
     /// module file under the unit cache and the (C function, guest address)
     /// pairs it binds. Bound after the unit, whether or not it has one.
     providers: Vec<Provided>,
@@ -156,7 +155,7 @@ struct Provided {
     /// `providers/<name>-<fingerprint>.wasm`, as `provider::build` names it.
     file: String,
     binds: Vec<(String, u64)>,
-    /// A stateful provider (docs/eject-pe.md §5.1): every export of the
+    /// A stateful provider: every export of the
     /// image by name and address, and its entry point (DllMain), which
     /// `gexp__entry` replaces.
     stateful: Option<(Vec<(String, u64)>, u64)>,
@@ -359,7 +358,7 @@ fn log_event(i: usize) -> u64 {
 /// out of the probe cache.
 static FTAB_SIZE: AtomicU32 = AtomicU32::new(0);
 
-// ---- Which indices the probe cache may hold (X's B16) ----
+// ---- Which indices the probe cache may hold ----
 //
 // The probe cache (`gex_abi::FCACHE`) is process-wide, and compiled code
 // (units, providers, winepe.wasm) calls an index it finds there straight
@@ -525,7 +524,7 @@ pub(crate) fn on() -> bool {
 }
 
 /// ELF export providers without units (`gex_cgen_set_mode` bit 3): the
-/// provider modules come from the page's dist (docs/gexcc.md §7.9), and no
+/// provider modules come from the page's dist, and no
 /// image looks for a unit.
 static PROVIDERS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -538,7 +537,7 @@ pub(crate) fn providers_on() -> bool {
 /// providers whether or not units are on. Bit 2 (4) selects the
 /// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
 /// the browser the guarded flavor guards only at the memory's end, as the
-/// unguarded one traps there by itself (docs/browser-units-plan.md).
+/// unguarded one traps there by itself.
 /// The TSO flavour (`?tso=1`, for weakly ordered hosts): guest loads and stores are
 /// atomic where aligned, which tier 1 and the function JIT emit and a
 /// function-tier unit, compiled ahead with plain accesses, does not. So units
@@ -1202,7 +1201,7 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     0
 }
 
-/// A region-entry module for placed unit `u` (docs/eject-pe.md §3.3): an
+/// A region-entry module for placed unit `u`: an
 /// entry of its own whose key is `regions/<u's key>`, which the loaders find
 /// at `<cache>/regions/<key>/` as natively. JS publishes it after the unit,
 /// when it has one. Returns its index, or -1.
@@ -1227,7 +1226,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
     (units.len() - 1) as i32
 }
 
-/// Unit `u` is a link group's member (docs/eject-pe.md §6a): not wanted on
+/// Unit `u` is a link group's member: not wanted on
 /// its own. JS publishes the group's module once every member is placed
 /// ([`gex_cgen_group`]); Wine maps an exe's static imports before any of
 /// their code runs, so no member runs before it.
@@ -1281,8 +1280,8 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // install writes their directory entries. Only the fresh ones used to
         // be listed, so a second publish over the same pages (two threads
         // placing one image) listed none, and an install that read that list
-        // wrote no entry at all (Paint's start-up spun on
-        // a block whose next page had no entry).
+        // wrote no entry at all (a program's start-up spun
+        // on a block whose next page had no entry).
         let mut pages: std::collections::BTreeMap<u64, u32> = Default::default();
         for &a in addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
@@ -1570,7 +1569,7 @@ pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
 
 /// `gex.clock_ns(clk)`: `clock_gettime(clk)` in nanoseconds, the value the
 /// system call gives, with no kernel and no lock (32-bit Wine's PE ntdll reads its
-/// performance counter with it, docs/wine-overhead.md F2).
+/// performance counter with it).
 #[no_mangle]
 pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
     gex_kernel::clock_ns(crate::browser_clock, clk as u64) as i64
@@ -2032,7 +2031,7 @@ fn fcache_stat(addr: u64) {
 }
 
 /// The table's index 1: code no function body holds, under the `F_body`
-/// contract (the call-out, docs/function-tier.md §7.3, as natively): tier-1
+/// contract (the call-out, as natively): tier-1
 /// runs the target nested -- JavaScript's loop inside this call -- until the
 /// guest returns to `ret` with the stack back (1, the predicted return), so
 /// the frames that called here carry on in their bodies instead of leaving
@@ -2052,7 +2051,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if t == STRAY_PC && stray_restore(c) {
         return gex_abi::ftab::RET_PREDICTED;
     }
-    // An ejected project's run (`gex_set_aot`, docs/eject-pe.md §3.1): no
+    // An ejected project's run (`gex_set_aot`): no
     // function body holds `t`. AOT-only (`gex_set_jit(0)`), nothing may
     // translate it either.
     if crate::aot() {
@@ -2801,7 +2800,7 @@ pub(crate) fn leaves() -> u64 {
 /// is dead whatever the bytes still hash to -- an unmapped object's bytes
 /// stay until the next mapping overwrites them, and that mapping retires
 /// nothing. Its entries leave the table now: otherwise the object that next
-/// lands there (HK: libxcb where libdbus had been, both with units) clears
+/// lands there (libxcb where libdbus had been, both with units) clears
 /// the bits for its own unit and every address it does not define runs the
 /// old object's functions.
 /// TEST(gex_test_keep_probe): a retirement leaves the probe cache's entries

@@ -1,5 +1,5 @@
-//! Shared libraries for native wasm32 programs in the browser (docs/gexcc.md
-//! §7; the native host's `dylink.rs`, and the shim-independent half in the
+//! Shared libraries for native wasm32 programs in the browser (the
+//! native host's `dylink.rs`, and the shim-independent half in the
 //! `gex-dylink` crate).
 //!
 //! A program whose module names libraries (`dylink.0` NEEDED) is published

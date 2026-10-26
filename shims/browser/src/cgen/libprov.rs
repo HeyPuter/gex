@@ -1,4 +1,4 @@
-//! Stateful Linux providers in the page (docs/unity-dotnet.md P5 B1): the
+//! Stateful Linux providers in the page: the
 //! native host's `libprov` for a Linux process with a 64-bit memory. A shared
 //! object named in the page's `wasmdlls` (`soname=guest path of a wasm64 PIC
 //! module`, Unity's `libmonobdwgc-2.0.so=/gex/mono.wasm`) is replaced when it
@@ -459,7 +459,7 @@ pub(crate) fn wasm(number: u32) -> Option<(u32, u32)> {
 /// The JIT's reserved table ranges: (provider module number, placeholder module).
 static RESERVES: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
 
-/// `gex.provider_jit_reserve(n)` (docs/unity-dotnet.md P5 B2, the native
+/// `gex.provider_jit_reserve(n)` (the native
 /// `wasmjit`): a range of the process's function table for the provider's
 /// JIT, every Worker's filled with the JIT-call placeholder as it catches up.
 /// Returns the range's first index.
@@ -904,7 +904,7 @@ pub extern "C" fn gex_libprov_start() {
 }
 
 // ---------------------------------------------------------------------------
-// Function-tier units for Linux shared objects in the page (P5 B4; the native
+// Function-tier units for Linux shared objects in the page (the native
 // host's `pe_units::on_elf_maps`): an object named in `?elfunits=` gets the
 // unit built natively for it at the bias it maps at (`gexc cgen-image --elf
 // SO --base HEX --mem64`), found in the unit cache by the same key.

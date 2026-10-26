@@ -1,5 +1,5 @@
-//! Native wasm32 programs in the browser (the native host's `wasmprog`,
-//! docs/wine-native.md §3.11): a Linux program compiled to wasm32 against
+//! Native wasm32 programs in the browser (the native host's `wasmprog`):
+//! a Linux program compiled to wasm32 against
 //! gex's musl, in an ELF32 container whose header (0x40 bytes below the
 //! entry) names the module. Nothing is translated: the module is installed
 //! as a stateful provider (`PROVIDER | number` in the function table) at
@@ -30,8 +30,8 @@ pub(super) struct Prog {
     pub key: Option<(u64, u64)>,
     /// The file the bytes are from, for the system-wide key cache.
     pub path: String,
-    /// Built LP64 for wasm64 and lowered to wasm32 (64-bit Wine,
-    /// docs/wine-native-x64.md): its base and stack-pointer globals are i64.
+    /// Built LP64 for wasm64 and lowered to wasm32 (64-bit Wine):
+    /// its base and stack-pointer globals are i64.
     pub lowered: bool,
 }
 

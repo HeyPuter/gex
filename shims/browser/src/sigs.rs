@@ -1,4 +1,4 @@
-//! Signals without the kernel lock (docs/kernel-locking.md §3.8, step 8).
+//! Signals without the kernel lock.
 //!
 //! A process's signal state is two kinds of shared object
 //! ([`gex_kernel::signal`]): the process's `ProcSig` (dispositions, the
@@ -35,7 +35,7 @@ pub(crate) struct Home {
     threads: Arc<gex_kernel::signal::ThreadSigs>,
     clock: ClockFn,
     /// Its futexes and its memory map's published view, for `futex`
-    /// without the kernel (docs/kernel-locking.md §5.2 step 4).
+    /// without the kernel.
     pub futexes: Arc<FutexTable>,
     map: Arc<MapView>,
     /// Its namespace's published view, for a descriptor rebuilt from its
@@ -58,10 +58,10 @@ pub(crate) struct Home {
     /// The process's first fs_struct (its directory and umask).
     proc_fs: Arc<gex_kernel::syscalls::FsCwd>,
     /// The global kernel's pipes, for `pipe2`, and the resource limits,
-    /// for `prlimit64` (L17).
+    /// for `prlimit64`.
     pipes: Option<gex_kernel::pipe::Remote>,
     rlimits: Arc<gex_kernel::syscalls::Rlimits>,
-    /// For the socket calls (L18): the resolver and the ports, the global
+    /// For the socket calls: the resolver and the ports, the global
     /// kernel's sockets, and the socket name tables (the network is the
     /// page's, `crate::page_net`).
     resolver: Arc<gex_kernel::net::Resolver>,
@@ -69,14 +69,14 @@ pub(crate) struct Home {
     unix_remote: Option<gex_kernel::unix::Remote>,
     socket_names: Arc<gex_kernel::unix::SocketNames>,
     host_names: Arc<gex_kernel::unix::SocketNames>,
-    /// Its threads, their contexts and run states (`Host::threads`, L23).
+    /// Its threads, their contexts and run states (`Host::threads`).
     table: Arc<crate::Threads>,
-    /// Its live thread count (`Kernel::live_threads`), for `exit` (L25a).
+    /// Its live thread count (`Kernel::live_threads`), for `exit`.
     live: Arc<std::sync::atomic::AtomicU32>,
     /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
-    /// `clone` (L25b).
+    /// `clone`.
     slots: Arc<std::sync::atomic::AtomicU32>,
-    /// How it ended, decided once (L24).
+    /// How it ended, decided once.
     exit: crate::ExitState,
     /// Its image, command line and environment as `/proc` shows them
     /// (`Kernel::publish_proc`, at its start and each exec).
@@ -253,7 +253,7 @@ impl Home {
 }
 
 /// This Worker's process, for the work after a syscall that runs without
-/// the kernel lock (the mapped-code drains, docs/kernel-locking.md L12c).
+/// the kernel lock (the mapped-code drains).
 pub(crate) fn proc_home() -> &'static Home {
     home().expect("mapped code before its process was published")
 }
@@ -305,7 +305,7 @@ pub(crate) fn bind(k: &mut Kernel, tid: i32) {
 }
 
 /// Make thread `tid`, one the process already has, this Worker's, with no
-/// kernel lock (a thread's adoption, L25b): its signal state from the
+/// kernel lock (a thread's adoption): its signal state from the
 /// process's table, where its `clone` put it; a thread made otherwise (an
 /// NT thread) gets one of its own, blocking nothing.
 pub(crate) fn bind_free(home: &Home, tid: i32) {

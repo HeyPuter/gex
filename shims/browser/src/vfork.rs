@@ -218,7 +218,7 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
         gm.read(ctx_addr, ctx::SIZE).map(<[u8]>::to_vec).unwrap_or_default()
     };
     // The parent's constants and a copy of its map, from what it publishes
-    // (no kernel lock, L25c).
+    // (no kernel lock).
     let compat = crate::compat_abi();
     let started = crate::clock_started();
     let wasm32 = crate::WASM32.load(Acquire);
@@ -260,7 +260,7 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     CHILD.with(|c| c.set(&mut *child));
     std::mem::forget(child);
     CURRENT.with(|c| c.set(0));
-    // The child's host is this Worker's alone (`CHILD`): no lock (L25c).
+    // The child's host is this Worker's alone (`CHILD`): no lock.
     with_child(|h| {
         // As `gex_set_compat` does for an adopted child: on an AArch64
         // build an i386-ABI process's stack is `esp`, where `__clone`'s
@@ -399,7 +399,7 @@ pub extern "C" fn gex_set_page_flavours(bits: i32) {
     PAGE_FLAVOURS.store(bits & 3, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The memory flavour an exec of `path` goes on in (docs/mem64.md §5), true
+/// The memory flavour an exec of `path` goes on in, true
 /// a 64-bit one: what the program needs (`exec_memory`), else what the exec
 /// asked for (the kernel's `exec_mem64`: the call's GEX_MEM64 entry, which
 /// it took out of the new environment, or the image's `user.gex.mem64`
@@ -432,7 +432,7 @@ pub(crate) fn exec_target(h: &Host, path: &str) -> bool {
 
 /// An exec of the caller's own command line (its arguments after the
 /// first, the same) keeps the caller's memory flavour unless the exec asks
-/// otherwise (docs/mem64.md §5): it is the same program started again, as
+/// otherwise: it is the same program started again, as
 /// 64-bit Wine's first Wine process starts the program it was given as a process
 /// of its own. Any other child is the page's flavour unless it asks.
 pub(crate) fn exec_relaunch(h: &mut Host, argv: &[String]) {
@@ -441,7 +441,7 @@ pub(crate) fn exec_relaunch(h: &mut Host, argv: &[String]) {
     }
 }
 
-/// The program an exec of `path` runs instead (docs/mem64.md §5): of a
+/// The program an exec of `path` runs instead: of a
 /// program and its memory64 twin `<path>.m64` side by side, the one of the
 /// memory the exec wants (`exec_mem64`, else the page's). 64-bit Wine's loader in a
 /// twin dist (wine64-dist.sh WINE64_TWIN=1) is the case: an exec of `wine` that
@@ -480,9 +480,9 @@ pub(crate) enum Need {
     Either,
 }
 
-/// What memory the program at `path` needs (docs/mem64.md §5): a 32-bit
-/// ELF (an i386 program, or a wasm32 container such as 64-bit Wine's wineserver,
-/// docs/wine-native-x64.md §4) a 32-bit one, a gex wasm container what its
+/// What memory the program at `path` needs: a 32-bit
+/// ELF (an i386 program, or a wasm32 container such as 64-bit Wine's wineserver)
+/// a 32-bit one, a gex wasm container what its
 /// module's memory import is, and a 64-bit ELF, translated, either. Not an
 /// ELF (a script) or unreadable: either.
 fn exec_memory(path: &str) -> Need {
@@ -680,7 +680,7 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     // This Worker's memory is new (host.mjs gives an exec child no recycled
     // one), so the exec need not clear what no program wrote.
     EXEC_FRESH.with(|c| c.set(true));
-    // A fresh Worker's process, its own until the program runs (L25c).
+    // A fresh Worker's process, its own until the program runs.
     crate::with_own_host(|h| {
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
