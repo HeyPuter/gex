@@ -370,6 +370,7 @@ async function handle(msg) {
         kernel: { ...msg.kernel, stackTop: stack },
         shared,
         modules: pooled,
+        fiber: rawPort.fiber ?? null,
       });
       await gex.preattach(msg.shim, msg.guest);
       return { gex, shared, stack, mem64 };
@@ -741,6 +742,7 @@ async function handle(msg) {
       moduleStore: msg.moduleStore ?? null,
       shared: !!msg.shared,
       modules: pooled,
+      fiber: rawPort.fiber ?? null,
     });
   if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
   // Module-scope, so a `sharedModule` message (which arrives outside this

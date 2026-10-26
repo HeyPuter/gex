@@ -300,7 +300,8 @@ export class Sched {
     // fiber parks (`#flush`), or until every fiber is blocked on something
     // else and the event loop turns -- the posted turn. A wake from outside
     // any fiber (a timer, the network, a key) gets that turn at once.
-    this.#ready.push(() => w.resolve(why));
+    // A fiber terminated meanwhile never resumes (`drop`).
+    this.#ready.push(() => { if (!w.fiber?.dead) w.resolve(why); });
     this.#postTurn();
   }
 
@@ -390,12 +391,12 @@ export class Sched {
    * nothing when the slice lasts, a promise for the next turn of the event
    * loop when it has run out.
    */
-  maybeYield() {
+  maybeYield(fiber = null) {
     this.checkSlots();
     if (!this.sliceOver()) return 0;
     this.stats.yields++;
     return new Promise((resolve) => {
-      this.#held.push(() => resolve(0));
+      this.#held.push(() => { if (!fiber?.dead) resolve(0); });
       this.#postTurn();
     });
   }
@@ -405,9 +406,9 @@ export class Sched {
    * then it. Without this a guest spinning on `sched_yield` for a fiber it
    * just woke would wait out the slice.
    */
-  yieldNow() {
+  yieldNow(fiber = null) {
     this.checkSlots();
-    if (!this.#ready.length) return this.maybeYield();
+    if (!this.#ready.length) return this.maybeYield(fiber);
     this.stats.yields++;
     this.#flush();
     return Promise.resolve(0);

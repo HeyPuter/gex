@@ -1103,6 +1103,9 @@ export class Gex {
   // table, file table, pipes), instantiated by every Worker against the same
   // shared kernel memory. Null is a run of one process, which needs none of it.
   #kernelSpec = null;
+  /** The single-thread build: the fiber this runtime runs on (single.mjs
+   *  `FiberWorker`), whose waits and turns end with it. */
+  #fiber = null;
   #census = null;
   /** The single-thread build: where this fiber's JS last was, for the census
    *  (a fiber that waits in JS is otherwise invisible to it). */
@@ -1200,7 +1203,8 @@ export class Gex {
     });
   }
 
-  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null, modules = null } = {}) {
+  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null, modules = null, fiber = null } = {}) {
+    this.#fiber = fiber;
     this.#env = env;
     // Compiled modules this Worker was given before it had a process, kept
     // as they are (a Map of key to Module), not copied one by one.
@@ -3038,7 +3042,7 @@ export class Gex {
         if (k.k_ws_seq(slot) !== seq) return 1;
         if (this.#hardNested()) nested();
         this.#where = `park(${ns})`;
-        return sched.parkSlot(words, (k.k_ws_addr(slot) >>> 0) >>> 2, seq, ns);
+        return sched.parkSlot(words, (k.k_ws_addr(slot) >>> 0) >>> 2, seq, ns, this.#fiber);
       });
       // A notify moved slot words nobody `Atomics.wait`s on here; the fibers
       // parked on them look (and every park and yield looks too, for the
@@ -7206,8 +7210,8 @@ export class Gex {
         // A preemption point as well: a program that only makes system
         // calls gives the other fibers a turn here, and `sched_yield` gives
         // the woken one at once (single.mjs `Sched#settle`).
-        if (e.gex_last_syscall() === (globalThis.GEX_ARCH === 'x86' ? 24 : 124)) return sched.yieldNow();
-        return sched.maybeYield();
+        if (e.gex_last_syscall() === (globalThis.GEX_ARCH === 'x86' ? 24 : 124)) return sched.yieldNow(this.#fiber);
+        return sched.maybeYield(this.#fiber);
       });
     });
   }
@@ -7218,7 +7222,7 @@ export class Gex {
     return (this.#safepointS ??= new WebAssembly.Suspending((ctx, pc) => {
       e.gex_safepoint(ctx, pc);
       this.#where = 'safepoint';
-      return this.#hardNested() ? 0 : sched.maybeYield();
+      return this.#hardNested() ? 0 : sched.maybeYield(this.#fiber);
     }));
   }
   #watchStub = null;
