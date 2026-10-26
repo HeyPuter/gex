@@ -1,4 +1,4 @@
-/* gex (stream W): FreeBSD's sys/soundcard.h (OSSv4 API, BSD-2-Clause, from
+/* gex: FreeBSD's sys/soundcard.h (OSSv4 API, BSD-2-Clause, from
  * freebsd-src main sys/sys/soundcard.h) for Wine's wineoss.drv on wasm32: its
  * includes made Linux's (sys/ioctl.h's _IOR/_IOWR, so the request numbers
  * are Linux OSSv4's). gex-kernel answers them (/dev/dsp, /dev/mixer). */

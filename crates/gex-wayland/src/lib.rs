@@ -1692,7 +1692,7 @@ impl Client {
             // buffer again but does not release it again. Wine's
             // winewayland counts releases, and fourteen for one attach
             // freed a buffer still in its queue, which it then destroyed a
-            // second time (Katana ZERO and Undertale, W3: libwayland's
+            // second time (Katana ZERO and Undertale on 32-bit Wine: libwayland's
             // `proxy->refcount > 0` assertion at the first swap-chain resize).
             if state.pending_buffer.is_some() {
                 let w = Writer::new(buffer_id, 0);

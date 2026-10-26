@@ -738,7 +738,7 @@ struct buffer_object_state {
        change it (buffer_contents_unknown). A map copies from it instead of
        reading the buffer back, and its unmap uploads only what changed.
        Only for buffers up to MIRROR_MAX: a second whole-size copy of a large
-       one costs a W3 process address space it does not have (wined3d's
+       one costs a 32-bit Wine process address space it does not have (wined3d's
        64 MiB chunks: a 64 MiB map shadow plus a 64 MiB mirror each). A map
        of a larger buffer reads back just its range. */
     uint8_t *mirror;
@@ -1033,7 +1033,7 @@ static int buffer_read(unsigned target, long offset, long size, void *data);
 /* persistent_publish's blocks and their hash: 64 bits a 4 KiB block. Each
    8-byte word goes through a multiply-xorshift mix on one of four lanes in
    turn, so four multiplies are in flight rather than one chain of 512: on
-   worldmachine (V8, wasm32) a 64 MiB mapping takes 6.0-6.5 ms to hash where
+   V8 (wasm32) a 64 MiB mapping takes 6.0-6.5 ms to hash where
    one lane took 12.8-13.0 ms and a memcmp against a full copy 9.7-10.3 ms;
    just reading it takes 5.3-5.4 ms. The lanes are folded with the same mix,
    and the tail of a short last block goes byte by byte. A collision would
@@ -1951,9 +1951,8 @@ static void gexgl_upload_ff_arrays(size_t vertices);
    of them a rewrite of a buffer the pending batch already read, which a
    batched WebGPU backend can only do as a staged copy that ends the render
    pass: Noita, through Wine, drew 56 times a frame from client memory and
-   paid ~140 copies and a render pass per draw for it (pewasm, handing the
-   same arrays to Mesa directly: 15 passes, no copies). The NT layer has sent
-   them this way since bdb682d9. GEXGL_CLIENT_ARRAYS=buffer keeps the scratch
+   paid ~140 copies and a render pass per draw for it (handing the same
+   arrays to Mesa directly: 15 passes, no copies). GEXGL_CLIENT_ARRAYS=buffer keeps the scratch
    buffers, for A/B runs. */
 static int client_array_mode = -1; /* 1 CLIENT_ARRAY, 0 scratch buffers */
 static int client_array_op(void) {
@@ -2987,7 +2986,7 @@ unsigned glGetError(void) {
  * (checkGLcall) whenever Wine's d3d ERR channel is on, which is the
  * default, unless the context has ARB_debug_output. Through this transport
  * each check is a synchronous round trip: Undertale's wined3d thread made
- * 93 a frame, 98% of all its submits (worldmachine, gltr1), and spent 15.6
+ * 93 a frame, 98% of all its submits, and spent 15.6
  * ms a frame waiting on them. Its capability probes call glGetError
  * directly and still get exact answers. */
 typedef void (*gexgl_debug_proc)(unsigned source, unsigned type, unsigned id,
@@ -4375,7 +4374,7 @@ static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
     if (!wayland) return;
     /* Both are variadic, and called as such: a call through a fixed-argument
        type works on native ABIs only by luck, and on wasm32 (Wine's
-       winewayland, W3) it is a type mismatch, since a variadic function
+       winewayland, 32-bit Wine) it is a type mismatch, since a variadic function
        takes its extra arguments as one pointer. */
     void (*marshal)(void *, unsigned, ...) = dlsym(wayland, "wl_proxy_marshal");
     if (!marshal) return;
@@ -4637,7 +4636,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
        frames shown as of the swap before, which the host has finished by
        now, so one frame more is in flight than with a waited swap. Waiting
        here made the host's whole frame a stall in the guest's: Noita's main
-       thread spent 13% of its time in this round trip (edger, 2026-10-13). */
+       thread spent 13% of its time in this round trip. */
     uint32_t shown;
     uint32_t in_flight;
     if (present_async(&shown)) {

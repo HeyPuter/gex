@@ -3,7 +3,7 @@
 # sources the wine32 dist is built from are named. Change a pin here and `make`
 # rebuilds what depends on it (outputs are keyed by these values).
 
-# The Wine fork: branch mw/wasm32-w3-next (46cb13f5e51 plus Unix-call user callbacks on the program's stack).
+# The Wine fork: branch mw/wasm32-w3-next (with Unix-call user callbacks on the program's stack).
 WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
 WINE_COMMIT := 47870386bfd527407e99f09efb779c9b50fc247f
 

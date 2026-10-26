@@ -1,6 +1,6 @@
 #!/bin/bash
-# A 64-bit Wine install and a win64 prefix for it (docs/wine-native-x64.md §5,
-# W64.1), built from a Wine tree with the 64-bit Wine work (Wine branch w64/main):
+# A 64-bit Wine install and a win64 prefix for it (docs/wine-native-x64.md §5),
+# built from a Wine tree with the 64-bit Wine work (Wine branch w64/main):
 #
 #   tools/wine-wasm/wine64-dist.sh WINE CACHE
 #
@@ -209,18 +209,18 @@ dist_make() {
 log "install ($K, $S)"; step dist64-$K-$S dist_make
 
 ntdll_native() {
-	# W64.2's native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
+	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
 	# in the wasm64 tree: the other DLLs stay translated
 	( cd "$C/b64-$K-$S" && nice -n 10 make -j"$J" dlls/ntdll/wasm64-windows/ntdll.dll )
 	cp -p "$C/b64-$K-$S"/dlls/ntdll/wasm64-windows/ntdll.dll .
 }
-# (W64.2's lone PE ntdll: the lowered flavour's only)
+# (the lone PE ntdll: the lowered flavour's only)
 [ "$M64" != 0 ] || { log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native; }
 
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
 NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 pe_native() {
-	# W64.2's native PE core: each DLL's relocatable object and export list
+	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
 	local b=$C/b64-$K-$S t
 	t="libs/gexrt/libgexrt.a"

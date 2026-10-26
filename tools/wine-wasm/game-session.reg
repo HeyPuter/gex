@@ -1,6 +1,6 @@
 REGEDIT4
 
-; A game site's session, on top of wine32-session.reg (scratch/G mksite.py
+; A game site's session, on top of wine32-session.reg (a site builder
 ; applies it with reg-apply.py; not the dist's prefix: a console program
 ; would get an explorer it never asks for).
 ;
@@ -9,8 +9,8 @@ REGEDIT4
 ;   desktop process comes up beside the services instead of when the game
 ;   makes its first window and waits for it (win32u's get_desktop_window).
 ;   A program that starts explorer itself still does so: "explorer /desktop"
-;   finds the desktop up and exits 0, as on demand. 64-bit Wine Dicey Dungeons on
-;   edger: explorer at about 6-8 s instead of about 27 s, first window 32.4 s
+;   finds the desktop up and exits 0, as on demand. 64-bit Wine Dicey Dungeons:
+;   explorer at about 6-8 s instead of about 27 s, first window 32.4 s
 ;   mean against 34.6 s (7 runs each, 300 s timed).
 ;   winemenubuilder's entry stays.
 

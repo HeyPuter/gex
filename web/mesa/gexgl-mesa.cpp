@@ -1418,7 +1418,7 @@ void note_surface_to_backend(unsigned uid) { (void)uid; }
  * The shared `#gex-gl` canvas holds one frame, so the page used to copy it
  * into each window's 2D canvas with `drawImage`. That read of a WebGPU
  * canvas through 2D came back fully transparent on Chromium on Linux
- * (edger) -- a red clear included -- so Solitaire counted every frame
+ * -- a red clear included -- so Solitaire counted every frame
  * presented and showed none. A page that can give the window a canvas
  * names it `#gex-gl-<uid>` (`gex_gl_surface_canvas`), and the frame is
  * copied there texture to texture: on the GPU all the way, nothing read
@@ -2824,8 +2824,8 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case CLIENT_ACTIVE_TEXTURE: glClientActiveTexture(a.u32()); break;
-    /* { slot, op, n, n words, bytes }: a client-memory array, as pewasm's
-     * GL takes them -- a pointer into memory, which st/mesa uploads with its
+    /* { slot, op, n, n words, bytes }: a client-memory array, as a
+     * native GL takes them -- a pointer into memory, which st/mesa uploads with its
      * stream uploader. The guest used to copy each one into a buffer of its
      * own with glBufferData before every draw, and a buffer the pending batch
      * already reads cannot be rewritten in place: every such upload became a
