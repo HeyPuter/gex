@@ -1096,7 +1096,14 @@ if shared and SHARED:
     wl = ','.join(a[4:] for a in sys.argv[1:] if a.startswith('-Wl,'))
     if not re.search(r'(^|,)(--no-undefined|-z,defs|-zdefs|-z defs)(,|$)', wl):
         pre += ['--unresolved-symbols=import-dynamic']
-    r = link_shared(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm]
+    # its thread-local block, as a program's: libc (a library the program
+    # starts with) or gex's dlopen gives every thread one for each module
+    # that exports these (wasm-ld drops __wasm_init_tls unexported, and a
+    # module without it has its thread-locals at address 0 in every thread
+    # but the first)
+    tls = ['--export-if-defined=__wasm_init_tls', '--export-if-defined=__tls_size',
+           '--export-if-defined=__tls_align', '--export-if-defined=__gex_set_tls_base']
+    r = link_shared(LDC_SHARED + ['-shared', '-Bsymbolic', '--soname=' + soname, '-o', wasm] + tls
             + ['--rpath=' + x for x in ld_opts['rpath']] + objs + pre + own_unwind() + sos + ld_flags)
     if r:
         sys.exit(r)
