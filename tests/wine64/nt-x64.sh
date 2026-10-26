@@ -447,13 +447,7 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/seqrace.exe" "$here/seqrace.c"; then
 	# 2000 writes a case on the page and without the door, where every read
 	# is a server request; 20000 otherwise.
 	sw=20000; { [ -n "$page" ] || [ "$door" = 0 ]; } && sw=2000
-	# SP page: the queue and input cases only (mask 6). Known bug, open: in
-	# SP a process that kept a window for a few seconds (no other threads
-	# needed) prints its last line and then never exits; base Wine (1b13)
-	# hangs the same way. A window made and destroyed at once, or 15 s with
-	# no window, exits.
-	sm=7; [ "${page:-}" = sp ] && sm=6
-	check seqrace 0 "$allok" "$w/seqrace.exe" $sw $sm
+	check seqrace 0 "$allok" "$w/seqrace.exe" $sw 7
 else
 	case " ${CASES:-seqrace} " in *" seqrace "*)
 		fail=$((fail + 1)); echo "FAIL x64/seqrace ($tag): x86_64-w64-mingw32-gcc" ;; esac
