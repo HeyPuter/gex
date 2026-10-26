@@ -2,11 +2,10 @@
 //! the ELF objects named for one.
 //!
 //! Wine's loader maps every image itself, so a Windows program's code
-//! arrives through the runtime translator. With `gexc run --cgen` on a PE
-//! program, every image the NT layer maps (the hook in
-//! `gex_kernel::nt::section`) gets its function-tier unit, if one was built
-//! for exactly those bytes at that base ([`prepare_pe`], `gexc cgen-image`,
-//! `gexc cgen-prefix` for Wine's): the whole image's recovered functions as
+//! arrives through the runtime translator. Under 32-bit Wine, every image
+//! Wine's loader maps ([`wine32_image`]) gets its function-tier unit, if one
+//! was built for exactly those bytes at that base ([`prepare_pe`], `gexc
+//! cgen-image`): the whole image's recovered functions as
 //! C, linked once into a module of its own. Installing it instantiates that
 //! module in every store against the process's body table and dispatcher and
 //! writes each entry into the dispatch and body tables at its slot
@@ -105,11 +104,6 @@ struct Pending {
     pe: Arc<gex_ld::pe::PeImage>,
 }
 
-static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
-/// Set after a push to [`PENDING`]: every syscall drains, and looks here
-/// first rather than taking the lock.
-static HAS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static ON: OnceLock<()> = OnceLock::new();
 /// One unit is placed at a time: slot assignment runs from a snapshot of the
 /// page table to the publish.
 static PLACING: Mutex<()> = Mutex::new(());
@@ -231,9 +225,8 @@ fn report_hints(image: &gex_ld::Image) {
 }
 
 /// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
-/// lines `icall <return address> <target> <count>` (pewasm's
-/// `PEWASM_PROFILE_INDIRECT` dump, in this image's addresses; anything
-/// before `icall` is ignored). As pewasm's `read_icall_hints`: a call site
+/// lines `icall <return address> <target> <count>` (in this image's
+/// addresses; anything before `icall` is ignored): a call site
 /// whose dominant target takes at least 90% of at least 64 calls gets a
 /// guarded direct call to it. By return address.
 pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
@@ -328,7 +321,7 @@ pub fn provider_stubs(pe: &gex_ld::pe::PeImage, base: u64) -> Vec<u64> {
 }
 
 /// A built-in provider's module and its slots: built here (clang) when
-/// missing, unless this runtime has no translator (gex-rt), which only finds
+/// missing, unless this runtime has no translator, which only finds
 /// the one its project's build made (`gex_cgen::provider::build`'s name).
 pub(crate) fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
     if cfg!(feature = "translate") {
@@ -832,37 +825,6 @@ fn prepare_with(
     Ok(out)
 }
 
-/// Turn the function tier on for this process's images (`--cgen`).
-/// `record`: a profile is being recorded (`--record`), which names each
-/// image as it maps (`profile::note_pe`), on every tier.
-pub(crate) fn enable(record: bool) -> Result<()> {
-    // Export providers bind on every tier, units or not.
-    if mode() == Mode::Off && !gex_cgen::provider::enabled() && !record {
-        return Ok(());
-    }
-    if ON.set(()).is_err() {
-        return Ok(());
-    }
-    gex_kernel::nt::section::set_image_mapped_hook(|m| {
-        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(Pending {
-            path: m.path.to_string(),
-            base: m.base,
-            pe: Arc::clone(m.pe),
-        });
-        HAS_PENDING.store(true, std::sync::atomic::Ordering::Release);
-    });
-    Ok(())
-}
-
-fn take_pending() -> Vec<Pending> {
-    // A load first: every syscall of every thread comes here, and a swap
-    // would write the shared line each time.
-    if !HAS_PENDING.load(std::sync::atomic::Ordering::Relaxed) || !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
-        return Vec::new();
-    }
-    std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
 /// A unit found for an image, checked against what is mapped.
 struct Placed {
     path: std::path::PathBuf,
@@ -1095,11 +1057,6 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], go
     }
 }
 
-/// Whether an installed unit covers the code page of `pc`.
-pub(crate) fn unit_covers(pc: u64) -> bool {
-    UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&(pc / gex_abi::DISPATCH_PAGE)))
-}
-
 /// Provided exports by guest address: a label (`kernel32.dll!OutputDebugStringA`),
 /// the first bytes of the library's own code there when the provider was
 /// bound, and whether a rewrite of them was reported.
@@ -1175,7 +1132,7 @@ pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::Path
     let (image, seeds) = trampoline_input(class32);
     let unit = prepare_image(&image, &seeds, jobs, true)?;
     // Its providers (nt_unixcall, i386 only), which a runtime without a
-    // translator (gex-rt, the browser) finds in the cache and cannot build.
+    // translator (the browser) finds in the cache and cannot build.
     if class32 {
         for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
             let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
@@ -1225,8 +1182,8 @@ fn publish_trampolines(data: &HostState, class32: bool) -> Result<bool> {
         let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
         for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
             // As every provider: built here only where there is a translator
-            // (gex-rt finds the project's), compiled through gex_cache (which
-            // gex-rt serves from its precompiled artifacts).
+            // (a runtime without one finds the project's), compiled through
+            // gex_cache (which serves it from precompiled artifacts there).
             let (path, slots) = provider_module(&prov)?;
             let pairs = gex_cgen::provider::bindings(&prov, &slots, &exports, TRAMPOLINES, trace());
             if pairs.is_empty() {
@@ -1244,15 +1201,6 @@ fn publish_trampolines(data: &HostState, class32: bool) -> Result<bool> {
         eprintln!("gex-cgen: function tier for the trampolines: {} entries, {:.1}s", entries.len(), t0.elapsed().as_secs_f64());
     }
     Ok(true)
-}
-
-/// [`publish_trampolines`] at boot, from the store.
-fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()> {
-    if publish_trampolines(store.data(), class32)? {
-        crate::ftab::catch_up(&mut *store)?;
-        catch_up_table(store)?;
-    }
-    Ok(())
 }
 
 /// [`publish_trampolines`] for a wine32 or wine64 process, with its first
@@ -1402,176 +1350,8 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     }
 }
 
-/// `GEX_WIN_CGEN_SYNC=1` (tests/nt under --cgen): a program image mapped
-/// without a unit has one built there and then, and installed, rather than
-/// running on tier-1 or failing.
-fn sync_build() -> bool {
-    std::env::var_os("GEX_WIN_CGEN_SYNC").is_some()
-}
-
-/// Build `p`'s unit now (the child `gexc cgen-image`), waiting for it.
-fn build_now(p: &Pending) -> Result<()> {
-    let status = spawn_build(p)?.wait()?;
-    if !status.success() {
-        bail!("building the function tier for {} failed ({status})", p.path);
-    }
-    Ok(())
-}
-
-/// A unit for `p`: placed if built; built first under `GEX_WIN_CGEN_SYNC`.
-fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
-    if let Some(pl) = place(p, memory, true)? {
-        return Ok(Some(pl));
-    }
-    if sync_build() && !is_wine(p) && mode() != Mode::Aot {
-        build_now(p)?;
-        return place(p, memory, true);
-    }
-    Ok(None)
-}
-
-/// An image Wine's prefix provides, not the program.
-fn is_wine(p: &Pending) -> bool {
-    p.path.to_ascii_lowercase().contains("/drive_c/windows/")
-}
-
-/// An image mapped with no unit for its base. `--cgen` refuses a program
-/// image; otherwise it runs on tier-1 and, unless `GEX_WIN_CGEN_BUILD` says
-/// no (`0`, or a list of file names that leaves it out), gets a unit built
-/// for the next run.
-fn missing(p: Pending) -> Result<()> {
-    if is_wasm_skeleton(&p.pe) {
-        return Ok(());
-    }
-    if mode() == Mode::Aot {
-        bail!(
-            "gex-eject: {} was mapped at {:#x}, and the ejected project has no code built for it there \
-             (the recorded session never mapped it, or mapped it elsewhere). Record a session that loads it \
-             and re-eject",
-            p.path,
-            p.base
-        );
-    }
-    // Always said, and kept for GEX_WIN_STATS: an image on tier-1 because its
-    // unit is missing (a base its unit was not built for, a stale key) is
-    // otherwise only visible as a lower AOT share.
-    let key = gex_xlate::func::pe_input(&p.pe, p.base)
-        .map(|(image, _)| unit_key(&image, &provided(&p.pe, p.base)))
-        .unwrap_or_else(|e| format!("(not placeable: {e})"));
-    eprintln!("gex-nt: warning: {} at {:#x}: no function-tier unit (key {key}); it runs on tier-1", p.path, p.base);
-    NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {:#x} (key {key})", p.path, p.base));
-    if mode() == Mode::Require && !is_wine(&p) {
-        bail!(
-            "--cgen: {} has no function-tier unit for base {:#x}; build one with \
-             `gexc cgen-image {} --pe-base {:#x}`, or run once without --cgen (it is then built \
-             for the next run)",
-            p.path,
-            p.base,
-            p.path,
-            p.base
-        );
-    }
-    // Wine's DLLs get theirs at staging, at their layout bases (`gexc
-    // cgen-prefix`); one placed anywhere else is not built for.
-    let build = !is_wine(&p)
-        && match std::env::var("GEX_WIN_CGEN_BUILD").as_deref() {
-        Err(_) | Ok("1") => true,
-        Ok("0") => false,
-        Ok(list) => {
-            let name = p.path.rsplit(['/', '\\']).next().unwrap_or(&p.path);
-            list.split(',').any(|n| n.trim().eq_ignore_ascii_case(name))
-        }
-        };
-    if !build {
-        if trace() {
-            eprintln!("gex-nt: {} at {:#x}: no function-tier unit, tier-1", p.path, p.base);
-        }
-        return Ok(());
-    }
-    eprintln!("gex-nt: no function-tier unit for {} at {:#x}: tier-1 this run, building it for the next", p.path, p.base);
-    match spawn_build(&p) {
-        // Not waited for: it outlives the run, and the next one finds it.
-        Ok(child) => drop(child),
-        Err(e) => eprintln!("gex-nt: could not start building the function tier for {}: {e}", p.path),
-    }
-    Ok(())
-}
-
 /// Images mapped with no unit for their base, as `missing` reported them.
 static NO_UNIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// GEX_WIN_STATS's "no unit" line: every image running on tier-1 for want of
-/// a unit, or `None` when there are none.
-pub(crate) fn no_unit_line() -> Option<String> {
-    let v = NO_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-    (!v.is_empty()).then(|| format!("gex-nt: no unit ({}): {}", v.len(), v.join(" | ")))
-}
-
-/// Place, compile, publish and install, for a caller inside the guest
-/// (after an NT syscall that mapped an image).
-pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
-    if ON.get().is_none() {
-        return Ok(());
-    }
-    let pending = take_pending();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
-    for p in pending {
-        crate::profile::note_pe(&p.path, p.base, &p.pe);
-        let (shared, engine, cache) = {
-            let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
-            (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
-        };
-        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        let t0 = std::time::Instant::now();
-        if mode() != Mode::Off {
-            match place_or_build(&p, memory.bytes())? {
-                Some(pl) => install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?,
-                None => missing(p.clone())?,
-            }
-        }
-        install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
-        crate::ftab::catch_up(&mut *caller)?;
-        crate::wasmdll::apply_pending(&shared, &memory);
-        replay_registry(caller)?;
-    }
-    Ok(())
-}
-
-/// The same, at boot (the exe and ntdll, mapped before any guest code runs).
-pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
-    let pending = take_pending();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    // The trampolines with the first images (the exe says the ABI).
-    if let Some(p) = pending.first().filter(|_| mode() != Mode::Off) {
-        install_trampolines(store, !p.pe.is64)?;
-    }
-    let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
-    for p in pending {
-        crate::profile::note_pe(&p.path, p.base, &p.pe);
-        let (shared, engine, cache) = {
-            let jit = store.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
-            (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
-        };
-        let memory = store.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        let t0 = std::time::Instant::now();
-        if mode() != Mode::Off {
-            match place_or_build(&p, memory.bytes())? {
-                Some(pl) => install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?,
-                None => missing(p.clone())?,
-            }
-        }
-        install_providers(&p, store.data_mut(), &shared, &engine, &memory)?;
-        crate::ftab::catch_up(&mut *store)?;
-        crate::wasmdll::apply_pending(&shared, &memory);
-        catch_up_table(store)?;
-    }
-    Ok(())
-}
 
 /// A link group's state in this process: its members' unit keys, and the
 /// members placed so far.

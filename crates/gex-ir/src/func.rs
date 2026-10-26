@@ -21,7 +21,7 @@
 //! tier-1 semantics: `ReadReg`/`WriteReg` read and write the architectural
 //! state (the context), values are local to the block that defines them, and
 //! blocks have no parameters. A backend may keep every guest register in a
-//! local (pewasm's scheme) and needs nothing more.
+//! local and needs nothing more.
 //!
 //! [`Form::Ssa`] is produced by [`crate::ssa::to_ssa`]. Every `WriteReg` is
 //! kept, so **the context is coherent at every program point** exactly as in

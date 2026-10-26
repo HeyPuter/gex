@@ -125,7 +125,7 @@ pub(crate) const TRAMPOLINES_PATH: &str = "[nt trampolines]";
 /// 32-bit Wine's KUSER fold on (`gexc cgen-image --wine32-kuser --nt-trampolines32`),
 /// guarded or not (see `rsrc::FLAVORS`).
 fn trampoline_keys() -> [String; 2] {
-    let (image, _) = gex_kernel::nt::boot::trampoline_input(true);
+    let (image, _) = gex_kernel::win::trampoline_input(true);
     [false, true].map(|unguarded| crate::rsrc::key_with(&image, (unguarded, true)))
 }
 
@@ -1019,12 +1019,12 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     // (cgen.rs `set_stateful`).
     if !config.providers.is_empty() {
         let gen = dir.join("build/gen");
-        write_file(&gen.join("provider.h"), crate::pe::PROVIDER_H.as_bytes(), false)?;
+        write_file(&gen.join("provider.h"), crate::provider::PROVIDER_H.as_bytes(), false)?;
         write_file(&gen.join("gex_abi.h"), gex_cgen::header::header().as_bytes(), false)?;
         let mut spec = Vec::new();
         for p in &config.providers {
             let rel = format!("stateful/{}", p.library.to_ascii_lowercase().replace(".dll", ".wasm"));
-            crate::pe::build_stateful(dir, p, &web.join("units").join(&rel), &gen)?;
+            crate::provider::build_stateful(dir, p, &web.join("units").join(&rel), &gen)?;
             spec.push(format!("{}={rel}", p.library.to_ascii_lowercase()));
         }
         params.retain(|(k, _)| k != "stateful");
@@ -1198,7 +1198,7 @@ mod tests {
         let was = gex_abi::kuser_fold();
         let keys = trampoline_keys();
         // The fold-on keys, not this process's flavor: a gexc eject runs with the fold off.
-        let (image, _) = gex_kernel::nt::boot::trampoline_input(true);
+        let (image, _) = gex_kernel::win::trampoline_input(true);
         assert!(!keys.contains(&crate::rsrc::key_with(&image, (false, false))));
         assert!(keys.iter().all(|k| k.len() == 64));
         assert_eq!(gex_abi::kuser_fold(), was);

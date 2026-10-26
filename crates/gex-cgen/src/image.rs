@@ -116,8 +116,8 @@ fn unit_inputs() -> String {
 }
 
 /// Store an i386 program's general-purpose registers to the low 32 bits of
-/// their 64-bit context slots, as pewasm's CpuState fields are 32-bit
-/// (3-4% of the wasm of Noita's large hot functions). Exact because every
+/// their 64-bit context slots (3-4% of the wasm of Noita's large hot
+/// functions). Exact because every
 /// other writer of those slots zero-extends (efcb8bfc: the host's syscall
 /// results, signal frames, the NT layer's contexts; GEX_CHECK_I386_HIGH=1
 /// checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`

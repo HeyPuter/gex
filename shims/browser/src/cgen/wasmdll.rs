@@ -176,7 +176,7 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
         }
         Err(e) => {
             crate::warn_line(&format!("gex-nt: {path}: native wasm32 DLL: {e}\n"));
-            crate::nt::end_process(0xc000_0135);
+            crate::end_process(0xc000_0135);
         }
     }
 }

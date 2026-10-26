@@ -91,7 +91,7 @@ pub(crate) fn base_module() -> Vec<u8> {
 /// Compile the modules every AOT-only process makes at run time -- the
 /// function table's runtime module and the base module -- into the
 /// content-addressed precompiled directory (`gex_cache::precompiled_dir`), for
-/// a runtime without a compiler (gex-rt).
+/// a runtime without a compiler.
 #[cfg(feature = "compile")]
 pub fn precompile(dir: &std::path::Path) -> Result<()> {
     let engine = crate::engine()?;
@@ -126,9 +126,6 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
         IMPORT_MODULE,
         imports::CALL_OUT,
         |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp: i64| -> wasmtime::Result<i32> {
-            if caller.data().nt.is_some() {
-                return crate::host((|| -> anyhow::Result<i32> { Ok(0) })());
-            }
             crate::host(super::call_out(&mut caller, ctx, target as u64, ret as u64, sp as u64, gex_abi::ftab::NEED_ALL))
         },
     )?;
@@ -154,18 +151,10 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, depth: i32,
         caller.data_mut().callout_signal = Some(CalloutSignal::Return(i));
         return Err(StopExecution.into());
     }
-    // An exception dispatched nested whose handler jumps back above it:
-    // not a call into code, the frames below resume there.
-    if nt::exc_escape(caller, target) {
-        return Err(StopExecution.into());
-    }
     // A branch to memory that is not executable is the guest's own fault
     // (DEP: an access violation, ExceptionInformation[0] = 8), delivered as
     // the translator's miss path delivers it. Not a gap in the build.
     if !caller.data_mut().with_kernel(|k| k.mem.lock().check_access(target, 1, prot::EXEC)) {
-        if caller.data().nt.is_some() {
-            return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
-        }
         return crate::branch_not_executable(caller, target);
     }
     // A window-procedure thunk made at run time (gex_kernel::win::thunk):
@@ -185,10 +174,7 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, depth: i32,
 
 /// Stop the run: `addr` has no ahead-of-time code.
 pub(crate) fn missing(caller: &mut Caller<'_, HostState>, addr: u64, how: &str) -> anyhow::Error {
-    let what = match caller.data().nt.as_ref() {
-        Some(p) => p.describe_addr(addr),
-        None => describe(caller, addr),
-    };
+    let what = describe(caller, addr);
     let exec = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::EXEC));
     let why = if !exec {
         "which is not executable"

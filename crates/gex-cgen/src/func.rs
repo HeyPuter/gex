@@ -1,7 +1,6 @@
 //! Phase B: one C function per recovered guest function.
 //!
-//! Registers and flags are C locals across the whole function (pewasm's
-//! scheme): loaded on entry, written back wherever control can leave, reloaded
+//! Registers and flags are C locals across the whole function: loaded on entry, written back wherever control can leave, reloaded
 //! after anything that can change guest state. Nothing stays in a local
 //! across a call, so the host's trap-out is a correct unwind with no landing
 //! pads (`docs/function-tier.md` §5). Each function `F` becomes
@@ -84,11 +83,9 @@ pub fn leaf_name(entry: u64) -> String {
     format!("fl_{entry:x}")
 }
 
-/// Whether `f` may be copied into its callers' translation units (pewasm's
-/// opt_inline.cc): a leaf (no calls, no transfers out other than its
-/// returns) of at most `LEAF_INSTS` guest instructions. pewasm bounds 48 C
-/// statements after its own optimisation, flags mostly gone; gex's lifted
-/// statements still hold every flag (a compare is about 30), so they are
+/// Whether `f` may be copied into its callers' translation units: a leaf (no calls, no transfers out other than its
+/// returns) of at most `LEAF_INSTS` guest instructions. Lifted statements
+/// still hold every flag (a compare is about 30), so they are
 /// no measure: 0x72b390, 18 instructions with four compares, is 288. The
 /// flags go when the copy is inlined, the caller's `need` folding the
 /// return's flag store away.
@@ -102,8 +99,8 @@ pub fn is_small_copyable(f: &Function) -> bool {
     // Also a small function making at most two calls that return to it
     // (noita.exe 0x70b110, 0x70b050: a load and a virtual call): V8 never
     // inlines those into 0x724580's outlined loop (726 wire bytes each, and
-    // the loop's 26 KB leaves it no inlining budget), where pewasm's
-    // TurboFan does. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
+    // the loop's 26 KB leaves it no inlining budget), where TurboFan
+    // would. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
     // outlined loops; `SMALLCALLSALL`: everywhere; not in the unit key): the
     // page ABBAs on edger (docs/noita-perf.md, i3b/i3c) found 2-3% less
     // time in 0x724580's family and no world-fps change beyond noise, so
@@ -373,12 +370,11 @@ pub struct FnUnit {
     /// The functions that need no depth guard (`guard_free`), from the
     /// recovery.
     pub guardfree: HashSet<u64>,
-    /// Profile-guided devirtualisation (pewasm's `--icall-profile`,
-    /// optimization-plan.md §8.1): an indirect call whose return address is
+    /// Profile-guided devirtualisation: an indirect call whose return address is
     /// here gets a guarded direct call to the target, which skips the probe
     /// and lets clang inline it. By return address.
     pub icall_hints: std::sync::Arc<HashMap<u64, u64>>,
-    /// Small leaf functions of the image (pewasm's opt_inline.cc, §3.6):
+    /// Small leaf functions of the image:
     /// a call to one goes to a private `static inline` copy in this
     /// translation unit, which clang can inline across the image's units.
     pub leaves: std::sync::Arc<HashMap<u64, Function>>,
@@ -420,7 +416,7 @@ impl FnUnit {
     /// reach the kernel, unwind or leave pending, and is not trap-free
     /// (those already have exact write-backs). The value is what the
     /// caller keeps dirty across it: the continuation's live registers its
-    /// call tree never names (pewasm's A*(g)), PC and SP excepted.
+    /// call tree never names, PC and SP excepted.
     fn carried(&self, f: &Function, known: &HashSet<u64>, sums: &HashMap<u64, Summary>, trapfree: &HashMap<u64, u32>) -> HashMap<usize, RegSet> {
         let mut out = HashMap::new();
         if !self.ftab || !minimal_writeback() {
@@ -430,8 +426,7 @@ impl FnUnit {
             // A direct call to a function of this unit, or an indirect one
             // devirtualised to one (`icall_hints`: its fallback writes the
             // carried registers back and reloads them). A trap-free callee
-            // too: what it never touches need not be stored for it either
-            // (pewasm's A*(g)).
+            // too: what it never touches need not be stored for it either.
             let (t, r) = match &b.term {
                 FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => (t, r),
                 FTerm::Call { callee: Callee::Indirect(_), ret: Some(r), ret_pc } if devirt_carry() && !self.no_devirt.contains(&i) => {
@@ -1312,8 +1307,7 @@ impl FnUnit {
                         let depth = format!("depth + {}", self.weight);
                         match self.icall_hints.get(ret_pc).copied().filter(|k| known.contains(k) && !self.no_devirt.contains(&i)) {
                             Some(k) => {
-                                // pewasm's `if (x == K) sub_K(s); else
-                                // recomp_call_indirect(s, x)`. A trap-free K
+                                // `if (x == K) K(); else indirect(x)`. A trap-free K
                                 // checks no pages itself: a rewritten one
                                 // goes through the table.
                                 self.stats.calls_devirt += 1;
@@ -1800,8 +1794,8 @@ fn reload_all(e: &mut Emitter<'_>) {
 }
 
 /// The helper indirect calls go through: a `switch` over every function
-/// entry with a C body. The slow path pewasm's dispatch-cache probe and
-/// devirtualization later speed up; priced before it is optimised.
+/// entry with a C body: the slow path, which the dispatch-cache probe and
+/// devirtualization speed up.
 pub fn call_known_source(entries: &[u64]) -> String {
     let mut s = String::from("#include \"gex_abi.h\"\n\n");
     for a in entries {
@@ -1898,7 +1892,7 @@ pub fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
     }
 }
 
-/// Clean-spill elision (pewasm's `opt_spill`, optimization-plan §16) is on
+/// Clean-spill elision is on
 /// unless `GEX_CGEN_CLEAN=0`.
 pub fn clean_spills() -> bool {
     std::env::var("GEX_CGEN_CLEAN").as_deref() != Ok("0")
@@ -2047,8 +2041,7 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
 /// Whether calls are taken not to read the arithmetic flags: no x86 ABI
 /// passes anything in them, and compilers treat every call as clobbering
 /// them. A flag computation whose only reader would be the callee is then
-/// dead, and a call writes back no flags (pewasm's flag elision across
-/// calls). Returns, switch defaults and unresolved jumps still read them
+/// dead, and a call writes back no flags. Returns, switch defaults and unresolved jumps still read them
 /// all. `GEX_CGEN_FLAGS_ABI=0` turns it off; `GEX_CGEN_LIVE=0` implies off.
 pub fn flags_abi() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2057,13 +2050,12 @@ pub fn flags_abi() -> bool {
 
 /// The whole-image units' write-back at calls to a summarised callee that
 /// cannot reach the kernel, unwind or leave pending (`FnUnit::add`): what
-/// it reads, and what the continuation reads that it may change, as
-/// pewasm does. A trap inside it (a memory fault: SEH) sees the caller's
+/// it reads, and what the continuation reads that it may change. A trap inside it (a memory fault: SEH) sees the caller's
 /// other registers as they were at the last write-back; the compilers'
 /// handlers reload callee-saved registers from their frames, not from the
 /// faulting context. `GEX_CGEN_WB=all` writes back every dirty register.
 /// The registers each function's call tree names (reads or writes, saving
-/// included), pewasm's A*(g): a least fixpoint over direct calls; anything
+/// included): a least fixpoint over direct calls; anything
 /// that reaches code outside `funcs`, an indirect transfer or a clobbering
 /// host call names everything.
 pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
@@ -2134,8 +2126,8 @@ static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// §7.1): not recursive, their whole call tree known (no indirect call, no
 /// unknown code, so nothing can re-enter them), and the tree's stack fits in
 /// the reserve every guarded function keeps below the budget, as a
-/// trap-free tree must. pewasm has no guard at all; this keeps gex's where
-/// a call chain can grow without bound.
+/// trap-free tree must. The guard stays where a call chain can grow
+/// without bound.
 pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u64> {
     let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
     let mut cand: Vec<Option<(u32, Vec<usize>)>> = Vec::with_capacity(funcs.len());
@@ -2412,7 +2404,7 @@ pub fn outline_loops() -> bool {
         Ok("0") => false,
         Ok("1") => true,
         // The native flavor (`image::unguarded`): no tiering engine to
-        // escape, so no loop functions (pewasm has none either).
+        // escape, so no loop functions.
         _ => !crate::image::unguarded(),
     }
 }
@@ -2570,8 +2562,8 @@ mod tests {
     /// `ret`; `0x2000` calls it. The leaf is copied into the caller's unit
     /// (`FnUnit::leaves`), and with loop outlining on (the browser's guarded
     /// flavor) both the leaf and its copy outline the loop: their loop
-    /// functions must be named apart (stream B: "redefinition of
-    /// 'l_419a70_0'" in tests/nt x64/cxx's unit).
+    /// functions must be named apart (a C++ program's unit failed with
+    /// "redefinition of 'l_419a70_0'").
     const LEAF: &str = "func 0x1000 - entries [] form memory values 12
 b0 0x1000..0x1003 insts [1000]:
   @1000 jump b1()

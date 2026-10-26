@@ -25,7 +25,7 @@ wasmparser = "0.219.2"
 [features]
 default = ["build"]
 # Ejecting and building projects (translation, unit builds). Off: only
-# running a built one, with a runtime that has no translator (gex-rt).
+# running a built one, in a runtime built without the translator.
 build = ["gex-native/translate", "gex-cache/compile"]
 # For an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-kernel/x86"]

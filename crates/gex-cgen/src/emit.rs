@@ -498,7 +498,7 @@ impl<'a> Emitter<'a> {
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
             } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
-                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // 32-bit stores: exact, every writer of
                 // the slot zero-extends (`image::narrow_stores`).
                 self.line(format!("GEX_C32({off}u) = {name};"));
             } else {
@@ -610,7 +610,7 @@ impl<'a> Emitter<'a> {
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
             } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
-                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // 32-bit stores: exact, every writer of
                 // the slot zero-extends (`image::narrow_stores`).
                 self.line(format!("GEX_C32({off}u) = {name};"));
             } else {

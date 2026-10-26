@@ -220,27 +220,6 @@ fn print_locked(n: usize) {
     }
 }
 
-/// The whole map, on the console.
-pub fn print() {
-    let _h = Held::take();
-    print_locked(T.len.load(Ordering::Relaxed) as usize);
-}
-
-/// Who owns `addr`, as "kind owner what start..end" (the last registered
-/// region containing it), or "nobody".
-pub fn owner_of(addr: u64) -> String {
-    let _h = Held::take();
-    let n = T.len.load(Ordering::Relaxed) as usize;
-    for i in (0..n).rev() {
-        let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
-        if s <= addr && addr < e {
-            let t = T.tag[i].load(Ordering::Relaxed);
-            return format!("{} {} ({}) {s:#x}..{e:#x}", Kind::from(t >> 32).name(), t & 0xffff_ffff, what_of(i));
-        }
-    }
-    "nobody".into()
-}
-
 /// The parts of `[start, end)` that only the guest owns (no shim heap,
 /// stack, thread-local block, foreign growth or fixed runtime region overlaps
 /// them), in order. `None` when the table has overflowed and so cannot say.

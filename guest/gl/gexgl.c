@@ -1951,8 +1951,8 @@ static void gexgl_upload_ff_arrays(size_t vertices);
    of them a rewrite of a buffer the pending batch already read, which a
    batched WebGPU backend can only do as a staged copy that ends the render
    pass: Noita, through Wine, drew 56 times a frame from client memory and
-   paid ~140 copies and a render pass per draw for it (pewasm, handing the
-   same arrays to Mesa directly: 15 passes, no copies). The NT layer has sent
+   paid ~140 copies and a render pass per draw for it (handing the same
+   arrays to Mesa directly: 15 passes, no copies). The NT layer has sent
    them this way since bdb682d9. GEXGL_CLIENT_ARRAYS=buffer keeps the scratch
    buffers, for A/B runs. */
 static int client_array_mode = -1; /* 1 CLIENT_ARRAY, 0 scratch buffers */

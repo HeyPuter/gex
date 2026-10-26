@@ -179,11 +179,9 @@ fn take_throw(caller: &mut Caller<'_, HostState>) -> Result<Option<i32>> {
     }
 }
 
-/// Guest pages from the NT allocator (a Windows process; there is no other
-/// kind of stateful provider yet).
+/// Guest pages for a provider's own use.
 pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
-    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, &k.mem, size, name)).map_err(|e| anyhow!(e))
+    alloc_linux(state, size, name)
 }
 
 /// Guest pages in a Linux process (a native wasm32 program, `wasmprog`):
@@ -234,18 +232,13 @@ const REVERSE_STRIDE: u64 = 16;
 /// The guest addresses a provider binds (its code region): low, where code
 /// lives in a 64-bit guest memory (docs/mem64.md), and read-only.
 fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
-    if state.nt.is_some() {
-        return alloc(state, CODE_PAGE, name);
-    }
     use gex_kernel::mem::prot;
     map_anon(state, 0, CODE_PAGE, prot::READ, 0, true, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
-/// [`alloc`] from the top down (`boot::alloc_private_top`): a built-in
-/// provider's data and heap, which must not move the program's later DLLs.
+/// [`alloc`] for a built-in provider's data and heap.
 pub(crate) fn alloc_top(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
-    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, &k.mem, size, name)).map_err(|e| anyhow!(e))
+    alloc_linux(state, size, name)
 }
 
 /// Install `p`'s functions for an image whose exports are `exports` at
@@ -459,11 +452,9 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
     })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
-    // The NT process clock as NtQueryPerformanceCounter reads it (100 ns
-    // units): the `nt_qpc` provider's.
-    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |caller: Caller<'_, HostState>| -> i64 {
-        caller.data().nt.as_ref().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
-    })?;
+    // The `nt_qpc` provider's counter: it binds only to an ntdll that is a
+    // PE image, which a 32-bit Wine prefix's (a wasm32 skeleton) is not.
+    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { 0 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter, docs/wine-overhead.md F2).
@@ -481,10 +472,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u32 as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
-        let what = match caller.data().nt.as_ref() {
-            Some(p) => p.describe_addr(addr),
-            None => format!("{addr:#x}"),
-        };
+        let what = format!("{addr:#x}");
         Err(crate::aot_only::stop(&mut caller, addr, &format!("gex-eject: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
     })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
@@ -703,10 +691,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
-        let what = match caller.data().nt.as_ref() {
-            Some(p) => p.describe_addr(addr),
-            None => format!("{addr:#x}"),
-        };
+        let what = format!("{addr:#x}");
         Err(crate::aot_only::stop(&mut caller, addr, &format!("gex: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
     })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {

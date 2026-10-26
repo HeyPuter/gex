@@ -652,7 +652,7 @@ pub const FCACHE_ENTRIES: u64 = 1 << FCACHE_BITS;
 pub const FCACHE_BYTES: u64 = FCACHE_ENTRIES * 8;
 
 /// The probe cache slot of guest address `a`: a multiplicative hash of its
-/// low 32 bits (pewasm's dispatch cache), so code that is 16-byte aligned
+/// low 32 bits, so code that is 16-byte aligned
 /// still spreads over every slot. Every emitter computes exactly this.
 #[inline]
 pub const fn fcache_slot(a: u64) -> u64 {

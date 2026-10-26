@@ -48,10 +48,6 @@ pub struct EjectOptions {
     /// gex's browser shim (`gex_browser.wasm`, built from the same source for
     /// the same guest), for a project with a web build.
     pub web_shim: Option<PathBuf>,
-    /// The app library (web/build-eject-page.sh's output: app.mjs, its
-    /// chunks and the runtime's wasm), for a Windows program's web build in a
-    /// browser: vendored as runtime/web/page.
-    pub web_page: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -198,16 +194,8 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             gex_abi::ARCH_NAME
         );
     }
-    // A Windows program's run is one process whose program is the NT
-    // layer's (docs/eject-pe.md).
-    let nt = session.nt.as_ref();
-    let (exe, argv) = match nt {
-        Some(n) => (n.exe.clone(), std::iter::once(n.exe.clone()).chain(n.args.iter().cloned()).collect::<Vec<_>>()),
-        None => {
-            let first = session.programs.first().ok_or_else(|| anyhow!("the session ran no program"))?;
-            (first.exe.clone(), session.argv.clone())
-        }
-    };
+    let first = session.programs.first().ok_or_else(|| anyhow!("the session ran no program"))?;
+    let (exe, argv) = (first.exe.clone(), session.argv.clone());
     let sysroot = session.sysroot.as_deref();
 
     let kept_user = prepare(out)?;
@@ -244,7 +232,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         objects.push(Object {
             id,
             path: ob.path.clone(),
-            role: if nt.is_some() && ob.path == exe { "exe".into() } else { ob.role.clone() },
+            role: ob.role.clone(),
             size: bytes.len() as u64,
         });
     }
@@ -257,20 +245,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     let mut files = Vec::new();
     let mut dirs = std::collections::BTreeSet::new();
     let (mut missing, mut outputs) = (Vec::new(), Vec::new());
-    // A Windows program's prefix: the build writes its own image layout, and
-    // the NT layer checks the prefix's Wine version.
-    let mut nt_files: Vec<gex_xlate::profile::FileEntry> = Vec::new();
-    if let Some(n) = nt {
-        let v = format!("{}/.wine-version", n.prefix);
-        if !session.files.contains_key(&v) {
-            nt_files.push(gex_xlate::profile::FileEntry { path: v, read: true, ok: 1, ..Default::default() });
-        }
-    }
-    let layout_file = nt.map(|n| format!("{}/{}", n.prefix, gex_kernel::nt::section::LAYOUT_FILE));
-    for f in session.files.values().chain(nt_files.iter()) {
-        if layout_file.as_deref() == Some(f.path.as_str()) {
-            continue;
-        }
+    for f in session.files.values() {
         if !f.path.starts_with('/') {
             // `<fd N>/name`: relative to a directory nobody could name.
             bail!("the session opened {:?}, relative to a directory with no known path", f.path);
@@ -332,13 +307,6 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         let src = host_path(sysroot, p);
         let meta = match std::fs::metadata(&src) {
             Ok(m) => m,
-            // A Windows program's file made and removed during the session
-            // by a way the NT layer's open hook does not see as a create
-            // (a rename, a copy): its output.
-            Err(_) if nt.is_some() => {
-                outputs.push(p.clone());
-                continue;
-            }
             Err(e) => return Err(anyhow!("the session read {p}, and {} is gone: {e}", src.display())),
         };
         if meta.is_dir() {
@@ -387,29 +355,6 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     if std::fs::hard_link(&o.runtime, &rt).is_err() {
         write_file(&rt, &runtime, true)?;
     }
-    // A Windows program's AOT-only runtime (gex-rt: no translator, no wasm
-    // compiler), from `GEX_RT` or beside this gexc.
-    if nt.is_some() {
-        let found = std::env::var_os("GEX_RT")
-            .map(PathBuf::from)
-            .or_else(|| o.runtime.parent().map(|d| d.join("gex-rt")))
-            .filter(|p| p.is_file());
-        // Without it run.sh's default would be gexc, which holds the
-        // translator (docs/eject-pe.md §0): refuse rather than ship that.
-        let Some(src) = found else {
-            bail!(
-                "no gex-rt for this Windows program's project: set GEX_RT to a gex-rt binary \
-                 (cargo build --release -p gex-rt --features x86 --target-dir target/x86-rt) \
-                 or put one beside {}",
-                o.runtime.display()
-            );
-        };
-        let dst = out.join("runtime/gex-rt");
-        if std::fs::hard_link(&src, &dst).is_err() {
-            write_file(&dst, &std::fs::read(&src)?, true)?;
-        }
-    }
-
     let project = Project {
         isa: session.isa.clone(),
         program: Program {
@@ -457,44 +402,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     for (f, text) in crate::web::GEX_MJS_DEPS {
         write_file(&out.join("runtime/web").join(f), text.as_bytes(), false)?;
     }
-    if let (Some(shim), true) = (&o.web_shim, nt.is_some()) {
-        // A Windows program runs on the shared-memory x86 shim with its
-        // kernel and seed (the browser's NT layer), named by their directory
-        // (web/public/gex) or any file in it.
-        let from = if shim.is_dir() { shim.clone() } else { shim.parent().map(Path::to_path_buf).unwrap_or_default() };
-        let to = out.join(crate::pe::WEB_NT_DIR);
-        for f in crate::pe::WEB_NT_WASM {
-            let src = from.join(f);
-            let b = std::fs::read(&src).with_context(|| {
-                format!("reading {} (a Windows program's web build needs the x86 shared-memory shim, kernel and seed: GEX_ARCH=x86 shims/browser/build.sh)", src.display())
-            })?;
-            write_file(&to.join(f), &b, false)?;
-        }
-        for (f, text) in crate::pe::WEB_NT_JS {
-            write_file(&to.join("js").join(f), text.as_bytes(), false)?;
-        }
-        write_file(&out.join("run.mjs"), crate::pe::WEB_NT_RUN_MJS.as_bytes(), true)?;
-        // The app library, when given (web/build-eject-page.sh's output):
-        // serve.mjs runs the web build in a browser, user/index.html at `/`
-        // calling app.mjs's `start()` (with OpenGL, on Mesa over WebGPU).
-        if let Some(page) = &o.web_page {
-            if !page.join("app.mjs").is_file() {
-                bail!("{} has no app.mjs (make it with web/build-eject-page.sh)", page.display());
-            }
-            crate::web::check_no_test_page(page)?;
-            let to = out.join(crate::pe::WEB_NT_PAGE);
-            if to.exists() {
-                std::fs::remove_dir_all(&to)?;
-            }
-            let mut n = 0;
-            crate::build::copy_tree(page, &to, &mut n)?;
-            // The Linux launcher's app.mjs is not this project's: the
-            // library is the vendored one, served at `/`.
-            let _ = std::fs::remove_file(out.join("app.mjs"));
-            write_file(&out.join("serve.mjs"), crate::pe::WEB_NT_SERVE_MJS.as_bytes(), true)?;
-        }
-        summary.web = true;
-    } else if let Some(shim) = &o.web_shim {
+    if let Some(shim) = &o.web_shim {
         let b = std::fs::read(shim).with_context(|| format!("reading {}", shim.display()))?;
         if b.get(..4) != Some(b"\0asm") {
             bail!("{} is not a wasm module", shim.display());
@@ -508,7 +416,7 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
 
     // What a stateful provider's sources (user/eject.json "providers")
     // build against.
-    write_file(&out.join("gen/provider.h"), crate::pe::PROVIDER_H.as_bytes(), false)?;
+    write_file(&out.join("gen/provider.h"), crate::provider::PROVIDER_H.as_bytes(), false)?;
 
     // The user's part, once.
     let user = out.join("user");

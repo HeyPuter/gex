@@ -11,13 +11,13 @@
 
 use crate::config::{Config, Coverage, Replace, Target, CONFIG_FILE};
 use crate::eject::sha256;
-use crate::json::{self, field, obj, str_field, Json};
-use crate::project::{rootfs_rel, Object, Project, PROJECT_FILE};
+use crate::json::{self, obj};
+use crate::project::{rootfs_rel, Object, Project};
 use anyhow::{anyhow, bail, Context, Result};
 use gex_native::aot::Abi;
 use gex_xlate::{Intrinsic, Options};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub use crate::manifest::{inputs_id, rootfs, BuildManifest, BuiltImage, BuiltReplacement, BUILD_FILE};
 
@@ -30,8 +30,6 @@ pub struct BuildReport {
     pub replacements: Vec<BuiltReplacement>,
     pub illegal_blocks: usize,
     pub rootfs_files: usize,
-    /// A Windows program's build (`pe`).
-    pub pe: Option<crate::pe::PeReport>,
     /// A 32-bit Wine page's build.
     pub w3: Option<crate::wine32::Wine32Report>,
     /// The libraries the placement window holds, of the closure's.
@@ -493,7 +491,7 @@ impl Translation<'_> {
             .iter()
             .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
             .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
-        let mut order: Vec<usize> = vec![main];
+        let order: Vec<usize> = vec![main];
         // (a placed library, and the interpreter, is a unit of its own:
         // `units`; one the window left out is translated by the run, in
         // each process)
@@ -699,11 +697,6 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
              (docs/eject.md, \"wine32 pages\") can leave them out so far",
             config.features_off.join(", ")
         );
-    }
-    if crate::pe::nt_session(dir)?.is_some() {
-        let pe = crate::pe::build(dir, &project, &config)?;
-        let rootfs_files = pe.rootfs_files;
-        return Ok(BuildReport { pe: Some(pe), rootfs_files, ..BuildReport::default() });
     }
     verify_rootfs(dir, &project)?;
     // What the session ran, per object, to seed discovery with.

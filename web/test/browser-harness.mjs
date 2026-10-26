@@ -1,5 +1,5 @@
-// What tests/nt's browser drivers share (docs/nt-layer.md §10.2): a vite
-// build of web/nt.html served cross-origin isolated, a headless Chromium driven over CDP (web/test/cdp.mjs)
+// What the Wine page's browser drivers share: a vite build of web/nt.html
+// served cross-origin isolated, a headless Chromium driven over CDP (cdp.mjs)
 // with every Worker's console relayed, web/nt.html opened on a bundle, and
 // screenshots decoded for pixel checks.
 
@@ -9,7 +9,7 @@ import { createServer } from 'node:http';
 import { join, dirname, normalize, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
-import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
+import { Cdp, browserWsUrl } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROOT = join(HERE, '..', '..');

@@ -190,8 +190,6 @@ pub extern "C" fn gex_vfork_ok() -> i32 {
         -2
     } else if IN_PROVIDER.with(|c| c.get()) || cgen::provider_callout_open() {
         -4
-    } else if nt::process().is_some() {
-        -5
     } else if unsafe { k_present() } == 0 {
         -6
     } else if !crate::fork_staged() {

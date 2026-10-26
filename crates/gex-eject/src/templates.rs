@@ -64,14 +64,7 @@ pub fn run_sh() -> String {
 #                            translate code the build never saw instead of
 #                            failing on it (off by default)
 #   ./run.sh --strace -- ARGS...   trace system calls
-#
-# A Windows program's project runs on runtime/gex-rt when it has one: the
-# runtime with no translator and no wasm compiler in it, which runs only
-# what build.sh compiled. --jit-fallback needs gexc.
 HERE=$(cd "$(dirname "$0")" && pwd)
-case " $* " in *" --jit-fallback "*) ;; *)
-    [ -x "$HERE/runtime/gex-rt" ] && exec "$HERE/runtime/gex-rt" "$HERE" "$@" ;;
-esac
 exec "$HERE/runtime/gexc" eject run "$HERE" "$@"
 "#
     .to_string()

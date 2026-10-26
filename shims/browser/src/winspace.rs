@@ -53,12 +53,7 @@ mod stub {
 #[cfg(feature = "shared-memory")]
 mod imp {
     use crate::{grow_memory_to, warn_line, ARENA_NEXT};
-    use gex_kernel::nt;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    fn log(s: &str) {
-        warn_line(&format!("{s}\n"));
-    }
 
     /// Where the shim's heap may climb to. A Linux process's arena ends at
     /// `MMAP_TOP` (the dispatch directory's reach); an NT process owns
@@ -70,7 +65,7 @@ mod imp {
     }
 
     /// The bottom of the shim's heap in an NT process: the top of the
-    /// Windows user address space and above (see `nt::vm::ALLOC_HIGH`).
+    /// Windows user address space and above.
     pub(crate) const NT_HEAP_BASE: u64 = 0x8000_0000;
 
     /// The NT layer's Windows address space: everything below 2 GiB is
@@ -84,7 +79,6 @@ mod imp {
     ///
     /// Native Wine (32-bit Wine) does not take this: see [`wine32_windows_space`].
     pub(crate) fn split_windows_space() -> Result<u64, String> {
-        nt::set_log(log);
         // Split already (an `execve` in a 32-bit Wine process, or a fork's child):
         // the same line again. The heap is above it by now, so measuring
         // afresh would put the line at 2 GiB and leave no space at all.
@@ -114,7 +108,6 @@ mod imp {
     /// [`WINE32_COMPACT_LO`], which only says "32-bit Wine" to the kernel and to a forked
     /// child.
     pub(crate) fn wine32_windows_space() -> u64 {
-        nt::set_log(log);
         let lo = WINDOWS_LO.load(Ordering::Relaxed);
         if lo != 0 {
             return lo;
@@ -226,7 +219,6 @@ mod imp {
     /// 32-bit Wine's compact space (the child's memory already covers what the
     /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
-        nt::set_log(log);
         if lo & !WINE32_KUSER_BIT == WINE32_COMPACT_LO {
             WINE32_COMPACT.store(true, Ordering::Relaxed);
             WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);

@@ -50,8 +50,6 @@ mod fjit;
 mod waitq;
 mod sigs;
 mod vfork;
-// The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
-mod nt;
 mod winspace;
 
 use std::sync::{Arc, Mutex};
@@ -2418,36 +2416,6 @@ static OWN_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// Bytes of memory grown outside the arena so far (GEX_WIN_STATS).
 pub(crate) static FOREIGN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// GEX_WIN_TRACE's look, around each NT call: memory grown outside the arena
-/// since the last look is recorded now, with the wasm stack of whoever is
-/// here (the grower ran just before, on this Worker or another).
-pub(crate) fn foreign_now(when: &str, call: &str) {
-    let mem = warch::memory_size(0) as u64 * 65536;
-    let known = OWN_TOP.load(std::sync::atomic::Ordering::Acquire);
-    if known == 0 || mem <= known {
-        return;
-    }
-    warn_line(&format!("[gex-stack] memory grown outside the arena noticed {when} {call}: {known:#x}..{mem:#x}\n"));
-    let _g = GrowLock::take();
-    note_foreign_growth();
-}
-
-/// The arena keeps out of memory someone else grows: grow a page behind its
-/// back, then take a span, and see where the span lands.
-pub(crate) fn arena_selftest() -> String {
-    let mem = warch::memory_size(0) as u64 * 65536;
-    if warch::memory_grow(0, 1) == usize::MAX {
-        return "skipped (the memory would not grow)".into();
-    }
-    let (fs, fe) = (mem, mem + 65536);
-    let at = arena_take(1 << 20);
-    match at {
-        Some(a) if a < fe && fs < a + (1 << 20) => format!("FAIL: a span at {a:#x} overlaps the foreign page {fs:#x}..{fe:#x}"),
-        Some(a) => format!("ok (foreign page {fs:#x}..{fe:#x}, the next span at {a:#x})"),
-        None => "FAIL: the arena could not take a span".into(),
-    }
-}
-
 /// Pages grown by someone else, kept out of the arena (`memmap::skip_foreign`).
 fn foreign(start: u64, end: u64) {
     if end <= start {
@@ -4798,11 +4766,6 @@ fn stack_overran(site: &str) {
     }
 }
 
-#[cfg(feature = "shared-memory")]
-pub(crate) fn stack_least() -> u32 {
-    STACK_LEAST.with(|l| l.get())
-}
-
 /// Which Worker this is. Per-Worker via TLS, exactly right here (unlike the
 /// kernel, hence `HOST` is a plain static). Zero is "not yet told", so the
 /// lock's owner word is id-plus-one and zero means free.
@@ -5536,18 +5499,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         f.read_at(0, &mut buf).ok()?;
         Some(buf)
     };
-    // A Windows program has nothing placed here: the NT layer maps it and
-    // Wine's ntdll below (see `nt::boot`, after the kernel is built).
-    let nt_abi = nt::exe_abi(bytes);
-    let program = match nt_abi {
-        Some(abi) => nt::empty_program(abi),
-        None => match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
-            Ok(p) => p,
-            Err(e) => {
-                warn_line(&format!("gex_load: load_program failed: {e:?}"));
-                return 0;
-            }
-        },
+    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
+        Ok(p) => p,
+        Err(e) => {
+            warn_line(&format!("gex_load: load_program failed: {e:?}"));
+            return 0;
+        }
     };
 
     // The break follows the executable, as Linux and the native host have it:
@@ -5691,8 +5648,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // page overrides with `gex_add_env`.
     let env: Vec<String> = {
         let given = std::mem::take(&mut *ENV.0.borrow_mut());
-        // Debian's defaults mean nothing to a Windows program.
-        if given.is_empty() && nt_abi.is_none() {
+        if given.is_empty() {
             vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
                 "HOME=/root".to_string(),
@@ -5721,7 +5677,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
     // The program's own code, when it has a unit (a Linux eject's
     // programs), announced as the interpreter is above.
-    if nt_abi.is_none() && crate::cgen::libprov::elf_listed(&kernel.exe_path) {
+    if crate::cgen::libprov::elf_listed(&kernel.exe_path) {
         let maps = gex_kernel::CodeMap::of_placed(&kernel.exe_path, bytes, program.exe.bias);
         kernel.mem.lock().log.new_code.extend(maps);
     }
@@ -5781,18 +5737,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
-    let entry = match nt_abi {
-        Some(abi) => match nt::boot(&mut kernel, abi, &args, &env) {
-            Ok(pc) => pc,
-            Err(e) => {
-                warn_line(&format!("gex_load: {e}\n"));
-                return 0;
-            }
-        },
-        None => program.entry(),
-    };
+    let entry = program.entry();
     // A native wasm32 program: published before it runs (cgen/wasmprog.rs).
-    cgen::wasmprog::stage(nt_abi.is_none().then_some(&program));
+    cgen::wasmprog::stage(Some(&program));
     install_jit(fresh_jit(&meta));
     set_host(Host {
         magic_head: HOST_MAGIC,
@@ -5878,9 +5825,7 @@ pub extern "C" fn gex_pin_report() {
 /// [`gex_add_file`] a piece at a time: `data` is the file's bytes from
 /// `offset`, and offset zero starts the file. JS sends a large file this way
 /// so that it never needs a buffer of the file's size in this module's heap:
-/// the heap never gives a span back, and before a Windows program boots
-/// whatever the heap has taken is address space the program cannot have
-/// (`nt::boot`). One game's music bank is 324 MiB.
+/// the heap never gives a span back. One game's music bank is 324 MiB.
 #[no_mangle]
 pub extern "C" fn gex_add_file_part(path: u32, path_len: u32, offset: u64, data: u32, data_len: u32) {
     if offset == 0 {
@@ -7830,13 +7775,70 @@ fn phases_end() {
     warn_line(&line);
 }
 
+#[cfg(feature = "shared-memory")]
+#[link(wasm_import_module = "gex_env")]
+extern "C" {
+    /// An AOT-only run (an ejected project's): serve what a syscall left
+    /// for JS -- the units of images just mapped, a thread just created --
+    /// inside the call, so the guest's frames survive it (leaving would
+    /// resume at continuations no unit has entries for).
+    fn serve_in_place();
+}
+
+/// An AOT-only run: JS serves units, catches this Worker up on the function
+/// table and posts new threads, inside this call.
+pub(crate) fn serve_now() {
+    #[cfg(feature = "shared-memory")]
+    // SAFETY: a host import without arguments.
+    unsafe {
+        serve_in_place()
+    };
+}
+
+/// End the process with Windows exit code `code`. The low byte is what a
+/// parent sees, as natively.
+pub(crate) fn end_process(code: u32) -> ! {
+    exit_process((code & 0xff) as i32);
+    trap()
+}
+
+thread_local! {
+    /// The last trap was `win::nr::NATIVE_LEFT`'s.
+    static NATIVE_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last trap was a `win::nr::NATIVE_LEFT` (and forget it).
+#[no_mangle]
+pub extern "C" fn gex_native_left() -> i32 {
+    NATIVE_LEFT.with(|c| c.replace(false)) as i32
+}
+
+/// gexrt's `win::nr::NATIVE_LEFT`, if that is the call, from Wine's own Unix
+/// side (32-bit Wine): the guest re-enters native code from above the
+/// innermost native entry, and JS's call-out decides whether its caller is
+/// gone (`#nativeSyscall` passes this on, `gex_native_left`). EAX: the
+/// function to call again from `jmp eax` (gexrt left it in ctx::BALLAST),
+/// whether or not the call-out leaves. Returns for any other call. Only the
+/// shared-memory build runs native Wine's nested call-outs.
+fn native_left(ctx: i32, pc: i64) {
+    if !cfg!(feature = "shared-memory") {
+        return;
+    }
+    let ctx_addr = ctx as u32 as u64;
+    let mut gm = GuestMem::new(guest_bytes());
+    if gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32 != gex_kernel::win::nr::NATIVE_LEFT {
+        return;
+    }
+    let target = gm.read_u64(ctx_addr + ctx::BALLAST as u64).unwrap_or(0);
+    let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, target);
+    NATIVE_LEFT.with(|c| c.set(true));
+    set_resume(pc as u64);
+    set_resume_ctx(ctx_addr);
+    trap();
+}
+
 fn syscall_entry(ctx: i32, pc: i64) {
     // A recording of which unit functions ran (`?covrec=1`): reported now and then.
-    // A Windows process's every syscall is an NT call, made before the kernel
-    // is taken: the NT layer takes it itself, briefly, and blocks without it.
-    if let Some(p) = nt::process() {
-        return nt::syscall(p, ctx, pc);
-    }
     // One clock reading for the whole call (`turn_now`), taken when first
     // asked: most calls never ask.
     let _now = NowScope::open();
@@ -7852,9 +7854,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // A Unix call from guest code under Wine's own Unix side (32-bit Wine): `int 0x80`
     // with EAX = UNIX_CALL from the trampoline page. ntdll.so's handler takes
     // it, nested, and sets EAX; the guest goes on after the syscall.
-    // And native Wine's NATIVE_LEFT (gexrt), served as for an NT process.
+    // And native Wine's NATIVE_LEFT (gexrt, [`native_left`]).
     if IN_PROVIDER.with(|c| c.get()) {
-        nt::native_left(ctx, pc);
+        native_left(ctx, pc);
     } else {
         let hook = cgen::guest_unix_call_hook();
         if hook != 0 {
@@ -12066,31 +12068,6 @@ fn chunk_sums(b: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-/// The first registry module whose bytes changed since they were pushed:
-/// its index, address, the changed chunk's offset and its bytes now. Each
-/// module is reported once.
-pub(crate) fn verify_registry(j: &mut Jit) -> Option<String> {
-    for i in 0..j.registry.len() {
-        let now = chunk_sums(&j.registry[i]);
-        if let Some(c) = now.iter().zip(&j.registry_sums[i]).position(|(a, b)| a != b) {
-            let m = &j.registry[i];
-            let at = c * 256;
-            let bytes: Vec<String> = m[at..(at + 256).min(m.len())].iter().map(|b| format!("{b:02x}")).collect();
-            let s = format!(
-                "module {i} at {:#x}+{:#x} (of {} modules): chunk at +{at:#x} (address {:#x}) changed; now {}",
-                m.as_ptr() as usize,
-                m.len(),
-                j.registry.len(),
-                m.as_ptr() as usize + at,
-                bytes.join(" ")
-            );
-            j.registry_sums[i] = now;
-            return Some(s);
-        }
-    }
-    None
-}
-
 /// The shared module holding this page's code, if there is one and this
 /// Worker has not installed it: `(id, slots, dirs, wasm)`.
 fn shared_module_at(
@@ -14221,9 +14198,6 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     let returns = pc as u64 & gex_abi::ILLEGAL_RETURNS_PC != 0;
     let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
     let pc = fault_pc((pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64);
-    if nt::active() {
-        nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
-    }
     // A process with a guest fault hook (Wine's ntdll.so): the hook takes
     // the illegal instruction, as shims/native's `deliver_guest_fault` does.
     // 64-bit native Wine's system and Unix calls are a ud2 at a fixed
@@ -14357,17 +14331,6 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         })();
         trace_line(&line);
         return;
-    }
-    // GEX_WIN_TRAP_PCS: noted in the thread's ring, silently.
-    #[cfg(feature = "shared-memory")]
-    if nt::active() && raw == gex_abi::imports::BRK_TRAP_PC {
-        nt::trap_note(_ctx as u32 as u64, pc as u64);
-        return;
-    }
-    // In a Windows process every other breakpoint is a processor exception
-    // the program may handle (`int3`, #DE, `hlt`).
-    if nt::active() && raw != gex_abi::imports::BRK_TRAP_PC {
-        nt::fault(_ctx, gex_kernel::nt::Fault::from_brk(raw), pc as u64);
     }
     // A process with a guest fault hook (Wine's ntdll.so) handles its own
     // processor exceptions, as natively (shims/native's brk import): a
@@ -14593,13 +14556,9 @@ fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
     let c = ctx as u32 as u64;
     let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
     warn_line(&format!(
-        "gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {}: an access violation. regs [{}]\n",
-        nt::describe(pc),
+        "gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation. regs [{}]\n",
         r.join(" ")
     ));
-    if nt::active() {
-        nt::fault(ctx, gex_kernel::nt::Fault::LowWrite(addr), pc);
-    }
     set_exit(128 + 11);
     trap();
 }
@@ -14673,9 +14632,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         let c = _ctx as u32 as u64;
         let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
         warn_line(&format!(
-            "gex: a locked access at {:#x} (block {}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses; regs [{}]\n",
+            "gex: a locked access at {:#x} (block {:#x}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses; regs [{}]\n",
             addr as u64,
-            nt::describe(_pc as u64),
+            _pc as u64,
             r.join(" ")
         ));
         return;
@@ -14812,7 +14771,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                     *n
                 });
                 if n.is_power_of_two() && n >= 4 {
-                    warn_line(&format!("[gex] stale block {start:#x} ({}) translated again {n} times\n", nt::describe(start)));
+                    warn_line(&format!("[gex] stale block {start:#x} translated again {n} times\n"));
                 }
             }
             gex_dispatch_miss(_ctx, start as i64);
@@ -14832,9 +14791,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 });
                 if n.is_power_of_two() && n >= 1024 {
                     warn_line(&format!(
-                        "[gex] pid {} stale blocks dispatched on to a newer translation {n} times; this one {start:#x} ({}); {}\n",
+                        "[gex] pid {} stale blocks dispatched on to a newer translation {n} times; this one {start:#x}; {}\n",
                         my_pid(),
-                        nt::describe(start),
                         STALE_INFO.with(|c| c.borrow().clone())
                     ));
                 }
@@ -14861,8 +14819,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 }
                 if n.is_power_of_two() && n >= 2 {
                     warn_line(&format!(
-                        "[gex] stale block {start:#x} ({}) resumed from JavaScript {n} times; module base/id {:#x}; {}\n",
-                        nt::describe(start),
+                        "[gex] stale block {start:#x} resumed from JavaScript {n} times; module base/id {:#x}; {}\n",
                         addr as u64,
                         STALE_INFO.with(|c| c.borrow().clone())
                     ));
@@ -14901,14 +14858,6 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a
         // mate) into a trampoline. See `gex_abi::DISPATCH_SHIFT`.
-        // `nt::slot_log()`: the first few hundred, named.
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if nt::slot_log() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
-            warn_line(&format!(
-                "gex: slot conflict: block {:#x} entered for {:#x}\n",
-                _pc as u64, addr as u64
-            ));
-        }
         with_jit_only(|j| {
             j.translated.remove(&(addr as u64));
         });
@@ -14981,20 +14930,12 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 
 fn safepoint(ctx: i32, pc: i64) {
     fjit::watch_check(pc as u64, "safepoint");
-    // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
-    // without a syscall: a loop that spins on them passes here.
-    nt::tick();
     // A stateful provider's collection stops guest threads here (its
     // registers are in the context at a safepoint), and a thread that came
     // back from a syscall through JS is running guest code again.
     if cgen::libprov::any_registered() {
         let tid = my_tid() as u32;
         cgen::libprov::guest_again(tid);
-    }
-    // A loop that has left an exception dispatched nested (nt::exc_escape).
-    if nt::exc_escape(ctx, pc as u64) {
-        set_resume_none();
-        trap();
     }
     // A thread another thread's `execve` took the process from, still
     // running the old program's code (a loop that makes no syscall): it goes
@@ -15478,17 +15419,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // thread's frames (leaving would resume at continuations no unit
         // has entries for).
         if aot() {
-            nt::serve_now();
+            serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
         set_resume(pc);
         set_resume_ctx(my_ctx());
-        trap();
-    }
-    // Control leaving an exception dispatched nested (nt::exc_escape).
-    if nt::exc_escape(_ctx, pc) {
-        miss_way(pc, 2);
-        set_resume_none();
         trap();
     }
     // The return a call-out of this Worker waits for, untranslated: that
@@ -15645,9 +15580,6 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // wild `pc` makes a wild directory index, and a shim trap on that reads as
     // a runtime bug where the guest's own crash is the story.
     let wild = gex_abi::X86 && !sigs::executable(pc);
-    if wild && nt::active() {
-        nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
-    }
     // A process with a guest fault hook (Wine's ntdll.so, 32-bit Wine): an access
     // violation, executing, handed to the hook by the host, which resumes
     // where the hook leaves the context (shims/native's
@@ -15769,7 +15701,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if n <= 3 {
             miss_way(pc, 11);
             miss_count(5);
-            nt::serve_now();
+            serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
     }
@@ -19345,9 +19277,6 @@ pub extern "C" fn gex_jit_millis() -> i64 {
 /// `GEX_EXC_TRACE`-style narration of NtRaiseException's nesting decision
 /// (set from JS with `gex_set_exc_trace`).
 static EXC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub(crate) fn tracing_exc() -> bool {
-    EXC_TRACE.load(std::sync::atomic::Ordering::Relaxed)
-}
 #[no_mangle]
 pub extern "C" fn gex_set_exc_trace(on: i32) {
     EXC_TRACE.store(on != 0, std::sync::atomic::Ordering::Relaxed);

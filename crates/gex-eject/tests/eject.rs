@@ -217,7 +217,6 @@ fn eject_build_run_and_replace() {
         runtime: std::env::current_exe().unwrap(),
         runtime_build: None,
         web_shim: None,
-        web_page: None,
     };
     let (p, p2) = (tmp.join("p"), tmp.join("p2"));
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
@@ -373,7 +372,7 @@ fn eject_keeps_files_only_looked_at() {
     let text = session.to_json();
     assert_eq!(Session::from_json(&text).unwrap().files, session.files, "the stat flag round-trips");
     std::fs::write(tmp.join("rec/session.json"), text).unwrap();
-    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None };
     let p = tmp.join("p");
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
     let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
@@ -423,7 +422,7 @@ fn eject_keeps_a_read_file_tried_as_a_directory() {
         session.files.insert(f.path.clone(), f);
     }
     std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
-    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None };
     let p = tmp.join("p");
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
     let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));
@@ -470,7 +469,7 @@ fn eject_keeps_directory_times() {
     let f = FileEntry { path: at("in/apps/a.desktop"), read: true, ok: 1, ..Default::default() };
     session.files.insert(f.path.clone(), f);
     std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
-    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None, web_page: None };
+    let opts = eject::EjectOptions { runtime: std::env::current_exe().unwrap(), runtime_build: None, web_shim: None };
     let p = tmp.join("p");
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
     let root = |rel: &str| p.join("rootfs").join(at(rel).trim_start_matches('/'));

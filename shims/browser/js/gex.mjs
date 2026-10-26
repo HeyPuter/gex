@@ -1725,13 +1725,6 @@ export class Gex {
         // BigInt origin once per thread. `hostNowNs` is the same sum.
         perf_now: () => performance.now(),
         clock_origin: () => ORIGIN_NS,
-        // The NT layer's monotonic clock: `now` is `Date.now()`, a
-        // millisecond wall clock that can step.
-        // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
-        mono_ns: () => performance.now() * 1e6,
-        // A Windows program's user-mode callback (docs/nt-layer.md §5): the
-        // guest runs nested, inside the `syscall` import, until it returns.
-        nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
         // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
         // runs nested until the guest returns to the function body that
         // called it.
@@ -1808,16 +1801,14 @@ export class Gex {
         },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
-        // An exception dispatched nested (nt.rs `raise_nested`).
-        exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
-        // An AOT-only run serves units and new threads inside the syscall
-        // (nt.rs `serve_in_place`), as the NT callback loop does.
         // This Worker's function table, short of what another Worker
         // allocated, or this Worker not yet counted (cgen.rs `ftab_resume`).
         ftab_grow: () => this.#cgenGrowIfShort(),
+        // An AOT-only run serves units and new threads inside the syscall
+        // (lib.rs `serve_now`).
         serve_in_place: () => {
           this.#cgenServe();
-          this.#startThread('gex-nt');
+          this.#startThread();
         },
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
@@ -2841,7 +2832,7 @@ export class Gex {
     if (stackTop) kernelThread(inst.exports, stackTop);
     this.#kernel = inst.exports;
     // `?timescale=N&fixedtime=S`: the benchmark clocks (gex-kernel
-    // `set_guest_clock`, as pewasm's PEWASM_TIME_SCALE and FIXED_TIME). The
+    // `set_guest_clock`). The
     // first process sets them for all.
     const scale = Number(globalThis.GEX_TIME_SCALE) || 0, fixed = Number(globalThis.GEX_FIXED_TIME) || 0;
     if ((scale > 0 && scale !== 1) || fixed) {
@@ -3550,7 +3541,7 @@ export class Gex {
 
   /**
    * `#drainThread` from a loop that may never reach the event loop again (a
-   * call-out, an NT callback, a system call served in place: a Wine thread's
+   * call-out, a system call served in place: a Wine thread's
    * whole life can be one call-out). Nothing asynchronous unless a thread is
    * there: a promise per trap, its rejection handler holding the trap's scope
    * (and so the trap's error), is a microtask that never runs, and a 64-bit game's
@@ -4036,7 +4027,6 @@ export class Gex {
         await this.#installModule(bytes, need, 64, null, who, cached);
       } catch (err) {
         if (err instanceof WebAssembly.CompileError) {
-          e.gex_nt_where?.(ptr | 0, len | 0);
           // And whether the registry's copy is still what was read.
           const now = this.#bytes().slice(ptr, ptr + len);
           let diff = 0;
@@ -5161,7 +5151,7 @@ export class Gex {
       const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
       const bytes = this.#env.loadFile?.(file) ?? null;
       if (!bytes) {
-        console.error(`gex-nt: missing unit: no provider module ${file} in the unit cache, so ${this.#cgenStr(e.gex_cgen_path, u)} runs without its providers; build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers (or natively: a run of the program, or gexc cgen-prefix)`);
+        console.error(`gex-nt: missing unit: no provider module ${file} in the unit cache, so ${this.#cgenStr(e.gex_cgen_path, u)} runs without its providers; build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers (or natively: a run of the program)`);
         continue;
       }
       const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -6145,7 +6135,7 @@ export class Gex {
       if (err?.gexHandoff || !e.gex_handoff()) throw err;
       err.gexHandoff = true;
       if (e.gex_exited?.()) throw err;
-      // gex_nr::NATIVE_LEFT: the guest re-entered native code from above
+      // win::nr::NATIVE_LEFT: the guest re-entered native code from above
       // the innermost native entry. Only when the innermost loop is a native
       // caller's call-out that the guest has left does it leave (its caller
       // drops its frames, `#callOutSteps`). Otherwise gexrt's mark is stale
@@ -6154,7 +6144,7 @@ export class Gex {
       // guest goes on nested, and gexrt's own checks drop the dead frames
       // when the guest returns past them. Trapping on would drop every
       // native frame down to the innermost loop, live ones included.
-      if (e.gex_nt_native_left?.()) {
+      if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
         const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + this.#ctxSp(), true);
         if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
@@ -6421,7 +6411,6 @@ export class Gex {
     let ctx = startCtx;
     // When the last trap came out, for GEX_WIN_STATS' time split: what the
     // glue costs between a trap and the guest again.
-    let trappedAt = 0;
     // A fault for the process's hook, taken at the last trap (`#faultTake`):
     // called at the next entry.
     let hook = null;
@@ -6437,10 +6426,6 @@ export class Gex {
       if (this.#cov.size && performance.now() - this.#covAt > 250) {
         this.#covAt = performance.now();
         this.covFlush();
-      }
-      if (trappedAt) {
-        this.#shim.exports.gex_nt_note_js_ns?.(ctx, (performance.now() - trappedAt) * 1e6);
-        trappedAt = 0;
       }
       try {
         // Address zero is never a guest instruction: entering there is how a
@@ -6485,7 +6470,6 @@ export class Gex {
         }
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
-        trappedAt = performance.now();
         this.#where = 'trap';
         // First, before asking the shim anything: was this a handoff or a
         // crash? Every way out is the same `unreachable` to the engine, and
@@ -7141,105 +7125,6 @@ export class Gex {
     for (const m of mine) await this.#adoptModule(m);
   }
 
-  /**
-   * Instantiate the module a dispatch miss left behind, and put its blocks in
-   * the table the guest dispatches through. The shim lifted and encoded it;
-   * only the engine can compile it, and only JS can ask the engine.
-   */
-  /**
-   * A user-mode callback of a Windows program (docs/nt-layer.md §5): run the
-   * guest from `pc` on this Worker, nested inside the `syscall` import that
-   * asked, until the thread's `NtCallbackReturn`. Synchronous throughout --
-   * there is a shim frame below this one, so nothing may yield -- which is
-   * why translations are compiled with `new WebAssembly.Module` here (legal
-   * in a Worker at any size). Returns 1 when the callback returned, 0 when
-   * the run failed or the process ended.
-   */
-  #ntCallback(ctx, pc) {
-    this.#nest.push('callback');
-    try {
-      return this.#ntCallbackLoop(ctx, pc);
-    } finally {
-      this.#nest.pop();
-    }
-  }
-
-  #ntCallbackLoop(ctx, pc) {
-    const e = this.#shim.exports;
-    // The shim's frames below this import are live: every trap out of the
-    // nested guest abandons only the frames above here, so the shadow stack
-    // goes back to exactly this, never to the Worker's base.
-    const sp = e.__stack_pointer.value;
-    const psp = this.#progSpAt();
-    pc = pc < 0n ? pc + (1n << 64n) : pc;
-    let bypass = null;
-    for (;;) {
-      try {
-        if (bypass) {
-          const f = bypass;
-          bypass = null;
-          this.#shim.exports.gex_callout_leave_ok?.(0);
-          f(ctx);
-        } else {
-          this.#shim.exports.gex_callout_leave_ok?.(0);
-          this.#cgenGrowIfShort();
-          this.#guest.exports.enter(ctx, pc);
-        }
-        console.error('[gex-nt] guest code returned out of a user-mode callback');
-        return 0;
-      } catch (err) {
-        e.__stack_pointer.value = sp;
-        this.#progSpBack(psp);
-        // A call-out's watched entry reached inside the callback: what the
-        // entry held runs (`#watchHit` never ends a call-out from here).
-        const sig = this.#calloutSignal;
-        this.#calloutSignal = null;
-        if (sig?.kind === 'bypass' && sig.f) {
-          bypass = sig.f;
-          continue;
-        }
-        // This callback's NtCallbackReturn, reached inside a call-out it
-        // made (up through the call-out's frames).
-        if (err?.gexCallbackDone && e.gex_nt_callback_done(ctx)) return 1;
-        if (!err?.gexHandoff && !e.gex_handoff()) {
-          // The sibling-numbered-page race, as in the outer loop.
-          if (/table index is out of bounds/.test(err.message)) {
-            const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
-            if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
-              pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
-              continue;
-            }
-          }
-          console.error(`[gex-nt] a user-mode callback crashed: ${err.stack ?? err}`);
-          return 0;
-        }
-        if (e.gex_nt_callback_done(ctx)) return 1;
-        if (e.gex_exited?.()) return 0;
-        const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
-        if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
-        this.#denseCatchUp();
-        if (e.gex_jit_pending_len() >>> 0) {
-          const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
-          if (need) this.#growTables(need, 'nt-callback');
-        }
-        while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
-        this.#catchUpSync();
-        this.#cgenServe();
-        // A thread created inside the callback: posting it is synchronous,
-        // only the answer would need the event loop.
-        this.#startThread('gex-nt');
-        const next = e.gex_resume_pc();
-        if (next === 0n) {
-          console.error('[gex-nt] a user-mode callback stopped with nowhere to resume');
-          return 0;
-        }
-        pc = next < 0n ? next + (1n << 64n) : next;
-        const c = e.gex_resume_ctx() >>> 0;
-        if (c) ctx = c;
-      }
-    }
-  }
-
   /** This Worker's call-outs in progress, innermost last: the return each
    *  waits for, the stack it comes back at, and the table entry watching
    *  for a translated return (`{ table, index, old }`). */
@@ -7247,9 +7132,8 @@ export class Gex {
   /** What the watch stub found (`{ kind: 'return', i }` or `{ kind:
    *  'bypass', f }`), for the nested loop to act on. */
   #calloutSignal = null;
-  /** Which nested loops this Worker is in, innermost last ('callout' or
-   *  'callback'): a watch stub reached inside an NT callback is not its
-   *  call-out's business. */
+  /** Which nested loops this Worker is in, innermost last ('callout', or
+   *  'callout~' for one that may suspend). */
   #nest = [];
 
   // --- The single-thread build (single.mjs, docs/single-thread.md) ---------
@@ -7347,13 +7231,8 @@ export class Gex {
     const target = dv.getBigUint64(ctx + CTX_LAST_TARGET, true);
     const sp = dv.getBigUint64(ctx + this.#ctxSp(), true);
     let i = -1;
-    // Only a call-out with no NT callback nested inside it: an outer one's
-    // return reached from inside a callback is not that call-out's (its
-    // caller's frame is below the callback's), and runs as a bypass.
-    const lastCallback = Math.max(this.#nest.lastIndexOf('callback'), this.#nest.lastIndexOf('exc'));
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
       const c = this.#callouts[k];
-      if (c.nestAt < lastCallback) break;
       if (c.ret === target && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
     }
     dv.setBigUint64(ctx + CTX_PC, target, true);
@@ -7482,8 +7361,8 @@ export class Gex {
    * at `spWant` (or what the callee popped above it). 1 then, and the
    * function body that called the fallback carries on; 0 when it cannot
    * (the process ended, the stack unwound past its caller), with `ctx::PC`
-   * where the guest is, and the body leaves as before. Synchronous, as
-   * `#ntCallback`: a shim frame is below this one.
+   * where the guest is, and the body leaves as before. Synchronous: a shim
+   * frame is below this one.
    */
   #callOut(ctx, target, ret, spWant) {
     return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false));
@@ -7567,7 +7446,7 @@ export class Gex {
     // (native Wine's own for a thread's loop, `gex_call_out(ctx, pc, 0, 0)`).
     // This list's index is not it.
     const ri = e.gex_callout_opened?.() ?? me;
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length, ri };
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri };
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -7652,7 +7531,7 @@ export class Gex {
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === ri ? 1 : 0); }
-          // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
+          // win::nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
@@ -7662,18 +7541,6 @@ export class Gex {
           if (e.gex_exited?.()) {
             err.gexHandoff = true;
             throw err;
-          }
-          // Control left an exception dispatched nested further out: this
-          // call-out's caller leaves, and the dispatch's loop sees the escape
-          // at the next check (nt.rs `exc_escape`).
-          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: exception escaped`); return 0; }
-          // The NtCallbackReturn of a callback further out (the function
-          // this call-out ran was the callback's dispatcher): its loop's, so
-          // up through every frame between, as natively.
-          if (this.#nest.lastIndexOf('callback') >= 0 && e.gex_nt_callback_done?.(ctx)) {
-            const up = new Error('gex: a user-mode callback returned inside a call-out');
-            up.gexCallbackDone = true;
-            throw up;
           }
           const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
           if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
@@ -7849,96 +7716,6 @@ export class Gex {
     return { spG, cur };
   }
 
-  /**
-   * An exception dispatched nested (nt.rs `raise_nested`, ffa2cec9's browser
-   * half): run the guest from `target` (KiUserExceptionDispatcher) in a loop
-   * on this Worker until control goes back above the raise (the escape for
-   * depth `level`): 1; 0 when it could not, and the syscall traps out as
-   * before. Synchronous, as `#ntCallback`.
-   */
-  #excDispatch(ctx, target, level) {
-    const e = this.#shim.exports;
-    const sp0 = e.__stack_pointer.value;
-    const psp0 = this.#progSpAt();
-    this.#nest.push('exc');
-    if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] nested dispatch depth ${level} at ${BigInt.asUintN(64, target).toString(16)}`);
-    let pc = BigInt.asUintN(64, target);
-    let bypass = null;
-    try {
-      for (;;) {
-        try {
-          if (bypass) {
-            const f = bypass;
-            bypass = null;
-            this.#shim.exports.gex_callout_leave_ok?.(0);
-            f(ctx);
-          } else {
-            this.#shim.exports.gex_callout_leave_ok?.(0);
-            this.#cgenGrowIfShort();
-            this.#guest.exports.enter(ctx, pc);
-          }
-          console.error('[gex] guest code returned out of exception dispatch');
-          return 0;
-        } catch (err) {
-          e.__stack_pointer.value = sp0;
-          this.#progSpBack(psp0);
-          const sig = this.#calloutSignal;
-          this.#calloutSignal = null;
-          if (sig?.kind === 'bypass' && sig.f) {
-            bypass = sig.f;
-            continue;
-          }
-          if (!err?.gexHandoff && !e.gex_handoff()) {
-            if (/table index is out of bounds/.test(err.message)) {
-              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
-              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
-                pc = BigInt.asUintN(64, tgt);
-                continue;
-              }
-            }
-            throw err;
-          }
-          if (e.gex_exc_escaped(0) === level) {
-            e.gex_exc_escaped(1);
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] depth ${level} escaped`);
-            return 1;
-          }
-          if (e.gex_exited?.()) {
-            err.gexHandoff = true;
-            throw err;
-          }
-          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
-          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
-          this.#denseCatchUp();
-          if (e.gex_jit_pending_len() >>> 0) {
-            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
-            if (need) this.#growTables(need, 'exception');
-          }
-          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
-          this.#catchUpSync();
-          this.#cgenServe();
-          this.#startThread();
-          const faulted = this.#deliverFault(ctx);
-          const resumed = e.gex_resume_pc();
-          const nextPc = faulted ?? resumed;
-          // Nowhere to resume (the thread ended, or waits): the run loop's
-          // business, down through every frame.
-          if (nextPc === 0n) {
-            err.gexHandoff = true;
-            throw err;
-          }
-          pc = BigInt.asUintN(64, nextPc);
-          const rc = e.gex_resume_ctx() >>> 0;
-          if (rc && rc !== ctx) return 0;
-          this.#armCallouts();
-        }
-      }
-    } finally {
-      this.#nest.pop();
-      e.gex_exc_unwind?.(level);
-    }
-  }
-
   /** What a dispatch miss needs, installed synchronously on this Worker
    *  (lib.rs `in_place`): 1, or 0 when it cannot be done here (a page's
    *  main thread may not compile synchronously) and the miss traps out. */
@@ -8065,7 +7842,7 @@ export class Gex {
     e.gex_jit_note_external(BigInt(off), bytes.length, Number(a) | 0, Number(b) | 0);
   }
 
-  /** `#installTranslation` without yielding, for `#ntCallback`. */
+  /** `#installTranslation` without yielding, for the nested loops. */
   #installTranslationSync() {
     const e = this.#shim.exports;
     // The queue's front now, not whenever this Worker last pushed or popped:
@@ -8134,7 +7911,7 @@ export class Gex {
     this.#offerModule(ukey, mod, Number(ukey.split(':')[1]) || 0);
   }
 
-  /** `#catchUp` (eager) without yielding, for `#ntCallback`. */
+  /** `#catchUp` (eager) without yielding, for the nested loops. */
   #catchUpSync() {
     const e = this.#shim.exports;
     if (!e.gex_module_count) return;
@@ -8299,7 +8076,7 @@ export class Gex {
           : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
     } catch (err) {
       // The engine refused a translation: hand its bytes to whoever serves
-      // the page (tests/nt's harness keeps them), synchronously, since the
+      // the page (a test harness may keep them), synchronously, since the
       // Worker may be about to die. Best effort.
       if (bytes instanceof Uint8Array && err instanceof WebAssembly.CompileError) {
         // Under Node, `GEX_DUMP_BAD_WASM=DIR` keeps it, as gexc does natively.

@@ -143,32 +143,9 @@ pub(crate) mod stats {
     pub fn note_resume_cause(cause: String, target: u64) {
         *RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((cause, target)).or_default() += 1;
     }
-    /// The causes since the last call, totals first, then the `n` busiest
-    /// (cause, target) pairs.
-    pub fn take_resume_causes(n: usize) -> (Vec<(String, u64)>, Vec<((String, u64), u64)>) {
-        let m = RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-        let mut by: std::collections::HashMap<String, u64> = Default::default();
-        for ((c, _), k) in &m {
-            *by.entry(c.clone()).or_default() += k;
-        }
-        let mut tot: Vec<_> = by.into_iter().collect();
-        tot.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut v: Vec<_> = m.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v.truncate(n);
-        (tot, v)
-    }
     /// Calls the fallback served, and 1 in 1024 of their targets.
     pub static FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static FALLBACK_SITES: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = std::sync::Mutex::new(None);
-    /// The `n` most sampled fallback targets since the last call.
-    pub fn take_fallback_sites(n: usize) -> Vec<(u64, u64)> {
-        let m = FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-        let mut v: Vec<_> = m.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v.truncate(n);
-        v
-    }
     /// Microseconds in the translator, in compiling its modules, and the
     /// longest single lookup miss (translate + compile + install).
     pub static TRANSLATE_US: AtomicU64 = AtomicU64::new(0);
@@ -179,23 +156,6 @@ pub(crate) mod stats {
     pub static QUEUED: AtomicU64 = AtomicU64::new(0);
     pub static DROPPED: AtomicU64 = AtomicU64::new(0);
     pub static LATENCY_US: AtomicU64 = AtomicU64::new(0);
-    pub fn line() -> String {
-        use std::sync::atomic::Ordering::Relaxed;
-        format!(
-            "ftab lookups={} translated={} fallback={} stale={} resumes={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
-            LOOKUPS.load(Relaxed),
-            TRANSLATED.load(Relaxed),
-            FALLBACKS.load(Relaxed),
-            STALE.load(Relaxed),
-            RESUMES.load(Relaxed),
-            TRANSLATE_US.load(Relaxed) / 1000,
-            COMPILE_US.load(Relaxed) / 1000,
-            WORST_US.load(Relaxed) / 1000,
-            QUEUED.load(Relaxed),
-            DROPPED.load(Relaxed),
-            LATENCY_US.load(Relaxed) / 1000
-        )
-    }
 }
 
 /// Room a table keeps past the highest index handed out, so a slot another
@@ -778,8 +738,8 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
 /// runs the code (`GEX_FJIT_BACKGROUND=1`), or on the missing thread before
 /// it carries on (the default). Natively the fallback is tier-1, whose
 /// translation of the same code costs about as much as the JIT's (it is
-/// compiled by the same Cranelift, a block at a time): tests/nt sync runs
-/// 6.0 s (x86) and 9.9 s (x64) in the background against 4.0 s and 3.9 s
+/// compiled by the same Cranelift, a block at a time): a Windows thread-sync
+/// test ran 6.0 s (x86) and 9.9 s (x64) in the background against 4.0 s and 3.9 s
 /// inline. Worth it only with a cheap fallback (the browser's, or an
 /// interpreter).
 pub(crate) fn background() -> bool {
@@ -1070,17 +1030,8 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
-    if crate::profile::active() {
-        crate::profile::note_nt_entry(target);
-    }
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
         *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
-    }
-    // A jump out of an exception being dispatched nested (a handler's
-    // longjmp to its `setjmp`, a `catch` continuation): back to the frames
-    // it was raised under.
-    if crate::nt::exc_escape(caller, target) {
-        return Err(StopExecution.into());
     }
     // No caller waits for a return (a root, or the bridge): leave, and the
     // root dispatches there flat.

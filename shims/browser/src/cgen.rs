@@ -46,19 +46,6 @@ mod dylink;
 /// without one (`--cgen`, as natively).
 static MODE: AtomicU32 = AtomicU32::new(0);
 
-/// An image the NT layer mapped, waiting to be placed.
-struct Pending {
-    path: String,
-    base: u64,
-    pe: Arc<gex_ld::pe::PeImage>,
-    /// When it was mapped (`host_now_ns`), for `GEX_LOG=placelat`.
-    at_ns: u64,
-}
-
-static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
-/// Whether `PENDING` may hold something (set after a push, cleared before a
-/// drain takes it).
-static ANY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // ---- Where each unit is: wanted, claimed, published, installed ----
 //
 // One byte of flags per unit (an index into `UNITS`), changed with atomic
@@ -525,8 +512,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// staged. Atomics and this Worker's own counters only: asked after every
 /// direct entry's call ([`wine64_entry`]), which goes to JS only when one is.
 pub(crate) fn serve_wanted() -> bool {
-    ANY_PENDING.load(Ordering::Acquire)
-        || wanted_any()
+    wanted_any()
         || (HAVE.with(|c| c.get()) as usize) < log_len()
         || wasmdll::behind()
         || elfprov::waiting()
@@ -598,13 +584,6 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode == 0 {
         return;
     }
-    static HOOK: OnceLock<()> = OnceLock::new();
-    if HOOK.set(()).is_ok() {
-        gex_kernel::nt::section::set_image_mapped_hook(|m| {
-            lock(&PENDING).push(Pending { path: m.path.to_string(), base: m.base, pe: Arc::clone(m.pe), at_ns: crate::host_now_ns() });
-            ANY_PENDING.store(true, Ordering::Release);
-        });
-    }
 }
 
 /// A hash of guest page `page` as it is now (the native host's `page_hash`).
@@ -643,46 +622,10 @@ pub(crate) fn in_pe_image(addr: u64) -> bool {
     lock(&PE_IMAGES).iter().any(|&(a, b)| a <= addr && addr < b)
 }
 
-fn is_wine(path: &str) -> bool {
-    path.to_ascii_lowercase().contains("/drive_c/windows/")
-}
-
-/// Place what was mapped since the last call: the key, and the check that
-/// the mapped code is what the unit was built from. Returns whether a unit
-/// now waits for JavaScript (the caller traps to it). A mismatch ends the
-/// run, as natively: running a unit over different code is wrong code.
+/// Whether a unit waits for JavaScript (the caller traps to it). Every
+/// syscall asks: an atomic load when nothing is wanted (no lock).
 pub(crate) fn drain() -> bool {
-    if !on() {
-        return false;
-    }
-    // Every syscall asks: an atomic load when nothing was mapped (no lock).
-    if !ANY_PENDING.load(Ordering::Acquire) && !wanted_any() {
-        return false;
-    }
-    ANY_PENDING.store(false, Ordering::Release);
-    let pending = std::mem::take(&mut *lock(&PENDING));
-    // The NT trampoline page with the first images (the exe says the ABI),
-    // as natively: every Wine DLL's unix calls and syscalls go through it.
-    static TRAMPOLINES: OnceLock<()> = OnceLock::new();
-    if let Some(p) = pending.first() {
-        if TRAMPOLINES.set(()).is_ok() {
-            let (image, _) = gex_kernel::win::trampoline_input(!p.pe.is64);
-            place(&image, "[the NT trampolines]", image.bias, true, None);
-        }
-    }
-    for p in pending {
-        PLACING_AT.with(|c| c.set(p.at_ns));
-        let (image, _) = match gex_xlate::func::pe_input(&p.pe, p.base) {
-            Ok(x) => x,
-            Err(e) => {
-                crate::warn_line(&format!("gex-cgen: {}: placing the image at {:#x}: {e}; tier-1\n", p.path, p.base));
-                continue;
-            }
-        };
-        let wine = is_wine(&p.path);
-        place(&image, &p.path, p.base, wine, Some(&p.pe));
-    }
-    wanted_any()
+    on() && wanted_any()
 }
 
 /// 32-bit Wine (Wine's own Unix side): an i386 image Wine's loader mapped
@@ -778,7 +721,7 @@ fn wine32_trampolines(class32: bool) {
     if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
-    let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
+    let (image, _) = gex_kernel::win::trampoline_input(class32);
     place(&image, "[the trampolines]", image.bias, true, None);
     if crate::tracing() {
         crate::stderr_line(&format!("gex-cgen: the trampolines' unit wanted ({}-bit)\n", if class32 { 32 } else { 64 }));
@@ -876,7 +819,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 memory[lo + i],
                 seg.bytes[i]
             ));
-            crate::nt::end_process(0xc000_0005);
+            crate::end_process(0xc000_0005);
         }
         let first = seg.vaddr / gex_abi::DISPATCH_PAGE;
         let last = (seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
@@ -1459,7 +1402,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
                 }
                 Err(e) => {
                     crate::warn_line(&format!("gex-nt: stateful provider {file}: {e}\n"));
-                    crate::nt::end_process(0xc000_0135);
+                    crate::end_process(0xc000_0135);
                 }
             }
         }
@@ -1545,10 +1488,9 @@ fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
     Err("not a position-independent module (no dylink.0 memory info)".into())
 }
 
-/// Guest pages from the NT allocator, for a stateful provider.
+/// Guest pages for a stateful provider.
 fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
-    gex_kernel::nt::boot::alloc_private(p, crate::sigs::proc_home().mm(), size, name)
+    linux_alloc(size, name)
 }
 
 /// Guest pages in a Linux process (an ELF provider's data and stack): an
@@ -1578,12 +1520,9 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     Ok(start)
 }
 
-/// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
-/// built-in provider's data, heap and stack, which then do not move the DLLs
-/// the program maps after them.
+/// [`provider_alloc_bytes`] for a built-in provider's data, heap and stack.
 fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
-    gex_kernel::nt::boot::alloc_private_top(p, crate::sigs::proc_home().mm(), size, name)
+    linux_alloc(size, name)
 }
 
 /// A built-in stateful provider's data (its `dylink.0` size, aligned).
@@ -1616,7 +1555,7 @@ pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
     // game may fill them (one with its units left no room for a Worker's
     // stack), while only wasm code runs on this one. It comes from the shim's
     // heap, above 2 GiB, zeroed, and lives as long as the process.
-    if crate::winspace::wine32_split() && crate::nt::process().is_none() {
+    if crate::winspace::wine32_split() {
         let layout = std::alloc::Layout::from_size_align(size as usize, 4096).expect("provider stack layout");
         // SAFETY: a non-zero size; the block is never freed (the process's stack).
         let p = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -1637,11 +1576,11 @@ pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
     gex_kernel::clock_ns(crate::browser_clock, clk as u64) as i64
 }
 
-/// `gex.nt_qpc()`: the process clock as NtQueryPerformanceCounter reads it
-/// (100 ns units), for the nt_qpc provider.
+/// `gex.nt_qpc()`: the nt_qpc provider's clock. That provider binds only
+/// to a PE ntdll, which no process here has: always 0.
 #[no_mangle]
 pub extern "C" fn gex_nt_qpc() -> i64 {
-    crate::nt::process().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
+    0
 }
 
 /// Provider module `number`'s data (`__memory_base`), 0 when stateless.
@@ -1683,9 +1622,9 @@ pub extern "C" fn gex_provider_missing(addr: u32) {
     let name = lock(&MISSING).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
     crate::warn_line(&format!(
         "gex-eject: the program called {name} ({}), an export of a replaced library that its provider does not implement\n",
-        crate::nt::describe(addr)
+        format!("{addr:#x}")
     ));
-    crate::nt::end_process(0xc000_0139);
+    crate::end_process(0xc000_0139);
 }
 
 /// Whether the provider data at `base` still needs its relocations applied
@@ -2113,22 +2052,10 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if t == STRAY_PC && stray_restore(c) {
         return gex_abi::ftab::RET_PREDICTED;
     }
-    // A jump out of an exception dispatched nested: back to the frames it
-    // was raised under (nt::exc_escape), the dispatch's loop ends.
-    if crate::nt::exc_escape(ctx, t) {
-        crate::set_resume_none();
-        crate::trap();
-    }
     // An ejected project's run (`gex_set_aot`, docs/eject-pe.md §3.1): no
     // function body holds `t`. AOT-only (`gex_set_jit(0)`), nothing may
     // translate it either.
     if crate::aot() {
-        // A branch to memory nothing executable is mapped at: the guest's
-        // access violation, as natively (34c3e45b).
-        let wild = !crate::sigs::executable(t);
-        if wild {
-            crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
-        }
         // A window-procedure thunk made at run time (gex_kernel::win::thunk):
         // its store done here, then the call goes on to where it jumps.
         if crate::compat_abi() {
@@ -2150,10 +2077,10 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         // placed): catch up, then call it, as the lookup would have (leaving
         // would lose the frames that called here).
         if placed {
-            crate::nt::serve_now();
+            crate::serve_now();
         }
         if let Some(idx) = ftab(|m| m.get(t).map(|f| f.idx)) {
-            crate::nt::serve_now();
+            crate::serve_now();
             CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
             // SAFETY: a host import taking scalars; nothing here holds a lock.
             return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
@@ -2180,15 +2107,14 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         // on top), to tell a lost return from an indirect branch.
         let from = gm.read_u64(c + gex_abi::ctx::LAST_SOURCE as u64).unwrap_or(0);
         let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0) & 0xffff_ffff;
-        let stack: Vec<String> = (0..8u64).map(|i| crate::nt::describe(gm.read_u32(sp + 4 * i).unwrap_or(0) as u64)).collect();
+        let stack: Vec<String> = (0..8u64).map(|i| format!("{:#x}", gm.read_u32(sp + 4 * i).unwrap_or(0))).collect();
         crate::warn_line(&format!(
             "gex-eject: the guest reached {t:#x} ({path}), which no unit, region entry or provider holds, \
              and this project runs without translation: record a session that reaches it and re-eject \
-             (from {}, ret {ret:#x}, sp {sp:#x} stack [{}])\n",
-            crate::nt::describe(from),
+             (from {from:#x}, ret {ret:#x}, sp {sp:#x} stack [{}])\n",
             stack.join(" ")
         ));
-        crate::nt::end_process(0xc000_001d);
+        crate::end_process(0xc000_001d);
     }
     // The awaited return itself, reached with the stack moved: a callee that
     // returns having changed `esp` (MSVC's `__chkstk`, `__SEH_prolog4`), whose
@@ -2224,7 +2150,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if CALLOUTS.with(|c| c.borrow().len()) >= limit {
         if pad {
             crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {limit}: the process ends (stack overflow)\n"));
-            crate::nt::end_process(0xc000_00fd);
+            crate::end_process(0xc000_00fd);
         }
         if limit == CALLOUT_MAX_DEPTH_PROVIDER {
             crate::warn_line(&format!("gex: a provider's guest calls nest deeper than {limit}\n"));
@@ -2342,10 +2268,8 @@ fn cout_stat(t: u64, ret: u64) {
     });
     if k == 64 {
         crate::warn_line(&format!(
-            "[cout] pid {} hot target {t:#x} ({}), from ret {ret:#x} ({}), 64 call-outs; served by fjit {}\n",
+            "[cout] pid {} hot target {t:#x}, from ret {ret:#x}, 64 call-outs; served by fjit {}\n",
             crate::gex_my_pid(),
-            crate::nt::describe(t),
-            crate::nt::describe(ret),
             ftab(|m| m.get(t).is_some()),
         ));
     }
@@ -2644,26 +2568,11 @@ pub extern "C" fn gex_callout_unwind(depth: u32) {
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth as usize));
 }
 
-/// NT user-mode callbacks in progress on this Worker.
-pub(crate) fn callback_depth() -> u32 {
-    CB_DEPTH.with(|d| d.get())
-}
-
-/// An NT user-mode callback begins (or ends) on this Worker.
-pub(crate) fn callback(enter: bool) {
-    CB_DEPTH.with(|d| d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) }));
-}
-
 /// The call-out a miss found returned (its depth, 0 outermost), or -1;
 /// reading it clears it.
 #[no_mangle]
 pub extern "C" fn gex_callout_hit() -> i32 {
     HIT.with(|h| h.replace(-1))
-}
-
-/// Call-outs made and left (for the stats line).
-pub(crate) fn callouts() -> (u64, u64) {
-    (CALLOUT_N.load(Ordering::Relaxed), CALLOUT_LEFT.load(Ordering::Relaxed))
 }
 
 /// How dispatch reaches `pc` in this Worker: `table << 32 | index`, the
@@ -2722,7 +2631,7 @@ fn runtime() -> &'static Vec<u8> {
             })
         };
         // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
-        // gex-ftab-runtime-...`; tests/nt/aot-share.mjs).
+        // gex-ftab-runtime-...`).
         let name = b"gex-ftab-runtime";
         let mut sub = vec![name.len() as u8];
         sub.extend_from_slice(name);

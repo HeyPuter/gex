@@ -36,9 +36,10 @@ pub mod decompile;
 #[cfg(feature = "build")]
 pub mod eject;
 pub mod json;
-pub mod pe;
 #[cfg(feature = "build")]
 pub mod plt;
+#[cfg(feature = "build")]
+pub mod provider;
 pub mod project;
 pub mod fanout;
 pub mod reach;

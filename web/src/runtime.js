@@ -1098,8 +1098,7 @@ async function runProgramHere(
       doorStats: globalThis.GEX_DOOR_STATS || undefined,
       fcacheStats: globalThis.GEX_FCACHE_STATS || undefined,
       // `?timescale=N&fixedtime=S` (benchmarks only): the monotonic clocks
-      // N times real speed, the wall clock starting at Unix time S, as
-      // pewasm's PEWASM_TIME_SCALE and PEWASM_FIXED_TIME.
+      // N times real speed, the wall clock starting at Unix time S.
       timeScale: globalThis.GEX_TIME_SCALE || undefined,
       fixedTime: globalThis.GEX_FIXED_TIME || undefined,
       calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,

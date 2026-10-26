@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>gex NT test page</title>
+    <title>gex Wine test page</title>
     <style>
       html, body { margin: 0; background: #000; }
       canvas { display: block; }
@@ -10,8 +10,8 @@
     </style>
   </head>
   <body>
-    <!-- A Windows program on gex's NT layer, its windows in the page's
-         compositor: tests/nt/browser-gui.mjs drives this. -->
+    <!-- A Windows program on 32-bit Wine, its windows in the page's
+         compositor: tools/wine-wasm/wine32/page-run.mjs drives this. -->
     <canvas id="out"></canvas>
     <pre id="log"></pre>
     <script type="module" src="/src/nt-page.js"></script>

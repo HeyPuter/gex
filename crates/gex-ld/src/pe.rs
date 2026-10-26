@@ -299,13 +299,6 @@ impl ImportName {
             ImportName::Ordinal(o) => format!("#{o}"),
         }
     }
-    /// pewasm's spelling: `name`, or `ordinal_N`.
-    pub fn pewasm_label(&self) -> String {
-        match self {
-            ImportName::Name { name, .. } => name.clone(),
-            ImportName::Ordinal(o) => format!("ordinal_{o}"),
-        }
-    }
     /// The key two imports of the same thing share: the hint is advisory.
     fn key(&self) -> ImportKey {
         match self {
@@ -1472,7 +1465,7 @@ pub struct PeLayout {
     /// Fixed bases by lower-case module name. A pinned image goes exactly
     /// there, the floor, ceiling and reserved ranges notwithstanding (only
     /// overlap with other images is still refused): this is how a layout
-    /// from somewhere else (a previous run, or pewasm) is reproduced.
+    /// from somewhere else (a previous run) is reproduced.
     pub pins: BTreeMap<String, u64>,
 }
 

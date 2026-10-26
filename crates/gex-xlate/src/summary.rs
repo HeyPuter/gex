@@ -3,8 +3,7 @@
 //! Each function is analysed by abstract interpretation over its memory-form
 //! CFG, with its callees' summaries standing in for the calls, and the
 //! results are iterated to a fixpoint over the call graph's strongly
-//! connected components, callees first. The rule is pewasm's
-//! (`opt_program.cc`): **summaries over-approximate and never guess.**
+//! connected components, callees first. The rule: **summaries over-approximate and never guess.**
 //! Anything unknown (an unresolved indirect jump, an indirect call, a callee
 //! that was not recovered, a syscall that is not on the known-harmless list)
 //! makes the affected parts of the summary "everything".

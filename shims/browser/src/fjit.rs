@@ -216,11 +216,6 @@ pub extern "C" fn gex_fjit_on() -> i32 {
     on() as i32
 }
 
-/// Translations made and declined (for the stats line).
-pub(crate) fn counts() -> (u64, u64) {
-    (TRANSLATED.load(Ordering::Relaxed), DECLINED.load(Ordering::Relaxed))
-}
-
 /// The bridge handed `addr` back to tier-1: serve it no more.
 pub(crate) fn tier1_only(addr: u64) {
     lock(&TIER1_ONLY).get_or_insert_with(Default::default).insert(addr);
@@ -567,7 +562,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     idx
 }
 
-/// `wasm` with a module name, `gex-fjit` (tests/nt/aot-share.mjs: jit).
+/// `wasm` with a module name, `gex-fjit`, which a CPU profile shows.
 fn named(mut wasm: Vec<u8>) -> Vec<u8> {
     let name = b"gex-fjit";
     let mut sec = vec![4u8];

@@ -1617,7 +1617,7 @@ mod tests {
     /// Past the stored bytes, up to the mapped size, a fetch reads zeros:
     /// from inside the stored bytes (an instruction ending in a trimmed zero)
     /// and from wholly past them (where `bytes[off..]` once panicked,
-    /// stopping `cgen-prefix` on a Wine DLL).
+    /// stopping a unit build on a Wine DLL).
     #[test]
     fn a_fetch_reads_zeros_past_the_stored_bytes() {
         let mut img = image_with(&[0x9090_9090], 0x1000);

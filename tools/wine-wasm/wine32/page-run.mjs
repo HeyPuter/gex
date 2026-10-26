@@ -26,7 +26,7 @@ if (!tree || !exe) {
   process.exit(2);
 }
 const secs = Number(secsArg) || 0;
-const { openPage, sleep, stopAll } = await import(join(tree, 'tests/nt/browser-harness.mjs'));
+const { openPage, sleep, stopAll } = await import(join(tree, 'web/test/browser-harness.mjs'));
 const size = process.env.WINE32_PAGE_SIZE || '1280x720';
 const [w, h] = size.split('x').map(Number);
 const tars = process.env.WINE32_PAGE_TARS;

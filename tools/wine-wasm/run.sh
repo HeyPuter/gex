@@ -16,7 +16,7 @@
 # web/build-mesa-wasm.sh). Two bundles: the dist at /w3 (WINE32_PAGE_DIR/wine32-KEY.tar,
 # made once per dist) and the prefix at /pfx, the host's xkb data at /usr and
 # EXE's directory at /g. The run tree (WINE32_PAGE_DIR/tree-NAME: hard links to
-# TREE's web, shims/browser/js and tests/nt) and the unit cache are synced to
+# TREE's web and shims/browser/js) and the unit cache are synced to
 # the box; it runs until the program exits or --timeout (default 300 s), and
 # prints the program's output, "unitless:" lines and an "== w3 page:" result
 # (wine32/page-run.mjs). With --build-units the unitless images' units are built
@@ -109,8 +109,8 @@ if [ -n "$page" ]; then
   wt=$pg/wine32-$WINE32_KEY.tar
   [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),w3," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
   # The run tree, at one path per program, so the box's copy updates by difference.
-  rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/web" "$rt/shims/browser" "$rt/tests" "$rt/tools/wine-wasm/wine32"
-  for d in web/nt.html web/vite.config.js web/package.json web/src web/test web/node_modules web/public web/eject-site/vendor shims/browser/js tests/nt; do
+  rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/web" "$rt/shims/browser" "$rt/tools/wine-wasm/wine32"
+  for d in web/nt.html web/vite.config.js web/package.json web/src web/test web/node_modules web/public web/eject-site/vendor shims/browser/js; do
     mkdir -p "$rt/$(dirname "$d")"; cp -al "$page/$d" "$rt/$(dirname "$d")/" 2>/dev/null || cp -a "$page/$d" "$rt/$(dirname "$d")/"
   done
   rm -rf "$rt/web/public/gex/nt"; mkdir -p "$rt/web/public/gex/nt"

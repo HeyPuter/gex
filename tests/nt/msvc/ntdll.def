@@ -1,7 +1,0 @@
-LIBRARY ntdll.dll
-EXPORTS
-_alldiv@16
-_aulldiv@16
-_allrem@16
-_aullrem@16
-_allmul@16

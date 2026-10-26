@@ -28,7 +28,6 @@ members = [
     "crates/gex-gpu",
     "crates/gex-gl",
     "crates/gex-eject",
-    "crates/gex-rt",
     "crates/gexc",
     "shims/browser",
     "shims/hostwl",

@@ -110,7 +110,7 @@ fn instantiate(
         match map.get(&key) {
             Some(m) => m.clone(),
             None => {
-                // Through gex_cache, so gex-rt (which links no compiler) can load it.
+                // Through gex_cache, so a runtime that links no compiler can load it.
                 let compiled = match &disk {
                     Some((dir, build)) => {
                         let k = gex_cache::key(build, [b"wasmjit".as_slice(), &wasm]);

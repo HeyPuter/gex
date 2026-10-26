@@ -66,8 +66,8 @@ for debugging and for building what a page loads ahead of time.
   never a wrong branch.
 - **Ahead-of-time builds.** `gexc run --record` records what a run loaded
   and executed. `gexc eject` turns a recording into a project that builds
-  everything ahead of time. Its runtime (`gex-rt`) has no translator and no
-  wasm compiler in it. `web/eject-site.mjs` makes the web build of an
+  everything ahead of time, and runs only what that build made.
+  `web/eject-site.mjs` makes the web build of an
   ejected project into a static site. The site is a JavaScript library that
   your own page imports.
 
@@ -90,7 +90,7 @@ for debugging and for building what a page loads ahead of time.
 | `crates/gex-cache`, `gex-key` | the compiled-module cache and the content keys every host agrees on |
 | `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
 | `crates/gex-gl` | OpenGL ES passthrough for the native host |
-| `crates/gex-eject`, `gex-rt` | ejected projects and their ahead-of-time runtime |
+| `crates/gex-eject` | ejected projects, built and run ahead of time |
 | `shims/browser` | the browser host: the kernel compiled to wasm, beside each guest |
 | `shims/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
 | `shims/hostwl` | the compositor for an X server that runs in the page |

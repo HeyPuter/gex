@@ -21,7 +21,6 @@ pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
-pub mod nt;
 pub mod pe_units;
 pub mod wasmprog;
 pub(crate) mod dylink;
@@ -111,6 +110,13 @@ const PROFILE_LIMIT: usize = 1 << 18;
 /// Back-edges between signal polls. Small enough that delivery is prompt,
 /// large enough that the check is noise.
 const SAFEPOINT_INTERVAL: i32 = 1024;
+
+/// A system call made by native Wine on wasm32 (gexrt's `__gexw_syscall`)
+/// carries this bit in its `pc`: a call that sends the thread elsewhere (an
+/// APC, an NtContinue) writes that state into the context and returns
+/// normally, as the program's native frames cannot be left and resumed; the
+/// caller runs it or unwinds itself.
+pub(crate) const NATIVE_SYSCALL: u64 = 1 << 61;
 
 /// Signal numbers the runtime raises.
 pub mod signal {
@@ -263,14 +269,8 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
-    /// This store's NT thread, once a syscall has looked it up.
-    nt_thread: Option<Arc<gex_kernel::nt::Thread>>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
-    /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
-    /// last: the stack pointer at each `NtRaiseException`. Control that
-    /// reaches the host with the stack above one has left that dispatch.
-    pub(crate) exc_levels: Vec<u64>,
     /// The host function watched slots hold (`watch_stub`).
     watch_stub: Option<wasmtime::Func>,
     /// Where the guest is spending its time, when anyone asked.
@@ -291,8 +291,6 @@ struct HostState {
     store_limits: wasmtime::StoreLimits,
     /// This store's profile counters, when recording. See `profile`.
     prof: Option<profile::StoreProf>,
-    /// Set for a Windows process: every `syscall` is an NT call. See `nt`.
-    nt: Option<Arc<gex_kernel::nt::Process>>,
     /// This store's instances of an ejected project's replacement modules,
     /// made on the first call. See `aot`.
     repl: Option<aot::StoreRepl>,
@@ -363,8 +361,6 @@ struct SpawnContext {
     limits: gex_xlate::BlockLimits,
     /// Where this process's objects are, for naming profile counts.
     prof_proc: Option<Arc<profile::ProcProf>>,
-    /// The NT process, for a Windows program's threads. See `nt`.
-    nt: Option<Arc<gex_kernel::nt::Process>>,
     /// A fork's child: the forking thread's blocks for `dlopen`ed modules'
     /// thread-local data, by module, which its first thread keeps
     /// (`dylink::thread_tls` takes each as it instantiates the module).
@@ -402,25 +398,6 @@ pub(crate) mod jit_stats {
         LAST[n % 4].store(pc, Relaxed);
         LO.fetch_min(pc, Relaxed);
         HI.fetch_max(pc, Relaxed);
-    }
-    pub fn line() -> String {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (lo, hi) = (LO.swap(u64::MAX, Relaxed), HI.swap(0, Relaxed));
-        format!(
-            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} stale={} slots={} grown={} t1cache={}/{} t1compile_ms={}",
-            LAST.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>(),
-            PUBLISHED.load(Relaxed),
-            BLOCKS.load(Relaxed),
-            WASM_BYTES.load(Relaxed) >> 20,
-            INSTALLS.load(Relaxed),
-            RETIRED.load(Relaxed),
-            STALE.load(Relaxed),
-            SLOTS.load(Relaxed),
-            GROWN.load(Relaxed),
-            CACHE_HITS.load(Relaxed),
-            CACHE_HITS.load(Relaxed) + CACHE_MISSES.load(Relaxed),
-            COMPILE_US.load(Relaxed) / 1000
-        )
     }
 }
 
@@ -743,7 +720,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
-    run_program_with(program, opts, xlate, None, None)
+    run_program_with(program, opts, xlate, None)
 }
 
 /// What survives an `execve`: the kernel, the process table, and the host-side
@@ -839,7 +816,6 @@ fn run_program_with(
     opts: &RunOptions,
     xlate: &Options,
     inherited: Option<Inherited>,
-    nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
     let fresh_process = inherited.is_none();
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
@@ -904,7 +880,7 @@ fn run_program_with(
     // hit skips it and reports empty stats apart from the sidecar block count.
     let mut stats = Stats::default();
     let translate = || {
-        // Without the translator (gex-rt) only an ejected project's
+        // Without the translator only an ejected project's
         // AOT-only process gets here, and it never calls this.
         #[cfg(not(feature = "translate"))]
         panic!("{} has no translator to translate the program image", env!("CARGO_PKG_NAME"));
@@ -1184,9 +1160,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
-            nt_thread: None,
             callout_signal: None,
-            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: sampler.clone(),
             wayland: compositor.clone(),
@@ -1197,7 +1171,6 @@ fn run_program_with(
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
-            nt: None,
             repl: None,
         },
     );
@@ -1299,9 +1272,7 @@ fn run_program_with(
             limits: xlate.limits,
             ftab: None,
         });
-        // (An NT program's images are the NT layer's to describe: as before,
-        // the translator starts from nothing for it.)
-        if let Some(t) = gex_kernel::ftab::translator().filter(|_| nt_setup.is_none()) {
+        if let Some(t) = gex_kernel::ftab::translator() {
             let process = store.data().jit.as_ref().map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.process.0);
             if let Some(process) = process {
                 t.image(process, program, xlate.image_elf.as_deref());
@@ -1312,28 +1283,19 @@ fn run_program_with(
         aot::install_shared(&mut store, aot_shared)?;
     }
 
-    let entry = match nt_setup {
-        Some(setup) => {
-            let pc = nt::boot(&mut store, memory.clone(), setup)?;
-            pe_units::drain_in_store(&mut store)?;
-            pc
-        }
-        None => {
-            place_image(
-                &mut store,
-                memory.clone(),
-                program,
-                opts,
-                Identity {
-                    uid,
-                    gid,
-                    interp_base: program.interp_base(),
-                    entry_hook: 0,
-                },
-            )?;
-            program.entry()
-        }
-    };
+    place_image(
+        &mut store,
+        memory.clone(),
+        program,
+        opts,
+        Identity {
+            uid,
+            gid,
+            interp_base: program.interp_base(),
+            entry_hook: 0,
+        },
+    )?;
+    let entry = program.entry();
 
     // Publish the image's page-directory entries, without which none of its
     // blocks are reachable through the table.
@@ -1350,34 +1312,32 @@ fn run_program_with(
     // A native wasm32 program (stream W): its module, not its x86 bytes,
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
-    if nt_setup.is_none() {
-        // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
-        // Windows' fixed addresses left free, and the trampoline page (its
-        // x86-64 entries and the native return pad serve 64-bit Wine)
-        if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
-            store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
-            // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
-            // constant addresses folded there, the old page and above a
-            // named fault (`gex_abi::KUSER_GUARD`).
-            let f = wasmprog::flags(program);
-            if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_WINE32 != 0 {
-                gex_abi::set_kuser_fold(true);
-                gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
-            }
-            // The NT layer's trampoline page, which native Wine's gexrt
-            // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
-            // wrappers): the same bytes at the same address.
-            use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
-            let page = gex_kernel::win::trampoline_page();
-            if let Some(dst) = memory.bytes().get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
-                dst.copy_from_slice(&page);
-            }
-            store.data_mut().with_kernel(|k| {
-                k.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
-            });
+    // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
+    // Windows' fixed addresses left free, and the trampoline page (its
+    // x86-64 entries and the native return pad serve 64-bit Wine)
+    if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
+        store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+        // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
+        // constant addresses folded there, the old page and above a
+        // named fault (`gex_abi::KUSER_GUARD`).
+        let f = wasmprog::flags(program);
+        if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_WINE32 != 0 {
+            gex_abi::set_kuser_fold(true);
+            gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
         }
-        wasmprog::install(&mut store, &memory, program)?;
+        // The NT layer's trampoline page, which native Wine's gexrt
+        // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
+        // wrappers): the same bytes at the same address.
+        use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
+        let page = gex_kernel::win::trampoline_page();
+        if let Some(dst) = memory.bytes().get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
+            dst.copy_from_slice(&page);
+        }
+        store.data_mut().with_kernel(|k| {
+            k.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
+        });
     }
+    wasmprog::install(&mut store, &memory, program)?;
 
     if opts.verbose {
         eprintln!(
@@ -1408,7 +1368,6 @@ fn run_program_with(
         jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
         limits: xlate.limits,
         prof_proc: prof_proc.clone(),
-        nt: store.data().nt.clone(),
         fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
     });
     note_live_process(&spawn);
@@ -2209,9 +2168,7 @@ fn run_thread_loop(
                 // SIGSEGV, as it would natively, or its handler runs. The
                 // translated code cannot say which instruction faulted, so
                 // the handler sees the context as last written back.
-                if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds))
-                    && store.data().nt.is_none()
-                {
+                if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
                     let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
                     // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
                     if std::env::var_os("GEX_TRACE_SEGV").is_some() {
@@ -2660,8 +2617,6 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         jit_shared: cx.jit_shared.clone(),
         limits: cx.limits,
         prof_proc: profile::fork_process(&cx.prof_proc),
-        // Windows has no fork: only a Linux process gets here.
-        nt: None,
         fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
     });
     note_live_process(&child_cx);
@@ -2762,9 +2717,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
-            nt_thread: None,
             callout_signal: None,
-            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
@@ -2775,7 +2728,6 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
-            nt: cx.nt.clone(),
             repl: None,
         },
     );
@@ -3119,7 +3071,6 @@ fn exec_program(
             proc_state,
             wayland,
         }),
-        None,
     )
 }
 
@@ -3140,9 +3091,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
-            nt_thread: None,
             callout_signal: None,
-            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
@@ -3153,7 +3102,6 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
-            nt: cx.nt.clone(),
             repl: None,
         },
     );
@@ -4034,9 +3982,6 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
 /// raised as an access violation for a Windows program, SIGSEGV otherwise.
 fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64) -> Result<()> {
     eprintln!("gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation");
-    if caller.data().nt.is_some() {
-        return nt::fault(caller, nt::Fault::LowWrite(addr), pc);
-    }
     caller.data_mut().exit = Some(Exit::Signal {
         signal: 11,
         pc,
@@ -4054,13 +3999,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { let r = (|| -> anyhow::Result<()> {
-            if caller.data().nt.is_some() {
-                let r = nt::syscall_import(&mut caller, pc as u64);
-                check_i386_high(&caller, "an NT syscall");
-                return r;
-            }
             // A Unix call from guest code under Wine's own Unix side (32-bit Wine).
-            if pc as u64 & nt::NATIVE_SYSCALL == 0 {
+            if pc as u64 & NATIVE_SYSCALL == 0 {
                 if let Some(memory) = caller.data().memory.clone() {
                     let ctx_addr = caller.data().thread.ctx_addr;
                     if read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32 == gex_kernel::win::nr::UNIX_CALL
@@ -4073,7 +4013,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // gexrt's NATIVE_LEFT under Wine's own Unix side (32-bit Wine), which
             // has no NT layer to take it: as `nt::syscall_import` does, the
             // innermost native call-out the guest has left is abandoned.
-            if pc as u64 & nt::NATIVE_SYSCALL != 0 {
+            if pc as u64 & NATIVE_SYSCALL != 0 {
                 if let Some(memory) = caller.data().memory.clone() {
                     let ctx_addr = caller.data().thread.ctx_addr;
                     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
@@ -4485,18 +4425,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
             }
-            if nt::exc_escape(&mut caller, pc) {
-                return Err(StopExecution.into());
-            }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
                 // Installed in this store: the miss stub dispatches again
                 // in place, keeping every wasm frame below it.
                 Ok(true) => Ok(gex_emit::module::DISPATCH_MISS_REDISPATCH),
                 Ok(false) => {
-                    if caller.data().nt.is_some() {
-                        return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
-                    }
                     branch_not_executable(&mut caller, pc)
                 }
                 Err(e) => {
@@ -4516,19 +4450,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
-            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64;
-            if caller.data().nt.is_some() {
-                // What gex could not decode, or a deliberate trap: the bytes
-                // say which (the guest's handler may take it either way).
-                if let Some(m) = caller.data().memory.clone() {
-                    let gm = GuestMem::new(m.bytes());
-                    let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
-                    eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
-                    fault_context(&gm, _ctx, pc as u64);
-                }
-                return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
-            }
             let pc = pc as u64;
             let raw = raw as u32;
             if deliver_guest_fault(&mut caller, fault_code::ILLEGAL_INSTRUCTION, pc, pc)? {
@@ -4609,7 +4531,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 });
                 return Err(StopExecution.into());
             }
-            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
             if imm == gex_abi::imports::BRK_TRAP_PC || imm == gex_abi::imports::BRK_TRACE {
@@ -4648,35 +4569,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 }
                 return Ok(());
-            }
-            if caller.data().nt.is_some() {
-                // A privileged instruction: log the bytes there now and the
-                // block that trapped, so a stale or misaligned translation
-                // (bytes that are no longer `hlt`/`in`/`out`/`int n`) shows.
-                if trace_ring_on() && imm != gex_abi::imports::BRK_GENERAL_PROTECTION {
-                    if let Some(m) = caller.data().memory.clone() {
-                        eprintln!("gex-nt: fault {imm} at {:#x}", pc as u64);
-                        fault_context(&GuestMem::new(m.bytes()), ctx, pc as u64);
-                    }
-                }
-                if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
-                    if let Some(m) = caller.data().memory.clone() {
-                        let gm = GuestMem::new(m.bytes());
-                        let at = |a: u64| -> String { gm.read(a, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")).unwrap_or_default() };
-                        let c = ctx as u32 as u64;
-                        let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
-                        let tgt = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
-                        eprintln!(
-                            "gex-nt: privileged instruction at {:#x}: {} (last source {src:#x}: {}; last target {tgt:#x}: {})",
-                            pc as u64,
-                            at(pc as u64),
-                            at(src),
-                            at(tgt)
-                        );
-                        fault_context(&gm, ctx, pc as u64);
-                    }
-                }
-                return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
@@ -4760,7 +4652,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // call-out caught. Its native caller is gone, so no handler can
             // make sense of it; say so instead of raising a breakpoint at an
             // address no code has.
-            if pc as u64 == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD {
+            if pc as u64 == gex_kernel::win::tramp::NATIVE_RETURN_PAD {
                 let sp = caller.data().memory.clone().and_then(|m| GuestMem::new(m.bytes()).read_u64(caller.data().thread.ctx_addr + ctx::x(sp_index()) as u64).ok()).unwrap_or(0);
                 let open: Vec<String> = caller.data().callouts.iter().map(|co| format!("{:#x} sp {:#x} slot {:?} live {}", co.ret, co.sp_want, co.slot.as_ref().map(|s| s.0), co.live)).collect();
                 let detail = format!("BUG: a guest return reached native Wine's return pad {pc:#x} (sp {sp:#x}) with no call-out catching it; call-outs open: {open:?}");
@@ -5061,9 +4953,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            if nt::exc_escape(&mut caller, pc as u64) {
-                return Err(StopExecution.into());
-            }
             // A call-out whose caller's frame the stack has unwound past
             // (longjmp, an exception) is abandoned: its caller leaves.
             if let Some(co) = caller.data().callouts.last() {
@@ -5121,11 +5010,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
-            // An NT thread another has suspended (NtSuspendThread) stops
-            // here, its registers written back, until it is resumed.
-            if let Some(p) = state.nt.clone() {
-                gex_kernel::nt::suspend_point(&p, ctx_addr);
-            }
             // A stateful provider's collection stops guest threads here.
             if libprov::guest_stop().active() {
                 libprov::guest_stop().park_if_stopping(state.thread.tid as u32, gm.bytes, false);
@@ -5167,12 +5051,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
-    // No translator in this build (gex-rt): nothing is ever translated.
+    // No translator in this build: nothing is ever translated.
     if cfg!(not(feature = "translate")) {
         return Ok(false);
-    }
-    if caller.data().nt.is_some() && profile::active() {
-        profile::note_nt_entry(pc);
     }
     // With runtime translation off, a miss is still worth catching up on --
     // another thread or a freshly mapped object may already have covered this
@@ -5688,11 +5569,6 @@ fn install_unit(
 /// by image.
 static TIER1_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
 
-/// Tier-1's translated blocks so far, by page.
-pub(crate) fn tier1_pages() -> Vec<(u64, u64)> {
-    TIER1_PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.iter().map(|(p, n)| (*p, *n)).collect()).unwrap_or_default()
-}
-
 /// Sampled nest exits by (the root's function, where it went), one in 4096.
 static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
 
@@ -5700,24 +5576,6 @@ static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = M
 /// `function->target count`.
 /// Sampled nest exits that were not a plain return (see NEST_EXIT_SAMPLE).
 static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
-
-/// The `n` most sampled leaves since the last call, and their total.
-pub(crate) fn take_leave_sites(n: usize) -> (u64, Vec<(u64, u64, u64)>) {
-    let m = LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-    let total = m.values().sum();
-    let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
-    v.sort_by(|a, b| b.2.cmp(&a.2));
-    v.truncate(n);
-    (total, v)
-}
-
-pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
-    let m = EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-    let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
-    v.sort_by(|a, b| b.2.cmp(&a.2));
-    v.truncate(n);
-    v
-}
 
 /// A function-tier call-out in progress (`call_out`): the return it waits
 /// for, and the dispatch slot it watches for it with the old content.
@@ -5748,9 +5606,6 @@ pub(crate) enum CalloutSignal {
     Bypass(wasmtime::Func),
     /// The stack unwound past the innermost call-out's caller.
     Abort,
-    /// Control left nested exception dispatch `i` (`nt::raise_nested`) for
-    /// the state in the context: every loop between passes it on.
-    Escape(usize),
 }
 
 /// Call-outs nested deeper than this leave instead: each holds a host frame
@@ -6375,12 +6230,6 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
                     next = Some(f);
                     continue;
                 }
-                // Not a frame of this call-out's: down to the dispatch's
-                // loop, every wasm frame between with it.
-                sig @ CalloutSignal::Escape(_) => {
-                    caller.data_mut().callout_signal = Some(sig);
-                    break Err(anyhow::Error::from(e));
-                }
             }
         }
         if caller.data().exit.is_some() {
@@ -6920,9 +6769,6 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
 /// Record a taken resume's cause (set with `resume_at`) and target, under
 /// GEX_WIN_STATS; `taker` names the loop that took it when no cause was set.
 pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
-    if state.nt.is_some() && profile::active() {
-        profile::note_nt_entry(target);
-    }
     let cause = state.resume_cause.take();
     if crate::ftab::stats_on() {
         crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);
@@ -6977,29 +6823,6 @@ thread_local! {
     /// `GEX_TRACE_RING=1`: the last blocks this thread entered among those
     /// traced (`GEX_TRACE_RANGE`): pc, rsp, [rsp], last target, last source.
     static TRACE_RING: std::cell::RefCell<std::collections::VecDeque<[u64; 5]>> = Default::default();
-}
-
-fn fault_context(gm: &GuestMem<'_>, ctx: i32, pc: u64) {
-    TRACE_RING.with(|t| {
-        for e in t.borrow().iter() {
-            eprintln!("gex-nt:   ring pc {:#x} rsp {:#x} [rsp] {:#x} last {:#x}<-{:#x}", e[0], e[1], e[2], e[3], e[4]);
-        }
-    });
-    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
-    if let Ok(b) = gm.read(pc.saturating_sub(64), 96) {
-        eprintln!("gex-nt:   bytes {:#x}: {}", pc.saturating_sub(64), hex(&b));
-    }
-    let c = ctx as u32 as u64;
-    let sp = gm.read_u64(c + gex_abi::ctx::X as u64 + 4 * 8).unwrap_or(0);
-    let words: Vec<String> = (0..12).map(|i| format!("{:#x}", gm.read_u64(sp + 8 * i).unwrap_or(0))).collect();
-    eprintln!("gex-nt:   rsp {sp:#x}: {}", words.join(" "));
-    let ret = gm.read_u64(sp).unwrap_or(0);
-    if let Ok(b) = gm.read(ret.saturating_sub(32), 40) {
-        eprintln!("gex-nt:   before [rsp] {:#x}: {}", ret.saturating_sub(32), hex(&b));
-    }
-    let names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
-    let regs: Vec<String> = (0..16).map(|i| format!("{}={:#x}", names[i], gm.read_u64(c + gex_abi::ctx::X as u64 + 8 * i as u64).unwrap_or(0))).collect();
-    eprintln!("gex-nt:   regs {}", regs.join(" "));
 }
 
 /// The PE images Wine mapped in this process (`gex.image_mapped`): base,

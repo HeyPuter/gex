@@ -154,7 +154,6 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let mut out = None;
             let mut then_build = false;
             let mut web_shim = None;
-            let mut web_page = None;
             let mut web_src = None;
             let mut unit_cache: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
                 .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
@@ -171,10 +170,6 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     "--web-shim" => {
                         i += 1;
                         web_shim = Some(PathBuf::from(args.get(i).context("--web-shim needs gex_browser.wasm")?));
-                    }
-                    "--web-page" => {
-                        i += 1;
-                        web_page = Some(PathBuf::from(args.get(i).context("--web-page needs a directory (web/build-eject-page.sh DIR)")?));
                     }
                     "--web-src" => {
                         i += 1;
@@ -243,7 +238,6 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     runtime,
                     runtime_build: gex_cache::build_fingerprint(),
                     web_shim,
-                    web_page,
                 },
             )?;
             eprintln!(
@@ -282,46 +276,6 @@ fn build(dir: &std::path::Path) -> Result<()> {
             w.units,
             if w.features_off.is_empty() { "none".to_string() } else { w.features_off.join(", ") }
         );
-        return Ok(());
-    }
-    if let Some(pe) = &r.pe {
-        for (path, base, entries, bytes, how) in &pe.units {
-            eprintln!("  {path:<60} {base:#10x} {entries:>7} entries {:>7} KiB  {how}", bytes / 1024);
-        }
-        for (names, iat, bytes) in &pe.groups {
-            eprintln!("  link group {names}: {iat} IAT call sites made direct, {} KiB", bytes / 1024);
-        }
-        for (path, n) in &pe.regions {
-            eprintln!("  region entries: {path}: {n}");
-        }
-        if !pe.providers.is_empty() {
-            eprintln!("  providers: {}", pe.providers.join(", "));
-        }
-        for (path, left) in &pe.left {
-            let f: Vec<String> = left.iter().map(|a| format!("{a:#x}")).collect();
-            eprintln!(
-                "  warning: {path}: {} functions have no AOT code (gex-cgen left them to tier-1: clang wanted a shadow stack): {}; the run stops if it reaches one",
-                left.len(),
-                f.join(" ")
-            );
-        }
-        for (path, n, first) in &pe.uncovered {
-            let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
-            eprintln!("  warning: {path}: {n} entries the session reached have no function or region entry (first: {})", f.join(" "));
-        }
-        if !pe.web_units.is_empty() {
-            let count = |h: &str| pe.web_units.iter().filter(|(_, x)| *x == h).count();
-            eprintln!(
-                "  web build: {} units ({}; {} present, {} reused, {} built), {} region entries; ./run.mjs",
-                pe.web_units.len(),
-                if std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1") { "guarded, build/web/cgen" } else { "unguarded: the native units, build/units" },
-                count("present"),
-                count("reused"),
-                count("built"),
-                pe.web_regions
-            );
-        }
-        eprintln!("{}: built ({} files in build/rootfs; no run-time translation)", dir.display(), r.rootfs_files);
         return Ok(());
     }
     for i in &r.images {

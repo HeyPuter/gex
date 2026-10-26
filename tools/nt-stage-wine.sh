@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Stage Wine's PE DLLs and NLS files into a gex Windows prefix (docs/nt-layer.md §8).
+# Stage Wine's PE DLLs and NLS files into a gex Windows prefix, which 32-bit
+# Wine's dist is staged from (tools/wine-wasm/stage-native.sh).
 #
 #   tools/nt-stage-wine.sh [PREFIX]          stage (default ~/.cache/gex/wine-11.15)
 #   tools/nt-stage-wine.sh --manifest        regenerate the manifest from the host
-#
-# Then, with a gexc around, `gexc cgen-prefix` compiles the core DLLs for the
-# function tier (below; GEX_STAGE_CGEN=0 skips it).
 #
 # The prefix gets
 #   drive_c/windows/system32/  <- $WINE_LIB/x86_64-windows/*  (PE32+ processes)
@@ -14,8 +12,7 @@
 # Nothing from x86_64-unix: gex replaces the Unix side of Wine entirely.
 #
 # Every file is checked against tools/nt-wine-11.15.manifest (path, size,
-# SHA-256). gex's NT layer is tied to one Wine release (syscall numbers, win32u
-# sub-codes, callback ids, shared-memory layouts), so a mismatch is an error.
+# SHA-256). The dist is tied to one Wine release, so a mismatch is an error.
 set -euo pipefail
 
 VERSION=11.15
@@ -107,9 +104,8 @@ if [ "$bad" -gt 0 ]; then
     echo "nt-stage-wine: $bad problem(s); is the host's Wine $VERSION?" >&2
     exit 1
 fi
-# The profile wineboot would make for the user gexc names (WINEUSERNAME
-# "gex", see crates/gexc/src/nt_run.rs): programs expect its folders, the
-# temporary directory above all, to exist.
+# The profile wineboot would make for the user "gex": programs expect its
+# folders, the temporary directory above all, to exist.
 for d in "AppData/Local/Temp" "AppData/LocalLow" "AppData/Roaming" Desktop Documents Downloads \
     Music Pictures Videos "Saved Games" Favorites Links Contacts Searches; do
     mkdir -p "$PREFIX/drive_c/users/gex/$d"
@@ -121,21 +117,3 @@ mkdir -p "$PREFIX/drive_c/ProgramData" "$PREFIX/drive_c/Program Files" "$PREFIX/
     "$PREFIX/drive_c/windows/temp"
 echo "$VERSION" >"$PREFIX/.wine-version"
 echo "staged $n files for Wine $VERSION in $PREFIX"
-
-# The function tier's core DLLs (docs/function-tier.md §11): PREFIX/gex-layout,
-# a fixed base for each DLL in tools/nt-cgen-core.txt, and a unit built for
-# each at that base, so every Windows program starts with Wine compiled.
-# GEX_STAGE_CGEN=0 skips it; GEXC names the gexc to use; the build runs under
-# MemoryMax=$GEX_CGEN_MEMORY_MAX (default 12G) when systemd-run is there.
-if [ "${GEX_STAGE_CGEN:-1}" != 0 ]; then
-    gexc=${GEXC:-$(command -v gexc || echo "$HERE/../target/release/gexc")}
-    if [ -x "$gexc" ]; then
-        run=(nice -n 10 "$gexc" cgen-prefix "$PREFIX")
-        if command -v systemd-run >/dev/null 2>&1; then
-            run=(systemd-run --user --scope -q -p "MemoryMax=${GEX_CGEN_MEMORY_MAX:-12G}" "${run[@]}")
-        fi
-        "${run[@]}" || { echo "nt-stage-wine: compiling the core DLLs failed" >&2; exit 1; }
-    else
-        echo "nt-stage-wine: no gexc at $gexc: the core DLLs are not compiled (gexc cgen-prefix $PREFIX does it)" >&2
-    fi
-fi

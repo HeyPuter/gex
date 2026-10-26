@@ -78,7 +78,7 @@ pub(crate) fn install(
     pairs.dedup_by_key(|&mut (a, _)| a);
     let n = pairs.len();
     // Compiled once and kept beside the DLL by content, as providers are
-    // (libprov::cwasm_path); a runtime without a compiler (gex-rt) only loads.
+    // (libprov::cwasm_path); a runtime without a compiler only loads.
     let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(std::path::Path::new(path), &wasm), &wasm)
         .with_context(|| format!("compiling {path}'s wasm module"))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);

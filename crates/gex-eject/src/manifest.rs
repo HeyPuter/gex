@@ -1,6 +1,6 @@
 //! `build/build.json`: what a project's build made, which a run reads. Apart
-//! from the build itself, so a runtime that cannot build (gex-rt, without
-//! the translator) still reads it.
+//! from the build itself, so a runtime that cannot build (one without the
+//! translator) still reads it.
 
 use crate::config::CONFIG_FILE;
 use crate::json::{self, field, obj, str_field, Json};

@@ -3,7 +3,7 @@
 //
 //   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--wgsl-cache FILE] [--level N]
 //
-// PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
+// PROJECT is a built project (`gexc eject ... --web-shim ...`,
 // then ./build.sh). OUT gets:
 //   index.html     the project's page (user/index.html, the user's), which
 //                  imports app.mjs and calls its start()

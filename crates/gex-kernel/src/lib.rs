@@ -42,7 +42,6 @@ pub mod ftab;
 pub mod futex;
 pub mod mem;
 pub mod net;
-pub mod nt;
 pub mod win;
 pub mod pipe;
 pub mod phase;
