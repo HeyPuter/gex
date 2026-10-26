@@ -1,9 +1,9 @@
 // A host-side X server: Xwayland as WebAssembly, and the compositor beside it.
 //
 // This is the machinery; `xwayland-worker.js` is the Worker that runs it in the
-// page and `web/test/hostx.mjs` is the same thing under Node, which is where it
-// is easiest to see the server come up. Both give it the same three things: the
-// two module URLs, the global kernel, and the page's scene arena.
+// page, and it runs the same way under Node, which is where it is easiest to
+// see the server come up. Either host gives it the same three things: the two
+// module URLs, the global kernel, and the page's scene arena.
 //
 // Nothing between the X server and the compositor is a socket. The server's
 // Wayland connection is a queue into the compositor module next door, and its
@@ -801,7 +801,7 @@ export class HostX {
       }
     }
     // A hook for a harness: this is the only turn anything else gets once the
-    // server's `main` has the thread. See web/test/hostx.mjs.
+    // server's `main` has the thread.
     globalThis.GEX_HOSTX_TICK?.();
     const hw = this.#hw;
     this.#reap();

@@ -1,5 +1,5 @@
 // Which files a persist snapshot looks at (persist-worker.js), apart from the
-// kernel so that it can be tested alone (web/test/persist-pick.mjs).
+// kernel so that it can be tested alone.
 
 /** path -> meta for a snapshot of `root`: the files under it the program
  *  wrote (`written`, from the kernel's `k_fs_written`), and the ones stored
