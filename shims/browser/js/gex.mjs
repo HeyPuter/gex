@@ -983,7 +983,7 @@ export function vforkTrace(line) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #wl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #d3d = false; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -1950,6 +1950,7 @@ export class Gex {
     }
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    this.#shim.exports.gex_set_d3d?.(this.#d3d ? 1 : 0);
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
@@ -2554,6 +2555,7 @@ export class Gex {
     // built, which is when the device nodes are made.
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_d3d?.(this.#d3d ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
@@ -6511,6 +6513,13 @@ export class Gex {
   useGl(gl) {
     this.#gl = gl;
     this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);
+  }
+
+  /** Say that the GL device runs D3D too (`/dev/gex-d3d`). After `useGl`,
+   *  before `load`. */
+  useD3d(on) {
+    this.#d3d = !!on;
+    this.#shim?.exports?.gex_set_d3d?.(on ? 1 : 0);
   }
 
   /**

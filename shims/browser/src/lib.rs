@@ -1898,6 +1898,9 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     }
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
+        if crate::gl::have_d3d() {
+            devfs.add("gex-d3d", crate::gl::GlDevice::new());
+        }
     }
     // Audio: OSS's /dev/dsp and /dev/mixer, a null output, as natively
     // (shims/native). 32-bit Wine's wineoss.drv is a pure Unix library linked into

@@ -71,6 +71,8 @@ async function main() {
       jitFallback: true,
       gl: q.get('gl') === '1',
       glBackend: q.get('glbackend') || 'wgpu',
+      // `d3d=1`: the GL device runs D3D too (a GEX_MESA_DIRK=1 Mesa).
+      d3d: q.get('d3d') === '1',
       hostx: q.get('hostx') === '1' || q.get('hostx') === 'rootful',
       // `hostx=rootful`: one fullscreen X screen under the session's own window manager
       hostxRootful: q.get('hostx') === 'rootful',
