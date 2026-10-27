@@ -717,6 +717,9 @@ if '-sMODULARIZE=1' not in s:
     open(p, 'w').write(s)
 PATCH
 rm -rf "$OUT/build/xserver"
+# The xkb directories are fixed guest paths rather than the prefix's, which
+# would put the build host's paths in the module: the server loads only the
+# keymap hostx.js writes, and runs no xkbcomp.
 # XRes, XINERAMA, DPMS and MIT-SCREEN-SAVER are left at the server's default
 # (built): a desktop's clients use them, and some without asking whether the
 # server has them, which xcb ends the connection for (Plasma's task manager
@@ -729,6 +732,7 @@ meson setup "$OUT/build/xserver" "$SRC/xserver" --cross-file "$OUT/emscripten.in
     -Dlisten_local=false -Dxselinux=false -Dsystemd_notify=false -Ddocs=false \
     -Ddevel-docs=false -Dlibdecor=false -Dxv=false -Dmitshm=false \
     -Ddefault_font_path=built-ins -Dc_thread_count=0 \
+    -Dxkb_dir=/usr/share/X11/xkb -Dxkb_output_dir=/var/lib/xkb -Dxkb_bin_dir=/usr/bin \
     > "$OUT/log-xserver.txt" 2>&1 || { tail -20 "$OUT/log-xserver.txt"; exit 1; }
 strip_pthread "$OUT/build/xserver"
 ninja -C "$OUT/build/xserver" >> "$OUT/log-xserver.txt" 2>&1 || {
@@ -743,7 +747,10 @@ ninja -C "$OUT/build/xserver" >> "$OUT/log-xserver.txt" 2>&1 || {
 # join this link.
 say "the host compositor module"
 GEX_ROOT="$(cd "$HERE/.." && pwd)"
-(cd "$GEX_ROOT" && cargo build -p gex-hostwl --target wasm32-unknown-unknown --release \
+# Its panic messages name source files: the tree's and the toolchain's
+# paths are remapped, as for the shims.
+REMAP="--remap-path-prefix=$GEX_ROOT=/gex --remap-path-prefix=$(rustc --print sysroot)=/rust --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+(cd "$GEX_ROOT" && RUSTFLAGS="$REMAP" cargo build -p gex-hostwl --target wasm32-unknown-unknown --release \
     > "$OUT/log-hostwl.txt" 2>&1) || { tail -20 "$OUT/log-hostwl.txt"; exit 1; }
 HOSTWL="$GEX_ROOT/target/wasm32-unknown-unknown/release/gex_hostwl.wasm"
 
