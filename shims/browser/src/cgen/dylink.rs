@@ -297,6 +297,15 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
     });
 }
 
+/// `execve` (`wasmprog::on_exec`): the old program's link map goes with it.
+pub(super) fn on_exec() {
+    *lock(&DYPROC) = None;
+    *lock(&BINDS) = None;
+    lock(&DL_NEW).clear();
+    *lock(&ADOPT) = None;
+    *lock(&REGISTRY) = None;
+}
+
 /// A fork's child: the parent's link map (`ADOPT`) again, at the same
 /// table bases, over the parent's data.
 pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32, String> {

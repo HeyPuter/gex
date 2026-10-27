@@ -2855,12 +2855,14 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
 /// could land there and stale entries were unreachable; now the old code
 /// ranges are retired as an unmap retires them (every tier: a provider's
 /// address in the old program is nothing in the new one), the providers' own
-/// bookkeeping is cleared, and the replaced libraries' provider installs are
-/// killed (`FuncMap::kill_module`) so a Worker started later does not
-/// instantiate them.
+/// bookkeeping is cleared, and the provider installs of the replaced
+/// libraries, and of a wasm32 program and its libraries, are killed
+/// (`FuncMap::kill_module`) so a Worker started later does not instantiate
+/// them.
 pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
     on_retire_pages(old_code, old_code);
-    let dead = libprov::on_exec(old_code);
+    let mut dead = libprov::on_exec(old_code);
+    dead.extend(wasmprog::on_exec());
     elfprov::on_exec();
     let memory = crate::guest_bytes();
     ftab(|m| {

@@ -70,6 +70,16 @@ fn put_staged(v: Option<Staged>) {
     }
 }
 
+/// `execve`: the old program's modules (it and its libraries) are gone with
+/// it. Returns their provider module numbers, for `cgen::on_exec` to kill:
+/// a Worker for a thread the new program starts would otherwise
+/// instantiate them too, and their active data segments would land over
+/// the new program's data at their old places.
+pub(crate) fn on_exec() -> Vec<u32> {
+    super::dylink::on_exec();
+    lock(&PROGS).drain(..).map(|p| p.number).collect()
+}
+
 /// A program is staged for JS to publish (`gex_wasmprog_serve`).
 pub(crate) fn staged_any() -> bool {
     !STAGED.load(Ordering::Acquire).is_null()
