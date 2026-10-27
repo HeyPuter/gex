@@ -628,7 +628,7 @@ const gears = {
         // `?glenv=KEY=VALUE`, repeatable, for the guest's own diagnostics --
         // GEXGL_EXTENSION_TRACE most of all, which lists the host extensions
         // the guest declines to repeat. Without this the flag existed and
-        // could not be set: nothing between tests/gl44-probe.sh and the
+        // could not be set: nothing between a test's page URL and the
         // guest process carried an environment. Passing any of these replaces
         // the shim's default environment, which a GL probe does not need.
         const guestEnv = qp.getAll('glenv');
@@ -1103,8 +1103,8 @@ const waylandGears = {
         //
         // An explicit `?wlclient=` / `?cmd=` beats the action's preset. It used
         // to lose, which silently discarded what the harness had asked to run:
-        // `tests/stk-webgpu-fps.sh` passes a full `--race-now ...` command line
-        // and was benchmarking STK's main menu instead, because the Run button
+        // a benchmark that passed a full `--race-now ...` command line
+        // was measuring STK's main menu instead, because the Run button
         // handed `stkLaunch` over the top of it.
         //
         // `?wlclient=` is two things at once: the id of a listed app, or a raw

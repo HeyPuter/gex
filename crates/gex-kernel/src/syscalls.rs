@@ -9248,7 +9248,7 @@ impl Kernel {
         // Linux would; a `writev` parks on its first non-empty segment and
         // returns that short count, which its callers loop on.
         // A blocking read can lose the same race to another reader of the
-        // pipe (two readers of one pipe: tests/browser-pipe-eagain.sh).
+        // pipe (two readers of one pipe).
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. });

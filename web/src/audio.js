@@ -24,7 +24,7 @@
 // was, to compare; `?audiolatency=S` gives the context a latency hint of S
 // seconds instead of 'interactive'; `?audioloop=1` copies what is played
 // into the capture ring, a digital loopback that /dev/dsp reads (the
-// software round trip, measured by tests/audio/dsp-impulse.c).
+// software round trip, for a test to measure).
 
 const WORKLET = `
 // Layout: shims/kernel/src/audio.rs (version 2).

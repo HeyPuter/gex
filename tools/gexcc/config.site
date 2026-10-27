@@ -3,8 +3,8 @@
 # have found. These are the answers gnulib's and autoconf's run-time checks
 # gave on gex itself (natively, musl gex-wasm32-slim). A "no" makes gnulib use its own
 # replacement, which is always safe; several are gex gaps being fixed
-# (trailing slashes, select's EBADF, getgroups, sigaltstack). Regenerate:
-# tests/gexcc/corpus/config-site.sh.
+# (trailing slashes, select's EBADF, getgroups, sigaltstack). Regenerated
+# by running a corpus of configure scripts on gex.
 # A Debian cross build (dpkg-buildpackage -a, which exports DEB_HOST_*) can
 # run a configure without --host, as some debian/rules do for a second
 # directory: that configure is still for the target, unless it was given a
