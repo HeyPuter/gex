@@ -3402,15 +3402,23 @@ pub extern "C" fn k_sock_close(id: i32) {
     // Out of the table under the lock, dropped after it: the last reference
     // to an end may free descriptors still queued in it, and releasing one of
     // those can be a `k_sock_close` of its own.
-    let s = {
+    // And whether another id still holds the end (`k_sock_dup`: a forked
+    // child's copy of its parent's descriptor): the socket closes with its
+    // last id, not with each.
+    let (s, last) = {
         let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
-        t.get_mut(id as usize).and_then(Option::take)
+        let s = t.get_mut(id as usize).and_then(Option::take);
+        let last = s.as_ref().is_some_and(|s| !t.iter().flatten().any(|o| std::sync::Arc::ptr_eq(o, s)));
+        (s, last)
     };
     // A listener on an abstract name (a leading NUL) gives the name up as it
     // closes, as on Linux; a path name stays until it is unlinked. (TCP ports
     // between a page's processes are abstract names.)
     if let Some(s) = s {
-        if let Some(p) = s.bound_path().filter(|p| p.starts_with('\0')) {
+        if last {
+            s.release();
+        }
+        if let Some(p) = s.bound_path().filter(|p| last && p.starts_with('\0')) {
             names().unbind_socket(&p, &s);
         }
         drop(s);

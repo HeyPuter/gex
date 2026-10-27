@@ -230,6 +230,8 @@ pub struct UnixSocket {
     /// (`SO_PEERCRED`): None for a peer this kernel did not see made (a
     /// host's end).
     peer_cred: Mutex<Option<Cred>>,
+    /// Its last descriptor has closed ([`Self::release`]).
+    gone: AtomicBool,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -251,6 +253,7 @@ impl UnixSocket {
             queue: crate::wait::Queue::new(),
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
+            gone: AtomicBool::new(false),
         }
     }
 
@@ -396,6 +399,23 @@ impl UnixSocket {
             Role::Listening { .. } => Ok(0),
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    /// Its last descriptor closed (a forked child's copy is one of them): a
+    /// listener listens no more, so a connect to a name that stays (a path,
+    /// until unlinked) is refused and the connections still waiting for
+    /// `accept` go with it, and an abstract name it had is free to bind.
+    pub fn release(&self) {
+        self.gone.store(true, Ordering::Release);
+        let mut role = self.role.lock().unwrap();
+        if let Role::Listening { path, .. } = &*role {
+            *role = Role::Bound(path.clone());
+        }
+    }
+
+    /// Whether [`Self::release`] has run.
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
     }
 
     /// Connect to a listener, producing this end's connected state.
@@ -684,6 +704,8 @@ impl SocketNames {
 
     pub fn bind(&self, path: &str, sock: Arc<UnixSocket>) -> SysResult {
         let mut bound = self.bound.lock().unwrap();
+        // An abstract name goes with its socket's last descriptor.
+        bound.retain(|(p, s)| !(p.starts_with('\0') && s.is_gone()));
         if bound.iter().any(|(p, _)| p == path) {
             return Err(Errno::EADDRINUSE);
         }

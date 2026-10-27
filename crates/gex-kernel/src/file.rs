@@ -77,6 +77,11 @@ impl Drop for OpenFile {
         if let Some(t) = &self.unlink_on_close {
             let _ = t.ns.unlink(&t.path);
         }
+        // A unix socket's last descriptor: it stops listening and gives up an
+        // abstract name, though its name list still holds it.
+        if let Some(s) = Arc::clone(&self.handle).as_unix_socket() {
+            s.release();
+        }
     }
 }
 
