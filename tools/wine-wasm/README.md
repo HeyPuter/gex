@@ -17,5 +17,16 @@ tools/wine-wasm/run.sh app.exe       # run a Windows program
 ```
 
 Outputs go to a cache directory named after their inputs, so a rerun only
-rebuilds what changed. The `Makefile` header lists the settings. 64-bit Wine
-(`wine64-dist.sh`) is in progress.
+rebuilds what changed. The `Makefile` header lists the settings.
+
+64-bit Wine is in progress. It is built from the Wine and musl commits in
+`wine64.pins`, beside a 32-bit Wine build tree (`make build`, made first when
+missing):
+
+```sh
+tools/wine-wasm/build-sysroot64.sh SR    # the LP64 sysroot; fetches the pinned musl
+git clone WINE64_REPO wine64 && git -C wine64 checkout WINE64_COMMIT
+GEX_WASM64_SYSROOT=SR/sysroot tools/wine-wasm/wine64-dist.sh wine64 CACHE
+```
+
+`wine64-dist.sh` prints where the install and its prefix are.
