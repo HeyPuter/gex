@@ -360,7 +360,7 @@ export class MesaGlDevice {
         ...fromSource?.extra,
       });
       out.#module = await (fromSource ? Promise.race([made, fromSource.failed]) : made);
-      console.warn(`[mesa-gl] Mesa loaded${fromSource ? ' from the page\'s files' : ''} in ${Math.round(performance.now() - t0)} ms`);
+      if (logOn('debug')) console.warn(`[mesa-gl] Mesa loaded${fromSource ? ' from the page\'s files' : ''} in ${Math.round(performance.now() - t0)} ms`);
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);

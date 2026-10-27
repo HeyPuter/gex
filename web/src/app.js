@@ -23,6 +23,7 @@ import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browse
 import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
+import { logOn } from '../../shims/browser/js/log.mjs';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -320,7 +321,11 @@ function progressMeter(state, onProgress) {
 }
 
 async function begin(opts, base, at, state, meter) {
-  const mark = (what) => console.warn(`[app] ${what} at ${Math.round(performance.timeOrigin + performance.now()) % 1e7} (+${Math.round(performance.now())} ms)`);
+  // Start-up's steps, as debug output (`?log=1`). `always`: the fill's end and
+  // its late units, which are said by default (tests/eject/wine32-page.mjs reads them).
+  const mark = (what, always = false) => {
+    if (always || logOn('debug')) console.warn(`[app] ${what} at ${Math.round(performance.timeOrigin + performance.now()) % 1e7} (+${Math.round(performance.now())} ms)`);
+  };
   const say = (s) => {
     state.out += s;
     opts.onLog?.(s);
@@ -653,9 +658,9 @@ async function begin(opts, base, at, state, meter) {
       } else if (m.kind === 'late') {
         if (m.error) say(`[app] a late unit failed: ${m.error}\n`);
         else add(m.entry);
-        if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+        if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`, true);
       } else if (m.kind === 'done') {
-        mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+        mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`, true);
         prefetchMesa('fetched');
         // Its late units may still be compiling: it ends with the page.
       } else if (m.kind === 'failed') {

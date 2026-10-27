@@ -2872,7 +2872,8 @@ export class Gex {
   /// so a wedged run printed nothing at all. Around the whole run loop, since a
   /// process parked on a pipe another process fills exits the loop differently.
   #armCensus() {
-    if (this.#census) return;
+    // What it finds is debug output (`narrate`), so it runs only when that is on.
+    if (this.#census || !logOn('debug')) return;
     const e = this.#shim?.exports;
     if (!e?.gex_wait_census) return;
     let last = '';
@@ -4232,8 +4233,9 @@ export class Gex {
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
     this.#compileMs += performance.now() - t0;
-    // Start-up's largest costs, one line per unit (a page loads about 40).
-    console.warn(`[unit] ${key.slice(0, 16)} ${((got.wasm.byteLength ?? 0) / 1048576).toFixed(1)} MiB: `
+    // Start-up's largest costs, one line per unit (a page loads about 40):
+    // `GEX_LOG=unit`.
+    if (logOn('unit')) console.warn(`[unit] ${key.slice(0, 16)} ${((got.wasm.byteLength ?? 0) / 1048576).toFixed(1)} MiB: `
       + `load ${Math.round(t0 - tl)} ms, compile ${Math.round(performance.now() - t0)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
     this.#offerModule(name, mod, got.wasm.byteLength ?? Infinity);
@@ -4737,7 +4739,7 @@ export class Gex {
     const t2 = performance.now();
     mod = new WebAssembly.Module(bytes);
     const t3 = performance.now();
-    console.warn(`[cold] ${key.slice(0, 16)} ${c}: ${zlen} bytes (${len} unpacked), fetch ${(t1 - t0).toFixed(1)} ms, `
+    if (logOn('unit')) console.warn(`[cold] ${key.slice(0, 16)} ${c}: ${zlen} bytes (${len} unpacked), fetch ${(t1 - t0).toFixed(1)} ms, `
       + `decode ${(t2 - t1).toFixed(1)} ms, compile ${(t3 - t2).toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
     this.#offerModule(name, mod, bytes.byteLength);
@@ -6255,7 +6257,7 @@ export class Gex {
       if (grp) {
         e.gex_cgen_hold(u);
         grp.held.set(key, { u, path });
-        console.error(`gex-pe: ${path}: held for its link group`);
+        if (logOn('unit')) console.warn(`gex-pe: ${path}: held for its link group`);
         if (grp.held.size === grp.members.length) this.#cgenGroup(grp, t0);
         continue;
       }

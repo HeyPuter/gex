@@ -13,7 +13,7 @@ import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
-import { logNamed } from '../../shims/browser/js/log.mjs';
+import { logNamed, logOn } from '../../shims/browser/js/log.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
@@ -838,7 +838,7 @@ async function runProgramHere(
   // worker never mounts /dev/gex-gl is otherwise indistinguishable from one
   // that never asked, and the guest's only symptom is an empty GL_VERSION
   // much later.
-  console.warn(`[gex] runtime rings: gl=${!!gl} wl=${!!wl}`);
+  if (logOn('debug')) console.warn(`[gex] runtime rings: gl=${!!gl} wl=${!!wl}`);
   // The GPU: a `MesaGlDevice` (web/src/mesa-gl.js) the guest drives through
   // libGLESv2/libEGL marshallers over a command ring. It needs a
   // SharedArrayBuffer bridge -- `gl_submit` is synchronous inside an
