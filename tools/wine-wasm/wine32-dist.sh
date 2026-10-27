@@ -1,6 +1,6 @@
 #!/bin/bash
-# A 32-bit Wine install and its prefixes, built from a given Wine checkout (the gate's
-# pinned one, as wine64-dist.sh does for 64-bit Wine):
+# A 32-bit Wine install and its prefixes, built from a given Wine checkout, as
+# wine64-dist.sh is for 64-bit Wine (`make` builds the one wine32.pins names):
 #
 #   tools/wine-wasm/wine32-dist.sh WINE CACHE
 #

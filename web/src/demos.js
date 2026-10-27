@@ -599,7 +599,7 @@ const gears = {
     // marks a frame produced. The wayland demo below drives that from its own
     // animation loop, and this demo -- whose entire point is to show a
     // picture -- had none, so its canvas was black for as long as it ran on
-    // Mesa. The terminal said "frames 200" and the gate matched on that text,
+    // Mesa. The terminal said "frames 200" and the test matched on that text,
     // so nothing noticed.
     let displayRaf = 0;
     const pump = () => {

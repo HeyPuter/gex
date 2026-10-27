@@ -279,7 +279,7 @@ mod tests {
                 let (p, stop) = (p.clone(), stop.clone());
                 std::thread::spawn(move || {
                     // At least one read, even if the writer finishes before this thread
-                    // first runs (a loaded machine: the gate runs every lane at once).
+                    // first runs (a loaded machine running many tests at once).
                     let mut n = 0u64;
                     loop {
                         p.read(slot, |s| {

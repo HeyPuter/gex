@@ -6,7 +6,7 @@
 //   node tests/eject/wine32-page.mjs SITE [--title RE] [--timeout S] [--port N (default: any free one)] [--chrome PATH] [--placed] [--shell PAGE]
 //
 // Checks, in order:
-//   1. the site's nt.json says kind w3, and for each feature it says is off,
+//   1. the site's nt.json says kind wine32, and for each feature it says is off,
 //      the files that feature is are not in the site ("compositor":
 //      assets/compositor-*, assets/compositor-worker-*, assets/gpu-device-*;
 //      "gl": gex/gex-wgpu-replay.*);

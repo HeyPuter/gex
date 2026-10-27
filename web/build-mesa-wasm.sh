@@ -11,7 +11,7 @@ SANITIZE=${GEX_MESA_SANITIZE:-0}
 # without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
 # Built in its own directory and published under web/public/gex/st/, beside
 # the threaded one.
-# GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (the gate's web build), not
+# GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (a page-only web build), not
 # the softpipe replay and smokes the Mesa tests use.
 THREADS=${GEX_MESA_THREADS:-1}
 VARIANT=mt
@@ -139,7 +139,7 @@ if [ "$SANITIZE" = 1 ]; then
 elif [ "${GEX_MESA_PAGE_ONLY:-0}" = 1 ]; then
     # Only what the page loads. The softpipe replay and the smokes are for the
     # Mesa tests; each of their links (wasm-opt, SPLIT_MODULE) costs
-    # minutes, which the gate's web build doesn't need to spend.
+    # minutes, which a page-only build doesn't need to spend.
     ninja -C "$BUILD" src/gallium/targets/gex-wasm/gex-wgpu-replay.js -j"${JOBS:-$(nproc)}"
 else
     ninja -C "$BUILD" \
