@@ -490,21 +490,9 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
-        let (cell, done, parent_q, own_q) = {
+        let (cell, done, was_ppid, own_q) = {
             let mut t = self.lock();
-            // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
-            // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
-            // `sigsuspend` between polls has nothing else to wake it -- coreutils
-            // `timeout` does exactly that.
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
-            if let Some(ppid) = ppid {
-                if let Some(parent) = t.procs.iter().find(|p| p.pid == ppid) {
-                    parent
-                        .pending
-                        .fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
-                    SIGNAL_SEQ.fetch_add(1, Ordering::Release);
-                }
-            }
             for p in t.procs.iter_mut() {
                 if p.ppid == pid {
                     p.ppid = INIT_PID;
@@ -512,13 +500,10 @@ impl ProcTable {
             }
             // Its threads went with it.
             t.threads.retain(|_, p| *p != pid);
-            let parent_q = ppid
-                .and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid))
-                .map_or(0, |p| p.queue.id());
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
-                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q, p.queue.id())
+                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id())
                 }
                 None => return,
             }
@@ -527,6 +512,27 @@ impl ProcTable {
         // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         done.notify_all();
+        // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
+        // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
+        // `sigsuspend` between polls has nothing else to wake it -- coreutils
+        // `timeout` does exactly that. Raised only now that the child is
+        // collectable: a handler's `WNOHANG` wait would otherwise find it
+        // still running and wait for a SIGCHLD that has already come (as
+        // dbus-daemon's activation helper does).
+        let parent_q = {
+            let t = self.lock();
+            // its parent now (it may have been given to init since), or, if
+            // a parked `wait4` has collected it already, the one it had
+            let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid).or(was_ppid);
+            match ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
+                Some(parent) => {
+                    parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                    SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+                    parent.queue.id()
+                }
+                None => 0,
+            }
+        };
         // The parent's `wait4`, and its SIGCHLD.
         crate::wait::notify(parent_q);
         // A process descriptor for it (`crate::pidfd`), wherever it is held.
