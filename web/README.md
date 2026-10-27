@@ -41,9 +41,9 @@ much longer than later ones. Stripping needs `wasm-tools`
 ## Ejected programs
 
 `build-eject-page.sh` builds the page library that an ejected project ships.
-`eject-site.mjs PROJECT OUT` packs a built 32-bit Wine project into a static site: the
-library, its runtime and Mesa, zstd-compressed assets, and the headers the
-host must send. The site's `index.html` belongs to the project, so the
+`eject-site.mjs PROJECT OUT` packs a built 32-bit Wine project into a static
+site: the library, its runtime and Mesa, zstd-compressed assets, and the
+headers the host must send. The site's `index.html` belongs to the project, so the
 library can be imported into a page of your own.
 
 ## The desktop demo
