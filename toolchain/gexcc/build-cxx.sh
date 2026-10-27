@@ -31,6 +31,8 @@ llvm_pin_check "$SRC"
 # exported at all).
 # (and LLVM_SRC's path as /llvm: libc++abi's assert()s name their files)
 F="-fwasm-exceptions -D_LIBUNWIND_HIDE_SYMBOLS -ffile-prefix-map=$(realpath "$SRC")=/llvm"
+# A deque of a type not yet complete where it is declared (a member queue
+# of a class declared later, as libstdc++ allows): libc++'s ABI flag for it
 cmake -G Ninja -S "$SRC/runtimes" -B "$B" \
   -DCMAKE_TOOLCHAIN_FILE="$PREFIX/share/gexcc/toolchain.cmake" \
   -DCMAKE_STAGING_PREFIX="$SR" -DCMAKE_INSTALL_PREFIX="$SR" -DCMAKE_BUILD_TYPE=Release \
@@ -38,6 +40,7 @@ cmake -G Ninja -S "$SRC/runtimes" -B "$B" \
   -DCMAKE_C_FLAGS="$F" -DCMAKE_CXX_FLAGS="$F" \
   -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
   -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBUNWIND_ENABLE_SHARED=OFF \
+  -DLIBCXX_ABI_DEFINES=_LIBCPP_ABI_INCOMPLETE_TYPES_IN_DEQUE \
   -DLIBCXX_HAS_MUSL_LIBC=ON -DLIBCXX_CXX_ABI=libcxxabi -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
   -DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
   -DLIBCXX_ENABLE_EXCEPTIONS=ON -DLIBCXXABI_ENABLE_EXCEPTIONS=ON \

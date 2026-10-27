@@ -18,7 +18,7 @@ MUSL64_COMMIT := d18ccf68d0027ba752071b109d5bd08d89a4f7aa
 # LLVM_SRC (a checkout of that commit) or LLVM_SEED (a clone that has it)
 # overrides the fetch.
 LLVM_REPO   := https://github.com/MercuryWorkshop/llvm-project
-LLVM_COMMIT := 1bb69944033d8a7c2d79d654df0a513e818b3caf
+LLVM_COMMIT := a2954c83de5db3464ce77d0672fa041cb25a0273
 
 # busybox, the guest's /bin/sh and coreutils (make busybox, gexcc's install,
 # the page's rootfs).
