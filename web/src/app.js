@@ -372,9 +372,9 @@ async function begin(opts, base, at, state, meter) {
   if (sq.get('cold') || sq.get('cgenzst') === '1') {
     const src = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
     globalThis.GEX_CGEN_ZSTD = src;
-    // Fetched once, here: every Worker imports it from memory, not with a
-    // request of its own at its start.
-    try {
+    // With compressed units, fetched once, here: every Worker imports it
+    // from memory, not with a request of its own at its start.
+    if (sq.get('cgenzst') === '1') try {
       const r = await fetch(src);
       if (r.ok) globalThis.GEX_CGEN_ZSTD = URL.createObjectURL(new Blob([await r.text()], { type: 'text/javascript' }));
     } catch { /* the URL, then */ }
