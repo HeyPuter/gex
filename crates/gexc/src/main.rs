@@ -691,7 +691,20 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     // that host path may mean nothing to the guest, so it can be overridden.
     let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| ra.path.clone())];
     argv.append(&mut ra.guest_args);
-    ra.opts.args = argv;
+    // (a program its interpreter maps: the interpreter's command line for
+    // it, by the program's path in the guest)
+    let guest_path = match &sysroot {
+        Some(root) => std::path::Path::new(&ra.path)
+            .strip_prefix(root)
+            .map(|r| format!("/{}", r.display()))
+            .unwrap_or_else(|_| ra.path.clone()),
+        None => ra.path.clone(),
+    };
+    ra.opts.args = program.argv(argv, &guest_path);
+    // (and `/proc/self/exe` is the program, not its interpreter)
+    if program.direct.is_some() && ra.opts.exe.is_none() {
+        ra.opts.exe = Some(ra.path.clone());
+    }
     // A client finds the display by joining these two, so default them when a
     // compositor is given. Only defaulted: a caller that set either meant it.
     if let Some(path) = ra.opts.wayland.clone() {
