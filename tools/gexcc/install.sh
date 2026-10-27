@@ -66,6 +66,8 @@ mkdir -p "$PREFIX/build/rt"
 # the runtime's sources by their names in gex, not this checkout's path
 RTMAP="-ffile-prefix-map=$HERE=/gex/tools/gexcc"
 clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
+# -fgex-no-fork's object (rt/nofork.c): linked only into links that ask
+clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$HERE/rt/nofork.c" -o "$L/nofork.o"
 for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/cxa_thread_atexit.c "$HERE"/rt/gshadow.c "$HERE"/rt/nlcompat.c "$HERE"/rt/poll.s; do
   clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done

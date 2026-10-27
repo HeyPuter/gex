@@ -25,7 +25,8 @@ Environment: GEXCC_SYSROOT overrides the sysroot; GEXCC_RUNNER the gexc a
 container runs under (also read by the container itself at run time);
 GEXCC_BAKE_RUNNER the runner path linked into containers (empty: none);
 GEXCC_KEEP_WASM=1 keeps OUT.wasm beside a linked program; GEXCC_VERBOSE=1
-prints every command."""
+prints every command; GEXCC_NOFORK=1 is -fgex-no-fork (a link whose fork
+returns ENOSYS, with no asyncify: rt/nofork.c)."""
 import atexit, os, re, shutil, subprocess, sys, tempfile
 
 TRIPLE = 'wasm32-unknown-linux-musl'
@@ -162,7 +163,11 @@ def expand_rsp(args):
 # Function pointer cast emulation (finish below): -fgex-fpcast-emu or
 # GEXCC_FPCAST=1, at link time.
 FPCAST = os.environ.get('GEXCC_FPCAST', '0') != '0' or '-fgex-fpcast-emu' in sys.argv[1:]
-args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu')]
+# A link that never forks (rt/nofork.c): -fgex-no-fork or GEXCC_NOFORK=1, at
+# link time. Off by default: fork there returns ENOSYS, and no asyncify.
+NOFORK = os.environ.get('GEXCC_NOFORK', '0') != '0' or '-fgex-no-fork' in sys.argv[1:]
+args = [a for a in expand_rsp(sys.argv[1:])
+        if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu', '-fgex-no-fork')]
 
 
 def in_sysroot(path):
@@ -921,6 +926,18 @@ def finish_shared(wasm, sos, lib):
     lenient = os.environ.get('GEXCC_LENIENT_CALLS', '0') != '0'
     if lenient and run([DYLINK, 'lenient-calls', wasm, wasm]):
         die('gex-dylink lenient-calls failed')
+    if NOFORK:
+        no_fork_point(wasm)
+        if run([opt, wasm, '-g', '--strip-dwarf'] + feats + (['--enable-gc'] if lenient else [])
+               + ['--translate-to-exnref', '-o', wasm]):
+            die('wasm-opt failed')
+        if lib:
+            # its summary: nothing in it reaches fork
+            txt = os.path.join(tmp, 'forkreach.txt')
+            open(txt, 'w').write('gex.forkreach 1\n')
+            if run([DYLINK, 'section', wasm, 'gex.forkreach', txt, wasm]):
+                die('gex-dylink section failed')
+        return
     may, known = set(), set()
     for so in sos:
         if not is_wasm_so(so):
@@ -964,6 +981,13 @@ def finish_shared(wasm, sos, lib):
         open(txt, 'w').write('gex.forkreach 1\n' + ''.join(n + '\n' for n in names))
         if run([DYLINK, 'section', wasm, 'gex.forkreach', txt, wasm]):
             die('gex-dylink section failed')
+
+
+def no_fork_point(wasm):
+    """A -fgex-no-fork link must not reach fork's driver: one that does
+    would unwind through frames asyncify left alone."""
+    if ('gex', 'fork_point') in imports(wasm):
+        die('-fgex-no-fork: %s still reaches fork (it imports gex.fork_point)' % os.path.basename(out))
 
 
 WASM_C = {'i32': 'int', 'i64': 'long long', 'f32': 'float', 'f64': 'double'}
@@ -1091,7 +1115,13 @@ def shared_undef():
     open(f, 'w').write('__c_longjmp\n__cpp_exception\n')
     return ['--allow-undefined-file=' + f]
 
+# -fgex-no-fork: the link's own fork, ahead of the libraries (rt/nofork.c)
+NOFORK_O = [os.path.join(LIBDIR, 'nofork.o')] if NOFORK and not relocatable else []
+if NOFORK_O and not os.path.exists(NOFORK_O[0]):
+    die('-fgex-no-fork: no %s (tools/gexcc/install.sh builds it)' % NOFORK_O[0])
+
 if shared and SHARED:
+    objs = objs + NOFORK_O
     ins, missing = expand(inputs, set())
     ins = whole_closed([x for x in ins if not x.startswith('-L')] + missing)
     soname = (ld_opts['soname'] or [os.path.basename(out)])[-1]
@@ -1167,6 +1197,7 @@ if shared:
     sys.exit(r)
 
 # A program.
+objs = objs + NOFORK_O
 ins, missing = expand(inputs, set())
 # -L from archives' deps: they only feed resolve(), already applied
 ins = [x for x in ins if not x.startswith('-L')]
@@ -1268,6 +1299,8 @@ if FPCAST:
 passes = []
 if SHARED:
     pass
+elif NOFORK:
+    no_fork_point(wasm)
 elif ('gex', 'fork_point') in imports(wasm):
     passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
     dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
