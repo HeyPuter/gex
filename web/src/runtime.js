@@ -650,6 +650,7 @@ async function runInSystemWorker(term, opts) {
         opts: {
           ...rest,
           networkUrl: network?.url ?? null,
+          pageHosts: network?.pageHosts,
           wl: canvas ? { inRealm: true } : undefined,
           gl: glHere ? 'compositor' : undefined,
           hostX: xHere ? hostX : undefined,
@@ -1122,6 +1123,7 @@ async function runProgramHere(
       // Wisp connection itself.
       wispNet: single.on ? network ?? undefined : undefined,
       wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
+      pageHosts: netChannel || single.on ? undefined : network?.pageHosts,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
       // writes it on startup, so a process forked after a resize would reset the

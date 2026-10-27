@@ -24,6 +24,7 @@ import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, worker
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
+import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -61,6 +62,9 @@ const PIECES = {
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
  *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
  *              guest's network (its TCP and DNS go over it); none by default
+ *   pageHosts  {host: path or URL}: hosts the page answers itself, over plain
+ *              HTTP (GET and HEAD), from the files under that path (relative
+ *              to baseUrl): files the guest fetches that no proxy reaches
  *   strace     true (every process) or a pid: narrate system calls
  *   trapstack  a trap's wasm frames
  *   debug      more runtime switches, {name: value}, as gex's test page's
@@ -752,9 +756,12 @@ async function begin(opts, base, at, state, meter) {
   // The guest's network: a Wisp proxy the page names (runtime.js serves it
   // to every Worker). With none, the guest's sockets reach nothing.
   let network = null;
-  if (opts.wisp) {
+  // `pageHosts`: hosts the page answers itself from files under its origin
+  // (page-host.mjs), with or without a proxy.
+  const hosts = pageHosts(opts.pageHosts, base);
+  if (opts.wisp || hosts) {
     const { WispNetwork } = await import('./net.js');
-    network = new WispNetwork(String(opts.wisp), (e) => say(`[net] ${e}\n`));
+    network = new WispNetwork(opts.wisp ? String(opts.wisp) : null, (e) => say(`[net] ${e}\n`), { pageHosts: hosts });
     // Opened and waited for, as worker.mjs does: constructing one only
     // remembers the address, and until the proxy has said hello `open`
     // answers zero, which the shim turns into ENETUNREACH (every guest
