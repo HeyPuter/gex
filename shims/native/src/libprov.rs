@@ -587,6 +587,23 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::set_fault_hook(caller.data(), idx as u32);
     })?;
     // Diagnostics: text a provider writes to its stderr.
+    // A program's i386 code calling or jumping to `addr` runs the function
+    // at table index `idx` (gexcc's rt/i386.c, gex_i386_bind): bound like an
+    // export of the install holding the index. -1 for an index no install
+    // has.
+    linker.func_wrap(IMPORT_MODULE, "i386_bind", |caller: Caller<'_, HostState>, addr: i64, idx: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
+        let Some(jit) = caller.data().jit.as_ref() else { return Ok(-1) };
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        let shared = Arc::clone(&jit.shared);
+        let idx = idx as u32;
+        let found = {
+            let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.ftab.map.installs().iter().position(|i| idx >= i.base && idx < i.base + i.len).map(|k| (k as u32, sh.ftab.map.installs()[k].base))
+        };
+        let Some((install, base)) = found else { return Ok(-1) };
+        ftab::bind_pairs(&shared, &memory, install, &[(addr as u64 & 0xffff_ffff, idx - base)])?;
+        Ok(0)
+    })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
             if let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) {

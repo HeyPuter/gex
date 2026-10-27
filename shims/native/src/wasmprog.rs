@@ -56,6 +56,12 @@ pub const FLAG_WINDOWS_SPACE: u32 = FLAG_GUEST_I386 | FLAG_GUEST_X86_64;
 /// the process folds Windows' constant addresses there.
 pub const FLAG_KUSER_WINE32: u32 = 4;
 
+/// Header flag, with [`FLAG_GUEST_I386`]: the program's i386 code is its
+/// own (a JIT's, gexcc -fgex-guest-i386), not Windows': the process keeps
+/// Linux's address space, only the trampoline page added (the return pad
+/// of its calls into the guest).
+pub const FLAG_LINUX_SPACE: u32 = 8;
+
 /// The header's flags, 0 for a program without them (or not wasm32).
 pub(crate) fn flags(program: &Program) -> u32 {
     let at = program.exe.entry.wrapping_sub(0x40);

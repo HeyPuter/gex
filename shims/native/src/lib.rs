@@ -1323,8 +1323,12 @@ fn run_program_with(
     // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
     // Windows' fixed addresses left free, and the trampoline page (its
     // x86-64 entries and the native return pad serve 64-bit Wine)
+    // A Linux program's own i386 code (FLAG_LINUX_SPACE) keeps Linux's
+    // address space and gets the trampoline page alone.
     if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
-        store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+        if wasmprog::flags(program) & wasmprog::FLAG_LINUX_SPACE == 0 {
+            store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+        }
         // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
         // constant addresses folded there, the old page and above a
         // named fault (`gex_abi::KUSER_GUARD`).

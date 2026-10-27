@@ -5919,6 +5919,9 @@ export class Gex {
       asyncify,
       // The snapshot flavour's (libgex-snap/snapshot.c).
       ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync, inst, mod),
+      // -fgex-guest-i386 (gexcc's rt/i386.c): i386 code calling `addr` runs
+      // the program's function at table index `idx` (cgen/libprov.rs)
+      i386_bind: (addr, idx) => e.gex_libprov_i386_bind(addrBig(addr), idx >>> 0),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
         if (st === 0) asyncify(1, rec);

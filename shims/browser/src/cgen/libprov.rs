@@ -488,6 +488,18 @@ pub extern "C" fn gex_libprov_table_size(base: u64) -> u64 {
     ftab(|t| t.installs().iter().find(|i| i.base as u64 == base).map_or(0, |i| i.len as u64))
 }
 
+/// `gex.i386_bind(addr, idx)`: a program's i386 code calling or jumping to
+/// `addr` runs the function at table index `idx` (gexcc's rt/i386.c,
+/// gex_i386_bind), bound like an export of the install holding the index.
+/// -1 for an index no install has.
+#[no_mangle]
+pub extern "C" fn gex_libprov_i386_bind(addr: u64, idx: u32) -> i32 {
+    let found = ftab(|t| t.installs().iter().position(|i| idx >= i.base && idx < i.base + i.len).map(|k| (k as u32, t.installs()[k].base)));
+    let Some((install, base)) = found else { return -1 };
+    super::wasmdll::bind(install, &[(addr & 0xffff_ffff, idx - base)]);
+    0
+}
+
 /// `gex.provider_abi(which)`: constants of gex's ABI a provider calling
 /// guest code needs.
 #[no_mangle]

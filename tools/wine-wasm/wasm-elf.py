@@ -2,13 +2,15 @@
 """Wrap a native wasm32 program (a PIE wasm module linked against gex's musl)
 in the ELF32 i386 container gexc runs (shims/native/src/wasmprog.rs).
 
-    wasm-elf.py IN.wasm OUT [--guest-i386] [--elf64 [--guest-x86-64]]
+    wasm-elf.py IN.wasm OUT [--guest-i386 [--linux-space]] [--elf64 [--guest-x86-64]]
                 [--host-stub BLOB [--runner GEXC]]
 
 --elf64 (64-bit Wine): an ELF64 x86-64 container for a
 program built LP64 and lowered to wasm32 (tools/wine-wasm/wcc64): gex runs it
 with the x86-64 Linux ABI. --guest-x86-64: it runs x86-64 Windows code (the
 64-bit Wine loader). The segments and the header are the same.
+--linux-space (gexcc -fgex-guest-i386): the i386 code is the program's own (a
+JIT's), so gex keeps Linux's address space and adds only its trampoline page.
 
 Segments:
   R    at BASE:          ELF header, program headers, then the wasm module
@@ -108,6 +110,11 @@ def main():
     # --guest-i386: the program runs i386 code (Wine's loader, 32-bit Wine): gex
     # translates i386 in its process and leaves Windows' addresses free.
     flags = 1 if '--guest-i386' in sys.argv[1:] else 0
+    # --linux-space: that i386 code is the program's own, not Windows'
+    # (FLAG_LINUX_SPACE)
+    if '--linux-space' in sys.argv[1:]:
+        assert flags & 1, '--linux-space needs --guest-i386'
+        flags |= 8
     elf64 = '--elf64' in sys.argv[1:]
     if '--guest-x86-64' in sys.argv[1:]:
         assert elf64, '--guest-x86-64 needs --elf64'
