@@ -46,6 +46,10 @@ GEX_CRT_SRC ?= $(HOME)/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/buil
 NICE := nice -n 19
 C := $(WINE32_CACHE)
 export WINE32_JOBS GEX_WINE_PREFIX GEX_CRT_SRC WINE32_DL_SEED
+# wcc: the Wine source and this cache by fixed names in what it compiles
+# (every recipe's, the loader's and server's links too), no host path.
+GEX_WCC_MAP = $(WINE_SRC)=/wine:$(C)=/cache
+export GEX_WCC_MAP
 export FREETYPE_VERSION FREETYPE_URL FREETYPE_SHA256 WAYLAND_VERSION WAYLAND_URL WAYLAND_SHA256
 export LIBXML2_VERSION LIBXML2_URL LIBXML2_SHA256 XKBCOMMON_VERSION XKBCOMMON_URL XKBCOMMON_SHA256
 export MESON_VERSION MESON_URL MESON_SHA256
@@ -83,7 +87,7 @@ TOOLS := $(C)/tools-$(WINE_BID)
 BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
 
 # The dist: everything above plus these scripts (stage, link, rebase).
-TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/wine32/*.sh $(WINE32)/wine32/*.c)),8)
+TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/Makefile $(WINE32)/wine32/*.sh $(WINE32)/wine32/*.c)),8)
 # WINE32_TLS=0: the loader without GnuTLS (crypt32's and schannel's dlopen of it
 # then fails, as on a host without it), 1.8 MB less wasm, for a site that
 # never speaks https. The Wine build is the same either way.

@@ -43,6 +43,8 @@ wasm)
   : "${GEX_WASM_SYSROOT:?}"
   o="$OPTS --with-gnutls --without-ffmpeg --without-fontconfig"
   export PKG_CONFIG_LIBDIR=$deps/install/lib/pkgconfig
+  # wcc: the Wine trees' paths as /wine, not this host's.
+  export GEX_WCC_MAP="$src=/wine:$build=/wine-build:$tools=/wine-tools:$deps=/wine-deps"
   configure "$build" "$src $o $deps $GEX_WASM_SYSROOT" "$src/configure" --host=wasm32-unknown-linux-musl --with-wine-tools="$tools" $o \
     CC="$here/../wcc" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$deps/host/wayland-scanner" \
     ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 ac_cv_lib_soname_EGL=libEGL.so.1 \

@@ -38,4 +38,19 @@ if [ -n "${GRAPHICS:-}" ]; then
         printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=%s\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' "${arch:-win32}" "$GRAPHICS" >> "$out/user.reg"
     fi
 fi
+# The install ran on DIST at its host path, and the registry names files
+# there (the fonts in share/wine/fonts): in the page the dist is at its mount
+# (DIST_MOUNT: /wine32, or /wine64 for a win64 prefix), and no host path ships.
+arch=$(sed -n 's/^#arch=//p' "$out/system.reg" | head -1)
+mount=${DIST_MOUNT:-$([ "$arch" = win64 ] && echo /wine64 || echo /wine32)}
+python3 -I - "$(cd "$dist" && pwd -P)" "$(cd "$dist" && pwd)" "$mount" "$out"/*.reg <<'PY'
+import sys
+dists, mount, regs = {sys.argv[1], sys.argv[2]}, sys.argv[3], sys.argv[4:]
+win = lambda p: 'Z:' + p.replace('/', '\\\\')
+for r in regs:
+    s = open(r, encoding='utf-8', errors='surrogateescape').read(); o = s
+    for d in sorted(dists, key=len, reverse=True):
+        s = s.replace(win(d), win(mount))
+    if s != o: open(r, 'w', encoding='utf-8', errors='surrogateescape').write(s)
+PY
 echo "$out: $(du -sh "$out" | cut -f1)"

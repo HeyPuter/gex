@@ -19,6 +19,8 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 WCC=$here/../wcc
 out=$(realpath -m "$1") dl=$(realpath -m "$2")
+# wcc names the libraries' sources by OUT's place, /wine-deps, not this host's.
+export GEX_WCC_MAP="${GEX_WCC_MAP:+$GEX_WCC_MAP:}$out=/wine-deps"
 J=${WINE32_JOBS:-12}
 for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT; do
   u=${p}_URL s=${p}_SHA256; "$here/dl.sh" "${!u}" "${!s}" "$dl"
@@ -95,7 +97,7 @@ tar xf "$dl/libxkbcommon-$XKBCOMMON_VERSION.tar.xz"
 PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain setup xkb-build libxkbcommon-$XKBCOMMON_VERSION \
   --cross-file "$out/wasm32-cross.ini" --prefix="$I" --default-library=static --buildtype=release \
   -Denable-x11=false -Denable-wayland=false -Denable-docs=false -Denable-tools=false -Denable-bash-completion=false \
-  -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale > "$out/xkb-setup.log" 2>&1
+  -Dxkb-config-root=/usr/share/X11/xkb -Dxkb-config-extra-path=/etc/xkb -Dx-locale-root=/usr/share/X11/locale > "$out/xkb-setup.log" 2>&1
 ninja -C xkb-build -j"$J" libxkbcommon.a libxkbregistry.a > "$out/xkb-make.log" 2>&1
 PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain install -C xkb-build --no-rebuild --tags devel,runtime > "$out/xkb-install.log" 2>&1
 

@@ -177,6 +177,8 @@ b64_build() {
 	# and GnuTLS (crypt32's and schannel's, unless WINE64_TLS=0)
 	local o=${without//--without-wayland/}; o=${o//--without-freetype/}; o=${o//--without-opengl/}
 	[ "$TLS" = 0 ] || o="${o//--without-gnutls/} --with-gnutls"
+	# wcc64: the Wine trees' paths as /wine, not this host's.
+	export GEX_WCC_MAP="$W=/wine:$PWD=/wine-build:$T=/wine-tools:$DEPS=/wine-deps"
 	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
 		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
 		CC="$WCC" CXX="$WCXX" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \

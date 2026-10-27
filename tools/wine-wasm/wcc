@@ -24,6 +24,12 @@ sysroot = os.environ.get('GEX_WASM_SYSROOT') or sys.exit('wcc: set GEX_WASM_SYSR
 CC = ['clang'] + CFLAGS + ['--sysroot=' + sysroot, '-isystem', sysroot + '/include']
 if os.path.basename(sys.argv[0]).endswith('++'):
     CC[0] = 'clang++'
+# No build host's paths in what ships (__FILE__, assertion and lock names,
+# debug info): this tree is /gex, the sysroot /sysroot, and GEX_WCC_MAP
+# (FROM=TO pairs, ':'-separated) names the rest, e.g. the Wine source tree.
+_maps = [(os.path.realpath(os.path.join(here, '..', '..')), '/gex'), (os.path.realpath(sysroot), '/sysroot')]
+_maps += [tuple(m.split('=', 1)) for m in os.environ.get('GEX_WCC_MAP', '').split(':') if '=' in m]
+CC += ['-ffile-prefix-map=%s=%s' % m for m in _maps]
 
 args = sys.argv[1:]
 # Wine's PE-side code (-D_WIN32) gets the ICALL pass: its indirect calls may

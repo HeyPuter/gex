@@ -35,6 +35,11 @@ for line in open(os.path.join(here, 'flags64.sh')):
         flags[k] = v
 sysroot = os.environ.get('GEX_WASM64_SYSROOT') or sys.exit('wcc64: set GEX_WASM64_SYSROOT')
 CC = ['clang'] + flags['WASM64_CFLAGS'].split() + ['--sysroot=' + sysroot, '-isystem', sysroot + '/include']
+# No build host's paths in what ships (wcc's maps: this tree, the sysroot,
+# GEX_WCC_MAP's FROM=TO pairs).
+_maps = [(os.path.realpath(os.path.join(here, '..', '..')), '/gex'), (os.path.realpath(sysroot), '/sysroot')]
+_maps += [tuple(m.split('=', 1)) for m in os.environ.get('GEX_WCC_MAP', '').split(':') if '=' in m]
+CC += ['-ffile-prefix-map=%s=%s' % m for m in _maps]
 if os.path.basename(sys.argv[0]).endswith('++'):
     CC[0] = 'clang++'
 args = sys.argv[1:]
