@@ -3316,9 +3316,6 @@ impl PathIo<'_> {
         Ok(bytes.len() as u64)
     }
 
-    /// The tree's one mount, by `statx`'s id (`stx_mnt_id`).
-    const STATX_ROOT_MNT_ID: u64 = 1;
-
     /// `statx`, how glibc stats a file on a modern kernel.
     ///
     /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
@@ -3333,15 +3330,18 @@ impl PathIo<'_> {
         buf: u64,
     ) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
-        let md = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            self.map.fds.get(dirfd)?.metadata()?
+        let (md, mnt_id) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            let f = self.map.fds.get(dirfd)?;
+            let id = if f.path.starts_with('/') { self.ns.mount_id_of(&f.path) } else { 1 };
+            (f.metadata()?, id)
         } else {
             let p = self.at_path(m, dirfd, path)?;
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
                 self.ns.metadata_nofollow(&p)?
             } else {
                 self.ns.metadata(&p)?
-            }
+            };
+            (md, self.ns.mount_id_of(&p))
         };
         let st = Kernel::stat_from(&md);
 
@@ -3357,13 +3357,13 @@ impl PathIo<'_> {
         // which parts it actually answered; claiming everything but the
         // birth time is what a Linux filesystem without one reports.
         const STATX_BASIC_STATS: u32 = 0x07ff;
-        // And the mount's id, as Linux has since 5.8 whether asked or not:
-        // the tree is one filesystem (`st_dev` is the same everywhere), so
-        // one mount. systemd's path lookups (chase) compare mount ids, and
-        // stop where a statx has none (sysusers found no dbus.conf).
+        // And the mount's id, as Linux has since 5.8 whether asked or not,
+        // the one /proc/self/mountinfo gives it. systemd's path lookups
+        // (chase) compare mount ids, and stop where a statx has none
+        // (sysusers found no dbus.conf).
         const STATX_MNT_ID: u32 = 0x1000;
         put32(&mut out, 0, STATX_BASIC_STATS | STATX_MNT_ID);
-        put64(&mut out, 144, Self::STATX_ROOT_MNT_ID);
+        put64(&mut out, 144, mnt_id);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.creds.uid());

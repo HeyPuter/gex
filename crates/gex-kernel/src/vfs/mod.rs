@@ -750,6 +750,11 @@ impl Moved {
 
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
+    /// Its type as `/proc/self/mountinfo` names it. tmpfs unless it says
+    /// otherwise, as `statfs` answers for every one.
+    fn fs_type(&self) -> &'static str {
+        "tmpfs"
+    }
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     fn metadata(&self, path: &str) -> Result<Metadata, Errno>;
@@ -900,6 +905,18 @@ pub trait FileSystem: Send + Sync {
 pub(crate) fn writes(flags: u64) -> bool {
     let acc = flags & crate::fs::oflags::ACCMODE;
     acc == crate::fs::oflags::O_WRONLY || acc == crate::fs::oflags::O_RDWR
+}
+
+/// The id of the mount at `at` (`/proc/self/mountinfo`'s first field,
+/// `statx`'s `stx_mnt_id`): 1 for the root, and for another the same number
+/// wherever and whenever it is asked, a forked child's table and the
+/// table after other mounts come and go included.
+pub fn mount_id(at: &str) -> u64 {
+    if at == "/" {
+        return 1;
+    }
+    let h = at.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    2 + h % 0x3fff_fff0
 }
 
 /// Whether absolute `abs` is `at` or below it.
@@ -1143,6 +1160,18 @@ impl Namespace {
     fn list_others(&mut self) {
         let others: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
         self.others = others.join("\0");
+    }
+
+    /// Every mount, parents before what is mounted under them: where, and
+    /// its [`FileSystem::fs_type`].
+    pub fn mount_table(&self) -> Vec<(String, &'static str)> {
+        self.mounts.iter().map(|(at, fs)| (at.clone(), fs.fs_type())).collect()
+    }
+
+    /// [`mount_id`] of the mount holding `path`, by its name: a symlink on
+    /// the way into another mount is not followed (the root's, then).
+    pub fn mount_id_of(&self, path: &str) -> u64 {
+        self.mount_at(&normalize(path, &self.cwd)).map_or(1, |(at, _)| mount_id(at))
     }
 
     /// Whether something is mounted at exactly this path.

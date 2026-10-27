@@ -157,6 +157,9 @@ impl ProcSource for KernelProcSource {
     fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
         tty_of(self.0.get()?.ptys, sid)
     }
+    fn mount_table(&self) -> Vec<(String, &'static str)> {
+        self.0.get().and_then(|l| l.vfs.upgrade()).map(|v| v.get().mount_table()).unwrap_or_default()
+    }
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
@@ -343,5 +346,50 @@ mod tests {
         drop(k);
         assert!(fds.upgrade().is_none(), "the descriptor table outlived its process");
         assert!(fs.upgrade().is_none(), "the fs_struct outlived its process");
+    }
+
+    /// `/proc/self/mountinfo` and `/proc/mounts` are the namespace's mount
+    /// table in Linux's format (`mountpoint`, `findmnt` and libmount read
+    /// them), each mount's id the one `statx` gives a path in it, and a
+    /// mount made later is in them.
+    #[test]
+    fn the_mount_table_is_in_proc() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        for d in ["/proc", "/dev", "/a b"] {
+            k.vfs.mkdir(d, 0o755).unwrap();
+        }
+        let cell = Arc::new(ProcCell::default());
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&cell))))));
+        k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
+        k.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+        k.publish_proc(&cell);
+        let read = |k: &Kernel, path: &str| {
+            let h = k.vfs.open(path, 0, 0).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = h.read_at(0, &mut buf).unwrap() as usize;
+            String::from_utf8(buf[..n].to_vec()).unwrap()
+        };
+        let info = read(&k, "/proc/self/mountinfo");
+        let lines: Vec<Vec<&str>> = info.lines().map(|l| l.split(' ').collect()).collect();
+        let at = |p: &str| lines.iter().find(|f| f[4] == p).unwrap_or_else(|| panic!("{p} not in {info}"));
+        let id = |p: &str| at(p)[0].parse::<u64>().unwrap();
+        assert_eq!(lines.len(), 4, "{info}");
+        assert_eq!(at("/")[..2], ["1", "0"], "{info}");
+        assert_eq!(&at("/proc")[6..10], ["-", "proc", "proc", "rw"], "{info}");
+        assert_eq!(at("/dev")[1].parse::<u64>().unwrap(), 1, "/dev under the root");
+        assert_eq!(at("/dev/shm")[1].parse::<u64>().unwrap(), id("/dev"), "/dev/shm under /dev");
+        assert_eq!(at("/dev/shm")[8], "tmpfs");
+        for (path, mount) in [("/proc/self/maps", "/proc"), ("/proc", "/proc"), ("/dev/null", "/dev"), ("/dev/shm/x", "/dev/shm"), ("/devx", "/"), ("/", "/")] {
+            assert_eq!(k.vfs.mount_id_of(path), id(mount), "statx's mount id for {path}");
+        }
+        let mounts = read(&k, "/proc/mounts");
+        assert!(mounts.lines().any(|l| l == "devtmpfs /dev devtmpfs rw,relatime 0 0"), "{mounts}");
+        assert_eq!(mounts, read(&k, "/proc/self/mounts"));
+        // a mount point with a space, escaped; and one made after
+        k.vfs.mount("/a b", Arc::new(TmpFs::new()));
+        let info = read(&k, "/proc/self/mountinfo");
+        assert!(info.lines().any(|l| l.contains(r" /a\040b rw,relatime - tmpfs ")), "{info}");
+        assert_eq!(k.vfs.mount_id_of("/dev"), id("/dev"), "an id stays as other mounts come");
     }
 }

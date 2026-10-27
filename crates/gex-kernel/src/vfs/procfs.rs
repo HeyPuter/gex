@@ -50,6 +50,51 @@ pub trait ProcSource: Send + Sync {
     fn task_owner(&self, _id: i32) -> Option<i32> {
         None
     }
+    /// The process's mounts ([`crate::vfs::Namespace::mount_table`]).
+    fn mount_table(&self) -> Vec<(String, &'static str)> {
+        Vec::new()
+    }
+}
+
+/// A mount point as Linux writes one in a mount table: space, tab, newline
+/// and backslash in octal.
+fn mount_path(at: &str) -> String {
+    let mut out = String::with_capacity(at.len());
+    for c in at.chars() {
+        match c {
+            ' ' | '\t' | '\n' | '\\' => out.push_str(&format!("\\{:03o}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `/proc/self/mountinfo`: one line per mount, Linux's fields -- id,
+/// parent's id, device (`st_dev`, 0 everywhere here), root, mount point,
+/// options, `-`, type, source, superblock options. The root's parent is 0,
+/// one not listed, as a chroot's is.
+pub fn mountinfo(table: &[(String, &'static str)]) -> String {
+    let mut out = String::new();
+    for (at, ty) in table {
+        let parent = if at == "/" {
+            0
+        } else {
+            table
+                .iter()
+                .filter(|(p, _)| p != at && (p == "/" || at.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('/'))))
+                .max_by_key(|(p, _)| p.len())
+                .map_or(1, |(p, _)| crate::vfs::mount_id(p))
+        };
+        let id = crate::vfs::mount_id(at);
+        out.push_str(&format!("{id} {parent} 0:0 / {} rw,relatime - {ty} {ty} rw\n", mount_path(at)));
+    }
+    out
+}
+
+/// `/proc/mounts` (`/proc/self/mounts`, what `/etc/mtab` links to): source,
+/// mount point, type, options, and the two zeros.
+pub fn mounts(table: &[(String, &'static str)]) -> String {
+    table.iter().map(|(at, ty)| format!("{ty} {} {ty} rw,relatime 0 0\n", mount_path(at))).collect()
 }
 
 /// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and
@@ -218,6 +263,8 @@ impl ProcFs {
             "self/stat" => s.stat(id, self.tasks_of("self").len()).into_bytes(),
             "self/status" => s.status(id, self.tasks_of("self").len()).into_bytes(),
             "self/statm" => b"0 0 0 0 0 0 0\n".to_vec(),
+            "self/mountinfo" => mountinfo(&s.mount_table()).into_bytes(),
+            "self/mounts" | "mounts" => mounts(&s.mount_table()).into_bytes(),
             "loadavg" => {
                 let n = s.others().len().max(1);
                 format!("0.00 0.00 0.00 1/{n} {}\n", s.pid()).into_bytes()
@@ -267,6 +314,9 @@ impl ProcFs {
 }
 
 impl FileSystem for ProcFs {
+    fn fs_type(&self) -> &'static str {
+        "proc"
+    }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         // A directory opens for reading only.
         if super::writes(flags) && self.metadata(path).is_ok_and(|md| md.file_type == FileType::Directory) {
@@ -317,7 +367,7 @@ impl FileSystem for ProcFs {
                 for pid in pids {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
-                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "sys"] {
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys"] {
                     let file_type = if matches!(name, "self" | "sys") { FileType::Directory } else { FileType::Regular };
                     out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
                 }
@@ -325,7 +375,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "task",
+                "task", "mountinfo", "mounts",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -660,6 +710,9 @@ impl SysCpuFs {
 }
 
 impl FileSystem for SysCpuFs {
+    fn fs_type(&self) -> &'static str {
+        "sysfs"
+    }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.trim_matches('/');
         if let Some(data) = Self::generate(path) {
