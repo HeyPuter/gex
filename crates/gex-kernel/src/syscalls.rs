@@ -3310,6 +3310,9 @@ impl PathIo<'_> {
         Ok(bytes.len() as u64)
     }
 
+    /// The tree's one mount, by `statx`'s id (`stx_mnt_id`).
+    const STATX_ROOT_MNT_ID: u64 = 1;
+
     /// `statx`, how glibc stats a file on a modern kernel.
     ///
     /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
@@ -3348,7 +3351,13 @@ impl PathIo<'_> {
         // which parts it actually answered; claiming everything but the
         // birth time is what a Linux filesystem without one reports.
         const STATX_BASIC_STATS: u32 = 0x07ff;
-        put32(&mut out, 0, STATX_BASIC_STATS);
+        // And the mount's id, as Linux has since 5.8 whether asked or not:
+        // the tree is one filesystem (`st_dev` is the same everywhere), so
+        // one mount. systemd's path lookups (chase) compare mount ids, and
+        // stop where a statx has none (sysusers found no dbus.conf).
+        const STATX_MNT_ID: u32 = 0x1000;
+        put32(&mut out, 0, STATX_BASIC_STATS | STATX_MNT_ID);
+        put64(&mut out, 144, Self::STATX_ROOT_MNT_ID);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.creds.uid());
@@ -14968,6 +14977,16 @@ mod tests {
             got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
             got.push(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20300, 0, 0x7ff, 0x23000]));
             got.extend(m.read(0x23000, 256).unwrap().iter().map(|&b| b as i64));
+            // the mount's id, the same for the file and for the root
+            // (systemd's chase compares them)
+            let sx = m.read(0x23000, 256).unwrap();
+            let mask = u32::from_le_bytes(sx[0..4].try_into().unwrap());
+            let mnt = u64::from_le_bytes(sx[144..152].try_into().unwrap());
+            assert!(mask & 0x1000 != 0 && mnt != 0, "statx mask {mask:#x}, mount {mnt}");
+            m.write(0x20600, b"/\0").unwrap();
+            assert_eq!(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20600, 0, 0x1000, 0x23000]), 0);
+            let root = m.read(0x23000, 256).unwrap();
+            assert_eq!(u64::from_le_bytes(root[144..152].try_into().unwrap()), mnt, "the root's mount");
             got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20200, 4]));
             got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20400, 0]));
             got.push(sys(&mut m, &mut k, nr::READLINKAT, &[dir as u64, 0x20500, 0x24000, 64]));
