@@ -377,22 +377,56 @@ pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     (regs, dirs, slots)
 }
 
-/// Provider module `number`'s bytes when it is a wasm32 program: read again
-/// if they went ([`gex_wasmprog_release`]), and none if the file no longer
-/// holds them.
+/// Provider module `number`'s bytes in the shim's heap when it is a wasm32
+/// program whose bytes are still held (a library's go once it is
+/// instantiated, [`gex_wasmprog_release`]; [`owned`] reads them again).
 pub(super) fn wasm(number: u32) -> Option<(u32, u32)> {
-    let mut g = lock(&PROGS);
-    let p = g.iter_mut().find(|p| p.number == number)?;
-    if let Some(id) = p.gone {
-        let same = file_id(&p.path).is_some_and(|(_, ino, mtime, size)| (ino, mtime, size) == id);
-        let Some(b) = super::dylink::read(&p.path).filter(|b| same && b.len() as u32 == p.len) else {
-            crate::warn_line(&format!("gex: {}: changed since it was loaded\n", p.path));
-            return None;
-        };
-        p.wasm = b;
-        p.gone = None;
+    let g = lock(&PROGS);
+    let p = g.iter().find(|p| p.number == number)?;
+    Some((if p.gone.is_some() { 0 } else { p.wasm.as_ptr() as u32 }, p.len))
+}
+
+/// Provider module `number`'s length when it is a wasm32 program, held or
+/// not.
+pub(super) fn len(number: u32) -> Option<u32> {
+    lock(&PROGS).iter().find(|p| p.number == number).map(|p| p.len)
+}
+
+/// A copy of provider module `number`'s bytes that the caller owns, when it
+/// is a wasm32 program: copied under the lock while they are held, else
+/// read again from the file they came from, which must be the same file
+/// (dpkg's rename gives a new inode). A pointer into the held bytes would
+/// not do: another Worker of the process instantiating the same module
+/// releases them, which freed them under a Worker still copying them out.
+pub(super) fn owned(number: u32) -> Option<Vec<u8>> {
+    let (path, id, len) = {
+        let g = lock(&PROGS);
+        let p = g.iter().find(|p| p.number == number)?;
+        match p.gone {
+            None => return Some(p.wasm.clone()),
+            Some(id) => (p.path.clone(), id, p.len),
+        }
+    };
+    let same = file_id(&path).is_some_and(|(_, ino, mtime, size)| (ino, mtime, size) == id);
+    let b = super::dylink::read(&path).filter(|b| same && b.len() as u32 == len);
+    if b.is_none() {
+        crate::warn_line(&format!("gex: {path}: changed since it was loaded\n"));
     }
-    Some((p.wasm.as_ptr() as u32, p.len))
+    b
+}
+
+/// [`owned`] for JS: the bytes in a block of exactly the module's length,
+/// which the caller gives back with `gex_free(ptr, len)`; 0 when there are
+/// none.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_owned(number: u32) -> u32 {
+    match owned(number) {
+        Some(b) if !b.is_empty() => {
+            let b = b.into_boxed_slice();
+            Box::into_raw(b) as *mut u8 as u32
+        }
+        _ => 0,
+    }
 }
 
 /// What stands for a library's bytes once they went at load

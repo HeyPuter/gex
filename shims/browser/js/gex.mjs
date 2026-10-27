@@ -4424,7 +4424,17 @@ export class Gex {
     // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
     // and the bytes copied out only when the page has no module for it.
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
-    const pcopy = () => new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, plen).slice();
+    // A wasm32 program's bytes as a copy the shim made for this Worker
+    // (`gex_wasmprog_owned`): another Worker of the process may release
+    // the shim's own while this one copies.
+    const pcopy = () => {
+      const own = wasmprog && e.gex_wasmprog_owned ? e.gex_wasmprog_owned(prov) >>> 0 : 0;
+      if (wasmprog && e.gex_wasmprog_owned && !own) throw new Error(`wasm32 module ${prov}: its bytes are gone`);
+      const at = own || (e.gex_cgen_pmod_wasm_ptr(prov) >>> 0);
+      const b = new Uint8Array(this.#memory.buffer, at, plen).slice();
+      if (own) e.gex_free(own, plen);
+      return b;
+    };
     let pbytes = null, pkey = null;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.

@@ -571,7 +571,7 @@ pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
-    if let Some((_, n)) = super::wasmprog::wasm(number).or_else(|| super::libprov::wasm(number)) {
+    if let Some(n) = super::wasmprog::len(number).or_else(|| super::libprov::wasm(number).map(|(_, n)| n)) {
         return n;
     }
     lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
