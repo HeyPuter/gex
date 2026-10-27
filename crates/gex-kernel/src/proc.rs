@@ -429,21 +429,26 @@ impl ProcTable {
             }
             return Vec::new();
         }
-        let t = self.lock();
-        t.procs
-            .iter()
-            .map(|p| {
-                let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
-                tids.sort_unstable();
-                ProcEntry {
-                    pid: p.pid,
-                    ppid: p.ppid,
-                    pgid: p.pgid,
-                    sid: p.sid,
-                    zombie: p.child.status.lock().map(|s| s.is_some()).unwrap_or(false),
-                    info: p.info.clone(),
-                    tids,
-                }
+        // Each status is read after the table is let go: a `wait4` that
+        // collects holds its child's status and then takes the table (to
+        // forget the child), so holding them in this order deadlocks with
+        // it. A process descriptor's poll asks here each time.
+        let rows: Vec<_> = {
+            let t = self.lock();
+            t.procs
+                .iter()
+                .map(|p| {
+                    let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
+                    tids.sort_unstable();
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), tids };
+                    (e, Arc::clone(&p.child.status))
+                })
+                .collect()
+        };
+        rows.into_iter()
+            .map(|(mut e, st)| {
+                e.zombie = st.lock().map(|s| s.is_some()).unwrap_or(false);
+                e
             })
             .collect()
     }
@@ -908,10 +913,9 @@ impl ProcTable {
     /// Whether `pid` is in the table and has not exited: [`ProcTable::exists`]
     /// without the zombies, which are in the table until reaped.
     pub fn alive(&self, pid: i32) -> bool {
-        self.lock()
-            .procs
-            .iter()
-            .any(|p| p.pid == pid && p.child.status.lock().map(|s| s.is_none()).unwrap_or(true))
+        // (the status read after the table is let go, as in `entries`)
+        let st = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status));
+        st.is_some_and(|st| st.lock().map(|s| s.is_none()).unwrap_or(true))
     }
 
     /// Whether a `wait4` by `ppid` for `want` would answer now: a child with a
