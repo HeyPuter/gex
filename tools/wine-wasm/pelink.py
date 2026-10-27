@@ -577,10 +577,37 @@ def link(dlls, out, gexrt, others=None):
         # lowered to wasm32 (wcc64's side modules: the one place an address
         # becomes a memory index), optimised as they are; the memory64
         # flavour left as it is, as wcc64 -mgex-memory64 leaves them
+        snap = not M64 and os.path.exists(os.path.join(sysroot or '', 'lib', 'gex-snapshot'))
+        # (the snapshot flavour's level root stays apart from the entry's C
+        # below it, which asyncify instruments)
+        apart = ['--no-inline=__gexw_entry_c'] if snap else []
         subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
                                '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
                                '--enable-exception-handling', '--enable-reference-types', '--enable-memory64'] +
-                              ([] if M64 else ['--memory64-lowering']) + ['-O2', '-o', out])
+                              ([] if M64 else ['--memory64-lowering']) + apart + ['-O2', '-o', out])
+        if snap:
+            # The snapshot flavour's (wcc64's sysroot): asyncify over the
+            # lowered module, what can reach a call-out by a type-correct
+            # call graph (forkreach.py), below gexrt's entry from the guest
+            # (each level's root, where an unwind ends: neither it nor its
+            # callers); its state and data the host's (relocatable), then
+            # the standard exception instructions.
+            dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+            roots = ['__gexw_entry']
+            reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', '--ignore', ','.join(roots), dis, out, 'gex.call_out'] + roots,
+                                   capture_output=True, text=True)
+            passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.call_out', '--pass-arg=asyncify-relocatable']
+            if reach.returncode == 0:
+                lst = out + '.onlylist'
+                open(lst, 'w').write(reach.stdout.strip() + '\n')
+                passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+            else:
+                passes += ['--pass-arg=asyncify-removelist@' + ','.join(roots)]
+            subprocess.check_call([opt, out, '-g', '--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals',
+                                   '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-exception-handling',
+                                   '--enable-reference-types'] + apart + passes + ['-O2', '--translate-to-exnref', '-o', out])
+            if reach.returncode == 0:
+                os.unlink(lst)
     elif os.path.exists(opt):
         subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
                                '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',

@@ -484,6 +484,11 @@ const SNAP_TRACE = !!globalThis.process?.env?.GEX_SNAP_TRACE;
 /** A snapshot record's levels (libgex-snap/snap.h `nlv`, `lv`): the
  *  count's offset, the first level's and a level's size; and how many. */
 const SNAP_NLV = 24, SNAP_LV = 32, SNAP_LVS = 40, SNAP_LEVELS = 8;
+// A record's upper half where Wine's PE module of the snapshot flavour runs
+// in the thread (`#snapPeWin`): the PE levels' calls and the per-thread state
+// at their call-outs (a slot each), then its asyncify window, up to the
+// restored thread's stack (snap.h SNAP_SIZE, SNAP_STACK).
+const SNAP_HALF = 0x20000, SNAP_PE_SLOT = 128, SNAP_PE_HDR = SNAP_LEVELS * SNAP_PE_SLOT, SNAP_PE_END = 0x40000 - 16384;
 /** Thrown by a snapshot's stop inside guest code a call-out runs, to that
  *  call-out (`#snapCallOut`). */
 const SNAP_NEST = Object.freeze({ snapNest: true });
@@ -4728,12 +4733,34 @@ export class Gex {
     // A unit split by function (gex_split): its cold clusters' loader,
     // or the recorder's hit map of an instrumented unit.
     if (prov < 0 && jit < 0) this.#splitImports(mod, this.#cgenStr(e.gex_cgen_key, u), imports);
+    // Wine's PE module of the snapshot flavour (pelink.py): its entries from
+    // the guest are levels of the thread's (`#snapPeStop`), its call-outs
+    // the flavour's (`#snapPeCallOut`), and its system and Unix calls go by
+    // the host's route, a call-out to the guest's entry, not the Unix
+    // side's direct entries (ops 1 and 5), which a stop could not unwind.
+    const peSnap = dllLowered && !single.on && WebAssembly.Module.exports(mod).some((x) => x.name === '__gexw_snap_globals');
+    if (peSnap) {
+      const g = imports.gex, ud = g.unix_dispatcher;
+      g.unix_dispatcher = (op, idx) => (op === 1 || op === 5 ? 0 : ud(op, idx));
+      g.snap_pe_stop = (ctx, depth, need, ret, body) => this.#snapPeStop(ctx, depth, need, ret, body);
+      if (this.#snapHooks) g.call_out = (ctx, target, ret, spWant) => this.#snapPeCallOut(ctx >>> 0, target, ret, spWant);
+      this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+      Object.assign(imports.env, {
+        __asyncify_state: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        __asyncify_data: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        __gexw_snap_depth: this.#snapDepth,
+      });
+    }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
     // What a door instance needs to run this program again on its memory
     // (a wineserver: `#doorPublish`).
     if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText };
     inst = new WebAssembly.Instance(mod, imports);
+    if (peSnap) {
+      this.#snapPe = { inst, state: imports.env.__asyncify_state };
+      this.#snapSplit();
+    }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
     if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
@@ -5777,6 +5804,7 @@ export class Gex {
       snap_register: (rec, root) => {
         this.#snapRec = Number(rec) >>> 0;
         this.#snapRoot = this.#snapRec ? root : 0;
+        this.#snapSplit();
         e.gex_snap_enable?.(this.#snapRec && !this.#vforkDepth ? 1 : 0);
       },
       // A restored thread's call into the program's handler, which its
@@ -5856,6 +5884,7 @@ export class Gex {
       throw SNAP_NEST;
     }
     v.setUint32(rec + 20, idx >>> 0, true);
+    if (SNAP_TRACE) this.#snapTraceLevels(rec);
     this.#snapPark(rec);
     new DataView(this.#memory.buffer).setUint32(rec + SNAP_NLV, 0, true);
     P.asyncify_start_rewind(rec);
@@ -5888,6 +5917,17 @@ export class Gex {
     const route = v.getUint32(b, true), idx = v.getUint32(b + 4, true);
     const rsp = v.getBigUint64(b + 32, true);
     const P = this.#snapProg().exports;
+    if (route === 2) {
+      // An entry into Wine's PE module, the guest's call of its export: its
+      // root called again, rewound, and the guest goes on where the
+      // export's return left it.
+      if (!this.#snapPe) this.#cgenCatchUp();
+      if (!this.#snapPe) throw new Error('snapshot: a level in Wine\'s PE module, which this thread has not installed');
+      const W = this.#snapPe.inst.exports, sl = rec + SNAP_HALF + k * SNAP_PE_SLOT;
+      W.asyncify_start_rewind(this.#snapPeWin(rec));
+      W.__gexw_entry(v.getInt32(sl, true), v.getInt32(sl + 4, true), v.getInt32(sl + 8, true), v.getBigUint64(sl + 16, true), v.getBigUint64(sl + 24, true));
+      return this.#faultPc(ctx);
+    }
     if (route === 0) {
       P.asyncify_start_rewind(rec);
       this.#entryCallFn(idx, ctx, rsp);
@@ -5940,6 +5980,93 @@ export class Gex {
       return 0;
     }
   }
+  /** A snapshot's stop at the root of an entry into Wine's PE module of the
+   *  snapshot flavour (gexrt's `__gexw_entry`), whose call came back
+   *  unwinding: the level kept (route 2, the root's arguments in its slot),
+   *  as `#snapStop` keeps one of the program's, and the root makes the call
+   *  again, rewound, when this returns. */
+  #snapPeStop(ctx, depth, need, ret, body) {
+    const W = this.#snapPe.inst.exports;
+    const rec = this.#snapRec;
+    if (!this.#snapPeUnwinding || !rec) throw new Error('snapshot: an unwind not the snapshot\'s reached an entry of Wine\'s PE module');
+    this.#snapPeUnwinding = false;
+    W.asyncify_stop_unwind();
+    const k = this.#snapDepth.value - 1;
+    const v = new DataView(this.#memory.buffer), b = rec + SNAP_LV + k * SNAP_LVS, sl = rec + SNAP_HALF + k * SNAP_PE_SLOT;
+    if (v.getUint32(rec + SNAP_NLV, true) === 0) v.setUint32(rec + SNAP_NLV, k + 1, true);
+    v.setUint32(b, 2, true);
+    v.setUint32(b + 4, 0, true);
+    v.setInt32(sl, ctx, true);
+    v.setInt32(sl + 4, depth, true);
+    v.setInt32(sl + 8, need, true);
+    v.setBigUint64(sl + 16, BigInt.asUintN(64, ret), true);
+    v.setBigUint64(sl + 24, BigInt.asUintN(64, body), true);
+    // (the root's count goes down as this leaves it)
+    if (k > 0) throw SNAP_NEST;
+    this.#snapProg().exports.__gex_snap_fill(BigInt(rec));
+    v.setUint32(rec + 20, 0, true);
+    if (SNAP_TRACE) this.#snapTraceLevels(rec);
+    this.#snapPark(rec);
+    new DataView(this.#memory.buffer).setUint32(rec + SNAP_NLV, 0, true);
+    W.asyncify_start_rewind(this.#snapPeWin(rec));
+  }
+  /** Wine's PE module's call-out in the snapshot flavour, as the program's
+   *  (`#snapCallOut`): the module's per-thread state and stack pointer at
+   *  the call kept in the inner level's slot, which its unwind does not
+   *  keep and its rewind puts back. */
+  #snapPeCallOut(ctx, target, ret, spWant) {
+    const pe = this.#snapPe, W = pe.inst.exports;
+    const rec = this.#snapRec, j = this.#snapDepth.value;
+    const sp = this.#providerStack64();
+    const sl = rec + SNAP_HALF + j * SNAP_PE_SLOT;
+    if (pe.state.value === 2) {
+      W.asyncify_stop_rewind();
+      W.__gexw_snap_globals(1, BigInt(sl + 40));
+      sp.value = new DataView(this.#memory.buffer).getBigUint64(sl + 80, true);
+      return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false, () => this.#snapLevelEnter(rec, j, ctx)));
+    }
+    if (rec && j < SNAP_LEVELS) {
+      W.__gexw_snap_globals(0, BigInt(sl + 40));
+      new DataView(this.#memory.buffer).setBigUint64(sl + 80, sp.value, true);
+    }
+    try {
+      return this.#callOut(ctx, target, ret, spWant);
+    } catch (err) {
+      if (err !== SNAP_NEST || !rec || j >= SNAP_LEVELS) throw err;
+      this.#snapPeUnwinding = true;
+      W.asyncify_start_unwind(this.#snapPeWin(rec));
+      return 0;
+    }
+  }
+  /** (GEX_SNAP_TRACE) a stopped thread's levels: each one's route. */
+  #snapTraceLevels(rec) {
+    const v = new DataView(this.#memory.buffer), n = v.getUint32(rec + SNAP_NLV, true);
+    const routes = Array.from({ length: n }, (_, k) => v.getUint32(rec + SNAP_LV + k * SNAP_LVS, true));
+    console.error(`[gex-snap] tid ${this.#threadTid}: stopped, levels by route [${routes.join(' ')}]`);
+  }
+  /** The asyncify window of Wine's PE module in this thread's record, made
+   *  at the first use (a restored record keeps its own). */
+  #snapPeWin(rec) {
+    const v = new DataView(this.#memory.buffer), h = rec + SNAP_HALF + SNAP_PE_HDR;
+    if (v.getUint32(h + 4, true) === 0) {
+      v.setUint32(h, h + 8, true);
+      v.setUint32(h + 4, rec + SNAP_PE_END, true);
+    }
+    return h;
+  }
+  /** With Wine's PE module of the flavour on this Worker, the program's
+   *  asyncify window ends at the record's upper half (`SNAP_HALF`). */
+  #snapSplit() {
+    const rec = this.#snapRec;
+    if (!this.#snapPe || !rec) return;
+    const v = new DataView(this.#memory.buffer);
+    if (v.getUint32(rec + 4, true) > rec + SNAP_HALF && v.getUint32(rec, true) < rec + SNAP_HALF) v.setUint32(rec + 4, rec + SNAP_HALF, true);
+  }
+  /** Wine's PE module of the snapshot flavour on this Worker (its instance
+   *  and asyncify state), and whether the unwind under way is the
+   *  snapshot's, through that module. */
+  #snapPe = null;
+  #snapPeUnwinding = false;
   /** Whether the program's hooks and call-outs are the snapshot flavour's
    *  (`#snapHookCall`, `#snapCallOut`). */
   #snapHooks = false;
@@ -6444,7 +6571,7 @@ export class Gex {
     // rest when the server goes. A plain read, before the lock as the
     // atomic load was: the flag only ever goes from 0 to set.
     if (i32[(a + 124) >> 2] !== 0) return 1;
-    if (Atomics.compareExchange(i32, L, 0, 1) !== 0) this.#doorLockSlow(i32, a, L, pid, tid);
+    if (Atomics.compareExchange(i32, L, 0, 1) !== 0 && !this.#doorLockSlow(i32, a, L, pid, tid)) return 1;
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
     let r;
@@ -6513,13 +6640,18 @@ export class Gex {
     return r;
   }
 
-  /** The door lock, contended: spin, then wait (the lock word 2: waiters). */
+  /** The door lock, contended: spin, then wait (the lock word 2: waiters).
+   *  False, the lock not taken, when a session snapshot asks this thread to
+   *  stop meanwhile: the holder may be stopped holding it (the server's
+   *  pump stops at any call that can block), and the request goes by the
+   *  pipe, whose wait stops. */
   #doorLockSlow(i32, a, L, pid, tid) {
     let waitedMs = 0;
     for (let spins = 0; ; spins++) {
       const v = Atomics.compareExchange(i32, L, 0, 1);
-      if (v === 0) return;
+      if (v === 0) return true;
       if (spins < 200) continue;
+      if (this.#snapRec && this.#kernel?.k_snap_pending?.()) return false;
       if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
       Atomics.wait(i32, L, 2, 1);
       // A lock held this long is a stuck door (a Worker ended inside one,
@@ -8010,6 +8142,10 @@ export class Gex {
     const sp0 = e.__stack_pointer.value;
     const psp0 = this.#progSpAt();
     const me = this.#callouts.length;
+    // The snapshot flavour's count of entries from the guest: an exception
+    // that reaches this loop has ended every one made inside it (a trap
+    // passes their own catches by), and the count goes back to this.
+    const d0 = this.#snapDepth?.value ?? 0;
     // `ri`: this call-out's index in the shim's list (cgen.rs `CALLOUTS`),
     // which `gex_callout_hit`, `gex_callout_leave_ok` and
     // `gex_callout_may_return` speak in; -1 for one the shim did not open
@@ -8067,6 +8203,7 @@ export class Gex {
         } catch (err) {
           e.__stack_pointer.value = sp0;
           this.#progSpBack(psp0);
+          if (this.#snapDepth) this.#snapDepth.value = d0;
           if (err === SNAP_NEST) throw err;
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;

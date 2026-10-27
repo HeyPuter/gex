@@ -56,15 +56,16 @@ if '-D_WIN32' in args:
     if not os.environ.get('GEX_WASM_NO_ICALL'):
         CC += ['-fpass-plugin=' + os.path.join(lib, 'GexIcall.so')]
 # The snapshot flavour's sysroot (build-sysroot64.sh GEX_SNAPSHOT=1, which
-# leaves lib/gex-snapshot): the Unix side's code takes the legacy exception
-# instructions, which asyncify can instrument (the link below translates
-# them to the standard ones), and a program's blocking calls, through
-# gex.syscall_b, are where a session snapshot unwinds a thread
-# (libgex-snap/entry64.c). Only there: another sysroot's programs are built
-# as before, byte for byte.
+# leaves lib/gex-snapshot): code takes the legacy exception instructions,
+# which asyncify can instrument (the program's link below, and pelink.py's
+# for the native PE core, translate them to the standard ones), and is
+# compiled with __GEX_SNAPSHOT__ (the PE core's roots: libs/gexrt). A
+# program's blocking calls, through gex.syscall_b, are where a session
+# snapshot unwinds a thread (libgex-snap/entry64.c). Only there: another
+# sysroot's programs are built as before, byte for byte.
 SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
-if SNAPSHOT and '-D_WIN32' not in args:
-    CC = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in CC]
+if SNAPSHOT:
+    CC = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in CC] + ['-D__GEX_SNAPSHOT__']
 if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
        for a in args) or not args:
     os.execvp(CC[0], CC + args)

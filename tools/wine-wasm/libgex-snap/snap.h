@@ -57,8 +57,11 @@ struct driver {
  * A wasm64 program's thread stopped inside guest code that Wine's call
  * runs (a window procedure's message loop) has a level for each of its
  * entries from the guest, outermost first: how the entry came (`route`: 0
- * the host's entry function, 1 the fault hook), the function, the hook's
- * arguments, the guest's stack pointer then, and the program's stack
+ * the host's entry function, 1 the fault hook, 2 an entry into Wine's PE
+ * module of the flavour, whose call and state the host keeps in the
+ * record's upper half, with that module's asyncify window: the program's
+ * then ends at the half), the function, the hook's arguments, the guest's
+ * stack pointer then, and the program's stack
  * pointer at the call-out the level runs in (`sp`, none for the first).
  * `nlv` levels are in use. */
 #define SNAP_LEVELS 8
