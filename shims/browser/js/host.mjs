@@ -189,6 +189,11 @@ function snapTake(buffer) {
   }
   return { length, runs: spans.map(([at, len]) => [at, new Uint8Array(buffer, at, len).slice()]) };
 }
+/** Nanoseconds since the epoch, as every Worker's clock reads it (gex.mjs
+ *  `hostNowNs`), as a decimal string. */
+function snapNow() {
+  return String(BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n + BigInt(Math.round(performance.now() * 1e6)));
+}
 function snapFill(memory, m) {
   const to = new Uint8Array(memory.buffer);
   if (!m.runs) to.set(m);
@@ -607,7 +612,7 @@ export class ProcessHost {
 
   /**
    * A session snapshot: every thread of every process stopped where it waits
-   * (the snapshot flavour's programs, libc's `GEX_SNAPSHOT`), the global
+   * (the snapshot flavour's programs, libgex-snap), the global
    * kernel's memory and each process's memory and module store copied, and
    * the threads let go on (`resume`) or stopped. Each thread is one of this
    * host's Workers; a Worker whose thread does not stop within `timeout` ms
@@ -677,6 +682,8 @@ export class ProcessHost {
       threads,
       maxPages,
       flavourOf: [...this.#flavourOf],
+      // when it was taken, on the clock every Worker shares (`hostNowNs`)
+      at: snapNow(),
       door: this.#door ? { ...this.#door, memory: undefined, module: undefined } : null,
     };
     const copyMs = performance.now() - t0 - stopMs;
@@ -713,6 +720,9 @@ export class ProcessHost {
     }
     let first = null;
     const ups = [];
+    // The time it spent saved, which the session's monotonic clocks skip.
+    const held = meta.at ? BigInt(snapNow()) - BigInt(meta.at) : 0n;
+    let heldAll = true;
     // The wineserver's process first: its Worker publishes the door
     // (`Gex#snapThread`), which the others' start messages then carry.
     const order = [...byPid].sort(([a], [b]) => (b === meta.door?.pid) - (a === meta.door?.pid));
@@ -730,13 +740,15 @@ export class ProcessHost {
       const main = ts.find((t) => t.main);
       if (!main) throw new Error(`restore: pid ${pid} has no first thread`);
       const one = (t, reset, door) => {
+        const clock = reset ? { held: String(held > 0n ? held : 0n), heldAll } : {};
+        if (reset) heldAll = false;
         let up;
         const attached = new Promise((r) => { up = r; });
         this.#snapUp.set(t.key, up);
         const done = this.#spawn(t.main ? pid : t.key, {
           kind: 'thread', tid: t.tid, memory, moduleStore,
           ctx: 0n, pc: BigInt(t.pc),
-          snap: { pc: t.pc, sp: t.sp, door }, snapMain: t.main || undefined, snapReset: reset || undefined,
+          snap: { pc: t.pc, sp: t.sp, door, ...clock }, snapMain: t.main || undefined, snapReset: reset || undefined,
         });
         return { attached, done };
       };

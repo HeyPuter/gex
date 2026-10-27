@@ -2865,9 +2865,17 @@ export class Gex {
   }
   #clockSet = null;
 
+  /** How long the monotonic clocks are held back (a restored session
+   *  snapshot's time saved, gex-kernel `MONOTONIC_HELD`): set before this
+   *  Worker's first guest instruction, so read once. */
+  #monoHeld() {
+    return (this.#monoHeldNs ??= BigInt(this.#kernel?.k_mono_held?.(0n) ?? 0n));
+  }
+  #monoHeldNs = null;
+
   /** Monotonic ns since boot as the guest reads it. */
   #guestMono(ns) {
-    const c = this.#guestClock(), m = ns - BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n;
+    const c = this.#guestClock(), m = ns - BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n - this.#monoHeld();
     return c.scale === 1 ? m : BigInt(Math.floor(Number(m) * c.scale));
   }
 
@@ -3730,6 +3738,9 @@ export class Gex {
     await this.attach(shimWasm, guestWasm, { devices: false });
     const e = this.#shim.exports;
     const entry = e.gex_snap_thread(thread.tid, BigInt(thread.snap.pc), BigInt(thread.snap.sp));
+    // The clocks, once per process: its monotonic clocks do not count the
+    // time the snapshot was saved (and every process's, from the first).
+    if (thread.snap.held !== undefined) e.gex_snap_clock?.(BigInt(thread.snap.held), thread.snap.heldAll ? 1 : 0);
     if (!entry) throw new Error(`snapshot: process has no thread ${thread.tid}`);
     if (thread.procOpts) this.#opts = thread.procOpts;
     await this.#catchUp();
@@ -5615,7 +5626,7 @@ export class Gex {
   }
 
   /** A session snapshot's imports, for a program built with the snapshot
-   *  flavour (libc's `GEX_SNAPSHOT`). Each thread's driver registers its
+   *  flavour (libgex's snapshot.c). Each thread's driver registers its
    *  record (`snap_register`); a call that may block goes through
    *  `syscall_b`, which unwinds the thread's frames to its driver instead
    *  of making the call while the kernel's snapshot word asks threads to
@@ -5654,6 +5665,9 @@ export class Gex {
         call(ctx, pc);
         if (e.gex_snap_stopped?.()) unwind();
       },
+      // No record for a posix_spawn child (`#vforkChild`): its parent's
+      // memory map is not its to change.
+      snap_wanted: () => (this.#vforkDepth ? 0 : 1),
       snap_register: (rec) => {
         this.#snapRec = rec >>> 0;
         e.gex_snap_enable?.(this.#snapRec && !this.#vforkDepth ? 1 : 0);
@@ -5746,7 +5760,7 @@ export class Gex {
         this.#cgenCatchUp();
       },
       asyncify,
-      // The snapshot flavour's (src/process/wasm32/__gex_fork.c in libc).
+      // The snapshot flavour's (libgex-snap/snapshot.c).
       ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
@@ -5961,6 +5975,7 @@ export class Gex {
         // A snapshot-flavour server's: a door call is never a snapshot's
         // stop (its thread has no record), so its calls are plain ones.
         syscall_b: syscall,
+        snap_wanted: () => 0,
         snap_register: () => {},
         snap_unwinding: () => 0,
         // a thread's wait pipe is resolved by the pump (init_thread); written in place
@@ -5997,7 +6012,7 @@ export class Gex {
     // (`dispatch(pid, tid, 0, 1)`), so a request that never looks at the
     // time costs no clock read (Chrome: performance.now() alone is ~0.5 us).
     const lazyTime = v.dv.getInt32(a + 40, true) >= 2;
-    return { door: d, dispatch, sp, stackTop, lazyTime, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
+    return { door: d, dispatch, sp, stackTop, lazyTime, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n + this.#monoHeld() };
   }
 
   /** A system call from server code inside a door (i386 numbers, the

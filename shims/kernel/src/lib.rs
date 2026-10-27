@@ -3800,6 +3800,17 @@ pub extern "C" fn k_boot_secs(want: u32) -> u32 {
     }
 }
 
+/// How long every process's monotonic clocks are held back, in nanoseconds
+/// (gex-kernel's `MONOTONIC_HELD`): a restored session snapshot's time
+/// saved. `add` more first; 0 only asks.
+static MONO_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn k_mono_held(add: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    MONO_HELD.fetch_add(add, Ordering::AcqRel) + add
+}
+
 /// The benchmark clocks every process reads (gex-kernel `set_guest_clock`):
 /// the monotonic clocks' speed in thousandths (high half) and the seconds
 /// the wall clock is set back (low half, signed); 0 for real time.

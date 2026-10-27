@@ -149,7 +149,7 @@ FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_threa
 # The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
 # leaves this file in its lib/): a program's blocking calls go through
 # gex.syscall_b, and a session snapshot unwinds a thread parked in one
-# (the musl fork's src/process/wasm32/__gex_fork.c). Only there: another
+# (libgex-snap/snapshot.c). Only there: another
 # sysroot's programs are linked as before, byte for byte.
 SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
 if SNAPSHOT:

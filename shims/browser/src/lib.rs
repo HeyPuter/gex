@@ -287,6 +287,8 @@ extern "C" {
     fn k_ws_addr(slot: i32) -> u32;
     /// A session snapshot asking threads to stop (`shims/kernel/src/wait.rs`).
     fn k_snap_pending() -> i32;
+    /// How long the monotonic clocks are held back, after adding `add`.
+    fn k_mono_held(add: u64) -> u64;
     fn k_wq_new() -> u32;
     fn k_wq_free(id: u32);
     fn k_wq_notify(id: u32);
@@ -1584,6 +1586,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     }
     // And one boot instant for every process's monotonic clocks.
     gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
+    gex_kernel::share_monotonic_held(|add| unsafe { k_mono_held(add) });
     // And one table of DNS answers: a name one process resolved means the
     // same address in the process that connects to it.
     gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
@@ -3397,6 +3400,10 @@ pub(crate) struct Run {
     blocked_on: Option<gex_kernel::BlockOp>,
     /// What else that call owes, taken from the kernel as it parked.
     owed: Owed,
+    /// The time its wait had left when a session snapshot stopped the
+    /// thread in it (`snap_stop`): the call, made again, waits that long,
+    /// not its whole timeout again.
+    snap_left: Option<u64>,
 }
 
 /// What a parked call owes besides its answer, taken from the kernel when it
@@ -3414,7 +3421,40 @@ struct Owed {
 
 impl Run {
     fn new(pc: u64, waiting: Waiting) -> Run {
-        Run { pc, waiting, blocked_on: None, owed: Owed::default() }
+        Run { pc, waiting, blocked_on: None, owed: Owed::default(), snap_left: None }
+    }
+
+    /// A new wait, `w`: its deadline the one a snapshot's stop left
+    /// (`snap_left`), if it was stopped in the call made again.
+    fn park_as(&mut self, w: Waiting) -> Waiting {
+        match self.snap_left.take() {
+            Some(left) => w.with_deadline(turn_now().saturating_add(left)),
+            None => w,
+        }
+    }
+}
+
+impl Waiting {
+    /// When the wait ends by itself (host nanoseconds), if it does.
+    fn deadline(&self) -> Option<u64> {
+        match self {
+            Waiting::Futex { deadline, .. } | Waiting::Pi { deadline, .. } => *deadline,
+            Waiting::Sleep(d) => Some(*d),
+            Waiting::Net(d) | Waiting::SigWait(d) => *d,
+            _ => None,
+        }
+    }
+
+    /// The same wait ending at `at`, if it ends by itself.
+    fn with_deadline(self, at: u64) -> Waiting {
+        match self {
+            Waiting::Futex { parked, deadline: Some(_), val, wake_gen } => Waiting::Futex { parked, deadline: Some(at), val, wake_gen },
+            Waiting::Pi { addr, gen, deadline: Some(_) } => Waiting::Pi { addr, gen, deadline: Some(at) },
+            Waiting::Sleep(_) => Waiting::Sleep(at),
+            Waiting::Net(Some(_)) => Waiting::Net(Some(at)),
+            Waiting::SigWait(Some(_)) => Waiting::SigWait(Some(at)),
+            w => w,
+        }
     }
 }
 
@@ -7710,6 +7750,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         match MAKE_AGAIN.with(|c| c.take()) {
             Some(again) => pc = again,
             None => {
+                snap_carry_end();
                 enter_guest();
                 return;
             }
@@ -8479,7 +8520,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 {
                     let mut r = h.threads[cur()].run();
                     r.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
-                    r.waiting = waiting;
+                    r.waiting = r.park_as(waiting);
                     r.blocked_on = Some(op);
                     r.owed = owed;
                 }
@@ -9145,6 +9186,23 @@ thread_local! {
     static SNAP_STOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// This Worker's thread's run state holds a wait's time left
+    /// (`Run::snap_left`) for the call it makes again.
+    static SNAP_CARRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A call made, past the one a snapshot stopped: the time left was for it
+/// alone (taken if it waited, dropped if it did not).
+fn snap_carry_end() {
+    if SNAP_CARRY.with(|c| c.get()) && !SNAP_STOPPED.with(|c| c.get()) {
+        SNAP_CARRY.with(|c| c.set(false));
+        if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+            run.lock().unwrap_or_else(|e| e.into_inner()).snap_left = None;
+        }
+    }
+}
+
 /// Turn the snapshot stop in this Worker's waits on or off.
 #[no_mangle]
 pub extern "C" fn gex_snap_enable(on: i32) {
@@ -9180,6 +9238,8 @@ fn snap_stop() -> bool {
         {
             return false;
         }
+        r.snap_left = r.waiting.deadline().map(|d| d.saturating_sub(turn_now()));
+        SNAP_CARRY.with(|c| c.set(r.snap_left.is_some()));
         r.waiting = Waiting::Runnable;
         r.blocked_on = None;
         r.owed = Owed::default();
@@ -10537,6 +10597,7 @@ pub extern "C" fn gex_snap_thread(tid: i32, pc: i64, sp: i64) -> i64 {
         r.blocked_on = None;
         r.owed = Owed::default();
         r.pc = pc as u64;
+        SNAP_CARRY.with(|c| c.set(r.snap_left.is_some()));
     }
     CURRENT.with(|c| c.set(i));
     bind_free(i);
@@ -10545,6 +10606,20 @@ pub extern "C" fn gex_snap_thread(tid: i32, pc: i64, sp: i64) -> i64 {
     write_u64(data, c + ctx::sp_slot(true), sp as u64);
     write_u64(data, c + ctx::PC, pc as u64);
     pc
+}
+
+/// A restored session snapshot's clocks: this process's monotonic clocks
+/// held back `ns` more, the time the snapshot spent saved, and every
+/// process's too (`all`: once per restored session).
+#[no_mangle]
+pub extern "C" fn gex_snap_clock(ns: i64, all: i32) {
+    if ns <= 0 || unsafe { k_present() } == 0 {
+        return;
+    }
+    if all != 0 {
+        unsafe { k_mono_held(ns as u64) };
+    }
+    gex_kernel::hold_monotonic(ns as u64);
 }
 
 /// This Worker's thread's id, for a snapshot's record of it.
@@ -13557,7 +13632,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
     {
         let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
-        r.waiting = waiting;
+        r.waiting = r.park_as(waiting);
         r.blocked_on = Some(op);
         r.owed = Owed { restore_sigmask, write_blocked, reissue };
     }

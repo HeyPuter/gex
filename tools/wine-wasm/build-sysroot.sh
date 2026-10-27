@@ -22,8 +22,8 @@ CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib
 JOBS=${JOBS:-4}
 . "$HERE/flags.sh"
 # GEX_SNAPSHOT=1: the snapshot flavour, for pages that save and restore a
-# session (the musl fork's GEX_SNAPSHOT: blocking calls through
-# gex.syscall_b, threads stopped and resumed by asyncify). wcc sees the
+# session (the libc's GEX_SNAPSHOT hooks and libgex-snap/: blocking calls
+# through gex.syscall_b, threads stopped and resumed by asyncify). wcc sees the
 # lib/gex-snapshot it leaves and instruments what reaches those calls. Its
 # libc is asyncify's too, so it takes the legacy exception instructions.
 if [ -n "${GEX_SNAPSHOT:-}" ]; then
@@ -68,7 +68,9 @@ make -s -j"$JOBS" install-headers install-libs >/dev/null
 # it before libc.
 mkdir -p "$OUT/libgex-build"
 gobjs=
-for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s; do
+# The snapshot flavour's part (libgex-snap/) only in its sysroot.
+snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/*.c"
+for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s $snapsrc; do
   o="$OUT/libgex-build/$(basename "$f").o"
   clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
   gobjs="$gobjs $o"

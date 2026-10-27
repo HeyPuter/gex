@@ -904,6 +904,30 @@ pub fn share_monotonic_base(f: fn(u64) -> u64) {
     let _ = MONOTONIC_SHARED.set(f);
 }
 
+/// Nanoseconds the monotonic clocks have been held back by: the time a
+/// restored session snapshot spent saved, which its clocks do not count
+/// (as a machine's do not while it is suspended). 0 for a session never
+/// restored.
+static MONOTONIC_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A host whose processes do not share this static: given nanoseconds to
+/// add (0 to only ask), how long every process's clocks are held back.
+static MONOTONIC_HELD_SHARED: std::sync::OnceLock<fn(u64) -> u64> = std::sync::OnceLock::new();
+
+/// See [`MONOTONIC_HELD_SHARED`]. Set before the first clock reading.
+pub fn share_monotonic_held(f: fn(u64) -> u64) {
+    let _ = MONOTONIC_HELD_SHARED.set(f);
+}
+
+/// Hold this process's monotonic clocks back `ns` more (a restored
+/// session's, by the time it was saved). A process that has not read them
+/// yet takes the shared value at its first reading.
+pub fn hold_monotonic(ns: u64) {
+    use std::sync::atomic::Ordering;
+    if MONOTONIC_BASE.load(Ordering::Relaxed) != 0 {
+        MONOTONIC_HELD.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
 /// How much faster than real time the monotonic clocks run, as f64 bits
 /// (0: real time). For benchmarks only, off unless a host sets it
 /// ([`set_guest_clock`]).
@@ -965,12 +989,20 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
         if let Some(f) = MONOTONIC_SHARED.get() {
             want = f(want);
         }
+        if let Some(f) = MONOTONIC_HELD_SHARED.get() {
+            MONOTONIC_HELD.store(f(0), Ordering::Relaxed);
+        }
         base = match MONOTONIC_BASE.compare_exchange(0, want, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => want,
             Err(other) => other,
         };
     }
-    let (secs, nanos) = (secs.saturating_sub(base), nanos);
+    let (mut secs, mut nanos) = (secs.saturating_sub(base), nanos);
+    let held = MONOTONIC_HELD.load(Ordering::Relaxed);
+    if held != 0 {
+        let ns = (secs * 1_000_000_000 + nanos as u64).saturating_sub(held);
+        (secs, nanos) = (ns / 1_000_000_000, (ns % 1_000_000_000) as u32);
+    }
     let scale = CLOCK_SCALE.load(Ordering::Relaxed);
     if scale == 0 {
         return (secs, nanos);
