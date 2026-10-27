@@ -1,7 +1,7 @@
 //! Stateful Linux providers in the page: the
 //! native host's `libprov` for a Linux process with a 64-bit memory. A shared
 //! object named in the page's `wasmdlls` (`soname=guest path of a wasm64 PIC
-//! module`, Unity's `libmonobdwgc-2.0.so=/gex/mono.wasm`) is replaced when it
+//! module`, `libsqlite3.so.0=/gex/sqlite3.wasm`, say) is replaced when it
 //! maps: every export it defines is bound to the module's `gexp_<name>` (or
 //! `gexp__missing`), its constructors and destructors to `gexp__noop`, and none
 //! of its own code runs. The module is installed as Wine's PE module is
@@ -448,70 +448,9 @@ pub extern "C" fn gex_libprov_installed(number: u32) {
 }
 
 /// The module bytes of provider module `number` when it is a replaced
-/// Linux library's, or a JIT reservation's placeholder (`gex_cgen_pmod_wasm_ptr`/`len`).
+/// Linux library's (`gex_cgen_pmod_wasm_ptr`/`len`).
 pub(crate) fn wasm(number: u32) -> Option<(u32, u32)> {
-    if let Some(r) = lock(&LIBS).iter().find(|l| l.number == Some(number)).map(|l| (l.wasm.as_ptr() as usize as u32, l.wasm.len() as u32)) {
-        return Some(r);
-    }
-    lock(&RESERVES).iter().find(|(n, _)| *n == number).map(|(_, w)| (w.as_ptr() as usize as u32, w.len() as u32))
-}
-
-/// The JIT's reserved table ranges: (provider module number, placeholder module).
-static RESERVES: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
-
-/// `gex.provider_jit_reserve(n)` (the native
-/// `wasmjit`): a range of the process's function table for the provider's
-/// JIT, every Worker's filled with the JIT-call placeholder as it catches up.
-/// Returns the range's first index.
-#[no_mangle]
-pub extern "C" fn gex_libprov_jit_reserve(n: u64) -> u64 {
-    let wasm = placeholder_module(n as u32);
-    let number = lock(&PROVIDERS).len() as u32;
-    let install = ftab(|t| t.publish(n as u32, PROVIDER | number, Tier::Unit, &[]));
-    lock(&PROVIDERS).push(ProviderModule { file: "wasmjit:reserve".into(), regs: Vec::new(), dirs: Vec::new(), slots: 0, memory_base: 0 });
-    lock(&RESERVES).push((number, wasm));
-    ftab(|t| t.install(install).base) as u64
-}
-
-/// A module of `n` copies of the JIT-call placeholder (the browser's
-/// `mono_jiterp_placeholder_jit_call`, `(ret_sp, sp, ftndesc, thrown)`, which
-/// stores 999 through `thrown`: "not here yet"), filling the function table
-/// from `__table_base`, as the native host makes it.
-fn placeholder_module(n: u32) -> Vec<u8> {
-    use wasm_encoder::*;
-    let mut m = wasm_encoder::Module::new();
-    let mut types = TypeSection::new();
-    types.ty().function([ValType::I64; 4], []);
-    m.section(&types);
-    let mut imports = ImportSection::new();
-    imports.import(
-        gex_abi::ftab::PIC_MODULE,
-        "memory",
-        MemoryType { minimum: 0, maximum: Some(gex_abi::LIMIT64_PAGES), memory64: true, shared: true, page_size_log2: None },
-    );
-    imports.import(
-        gex_abi::ftab::PIC_MODULE,
-        gex_abi::ftab::PIC_TABLE,
-        TableType { element_type: RefType::FUNCREF, table64: true, minimum: 0, maximum: None, shared: false },
-    );
-    imports.import(gex_abi::ftab::PIC_MODULE, gex_abi::ftab::PIC_TABLE_BASE, GlobalType { val_type: ValType::I64, mutable: false, shared: false });
-    m.section(&imports);
-    let mut funcs = FunctionSection::new();
-    funcs.function(0);
-    m.section(&funcs);
-    let mut elems = ElementSection::new();
-    let idx: Vec<u32> = vec![0; n as usize];
-    elems.active(Some(0), &ConstExpr::global_get(0), Elements::Functions(idx.into()));
-    m.section(&elems);
-    let mut code = CodeSection::new();
-    let mut f = Function::new([]);
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::I32Const(999));
-    f.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
-    f.instruction(&Instruction::End);
-    code.function(&f);
-    m.section(&code);
-    m.finish()
+    lock(&LIBS).iter().find(|l| l.number == Some(number)).map(|l| (l.wasm.as_ptr() as usize as u32, l.wasm.len() as u32))
 }
 
 /// Whether provider module `number` is a replaced Linux library's: its
@@ -547,50 +486,6 @@ pub extern "C" fn gex_libprov_missing(addr: u64) {
 #[no_mangle]
 pub extern "C" fn gex_libprov_table_size(base: u64) -> u64 {
     ftab(|t| t.installs().iter().find(|i| i.base as u64 == base).map_or(0, |i| i.len as u64))
-}
-
-/// The dynamic symbols of a mapped object, by path: (name -> value, its
-/// executable segment's page-aligned vaddr).
-type ObjSyms = (HashMap<String, u64>, u64);
-static OBJ_SYMS: Mutex<Option<HashMap<String, Arc<ObjSyms>>>> = Mutex::new(None);
-
-/// `gex.provider_guest_sym(name, len)`: the guest address of `name` in the
-/// first executable mapping that defines it (RTLD_DEFAULT's order), or 0.
-#[no_mangle]
-pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
-    let name = String::from_utf8_lossy(crate::guest_bytes().get(ptr as usize..(ptr + len) as usize).unwrap_or(&[])).into_owned();
-    let maps: Vec<(u64, String)> = {
-        crate::sigs::proc_home().mm().lock().vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
-    };
-    let mut seen = std::collections::HashSet::new();
-    for (start, path) in maps {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let cached = lock(&OBJ_SYMS).get_or_insert_with(Default::default).get(&path).cloned();
-        let syms = match cached {
-            Some(s) => s,
-            None => {
-                let Some(bytes) = crate::sigs::proc_home().read_file(&path) else { continue };
-                let Ok(image) = gex_ld::elf::load(&bytes, 0) else { continue };
-                let Some(text) = image.segments.iter().find(|s| s.executable) else { continue };
-                let map = image.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value != 0).map(|y| (y.name.clone(), y.value)).collect();
-                let s = Arc::new((map, text.vaddr & !0xfff));
-                lock(&OBJ_SYMS).get_or_insert_with(Default::default).insert(path.clone(), Arc::clone(&s));
-                s
-            }
-        };
-        if let Some(v) = syms.0.get(&name) {
-            return start.wrapping_sub(syms.1).wrapping_add(*v);
-        }
-    }
-    0
-}
-
-/// `gex.provider_guest_stack_end(sp)`: the end of the mapping holding `sp`.
-#[no_mangle]
-pub extern "C" fn gex_libprov_guest_stack_end(sp: u64) -> u64 {
-    crate::sigs::proc_home().mm().lock().vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)
 }
 
 /// `gex.provider_abi(which)`: constants of gex's ABI a provider calling
@@ -647,137 +542,6 @@ fn elf_fini(bytes: &[u8]) -> Vec<u64> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Stopping the guest's threads for the provider's collector (native
-// `libprov::GuestStop`): each thread registers the provider's "in guest
-// code" word for it and the provider's stop flag; threads running guest code
-// stop at their next safepoint or syscall while a collection runs, a thread
-// inside a syscall counts as stopped. Every Worker shares these statics (the
-// shim's memory is the process's).
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct StopState {
-    threads: HashMap<u32, u64>,
-    stop_word: u64,
-    parked: std::collections::HashSet<u32>,
-    in_kernel: std::collections::HashSet<u32>,
-    stopper: Option<u32>,
-}
-
-static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Some thread registered (the syscall path's fast test).
-static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether any thread of this process registered with a provider.
-pub(crate) fn any_registered() -> bool {
-    ANY.load(Ordering::Relaxed)
-}
-static STOP: Mutex<Option<StopState>> = Mutex::new(None);
-/// Bumped on every change a waiter could be waiting for (park, start).
-static STOP_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-fn stop_state<R>(f: impl FnOnce(&mut StopState) -> R) -> R {
-    f(lock(&STOP).get_or_insert_with(Default::default))
-}
-
-fn word(addr: u64) -> u32 {
-    let mem = crate::guest_bytes();
-    mem.get(addr as usize..addr as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
-}
-
-fn store_word(addr: u64, v: u32) {
-    std::sync::atomic::fence(Ordering::SeqCst);
-    if let Some(b) = crate::guest_bytes().get_mut(addr as usize..addr as usize + 4) {
-        b.copy_from_slice(&v.to_le_bytes());
-    }
-    std::sync::atomic::fence(Ordering::SeqCst);
-}
-
-fn bump() {
-    STOP_EPOCH.fetch_add(1, Ordering::SeqCst);
-    #[cfg(feature = "shared-memory")]
-    unsafe {
-        crate::warch::memory_atomic_notify(STOP_EPOCH.as_ptr() as *mut i32, u32::MAX);
-    }
-}
-
-/// Wait (at most `ns`) for the next bump after `seen`.
-fn wait_epoch(seen: u32, ns: i64) {
-    #[cfg(feature = "shared-memory")]
-    unsafe {
-        crate::warch::memory_atomic_wait32(STOP_EPOCH.as_ptr() as *mut i32, seen as i32, ns);
-    }
-    #[cfg(not(feature = "shared-memory"))]
-    let _ = (seen, ns);
-}
-
-fn this_tid() -> u32 {
-    crate::my_tid() as u32
-}
-
-/// Whether a collection is stopping the guest's threads.
-pub(crate) fn stop_active() -> bool {
-    STOPPING.load(Ordering::Acquire)
-}
-
-/// At a safepoint or a syscall boundary in guest code (or from the
-/// provider, `forced`): park while a collection runs.
-pub(crate) fn park_if_stopping(tid: u32, forced: bool) {
-    if !STOPPING.load(Ordering::Acquire) {
-        return;
-    }
-    let parks = stop_state(|st| {
-        let Some(&w) = st.threads.get(&tid) else { return false };
-        if st.stopper == Some(tid) || (!forced && word(w) == 0) {
-            return false;
-        }
-        st.parked.insert(tid);
-        true
-    });
-    if !parks {
-        return;
-    }
-    bump();
-    while STOPPING.load(Ordering::Acquire) {
-        let seen = STOP_EPOCH.load(Ordering::SeqCst);
-        if !STOPPING.load(Ordering::Acquire) {
-            break;
-        }
-        wait_epoch(seen, 1_000_000);
-    }
-    stop_state(|st| st.parked.remove(&tid));
-}
-
-/// A syscall made from guest code: counts as stopped until it returns.
-pub(crate) fn syscall_enter(tid: u32) {
-    if lock(&STOP).as_ref().is_some_and(|st| st.threads.contains_key(&tid)) {
-        stop_state(|st| st.in_kernel.insert(tid));
-        bump();
-    }
-}
-
-/// Back to guest code (a syscall returned, or a safepoint): park if a
-/// collection is on.
-pub(crate) fn guest_again(tid: u32) {
-    let was = lock(&STOP).as_mut().is_some_and(|st| st.in_kernel.remove(&tid));
-    if was || STOPPING.load(Ordering::Acquire) {
-        park_if_stopping(tid, false);
-    }
-}
-
-/// `gex.provider_thread_register(in_guest, stop)`.
-#[no_mangle]
-pub extern "C" fn gex_libprov_thread_register(in_guest: u64, stop: u64) {
-    let tid = this_tid();
-    ANY.store(true, Ordering::Relaxed);
-    stop_state(|st| {
-        st.threads.insert(tid, in_guest);
-        st.stop_word = stop;
-    });
-}
-
-/// `gex.provider_park()`.
 thread_local! {
     /// The provider's guest calls open on this Worker (`gexp_call_guest`):
     /// while any is, the guest code running has the provider's wasm frames
@@ -850,59 +614,6 @@ pub(crate) fn guest_call_open() -> bool {
     GUEST_CALLS.with(|c| c.get()) > 0
 }
 
-#[no_mangle]
-pub extern "C" fn gex_libprov_park() {
-    park_if_stopping(this_tid(), true);
-}
-
-/// `gex.provider_stop_guest()`: stop every other registered thread that is
-/// in guest code (10 s at most, then on without the stragglers, said).
-#[no_mangle]
-pub extern "C" fn gex_libprov_stop() {
-    let me = this_tid();
-    let stop_word = stop_state(|st| {
-        st.stopper = Some(me);
-        st.stop_word
-    });
-    if stop_word != 0 {
-        store_word(stop_word, 1);
-    }
-    STOPPING.store(true, Ordering::SeqCst);
-    let deadline = crate::now_ns() + 10_000_000_000;
-    loop {
-        let seen = STOP_EPOCH.load(Ordering::SeqCst);
-        let waiting: Vec<u32> = stop_state(|st| {
-            st.threads
-                .iter()
-                .filter(|(&t, &w)| t != me && word(w) != 0 && !st.parked.contains(&t) && !st.in_kernel.contains(&t))
-                .map(|(&t, _)| t)
-                .collect()
-        });
-        if waiting.is_empty() {
-            return;
-        }
-        if crate::now_ns() > deadline {
-            crate::warn_line(&format!("gex: provider stop-the-world: threads {waiting:?} never reached a safepoint; going on without them\n"));
-            return;
-        }
-        wait_epoch(seen, 2_000_000);
-    }
-}
-
-/// `gex.provider_start_guest()`.
-#[no_mangle]
-pub extern "C" fn gex_libprov_start() {
-    let stop_word = stop_state(|st| {
-        st.stopper = None;
-        st.stop_word
-    });
-    if stop_word != 0 {
-        store_word(stop_word, 0);
-    }
-    STOPPING.store(false, Ordering::SeqCst);
-    bump();
-}
-
 // ---------------------------------------------------------------------------
 // Function-tier units for Linux shared objects in the page (the native
 // host's `pe_units::on_elf_maps`): an object named in `?elfunits=` gets the
@@ -918,17 +629,15 @@ static ELF_PLACED: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new()
 
 /// `execve`: every replaced library of the old program is gone, and its
 /// addresses may hold the new program's code (see `cgen::on_exec`). Returns
-/// the provider module numbers that went with them (JIT reservations too).
+/// the provider module numbers that went with them.
 pub(crate) fn on_exec(old_code: &[(u64, u64)]) -> Vec<u32> {
-    let mut dead: Vec<u32> = lock(&LIBS).iter().filter_map(|l| l.number).collect();
-    dead.extend(lock(&RESERVES).iter().map(|(n, _)| *n));
+    let dead: Vec<u32> = lock(&LIBS).iter().filter_map(|l| l.number).collect();
     lock(&LIBS).clear();
     lock(&REPLACED).clear();
     THREAD_ENTRY.store(0, Ordering::Release);
     if let Some(m) = lock(&MISSING).as_mut() {
         m.clear();
     }
-    lock(&RESERVES).clear();
     forget_gone(old_code);
     dead
 }

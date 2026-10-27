@@ -93,8 +93,6 @@ pub(crate) struct Store {
     pub provider_sp64: Option<wasmtime::Global>,
     /// The lowest address of that stack (`libprov::STACK` bytes).
     pub provider_stack_lo: u64,
-    /// The wasm exception tag of `gex.provider_throw` (wasm64 providers; [`crate::libprov::tag`]).
-    pub provider_tag: Option<wasmtime::Tag>,
     /// This store's instance of each shared-library module (`dylink`), by
     /// module: what later modules' imports are bound to.
     pub dyl: HashMap<u32, wasmtime::Instance>,
@@ -234,7 +232,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, provider_tag: None, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
     Ok(())
 }
 

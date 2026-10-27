@@ -1,7 +1,0 @@
-# The Mono runtime build.sh builds: gex's fork of dotnet/runtime, branch gex
-# (v10.0.3, r58Playz/dotnet-runtime's runtime wasm JIT for Mono,
-# and gex's changes as commits on top).
-# MONO_REPO: the fork's repository URL. It has no public remote yet, so
-# build.sh needs MONO_REPO set to a local clone of it until this line names one.
-MONO_REPO=
-MONO_COMMIT=790b6447f3ab17501156e2b2e3fa984de67f4148
