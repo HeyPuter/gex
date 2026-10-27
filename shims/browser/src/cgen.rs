@@ -226,7 +226,10 @@ const PROVIDER: u32 = 1 << 31;
 /// joined by `;`). Taken instead of hashing every byte of every image at
 /// start-up (~1 s of the page's main thread); the mapped code is still
 /// compared with the image byte for byte below, and an image not listed is
-/// hashed as before.
+/// hashed as before. A key is a memory flavour's: one whose base is written
+/// `m<base>` is the 64-bit memory's, the others the 32-bit memory's, and a
+/// process takes only its own flavour's (a 64-bit Wine page runs both, an
+/// image at one base in each).
 static KNOWN: Mutex<Option<std::collections::HashMap<(u64, String), (String, String)>>> = Mutex::new(None);
 
 pub(crate) fn set_identities(spec: &str) {
@@ -234,6 +237,13 @@ pub(crate) fn set_identities(spec: &str) {
     for item in spec.split(';') {
         let mut f = item.splitn(4, ':');
         let (Some(base), Some(key), Some(id), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
+        let (m64, base) = match base.strip_prefix('m') {
+            Some(b) => (true, b),
+            None => (false, base),
+        };
+        if m64 != gex_abi::mem64() {
+            continue;
+        }
         let Ok(base) = u64::from_str_radix(base, 16) else { continue };
         m.insert((base, path.to_string()), (key.to_string(), id.to_string()));
     }

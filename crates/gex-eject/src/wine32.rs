@@ -452,7 +452,8 @@ fn aot_only(config: &Config) -> Result<bool> {
 /// image as the site ships it (web/rootfs.tar, trimmed or not) at the base
 /// the unit was built for (found from the unit's addresses). A line is
 /// written only when the key this gexc computes for that image is the unit's
-/// own, so the page never takes a key its own hashing would not give.
+/// own, so the page never takes a key its own hashing would not give. A
+/// 64-bit memory's unit's base is written `m<base>` (the shim's `KNOWN`).
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
@@ -471,8 +472,9 @@ fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&st
             let addrs: std::collections::HashSet<u64> = unit.addresses().into_iter().collect();
             let base = crate::reach::find_base(&pe, &addrs)?;
             let image = gex_xlate::func::pe_input(&pe, base).ok()?.0;
-            crate::rsrc::flavors_mem().find(|&(g, m)| crate::rsrc::key_with_mem(&image, g, m) == site)?;
-            Some(format!("{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
+            let (_, m64) = crate::rsrc::flavors_mem().find(|&(g, m)| crate::rsrc::key_with_mem(&image, g, m) == site)?;
+            let flavor = if m64 { "m" } else { "" };
+            Some(format!("{flavor}{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
         })();
         match found {
             Some(l) => lines.push(l),
