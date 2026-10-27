@@ -160,7 +160,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
             .static_weak_binds()
             .map_err(|e| anyhow!("{path}: {e}"))?
             .into_iter()
-            .map(|(m, name, b)| {
+            .map(|(m, name, b, _)| {
                 let nb = match b {
                     gex_dylink::Bind::GotMem(v) | gex_dylink::Bind::GotFunc(v) => crate::dylink::NBind::Global(v),
                     _ => crate::dylink::NBind::Missing(String::new()),

@@ -5383,7 +5383,9 @@ export class Gex {
           }
           break;
         case 'G': {
-          const g = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
+          const g = f[5] === '64'
+            ? new WebAssembly.Global({ value: 'i64', mutable: f[4] === '1' }, BigInt(f[3]))
+            : new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
           if (f[4] === '1') this.#wasmprogMuts.push(g);
           set(f[1], f[2], g);
           break;

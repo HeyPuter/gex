@@ -60,6 +60,8 @@ pub struct Import {
     /// For a function: its type index; for a global: whether mutable.
     pub ty: u32,
     pub weak: bool,
+    /// A global of type `i64` (a wasm64 module's `GOT.*` and bases).
+    pub wide: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +213,7 @@ impl Info {
                 Payload::ImportSection(s) => {
                     for imp in s {
                         let imp = imp?;
+                        let wide = matches!(imp.ty, TypeRef::Global(g) if g.content_type == wasmparser::ValType::I64);
                         let (kind, ty) = match imp.ty {
                             TypeRef::Func(t) => {
                                 info.func_imports += 1;
@@ -230,6 +233,7 @@ impl Info {
                             kind,
                             ty,
                             weak: false,
+                            wide,
                         });
                     }
                 }
@@ -350,17 +354,18 @@ impl Info {
     /// in a static link, so any other `GOT.*` import is a strong undefined
     /// symbol, an error here as a link error would have been.
     /// `(module, name, binding)` per import it concerns.
-    pub fn static_weak_binds(&self) -> std::result::Result<Vec<(String, String, Bind)>, String> {
+    /// Each with whether it is an `i64` global.
+    pub fn static_weak_binds(&self) -> std::result::Result<Vec<(String, String, Bind, bool)>, String> {
         let mut out = Vec::new();
         for imp in &self.imports {
             match imp.module.as_str() {
                 "GOT.func" | "GOT.mem" if imp.weak => {
                     let b = if imp.module == "GOT.func" { Bind::GotFunc(0) } else { Bind::GotMem(0) };
-                    out.push((imp.module.clone(), imp.name.clone(), b));
+                    out.push((imp.module.clone(), imp.name.clone(), b, imp.wide));
                 }
                 "GOT.func" | "GOT.mem" => return Err(format!("undefined symbol: {}", imp.name)),
                 "env" if imp.weak && imp.kind == Kind::Func => {
-                    out.push((imp.module.clone(), imp.name.clone(), Bind::Missing(String::new())));
+                    out.push((imp.module.clone(), imp.name.clone(), Bind::Missing(String::new()), false));
                 }
                 _ => {}
             }
