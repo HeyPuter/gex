@@ -13,6 +13,12 @@ PREFIX=$(realpath "$1")
 SRC=$(realpath "$2")
 B=$(realpath -m "${3:-$PREFIX/build/cxx}")
 SR=$PREFIX/sysroot
+# CMake's feature checks link test programs: without the sysroot's builtins
+# every one fails, and the build then dies far off (no -nostdinc++, so
+# libc++'s headers include an older copy of themselves: errno undeclared)
+for f in "$SR/lib/libc.a" "$SR/lib/libclang_rt.builtins-wasm32.a"; do
+  [ -f "$f" ] || { echo "build-cxx.sh: no $f (tools/gexcc/install.sh PREFIX first)" >&2; exit 1; }
+done
 JOBS=${JOBS:-6}
 export PATH=$PREFIX/bin:$PATH
 rm -rf "$B"
