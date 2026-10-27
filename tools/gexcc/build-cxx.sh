@@ -27,7 +27,8 @@ done
 # wasm is not ELF, so libunwind would mark its exports __declspec(dllexport)
 # unless told the symbols are hidden (one static module: they need not be
 # exported at all).
-F="-fwasm-exceptions -D_LIBUNWIND_HIDE_SYMBOLS"
+# (and LLVM_SRC's path as /llvm: libc++abi's assert()s name their files)
+F="-fwasm-exceptions -D_LIBUNWIND_HIDE_SYMBOLS -ffile-prefix-map=$(realpath "$SRC")=/llvm"
 cmake -G Ninja -S "$SRC/runtimes" -B "$B" \
   -DCMAKE_TOOLCHAIN_FILE="$PREFIX/share/gexcc/toolchain.cmake" \
   -DCMAKE_STAGING_PREFIX="$SR" -DCMAKE_INSTALL_PREFIX="$SR" -DCMAKE_BUILD_TYPE=Release \

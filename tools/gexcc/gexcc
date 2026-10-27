@@ -23,6 +23,7 @@ Layout (tools/gexcc/install.sh PREFIX):
 
 Environment: GEXCC_SYSROOT overrides the sysroot; GEXCC_RUNNER the gexc a
 container runs under (also read by the container itself at run time);
+GEXCC_BAKE_RUNNER the runner path linked into containers (empty: none);
 GEXCC_KEEP_WASM=1 keeps OUT.wasm beside a linked program; GEXCC_VERBOSE=1
 prints every command."""
 import atexit, os, re, shutil, subprocess, sys, tempfile
@@ -119,6 +120,11 @@ for d in ('include/gexcc', 'usr/local/include', 'usr/include/wasm32-linux-musl',
 if CXX and os.path.isdir(os.path.join(SYSROOT, 'include', 'c++', 'v1')) and \
         not any(a in ('-nostdinc++', '-nostdinc') for a in sys.argv[1:]):
     INCS = ['-isystem', os.path.join(SYSROOT, 'include', 'c++', 'v1')] + INCS
+# The sysroot's headers by their installed names (/usr/include/...): their
+# assert()s and __FILE__s name no path of the build machine's
+BASE += ['-ffile-prefix-map=' + os.path.realpath(SYSROOT) + '=']
+if os.path.realpath(SYSROOT) != SYSROOT:
+    BASE += ['-ffile-prefix-map=' + SYSROOT + '=']
 CLANG = ['clang++' if CXX else 'clang'] + BASE + ['--sysroot=' + SYSROOT]
 # Loop safepoints (poll/GexPoll.cpp): signals reach code that never makes a
 # system call. GEXCC_POLL=0 or -fno-gex-poll leaves them out.
@@ -1282,8 +1288,15 @@ r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + passes + ['-o', wasm])
 if r:
     die('wasm-opt failed')
 cont = ['--host-stub', os.path.join(LIBDIR, 'hoststub.bin')]
+# GEXCC_BAKE_RUNNER (set, even empty) bakes that path instead: a package
+# built for an image says none, since the build machine's runner path means
+# nothing there (on the build machine its containers still find the runner
+# through GEXCC_RUNNER or gexc on PATH)
 rf = os.path.join(LIBDIR, 'runner')
-if os.path.exists(rf):
+if 'GEXCC_BAKE_RUNNER' in os.environ:
+    if os.environ['GEXCC_BAKE_RUNNER']:
+        cont += ['--runner', os.environ['GEXCC_BAKE_RUNNER']]
+elif os.path.exists(rf):
     cont += ['--runner', open(rf).read().strip()]
 r = run([sys.executable, os.path.join(LIBDIR, 'wasm-elf.py'), wasm, out] + cont)
 if r:
