@@ -40,6 +40,7 @@ mod wasmdll;
 pub(crate) use wasmdll::skeleton_code;
 pub(crate) mod wasmprog;
 mod dylink;
+pub(crate) use dylink::gex_wasmprog_dl_gen as dl_gen;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).

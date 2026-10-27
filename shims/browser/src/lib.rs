@@ -9024,6 +9024,106 @@ pub extern "C" fn gex_wasmprog_staged() -> i32 {
     WASM32_STAGED.with(|c| c.replace(false)) as i32
 }
 
+// ---- System calls without a JS frame --------------------------------------
+//
+// A native wasm32 program, a wasm64 provider, a native PE DLL and (with
+// such DLLs) a translated guest each import `gex.syscall`. In the default
+// build that import is one of these exports, so a call goes from the
+// program into the shim and back with no JS in between. JS is called only
+// when the call left it something to do (`syscall_after`): a thread or a
+// child to start, or a library another thread `dlopen`ed to catch up on.
+// The single-thread build keeps its JS wrappers, which suspend.
+
+/// `syscall_after`'s flags: the call staged a thread or a child.
+const AFTER_STAGED: i32 = 1;
+/// A wasm32 program's call: a posix_spawn child may run in this Worker.
+const AFTER_WASMPROG: i32 = 2;
+/// The dylink generation moved since this Worker last caught up.
+const AFTER_DL: i32 = 4;
+
+#[cfg(feature = "shared-memory")]
+#[link(wasm_import_module = "gex_env")]
+extern "C" {
+    /// What a system call left for JS ([`AFTER_STAGED`] and the rest).
+    fn syscall_after(flags: i32);
+    /// A native PE DLL's call marked as a provider's (bit 61): served in
+    /// JS, which catches the trap a hand-off ends in.
+    fn native_syscall_marked(ctx: i32, pc: i64);
+}
+
+fn after(flags: i32) {
+    #[cfg(feature = "shared-memory")]
+    if flags != 0 {
+        // SAFETY: a host import taking a scalar; the call has returned and
+        // holds no lock.
+        unsafe { syscall_after(flags) };
+    }
+    #[cfg(not(feature = "shared-memory"))]
+    let _ = flags;
+}
+
+fn staged_flag() -> i32 {
+    if WASM32_STAGED.with(|c| c.replace(false)) { AFTER_STAGED } else { 0 }
+}
+
+thread_local! {
+    /// The dylink generation this Worker last caught up with.
+    static DL_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A wasm32 program's `gex.syscall`.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_syscall(ctx: i32, pc: i64) {
+    gex_syscall(ctx, pc);
+    let mut flags = staged_flag();
+    if flags != 0 {
+        flags |= AFTER_WASMPROG;
+    }
+    let g = cgen::dl_gen();
+    if g != DL_SEEN.with(|c| c.get()) {
+        DL_SEEN.with(|c| c.set(g));
+        flags |= AFTER_DL;
+    }
+    after(flags);
+}
+
+/// The dylink generation this Worker has caught up with: now's.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_dl_seen() {
+    DL_SEEN.with(|c| c.set(cgen::dl_gen()));
+}
+
+/// A wasm64 provider's `gex.syscall`: marked (bit 61), so the shim serves it
+/// without leaving the provider's frames.
+#[no_mangle]
+pub extern "C" fn gex_provider_syscall(ctx: i32, pc: i64) {
+    gex_syscall(ctx, pc | (1 << 61));
+    after(staged_flag());
+}
+
+/// A translated guest's `gex.syscall` in a process with native PE DLLs.
+#[no_mangle]
+pub extern "C" fn gex_staged_syscall(ctx: i32, pc: i64) {
+    gex_syscall(ctx, pc);
+    after(staged_flag());
+}
+
+/// A native PE DLL's `gex.syscall`: straight through unless marked.
+#[no_mangle]
+pub extern "C" fn gex_native_syscall(ctx: i32, pc: i64) {
+    if pc & (1 << 61) == 0 {
+        gex_syscall(ctx, pc);
+        return;
+    }
+    #[cfg(feature = "shared-memory")]
+    // SAFETY: a host import taking scalars; nothing here holds a lock.
+    unsafe {
+        native_syscall_marked(ctx, pc)
+    };
+    #[cfg(not(feature = "shared-memory"))]
+    gex_syscall(ctx, pc);
+}
+
 thread_local! {
     /// `wasm32_wait` has said this Worker's program waits on the page.
     static PAGE_WAIT_SAID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
