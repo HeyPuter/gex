@@ -1119,10 +1119,57 @@ pub fn kuser_fold() -> bool {
     KUSER_FOLD.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// A constant effective address in Windows' KUSER_SHARED_DATA page, moved to
-/// 32-bit Wine's ([`WINE32_KUSER`]) when folding is on; `None` for any other address.
+/// Whether `exe` (Wine's loader's first argument, a Windows or Unix path)
+/// is one of Wine's session programs: the services, device and RPC hosts,
+/// the desktop and the prefix's boot, into which no program's code is
+/// loaded. Not rundll32 or regsvr32, which load a program's DLLs.
+pub fn wine_session_program(exe: &str) -> bool {
+    const SESSION: &[&str] = &["explorer", "services", "plugplay", "winedevice", "rpcss", "svchost", "wineboot", "winemenubuilder"];
+    let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+    let name = match name.len().checked_sub(4) {
+        Some(n) if name.is_char_boundary(n) && name[n..].eq_ignore_ascii_case(".exe") => &name[..n],
+        _ => name,
+    };
+    SESSION.iter().any(|s| s.eq_ignore_ascii_case(name))
+}
+
+static KUSER_FOLD_ENTRY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// With [`set_kuser_fold`]: fold the page after KUSER_SHARED_DATA too (64-bit
+/// Wine's entry page, which x86-64 system call stubs call through by
+/// constant), to the page after [`WINE32_KUSER`]. In the unit key.
+pub fn set_kuser_fold_entry(on: bool) {
+    KUSER_FOLD_ENTRY.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`fold_kuser`] covers the entry page ([`set_kuser_fold_entry`]).
+pub fn kuser_fold_entry() -> bool {
+    KUSER_FOLD_ENTRY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One past the pages [`fold_kuser`] moves.
+pub fn kuser_fold_end() -> u64 {
+    if kuser_fold_entry() {
+        KUSER_WINDOWS_END + 0x1000
+    } else {
+        KUSER_WINDOWS_END
+    }
+}
+
+/// Where this process has KUSER_SHARED_DATA: [`WINE32_KUSER`] when folding is on, else Windows' address.
+pub fn kuser_address() -> u64 {
+    if kuser_fold() {
+        WINE32_KUSER
+    } else {
+        KUSER_WINDOWS
+    }
+}
+
+/// A constant effective address in Windows' KUSER_SHARED_DATA page (and,
+/// with [`set_kuser_fold_entry`], the next), moved to 32-bit Wine's
+/// ([`WINE32_KUSER`]) when folding is on; `None` for any other address.
 pub fn fold_kuser(ea: u64) -> Option<u64> {
-    (kuser_fold() && (KUSER_WINDOWS..KUSER_WINDOWS_END).contains(&ea)).then(|| ea - KUSER_WINDOWS + WINE32_KUSER)
+    (kuser_fold() && (KUSER_WINDOWS..kuser_fold_end()).contains(&ea)).then(|| ea - KUSER_WINDOWS + WINE32_KUSER)
 }
 
 /// With folding on, the bounds guard's limit (tier-1 and gex-cgen): an

@@ -206,6 +206,10 @@ pub extern "C" fn gex_wasmprog_serve() -> i32 {
     }
 }
 
+fn wine64_session_program(argv: &[String]) -> bool {
+    argv.get(1).is_some_and(|exe| gex_abi::wine_session_program(exe))
+}
+
 fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, String> {
     let mem = crate::guest_bytes();
     let at = entry.wrapping_sub(0x40) as usize;
@@ -238,13 +242,23 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // Or the 2 GiB split, for a site that asks (`?winesplit=1`), and
         // always for a 64-bit (64-bit Wine) process: the compact space ends at 2 GiB,
         // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
-        // memory at 2 GiB with it).
-        if flags & FLAG_GUEST_X86_64 != 0 {
+        // memory at 2 GiB with it). Except Wine's own session programs in
+        // a wasm32 memory, which use little and stay in the compact space
+        // (`winspace::wine64_compact`); not in a process that has its space
+        // already (an exec in the same memory keeps it).
+        let compact64 = flags & FLAG_GUEST_X86_64 != 0
+            && !gex_abi::mem64()
+            && crate::winspace::windows_space() == 0
+            && wine64_session_program(&crate::sigs::proc_home().argv());
+        if flags & FLAG_GUEST_X86_64 != 0 && !compact64 {
             crate::winspace::set_wine_split(true);
         }
         let lo = crate::winspace::wine32_space().map_err(|e| format!("wine32: {e}"))?;
         if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_WINE32 != 0 {
             crate::winspace::wine32_kuser();
+        }
+        if compact64 {
+            crate::winspace::wine64_compact();
         }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();

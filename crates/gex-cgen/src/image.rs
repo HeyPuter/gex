@@ -100,6 +100,8 @@ fn unit_inputs() -> String {
     // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units
     // read the page where 32-bit Wine maps it and check every other address.
     let base = if gex_abi::kuser_fold() { format!("{base}:wine32kuser") } else { base };
+    // And the entry page after it (64-bit Wine's compact space).
+    let base = if gex_abi::kuser_fold() && gex_abi::kuser_fold_entry() { format!("{base}:kuserentry") } else { base };
     // The null guard, a debugging opt-in: named only when on, so the
     // units of a build without it keep their keys.
     let base = if gex_emit::tier1::null_guard_on() { format!("{base}:nullguard:{:x}", gex_abi::NULL_GUARD) } else { base };

@@ -9874,13 +9874,20 @@ pub(crate) const WINE64_PE_DATA: (u64, u64) = (0x7fde_0000, 0x7ffe_0000);
 
 /// 64-bit Wine: 64-bit native Wine's entry page, the page after KUSER_SHARED_DATA
 /// (its ntdll maps it at start). At its start, the pointer x86-64 system
-/// call stubs call through, holding [`WINE64_SYSCALL_ENTRY`]; that entry and
-/// [`WINE64_UNIX_CALL_ENTRY`] (winecrt0's Unix calls) are each a `ud2` Wine's
+/// call stubs call through, holding [`wine64_syscall_entry`]; that entry and
+/// [`wine64_unix_call_entry`] (winecrt0's Unix calls) are each a `ud2` Wine's
 /// fault hook runs as the call. Its direct entries for the same calls are
 /// `gex.unix_dispatcher`'s ops 0 and 4.
-pub(crate) const WINE64_ENTRY_PAGE: u64 = gex_abi::KUSER_WINDOWS_END;
-pub(crate) const WINE64_SYSCALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x10;
-pub(crate) const WINE64_UNIX_CALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x20;
+/// It follows KUSER_SHARED_DATA (`gex_abi::kuser_address`), so it is folded with it.
+pub(crate) fn wine64_entry_page() -> u64 {
+    gex_abi::kuser_address() + 0x1000
+}
+pub(crate) fn wine64_syscall_entry() -> u64 {
+    wine64_entry_page() + 0x10
+}
+pub(crate) fn wine64_unix_call_entry() -> u64 {
+    wine64_entry_page() + 0x20
+}
 
 /// The top of a 64-bit Wine process's space in a 64-bit memory: no mapping
 /// ends above it. Wine places images and stacks top down from the top it
@@ -9897,18 +9904,28 @@ const _: () = assert!(WINE64_TOP_M64.is_power_of_two() && WINE64_TOP_M64 > gex_a
 /// 64 KiB guard), above every image and within 4 GiB of the first ones.
 const WINE64_PE_DATA_M64: (u64, u64) = (WINE64_TOP_M64 - 0x21_0000, WINE64_TOP_M64 - 0x1_0000);
 
+/// In the compact space (`winspace::wine64_compact`) the window is the top
+/// of the island Wine's images are kept in (`winspace::WINE32_ISLAND`), above
+/// every image Wine places there and within 4 GiB of them, so that it does
+/// not pin the memory's length.
+const WINE64_PE_DATA_COMPACT: (u64, u64) = (0x1fdf_0000, 0x1fff_0000);
+#[cfg(feature = "shared-memory")]
+const _: () = assert!(WINE64_PE_DATA_COMPACT.1 + 0x1_0000 == winspace::WINE32_ISLAND.1 && WINE64_PE_DATA_COMPACT.0 > winspace::WINE32_ISLAND.0);
+
 /// The 64-bit Wine PE data window of this process's memory.
 pub(crate) fn wine64_pe_data() -> (u64, u64) {
     if gex_abi::mem64() {
         WINE64_PE_DATA_M64
+    } else if winspace::wine64_compact_on() {
+        WINE64_PE_DATA_COMPACT
     } else {
         WINE64_PE_DATA
     }
 }
 
 /// Reserve [`wine64_pe_data`] (no access until the core's data is placed in
-/// it) and, in a 32-bit memory, keep mmap below it; in a 64-bit memory, end
-/// the process's space at [`WINE64_TOP_M64`].
+/// it) and, in a 32-bit memory with the split, keep mmap below it; in a
+/// 64-bit memory, end the process's space at [`WINE64_TOP_M64`].
 pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     use gex_kernel::mem::{flags, prot};
     if gex_abi::mem64() {
@@ -9918,7 +9935,7 @@ pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {
         warn_line(&format!("gex: wine64: reserving the PE data window {lo:#x}..{hi:#x}: errno {}\n", e.0));
     }
-    if !gex_abi::mem64() {
+    if !gex_abi::mem64() && !winspace::wine64_compact_on() {
         mem.set_mmap_top(lo);
     }
 }
@@ -9959,7 +9976,7 @@ pub(crate) fn wine32_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64
 /// every constant read of it landing on nothing.
 #[no_mangle]
 pub extern "C" fn gex_kuser_address() -> u32 {
-    if gex_abi::kuser_fold() { gex_abi::WINE32_KUSER as u32 } else { gex_abi::KUSER_WINDOWS as u32 }
+    gex_abi::kuser_address() as u32
 }
 
 /// Where this process's Windows address space starts (32-bit Wine), or 0: what a fork
@@ -14588,7 +14605,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // steps over. Reached from tier 1, which dispatches to the context's PC
     // when this returns, Wine's direct entry runs the call here instead,
     // without the trap.
-    if returns && gex_abi::X86 && (pc as u64 == WINE64_SYSCALL_ENTRY || pc as u64 == WINE64_UNIX_CALL_ENTRY) && cgen::wine64_entry_illegal(my_ctx(), pc as u64) {
+    if returns && gex_abi::X86 && (pc as u64 == wine64_syscall_entry() || pc as u64 == wine64_unix_call_entry()) && cgen::wine64_entry_illegal(my_ctx(), pc as u64) {
         return;
     }
     if hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64, resumable) {

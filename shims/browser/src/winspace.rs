@@ -45,6 +45,12 @@ mod stub {
 
     pub(crate) fn wine32_kuser() {}
 
+    pub(crate) fn wine64_compact() {}
+
+    pub(crate) fn wine64_compact_on() -> bool {
+        false
+    }
+
     pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
         Err("a Windows address space needs the shared-memory build".into())
     }
@@ -199,6 +205,27 @@ mod imp {
         WINDOWS_LO.fetch_or(WINE32_KUSER_BIT, Ordering::Relaxed);
     }
 
+    /// With [`WINE32_COMPACT_LO`] and [`WINE32_KUSER_BIT`]: a 64-bit Wine process
+    /// in the compact space ([`wine64_compact`]), so a forked child folds the
+    /// entry page and places the PE data window as its parent did.
+    const WINE64_COMPACT_BIT: u64 = 4;
+
+    /// A 64-bit Wine process in a wasm32 memory that takes 32-bit Wine's compact
+    /// space instead of the split: KUSER_SHARED_DATA and the entry page after
+    /// it folded to [`gex_abi::WINE32_KUSER`], so nothing pins the memory's
+    /// length near 2 GiB. Its ntdll sees the folded address
+    /// (`gex.kuser_address`) and allocates bottom-up. After [`wine32_windows_space`].
+    pub(crate) fn wine64_compact() {
+        wine32_kuser();
+        gex_abi::set_kuser_fold_entry(true);
+        WINDOWS_LO.fetch_or(WINE64_COMPACT_BIT, Ordering::Relaxed);
+    }
+
+    /// Whether this is a 64-bit Wine process in the compact space ([`wine64_compact`]).
+    pub(crate) fn wine64_compact_on() -> bool {
+        WINE32_COMPACT.load(Ordering::Relaxed) && WINDOWS_LO.load(Ordering::Relaxed) & WINE64_COMPACT_BIT != 0
+    }
+
     /// Whether this process's Windows address space is 32-bit Wine's compact one
     /// (no split; see [`wine32_windows_space`]).
     static WINE32_COMPACT: AtomicBool = AtomicBool::new(false);
@@ -220,11 +247,13 @@ mod imp {
     /// 32-bit Wine's compact space (the child's memory already covers what the
     /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
-        if lo & !WINE32_KUSER_BIT == WINE32_COMPACT_LO {
+        if lo & !(WINE32_KUSER_BIT | WINE64_COMPACT_BIT) == WINE32_COMPACT_LO {
             WINE32_COMPACT.store(true, Ordering::Relaxed);
             WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
             keep_exe_slot();
-            if lo & WINE32_KUSER_BIT != 0 {
+            if lo & WINE64_COMPACT_BIT != 0 {
+                wine64_compact();
+            } else if lo & WINE32_KUSER_BIT != 0 {
                 wine32_kuser();
             }
             return Ok(());

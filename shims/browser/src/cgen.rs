@@ -2923,7 +2923,7 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
 }
 
 /// A call to 64-bit native Wine's system or Unix call entry
-/// (`crate::WINE64_SYSCALL_ENTRY`, `WINE64_UNIX_CALL_ENTRY`) from code no
+/// (`crate::wine64_syscall_entry`, `wine64_unix_call_entry`) from code no
 /// nested dispatch need run: Wine's direct entry for it
 /// (`gex.unix_dispatcher` op 0 or 4) takes the registers as the call left
 /// them, its return address at `[sp]`, and returns as the `ud2` route does,
@@ -2934,13 +2934,16 @@ pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
 /// entry, the entry page holds Wine's pointer, and the call's return
 /// address is `ret`.
 fn wine64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
-    let slot = match t {
-        crate::WINE64_SYSCALL_ENTRY => 0,
-        crate::WINE64_UNIX_CALL_ENTRY => 2,
-        _ => return None,
+    let entry = crate::wine64_syscall_entry();
+    let slot = if t == entry {
+        0
+    } else if t == crate::wine64_unix_call_entry() {
+        2
+    } else {
+        return None;
     };
     let idx = UNIX_DISPATCHERS[slot].load(Ordering::Relaxed);
-    if idx == 0 || gm.read_u64(crate::WINE64_ENTRY_PAGE).ok()? != crate::WINE64_SYSCALL_ENTRY {
+    if idx == 0 || gm.read_u64(crate::wine64_entry_page()).ok()? != entry {
         return None;
     }
     let sp_at = c + gex_abi::ctx::x(sp_index()) as u64;

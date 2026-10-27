@@ -173,7 +173,7 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--wine32-kuser] [--entries FILE]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--wine32-kuser] [--wine64-compact] [--entries FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run`, which installs it when Wine maps
@@ -181,7 +181,10 @@ usage:
                                    with a memory cap: recovery of a large image
                                    is the peak. --wine32-kuser: a wine32 unit (Wine as
                                    wasm32): KUSER_SHARED_DATA's constant
-                                   addresses folded to wine32's page. --entries:
+                                   addresses folded to wine32's page.
+                                   --wine64-compact: a 64-bit Wine unit for a
+                                   compact-space process (that page and the
+                                   entry page after it folded). --entries:
                                    region entries too, at the hex addresses
                                    in FILE (resumes a run without translation
                                    makes inside the image's functions)
@@ -2410,6 +2413,13 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             // gex_abi::WINE32_KUSER): constant accesses to Windows' page folded
             // there, every other address checked. Another key.
             "--wine32-kuser" => gex_abi::set_kuser_fold(true),
+            // A 64-bit Wine unit for a process in the compact space (Wine's
+            // session programs in a wasm32 memory): KUSER_SHARED_DATA and the
+            // entry page after it folded as --wine32-kuser folds the first.
+            "--wine64-compact" => {
+                gex_abi::set_kuser_fold(true);
+                gex_abi::set_kuser_fold_entry(true);
+            }
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
