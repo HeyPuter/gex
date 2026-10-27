@@ -9751,11 +9751,20 @@ pub(crate) const WINE64_ENTRY_PAGE: u64 = gex_abi::KUSER_WINDOWS_END;
 pub(crate) const WINE64_SYSCALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x10;
 pub(crate) const WINE64_UNIX_CALL_ENTRY: u64 = WINE64_ENTRY_PAGE + 0x20;
 
+/// The top of a 64-bit Wine process's space in a 64-bit memory: no mapping
+/// ends above it. Wine places images and stacks top down from the top it
+/// finds, and the memory is as long as its highest mapping, so this, not
+/// [`gex_abi::LIMIT64`], is the memory's length from the process's start.
+/// A power of two above [`gex_abi::HIGH_ARENA_BASE`]: Wine finds the top by
+/// probing at powers of two, and the high arena's data lies below it.
+const WINE64_TOP_M64: u64 = 8 << 30;
+const _: () = assert!(WINE64_TOP_M64.is_power_of_two() && WINE64_TOP_M64 > gex_abi::HIGH_ARENA_BASE && WINE64_TOP_M64 <= gex_abi::LIMIT64);
+
 /// In a 64-bit memory (a twin install's 64-bit process)
-/// Wine places its images top down from the top of the 16 GiB, far above
+/// Wine places its images top down from [`WINE64_TOP_M64`], far above
 /// [`WINE64_PE_DATA`]: the window is the top of that space instead (below a
 /// 64 KiB guard), above every image and within 4 GiB of the first ones.
-const WINE64_PE_DATA_M64: (u64, u64) = (gex_abi::LIMIT64 - 0x21_0000, gex_abi::LIMIT64 - 0x1_0000);
+const WINE64_PE_DATA_M64: (u64, u64) = (WINE64_TOP_M64 - 0x21_0000, WINE64_TOP_M64 - 0x1_0000);
 
 /// The 64-bit Wine PE data window of this process's memory.
 pub(crate) fn wine64_pe_data() -> (u64, u64) {
@@ -9767,9 +9776,13 @@ pub(crate) fn wine64_pe_data() -> (u64, u64) {
 }
 
 /// Reserve [`wine64_pe_data`] (no access until the core's data is placed in
-/// it) and, in a 32-bit memory, keep mmap below it.
+/// it) and, in a 32-bit memory, keep mmap below it; in a 64-bit memory, end
+/// the process's space at [`WINE64_TOP_M64`].
 pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     use gex_kernel::mem::{flags, prot};
+    if gex_abi::mem64() {
+        mem.set_high_arena(gex_abi::HIGH_ARENA_BASE, WINE64_TOP_M64);
+    }
     let (lo, hi) = wine64_pe_data();
     if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {
         warn_line(&format!("gex: wine64: reserving the PE data window {lo:#x}..{hi:#x}: errno {}\n", e.0));
