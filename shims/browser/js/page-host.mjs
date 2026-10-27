@@ -48,9 +48,11 @@ export class PageHostStream {
 
   /** `base`: the URL (ending in a slash) a request's path is under;
    *  `fetchImpl`: `fetch`, or what stands in for it (a test's files). */
-  constructor(base, fetchImpl = globalThis.fetch) {
+  constructor(base, fetchImpl = null) {
     this.#base = base;
-    this.#fetch = fetchImpl;
+    // Called as a plain function: a browser's `fetch` called as a method of
+    // anything but the global throws ("Illegal invocation").
+    this.#fetch = fetchImpl ?? ((url, init) => globalThis.fetch(url, init));
     queueMicrotask(() => this.onopen?.());
   }
 
