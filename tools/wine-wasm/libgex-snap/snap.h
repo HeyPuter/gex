@@ -51,11 +51,28 @@ struct driver {
  * gives the restored thread's context (its PC, the image's thread entry,
  * and its stack pointer); `sp_at`, the host's, the program's stack pointer
  * at the call; `idx`, the host's, the function its entry called (a wasm64
- * program's). The host reads and writes the words at offsets 0 to 20. */
+ * program's). The host reads and writes the words at offsets 0 to 20, and
+ * `nlv` and `lv`, its own as well.
+ *
+ * A wasm64 program's thread stopped inside guest code that Wine's call
+ * runs (a window procedure's message loop) has a level for each of its
+ * entries from the guest, outermost first: how the entry came (`route`: 0
+ * the host's entry function, 1 the fault hook), the function, the hook's
+ * arguments, the guest's stack pointer then, and the program's stack
+ * pointer at the call-out the level runs in (`sp`, none for the first).
+ * `nlv` levels are in use. */
+#define SNAP_LEVELS 8
+struct snap_level {
+	uint32_t route, idx, code, kind;
+	uint32_t sp, pad;
+	uint64_t addr, rsp;
+};
 struct snap {
 	uint32_t cur, end;
 	uint32_t entry, start;
 	uint32_t sp_at, idx;
+	uint32_t nlv, pad;
+	struct snap_level lv[SNAP_LEVELS];
 	uint64_t regs[16], pc;
 	struct driver drv;
 };

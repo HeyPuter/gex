@@ -101,6 +101,9 @@ const files = {};
 const lazy = [];
 // Each bundled file's modification time, as the host has it (seconds).
 const mtimes = {};
+// The host files the bundle came from (`--file`, `--tar`, `--busybox`;
+// a `--dir`'s files by `mtimes`), for a snapshot's identity of it.
+const inputs = [];
 // Extended attributes from a `--tar`'s pax headers: path to { name: bytes }.
 const xattrs = {};
 let strace = false;
@@ -128,6 +131,7 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--file wants <guest>=<host>'); process.exit(2); }
       files[spec.slice(0, eq)] = readFileSync(spec.slice(eq + 1));
+      inputs.push(spec.slice(eq + 1));
       mtimes[spec.slice(0, eq)] = Math.trunc(statSync(spec.slice(eq + 1)).mtimeMs / 1000);
     } else if (av[i] === '--dir') {
       // A whole directory tree, which is what a program that reads headers or
@@ -202,6 +206,7 @@ const rest = [];
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
     } else if (av[i] === '--tar') {
       const { untar } = await import('../../../web/src/tar.js');
+      inputs.push(av[i + 1] ?? '');
       const buf = readFileSync(av[++i] ?? '');
       const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
       Object.assign(files, tree.files);
@@ -213,6 +218,7 @@ const rest = [];
     } else if (av[i] === '--busybox') {
       const host = av[++i] ?? '';
       files['/bin/busybox'] = readFileSync(host);
+      inputs.push(host);
       modes['/bin/busybox'] = 0o755;
       const list = readFileSync(new URL('../../../tools/wine-wasm/busybox.applets', import.meta.url), 'utf8');
       for (const name of list.split('\n').filter(Boolean)) {
@@ -381,7 +387,7 @@ function snapWatch(text) {
 }
 async function snapTake() {
   const resume = process.env.GEX_SNAP_RESUME === '1';
-  const r = await host.snapshot({ timeout: Number(process.env.GEX_SNAP_TIMEOUT_MS ?? 10000), resume });
+  const r = await host.snapshot({ timeout: Number(process.env.GEX_SNAP_TIMEOUT_MS ?? 10000), resume, sources: await snapSourcesMake() });
   if (r.refused) {
     process.stderr.write(`[gex] snapshot refused after ${r.stopMs.toFixed(1)} ms: ${r.refused}\n`);
     process.exit(3);
@@ -389,11 +395,14 @@ async function snapTake() {
   const t0 = performance.now();
   mkdirSync(SNAP_OUT, { recursive: true });
   let bytes = snapWrite(join(SNAP_OUT, 'kernel'), r.kernel);
+  writeFileSync(join(SNAP_OUT, 'kernel.refs.json'), JSON.stringify({ refs: r.kernel.refs, sources: r.kernel.sources }));
+  const byRef = r.kernel.refs.reduce((n, x) => n + x[1], 0);
   for (const [pid, b] of r.memories) bytes += snapWrite(join(SNAP_OUT, `mem-${pid}`), b);
   for (const [pid, b] of r.stores) { writeFileSync(join(SNAP_OUT, `store-${pid}.bin`), b); bytes += b.length; }
   writeFileSync(join(SNAP_OUT, 'meta.json'), JSON.stringify(r.meta, (k, v) => (typeof v === 'bigint' ? `${v}n` : v)));
   process.stderr.write(`[gex] snapshot: ${r.meta.threads.length} threads of ${r.memories.size} processes, `
-    + `stop ${r.stopMs.toFixed(1)} ms, copy ${r.copyMs.toFixed(1)} ms, write ${(performance.now() - t0).toFixed(1)} ms, ${(bytes / 1048576).toFixed(1)} MiB\n`);
+    + `stop ${r.stopMs.toFixed(1)} ms, copy ${r.copyMs.toFixed(1)} ms, write ${(performance.now() - t0).toFixed(1)} ms, ${(bytes / 1048576).toFixed(1)} MiB`
+    + ` (and ${(byRef / 1048576).toFixed(1)} MiB of the kernel's by reference)\n`);
   if (!resume) process.exit(0);
 }
 // A memory as the snapshot holds it (its nonzero runs): NAME.bin the runs'
@@ -421,6 +430,46 @@ function snapMem(name) {
   closeSync(fd);
   return { length: map.length, runs };
 }
+// What a snapshot's kernel pages may be by reference to (host.mjs
+// `snapRefs`): this run's bundled files (kind 0, by guest path) and its lazy
+// files (kind 1, by host path), under an identity of all of them made from
+// names, sizes and modification times (the host files the bundle came from,
+// each bundled file, each lazy one), never their bytes: it is made while
+// the session is stopped, and again before a restore.
+let snapSources = null;
+async function snapSourcesMake() {
+  if (snapSources) return snapSources;
+  const { createHash } = await import('node:crypto');
+  const h = createHash('sha256');
+  for (const p of inputs) {
+    let st = null;
+    try { st = statSync(p); } catch {}
+    h.update(`${resolve(p)}\0${st?.size ?? -1}\0${st?.mtimeMs ?? 0}\0`);
+  }
+  for (const p of Object.keys(files).sort()) h.update(`${p}\0${files[p].length}\0${mtimes[p] ?? 0}\0`);
+  for (const [g, size, host] of [...lazy].sort((x, y) => (x[0] < y[0] ? -1 : 1))) {
+    let mt = 0;
+    try { mt = statSync('/' + host).mtimeMs; } catch {}
+    h.update(`${g}\0${size}\0${host}\0${mt}\0`);
+  }
+  const id = h.digest('hex');
+  snapSources = {
+    id,
+    read(kind, name, off, len) {
+      if (kind === 0) {
+        const b = files[name];
+        return b && off + len <= b.length ? new Uint8Array(b.buffer, b.byteOffset + off, len) : null;
+      }
+      if (kind !== 1) return null;
+      const fd = openSync(name.startsWith('/') ? name : `/${name}`, 'r');
+      try {
+        const b = new Uint8Array(len);
+        return readSync(fd, b, 0, len, off) === len ? b : null;
+      } finally { closeSync(fd); }
+    },
+  };
+  return snapSources;
+}
 function snapRead(dir) {
   const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'), (k, v) => (typeof v === 'string' && /^\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v));
   const memories = new Map(), stores = new Map();
@@ -430,7 +479,9 @@ function snapRead(dir) {
     if (m[1] === 'mem' && m[3] === 'map') memories.set(Number(m[2]), snapMem(join(dir, `mem-${m[2]}`)));
     if (m[1] === 'store') stores.set(Number(m[2]), readFileSync(join(dir, f)));
   }
-  return { kernel: snapMem(join(dir, 'kernel')), memories, stores, meta };
+  const kernel = snapMem(join(dir, 'kernel'));
+  try { Object.assign(kernel, JSON.parse(readFileSync(join(dir, 'kernel.refs.json'), 'utf8'))); } catch {}
+  return { kernel, memories, stores, meta };
 }
 
 const host = new ProcessHost({
@@ -505,6 +556,9 @@ const host = new ProcessHost({
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
     // its start (a test-only switch).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
+    // GEX_TEST_UD2_ENTRY=1: 64-bit Wine's every system and Unix call by the
+    // fault hook's route, none by the direct entry (a test-only switch).
+    testUd2Entry: process.env.GEX_TEST_UD2_ENTRY === '1' || undefined,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
@@ -823,6 +877,7 @@ try {
     const snap = snapRead(SNAP_IN);
     process.stderr.write(`[gex] restore: read in ${(performance.now() - t0).toFixed(1)} ms\n`);
     status = await host.restore(snap, {
+      sources: snap.kernel.refs?.length ? await snapSourcesMake() : null,
       onRunning: (ms) => process.stderr.write(`[gex] restore: ${snap.meta.threads.length} threads running ${ms.toFixed(1)} ms after the read\n`),
     });
   } else

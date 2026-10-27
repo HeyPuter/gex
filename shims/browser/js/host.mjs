@@ -174,12 +174,14 @@ const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 function snapLength(m) {
   return m.length;
 }
-/** A memory's nonzero 64 KiB pages, copied, as `{ length, runs }`. */
-function snapTake(buffer) {
+/** A memory's nonzero 64 KiB pages, copied, as `{ length, runs }`, less
+ *  the pages in `skip` (by offset). */
+function snapTake(buffer, skip = null) {
   const P = 65536, length = buffer.byteLength;
   const words = new Int32Array(buffer, 0, length >>> 2);
   const spans = [];
   for (let p = 0; p < length; p += P) {
+    if (skip?.has(p)) continue;
     let z = true;
     for (let i = p >>> 2, e = (p + P) >>> 2; i < e; i++) if (words[i] !== 0) { z = false; break; }
     if (z) continue;
@@ -194,10 +196,75 @@ function snapTake(buffer) {
 function snapNow() {
   return String(BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n + BigInt(Math.round(performance.now() * 1e6)));
 }
-function snapFill(memory, m) {
+function snapFill(memory, m, sources = null) {
   const to = new Uint8Array(memory.buffer);
   if (!m.runs) to.set(m);
   else for (const [at, bytes] of m.runs) to.set(bytes, at);
+  for (const [at, len, si, off] of m.refs ?? []) {
+    const [kind, name] = m.sources[si];
+    const b = sources?.read(kind, name, off, len);
+    if (!b || b.length !== len) throw new Error(`restore: ${name} has no ${len} bytes at ${off} (the snapshot's source)`);
+    to.set(b, at);
+  }
+}
+/** Whether two byte ranges hold the same bytes. */
+const snapSame = globalThis.Buffer
+  ? (a, b) => globalThis.Buffer.from(a.buffer, a.byteOffset, a.length).equals(globalThis.Buffer.from(b.buffer, b.byteOffset, b.length))
+  : (a, b) => {
+    if (a.length !== b.length) return false;
+    const n = a.length >>> 2;
+    if ((a.byteOffset | b.byteOffset) & 3) { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; }
+    const x = new Int32Array(a.buffer, a.byteOffset, n), y = new Int32Array(b.buffer, b.byteOffset, n);
+    for (let i = 0; i < n; i++) if (x[i] !== y[i]) return false;
+    for (let i = n << 2; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+/** The kernel's list of where file bytes lie (shims/kernel
+ *  `k_snap_extents`), at its header `h` in `buffer`: `[kind, address,
+ *  length, offset, name]`, empty when no thread made one. */
+function snapExtents(buffer, h) {
+  if (!h) return [];
+  const w = new Int32Array(buffer), i = h >>> 2;
+  if (Atomics.load(w, i + 1) !== 1) return [];
+  const at = w[i + 2] >>> 0, n = w[i + 3] >>> 0;
+  const text = new TextDecoder().decode(new Uint8Array(buffer, at, n).slice());
+  return text.split('\n').filter(Boolean).map((l) => {
+    const [k, a, len, off, ...name] = l.split(' ');
+    return [Number(k), Number(a), Number(len), Number(off), name.join(' ')];
+  });
+}
+/** The kernel memory's pages that hold a source's bytes unchanged (a
+ *  bundled file's, a lazy file's chunk), by reference: `{ skip, refs,
+ *  sources }`, `refs` as runs `[offset, length, source, source offset]`.
+ *  `sources.read(kind, name, offset, length)` gives a source's bytes or
+ *  null. */
+function snapRefs(buffer, extents, sources) {
+  const P = 65536, skip = new Set(), table = [], ids = new Map(), pages = [], seen = new Set();
+  if (!sources) return { skip, refs: [], sources: table };
+  for (const [kind, at, len, off, name] of extents) {
+    if (seen.has(at)) continue;
+    const first = Math.ceil(at / P) * P, end = Math.floor((at + len) / P) * P;
+    if (first >= end) continue;
+    let src = null;
+    try { src = sources.read(kind, name, off + (first - at), end - first); } catch { src = null; }
+    if (!src || src.length !== end - first) continue;
+    seen.add(at);
+    let si = ids.get(`${kind} ${name}`);
+    for (let p = first; p < end; p += P) {
+      if (skip.has(p) || !snapSame(new Uint8Array(buffer, p, P), src.subarray(p - first, p - first + P))) continue;
+      if (si === undefined) { si = table.length; table.push([kind, name]); ids.set(`${kind} ${name}`, si); }
+      skip.add(p);
+      pages.push([p, si, off + (p - at)]);
+    }
+  }
+  pages.sort((x, y) => x[0] - y[0]);
+  const refs = [];
+  for (const [p, si, o] of pages) {
+    const r = refs.at(-1);
+    if (r && r[0] + r[1] === p && r[2] === si && r[3] + r[1] === o) r[1] += P;
+    else refs.push([p, P, si, o]);
+  }
+  return { skip, refs, sources: table };
 }
 
 export class ProcessHost {
@@ -621,7 +688,7 @@ export class ProcessHost {
    * stopMs, copyMs }` (a memory as its nonzero runs, `snapTake`), or
    * `{ refused, stopMs }`.
    */
-  async snapshot({ timeout = 10000, resume = true } = {}) {
+  async snapshot({ timeout = 10000, resume = true, sources = null } = {}) {
     const st = this.#stacks;
     if (!this.#kernel?.memory || !st?.snapWord) throw new Error('snapshot: no global kernel with a snapshot word');
     if (this.#pending.size) return { refused: `still starting: ${[...this.#pending.keys()].join(' ')}`, stopMs: 0 };
@@ -652,6 +719,7 @@ export class ProcessHost {
     this.#snapWait = null;
     const stopMs = performance.now() - t0;
     const release = () => {
+      if (st.extents) for (let i = 0; i < 4; i++) Atomics.store(words, (st.extents >>> 2) + i, 0);
       Atomics.store(words, st.snapWord >>> 2, 0);
       Atomics.notify(words, st.snapWord >>> 2);
       wake();
@@ -660,9 +728,17 @@ export class ProcessHost {
       release();
       return { refused: `not stopped: ${want.filter((k) => !parked.has(k)).join(' ')}`, stopMs };
     }
-    const kernel = snapTake(this.#kernel.memory.buffer);
+    // The kernel's pages that still hold a source's bytes (the page's
+    // bundle, its lazy files' chunks), by reference; the rest copied.
+    const kb = this.#kernel.memory.buffer;
+    const byRef = snapRefs(kb, snapExtents(kb, st.extents), sources);
+    const kernel = snapTake(kb, byRef.skip);
+    kernel.refs = byRef.refs;
+    kernel.sources = byRef.sources;
     for (const [at, bytes] of kernel.runs) {
-      if (st.snapWord >= at && st.snapWord < at + bytes.length) new DataView(bytes.buffer).setInt32(st.snapWord - at, 0, true);
+      const dv = new DataView(bytes.buffer);
+      if (st.snapWord >= at && st.snapWord < at + bytes.length) dv.setInt32(st.snapWord - at, 0, true);
+      if (st.extents) for (let i = 0; i < 16; i += 4) if (st.extents + i >= at && st.extents + i < at + bytes.length) dv.setInt32(st.extents + i - at, 0, true);
     }
     const memories = new Map(), stores = new Map(), maxPages = {};
     const threads = [];
@@ -686,6 +762,8 @@ export class ProcessHost {
       maxPages,
       flavourOf: [...this.#flavourOf],
       at,
+      // what the references are to (`restore` takes only the same)
+      bundle: kernel.refs.length ? sources.id ?? null : null,
       door: this.#door ? { ...this.#door, memory: undefined, module: undefined } : null,
     };
     const copyMs = performance.now() - t0 - stopMs;
@@ -704,14 +782,17 @@ export class ProcessHost {
    * (it frees the snapshot's shim slots). Resolves with pid 1's status;
    * `onRunning(ms)` once every thread's Worker is up.
    */
-  async restore({ kernel, memories, stores = new Map(), meta }, { onRunning } = {}) {
+  async restore({ kernel, memories, stores = new Map(), meta }, { onRunning, sources = null } = {}) {
     const t0 = performance.now();
     watchLibraries();
     if (!this.#kernel?.memory) throw new Error('restore: no global kernel');
+    if (kernel.refs?.length && (!sources || (sources.id ?? null) !== meta.bundle)) {
+      throw new Error(`restore: the snapshot's pages are by reference to bundle ${meta.bundle}, and this session's is ${sources?.id ?? 'none'}`);
+    }
     const km = this.#kernel.memory;
     const grow = Math.ceil((snapLength(kernel) - km.buffer.byteLength) / 65536);
     if (grow > 0) km.grow(grow);
-    snapFill(km, kernel);
+    snapFill(km, kernel, sources);
     // Every restored thread waits, attached, until all are (`snapRelease`).
     const words = new Int32Array(km.buffer), word = meta.stacks.snapWord >>> 2;
     Atomics.store(words, word, 1);

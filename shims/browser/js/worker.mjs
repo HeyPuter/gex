@@ -798,6 +798,7 @@ async function handle(msg) {
   // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
   if (msg.sehReport) globalThis.GEX_SEH_REPORT = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
+  if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
   if (msg.relayAll) globalThis.GEX_RELAY_ALL = 1;

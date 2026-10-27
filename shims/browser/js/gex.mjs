@@ -463,10 +463,10 @@ function entryFnModule(t64, s64) {
  *  snapshot sysroot, libgex-snap/entry64.c): `entryFnModule`'s, its depth
  *  counted in `d` (a session snapshot stops a thread only in the outermost
  *  entry), and the program's asyncify state looked at after the call: an
- *  unwind the snapshot began (1) ends here, `af(idx, ctx)` keeps the record,
+ *  unwind the snapshot began (1) ends here, `af(idx, ctx, rsp)` keeps the record,
  *  parks and starts the rewind, and the call is made again (rewound).
  *  (module (type $vi (func (param i32))) (type $e (func (param i32 i32 i64) (result i32)))
- *    (type $st (func (result i32))) (type $af (func (param i32 i32)))
+ *    (type $st (func (result i32))) (type $af (func (param i32 i32 i64)))
  *    (import "e" "t" (table T 0 funcref)) (import "e" "sp" (global $sp (mut S)))
  *    (import "e" "d" (global $d (mut i32)))
  *    (import "e" "st" (func $st (type $st))) (import "e" "af" (func $af (type $af)))
@@ -475,10 +475,18 @@ function entryFnModule(t64, s64) {
  *      loop $again
  *        try (call_indirect (type $vi) (local.get 1) (local.get 0))
  *        catch_all d -= 1 (global.set $sp (local.get $cur)) rethrow 0 end
- *        (if (i32.eq (call $st) (i32.const 1)) (then (call $af (local.get 0) (local.get 1)) (br $again)))
+ *        (if (i32.eq (call $st) (i32.const 1)) (then (call $af (local.get 0) (local.get 1) (local.get 2)) (br $again)))
  *      end
  *      d -= 1 (global.set $sp (local.get $cur)) i32.const 1)) */
 const entrySnapMods = new Map();
+/** GEX_SNAP_TRACE: each thread a session snapshot cannot stop says why, once. */
+const SNAP_TRACE = !!globalThis.process?.env?.GEX_SNAP_TRACE;
+/** A snapshot record's levels (libgex-snap/snap.h `nlv`, `lv`): the
+ *  count's offset, the first level's and a level's size; and how many. */
+const SNAP_NLV = 24, SNAP_LV = 32, SNAP_LVS = 40, SNAP_LEVELS = 8;
+/** Thrown by a snapshot's stop inside guest code a call-out runs, to that
+ *  call-out (`#snapCallOut`). */
+const SNAP_NEST = Object.freeze({ snapNest: true });
 function entryFnSnapModule(t64, s64) {
   const k = (t64 ? 2 : 0) | (s64 ? 1 : 0);
   let m = entrySnapMods.get(k);
@@ -496,7 +504,7 @@ function entryFnSnapModule(t64, s64) {
     0x03, 0x40,
     0x06, 0x40, 0x20, 1, 0x20, 0, ...(t64 ? [0xad] : []), 0x11, 0, 0,
     0x19, ...dDec, 0x20, 3, 0x24, 0, 0x09, 0, 0x0b,
-    0x10, 0, 0x41, 1, 0x46, 0x04, 0x40, 0x20, 0, 0x20, 1, 0x10, 1, 0x0c, 1, 0x0b,
+    0x10, 0, 0x41, 1, 0x46, 0x04, 0x40, 0x20, 0, 0x20, 1, 0x20, 2, 0x10, 1, 0x0c, 1, 0x0b,
     0x0b,
     ...dDec, 0x20, 3, 0x24, 0, 0x41, 1, 0x0b,
   ];
@@ -509,7 +517,7 @@ function entryFnSnapModule(t64, s64) {
     1, 101, 2, 97, 102, 0, 3];
   const bytes = new Uint8Array([
     0, 97, 115, 109, 1, 0, 0, 0,
-    ...sec(1, [4, 96, 1, 127, 0, 96, 3, 127, 127, 126, 1, 127, 96, 0, 1, 127, 96, 2, 127, 127, 0]),
+    ...sec(1, [4, 96, 1, 127, 0, 96, 3, 127, 127, 126, 1, 127, 96, 0, 1, 127, 96, 3, 127, 127, 126, 0]),
     ...sec(2, imps),
     ...sec(3, [1, 1]),
     ...sec(7, [1, 5, 101, 110, 116, 114, 121, 0, 2]),
@@ -1868,7 +1876,9 @@ export class Gex {
             spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
           }
           try {
-            f(ctx, code, this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind);
+            const a = this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0;
+            if (this.#snapHooks) this.#snapHookCall(f, idx >>> 0, ctx, code, a, kind, BigInt.asUintN(64, sp));
+            else f(ctx, code, a, kind);
           } finally {
             spG.value = cur;
           }
@@ -2958,6 +2968,7 @@ export class Gex {
       // (`ProcessHost.snapshot`).
       ...(k.k_snap_word ? { snapWord: k.k_snap_word() >>> 0, wsAddr: k.k_ws_addr(0) >>> 0, wsCount: k.k_ws_count() >>> 0 } : {}),
       ...(k.k_mono_held_at ? { monoHeld: k.k_mono_held_at() >>> 0 } : {}),
+      ...(k.k_snap_extents_at ? { extents: k.k_snap_extents_at() >>> 0 } : {}),
     };
   }
 
@@ -4661,7 +4672,11 @@ export class Gex {
           // Wine's Unix side : its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults
           // is still to come).
-          unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, addrNum(idx)) ?? 0,
+          // (a test's, GEX_TEST_UD2_ENTRY: 64-bit Wine's direct entries,
+          // ops 0 and 4, never registered, so its every system and Unix
+          // call takes the ud2 route)
+          unix_dispatcher: (op, idx) => (globalThis.GEX_TEST_UD2_ENTRY && (op === 0 || op === 4)) ? 0 :
+            e.gex_unix_dispatcher?.(op, addrNum(idx)) ?? 0,
           fault_hook: (idx) => e.gex_fault_hook_set?.(addrNum(idx)),
           signal_hook: (idx) => e.gex_signal_hook_set?.(addrNum(idx)),
           code_changed: (addr, len) => e.gex_code_changed?.(addrBig(addr), len),
@@ -4707,7 +4722,7 @@ export class Gex {
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         // its runtime's heap: fresh guest pages
         ...(lowered ? { provider_alloc: (size) => e.gex_provider_alloc(size) } : {}),
-        ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall) } : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst, mod) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall) } : {}),
       },
     };
     // A unit split by function (gex_split): its cold clusters' loader,
@@ -5543,7 +5558,7 @@ export class Gex {
     const f = prog?.__gex_snap_resume64
       ? new WebAssembly.Instance(entryFnSnapModule(m64(), typeof spG.value === 'bigint'), { e: {
         t: this.#cgen.ftab, sp: spG, d: (this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0)), st: prog.asyncify_get_state,
-        af: (idx, ctx) => this.#snapEntryStop(idx, ctx),
+        af: (idx, ctx, rsp) => this.#snapStop(0, idx, ctx, rsp),
       } }).exports.entry
       : new WebAssembly.Instance(entryFnModule(m64(), typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
     this.#entryHook.set(0, f);
@@ -5720,8 +5735,12 @@ export class Gex {
    *  is cleared, and rewinds: the rewound `syscall_b` makes the call. The
    *  record holds the program's stack pointer at the call (+16), which the
    *  unwind does not keep: the rewind puts it back. */
-  #snapImports(asyncify, call, inst) {
+  #snapImports(asyncify, call, inst, mod = null) {
     this.#snapProg = inst;
+    // A wasm64 program of the flavour: its hooks and call-outs stop too.
+    const flavour = !single.on && !!mod && WebAssembly.Module.exports(mod).some((x) => x.name === '__gex_snap_resume64');
+    this.#snapHooks = flavour;
+    if (flavour) this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
     const e = this.#shim.exports;
     const k = () => this.#kernel;
     const dv = () => new DataView(this.#memory.buffer);
@@ -5765,14 +5784,9 @@ export class Gex {
       // this Worker's entry function, then finished as `w64_entry` finishes
       // one (`gex_snap_entry_tail`).
       snap_entry_rewind: (rec) => {
-        const r = Number(rec) >>> 0;
-        const ctx = Number(e.gex_snap_ctx());
-        const idx = dv().getUint32(r + 20, true);
-        const rsp = dv().getBigUint64(ctx + 4 * 8, true);
-        asyncify(3, r);
-        this.#entryCallFn(idx, ctx, rsp);
-        if (!e.gex_snap_entry_tail(ctx)) throw new Error('snapshot: a restored thread\'s call left another context to resume');
+        this.#snapLevelEnter(Number(rec) >>> 0, 0, Number(e.gex_snap_ctx()));
       },
+      ...(flavour ? { call_out: (ctx, target, ret, spWant) => this.#snapCallOut(ctx >>> 0, target, ret, spWant) } : {}),
       snap_unwinding: () => {
         const was = this.#snapUnwinding;
         this.#snapUnwinding = false;
@@ -5792,6 +5806,12 @@ export class Gex {
     const words = new Int32Array(kern.buffer);
     const at = (k().k_snap_word() >>> 0) >>> 2;
     const r = Number(rec) >>> 0, d = dv();
+    // The first thread to stop lists where the kernel's file bytes lie
+    // (`k_snap_extents`), for the host's references.
+    if (k().k_snap_extents_at) {
+      const h = (k().k_snap_extents_at() >>> 0) >>> 2;
+      if (Atomics.compareExchange(words, h, 0, 1) === 0) k().k_snap_extents();
+    }
     this.#env.snapParked?.({
       pid: e.gex_my_pid?.() ?? 0,
       tid: e.gex_snap_tid?.() ?? this.#threadTid,
@@ -5803,22 +5823,126 @@ export class Gex {
     });
     while (Atomics.load(words, at) !== 0) Atomics.wait(words, at, Atomics.load(words, at), 1000);
   }
-  /** The snapshot entry function's stop (`entryFnSnapModule`): the
-   *  program's handler `idx` came back unwinding. The snapshot's unwind
-   *  ends here: the record kept (the function, the registers, a restored
-   *  thread's start), parked, and the rewind begun, which the entry
-   *  function's call makes. */
-  #snapEntryStop(idx, ctx) {
+  /** A snapshot's stop where the program's handler came back unwinding,
+   *  called by the snapshot entry function (`entryFnSnapModule`, `route`
+   *  0) or the hook's call (`#snapHookCall`, `route` 1): `idx` the
+   *  function, `rsp` the guest's stack pointer at the entry, and a hook's
+   *  arguments. The unwind ends here; the level is kept in the record
+   *  (`SNAP_LV`). The outermost level keeps the rest (the registers, a
+   *  restored thread's start), parks, and begins the rewind, which its
+   *  caller's call makes. A level inside guest code that an outer level's
+   *  call-out runs leaves by `SNAP_NEST` to that call-out
+   *  (`#snapCallOut`), which unwinds the outer level's frames in turn. */
+  #snapStop(route, idx, ctx, rsp, code = 0, addr = 0n, kind = 0) {
     const P = this.#snapProg().exports;
     const rec = this.#snapRec;
     if (!this.#snapUnwinding || !rec) throw new Error('snapshot: an unwind not the snapshot\'s reached the entry');
     this.#snapUnwinding = false;
     P.asyncify_stop_unwind();
-    new DataView(this.#memory.buffer).setUint32(rec + 20, idx >>> 0, true);
+    const k = this.#snapDepth.value - 1;
+    const v = new DataView(this.#memory.buffer), b = rec + SNAP_LV + k * SNAP_LVS;
+    if (v.getUint32(rec + SNAP_NLV, true) === 0) v.setUint32(rec + SNAP_NLV, k + 1, true);
+    v.setUint32(b, route, true);
+    v.setUint32(b + 4, idx >>> 0, true);
+    v.setUint32(b + 8, code >>> 0, true);
+    v.setUint32(b + 12, kind >>> 0, true);
+    v.setBigUint64(b + 24, BigInt.asUintN(64, BigInt(addr)), true);
+    v.setBigUint64(b + 32, BigInt.asUintN(64, BigInt(rsp)), true);
     P.__gex_snap_fill(BigInt(rec));
+    if (k > 0) {
+      // (the entry function's own count is left to this: its call of the
+      // stop is outside its catch; the hook's call counts its own)
+      if (route === 0) this.#snapDepth.value--;
+      throw SNAP_NEST;
+    }
+    v.setUint32(rec + 20, idx >>> 0, true);
     this.#snapPark(rec);
+    new DataView(this.#memory.buffer).setUint32(rec + SNAP_NLV, 0, true);
     P.asyncify_start_rewind(rec);
   }
+  /** A fault hook's call (`f`, function `idx`) in the snapshot flavour:
+   *  counted as an entry, and a snapshot's unwind that comes back through
+   *  it stops there (`#snapStop`) and the hook is called again, rewound.
+   *  `rsp`: the guest's stack pointer as the fault left it. */
+  #snapHookCall(f, idx, ctx, code, addr, kind, rsp) {
+    if (!this.#snapHooks) return f(ctx, code, addr, kind);
+    const P = this.#snapProg().exports, d = this.#snapDepth;
+    d.value++;
+    try {
+      for (;;) {
+        f(ctx, code, addr, kind);
+        if (P.asyncify_get_state() !== 1) return undefined;
+        this.#snapStop(1, idx, ctx, rsp, code, addr, kind);
+      }
+    } finally {
+      d.value--;
+    }
+  }
+  /** A level of a restored or rewound thread's record entered again
+   *  (`#snapStop` kept it): the handler's call made as the level's route
+   *  made it, rewound, then finished as `w64_entry` finishes one. Where
+   *  the guest goes on. */
+  #snapLevelEnter(rec, k, ctx) {
+    const e = this.#shim.exports;
+    const v = new DataView(this.#memory.buffer), b = rec + SNAP_LV + k * SNAP_LVS;
+    const route = v.getUint32(b, true), idx = v.getUint32(b + 4, true);
+    const rsp = v.getBigUint64(b + 32, true);
+    const P = this.#snapProg().exports;
+    if (route === 0) {
+      P.asyncify_start_rewind(rec);
+      this.#entryCallFn(idx, ctx, rsp);
+    } else {
+      const f = this.#cgenStore().ftab.get(tIdx(idx));
+      const wide = e.gex_guest_x86_64?.() === 1;
+      const addr = v.getBigUint64(b + 24, true);
+      const spG = this.#wasmprogStack();
+      const cur = spG.value;
+      if (typeof cur === 'bigint') spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+      else {
+        const esp = Number(rsp & 0xffffffffn), c32 = Number(cur) >>> 0;
+        spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
+      }
+      try {
+        P.asyncify_start_rewind(rec);
+        this.#snapHookCall(f, idx, ctx, v.getUint32(b + 8, true) | 0, wide ? addr : Number(BigInt.asUintN(32, addr)) | 0, v.getUint32(b + 12, true) | 0, rsp);
+      } finally {
+        spG.value = cur;
+      }
+    }
+    if (!e.gex_snap_entry_tail(ctx)) throw new Error('snapshot: a restored thread\'s call left another context to resume');
+    return this.#faultPc(ctx);
+  }
+  /** The program's call-out in the snapshot flavour (an import its
+   *  asyncify unwinds through): a stop inside the guest code it runs
+   *  (`SNAP_NEST`) unwinds the program's frames from here, the program's
+   *  stack pointer kept in the inner level; called again by their rewind,
+   *  it enters the inner level again (`#snapLevelEnter`) and runs the
+   *  guest on from there, as the call-out it was. */
+  #snapCallOut(ctx, target, ret, spWant) {
+    const P = this.#snapProg().exports;
+    const rec = this.#snapRec;
+    if (P.asyncify_get_state() === 2) {
+      P.asyncify_stop_rewind();
+      const j = this.#snapDepth.value;
+      const sp = new DataView(this.#memory.buffer).getUint32(rec + SNAP_LV + j * SNAP_LVS + 16, true);
+      const spG = this.#wasmprogStack();
+      spG.value = typeof spG.value === 'bigint' ? BigInt(sp) : sp | 0;
+      return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false, () => this.#snapLevelEnter(rec, j, ctx)));
+    }
+    try {
+      return this.#callOut(ctx, target, ret, spWant);
+    } catch (err) {
+      if (err !== SNAP_NEST) throw err;
+      const j = this.#snapDepth.value;
+      new DataView(this.#memory.buffer).setUint32(rec + SNAP_LV + j * SNAP_LVS + 16, Number(this.#wasmprogStack().value) >>> 0, true);
+      this.#snapUnwinding = true;
+      P.asyncify_start_unwind(rec);
+      return 0;
+    }
+  }
+  /** Whether the program's hooks and call-outs are the snapshot flavour's
+   *  (`#snapHookCall`, `#snapCallOut`). */
+  #snapHooks = false;
   /** Whether this Worker's thread can be unwound to its program's snapshot
    *  root where it waits now (`snap_ok`): its driver (root 1) with nothing
    *  of the host's above it, or (root 2) the outermost entry from the
@@ -5828,10 +5952,26 @@ export class Gex {
     if (!this.#snapRec || this.#vforkDepth) return 0;
     const depth = this.#snapDepth?.value ?? 0;
     if ((this.#snapRoot & 1) && depth === 0 && this.#callouts.length === 0 && this.#nest.length === 0) return 1;
-    if ((this.#snapRoot & 2) && depth === 1 && this.#callouts.length === 1 && this.#nest.length === 1
-      && this.#callouts[0].ri === -1) return 1;
+    // (root 2) every level an entry from guest code that the call-out
+    // below it runs, each call-out the program's own (Wine's)
+    const n = this.#callouts.length;
+    if ((this.#snapRoot & 2) && depth >= 1 && depth === n && n <= SNAP_LEVELS && this.#nest.length === n
+      && (n === 1 || this.#snapHooks) && this.#callouts.every((c) => c.ri === -1)) return 1;
+    if (SNAP_TRACE && !this.#snapTraced) {
+      // Once per thread: why it cannot be stopped where it waits.
+      this.#snapTraced = true;
+      let pc = '?';
+      try {
+        const v = new DataView(this.#memory.buffer), c = Number(this.#shim.exports.gex_snap_ctx());
+        const rsp = v.getBigUint64(c + 4 * 8, true);
+        pc = `0x${v.getBigUint64(c + 32 * 8, true).toString(16)} rax 0x${v.getBigUint64(c, true).toString(16)} ret 0x${v.getBigUint64(Number(rsp), true).toString(16)}`;
+      } catch {}
+      console.error(`[gex-snap] tid ${this.#threadTid}: not at a root (rec ${this.#snapRec}, root ${this.#snapRoot}, vfork ${this.#vforkDepth}, entry depth ${depth}, `
+        + `call-outs ${this.#callouts.length} [${this.#callouts.map((c) => c.ri).join(' ')}], nest ${this.#nest.length}, pc ${pc})`);
+    }
     return 0;
   }
+  #snapTraced = false;
   /** The program built with the snapshot flavour (its instance), its
    *  thread's roots (bits: 1 a driver, 2 the host's entry), and the
    *  snapshot entry function's depth on this Worker. */
@@ -5850,7 +5990,7 @@ export class Gex {
    *  thread or a child they staged is handed to the host here), and fork's
    *  asyncify operations on its own instance (the musl fork's
    *  src/process/wasm32/__gex_fork.c). */
-  #wasmprogImports(inst) {
+  #wasmprogImports(inst, mod = null) {
     const e = this.#shim.exports;
     const ops = ['asyncify_get_state', 'asyncify_start_unwind', 'asyncify_stop_unwind', 'asyncify_start_rewind', 'asyncify_stop_rewind'];
     const asyncify = (op, arg) => {
@@ -5903,7 +6043,7 @@ export class Gex {
       },
       asyncify,
       // The snapshot flavour's (libgex-snap/snapshot.c).
-      ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync, inst),
+      ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync, inst, mod),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
         if (st === 0) asyncify(1, rec);
@@ -7865,7 +8005,7 @@ export class Gex {
     return false;
   }
 
-  *#callOutSteps(ctx, target, ret, spWant, suspendable) {
+  *#callOutSteps(ctx, target, ret, spWant, suspendable, resume = null) {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
     const psp0 = this.#progSpAt();
@@ -7895,6 +8035,9 @@ export class Gex {
     let pc = BigInt.asUintN(64, target);
     let next = null;
     try {
+      // A snapshot's level entered again inside it (`#snapCallOut`): the
+      // guest goes on where that leaves it.
+      if (resume) pc = resume();
       this.#armCallouts();
       for (;;) {
         try {
@@ -7924,6 +8067,7 @@ export class Gex {
         } catch (err) {
           e.__stack_pointer.value = sp0;
           this.#progSpBack(psp0);
+          if (err === SNAP_NEST) throw err;
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;
           // A call-out ended here was the trap's whole business: the resume
@@ -7994,7 +8138,8 @@ export class Gex {
           const ft = this.#faultTake(ctx);
           if (ft) {
             try {
-              yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+              if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
+              else yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
             } finally {
               ft.spG.value = ft.cur;
             }
@@ -8096,11 +8241,12 @@ export class Gex {
     }
     const f = this.#cgenStore().ftab.get(tIdx(hook));
     if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
+    const rsp = this.#snapHooks ? this.#dv().getBigUint64(ctx + this.#ctxSp(), true) : 0n;
     const { spG, cur } = this.#hookStack(ctx);
     // 64-bit Wine's hook (signal_wasm64.c) takes the address as a 64-bit integer
     // (above 4 GiB in a 64-bit memory), 32-bit Wine's (signal_wasm32.c) as 32 bits.
     const wide = e.gex_guest_x86_64?.() === 1;
-    return { f, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+    return { f, idx: hook, rsp, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }
 
   /** The program's stack pointer moved below the guest's for a hook's C

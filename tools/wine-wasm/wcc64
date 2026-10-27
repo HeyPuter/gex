@@ -156,9 +156,11 @@ if SNAPSHOT and not mem64:
     dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
     roots = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c', '__gex_snap_resume64',
              '__gex_snap_run', '__gex_snap_run_loop', '__gex_snap_resume_run']
-    reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', dis, wasm, 'gex.syscall_b'] + roots,
+    # (and through the host's call-outs, which a thread stopped inside guest
+    # code a call of Wine's runs unwinds through)
+    reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', '--also', 'gex.call_out', dis, wasm, 'gex.syscall_b'] + roots,
                            capture_output=True, text=True)
-    passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.syscall_b']
+    passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.syscall_b,gex.call_out']
     if reach.returncode == 0:
         lst = os.path.join(tmp, 'onlylist')
         open(lst, 'w').write(reach.stdout.strip() + '\n')
