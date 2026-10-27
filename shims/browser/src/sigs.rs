@@ -493,7 +493,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     };
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid, creds: &home.creds, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
         map: map(),
         path: PathIo {
             ns: &ns,

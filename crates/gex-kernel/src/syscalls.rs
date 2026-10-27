@@ -1191,6 +1191,9 @@ pub struct FdIo<'a> {
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
     pub pid: i32,
+    /// The process's user and group, which a socket it joins records
+    /// (`SO_PEERCRED`).
+    pub creds: &'a Creds,
     /// `flock`'s locks (`Kernel::file_locks`, shared with the process's
     /// forks), released when a description goes.
     pub file_locks: &'a Arc<unix::FileLocks>,
@@ -1202,6 +1205,11 @@ pub struct FdIo<'a> {
 }
 
 impl FdIo<'_> {
+    /// This process's credentials as `struct ucred` has them.
+    pub fn cred(&self) -> unix::Cred {
+        unix::Cred { pid: self.pid, uid: self.creds.uid(), gid: self.creds.gid() }
+    }
+
     /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
     ///
     /// One descriptor, readable and writable, over a single `EventFd`. The
@@ -4537,7 +4545,10 @@ impl NetIo<'_> {
             nr::LISTEN => match io.remote_unix_of(fd) {
                 Ok(_) => Ok(0),
                 Err(_) => match io.unix_of(fd) {
-                    Ok(s) => s.listen(),
+                    Ok(s) => {
+                        s.set_cred(io.cred());
+                        s.listen()
+                    }
                     // A TCP listener, for guests on this machine.
                     Err(Errno::ENOTSOCK) => io.socket_of(fd).and_then(|s| s.listen()).map(|_| 0),
                     Err(e) => Err(e),
@@ -4703,6 +4714,7 @@ impl NetIo<'_> {
             return Ok(0);
         }
         let (a, b) = unix::UnixSocket::pair();
+        unix::UnixSocket::set_pair_cred(&a, &b, io.cred());
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -4792,6 +4804,7 @@ impl NetIo<'_> {
         // This process's own host first -- its compositor, its GPU device --
         // then the system-wide table, which is where a guest server (an X
         // server's socket) lives.
+        sock.set_cred(io.cred());
         if let Ok(r) = self.host_names.connect(&sock, &path) {
             return Ok(r);
         }
@@ -5018,6 +5031,35 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         return Ok(0);
     }
     socket_family_type(io, fd)?;
+    // SO_PEERCRED: the far end's `struct ucred` (pid, uid, gid; 12 bytes on
+    // every ABI), as it was when the two were joined. Every byte is written:
+    // dbus-daemon reads the struct off its stack uninitialised and compares
+    // the uid with the one a client claims, so a struct left as the caller
+    // had it refused every wasm32 client's authentication. A peer this
+    // kernel did not see made (in the global kernel, or a host's end) has
+    // no pid to give (0) and this process's user and group, the only ones
+    // there are.
+    const SO_PEERCRED: u64 = 17;
+    if level == SOL_SOCKET && name == SO_PEERCRED {
+        let me = io.cred();
+        let peer = io
+            .unix_of(fd)
+            .ok()
+            .and_then(|s| s.peer_cred())
+            .unwrap_or(unix::Cred { pid: 0, uid: me.uid, gid: me.gid });
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(&peer.pid.to_le_bytes());
+        bytes[4..8].copy_from_slice(&peer.uid.to_le_bytes());
+        bytes[8..12].copy_from_slice(&peer.gid.to_le_bytes());
+        if val != 0 {
+            let room = if optlen != 0 { (m.read_u32(optlen)? as usize).min(12) } else { 12 };
+            m.write(val, &bytes[..room])?;
+            if optlen != 0 {
+                m.write_u32(optlen, room as u32)?;
+            }
+        }
+        return Ok(0);
+    }
     // `setsockopt` takes every option without effect, so these read back
     // as a Linux socket's defaults: the options programs ask about (Wine's
     // ws2_32 for Windows programs, libuv, Chromium's net stack, dbus).
@@ -5040,9 +5082,6 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         (SOL_SOCKET, 18 | 19) => (1, 4),
         // SO_ACCEPTCONN
         (SOL_SOCKET, 30) => (io.socket_of(fd).map(|s| s.is_listening()).unwrap_or(false) as u64, 4),
-        // SO_PEERCRED: a pid of 0, as before (the rest of the struct is
-        // left as the caller had it)
-        (SOL_SOCKET, 17) => (0, 0),
         // SO_LINGER: off (struct linger, two ints)
         (SOL_SOCKET, 13) => (0, 8),
         // SO_RCVTIMEO, SO_SNDTIMEO (and their 64-bit-time forms): none
@@ -9305,6 +9344,7 @@ impl Kernel {
             compat: self.compat,
             ns: &self.vfs,
             pid: self.pid,
+            creds: &self.creds,
             file_locks: &self.file_locks,
             pipes: self.pipes,
             shared: Some(self.mem.shared_maps()),

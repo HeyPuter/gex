@@ -222,6 +222,22 @@ pub struct UnixSocket {
     /// Who waits on this end (`crate::wait`): readers, writers, and for a
     /// listener `accept`.
     queue: crate::wait::Queue,
+    /// The credentials this end was made with, as `SO_PEERCRED` hands them
+    /// to the far end: the process that called `socketpair`, `connect` or
+    /// `listen` on it (an accepted end has its listener's).
+    cred: Mutex<Option<Cred>>,
+    /// The far end's credentials, taken when the two were joined
+    /// (`SO_PEERCRED`): None for a peer this kernel did not see made (a
+    /// host's end).
+    peer_cred: Mutex<Option<Cred>>,
+}
+
+/// A process's credentials as `struct ucred` has them: pid, uid, gid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cred {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl UnixSocket {
@@ -233,6 +249,28 @@ impl UnixSocket {
             pending_send: Mutex::new(Vec::new()),
             pending_recv: Mutex::new(Vec::new()),
             queue: crate::wait::Queue::new(),
+            cred: Mutex::new(None),
+            peer_cred: Mutex::new(None),
+        }
+    }
+
+    /// Record the credentials of the process making this end (before its
+    /// `connect` or `listen`, and on both ends of a `socketpair`).
+    pub fn set_cred(&self, cred: Cred) {
+        *self.cred.lock().unwrap() = Some(cred);
+    }
+
+    /// The far end's credentials (`SO_PEERCRED`), when they are known.
+    pub fn peer_cred(&self) -> Option<Cred> {
+        *self.peer_cred.lock().unwrap()
+    }
+
+    /// Both ends of a `socketpair` made by `cred`: each end's peer is that
+    /// process, as Linux has it.
+    pub fn set_pair_cred(a: &UnixSocket, b: &UnixSocket, cred: Cred) {
+        for s in [a, b] {
+            s.set_cred(cred);
+            *s.peer_cred.lock().unwrap() = Some(cred);
         }
     }
 
@@ -373,6 +411,14 @@ impl UnixSocket {
             if let Role::Connected { local, .. } = &mut *theirs.role.lock().unwrap() {
                 *local = Some(path.to_string());
             }
+            // Each end has the other's credentials as they were now: the
+            // connecting process's for the end `accept` gives out, the
+            // listener's (from its `listen`) for this one.
+            let client = *self.cred.lock().unwrap();
+            let server = *listener.cred.lock().unwrap();
+            *theirs.cred.lock().unwrap() = server;
+            *theirs.peer_cred.lock().unwrap() = client;
+            *self.peer_cred.lock().unwrap() = server;
             backlog.lock().unwrap().push_back(theirs);
         }
         // A connection is waiting for `accept`.
