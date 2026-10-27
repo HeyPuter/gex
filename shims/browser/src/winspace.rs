@@ -153,7 +153,7 @@ mod imp {
     /// bundle has there is 9.4 MiB). A relocated native-wasm skeleton
     /// executable did not run (wineboot at 0x320000: a table call into a
     /// provider never installed). Above it, [`DLL_BAND`]: the DLLs a bundle
-    /// pins (its prefix's dll-bases, soju's dll-bases.py), at the addresses
+    /// pins (its prefix's dll-bases, from wine32/dll-bases.py), at the addresses
     /// its units were built for. Both are kept out of the arena's way as one
     /// island, which grows nothing until something is mapped there, as Wine's
     /// reservation keeps 0x10000-0x05000000 for executables at 0x400000 and
@@ -173,8 +173,9 @@ mod imp {
     /// [`keep_exe_slot`]'s island, `[EXE_SLOT, DLL_BAND_END)`: where only a
     /// mapping that names its address goes (`wine32_address_space`).
     pub(crate) const WINE32_ISLAND: (u64, u64) = (EXE_SLOT, DLL_BAND_END);
-    /// The pinned DLLs' band, [0x11000000, 0x20000000): soju's dll-bases.py
-    /// lays them out from its start and asserts they end below its end.
+    /// The pinned DLLs' band, [0x11000000, 0x20000000):
+    /// tools/wine-wasm/wine32/dll-bases.py lays them out from its start and
+    /// asserts they end below its end.
     const DLL_BAND: u64 = 0x1100_0000;
     const DLL_BAND_END: u64 = 0x2000_0000;
     const _: () = assert!(EXE_SLOT + (16 << 20) == DLL_BAND && DLL_BAND < DLL_BAND_END);

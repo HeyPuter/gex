@@ -1,6 +1,6 @@
 #!/bin/sh
 # The wasm32 sysroot Wine's Unix side builds against:
-# musl with the gex `wasm32` arch (fork: wt/musl-wasm, branch gex-wasm32) and
+# musl with the gex `wasm32` arch (the fork wine32.pins names) and
 # compiler-rt's builtins, both built with the system clang.
 #
 #   tools/wine-wasm/build-sysroot.sh OUT [MUSL_SRC]
