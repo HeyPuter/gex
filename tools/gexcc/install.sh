@@ -12,7 +12,8 @@
 # MUSL_SRC: a checkout of the musl fork (MercuryWorkshop/musl-wasm, branch
 # gex-wasm32-slim or a descendant). GEXC: the gexc a program's host launcher
 # runs (default: this tree's target/release/gexc if built, else `gexc` on
-# PATH at run time). GEX_BINARYEN: an existing binaryen install.
+# PATH at run time). GEXC_X86: an x86 gexc for -fgex-guest-i386's runtime
+# (default GEXC). GEX_BINARYEN: an existing binaryen install.
 # BUSYBOX_TAR: busybox 1.37.0's tarball, built as the guest's native
 # /bin/sh and coreutils. LLVM_SRC: an LLVM tree for libc++ (build-cxx.sh).
 set -eu
@@ -95,6 +96,16 @@ G=gexc
 [ -n "$GEXC" ] && G=$(realpath "$GEXC")
 # Containers run under gexcc-exec (below), which adds gexcc's defaults to gexc.
 echo "$PREFIX/bin/gexcc-exec" > "$L/runner"
+# -fgex-guest-i386's object (rt/i386.c), against the gex_abi.h of an x86
+# gexc (GEX_X86: only it translates i386 code): GEXC_X86, else GEXC. Without
+# one the flag is refused at link time.
+rm -f "$L/i386.o"
+GX=${GEXC_X86:-$GEXC}
+if [ -n "$GX" ] && "$GX" cgen-c --header > "$PREFIX/build/gex_abi.h" 2>/dev/null &&
+    grep -qx '#define GEX_X86 1' "$PREFIX/build/gex_abi.h"; then
+  clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -I"$HERE/include" -I"$PREFIX/build" \
+    -I"$ROOT/crates/gex-cgen/providers" -c "$HERE/rt/i386.c" -o "$L/i386.o"
+fi
 
 # tool names autotools (--host=$TRIPLE), CMake and Meson look for
 B=$PREFIX/bin
