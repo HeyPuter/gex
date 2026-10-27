@@ -3011,6 +3011,74 @@ pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_k
     }
 }
 
+// ---------------------------------------------------------------------------
+// inotify: instances beside the tree every process shares, so they hear its
+// changes whoever makes them (gex_kernel::inotify). Ids, counts or negated
+// errnos; addresses in the caller's memory.
+
+#[no_mangle]
+pub extern "C" fn k_inotify_create() -> i32 {
+    gex_kernel::inotify::create()
+}
+
+#[no_mangle]
+pub extern "C" fn k_inotify_dup(id: i32) -> i32 {
+    as_unit(gex_kernel::inotify::dup(id).map(|_| ()))
+}
+
+#[no_mangle]
+pub extern "C" fn k_inotify_close(id: i32) {
+    gex_kernel::inotify::close(id)
+}
+
+/// A watch on `path` of the shared tree (relative to its root).
+#[no_mangle]
+pub extern "C" fn k_inotify_add_watch(id: i32, path: gex_kmem::PAddr, path_len: u32, mask: u32) -> i32 {
+    let p = path_of(path, path_len);
+    let r = rootfs().watch_key(&p).and_then(|(key, isdir)| gex_kernel::inotify::add_watch(id, key, isdir, mask));
+    match r {
+        Ok(wd) => wd as i32,
+        Err(e) => -e.0,
+    }
+}
+
+/// A watch whose changes this module does not hear (a process's own mount).
+#[no_mangle]
+pub extern "C" fn k_inotify_add_dead(id: i32, mask: u32, isdir: u32) -> i32 {
+    match gex_kernel::inotify::add_watch(id, None, isdir != 0, mask) {
+        Ok(wd) => wd as i32,
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_inotify_rm_watch(id: i32, wd: i32) -> i32 {
+    as_unit(gex_kernel::inotify::rm_watch(id, wd).map(|_| ()))
+}
+
+/// Whole events into the caller's memory: the bytes, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_inotify_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let mut buf = vec![0u8; (len as usize).min(1 << 16)];
+    match gex_kernel::inotify::read(id, &mut buf) {
+        Ok(n) => {
+            unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
+            n as i32
+        }
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_inotify_queued(id: i32) -> i32 {
+    gex_kernel::inotify::queued(id).map_or(-9, |n| n as i32)
+}
+
+#[no_mangle]
+pub extern "C" fn k_inotify_queue(id: i32) -> u32 {
+    gex_kernel::inotify::queue(id)
+}
+
 #[no_mangle]
 pub extern "C" fn k_fs_unlink(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     as_unit(rootfs().unlink(&path_of(path, path_len)))

@@ -164,6 +164,9 @@ pub mod nr {
     pub const FALLOCATE: u64 = 47;
     pub const EVENTFD2: u64 = 19;
     pub const EPOLL_CREATE1: u64 = 20;
+    pub const INOTIFY_INIT1: u64 = 26;
+    pub const INOTIFY_ADD_WATCH: u64 = 27;
+    pub const INOTIFY_RM_WATCH: u64 = 28;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
     pub const EPOLL_PWAIT2: u64 = 441;
@@ -1295,6 +1298,49 @@ impl FdIo<'_> {
         m.write_u64(curr + 24, rem % 1_000_000_000)?;
         Ok(0)
     }
+    /// `inotify_init1`: an instance as a descriptor (`IN_NONBLOCK` and
+    /// `IN_CLOEXEC` are `O_NONBLOCK` and `O_CLOEXEC`; any other flag is
+    /// `EINVAL`).
+    pub fn inotify_init1(&self, flags: u64) -> SysResult {
+        if flags & !(oflags::O_NONBLOCK | oflags::O_CLOEXEC) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::inotify::Inotify::new()?);
+        let file = OpenFile::new(handle, "anon_inode:inotify".to_string(), (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY, true, false);
+        self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// The instance descriptor `fd` is: `EBADF` for no descriptor, `EINVAL`
+    /// for one that is not an instance.
+    fn inotify_of(&self, fd: i32) -> Result<Arc<crate::inotify::Inotify>, Errno> {
+        let file = self.fds.get(fd)?;
+        Arc::clone(&file.handle).as_inotify().ok_or(Errno::EINVAL)
+    }
+
+    /// `inotify_add_watch`: a watch on what `path` names, by the filesystem
+    /// holding it ([`crate::vfs::FileSystem::watch_key`]).
+    pub fn inotify_add_watch(&self, m: &GuestMem<'_>, fd: i32, path: u64, mask: u64) -> SysResult {
+        use crate::inotify::mask as im;
+        let inst = self.inotify_of(fd)?;
+        let raw = m.read_cstr(path, 4095)?;
+        let path = String::from_utf8_lossy(&raw).into_owned();
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let mask = mask as u32;
+        let (fs, rel) = self.ns.watch_target(&path, mask & im::DONT_FOLLOW == 0)?;
+        if fs.watched_remotely() {
+            let isdir = fs.metadata(&rel)?.file_type == crate::vfs::FileType::Directory;
+            return inst.add_remote(&rel, isdir, mask);
+        }
+        let (key, isdir) = fs.watch_key(&rel)?;
+        inst.add_local(key, isdir, mask)
+    }
+
+    pub fn inotify_rm_watch(&self, fd: i32, wd: i32) -> SysResult {
+        self.inotify_of(fd)?.rm_watch(wd)
+    }
+
     pub fn memfd_create(&self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
         const MFD_CLOEXEC: u64 = 1;
         let raw = m.read_cstr(name, 249)?;
@@ -5492,6 +5538,9 @@ pub fn is_fd_object(n: u64) -> bool {
         n,
         nr::EVENTFD2
             | nr::EPOLL_CREATE1
+            | nr::INOTIFY_INIT1
+            | nr::INOTIFY_ADD_WATCH
+            | nr::INOTIFY_RM_WATCH
             | nr::MEMFD_CREATE
             | nr::TIMERFD_CREATE
             | nr::TIMERFD_SETTIME
@@ -5510,6 +5559,9 @@ pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u6
     match n {
         nr::EVENTFD2 => io.eventfd2(a[0], a[1]),
         nr::EPOLL_CREATE1 => io.epoll_create(a[0]),
+        nr::INOTIFY_INIT1 => io.inotify_init1(a[0]),
+        nr::INOTIFY_ADD_WATCH => io.inotify_add_watch(m, a[0] as i32, a[1], a[2]),
+        nr::INOTIFY_RM_WATCH => io.inotify_rm_watch(a[0] as i32, a[1] as i32),
         nr::MEMFD_CREATE => io.memfd_create(m, a[0], a[1]),
         nr::TIMERFD_CREATE => io.timerfd_create(clock, a[0], a[1]),
         nr::TIMERFD_SETTIME => io.timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
@@ -11419,6 +11471,9 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
         nr::EVENTFD2 => "eventfd2",
+        nr::INOTIFY_INIT1 => "inotify_init1",
+        nr::INOTIFY_ADD_WATCH => "inotify_add_watch",
+        nr::INOTIFY_RM_WATCH => "inotify_rm_watch",
         nr::TIMERFD_CREATE => "timerfd_create",
         nr::TIMERFD_SETTIME => "timerfd_settime",
         nr::TIMERFD_GETTIME => "timerfd_gettime",

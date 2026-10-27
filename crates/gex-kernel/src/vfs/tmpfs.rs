@@ -39,6 +39,68 @@ fn saved(path: &str) {
     }
 }
 
+/// This filesystem's half of an [`inotify::Key`](crate::inotify::Key).
+fn fs_key(shared: &Arc<Shared>) -> usize {
+    Arc::as_ptr(shared) as *const () as usize
+}
+
+/// A path's directory and its last name.
+fn split_name(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// The inode `path` names and whether it is a directory.
+fn node_ino(inner: &Inner, path: &str) -> Option<(u64, bool)> {
+    match inner.nodes.get(path)? {
+        Node::File(f) => Some((f.ino, false)),
+        Node::Dir => Some((TmpFs::ino_of(inner, path), true)),
+        _ => Some((TmpFs::ino_of(inner, path), false)),
+    }
+}
+
+/// `ev` about name `path`, said to its directory's watches and (as `own`,
+/// an inode and whether it is a directory) to its own. Nothing is worked
+/// out while nothing is watched.
+fn note(inner: &Inner, fs: usize, path: &str, own: Option<(u64, bool)>, ev: u32, cookie: u32) {
+    use crate::inotify::{entry_event, Key};
+    if !crate::inotify::any() {
+        return;
+    }
+    let (dir, name) = split_name(path);
+    let isdir = own.is_some_and(|(_, d)| d);
+    entry_event(Key { fs, ino: TmpFs::ino_of(inner, dir) }, name, own.map(|(ino, _)| Key { fs, ino }), ev, cookie, isdir);
+}
+
+/// [`note`] of what `path` names now.
+fn note_path(inner: &Inner, fs: usize, path: &str, ev: u32) {
+    if crate::inotify::any() {
+        note(inner, fs, path, node_ino(inner, path), ev, 0);
+    }
+}
+
+/// A name removed (`own`: the inode it named and whether that is a
+/// directory): to the inode `IN_ATTRIB` (a file's link count changed), to
+/// the directory `IN_DELETE`, and with the inode's last name gone
+/// `IN_DELETE_SELF` to the inode, as Linux orders them.
+fn note_removed(inner: &Inner, fs: usize, path: &str, own: (u64, bool)) {
+    use crate::inotify::{event, mask, Key};
+    if !crate::inotify::any() {
+        return;
+    }
+    let key = Key { fs, ino: own.0 };
+    let (dir, name) = split_name(path);
+    if !own.1 {
+        event(key, mask::ATTRIB, 0, None, false);
+    }
+    event(Key { fs, ino: TmpFs::ino_of(inner, dir) }, mask::DELETE, 0, Some(name), own.1);
+    if own.1 || inner.nlink(own.0) == 0 {
+        event(key, mask::DELETE_SELF, 0, None, own.1);
+    }
+}
+
 fn note_capacity(before: usize, after: usize) {
     if after >= before {
         TMPFS_BYTES.fetch_add((after - before) as u64, core::sync::atomic::Ordering::Relaxed);
@@ -520,18 +582,16 @@ impl TmpFs {
     pub fn set_times_now(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {
-            None => Err(Errno::ENOENT),
-            Some(Node::File(f)) => {
-                f.set_times(atime, mtime, now);
-                Ok(())
-            }
+            None => return Err(Errno::ENOENT),
+            Some(Node::File(f)) => f.set_times(atime, mtime, now),
             Some(_) => {
                 if let Some((s, _)) = mtime {
                     inner.mtimes.insert(path.to_string(), s);
                 }
-                Ok(())
             }
         }
+        note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
+        Ok(())
     }
 
     /// [`super::walk_plain`] here: the walk's answer for `abs` with no link
@@ -588,6 +648,7 @@ impl TmpFs {
         if is_dir && to.starts_with(from) && (from.is_empty() || to.as_bytes().get(from.len()) == Some(&b'/')) {
             return Err(Errno::EINVAL);
         }
+        let mut replaced = None;
         if let Some(dst) = inner.nodes.get(to) {
             if noreplace {
                 return Err(Errno::EEXIST);
@@ -602,8 +663,10 @@ impl TmpFs {
             if !is_dir && inner.inos.get(from).is_some() && inner.inos.get(from) == inner.inos.get(to) {
                 return Ok(());
             }
+            replaced = node_ino(&inner, to);
             inner.forget(to);
         }
+        let own = node_ino(&inner, from);
         let node = inner.nodes.remove(from).unwrap();
         let ino = inner.inos.remove(from).unwrap_or(1);
         // A file under a new name is a change to keep; a directory's files
@@ -645,6 +708,27 @@ impl TmpFs {
             moved.push(ino);
             for i in moved {
                 *inner.moves.entry(i).or_insert(0) += 1;
+            }
+        }
+        if crate::inotify::any() {
+            use crate::inotify::{event, mask, Key};
+            let fs = fs_key(&self.inner);
+            let cookie = crate::inotify::cookie();
+            let (fd, fname) = split_name(from);
+            let (td, tname) = split_name(to);
+            event(Key { fs, ino: TmpFs::ino_of(&inner, fd) }, mask::MOVED_FROM, cookie, Some(fname), is_dir);
+            event(Key { fs, ino: TmpFs::ino_of(&inner, td) }, mask::MOVED_TO, cookie, Some(tname), is_dir);
+            if let Some((ino, d)) = own {
+                event(Key { fs, ino }, mask::MOVE_SELF, 0, None, d);
+            }
+            // The name moved over: its inode loses that name.
+            if let Some((ino, d)) = replaced {
+                if !d {
+                    event(Key { fs, ino }, mask::ATTRIB, 0, None, false);
+                }
+                if d || inner.nlink(ino) == 0 {
+                    event(Key { fs, ino }, mask::DELETE_SELF, 0, None, d);
+                }
             }
         }
         Ok(())
@@ -930,6 +1014,8 @@ struct TmpHandle {
     /// Whether this handle wrote or truncated: its close is then a change
     /// finished ([`saved`]).
     wrote: core::sync::atomic::AtomicBool,
+    /// Opened to write: its close is `IN_CLOSE_WRITE`, else `IN_CLOSE_NOWRITE`.
+    for_write: bool,
 }
 
 impl TmpHandle {
@@ -947,10 +1033,38 @@ impl Drop for TmpHandle {
         if self.wrote.load(Ordering::Relaxed) {
             saved(&self.path);
         }
+        if crate::inotify::any() {
+            use crate::inotify::mask;
+            let ev = if self.for_write { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE };
+            self.note_here(ev);
+        }
     }
 }
 
 impl TmpHandle {
+    /// `ev` about this handle's node, by the name it has now (to its own
+    /// watches only, once it has none).
+    fn note_here(&self, ev: u32) {
+        if !crate::inotify::any() {
+            return;
+        }
+        let inner = self.inner.read().unwrap();
+        let own = match (&self.file, self.dir) {
+            (Some(f), _) => Some((f.ino, false)),
+            (None, Some(d)) => Some((d, true)),
+            _ => None,
+        };
+        let fs = fs_key(&self.inner);
+        match self.here(&inner) {
+            Some(path) => note(&inner, fs, &path, own.or_else(|| node_ino(&inner, &path)), ev, 0),
+            None => {
+                if let Some((ino, isdir)) = own {
+                    crate::inotify::event(crate::inotify::Key { fs, ino }, ev, 0, None, isdir);
+                }
+            }
+        }
+    }
+
     /// The name this handle's node has now: a directory's where it has
     /// moved to, a file's one of its names (`None` once removed or
     /// unlinked), anything else's as opened.
@@ -1031,6 +1145,7 @@ impl FileHandle for TmpHandle {
         drop(data);
         file.touch();
         self.note_write();
+        self.note_here(crate::inotify::mask::MODIFY);
         Ok(buf.len() as u64)
     }
 
@@ -1129,6 +1244,9 @@ impl FileHandle for TmpHandle {
         Ok(out)
     }
 
+    /// The stamp a write or a truncating open leaves (`utimensat` comes
+    /// through `set_times_now`): no event of its own, the change already
+    /// made one.
     fn set_mtime(&self, secs: i64) -> Result<(), Errno> {
         match &self.file {
             Some(f) => {
@@ -1150,6 +1268,7 @@ impl FileHandle for TmpHandle {
         match &self.file {
             Some(f) => {
                 f.set_times(atime, mtime, now);
+                self.note_here(crate::inotify::mask::ATTRIB);
                 Ok(())
             }
             None => {
@@ -1174,6 +1293,7 @@ impl FileHandle for TmpHandle {
             file.changed();
         }
         file.touch();
+        self.note_here(crate::inotify::mask::MODIFY);
         Ok(())
     }
 
@@ -1188,7 +1308,11 @@ impl FileHandle for TmpHandle {
         if matches!(inner.nodes.get(&path), Some(Node::Symlink(_))) {
             return Some(Err(Errno::EOPNOTSUPP));
         }
-        Some(inner.chmod(&path, mode))
+        let r = inner.chmod(&path, mode);
+        if r.is_ok() {
+            note_path(&inner, fs_key(&self.inner), &path, crate::inotify::mask::ATTRIB);
+        }
+        Some(r)
     }
 
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
@@ -1203,7 +1327,13 @@ impl FileHandle for TmpHandle {
                 *inner.inos.get(&path)?
             }
         };
-        Some(inner.xattr(ino, false, op))
+        let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
+        let r = inner.xattr(ino, false, op);
+        if changes && r.is_ok() {
+            drop(inner);
+            self.note_here(crate::inotify::mask::ATTRIB);
+        }
+        Some(r)
     }
 
     fn rename_epoch(&self) -> Option<u64> {
@@ -1232,6 +1362,7 @@ impl FileSystem for TmpFs {
         let path = path.to_string();
         let mut dir = None;
         let mut wrote = false;
+        let mut created = false;
         let file = {
             let mut inner = self.inner.lock().unwrap();
             match inner.nodes.get(&path) {
@@ -1287,18 +1418,37 @@ impl FileSystem for TmpFs {
                     let f = Arc::new(FileNode::new(Vec::new(), ino));
                     f.mark_written();
                     wrote = true;
+                    created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
                     Some(f)
                 }
             }
         };
-        Ok(Arc::new(TmpHandle {
+        let acc = flags & oflags::ACCMODE;
+        let h = TmpHandle {
             inner: Arc::clone(&self.inner),
             path,
             file,
             dir,
             wrote: core::sync::atomic::AtomicBool::new(wrote),
-        }))
+            for_write: acc == oflags::O_WRONLY || acc == oflags::O_RDWR,
+        };
+        if crate::inotify::any() {
+            use crate::inotify::mask;
+            if created {
+                h.note_here(mask::CREATE);
+            } else if wrote {
+                h.note_here(mask::MODIFY);
+            }
+            h.note_here(mask::OPEN);
+        }
+        Ok(Arc::new(h))
+    }
+
+    fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
+        let inner = self.inner.read().unwrap();
+        let (ino, isdir) = node_ino(&inner, path).ok_or(Errno::ENOENT)?;
+        Ok((Some(crate::inotify::Key { fs: fs_key(&self.inner), ino }), isdir))
     }
 
     /// From the tree, under one lock: no handle made (with its own copy of
@@ -1314,11 +1464,19 @@ impl FileSystem for TmpFs {
             Some(n) => matches!(n, Node::Symlink(_)),
         };
         let ino = TmpFs::ino_of(&inner, path);
-        inner.xattr(ino, symlink, op)
+        let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
+        let r = inner.xattr(ino, symlink, op);
+        if changes && r.is_ok() {
+            note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
+        }
+        r
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        self.inner.lock().unwrap().chmod(path, mode)
+        let mut inner = self.inner.lock().unwrap();
+        inner.chmod(path, mode)?;
+        note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
+        Ok(())
     }
 
     /// A name here is its node, link or not: `metadata` never follows.
@@ -1330,13 +1488,12 @@ impl FileSystem for TmpFs {
         let mut inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {
             None => return Err(Errno::ENOENT),
-            Some(Node::File(f)) => {
-                f.stamp(secs);
-                return Ok(());
+            Some(Node::File(f)) => f.stamp(secs),
+            Some(_) => {
+                inner.mtimes.insert(path.to_string(), secs);
             }
-            Some(_) => {}
         }
-        inner.mtimes.insert(path.to_string(), secs);
+        note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
         Ok(())
     }
 
@@ -1409,10 +1566,14 @@ impl FileSystem for TmpFs {
         match inner.nodes.get(path) {
             Some(Node::Dir) => Err(Errno::EISDIR),
             Some(_) => {
+                let own = node_ino(&inner, path);
                 inner.nodes.remove(path);
                 inner.drop_ino(path);
                 inner.mtimes.remove(path);
                 saved(path);
+                if let Some(own) = own {
+                    note_removed(&inner, fs_key(&self.inner), path, own);
+                }
                 Ok(())
             }
             None => Err(Errno::ENOENT),
@@ -1432,6 +1593,7 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Dir);
+        note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
 
@@ -1450,9 +1612,13 @@ impl FileSystem for TmpFs {
         if inner.nodes.keys().any(|k| k.starts_with(&prefix)) {
             return Err(Errno::ENOTEMPTY);
         }
+        let own = node_ino(&inner, path);
         inner.nodes.remove(path);
         inner.drop_ino(path);
         inner.modes.remove(path);
+        if let Some(own) = own {
+            note_removed(&inner, fs_key(&self.inner), path, own);
+        }
         // A directory gone is a directory whose path changed, for whoever
         // holds it ([`FileHandle::rename_epoch`]).
         self.inner.gate.bump();
@@ -1501,6 +1667,11 @@ impl FileSystem for TmpFs {
         if let Some(m) = mode {
             inner.modes.insert(to.to_string(), m);
         }
+        if crate::inotify::any() {
+            let fs = fs_key(&self.inner);
+            crate::inotify::event(crate::inotify::Key { fs, ino }, crate::inotify::mask::ATTRIB, 0, None, false);
+            note(&inner, fs, to, None, crate::inotify::mask::CREATE, 0);
+        }
         Ok(())
     }
 
@@ -1516,6 +1687,7 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Socket);
+        note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
 
@@ -1530,6 +1702,7 @@ impl FileSystem for TmpFs {
         inner
             .nodes
             .insert(path.to_string(), Node::Symlink(target.to_string()));
+        note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
 }

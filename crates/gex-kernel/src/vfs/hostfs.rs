@@ -3,6 +3,9 @@
 //! Only meaningful on the native runtime; the browser mounts OPFS or a
 //! read-only image at the same points. A `root` prefix confines the guest to
 //! a subtree, which is what `gexc run --sysroot` uses to present a rootfs.
+//!
+//! `inotify` here hears only the changes made through this mount by this
+//! process: not the host's own, nor another gex process's.
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
@@ -46,6 +49,11 @@ impl HostFs {
             gate: Default::default(),
             root_dir: Default::default(),
         }
+    }
+
+    /// This mount's half of an [`inotify::Key`](crate::inotify::Key).
+    fn watch_fs(&self) -> usize {
+        Arc::as_ptr(&self.gate) as usize
     }
 
     /// Map a guest-relative path to a host path, refusing anything that would
@@ -159,6 +167,61 @@ struct HostHandle {
     file: Mutex<File>,
     /// Not a regular file (a FIFO, a socket, a device): no offset.
     stream: bool,
+    /// For `inotify`: the mount's key, the host path opened, and whether
+    /// opened to write.
+    at: (usize, PathBuf, bool),
+}
+
+/// The inode a host path names, and whether it is a directory.
+fn host_ino(p: &Path) -> Option<(u64, bool)> {
+    std::fs::symlink_metadata(p).ok().map(|m| (m.ino(), m.is_dir()))
+}
+
+/// `ev` about host path `p` (whose inode is `own`, when known), to its
+/// directory's watches by name and to its own.
+fn hnote(fs: usize, p: &Path, own: Option<(u64, bool)>, ev: u32, cookie: u32) {
+    use crate::inotify::{entry_event, Key};
+    if !crate::inotify::any() {
+        return;
+    }
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
+    let Some((dino, _)) = host_ino(dir) else { return };
+    let isdir = own.is_some_and(|(_, d)| d);
+    entry_event(Key { fs, ino: dino }, &name.to_string_lossy(), own.map(|(ino, _)| Key { fs, ino }), ev, cookie, isdir);
+}
+
+/// A name removed whose inode was `own`: as tmpfs says it.
+fn hnote_removed(fs: usize, p: &Path, own: (u64, bool), links_left: u64) {
+    use crate::inotify::{event, mask, Key};
+    if !crate::inotify::any() {
+        return;
+    }
+    let key = Key { fs, ino: own.0 };
+    if !own.1 {
+        event(key, mask::ATTRIB, 0, None, false);
+    }
+    hnote(fs, p, None, mask::DELETE | if own.1 { mask::ISDIR } else { 0 }, 0);
+    if own.1 || links_left == 0 {
+        event(key, mask::DELETE_SELF, 0, None, own.1);
+    }
+}
+
+impl HostHandle {
+    fn note(&self, ev: u32) {
+        if crate::inotify::any() {
+            let own = self.file.lock().ok().and_then(|f| f.metadata().ok()).map(|m| (m.ino(), m.is_dir()));
+            hnote(self.at.0, &self.at.1, own, ev, 0);
+        }
+    }
+}
+
+impl Drop for HostHandle {
+    fn drop(&mut self) {
+        use crate::inotify::mask;
+        if crate::inotify::any() {
+            self.note(if self.at.2 { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE });
+        }
+    }
 }
 
 /// `(seconds, nanoseconds)` since the epoch as a host time.
@@ -187,7 +250,9 @@ impl FileHandle for HostHandle {
     }
 
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
-        self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
+        self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))?;
+        self.note(crate::inotify::mask::ATTRIB);
+        Ok(())
     }
 
     /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
@@ -197,7 +262,9 @@ impl FileHandle for HostHandle {
             .lock()
             .unwrap()
             .set_len(len)
-            .map_err(|e| Errno::from_io(&e))
+            .map_err(|e| Errno::from_io(&e))?;
+        self.note(crate::inotify::mask::MODIFY);
+        Ok(())
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
@@ -217,9 +284,10 @@ impl FileHandle for HostHandle {
             f.seek(SeekFrom::Start(offset))
                 .map_err(|e| Errno::from_io(&e))?;
         }
-        f.write(buf)
-            .map(|n| n as u64)
-            .map_err(|e| Errno::from_io(&e))
+        let n = f.write(buf).map(|n| n as u64).map_err(|e| Errno::from_io(&e))?;
+        drop(f);
+        self.note(crate::inotify::mask::MODIFY);
+        Ok(n)
     }
 
     fn is_stream(&self) -> bool {
@@ -434,10 +502,21 @@ impl FileSystem for HostFs {
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
         // A FIFO, socket or device has no offset: read and write it as is.
         let stream = file.metadata().is_ok_and(|m| !m.is_file());
-        Ok(Arc::new(HostHandle {
+        let h = HostHandle {
             file: Mutex::new(file),
             stream,
-        }))
+            at: (self.watch_fs(), host, want_write),
+        };
+        if crate::inotify::any() {
+            use crate::inotify::mask;
+            if md.is_err() {
+                h.note(mask::CREATE);
+            } else if flags & oflags::O_TRUNC != 0 {
+                h.note(mask::MODIFY);
+            }
+            h.note(mask::OPEN);
+        }
+        Ok(Arc::new(h))
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
@@ -477,7 +556,14 @@ impl FileSystem for HostFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::remove_file(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
+        let host = self.host_path(path)?;
+        let own = host_ino(&host);
+        let links = std::fs::symlink_metadata(&host).map_or(1, |m| m.nlink());
+        std::fs::remove_file(&host).map_err(|e| Errno::from_io(&e))?;
+        if let Some(own) = own {
+            hnote_removed(self.watch_fs(), &host, own, links.saturating_sub(1));
+        }
+        Ok(())
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
@@ -489,18 +575,26 @@ impl FileSystem for HostFs {
         // owner keeps rwx, as `chmod` does for files, so gex can always
         // manage what it made.
         use std::os::unix::fs::DirBuilderExt;
+        let host = self.host_path(path)?;
         std::fs::DirBuilder::new()
             .mode((mode & 0o7777) | 0o700)
-            .create(self.host_path(path)?)
-            .map_err(|e| Errno::from_io(&e))
+            .create(&host)
+            .map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
+        Ok(())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::remove_dir(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        let host = self.host_path(path)?;
+        let own = host_ino(&host);
+        std::fs::remove_dir(&host).map_err(|e| Errno::from_io(&e))?;
         self.gate.bump();
+        if let Some(own) = own {
+            hnote_removed(self.watch_fs(), &host, own, 0);
+        }
         Ok(())
     }
 
@@ -510,7 +604,43 @@ impl FileSystem for HostFs {
         }
         let (from, to) = (self.host_path(from)?, self.host_path(to)?);
         let dir = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_dir());
-        self.gate.rename(super::own_holds(), dir, || std::fs::rename(&from, &to).map_err(|e| Errno::from_io(&e)))
+        let watched = crate::inotify::any();
+        let own = if watched { host_ino(&from) } else { None };
+        let replaced = if watched { std::fs::symlink_metadata(&to).ok().map(|m| ((m.ino(), m.is_dir()), m.nlink())) } else { None };
+        self.gate.rename(super::own_holds(), dir, || std::fs::rename(&from, &to).map_err(|e| Errno::from_io(&e)))?;
+        if watched {
+            use crate::inotify::{event, mask, Key};
+            let fs = self.watch_fs();
+            let cookie = crate::inotify::cookie();
+            let isdir = own.is_some_and(|(_, d)| d);
+            let say = |p: &Path, ev: u32| {
+                let (Some(d), Some(name)) = (p.parent(), p.file_name()) else { return };
+                if let Some((dino, _)) = host_ino(d) {
+                    event(Key { fs, ino: dino }, ev, cookie, Some(&name.to_string_lossy()), isdir);
+                }
+            };
+            say(&from, mask::MOVED_FROM);
+            say(&to, mask::MOVED_TO);
+            if let Some((ino, d)) = own {
+                event(Key { fs, ino }, mask::MOVE_SELF, 0, None, d);
+            }
+            if let Some(((ino, d), links)) = replaced {
+                if Some(ino) != own.map(|o| o.0) {
+                    if !d {
+                        event(Key { fs, ino }, mask::ATTRIB, 0, None, false);
+                    }
+                    if d || links <= 1 {
+                        event(Key { fs, ino }, mask::DELETE_SELF, 0, None, d);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
+        let md = std::fs::metadata(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        Ok((Some(crate::inotify::Key { fs: self.watch_fs(), ino: md.ino() }), md.is_dir()))
     }
 
     /// `chmod`, same floor as creation: the host must keep owner rw on what it
@@ -520,18 +650,23 @@ impl FileSystem for HostFs {
             return Err(Errno::EROFS);
         }
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            self.host_path(path)?,
-            std::fs::Permissions::from_mode((mode & 0o7777) | 0o600),
-        )
-        .map_err(|e| Errno::from_io(&e))
+        let host = self.host_path(path)?;
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode((mode & 0o7777) | 0o600)).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
     }
 
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
         if self.read_only && matches!(op, super::XattrOp::Set { .. } | super::XattrOp::Remove { .. }) {
             return Err(Errno::EROFS);
         }
-        host_xattr::call(host_xattr::On::Path(&self.host_path(path)?), op)
+        let host = self.host_path(path)?;
+        let changes = matches!(op, super::XattrOp::Set { .. } | super::XattrOp::Remove { .. });
+        let r = host_xattr::call(host_xattr::On::Path(&host), op)?;
+        if changes {
+            hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        }
+        Ok(r)
     }
 
     fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
@@ -545,8 +680,10 @@ impl FileSystem for HostFs {
         if std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink()) {
             return Ok(());
         }
-        let f = std::fs::File::open(host).map_err(|e| Errno::from_io(&e))?;
-        f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
+        let f = std::fs::File::open(&host).map_err(|e| Errno::from_io(&e))?;
+        f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
     }
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
@@ -558,25 +695,34 @@ impl FileSystem for HostFs {
         } else {
             std::time::UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs())
         };
-        let f = std::fs::File::open(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
-        f.set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t))
-            .map_err(|e| Errno::from_io(&e))
+        let host = self.host_path(path)?;
+        let f = std::fs::File::open(&host).map_err(|e| Errno::from_io(&e))?;
+        f.set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t)).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
     }
 
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::hard_link(self.host_path(from)?, self.host_path(to)?)
-            .map_err(|e| Errno::from_io(&e))
+        let to = self.host_path(to)?;
+        std::fs::hard_link(self.host_path(from)?, &to).map_err(|e| Errno::from_io(&e))?;
+        if let Some((ino, d)) = host_ino(&to) {
+            crate::inotify::event(crate::inotify::Key { fs: self.watch_fs(), ino }, crate::inotify::mask::ATTRIB, 0, None, d);
+        }
+        hnote(self.watch_fs(), &to, None, crate::inotify::mask::CREATE, 0);
+        Ok(())
     }
 
     fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::os::unix::fs::symlink(Path::new(target), self.host_path(path)?)
-            .map_err(|e| Errno::from_io(&e))
+        let host = self.host_path(path)?;
+        std::os::unix::fs::symlink(Path::new(target), &host).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
+        Ok(())
     }
 
     /// A real socket node, made by binding a `UnixListener` and dropping it,
@@ -589,6 +735,7 @@ impl FileSystem for HostFs {
         match std::os::unix::net::UnixListener::bind(&host) {
             Ok(l) => {
                 drop(l);
+                hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
                 Ok(())
             }
             Err(e) => Err(Errno::from_io(&e)),

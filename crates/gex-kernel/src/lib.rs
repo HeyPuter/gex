@@ -35,6 +35,7 @@ fn big_op_slow(what: &str, len: usize, at: &std::panic::Location<'_>) {
 pub mod cpus;
 pub mod errno;
 pub mod eventfd;
+pub mod inotify;
 pub mod netlink;
 pub mod file;
 pub mod fs;

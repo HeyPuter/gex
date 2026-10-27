@@ -297,6 +297,11 @@ impl std::fmt::Debug for RemoteFs {
 }
 
 impl FileSystem for RemoteFs {
+    /// Its watches are the global kernel's, beside the tree.
+    fn watched_remotely(&self) -> bool {
+        true
+    }
+
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let p = path.as_bytes();
         let (a, n) = at(p);

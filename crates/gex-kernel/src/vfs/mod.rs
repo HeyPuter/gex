@@ -458,6 +458,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
 
     /// This handle as an anonymous shared file (`memfd_create`), when it is
     /// one: its seals and `fallocate`.
+    /// An `inotify` instance's descriptor ([`crate::inotify::Inotify`]).
+    fn as_inotify(self: Arc<Self>) -> Option<Arc<crate::inotify::Inotify>> {
+        None
+    }
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
@@ -841,6 +845,21 @@ pub trait FileSystem: Send + Sync {
         let _ = path;
         Err(Errno::EROFS)
     }
+
+    /// What an `inotify` watch on `path` watches: the inode's key and
+    /// whether it is a directory. `None` for the key where this filesystem
+    /// says no changes (the default: `/proc`, `/dev`); `ENOENT` for nothing
+    /// there.
+    fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
+        self.metadata(path).map(|m| (None, m.file_type == FileType::Directory))
+    }
+
+    /// Whether its watches are kept in another module, by path
+    /// ([`crate::inotify::Remote`]): the global kernel's tree.
+    fn watched_remotely(&self) -> bool {
+        false
+    }
+
     /// An extended-attribute call on `path` (the node it names: a final
     /// symlink is the link's own, the caller follows it first). A
     /// filesystem that keeps none answers `EOPNOTSUPP`, as Linux's do.
@@ -1300,6 +1319,34 @@ impl Namespace {
                     };
                 }
                 Err(_) => return fs.access(&rel, mode),
+            }
+        }
+        Err(Errno::ELOOP)
+    }
+
+    /// The filesystem holding what `path` names and the path in it, for an
+    /// `inotify` watch: a final symlink followed unless `!follow`
+    /// (`IN_DONT_FOLLOW`), as [`Vfs::access`] follows them.
+    pub fn watch_target(&self, path: &str, follow: bool) -> Result<(Arc<dyn FileSystem>, String), Errno> {
+        if !follow {
+            let (fs, rel) = self.resolve(path)?;
+            return Ok((Arc::clone(fs), rel));
+        }
+        let mut current = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_final(&current)? {
+            return Ok((Arc::clone(fs), rel));
+        }
+        for _ in 0..40 {
+            let (fs, rel) = self.resolve(&current)?;
+            match fs.read_link(&rel) {
+                Ok(target) => {
+                    current = if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&current))
+                    };
+                }
+                Err(_) => return Ok((Arc::clone(fs), rel)),
             }
         }
         Err(Errno::ELOOP)

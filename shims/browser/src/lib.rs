@@ -476,6 +476,18 @@ extern "C" {
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
 
+    // inotify instances, kept beside the shared tree whose changes they hear
+    // (gex_kernel::inotify::Remote).
+    fn k_inotify_create() -> i32;
+    fn k_inotify_dup(id: i32) -> i32;
+    fn k_inotify_close(id: i32);
+    fn k_inotify_add_watch(id: i32, path: gex_kernel::PAddr, path_len: u32, mask: u32) -> i32;
+    fn k_inotify_add_dead(id: i32, mask: u32, isdir: u32) -> i32;
+    fn k_inotify_rm_watch(id: i32, wd: i32) -> i32;
+    fn k_inotify_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_inotify_queued(id: i32) -> i32;
+    fn k_inotify_queue(id: i32) -> u32;
+
     // Unix98 pseudoterminals. xterm holds the master, its shell the slave, and
     // with a Worker per process those are two memories -- so the pair, and the
     // terminal's line discipline, live in the global kernel like a pipe does.
@@ -1604,6 +1616,34 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     })
 }
 
+extern "C" fn ri_create() -> i32 {
+    unsafe { k_inotify_create() }
+}
+extern "C" fn ri_dup(id: i32) -> i32 {
+    unsafe { k_inotify_dup(id) }
+}
+extern "C" fn ri_close(id: i32) {
+    unsafe { k_inotify_close(id) }
+}
+extern "C" fn ri_add_watch(id: i32, path: gex_kernel::PAddr, path_len: u32, mask: u32) -> i32 {
+    unsafe { k_inotify_add_watch(id, path, path_len, mask) }
+}
+extern "C" fn ri_add_dead(id: i32, mask: u32, isdir: u32) -> i32 {
+    unsafe { k_inotify_add_dead(id, mask, isdir) }
+}
+extern "C" fn ri_rm_watch(id: i32, wd: i32) -> i32 {
+    unsafe { k_inotify_rm_watch(id, wd) }
+}
+extern "C" fn ri_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
+    unsafe { k_inotify_read(id, at, len) }
+}
+extern "C" fn ri_queued(id: i32) -> i32 {
+    unsafe { k_inotify_queued(id) }
+}
+extern "C" fn ri_queue(id: i32) -> u32 {
+    unsafe { k_inotify_queue(id) }
+}
+
 /// The root every process shares, if the host gave us a global kernel.
 ///
 /// Mounted at `/` in place of this process's own `TmpFs`. Without it a forked
@@ -1614,6 +1654,17 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    gex_kernel::inotify::set_remote(gex_kernel::inotify::Remote {
+        create: ri_create,
+        dup: ri_dup,
+        close: ri_close,
+        add_watch: ri_add_watch,
+        add_dead: ri_add_dead,
+        rm_watch: ri_rm_watch,
+        read: ri_read,
+        queued: ri_queued,
+        queue: ri_queue,
+    });
     Some(Arc::new(gex_kernel::vfs::RemoteFs::new(
         gex_kernel::vfs::remote::Remote {
             open: rf_open,
@@ -9262,6 +9313,11 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
     if let Some(pid) = file.handle.pidfd() {
         return (pid != holder).then(|| format!("pidfd:{pid}"));
     }
+    // An inotify instance in the global kernel: one more holder of it, so
+    // both processes read the one queue, as one description on Linux.
+    if let Some(inst) = Arc::clone(&file.handle).as_inotify() {
+        return inst.dup_id().map(|id| format!("inotify:{id}"));
+    }
     if let Some(set) = Arc::clone(&file.handle).as_epoll() {
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
         return Some(format!("epoll:{key}:{}", set.describe()));
@@ -9472,6 +9528,12 @@ fn rebuild_carried(
     } else if let Some(pid) = path.strip_prefix("pidfd:").and_then(|p| p.parse::<i32>().ok()) {
         let procs = global_procs().ok_or("no global kernel")?;
         gex_kernel::pidfd::open_file(pid, &procs, flags & oflags::O_NONBLOCK != 0)
+    } else if let Some(id) = path.strip_prefix("inotify:") {
+        let id = id.parse::<i32>().map_err(|_| "bad inotify id")?;
+        // Which also says where instances are kept, should nothing here have yet.
+        global_root().ok_or("no global kernel")?;
+        let handle: Arc<dyn FileHandle> = Arc::new(gex_kernel::inotify::Inotify::adopt_remote(id));
+        OpenFile::new(handle, "anon_inode:inotify".to_string(), flags, true, false)
     } else if let Some(rest) = path.strip_prefix("epoll:") {
         let (key, watches) = rest.split_once(':').ok_or("bad epoll name")?;
         let watches = gex_kernel::unix::EpollSet::parse(watches).ok_or("bad epoll registrations")?;
