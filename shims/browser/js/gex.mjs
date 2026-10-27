@@ -1810,6 +1810,10 @@ export class Gex {
           this.#startThread();
         },
         drain_output: () => this.#env.drainOutput?.(),
+        // What a system call made through the shim's own export left for JS
+        // (lib.rs `syscall_after`), and a native PE DLL's marked call.
+        syscall_after: (flags) => this.#syscallAfter(flags),
+        native_syscall_marked: (ctx, pc) => this.#nativeSyscall(ctx, pc),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
         // A buffer's address is a full one (a BigInt: the guest's buffer, in
@@ -4525,7 +4529,7 @@ export class Gex {
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         // its runtime's heap: fresh guest pages
         ...(lowered ? { provider_alloc: (size) => e.gex_provider_alloc(size) } : {}),
-        ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall) } : {}),
       },
     };
     // A unit split by function (gex_split): its cold clusters' loader,
@@ -5562,13 +5566,16 @@ export class Gex {
       }
     };
     return {
-      syscall: single.on ? this.#suspendingSyscall(sync, staged) : sync,
+      // The default build: the shim's export, with no JS frame
+      // (`#syscallAfter` gets what the call left).
+      syscall: single.on ? this.#suspendingSyscall(sync, staged) : (e.gex_wasmprog_syscall ?? sync),
       // a module built with GEX_DL_CHECKED_CALLS (cgen/dylink.rs `checked`):
       // the slots this Worker's table has caught up with, and the catch-up
       // its guard calls at an index past them
       dl_size: this.#dlSize,
       dl_stale: () => {
         this.#dlGen = e.gex_wasmprog_dl_gen?.() ?? this.#dlGen;
+        e.gex_wasmprog_dl_seen?.();
         this.#cgenCatchUp();
       },
       asyncify,
@@ -6118,7 +6125,7 @@ export class Gex {
       e.gex_syscall(ctx, pc);
       staged();
     };
-    return single.on ? this.#suspendingSyscall(sync, staged) : sync;
+    return single.on ? this.#suspendingSyscall(sync, staged) : (e.gex_staged_syscall ?? sync);
   }
 
   /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
@@ -6139,8 +6146,27 @@ export class Gex {
   #providerSyscallS = null;
   /** The single-thread build's: see `#suspendingSyscall`. */
   get #providerSyscall() {
-    if (!single.on) return this.#providerSyscallSync;
+    if (!single.on) return this.#shim.exports.gex_provider_syscall ?? this.#providerSyscallSync;
     return (this.#providerSyscallS ??= this.#suspendingSyscall(this.#providerSyscallSync, this.#providerStaged, 1n << 61n));
+  }
+
+  /** What a system call through the shim's export (lib.rs
+   *  `gex_wasmprog_syscall` and the rest) left: bit 0 a thread or a child
+   *  it staged, bit 1 a wasm32 program's (whose posix_spawn child may run in
+   *  this Worker), bit 2 a library another thread `dlopen`ed since this
+   *  Worker last caught up. */
+  #syscallAfter(flags) {
+    if (flags & 1) {
+      if (flags & 2) {
+        const e = this.#shim.exports;
+        const ok = e.gex_vfork_ok?.() ?? 0;
+        if (ok > 0) this.#vforkChild();
+        else if (ok !== -2) this.#vforkCopied(ok);
+      }
+      this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+      this.#startThread();
+    }
+    if (flags & 4) this.#cgenCatchUp();
   }
 
   #nativeSyscall = (ctx, pc) => {
