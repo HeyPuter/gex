@@ -55,6 +55,18 @@ if '-D_WIN32' in args:
            '-mms-bitfields', '-fshort-wchar']
     if not os.environ.get('GEX_WASM_NO_ICALL'):
         CC += ['-fpass-plugin=' + os.path.join(lib, 'GexIcall.so')]
+# The snapshot flavour's sysroot (build-sysroot64.sh GEX_SNAPSHOT=1, which
+# leaves lib/gex-snapshot): code takes the legacy exception instructions,
+# which asyncify can instrument (the program's link below, and pelink.py's
+# for the native PE core, translate them to the standard ones), and is
+# compiled with __GEX_SNAPSHOT__ (the PE core's roots: libs/gexrt). A
+# program's system calls, through gex.syscall as the default build's, are
+# where a session snapshot unwinds a thread, at one that can block
+# (libgex-snap/call.c). Only there: another sysroot's programs are built
+# as before, byte for byte.
+SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
+if SNAPSHOT:
+    CC = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in CC] + ['-D__GEX_SNAPSHOT__']
 if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
        for a in args) or not args:
     os.execvp(CC[0], CC + args)
@@ -127,15 +139,45 @@ if shared:
 w64 = out + '.64.wasm'
 wasm = out + '.wasm'
 # libgex before libc: its setjmp runtime, dlopen registry and signal frames.
+# The snapshot flavour's part last (its sysroot's libgex-snap.a): the
+# default build's data and table slots keep their places.
+snap_a = [lib + '/libgex-snap.a'] if SNAPSHOT else []
 cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
        '--max-memory=' + ('17179869184' if mem64 else '4294967296'), '-L' + lib, '-pie', '--no-entry', '-o', w64, lib + '/crt1.o'] + \
-    objs + ld_in + ld_flags + [lib + '/libgex.a', '-lc', lib + '/libclang_rt.builtins-wasm64.a']
+    objs + ld_in + ld_flags + [lib + '/libgex.a', '-lc', lib + '/libclang_rt.builtins-wasm64.a'] + snap_a
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)
+# (the snapshot flavour's roots stay apart from the libc's start they
+# run, which asyncify instruments: neither -O2 inlines it into a root)
+apart = ['--no-inline=__gex_snap_libc_start'] if SNAPSHOT and not mem64 else []
 # Names kept (-g): gex binds the entries by name.
-r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + ['-O2', '-o', wasm])
+r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + apart + ['-O2', '-o', wasm])
 if r:
     sys.exit('wcc64: wasm-opt failed on ' + w64)
+if SNAPSHOT and not mem64:
+    # Asyncify over the lowered module, only what can reach a blocking call
+    # by a type-correct call graph (forkreach.py, as wcc's fork), less the
+    # thread's start and the snapshot's own roots, where an unwind ends (the
+    # host's entry, or libgex-snap's run of a thread's function); then the
+    # standard exception instructions.
+    dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+    roots = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c', '__gex_snap_resume64',
+             '__gex_snap_run', '__gex_snap_run_loop', '__gex_snap_resume_run']
+    # (and through the host's call-outs, which a thread stopped inside guest
+    # code a call of Wine's runs unwinds through)
+    reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', '--also', 'gex.call_out', dis, wasm, 'gex.syscall'] + roots,
+                           capture_output=True, text=True)
+    passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.syscall,gex.call_out']
+    if reach.returncode == 0:
+        lst = os.path.join(tmp, 'onlylist')
+        open(lst, 'w').write(reach.stdout.strip() + '\n')
+        passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+    else:
+        passes += ['--pass-arg=asyncify-removelist@' + ','.join(roots)]
+    feats32 = [f for f in feats if f != '--enable-memory64']
+    r = subprocess.call([opt, wasm, '-g'] + feats32 + apart + passes + ['-O2', '--translate-to-exnref', '-o', wasm])
+    if r:
+        sys.exit('wcc64: asyncify failed on ' + wasm)
 sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out, '--elf64'] +
                          (['--guest-x86-64'] if guest else [])))

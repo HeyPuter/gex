@@ -821,6 +821,33 @@ impl TmpFs {
             .collect()
     }
 
+    /// Where file contents lie in this address space, for a session
+    /// snapshot that takes the pages still holding a source's bytes by
+    /// reference: `(0, address, length, 0, path)` for a file's bytes (its
+    /// path with the leading `/`), `(1, address, length, offset, url)` for a
+    /// lazy file's chunk at `offset`. A file another thread holds is left out
+    /// (the snapshot copies its pages, as it does any it cannot match).
+    pub fn extents(&self) -> Vec<(u8, usize, usize, u64, String)> {
+        let inner = self.inner.read().unwrap();
+        let mut out = Vec::new();
+        for (p, n) in inner.nodes.iter() {
+            let Node::File(f) = n else { continue };
+            if let Ok(d) = f.data.try_lock() {
+                if !d.is_empty() {
+                    out.push((0, d.as_ptr() as usize, d.len(), 0, format!("/{p}")));
+                }
+            }
+            if let Ok(l) = f.lazy.try_lock() {
+                if let Some(l) = l.as_ref() {
+                    for (k, c) in l.chunks.iter() {
+                        out.push((1, c.as_ptr() as usize, c.len(), k * LAZY_CHUNK, l.url.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Every file whose bytes something used ([`FileNode::read`]), by path
     /// (with its leading `/`; a hard-linked file under each of its names),
     /// sorted. A recorded run's read set: gex-eject's bundle split keeps

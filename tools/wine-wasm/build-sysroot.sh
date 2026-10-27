@@ -21,6 +21,15 @@ MUSL=$(realpath "${2:-$HERE/../../../musl-wasm}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-4}
 . "$HERE/flags.sh"
+# GEX_SNAPSHOT=1: the snapshot flavour, for pages that save and restore a
+# session (the libc's GEX_SNAPSHOT hooks and libgex-snap/: threads stopped
+# at a call that can block and resumed by asyncify). wcc sees the
+# lib/gex-snapshot it leaves and instruments what reaches gex.syscall. Its
+# libc is asyncify's too, so it takes the legacy exception instructions.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  GEX_WASM_LEGACY_EH=1
+  GEX_WASM_EXTRA_CFLAGS="${GEX_WASM_EXTRA_CFLAGS:+$GEX_WASM_EXTRA_CFLAGS }-DGEX_SNAPSHOT"
+fi
 # GEX_WASM_LEGACY_EH=1 (gexcc): the libc's setjmp lowers onto the legacy
 # exception instructions, as programs' does (wcc), so binaryen's asyncify
 # can instrument a libc function a fork can reach (timer_create's thread,
@@ -64,8 +73,20 @@ for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s; do
   clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
   gobjs="$gobjs $o"
 done
-rm -f "$OUT/sysroot/lib/libgex.a"
+rm -f "$OUT/sysroot/lib/libgex.a" "$OUT/sysroot/lib/libgex-snap.a"
 llvm-ar crs "$OUT/sysroot/lib/libgex.a" $gobjs
+# The snapshot flavour's part (libgex-snap/) only in its sysroot, an archive
+# of its own that the link takes last: its data and table slots come after
+# the default build's, which keep their places.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  sobjs=
+  for f in "$HERE/libgex-snap/call.c" "$HERE/libgex-snap/drive32.c"; do
+    o="$OUT/libgex-build/$(basename "$f").o"
+    clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
+    sobjs="$sobjs $o"
+  done
+  llvm-ar crs "$OUT/sysroot/lib/libgex-snap.a" $sobjs
+fi
 
 # Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
 # host's x86 set taken down its i386 branches: gex-kernel serves the i386
@@ -109,4 +130,5 @@ elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
   rm -rf "$OUT/sysroot/binaryen"
   mv "$OUT/$t" "$OUT/sysroot/binaryen"
 fi
+if [ -n "${GEX_SNAPSHOT:-}" ]; then touch "$OUT/sysroot/lib/gex-snapshot"; else rm -f "$OUT/sysroot/lib/gex-snapshot"; fi
 echo "sysroot: $OUT/sysroot"

@@ -383,6 +383,30 @@ pub extern "C" fn k_ws_free(slot: i32) {
     }
 }
 
+/// A session snapshot's word (`ProcessHost.snapshot`): nonzero while the
+/// page asks every thread to stop at its next wait. The page sets it and
+/// bumps every slot (`k_ws_addr(0)`, `SLOTS` words), so a parked thread
+/// wakes and looks; it clears it and bumps them again to let them go on.
+static SNAPSHOT: AtomicI32 = AtomicI32::new(0);
+
+/// Where the snapshot word is, for the page to set.
+#[no_mangle]
+pub extern "C" fn k_snap_word() -> u32 {
+    &SNAPSHOT as *const AtomicI32 as u32
+}
+
+/// Whether a snapshot is asking threads to stop.
+#[no_mangle]
+pub extern "C" fn k_snap_pending() -> i32 {
+    SNAPSHOT.load(SeqCst)
+}
+
+/// How many slots there are past `k_ws_addr(0)`.
+#[no_mangle]
+pub extern "C" fn k_ws_count() -> u32 {
+    SLOTS as u32
+}
+
 /// What slot `slot` reads now: sampled before a waiter registers and checks.
 #[no_mangle]
 pub extern "C" fn k_ws_seq(slot: i32) -> i32 {

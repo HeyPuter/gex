@@ -3800,6 +3800,54 @@ pub extern "C" fn k_boot_secs(want: u32) -> u32 {
     }
 }
 
+/// How long every process's monotonic clocks are held back, in nanoseconds
+/// (gex-kernel's `MONOTONIC_HELD`): a restored session snapshot's time
+/// saved. `add` more first; 0 only asks.
+static MONO_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn k_mono_held(add: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    MONO_HELD.fetch_add(add, Ordering::AcqRel) + add
+}
+
+/// Where that is, for the page to add to.
+#[no_mangle]
+pub extern "C" fn k_mono_held_at() -> u32 {
+    &MONO_HELD as *const std::sync::atomic::AtomicU64 as u32
+}
+
+/// A session snapshot's list of where file contents lie in the kernel's
+/// memory (`TmpFs::extents`), one line each, `kind address length offset
+/// name`, made by the first thread to stop and read by the page from the
+/// kernel's memory: the header's words are a claim (0 none, 1 taken), 1
+/// once the list is ready, its address and its length. The page clears
+/// the claim when the session goes on.
+static SNAP_EXTENTS: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static SNAP_EXTENTS_TEXT: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The header's address.
+#[no_mangle]
+pub extern "C" fn k_snap_extents_at() -> u32 {
+    &SNAP_EXTENTS as *const _ as u32
+}
+
+/// Makes the list, for the thread that took the claim.
+#[no_mangle]
+pub extern "C" fn k_snap_extents() {
+    use std::fmt::Write as _;
+    use std::sync::atomic::Ordering;
+    let mut s = String::new();
+    for (kind, at, len, off, name) in rootfs().extents() {
+        let _ = writeln!(s, "{kind} {at} {len} {off} {name}");
+    }
+    let mut t = SNAP_EXTENTS_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+    *t = s.into_bytes();
+    SNAP_EXTENTS[2].store(t.as_ptr() as u32, Ordering::Relaxed);
+    SNAP_EXTENTS[3].store(t.len() as u32, Ordering::Relaxed);
+    SNAP_EXTENTS[1].store(1, Ordering::Release);
+}
+
 /// The benchmark clocks every process reads (gex-kernel `set_guest_clock`):
 /// the monotonic clocks' speed in thousandths (high half) and the seconds
 /// the wall clock is set back (low half, signed); 0 for real time.

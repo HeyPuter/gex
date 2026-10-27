@@ -2231,6 +2231,12 @@ extern "C" {
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
     fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
+    /// Whether this Worker's thread may be stopped for a session snapshot
+    /// where it waits now: 1 when its frames below the wait are its
+    /// program's snapshot root and its own (a thread's driver, or the
+    /// outermost call-out's direct entry), 0 otherwise. Asked only while a
+    /// snapshot is pending.
+    pub(crate) fn snap_ok() -> i32;
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -2974,6 +2980,27 @@ fn wine64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
     let back = gm.read_u64(sp_at).unwrap_or(0);
     Some(if pc == ret && back == sp + 8 { gex_abi::ftab::RET_PREDICTED } else { gex_abi::ftab::RET_LEFT })
+}
+
+/// A restored session's thread whose call into Wine's direct entry the host
+/// rewound and finished (its snapshot stopped it inside the call): what
+/// [`w64_entry`] does once the entry returns, with no unit to return to; the
+/// thread goes on at the context's PC. 0 when the call left another
+/// thread's context to resume with, which no restored thread can.
+#[no_mangle]
+pub extern "C" fn gex_snap_entry_tail(c: i32) -> i32 {
+    if serve_wanted() || SERVE_ALWAYS.load(Ordering::Relaxed) {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen_serve() };
+    }
+    if crate::thread_staged() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { thread_start() };
+    }
+    let other = crate::resume_ctx().is_some_and(|v| v != c as u32 as u64);
+    crate::set_resume_none();
+    crate::set_resume_ctx_none();
+    (!other) as i32
 }
 
 /// The `ud2` at 64-bit native Wine's system or Unix call entry reached by

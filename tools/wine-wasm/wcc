@@ -146,6 +146,16 @@ FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_threa
               '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
 
 
+# The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
+# leaves this file in its lib/): asyncify also instruments what reaches
+# gex.syscall, and a session snapshot unwinds a thread at a call that can
+# block (libgex-snap/call.c). Only there: another sysroot's programs are
+# linked as before, byte for byte.
+SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
+if SNAPSHOT:
+    FORK_ROOTS = FORK_ROOTS + ['__gex_snap_resume']
+
+
 def finish(path):
     """binaryen over a linked module: asyncify when it can fork (it imports
     gex.fork_point: every function that can reach it saves and restores its
@@ -153,13 +163,18 @@ def finish(path):
     ones. Names kept (-g): gex binds the entries by name."""
     opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
     passes = []
-    if ('gex', 'fork_point') in imports(path):
-        passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
+    imps = imports(path)
+    points = [i for i in [('gex', 'fork_point')] + ([('gex', 'syscall')] if SNAPSHOT else []) if i in imps]
+    if points:
+        names = ','.join(f'{m}.{n}' for m, n in points)
+        passes += ['--asyncify', '--pass-arg=asyncify-imports@' + names]
         # Only what can reach a fork by a type-correct call graph
         # (forkreach.py); asyncify's own analysis takes every indirect call
         # for a fork point, which is nearly every function.
         dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
-        reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), dis, path, 'gex.fork_point'] + FORK_ROOTS,
+        also = ['--also', ','.join(f'{m}.{n}' for m, n in points[1:])] if len(points) > 1 else []
+        reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py')] + also +
+                               [dis, path, f'{points[0][0]}.{points[0][1]}'] + FORK_ROOTS,
                                capture_output=True, text=True)
         if reach.returncode == 0 and not os.environ.get('GEX_WCC_FORK_ALL'):
             lst = os.path.join(tmp, 'onlylist')
@@ -189,9 +204,12 @@ if shared:
 # dlopen, __dlsym and vfork replace libc's; the setjmp runtime and the
 # signal frames are only there.
 libgex = [lib + '/libgex.a'] if os.path.exists(lib + '/libgex.a') else []
+# (the snapshot flavour's part last, its own archive: the default build's
+# data and table slots keep their places)
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
-    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
+    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a'] + \
+    ([lib + '/libgex-snap.a'] if SNAPSHOT else [])
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)

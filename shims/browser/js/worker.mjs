@@ -564,6 +564,11 @@ async function handle(msg) {
     // A thread carries the memory itself, not a copy: a shared
     // `WebAssembly.Memory` crosses `postMessage` as itself, so the other Worker
     // is on this process's address space.
+    // A session snapshot's stop: this Worker's thread parked, its frames
+    // unwound into its record (`Gex#snapImports`).
+    snapParked(info) {
+      port.post({ kind: 'snap-parked', ...info, memory: gex.memory });
+    }
     async spawnThread(thread) {
       recyclable = false;
       // The memory to the thread's Worker directly, as a fork's bulk (unless
@@ -793,6 +798,7 @@ async function handle(msg) {
   // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
   if (msg.sehReport) globalThis.GEX_SEH_REPORT = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
+  if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
   if (msg.relayAll) globalThis.GEX_RELAY_ALL = 1;
@@ -1072,7 +1078,11 @@ async function handle(msg) {
       if (msg.spare) {
         msg.spareGo = () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; }));
       }
-      ({ entry, ctx, gone } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      ({ entry, ctx, gone } = await (msg.snap ? gex.snapThread(msg.shim, msg.guest, msg) : gex.adoptThread(msg.shim, msg.guest, msg)));
+      if (msg.snap) {
+        port.post({ kind: 'snap-attached' });
+        gex.snapRelease();
+      }
       execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
@@ -1254,13 +1264,16 @@ async function handle(msg) {
     // A thread exits through syscall 93 without marking the whole process
     // exited, so only a process Worker should label an unreachable return as
     // an abandoned process stack.
-    globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
+    // A restored snapshot's first thread is its process's, as the Worker
+    // that ran `load` was (`ProcessHost.restore`).
+    const asThread = msg.kind === 'thread' && !msg.snapMain;
+    globalThis.GEX_REPORT_ABANDONED = !asThread;
     const runStarted = performance.now();
     const status = gone ? 0 : await gex.run(entry, ctx);
     // The process's exec went to another Worker (a program of the other
     // memory flavour, lib.rs `exec_away`): this one ends, the process does
     // not. The host starts the exec as a posix_spawn child's.
-    const away = !gone && msg.kind !== 'thread' ? gex.execAwayRecord?.() : null;
+    const away = !gone && !asThread ? gex.execAwayRecord?.() : null;
     if (away) {
       gex.close?.();
       gex.releaseWorker?.();
@@ -1274,13 +1287,13 @@ async function handle(msg) {
     // And the other way round: a thread Worker whose thread made that
     // `execve` (or one since) carries the process now, and ends it as its
     // process Worker would have.
-    const carries = msg.kind === 'thread' && !gone && !ex.gex_thread_gone?.()
+    const carries = asThread && !gone && !ex.gex_thread_gone?.()
       && (ex.gex_exec_gen?.() ?? 0) !== execGen;
-    const thread = (msg.kind === 'thread' && !carries) || !!ex.gex_thread_gone?.();
+    const thread = (asThread && !carries) || !!ex.gex_thread_gone?.();
     // A thread's end, its process going on as the same program: the
     // thread-local blocks its Worker made for `dlopen`ed modules go with it
     // (after an `execve` the addresses are the new program's).
-    if (msg.kind === 'thread' && !gone && !carries && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
+    if (asThread && !gone && !carries && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
       && (ex.gex_exec_gen?.() ?? 0) === execGen) gex.freeThreadTls?.();
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
@@ -1324,7 +1337,7 @@ async function handle(msg) {
     const exitMsg = {
       kind: 'exit',
       status,
-      threadGone: thread && msg.kind !== 'thread' ? true : undefined,
+      threadGone: thread && !asThread ? true : undefined,
       carries: carries || undefined,
       guestMillis,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
