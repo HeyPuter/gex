@@ -146,6 +146,16 @@ FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_threa
               '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
 
 
+# The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
+# leaves this file in its lib/): a program's blocking calls go through
+# gex.syscall_b, and a session snapshot unwinds a thread parked in one
+# (the musl fork's src/process/wasm32/__gex_fork.c). Only there: another
+# sysroot's programs are linked as before, byte for byte.
+SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
+if SNAPSHOT:
+    FORK_ROOTS = FORK_ROOTS + ['__gex_snap_resume']
+
+
 def finish(path):
     """binaryen over a linked module: asyncify when it can fork (it imports
     gex.fork_point: every function that can reach it saves and restores its
@@ -153,13 +163,18 @@ def finish(path):
     ones. Names kept (-g): gex binds the entries by name."""
     opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
     passes = []
-    if ('gex', 'fork_point') in imports(path):
-        passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
+    imps = imports(path)
+    points = [i for i in [('gex', 'fork_point')] + ([('gex', 'syscall_b')] if SNAPSHOT else []) if i in imps]
+    if points:
+        names = ','.join(f'{m}.{n}' for m, n in points)
+        passes += ['--asyncify', '--pass-arg=asyncify-imports@' + names]
         # Only what can reach a fork by a type-correct call graph
         # (forkreach.py); asyncify's own analysis takes every indirect call
         # for a fork point, which is nearly every function.
         dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
-        reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), dis, path, 'gex.fork_point'] + FORK_ROOTS,
+        also = ['--also', ','.join(f'{m}.{n}' for m, n in points[1:])] if len(points) > 1 else []
+        reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py')] + also +
+                               [dis, path, f'{points[0][0]}.{points[0][1]}'] + FORK_ROOTS,
                                capture_output=True, text=True)
         if reach.returncode == 0 and not os.environ.get('GEX_WCC_FORK_ALL'):
             lst = os.path.join(tmp, 'onlylist')

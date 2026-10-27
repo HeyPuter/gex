@@ -168,6 +168,33 @@ const regKeyBytes = (k) => Number(String(k).replace(/^u:/, '').split(':')[0]) ||
 /** A `wasm:` key's module size: the key is `wasm:LENGTH:HASH:HASH`. */
 const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 
+/** A memory's bytes in a snapshot (`ProcessHost.restore`): a Uint8Array of
+ *  all of them, or `{ length, runs }`, its nonzero runs as `[offset, bytes]`
+ *  (the rest zero, as a new memory is). */
+function snapLength(m) {
+  return m.length;
+}
+/** A memory's nonzero 64 KiB pages, copied, as `{ length, runs }`. */
+function snapTake(buffer) {
+  const P = 65536, length = buffer.byteLength;
+  const words = new Int32Array(buffer, 0, length >> 2);
+  const spans = [];
+  for (let p = 0; p < length; p += P) {
+    let z = true;
+    for (let i = p >> 2, e = (p + P) >> 2; i < e; i++) if (words[i] !== 0) { z = false; break; }
+    if (z) continue;
+    const last = spans.at(-1);
+    if (last && last[0] + last[1] === p) last[1] += P;
+    else spans.push([p, P]);
+  }
+  return { length, runs: spans.map(([at, len]) => [at, new Uint8Array(buffer, at, len).slice()]) };
+}
+function snapFill(memory, m) {
+  const to = new Uint8Array(memory.buffer);
+  if (!m.runs) to.set(m);
+  else for (const [at, bytes] of m.runs) to.set(bytes, at);
+}
+
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
   /// The other memory flavour's runtime, `{ shim, guest, kernel }` (a
@@ -577,6 +604,156 @@ export class ProcessHost {
   resize(rows, cols) {
     for (const w of this.#workers.values()) w.postMessage({ kind: 'winsize', rows, cols });
   }
+
+  /**
+   * A session snapshot: every thread of every process stopped where it waits
+   * (the snapshot flavour's programs, libc's `GEX_SNAPSHOT`), the global
+   * kernel's memory and each process's memory and module store copied, and
+   * the threads let go on (`resume`) or stopped. Each thread is one of this
+   * host's Workers; a Worker whose thread does not stop within `timeout` ms
+   * (one in a call that is not left so, computing, or not built so) refuses
+   * the snapshot, and the threads go on. `{ kernel, memories, stores, meta,
+   * stopMs, copyMs }` (a memory as its nonzero runs, `snapTake`), or
+   * `{ refused, stopMs }`.
+   */
+  async snapshot({ timeout = 10000, resume = true } = {}) {
+    const st = this.#stacks;
+    if (!this.#kernel?.memory || !st?.snapWord) throw new Error('snapshot: no global kernel with a snapshot word');
+    if (this.#pending.size) return { refused: `still starting: ${[...this.#pending.keys()].join(' ')}`, stopMs: 0 };
+    const want = [...this.#workers.keys()].map(String);
+    const parked = new Map();
+    const words = new Int32Array(this.#kernel.memory.buffer);
+    const wake = () => {
+      const base = st.wsAddr >>> 2;
+      for (let i = 0; i < st.wsCount; i++) {
+        Atomics.add(words, base + i, 1);
+        Atomics.notify(words, base + i);
+      }
+    };
+    const t0 = performance.now();
+    let timer;
+    const all = new Promise((res) => {
+      this.#snapWait = { parked, check: () => { if (want.every((k) => parked.has(k))) res(true); } };
+      timer = setTimeout(() => res(false), timeout);
+    });
+    Atomics.store(words, st.snapWord >>> 2, 1);
+    wake();
+    this.#snapWait.check();
+    const ok = await all;
+    clearTimeout(timer);
+    this.#snapWait = null;
+    const stopMs = performance.now() - t0;
+    const release = () => {
+      Atomics.store(words, st.snapWord >>> 2, 0);
+      Atomics.notify(words, st.snapWord >>> 2);
+      wake();
+    };
+    if (!ok) {
+      release();
+      return { refused: `not stopped: ${want.filter((k) => !parked.has(k)).join(' ')}`, stopMs };
+    }
+    const kernel = snapTake(this.#kernel.memory.buffer);
+    for (const [at, bytes] of kernel.runs) {
+      if (st.snapWord >= at && st.snapWord < at + bytes.length) new DataView(bytes.buffer).setInt32(st.snapWord - at, 0, true);
+    }
+    const memories = new Map(), stores = new Map(), maxPages = {};
+    const threads = [];
+    for (const key of want) {
+      const m = parked.get(key);
+      const pid = Number(key.split(':')[0]);
+      if (!memories.has(pid)) {
+        memories.set(pid, snapTake(m.memory.buffer));
+        maxPages[pid] = m.maxPages;
+        if (m.moduleStore) {
+          const used = Number(Atomics.load(new BigInt64Array(m.moduleStore, 0, 1), 0));
+          stores.set(pid, new Uint8Array(m.moduleStore, 0, used).slice());
+        }
+      }
+      threads.push({ key, pid, tid: m.tid, pc: m.entry, sp: m.start, main: !key.includes(':') });
+    }
+    const meta = {
+      version: 1,
+      stacks: { ...st },
+      threads,
+      maxPages,
+      flavourOf: [...this.#flavourOf],
+      door: this.#door ? { ...this.#door, memory: undefined, module: undefined } : null,
+    };
+    const copyMs = performance.now() - t0 - stopMs;
+    if (resume) release();
+    else this.stop();
+    return { kernel, memories, stores, meta, stopMs, copyMs };
+  }
+  #snapWait = null;
+
+  /**
+   * Run a session from a snapshot (`snapshot`) in place of `start`: the global
+   * kernel's memory as it held it (this host's kernel memory, before any
+   * Worker attaches), each process's memory and module store, and every
+   * thread in a Worker of its own, entering where its libc's record says
+   * (`Gex#snapThread`). A process's first Worker comes up before its others
+   * (it frees the snapshot's shim slots). Resolves with pid 1's status;
+   * `onRunning(ms)` once every thread's Worker is up.
+   */
+  async restore({ kernel, memories, stores = new Map(), meta }, { onRunning } = {}) {
+    const t0 = performance.now();
+    watchLibraries();
+    if (!this.#kernel?.memory) throw new Error('restore: no global kernel');
+    const km = this.#kernel.memory;
+    const grow = Math.ceil((snapLength(kernel) - km.buffer.byteLength) / 65536);
+    if (grow > 0) km.grow(grow);
+    snapFill(km, kernel);
+    this.#stacks = meta.stacks;
+    for (const [p, f] of meta.flavourOf ?? []) this.#flavourOf.set(p, f);
+    inform(`[gex] restore: ${meta.threads.length} threads of ${memories.size} processes`);
+    const byPid = new Map();
+    for (const t of meta.threads) {
+      if (!byPid.has(t.pid)) byPid.set(t.pid, []);
+      byPid.get(t.pid).push(t);
+    }
+    let first = null;
+    const ups = [];
+    // The wineserver's process first: its Worker publishes the door
+    // (`Gex#snapThread`), which the others' start messages then carry.
+    const order = [...byPid].sort(([a], [b]) => (b === meta.door?.pid) - (a === meta.door?.pid));
+    for (const [pid, ts] of order) {
+      const bytes = memories.get(pid);
+      const memory = new WebAssembly.Memory({ initial: snapLength(bytes) / 65536, maximum: meta.maxPages[pid], shared: true });
+      snapFill(memory, bytes);
+      let moduleStore;
+      const sb = stores.get(pid);
+      if (sb) {
+        moduleStore = new SharedArrayBuffer(Math.max(1 << 20, sb.length), { maxByteLength: 4 * 1024 * 1024 * 1024 });
+        new Uint8Array(moduleStore).set(sb);
+      }
+      if (MEMORIES) (globalThis.__gexMemories ??= new Map()).set(pid, memory);
+      const main = ts.find((t) => t.main);
+      if (!main) throw new Error(`restore: pid ${pid} has no first thread`);
+      const one = (t, reset, door) => {
+        let up;
+        const attached = new Promise((r) => { up = r; });
+        this.#snapUp.set(t.key, up);
+        const done = this.#spawn(t.main ? pid : t.key, {
+          kind: 'thread', tid: t.tid, memory, moduleStore,
+          ctx: 0n, pc: BigInt(t.pc),
+          snap: { pc: t.pc, sp: t.sp, door }, snapMain: t.main || undefined, snapReset: reset || undefined,
+        });
+        return { attached, done };
+      };
+      const m = one(main, true, pid === meta.door?.pid ? meta.door.area : undefined);
+      if (pid === 1) first = m.done;
+      else m.done.catch((e) => console.error(`[gex] restore: pid ${pid}: ${e?.message ?? e}`));
+      await m.attached;
+      for (const t of ts) if (t !== main) ups.push(one(t, false).attached);
+    }
+    if (!first) throw new Error('restore: no pid 1');
+    Promise.all(ups).then(() => onRunning?.(performance.now() - t0));
+    const status = await first;
+    this.stop();
+    return status;
+  }
+  /** A restored thread's Worker is up (`snap-attached`): by key. */
+  #snapUp = new Map();
 
   /** Stop every Worker, whatever it is doing -- once no process is inside a
    *  save of the translation store (xcache.mjs's gate): a Worker ended
@@ -1152,6 +1329,16 @@ export class ProcessHost {
       case 'wantLibrary':
         this.#sendLibrary(w, m.i);
         break;
+      case 'snap-parked':
+        this.#snapWait?.parked.set(String(pid), m);
+        this.#snapWait?.check();
+        break;
+      case 'snap-attached': {
+        const up = this.#snapUp.get(String(pid));
+        this.#snapUp.delete(String(pid));
+        up?.();
+        break;
+      }
       case 'kernelStacks':
         this.#stacks = m;
         // A pooled Worker that was ready before the stacks were known.

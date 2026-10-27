@@ -2879,7 +2879,12 @@ export class Gex {
   kernelStacks() {
     const k = this.#kernel;
     if (!k?.k_stack_area) return null;
-    return { area: k.k_stack_area() >>> 0, size: k.k_stack_size() >>> 0, count: k.k_stack_count() >>> 0 };
+    return {
+      area: k.k_stack_area() >>> 0, size: k.k_stack_size() >>> 0, count: k.k_stack_count() >>> 0,
+      // A session snapshot's word, and the wait slots it bumps
+      // (`ProcessHost.snapshot`).
+      ...(k.k_snap_word ? { snapWord: k.k_snap_word() >>> 0, wsAddr: k.k_ws_addr(0) >>> 0, wsCount: k.k_ws_count() >>> 0 } : {}),
+    };
   }
 
   /// Armed once: every few seconds, say what this process is waiting for.
@@ -3711,6 +3716,30 @@ export class Gex {
     return { entry, ctx: Number(thread.ctx) };
   }
 
+  /** A thread of a restored session snapshot (`ProcessHost.restore`), in
+   *  this Worker: as a started thread (`adoptThread`), on the memory the
+   *  snapshot held, entering at the start its libc left in its record
+   *  (`snap.pc`, `snap.sp`). */
+  async snapThread(shimWasm, guestWasm, thread) {
+    this.#threaded();
+    this.#threadTid = thread.tid;
+    this.#promise = false;
+    // The first of a process's Workers: the memory's shim slots are the
+    // snapshot's Workers', none of which runs now (as a fork child's).
+    if (thread.snapReset) this.#forkChild = true;
+    await this.attach(shimWasm, guestWasm, { devices: false });
+    const e = this.#shim.exports;
+    const entry = e.gex_snap_thread(thread.tid, BigInt(thread.snap.pc), BigInt(thread.snap.sp));
+    if (!entry) throw new Error(`snapshot: process has no thread ${thread.tid}`);
+    if (thread.procOpts) this.#opts = thread.procOpts;
+    await this.#catchUp();
+    this.#cgenCatchUp();
+    // The wineserver's: its door, published again for the restored
+    // session's Workers (the snapshot's area, in its memory).
+    if (thread.snap.door !== undefined) this.#doorPublish(thread.snap.door >>> 0);
+    return { entry, ctx: Number(e.gex_snap_ctx()) };
+  }
+
   /**
    * posix_spawn's child (a wasm32 program's CLONE_VM | CLONE_VFORK clone),
    * run here before the parent's `clone` returns, as Linux runs it: in the
@@ -3734,6 +3763,9 @@ export class Gex {
     const ctx = Number(e.gex_fork_ctx());
     let why = 'exit';
     let crash = null;
+    // The child is not stopped for a snapshot: the record is its parent's.
+    this.#vforkDepth++;
+    e.gex_snap_enable?.(0);
     try {
       this.#guest.exports.enter(ctx, entry);
     } catch (err) {
@@ -3745,6 +3777,7 @@ export class Gex {
         why = w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
       }
     }
+    if (--this.#vforkDepth === 0 && this.#snapRec) e.gex_snap_enable?.(1);
     // A trap abandons the shim's frames without restoring its stack pointer.
     e.__stack_pointer.value = saved.shimSp;
     // Frames that ended with no exit said: nothing will tell the parent.
@@ -5581,6 +5614,81 @@ export class Gex {
     this.#dlTlsChunks = [];
   }
 
+  /** A session snapshot's imports, for a program built with the snapshot
+   *  flavour (libc's `GEX_SNAPSHOT`). Each thread's driver registers its
+   *  record (`snap_register`); a call that may block goes through
+   *  `syscall_b`, which unwinds the thread's frames to its driver instead
+   *  of making the call while the kernel's snapshot word asks threads to
+   *  stop, or when the shim left the call's wait for it
+   *  (`gex_snap_stopped`). The driver parks in `snap_park` until the word
+   *  is cleared, and rewinds: the rewound `syscall_b` makes the call. The
+   *  record holds the program's stack pointer at the call (+16), which the
+   *  unwind does not keep: the rewind puts it back. */
+  #snapImports(asyncify, call) {
+    const e = this.#shim.exports;
+    const k = () => this.#kernel;
+    const dv = () => new DataView(this.#memory.buffer);
+    const unwind = () => {
+      const rec = this.#snapRec;
+      const sp = this.#wasmprogSp;
+      if (sp) dv().setUint32(rec + 16, Number(sp.value) >>> 0, true);
+      this.#snapUnwinding = true;
+      asyncify(1, rec);
+    };
+    return {
+      syscall_b: (ctx, pc) => {
+        const st = asyncify(0, 0);
+        if (st === 2) {
+          asyncify(4, 0);
+          const sp = this.#wasmprogSp;
+          if (sp) {
+            const v = dv().getUint32(this.#snapRec + 16, true);
+            sp.value = typeof sp.value === 'bigint' ? BigInt(v) : v | 0;
+          }
+        } else if (st !== 0) {
+          throw new Error(`gex.syscall_b in asyncify state ${st}`);
+        } else if (this.#snapRec && !this.#vforkDepth && k()?.k_snap_pending?.()) {
+          unwind();
+          return;
+        }
+        call(ctx, pc);
+        if (e.gex_snap_stopped?.()) unwind();
+      },
+      snap_register: (rec) => {
+        this.#snapRec = rec >>> 0;
+        e.gex_snap_enable?.(this.#snapRec && !this.#vforkDepth ? 1 : 0);
+      },
+      snap_unwinding: () => {
+        const was = this.#snapUnwinding;
+        this.#snapUnwinding = false;
+        return was ? this.#snapRec : 0;
+      },
+      snap_park: (rec) => {
+        const kern = this.#kernelSpec?.memory;
+        if (!kern || !k()) throw new Error('gex.snap_park: no global kernel');
+        const words = new Int32Array(kern.buffer);
+        const at = (k().k_snap_word() >>> 0) >>> 2;
+        const r = rec >>> 0, d = dv();
+        this.#env.snapParked?.({
+          pid: e.gex_my_pid?.() ?? 0,
+          tid: e.gex_snap_tid?.() ?? this.#threadTid,
+          rec: r,
+          entry: d.getUint32(r + 8, true),
+          start: d.getUint32(r + 12, true),
+          maxPages: memCapPages() ?? PAGES,
+          moduleStore: this.#moduleStore ?? undefined,
+        });
+        while (Atomics.load(words, at) !== 0) Atomics.wait(words, at, Atomics.load(words, at), 1000);
+      },
+    };
+  }
+  /** This Worker's thread's snapshot record (`snap_register`), and whether
+   *  the unwind under way is the snapshot's. */
+  #snapRec = 0;
+  #snapUnwinding = false;
+  /** posix_spawn children running on this Worker (`#vforkChild`). */
+  #vforkDepth = 0;
+
   /** What a native wasm32 program imports from `gex` (cgen/wasmprog.rs):
    *  its system calls, which return unless the program's frames end (a
    *  thread or a child they staged is handed to the host here), and fork's
@@ -5638,6 +5746,8 @@ export class Gex {
         this.#cgenCatchUp();
       },
       asyncify,
+      // The snapshot flavour's (src/process/wasm32/__gex_fork.c in libc).
+      ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
         if (st === 0) asyncify(1, rec);
@@ -5848,6 +5958,11 @@ export class Gex {
       gex: {
         syscall,
         asyncify: (op) => { if (op === 0) return 0; throw new Error('gex.asyncify: no fork inside a door call'); },
+        // A snapshot-flavour server's: a door call is never a snapshot's
+        // stop (its thread has no record), so its calls are plain ones.
+        syscall_b: syscall,
+        snap_register: () => {},
+        snap_unwinding: () => 0,
         // a thread's wait pipe is resolved by the pump (init_thread); written in place
         wake_pipe: () => -1,
         wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),

@@ -35,7 +35,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { appendFileSync, lstatSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -364,6 +364,68 @@ if (MEM64 && SHARED && kernel) {
   });
 }
 
+// GEX_SNAP_OUT=DIR GEX_SNAP_AT=TEXT: once the guest's output has said TEXT,
+// a session snapshot (`ProcessHost.snapshot`) into DIR, after
+// GEX_SNAP_DELAY_MS (200); the run then ends (status 0), or goes on with
+// GEX_SNAP_RESUME=1. GEX_SNAP_IN=DIR: the run is DIR's snapshot, restored
+// (`ProcessHost.restore`), in place of the program. A refused snapshot ends
+// the run with status 3.
+const SNAP_OUT = process.env.GEX_SNAP_OUT, SNAP_AT = process.env.GEX_SNAP_AT, SNAP_IN = process.env.GEX_SNAP_IN;
+let snapSeen = '', snapTaken = false;
+function snapWatch(text) {
+  if (!SNAP_OUT || !SNAP_AT || snapTaken) return;
+  snapSeen = (snapSeen + text).slice(-4096);
+  if (!snapSeen.includes(SNAP_AT)) return;
+  snapTaken = true;
+  setTimeout(snapTake, Number(process.env.GEX_SNAP_DELAY_MS ?? 200));
+}
+async function snapTake() {
+  const resume = process.env.GEX_SNAP_RESUME === '1';
+  const r = await host.snapshot({ timeout: Number(process.env.GEX_SNAP_TIMEOUT_MS ?? 10000), resume });
+  if (r.refused) {
+    process.stderr.write(`[gex] snapshot refused after ${r.stopMs.toFixed(1)} ms: ${r.refused}\n`);
+    process.exit(3);
+  }
+  const t0 = performance.now();
+  mkdirSync(SNAP_OUT, { recursive: true });
+  let bytes = snapWrite(join(SNAP_OUT, 'kernel'), r.kernel);
+  for (const [pid, b] of r.memories) bytes += snapWrite(join(SNAP_OUT, `mem-${pid}`), b);
+  for (const [pid, b] of r.stores) { writeFileSync(join(SNAP_OUT, `store-${pid}.bin`), b); bytes += b.length; }
+  writeFileSync(join(SNAP_OUT, 'meta.json'), JSON.stringify(r.meta, (k, v) => (typeof v === 'bigint' ? `${v}n` : v)));
+  process.stderr.write(`[gex] snapshot: ${r.meta.threads.length} threads of ${r.memories.size} processes, `
+    + `stop ${r.stopMs.toFixed(1)} ms, copy ${r.copyMs.toFixed(1)} ms, write ${(performance.now() - t0).toFixed(1)} ms, ${(bytes / 1048576).toFixed(1)} MiB\n`);
+  if (!resume) process.exit(0);
+}
+// A memory as the snapshot holds it (its nonzero runs): NAME.bin the runs'
+// bytes one after another, NAME.map `{ length, runs: [[offset, length]] }`.
+// The bytes written.
+function snapWrite(name, m) {
+  const fd = openSync(`${name}.bin`, 'w');
+  let n = 0;
+  for (const [, bytes] of m.runs) { writeSync(fd, bytes); n += bytes.length; }
+  closeSync(fd);
+  writeFileSync(`${name}.map`, JSON.stringify({ length: m.length, runs: m.runs.map(([at, b]) => [at, b.length]) }));
+  return n;
+}
+function snapMem(name) {
+  const map = JSON.parse(readFileSync(`${name}.map`, 'utf8'));
+  const all = readFileSync(`${name}.bin`);
+  let off = 0;
+  const runs = map.runs.map(([at, len]) => { const r = [at, all.subarray(off, off + len)]; off += len; return r; });
+  return { length: map.length, runs };
+}
+function snapRead(dir) {
+  const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'), (k, v) => (typeof v === 'string' && /^\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v));
+  const memories = new Map(), stores = new Map();
+  for (const f of readdirSync(dir)) {
+    const m = /^(mem|store)-(\d+)\.(bin|map)$/.exec(f);
+    if (!m) continue;
+    if (m[1] === 'mem' && m[3] === 'map') memories.set(Number(m[2]), snapMem(join(dir, `mem-${m[2]}`)));
+    if (m[1] === 'store') stores.set(Number(m[2]), readFileSync(join(dir, f)));
+  }
+  return { kernel: snapMem(join(dir, 'kernel')), memories, stores, meta };
+}
+
 const host = new ProcessHost({
   makeWorker: SINGLE ? () => new FiberWorker() : () => new Worker(new URL('./worker.mjs', import.meta.url),
     // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
@@ -557,6 +619,7 @@ const host = new ProcessHost({
     extract: extract.map(([guest]) => guest),
   },
   onOutput: (fd, text, pid, m) => {
+    snapWatch(m?.bytes ? Buffer.from(m.bytes).toString() : String(text));
     // Through `process.stdout`, not `writeSync(1, ...)`: this runner is itself
     // sometimes inside a Worker, whose fd 1 is the process's fd 1 -- writing it
     // directly interleaved with the parent's output out of order.
@@ -748,6 +811,14 @@ if (process.env.GEX_MEMSTATS) {
   }, every).unref();
 }
 try {
+  if (SNAP_IN) {
+    const t0 = performance.now();
+    const snap = snapRead(SNAP_IN);
+    process.stderr.write(`[gex] restore: read in ${(performance.now() - t0).toFixed(1)} ms\n`);
+    status = await host.restore(snap, {
+      onRunning: (ms) => process.stderr.write(`[gex] restore: ${snap.meta.threads.length} threads running ${ms.toFixed(1)} ms after the read\n`),
+    });
+  } else
   status = await host.start({
     elf,
     files,

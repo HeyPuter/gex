@@ -21,6 +21,15 @@ MUSL=$(realpath "${2:-$HERE/../../../musl-wasm}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-4}
 . "$HERE/flags.sh"
+# GEX_SNAPSHOT=1: the snapshot flavour, for pages that save and restore a
+# session (the musl fork's GEX_SNAPSHOT: blocking calls through
+# gex.syscall_b, threads stopped and resumed by asyncify). wcc sees the
+# lib/gex-snapshot it leaves and instruments what reaches those calls. Its
+# libc is asyncify's too, so it takes the legacy exception instructions.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  GEX_WASM_LEGACY_EH=1
+  GEX_WASM_EXTRA_CFLAGS="${GEX_WASM_EXTRA_CFLAGS:+$GEX_WASM_EXTRA_CFLAGS }-DGEX_SNAPSHOT"
+fi
 # GEX_WASM_LEGACY_EH=1 (gexcc): the libc's setjmp lowers onto the legacy
 # exception instructions, as programs' does (wcc), so binaryen's asyncify
 # can instrument a libc function a fork can reach (timer_create's thread,
@@ -109,4 +118,5 @@ elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
   rm -rf "$OUT/sysroot/binaryen"
   mv "$OUT/$t" "$OUT/sysroot/binaryen"
 fi
+if [ -n "${GEX_SNAPSHOT:-}" ]; then touch "$OUT/sysroot/lib/gex-snapshot"; else rm -f "$OUT/sysroot/lib/gex-snapshot"; fi
 echo "sysroot: $OUT/sysroot"

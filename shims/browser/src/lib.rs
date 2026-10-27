@@ -285,6 +285,8 @@ extern "C" {
     fn k_ws_seq(slot: i32) -> i32;
     fn k_ws_park(slot: i32, seq: i32, ns: i64) -> i32;
     fn k_ws_addr(slot: i32) -> u32;
+    /// A session snapshot asking threads to stop (`shims/kernel/src/wait.rs`).
+    fn k_snap_pending() -> i32;
     fn k_wq_new() -> u32;
     fn k_wq_free(id: u32);
     fn k_wq_notify(id: u32);
@@ -9133,6 +9135,62 @@ thread_local! {
 /// given back to JS, so the Worker waits here until the call can finish, and
 /// the call returns. Anything else that ends the wait (the process gone)
 /// traps as usual.
+thread_local! {
+    /// This Worker's thread can be stopped for a session snapshot
+    /// (`gex_snap_enable`): its program has a snapshot record. Off, its
+    /// waits do not look for a snapshot's request.
+    static SNAP_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This Worker's thread left its call for a snapshot (`snap_stop`): the
+    /// call was not made, and the program's frames are to be unwound.
+    static SNAP_STOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turn the snapshot stop in this Worker's waits on or off.
+#[no_mangle]
+pub extern "C" fn gex_snap_enable(on: i32) {
+    SNAP_ON.with(|c| c.set(on != 0));
+}
+
+/// Whether this Worker's thread left its call for a snapshot; the answer is
+/// taken.
+#[no_mangle]
+pub extern "C" fn gex_snap_stopped() -> i32 {
+    SNAP_STOPPED.with(|c| c.replace(false)) as i32
+}
+
+/// Leave the wait this Worker's thread is in, as if its call had not been
+/// made, when a snapshot asks and the wait can be left so: a call that waits
+/// with nothing done, which made again finds what it would have found. Not a
+/// wait with a mask to put back (`rt_sigsuspend`), a write that wrote part,
+/// a connect under way, or a priority-inheritance lock's: the thread stays, and the snapshot finds
+/// it has not stopped.
+fn snap_stop() -> bool {
+    if !SNAP_ON.with(|c| c.get()) || unsafe { k_present() } == 0 || unsafe { k_snap_pending() } == 0 {
+        return false;
+    }
+    if !waitq::waiting_here() {
+        return false;
+    }
+    let Some(run) = MY_RUN.with(|c| c.borrow().clone()) else { return false };
+    {
+        let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
+        if r.owed.restore_sigmask.is_some()
+            || r.owed.write_blocked
+            || matches!(r.blocked_on, Some(gex_kernel::BlockOp::FutexLockPi { .. } | gex_kernel::BlockOp::Connect { .. }) | None)
+        {
+            return false;
+        }
+        r.waiting = Waiting::Runnable;
+        r.blocked_on = None;
+        r.owed = Owed::default();
+    }
+    waitq::leave();
+    set_resume_none();
+    set_resume_ctx_none();
+    SNAP_STOPPED.with(|c| c.set(true));
+    true
+}
+
 fn wasm32_wait(pc: u64) -> i32 {
     // Narration, once per Worker: a wasm32 program's every blocking call
     // comes through here (all of 32-bit Wine), and a line per call was about
@@ -9175,6 +9233,12 @@ fn wasm32_wait(pc: u64) -> i32 {
         said = true;
         if unsafe { k_present() } == 0 {
             continue;
+        }
+        // A snapshot's stop, looked for before each park: a thread that
+        // came to its wait after the snapshot bumped the slots sees the
+        // word here, as one the bump woke does.
+        if snap_stop() {
+            return 0;
         }
         if waitq::wants_page() == Some(true) {
             // The page's own input, which this Worker's frames keep it from
@@ -10452,6 +10516,47 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     bind_free(i);
     let pc = table[i].run().pc;
     pc as i64
+}
+
+/// A thread of a restored session snapshot, in this Worker: thread `tid`
+/// of the process whose memory the snapshot held, bound here as a started
+/// thread is ([`gex_adopt_thread`]), its context's PC and stack pointer
+/// `pc` and `sp` (the start its libc left in its snapshot record, which
+/// puts back the registers it overwrites). The PC to enter at, or 0 for a
+/// thread the process does not have.
+#[no_mangle]
+pub extern "C" fn gex_snap_thread(tid: i32, pc: i64, sp: i64) -> i64 {
+    let Some(home) = sigs::home() else { return 0 };
+    let table = home.table();
+    let Some(i) = table.position(tid) else {
+        return 0;
+    };
+    {
+        let mut r = table[i].run();
+        r.waiting = Waiting::Runnable;
+        r.blocked_on = None;
+        r.owed = Owed::default();
+        r.pc = pc as u64;
+    }
+    CURRENT.with(|c| c.set(i));
+    bind_free(i);
+    let c = my_ctx() as usize;
+    let data = guest_bytes();
+    write_u64(data, c + ctx::sp_slot(true), sp as u64);
+    write_u64(data, c + ctx::PC, pc as u64);
+    pc
+}
+
+/// This Worker's thread's id, for a snapshot's record of it.
+#[no_mangle]
+pub extern "C" fn gex_snap_tid() -> i32 {
+    my_tid()
+}
+
+/// This Worker's thread's context, where a restored thread enters.
+#[no_mangle]
+pub extern "C" fn gex_snap_ctx() -> i64 {
+    my_ctx() as i64
 }
 
 /// [`bind_mine`] with no kernel lock: thread `i` of this
