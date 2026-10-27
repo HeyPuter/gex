@@ -1076,7 +1076,10 @@ async function handle(msg) {
         msg.spareGo = () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; }));
       }
       ({ entry, ctx, gone } = await (msg.snap ? gex.snapThread(msg.shim, msg.guest, msg) : gex.adoptThread(msg.shim, msg.guest, msg)));
-      if (msg.snap) port.post({ kind: 'snap-attached' });
+      if (msg.snap) {
+        port.post({ kind: 'snap-attached' });
+        gex.snapRelease();
+      }
       execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {

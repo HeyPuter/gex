@@ -459,6 +459,67 @@ function entryFnModule(t64, s64) {
   return m;
 }
 
+/** The snapshot flavour's entry function (a program built against the
+ *  snapshot sysroot, libgex-snap/entry64.c): `entryFnModule`'s, its depth
+ *  counted in `d` (a session snapshot stops a thread only in the outermost
+ *  entry), and the program's asyncify state looked at after the call: an
+ *  unwind the snapshot began (1) ends here, `af(idx, ctx)` keeps the record,
+ *  parks and starts the rewind, and the call is made again (rewound).
+ *  (module (type $vi (func (param i32))) (type $e (func (param i32 i32 i64) (result i32)))
+ *    (type $st (func (result i32))) (type $af (func (param i32 i32)))
+ *    (import "e" "t" (table T 0 funcref)) (import "e" "sp" (global $sp (mut S)))
+ *    (import "e" "d" (global $d (mut i32)))
+ *    (import "e" "st" (func $st (type $st))) (import "e" "af" (func $af (type $af)))
+ *    (func (export "entry") (type $e) (local $cur S)
+ *      ... sp as entryFnModule's ...  d += 1
+ *      loop $again
+ *        try (call_indirect (type $vi) (local.get 1) (local.get 0))
+ *        catch_all d -= 1 (global.set $sp (local.get $cur)) rethrow 0 end
+ *        (if (i32.eq (call $st) (i32.const 1)) (then (call $af (local.get 0) (local.get 1)) (br $again)))
+ *      end
+ *      d -= 1 (global.set $sp (local.get $cur)) i32.const 1)) */
+const entrySnapMods = new Map();
+function entryFnSnapModule(t64, s64) {
+  const k = (t64 ? 2 : 0) | (s64 ? 1 : 0);
+  let m = entrySnapMods.get(k);
+  if (m) return m;
+  const S = s64 ? 0x7e : 0x7f;
+  const head = s64
+    ? [0x20, 3, 0x20, 2, 0x20, 3, 0x50, 0x45, 0x20, 3, 0x20, 2, 0x54, 0x71, 0x1b, 0x42, 0x80, 0x20, 0x7d, 0x42, 0x70, 0x83]
+    : [0x20, 3, 0x20, 2, 0xa7, 0x20, 3, 0x20, 2, 0xa7, 0x49, 0x1b, 0x41, 0x80, 0x20, 0x6b, 0x41, 0x70, 0x71];
+  const dDec = [0x23, 1, 0x41, 1, 0x6b, 0x24, 1];
+  const body = [
+    1, 1, S,
+    0x23, 0, 0x21, 3,
+    ...head, 0x24, 0,
+    0x23, 1, 0x41, 1, 0x6a, 0x24, 1,
+    0x03, 0x40,
+    0x06, 0x40, 0x20, 1, 0x20, 0, ...(t64 ? [0xad] : []), 0x11, 0, 0,
+    0x19, ...dDec, 0x20, 3, 0x24, 0, 0x09, 0, 0x0b,
+    0x10, 0, 0x41, 1, 0x46, 0x04, 0x40, 0x20, 0, 0x20, 1, 0x10, 1, 0x0c, 1, 0x0b,
+    0x0b,
+    ...dDec, 0x20, 3, 0x24, 0, 0x41, 1, 0x0b,
+  ];
+  const sec = (id, b) => [id, b.length, ...b];
+  const imps = [5,
+    1, 101, 1, 116, 1, 112, t64 ? 4 : 0, 0,
+    1, 101, 2, 115, 112, 3, S, 1,
+    1, 101, 1, 100, 3, 0x7f, 1,
+    1, 101, 2, 115, 116, 0, 2,
+    1, 101, 2, 97, 102, 0, 3];
+  const bytes = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    ...sec(1, [4, 96, 1, 127, 0, 96, 3, 127, 127, 126, 1, 127, 96, 0, 1, 127, 96, 2, 127, 127, 0]),
+    ...sec(2, imps),
+    ...sec(3, [1, 1]),
+    ...sec(7, [1, 5, 101, 110, 116, 114, 121, 0, 2]),
+    ...sec(10, [1, body.length, ...body]),
+  ]);
+  m = new WebAssembly.Module(bytes);
+  entrySnapMods.set(k, m);
+  return m;
+}
+
 function growTable(table, delta, init, which) {
   const to = table.length + delta;
   if (to > (1 << 20)) console.warn(`[gex] dispatch table ${which} grows ${table.length} -> ${to} entries`);
@@ -1777,6 +1838,10 @@ export class Gex {
         // call. 0 in the single-thread build (a blocking call needs a
         // promising frame).
         entry_call: single.on ? (idx, ctx, sp) => 0 : this.#entryTramp(),
+        // A session snapshot's question (`snap_stop`), asked only while one
+        // is pending: whether this thread's frames below its wait can be
+        // unwound to its program's snapshot root (`#snapOk`).
+        snap_ok: () => this.#snapOk(),
         // The units and bindings the shim says are waiting, after a direct
         // entry's call (cgen.rs `wine64_entry`, only when there are some).
         cgen_serve: () => this.#cgenServe(),
@@ -2892,6 +2957,7 @@ export class Gex {
       // A session snapshot's word, and the wait slots it bumps
       // (`ProcessHost.snapshot`).
       ...(k.k_snap_word ? { snapWord: k.k_snap_word() >>> 0, wsAddr: k.k_ws_addr(0) >>> 0, wsCount: k.k_ws_count() >>> 0 } : {}),
+      ...(k.k_mono_held_at ? { monoHeld: k.k_mono_held_at() >>> 0 } : {}),
     };
   }
 
@@ -3738,9 +3804,6 @@ export class Gex {
     await this.attach(shimWasm, guestWasm, { devices: false });
     const e = this.#shim.exports;
     const entry = e.gex_snap_thread(thread.tid, BigInt(thread.snap.pc), BigInt(thread.snap.sp));
-    // The clocks, once per process: its monotonic clocks do not count the
-    // time the snapshot was saved (and every process's, from the first).
-    if (thread.snap.held !== undefined) e.gex_snap_clock?.(BigInt(thread.snap.held), thread.snap.heldAll ? 1 : 0);
     if (!entry) throw new Error(`snapshot: process has no thread ${thread.tid}`);
     if (thread.procOpts) this.#opts = thread.procOpts;
     await this.#catchUp();
@@ -3749,6 +3812,20 @@ export class Gex {
     // session's Workers (the snapshot's area, in its memory).
     if (thread.snap.door !== undefined) this.#doorPublish(thread.snap.door >>> 0);
     return { entry, ctx: Number(e.gex_snap_ctx()) };
+  }
+
+  /** A restored thread, attached (`snapThread`), waits here until the host
+   *  lets the whole session go on (the kernel's snapshot word cleared);
+   *  its clocks then skip the time the session spent saved, which the host
+   *  has added to the kernel's (`k_mono_held`). */
+  snapRelease() {
+    const kern = this.#kernelSpec?.memory, k = this.#kernel;
+    if (kern && k?.k_snap_word) {
+      const words = new Int32Array(kern.buffer), at = (k.k_snap_word() >>> 0) >>> 2;
+      while (Atomics.load(words, at) !== 0) Atomics.wait(words, at, Atomics.load(words, at), 1000);
+    }
+    this.#monoHeldNs = null;
+    this.#shim.exports.gex_snap_clock?.();
   }
 
   /**
@@ -5454,13 +5531,21 @@ export class Gex {
     const t = new WebAssembly.Instance(entryTrampMod, { e: { hook, slow: (idx, ctx, sp) => this.#entrySlow(idx, ctx, sp) } });
     this.#entryHook = hook;
     this.#entrySlowFn = t.exports.slow;
+    this.#entryCallFn = t.exports.entry_call;
     return t.exports.entry_call;
   }
+  #entryCallFn = null;
   /** The first call since the function table or Wine's stack pointer
    *  changed: the entry function over them, in the hook, then called. */
   #entrySlow(idx, ctx, sp) {
     const spG = this.#wasmprogSp ?? this.#wasmprogStack();
-    const f = new WebAssembly.Instance(entryFnModule(m64(), typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
+    const prog = this.#snapProg?.()?.exports;
+    const f = prog?.__gex_snap_resume64
+      ? new WebAssembly.Instance(entryFnSnapModule(m64(), typeof spG.value === 'bigint'), { e: {
+        t: this.#cgen.ftab, sp: spG, d: (this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0)), st: prog.asyncify_get_state,
+        af: (idx, ctx) => this.#snapEntryStop(idx, ctx),
+      } }).exports.entry
+      : new WebAssembly.Instance(entryFnModule(m64(), typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
     this.#entryHook.set(0, f);
     return f(idx, ctx, sp);
   }
@@ -5635,7 +5720,8 @@ export class Gex {
    *  is cleared, and rewinds: the rewound `syscall_b` makes the call. The
    *  record holds the program's stack pointer at the call (+16), which the
    *  unwind does not keep: the rewind puts it back. */
-  #snapImports(asyncify, call) {
+  #snapImports(asyncify, call, inst) {
+    this.#snapProg = inst;
     const e = this.#shim.exports;
     const k = () => this.#kernel;
     const dv = () => new DataView(this.#memory.buffer);
@@ -5658,7 +5744,7 @@ export class Gex {
           }
         } else if (st !== 0) {
           throw new Error(`gex.syscall_b in asyncify state ${st}`);
-        } else if (this.#snapRec && !this.#vforkDepth && k()?.k_snap_pending?.()) {
+        } else if (this.#snapRec && !this.#vforkDepth && k()?.k_snap_pending?.() && this.#snapOk()) {
           unwind();
           return;
         }
@@ -5668,34 +5754,90 @@ export class Gex {
       // No record for a posix_spawn child (`#vforkChild`): its parent's
       // memory map is not its to change.
       snap_wanted: () => (this.#vforkDepth ? 0 : 1),
-      snap_register: (rec) => {
-        this.#snapRec = rec >>> 0;
+      // (a wasm64 program's pointers are i64s)
+      snap_register: (rec, root) => {
+        this.#snapRec = Number(rec) >>> 0;
+        this.#snapRoot = this.#snapRec ? root : 0;
         e.gex_snap_enable?.(this.#snapRec && !this.#vforkDepth ? 1 : 0);
+      },
+      // A restored thread's call into the program's handler, which its
+      // snapshot stopped inside the host's entry (entry64.c): rewound under
+      // this Worker's entry function, then finished as `w64_entry` finishes
+      // one (`gex_snap_entry_tail`).
+      snap_entry_rewind: (rec) => {
+        const r = Number(rec) >>> 0;
+        const ctx = Number(e.gex_snap_ctx());
+        const idx = dv().getUint32(r + 20, true);
+        const rsp = dv().getBigUint64(ctx + 4 * 8, true);
+        asyncify(3, r);
+        this.#entryCallFn(idx, ctx, rsp);
+        if (!e.gex_snap_entry_tail(ctx)) throw new Error('snapshot: a restored thread\'s call left another context to resume');
       },
       snap_unwinding: () => {
         const was = this.#snapUnwinding;
         this.#snapUnwinding = false;
         return was ? this.#snapRec : 0;
       },
-      snap_park: (rec) => {
-        const kern = this.#kernelSpec?.memory;
-        if (!kern || !k()) throw new Error('gex.snap_park: no global kernel');
-        const words = new Int32Array(kern.buffer);
-        const at = (k().k_snap_word() >>> 0) >>> 2;
-        const r = rec >>> 0, d = dv();
-        this.#env.snapParked?.({
-          pid: e.gex_my_pid?.() ?? 0,
-          tid: e.gex_snap_tid?.() ?? this.#threadTid,
-          rec: r,
-          entry: d.getUint32(r + 8, true),
-          start: d.getUint32(r + 12, true),
-          maxPages: memCapPages() ?? PAGES,
-          moduleStore: this.#moduleStore ?? undefined,
-        });
-        while (Atomics.load(words, at) !== 0) Atomics.wait(words, at, Atomics.load(words, at), 1000);
-      },
+      snap_park: (rec) => this.#snapPark(rec),
     };
   }
+  /** Park this Worker's thread for the session snapshot, its record `rec`
+   *  filled in, until the kernel's snapshot word is cleared. */
+  #snapPark(rec) {
+    const e = this.#shim.exports;
+    const k = () => this.#kernel;
+    const dv = () => new DataView(this.#memory.buffer);
+    const kern = this.#kernelSpec?.memory;
+    if (!kern || !k()) throw new Error('gex.snap_park: no global kernel');
+    const words = new Int32Array(kern.buffer);
+    const at = (k().k_snap_word() >>> 0) >>> 2;
+    const r = Number(rec) >>> 0, d = dv();
+    this.#env.snapParked?.({
+      pid: e.gex_my_pid?.() ?? 0,
+      tid: e.gex_snap_tid?.() ?? this.#threadTid,
+      rec: r,
+      entry: d.getUint32(r + 8, true),
+      start: d.getUint32(r + 12, true),
+      maxPages: memCapPages() ?? PAGES,
+      moduleStore: this.#moduleStore ?? undefined,
+    });
+    while (Atomics.load(words, at) !== 0) Atomics.wait(words, at, Atomics.load(words, at), 1000);
+  }
+  /** The snapshot entry function's stop (`entryFnSnapModule`): the
+   *  program's handler `idx` came back unwinding. The snapshot's unwind
+   *  ends here: the record kept (the function, the registers, a restored
+   *  thread's start), parked, and the rewind begun, which the entry
+   *  function's call makes. */
+  #snapEntryStop(idx, ctx) {
+    const P = this.#snapProg().exports;
+    const rec = this.#snapRec;
+    if (!this.#snapUnwinding || !rec) throw new Error('snapshot: an unwind not the snapshot\'s reached the entry');
+    this.#snapUnwinding = false;
+    P.asyncify_stop_unwind();
+    new DataView(this.#memory.buffer).setUint32(rec + 20, idx >>> 0, true);
+    P.__gex_snap_fill(BigInt(rec));
+    this.#snapPark(rec);
+    P.asyncify_start_rewind(rec);
+  }
+  /** Whether this Worker's thread can be unwound to its program's snapshot
+   *  root where it waits now (`snap_ok`): its driver (root 1) with nothing
+   *  of the host's above it, or (root 2) the outermost entry from the
+   *  thread's outermost call-out, Wine's own loop (the shim opened none for
+   *  it). */
+  #snapOk() {
+    if (!this.#snapRec || this.#vforkDepth) return 0;
+    const depth = this.#snapDepth?.value ?? 0;
+    if ((this.#snapRoot & 1) && depth === 0 && this.#callouts.length === 0 && this.#nest.length === 0) return 1;
+    if ((this.#snapRoot & 2) && depth === 1 && this.#callouts.length === 1 && this.#nest.length === 1
+      && this.#callouts[0].ri === -1) return 1;
+    return 0;
+  }
+  /** The program built with the snapshot flavour (its instance), its
+   *  thread's roots (bits: 1 a driver, 2 the host's entry), and the
+   *  snapshot entry function's depth on this Worker. */
+  #snapProg = null;
+  #snapRoot = 0;
+  #snapDepth = null;
   /** This Worker's thread's snapshot record (`snap_register`), and whether
    *  the unwind under way is the snapshot's. */
   #snapRec = 0;
@@ -5761,7 +5903,7 @@ export class Gex {
       },
       asyncify,
       // The snapshot flavour's (libgex-snap/snapshot.c).
-      ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync),
+      ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync, inst),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
         if (st === 0) asyncify(1, rec);

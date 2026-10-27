@@ -177,11 +177,11 @@ function snapLength(m) {
 /** A memory's nonzero 64 KiB pages, copied, as `{ length, runs }`. */
 function snapTake(buffer) {
   const P = 65536, length = buffer.byteLength;
-  const words = new Int32Array(buffer, 0, length >> 2);
+  const words = new Int32Array(buffer, 0, length >>> 2);
   const spans = [];
   for (let p = 0; p < length; p += P) {
     let z = true;
-    for (let i = p >> 2, e = (p + P) >> 2; i < e; i++) if (words[i] !== 0) { z = false; break; }
+    for (let i = p >>> 2, e = (p + P) >>> 2; i < e; i++) if (words[i] !== 0) { z = false; break; }
     if (z) continue;
     const last = spans.at(-1);
     if (last && last[0] + last[1] === p) last[1] += P;
@@ -645,6 +645,9 @@ export class ProcessHost {
     wake();
     this.#snapWait.check();
     const ok = await all;
+    // when the session stopped, on the clock every Worker shares
+    // (`hostNowNs`): a restored one skips the time since
+    const at = snapNow();
     clearTimeout(timer);
     this.#snapWait = null;
     const stopMs = performance.now() - t0;
@@ -682,8 +685,7 @@ export class ProcessHost {
       threads,
       maxPages,
       flavourOf: [...this.#flavourOf],
-      // when it was taken, on the clock every Worker shares (`hostNowNs`)
-      at: snapNow(),
+      at,
       door: this.#door ? { ...this.#door, memory: undefined, module: undefined } : null,
     };
     const copyMs = performance.now() - t0 - stopMs;
@@ -710,6 +712,9 @@ export class ProcessHost {
     const grow = Math.ceil((snapLength(kernel) - km.buffer.byteLength) / 65536);
     if (grow > 0) km.grow(grow);
     snapFill(km, kernel);
+    // Every restored thread waits, attached, until all are (`snapRelease`).
+    const words = new Int32Array(km.buffer), word = meta.stacks.snapWord >>> 2;
+    Atomics.store(words, word, 1);
     this.#stacks = meta.stacks;
     for (const [p, f] of meta.flavourOf ?? []) this.#flavourOf.set(p, f);
     inform(`[gex] restore: ${meta.threads.length} threads of ${memories.size} processes`);
@@ -720,9 +725,6 @@ export class ProcessHost {
     }
     let first = null;
     const ups = [];
-    // The time it spent saved, which the session's monotonic clocks skip.
-    const held = meta.at ? BigInt(snapNow()) - BigInt(meta.at) : 0n;
-    let heldAll = true;
     // The wineserver's process first: its Worker publishes the door
     // (`Gex#snapThread`), which the others' start messages then carry.
     const order = [...byPid].sort(([a], [b]) => (b === meta.door?.pid) - (a === meta.door?.pid));
@@ -740,15 +742,13 @@ export class ProcessHost {
       const main = ts.find((t) => t.main);
       if (!main) throw new Error(`restore: pid ${pid} has no first thread`);
       const one = (t, reset, door) => {
-        const clock = reset ? { held: String(held > 0n ? held : 0n), heldAll } : {};
-        if (reset) heldAll = false;
         let up;
         const attached = new Promise((r) => { up = r; });
         this.#snapUp.set(t.key, up);
         const done = this.#spawn(t.main ? pid : t.key, {
           kind: 'thread', tid: t.tid, memory, moduleStore,
           ctx: 0n, pc: BigInt(t.pc),
-          snap: { pc: t.pc, sp: t.sp, door, ...clock }, snapMain: t.main || undefined, snapReset: reset || undefined,
+          snap: { pc: t.pc, sp: t.sp, door }, snapMain: t.main || undefined, snapReset: reset || undefined,
         });
         return { attached, done };
       };
@@ -759,7 +759,15 @@ export class ProcessHost {
       for (const t of ts) if (t !== main) ups.push(one(t, false).attached);
     }
     if (!first) throw new Error('restore: no pid 1');
-    Promise.all(ups).then(() => onRunning?.(performance.now() - t0));
+    // All up: the session goes on, its monotonic clocks held back the time
+    // since it stopped (every Worker's, as each is let go).
+    Promise.all(ups).then(() => {
+      const held = meta.at ? BigInt(snapNow()) - BigInt(meta.at) : 0n;
+      if (held > 0n && meta.stacks.monoHeld) Atomics.add(new BigUint64Array(km.buffer), meta.stacks.monoHeld >>> 3, held);
+      Atomics.store(words, word, 0);
+      Atomics.notify(words, word);
+      onRunning?.(performance.now() - t0);
+    });
     const status = await first;
     this.stop();
     return status;

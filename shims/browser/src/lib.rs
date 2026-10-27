@@ -9172,10 +9172,6 @@ thread_local! {
     static PAGE_WAIT_SAID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
-/// given back to JS, so the Worker waits here until the call can finish, and
-/// the call returns. Anything else that ends the wait (the process gone)
-/// traps as usual.
 thread_local! {
     /// This Worker's thread can be stopped for a session snapshot
     /// (`gex_snap_enable`): its program has a snapshot record. Off, its
@@ -9226,6 +9222,10 @@ fn snap_stop() -> bool {
     if !SNAP_ON.with(|c| c.get()) || unsafe { k_present() } == 0 || unsafe { k_snap_pending() } == 0 {
         return false;
     }
+    // SAFETY: a host import without arguments; nothing here holds a lock.
+    if unsafe { cgen::snap_ok() } == 0 {
+        return false;
+    }
     if !waitq::waiting_here() {
         return false;
     }
@@ -9251,6 +9251,10 @@ fn snap_stop() -> bool {
     true
 }
 
+/// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
+/// given back to JS, so the Worker waits here until the call can finish, and
+/// the call returns. Anything else that ends the wait (the process gone)
+/// traps as usual.
 fn wasm32_wait(pc: u64) -> i32 {
     // Narration, once per Worker: a wasm32 program's every blocking call
     // comes through here (all of 32-bit Wine), and a line per call was about
@@ -10608,18 +10612,15 @@ pub extern "C" fn gex_snap_thread(tid: i32, pc: i64, sp: i64) -> i64 {
     pc
 }
 
-/// A restored session snapshot's clocks: this process's monotonic clocks
-/// held back `ns` more, the time the snapshot spent saved, and every
-/// process's too (`all`: once per restored session).
+/// A restored session snapshot's clocks, as the session goes on: this
+/// process's monotonic clocks held back the time the snapshot spent saved,
+/// which the host has added to the shared value (`k_mono_held`).
 #[no_mangle]
-pub extern "C" fn gex_snap_clock(ns: i64, all: i32) {
-    if ns <= 0 || unsafe { k_present() } == 0 {
+pub extern "C" fn gex_snap_clock() {
+    if unsafe { k_present() } == 0 {
         return;
     }
-    if all != 0 {
-        unsafe { k_mono_held(ns as u64) };
-    }
-    gex_kernel::hold_monotonic(ns as u64);
+    gex_kernel::set_monotonic_held(unsafe { k_mono_held(0) });
 }
 
 /// This Worker's thread's id, for a snapshot's record of it.
@@ -14862,8 +14863,9 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     let _pc = fault_pc(_pc);
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
-        // so the guest's own arithmetic on it comes out exact.
-        -3 => host_now_ns() as i64,
+        // so the guest's own arithmetic on it comes out exact; less the time
+        // a restored session spent saved, as the monotonic clocks.
+        -3 => host_now_ns().wrapping_sub(gex_kernel::monotonic_held()) as i64,
         // MIDR_EL1: a plausible Cortex-A72, the same one the native host
         // claims to be.
         -7 => 0x410f_d083,

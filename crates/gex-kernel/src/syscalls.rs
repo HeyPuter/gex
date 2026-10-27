@@ -918,14 +918,17 @@ pub fn share_monotonic_held(f: fn(u64) -> u64) {
     let _ = MONOTONIC_HELD_SHARED.set(f);
 }
 
-/// Hold this process's monotonic clocks back `ns` more (a restored
-/// session's, by the time it was saved). A process that has not read them
-/// yet takes the shared value at its first reading.
-pub fn hold_monotonic(ns: u64) {
-    use std::sync::atomic::Ordering;
-    if MONOTONIC_BASE.load(Ordering::Relaxed) != 0 {
-        MONOTONIC_HELD.fetch_add(ns, Ordering::Relaxed);
-    }
+/// Hold this process's monotonic clocks back `ns` (a restored session's,
+/// the time it spent saved, as the host shares it).
+pub fn set_monotonic_held(ns: u64) {
+    MONOTONIC_HELD.store(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long this process's monotonic clocks are held back (nanoseconds): a
+/// counter of the host's time read without them (the x86 time-stamp
+/// counter) takes it off too.
+pub fn monotonic_held() -> u64 {
+    MONOTONIC_HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How much faster than real time the monotonic clocks run, as f64 bits

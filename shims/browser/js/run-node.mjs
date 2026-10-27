@@ -35,7 +35,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -409,9 +409,16 @@ function snapWrite(name, m) {
 }
 function snapMem(name) {
   const map = JSON.parse(readFileSync(`${name}.map`, 'utf8'));
-  const all = readFileSync(`${name}.bin`);
+  // Run by run: a kernel's file passes what one read may take (2 GiB).
+  const fd = openSync(`${name}.bin`, 'r');
   let off = 0;
-  const runs = map.runs.map(([at, len]) => { const r = [at, all.subarray(off, off + len)]; off += len; return r; });
+  const runs = map.runs.map(([at, len]) => {
+    const b = Buffer.allocUnsafe(len);
+    for (let got = 0; got < len;) got += readSync(fd, b, got, len - got, off + got);
+    off += len;
+    return [at, b];
+  });
+  closeSync(fd);
   return { length: map.length, runs };
 }
 function snapRead(dir) {

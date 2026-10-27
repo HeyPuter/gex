@@ -32,6 +32,13 @@ done
 [ -n "$CRT" ] && [ -f "$CRT/udivti3.c" ] || { echo "build-sysroot64: no compiler-rt builtins sources (GEX_CRT_SRC)" >&2; exit 2; }
 JOBS=${JOBS:-4}
 . "$HERE/flags64.sh"
+# GEX_SNAPSHOT=1: the snapshot flavour (as build-sysroot.sh's): the libc's
+# GEX_SNAPSHOT hook and libgex-snap/'s wasm64 root; wcc64 sees the
+# lib/gex-snapshot it leaves and instruments what reaches the blocking
+# calls, so everything here takes the legacy exception instructions.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  WASM64_CFLAGS="$(printf '%s' "$WASM64_CFLAGS" | sed 's/-wasm-use-legacy-eh=false/-wasm-use-legacy-eh=true/') -DGEX_SNAPSHOT"
+fi
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/libgex-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"
@@ -59,7 +66,9 @@ cp -rL /usr/include/asm "$SR/asm"
 # libgex: the wasm32 runtime's setjmp and dlopen (data-model neutral C) and
 # the x86-64 signal-frame runner.
 gobjs=
-for f in "$HERE/libgex/setjmp.c" "$HERE/libgex/dl.c" "$HERE/libgex64/signal.c"; do
+# The snapshot flavour's part (libgex-snap/) only in its sysroot.
+snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/call.c $HERE/libgex-snap/entry64.c"
+for f in "$HERE/libgex/setjmp.c" "$HERE/libgex/dl.c" "$HERE/libgex64/signal.c" $snapsrc; do
   o="$OUT/libgex-build/$(basename "$f").o"
   clang $WASM64_CFLAGS --sysroot="$OUT/sysroot" -isystem "$SR" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
   gobjs="$gobjs $o"
@@ -106,4 +115,5 @@ fi
 # ICALL pass (its Win64 mode)
 "$HERE/llp64/build.sh" "$OUT/sysroot/lib"
 "$HERE/icall/build.sh" "$OUT/sysroot/lib"
+if [ -n "${GEX_SNAPSHOT:-}" ]; then touch "$OUT/sysroot/lib/gex-snapshot"; else rm -f "$OUT/sysroot/lib/gex-snapshot"; fi
 echo "sysroot: $OUT/sysroot"

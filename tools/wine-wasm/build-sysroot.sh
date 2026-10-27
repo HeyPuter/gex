@@ -69,7 +69,7 @@ make -s -j"$JOBS" install-headers install-libs >/dev/null
 mkdir -p "$OUT/libgex-build"
 gobjs=
 # The snapshot flavour's part (libgex-snap/) only in its sysroot.
-snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/*.c"
+snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/call.c $HERE/libgex-snap/drive32.c"
 for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s $snapsrc; do
   o="$OUT/libgex-build/$(basename "$f").o"
   clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"

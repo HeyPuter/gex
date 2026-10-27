@@ -68,7 +68,7 @@ pub mod i386;
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
 pub use syscalls::{
-    clock_ns, hold_monotonic, set_guest_clock, share_monotonic_base, share_monotonic_held, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
+    clock_ns, monotonic_held, set_monotonic_held, set_guest_clock, share_monotonic_base, share_monotonic_held, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
     SyscallOutcome, ThreadState,
 };
 pub use proclive::{KernelProcSource, ProcCell};

@@ -13,7 +13,10 @@ cannot be analysed this way (a name asyncify's list cannot carry).
 
 For shared libraries and programs linked against them:
 --also names more imports that may fork (other modules' functions their
-gex.forkreach summaries say may, or whose provider is unknown); --indirect
+gex.forkreach summaries say may, or whose provider is unknown); --quoted takes
+functions whose names the text format quotes (C++'s, with spaces and
+commas) and prints one name per line, as a list file carries them
+(asyncify-onlylist@@FILE); --indirect
 makes every indirect call reach (the callee may be another module's);
 --exports FILE writes the exports that reach, one per line (the module's
 own gex.forkreach summary); --ignore F,... names functions taken not to
@@ -23,7 +26,7 @@ program)."""
 import re, subprocess, sys
 
 argv = sys.argv[1:]
-also, indirect, exports_out, ignore = set(), False, None, set()
+also, indirect, exports_out, ignore, quoted = set(), False, None, set(), False
 while argv and argv[0].startswith('--'):
     o = argv.pop(0)
     if o == '--also':
@@ -34,10 +37,22 @@ while argv and argv[0].startswith('--'):
         exports_out = argv.pop(0)
     elif o == '--ignore':
         ignore |= set(argv.pop(0).split(','))
+    elif o == '--quoted':
+        quoted = True
 dis, path, target = argv[:3]
 roots = set(argv[3:])
 mod, imp = target.split('.', 1)
 text = subprocess.run([dis, path], capture_output=True, text=True, check=True).stdout
+# (--quoted: each quoted name stands in the text as a token of its own)
+qnames, qtok = [], {}
+if quoted:
+    def _q(m):
+        t = qtok.get(m.group(1))
+        if t is None:
+            t = qtok[m.group(1)] = '$\x00q%d' % len(qnames)
+            qnames.append(m.group(1))
+        return t
+    text = re.sub(r'\$"((?:[^"\\]|\\.)*)"', _q, text)
 
 NAME = r'\$([^\s()]+)'
 types = {}           # type name -> signature
@@ -114,6 +129,14 @@ if exports_out:
         for e in sorted(e for e, f in exports.items() if f in reach):
             fh.write(e + '\n')
 out = sorted(f for f in reach if f in funcs and f not in roots)
+if quoted:
+    def _name(f):
+        return qnames[int(f[2:])] if f.startswith('\x00q') else f
+    out = [_name(f) for f in out]
+    if any('\n' in f or '\\' in f for f in out):
+        sys.exit(1)
+    print('\n'.join(out))
+    sys.exit(0)
 if any(re.search(r'[,"\\\s]', f) for f in out):
     sys.exit(1)
 print(','.join(out))

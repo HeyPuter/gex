@@ -3811,6 +3811,12 @@ pub extern "C" fn k_mono_held(add: u64) -> u64 {
     MONO_HELD.fetch_add(add, Ordering::AcqRel) + add
 }
 
+/// Where that is, for the page to add to.
+#[no_mangle]
+pub extern "C" fn k_mono_held_at() -> u32 {
+    &MONO_HELD as *const std::sync::atomic::AtomicU64 as u32
+}
+
 /// The benchmark clocks every process reads (gex-kernel `set_guest_clock`):
 /// the monotonic clocks' speed in thousandths (high half) and the seconds
 /// the wall clock is set back (low half, signed); 0 for real time.
