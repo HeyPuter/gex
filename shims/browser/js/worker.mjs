@@ -1029,7 +1029,7 @@ async function handle(msg) {
   // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
-    const net = new NodeNetwork();
+    const net = new NodeNetwork({ pageHosts: msg.pageHosts ? new Map(msg.pageHosts) : null, tcp: msg.network === true });
     if (single.on) net.onActivity = () => sched.wake();
     gex.useNetwork(net);
   }
@@ -1044,10 +1044,11 @@ async function handle(msg) {
     // WebSocket of its own here would never deliver.
     const { NetProxy } = await bridge('net');
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
-  } else if (msg.wispUrl) {
+  } else if (msg.wispUrl || (msg.pageHosts && !msg.network)) {
     // The site's Wisp client, imported only when a proxy was named.
     const { WispNetwork } = await import('../../../web/src/net.js');
-    const net = new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e }));
+    const net = new WispNetwork(msg.wispUrl ?? null, (e) => port.post({ kind: 'net', event: e }),
+      { pageHosts: msg.pageHosts ? new Map(msg.pageHosts) : null });
     // Opened and waited for: constructing one only remembers the address, and
     // until the WebSocket has said hello `open` answers zero -- which the shim
     // turns into `ENETUNREACH`. A proxy that cannot be reached is not a reason
@@ -1444,7 +1445,7 @@ async function handle(msg) {
     exitMsg.workerRuns = runs;
     exitMsg.giveBack = !single.on && !thread && !carries && !gone && recyclable
       && (msg.kind === 'adopt' || msg.kind === 'run')
-      && status >= 0 && status < 128 && !msg.network && !msg.wispUrl;
+      && status >= 0 && status < 128 && !msg.network && !msg.wispUrl && !msg.pageHosts;
     port.post(exitMsg);
   } catch (e) {
     // A thread that failed before its claim gives its promised slot back.

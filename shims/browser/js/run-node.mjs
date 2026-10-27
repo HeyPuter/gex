@@ -37,10 +37,26 @@
 
 import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
 import { spareMemories } from './lazy-fetch.mjs';
+
+/** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as `[name, base]` pairs, a
+ *  directory as a `file:` URL. */
+function pageHostsFromEnv(v) {
+  if (!v) return undefined;
+  const out = [];
+  for (const item of v.split(',')) {
+    const at = item.indexOf('=');
+    if (at <= 0) continue;
+    const name = item.slice(0, at).toLowerCase(), to = item.slice(at + 1);
+    const base = /^[a-z]+:/i.test(to) ? to : pathToFileURL(resolve(to)).href;
+    out.push([name, base.endsWith('/') ? base : `${base}/`]);
+  }
+  return out.length ? out : undefined;
+}
 
 /** GEX_PROVIDER_DIRS as the shim takes it (`gex_provider_sources`). */
 function providerSources(dirs) {
@@ -521,7 +537,11 @@ const host = new ProcessHost({
     // GEX_NETWORK gives the guest a network of real TCP sockets. Inherited:
     // apt fetches in a forked helper, so the one process needing a network was
     // the only one without one when this was not carried.
-    network: !!process.env.GEX_NETWORK,
+    network: process.env.GEX_NETWORK ? true : process.env.GEX_PAGE_HOSTS ? 'hosts' : false,
+    // GEX_PAGE_HOSTS=name=DIR_OR_URL,...: hosts answered from those files
+    // (page-host.mjs), as a page's `pageHosts`; with no GEX_NETWORK, the
+    // guest reaches only these.
+    pageHosts: pageHostsFromEnv(process.env.GEX_PAGE_HOSTS),
     // GEX_WL_STUB: run the shim's gex-wayland compositor with a headless present
     // (no canvas), so a native-wayland guest connects and inits under node --
     // for reproducing the browser-only native-wayland thread deadlock with node
