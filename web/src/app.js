@@ -882,8 +882,8 @@ function mergeEnv(base = [], more = null) {
 }
 
 /**
- * The build's launch file (gex-eject: a 32-bit Wine page's, kind "wine32", or an NT-layer
- * program's) as the options `start` reads. Site paths in it (`/project/...`)
+ * The build's launch file (gex-eject: a 32-bit Wine page's, kind "wine32") as
+ * the options `start` reads. Site paths in it (`/project/...`)
  * are under `at`'s base.
  */
 export function fromLaunch(m, at = (p) => p) {
@@ -958,30 +958,7 @@ function launchBuild(m, at) {
     };
   }
   if (m.unsupported) throw new Error(`gex-eject: this project has no web build: ${m.unsupported}`);
-  const switches = {
-    cgen: '2',
-    cgenurl: at(`project/${m.cgen ?? 'build/web/cgen'}`),
-    aot: '1',
-    unguarded: m.unguarded ? '1' : '0',
-  };
-  if (m.direct) switches.direct = '1';
-  return {
-    tar: ['project/build/web/rootfs.tar'],
-    exe: m.exe,
-    argv: m.args ?? [],
-    env: [`GEX_WINE_PREFIX=${m.prefix}`, ...(m.settings ?? []), ...(m.env ?? [])],
-    cwd: m.cwd && m.cwd !== '/' ? m.cwd : undefined,
-    size: m.size ?? 'fit',
-    mtimes: false,
-    featuresOff: m.features_off ?? [],
-    aot: '1',
-    gl: !!m.gl,
-    glBackend: 'wgpu',
-    pack,
-    preload: `project/${m.cgen ?? 'build/web/cgen'}/preload.json`,
-    persist: m.persist ? { dir: m.persist, db: `gex-eject:${m.exe}` } : null,
-    switches,
-  };
+  throw new Error(`gex-eject: the build's launch file is of kind ${JSON.stringify(m.kind)}, not a 32-bit Wine page's`);
 }
 
 /**

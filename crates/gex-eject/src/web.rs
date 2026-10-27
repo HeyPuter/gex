@@ -466,7 +466,7 @@ const server = createServer(async (req, res) => {
 "#;
 
 /// `user/index.html`: the example page, the same for every kind of project
-/// (a Linux program, an NT-layer one, a 32-bit Wine page). Written once; the user's
+/// (a Linux program, a 32-bit Wine page). Written once; the user's
 /// from then on. Everything the program needs is the app library's
 /// (`app.mjs`, `start()`): the page only gives it an element. Its own file,
 /// so a site put together without `gexc eject` can copy it as it is.

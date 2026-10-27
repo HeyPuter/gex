@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--wgsl-cache FILE] [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe]
+//                           [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE]
 //
-// PROJECT is a built project (`gexc eject ... --web-shim ...`,
-// then ./build.sh). OUT gets:
+// PROJECT is a built 32-bit Wine project (`gexc eject` of a
+// tools/eject/record-wine32.mjs recording, then ./build.sh). OUT gets:
 //   index.html     the project's page (user/index.html, the user's), which
 //                  imports app.mjs and calls its start()
-//   app.mjs, assets/, gex/, vendor/   the app library (runtime/web/page, or
-//                  a 32-bit Wine build's build/web/page), runtime and Mesa, plain files
-//   project/build/web/nt.json, project/build/web/rootfs.tar.zst, and the
-//                  units the browser loads (project/build/units/...)
+//   app.mjs, assets/, gex/, vendor/   the app library (the build's
+//                  build/web/page), runtime and Mesa, plain files
+//   project/build/web/nt.json (the launch), the bundle, and the units the
+//                  browser loads
 //   pack.json      every packed file: size, compressed size; the build id
 //   _headers       caching and isolation headers (Netlify, Cloudflare Pages)
 //   serve.mjs      a static server with the same headers (node serve.mjs [port])
@@ -18,15 +19,12 @@
 // Every file of the bundle over 64 KiB, and the units' over 4 KiB, is zstd-compressed (-19
 // --long=27, cached beside OUT in OUT.zcache by content) as FILE.zst, which
 // the library fetches and decodes itself (app.js, pack.json). No service
-// worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
-// (scripted input, the 4x clock); without it they are dropped, so a player
-// gets the real clock and their own input. --drop removes a guest path from
-// the bundle (e.g. a benchmark's seed-pinning mod). --late FILE and
-// --boot-units FILE: what goes in the background fill (below).
+// worker: the host sends the isolation headers (serve.mjs, _headers).
+// --late FILE and --boot-units FILE: what goes in the background fill (below).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
@@ -36,8 +34,8 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
-// A 32-bit Wine page's site (below): --strip takes the debug sections out of every
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--level', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
+// --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
 // next to each other in the tar so zstd's window stores the second as a match.
@@ -48,15 +46,17 @@ const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '
 // own directory) keeps the files whose bytes are DIR's in pieces of their
 // own, which a rebuild of the rest never changes.
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--wgsl-cache FILE] [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe] [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE]');
   process.exit(2);
 }
 const level = opt('--level', '19');
-// A 32-bit Wine page's project (gexc eject of a tools/eject/record-wine32.mjs recording):
-// build/web/wine32.json instead of nt.json. See `wine32Site` below.
-const wine32 = existsSync(join(project, 'build/web/wine32.json')) ? JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8')) : null;
-const nt = wine32 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
-const title = opt('--title', wine32 ? (wine32.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
+// The project's launch (gex-eject's build/web/wine32.json). See `wine32Site` below.
+if (!existsSync(join(project, 'build/web/wine32.json'))) {
+  console.error(`eject-site: ${project} has no build/web/wine32.json (a built 32-bit Wine project)`);
+  process.exit(2);
+}
+const wine32 = JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8'));
+const title = opt('--title', (wine32.title ?? 'gex').replace(/^Untitled - /, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -123,143 +123,8 @@ function coldPack(dir, path) {
  *  so a changed file changes its own piece and no other. */
 const PIECES = 16;
 
-if (wine32) {
-  wine32Site();
-  process.exit(0);
-}
+wine32Site();
 
-/** Put `src` at site path `path` as it is (what the page loads by URL). */
-function plain(src, path) {
-  const dst = join(out, path);
-  mkdirSync(dirname(dst), { recursive: true });
-  copyFileSync(src, dst);
-}
-
-// The page and the runtime, plain: nothing between the page and the server
-// decodes (a host's own compression still applies).
-walk(join(project, 'runtime/web/page'), (p, rel) => plain(p, rel));
-// --wgsl-cache FILE: Mesa's shader translations from a training run
-// (play.mjs's `wgsl` step), beside the Mesa glue, where mesa-gl.js looks.
-// Mesa refuses a blob another build of it made, so it goes stale with Mesa.
-if (opt('--wgsl-cache', null)) plain(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
-
-// The units the browser loads: each unit's module and entries, region
-// entries, providers, stateful providers, indirect-call profiles (part of a
-// unit's key) and the link groups' index. Not the native build's (.cwasm,
-// objects, recovery, precompiled).
-const cgen = nt.cgen;
-const units = join(project, cgen);
-let unitBytes = 0;
-const preload = [];
-// Only this build's units: a unit cache keeps every key it ever built
-// (a re-keyed rebuild leaves the old ones). build/build.json names the
-// images' units; the NT trampolines' unit is not an image, and is kept when
-// it was linked by this build (no older than the oldest image unit).
-const built = JSON.parse(readFileSync(join(project, 'build/build.json'), 'utf8'));
-const ids = new Set(built.images.map((i) => i.identity).filter(Boolean));
-const since = Math.min(...[...ids].map((k) => statSync(join(units, k, 'c.wasm')).mtimeMs)) - 60000;
-// The NT trampolines' unit is no image's: nt.json names it (older builds
-// did not, and fall back to the age test).
-if (nt.trampolines) ids.add(nt.trampolines);
-const current = (key) => ids.has(key) || (existsSync(join(units, key, 'c.wasm')) && statSync(join(units, key, 'c.wasm')).mtimeMs >= since);
-let stale = 0;
-walk(units, (p, rel) => {
-  const parts = rel.split('/');
-  const top = parts[0];
-  if (['objects', 'recovery', 'precompiled'].includes(top)) return;
-  const key = top === 'regions' ? parts[1] : parts.length === 2 && /^[0-9a-f]{64}/.test(top) ? top : null;
-  if (key && !current(key)) { stale++; return; }
-  if (rel.includes('/recovery/')) return;
-  const name = rel.split('/').pop();
-  const want = name === 'c.wasm' || name === 'c.entries'
-    || (top === 'providers' && name.endsWith('.wasm'))
-    || top === 'stateful'
-    || (top === 'icall' && name.endsWith('.txt'))
-    || (top === 'groups' && name === 'index.txt');
-  if (!want) return;
-  unitBytes += statSync(p).size;
-  place(p, join('project', cgen, rel));
-  // What the library compiles while the bundle downloads (its preload list):
-  // module names as gex.mjs keys them.
-  const url = `/project/${cgen}/${rel}`;
-  if (name === 'c.wasm') preload.push([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, url]);
-  else if (top === 'providers') preload.push([`cgenfile:${rel}`, url]);
-  // Every other file a Worker reads from the unit cache with a synchronous
-  // request (entries, providers, Lua, icall profiles, the groups' index):
-  // fetched by the page ahead and handed to every Worker.
-  if (name !== 'c.wasm') preload.push([`file:${rel}`, url]);
-});
-
-// Largest first: a game's exe unit is often most of the compile.
-preload.sort((a, b) => (files[b[1]]?.size ?? 0) - (files[a[1]]?.size ?? 0));
-writeFileSync(join(out, 'project', cgen, 'preload.json'), JSON.stringify(preload));
-
-// The bundle, without what --drop names, with --overlay DIR's files (guest
-// paths under DIR, as user/files) laid over it.
-const drops = opts('--drop');
-const overlays = opts('--overlay');
-let tar = join(project, 'build/web/rootfs.tar');
-if (drops.length || overlays.length) {
-  tar = join(zcache, 'rootfs.tar');
-  execFileSync('tar', ['-C', join(project, 'build/rootfs'), '-chf', tar, ...drops.map((d) => `--exclude=.${d}`), '.']);
-  for (const d of overlays) execFileSync('tar', ['-C', d, '-rhf', tar, '.']);
-}
-place(tar, 'project/build/web/rootfs.tar');
-
-// How to start: the recorded settings, less the benchmark's.
-const bench = /^(GEX_WIN_INPUT|GEX_WIN_TIME_SCALE|GEX_WIN_FIXED_TIME)=/;
-let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.test(s));
-// --input SCRIPT: GEX_WIN_INPUT instead of the recorded one (a benchmark's
-// clicks, by presented frame).
-if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_WIN_INPUT=')), `GEX_WIN_INPUT=${opt('--input', null)}`];
-// --args 'A B': the program's arguments instead of the recorded ones ('' for none).
-const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
-// Direct present for a GL program (the page composites again whenever a
-// second window or one without GL appears); --no-direct: always composite.
-const ntOut = { ...nt, settings, args, direct: !!nt.gl && !flag('--no-direct') };
-mkdirSync(join(out, 'project/build/web'), { recursive: true });
-writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
-
-// The page (the user's). The build: everything served, packed or not (a
-// page-only change is a new build too).
-page();
-const smallHash = createHash('sha256');
-walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
-const build = sha(JSON.stringify(files) + JSON.stringify(ntOut) + smallHash.digest('hex')).slice(0, 12);
-writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
-
-writeHosting();
-noTestPage();
-
-const total = Object.values(files).reduce((a, f) => a + f.size, 0);
-const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
-let small = 0;
-walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
-writeFileSync(join(out, 'README.txt'), `${title} in the browser (an ejected Windows program on gex), build ${build}
-
-Serve this directory as static files at the root of an HTTPS origin (or
-http://localhost): node serve.mjs [port] does, with the headers below.
-
-Browser: a desktop Chrome or Edge with WebGPU and hardware acceleration.
-Download: ${mb(ztotal + small)} MB (${mb(total)} MB unpacked), cached by the browser after
-the first load; saves stay in this browser's IndexedDB.
-
-Headers (_headers has them for Netlify and Cloudflare Pages):
-  every file:  Cross-Origin-Opener-Policy: same-origin
-               Cross-Origin-Embedder-Policy: require-corp
-  *.zst and assets/*: Cache-Control: public, max-age=31536000, immutable
-  the rest:    Cache-Control: no-cache
-The isolation headers are required (threads need them); the launcher says so
-when they are missing.
-
-The .zst files are decoded by the page; serve them as plain bytes, with no
-Content-Encoding. nginx:
-  location / {
-    add_header Cross-Origin-Opener-Policy same-origin always;
-    add_header Cross-Origin-Embedder-Policy require-corp always;
-    types { application/javascript mjs js; application/wasm wasm; application/json json; text/html html; }
-  }
-`);
 /** _headers and serve.mjs: the headers the site wants from its host. */
 function writeHosting() {
   // Headers: isolation everywhere; packed files and hashed assets cached for
