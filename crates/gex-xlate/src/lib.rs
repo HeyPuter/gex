@@ -1530,6 +1530,23 @@ fn is_volatile(addr: u64) -> bool {
 /// its head only, which still catches a JIT reusing the region.
 const GUARD_MAX: usize = 256;
 
+/// How much of `memory` exists: on wasm, no more than the memory's current
+/// size (a guest slice names more than has been grown).
+fn live_len(memory: &[u8]) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ((core::arch::wasm32::memory_size(0) as u64) << 16).min(memory.len() as u64) as usize
+    }
+    #[cfg(target_arch = "wasm64")]
+    {
+        ((core::arch::wasm64::memory_size(0) as u64) << 16).min(memory.len() as u64) as usize
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        memory.len()
+    }
+}
+
 fn lift_one(
     addr: u64,
     memory: &[u8],
@@ -1547,9 +1564,14 @@ fn lift_one(
     });
     let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
+    // `memory` may span the whole nameable space (the page's guest slice):
+    // only what the memory has grown to is read. A constant address in the
+    // pages KUSER_SHARED_DATA folding moves reads them where they are.
+    let live = live_len(memory);
     let read = |a: u64, bytes: u32| -> Option<u64> {
-        let off = a as usize;
-        if off + bytes as usize > memory.len() {
+        let a = gex_abi::fold_kuser(a).unwrap_or(a);
+        let off = usize::try_from(a).ok()?;
+        if off.checked_add(bytes as usize)? > live {
             return None;
         }
         Some(match bytes {

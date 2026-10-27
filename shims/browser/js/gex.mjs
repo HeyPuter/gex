@@ -4729,7 +4729,11 @@ export class Gex {
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         // its runtime's heap: fresh guest pages
         ...(lowered ? { provider_alloc: (size) => e.gex_provider_alloc(size) } : {}),
-        ...(wasmprog ? this.#wasmprogImports(() => inst, mod) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall) } : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst, mod) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? {
+          syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall),
+          // Where this process has KUSER_SHARED_DATA (64-bit Wine's PE side reads it there).
+          kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
+        } : {}),
       },
     };
     // A unit split by function (gex_split): its cold clusters' loader,

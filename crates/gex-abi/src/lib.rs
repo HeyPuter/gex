@@ -1156,6 +1156,15 @@ pub fn kuser_fold_end() -> u64 {
     }
 }
 
+/// A 64-bit Wine process in the compact space (Wine's session programs in a
+/// wasm32 memory, with [`set_kuser_fold_entry`]): the window its native PE
+/// core's data goes in, the top of the DLL band [0x10000000, 0x20000000)
+/// below a 64 KiB guard. Wine places the space's images below it (a data
+/// export's RVA is its offset from the skeleton's base), and it is low, so
+/// that the memory need not be long and every guest access to it is under
+/// [`KUSER_GUARD`].
+pub const WINE64_COMPACT_PE_DATA: (u64, u64) = (0x1fdf_0000, 0x1fff_0000);
+
 /// Where this process has KUSER_SHARED_DATA: [`WINE32_KUSER`] when folding is on, else Windows' address.
 pub fn kuser_address() -> u64 {
     if kuser_fold() {

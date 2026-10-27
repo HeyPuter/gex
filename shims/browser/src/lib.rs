@@ -9908,7 +9908,7 @@ const WINE64_PE_DATA_M64: (u64, u64) = (WINE64_TOP_M64 - 0x21_0000, WINE64_TOP_M
 /// of the island Wine's images are kept in (`winspace::WINE32_ISLAND`), above
 /// every image Wine places there and within 4 GiB of them, so that it does
 /// not pin the memory's length.
-const WINE64_PE_DATA_COMPACT: (u64, u64) = (0x1fdf_0000, 0x1fff_0000);
+const WINE64_PE_DATA_COMPACT: (u64, u64) = gex_abi::WINE64_COMPACT_PE_DATA;
 #[cfg(feature = "shared-memory")]
 const _: () = assert!(WINE64_PE_DATA_COMPACT.1 + 0x1_0000 == winspace::WINE32_ISLAND.1 && WINE64_PE_DATA_COMPACT.0 > winspace::WINE32_ISLAND.0);
 

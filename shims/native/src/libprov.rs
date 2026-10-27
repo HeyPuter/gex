@@ -205,12 +205,26 @@ fn map_anon(state: &mut HostState, addr: u64, len: u64, prot_bits: u32, extra: u
 /// wasmdll::install_shared): above every image, so the RVA from any
 /// skeleton's base is positive. 64-bit Wine's images stay in its code space, below
 /// 2 GiB (Wine's wine64_code_space_limit); its data may use the whole 4 GiB.
-/// Top-down from 4 GiB, the first free range.
+/// Top-down from 4 GiB, the first free range; in the compact space, in
+/// `gex_abi::WINE64_COMPACT_PE_DATA`.
 pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     use gex_kernel::mem::{flags, prot};
     const FLOOR: u64 = 0x8000_0000;
     const STEP: u64 = 0x10_0000;
     let len = (size + 0xffff) & !0xffff;
+    // The compact space (Wine's session programs): the window at the top of
+    // the DLL band, as in the page, under the KUSER guard.
+    if gex_abi::kuser_fold_entry() {
+        let (lo, hi) = gex_abi::WINE64_COMPACT_PE_DATA;
+        let mut at = hi.checked_sub(len).filter(|&a| a >= lo);
+        while let Some(a) = at {
+            if let Ok(a) = map_anon(state, a, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name) {
+                return Ok(a);
+            }
+            at = a.checked_sub(0x1_0000).filter(|&a| a >= lo);
+        }
+        bail!("mapping {name}: no {len:#x} bytes free in the compact PE data window");
+    }
     let mut at = (0x1_0000_0000u64.saturating_sub(len + STEP)) & !0xffff;
     while at >= FLOOR {
         let r = map_anon(state, at, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name);
