@@ -1340,7 +1340,7 @@ async function handle(msg) {
         ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_lift_why(i)))
         : undefined,
       // For each address that translated although its span was filled, whether
-      // the slot it dispatches through is written now. See #136.
+      // the slot it dispatches through is written now.
       liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // What the translator did: instructions lifted, wasm bytes, translations,

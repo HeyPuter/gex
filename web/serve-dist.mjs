@@ -14,7 +14,7 @@
 // SharedArrayBuffer, and threads and the global kernel silently vanish.
 //
 // Open the URL it prints, choose a demo, and read the per-process console lines
-// `[gex] pid N: lived Xms (guest Yms)` -- guest-side timing reads zero (#134).
+// `[gex] pid N: lived Xms (guest Yms)` -- guest-side timing reads zero.
 
 import { createServer } from 'node:http';
 import { appendFileSync } from 'node:fs';

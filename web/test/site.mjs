@@ -630,7 +630,7 @@ for (const id of list) {
       '--enable-logging=stderr',
       '--v=0',
       // `performance.memory` exists only behind this -- the only way to measure
-      // the JS heap from a Worker here, and the only account of the V8 OOM (#145).
+      // the JS heap from a Worker here, and the only account of the V8 OOM.
       '--enable-precise-memory-info',
       ...(debugPort ? [`--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*'] : []),
       // `GEX_USER_DATA_DIR=<dir>`: a profile that outlives this launch, so a

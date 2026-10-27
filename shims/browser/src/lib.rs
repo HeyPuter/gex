@@ -2504,7 +2504,7 @@ pub extern "C" fn gex_set_wl_trace(on: i32) {
 
 /// Dump every thread's register context on a crash -- called from the JS trap
 /// handler so the common OOB/"trapped inside" crash (not just guest SIGABRT)
-/// names all threads. TWO threads with the SAME `ctx=` is issue #126: two
+/// names all threads. TWO threads with the SAME `ctx=` is what this catches: two
 /// Workers on one register context, which clobbers stacks and looks like
 /// corruption anywhere. Reads the thread table, which needs no kernel lock,
 /// so it answers even when a crash left the kernel held.
@@ -2706,11 +2706,11 @@ static PENDING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static PENDING_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many times talc has asked the arena for another span, and the largest
-/// allocation that forced one. See #140.
+/// allocation that forced one.
 static HEAP_REFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEAP_BIGGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Bytes held by `Jit::registry`, for the arena report. See #140.
+/// Bytes held by `Jit::registry`, for the arena report.
 static REGISTRY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn arena_note(who: usize, len: u64) {
@@ -6296,7 +6296,7 @@ fn current_image_program(p: &Px<'_>) -> Option<String> {
 /// `(owner, page)` -- while `IMAGE_PAGES` does have the page, or the owner
 /// would not have resolved. Both maps are written from the same list in the
 /// same call, so the two must be disagreeing about *which* index owns the
-/// page. This prints the candidates and what each answers. See #136.
+/// page. This prints the candidates and what each answers.
 #[no_mangle]
 pub extern "C" fn gex_explain_page(page: u64) {
     with_px(|px| with_jit_only(|_| {
@@ -11999,7 +11999,7 @@ fn shared_modules_of_object(
 /// The registry is what a joining Worker replays into its own tables (its
 /// tables are per-instance; only the dispatch *directory* is shared). Until a
 /// process threads, nothing is kept -- a single-threaded `apt` would otherwise
-/// hold ~1,640 modules against a fixed heap (#140) -- so `gex_jit_installed`
+/// hold ~1,640 modules against a fixed heap -- so `gex_jit_installed`
 /// gates the keep on `ever_threaded`. That gate means every module lifted
 /// before the first thread spawned is missing from the registry: the main
 /// Worker installed it in *its* tables and wrote the shared directory to point

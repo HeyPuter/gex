@@ -937,7 +937,7 @@ export function metadataSection(wasm) {
 // The dispatch tables a translated module imports and exports, in index order.
 // More than one because V8 caps a table at ten million entries (38 MiB of guest
 // text) and the graphics rootfs exceeds that. Table 0 keeps its bare name for
-// modules built when there was only one. See #64.
+// modules built when there was only one.
 const TABLE_NAMES = [
   'dispatch',
   'dispatch1',
@@ -1326,7 +1326,7 @@ export class Gex {
   #wantLibrary = null;
   /// The dispatch pages to narrate, by number. Empty in a normal run; the gate
   /// is the set itself, since `opts.strace` never reaches a Worker. `?trace=1`
-  /// prints for these only. See #136.
+  /// prints for these only.
   static watchPages = new Set();
   /// Fill a whole image page on first ask. See `fillSlotNow`.
   static wholePage = false;
@@ -1347,7 +1347,6 @@ export class Gex {
   static askState = new Map();
   /// A dispatch page whose directory writes should be narrated, or -1: every
   /// writer of `DISPATCH_DIR` reports itself, naming the one that moves it.
-  /// See #136.
   static watchDir = -1;
   /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
   static wasmDlls = '';
@@ -1955,7 +1954,7 @@ export class Gex {
     // The processors the guest sees: each of its threads is a Worker, so the
     // host's count (`opts.cpus` overrides it).
     this.#shim.exports.gex_set_cpus?.(opts.cpus || globalThis.navigator?.hardwareConcurrency || 1);
-    // Narrate one page's directory writes, in every process. See #136.
+    // Narrate one page's directory writes, in every process.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
     // it into the shim's own region, above everything the guest maps.
@@ -2552,7 +2551,7 @@ export class Gex {
       if (logOn('record')) this.#shim.exports.gex_cgen_set_record?.(1);
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
-    // Narrate one page's directory writes, in every process. See #136.
+    // Narrate one page's directory writes, in every process.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
     const e = this.#shim.exports;
@@ -2727,7 +2726,7 @@ export class Gex {
     if (staging) this.#stageImage(out);
     // A checksum per region, so the child can say whether what it runs on is
     // what was sent: a corrupt copy and a good copy under a disagreeing kernel
-    // look identical otherwise (#96).
+    // look identical otherwise.
     if (globalThis.GEX_DEBUG_EXIT) for (const r of out) r.sum = sum32(r.bytes);
     if (globalThis.GEX_DEBUG_EXIT) {
       const bytes = out.reduce((n, r) => n + r.bytes.byteLength, 0);
@@ -3925,7 +3924,7 @@ export class Gex {
       // Every slot this process has claimed -- not the highest any module needed.
       // The directory is written when a page is *claimed*, not when its module
       // installs, so the max over inherited modules misses a page claimed after
-      // the last install, and a branch there traps rather than misses. See #114.
+      // the last install, and a branch there traps rather than misses.
       slots: e.gex_jit_slots_total?.() ?? 0,
       pages: this.#pageMap(),
       // Which object each page belongs to -- the only part that outlives the
@@ -7083,7 +7082,7 @@ export class Gex {
     // table; each table's share is that total clamped to its window. Finite,
     // not `Infinity`: the window arithmetic multiplies this by the table index
     // and `0 * Infinity` is `NaN`. A pre-export shim has one table, so any
-    // unreachable number is right. See #64.
+    // unreachable number is right.
     const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
     // Which table the module's highest slot lands in, and how far into it.
     // Slot indices are global (table `slot / per`, offset `slot % per`), so a
@@ -8335,7 +8334,7 @@ export class Gex {
     e.gex_free?.(gp, lazy.meta.length);
     // No grow here: a library's pages reach the table one at a time as
     // `#pageBase` claims them. Counted unconditionally because publishing is a
-    // real per-process cost that no other counter accounts for (#125).
+    // real per-process cost that no other counter accounts for.
     this.#publishes++;
     this.#publishMs += performance.now() - t0;
     if (globalThis.GEX_DEBUG_EXIT) {
@@ -8402,7 +8401,7 @@ export class Gex {
 
   /**
    * For each address that translated although its span had been filled, whether
-   * its dispatch slot is written (#136 diagnostic). A written slot means
+   * its dispatch slot is written (a diagnostic). A written slot means
    * dispatch reads elsewhere than the fill wrote; a stub means the module holds
    * no block there. The shim collects the addresses; the table is read here.
    */
@@ -8428,7 +8427,7 @@ export class Gex {
         what = 'no base';
         // And why there is none: which images claim this page, which one
         // `image_is_ours` picks, and whether that one has a table for it.
-        // Only the shim can see any of that. See #136.
+        // Only the shim can see any of that.
         if (seen.size < 3 && !seen.has(page)) {
           seen.add(page);
           e.gex_explain_page?.(BigInt(page));
@@ -8443,7 +8442,7 @@ export class Gex {
         // A stub, asked again for exactly this address's span: `FILL_ASKED`
         // keys a span once, so if the fill later runs at a different base the
         // gap is lost. `stub->written` means the span was mismatched,
-        // `stub->stub` means there is nothing to write. See #136.
+        // `stub->stub` means there is nothing to write.
         if (what === 'stub') {
           const owner = e.gex_closure_owner
             ? e.gex_closure_owner(BigInt(page >>> 0)) : -1;
@@ -8512,8 +8511,8 @@ export class Gex {
   fillSlotNow(page) {
     const e = this.#shim.exports;
     // Every object that covers this page, not just the first: translation is
-    // batched by block, so one image page can span several objects. See #136
-    // and `gex_closure_owner_at`.
+    // batched by block, so one image page can span several objects. See
+    // `gex_closure_owner_at`.
     let owned = false;
     let filled = false;
     for (let k = 0; ; k++) {
@@ -8526,7 +8525,6 @@ export class Gex {
       const lazy = this.#lazyClosure[owner];
       // Which of the three ways this gives up, for the watched pages: an owned,
       // claimed image page should be answered here and after an execve was not.
-      // See #136.
       if (Gex.watchPages.has(page) && Gex.#whyNo < 24) {
         Gex.#whyNo++;
         const why = !lazy ? 'no lazy entry'
@@ -8561,7 +8559,7 @@ export class Gex {
       this.#faBaseMs += b1 - b0;
       // `> 0`, not `>= 0`: zero is `#pageBase`'s "no translation" sentinel, and
       // filling at base 0 writes funcrefs over the bottom of table 0 and reports
-      // success, wedging the address for good. See #136.
+      // success, wedging the address for good.
       // askState keeps what the module and table looked like here, so the retry
       // in `liftSlots` can be compared against it.
       const askFrom = this.#fillFrom();
@@ -8579,7 +8577,6 @@ export class Gex {
       this.#faInitMs += performance.now() - b1;
       // Read back the one slot the guest will dispatch through: a span read-back
       // says the fill wrote something, this says it wrote the slot that missed.
-      // See #136.
       if (Gex.watchSlot && at > 0) {
         const mpc = Number(this.#shim.exports.gex_fill_pc?.() ?? 0n);
         if (mpc && Gex.#whySlot < 12) {

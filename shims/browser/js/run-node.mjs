@@ -281,8 +281,8 @@ try {
     module: await WebAssembly.compile(readFileSync(path)),
     // Four gigabytes, all a wasm32 memory can be. The rootfs lives here (the
     // filesystem belongs to the kernel), so this ceiling is the largest rootfs
-    // a run can have -- at one gigabyte a full Debian arm64 image did not fit
-    // (#91). `maximum` reserves address space, not pages, so raising it is free.
+    // a run can have -- at one gigabyte a full Debian arm64 image did not
+    // fit. `maximum` reserves address space, not pages, so raising it is free.
     // GEX_KERNEL_MAX_MIB (a test-only switch): a smaller
     // ceiling, so the kernel's memory runs out the way an engine's does.
     memory: new WebAssembly.Memory({ initial: 2048, maximum: process.env.GEX_KERNEL_MAX_MIB ? Math.max(2048, Math.min(65536, Number(process.env.GEX_KERNEL_MAX_MIB) * 16)) : 65536, shared: true }),
@@ -497,7 +497,7 @@ const host = new ProcessHost({
     // GEX_RECOMPILE_OBJECTS statically recompiles each shared object once it
     // proves hot -- the feature this project exists for. The value is a cap in
     // KiB of mapped text; 8 MB is the largest that works (Mesa's rasteriser
-    // above it brings the run down inside ld.so). See #73.
+    // above it brings the run down inside ld.so).
     recompileObjects: process.env.GEX_RECOMPILE_OBJECTS
       ? Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192
       : 0,
@@ -517,7 +517,7 @@ const host = new ProcessHost({
     watchMem: process.env.GEX_WATCH_MEM || undefined,
     // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
     // invisible until dereferenced, so this names the block that arrives with
-    // the bad value, not the one that dies on it. See #73.
+    // the bad value, not the one that dies on it.
     checkSp: !!process.env.GEX_CHECK_SP,
     // GEX_COHERENT_LOADS emits guest scalar loads/stores as atomic-when-aligned
     // so shared reads stay coherent under true parallelism (V8 can't hoist a

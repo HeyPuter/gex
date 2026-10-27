@@ -193,7 +193,7 @@ export async function start() {
     let failed = null;
     try {
       // Against a deadline (`?wait=`): a program that wedges -- a closure run
-      // does, see #105 -- otherwise leaves the harness waiting for ever.
+      // can -- otherwise leaves the harness waiting for ever.
       const running = runProgram(io.term, {
         elf: exe,
         files,
