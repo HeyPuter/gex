@@ -9,34 +9,7 @@
 
 import { assetUrl, pageParams } from './page-env.js';
 import { startWakeRelay } from '@gex/wl-bridge.mjs';
-
-/** `KeyboardEvent.code` -> Linux evdev keycode, which is what Wayland carries. */
-const EVDEV = {
-  Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7,
-  Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11, Minus: 12, Equal: 13,
-  Backspace: 14, Tab: 15, KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20,
-  KeyY: 21, KeyU: 22, KeyI: 23, KeyO: 24, KeyP: 25, BracketLeft: 26,
-  BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30, KeyS: 31, KeyD: 32,
-  KeyF: 33, KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38, Semicolon: 39,
-  Quote: 40, Backquote: 41, ShiftLeft: 42, Backslash: 43, KeyZ: 44, KeyX: 45,
-  KeyC: 46, KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50, Comma: 51, Period: 52,
-  Slash: 53, ShiftRight: 54, NumpadMultiply: 55, AltLeft: 56, Space: 57,
-  CapsLock: 58, F1: 59, F2: 60, F3: 61, F4: 62, F5: 63, F6: 64, F7: 65, F8: 66,
-  F9: 67, F10: 68, F11: 87, F12: 88, ControlRight: 97, AltRight: 100,
-  Home: 102, ArrowUp: 103, PageUp: 104, ArrowLeft: 105, ArrowRight: 106,
-  End: 107, ArrowDown: 108, PageDown: 109, Insert: 110, Delete: 111,
-  MetaLeft: 125, MetaRight: 126,
-};
-
-// xkb modifier-mask bits, matching the "complete" types the keymap includes.
-const MOD_SHIFT = 1;
-const MOD_LOCK = 2; // Caps
-const MOD_CONTROL = 4;
-const MOD_MOD1 = 8; // Alt
-const MOD_MOD4 = 64; // Super
-
-/** Browser mouse buttons (0 left, 1 middle, 2 right) to Linux `BTN_*` codes. */
-const BTN = { 0: 0x110, 1: 0x112, 2: 0x111 };
+import { EVDEV, BTN, modsOf } from './input-map.js';
 
 export class Compositor {
   #worker;
@@ -233,12 +206,9 @@ export class Compositor {
   #listen(target) {
     const post = (m) => this.#worker.postMessage(m);
     const now = () => performance.now() | 0;
-    const mods = (e) =>
-      (e.shiftKey ? MOD_SHIFT : 0) |
-      (e.ctrlKey ? MOD_CONTROL : 0) |
-      (e.altKey ? MOD_MOD1 : 0) |
-      (e.metaKey ? MOD_MOD4 : 0) |
-      (e.getModifierState?.('CapsLock') ? MOD_LOCK : 0);
+    // Back and forward pressed here: their release is not the browser's
+    // history navigation.
+    const navHere = new Set();
 
     const onMove = (e) => {
       const { x, y } = this.#at(e);
@@ -255,6 +225,7 @@ export class Compositor {
       if (this.#direct && this.#pointerLock && document.pointerLockElement !== target) target.requestPointerLock?.();
       const button = BTN[e.button];
       if (button === undefined) return;
+      if (e.button >= 3) navHere.add(e.button);
       const { x, y } = this.#at(e);
       post({ kind: 'pointer-move', x, y, time: now() });
       post({ kind: 'pointer-button', button, pressed: true, time: now() });
@@ -266,6 +237,7 @@ export class Compositor {
     const onUp = (e) => {
       const button = BTN[e.button];
       if (button === undefined) return;
+      if (navHere.delete(e.button)) e.preventDefault();
       post({ kind: 'pointer-button', button, pressed: false, time: now() });
     };
     const onWheel = (e) => {
@@ -290,7 +262,7 @@ export class Compositor {
       }
       const code = EVDEV[e.code];
       if (code === undefined) return;
-      post({ kind: 'key', code, pressed, mods: mods(e), time: now() });
+      post({ kind: 'key', code, pressed, mods: modsOf(e), time: now() });
       e.preventDefault();
     };
     const onCtx = (e) => e.preventDefault(); // right-click is a button here
