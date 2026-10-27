@@ -174,7 +174,7 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
             n
         }
         Err(e) => {
-            crate::warn_line(&format!("gex-nt: {path}: native wasm32 DLL: {e}\n"));
+            crate::warn_line(&format!("gex-pe: {path}: native wasm32 DLL: {e}\n"));
             crate::end_process(0xc000_0135);
         }
     }
@@ -283,7 +283,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         let functions = gm.read_u32(base + dir as u64 + 28).map_err(|_| "export directory outside memory")? as u64;
         for (idx, link) in &data_list {
             let Some(off) = wp.data_exports.get(&format!("{dll}!{link}")) else {
-                crate::warn_line(&format!("gex-nt: {path}: data export {link} is not in Wine's PE module\n"));
+                crate::warn_line(&format!("gex-pe: {path}: data export {link} is not in Wine's PE module\n"));
                 continue;
             };
             let target = (wp.data + *off as u64).wrapping_sub(base) as u32;
@@ -313,7 +313,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     }
 
     let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
-    crate::warn_line(&format!("gex-nt: native wasm32 module for {path}: {} entries\n", pairs.len()));
+    crate::warn_line(&format!("gex-pe: native wasm32 module for {path}: {} entries\n", pairs.len()));
     if first {
         let len = gex_cgen::provider::slot_names(&wp.wasm).map_err(|e| e.to_string())?.len() as u32;
         wp.install = ftab(|m| m.publish(len, PROVIDER | wp.number, Tier::Unit, &pairs));

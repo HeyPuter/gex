@@ -9797,7 +9797,7 @@ fn set_resume(v: u64) {
         static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u64)>>> = std::sync::Mutex::new(None);
         let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((at.line(), v));
         if fresh {
-            warn_line(&format!("gex-nt: resume at {v:#x} from {}:{}\n", at.file(), at.line()));
+            warn_line(&format!("gex-pe: resume at {v:#x} from {}:{}\n", at.file(), at.line()));
         }
     }
 }

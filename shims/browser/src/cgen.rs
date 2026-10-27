@@ -1127,7 +1127,7 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // line names it, and without it every trampoline misses into tier-1.
     if x.path.starts_with('[') {
         crate::warn_line(&format!(
-            "gex-nt: missing unit: {} (key {}) has no function-tier unit, so every call through it misses into tier-1; \
+            "gex-pe: missing unit: {} (key {}) has no function-tier unit, so every call through it misses into tier-1; \
              build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines32\n",
             x.path, x.key
         ));
@@ -1136,7 +1136,7 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // Loudly, as natively: a unit built at another base (or under another
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
-        "gex-nt: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
+        "gex-pe: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
          {}gexc cgen-image <image> --pe-base {:#x}\n",
         x.path,
         x.base,
@@ -1355,7 +1355,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         let had = binds.len();
         binds.retain(|(_, a)| ftab(|m| m.twin(*a).is_some()));
         if binds.len() < had {
-            crate::warn_line(&format!("gex-nt: provider {file}: {} of {had} exports left unbound (no lifted twin in its unit)\n", had - binds.len()));
+            crate::warn_line(&format!("gex-pe: provider {file}: {} of {had} exports left unbound (no lifted twin in its unit)\n", had - binds.len()));
         }
     }
     let wasm = crate::shim_slice(ptr, len);
@@ -1375,7 +1375,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
                 match builtin_data(&file, wasm) {
                     Ok(b) => memory_base = b as u64,
                     Err(e) => {
-                        crate::warn_line(&format!("gex-nt: provider {file}: {e}\n"));
+                        crate::warn_line(&format!("gex-pe: provider {file}: {e}\n"));
                         return -1;
                     }
                 }
@@ -1388,7 +1388,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
             // lacks, a slot the module lacks) is left to the guest whole.
             let dropped = gex_cgen::provider::whole_groups(&mut pairs, &groups);
             if dropped > 0 {
-                crate::warn_line(&format!("gex-nt: provider {file}: {dropped} exports of incomplete groups left unbound\n"));
+                crate::warn_line(&format!("gex-pe: provider {file}: {dropped} exports of incomplete groups left unbound\n"));
             }
             pairs
         }
@@ -1399,7 +1399,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
                     pairs
                 }
                 Err(e) => {
-                    crate::warn_line(&format!("gex-nt: stateful provider {file}: {e}\n"));
+                    crate::warn_line(&format!("gex-pe: stateful provider {file}: {e}\n"));
                     crate::end_process(0xc000_0135);
                 }
             }
@@ -1418,7 +1418,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         }
     }
     let (regs, dirs, slots) = bridges(&addrs);
-    crate::trace_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    crate::trace_line(&format!("gex-pe: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
 }
@@ -1457,7 +1457,7 @@ fn stateful_pairs(file: &str, wasm: &[u8], names: &[Option<String>], exports: &[
     let (size, align) = dylink_memory(wasm)?;
     let data = provider_alloc_bytes((size as u64).max(16) + (1u64 << align), &format!("[provider {file} data]"))?;
     let data = (data + (1u64 << align) - 1) & !((1u64 << align) - 1);
-    crate::warn_line(&format!("gex-nt: stateful provider {file}: {} exports, data at {data:#x}\n", pairs.len()));
+    crate::warn_line(&format!("gex-pe: stateful provider {file}: {} exports, data at {data:#x}\n", pairs.len()));
     Ok((pairs, data as u32))
 }
 
@@ -1538,7 +1538,7 @@ pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
     match provider_alloc_top_bytes(size as u64, "[provider heap]") {
         Ok(a) => a as u32,
         Err(e) => {
-            crate::warn_line(&format!("gex-nt: provider_alloc_top({size:#x}): {e}\n"));
+            crate::warn_line(&format!("gex-pe: provider_alloc_top({size:#x}): {e}\n"));
             0
         }
     }
@@ -1600,7 +1600,7 @@ pub extern "C" fn gex_provider_alloc(size: u32) -> u32 {
     match provider_alloc_bytes(size as u64, "[provider heap]") {
         Ok(a) => a as u32,
         Err(e) => {
-            crate::warn_line(&format!("gex-nt: provider_alloc({size:#x}): {e}\n"));
+            crate::warn_line(&format!("gex-pe: provider_alloc({size:#x}): {e}\n"));
             0
         }
     }
@@ -1639,7 +1639,7 @@ pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
 }
 
 /// GEX_WIN_ENTRY_LOG: print each pc entered inside a unit's pages without an
-/// entry there, once (`gex-nt: web entry <pc>`), for an ejected project's
+/// entry there, once (`gex-pe: web entry <pc>`), for an ejected project's
 /// training run.
 pub(crate) static ENTRY_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1666,7 +1666,7 @@ pub(crate) fn note_web_entry(pc: u64) {
         // Through the guest's stderr, which run.mjs reads: a Worker's console
         // output under Node reaches the parent only when the Worker's event
         // loop turns, and a run that never yields loses it at the end.
-        let line = format!("gex-nt: web entry {pc:#x}\n");
+        let line = format!("gex-pe: web entry {pc:#x}\n");
         unsafe { crate::write_stderr(&line) };
     }
 }

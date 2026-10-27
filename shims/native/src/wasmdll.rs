@@ -127,7 +127,7 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
     }
     if !wp.entries_bound.swap(true, std::sync::atomic::Ordering::AcqRel) {
         if let Err(e) = bind_entry_thunks(&wp, shared, memory) {
-            eprintln!("gex-nt: Wine's PE module: entry thunks: {e:#}");
+            eprintln!("gex-pe: Wine's PE module: entry thunks: {e:#}");
         }
     }
 }
@@ -443,7 +443,7 @@ fn install_shared(
         let functions = memory_u32(memory, base + dir as u64 + 28)? as u64;
         for (idx, link) in &data_exports {
             let Some(off) = wp.data_exports.get(&format!("{dll}!{link}")) else {
-                eprintln!("gex-nt: {path}: data export {link} is not in Wine's PE module");
+                eprintln!("gex-pe: {path}: data export {link} is not in Wine's PE module");
                 continue;
             };
             let target = (wp.data + *off as u64).wrapping_sub(base) as u32;

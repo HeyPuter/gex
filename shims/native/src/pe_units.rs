@@ -602,7 +602,7 @@ fn install_regions(
     let entries = gex_cgen::image::read_entries(&path)?;
     let module = compile(engine, cache, &path, &wasm).with_context(|| format!("compiling {}'s region entries", p.path))?;
     crate::ftab::publish(shared, memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
-    eprintln!("gex-nt: region entries for {}: {}", p.path, entries.iter().filter(|&&a| a != 0).count());
+    eprintln!("gex-pe: region entries for {}: {}", p.path, entries.iter().filter(|&&a| a != 0).count());
     Ok(())
 }
 
@@ -1119,7 +1119,7 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], go
                     *b |= 1 << (page % 8);
                 }
                 if trace() {
-                    eprintln!("gex-nt: page {:#x} of a compiled image was rewritten: its functions leave for tier-1", page * gex_abi::DISPATCH_PAGE);
+                    eprintln!("gex-pe: page {:#x} of a compiled image was rewritten: its functions leave for tier-1", page * gex_abi::DISPATCH_PAGE);
                 }
             }
         }
@@ -1160,7 +1160,7 @@ pub(crate) fn provided_rewrites(memory: &gex_mem::GuestMemory, ranges: &[(u64, u
                 *told = true;
                 let e = label.rsplit('!').next().unwrap_or(label);
                 eprintln!(
-                    "gex-nt: the guest rewrote provided export {label} at {addr:#x} (a hook?); the provider stays bound, so its new code does not run (GEX_PROVIDER_SKIP={e} runs the library's own code)"
+                    "gex-pe: the guest rewrote provided export {label} at {addr:#x} (a hook?); the provider stays bound, so its new code does not run (GEX_PROVIDER_SKIP={e} runs the library's own code)"
                 );
             }
         }
@@ -1484,7 +1484,7 @@ fn install_placed(
     });
     match ready.flatten() {
         None => {
-            eprintln!("gex-nt: {} at {:#x}: held for its link group", p.path, p.base);
+            eprintln!("gex-pe: {} at {:#x}: held for its link group", p.path, p.base);
             Ok(())
         }
         Some((gkey, members)) => {
@@ -1505,7 +1505,7 @@ fn install_placed(
             }
             crate::ftab::publish(shared, memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
             eprintln!(
-                "gex-nt: link group {gkey}: {} members ({}), {} entries, {} MiB wasm, placed in {:.1}s",
+                "gex-pe: link group {gkey}: {} members ({}), {} entries, {} MiB wasm, placed in {:.1}s",
                 members.len(),
                 members.iter().map(|(mp, _)| mp.path.rsplit(['/', '\\']).next().unwrap_or("")).collect::<Vec<_>>().join(", "),
                 entries.iter().filter(|&&a| a != 0).count(),
@@ -1541,12 +1541,12 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
                 pairs.retain(|&(a, _)| s.ftab.map.twin(a).is_some());
             }
             if pairs.len() < had {
-                eprintln!("gex-nt: provider {} for {}: {} of {had} exports left unbound (no lifted twin in its unit)", prov.name, p.path, had - pairs.len());
+                eprintln!("gex-pe: provider {} for {}: {} of {had} exports left unbound (no lifted twin in its unit)", prov.name, p.path, had - pairs.len());
             }
             // A group cut into is left to the guest whole.
             let dropped = gex_cgen::provider::whole_groups(&mut pairs, &gex_cgen::provider::group_addrs(prov, &pv.exports, p.base));
             if dropped > 0 {
-                eprintln!("gex-nt: provider {} for {}: {dropped} exports of incomplete groups left unbound", prov.name, p.path);
+                eprintln!("gex-pe: provider {} for {}: {dropped} exports of incomplete groups left unbound", prov.name, p.path);
             }
         }
         if pairs.is_empty() {
@@ -1573,7 +1573,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
             }
         }
         if crate::log_on() {
-            eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
+            eprintln!("gex-pe: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
         }
     }
     // A native wasm32 Wine DLL: its module, at its skeleton's
@@ -1581,7 +1581,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
     if let Some(n) = crate::wasmdll::install(&p.pe, &p.path, p.base, state, shared, engine, memory)? {
         crate::note_library(&p.path);
         if crate::log_on() {
-            eprintln!("gex-nt: native wasm32 module for {}: {n} entries", p.path);
+            eprintln!("gex-pe: native wasm32 module for {}: {n} entries", p.path);
         }
     }
     // Stateful providers (`libprov`: an ejected project's), after the
@@ -1596,7 +1596,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         }
         for lp in libs {
             let n = crate::libprov::install(lp, state, shared, engine, memory, &exports, p.base, p.pe.entry_rva)?;
-            eprintln!("gex-nt: provider {} for {}: {n} exports", lp.name, p.path);
+            eprintln!("gex-pe: provider {} for {}: {n} exports", lp.name, p.path);
         }
     }
     Ok(())
@@ -1608,7 +1608,7 @@ fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
         return;
     }
     eprintln!(
-        "gex-nt: function tier for {} at {:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
+        "gex-pe: function tier for {} at {:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
         p.path,
         p.base,
         pl.entries.iter().filter(|&&a| a != 0).count(),

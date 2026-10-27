@@ -1702,7 +1702,7 @@ export class Gex {
           // The shim's own per-library line, said once per session instead
           // (the host's `loaded` line, from `noteStatus`).
           // Said to the host, which says it the first time in the session.
-          const dll = /^gex-nt: native wasm32 module for (\S+): /.exec(text);
+          const dll = /^gex-pe: native wasm32 module for (\S+): /.exec(text);
           if (dll) {
             this.#env.noteStatus?.({ kind: 'module', path: dll[1] });
             if (!logOn('debug')) return;
@@ -4858,7 +4858,7 @@ export class Gex {
           ? ` (arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
             `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB)`
           : '';
-        throw new Error(`gex-nt: no memory for a provider stack${a}`);
+        throw new Error(`gex-pe: no memory for a provider stack${a}`);
       }
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
     }
@@ -5200,7 +5200,7 @@ export class Gex {
       const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
       const bytes = this.#env.loadFile?.(file) ?? null;
       if (!bytes) {
-        console.error(`gex-nt: missing unit: no provider module ${file} in the unit cache, so ${this.#cgenStr(e.gex_cgen_path, u)} runs without its providers; build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers (or natively: a run of the program)`);
+        console.error(`gex-pe: missing unit: no provider module ${file} in the unit cache, so ${this.#cgenStr(e.gex_cgen_path, u)} runs without its providers; build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers (or natively: a run of the program)`);
         continue;
       }
       const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -5237,7 +5237,7 @@ export class Gex {
     e.gex_cgen_installed(r);
     let n = 0;
     for (let i = 0; i + 8 <= ent.byteLength; i += 8) if (ent[i] | ent[i + 1] | ent[i + 2] | ent[i + 3] | ent[i + 4] | ent[i + 5] | ent[i + 6] | ent[i + 7]) n++;
-    console.error(`gex-nt: region entries for ${path}: ${n}`);
+    console.error(`gex-pe: region entries for ${path}: ${n}`);
   }
 
   /** Function JIT module `n` (fjit.rs), compiled once per process from the
@@ -6288,7 +6288,7 @@ export class Gex {
       if (grp) {
         e.gex_cgen_hold(u);
         grp.held.set(key, { u, path });
-        console.error(`gex-nt: ${path}: held for its link group`);
+        console.error(`gex-pe: ${path}: held for its link group`);
         if (grp.held.size === grp.members.length) this.#cgenGroup(grp, t0);
         continue;
       }
@@ -6328,11 +6328,11 @@ export class Gex {
     if (this.#cgenPublish(u, key, path, got) === 1) {
       // Another thread of this process took the same wanted unit first and
       // publishes it (and its providers and region entries); installed here.
-      if (logOn('unit')) console.error(`gex-nt: function tier for ${path}: placed by another thread`);
+      if (logOn('unit')) console.error(`gex-pe: function tier for ${path}: placed by another thread`);
       return;
     }
     this.#cgenProviders(u);
-    if (logOn('unit')) console.error(`gex-nt: pid ${e.gex_my_pid?.() ?? '?'}: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (logOn('unit')) console.error(`gex-pe: pid ${e.gex_my_pid?.() ?? '?'}: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
     if (tp >= 0) console.warn(`[unitpub] ${this.#whoFills()}${this.#forkChild ? ' (fork child)' : ''}: ${path.split('/').pop()} ${(performance.now() - tp).toFixed(1)} ms (load ${(tl - tp).toFixed(1)})`);
   }
@@ -6392,7 +6392,7 @@ export class Gex {
     const ms = grp.members.map((k) => ({ key: k, ...grp.held.get(k) }));
     const got = this.#env.loadUnit?.(`groups/${grp.key}`) ?? null;
     if (!got) {
-      console.error(`gex-nt: link group ${grp.key} is not in the unit cache; its members' own units`);
+      console.error(`gex-pe: link group ${grp.key} is not in the unit cache; its members' own units`);
       for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
       return;
     }
@@ -6409,7 +6409,7 @@ export class Gex {
     if (g < 0) throw new Error(`gex-cgen: link group ${grp.key}: no unit`);
     const path = this.#cgenStr(e.gex_cgen_path, g);
     this.#cgenPublish(g, `groups/${grp.key}`, path, got);
-    console.error(`gex-nt: ${path} (${grp.key}): ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    console.error(`gex-pe: ${path} (${grp.key}): ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     for (const m of ms) {
       this.#cgenProviders(m.u);
       this.#cgenRegions(m.u, m.path);

@@ -137,7 +137,7 @@ browser.on('Runtime.consoleAPICalled', (p) => {
   } else {
     // The page's own word for an image without a unit, with where it was
     // loaded: a unit is built for an image at a base (gexc cgen-image --pe-base).
-    if ((m = /gex-nt: image (.*) at base (0x[0-9a-f]+): no function-tier unit \(key ([0-9a-f]{64})\)/.exec(t))) bases.set(m[3], m[2]);
+    if ((m = /gex-(?:pe|nt): image (.*) at base (0x[0-9a-f]+): no function-tier unit \(key ([0-9a-f]{64})\)/.exec(t))) bases.set(m[3], m[2]);
     if (p.type === 'error') errors.push(t.slice(0, 300));
   }
 });

@@ -246,7 +246,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     // too, since a log that fills the disk ends more than the run.
     const wanted = p.type === 'error'
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
-      : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
+      : p.type === 'warning' && /gex-pe|gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
     // GEX_WIN_BROWSER_KEEP=REGEX: also any line it matches (Mesa's compile
     // and link notes, say), without the verbose flood.
     keepRe ??= process.env.GEX_WIN_BROWSER_KEEP ? new RegExp(process.env.GEX_WIN_BROWSER_KEEP) : false;
