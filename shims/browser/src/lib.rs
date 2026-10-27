@@ -8538,7 +8538,14 @@ fn syscall_entry(ctx: i32, pc: i64) {
             // A program of the other memory flavour (a wasm32 one, 64-bit Wine's
             // wineserver, in a 64-bit memory's page): the exec goes on in a
             // new Worker, and this one ends without the process.
-            SyscallOutcome::Exec { path, argv, envp } if vfork::exec_elsewhere(h, &path) => {
+            // A forked child's: its memory is a copy of its parent's, which an
+            // exec here would keep for the new program's whole life (a memory
+            // never shrinks), so the exec goes on in a new Worker and memory,
+            // as a posix_spawn child's does. From its first thread, whose
+            // Worker is the process's; a later thread's exec stays here.
+            SyscallOutcome::Exec { path, argv, envp }
+                if vfork::exec_elsewhere(h, &path) || (FORK_COPY.load(std::sync::atomic::Ordering::Relaxed) && cur() == 0) =>
+            {
                 h.exec_waited_since = None;
                 exec_away(h, &path, &argv, &envp)
             }
@@ -10396,6 +10403,7 @@ pub extern "C" fn gex_adopt_child(
     if gex_has_host() != 0 {
         forget_copied_host();
     }
+    FORK_COPY.store(true, std::sync::atomic::Ordering::Relaxed);
     // The slot maps the copied low region names are the parent's.
     dense::child();
     // So is the probe cache, which names the parent's table indices.
@@ -10630,6 +10638,11 @@ fn exit_process(code: i32) -> i32 {
     2
 }
 
+/// This process's memory is a forked copy of its parent's (`gex_adopt_child`):
+/// its exec goes on in a new memory (`exec_away`). In the memory, so a fresh
+/// one (a load, an exec's) starts without it.
+static FORK_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 thread_local! {
     /// This process's exec went to another Worker (`exec_away`): its pid
     /// and the exec'ing thread's context, for the record JS sends.
@@ -10638,7 +10651,7 @@ thread_local! {
 
 /// The exec of a program this Worker's memory cannot run (in a 64-bit
 /// memory's page, a wasm32 program or a 32-bit ELF: `vfork::exec_memory`),
-/// handed to a new Worker as a posix_spawn child's is (`vfork::stage_exec`):
+/// or a forked child's (`FORK_COPY`), handed to a new Worker as a posix_spawn child's is (`vfork::stage_exec`):
 /// the record staged, and this Worker's run ended with the process's end
 /// claimed, so nothing of it is torn down or published -- the process goes
 /// on, its descriptors and signal state carried, in the Worker the host
@@ -14116,7 +14129,9 @@ pub extern "C" fn gex_exit_code() -> i32 {
     // Worker that stopped on `exited` meanwhile would report 0 for it
     // (main-thread-exit under load). It is a few calls away: wait for it,
     // bounded, as the kernel lock used to make this wait.
-    if let Some(home) = sigs::home() {
+    // Not for an exec handed to another Worker (`exec_away`), whose claim
+    // records no status: the process goes on there.
+    if let Some(home) = sigs::home().filter(|_| gex_exec_away() == 0) {
         if home.exit().over() && home.exit().status().is_none() {
             let until = now_ns() + 5_000_000_000;
             while home.exit().status().is_none() && now_ns() < until {

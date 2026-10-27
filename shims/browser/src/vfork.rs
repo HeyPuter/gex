@@ -357,6 +357,10 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
         cmd.extend_from_slice(s.as_bytes());
         cmd.push(0);
     }
+    // Closed here, as the exec closes them, not carried for the new Worker
+    // to close: what this Worker closes when it ends without the process
+    // may never be let go.
+    h.kernel.close_on_exec();
     stage_fork_fds(h, pid, false);
     let fds = FORK_FDS.with(|c| std::mem::take(&mut *c.borrow_mut())).into_bytes();
     let cwd = h.kernel.caller_cwd().into_bytes();
