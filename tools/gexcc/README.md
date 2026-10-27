@@ -14,7 +14,8 @@ PREFIX/bin/gexcc -O2 -o hello hello.c
 gexc run hello
 ```
 
-Libraries are static. `-shared` writes an archive, so a build that insists
-on `libfoo.so` still links. The debdemo repository builds Debian
+Libraries are static by default. `-shared` writes an archive, so a build that
+insists on `libfoo.so` still links. With `GEXCC_SHARED=1`, `-shared` writes a
+real wasm side module instead, which gex's loader binds at run time. The debdemo repository builds Debian
 packages with gexcc and assembles a Debian root filesystem around them. The
 `gexcc` script's header lists its options and environment.

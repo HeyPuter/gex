@@ -3,6 +3,7 @@ name = "gex-kernel-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The global kernel module every Worker of every guest process shares"
 
 [lib]
 crate-type = ["cdylib"]

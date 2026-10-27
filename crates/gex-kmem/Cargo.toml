@@ -3,6 +3,7 @@ name = "gex-kmem"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Reaching the calling process's memory from the global kernel module"
 
 [lib]
 crate-type = ["rlib"]

@@ -3,6 +3,7 @@ name = "gex-browser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The browser host: gex-kernel compiled to wasm beside each guest"
 
 [lib]
 crate-type = ["cdylib"]
