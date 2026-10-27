@@ -1,5 +1,5 @@
-# Mesa replay functions kept out of the cold part: tools/mesa-hot.py,
-# docs/mesa-wasm-size.md. Binaryen names, without .llvm.<hash>.
+# Mesa replay functions kept out of the cold part (tools/mesa-hot.py).
+# Binaryen names, without .llvm.<hash>.
 WGPUBufferImpl::AbortPendingMap\28char\20const*\29
 WGPUBufferImpl::MapAsync\28unsigned\20long\20long\2c\20unsigned\20long\2c\20unsigned\20long\2c\20WGPUBufferMapCallbackInfo\29
 WGPUBufferImpl::WillDropLastExternalRef\28\29

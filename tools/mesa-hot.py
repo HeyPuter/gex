@@ -185,8 +185,8 @@ def main():
     report('kept', keep)
     if out:
         with open(out, 'w') as f:
-            f.write('# Mesa replay functions kept out of the cold part: tools/mesa-hot.py,\n'
-                    '# docs/mesa-wasm-size.md. Binaryen names, without .llvm.<hash>.\n')
+            f.write('# Mesa replay functions kept out of the cold part (tools/mesa-hot.py).\n'
+                    '# Binaryen names, without .llvm.<hash>.\n')
             f.writelines(sorted({LLVM_SUFFIX.sub('', defined[i]) + '\n' for i in keep}))
         print(f'wrote {out}')
 
