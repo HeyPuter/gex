@@ -83,6 +83,7 @@ for debugging and for building what a page loads ahead of time.
 | `crates/gex-emit` | the wasm writer and tier-1 code generation |
 | `crates/gex-fjit` | the function JIT |
 | `crates/gex-cgen`, `gex-split` | the function tier, and splitting its units into hot and cold parts |
+| `crates/gex-units` | what a build ships of its function-tier units: whole, instrumented, or cut to a slot set |
 | `crates/gex-xlate` | code discovery and the translation driver |
 | `crates/gex-ld`, `gex-dylink` | ELF and PE loading; shared libraries for wasm32 programs |
 | `crates/gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map, processes |

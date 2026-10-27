@@ -1,6 +1,4 @@
-//! `gexc` — the gex command-line driver.
-//!
-//! M0 subcommands:
+//! `gexc` — the gex command-line driver. The main subcommands:
 //!
 //! ```text
 //!   gexc run <elf> [args...]   translate and execute, natively
@@ -8,6 +6,8 @@
 //!   gexc disasm <elf>          disassemble, to check the decoder by eye
 //!   gexc ir <elf> --at <addr>  dump the GIR for one basic block
 //! ```
+//!
+//! `gexc --help` lists the rest (eject, units, closure, funcs, pe-info, ...).
 
 use anyhow::{bail, Context, Result};
 use gex_native::{Exit, RunOptions};
@@ -128,7 +128,7 @@ fn real_main() -> Result<ExitCode> {
 
 fn usage() {
     eprintln!(
-        "gex — AArch64 to WebAssembly ahead-of-time compiler and Linux runtime
+        "gex — runs Linux programs (AArch64, x86-64, i386) as WebAssembly, on its own Linux kernel ABI
 
 usage:
   gexc run    <elf> [args...]      translate and run the program
