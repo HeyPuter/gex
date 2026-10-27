@@ -26,6 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet } from './log.mjs';
+import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
  *  console's info level. */
@@ -135,6 +136,8 @@ const REUSES = Symbol('gex.reuses');
  *  given-back Workers the pool keeps beyond the new ones it is topped up to. */
 const REUSE_MAX = 256;
 const GIVEN_BACK_MAX = 2;
+/** How long `stop` waits for store saves under way. */
+const SAVE_WAIT_MS = 60_000;
 /** How many exited processes' memories are kept for fork children, and how
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
@@ -478,6 +481,8 @@ export class ProcessHost {
     this.#shim = shim;
     this.#guest = guest;
     this.#kernel = kernel;
+    // Only a global kernel has a store to save.
+    this.#saveGate = kernel ? xcGate() : undefined;
     this.#onOutput = onOutput;
     this.#onFork = onFork;
     this.#onExit = onExit;
@@ -563,7 +568,7 @@ export class ProcessHost {
       opts,
       transfer,
     });
-    this.stop();
+    await this.stop();
     return status;
   }
 
@@ -582,13 +587,35 @@ export class ProcessHost {
     for (const w of this.#workers.values()) w.postMessage({ kind: 'winsize', rows, cols });
   }
 
-  /** Stop every Worker, whatever it is doing. */
+  /** Stop every Worker, whatever it is doing -- once no process is inside a
+   *  save of the translation store (xcache.mjs's gate): a Worker ended
+   *  during its write loses the save. No save starts once this is called,
+   *  so the wait ends. Resolves when they are stopped. */
   stop() {
+    const g = this.#saveGate;
+    if (g) Atomics.or(g, 0, XC_STOP);
+    if (!xcBusy(g)) {
+      this.#end();
+      return Promise.resolve();
+    }
+    return (async () => {
+      const t0 = performance.now();
+      while (xcBusy(g) && performance.now() - t0 < SAVE_WAIT_MS) await xcSleep(5);
+      if (xcBusy(g)) console.log(`[gex] xcache: a save still under way after ${SAVE_WAIT_MS / 1000} s; stopping anyway`);
+      this.#end();
+    })();
+  }
+
+  #saveGate;
+
+  #end() {
     for (const w of this.#workers.values()) w.terminate();
     this.#workers.clear();
     // Including the warm ones nobody claimed.
     for (const w of this.#warm) w.terminate();
     this.#warm = [];
+    // A later `start` saves again (a Worker cut off inside a save left its count).
+    if (this.#saveGate) this.#saveGate.fill(0);
   }
 
   /**
@@ -971,6 +998,7 @@ export class ProcessHost {
             kernel: rt.kernel,
             mem64: rt.mem64,
             pageFlavours: this.#pageFlavours(),
+            saveGate: this.#saveGate,
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all
             // again (each thread of a game spent ~3 s doing that, one after the

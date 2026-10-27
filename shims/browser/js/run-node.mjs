@@ -462,6 +462,8 @@ const host = new ProcessHost({
     xcache: process.env.GEX_XCACHE || undefined,
     // GEX_XCACHE_MIN=bytes: save when the store grew by this much (default 1 MiB).
     xcacheMin: process.env.GEX_XCACHE_MIN ? Number(process.env.GEX_XCACHE_MIN) : undefined,
+    // GEX_XCACHE_DELAY_MS=ms: each save waits this long before it writes (tests: a slow disk).
+    xcacheDelay: process.env.GEX_XCACHE_DELAY_MS ? Number(process.env.GEX_XCACHE_DELAY_MS) : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).

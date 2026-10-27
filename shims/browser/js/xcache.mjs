@@ -80,3 +80,47 @@ export function xcHash(...parts) {
   }
   return (a >>> 0).toString(16).padStart(8, '0') + (b >>> 0).toString(16).padStart(8, '0');
 }
+
+// Saves under way, across a page's processes: a store save is one process's
+// copy of the global kernel's store, written out after that process has
+// published its exit. Pid 1's exit stops every Worker (host.mjs `stop`), so a
+// write still going in another process was cut off, and the kernel refused pid
+// 1's own save while that one was being taken. The gate is two words of shared
+// memory the host makes and every process Worker is given:
+//   [0] processes inside a save (`xcEnter` to `xcLeave`), with XC_STOP set
+//       once the host is stopping, after which no save starts;
+//   [1] of those, the ones taking or writing the store's bytes.
+// The host waits for [0] to empty before it ends the Workers; a process whose
+// save found nothing to take while [1] was not empty waits for those writes and
+// asks again, so what it added after their copy is saved too.
+export const XC_STOP = 1 << 30;
+
+/** The gate, or undefined where memory cannot be shared (one process). */
+export function xcGate() {
+  try {
+    return new Int32Array(new SharedArrayBuffer(8));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Into a save; false once the host is stopping. */
+export function xcEnter(gate) {
+  for (;;) {
+    const v = Atomics.load(gate, 0);
+    if (v & XC_STOP) return false;
+    if (Atomics.compareExchange(gate, 0, v, v + 1) === v) return true;
+  }
+}
+
+/** Out of a save. */
+export function xcLeave(gate) {
+  Atomics.sub(gate, 0, 1);
+}
+
+/** How many processes are inside a save. */
+export function xcBusy(gate) {
+  return gate ? Atomics.load(gate, 0) & ~XC_STOP : 0;
+}
+
+export const xcSleep = (ms) => new Promise((r) => setTimeout(r, ms));

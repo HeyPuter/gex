@@ -1314,7 +1314,7 @@ async function handle(msg) {
     // not wait for it.
     const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
     const xcacheMin = msg.xcacheMin ?? msg.opts?.xcacheMin ?? msg.child?.opts?.xcacheMin;
-    if (!thread && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
+    if (!thread && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20, msg.saveGate, msg.xcacheDelay, msg.child?.pid ?? msg.pid ?? 1);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();

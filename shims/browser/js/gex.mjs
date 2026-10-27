@@ -12,7 +12,7 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { kernelThread, lazyFetch, processMemories } from "./lazy-fetch.mjs";
-import { xcRead, xcWrite } from "./xcache.mjs";
+import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logQuiet } from "./log.mjs";
 
@@ -2926,20 +2926,49 @@ export class Gex {
 
   /**
    * Save the kernel's store for the next load if it grew by `minBytes` since
-   * the last save. The kernel lets one save run at a time.
+   * the last save. The kernel lets one save run at a time. `gate`: the page's
+   * save gate (xcache.mjs), which every process of a page shares; `pid`, for
+   * the line it prints.
    */
-  async xcacheSave(name, minBytes = 1 << 20) {
+  async xcacheSave(name, minBytes = 1 << 20, gate = undefined, delayMs = 0, pid = undefined) {
     const k = this.#kernel;
     if (!name || !k?.k_store_save) return;
-    const t0 = performance.now();
-    const n = k.k_store_save(minBytes) >>> 0;
-    if (!n) return;
+    // The page's save gate (xcache.mjs): the host does not end Workers while
+    // this is inside it, and refuses entry once it is stopping.
+    if (gate && !xcEnter(gate)) return;
+    try {
+      for (let again = false; ; again = true) {
+        const t0 = performance.now();
+        if (gate) Atomics.add(gate, 1, 1);
+        let n = 0;
+        try {
+          n = k.k_store_save(minBytes) >>> 0;
+          if (n) await this.#xcacheWrite(name, n, t0, delayMs, pid);
+        } finally {
+          if (gate) Atomics.sub(gate, 1, 1);
+        }
+        // Nothing taken: nothing new, or another process's save under way
+        // (the kernel takes one at a time). Wait for that one, then ask once
+        // more for what it did not cover.
+        if (n || again || !gate || !Atomics.load(gate, 1)) return;
+        while (Atomics.load(gate, 1)) await xcSleep(5);
+      }
+    } finally {
+      if (gate) xcLeave(gate);
+    }
+  }
+
+  /** The `n` bytes `k_store_save` took, out to the store `name`. */
+  async #xcacheWrite(name, n, t0, delayMs, pid) {
+    const k = this.#kernel;
     try {
       const at = k.k_store_save_ptr() >>> 0;
       const bytes = new Uint8Array(this.#kernelSpec.memory.buffer, at, n).slice();
       k.k_store_save_done();
+      // A test's stand-in for a slow disk (run-node GEX_XCACHE_DELAY_MS).
+      if (delayMs) await xcSleep(delayMs);
       await xcWrite(String(name), bytes);
-      console.log(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+      console.log(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms${pid ? `, pid ${pid}` : ''}`);
     } catch (err) {
       k.k_store_save_done();
       console.log(`[gex] xcache ${name}: not saved: ${err?.message ?? err}`);
