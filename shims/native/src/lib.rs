@@ -2522,6 +2522,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
+        child.forget_own_pidfds();
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
 

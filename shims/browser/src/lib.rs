@@ -9257,6 +9257,11 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         let dup = sock.dup_id()?;
         return Some(format!("sock:{dup}:{}", sock.listening as i32));
     }
+    // A process descriptor, by its pid; a fork's child does not get the one
+    // its parent made for it in the same `clone` (`forget_own_pidfds`).
+    if let Some(pid) = file.handle.pidfd() {
+        return (pid != holder).then(|| format!("pidfd:{pid}"));
+    }
     if let Some(set) = Arc::clone(&file.handle).as_epoll() {
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
         return Some(format!("epoll:{key}:{}", set.describe()));
@@ -9464,6 +9469,9 @@ fn rebuild_carried(
         );
         f.set_offset(offset);
         f
+    } else if let Some(pid) = path.strip_prefix("pidfd:").and_then(|p| p.parse::<i32>().ok()) {
+        let procs = global_procs().ok_or("no global kernel")?;
+        gex_kernel::pidfd::open_file(pid, &procs, flags & oflags::O_NONBLOCK != 0)
     } else if let Some(rest) = path.strip_prefix("epoll:") {
         let (key, watches) = rest.split_once(':').ok_or("bad epoll name")?;
         let watches = gex_kernel::unix::EpollSet::parse(watches).ok_or("bad epoll registrations")?;

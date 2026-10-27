@@ -485,7 +485,7 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
-        let (cell, done, parent_q) = {
+        let (cell, done, parent_q, own_q) = {
             let mut t = self.lock();
             // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
             // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
@@ -513,7 +513,7 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
-                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q)
+                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q, p.queue.id())
                 }
                 None => return,
             }
@@ -524,6 +524,8 @@ impl ProcTable {
         done.notify_all();
         // The parent's `wait4`, and its SIGCHLD.
         crate::wait::notify(parent_q);
+        // A process descriptor for it (`crate::pidfd`), wherever it is held.
+        crate::wait::notify(own_q);
     }
 
     /// Forget a collected process, so a long-lived init doesn't accumulate a

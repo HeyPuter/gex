@@ -290,6 +290,8 @@ pub mod raw {
     pub const SPLICE: u64 = 275;
     pub const STATX: u64 = 332;
     pub const RSEQ: u64 = 334;
+    pub const PIDFD_SEND_SIGNAL: u64 = 424;
+    pub const PIDFD_OPEN: u64 = 434;
     pub const CLONE3: u64 = 435;
     pub const CLOSE_RANGE: u64 = 436;
     pub const OPENAT2: u64 = 437;
@@ -607,6 +609,8 @@ pub fn translate(
         x::RSEQ => nr::RSEQ,
         x::CLONE3 => nr::CLONE3,
         x::CLOSE_RANGE => nr::CLOSE_RANGE,
+        x::PIDFD_OPEN => nr::PIDFD_OPEN,
+        x::PIDFD_SEND_SIGNAL => nr::PIDFD_SEND_SIGNAL,
         x::OPENAT2 => nr::OPENAT2,
         x::FACCESSAT2 => nr::FACCESSAT2,
         x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,

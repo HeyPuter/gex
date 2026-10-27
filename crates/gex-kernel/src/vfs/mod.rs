@@ -450,6 +450,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The process a process descriptor names (`crate::pidfd`), when this
+    /// handle is one.
+    fn pidfd(&self) -> Option<i32> {
+        None
+    }
+
     /// This handle as an anonymous shared file (`memfd_create`), when it is
     /// one: its seals and `fallocate`.
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {

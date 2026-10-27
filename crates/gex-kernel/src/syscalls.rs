@@ -168,6 +168,8 @@ pub mod nr {
     pub const EPOLL_PWAIT: u64 = 22;
     pub const EPOLL_PWAIT2: u64 = 441;
     pub const CLOSE_RANGE: u64 = 436;
+    pub const PIDFD_SEND_SIGNAL: u64 = 424;
+    pub const PIDFD_OPEN: u64 = 434;
     pub const MEMBARRIER: u64 = 283;
     pub const CONNECT: u64 = 203;
     pub const GETSOCKNAME: u64 = 204;
@@ -527,6 +529,7 @@ impl BlockOp {
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
     pub const FS: u64 = 0x0000_0200;
+    pub const PIDFD: u64 = 0x0000_1000;
     pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
     pub const SETTLS: u64 = 0x0008_0000;
@@ -5674,7 +5677,8 @@ fn clone3_args(m: &GuestMem<'_>, c: u64, compat: bool) -> Result<[u64; 6], Errno
     } else {
         tls
     };
-    Ok([flags, stack.wrapping_add(stack_size), parent_tid, tls, child_tid, 0])
+    // and pidfd@8: where CLONE_PIDFD's descriptor goes
+    Ok([flags, stack.wrapping_add(stack_size), parent_tid, tls, child_tid, w(8)?])
 }
 
 /// What making a thread needs of its process, the same for the
@@ -5719,6 +5723,10 @@ impl ThreadMaker<'_> {
     /// with `EAGAIN` before anything of it exists, as Linux refuses one
     /// past its limits: made, it would never run.
     pub fn make(&self, m: &mut GuestMem<'_>, parent: u64, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
+        // a thread has no process descriptor of its own
+        if a[0] & clone_flags::PIDFD != 0 {
+            return Err(Errno::EINVAL);
+        }
         let runners = THREAD_RUNNERS.get();
         if runners.is_some_and(|r| !(r.take)()) {
             return Err(Errno::EAGAIN);
@@ -5807,9 +5815,21 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
 /// and `P_PID` (and `P_PGID`, as any child: process groups are not told
 /// apart, as for `wait4`), `WEXITED` with `WNOHANG` and `WNOWAIT`. No child
 /// stops or continues here, so `WSTOPPED`/`WCONTINUED` alone find nothing.
-/// `P_PIDFD` is `EINVAL`, as a kernel without pidfds answers, which is what
-/// sends a caller (Qt's forkfd) to its `SIGCHLD` path.
-fn waitid_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6], compat: bool) -> Result<BlockOp, Errno> {
+/// `P_PIDFD` waits for the child a process descriptor names (`crate::pidfd`):
+/// `EBADF` for no descriptor, `EINVAL` for one that is not a process's,
+/// `ECHILD` for a process that is not the caller's child, and `EAGAIN` for
+/// an `O_NONBLOCK` one whose child is still running.
+fn waitid_child(procs: &Arc<ProcTable>, fds: &FdTable, pid: i32, mut a: [u64; 6], compat: bool) -> Result<BlockOp, Errno> {
+    if a[0] as u32 == crate::pidfd::P_PIDFD {
+        let f = fds.get(a[1] as i32)?;
+        let child = f.handle.pidfd().ok_or(Errno::EINVAL)?;
+        const WNOHANG: u64 = 1;
+        if f.flags() & oflags::O_NONBLOCK != 0 && a[3] & WNOHANG == 0 && !procs.wait_ready(pid, child) {
+            return Err(Errno::EAGAIN);
+        }
+        a[0] = 1;
+        a[1] = child as u64;
+    }
     const WNOHANG: u64 = 1;
     const WSTOPPED: u64 = 2;
     const WEXITED: u64 = 4;
@@ -5943,7 +5963,42 @@ pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_
 /// process's threads' signal states ([`ThreadSigs`](crate::signal::ThreadSigs),
 /// behind their own lock), and the caller's. Canonical.
 pub fn is_signal_call(n: u64) -> bool {
-    matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN)
+    matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN | nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL)
+}
+
+/// `pidfd_open` and `pidfd_send_signal` (`crate::pidfd`), for the kernel's
+/// arm and [`free_call`] alike, into the caller's descriptor table `fds`.
+///
+/// `pidfd_open(pid, flags)`: a process descriptor for `pid`, which must be
+/// a process (a thread's id that is not its process's is `EINVAL`, as
+/// without `PIDFD_THREAD`); `PIDFD_NONBLOCK` (`O_NONBLOCK`) the one flag.
+///
+/// `pidfd_send_signal(pidfd, sig, info, flags)`: `kill` of the process the
+/// descriptor names (a zombie too), `ESRCH` once it is reaped. No flags,
+/// and no `siginfo` of the caller's: one is `EINVAL` here (Linux would
+/// queue it as `rt_sigqueueinfo` does, which gex has no path for).
+pub fn pidfd_call(fds: &FdTable, procs: &Arc<ProcTable>, to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    if n == nr::PIDFD_OPEN {
+        let (pid, flags) = (a[0] as i32, a[1]);
+        if flags & !oflags::O_NONBLOCK != 0 || pid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        match procs.task_owner(pid) {
+            None => return Err(Errno::ESRCH),
+            Some(owner) if owner != pid => return Err(Errno::EINVAL),
+            Some(_) => {}
+        }
+        return fds.insert(crate::pidfd::open_file(pid, procs, flags & oflags::O_NONBLOCK != 0), true);
+    }
+    let f = fds.get(a[0] as i32)?;
+    let pid = f.handle.pidfd().ok_or(Errno::EBADF)?;
+    if a[3] != 0 || a[2] != 0 || a[1] > crate::signal::sig::MAX as u64 {
+        return Err(Errno::EINVAL);
+    }
+    if f.handle.poll_hup() {
+        return Err(Errno::ESRCH);
+    }
+    kill_call(to, nr::KILL, [pid as u64, a[1], 0, 0, 0, 0])
 }
 
 /// `rt_sigtimedwait`'s answer now: a signal of `set` already pending is
@@ -6753,7 +6808,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 return FreeOutcome::Exit((a[0] & 0xff) as i32);
             }
             nr::WAIT4 => return FreeOutcome::Blocking(wait_child(f.procs, f.pid, a), None),
-            nr::WAITID => match waitid_child(f.procs, f.pid, a, compat) {
+            nr::WAITID => match waitid_child(f.procs, f.io.fds, f.pid, a, compat) {
                 Ok(op) => return FreeOutcome::Blocking(op, None),
                 Err(e) => Err(e),
             },
@@ -6799,6 +6854,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 Some(op) => return FreeOutcome::Blocking(op, None),
                 None => sigtimedwait(f.signals, m, compat, a),
             },
+            nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL => {
+                let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
+                pidfd_call(f.io.fds, f.procs, &to, n, a)
+            }
             _ => {
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 kill_call(&to, n, a)
@@ -8773,6 +8832,36 @@ impl Kernel {
         Ok(())
     }
 
+    /// A new process's entry in the table, for `clone`/`clone3` without
+    /// `CLONE_THREAD`, and with `CLONE_PIDFD` its process descriptor in this
+    /// process (close-on-exec), its number written as an `int` at `at`
+    /// (`u64::MAX`: a combination Linux refuses, `EINVAL`). Checked before
+    /// the entry is made, so a refused call makes no process.
+    fn spawn_with_pidfd(&self, m: &mut GuestMem<'_>, flags: u64, at: u64) -> Result<i32, Errno> {
+        if flags & clone_flags::PIDFD == 0 {
+            return Ok(self.procs.spawn(self.pid));
+        }
+        if at == u64::MAX {
+            return Err(Errno::EINVAL);
+        }
+        m.write_u32(at, u32::MAX).map_err(|_| Errno::EFAULT)?;
+        let pid = self.procs.spawn(self.pid);
+        let fd = self.fds.insert(crate::pidfd::open_file(pid, &self.procs, false), true)?;
+        let _ = m.write_u32(at, fd as u32);
+        Ok(pid)
+    }
+
+    /// A fork's child: the process descriptor its parent made for it in the
+    /// same `clone` is not its own (Linux makes it after copying the table);
+    /// one for any other process it keeps.
+    pub fn forget_own_pidfds(&self) {
+        for (fd, file, _) in self.fds.entries() {
+            if file.handle.pidfd() == Some(self.pid) {
+                let _ = self.fds.close(fd);
+            }
+        }
+    }
+
     pub fn fork_kernel(&self) -> Kernel {
         let mut child = self.fork_kernel_inner();
         let cwd = child.proc_fs.get();
@@ -9086,7 +9175,13 @@ impl Kernel {
             };
             let (flags, sp, tls) = (ca[0], ca[1], ca[3]);
             if flags & clone_flags::THREAD == 0 {
-                let pid = self.procs.spawn(self.pid);
+                let pid = match self.spawn_with_pidfd(m, flags, ca[5]) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        let _ = set_result(m, self.ctx_addr, e.as_return());
+                        return SyscallOutcome::Continue;
+                    }
+                };
                 let _ = set_result(m, self.ctx_addr, pid as u64);
                 return SyscallOutcome::SpawnProcess {
                     pid,
@@ -9112,7 +9207,16 @@ impl Kernel {
         // A clone without CLONE_THREAD is a new process, which only the host
         // can build: it needs a second address space.
         if n == nr::CLONE && a[0] & clone_flags::THREAD == 0 {
-            let pid = self.procs.spawn(self.pid);
+            // clone's CLONE_PIDFD descriptor goes where its parent tid would,
+            // so the two together are EINVAL
+            let pidfd_at = if a[0] & clone_flags::PIDFD != 0 && a[0] & clone_flags::PARENT_SETTID != 0 { u64::MAX } else { a[2] };
+            let pid = match self.spawn_with_pidfd(m, a[0], pidfd_at) {
+                Ok(pid) => pid,
+                Err(e) => {
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
+                    return SyscallOutcome::Continue;
+                }
+            };
             // The parent sees the child's pid; the child sees zero, which the
             // host writes into the copy it makes.
             let _ = set_result(m, self.ctx_addr, pid as u64);
@@ -9493,7 +9597,7 @@ impl Kernel {
             }
             nr::WAIT4 => Some(wait_child(&self.procs, self.pid, a)),
             // Its argument errors are the dispatch's (below).
-            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).ok(),
+            nr::WAITID => waitid_child(&self.procs, &self.fds, self.pid, a, self.compat).ok(),
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
                 // The clocks as of now, the processor-time ones counted from
                 // a start this sets if it has none yet.
@@ -9709,7 +9813,7 @@ impl Kernel {
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
             // A waitid that parks is `blocking_op`'s; one that gets here had bad arguments.
-            nr::WAITID => waitid_child(&self.procs, self.pid, a, self.compat).map(|_| 0),
+            nr::WAITID => waitid_child(&self.procs, &self.fds, self.pid, a, self.compat).map(|_| 0),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -9728,6 +9832,10 @@ impl Kernel {
                 }
                 let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
                 kill_call(&to, n, a)
+            }
+            nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL => {
+                let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
+                pidfd_call(&self.fds, &self.procs, &to, n, a)
             }
             nr::RT_SIGRETURN => {
                 // Handled by the caller, which must redirect execution to the
@@ -11441,6 +11549,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::WAIT4 => "wait4",
         nr::WAITID => "waitid",
         nr::PRLIMIT64 => "prlimit64",
+        nr::PIDFD_OPEN => "pidfd_open",
+        nr::PIDFD_SEND_SIGNAL => "pidfd_send_signal",
         nr::GETRANDOM => "getrandom",
         nr::PROCESS_VM_READV => "process_vm_readv",
         nr::PROCESS_VM_WRITEV => "process_vm_writev",
@@ -12885,8 +12995,8 @@ mod tests {
             k.syscall(&mut m, 0),
             SyscallOutcome::Blocking(BlockOp::WaitChild { ppid, want: -1, nohang: false, .. }) if ppid == pid
         ));
-        // waitid parks the same, with its siginfo and WNOWAIT; P_PIDFD and
-        // no wait kind are EINVAL, with and without the kernel.
+        // waitid parks the same, with its siginfo and WNOWAIT; no wait kind
+        // is EINVAL, with and without the kernel.
         set_args(&mut m, main.ctx_addr, nr::WAITID, &[1, 7, 0x32000, 4 | 1 | 0x0100_0000]);
         let info = WaitidOut { info: 0x32000, nowait: true, compat: false };
         assert!(matches!(
@@ -12898,13 +13008,14 @@ mod tests {
             k.syscall(&mut m, 0),
             SyscallOutcome::Blocking(BlockOp::WaitChild { want: -1, nohang: false, waitid: Some(WaitidOut { nowait: false, .. }), .. })
         ));
-        for args in [[3u64, 5, 0x32000, 4 | 1], [0, 0, 0x32000, 1]] {
+        // (P_PIDFD of a descriptor that is not open: EBADF)
+        for (args, e) in [([3u64, 5, 0x32000, 4 | 1], Errno::EBADF), ([0, 0, 0x32000, 1], Errno::EINVAL)] {
             set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
             assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Done(_)));
-            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+            assert_eq!(ret(&m, main.ctx_addr), e.as_return() as i64);
             set_args(&mut m, main.ctx_addr, nr::WAITID, &args);
             assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
-            assert_eq!(ret(&m, main.ctx_addr), Errno::EINVAL.as_return() as i64);
+            assert_eq!(ret(&m, main.ctx_addr), e.as_return() as i64);
         }
         // reboot: CAD_OFF answers 0 and halts nothing; a halt ends the
         // process with 0 and halts the machine.
