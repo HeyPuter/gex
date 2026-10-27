@@ -1937,15 +1937,6 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     if !served {
         fcache_publish(mem, addr, idx);
     }
-    if libprov::any_registered() {
-        LOOKUP_RING.with(|r| {
-            let mut r = r.borrow_mut();
-            if r.len() >= 16 {
-                r.remove(0);
-            }
-            r.push((addr, idx));
-        });
-    }
     idx as i32
 }
 
@@ -2139,8 +2130,8 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     }
     // A stateful provider's guest call (its return address in the provider's
     // code page) cannot be left: its frames would be lost. Those nest as deep
-    // as the program's calls between guest and provider do (Unity: icall ->
-    // runtime_invoke -> icall ...). Nor can native Wine's (its return pad):
+    // as the program's calls between guest and provider do (a callback that
+    // calls back into the library ...). Nor can native Wine's (its return pad):
     // left, its C caller never runs again, and the guest's return to the pad
     // finds no call-out (a callback that calls back in: qsort's comparator
     // sorting).
@@ -2423,8 +2414,6 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
 }
 
 thread_local! {
-    /// The last function-table lookups of this Worker (address, index), in a provider's process.
-    static LOOKUP_RING: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The last stateful-provider guest calls that reached the fallback: (target, return, sp).
     static PROV_RING: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// This Worker's last finished call-outs: (target, return, sp wanted,
@@ -2543,11 +2532,6 @@ pub(crate) fn callouts_recent() -> Vec<(u64, u64, u64, u32, i32, u64)> {
 /// JS's run loop would abandon.
 pub(crate) fn provider_callout_open() -> bool {
     libprov::guest_call_open() || CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _, _)| libprov::provider_return(r)))
-}
-
-/// [`LOOKUP_RING`], for a diagnostic.
-pub(crate) fn lookups_recent() -> Vec<(u64, u32)> {
-    LOOKUP_RING.with(|r| r.borrow().clone())
 }
 
 /// [`PROV_RING`], for a diagnostic.

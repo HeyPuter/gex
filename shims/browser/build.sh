@@ -231,9 +231,8 @@ $GEXC seed -o web/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
 $GEXC seed -o web/public/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
-# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory (the Unity
-# games on .NET), x86-64 guests
-# only. Same source, target wasm64-unknown-unknown (nightly, build-std),
+# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory, x86-64
+# guests only. Same source, target wasm64-unknown-unknown (nightly, build-std),
 # shared memory only; its memory is a memory64 of LIMIT64 (16 GiB). The
 # layout below 4 GiB is the wasm32 one. Artefacts get `.m64` after the arch.
 if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
