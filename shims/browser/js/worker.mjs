@@ -45,29 +45,6 @@ async function channel() {
   };
 }
 
-/**
- * The buffers in a fork record, so `postMessage` transfers them instead of
- * copying. Views on a `SharedArrayBuffer` are skipped -- shared buffers cannot
- * be transferred, and the guest's memory is shared when threads are on; the
- * regions are `slice`d, so each owns its buffer and transferring one cannot
- * detach another.
- */
-function forkTransfer(child) {
-  const out = [];
-  const add = (v) => {
-    if (!ArrayBuffer.isView(v)) return;
-    const b = v.buffer;
-    if (!(b instanceof ArrayBuffer) || out.includes(b)) return;
-    out.push(b);
-  };
-  for (const r of child?.image ?? []) add(r?.bytes);
-  add(child?.vmaBlob);
-  add(child?.fds);
-  add(child?.pages);
-  add(child?.shared);
-  return out;
-}
-
 /// The fork record's bulk: what the parent hands its child (modules, memory
 /// image, maps) and the host never reads. In a browser it goes from the
 /// parent's Worker to the child's over a channel of its own (`bulk`), so the
@@ -101,6 +78,7 @@ async function forkBulkIn(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { setFill, fillFile } from './lazy-fetch.mjs';
+import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';

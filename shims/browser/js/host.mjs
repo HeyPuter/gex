@@ -24,6 +24,7 @@ function narrate(text) {
  * scraping, which fails open. See task 146.
  */
 import { single } from './single.mjs';
+import { forkTransfer } from './fork-transfer.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
@@ -76,29 +77,6 @@ function crashed(what) {
   } catch {
     // A reporter that throws must not add a failure to the one it reports.
   }
-}
-
-/**
- * The buffers in a fork record, so `postMessage` transfers them instead of
- * copying. Views on a `SharedArrayBuffer` are skipped -- shared buffers cannot
- * be transferred, and the guest's memory is shared when threads are on; the
- * regions are `slice`d, so each owns its buffer and transferring one cannot
- * detach another.
- */
-function forkTransfer(child) {
-  const out = [];
-  const add = (v) => {
-    if (!ArrayBuffer.isView(v)) return;
-    const b = v.buffer;
-    if (!(b instanceof ArrayBuffer) || out.includes(b)) return;
-    out.push(b);
-  };
-  for (const r of child?.image ?? []) add(r?.bytes);
-  add(child?.vmaBlob);
-  add(child?.fds);
-  add(child?.pages);
-  add(child?.shared);
-  return out;
 }
 
 /// Where a pooled Worker's early messages are kept until somebody owns it.
