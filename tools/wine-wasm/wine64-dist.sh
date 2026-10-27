@@ -1,6 +1,7 @@
 #!/bin/bash
 # A 64-bit Wine install and a win64 prefix for it,
-# built from a Wine tree with the 64-bit Wine work (Wine branch w64/main):
+# built from a Wine tree with the 64-bit Wine work (wine64.pins names the
+# commit; another is built too, with a note):
 #
 #   tools/wine-wasm/wine64-dist.sh WINE CACHE
 #
@@ -61,6 +62,8 @@ W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
 J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
+pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine64.pins")
+[ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine64.pins' $(printf %.12s "$pin")" >&2
 log() { echo "wine64-dist: $*" >&2; }
 # The server's prerequisite first, so a missing one fails now, not after
 # the Wine builds: a configured 32-bit Wine build tree and its sysroot.

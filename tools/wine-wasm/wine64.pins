@@ -1,0 +1,15 @@
+# wine64 (64-bit Wine's Unix side as wasm on gex) pins: the sources the
+# wine64 dist and its LP64 sysroot are built from. The Unix libraries it links
+# and Wine Mono are wine32.pins' (wine64-deps.sh).
+#
+# wine64-dist.sh builds the Wine tree it is given and says so when that tree
+# is not at WINE64_COMMIT; build-sysroot64.sh, given no musl tree, fetches
+# MUSL64_COMMIT.
+
+# The Wine fork: branch w64/desktop-proc.
+WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
+WINE64_COMMIT := 0b4a45eb9f1e8d383e39c5787eb30ee5bfed7bf2
+
+# The musl fork with gex's wasm64 arch: branch w64/wasm64.
+MUSL64_REPO   := https://github.com/MercuryWorkshop/musl-wasm64.git
+MUSL64_COMMIT := d18ccf68d0027ba752071b109d5bd08d89a4f7aa

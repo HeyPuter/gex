@@ -1,20 +1,29 @@
 #!/bin/sh
 # 64-bit Wine's LP64 sysroot: what Wine's Unix side for
 # x64 programs builds against, for wcc64. musl with the gex `wasm64` arch (the
-# x86-64 Linux syscall ABI through gex.syscall(ctx); fork: wt/musl-wasm64,
-# branch wine64/wasm64, from U's gex-wasm64), libgex (setjmp runtime, dlopen
+# x86-64 Linux syscall ABI through gex.syscall(ctx); the fork wine64.pins
+# names), libgex (setjmp runtime, dlopen
 # registry, x86-64 signal frames), compiler-rt's builtins and the host's x86
 # UAPI headers (their 64-bit branches are x86-64's). Compiled for wasm64; wcc64
 # lowers every program to wasm32 at link time.
 #
 #   tools/wine-wasm/build-sysroot64.sh OUT [MUSL_SRC]
 #
+# MUSL_SRC is a musl tree; without one, wine64.pins' MUSL64_COMMIT is fetched
+# into OUT/src (through a bare mirror in OUT/mirror; WINE32_SEED=DIR, a local
+# clone, is tried first).
 # OUT/sysroot gets include/, lib/{libc.a,crt1.o,libgex.a,
 # libclang_rt.builtins-wasm64.a} and binaryen/ (GEX_BINARYEN, or fetched).
 set -eu
 OUT=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
-MUSL=$(realpath "${2:-$HERE/../../../musl-w64}")
+if [ -n "${2:-}" ]; then
+  MUSL=$(realpath "$2")
+else
+  eval "$(sed -n 's/^\([A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$HERE/wine64.pins")"
+  MUSL=$OUT/src/musl64-$(printf %.12s "$MUSL64_COMMIT")
+  "$HERE/wine32/src.sh" "$MUSL64_REPO" "$MUSL64_COMMIT" "$OUT/mirror/musl64.git" "$MUSL"
+fi
 # compiler-rt's builtins sources: GEX_CRT_SRC, else an emsdk's
 CRT=${GEX_CRT_SRC:-}
 for c in "$HOME/emsdk" /usr/lib/emsdk; do
