@@ -107,7 +107,10 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
     // `__memcpy_chk` takes a fourth bounds argument, and `__mempcpy_small`
     // takes the bytes to store rather than a pointer and length. Both are real
     // symbols in Debian's libc.
-    if name.ends_with("_chk") || name.ends_with("_small") {
+    // An IFUNC resolver (`__mempcpy_ifunc`, a local `STT_FUNC` in a static
+    // executable) shares the stem too, but returns the implementation's
+    // address instead of doing the work.
+    if name.ends_with("_chk") || name.ends_with("_small") || name.ends_with("_ifunc") {
         return None;
     }
     // `__memcpy_generic`, `__memcpy_simd`, ... -- the variant suffix differs
@@ -245,6 +248,8 @@ mod tests {
         // Both of these are in Debian's libc and neither takes a pointer and
         // a length.
         assert_eq!(recognise("__mempcpy_small"), None);
+        // A static executable's resolver for the IFUNC `__mempcpy`.
+        assert_eq!(recognise("__mempcpy_ifunc"), None);
         assert_eq!(recognise("memchr"), None);
         assert_eq!(recognise("memory_pool_init"), None);
         assert_eq!(recognise("my_memcpy"), None);
