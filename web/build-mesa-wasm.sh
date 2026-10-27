@@ -76,7 +76,9 @@ command -v emcc >/dev/null 2>&1 || { echo "need Emscripten" >&2; exit 1; }
 if [ -z "${GEX_MESA_TINT:-}" ] && [ -f "$MESA/wink/lib/tint.sh" ]; then
     WINK_CACHE=${GEX_MESA_WINK_CACHE:-${TMPDIR:-/tmp}/gex-mesa-wink-cache}
     EMSDK_ROOT=$(CDPATH='' cd -- "$(dirname "$(command -v emcc)")/../.." && pwd)
-    tint_log=$(EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma -Wno-lifetime-safety-intra-tu-suggestions" \
+    # The cache's and the tree's paths as fixed names: Tint's assertion and
+    # file strings ship in the replay module.
+    tint_log=$(EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma -Wno-lifetime-safety-intra-tu-suggestions -ffile-prefix-map=$WINK_CACHE=/tint -ffile-prefix-map=$ROOT=/gex" \
         WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=$VARIANT --until=tint \
         --cache="$WINK_CACHE" --build-dir="$WINK_CACHE/build" --jobs="${JOBS:-$(nproc)}" \
         --emsdk="$EMSDK_ROOT" 2>&1) || { echo "$tint_log" | tail -20 >&2; exit 1; }
