@@ -515,6 +515,10 @@ fn engine_config() -> wasmtime::Config {
     // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
+    // `ref.test` of a table's function: gexcc's lenient indirect calls
+    // (gex_dylink::lenient_calls, GLib's).
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
     config.wasm_multi_memory(true);
     config
 }

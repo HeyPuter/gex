@@ -697,6 +697,10 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
+    // `ref.test` of a table's function: gexcc's lenient indirect calls
+    // (gex_dylink::lenient_calls, GLib's).
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
     // A 64-bit guest memory.
@@ -778,6 +782,10 @@ fn new_engine() -> Result<Engine> {
     // programs (clang's SjLj lowering).
     config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
+    // `ref.test` of a table's function: gexcc's lenient indirect calls
+    // (gex_dylink::lenient_calls, GLib's).
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
     // A 64-bit guest memory: a shared memory is a static

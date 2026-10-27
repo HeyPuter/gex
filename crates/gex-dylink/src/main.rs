@@ -5,6 +5,8 @@
 //!   gex-dylink section IN NAME DATA OUT add custom section NAME (DATA: a file)
 //!   gex-dylink fpcast-prep IN OUT       before binaryen --fpcast-emu: every
 //!   gex-dylink fpcast-post IN OUT       export gets a thunk, exported after
+//!   gex-dylink lenient-calls IN OUT     indirect calls with trailing arguments
+//!                                       cut as C makes them (lenient_calls)
 //!   gex-dylink info FILE                print dylink.0, NEEDED and the table plan
 use gex_dylink::*;
 
@@ -21,6 +23,9 @@ fn main() -> Result<()> {
         }
         Some("fpcast-post") if a.len() == 4 => {
             std::fs::write(&a[3], fpcast_post(&read(&a[2])?)?)?;
+        }
+        Some("lenient-calls") if a.len() == 4 => {
+            std::fs::write(&a[3], lenient_calls(&read(&a[2])?)?)?;
         }
         Some("section") if a.len() == 6 => {
             let out = set_custom_section(&read(&a[2])?, &a[3], &read(&a[4])?)?;
@@ -60,7 +65,7 @@ fn main() -> Result<()> {
                 println!("forkreach: {} exports may fork", f.may_fork.len());
             }
         }
-        _ => bail!("usage: gex-dylink selfbind IN OUT | section IN NAME DATA OUT | info FILE"),
+        _ => bail!("usage: gex-dylink selfbind IN OUT | lenient-calls IN OUT | section IN NAME DATA OUT | info FILE"),
     }
     Ok(())
 }

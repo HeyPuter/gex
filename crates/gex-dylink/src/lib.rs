@@ -800,6 +800,187 @@ pub fn checked_calls(wasm: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Indirect calls as C on a real machine makes them: a function called
+/// through a pointer of a type with more trailing parameters than it takes
+/// (GObject's class and instance initialisers, which `G_DEFINE_TYPE`
+/// defines with one and GLib calls with two; a `GFunc` that is `g_free`)
+/// gets the ones it takes, and one that returns a value called as
+/// returning none has it dropped. wasm traps on such a call.
+///
+/// Every `call_indirect` through table 0 of a type with parameters goes to
+/// a helper for its type: the call as it was when the table's function has
+/// that type (`ref.test` of a `table.get`, the only cost on that path),
+/// else the first type the function has of the call's parameters cut from
+/// the end, else the original call (which traps as before). The calls stay
+/// `call_indirect`, so asyncify instruments the helpers like any other
+/// function. Needs `ref.test` (wasm GC) of the engine.
+pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Error as RError, Reencode};
+    use wasmparser::{CompositeInnerType, Operator, Payload};
+    let (mut sigs, mut nfi, mut ndef, mut used) = (Vec::new(), 0u32, 0u32, Vec::<u32>::new());
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            Payload::TypeSection(r) => {
+                for g in r {
+                    let g = g?;
+                    if g.is_explicit_rec_group() {
+                        bail!("lenient calls: a recursion group");
+                    }
+                    for t in g.into_types() {
+                        sigs.push(match &t.composite_type.inner {
+                            CompositeInnerType::Func(f) => Some((f.params().to_vec(), f.results().to_vec())),
+                            _ => None,
+                        });
+                    }
+                }
+            }
+            Payload::ImportSection(r) => {
+                for i in r {
+                    if let wasmparser::TypeRef::Func(_) = i?.ty {
+                        nfi += 1;
+                    }
+                }
+            }
+            Payload::FunctionSection(r) => ndef = r.count(),
+            Payload::CodeSectionEntry(body) => {
+                let mut ops = body.get_operators_reader()?;
+                while !ops.eof() {
+                    if let Operator::CallIndirect { type_index, table_index: 0 } | Operator::ReturnCallIndirect { type_index, table_index: 0 } = ops.read()? {
+                        if sigs.get(type_index as usize).is_some_and(|s| s.as_ref().is_some_and(|(p, _)| !p.is_empty())) && !used.contains(&type_index) {
+                            used.push(type_index);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if used.is_empty() {
+        return Ok(wasm.to_vec());
+    }
+    used.sort();
+    // the types to add: per used type, its helper's (its parameters, the
+    // index), then the shorter ones in the order they are tried
+    struct Helper {
+        ty: u32,
+        own: u32,
+        tries: Vec<(u32, u32, bool)>,
+    }
+    let mut add: Vec<(Vec<wasmparser::ValType>, Vec<wasmparser::ValType>)> = Vec::new();
+    let mut next = sigs.len() as u32;
+    let mut helpers = Vec::new();
+    for &t in &used {
+        let (p, r) = sigs[t as usize].clone().unwrap();
+        let mut hp = p.clone();
+        hp.push(wasmparser::ValType::I32);
+        add.push((hp, r.clone()));
+        let own = next;
+        next += 1;
+        let mut tries = Vec::new();
+        for k in (0..p.len()).rev() {
+            add.push((p[..k].to_vec(), r.clone()));
+            tries.push((next, k as u32, false));
+            next += 1;
+        }
+        if r.is_empty() {
+            for k in (0..=p.len()).rev() {
+                add.push((p[..k].to_vec(), vec![wasmparser::ValType::I32]));
+                tries.push((next, k as u32, true));
+                next += 1;
+            }
+        }
+        helpers.push(Helper { ty: t, own, tries });
+    }
+    struct R {
+        add: Vec<(Vec<wasmparser::ValType>, Vec<wasmparser::ValType>)>,
+        helpers: Vec<Helper>,
+        sigs: Vec<Option<(Vec<wasmparser::ValType>, Vec<wasmparser::ValType>)>>,
+        first: u32,
+    }
+    impl R {
+        fn helper(&self, ty: u32) -> Option<u32> {
+            self.helpers.iter().position(|h| h.ty == ty).map(|i| self.first + i as u32)
+        }
+    }
+    impl Reencode for R {
+        type Error = std::convert::Infallible;
+        fn parse_type_section(&mut self, types: &mut wasm_encoder::TypeSection, section: wasmparser::TypeSectionReader<'_>) -> Result<(), RError<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_type_section(self, types, section)?;
+            for (p, r) in std::mem::take(&mut self.add) {
+                let p: Vec<_> = p.into_iter().map(|v| self.val_type(v)).collect::<Result<_, _>>()?;
+                let r: Vec<_> = r.into_iter().map(|v| self.val_type(v)).collect::<Result<_, _>>()?;
+                types.ty().function(p, r);
+            }
+            Ok(())
+        }
+        fn parse_function_section(&mut self, funcs: &mut wasm_encoder::FunctionSection, section: wasmparser::FunctionSectionReader<'_>) -> Result<(), RError<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_function_section(self, funcs, section)?;
+            for h in &self.helpers {
+                funcs.function(h.own);
+            }
+            Ok(())
+        }
+        fn parse_code_section(&mut self, code: &mut wasm_encoder::CodeSection, section: wasmparser::CodeSectionReader<'_>) -> Result<(), RError<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_code_section(self, code, section)?;
+            use wasm_encoder::{BlockType, HeapType, Instruction as I};
+            for h in &self.helpers {
+                let n = self.sigs[h.ty as usize].as_ref().unwrap().0.len() as u32;
+                // locals: the call's arguments, then the table index. The
+                // function is read from the table for each test rather than
+                // kept in a local: asyncify keeps no reference-typed local.
+                let mut f = wasm_encoder::Function::new([]);
+                let call = |f: &mut wasm_encoder::Function, ty: u32, k: u32, drop: bool| {
+                    f.instruction(&I::LocalGet(n)).instruction(&I::TableGet(0));
+                    f.instruction(&I::RefTestNonNull(HeapType::Concrete(ty))).instruction(&I::If(BlockType::Empty));
+                    for a in 0..k {
+                        f.instruction(&I::LocalGet(a));
+                    }
+                    f.instruction(&I::LocalGet(n)).instruction(&I::CallIndirect { type_index: ty, table_index: 0 });
+                    if drop {
+                        f.instruction(&I::Drop);
+                    }
+                    f.instruction(&I::Return).instruction(&I::End);
+                };
+                call(&mut f, h.ty, n, false);
+                for &(ty, k, drop) in &h.tries {
+                    call(&mut f, ty, k, drop);
+                }
+                for a in 0..=n {
+                    f.instruction(&I::LocalGet(a));
+                }
+                f.instruction(&I::CallIndirect { type_index: h.ty, table_index: 0 }).instruction(&I::End);
+                code.function(&f);
+            }
+            Ok(())
+        }
+        fn instruction<'a>(&mut self, op: wasmparser::Operator<'a>) -> Result<wasm_encoder::Instruction<'a>, RError<Self::Error>> {
+            use wasm_encoder::Instruction as I;
+            match op {
+                wasmparser::Operator::CallIndirect { type_index, table_index: 0 } => {
+                    if let Some(h) = self.helper(type_index) {
+                        return Ok(I::Call(h));
+                    }
+                }
+                wasmparser::Operator::ReturnCallIndirect { type_index, table_index: 0 } => {
+                    if let Some(h) = self.helper(type_index) {
+                        return Ok(I::ReturnCall(h));
+                    }
+                }
+                _ => {}
+            }
+            wasm_encoder::reencode::utils::instruction(self, op)
+        }
+    }
+    let mut r = R { add, helpers, sigs, first: nfi + ndef };
+    let mut module = wasm_encoder::Module::new();
+    r.parse_core_module(&mut module, wasmparser::Parser::new(0), wasm).map_err(|e| anyhow!("lenient calls: {e:?}"))?;
+    let out = module.finish();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&out)
+        .context("lenient calls: the rewritten module does not validate")?;
+    Ok(out)
+}
+
 /// Add (or replace) a custom section at the end of a module.
 pub fn set_custom_section(wasm: &[u8], name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = wasm[..8].to_vec();

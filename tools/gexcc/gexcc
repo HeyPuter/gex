@@ -908,6 +908,13 @@ def finish_shared(wasm, sos, lib):
     summary added."""
     if lib and run([DYLINK, 'selfbind', wasm, wasm]):
         die('gex-dylink selfbind failed')
+    # GEXCC_LENIENT_CALLS=1: indirect calls with more trailing arguments than
+    # the function takes cut as C makes them (gex-dylink lenient-calls), for
+    # GLib, whose callers pass GObject's initialisers and a GFunc more than
+    # they take; before asyncify, which then instruments the helpers
+    lenient = os.environ.get('GEXCC_LENIENT_CALLS', '0') != '0'
+    if lenient and run([DYLINK, 'lenient-calls', wasm, wasm]):
+        die('gex-dylink lenient-calls failed')
     may, known = set(), set()
     for so in sos:
         if not is_wasm_so(so):
@@ -943,7 +950,7 @@ def finish_shared(wasm, sos, lib):
             passes += ['--pass-arg=asyncify-removelist@' + ','.join(roots)]
         passes += ['-O2']
     passes += ['--translate-to-exnref']
-    if run([opt, wasm, '-g', '--strip-dwarf'] + feats + passes + ['-o', wasm]):
+    if run([opt, wasm, '-g', '--strip-dwarf'] + feats + (['--enable-gc'] if lenient else []) + passes + ['-o', wasm]):
         die('wasm-opt failed')
     if lib:
         txt = os.path.join(tmp, 'forkreach.txt')
