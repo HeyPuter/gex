@@ -6,8 +6,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-struct passwd *fgetpwent(FILE *);
-int putpwent(const struct passwd *, FILE *);
+struct _IO_FILE;
+struct passwd *fgetpwent(struct _IO_FILE *);
+int putpwent(const struct passwd *, struct _IO_FILE *);
 #ifdef __cplusplus
 }
 #endif
