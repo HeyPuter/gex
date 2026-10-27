@@ -913,6 +913,7 @@ async function handle(msg) {
       port.post({ kind: 'wl-memory', token, memory: pixels ? undefined : gex.memory, kernel });
     };
     proxy.onToken = gex.onWlToken;
+    proxy.onPixels = (p) => port.post({ kind: 'wl-pixels', ...p });
     proxy.wakeAddr = () => gex.kernelWake();
   } else if (msg.wlStub) {
     // A headless compositor for node: the shim's gex-wayland runs and binds

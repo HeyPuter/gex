@@ -11,6 +11,15 @@
 // copied every frame four times (out of the pool, into a staging buffer, out
 // of it again, and into a canvas) and could only ever show one window.
 //
+// Each process's proxy in each of its Workers has a buffer of its own, sized
+// to what its surfaces need and replaced by a larger one when they outgrow
+// it. A record names its buffer by number (`R_ADDR_HI`); the guest posts
+// the compositor each new buffer ('wl-pixels'), and the compositor draws a
+// surface once its buffer has come. Fixed in size once made, because
+// `writeTexture` refuses a view of a growable buffer; and not made ahead for
+// every block, because a buffer's whole length counts in the page's data
+// size whether it is written or not.
+//
 // The compositor reads that buffer and not the guest's memory, because it
 // must not hold the memory. V8 counts every wasm memory an isolate holds, at
 // its length, in the size its next full collection is scheduled from; past
@@ -146,6 +155,8 @@ const M_KERNEL_SENT = 4;
  *  the kernel notifies those blocks' queues. */
 const M_RELAY = 5;
 const M_RELAY_BLOCKS = 6;
+/** The last pixel buffer number handed out (`WlProxy`'s buffers). */
+const M_PIXEL_IDS = 7;
 const M_WORDS = 8;
 
 // Block header: the token that claimed it, a heartbeat so a dead process's
@@ -176,35 +187,28 @@ const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
 const blockBase = (b) => M_WORDS + b * BLOCK_WORDS;
 const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
 
-// A block's pixel buffer: a header -- a lock, the next free byte, and a
-// region per surface -- then the surfaces' pixels, packed rows of width * 4.
+// A pixel buffer: a header -- a lock, the next free byte, and a region per
+// surface -- then the surfaces' pixels, packed rows of width * 4.
 const P_LOCK = 0;
 const P_NEXT = 1;
 const P_ENTRIES = 4;
 /** Per surface: client, surface, offset, size, the serial last copied. */
 const PE = 5;
 const P_DATA = 2048;
-/** A block's pixel buffer: room for seven 1920x1080 surfaces. Its pages are
- *  only memory once written. Fixed, because `writeTexture` refuses a view
- *  of a growable buffer. */
-const PIXELS_BYTES = 64 << 20;
+/** The largest pixel buffer: room for seven 1920x1080 surfaces. */
+const PIXELS_MAX = 64 << 20;
+/** Pixel buffers are made in steps of this. */
+const PIXELS_STEP = 1 << 20;
 
-/** The shared arena a compositor and its guests share, and a pixel buffer per
- *  block (see the top of this file). */
+/** The shared arena a compositor and its guests share (see the top of this
+ *  file); `pixels` says the guests copy their surfaces' pixels into buffers
+ *  of their own. */
 export function makeWlChannel() {
   // A plain buffer in the single-thread build, where the compositor and every
   // guest are one realm -- and there no pixel buffers: the one isolate holds
   // the guests' memories whatever this does, and counts a plain ArrayBuffer.
   if (typeof SharedArrayBuffer !== 'function') return { arena: new ArrayBuffer(TOTAL_WORDS * 4) };
-  const pixels = [];
-  for (let b = 0; b < BLOCKS; b++) pixels.push(new SharedArrayBuffer(PIXELS_BYTES));
-  return { arena: new SharedArrayBuffer(TOTAL_WORDS * 4), pixels };
-}
-
-/** Block `b`'s pixels, where its records' addresses point: a view the caller
- *  re-takes when the buffer has grown (`view.length !== buffer.byteLength`). */
-export function blockPixels(channel, b) {
-  return channel.pixels?.[b] ?? null;
+  return { arena: new SharedArrayBuffer(TOTAL_WORDS * 4), pixels: true };
 }
 
 /** Tell the guests how large the output is, so a toplevel is configured to it. */
@@ -250,6 +254,9 @@ const titleBytes = new Uint8Array(R_TITLE_WORDS * 4);
 
 export function readScene(channel, { onlyChanged = false } = {}) {
   const a = new Int32Array(channel.arena);
+  // With pixel buffers an address is an offset into the buffer the record
+  // names (`pix`), not into the process's memory.
+  const pixels = !!channel.pixels;
   const out = [];
   const blocks = [];
   const now = Date.now();
@@ -287,7 +294,8 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         relY: a[r + R_REL_Y],
         width: a[r + R_WIDTH],
         height: a[r + R_HEIGHT],
-        addr: recordAddr(a, r),
+        addr: pixels ? a[r + R_ADDR] >>> 0 : recordAddr(a, r),
+        pix: pixels ? a[r + R_ADDR_HI] >>> 0 : 0,
         stride: a[r + R_STRIDE],
         format: a[r + R_FORMAT],
         serial: a[r + R_SERIAL] >>> 0,
@@ -526,13 +534,35 @@ export class WlProxy {
    */
   constructor(channel, wake, tokenFn) {
     this.#a = new Int32Array(channel.arena);
-    this.#pixels = channel.pixels ?? null;
+    this.#pixels = !!channel.pixels;
     this.#tokenFn = tokenFn;
     this.#wake = wake;
   }
 
   #pixels;
+  /** This proxy's pixel buffer and its number, or null before the first
+   *  surface with pixels. */
+  #buf = null;
+  #bufId = 0;
   #saidTooBig = false;
+  /** Called with `{ token, id, buffer, replaces }` for each new pixel buffer,
+   *  for the host to send the compositor. */
+  onPixels = null;
+
+  /** A buffer of `bytes` in place of this proxy's, empty, sent to the
+   *  compositor; or false when one that large is not made. */
+  #newBuffer(bytes) {
+    const size = Math.ceil(bytes / PIXELS_STEP) * PIXELS_STEP;
+    if (size > PIXELS_MAX) return false;
+    const replaces = this.#bufId;
+    this.#buf = new SharedArrayBuffer(size);
+    // Numbers are page-wide and never 0, which is a record without pixels.
+    let id = (Atomics.add(this.#a, M_PIXEL_IDS, 1) + 1) >>> 0;
+    if (!id) id = (Atomics.add(this.#a, M_PIXEL_IDS, 1) + 1) >>> 0;
+    this.#bufId = id;
+    this.onPixels?.({ token: this.#token, id: this.#bufId, buffer: this.#buf, replaces });
+    return true;
+  }
 
   /** Whether this is the first process to ask: it hands the page the
    *  kernel's memory (`M_KERNEL_SENT`). */
@@ -547,13 +577,44 @@ export class WlProxy {
    * none for one whose serial was copied already.
    */
   #copyPixels(memory, recs) {
-    const buf = this.#pixels?.[this.#block];
-    if (!buf) return;
+    if (!this.#pixels) return;
+    const a = this.#a;
+    // A buffer that cannot take this publish's new regions is replaced by
+    // one that can, with room to spare, and every surface is copied whole.
+    // A first one is made for what this publish needs.
+    {
+      const h = this.#buf && new Int32Array(this.#buf, 0, P_DATA >> 2);
+      let more = 0;
+      let all = 0;
+      for (const { dst } of recs) {
+        const need = ((a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4) + 255) & ~255;
+        all += need;
+        if (!h) continue;
+        let o = -1;
+        for (let e = 0; e < SLOTS && o < 0; e++) {
+          const q = P_ENTRIES + e * PE;
+          if (h[q + 2] && h[q] === a[dst + R_CLIENT] && h[q + 1] === a[dst + R_SURFACE]) o = q;
+        }
+        if (o < 0 || h[o + 3] < need) more += need;
+      }
+      const used = h ? Math.max(h[P_NEXT], P_DATA) : P_DATA;
+      if (!h || (used + more > this.#buf.byteLength && P_DATA + all > this.#buf.byteLength)) {
+        const want = P_DATA + all;
+        const grown = Math.max(want + (want >> 2), this.#buf ? this.#buf.byteLength * 2 : 0);
+        if (!this.#newBuffer(Math.min(grown, PIXELS_MAX)) && !this.#buf) {
+          for (const { dst } of recs) {
+            a[dst + R_ADDR] = 0;
+            a[dst + R_ADDR_HI] = 0;
+          }
+          return;
+        }
+      }
+    }
+    const buf = this.#buf;
     const h = new Int32Array(buf, 0, P_DATA >> 2);
     while (Atomics.compareExchange(h, P_LOCK, 0, 1) !== 0);
     try {
       if (h[P_NEXT] < P_DATA) h[P_NEXT] = P_DATA;
-      const a = this.#a;
       const find = (c, sf) => {
         for (let e = 0; e < SLOTS; e++) {
           const o = P_ENTRIES + e * PE;
@@ -574,14 +635,17 @@ export class WlProxy {
         h[P_NEXT] = P_DATA;
       }
       const src = new Uint8Array(memory.buffer);
-      for (const { dst, rect } of recs) {
+      for (const { dst, rect, mine: last } of recs) {
+        const mine = last === this.#bufId;
         const w = a[dst + R_WIDTH];
         const ht = a[dst + R_HEIGHT];
         const need = w * ht * 4;
         const from = recordAddr(a, dst);
         const stride = a[dst + R_STRIDE];
         let o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
-        let whole = false;
+        // Only the damage when this buffer has the surface's last commit:
+        // another thread's proxy may have published the ones between.
+        let whole = !mine;
         if (o < 0 || h[o + 3] < need) {
           if (o < 0) {
             for (let e = 0; e < SLOTS && o < 0; e++) if (!h[P_ENTRIES + e * PE + 2]) o = P_ENTRIES + e * PE;
@@ -623,7 +687,7 @@ export class WlProxy {
           h[o + 4] = serial;
         }
         a[dst + R_ADDR] = at;
-        a[dst + R_ADDR_HI] = 0;
+        a[dst + R_ADDR_HI] = this.#bufId;
         a[dst + R_STRIDE] = w * 4;
       }
     } finally {
@@ -686,8 +750,7 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
         // The last process's regions are not this one's: its surfaces may
         // have the same numbers.
-        const px = this.#pixels?.[b];
-        if (px) new Int32Array(px, 0, P_DATA >> 2).fill(0);
+        if (this.#buf) new Int32Array(this.#buf, 0, P_DATA >> 2).fill(0);
         this.#noteWake();
         return;
       }
@@ -748,9 +811,13 @@ export class WlProxy {
     for (let i = 0; i < n; i++) {
       const o = i * REC;
       const dst = this.#base + B_WORDS + o;
+      // The buffer this slot's surface was last published from, if it is the
+      // same surface.
+      const same = this.#a[dst + R_CLIENT] === src[o + R_CLIENT] && this.#a[dst + R_SURFACE] === src[o + R_SURFACE];
+      const mine = same && this.#pixels ? this.#a[dst + R_ADDR_HI] >>> 0 : 0;
       for (let w = 0; w < REC; w++) this.#a[dst + w] = src[o + w];
       if (this.#pixels && recordAddr(this.#a, dst) && src[o + R_WIDTH] > 0 && src[o + R_HEIGHT] > 0) {
-        shm.push({ dst, rect: { x: src[o + R_DAMAGE_X], y: src[o + R_DAMAGE_Y], w: src[o + R_DAMAGE_W], h: src[o + R_DAMAGE_H] } });
+        shm.push({ dst, mine, rect: { x: src[o + R_DAMAGE_X], y: src[o + R_DAMAGE_Y], w: src[o + R_DAMAGE_W], h: src[o + R_DAMAGE_H] } });
       }
       // Accumulate damage for a surface the compositor has not caught up with.
       const key = `${src[o + R_CLIENT]}:${src[o + R_SURFACE]}`;

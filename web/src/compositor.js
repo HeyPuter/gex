@@ -300,6 +300,11 @@ export class Compositor {
     if (memory || kernel) this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
   }
 
+  /** A guest's new pixel buffer (wl-bridge.mjs `WlProxy`). */
+  addPixels(token, id, buffer, replaces) {
+    this.#worker.postMessage({ kind: 'pixels', token, id, buffer, replaces });
+  }
+
   /** That process has exited: its memory, its GL context and its GL windows
    *  go (compositor-worker.js 'drop-memory'). */
   dropMemory(token) {
