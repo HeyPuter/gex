@@ -94,7 +94,7 @@ export class WispNetwork {
   /** The page-served hosts, as `[name, base]` pairs: what a Worker that
    *  makes a network of its own is given with the proxy's address. */
   get pageHosts() {
-    return this.#pageHosts ? [...this.#pageHosts] : undefined;
+    return this.#pageHosts ?? undefined;
   }
 
   /** The proxy this was pointed at, normalised. Each guest process (a Worker)

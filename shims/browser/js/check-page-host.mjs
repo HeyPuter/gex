@@ -68,8 +68,14 @@ if (three.id) net.close(three.id);
 const out = await exchange(`GET /../${dir.split('/').pop()}-outside HTTP/1.1\r\nHost: files.test\r\nConnection: close\r\n\r\n`);
 check(/^HTTP\/1\.1 404 /.test(out.got) && out.ended, 'a path out of the directory: 404', out.got);
 
-const post = await exchange('POST /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nContent-Length: 2\r\n\r\nhi');
-check(/^HTTP\/1\.1 405 [^]*Allow: GET, HEAD/.test(post.got) && post.ended, 'POST: 405, and the connection ends', post.got);
+const post = await exchange('POST /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nContent-Length: 2\r\n\r\nhi'
+  + 'GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\n\r\n');
+check(/^HTTP\/1\.1 405 [^]*Allow: GET, HEAD/.test(post.got) && post.ended && !/200/.test(post.got),
+  'POST: 405, and the connection ends, the request after it not answered', post.got);
+
+const part = await exchange('GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nRange: bytes=4-6\r\nConnection: close\r\n\r\n');
+check(/^HTTP\/1\.1 206 [^]*Content-Range: bytes 4-6\/12\r\n[^]*Content-Length: 3\r\n/.test(part.got) && part.got.endsWith('\r\n\r\nve '),
+  'a range: 206, those bytes', part.got);
 
 const ws = await exchange('GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
 check(/^HTTP\/1\.1 405 /.test(ws.got) && ws.ended, 'a WebSocket upgrade: 405', ws.got);

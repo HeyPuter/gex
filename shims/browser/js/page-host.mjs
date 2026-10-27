@@ -28,6 +28,7 @@ const REASON = { 200: 'OK', 206: 'Partial Content', 304: 'Not Modified', 400: 'B
 const FORWARD = ['range', 'if-range', 'if-modified-since', 'if-none-match', 'accept'];
 /** What of the response comes back. */
 const KEEP = ['content-type', 'last-modified', 'etag', 'content-range', 'accept-ranges', 'cache-control'];
+const enc = new TextEncoder();
 
 export class PageHostStream {
   /** Open from the start: there is no far end to wait for. */
@@ -41,6 +42,8 @@ export class PageHostStream {
   #in = new Uint8Array(0);
   #queue = Promise.resolve();
   #closed = false;
+  /** A request this does not answer has come: nothing after it is read. */
+  #stopped = false;
   #reader = null;
 
   /** `base`: the URL (ending in a slash) a request's path is under;
@@ -52,7 +55,7 @@ export class PageHostStream {
   }
 
   send(bytes) {
-    if (this.#closed) return;
+    if (this.#closed || this.#stopped) return;
     const all = new Uint8Array(this.#in.length + bytes.length);
     all.set(this.#in);
     all.set(bytes, this.#in.length);
@@ -68,7 +71,10 @@ export class PageHostStream {
       this.#queue = this.#queue.then(() => this.#serve(req)).catch(() => this.#end());
       // A request with a body is not one this answers (no POST): the
       // connection ends after its 405, so whatever follows is not read.
-      if (req.body || req.bad) break;
+      if (req.body || req.bad) {
+        this.#stopped = true;
+        break;
+      }
     }
   }
 
@@ -90,7 +96,7 @@ export class PageHostStream {
   #head(status, headers) {
     const lines = [`HTTP/1.1 ${status} ${REASON[status] ?? ''}`.trimEnd()];
     for (const [k, v] of headers) lines.push(`${k}: ${v}`);
-    this.#emit(new TextEncoder().encode(`${lines.join('\r\n')}\r\n\r\n`));
+    this.#emit(enc.encode(`${lines.join('\r\n')}\r\n\r\n`));
   }
 
   async #serve(req) {
@@ -127,11 +133,12 @@ export class PageHostStream {
     for (const h of KEEP) if (r.headers.get(h) != null) out.push([h.replace(/(^|-)./g, (c) => c.toUpperCase()), r.headers.get(h)]);
     // The length as served, unless fetch decoded a compressed body (then
     // it is the compressed one's): otherwise chunked.
+    // A HEAD of one whose length is not known says none.
     const len = r.headers.get('content-encoding') ? null : r.headers.get('content-length');
     const chunked = len == null && req.method === 'GET' && r.status !== 304;
     if (len != null) out.push(['Content-Length', len]);
     else if (chunked) out.push(['Transfer-Encoding', 'chunked']);
-    else out.push(['Content-Length', '0']);
+    else if (req.method !== 'HEAD') out.push(['Content-Length', '0']);
     this.#head(r.status, [...out, ...conn]);
     if (req.method === 'GET' && r.body && r.status !== 304) {
       this.#reader = r.body.getReader();
@@ -139,12 +146,12 @@ export class PageHostStream {
         const { done, value } = await this.#reader.read();
         if (done || this.#closed) break;
         if (!value?.length) continue;
-        if (chunked) this.#emit(new TextEncoder().encode(`${value.length.toString(16)}\r\n`));
+        if (chunked) this.#emit(enc.encode(`${value.length.toString(16)}\r\n`));
         this.#emit(value);
-        if (chunked) this.#emit(new TextEncoder().encode('\r\n'));
+        if (chunked) this.#emit(enc.encode('\r\n'));
       }
       this.#reader = null;
-      if (chunked) this.#emit(new TextEncoder().encode('0\r\n\r\n'));
+      if (chunked) this.#emit(enc.encode('0\r\n\r\n'));
     } else {
       await r.body?.cancel().catch(() => {});
     }

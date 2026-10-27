@@ -132,7 +132,7 @@ self.onmessage = async (ev) => {
       if (opts.networkUrl || opts.pageHosts) {
         const { WispNetwork } = await import('./net.js');
         const net = new WispNetwork(opts.networkUrl ?? null, (e) => self.postMessage({ kind: 'net', event: e }),
-          { pageHosts: opts.pageHosts ? new Map(opts.pageHosts) : null });
+          { pageHosts: opts.pageHosts ?? null });
         try {
           await net.start();
         } catch (e) {

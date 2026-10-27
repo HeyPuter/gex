@@ -7,23 +7,40 @@
 // kernel, so blocking here would take the wasm stack and nothing would ever
 // deliver the bytes being waited for.
 import { createConnection } from 'node:net';
-import { readFile, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { PageHostStream } from './page-host.mjs';
 
 /** `fetch`, and for a `file:` URL the file itself (a page-served host's
- *  files in a directory): 404 where there is none. */
+ *  files in a directory), streamed, one `bytes=a-b` range of it if asked:
+ *  404 where there is none. */
 async function fetchOrFile(url, init) {
   if (!url.startsWith('file:')) return fetch(url, init);
   const path = fileURLToPath(url);
+  let st;
   try {
-    const st = await stat(path);
+    st = await stat(path);
     if (!st.isFile()) throw new Error('not a file');
-    const body = init?.method === 'HEAD' ? null : await readFile(path);
-    return new Response(body, { status: 200, headers: { 'content-length': String(st.size), 'last-modified': st.mtime.toUTCString() } });
   } catch {
     return new Response(null, { status: 404, headers: { 'content-length': '0' } });
   }
+  const headers = { 'last-modified': st.mtime.toUTCString(), 'accept-ranges': 'bytes' };
+  let [start, end, status] = [0, st.size - 1, 200];
+  const range = /^bytes=(\d*)-(\d*)$/.exec(init?.headers?.range ?? '');
+  if (range && (range[1] || range[2])) {
+    if (range[1]) [start, end] = [Number(range[1]), range[2] ? Math.min(Number(range[2]), st.size - 1) : st.size - 1];
+    else [start, end] = [Math.max(0, st.size - Number(range[2])), st.size - 1];
+    if (start > end || start >= st.size) {
+      return new Response(null, { status: 416, headers: { 'content-range': `bytes */${st.size}`, 'content-length': '0' } });
+    }
+    status = 206;
+    headers['content-range'] = `bytes ${start}-${end}/${st.size}`;
+  }
+  headers['content-length'] = String(end - start + 1);
+  const body = init?.method === 'HEAD' || end < start ? null : Readable.toWeb(createReadStream(path, { start, end }));
+  return new Response(body, { status, headers });
 }
 
 /** Status codes the shim understands. */
