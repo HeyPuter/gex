@@ -8,6 +8,7 @@
 // can do: DOM events, and the canvas's size.
 
 import { assetUrl, pageParams } from './page-env.js';
+import { startWakeRelay } from '@gex/wl-bridge.mjs';
 
 /** `KeyboardEvent.code` -> Linux evdev keycode, which is what Wayland carries. */
 const EVDEV = {
@@ -39,6 +40,7 @@ const BTN = { 0: 0x110, 1: 0x112, 2: 0x111 };
 
 export class Compositor {
   #worker;
+  #channel;
   #canvas;
   #detach = [];
   #pending = new Map();
@@ -104,6 +106,7 @@ export class Compositor {
   }
 
   async #start(canvas, channel, inputTarget, makeWorker, { scale = 1 } = {}) {
+    this.#channel = channel;
     const sameTarget = inputTarget === canvas;
     // A canvas can be handed to a worker once and never again, and a page
     // that runs a session twice hands over the same element the second time:
@@ -313,9 +316,16 @@ export class Compositor {
     });
   }
 
-  /** A guest process's memory: where its surfaces' pixels are. */
+  /** A guest process's memory, where its surfaces' pixels are, for a channel
+   *  without pixel buffers; and the global kernel's, for the wake. With pixel
+   *  buffers the worker gets neither: this thread holds the kernel already
+   *  and relays the wake (wl-bridge.mjs `startWakeRelay`). */
   addMemory(token, memory, kernel) {
-    this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
+    if (kernel && this.#channel?.pixels) {
+      startWakeRelay(this.#channel, kernel);
+      kernel = undefined;
+    }
+    if (memory || kernel) this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
   }
 
   /** That process has exited: its memory, its GL context and its GL windows

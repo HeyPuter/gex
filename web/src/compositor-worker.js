@@ -5,19 +5,24 @@ import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 //
 // Every guest process publishes descriptors for its surfaces into a shared
 // arena (see `wl-bridge.mjs`); this reads them once a frame, uploads the rows
-// that changed straight out of the guest's own memory, and draws the scene --
+// that changed, and draws the scene --
 // windows with server-side decorations, their popups and subsurfaces above
 // them, and the client's cursor on top. Input goes the other way: the hit test
 // happens here, because this is the only place that knows where the windows
 // are.
 //
-// What does NOT happen here is a copy of a frame. A `wl_shm` buffer is guest
-// memory, the guest's memory is a SharedArrayBuffer, and `texSubImage2D` reads
-// it in place. An OpenGL client's frame comes from Mesa in this worker (see
-// startGl).
+// A `wl_shm` buffer's damaged rows come from the channel's pixel buffers: the
+// guest copies them there as it publishes, so this worker holds no process's
+// memory and the engine counts none of it against this worker's heap (a
+// WebAssembly memory is counted at its whole length in every worker that
+// holds it, and a large one held here made every few megabytes allocated a
+// full collection). Only a build without the pixel buffers (a single-threaded
+// page) still sends the memory, and the rows are read from it in place. An
+// OpenGL client's frame comes from Mesa in this worker (see startGl).
 
 import {
   readScene,
+  blockPixels,
   ackBlock,
   sendEvent,
   setKernelMemory,
@@ -551,9 +556,23 @@ class Compositor {
    * buffer was "past the end of memory".
    */
   addMemory(token, memory, kernel) {
-    this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
     setKernelMemory(this.#channel, kernel);
+    // Where surfaces' pixels are copied for this worker (wl-bridge.mjs
+    // `pixels`), the guest's memory is not kept: see the top of that file.
+    // A channel without them (an older guest bundle) still reads the memory.
+    if (memory && !this.#channel.pixels) this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
   }
+
+  /** The bytes a surface's address points into: its block's pixel buffer, or
+   *  for a channel without one, its process's memory. */
+  #pixelsOf(s) {
+    const buf = blockPixels(this.#channel, s.block);
+    if (!buf) return this.#memoryOf(s.token);
+    let v = this.#pixelViews[s.block];
+    if (!v || v.buffer !== buf || v.length !== buf.byteLength) v = this.#pixelViews[s.block] = new Uint8Array(buf);
+    return v;
+  }
+  #pixelViews = [];
 
   /** The current view of a process's memory, re-derived if it has grown. */
   #memoryOf(token) {
@@ -966,7 +985,7 @@ class Compositor {
     // window can have both: a background the server painted, with the GL
     // frame drawn over it.
     if (!s.addr) return true;
-    const mem = this.#memoryOf(s.token);
+    const mem = this.#pixelsOf(s);
     if (!mem) return false;
     const t = this.#texture(k, s.width, s.height);
     const full = s.damage.w <= 0 || s.damage.h <= 0 || t.serial === 0 || s.serial !== t.serial + 1;
@@ -1325,7 +1344,7 @@ class Compositor {
   #cursorImage(s, win) {
     if (!s || !s.addr || s.width <= 0 || s.height <= 0 || s.width > 256 || s.height > 256) return 'none';
     if (win.cursorSerial === s.serial && win.cursorAddr === s.addr && win.cursorCss) return win.cursorCss;
-    const mem = this.#memoryOf(s.token);
+    const mem = this.#pixelsOf(s);
     if (!mem || s.addr + (s.height - 1) * s.stride + s.width * 4 > mem.length) return 'none';
     const px = new Uint8ClampedArray(s.width * s.height * 4);
     const opaque = s.format === 1;

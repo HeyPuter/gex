@@ -2,14 +2,22 @@
 // where their pixels live, carried from every guest process to the one worker
 // that draws them.
 //
-// Nothing here copies a frame. A `wl_shm` pool is guest memory mapped shared,
-// so a surface's pixels are already in a `SharedArrayBuffer` the compositor can
-// read: what crosses this channel is a *descriptor* per surface -- address,
-// stride, size, role, and the rectangle that changed -- and the compositor
-// uploads the damaged rows straight out of the guest's memory into a texture.
-// The old path copied every frame four times (out of the pool, into a staging
-// buffer, out of it again, and into a canvas) and could only ever show one
-// window.
+// What crosses this channel is a *descriptor* per surface -- where its pixels
+// are, stride, size, role, and the rectangle that changed -- and the compositor
+// uploads the damaged rows into a texture. The pixels are copied once, by the
+// guest as it publishes, out of its `wl_shm` pool into its block's pixel
+// buffer (`pixels`, a SharedArrayBuffer per block): the damaged rows
+// only, and nothing for a surface whose commit has not moved on. The old path
+// copied every frame four times (out of the pool, into a staging buffer, out
+// of it again, and into a canvas) and could only ever show one window.
+//
+// The compositor reads that buffer and not the guest's memory, because it
+// must not hold the memory. V8 counts every wasm memory an isolate holds, at
+// its length, in the size its next full collection is scheduled from; past
+// about 8 GiB in all the headroom stops growing and it collects every few
+// megabytes allocated. A memory64 game's memory alone can be past that, a
+// Wine process's is about 2 GiB, and the compositor that held them all
+// collected 25 times a second. A plain SharedArrayBuffer is not counted.
 //
 // There is one channel per page and a compositor in every guest process (see
 // `mount_devices`), so the layout is a small arena: each process claims a block
@@ -129,6 +137,15 @@ const M_OUT_H = 1;
 const M_PUB = 2;
 /** Device pixels per surface unit for guest Wayland clients (wl_output.scale). */
 const M_SCALE = 3;
+/** Set by the first process to hand the page the global kernel's memory, so
+ *  every other one (and every thread) does not send another copy of it. */
+const M_KERNEL_SENT = 4;
+/** The wake relay (`startWakeRelay`): a compositor that does not hold the
+ *  kernel's memory sets its block's bit in `M_RELAY_BLOCKS` after putting an
+ *  event in the ring, and bumps and notifies `M_RELAY`; the thread that holds
+ *  the kernel notifies those blocks' queues. */
+const M_RELAY = 5;
+const M_RELAY_BLOCKS = 6;
 const M_WORDS = 8;
 
 // Block header: the token that claimed it, a heartbeat so a dead process's
@@ -159,12 +176,35 @@ const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
 const blockBase = (b) => M_WORDS + b * BLOCK_WORDS;
 const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
 
-/** The shared arena a compositor and its guests share. */
+// A block's pixel buffer: a header -- a lock, the next free byte, and a
+// region per surface -- then the surfaces' pixels, packed rows of width * 4.
+const P_LOCK = 0;
+const P_NEXT = 1;
+const P_ENTRIES = 4;
+/** Per surface: client, surface, offset, size, the serial last copied. */
+const PE = 5;
+const P_DATA = 2048;
+/** A block's pixel buffer: room for seven 1920x1080 surfaces. Its pages are
+ *  only memory once written. Fixed, because `writeTexture` refuses a view
+ *  of a growable buffer. */
+const PIXELS_BYTES = 64 << 20;
+
+/** The shared arena a compositor and its guests share, and a pixel buffer per
+ *  block (see the top of this file). */
 export function makeWlChannel() {
   // A plain buffer in the single-thread build, where the compositor and every
-  // guest are one realm.
-  const Buf = typeof SharedArrayBuffer === 'function' ? SharedArrayBuffer : ArrayBuffer;
-  return { arena: new Buf(TOTAL_WORDS * 4) };
+  // guest are one realm -- and there no pixel buffers: the one isolate holds
+  // the guests' memories whatever this does, and counts a plain ArrayBuffer.
+  if (typeof SharedArrayBuffer !== 'function') return { arena: new ArrayBuffer(TOTAL_WORDS * 4) };
+  const pixels = [];
+  for (let b = 0; b < BLOCKS; b++) pixels.push(new SharedArrayBuffer(PIXELS_BYTES));
+  return { arena: new SharedArrayBuffer(TOTAL_WORDS * 4), pixels };
+}
+
+/** Block `b`'s pixels, where its records' addresses point: a view the caller
+ *  re-takes when the buffer has grown (`view.length !== buffer.byteLength`). */
+export function blockPixels(channel, b) {
+  return channel.pixels?.[b] ?? null;
 }
 
 /** Tell the guests how large the output is, so a toplevel is configured to it. */
@@ -359,7 +399,45 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
     notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
     // The single-thread build: the fibers parked on those words look.
     if (single.on) sched.checkSlots();
+  } else if (q && slots && channel.arena instanceof SharedArrayBuffer) {
+    // No kernel memory here: the relay's thread has it (`startWakeRelay`).
+    Atomics.or(a, M_RELAY_BLOCKS, 1 << block);
+    Atomics.add(a, M_RELAY, 1);
+    Atomics.notify(a, M_RELAY);
   }
+}
+
+/**
+ * Notify, for a compositor that does not hold the global kernel's memory,
+ * the wait queue of every block `sendEvent` marked (`M_RELAY_BLOCKS`). Runs
+ * on the thread that has the kernel anyway (the page's), so the compositor
+ * holds no kernel memory, which the engine would count against its heap at
+ * the memory's whole length. Started once per channel; the first call's
+ * memory is the one used, as `setKernelMemory`'s is.
+ */
+export function startWakeRelay(channel, kernel) {
+  if (!kernel || channel.relay || typeof Atomics.waitAsync !== 'function' || !(channel.arena instanceof SharedArrayBuffer)) return;
+  channel.relay = kernel;
+  const a = new Int32Array(channel.arena);
+  (async () => {
+    for (;;) {
+      const v = Atomics.load(a, M_RELAY);
+      let bits = Atomics.exchange(a, M_RELAY_BLOCKS, 0) >>> 0;
+      if (bits) {
+        // Re-taken each time: the kernel's memory grows.
+        const w = new Int32Array(kernel.buffer);
+        while (bits) {
+          const b = 31 - Math.clz32(bits & -bits);
+          bits &= bits - 1;
+          const q = Atomics.load(a, blockBase(b) + B_WAKE);
+          const slots = Atomics.load(a, blockBase(b) + B_SLOTS);
+          if (q && slots) notifyQueue(w, q >>> 0, slots >>> 0);
+        }
+      }
+      const r = Atomics.waitAsync(a, M_RELAY, v);
+      if (r.async) await r.value;
+    }
+  })();
 }
 
 /** Queue words: a bitmap of the slots registered on it, 64 words
@@ -408,8 +486,109 @@ export class WlProxy {
    */
   constructor(channel, wake, tokenFn) {
     this.#a = new Int32Array(channel.arena);
+    this.#pixels = channel.pixels ?? null;
     this.#tokenFn = tokenFn;
     this.#wake = wake;
+  }
+
+  #pixels;
+  #saidTooBig = false;
+
+  /** Whether this is the first process to ask: it hands the page the
+   *  kernel's memory (`M_KERNEL_SENT`). */
+  firstForKernel() {
+    return Atomics.compareExchange(this.#a, M_KERNEL_SENT, 0, 1) === 0;
+  }
+
+  /**
+   * Copy the pixels of this publish's surfaces out of `memory` into the
+   * block's pixel buffer and point their records (at `dst` in the arena) at
+   * them: the damaged rows, all of them for a surface with a new region, and
+   * none for one whose serial was copied already.
+   */
+  #copyPixels(memory, recs) {
+    const buf = this.#pixels?.[this.#block];
+    if (!buf) return;
+    const h = new Int32Array(buf, 0, P_DATA >> 2);
+    while (Atomics.compareExchange(h, P_LOCK, 0, 1) !== 0);
+    try {
+      if (h[P_NEXT] < P_DATA) h[P_NEXT] = P_DATA;
+      const a = this.#a;
+      const find = (c, sf) => {
+        for (let e = 0; e < SLOTS; e++) {
+          const o = P_ENTRIES + e * PE;
+          if (h[o + 2] && h[o] === c && h[o + 1] === sf) return o;
+        }
+        return -1;
+      };
+      // The regions this publish needs; a buffer that cannot take the new
+      // ones as well starts again from empty, every surface copied whole.
+      let more = 0;
+      for (const { dst } of recs) {
+        const o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
+        const need = a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4;
+        if (o < 0 || h[o + 3] < need) more += (need + 255) & ~255;
+      }
+      if (h[P_NEXT] + more > buf.byteLength) {
+        for (let e = 0; e < SLOTS * PE; e++) h[P_ENTRIES + e] = 0;
+        h[P_NEXT] = P_DATA;
+      }
+      const src = new Uint8Array(memory.buffer);
+      for (const { dst, rect } of recs) {
+        const w = a[dst + R_WIDTH];
+        const ht = a[dst + R_HEIGHT];
+        const need = w * ht * 4;
+        const from = recordAddr(a, dst);
+        const stride = a[dst + R_STRIDE];
+        let o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
+        let whole = false;
+        if (o < 0 || h[o + 3] < need) {
+          if (o < 0) {
+            for (let e = 0; e < SLOTS && o < 0; e++) if (!h[P_ENTRIES + e * PE + 2]) o = P_ENTRIES + e * PE;
+            if (o < 0) o = P_ENTRIES;
+          }
+          const at = h[P_NEXT];
+          // Bigger than the whole buffer: not shown, and said once.
+          if (at + need > buf.byteLength) {
+            if (!this.#saidTooBig) console.warn(`[wl] a ${w}x${ht} surface does not fit its block's ${buf.byteLength >> 20} MiB of pixels`);
+            this.#saidTooBig = true;
+            a[dst + R_ADDR] = 0;
+            a[dst + R_ADDR_HI] = 0;
+            continue;
+          }
+          h[o] = a[dst + R_CLIENT];
+          h[o + 1] = a[dst + R_SURFACE];
+          h[o + 2] = at;
+          h[o + 3] = need;
+          h[P_NEXT] = at + ((need + 255) & ~255);
+          whole = true;
+        }
+        const at = h[o + 2];
+        const serial = a[dst + R_SERIAL];
+        if (whole || h[o + 4] !== serial) {
+          let x = 0, y = 0, rw = w, rh = ht;
+          if (!whole && rect.w > 0 && rect.h > 0) {
+            x = Math.max(0, Math.min(rect.x, w));
+            y = Math.max(0, Math.min(rect.y, ht));
+            rw = Math.max(0, Math.min(rect.w, w - x));
+            rh = Math.max(0, Math.min(rect.h, ht - y));
+          }
+          const out = new Uint8Array(buf, at, need);
+          if (from + (y + rh - 1) * stride + (x + rw) * 4 <= src.length || rh === 0) {
+            for (let r = 0; r < rh; r++) {
+              const s0 = from + (y + r) * stride + x * 4;
+              out.set(src.subarray(s0, s0 + rw * 4), (y + r) * w * 4 + x * 4);
+            }
+          }
+          h[o + 4] = serial;
+        }
+        a[dst + R_ADDR] = at;
+        a[dst + R_ADDR_HI] = 0;
+        a[dst + R_STRIDE] = w * 4;
+      }
+    } finally {
+      Atomics.store(h, P_LOCK, 0);
+    }
   }
 
   #tokenFn;
@@ -465,6 +644,10 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_GEN, 0);
         Atomics.store(this.#a, base + B_ACK, 0);
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
+        // The last process's regions are not this one's: its surfaces may
+        // have the same numbers.
+        const px = this.#pixels?.[b];
+        if (px) new Int32Array(px, 0, P_DATA >> 2).fill(0);
         this.#noteWake();
         return;
       }
@@ -521,10 +704,14 @@ export class WlProxy {
     const gen = Atomics.load(this.#a, this.#base + B_GEN);
     const drawn = Atomics.load(this.#a, this.#base + B_ACK) === gen;
     if (drawn) this.#pending.clear();
+    const shm = [];
     for (let i = 0; i < n; i++) {
       const o = i * REC;
       const dst = this.#base + B_WORDS + o;
       for (let w = 0; w < REC; w++) this.#a[dst + w] = src[o + w];
+      if (this.#pixels && recordAddr(this.#a, dst) && src[o + R_WIDTH] > 0 && src[o + R_HEIGHT] > 0) {
+        shm.push({ dst, rect: { x: src[o + R_DAMAGE_X], y: src[o + R_DAMAGE_Y], w: src[o + R_DAMAGE_W], h: src[o + R_DAMAGE_H] } });
+      }
       // Accumulate damage for a surface the compositor has not caught up with.
       const key = `${src[o + R_CLIENT]}:${src[o + R_SURFACE]}`;
       const held = drawn ? null : this.#pending.get(key);
@@ -541,6 +728,7 @@ export class WlProxy {
       this.#a[dst + R_DAMAGE_W] = merged.w;
       this.#a[dst + R_DAMAGE_H] = merged.h;
     }
+    if (shm.length) this.#copyPixels(memory, shm);
     Atomics.store(this.#a, this.#base + B_COUNT, n);
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);

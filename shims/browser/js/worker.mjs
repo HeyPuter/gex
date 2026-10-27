@@ -894,17 +894,19 @@ async function handle(msg) {
     // The output size a toplevel is configured to, before the guest runs.
     const out = outputSize(msg.wlChannel);
     gex.wlOutput(out.w, out.h, out.scale);
-    // The compositor reads this process's pixels out of this memory, so it
-    // needs the memory itself. Sent once, with the token that names this
-    // process's block in the arena.
-    // The compositor reads this process's pixels out of this memory, so it
-    // needs the memory itself. Sent when the token is known, which is after
-    // load: `onLoaded` is the first moment this process has a pid.
-    // The memory object, not its buffer: a shared memory that grows gives out a
-    // new buffer, and the compositor has to be able to see the new length.
+    // Sent when the token is known, which is after load: `onLoaded` is the
+    // first moment this process has a pid. With pixel buffers in the channel
+    // (wl-bridge.mjs) the compositor never needs this process's memory --
+    // and must not hold it -- so only the global kernel's goes, once a page,
+    // for the wake. Without them (the single-thread build) the compositor
+    // reads pixels out of the memory: the object, not its buffer, since a
+    // shared memory that grows gives out a new buffer.
     gex.onWlToken = (token) => {
       recyclable = false;
-      port.post({ kind: 'wl-memory', token, memory: gex.memory, kernel: gex.kernelWake()?.memory });
+      const kernel = proxy.firstForKernel() ? gex.kernelWake()?.memory : undefined;
+      const pixels = !!msg.wlChannel.pixels;
+      if (pixels && !kernel) return;
+      port.post({ kind: 'wl-memory', token, memory: pixels ? undefined : gex.memory, kernel });
     };
     proxy.onToken = gex.onWlToken;
     proxy.wakeAddr = () => gex.kernelWake();

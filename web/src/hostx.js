@@ -276,10 +276,15 @@ export class HostX {
     // notifies through the server's own queue when it puts input in this
     // block's ring.
     this.#proxy.wakeAddr = () => ({ addr: this.#k.k_wq_addr(this.#queue) >>> 0, slots: this.#k.k_ws_addr(0) >>> 0 });
-    // The compositor Worker reads an X window's pixels out of this memory, so
-    // it needs the memory itself -- the object, not a buffer, since a shared
-    // memory that grows hands out a new one.
-    this.emit({ kind: 'wl-memory', token: this.#token, memory: this.#x.wasmMemory, kernel: msg.kernel.memory });
+    // The compositor Worker reads an X window's pixels out of this memory
+    // only without pixel buffers in the channel (wl-bridge.mjs) -- the
+    // object, not a buffer, since a shared memory that grows hands out a new
+    // one. The global kernel's goes once a page, for the wake.
+    {
+      const kernel = this.#proxy.firstForKernel() ? msg.kernel.memory : undefined;
+      const pixels = !!msg.wlChannel.pixels;
+      if (!pixels || kernel) this.emit({ kind: 'wl-memory', token: this.#token, memory: pixels ? undefined : this.#x.wasmMemory, kernel });
+    }
 
     // -- the transport the server will use ---------------------------------
     this.#x.gexos = this.#gexos();

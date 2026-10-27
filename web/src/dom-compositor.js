@@ -483,9 +483,22 @@ export class DomDesktop {
    * that point reads as zero -- a window that is simply blank, with nothing
    * to say for itself. */
   addMemory(token, memory, kernel) {
-    this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
     setKernelMemory(this.#channel, kernel);
+    // With pixel buffers in the channel the memory is neither sent nor read
+    // (wl-bridge.mjs); without them, as before.
+    if (memory && !this.#channel.pixels) this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
   }
+
+  /** The bytes a surface's address points into: its block's pixel buffer,
+   *  or for a channel without one, its process's memory. */
+  #pixelsOf(s) {
+    const buf = this.#channel.pixels?.[s.block];
+    if (!buf) return this.#memoryOf(s.token);
+    let v = this.#pixelViews[s.block];
+    if (!v || v.buffer !== buf) v = this.#pixelViews[s.block] = new Uint8Array(buf);
+    return v;
+  }
+  #pixelViews = [];
 
   /** The current view of a process's memory, re-derived if it has grown. */
   #memoryOf(token) {
@@ -686,7 +699,7 @@ export class DomDesktop {
     if (!s.addr) return;
     if (s.serial === win.serial) return;
     const prev = win.serial;
-    const mem = this.#memoryOf(s.token);
+    const mem = this.#pixelsOf(s);
     // A commit is only taken once it is painted: a process's memory can reach
     // the page after its first publish, and an idle client commits no more,
     // so a commit taken without the memory would leave its window blank.
