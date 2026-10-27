@@ -5737,12 +5737,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         0
     };
     let snap_key_1 = snap_key(&kernel.exe_path, &kernel.envp);
+    let stack_args = program.argv(args.clone(), &kernel.exe_path);
     let layout = gex_ld::build_initial_stack(
         &program.exe,
         // `STACK_TOP`, not the top of the addressable range: a stack at the
         // top makes the memory allocate up to it, four gigabytes per process.
         gex_abi::STACK_TOP,
-        &args,
+        &stack_args,
         &env,
         *b"gexdeterministic",
         gex_ld::Identity {
@@ -10928,7 +10929,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // The probe cache names the old program's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
     cgen::ftab_registry_reset();
-    h.kernel.exe_path = path.to_string();
+    // (an exec of `/proc/self/exe` runs the program it links to, and that
+    // is what the new image's link says too)
+    if path != "/proc/self/exe" && path != format!("/proc/{}/exe", h.kernel.pid) {
+        h.kernel.exe_path = path.to_string();
+    }
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
     // The program the compositor's pump asks about (`wl::ProcCx`), and the
@@ -11045,12 +11050,15 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A restored process is past the linker, so `AT_ENTRY` is the honest
     // answer and the stub is not armed.
     let hook = if restored.is_some() { 0 } else { hook };
+    // (a program its interpreter maps starts as the interpreter's command
+    // line for it: gex_ld::Program::direct)
+    let direct_argv = program.as_ref().filter(|p| p.direct.is_some()).map(|p| p.argv(argv.to_vec(), &h.kernel.exe_path));
     let layout = gex_ld::build_initial_stack(
         &facts,
         // `STACK_TOP`, not the top of the addressable range: a stack at the
         // top makes the memory allocate up to it, four gigabytes per process.
         gex_abi::STACK_TOP,
-        argv,
+        direct_argv.as_deref().unwrap_or(argv),
         envp,
         *b"gexdeterministic",
         gex_ld::Identity {

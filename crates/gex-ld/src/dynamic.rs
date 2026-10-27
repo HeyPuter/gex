@@ -18,6 +18,13 @@ pub struct Program {
     pub exe: Image,
     /// The dynamic linker, already placed.
     pub interp: Option<Image>,
+    /// A position-independent executable too big for the space below the
+    /// interpreter (chromium, 300 MB) is not placed: the interpreter is run
+    /// as the program (`exe` is it, at the interpreter's address), and maps
+    /// the executable itself wherever its mappings go, as Linux's
+    /// `ld.so PROGRAM` does. This is the interpreter's path; [`Self::argv`]
+    /// gives it the program to run.
+    pub direct: Option<String>,
 }
 
 impl Program {
@@ -33,6 +40,16 @@ impl Program {
     /// compatibility mode and it speaks the i386 system-call ABI.
     pub fn compat(&self) -> bool {
         self.exe.class32
+    }
+
+    /// The arguments the process starts with: `argv` as asked, or for a
+    /// program its interpreter runs ([`Self::direct`]) the interpreter's own
+    /// command line for it (`--argv0` keeps the program's `argv[0]`).
+    pub fn argv(&self, argv: Vec<String>, exe_path: &str) -> Vec<String> {
+        let Some(interp) = &self.direct else { return argv };
+        let mut out = vec![interp.clone(), "--argv0".into(), argv.first().cloned().unwrap_or_else(|| exe_path.into()), exe_path.into()];
+        out.extend(argv.into_iter().skip(1));
+        out
     }
 
     /// Load bias of the interpreter, for `AT_BASE`.
@@ -54,10 +71,11 @@ impl Program {
     /// re-lift the whole dynamic linker per executable.
     pub fn placements(&self) -> impl Iterator<Item = (&crate::elf::Segment, Option<&str>)> {
         let interp = self.exe.interp.as_deref();
+        let exe_is = self.direct.as_deref();
         self.exe
             .segments
             .iter()
-            .map(|s| (s, None))
+            .map(move |s| (s, exe_is))
             .chain(self.interp.iter().flat_map(move |i| {
                 i.segments.iter().map(move |s| (s, interp))
             }))
@@ -83,7 +101,7 @@ pub fn load_program(
 ) -> Result<Program, LoadError> {
     let exe = load(bytes, pie_base)?;
     let Some(path) = exe.interp.clone() else {
-        return Ok(Program { exe, interp: None });
+        return Ok(Program { exe, interp: None, direct: None });
     };
     let Some(interp_bytes) = read(&path) else {
         return Err(LoadError::NeedsInterpreter(path));
@@ -91,10 +109,14 @@ pub fn load_program(
     // The interpreter is position-independent and goes wherever we say, well
     // clear of the executable so neither can overlap the other's mappings.
     let interp = load(&interp_bytes, interp_base)?;
+    if too_big(&exe, interp_base) {
+        return Ok(Program { exe: interp, interp: None, direct: Some(path) });
+    }
     check_overlap(&exe, &interp)?;
     Ok(Program {
         exe,
         interp: Some(interp),
+        direct: None,
     })
 }
 
@@ -110,7 +132,7 @@ pub fn plan_program(
 ) -> Result<(Program, crate::elf::FileRanges), LoadError> {
     let (exe_image, mut ranges) = crate::elf::plan(&|o, b| read_at(exe, o, b), pie_base)?;
     let Some(path) = exe_image.interp.clone() else {
-        return Ok((Program { exe: exe_image, interp: None }, ranges));
+        return Ok((Program { exe: exe_image, interp: None, direct: None }, ranges));
     };
     let (interp, interp_ranges) = match crate::elf::plan(&|o, b| read_at(&path, o, b), interp_base) {
         Ok(p) => p,
@@ -120,9 +142,18 @@ pub fn plan_program(
         }
         Err(e) => return Err(e),
     };
+    if too_big(&exe_image, interp_base) {
+        return Ok((Program { exe: interp, interp: None, direct: Some(path) }, interp_ranges));
+    }
     check_overlap(&exe_image, &interp)?;
     ranges.extend(interp_ranges);
-    Ok((Program { exe: exe_image, interp: Some(interp) }, ranges))
+    Ok((Program { exe: exe_image, interp: Some(interp), direct: None }, ranges))
+}
+
+/// A position-independent executable that reaches the interpreter's
+/// address from where executables go: its interpreter maps it instead.
+fn too_big(exe: &crate::elf::Image, interp_base: u64) -> bool {
+    exe.pie && exe.segments.iter().any(|s| s.vaddr + s.mem_size > interp_base)
 }
 
 /// Two independently placed images must not claim the same addresses.

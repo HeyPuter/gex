@@ -716,6 +716,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         &Program {
             exe: image.clone(),
             interp: None,
+            direct: None,
         },
         opts,
         xlate,
@@ -3061,13 +3062,19 @@ fn exec_program(
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).
-    kernel.exe_path = if req.path.starts_with('/') {
+    // (an exec of `/proc/self/exe` runs the program it links to, and that
+    // is what the new image's link says too)
+    kernel.exe_path = if req.path == "/proc/self/exe" || req.path == format!("/proc/{}/exe", kernel.pid) {
+        kernel.exe_path.clone()
+    } else if req.path.starts_with('/') {
         req.path.clone()
     } else {
         format!("{}/{}", kernel.caller_cwd().trim_end_matches('/'), req.path)
     };
     let opts = RunOptions {
-        args: req.argv,
+        // (a program its interpreter maps: the interpreter's command line
+        // for it, gex_ld::Program::direct)
+        args: program.argv(req.argv, &kernel.exe_path),
         env: req.envp,
         ..opts.clone()
     };
