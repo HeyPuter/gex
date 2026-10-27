@@ -876,6 +876,8 @@ async function handle(msg) {
       if (!msg.glChannel.direct) port.post({ kind: 'gl' });
     }));
   }
+  // The GL device runs D3D too: /dev/gex-d3d beside /dev/gex-gl.
+  if (msg.glChannel?.d3d) gex.useD3d(true);
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
   // load, so it must run before `load` -- which binds `wayland-0` only when it

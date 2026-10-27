@@ -710,6 +710,9 @@ async function runProgramHere(
     // Which Gallium driver the host's Mesa runs when `gl` is 'compositor':
     // gex_wgpu, straight onto WebGPU.
     glBackend = 'wgpu',
+    // The GL device runs D3D too: its Mesa has the D3D device (a
+    // GEX_MESA_DIRK=1 build), and the guest gets /dev/gex-d3d.
+    d3d = false,
     // The compositor's output canvas. Its control is transferred to a worker
     // that owns a WebGPU device and draws the whole scene there: every
     // window, its decorations, its menus, and the cursor.
@@ -873,13 +876,14 @@ async function runProgramHere(
     // The single-thread build: no ring. Each process's `gl_submit` calls the
     // compositor's Mesa in this realm on its own memory (compositor-worker.js
     // `glInRealm`), started by the system Worker.
-    glChannel = { inRealm: true };
+    glChannel = { inRealm: true, d3d: !!d3d };
   } else if (gl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the GL demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
     const { makeGlChannel, serveGl } = await import('@gex/gl-bridge.mjs');
     glChannel = makeGlChannel();
+    glChannel.d3d = !!d3d;
     // `gl: 'compositor'` means the device is not here at all: the compositor's
     // worker hosts it, so its frames are textures in the context that draws
     // the scene. Nothing on this side serves the ring in that case -- see

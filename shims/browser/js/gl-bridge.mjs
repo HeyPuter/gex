@@ -34,6 +34,17 @@ const ASYNC = 4;
 // on one that will not come.
 const HOST = 5;
 const HOST_WAIT_MS = 600000;
+// Timing, while the page's device asks for it (STATS 1: its D3D stats,
+// DIRK_WIRE_STATS): what clients spent claiming the ring, copying into it
+// and in all of `submit`, in microseconds, and how many submits that was;
+// and, as a float64 at TIME_AT, when the last request was made (time origin
+// plus now, comparable across Workers). The page reads and resets them.
+const STATS = 6;
+const CLAIM_US = 7;
+const TIME_AT = 32; // bytes: words 8 and 9
+const COPY_US = 10;
+const PROXY_US = 11;
+const STAT_N = 12;
 // Per client, what its last unwaited batch left to say: one slot of
 // SLOT_WORDS words per `client % SLOTS` (key = the client's number + 1,
 // the frames that client's surface has shown as of that batch's PRESENT, and
@@ -103,6 +114,15 @@ export function serveGl(glDevice, channel) {
   const serve = function serve() {
     if (inFlight) return inFlight;
     if (Atomics.load(ctl, STATE) !== REQUEST) return;
+    // The device's timing, when it keeps any (`noteBridge`): the clients'
+    // side, and how long this request waited for the page to see it.
+    if (glDevice.statsOn) {
+      ctl[STATS] = 1;
+      const asked = new Float64Array(channel.control, TIME_AT, 1)[0];
+      glDevice.noteBridge(asked ? performance.timeOrigin + performance.now() - asked : 0,
+        Atomics.exchange(ctl, CLAIM_US, 0), Atomics.exchange(ctl, COPY_US, 0),
+        Atomics.exchange(ctl, PROXY_US, 0), Atomics.exchange(ctl, STAT_N, 0));
+    }
     const unwaited = Atomics.load(ctl, ASYNC) === 1;
     const client = Atomics.load(ctl, CLIENT) >>> 0;
     const finish = (result) => {
@@ -207,6 +227,36 @@ export class GlProxy {
    * previous unwaited batch (0 when unknown), or -1 when that batch failed.
    */
   submit(memory, ring, client = 0, async = false, noteWait = null) {
+    if (this.#ctl[STATS] !== 1) return this.#submit(memory, ring, client, async, noteWait);
+    const t0 = performance.now();
+    this.#claimMs = 0;
+    this.#copyMs = 0;
+    try {
+      return this.#submit(memory, ring, client, async, noteWait);
+    } finally {
+      const ctl = this.#ctl;
+      Atomics.add(ctl, CLAIM_US, Math.round(this.#claimMs * 1000));
+      Atomics.add(ctl, COPY_US, Math.round(this.#copyMs * 1000));
+      Atomics.add(ctl, PROXY_US, Math.round((performance.now() - t0) * 1000));
+      Atomics.add(ctl, STAT_N, 1);
+    }
+  }
+
+  #claimMs = 0;
+  #copyMs = 0;
+
+  #copy(gbytes, ring, tail) {
+    if (this.#ctl[STATS] !== 1) {
+      this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
+      return;
+    }
+    const t0 = performance.now();
+    this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
+    this.#copyMs += performance.now() - t0;
+    new Float64Array(this.#ctl.buffer, TIME_AT, 1)[0] = performance.timeOrigin + performance.now();
+  }
+
+  #submit(memory, ring, client, async, noteWait) {
     const gbytes = new Uint8Array(memory.buffer);
     const ghead = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
     const capacity = ghead[H_CAPACITY];
@@ -243,7 +293,10 @@ export class GlProxy {
         break;
       }
     }
-    if (t0) noteWait?.(performance.now() - t0);
+    if (t0) {
+      noteWait?.(performance.now() - t0);
+      this.#claimMs += performance.now() - t0;
+    }
     // What this client's last unwaited batch left: the host has run it (the
     // claim was released after it), so this is its final word.
     const slot = slotOf(client);
@@ -261,7 +314,7 @@ export class GlProxy {
     }
     if (async) {
       // Released by the page: the channel's buffer is in use until then.
-      this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
+      this.#copy(gbytes, ring, tail);
       Atomics.store(ctl, CLIENT, client >>> 0);
       Atomics.store(ctl, ASYNC, 1);
       Atomics.store(ctl, STATE, REQUEST);
@@ -281,7 +334,7 @@ export class GlProxy {
 
   #exchange(gbytes, ring, capacity, tail, client) {
     // Forward: the header and the commands recorded so far.
-    this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
+    this.#copy(gbytes, ring, tail);
 
     const ctl = this.#ctl;
     Atomics.store(ctl, CLIENT, client >>> 0);

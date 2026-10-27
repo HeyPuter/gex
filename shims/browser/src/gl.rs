@@ -1,4 +1,5 @@
-//! The guest's graphics device in a browser: `/dev/gex-gl`.
+//! The guest's graphics device in a browser: `/dev/gex-gl`, and as
+//! `/dev/gex-d3d` the same device for D3D (`have_d3d`).
 //!
 //! Same protocol as the native device (the guest's `libGLESv2.so.2` is one
 //! binary), executed here by Mesa (gex_wgpu over WebGPU). Page side is
@@ -44,6 +45,27 @@ pub extern "C" fn gex_set_gl(on: i32) {
 
 pub fn have_gl() -> bool {
     unsafe { HAVE_GL }
+}
+
+/// Set when the page's GL device can also run D3D (its Mesa was built with
+/// the D3D device): the guest then has `/dev/gex-d3d` too. The same device
+/// as `/dev/gex-gl` -- the same ioctls, the same imports, the same client --
+/// whose rings say by their magic which decoder the page runs them with. A
+/// node of its own so that a guest's D3D finds no device on a page without
+/// one, rather than a device that refuses every batch.
+static mut HAVE_D3D: bool = false;
+
+/// Say that the page's GL device runs D3D as well.
+///
+/// # Safety
+/// As `gex_set_gl`.
+#[no_mangle]
+pub extern "C" fn gex_set_d3d(on: i32) {
+    unsafe { HAVE_D3D = on != 0 }
+}
+
+pub fn have_d3d() -> bool {
+    unsafe { HAVE_D3D }
 }
 
 /// The same ioctl numbers the native device uses, for the same reason: one

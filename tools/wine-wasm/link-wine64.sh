@@ -190,6 +190,24 @@ for spec in $uxl; do
 	done
 	reg="$reg $lib.so:data:__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
 done
+# WINE64_DIRK=1: d3d11.so, the Unix side of the D3D shim (dxvk's src/dirk/pe;
+# Mesa pins dxvk, and web/build-mesa-wasm.sh with GEX_MESA_DIRK=1 fetches it
+# into third_party/mesa/subprojects/dxvk), with the same template. Its
+# d3d11.dll is in the native core only with WINE64_EXTRA_DLLS, a page layer
+# apps turn on with d3d=1.
+dk=$HERE/../../third_party/mesa/subprojects/dxvk/src/dirk/pe
+if [ "${WINE64_DIRK:-0}" = 1 ]; then
+	[ -f "$dk/unixlib.c" ] || { echo "link-wine64: WINE64_DIRK=1 needs third_party/mesa/subprojects/dxvk (cd third_party/mesa && meson subprojects download dxvk)" >&2; exit 1; }
+	mkdir -p gexw64/dirk
+	out=gexw64/dirk/unixlib.o; objs="$objs $out"
+	if ! [ "$out" -nt "$dk/unixlib.c" ] || ! [ "$out" -nt "$dk/unixlib.h" ] || ! [ "$out" -nt "$HERE/link-wine64.sh" ]; then
+		cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$dk\/unixlib.c}
+		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$dk}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
+		( eval "$cmd -D__wine_unix_call_funcs=d3d11__wine_unix_call_funcs" >&2 ) ||
+			{ echo "link-wine64: dirk's unixlib.c failed" >&2; touch "$fail"; }
+	fi
+	reg="$reg d3d11.so:data:__wine_unix_call_funcs=d3d11__wine_unix_call_funcs"
+fi
 wait
 [ ! -e "$fail" ] || { echo "link-wine64: compile failed; not linking" >&2; exit 1; }
 if [ -n "$M64" ]; then

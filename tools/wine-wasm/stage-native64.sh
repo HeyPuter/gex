@@ -25,8 +25,31 @@ mkdir -p "$out"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/stage-native64.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-PATH=$GEX_WASM64_SYSROOT/binaryen/bin:$PATH TMPDIR=$tmp python3 "$here/pelink.py" --wasm64 "$build" "$src" "$tmp/winepe.wasm" "$@"
+# WINE64_EXTRA_DLLS=DIR: DLLs built outside the tree linked in too (dirk's
+# d3d11.dll and dxgi.dll,
+# third_party/mesa/subprojects/dxvk/tests/dirk/w64/build.sh): for each,
+# NAME.so.r.o, NAME.so.exports, NAME.spec and NAME.imports (a comma list) in
+# DIR. Their skeletons go in OUTDIR/extra, not beside the others: a prefix
+# loads them only when told to (a DLL override), its own DLLs of those names
+# staying.
+extra=() extras=()
+if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
+    for ro in "$WINE64_EXTRA_DLLS"/*.so.r.o; do
+        [ -e "$ro" ] || continue
+        n=$(basename "$ro" .so.r.o)
+        extra+=(--extra "$n" "$ro" "${ro%.r.o}.exports" "$(cat "$WINE64_EXTRA_DLLS/${n%.*}.imports")")
+        extras+=("$n")
+    done
+fi
+PATH=$GEX_WASM64_SYSROOT/binaryen/bin:$PATH TMPDIR=$tmp python3 "$here/pelink.py" --wasm64 "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
 cp "$tmp/winepe.wasm" "$out/winepe.wasm"
+if [ ${#extras[@]} -gt 0 ]; then
+    mkdir -p "$out/extra"
+    for dll in "${extras[@]}"; do
+        "$winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$here/wcc64 -D_WIN32" --dll -E "$WINE64_EXTRA_DLLS/${dll%.*}.spec" \
+            --fake-module --wasm-shared winepe.wasm -F "$dll" -o "$out/extra/$dll"
+    done
+fi
 for dll in "$@"; do
     name=${dll%.*}
     dir=$build/dlls/$name

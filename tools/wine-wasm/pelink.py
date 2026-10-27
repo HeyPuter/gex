@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link Wine's PE side as one wasm module.
 
-    pelink.py WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
+    pelink.py [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
 
 For each DLL (all of them, or those named), the build left the DLL as one
@@ -167,6 +167,13 @@ def main():
             else:
                 sys.exit(f'unknown argument {args[i]}')
         return link(dlls, out, gexrt)
+    # --extra NAME R.O EXPORTS IMPORTS (a comma list): a DLL built outside
+    # the tree (dirk's d3d11.dll and dxgi.dll), linked in, in place of the
+    # tree's own of that name.
+    extra = []
+    while sys.argv[1] == '--extra':
+        extra.append((sys.argv[2], sys.argv[3], sys.argv[4], [i for i in sys.argv[5].split(',') if i]))
+        del sys.argv[1:6]
     build, src, out = sys.argv[1:4]
     global SRC
     SRC = src
@@ -219,6 +226,11 @@ def main():
             # STATUS_INVALID_SYSTEM_SERVICE)
             EAGER[mod] = [modname(i) for i in eager]
             DELAY[mod] = [modname(i.lstrip('-')) for i in makefile_var(mk, 'DELAYIMPORTS')]
+    extra_names = {e[0] for e in extra}
+    dlls = [d for d in dlls if d[0] not in extra_names] + extra
+    for mod, ro, ex, imports in extra:
+        EAGER[mod] = list(imports)
+        DELAY[mod] = []
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
     if WINE64 and only - {d[0] for d in dlls}:
@@ -243,6 +255,8 @@ def main():
                     with open(ex, 'w') as f:
                         f.writelines(f'{n} func\n' for n in names)
                     others[mod[0]] = ex
+    for mod, ro, ex, imports in extra:
+        others[mod] = ex
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 

@@ -48,7 +48,9 @@ def stable(name):
 # which then holds something else at that index.
 FEATURES = ['--mvp-features', '--enable-threads', '--enable-simd', '--enable-bulk-memory',
             '--enable-bulk-memory-opt', '--enable-nontrapping-float-to-int', '--enable-sign-ext',
-            '--enable-mutable-globals', '--enable-multivalue']
+            '--enable-mutable-globals', '--enable-multivalue',
+            # The D3D device's (GEX_MESA_DIRK): DXVK throws.
+            '--enable-exception-handling']
 
 
 def binaryen(tool):

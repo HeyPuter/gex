@@ -295,6 +295,8 @@ struct gex_surface {
     uint32_t produced = 0;
     uint32_t displayed = 0;
     unsigned generation = 0;
+    /* Its frames come from the D3D device (gex_gl_external_frame). */
+    bool external = false;
 };
 
 /* This client's surfaces, and which is current. `sur` is always the entry
@@ -477,6 +479,11 @@ void drop_surface(uint32_t handle, bool repoint = true) {
 }
 uint32_t produced = 0;
 uint32_t displayed = 0;
+/* Frames shown, by where they came from, across every client: the frame
+ * report says which, since a D3D program's process may run GL as well. */
+uint32_t displayed_gl = 0, displayed_d3d = 0;
+/* The frames a D3D window's last show left unshown: none, newest-first. */
+uint32_t d3d_behind = 0;
 GLuint default_vao = 0;
 std::vector<GLenum> current_draw_buffers{GL_BACK};
 GLfloat current_clear_color[4] = {0.f, 0.f, 0.f, 0.f};
@@ -1365,10 +1372,19 @@ WGPUQueue present_queue(WGPUDevice device) {
     return queue;
 }
 
+/* The device frames are shown with: this client's screen's, or for a
+ * client with no GL of its own (one whose frames come from the D3D device,
+ * gexd3d-mesa.cpp) the page's, which every screen is made on. */
+WGPUDevice display_device() {
+    return mesa_frontend_screen.screen
+        ? gex_wgpu_screen_device(mesa_frontend_screen.screen)
+        : emscripten_webgpu_get_device();
+}
+
 void configure_present_surface() {
-    if (mesa_surface || !mesa_frontend_screen.screen) return;
+    if (mesa_surface) return;
     GEX_PRESENT_MARK(configure_begin);
-    WGPUDevice device = gex_wgpu_screen_device(mesa_frontend_screen.screen);
+    WGPUDevice device = display_device();
     if (!device) return;
     WGPUInstance instance = wgpuCreateInstance(nullptr);
     if (!instance) return;
@@ -1506,6 +1522,22 @@ bool display_pending(const gex_surface& s) {
     return found != window_canvases.end() && found->second.reshow;
 }
 
+/* The current surface's newest frame has been shown. A GL client is paced
+ * by these counts, one frame each; a D3D window is not, and its frames are
+ * shown newest-first: the ones it presented in between are passed over, not
+ * shown later one per page frame as though each were new. */
+void note_shown() {
+    ++displayed;
+    if (sur->external) {
+        sur->displayed = sur->produced;
+        ++displayed_d3d;
+        d3d_behind = sur->produced - sur->displayed;
+    } else {
+        ++sur->displayed;
+        ++displayed_gl;
+    }
+}
+
 bool display_backend() {
     if (!sur || !display_pending(*sur)) return false;
     /* A reshow repeats a frame already counted: it moves no counter. */
@@ -1517,8 +1549,7 @@ bool display_backend() {
     struct pipe_resource *source =
         sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
     WGPUTexture from = source ? gex_wgpu_resource_texture(source) : nullptr;
-    WGPUDevice device = mesa_frontend_screen.screen
-        ? gex_wgpu_screen_device(mesa_frontend_screen.screen) : nullptr;
+    WGPUDevice device = display_device();
     WGPUSurface target = device ? present_target(device) : nullptr;
     if (!target || !from || !device) {
         /* Counted anyway: the frame really was produced, and reporting
@@ -1536,10 +1567,7 @@ bool display_backend() {
                         : !from ? "no back-left drawable texture"
                                 : "no device");
         }
-        if (fresh) {
-            ++displayed;
-            ++sur->displayed;
-        }
+        if (fresh) note_shown();
         return true;
     }
     /* Tell the driver which texture reaches the canvas, so it can count the
@@ -1560,10 +1588,7 @@ bool display_backend() {
                     "canvas will not change while frames keep counting\n",
                     (unsigned)surface_texture.status);
         }
-        if (fresh) {
-            ++displayed;
-            ++sur->displayed;
-        }
+        if (fresh) note_shown();
         return true;
     }
     {
@@ -1586,12 +1611,14 @@ bool display_backend() {
         if ((frames++ % every) == 0) {
             fprintf(stderr,
                     "gex-wgpu: frame %u -- issued %u, declined %u "
-                    "(constant %u, texture %u, vertex %u; last: %s)\n",
+                    "(constant %u, texture %u, vertex %u; last: %s); "
+                    "new frames shown: %u GL, %u D3D (%u behind)\n",
                     frames, gex_wgpu_draws_issued, gex_wgpu_draws_declined,
                     gex_wgpu_declined_constant, gex_wgpu_declined_texture,
                     gex_wgpu_declined_vertex,
                     gex_wgpu_declined_last_why ? gex_wgpu_declined_last_why
-                                               : "-");
+                                               : "-",
+                    displayed_gl, displayed_d3d, d3d_behind);
             gex_wgpu_report_draw_targets();
         }
     }
@@ -1622,10 +1649,7 @@ bool display_backend() {
     GEX_PRESENT_MARK(texture_release);
     wgpuTextureRelease(surface_texture.texture);
     GEX_PRESENT_MARK(done);
-    if (fresh) {
-        ++displayed;
-        ++sur->displayed;
-    }
+    if (fresh) note_shown();
     return true;
 }
 
@@ -3007,12 +3031,17 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_setenv(const char *pair) {
 }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reply_len() { return reply.size(); }
 EMSCRIPTEN_KEEPALIVE const uint8_t* gex_gl_reply_data() { return reply.data(); }
+/* gexd3d-mesa.cpp, when the D3D device is built in. */
+extern "C" __attribute__((weak)) void gex_d3d_display_tick();
+
 /* Show one frame of every window that has one waiting.
  *
  * Not just the current one: a page frame shows every window, and a client
  * whose window is not the one that submitted last must not be left waiting
  * for a count that only moves when it is. */
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_display() {
+    /* The D3D device's, when it is built in (gexd3d-mesa.cpp). */
+    if (gex_d3d_display_tick) gex_d3d_display_tick();
     const uint32_t was_client = current_client;
     const uint32_t was_surface = current_surface;
     std::vector<uint32_t> ids;
@@ -3021,7 +3050,9 @@ EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_display() {
         if (entry.first != was_client) ids.push_back(entry.first);
     for (uint32_t id : ids) {
         use_client(id);
-        if (!mesa_context) continue;
+        /* A client with no GL context may still have frames: the D3D
+         * device's (gex_gl_external_frame). */
+        if (!mesa_context && surfaces.empty()) continue;
         std::vector<uint32_t> pending;
         for (const auto& entry : surfaces)
             if (display_pending(entry.second))
@@ -3133,6 +3164,36 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
     /* Back to whoever was running, unless that was this one. */
     use_client(was == client ? 0 : was);
     clients.erase(client);
+}
+
+/* A frame for one of a client's windows that this decoder did not draw:
+ * the D3D device's (gexd3d-mesa.cpp), which shares this table of windows so
+ * that its frames are shown, listed and forgotten as a GL client's are.
+ *
+ * `handle` names the drawable, from a range the client's EGL does not use;
+ * `image` becomes its back buffer, held until the next frame replaces it. */
+EMSCRIPTEN_KEEPALIVE void gex_gl_external_frame(uint32_t client, uint32_t handle,
+                                                unsigned kind, unsigned id,
+                                                unsigned token,
+                                                struct pipe_resource *image,
+                                                unsigned width, unsigned height) {
+    const uint32_t was = current_client;
+    use_client(client);
+    gex_surface *s = surface_for(handle);
+    if (s->kind != kind || s->id != id || s->token != token) {
+        s->kind = kind;
+        s->id = id;
+        s->token = token;
+        ++s->generation;
+        attached_generation++;
+    }
+    s->external = true;
+    pipe_resource_reference(&s->drawable.attachments[ST_ATTACHMENT_BACK_LEFT], image);
+    s->drawable.width = width;
+    s->drawable.height = height;
+    ++produced;
+    ++s->produced;
+    use_client(was);
 }
 
 /* Why the last batch was refused: see `last_reject_op`. */

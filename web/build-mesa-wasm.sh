@@ -13,6 +13,12 @@ SANITIZE=${GEX_MESA_SANITIZE:-0}
 # the threaded one.
 # GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (a page-only web build), not
 # the softpipe replay and smokes the Mesa tests use.
+# GEX_MESA_DIRK=1: the D3D device too (web/mesa/gexd3d-mesa.cpp), on dirk:
+# DXVK's D3D11/DXGI front end on gallium, built here into a package the
+# replay links (-Dgex-dirk-dir). Mesa pins it (subprojects/dxvk.wrap); the
+# build fetches it into third_party/mesa/subprojects/dxvk at that commit. Off,
+# the module is GL only, as before.
+DIRK=${GEX_MESA_DIRK:-0}
 THREADS=${GEX_MESA_THREADS:-1}
 VARIANT=mt
 [ "$THREADS" = 0 ] && VARIANT=st
@@ -130,6 +136,37 @@ else
     meson configure "$BUILD" -Dgex-emdawn-dir="$EMDAWN" \
         -Dgex-tint-dir="$TINT_OUT" -Dgex-sanitize="$GEX_SANITIZE"
 fi
+DIRK_PKG=
+if [ "$DIRK" = 1 ]; then
+    DXVK=$MESA/subprojects/dxvk
+    [ -f "$MESA/subprojects/dxvk.wrap" ] || {
+        echo "third_party/mesa has no subprojects/dxvk.wrap: a Mesa without the D3D front end" >&2
+        exit 1
+    }
+    want=$(sed -n 's/^revision *= *//p' "$MESA/subprojects/dxvk.wrap")
+    if [ ! -d "$DXVK" ]; then
+        (cd "$MESA" && meson subprojects download dxvk)
+    elif [ "$(git -C "$DXVK" rev-parse HEAD)" != "$want" ]; then
+        (cd "$MESA" && meson subprojects update --reset dxvk)
+    fi
+    [ -f "$DXVK/tests/dirk/objects.mk" ] &&
+        [ -f "$DXVK/include/vulkan/include/vulkan/vulkan.h" ] &&
+        [ -f "$DXVK/include/native/directx/dxgi1_6.h" ] || {
+        echo "$DXVK is incomplete: (cd third_party/mesa && meson subprojects update --reset dxvk)" >&2
+        exit 1
+    }
+    # Its objects include Mesa's generated headers: those are built first.
+    ninja -C "$BUILD" src/gallium/auxiliary/libgallium.a src/mesa/libmesa.a -j"${JOBS:-$(nproc)}"
+    DIRK_PKG=$OUT/dirk
+    EMSDK_ROOT=$(CDPATH='' cd -- "$(dirname "$(command -v emcc)")/../.." && pwd)
+    make -f "$DXVK/tests/dirk/objects.mk" O="$OUT/dirk-obj" PKG="$DIRK_PKG" \
+        MESA="$MESA" MESA_BUILD="$BUILD" WEBGPU_INC="$EMDAWN/webgpu/include" \
+        EMSDK="$EMSDK_ROOT" THREADS="$THREADS" -j"${JOBS:-$(nproc)}"
+fi
+# A Mesa from before the option has no D3D device to switch.
+if grep -q "'gex-dirk-dir'" "$MESA/meson.options"; then
+    meson configure "$BUILD" -Dgex-dirk-dir="$DIRK_PKG"
+fi
 
 if [ "$SANITIZE" = 1 ]; then
     ninja -C "$BUILD" \
@@ -177,7 +214,7 @@ if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
         # The link's features, as web/mesa-split.py names them.
         "$(em-config BINARYEN_ROOT)/bin/wasm-split" --mvp-features --enable-threads --enable-simd \
             --enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int \
-            --enable-sign-ext --enable-mutable-globals --enable-multivalue \
+            --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-exception-handling \
             --instrument --in-memory -g \
             "$TGT/gex-wgpu-replay.wasm.orig" -o "$TGT/split/gex-wgpu-replay.wasm"
         echo "  profiling build: tools/mesa-hot.py $TGT/gex-wgpu-replay.wasm.orig LOG..."

@@ -788,6 +788,7 @@ async function begin(opts, base, at, state, meter) {
     glLazy,
     glSource: mesa,
     glBackend: b.glBackend ?? 'wgpu',
+    d3d: !!b.d3d,
     wl: desk ?? canvas,
     wlInput: desk ?? canvas,
     onDesktop: desk ? (d) => { desktop = d; globalThis.__gexCompositor = bareDesktop(d, desk); } : null,

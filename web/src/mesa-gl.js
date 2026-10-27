@@ -27,6 +27,13 @@ const H_STATUS = 5;
 const H_FAILED_AT = 6;
 const H_PROTOCOL_VERSION = 7;
 
+// The D3D device's ring: the same header, with its own magic and version,
+// and dirk's records (dxvk, pinned by Mesa: src/dirk/wire/dirk_wire.h) for
+// commands. The module has the decoder when it was built with
+// GEX_MESA_DIRK=1 (web/mesa/gexd3d-mesa.cpp).
+export const D3D_MAGIC = 0x44334447; // "GD3D"
+export const D3D_PROTOCOL_VERSION = 1;
+
 // Imported directly where that works: Emscripten resolves its .wasm against the
 // module's own URL, so a real URL keeps `locateFile` and the pthread workers on
 // the same simple footing.
@@ -256,6 +263,8 @@ export class MesaGlDevice {
   #device = null;
   #module = null;
   #submit = null;
+  /** The D3D device's submit, when the module has one. */
+  #d3dSubmit = null;
   #failed = null;
   /** WebGPU validation errors: counted, the first kept, rate-limited logs. */
   #validation = new ValidationLog();
@@ -364,6 +373,8 @@ export class MesaGlDevice {
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
+      if (out.#module.gexD3dSubmitRaw)
+        out.#d3dSubmit = WebAssembly.promising(out.#module.gexD3dSubmitRaw);
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
       // Environment for Mesa (`?mesaenv=`), before the context exists.
@@ -495,8 +506,12 @@ export class MesaGlDevice {
   submit(memory, ring, client = 0) {
     if (!this.#module) return -1;
     const words = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
-    if (words[H_MAGIC] !== MAGIC) return -1;
-    if (words[H_PROTOCOL_VERSION] !== PROTOCOL_VERSION) {
+    // GL's ring or the D3D device's: one ring, one claim, one client token,
+    // a decoder each.
+    const d3d = words[H_MAGIC] === D3D_MAGIC;
+    if (!d3d && words[H_MAGIC] !== MAGIC) return -1;
+    if (d3d && !this.#d3dSubmit) return -1;
+    if (words[H_PROTOCOL_VERSION] !== (d3d ? D3D_PROTOCOL_VERSION : PROTOCOL_VERSION)) {
       words[H_STATUS] = error.VERSION_MISMATCH;
       return -1;
     }
@@ -509,7 +524,7 @@ export class MesaGlDevice {
     this.#submits++;
     this.#bytes += tail;
     const src = new Uint8Array(memory.buffer, ring + HEADER_BYTES, tail);
-    if (this.capture && !this.capture.record(src, replyCap) && !this.capture.posted) {
+    if (!d3d && this.capture && !this.capture.record(src, replyCap) && !this.capture.posted) {
       // Full: hand the recording to whoever serves the page (a Worker has
       // no CDP-reachable global the page's driver can read).
       this.capture.posted = true;
@@ -518,10 +533,17 @@ export class MesaGlDevice {
       fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
     }
 
+    const timed = d3d && this.statsOn;
+    const copied = timed ? performance.now() : 0;
     const ptr = this.#module._malloc(tail || 1);
     if (tail) this.#module.HEAPU8.set(src, ptr);
+    const decoding = timed ? performance.now() : 0;
 
     const finish = (rc) => {
+      if (timed) {
+        this.#module._gex_d3d_note_js(decoding - copied, performance.now() - decoding,
+          this.#module._gex_d3d_reply_len() ? 1 : 0);
+      }
       // Taken again: a JSPI submit suspends, and a plain guest memory (the
       // single-thread build's) that another thread grew meanwhile has a new
       // buffer -- the old view is detached and writes into it are lost.
@@ -531,7 +553,10 @@ export class MesaGlDevice {
       this.#submitMs += elapsed;
       // A frame's readback (a reply of 256 KiB or more): what the GPU --
       // SwiftShader, headless -- took.
-      if ((this.#module?._gex_gl_reply_len?.() ?? 0) >= 256 * 1024) {
+      const m = this.#module;
+      const replyLenOf = d3d ? m._gex_d3d_reply_len : m._gex_gl_reply_len;
+      const replyDataOf = d3d ? m._gex_d3d_reply_data : m._gex_gl_reply_data;
+      if ((replyLenOf?.() ?? 0) >= 256 * 1024) {
         this.#readbacks++;
         this.#readbackMs += elapsed;
       }
@@ -549,7 +574,15 @@ export class MesaGlDevice {
         // compositor's whole GL path with it, and the client that lost its
         // window was usually not the one at fault.
         this.#rejects++;
-        const m = this.#module;
+        if (d3d) {
+          this.#lastReject = `client ${client} D3D stream refused (${rc})`;
+          console.error(`[mesa-gl] ${this.#lastReject}`);
+          words[H_STATUS] = error.BAD_OPCODE;
+          words[H_REPLY_LEN] = 0;
+          words[H_TAIL] = 0;
+          words[H_FAILED_AT] = 0;
+          return rc;
+        }
         const why = ['', 'short read', 'trailing data', 'unknown opcode',
                      'no context'][m._gex_gl_reject_why?.() ?? 0] || 'refused';
         this.#lastReject = `client ${client} batch rejected (${rc}): opcode `
@@ -564,7 +597,7 @@ export class MesaGlDevice {
       }
       // A reply larger than the ring's reply area is cut to it, as the
       // native host does (gl-reply.js), not refused.
-      const fit = fitReply(this.#module._gex_gl_reply_len(), replyCap);
+      const fit = fitReply(replyLenOf(), replyCap);
       const replyLen = fit.len;
       if (fit.cut) {
         if (!this.#replyCuts++) {
@@ -572,7 +605,7 @@ export class MesaGlDevice {
         }
       }
       if (replyLen) {
-        const from = this.#module._gex_gl_reply_data();
+        const from = replyDataOf();
         new Uint8Array(memory.buffer, ring + HEADER_BYTES + capacity, replyLen)
           .set(this.#module.HEAPU8.subarray(from, from + replyLen));
       }
@@ -606,7 +639,7 @@ export class MesaGlDevice {
     };
     let result;
     try {
-      result = this.#submit(ptr, tail, client >>> 0);
+      result = (d3d ? this.#d3dSubmit : this.#submit)(ptr, tail, client >>> 0);
     } catch (e) {
       return report(e);
     }
@@ -694,7 +727,28 @@ export class MesaGlDevice {
       this.#forgetLater.push(client >>> 0);
       return;
     }
+    m._gex_d3d_forget_client?.(client >>> 0);
     m._gex_gl_forget_client(client >>> 0);
+  }
+
+  /** Whether the D3D device keeps its transport's timing (Mesa's
+   * DIRK_WIRE_STATS, `?mesaenv=`): the bridge then measures its side too. */
+  get statsOn() {
+    if (this.#statsOn === undefined) this.#statsOn = !!this.#module?._gex_d3d_stats_on?.();
+    return this.#statsOn;
+  }
+
+  #statsOn = undefined;
+
+  /** The bridge's side of the submits since the last: see gl-bridge.mjs. */
+  noteBridge(wakeMs, claimUs, copyUs, proxyUs, n) {
+    if (this.#busy) return;
+    this.#module?._gex_d3d_note_bridge?.(wakeMs, claimUs, copyUs, proxyUs, n);
+  }
+
+  /** Whether the module has the D3D device (/dev/gex-d3d). */
+  get hasD3d() {
+    return !!this.#d3dSubmit;
   }
 
   /** A submit has ended: what waited for it runs now. */

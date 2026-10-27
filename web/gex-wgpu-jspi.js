@@ -47,11 +47,12 @@ mergeInto(LibraryManager.library, {
     });
   },
   // Two targets share this bridge: the Gallium corpus, whose entry is
-  // gex_wgpu_smoke, and the wire-decoder replay, whose entry is gex_gl_submit.
+  // gex_wgpu_smoke, and the wire-decoder replay, whose entry is gex_gl_submit
+  // (and gex_d3d_submit, when it has the D3D device).
   // Publish whichever the linked module actually exports -- the raw wasm
   // export, because WebAssembly.promising cannot wrap the JS-side wrapper.
   gex_wgpu_jspi_wait__postset:
-    '_gex_wgpu_jspi_wait = new WebAssembly.Suspending(_gex_wgpu_jspi_wait); addOnPostRun(function() { if (wasmExports[\'gex_wgpu_smoke\']) Module[\'gexWgpuRaw\'] = wasmExports[\'gex_wgpu_smoke\']; if (wasmExports[\'gex_gl_submit\']) Module[\'gexGlSubmitRaw\'] = wasmExports[\'gex_gl_submit\']; if (wasmExports[\'__write_profile\']) gexReportProfile(wasmExports[\'__write_profile\']); });' +
+    '_gex_wgpu_jspi_wait = new WebAssembly.Suspending(_gex_wgpu_jspi_wait); addOnPostRun(function() { if (wasmExports[\'gex_wgpu_smoke\']) Module[\'gexWgpuRaw\'] = wasmExports[\'gex_wgpu_smoke\']; if (wasmExports[\'gex_gl_submit\']) Module[\'gexGlSubmitRaw\'] = wasmExports[\'gex_gl_submit\']; if (wasmExports[\'gex_d3d_submit\']) Module[\'gexD3dSubmitRaw\'] = wasmExports[\'gex_d3d_submit\']; if (wasmExports[\'__write_profile\']) gexReportProfile(wasmExports[\'__write_profile\']); });' +
     GEX_PROFILE_JS,
 
   gex_wgpu_jspi_signal: function () {
