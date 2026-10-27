@@ -275,6 +275,7 @@ export class HostX {
     // The server waits on its wait slot (`wait` below), which the compositor
     // notifies through the server's own queue when it puts input in this
     // block's ring.
+    this.#proxy.onPixels = (p) => this.emit({ kind: 'wl-pixels', ...p });
     this.#proxy.wakeAddr = () => ({ addr: this.#k.k_wq_addr(this.#queue) >>> 0, slots: this.#k.k_ws_addr(0) >>> 0 });
     // The compositor Worker reads an X window's pixels out of this memory
     // only without pixel buffers in the channel (wl-bridge.mjs) -- the

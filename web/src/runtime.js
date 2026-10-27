@@ -1007,6 +1007,7 @@ async function runProgramHere(
         if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
       } else if (m.kind === 'win') console.log(`[win] ${m.text}`);
       else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
+      else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
       else if (m.kind === 'ready') listening(true);
       else if (m.kind === 'failed') {
         term.writeln(`gex: the X server failed: ${m.why}`);
@@ -1321,6 +1322,7 @@ async function runProgramHere(
       // A process that has a compositor block hands the compositor its memory:
       // that is where the pixels of every one of its surfaces are.
       else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
+      else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
       else if (m.kind === 'wl') {
         /* a publish happened; the compositor draws on its own clock */
       }

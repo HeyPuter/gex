@@ -25,7 +25,6 @@ import {
   sceneMarks,
   sceneMark,
   sceneStill,
-  blockPixels,
   ackBlock,
   sendEvent,
   setKernelMemory,
@@ -566,16 +565,21 @@ class Compositor {
     if (memory && !this.#channel.pixels) this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
   }
 
-  /** The bytes a surface's address points into: its block's pixel buffer, or
-   *  for a channel without one, its process's memory. */
-  #pixelsOf(s) {
-    const buf = blockPixels(this.#channel, s.block);
-    if (!buf) return this.#memoryOf(s.token);
-    let v = this.#pixelViews[s.block];
-    if (!v || v.buffer !== buf || v.length !== buf.byteLength) v = this.#pixelViews[s.block] = new Uint8Array(buf);
-    return v;
+  /** A guest's new pixel buffer (wl-bridge.mjs `WlProxy`), `id` in its
+   *  surfaces' records; the one it `replaces` is no longer read. */
+  addPixels(token, id, buffer, replaces) {
+    if (replaces) this.#pixelBufs.delete(replaces);
+    if (id && buffer) this.#pixelBufs.set(id, { token, view: new Uint8Array(buffer) });
   }
-  #pixelViews = [];
+
+  /** The bytes a surface's address points into: the pixel buffer its record
+   *  names, or for a channel without them, its process's memory. Null until
+   *  that buffer has come. */
+  #pixelsOf(s) {
+    if (!this.#channel.pixels) return this.#memoryOf(s.token);
+    return this.#pixelBufs.get(s.pix)?.view ?? null;
+  }
+  #pixelBufs = new Map();
 
   /** The current view of a process's memory, re-derived if it has grown. */
   #memoryOf(token) {
@@ -595,6 +599,7 @@ class Compositor {
 
   dropMemory(token) {
     this.#memories.delete(token);
+    for (const [id, p] of this.#pixelBufs) if (p.token === token) this.#pixelBufs.delete(id);
     // Its windows too: a process that was killed never released its block.
     const n = releaseToken(this.#channel, token);
     if (n) this.#note(`released ${n} block(s) of exited process ${token}`);
@@ -2121,6 +2126,8 @@ const onMessage = ({ data: m }) => {
         post({ kind: 'gl-failed', error: e?.message || String(e) }));
     } else if (m.kind === 'memory') {
       comp?.addMemory(m.token, m.memory, m.kernel);
+    } else if (m.kind === 'pixels') {
+      comp?.addPixels(m.token, m.id, m.buffer, m.replaces);
     } else if (m.kind === 'drop-memory') {
       comp?.dropMemory(m.token);
       // That process is gone: its GL context, its windows and their frames go
