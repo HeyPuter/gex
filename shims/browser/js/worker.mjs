@@ -225,6 +225,10 @@ let preattached = null;
 /// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
 /// compositor reading its pixels, the session reaching its door.
 let recyclable = true;
+/// A spare's thread (`Gex#adoptThread`): the host's `spareGo`, held until
+/// the spare waits for it, or the wait it answers. `thread` null: let go.
+let spareGot = null;
+let spareWaiter = null;
 
 // Standard input, as it arrives. A guest read that finds nothing asks the
 // host and waits here; `readStdin` below is what the run loop awaits.
@@ -243,6 +247,13 @@ let winsize = () => {};
 // rejected promise nobody holds, and a Worker that rejects on the way in looks
 // exactly like one that is busy.
 port.on((msg) => {
+  // A spare's thread, or its letting go (`spareGot`): never a start.
+  if (msg?.kind === 'spareGo') {
+    if (spareWaiter) spareWaiter(msg.thread ?? null);
+    else spareGot = msg;
+    spareWaiter = null;
+    return;
+  }
   // Given back to the pool: this process's state stays here, unreachable,
   // and the next one starts on a new call (see `workerMain`).
   if (msg?.kind === 'reset') {
@@ -586,6 +597,13 @@ async function handle(msg) {
         return;
       }
       port.post({ kind: 'thread', thread });
+    }
+    // A Worker made ahead for this program's next thread (`Gex#offerSpare`):
+    // the host keeps what it needs to start one, the memory among it, while
+    // the process lives.
+    offerSpare(spare) {
+      recyclable = false;
+      port.post({ kind: 'threadSpare', spare });
     }
     // A module this Worker just compiled, up to the host to relay to the sibling
     // Workers of the same process so they reuse it rather than recompiling the
@@ -1069,6 +1087,9 @@ async function handle(msg) {
     if (msg.kind === 'thread') {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
+      if (msg.spare) {
+        msg.spareGo = () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; }));
+      }
       ({ entry, ctx, gone } = await gex.adoptThread(msg.shim, msg.guest, msg));
       execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);

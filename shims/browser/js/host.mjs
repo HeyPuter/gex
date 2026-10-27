@@ -142,6 +142,9 @@ const SAVE_WAIT_MS = 60_000;
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
 const RECYCLE_COUNT = 4;
+/** How many spare thread Workers (`#startSpare`) the page keeps waiting at
+ *  once; past it the oldest is let go. */
+const SPARE_MAX = 8;
 /** A test-only switch: whether a running fork child's
  *  record, its parent's modules with it, can be collected once the child's
  *  Worker has it. Node only, with `--expose-gc`. */
@@ -414,6 +417,14 @@ export class ProcessHost {
    *  Worker, `{ status }` from the thread Worker that carried it. */
   #carried = new Map();
   #threads = 0;
+  /** Spare thread Workers waiting for their process's next thread, oldest
+   *  first: `{ proc, key, w, ref, gen }` (`#startSpare`). */
+  #spares = [];
+  #spareSeq = 0;
+  /** What a process offered for its spares (worker.mjs `offerSpare`), by pid. */
+  #spareRec = new Map();
+  /** How many threads each process with a spare record has started. */
+  #threadsOf = new Map();
   // The global kernel's per-Worker stacks, as the first Worker reported them.
   // Each Worker's kernel instance has its own `__stack_pointer` global, all
   // pointing into the shared memory, so each needs its own slice or two Workers
@@ -914,12 +925,126 @@ export class ProcessHost {
     this.#releaseNow(key, w, reuse);
   }
 
+  /** Start thread Worker `key` of process `pid` from its start record
+   *  `rec`, sent when the Worker is ready. Its messages are delivered under
+   *  the returned `ref.key`, which a spare's thread renames. */
+  #threadWorker(pid, key, rec) {
+    // From the warm pool, as a process's: a fresh Worker was ~100 ms of
+    // script load and shim instantiation before the thread could start,
+    // and a starting Wine process makes its threads one after another
+    // (61 of them before one program's first window, 13.5 s in all).
+    const w2 = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker();
+    this.#workers.set(key, w2);
+    workerRan(w2, key);
+    // Keyed by the thread, so its end stops the right Worker and frees the
+    // right kernel stack.
+    const ref = { key };
+    const deliver = (mm) => this.#onMessage(ref.key, w2, mm, () => {}, () => {});
+    w2.addEventListener?.('message', (e) => deliver(e.data));
+    w2.on?.('message', deliver);
+    // A thread that throws, said out loud: a thread Worker had no `error`
+    // listener, so an exception was swallowed and read as a hang.
+    const threadFailed = (e) => {
+      this.#onOutput(2, `gex: thread ${ref.key} failed: ${e?.message ?? String(e)}\n`, pid);
+      crashed(`thread ${ref.key}: ${e?.message ?? String(e)}`);
+    };
+    w2.addEventListener?.('error', threadFailed);
+    w2.on?.('error', threadFailed);
+    // Sent from the `ready` case, which finds it here.
+    this.#pending.set(key, rec);
+    // A pooled Worker's 'ready' came while it sat in the pool: deliver it
+    // now that `#pending` names this thread.
+    const held = w2[EARLY];
+    if (held) {
+      delete w2[EARLY];
+      w2.removeEventListener?.('message', held.buf);
+      w2.off?.('message', held.buf);
+      for (const mm of held.early) deliver(mm);
+    }
+    return { w: w2, ref };
+  }
+
+  /** A Worker for process `proc`'s next thread, started on what the process
+   *  offered (`threadSpare`): it instantiates the process's modules and
+   *  waits (`Gex#adoptThread`). The page's oldest spare goes past SPARE_MAX. */
+  #startSpare(proc) {
+    const rec = this.#spareRec.get(proc);
+    if (!rec) return;
+    const key = `${proc}:spare${++this.#spareSeq}`;
+    const { w, ref } = this.#threadWorker(proc, key, {
+      kind: 'thread',
+      spare: true,
+      memory: rec.memory,
+      moduleStore: rec.moduleStore,
+      compat: rec.compat,
+      procOpts: rec.procOpts,
+    });
+    this.#spares.push({ proc, key, w, ref, gen: rec.execGen });
+    if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
+    while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
+  }
+
+  /** Process `proc`'s spare for a thread of its program `gen`, taken; null
+   *  with none (one caught up with an earlier program is let go). */
+  #takeSpare(proc, gen) {
+    const i = this.#spares.findIndex((x) => x.proc === proc);
+    if (i < 0) return null;
+    const [sp] = this.#spares.splice(i, 1);
+    if (gen === sp.gen) return sp;
+    this.#letSpareGo(sp);
+    this.#dropSpares(proc);
+    return null;
+  }
+
+  /** Let a spare go: it gives back what it took of its process and ends,
+   *  its exit releasing it (or now, if it never started). */
+  #letSpareGo(sp) {
+    if (this.#pending.has(sp.ref.key)) {
+      this.#pending.delete(sp.ref.key);
+      this.#releaseNow(sp.ref.key, sp.w);
+      return;
+    }
+    sp.w.postMessage({ kind: 'spareGo', thread: null });
+  }
+
+  /** Process `proc`'s spares and their record, let go. */
+  #dropSpares(proc) {
+    this.#spareRec.delete(proc);
+    this.#threadsOf.delete(proc);
+    const mine = this.#spares.filter((x) => x.proc === proc);
+    if (!mine.length) return;
+    this.#spares = this.#spares.filter((x) => x.proc !== proc);
+    for (const sp of mine) this.#letSpareGo(sp);
+  }
+
   #releaseNow(key, w, reuse = false) {
     this.#workers.delete(key);
+    // A spare that ended without a thread (let go, or its start failed).
+    const at = this.#spares.findIndex((x) => x.w === w);
+    if (at >= 0) this.#spares.splice(at, 1);
     // The last Worker of a process gone: drop its shared-module cache so a long
     // page does not accumulate every process's compiled modules forever.
     const proc = String(key).split(':')[0];
-    if (![...this.#workers.keys()].some((k) => String(k).split(':')[0] === proc)) {
+    // Only spares left: the process has ended (or gone on in another Worker
+    // as another program), and they end with it, unasked -- its memory goes.
+    const left = [...this.#workers.keys()].filter((k) => String(k).split(':')[0] === proc);
+    if (left.length && left.every((k) => this.#spares.some((x) => x.ref.key === k))) {
+      this.#spareRec.delete(proc);
+      this.#threadsOf.delete(proc);
+      for (const sp of this.#spares.filter((x) => x.proc === proc)) {
+        this.#workers.delete(sp.ref.key);
+        this.#pending.delete(sp.ref.key);
+        const s2 = this.#stackOf.get(sp.ref.key);
+        if (s2 !== undefined) {
+          this.#stackOf.delete(sp.ref.key);
+          this.#stacksFree.push(s2);
+        }
+        sp.w.terminate();
+      }
+      this.#spares = this.#spares.filter((x) => x.proc !== proc);
+      left.length = 0;
+    }
+    if (!left.length) {
       this.#moduleCache.delete(proc);
     }
     const slice = this.#stackOf.get(key);
@@ -1249,86 +1374,50 @@ export class ProcessHost {
         // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
+        const proc = String(pid).split(':')[0];
         // A threaded process's memory, for a harness (`MEMORIES`).
-        if (MEMORIES && m.thread.memory) (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), m.thread.memory);
+        if (MEMORIES && m.thread.memory) (globalThis.__gexMemories ??= new Map()).set(Number(proc), m.thread.memory);
         if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, taking a Worker (t=${Date.now()})`);
-        // From the warm pool, as a process's: a fresh Worker was ~100 ms of
-        // script load and shim instantiation before the thread could start,
-        // and a starting Wine process makes its threads one after another
-        // (61 of them before one program's first window, 13.5 s in all).
-        const w2 = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker();
-        this.#workers.set(key, w2);
-        workerRan(w2, key);
-        // Keyed by the thread, so its end stops the right Worker and frees the
-        // right kernel stack.
-        const deliver = (mm) => this.#onMessage(key, w2, mm, () => {}, () => {});
-        w2.addEventListener?.('message', (e) => deliver(e.data));
-        w2.on?.('message', deliver);
-        // A thread that throws, said out loud: a thread Worker had no `error`
-        // listener, so an exception was swallowed and read as a hang.
-        const threadFailed = (e) => {
-          this.#onOutput(2, `gex: thread ${key} failed: ${e?.message ?? String(e)}\n`, pid);
-          crashed(`thread ${key}: ${e?.message ?? String(e)}`);
-        };
-        w2.addEventListener?.('error', threadFailed);
-        w2.on?.('error', threadFailed);
-        this.#pending.set(key, { kind: 'thread', ...m.thread });
-        // A pooled Worker's 'ready' came while it sat in the pool: deliver it
-        // now that `#pending` names this thread.
-        const held = w2[EARLY];
-        if (held) {
-          delete w2[EARLY];
-          w2.removeEventListener?.('message', held.buf);
-          w2.off?.('message', held.buf);
-          for (const mm of held.early) deliver(mm);
+        const before = this.#threadsOf.get(proc);
+        if (before !== undefined) this.#threadsOf.set(proc, before + 1);
+        const spare = this.#takeSpare(proc, m.thread.execGen);
+        if (spare) {
+          // The thread goes to the Worker already caught up with its
+          // process; the memory it was posted with is not needed.
+          m.thread.bulk?.close?.();
+          this.#workers.delete(spare.key);
+          this.#workers.set(key, spare.w);
+          workerRan(spare.w, key);
+          const slice = this.#stackOf.get(spare.key);
+          if (slice !== undefined) {
+            this.#stackOf.delete(spare.key);
+            this.#stackOf.set(key, slice);
+          }
+          const held = this.#pending.get(spare.key);
+          if (held) {
+            this.#pending.delete(spare.key);
+            this.#pending.set(key, held);
+          }
+          spare.ref.key = key;
+          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${held ? 'still starting' : 'ready'}`);
+          const { tid, ctx, pc, procOpts } = m.thread;
+          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
+        } else {
+          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread });
         }
-        // A thread's start message is keyed by tid and handed over here, once.
-        const start = (mm) => {
-          if (mm?.kind !== 'ready') return;
-          if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'ready' from ${key}, sending start (t=${Date.now()})`);
-          this.#pending.delete(key);
-          // Without the closure, as the fork path: `closure` entries are mostly
-          // promises (a library is fetched on first branch into it), and a
-          // promise is not structured-cloneable. A count instead; the Worker
-          // asks for what it needs.
-          const { closure: _closure, ...extra } = this.#extra ?? {};
-          this.#runtimeFor(pid).then((rt) =>
-          w2.postMessage({
-            ...extra,
-            closureCount: (this.#extra?.closure ?? []).length,
-            kind: 'thread',
-            outputAck: this.#outputAck(w2),
-            tid: m.thread.tid,
-            // `ctx` and `pc` are forwarded explicitly: `adoptThread` re-derives
-            // `pc`, but a dropped `ctx` became NaN -> 0, so every guest thread
-            // read its registers from address 0 and died at its first
-            // instruction.
-            ctx: m.thread.ctx,
-            pc: m.thread.pc,
-            memory: m.thread.memory,
-            moduleStore: m.thread.moduleStore,
-            procOpts: m.thread.procOpts,
-            kernelStack: this.#stackFor(w2, key),
-            shim: rt.shim,
-            guest: rt.guest,
-            kernel: rt.kernel,
-            mem64: rt.mem64,
-            pageFlavours: this.#pageFlavours(),
-            // Every module the process's Workers have compiled so far, so this
-            // thread reuses them instead of recompiling from bytes in its own
-            // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
-            // references, not a byte copy. See `#moduleCache`.
-            sharedModules: this.#sharedFor(pid, true),
-            unitFiles: this.#unitFilePack(),
-            door: this.#door ?? undefined,
-          }),
-          );
-        };
-        // NOT registered as a second listener: `start` is already reached
-        // through `deliver` (which finds this thread in `#pending`). Registering
-        // it too sent the start message twice and ran `gex.run` twice on one
-        // thread. One record, one path, one start.
-        void start;
+        // The next spare, for a process that starts more than one thread.
+        if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);
+        break;
+      }
+      case 'threadSpare': {
+        // A program with many modules has started (`Gex#offerSpare`): a
+        // Worker for its first thread, caught up with them meanwhile.
+        const proc = String(pid).split(':')[0];
+        this.#dropSpares(proc);
+        if (this.#foreign(proc) || !this.#extra?.shared || single.on) break;
+        this.#spareRec.set(proc, m.spare);
+        this.#threadsOf.set(proc, 0);
+        this.#startSpare(proc);
         break;
       }
       case 'stdin': {

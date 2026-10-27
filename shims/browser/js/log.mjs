@@ -17,6 +17,8 @@
 //   GEX_LOG=wasmlib      a line per native wasm32 module a process installs: its
 //                        compile (or that the Worker had it) and instantiation
 //                        (only when named)
+//   GEX_LOG=spare        spare thread Workers: a program's offer, each spare
+//                        started, caught up and given its thread (only when named)
 //   GEX_LOG=win          a line when a toplevel appears, first shows pixels and
 //                        is retitled, in the page's desktop (only when named)
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge

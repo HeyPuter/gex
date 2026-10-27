@@ -205,6 +205,17 @@ function isShared(buf) {
 const MODULE_STORE_MAX = [32, 16, 8, 4].map((g) => g * 1024 * 1024 * 1024);
 /** A new module store: a growable SharedArrayBuffer whose first eight bytes
  *  are the bump cursor. Null where SharedArrayBuffer cannot grow. */
+/** How many wasm32 modules a program installs before its first thread is
+ *  given a Worker ahead (`#offerSpare`): below it, instantiating them again
+ *  in the thread's Worker is short. */
+const SPARE_MODULES = 20;
+/** How often a waiting spare looks for new installs: at first, and at most
+ *  apart once nothing has come for a while. */
+const SPARE_POLL_MS = 20;
+const SPARE_POLL_MAX_MS = 1000;
+/** A test-only switch: the threshold itself, so a small program gets one. */
+const spareModules = () => Number(globalThis.GEX_TEST_SPARE_MODULES ?? globalThis.process?.env?.GEX_TEST_SPARE_MODULES ?? 0) || SPARE_MODULES;
+
 function makeModuleStore() {
   if (typeof SharedArrayBuffer === 'undefined' || typeof SharedArrayBuffer.prototype.grow !== 'function') return null;
   // Off, for comparing against the registry keeping its own bytes.
@@ -3375,6 +3386,8 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
+    // Its program is its parent's, served again here: no spare for that one.
+    this.#spareGen = e.gex_exec_gen?.() ?? 0;
     if (child.wasm32) {
       if (child.wasm32Link && e.gex_wasmprog_adopt_link) {
         // Before the link: adopting it may instantiate the modules.
@@ -3613,6 +3626,8 @@ export class Gex {
       // child the same ones (the fork record's `opts`): a thread Worker had
       // none, and a child of a thread lost dense numbering and the rest.
       procOpts: this.#opts,
+      // Which program it belongs to: a spare caught up with another one is not used.
+      execGen: e.gex_exec_gen?.() ?? 0,
     };
     if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] #drainThread posting tid ${tid} (t=${Date.now()})`);
     e.gex_thread_taken();
@@ -3658,9 +3673,50 @@ export class Gex {
    */
   async adoptThread(shimWasm, guestWasm, thread) {
     this.#threaded();
-    this.#threadTid = thread.tid;
-    this.#promise = true;
+    // A spare (`#offerSpare`) claims its slot unpromised, and is promised
+    // one when it is given its thread.
+    this.#promise = !thread.spare;
     await this.attach(shimWasm, guestWasm, { devices: false });
+    if (thread.spare) {
+      // Everything the process has installed so far, before it has a thread;
+      // what it installs meanwhile is caught up with below, as any thread's.
+      const gen = this.#shim.exports.gex_exec_gen?.() ?? 0;
+      this.#spareWait = true;
+      await this.#catchUp();
+      this.#cgenCatchUp();
+      const said = logNamed('spare');
+      if (said) console.warn(`[spare] pid ${this.#shim.exports.gex_my_pid?.() ?? '?'}: caught up with ${this.#cgen?.dyl.size ?? 0} modules, waiting`);
+      // And what the process installs while it waits (its program's modules
+      // as its first Worker installs them, the libraries it dlopens),
+      // looked for less often while there is nothing new.
+      let go;
+      const got = thread.spareGo().then((g) => { go = g ?? false; });
+      for (let delay = SPARE_POLL_MS; go === undefined;) {
+        await Promise.race([got, new Promise((r) => setTimeout(r, delay))]);
+        if (go !== undefined) break;
+        const was = this.#cgen?.have ?? 0;
+        // Not another program's: the host lets this spare go when it hears of it.
+        const same = (this.#shim.exports.gex_exec_gen?.() ?? 0) === gen && !this.#shim.exports.gex_exited?.();
+        if (same && (this.#shim.exports.gex_ftab_log_len?.() >>> 0) > was) this.#cgenCatchUp();
+        const now = this.#cgen?.have ?? 0;
+        if (now !== was && said) console.warn(`[spare] pid ${this.#shim.exports.gex_my_pid?.() ?? '?'}: caught up with ${this.#cgen?.dyl.size ?? 0} modules while waiting`);
+        delay = now !== was ? SPARE_POLL_MS : Math.min(2 * delay, SPARE_POLL_MAX_MS);
+      }
+      this.#spareWait = false;
+      if (!go?.tid) {
+        // Let go while the program it caught up with still runs: its blocks go.
+        if ((this.#shim.exports.gex_exec_gen?.() ?? 0) === gen && !this.#shim.exports.gex_exited?.()) this.freeThreadTls();
+        return { entry: 0n, ctx: 0, gone: true };
+      }
+      Object.assign(thread, go);
+      this.#promise = true;
+      const had = this.#cgen?.dyl.size ?? 0;
+      if (said) {
+        const ta = performance.now();
+        thread.spareSaid = () => console.warn(`[spare] tid ${thread.tid}: adopted, ${(this.#cgen?.dyl.size ?? 0) - had} modules more, in ${(performance.now() - ta).toFixed(1)} ms`);
+      }
+    }
+    this.#threadTid = thread.tid;
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
@@ -3682,6 +3738,7 @@ export class Gex {
     // And the function table's installs (a wasm32 program's module, units):
     // its entry is a bridge into one.
     this.#cgenCatchUp();
+    thread.spareSaid?.();
     return { entry, ctx: Number(thread.ctx) };
   }
 
@@ -4561,7 +4618,9 @@ export class Gex {
     // (a wineserver: `#doorPublish`).
     if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText };
     inst = new WebAssembly.Instance(mod, imports);
-    if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    // Not a spare's to apply: it may install a module before the Worker that
+    // published it, which then runs it at once (`#spareWait`).
+    if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
       for (const [slot, name] of extra) {
         const f = inst.exports[name];
@@ -6122,10 +6181,48 @@ export class Gex {
     const e = this.#shim.exports;
     const n = e.gex_wasmprog_serve?.() ?? -1;
     if (n < 0) return;
+    // Published, not yet installed here: the spare installs them meanwhile.
+    this.#offerSpare((e.gex_ftab_log_len?.() >>> 0) - (this.#cgen?.have ?? 0));
     this.#cgenCatchUp();
     e.gex_cgen_pmod_installed(n);
     // libc's registry of the program's shared libraries (cgen/dylink.rs)
     e.gex_wasmprog_ready?.();
+  }
+
+  /** A spare waiting for its thread (`adoptThread`): what it installs, the
+   *  Worker that published it installs too, and applies the module's data
+   *  relocations there -- once, by whichever instance is first to ask -- so
+   *  they are done before that Worker runs the module. */
+  #spareWait = false;
+  /** The `gex_exec_gen` a spare was last offered for (or, in a fork's
+   *  child, of the program it was forked running). */
+  #spareGen = -1;
+
+  /**
+   * A program just published with many modules (`n` installs to come): a
+   * Worker for its first thread, made now and caught up with them while
+   * this Worker installs them too and the program starts
+   * (host.mjs `#startSpare`), so the thread's `clone` does not wait for
+   * every module to be instantiated again. Once per program; none in the
+   * single-thread build, whose threads are fibers of this realm.
+   */
+  #offerSpare(n) {
+    const e = this.#shim.exports;
+    const gen = e.gex_exec_gen?.() ?? 0;
+    const why = gen === this.#spareGen ? 'its parent\'s program' : single.on ? 'single-thread build'
+      : typeof this.#env.offerSpare !== 'function' ? 'no offerSpare' : n < spareModules() ? 'few modules'
+      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '';
+    if (logNamed('spare')) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${why ? `no spare (${why})` : 'offered'}`);
+    this.#spareGen = gen;
+    if (why) return;
+    this.#moduleStore ??= makeModuleStore();
+    this.#env.offerSpare({
+      memory: this.#memory,
+      moduleStore: this.#moduleStore,
+      compat: e.gex_compat?.() ?? 0,
+      procOpts: this.#opts,
+      execGen: gen,
+    });
   }
 
   /** Wine's PE module's `gex.syscall` (cgen/wasmdll.rs): a system call from
