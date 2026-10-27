@@ -32,7 +32,13 @@ GUEST_INITIAL=$((0x07000000))
 # come from, so neither pays for a ceiling it is not using.
 SHIM_STACK_TOP=$((0x06000000))
 SHIM_BASE=$SHIM_STACK_TOP
-LINK="-C link-arg=--import-memory \
+# No build host's paths in the shim (panic locations name source files): the
+# tree, the toolchain's std and the crate registry by fixed names.
+# (Both toolchains': the shared-memory build below is nightly's.)
+REMAP="--remap-path-prefix=$(pwd)=/gex --remap-path-prefix=$(rustc --print sysroot)=/rust --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+NIGHTLY_SYSROOT=$(rustc +nightly --print sysroot 2>/dev/null || true)
+[ -z "$NIGHTLY_SYSROOT" ] || REMAP="$REMAP --remap-path-prefix=$NIGHTLY_SYSROOT=/rust"
+LINK="$REMAP -C link-arg=--import-memory \
   -C link-arg=--initial-memory=$GUEST_INITIAL \
   -C link-arg=--max-memory=$GUEST_BYTES \
   -C link-arg=--global-base=$SHIM_BASE \

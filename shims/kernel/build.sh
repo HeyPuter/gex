@@ -46,7 +46,9 @@ OUT=$TDIR/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 #
 # It is a reservation, not an allocation: the host still creates the memory at
 # 128 MiB and it grows as files arrive.
-RUSTFLAGS="-C link-arg=--import-memory \
+# No build host's paths in the kernel (panic locations): fixed names instead.
+REMAP="--remap-path-prefix=$(pwd)=/gex --remap-path-prefix=$(rustc +nightly --print sysroot)=/rust --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+RUSTFLAGS="$REMAP -C link-arg=--import-memory \
   -C link-arg=--shared-memory \
   -C link-arg=--max-memory=4294967296 \
   -C link-arg=--export-table \
