@@ -105,6 +105,12 @@ if not CXX:
 # clang's default is an error.
 if CXX:
     BASE += ['-Wno-error=register']
+# A narrowing conversion of a non-constant in a braced initializer: GCC
+# warns, clang's default is an error, so code Debian builds for its 32-bit
+# ports (apt's fileutl.cc: a 64-bit offset into a size_t) stops here.
+# (Clang's one flag covers a constant too, which GCC rejects.)
+if CXX:
+    BASE += ['-Wno-error=c++11-narrowing']
 # An unused `static inline` function: GCC says nothing, clang warns, and a
 # -Werror build (keyutils) stops. Still a warning here.
 BASE += ['-Wno-error=unused-function']
