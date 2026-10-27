@@ -70,6 +70,91 @@ function nodeFetch(href, from, memory, dst, len) {
   }
 }
 
+// A site's rest bundle (web/eject-site.mjs): the lazy files as one tar, its
+// stream cut into independent zstd frames of one size (the last shorter), and
+// beside it an index (BUNDLE.json: `frame`, the frames' unpacked size, and
+// `frames`, each one's [offset, length] in BUNDLE). A lazy file in it has the
+// URL `BUNDLE#OFFSET`, OFFSET its bytes' place in the tar. A read fetches the
+// frames over its range (one ranged request), decodes them, copies its bytes
+// out and keeps the last few frames decoded (`FRAMES_KEPT`) for the reads
+// that follow; nothing else of the bundle stays here.
+const FRAMES_KEPT = 3;
+let zstd = null;
+let zstdLoad = null;
+/** The decoder the rest bundle's reads need, loaded and set up (a read
+ *  cannot wait for it: the Worker's guest runs synchronously). The Worker
+ *  awaits this before its kernel starts. */
+export function lazyReady() {
+  zstdLoad ??= import('../../../web/eject-site/vendor/zstddec-stream.mjs')
+    .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); zstd = d; })
+    .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
+  return zstdLoad;
+}
+const bundles = new Map(); // bundle URL -> { frame, frames, kept: Map(k -> bytes) } or null
+function syncGet(url, range) {
+  const x = new XMLHttpRequest();
+  x.open('GET', url, false);
+  x.responseType = 'arraybuffer';
+  if (range) x.setRequestHeader('Range', `bytes=${range[0]}-${range[1] - 1}`);
+  x.setRequestHeader('Cache-Control', 'no-store');
+  x.send();
+  const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
+  if (!range) return x.status === 200 ? got : null;
+  if (x.status === 206 && got.length === range[1] - range[0]) return got;
+  if (x.status === 200 && got.length >= range[1]) return got.subarray(range[0], range[1]);
+  return null;
+}
+function bundleIndex(url) {
+  if (bundles.has(url)) return bundles.get(url);
+  let b = null;
+  try {
+    const j = JSON.parse(new TextDecoder().decode(syncGet(`${url}.json`)));
+    b = { frame: j.frame, frames: j.frames, kept: new Map() };
+  } catch (e) {
+    console.error(`[lazy] ${url}.json: ${e?.message ?? e}`);
+  }
+  bundles.set(url, b);
+  return b;
+}
+function bundleRead(href, from, memory, dst, len) {
+  const h = absolute(href);
+  const cut = h.lastIndexOf('#');
+  if (cut < 0 || typeof XMLHttpRequest !== 'function') return -1;
+  const url = h.slice(0, cut);
+  const start = Number(h.slice(cut + 1)) + from;
+  const b = bundleIndex(url);
+  if (!b || !zstd) {
+    if (!zstd) console.error(`[lazy] ${url}: the zstd decoder is not loaded (lazyReady)`);
+    return -1;
+  }
+  const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
+  const want = [];
+  for (let k = first; k <= last; k++) if (!b.kept.has(k)) want.push(k);
+  if (want.length) {
+    // The missing frames, one request (they are adjacent in BUNDLE).
+    const lo = b.frames[want[0]][0], hi = b.frames[want.at(-1)][0] + b.frames[want.at(-1)][1];
+    const z = syncGet(url, [lo, hi]);
+    if (!z) return -1;
+    for (const k of want) {
+      const [o, n] = b.frames[k];
+      const unpacked = k === b.frames.length - 1 ? 0 : b.frame;
+      b.kept.set(k, zstd.decode(z.subarray(o - lo, o - lo + n), unpacked));
+      while (b.kept.size > Math.max(FRAMES_KEPT, last - first + 1)) b.kept.delete(b.kept.keys().next().value);
+    }
+  }
+  const out = new Uint8Array(memory.buffer, dst, len);
+  for (let k = first, at = start; k <= last; k++) {
+    const f = b.kept.get(k);
+    // most recently used last
+    b.kept.delete(k); b.kept.set(k, f);
+    const a = at - k * b.frame, n = Math.min(f.length - a, start + len - at);
+    if (n <= 0) return -1;
+    out.set(f.subarray(a, a + n), at - start);
+    at += n;
+  }
+  return len;
+}
+
 const absolute = (h) => {
   try { return new URL(h, globalThis.GEX_BASE ?? globalThis.location?.href).href; } catch { return h; }
 };
@@ -173,6 +258,12 @@ export function lazyFetch(memory) {
       if (n >= 0) return n;
     }
     const done = noteFetch(href, len);
+    if (href.includes('#')) {
+      const n = bundleRead(href, from, memory, dst, len);
+      done(n > 0 ? n : 0);
+      if (n < 0) console.error(`[lazy] ${href} @${from}+${len}: failed (rest bundle)`);
+      return n;
+    }
     // The page's cache of lazy files, when it keeps one (lazy-cache.mjs).
     if (cachedRead(absolute(href), from, dst, len) === len) {
       done(len);

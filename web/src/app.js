@@ -571,7 +571,10 @@ async function begin(opts, base, at, state, meter) {
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
-    lazy = m.files.map(([path, size, rel]) => [path, size, lazyBase + rel.split('/').map(encodeURIComponent).join('/')]);
+    // `BUNDLE#OFFSET`: a file in the site's rest bundle (lazy-fetch.mjs), its
+    // offset kept as the URL's fragment.
+    const href = (rel) => { const i = rel.indexOf('#'), p = i < 0 ? rel : rel.slice(0, i); return lazyBase + p.split('/').map(encodeURIComponent).join('/') + (i < 0 ? '' : rel.slice(i)); };
+    lazy = m.files.map(([path, size, rel]) => [path, size, href(rel)]);
     for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
