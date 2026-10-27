@@ -8,11 +8,13 @@
 #define _LARGEFILE64_SOURCE 1
 #endif
 
-/* glibc's internal name for ino_t (<bits/types.h>, which every glibc
- * header brings in), which programs written on glibc use as if it were
- * public (libselinux's matchpathcon.c). musl's ino_t is 64-bit everywhere. */
+/* glibc's internal names for the inode types (<bits/types.h>, which every
+ * glibc header brings in), which programs written on glibc use as if they
+ * were public (libselinux's matchpathcon.c). As glibc has them on a 32-bit
+ * target: __ino_t the long of the non-LFS interface, __ino64_t 64-bit (what
+ * musl's ino_t is everywhere). */
 #ifndef __GEXCC_INO_T
 #define __GEXCC_INO_T
-typedef unsigned long long __ino_t;
+typedef unsigned long __ino_t;
 typedef unsigned long long __ino64_t;
 #endif
