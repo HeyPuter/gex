@@ -356,8 +356,10 @@ function wine32Site() {
   // app.js, pack.json) is packed. A host's own compression still applies.
   walk(join(web, 'page'), (p, rel) => {
     // The runtime's wasm (shim, seed, kernel) is fetched by the page itself
-    // (app.js primes runtime.js with it): packed, as the units are.
-    if (/^gex\/(gex_browser|gex_kernel|seed)[^/]*\.wasm$/.test(rel)) {
+    // (app.js primes runtime.js with it): packed, as the units are. The
+    // memory64 shim and seed are not primed: runtime.js fetches them as they
+    // are when a program first asks for a 64-bit memory, so they stay plain.
+    if (/^gex\/(gex_browser|gex_kernel|seed)[^/]*\.wasm$/.test(rel) && !/\.m64\./.test(rel)) {
       place(stripped(p), rel);
       return;
     }
