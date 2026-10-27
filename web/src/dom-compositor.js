@@ -365,9 +365,6 @@ export class DomDesktop {
   #glServed = false;
   #glServe = null;
   #glList = [];
-  #glLooks = 0;
-  /* Windows given a GL canvas of their own (see `DomWindow.showGlCanvas`). */
-  #glWindows = 0;
   #glGone = false;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
@@ -454,19 +451,6 @@ export class DomDesktop {
   /** Told when the guest's OpenGL is up, or would not start. */
   ongl = null;
   onglfailed = null;
-
-  /** What this desktop has done about the host's OpenGL: how often it looked,
-   *  how many windows it gave a GL canvas, and what its list of windows
-   *  says. For diagnosis -- a window that stays black is either not being
-   *  looked at, not matched, or matched and drawn from an empty frame. */
-  glStats() {
-    return {
-      looks: this.#glLooks,
-      windows: this.#glWindows,
-      list: this.#glList.length,
-      served: this.#glServed,
-    };
-  }
 
   /** The GL device, when one is running: what it presents and how much of it,
    *  which is the only way to tell a black frame from a frame that never
@@ -800,7 +784,6 @@ export class DomDesktop {
    */
   #drawGl() {
     const device = this.#gl;
-    this.#glLooks++;
     if (!device?.ok) {
       // Once, and loudly. A device that dies after it started -- a WebGPU
       // device whose `lost` promise resolves is the way this happens -- fails
@@ -842,7 +825,6 @@ export class DomDesktop {
         if (win.glFrame) device.surfaceCanvas?.(win.glFrame, false);
         if (!win.showGlCanvas(found.frame)) continue;
         device.surfaceCanvas?.(found.frame, true);
-        this.#glWindows++;
         if (!win.glShown) { win.glShown = true; winNote(win, 'gl'); }
       }
       win.placeGl();

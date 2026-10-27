@@ -677,11 +677,6 @@ export class MesaGlDevice {
     m._gex_gl_surface_canvas(frame >>> 0, on ? 1 : 0);
   }
 
-  /** Bumped whenever a window is attached or goes away. */
-  surfaceGeneration() {
-    return this.#module?._gex_gl_surface_generation?.() ?? 0;
-  }
-
   /** That process is gone: release its context, its windows and their frames.
    *
    * A client that exits says nothing -- it is not there to say it -- so the

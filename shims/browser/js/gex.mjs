@@ -2986,45 +2986,9 @@ export class Gex {
     // What the shim actually imports, from `WebAssembly.Module.imports` -- the
     // only authority. A hand-written list was a third place to keep in step and
     // `check-glue.mjs` did not catch drift, because these arrive via the kernel.
-    const asked = shimMod
-      ? WebAssembly.Module.imports(shimMod)
-          .filter((i) => i.module === 'gex_k' && i.kind === 'function')
-          .map((i) => i.name)
-      : [];
-    // Kept only for a caller that has no module to ask -- there is none in
-    // this file, and this list is not to be extended.
-    const LEGACY_NAMES = [
-      'k_spawn', 'k_exit', 'k_reap', 'k_wait', 'k_wait_ready',
-      'k_has_children', 'k_kill', 'k_take_signals', 'k_has_signals',
-      'k_ppid', 'k_pgid', 'k_sid', 'k_setsid', 'k_setpgid',
-      'k_request_halt', 'k_halt_code',
-      'k_fs_open', 'k_fs_close', 'k_fs_read', 'k_fs_write', 'k_fs_meta',
-      'k_fs_truncate', 'k_fs_read_dir', 'k_fs_path_meta', 'k_fs_read_link',
-      'k_fs_unlink', 'k_fs_mkdir', 'k_fs_rmdir', 'k_fs_rename', 'k_fs_chmod',
-      'k_fs_symlink', 'k_fs_link', 'k_fs_mksocket', 'k_fs_add', 'k_fs_populated',
-      'k_fs_populate_done',
-      'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
-      'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
-      'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
-      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable', 'k_sock_hup',
-      'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
-      'k_ws_self', 'k_ws_seq', 'k_ws_park', 'k_ws_addr',
-      'k_wq_new', 'k_wq_free', 'k_wq_notify', 'k_wq_chain', 'k_wq_unchain',
-      'k_wq_add', 'k_wq_del', 'k_wq_addr',
-      'k_pipe_queue', 'k_sock_queue', 'k_pty_queue', 'k_proc_queue', 'k_stdin_queue', 'k_futex_queue',
-      // Which dispatch slots an identity's code is in, system-wide rather than
-      // per Worker. Without a kernel these answer zero: one process has no
-      // sibling to share with, and the shim keeps its own map.
-      'k_slot_get', 'k_slot_put', 'k_slot_alloc', 'k_slot_floor',
-      'k_stdin_write', 'k_stdin_read', 'k_stdin_ready', 'k_stdin_eof',
-      'k_mod_claim_object', 'k_mod_for_object',
-      'k_place', 'k_place_set',
-      'k_mod_store', 'k_mod_claim', 'k_mod_for', 'k_mod_slots',
-      'k_mod_len', 'k_mod_dirs_len', 'k_mod_read', 'k_mod_dirs_read',
-    ];
-    const NAMES = asked.length ? asked : LEGACY_NAMES;
-    // Not imported by the shim -- the host reads it after a crash -- so it is
-    // not in the list above and its absence is not a link error.
+    const NAMES = WebAssembly.Module.imports(shimMod)
+      .filter((i) => i.module === 'gex_k' && i.kind === 'function')
+      .map((i) => i.name);
     // Some of these return an i64, which JS has to answer with a BigInt.
     const BIG = new Set(['k_inet_op', 'k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_take_thread_signal', 'k_tty_winsize']);
     const out = { k_present: () => (k ? 1 : 0) };
@@ -5937,15 +5901,6 @@ export class Gex {
   /** GEX_DOOR_STATS, read once per Worker (a page sets it before it starts). */
   #doorStatsOn = !!globalThis.GEX_DOOR_STATS;
 
-  /** The guest memory's DataView, rebuilt as `#bytes` is. */
-  #gdv = null;
-  #guestView() {
-    const cm = this.#bytes();
-    let v = this.#gdv;
-    if (!v || v.buffer !== cm.buffer || v.byteLength !== cm.byteLength) v = this.#gdv = new DataView(cm.buffer, 0, cm.byteLength);
-    return v;
-  }
-
   /** Views of the guest's memory for door calls: { u8, i32, dv } (word
    *  indices with `>>> 2`: the memory passes 2 GiB). A shared
    *  memory never detaches (an old SharedArrayBuffer stays valid at its old
@@ -7719,24 +7674,6 @@ export class Gex {
     return this.#ctxSpAt;
   }
 
-  /**
-   * A guest fault the shim staged (`gex_fault_take`: a 32-bit Wine process's branch
-   * to non-executable memory) given to the process's fault hook, Wine's
-   * ntdll.so, as shims/native's `deliver_guest_fault_kind` does: the hook
-   * builds the guest's exception frame and points the context at the
-   * dispatcher. Returns where the guest goes on, or null with none staged.
-   */
-  #deliverFault(ctx) {
-    const t = this.#faultTake(ctx);
-    if (!t) return null;
-    try {
-      t.f(ctx, t.code, t.addr, t.kind);
-    } finally {
-      t.spG.value = t.cur;
-    }
-    return this.#faultPc(ctx);
-  }
-
   /** Where the hook left the context. */
   #faultPc(ctx) {
     return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
@@ -8301,17 +8238,6 @@ export class Gex {
       // Until it says there are no more: the count is the module's own (1 for
       // the image, 355 for libc), and guessing left segments unwritten.
       for (let seg = 0; inst.exports[FILL](seg); seg++);
-    }
-    // This loop writes nothing for a module this translator built: it exports
-    // only `enter` and fills its blocks through its own element segments. Kept
-    // for modules of the older shape, which name each block.
-    for (const name of Object.keys(inst.exports)) {
-      if (name[0] !== 'b') continue;
-      // The shim packs the table index into the top eight bits, like a
-      // directory entry.
-      const packed = e.gex_dispatch_slot(BigInt('0x' + name.slice(1)));
-      if (packed < 0) continue;
-      tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
     P.push(performance.now());
     this.#installSplit = P;
