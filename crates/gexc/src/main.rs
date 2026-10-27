@@ -2407,6 +2407,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 println!("{}", gex_cgen::image::inputs_id());
                 return Ok(());
             }
+            // An option this gexc does not know is an error, not the image: a
+            // renamed flag taken for the path and then replaced by the real one
+            // builds a unit of another key, and nothing says so.
+            other if other.starts_with("--") => anyhow::bail!("cgen-image: unknown option {other}"),
             other => path = Some(other.to_string()),
         }
         i += 1;
