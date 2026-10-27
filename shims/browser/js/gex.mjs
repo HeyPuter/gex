@@ -4585,6 +4585,12 @@ export class Gex {
     if (jit >= 0) e.gex_fjit_installed(jit);
     // What each Worker pays to install a unit (instantiation fills its slots).
     const ms = performance.now() - tInst;
+    // GEX_LOG=wasmlib: each native wasm32 module a process installs, what its
+    // compile and its instantiation took.
+    if (wasmdll && logNamed('wasmlib')) {
+      const c = this.#fileModuleMs;
+      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+    }
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${bridges} bridges)`);
     return bridges;
   }
@@ -5145,13 +5151,18 @@ export class Gex {
 
   /** A module file from the unit cache (an export provider's), compiled
    *  once per process and offered to the siblings. Synchronous. */
+  /** The last `#cgenFileModule`'s compile, ms; -1 when the Worker had it. */
+  #fileModuleMs = -1;
   #cgenFileModule(file, bytes = null, key = null) {
     const name = key ?? `cgenfile:${file}`;
     let mod = this.#sharedModules.get(name);
+    this.#fileModuleMs = -1;
     if (mod) return mod;
     bytes ??= this.#env.loadFile?.(file) ?? null;
     if (!bytes) throw new Error(`gex-cgen: ${file} was published but cannot be loaded here`);
+    const t0 = performance.now();
     mod = new WebAssembly.Module(bytes);
+    this.#fileModuleMs = performance.now() - t0;
     this.#sharedModules.set(name, mod);
     this.#offerModule(name, mod, bytes.byteLength);
     return mod;
