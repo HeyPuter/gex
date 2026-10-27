@@ -1558,7 +1558,7 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let mut ea = c.wrapping_add(offset as u64);
-            // 32-bit Wine: Windows' KUSER_SHARED_DATA page is 32-bit Wine's (`gex_abi::W3_KUSER`).
+            // 32-bit Wine: Windows' KUSER_SHARED_DATA page is 32-bit Wine's (`gex_abi::WINE32_KUSER`).
             if let Some(f) = gex_abi::fold_kuser(ea) {
                 gex_ir::note_kuser_fold();
                 ea = f;

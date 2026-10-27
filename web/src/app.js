@@ -1,6 +1,6 @@
 // gex's app library: run a program on gex's browser runtime inside any page.
 //
-// An ejected program's web build (docs/eject.md, "The web build") is this
+// An ejected program's web build (crates/gex-eject/README.md, "The web build") is this
 // module, built as `app.mjs`, plus its files. The page around it is the
 // user's: it imports `start` and gives it an element.
 //
@@ -63,7 +63,7 @@ const PIECES = {
  *   strace     true (every process) or a pid: narrate system calls
  *   trapstack  a trap's wasm frames
  *   debug      more runtime switches, {name: value}, as gex's test page's
- *              ?name=value (docs/eject.md lists them)
+ *              ?name=value (crates/gex-eject/README.md lists them)
  *   compositor, gl, translation, hostx, mem64
  *              true asks for a runtime piece; an error if the build left it out.
  *              compositor: false draws windows straight into the page.
@@ -534,7 +534,7 @@ async function begin(opts, base, at, state, meter) {
     for (const [path, i, off, n] of pieceList.files) {
       // A hard link's name is its target's inode (below), not a copy: a copy
       // has no time of its own (the archive gives a link none), so Wine's
-      // wineboot saw /w3/share/wine/wine.inf from 1970, took the prefix for
+      // wineboot saw /wine32/share/wine/wine.inf from 1970, took the prefix for
       // stale and ran wine.inf's whole install on every boot of the page.
       if (tree.hard?.[path]) continue;
       const u = bufs[i];
@@ -556,7 +556,7 @@ async function begin(opts, base, at, state, meter) {
   // library by its inode.
   const hard = Object.fromEntries(Object.entries(tree.hard ?? {}).filter(([, t]) => files[t]));
   // Lazy files: read from the host when the guest first reads them (a bundle
-  // split's, docs/eject.md "The bundle split").
+  // split's, crates/gex-eject/README.md "The bundle split").
   let lazy = [];
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
@@ -882,7 +882,7 @@ function mergeEnv(base = [], more = null) {
 }
 
 /**
- * The build's launch file (gex-eject: a 32-bit Wine page's, kind "w3", or an NT-layer
+ * The build's launch file (gex-eject: a 32-bit Wine page's, kind "wine32", or an NT-layer
  * program's) as the options `start` reads. Site paths in it (`/project/...`)
  * are under `at`'s base.
  */
@@ -914,7 +914,8 @@ function withStart(b, st) {
 
 function launchBuild(m, at) {
   const pack = `pack.json${m.build ? `?v=${m.build}` : ''}`;
-  if (m.kind === 'w3') {
+  // ("w3": a build made before the rename.)
+  if (m.kind === 'wine32' || m.kind === 'w3') {
     const p = { ...(m.params ?? {}) };
     const lazy = p.lazy ?? null;
     delete p.lazy;

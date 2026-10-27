@@ -1,6 +1,6 @@
 //! `gexc` — the gex command-line driver.
 //!
-//! M0 subcommands (PLAN §11):
+//! M0 subcommands:
 //!
 //! ```text
 //!   gexc run <elf> [args...]   translate and execute, natively
@@ -264,11 +264,11 @@ run options:
                   holds only the libc paths that program walks
   --no-jit        no runtime translation; implies --exhaustive
   --cgen          the function tier: compile the program's blocks as C with
-                  clang (needs clang and wasm-ld; docs/function-tier.md)
+                  clang (needs clang and wasm-ld)
   --fjit          the function JIT: every function recovered at run time
                   from guest memory, a batch at a time, as wasm emitted
-                  directly and installed in the function table
-                  (docs/merge-plan.md §9.8); tier-1 runs what it does not
+                  directly and installed in the function table;
+                  tier-1 runs what it does not
   --fjit-image    the function JIT ahead of time: the program image's
                   recovered functions spliced into its tier-1 module, as
                   --cgen does with clang
@@ -280,8 +280,7 @@ run options:
                   and call counts, top-4 indirect targets, unexpected
                   returns, interior entries, syscalls per function, the
                   objects loaded, files opened. GEX_PROFILE=1 does the same
-                  into $GEX_PROFILE_OUT (default ./gex-profile). Formats:
-                  docs/profile-format.md
+                  into $GEX_PROFILE_OUT (default ./gex-profile).
   --cwd DIR       start in this guest directory
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
@@ -301,7 +300,7 @@ struct RunArgs {
     xlate: Options,
     jit: bool,
     /// `--mem64` / `--mem32`: the guest memory, overriding the learned
-    /// record (docs/mem64.md §5). `None`: the record decides.
+    /// record. `None`: the record decides.
     mem64: Option<bool>,
 }
 
@@ -590,15 +589,15 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
     }
 }
 
-/// The guest memory for this run (docs/mem64.md §5): `--mem64`/`--mem32`,
+/// The guest memory for this run: `--mem64`/`--mem32`,
 /// else what an earlier run of the same image learned. `wide` is whether
 /// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
 /// has a wasm32 memory.
 /// Native wasm libraries in place of guest ones, as stateful providers
-/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` (docs/
-/// wine-native.md) binds each module's `gexp_<export>` functions at
+/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` binds each
+/// module's `gexp_<export>` functions at
 /// that DLL's exports when it maps. A Linux shared object is named by its
-/// file name (`libmonobdwgc-2.0.so=mono.wasm`, docs/unity-dotnet.md).
+/// file name (`libmonobdwgc-2.0.so=mono.wasm`).
 fn set_wasm_libs() -> Result<()> {
     if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
         let libs = v
@@ -633,7 +632,7 @@ fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
 }
 
 /// After a 64-bit guest's wasm32 run: if it ran out of address space,
-/// record it so the next start has a 64-bit memory (docs/mem64.md §5).
+/// record it so the next start has a 64-bit memory.
 fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
     if !wide || ra.opts.mem.is_64() || ra.mem64 == Some(false) {
         return;
@@ -729,7 +728,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     // A native wasm program's container is not a 64-bit guest whose memory
     // gex chooses: 64-bit Wine's LP64 program is lowered to wasm32 (its x86-64 code
     // keeps below its code space), and its memory64 flavour is the module's
-    // own (docs/wine-native-x64.md §0.1).
+    // own.
     let wide = !program.compat() && !program.exe.is_wasm_program();
     // GEX_EJECT_BUILD=DIR (debugging): an ejected project's modules and pins
     // under an ordinary run with its own options (a display, binds), so a
@@ -899,10 +898,10 @@ fn cmd_build(args: &[String]) -> Result<()> {
             }
             "--shared-image" => shared_image = true,
             // The function tier: the blocks as C, through clang, spliced into
-            // the module (docs/function-tier.md).
+            // the module.
             "--cgen" => cgen = true,
             // The function JIT: recovered functions straight to wasm, no
-            // clang (gex-fjit, docs/merge-plan.md §9.8).
+            // clang (gex-fjit).
             "--fjit" => fjit = true,
             "--sysroot" => {
                 i += 1;
@@ -2391,11 +2390,11 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 entries = Some(args.get(i).context("--entries needs a file")?.clone());
             }
-            // A unit for a 64-bit guest memory (docs/mem64.md): another
+            // A unit for a 64-bit guest memory: another
             // key, other code.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             // A 32-bit Wine unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
-            // gex_abi::W3_KUSER): constant accesses to Windows' page folded
+            // gex_abi::WINE32_KUSER): constant accesses to Windows' page folded
             // there, every other address checked. Another key.
             "--wine32-kuser" => gex_abi::set_kuser_fold(true),
             // The NT trampoline page (i386 with --nt-trampolines32): built

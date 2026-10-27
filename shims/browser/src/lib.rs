@@ -9631,13 +9631,13 @@ pub(crate) fn wine32_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64
 }
 
 /// `gex.kuser_address()` (32-bit Wine, at start): where this gex has i386
-/// code read KUSER_SHARED_DATA. `gex_abi::W3_KUSER` when the loader's
+/// code read KUSER_SHARED_DATA. `gex_abi::WINE32_KUSER` when the loader's
 /// header asked for the fold (`FLAG_KUSER_WINE32`), else Windows' 0x7ffe0000.
 /// Wine stops at once when it maps the page elsewhere, rather than run with
 /// every constant read of it landing on nothing.
 #[no_mangle]
 pub extern "C" fn gex_kuser_address() -> u32 {
-    if gex_abi::kuser_fold() { gex_abi::W3_KUSER as u32 } else { gex_abi::KUSER_WINDOWS as u32 }
+    if gex_abi::kuser_fold() { gex_abi::WINE32_KUSER as u32 } else { gex_abi::KUSER_WINDOWS as u32 }
 }
 
 /// Where this process's Windows address space starts (32-bit Wine), or 0: what a fork

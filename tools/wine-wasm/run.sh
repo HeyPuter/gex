@@ -13,12 +13,12 @@
 # through BENCH_SH (required: a runner taking `-s DIR... -- CMD`, which syncs
 # each DIR to the box; BENCH_TIMEOUT, default 20m), web/nt.html with gl=1, from TREE, a page-ready gex tree (web/node_modules,
 # web/public/gex's x86 shims and Mesa: GEX_ARCH=x86 shims/{kernel,browser}/build.sh,
-# web/build-mesa-wasm.sh). Two bundles: the dist at /w3 (WINE32_PAGE_DIR/wine32-KEY.tar,
+# web/build-mesa-wasm.sh). Two bundles: the dist at /wine32 (WINE32_PAGE_DIR/wine32-KEY.tar,
 # made once per dist) and the prefix at /pfx, the host's xkb data at /usr and
 # EXE's directory at /g. The run tree (WINE32_PAGE_DIR/tree-NAME: hard links to
 # TREE's web and shims/browser/js) and the unit cache are synced to
 # the box; it runs until the program exits or --timeout (default 300 s), and
-# prints the program's output, "unitless:" lines and an "== w3 page:" result
+# prints the program's output, "unitless:" lines and an "== wine32 page:" result
 # (wine32/page-run.mjs). With --build-units the unitless images' units are built
 # afterwards (wine32/units.sh) for the next run: the page builds none itself.
 # WINE32_PAGE_DIR defaults to WINE32_CACHE/page; on a remote box it and the unit
@@ -107,7 +107,7 @@ if [ -n "$page" ]; then
   name=$(basename "$exe"); name=${name%.*}
   # The dist bundle, once per dist (links dereferenced: the page has none).
   wt=$pg/wine32-$WINE32_KEY.tar
-  [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),w3," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
+  [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),wine32," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
   # The run tree, at one path per program, so the box's copy updates by difference.
   rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/web" "$rt/shims/browser" "$rt/tools/wine-wasm/wine32"
   for d in web/nt.html web/vite.config.js web/package.json web/src web/test web/node_modules web/public web/eject-site/vendor shims/browser/js; do
@@ -115,7 +115,7 @@ if [ -n "$page" ]; then
   done
   rm -rf "$rt/web/public/gex/nt"; mkdir -p "$rt/web/public/gex/nt"
   cp "$WINE32/run.sh" "$rt/tools/wine-wasm/"; cp "$WINE32/wine32/page-run.mjs" "$rt/tools/wine-wasm/wine32/"
-  ln "$wt" "$rt/web/public/gex/nt/w3.tar" 2>/dev/null || cp "$wt" "$rt/web/public/gex/nt/w3.tar"
+  ln "$wt" "$rt/web/public/gex/nt/wine32.tar" 2>/dev/null || cp "$wt" "$rt/web/public/gex/nt/wine32.tar"
   # The program's bundle: the prefix, xkb data, its directory.
   st=$(mktemp -d "$pg/stage.XXXXXX"); trap 'rm -rf "$st"' EXIT
   cp -a "$prefix" "$st/pfx"; mkdir -p "$st/usr/share/X11"; cp -rL /usr/share/X11/xkb "$st/usr/share/X11/"
@@ -126,7 +126,7 @@ if [ -n "$page" ]; then
   env=() ; for ((i = 1; i < ${#envs[@]}; i += 2)); do env+=("${envs[i]}"); done
   log=$pg/$name.log
   BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:?--page needs BENCH_SH, a bench runner}" -s "$rt" -s "$units" -- \
-    env WINE32_PAGE_TARS=/gex/nt/w3.tar,/gex/nt/app.tar WINE32_PAGE_SIZE="$size" WINE32_PAGE_DEBUG="$debug" \
+    env WINE32_PAGE_TARS=/gex/nt/wine32.tar,/gex/nt/app.tar WINE32_PAGE_SIZE="$size" WINE32_PAGE_DEBUG="$debug" \
     WINE32_PAGE_ENV="$(IFS=,; echo "${env[*]}")" ${WINE32_PAGE_Q+WINE32_PAGE_Q="$WINE32_PAGE_Q"} \
     bash "$rt/tools/wine-wasm/run.sh" --remote "$rt" "$units" "${tmo:-300}" "$(basename "$exe")" "$@" 2>&1 | tee "$log"
   rc=${PIPESTATUS[0]}

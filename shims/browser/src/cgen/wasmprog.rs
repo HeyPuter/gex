@@ -96,7 +96,7 @@ const FLAG_GUEST_I386: u32 = 1;
 /// shares 32-bit Wine's address-space split and trampoline page.
 const FLAG_GUEST_X86_64: u32 = 2;
 /// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
-/// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
+/// `gex_abi::WINE32_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
 /// the process folds Windows' constant addresses there (`winspace::wine32_kuser`).
 const FLAG_KUSER_WINE32: u32 = 4;
 

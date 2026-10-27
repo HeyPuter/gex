@@ -1102,9 +1102,9 @@ pub const ILLEGAL_RETURNS_PC: u64 = 1 << 61;
 /// low space it reserves below the wasm32 program's stack (`STACK_TOP -
 /// STACK_SIZE`), so that a 32-bit Wine process's memory need not reach 2 GiB. Wine's
 /// `include/wine/kuser.h` says the same address (its ntdll checks it against
-/// `GEX_W3_KUSER`). i386 code's constant accesses to [`KUSER_WINDOWS`] are
+/// `GEX_WINE32_KUSER`). i386 code's constant accesses to [`KUSER_WINDOWS`] are
 /// folded to it ([`fold_kuser`]); any other access to the old page faults.
-pub const W3_KUSER: u64 = 0x04ff_0000;
+pub const WINE32_KUSER: u64 = 0x04ff_0000;
 
 static KUSER_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1120,9 +1120,9 @@ pub fn kuser_fold() -> bool {
 }
 
 /// A constant effective address in Windows' KUSER_SHARED_DATA page, moved to
-/// 32-bit Wine's ([`W3_KUSER`]) when folding is on; `None` for any other address.
+/// 32-bit Wine's ([`WINE32_KUSER`]) when folding is on; `None` for any other address.
 pub fn fold_kuser(ea: u64) -> Option<u64> {
-    (kuser_fold() && (KUSER_WINDOWS..KUSER_WINDOWS_END).contains(&ea)).then(|| ea - KUSER_WINDOWS + W3_KUSER)
+    (kuser_fold() && (KUSER_WINDOWS..KUSER_WINDOWS_END).contains(&ea)).then(|| ea - KUSER_WINDOWS + WINE32_KUSER)
 }
 
 /// With folding on, the bounds guard's limit (tier-1 and gex-cgen): an
@@ -1146,8 +1146,8 @@ pub fn kuser_miss_unpack(arg: i64) -> (u64, u64) {
     (a & 0xffff_ffff, a >> 32)
 }
 
-const _: () = assert!(W3_KUSER + 0x1_0000 <= STACK_TOP - STACK_SIZE);
-const _: () = assert!(W3_KUSER % 0x1_0000 == 0);
+const _: () = assert!(WINE32_KUSER + 0x1_0000 <= STACK_TOP - STACK_SIZE);
+const _: () = assert!(WINE32_KUSER % 0x1_0000 == 0);
 
 /// Size in bytes zeroed by one `dc zva`, and the value reported by
 /// `DCZID_EL0`. 64 bytes is what every mainstream aarch64 core reports.

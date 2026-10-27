@@ -1,5 +1,5 @@
 //! Which parts of gex's runtime an ejected build keeps (`user/eject.json`
-//! `"features"`, docs/eject.md "Features").
+//! `"features"`, crates/gex-eject/README.md "Features").
 //!
 //! An ejected project starts as the runtime a gex page runs, everything in;
 //! each feature switched off is taken out of the build. A feature is only

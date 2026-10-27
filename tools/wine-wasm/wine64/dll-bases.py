@@ -20,7 +20,7 @@ order given. Keep the list's order stable and only append to it
     dll-bases.py check FILE
 
 assign: PATHS is one image per line, as the server names it (the unix path
-it opened: /w64/lib/wine/x86_64-windows/x.dll in the page, the dist's own
+it opened: /wine64/lib/wine/x86_64-windows/x.dll in the page, the dist's own
 path natively). --map says where a path prefix is on this machine, to read
 the image's header. Programs, images without relocations (they cannot
 move) and paths not found are left out, each said once on stderr; a line

@@ -104,8 +104,8 @@ fn futex_slot(addr: u64) -> usize {
 }
 
 /// The wait queue of the futex bucket `addr` hashes to, made on first use: a
-/// thread parked on a futex registers its wait slot here
-/// (docs/kernel-locking.md §5.2 step 2), and a wake notifies it. Fewer
+/// thread parked on a futex registers its wait slot here,
+/// and a wake notifies it. Fewer
 /// buckets than generation slots; a shared bucket only wakes a waiter that
 /// then finds its own generation unmoved and parks again.
 const FUTEX_QUEUES: usize = 4096;
@@ -1001,7 +1001,7 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> 
     b.len() as u32
 }
 
-// ---- The translation cache across page loads (docs/gexcc.md §8) ----
+// ---- The translation cache across page loads ----
 //
 // The store above, its claims and the slot map, written out for the page to
 // keep (`k_store_save`) and laid back in by the next load's first process

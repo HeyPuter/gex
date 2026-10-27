@@ -974,7 +974,7 @@ fn remembered_unit_key(id: &(String, u64, usize, u64), image: &gex_ld::Image, pv
         std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos())))
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    "gex-w3-key 1".hash(&mut h);
+    "gex-wine32-key 1".hash(&mut h);
     id.hash(&mut h);
     // What else decides the key at run time: the memory flavour, guards
     // and store widths (gex-cgen's unit inputs).

@@ -18,7 +18,7 @@ by its image and its base).
     dll-bases.py check FILE
 
 assign: PATHS is one image per line, as the server names it (the unix path
-it opened: /w3/lib/wine/i386-windows/x.dll in the page, the dist's own path
+it opened: /wine32/lib/wine/i386-windows/x.dll in the page, the dist's own path
 natively). --map says where a path prefix is on this machine, to read the
 image's header. Programs, images without relocations (they cannot move) and
 paths not found are left out, each said once on stderr; a line already

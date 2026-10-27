@@ -82,8 +82,8 @@ RUSTFLAGS="-C link-arg=--import-memory \
 # page and satisfies the minimum as it always did.
 #
 # Then a second one, `process64`, a memory64 (gex-kmem's memory 2): one module
-# serves processes of both flavours, a 32-bit memory and a 64-bit one
-# (docs/mem64.md step 6), each Worker giving its own as the one of its type
+# serves processes of both flavours, a 32-bit memory and a 64-bit one,
+# each Worker giving its own as the one of its type
 # and an empty memory as the other (lazy-fetch.mjs `processMemories`). Two
 # builds, one per flavour, laid their statics out 16 bytes apart and could
 # not share one kernel memory: in a page whose processes differ (64-bit Wine's

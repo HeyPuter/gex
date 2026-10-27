@@ -97,7 +97,7 @@ pub struct Config {
     pub jit_fallback: bool,
     /// Windows programs: link groups, each a list of image file names whose
     /// functions are linked into one module with direct calls between them
-    /// (docs/eject-pe.md §6a).
+    ///.
     pub link_groups: Vec<Vec<String>>,
     /// The runtime's features this build leaves out (`"features"`, each
     /// `false`; see [`crate::features`]). Empty: everything in.
@@ -117,7 +117,7 @@ pub struct Config {
     /// units that report the functions a run calls, for a recording of the
     /// site to take its coverage from (tools/eject/record-wine32.mjs). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
-    /// on first call (docs/eject.md, "Cold code"). `"jit"`: the rest are not
+    /// on first call (crates/gex-eject/README.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the
     /// guest's code on first call (gex_split::jit). `"tier1"`: the same
     /// units, with the function JIT off, so the rest runs on tier 1.
@@ -146,7 +146,7 @@ pub struct Config {
     pub services: Vec<(String, u32)>,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
-    /// that change nothing in the build's output belong here (docs/eject.md,
+    /// that change nothing in the build's output belong here (crates/gex-eject/README.md,
     /// "The web build"); each is checked by name.
     /// As written (a JSON object's text), "{}" when absent.
     pub start: String,
@@ -190,13 +190,13 @@ fn template_fields() -> Vec<(&'static str, Json)> {
             "about",
             json::s(
                 "Your settings; gexc eject never rewrites this file. \"replace\" lists guest \
-                 functions served by your wasm (see docs/eject.md), e.g. {\"object\": \"prog\", \
+                 functions served by your wasm (see crates/gex-eject/README.md), e.g. {\"object\": \"prog\", \
                  \"symbol\": \"strlen\", \"export\": \"my_strlen\", \"abi\": \"c\"}, or by \"offset\", \
                  \"import\" or \"library\"; `gexc eject override` prints a checked entry. \"coverage\" is \"profile\" (what the session ran), \"static\" (and what discovery finds) or \"exhaustive\". \"args\" \
                  replaces the recorded arguments. \"syscalls\": \"recorded\" allows only the system \
                  calls the session made (\"all\": any); \"allow_syscalls\" adds some by name. \"jit_fallback\": true translates code the build \
                  never saw instead of failing on it. \"features\": the parts of gex's runtime the \
-                 build keeps; false leaves one out (see docs/eject.md, \"Features\").",
+                 build keeps; false leaves one out (see crates/gex-eject/README.md, \"Features\").",
             ),
         ),
         ("replace", Json::Arr(Vec::new())),

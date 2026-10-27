@@ -1,7 +1,7 @@
 //! Who makes a process's commonest syscalls, by module+offset (a debug
 //! switch: with `?heartbeat=N` on). A sampled call's guest stack, from the
 //! context's stack pointer up, is scanned for the first word inside an
-//! executable file mapping that is not Wine's own (`/w64/`, `/w3/`, `wine`),
+//! executable file mapping that is not Wine's own (`/w64/` and `/w3/` in pages recorded before the rename, `wine`),
 //! else the first inside any: the return address into whatever called the
 //! API that ended in this call. Printed with the heartbeat's census as the
 //! file's name, its lowest mapping (an image's base) and the offset from it.

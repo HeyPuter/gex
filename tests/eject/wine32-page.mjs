@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The ejected 32-bit Wine page leg: a site from web/eject-site.mjs of a 32-bit Wine project
-// (docs/eject.md, "32-bit Wine pages") reaches its window in headless Chromium, built
+// (crates/gex-eject/README.md, "32-bit Wine pages") reaches its window in headless Chromium, built
 // with the features its project left out really gone.
 //
 //   node tests/eject/wine32-page.mjs SITE [--title RE] [--timeout S] [--port N (default: any free one)] [--chrome PATH] [--placed] [--shell PAGE]
@@ -72,7 +72,7 @@ const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if
 const ntPath = join(site, 'project/build/web/nt.json');
 if (!check(existsSync(ntPath), `${ntPath} exists`)) process.exit(1);
 const nt = JSON.parse(readFileSync(ntPath, 'utf8'));
-check(nt.kind === 'w3', `the site is a wine32 page (kind ${nt.kind})`);
+check(nt.kind === 'wine32', `the site is a wine32 page (kind ${nt.kind})`);
 const off = nt.features_off ?? [];
 const assets = existsSync(join(site, 'assets')) ? readdirSync(join(site, 'assets')) : [];
 const gexDir = existsSync(join(site, 'gex')) ? readdirSync(join(site, 'gex')) : [];

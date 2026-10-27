@@ -34,7 +34,7 @@ const DEMOS = {
   // Prompt patterns taken from a real run: xterm's `innerText` drops the
   // trailing space, so a pattern anchored on "$ " never matches.
   busybox: { want: /~ \$/ },
-  // The Debian rootfs built from source (docs/gexcc.md §6): bash -l as root.
+  // The Debian rootfs built from source: bash -l as root.
   'native-debian': { want: /:~#/ },
   // Typing into the terminal as a person does (CDP key events into xterm's
   // textarea, after the prompt): `$((1+1))` so the echo of the typed line
@@ -472,7 +472,7 @@ const server = createServer(async (req, res) => {
     // global kernel's memory, and without these headers it is not defined.
     // `GEX_NO_COI=1` leaves them off, as any static host would: the page then
     // has no SharedArrayBuffer and runs the single-thread build
-    // (docs/single-thread.md).
+    //.
     res.writeHead(200, {
       'content-type': TYPES[extname(name)] || 'application/octet-stream',
       ...(process.env.GEX_NO_COI ? {} : {

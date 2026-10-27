@@ -2,7 +2,7 @@
 // `read_set`, shims/kernel `k_fs_opened`; an open or a stat alone is not a use): what gex-eject's 32-bit Wine recorder
 // (tools/eject/record-wine32.mjs) keeps as the run's read set, so that the site
 // can ship those in its bundle and serve the rest as lazy files
-// (docs/eject.md, "The bundle split").
+// (crates/gex-eject/README.md, "The bundle split").
 //
 // A Worker asks, not the page: the kernel's locks may wait
 // (memory.atomic.wait), which the main thread may not.

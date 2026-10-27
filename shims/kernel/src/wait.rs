@@ -1,4 +1,4 @@
-//! Wait slots and wait queues (docs/kernel-locking.md §5.2 step 2).
+//! Wait slots and wait queues.
 //!
 //! A *slot* is one waiting thread: a word here, in the memory every Worker
 //! shares, that its Worker parks on (`k_ws_park`) and a waker bumps and

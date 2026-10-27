@@ -1,5 +1,5 @@
 //! Static reachability of a unit's functions, for pruning (`"prune":
-//! "static"`, docs/eject.md "Pruning"): which of an image's recovered
+//! "static"`, crates/gex-eject/README.md "Pruning"): which of an image's recovered
 //! functions no path from outside the image can reach, so that a site can
 //! leave their code out.
 //!

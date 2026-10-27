@@ -560,7 +560,7 @@ const gears = {
     // st/mesa and the gex_wgpu Gallium driver below the decoder: the only
     // browser GL backend.
     //
-    // The single-thread build (docs/single-thread.md) has no device on the
+    // The single-thread build has no device on the
     // page: the canvas becomes the compositor's output, and the non-pthread
     // Mesa runs beside the compositor in the system Worker (`gl: 'compositor'`).
     // The guest reports its own verdict from a readback, so a run is checked

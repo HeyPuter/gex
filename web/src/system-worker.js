@@ -1,6 +1,6 @@
 // The single-thread build's one Worker: the whole guest system -- the global
 // kernel, every process and thread as a fiber, the Wisp connection -- on this
-// thread, with no SharedArrayBuffer (docs/single-thread.md). The page keeps
+// thread, with no SharedArrayBuffer. The page keeps
 // the terminal and talks to this by messages.
 //
 // A Worker rather than the page's own thread because a Worker may compile a

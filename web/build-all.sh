@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the page for the multi-process build (MP, the default), the
-# single-thread build (SP, docs/single-thread.md), or both, from one tree.
+# single-thread build (SP), or both, from one tree.
 #
 #   web/build-all.sh [--mp | --sp | --both] [--debug]
 #                    [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]
@@ -22,8 +22,7 @@
 #    - the providers, rootfs and guest GL libraries.
 #    SP loads the same three files and clears their memories' `shared` flag
 #    as it compiles them (single.mjs enableSingle). An SP-only shim cannot be
-#    smaller: its per-fiber stacks and TLS are what the atomics build provides
-#    (docs/single-thread.md §9).
+#    smaller: its per-fiber stacks and TLS are what the atomics build provides.
 # 2. Mesa and Xwayland for each flavour, each in its own build tree:
 #
 #      Mesa      MP: $CACHE/mesa-mt -> web/public/gex/

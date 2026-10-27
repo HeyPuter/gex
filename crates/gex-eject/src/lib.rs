@@ -24,7 +24,7 @@
 //! function). [`run::run`] runs the result with no runtime translation: code
 //! the build never saw fails loudly unless `--jit-fallback` is given.
 //!
-//! The design and its limits are in `docs/eject.md`.
+//! The design and its limits are in `crates/gex-eject/README.md`.
 
 #[cfg(feature = "build")]
 pub mod build;

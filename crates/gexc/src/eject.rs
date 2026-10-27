@@ -1,5 +1,5 @@
 //! `gexc eject`: the command line of `gex-eject` (see that crate and
-//! docs/eject.md).
+//! crates/gex-eject/README.md).
 
 use anyhow::{bail, Context, Result};
 use gex_native::Exit;
@@ -9,12 +9,12 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    write a standalone project from a session
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
-                                   and a launcher (docs/eject.md)
+                                   and a launcher (crates/gex-eject/README.md)
   gexc eject <wine32-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
                                    the same for a wine32 page (Wine as wasm32)
                                    recorded by tools/eject/record-wine32.mjs: its
                                    bundle, units and runtime, and the features
-                                   the build keeps (docs/eject.md, \"wine32 pages\")
+                                   the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
   gexc eject override <project> <object> <symbol|0xoffset> [--size N]
@@ -268,7 +268,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
 
 fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
-    if let Some(w) = &r.w3 {
+    if let Some(w) = &r.wine32 {
         eprintln!(
             "{}: wine32 page built: {} page files, {} units; features off: {}",
             dir.display(),

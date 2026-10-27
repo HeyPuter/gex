@@ -440,7 +440,7 @@ pub(crate) const FLAVORS: [(bool, bool); 4] = [(true, false), (false, false), (t
 /// The hash of `gex_cgen::image::abi_fingerprint` with 32-bit Wine's KUSER fold on
 /// or off: the C header a unit is built against has the fold's helpers only
 /// with it on (`gexc cgen-image --wine32-kuser`), so the two flavors' keys differ
-/// there as well as in their `:w3kuser`. Each is computed once, with the
+/// there as well as in their `:wine32kuser`. Each is computed once, with the
 /// process's fold set for the call and put back.
 fn abi_hash(kuser: bool) -> String {
     static H: [std::sync::OnceLock<String>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
@@ -471,7 +471,7 @@ pub(crate) fn key_with(image: &gex_ld::Image, (unguarded, kuser): (bool, bool)) 
         inputs.push_str(":icallcount");
     }
     if kuser {
-        inputs.push_str(":w3kuser");
+        inputs.push_str(":wine32kuser");
     }
     if gex_abi::mem64() {
         inputs.push_str(":mem64");
@@ -497,7 +497,7 @@ pub fn rekey(unit_wasm: &[u8], orig: &[u8], trimmed: &[u8], old: &str) -> Result
     if std::env::var_os("GEX_RSRC_TRACE").is_some() {
         eprintln!("[rsrc] {old}: base {base:#x} (preferred {:#x}); identity {}", pe.preferred_base, gex_key::image_identity(&was));
         for g in FLAVORS {
-            eprintln!("[rsrc]   (unguarded, w3kuser)={g:?} -> {}", key_with(&was, g));
+            eprintln!("[rsrc]   (unguarded, wine32kuser)={g:?} -> {}", key_with(&was, g));
         }
     }
     let Some(g) = FLAVORS.into_iter().find(|&g| key_with(&was, g) == old) else { return Ok(None) };

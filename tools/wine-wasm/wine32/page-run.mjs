@@ -5,15 +5,15 @@
 //
 // TREE is a page-ready tree (web/node_modules, web/public/gex's x86 shims and
 // Mesa) whose web/public/gex/nt holds the bundles WINE32_PAGE_TARS names (comma
-// separated page paths; run.sh's: the dist at /w3, then the prefix at /pfx,
+// separated page paths; run.sh's: the dist at /wine32, then the prefix at /pfx,
 // xkb data at /usr and the program's directory at /g). EXE is the program's
 // file name in /g. Runs until it exits or for SECS seconds (0: until it
 // exits), then prints the program's output tail, a "unitless: PATH BASE" line
 // for each image that ran without a function-tier unit (run.sh --build-units
 // builds them), and one result line:
-//   "== w3 page: exited STATUS at T s (F frames)"
-//   "== w3 page: running at SECS s (F frames)"   (a timeout is no failure)
-//   "== w3 page: FAIL WHY"
+//   "== wine32 page: exited STATUS at T s (F frames)"
+//   "== wine32 page: running at SECS s (F frames)"   (a timeout is no failure)
+//   "== wine32 page: FAIL WHY"
 // Env: WINE32_PAGE_SIZE (WxH, default 1280x720), WINE32_PAGE_ENV (more K=V,...),
 // WINE32_PAGE_DEBUG (WINEDEBUG), WINE32_PAGE_Q (the page's query flags, default
 // &cgen=1), WINE32_PAGE_SHOT (DIR: the compositor's last frame as DIR/end.ppm).
@@ -34,7 +34,7 @@ const argv = encodeURIComponent(JSON.stringify([exe, ...args]));
 const env = encodeURIComponent(['WINEPREFIX=/pfx', `WINEDEBUG=${process.env.WINE32_PAGE_DEBUG || 'err+all,fixme-all'}`,
   'XDG_RUNTIME_DIR=/tmp', 'WAYLAND_DISPLAY=wayland-0', ...(process.env.WINE32_PAGE_ENV ? [process.env.WINE32_PAGE_ENV] : [])].join(','));
 const { evaluate, state, consoleLines } = await openPage(
-  `tar=${tars}&exe=/w3/lib/wine/i386-unix/wine&mtimes=1&cwd=/g&gl=1&glbackend=wgpu&size=${size}`
+  `tar=${tars}&exe=/wine32/lib/wine/i386-unix/wine&mtimes=1&cwd=/g&gl=1&glbackend=wgpu&size=${size}`
     + `&argv=${argv}&env=${env}${process.env.WINE32_PAGE_Q ?? '&cgen=1'}`,
   { width: w + 20, height: h + 100 },
 );
@@ -76,8 +76,8 @@ for (const l of consoleLines) {
   const m = /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l);
   if (m && !seen.has(m[1] + m[2])) { seen.add(m[1] + m[2]); console.log(`unitless: ${m[1]} ${m[2]}`); }
 }
-if (s?.phase === 'failed') console.log(`== w3 page: FAIL ${s.error}`);
-else if (s?.phase === 'done') console.log(`== w3 page: exited ${s.status} at ${at()} s (${n} frames)`);
-else console.log(`== w3 page: running at ${at()} s (${n} frames)`);
+if (s?.phase === 'failed') console.log(`== wine32 page: FAIL ${s.error}`);
+else if (s?.phase === 'done') console.log(`== wine32 page: exited ${s.status} at ${at()} s (${n} frames)`);
+else console.log(`== wine32 page: running at ${at()} s (${n} frames)`);
 stopAll();
 process.exit(s?.phase === 'failed' ? 1 : 0);

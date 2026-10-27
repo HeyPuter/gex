@@ -6,7 +6,7 @@
 # Every "unitless: PATH BASE" line of LOG (tools/wine-wasm/wine32/page-run.mjs's,
 # or "image PATH at base BASE: no function-tier unit" from gexc) gets
 # `gexc cgen-image PATH --pe-base BASE` into the unit cache UNITS
-# (GEX_CGEN_CACHE). Page paths are mapped: /w3 is DIST, /g GAMEDIR; host paths
+# (GEX_CGEN_CACHE). Page paths are mapped: /wine32 is DIST (/w3 in recordings made before the rename), /g GAMEDIR; host paths
 # (a native run's) are used as they are. The provider modules are built too
 # (`cgen-image --providers`), once per gexc. Unit keys include gexc's gex-cgen
 # sources: units from another gexc are simply not found, never wrong.
@@ -20,6 +20,7 @@ GEX_CGEN_CACHE=$U nice -n 19 "$G" cgen-image --providers --jobs ${WINE32_JOBS:-1
 one() {
   local p=$1 b=$2 f
   case $p in
+    /wine32/*) f=$D/${p#/wine32/} ;;
     /w3/*) f=$D/${p#/w3/} ;;
     /g/*) f=$A/${p#/g/} ;;
     /pfx/dosdevices/z:/*) f=/${p#/pfx/dosdevices/z:/} ;;

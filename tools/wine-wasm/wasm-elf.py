@@ -78,13 +78,13 @@ def custom_section(w, want):
     return None
 
 
-# Where 32-bit Wine maps KUSER_SHARED_DATA (gex_abi::W3_KUSER). Wine's ntdll
+# Where 32-bit Wine maps KUSER_SHARED_DATA (gex_abi::WINE32_KUSER). Wine's ntdll
 # names its address in a custom section, gex_kuser (include/wine/kuser.h's
 # WINE_USER_SHARED_DATA, 4 bytes little-endian); a loader that does sets the
 # header's FLAG_KUSER_WINE32 (4), and gex folds i386 code's constant accesses to
 # Windows' page (0x7ffe0000) there. A loader without the section keeps
 # Windows' address and gex folds nothing.
-W3_KUSER = 0x04ff0000
+WINE32_KUSER = 0x04ff0000
 
 
 def up(v, a):
@@ -116,8 +116,8 @@ def main():
     kuser = custom_section(w, b'gex_kuser')
     if kuser is not None and flags & 1:
         at = struct.unpack('<I', kuser[:4])[0]
-        if at != W3_KUSER:
-            raise SystemExit(f'{src}: KUSER_SHARED_DATA at {at:#x}, gex folds to {W3_KUSER:#x} (gex_abi::W3_KUSER)')
+        if at != WINE32_KUSER:
+            raise SystemExit(f'{src}: KUSER_SHARED_DATA at {at:#x}, gex folds to {WINE32_KUSER:#x} (gex_abi::WINE32_KUSER)')
         flags |= 4
     mem_size, mem_align = dylink_mem(w)
     ehsize, phsize, nph = (64, 56, 4 if stub else 5) if elf64 else (52, 32, 4 if stub else 5)

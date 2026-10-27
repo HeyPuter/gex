@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build gex-steam for Windows games (docs/games.md, "gex-steam"):
+# Build gex-steam for Windows games:
 # steam_api.dll (i386) and steam_api64.dll (x86-64), with every interface
 # version of the Steamworks SDK.
 #

@@ -99,7 +99,7 @@ fn unit_inputs() -> String {
     let base = if max_insns() != DEFAULT_MAX_INSNS { format!("{base}:maxinsns{}", max_insns()) } else { base };
     // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units
     // read the page where 32-bit Wine maps it and check every other address.
-    let base = if gex_abi::kuser_fold() { format!("{base}:w3kuser") } else { base };
+    let base = if gex_abi::kuser_fold() { format!("{base}:wine32kuser") } else { base };
     // The null guard, a debugging opt-in: named only when on, so the
     // units of a build without it keep their keys.
     let base = if gex_emit::tier1::null_guard_on() { format!("{base}:nullguard:{:x}", gex_abi::NULL_GUARD) } else { base };
@@ -218,10 +218,10 @@ pub fn abi_fingerprint() -> String {
         ("INST_ALIGN", gex_abi::INST_ALIGN),
         ("DISPATCH_PAGE", gex_abi::DISPATCH_PAGE),
         ("SYSCALL_INST_BYTES", gex_abi::SYSCALL_INST_BYTES),
-        // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::fold_kuser`, `:w3kuser` units).
+        // 32-bit Wine's KUSER_SHARED_DATA fold (`gex_abi::fold_kuser`, `:wine32kuser` units).
         ("KUSER_WINDOWS", gex_abi::KUSER_WINDOWS),
         ("KUSER_WINDOWS_END", gex_abi::KUSER_WINDOWS_END),
-        ("W3_KUSER", gex_abi::W3_KUSER),
+        ("WINE32_KUSER", gex_abi::WINE32_KUSER),
         ("KUSER_GUARD", gex_abi::KUSER_GUARD),
         ("ctx::SP", ctx::SP as u64),
         ("ctx::PC", ctx::PC as u64),

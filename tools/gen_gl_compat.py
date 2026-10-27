@@ -480,7 +480,7 @@ def host_case(c, opcode, plan):
     r, ptoks = toks[0], toks[1:]
     # Never inlined: each is called from one case of the decoder's switch, and
     # inlined, all 2,520 made that switch one 1.2 MB function -- slow for V8
-    # to compile, and indivisible by wasm-split (docs/mesa-wasm-size.md).
+    # to compile, and indivisible by wasm-split.
     L = [f"/* {c.name} */", f"template <typename R> __attribute__((noinline)) static bool gexgen_{opcode}(R& a) {{"]
     args = []
     post = []

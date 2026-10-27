@@ -393,7 +393,7 @@ export class HostX {
     return this.#reserve({ kind: 'listen', id });
   }
 
-  // -- waiting (docs/kernel-locking.md §5.2 step 2) -------------------------
+  // -- waiting -------------------------
   //
   // The server waits as a guest thread does: on a wait slot of its own in the
   // global kernel's memory, registered on the wait queue of every socket it
@@ -776,7 +776,7 @@ export class HostX {
           self.#seq = k.k_ws_seq(slot);
           return 0;
         };
-        // The single-thread build (docs/single-thread.md): the server is a
+        // The single-thread build: the server is a
         // fiber of the system Worker, so it parks on the scheduler, and the
         // wait is a promise its stack suspends on (gexos.c GEX_XWL_JSPI).
         if (single.on) {

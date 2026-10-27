@@ -130,7 +130,7 @@ async function loadFromSource(url, source) {
  *  `glState` reports them per frame since it was last asked. Only when asked
  *  for (`?wgpustats=1`, the `wgpuStats` option): the wrapper is a
  *  performance.now pair and a Map lookup on each of a few thousand calls a
- *  frame, which was 2.5% of the GL worker's time in Noita's page. */
+ *  frame, a few percent of the GL worker's time in a busy game. */
 const wgpuCalls = new Map();
 function countWebGpu() {
   if (countWebGpu.done || typeof GPUQueue === 'undefined') return;
@@ -187,7 +187,7 @@ function countWebGpu() {
  *  every thirty frames, nine at a time) at most once a minute each, keyed by
  *  their first words; everything else as it comes. Each console line is a
  *  message to whatever is listening (DevTools, a harness over CDP), on the
- *  thread that runs Mesa: two thousand batches in a seven-minute Noita run.
+ *  thread that runs Mesa: thousands of batches in a long game session.
  *  `?gltrace=1` keeps them all: the `glTrace` option, which a Worker gets
  *  from its page (a Worker's own `location` has none of the page's query). */
 /** A page's `?NAME=1`. In a Worker `location` is the worker script's, so

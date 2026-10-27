@@ -1896,9 +1896,9 @@ export class Gex {
     // Windows DLLs load (0x10000000).
     // A 64-bit one (64-bit Wine) the 2 GiB split: 32-bit Wine's compact space ends at
     // 2 GiB, and a 64-bit Wine maps past it.
-    const w3 = wine32ProgramFlags(elf);
-    if (w3) this.#windowsSpace = -1;
-    this.#wine64Split = (w3 & 2) !== 0;
+    const wine = wine32ProgramFlags(elf);
+    if (wine) this.#windowsSpace = -1;
+    this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.

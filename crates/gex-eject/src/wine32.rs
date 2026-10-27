@@ -1,5 +1,5 @@
 //! Ejecting a 32-bit Wine page: a Windows program on Wine as native wasm32, recorded
-//! in the browser (docs/eject.md, "32-bit Wine pages").
+//! in the browser (crates/gex-eject/README.md, "32-bit Wine pages").
 //!
 //! A 32-bit Wine program is not one process but Wine: the
 //! wineserver, services, the program and its helpers are each a guest
@@ -40,7 +40,12 @@ use std::path::{Path, PathBuf};
 /// What the recorder writes.
 pub const SESSION: &str = "wine32-session.json";
 /// What makes a project a 32-bit Wine one.
-pub const KIND: &str = "w3";
+pub const KIND: &str = "wine32";
+/// What a build made before the rename wrote, still read.
+pub const KIND_OLD: &str = "w3";
+/// A recording's format, and the name recordings made before the rename carry.
+pub const FORMAT: &str = "gex-wine32-session";
+pub const FORMAT_OLD: &str = "gex-w3-session";
 
 /// The runtime's wasm the page loads from `gex/` (web/build-eject-page.sh).
 const RUNTIME_WASM: &[&str] = &["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
@@ -55,7 +60,7 @@ pub fn is_project(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join(crate::project::PROJECT_FILE))
         .ok()
         .and_then(|t| Json::parse(&t).ok())
-        .is_some_and(|v| v.get("kind").and_then(|k| k.as_str()) == Some(KIND))
+        .is_some_and(|v| matches!(v.get("kind").and_then(|k| k.as_str()), Some(KIND | KIND_OLD)))
 }
 
 pub struct Wine32Options {
@@ -206,8 +211,8 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     let text = std::fs::read_to_string(&session_path).with_context(|| format!("reading {}", session_path.display()))?;
     let v = Json::parse(&text).map_err(|e| anyhow!("{}: {e}", session_path.display()))?;
     let what = SESSION;
-    if json::opt_str(&v, "format").as_deref() != Some("gex-w3-session") {
-        bail!("{what}: not a wine32 session (format \"gex-w3-session\")");
+    if !matches!(json::opt_str(&v, "format").as_deref(), Some(FORMAT | FORMAT_OLD)) {
+        bail!("{what}: not a wine32 session (format \"{FORMAT}\")");
     }
     let page = json::field(&v, "page", what)?;
     json::str_field(page, "exe", what)?;
@@ -292,7 +297,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     let web_src = std::fs::canonicalize(&o.web_src).unwrap_or_else(|_| o.web_src.clone());
     let project = obj(vec![
         ("kind", s(KIND)),
-        ("about", s("A wine32 page (Wine as native wasm32) ejected by gexc eject; see docs/eject.md, \"wine32 pages\". Generated: rewritten by every eject.")),
+        ("about", s("A wine32 page (Wine as native wasm32) ejected by gexc eject; see crates/gex-eject/README.md, \"32-bit Wine pages\". Generated: rewritten by every eject.")),
         ("page", page.clone()),
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("bundle", obj(vec![("file", s("bundle/rootfs.tar")), ("sha256", s(&bundle_sha)), ("from", s(&bundle))])),
@@ -341,19 +346,19 @@ fn template(off: &[String]) -> String {
         (
             "about",
             s("Your settings; gexc eject never rewrites this file. \"features\": the parts of gex's \
-               runtime the build keeps, false leaves one out (docs/eject.md, \"Features\"); \
+               runtime the build keeps, false leaves one out (crates/gex-eject/README.md, \"Features\"); \
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
-               first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
+               first reads one (\"whole\": everything in the bundle); see crates/gex-eject/README.md, \
                \"The bundle split\". \"cold\": \"none\" ships every unit whole in one archive; a clustering \
                (\"chunk:256\", ...) splits off each unit's code the recording never ran and \
                fetches it on first call, \"instrument\" builds units that record the functions a \
-               run calls; see docs/eject.md, \"Cold code\". \"resources\": \"trim\" ships no \
+               run calls; see crates/gex-eject/README.md, \"Cold code\". \"resources\": \"trim\" ships no \
                resource the site's locale and DPI cannot load (\"whole\": every one); see \
-               docs/eject.md, \"Resources\". \
+               crates/gex-eject/README.md, \"Resources\". \
                \"start\": defaults for the app library's start() \
                (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
-               recording's; the page's own options win (docs/eject.md, \"The web build\")."),
+               recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
         ),
         (
             "features",
@@ -714,7 +719,7 @@ pub struct Wine32Report {
 /// A new 32-bit Wine project's `"cold"`: none. Every unit ships whole, in the site's
 /// one units archive (web/eject-site.mjs), and nothing is fetched on a call.
 /// A split (`"chunk:256"` and the other clusterings) is opt-in: it cuts the
-/// download and costs a fetch per cluster at first call (docs/eject.md,
+/// download and costs a fetch per cluster at first call (crates/gex-eject/README.md,
 /// "Cold code").
 const COLD_DEFAULT: &str = "none";
 
@@ -839,7 +844,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         (Some(_), _) => {
             eprintln!(
                 "gexc eject build: user/eject.json says \"cold\", but the recording has no coverage: \
-                 the units stay whole (docs/eject.md, \"Cold code\": record a site built with \
+                 the units stay whole (crates/gex-eject/README.md, \"Cold code\": record a site built with \
                  \"cold\": \"instrument\" with record-wine32.mjs --coverage-into)"
             );
             None
@@ -1082,7 +1087,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         }).collect())),
         ("bundle", bundle),
         // user/eject.json "start": the app library's start() defaults, over
-        // the recording's (docs/eject.md, "The web build").
+        // the recording's (crates/gex-eject/README.md, "The web build").
         ("start", Json::parse(&config.start).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?),
     ]);
     write_file(&web.join("wine32.json"), json::write(&launch).as_bytes(), false)?;
@@ -1128,16 +1133,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ok = Json::parse(r#"{"uncovered": []}"#).unwrap();
         assert!(check_covered(&ok, &dir).is_ok());
-        let bad = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "k", "path": "/w3/combase.dll"}]}"#).unwrap();
+        let bad = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "k", "path": "/wine32/combase.dll"}]}"#).unwrap();
         let e = check_covered(&bad, &dir).unwrap_err().to_string();
-        assert!(e.contains("0x612c52cd (/w3/combase.dll)"), "{e}");
+        assert!(e.contains("0x612c52cd (/wine32/combase.dll)"), "{e}");
         // A region entry of its unit's holds it.
         std::fs::create_dir_all(dir.join("units/regions/k")).unwrap();
         let entries: Vec<u8> = [0x612c0000u64, 0x612c52cd].iter().flat_map(|a| a.to_le_bytes()).collect();
         std::fs::write(dir.join("units/regions/k/c.entries"), entries).unwrap();
         assert!(check_covered(&bad, &dir).is_ok());
         // Another unit's does not.
-        let other = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "j", "path": "/w3/ole32.dll"}]}"#).unwrap();
+        let other = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "j", "path": "/wine32/ole32.dll"}]}"#).unwrap();
         assert!(check_covered(&other, &dir).is_err());
         // Its unit's own entries hold it too (a later recovery found it).
         std::fs::create_dir_all(dir.join("units/j")).unwrap();
@@ -1202,7 +1207,7 @@ mod tests {
         assert!(!keys.contains(&crate::rsrc::key_with(&image, (false, false))));
         assert!(keys.iter().all(|k| k.len() == 64));
         assert_eq!(gex_abi::kuser_fold(), was);
-        let mut units = vec![("a".repeat(64), "/w3/lib/wine/i386-windows/ntdll.dll".to_string())];
+        let mut units = vec![("a".repeat(64), "/wine32/lib/wine/i386-windows/ntdll.dll".to_string())];
         // None in the cache: the eject fails, naming the build.
         let e = add_trampolines(&mut units, &[dir.clone()]).unwrap_err().to_string();
         assert!(e.contains("--wine32-kuser --nt-trampolines32"), "{e}");

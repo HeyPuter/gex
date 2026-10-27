@@ -542,7 +542,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
     // address against it at start; the browser's `gex_kuser_address`).
     linker.func_wrap(IMPORT_MODULE, "kuser_address", || -> i32 {
-        (if gex_abi::kuser_fold() { gex_abi::W3_KUSER } else { gex_abi::KUSER_WINDOWS }) as i32
+        (if gex_abi::kuser_fold() { gex_abi::WINE32_KUSER } else { gex_abi::KUSER_WINDOWS }) as i32
     })?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image : a native DLL's skeleton gets

@@ -35,11 +35,11 @@
 /* KUSER_SHARED_DATA's page as a process of this build has it, the one name a
  * provider uses for it (provider.rs rejects a raw address of Windows' page
  * in a provider's source): 32-bit Wine's, where its Wine maps the page and its units
- * fold constant accesses to (GEX_W3_KUSER, from gex_abi.h; GEX_KUSER_GUARD
+ * fold constant accesses to (GEX_WINE32_KUSER, from gex_abi.h; GEX_KUSER_GUARD
  * is defined only then), else Windows' own (gex_abi::KUSER_WINDOWS, checked
  * by provider.rs's tests). */
 #ifdef GEX_KUSER_GUARD
-#define GP_KUSER GEX_W3_KUSER
+#define GP_KUSER GEX_WINE32_KUSER
 #else
 #define GP_KUSER 0x7ffe0000u
 #endif

@@ -50,7 +50,7 @@ export function archAsset(path) {
   return guestArch() === 'x86' ? path.replace(/^\/(rootfs|closure|fs)\//, '/$1/x86/') : path;
 }
 /** Whether this build has the scene compositor (compositor.js and its
- *  worker). gex-eject's feature selection (docs/eject.md, "Features") builds
+ *  worker). gex-eject's feature selection (crates/gex-eject/README.md, "Features") builds
  *  the page with `__GEX_COMPOSITOR__` defined false, and everything behind
  *  this constant drops out of the bundle; anything else has it. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -63,7 +63,7 @@ export function multiarch() {
 export function elfMachine() {
   return guestArch() === 'x86' ? 0x3e : 0xb7;
 }
-// `?mem64=1` (globalThis.GEX_MEM64): a 64-bit guest memory (docs/mem64.md step 6) -- the wasm64
+// `?mem64=1` (globalThis.GEX_MEM64): a 64-bit guest memory -- the wasm64
 // shim and seed and the kernel that reaches a process's memory with i64 (`.m64`, x86 only).
 const m64Infix = () => (globalThis.GEX_MEM64 && guestArch() === 'x86' ? '.m64' : '');
 const SHIM_URL = () => assetUrl(`/gex/gex_browser${archInfix()}${m64Infix()}.shared.wasm`);
@@ -158,8 +158,7 @@ async function fetchBytes(url, onProgress) {
 let kernelBytes = null;
 
 /**
- * `?xcache=1`: the name the translation cache is saved under (docs/gexcc.md
- * §8), a fingerprint of everything a saved module depends on: the shim and
+ * `?xcache=1`: the name the translation cache is saved under, a fingerprint of everything a saved module depends on: the shim and
  * kernel this page loaded (an SP dist and an MP dist load different ones),
  * the dist's own flavour if it says, and the switches that change emission.
  * A different build never reads another's cache.
@@ -545,7 +544,7 @@ async function guestWorkerFactory() {
  * share is in the global kernel, instantiated against one shared memory.
  */
 /**
- * Whether this page runs the single-thread build (docs/single-thread.md):
+ * Whether this page runs the single-thread build:
  * `?single=1` asks for it, `?single=0` refuses it, and otherwise a page that
  * has no SharedArrayBuffer (not cross-origin isolated) gets it when the engine
  * has JSPI. A cross-origin isolated page keeps the Worker build.
@@ -977,7 +976,7 @@ async function runProgramHere(
   let xServer = null;
   if (hostX && wlChannel) {
     if (!kernel) throw new Error('the host X server needs the global kernel');
-    // The single-thread build (docs/single-thread.md): the server is a fiber of
+    // The single-thread build: the server is a fiber of
     // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
     // waits suspend. The same messages, without a Worker between.
     const xDir = assetUrl(single.on ? '/gex/xwayland-st/' : '/gex/xwayland/');
@@ -1063,7 +1062,7 @@ async function runProgramHere(
     // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
     // needs it (host.mjs `#other`: 64-bit Wine's wineserver, a wasm32 module).
     // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
-    // program an exec asks one for (docs/mem64.md §5: its GEX_MEM64=1, or its
+    // program an exec asks one for (its GEX_MEM64=1, or its
     // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
     // only then, so a page that never asks loads nothing more.
     other: m64Infix() ? async () => ({
@@ -1140,7 +1139,7 @@ async function runProgramHere(
       // because a trap that matters happens in a Worker, and a global set in
       // the page is not visible there.
       trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
-      // `?doorstats=1`: wineserver door call counts every 10 s (docs/wineserver-kernel.md).
+      // `?doorstats=1`: wineserver door call counts every 10 s.
       // (a number past 1: the line's period in ms)
       doorStats: globalThis.GEX_DOOR_STATS || undefined,
       fcacheStats: globalThis.GEX_FCACHE_STATS || undefined,
@@ -1167,8 +1166,8 @@ async function runProgramHere(
       // a program image), read from the server's `/gex-cgen/` (a unit
       // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
       // `?cgenurl=` (an ejected project's build/web/cgen) instead.
-      // Otherwise the export providers the dist carries (gex/cgen/providers/,
-      // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
+      // Otherwise the export providers the dist carries (gex/cgen/providers/),
+      // with no units; `?providers=0` runs glibc's
       // own code translated instead.
       // Absolute: a Worker started from a blob URL has no base to resolve a path against.
       cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined }
@@ -1183,7 +1182,7 @@ async function runProgramHere(
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
       // `?fjit=1`: the function JIT in every process.
       fjit: globalThis.GEX_FJIT || undefined,
-      // `?xcache=1`: the translation cache across page loads (docs/gexcc.md §8).
+      // `?xcache=1`: the translation cache across page loads.
       xcache: xcacheName(),
       // `?liftmax=N`: blocks one dispatch miss may lift (default 2048).
       liftMax: globalThis.GEX_LIFT_MAX || undefined,

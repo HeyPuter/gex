@@ -1,5 +1,5 @@
 #!/bin/bash
-# The demo build: the desktop page (docs/gexcc.md §9) into web/dist-demo,
+# The demo build: the desktop page into web/dist-demo,
 # always stripped, runtime modules shipped as .wasm.zst. No test runs on this
 # build.
 #

@@ -1981,7 +1981,7 @@ async function startGl(m, canvas) {
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
   glChannel = m.channel;
   post({ kind: 'gl-ready', describe: glDevice.describe() });
-  // The single-thread build (docs/single-thread.md): no ring and no
+  // The single-thread build: no ring and no
   // SharedArrayBuffer. The guests are fibers of this same realm, and their
   // `gl_submit` calls `glInRealm.submit` on their own memory (gex.mjs).
   if (!glChannel) {
@@ -2099,7 +2099,7 @@ const onMessage = ({ data: m }) => {
 };
 
 /**
- * The single-thread build (docs/single-thread.md): this compositor in the
+ * The single-thread build: this compositor in the
  * realm that holds the guests, since their memories are plain ones no other
  * Worker can read. `send(m, transfer)` carries what this side would post to
  * the page; the result takes the page's messages, as `onmessage` would.

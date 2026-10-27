@@ -1,4 +1,4 @@
-//! A value published to lock-free readers (docs/kernel-locking.md §4.2).
+//! A value published to lock-free readers.
 //!
 //! gex-kernel forbids unsafe code, and handing a reader a reference to a
 //! value a writer may replace at any moment needs a raw pointer and a rule

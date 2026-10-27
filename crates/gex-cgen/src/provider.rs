@@ -669,13 +669,13 @@ mod tests {
     }
 
     /// provider.h's KUSER base is gex-abi's (Windows' page; 32-bit Wine's under the
-    /// fold, by GEX_W3_KUSER), and no provider source names the page by a
+    /// fold, by GEX_WINE32_KUSER), and no provider source names the page by a
     /// raw address (`raw_kuser`; `every_source_parses` holds every built-in
     /// to it).
     #[test]
     fn kuser_base_is_gex_abi() {
         assert!(super::PRELUDE.contains(&format!("#define GP_KUSER 0x{:x}u\n", gex_abi::KUSER_WINDOWS)));
-        assert!(super::PRELUDE.contains("#define GP_KUSER GEX_W3_KUSER\n"));
+        assert!(super::PRELUDE.contains("#define GP_KUSER GEX_WINE32_KUSER\n"));
         assert!(super::raw_kuser("#define X 0x7FFE0FF0u"));
         assert!(!super::raw_kuser("#define X (GP_KUSER + 0xff0u)"));
         assert!(super::parse("t", "/* PROVIDES t.dll i386\nGEX_PROVIDE(p, \"e\")\n#define W 0x7ffe0fe0u\n").is_err());

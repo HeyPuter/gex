@@ -1,4 +1,4 @@
-// A Windows program under Wine in a page (docs/nt-layer.md §10.2):
+// A Windows program under Wine in a page:
 // the bundle is a tar (a staged Wine prefix under /wine plus the program),
 // the program's windows are toplevels in the page's compositor, and its GL
 // (opengl32 → /dev/gex-gl) runs on Mesa in the compositor's worker.
@@ -24,7 +24,7 @@ const logEl = document.getElementById('log');
 
 // This is gex's test page: its query is the library's options (app.js
 // `start`), one switch per parameter. An ejected program's page is the
-// user's, and calls `start` itself (docs/eject.md, "The web build").
+// user's, and calls `start` itself (crates/gex-eject/README.md, "The web build").
 async function main() {
   // `size=WxH`, or `size=fit`: the browser's viewport at load. The desktop is
   // then the whole page, which does not scroll.

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Record a 32-bit Wine page session for gex-eject (docs/eject.md, "32-bit Wine pages").
+// Record a 32-bit Wine page session for gex-eject (crates/gex-eject/README.md, "32-bit Wine pages").
 //
 // A 32-bit Wine program (Wine as native wasm32, every Wine process a guest process)
 // runs in nt.html like any page. This opens one in headless Chromium, waits
@@ -201,7 +201,7 @@ function runs(v) {
 }
 
 const session = {
-  format: 'gex-w3-session',
+  format: 'gex-wine32-session',
   version: 1,
   url: pageUrl,
   title,
@@ -241,7 +241,7 @@ console.log(`${out}/wine32-session.json: "${title}" at ${atTitle.toFixed(1)} s; 
   + `${session.units.length} units (${session.unit_misses.length} images without one, ${session.uncovered.length} addresses no unit holds), ${session.modules.length} wasm modules`
   + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
 // --coverage-into SESSION: a run of a site built with "cold": "instrument"
-// (docs/eject.md, "Cold code") adds the functions it called to another
+// (crates/gex-eject/README.md, "Cold code") adds the functions it called to another
 // recording's coverage, the one the project is ejected from.
 if (opt('--coverage-into', null)) {
   const into = opt('--coverage-into', null);

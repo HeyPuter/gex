@@ -1,4 +1,4 @@
-//! Instruction-level differential fuzzing against QEMU (PLAN §12.1).
+//! Instruction-level differential fuzzing against QEMU.
 //!
 //! The method is the one `risu` uses, adapted so the oracle is a process
 //! rather than hardware:

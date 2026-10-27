@@ -37,7 +37,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_CACHE_OP_NEST_EXIT_SAMPLE {}", gex_abi::cache_op::NEST_EXIT_SAMPLE);
     let _ = writeln!(w, "#define GEX_CACHE_OP_LOW_ACCESS {}", gex_abi::cache_op::LOW_ACCESS);
     let _ = writeln!(w, "#define GEX_GUEST_FLOOR 0x{:x}u", gex_abi::GUEST_FLOOR);
-    let _ = writeln!(w, "#define GEX_W3_KUSER 0x{:x}u", gex_abi::W3_KUSER);
+    let _ = writeln!(w, "#define GEX_WINE32_KUSER 0x{:x}u", gex_abi::WINE32_KUSER);
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
     let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}{sfx}", gex_abi::patched_pages());
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);

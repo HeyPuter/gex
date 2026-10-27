@@ -394,7 +394,7 @@ function pieces(x) {
   const inodes = new Map(); // "dev:ino" -> [rel, bytes]
   // Each file with its bytes and class, then its group: the group of the
   // first path (in order) of its class with the same bytes, so a file's
-  // copies (Wine's builtin in /w3 and its copy in system32, the four of each
+  // copies (Wine's builtin in /wine32 and its copy in system32, the four of each
   // .nls) are stored once, in one piece. By its own path they fell in
   // different pieces, and zstd, a piece at a time, stored each: 22.5 MB of
   // a desktop shell's 479 MB, 7.7 MB packed. Still a function of the files
@@ -711,7 +711,7 @@ function wine32Site() {
     if (rel.endsWith('/cold.bin')) cold += statSync(p).size;
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
   console.log(`${out}: wine32 build ${build}; features off: ${wine32.features_off.join(', ') || 'none'}; ${wine32.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
 }

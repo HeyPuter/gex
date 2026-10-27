@@ -184,7 +184,7 @@ mod imp {
     pub(crate) const WINE32_COMPACT_LO: u64 = 1;
 
     /// With [`WINE32_COMPACT_LO`]: this 32-bit Wine maps KUSER_SHARED_DATA at
-    /// `gex_abi::W3_KUSER` (its header's `FLAG_KUSER_WINE32`), so a forked child
+    /// `gex_abi::WINE32_KUSER` (its header's `FLAG_KUSER_WINE32`), so a forked child
     /// folds as its parent did.
     const WINE32_KUSER_BIT: u64 = 2;
 

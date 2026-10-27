@@ -40,6 +40,8 @@ import { fileURLToPath } from 'node:url';
 import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const web = dirname(fileURLToPath(import.meta.url));
+// A wine32 recording's format (tools/eject/record-wine32.mjs), and the name ones made before the rename carry.
+const WINE32_FORMATS = ['gex-wine32-session', 'gex-w3-session'];
 const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
@@ -111,7 +113,7 @@ if (flag('--strip') || flag('--prune') || flag('--dedupe') || flag('--split')) {
   if (flag('--strip')) stripTree(tree.x, stripper(work, true));
   if (flag('--prune')) pruneTree(tree.x);
   if (flag('--split')) {
-    if (recording.format !== 'gex-w3-session' || !Array.isArray(recording.files_read)) {
+    if (!WINE32_FORMATS.includes(recording.format) || !Array.isArray(recording.files_read)) {
       console.error(`page-site: --split needs a recording with files_read as --params (${paramsIn})`);
       process.exit(1);
     }
@@ -162,7 +164,7 @@ walk(unitsIn, (p, rel) => {
 // The launch.
 const build = sha(JSON.stringify(files)).slice(0, 12);
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
-const params = recording.format === 'gex-w3-session' ? Object.fromEntries(new URL(recording.url).searchParams) : { ...recording };
+const params = WINE32_FORMATS.includes(recording.format) ? Object.fromEntries(new URL(recording.url).searchParams) : { ...recording };
 for (const k of ['tar', 'cgen', 'cgenurl', 'preload', 'pack', 'lazy', 'fill']) delete params[k];
 if (lazyNote) params.lazy = '/lazy.json';
 if (fillNote) params.fill = '/fill.json';
