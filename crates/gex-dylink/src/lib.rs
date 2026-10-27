@@ -1090,7 +1090,20 @@ impl Link {
     pub fn needed_of(
         &self,
         first: usize,
+        find: impl FnMut(&str, &[String]) -> Result<(String, Vec<u8>)>,
+    ) -> Result<Vec<(String, String, Vec<u8>, Info)>> {
+        self.needed_of_shed(first, find, |_, b| b)
+    }
+
+    /// [`Link::needed_of`], each library's bytes handed to `shed` once they
+    /// are parsed, which gives back what to keep: a loader that can read a
+    /// file again keeps none, so a program's libraries are never all in
+    /// memory at once.
+    pub fn needed_of_shed(
+        &self,
+        first: usize,
         mut find: impl FnMut(&str, &[String]) -> Result<(String, Vec<u8>)>,
+        mut shed: impl FnMut(&str, Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<(String, String, Vec<u8>, Info)>> {
         let mut have: HashSet<String> = self.mods.iter().map(|m| m.name.clone()).collect();
         let mut out = Vec::new();
@@ -1110,6 +1123,7 @@ impl Link {
                     bail!("{path}: not a wasm shared library (no dylink.0)");
                 }
                 q.push_back((info.needed.clone(), origin_expanded(&info.runpath, &path)));
+                let bytes = shed(&path, bytes);
                 out.push((n, path, bytes, info));
             }
         }

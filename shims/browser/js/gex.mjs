@@ -4569,6 +4569,9 @@ export class Gex {
         st.ftab.set(tIdx(slot), f);
       }
       st.dyl.set(prov, inst);
+      // Instantiated: the shim's copy of a library's bytes can go
+      // (`gex_wasmprog_release`); a Worker that needs them again reads them.
+      e.gex_wasmprog_release?.(prov);
       if (this.#wasmprogTls) this.#dlTlsInit(prov, inst, st, this.#wasmprogTls);
     }
     // A wasm64 provider's slots' function types, for its JIT's `provider_jit_table` SIG.

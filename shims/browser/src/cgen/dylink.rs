@@ -30,7 +30,7 @@
 //! with `gex_wasmprog_adopt_link`): it reads the same files and publishes
 //! the same modules at the same table bases over the parent's data.
 
-use super::wasmprog::{entry_bridges, exe_path, Prog, CURRENT_BASE, PROGS};
+use super::wasmprog::{entry_bridges, exe_path, Prog, Shed, CURRENT_BASE, PROGS};
 use super::*;
 use gex_dylink::{Bind, Info, Kind, Link, Loaded, HANDLE_BASE};
 use std::collections::{HashMap, HashSet};
@@ -64,7 +64,7 @@ static ADOPT: Mutex<Option<String>> = Mutex::new(None);
 static REGISTRY: Mutex<Option<(Vec<usize>, usize)>> = Mutex::new(None);
 
 /// A library's bytes as loaded: guarded when [`gex_set_dl_checked`] is on.
-fn read(path: &str) -> Option<Vec<u8>> {
+pub(super) fn read(path: &str) -> Option<Vec<u8>> {
     crate::sigs::proc_home().read_file(path).map(checked)
 }
 
@@ -94,16 +94,32 @@ fn checked(b: Vec<u8>) -> Vec<u8> {
     }
 }
 
-fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Vec<u8>>, String> {
+/// A module's bytes at publishing: the bytes, or what stands for them
+/// once they went ([`super::wasmprog::shed`]).
+type Bytes = (Vec<u8>, Option<Shed>);
+
+fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Bytes>, String> {
     let (o, lp) = (p.origin.clone(), p.ldpath.clone());
+    let mut sheds: HashMap<String, Shed> = HashMap::new();
     let libs = p
         .link
-        .needed_of(from, |name, rp| gex_dylink::search(name, rp, &o, &lp, read))
+        .needed_of_shed(
+            from,
+            |name, rp| gex_dylink::search(name, rp, &o, &lp, read),
+            |path, b| match super::wasmprog::shed(path, &b) {
+                Some(s) => {
+                    sheds.insert(path.to_string(), s);
+                    Vec::new()
+                }
+                None => b,
+            },
+        )
         .map_err(|e| format!("{e:#}"))?;
     let mut out = Vec::new();
     for (name, path, b, info) in libs {
+        let s = sheds.remove(&path);
         p.link.mods.push(Loaded { name, path, info, memory_base: 0, table_base: 0 });
-        out.push(b);
+        out.push((b, s));
     }
     Ok(out)
 }
@@ -112,7 +128,7 @@ fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Vec<u8>>, String> {
 /// initialisation order: map data where it has none, give table ranges
 /// where `keep` is false, bind. `entries` are gex's entries, bound in
 /// libc's table range. Returns the order and libc's provider module.
-fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, keep: bool, entries: Option<(u64, u64)>) -> Result<(Vec<usize>, Option<u32>), String> {
+fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep: bool, entries: Option<(u64, u64)>) -> Result<(Vec<usize>, Option<u32>), String> {
     for m in p.link.mods[from..].iter_mut() {
         if m.memory_base != 0 {
             continue;
@@ -140,7 +156,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
         return Err(format!("{}: no library defines __gex_start (libc.so)", p.link.mods[0].path));
     }
     p.module_of.resize(p.link.mods.len(), u32::MAX);
-    let mut bytes: Vec<Option<Vec<u8>>> = bytes.into_iter().map(Some).collect();
+    let mut bytes: Vec<Option<Bytes>> = bytes.into_iter().map(Some).collect();
     let mut done: HashSet<usize> = (0..from).collect();
     let mut libc_number = None;
     for &i in &order {
@@ -190,7 +206,14 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
         };
         p.module_of[i] = number;
         lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
-        lock(&PROGS).push(Prog { number, wasm: bytes[i - from].take().unwrap_or_default(), relocate, key: None, path: m.path.clone(), lowered: false });
+        let (wasm, shed) = bytes[i - from].take().unwrap_or_default();
+        // the program's own bytes are from its image, a library's from its file
+        let from_file = i != 0;
+        let (size, key, gone) = match shed {
+            Some(s) => (s.len, Some(s.key), Some(s.gone)),
+            None => (wasm.len() as u32, None, None),
+        };
+        lock(&PROGS).push(Prog { number, len: size, wasm, relocate, key, path: m.path.clone(), lowered: false, from_file, gone });
         let (_, ok) = ftab(|f| f.publish_at(m.table_base, len.max(1), PROVIDER | number, Tier::Unit, &pairs));
         if !ok {
             return Err(format!("{}: table range {}+{} is taken", m.path, m.table_base, len));
@@ -250,7 +273,7 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
         origin,
         startup: usize::MAX,
     };
-    let mut bytes = vec![wasm];
+    let mut bytes = vec![(wasm, None)];
     bytes.extend(find_needed(&mut p, 0)?);
     p.startup = p.link.mods.len();
     let (order, libc) = publish(&mut p, 0, bytes, true, false, Some((entry, thread_entry)))?;
@@ -335,7 +358,8 @@ pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32,
         let info = Info::parse(&b).map_err(|e| format!("{path}: {e:#}"))?;
         let num = |s: &str| s.parse::<u32>().map_err(|_| format!("link map: bad number {s:?}"));
         p.link.mods.push(Loaded { name: name.to_string(), path: path.to_string(), info, memory_base: num(mb)?, table_base: num(tb)? });
-        bytes.push(b);
+        let shed = if k == 0 { None } else { super::wasmprog::shed(path, &b) };
+        bytes.push(if shed.is_some() { (Vec::new(), shed) } else { (b, None) });
     }
     let (_, libc) = publish(&mut p, 0, bytes, false, true, Some((entry, thread_entry)))?;
     *lock(&DYPROC) = Some(p);
@@ -408,7 +432,8 @@ fn dlopen(path: &str) -> Result<u32, String> {
     let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o, startup: p.startup };
     let from = q.link.mods.len();
     q.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
-    let mut all = vec![b];
+    let shed = super::wasmprog::shed(&q.link.mods[from].path, &b);
+    let mut all = vec![if shed.is_some() { (Vec::new(), shed) } else { (b, None) }];
     all.extend(find_needed(&mut q, from)?);
     let (order, _) = publish(&mut q, from, all, true, false, None)?;
     DL_GEN.fetch_add(1, Ordering::Release);

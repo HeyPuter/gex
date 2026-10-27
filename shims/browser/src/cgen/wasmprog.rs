@@ -33,6 +33,14 @@ pub(super) struct Prog {
     /// Built LP64 for wasm64 and lowered to wasm32 (64-bit Wine):
     /// its base and stack-pointer globals are i64.
     pub lowered: bool,
+    /// The bytes are file `path`'s as `dylink::read` gives them (a library),
+    /// so they can go once the page holds the compiled module
+    /// ([`gex_wasmprog_release`]) and be read again if a Worker asks.
+    pub from_file: bool,
+    /// Their length, kept when they go.
+    pub len: u32,
+    /// The file's identity (inode, mtime, size) when they went.
+    pub gone: Option<(u64, i64, u64)>,
 }
 
 /// Whether `wasm` imports `env.__memory_base` as an i64: a module built for
@@ -297,7 +305,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     let path = path.clone();
     let lowered = is_lowered(&wasm);
-    lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path, lowered });
+    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, key: None, path, lowered, from_file: false, gone: None });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
 }
@@ -369,9 +377,57 @@ pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     (regs, dirs, slots)
 }
 
-/// Provider module `number`'s bytes when it is a wasm32 program.
+/// Provider module `number`'s bytes when it is a wasm32 program: read again
+/// if they went ([`gex_wasmprog_release`]), and none if the file no longer
+/// holds them.
 pub(super) fn wasm(number: u32) -> Option<(u32, u32)> {
-    lock(&PROGS).iter().find(|p| p.number == number).map(|p| (p.wasm.as_ptr() as u32, p.wasm.len() as u32))
+    let mut g = lock(&PROGS);
+    let p = g.iter_mut().find(|p| p.number == number)?;
+    if let Some(id) = p.gone {
+        let same = file_id(&p.path).is_some_and(|(_, ino, mtime, size)| (ino, mtime, size) == id);
+        let Some(b) = super::dylink::read(&p.path).filter(|b| same && b.len() as u32 == p.len) else {
+            crate::warn_line(&format!("gex: {}: changed since it was loaded\n", p.path));
+            return None;
+        };
+        p.wasm = b;
+        p.gone = None;
+    }
+    Some((p.wasm.as_ptr() as u32, p.len))
+}
+
+/// What stands for a library's bytes once they went at load
+/// ([`shed`]): their length, content key and file identity.
+pub(super) struct Shed {
+    pub len: u32,
+    pub key: (u64, u64),
+    pub gone: (u64, i64, u64),
+}
+
+/// A library's bytes, parsed at load, given up for what [`wasm`] needs to
+/// read them again: a Qt program's libraries are 150 to 300 MiB, and held
+/// at once they were its heap's high-water mark for the life of the
+/// process (and a fork's child's). `None` (keep them) without a file to
+/// read again.
+pub(super) fn shed(path: &str, bytes: &[u8]) -> Option<Shed> {
+    let (_, ino, mtime, size) = file_id(path)?;
+    if size != bytes.len() as u64 {
+        return None;
+    }
+    Some(Shed { len: bytes.len() as u32, key: file_key(path, bytes), gone: (ino, mtime, size) })
+}
+
+/// The page holds wasm32 program module `number` compiled (JS, once the
+/// Worker that published it has instantiated it): a library's bytes go.
+/// They are most of a Qt program's heap (150 to 200 MiB for Plasma's), and
+/// a fork copied them again.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_release(number: u32) {
+    let mut g = lock(&PROGS);
+    let Some(p) = g.iter_mut().find(|p| p.number == number && p.from_file && p.gone.is_none()) else { return };
+    // read again only from the same file (dpkg's rename gives a new inode)
+    let Some((_, ino, mtime, size)) = file_id(&p.path) else { return };
+    p.gone = Some((ino, mtime, size));
+    p.wasm = Vec::new();
 }
 
 /// A content key for `b`: two 64-bit lanes over its little-endian words, then
