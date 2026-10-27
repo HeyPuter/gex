@@ -250,7 +250,7 @@ const debian = {
       { label: 'Wisp endpoint…', onClick: () => setWisp(ctx) },
     ]);
     ctx.hint(`network: ${wispUrl() || 'not set'}`);
-    ctx.term.writeln('A Debian bookworm arm64 rootfs, built by gex-debian\'s rootfs/build-debian.sh.');
+    ctx.term.writeln('A Debian bookworm arm64 rootfs, built by the debdemo repository.');
     ctx.term.writeln('');
     ctx.term.writeln(ctx.ansi.dim('glibc is a harder target than musl -- a real dynamic loader and'));
     ctx.term.writeln(ctx.ansi.dim('far more syscalls. `apt-get update` fetches and parses the real'));
@@ -421,7 +421,7 @@ const nativeDebian = {
     ctx.term.writeln('Debian trixie: native wasm32 tools from Debian source, Debian arm64 underneath.');
     ctx.term.writeln('');
     ctx.term.writeln(ctx.ansi.dim('The shell and the tools it runs are wasm32 programs built by'));
-    ctx.term.writeln(ctx.ansi.dim('gexcc (gex-debian) from Debian\'s source packages (architecture'));
+    ctx.term.writeln(ctx.ansi.dim('gexcc (debdemo) from Debian\'s source packages (architecture'));
     ctx.term.writeln(ctx.ansi.dim('musl-linux-wasm32 in dpkg). apt, dpkg, perl and every library are'));
     ctx.term.writeln(ctx.ansi.dim("Debian's arm64 packages, translated. apt pins keep ours: try"));
     ctx.term.writeln(ctx.ansi.dim('`apt update && apt install jq`.'));

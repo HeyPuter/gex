@@ -122,10 +122,10 @@ echo "  $PUB/rootfs/busybox.tar: $(du -h "$PUB/rootfs/busybox.tar" | cut -f1)"
 # -- the Debian root filesystems -------------------------------------------
 #
 # rootfs/debian.tar (the debian demo) and rootfs/graphics.tar (the Mesa and
-# compositor demos) come from the gex-debian repository (`make debian`,
+# compositor demos) come from the debdemo repository (`make debian`,
 # `make graphics`); copy them into web/public/rootfs.
 for f in debian.tar graphics.tar; do
-    [ -f "$PUB/rootfs/$f" ] || echo "no rootfs/$f -- build it with gex-debian"
+    [ -f "$PUB/rootfs/$f" ] || echo "no rootfs/$f -- build it with debdemo"
 done
 
 # -- the gears, and the GL driver it links against -------------------------

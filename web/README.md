@@ -10,7 +10,7 @@ The page that runs gex in a browser, and the builds of what it loads:
   (`build-mesa-wasm.sh`);
 - Xwayland as wasm32, which runs in a Worker of the page and talks to
   `shims/hostwl` (`build-xwayland-wasm.sh`);
-- the guest root filesystems come from the gex-debian repository, which
+- the guest root filesystems come from the debdemo repository, which
   writes them into `web/public/rootfs` (and the desktop demo's launcher
   packages into `web/public/pkgs`).
 
@@ -49,14 +49,14 @@ library can be imported into a page of your own.
 ## The desktop demo
 
 `build-demo.sh` builds the desktop page into `web/dist-demo`. Its guest side
-(the base rootfs and the launcher's packages) comes from the gex-debian
+(the base rootfs and the launcher's packages) comes from the debdemo
 repository, built against this checkout first:
 
 ```sh
-make -C path/to/gex-debian native GEXCC_PREFIX=...   # the gexcc .deb pool, once
-make -C path/to/gex-debian desktop GEX_DIR=$PWD      # web/public/rootfs/base.tar.zst, web/public/pkgs
+make -C path/to/debdemo native GEXCC_PREFIX=...   # the gexcc .deb pool, once
+make -C path/to/debdemo desktop GEX_DIR=$PWD      # web/public/rootfs/base.tar.zst, web/public/pkgs
 web/build-demo.sh
 ```
 
 Without them `build-demo.sh` stops and says so. The other pages (`build-all.sh`)
-need nothing from gex-debian; their Debian demos say when their rootfs is missing.
+need nothing from debdemo; their Debian demos say when their rootfs is missing.

@@ -10,7 +10,7 @@
 #    (gexc cgen-image --providers), into web/public/gex as build-assets.sh does.
 # 2. Xwayland, threaded (web/build-all.sh --x-only; skipped while its stamp
 #    matches), into web/public/gex/xwayland.
-# 3. The guest side is the gex-debian repository's (`make desktop`): the base
+# 3. The guest side is the debdemo repository's (`make desktop`): the base
 #    rootfs, web/public/rootfs/base.tar.zst, and the launcher's packages,
 #    web/public/pkgs (and web/public/gex-apt). They must be there already.
 # 4. A staged public tree with only what the desktop loads; every .wasm
@@ -43,7 +43,7 @@ mib() { awk -v n="$1" 'BEGIN { printf "%.1f MiB", n / 1048576 }'; }
 command -v wasm-tools >/dev/null || { echo "need wasm-tools (cargo install wasm-tools)" >&2; exit 1; }
 command -v zstd >/dev/null || { echo "need zstd" >&2; exit 1; }
 mkdir -p "$CACHE" "$PUB/gex"
-[ -f "$PUB/rootfs/base.tar.zst" ] || { echo "no web/public/rootfs/base.tar.zst: build it with gex-debian (make desktop GEX_DIR=$ROOT)" >&2; exit 1; }
+[ -f "$PUB/rootfs/base.tar.zst" ] || { echo "no web/public/rootfs/base.tar.zst: build it with debdemo (make desktop GEX_DIR=$ROOT)" >&2; exit 1; }
 
 # -- 1. runtime ----------------------------------------------------------------
 if [ "$RUNTIME" = 1 ]; then

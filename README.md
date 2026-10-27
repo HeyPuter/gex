@@ -26,7 +26,7 @@ for debugging and for building what a page loads ahead of time.
   space. The kernel's shared state is one module that every process's
   Workers share.
 - **wasm32 Linux programs.** `tools/gexcc` is a C/C++ compiler for gex's
-  wasm32 Linux target. It is used like `gcc`. The gex-debian repository
+  wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
 - **32-bit Windows programs, through Wine.** `tools/wine-wasm` builds
   Wine's own Unix side as wasm32 for gex, plus a ready-to-run prefix.

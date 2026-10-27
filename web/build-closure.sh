@@ -12,7 +12,7 @@
 # What the demo site is actually built with, which was written down nowhere
 # and cost a day of bisecting a closure nobody could reproduce:
 #
-#   web/build-closure.sh debian /tmp/gex-debian/root \
+#   web/build-closure.sh debian /tmp/debdemo/root \
 #       /bin/bash /usr/bin/apt-get /usr/bin/dpkg /usr/bin/apt-config \
 #       /usr/bin/gpgv /bin/true /bin/ls /usr/lib/apt/methods
 #

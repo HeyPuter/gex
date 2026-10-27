@@ -15,6 +15,6 @@ gexc run hello
 ```
 
 Libraries are static. `-shared` writes an archive, so a build that insists
-on `libfoo.so` still links. The gex-debian repository builds Debian
+on `libfoo.so` still links. The debdemo repository builds Debian
 packages with gexcc and assembles a Debian root filesystem around them. The
 `gexcc` script's header lists its options and environment.
