@@ -498,6 +498,14 @@ while i < len(args):
                 elif want:
                     ld_opts[want].append(parts[k + 1])
                 k += 2; continue
+            # GNU ld's -R DIR: a run path directory (-R FILE, symbols from a
+            # file, is left to wasm-ld, which refuses it)
+            if p == '-R' and k + 1 < len(parts) and not os.path.isfile(parts[k + 1]):
+                ld_opts['rpath'].append(parts[k + 1]); k += 2; continue
+            if p == '-R' and k + 1 == len(parts):
+                ld_skip = 1; ld_want = 'rpath'; k += 1; continue
+            if p.startswith('-R') and len(p) > 2 and not os.path.isfile(p[2:]):
+                ld_opts['rpath'].append(p[2:]); k += 1; continue
             m = re.match(r'^(--?soname|--?rpath)=(.*)$', p)
             if m:
                 ld_opts['soname' if 'soname' in m.group(1) else 'rpath'].append(m.group(2))
