@@ -8590,8 +8590,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
             // never shrinks), so the exec goes on in a new Worker and memory,
             // as a posix_spawn child's does. From its first thread, whose
             // Worker is the process's; a later thread's exec stays here.
+            // Or one the program asked to start afresh (`gex_exec_fresh`): Wine's
+            // server starter, whose Worker has no door and whose memory the
+            // program run again would not use.
             SyscallOutcome::Exec { path, argv, envp }
-                if vfork::exec_elsewhere(h, &path) || (FORK_COPY.load(std::sync::atomic::Ordering::Relaxed) && cur() == 0) =>
+                if vfork::exec_elsewhere(h, &path)
+                    || ((FORK_COPY.load(std::sync::atomic::Ordering::Relaxed) || EXEC_AFRESH.swap(false, std::sync::atomic::Ordering::Relaxed)) && cur() == 0) =>
             {
                 h.exec_waited_since = None;
                 exec_away(h, &path, &argv, &envp)
@@ -10957,6 +10961,16 @@ fn exit_process(code: i32) -> i32 {
 /// its exec goes on in a new memory (`exec_away`). In the memory, so a fresh
 /// one (a load, an exec's) starts without it.
 static FORK_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next exec goes on in a new Worker and memory (`gex_exec_fresh`).
+static EXEC_AFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `gex.exec_fresh()`: this process's next exec, from its first thread, goes
+/// on in a new Worker and memory, as a forked child's does, with its pid.
+#[no_mangle]
+pub extern "C" fn gex_exec_fresh() {
+    EXEC_AFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 thread_local! {
     /// This process's exec went to another Worker (`exec_away`): its pid

@@ -518,6 +518,8 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // Natively every process sees the door once published (one host
     // process): never missing.
     linker.func_wrap(IMPORT_MODULE, "door_missing", || -> i32 { 0 })?;
+    // And an exec in place is one natively: nothing to ask for.
+    linker.func_wrap(IMPORT_MODULE, "exec_fresh", || {})?;
     linker.func_wrap(IMPORT_MODULE, "session_copy", |mut caller: Caller<'_, HostState>, dst: i32, off: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::session_copy(&mut caller, dst as u32, off as u32, size as u32))
     })?;

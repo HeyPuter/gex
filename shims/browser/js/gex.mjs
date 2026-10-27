@@ -6229,9 +6229,13 @@ export class Gex {
       // gather list at LP64 offsets (`#doorRun`, shims/native's door::req_layout).
       door_call_lp64: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, true),
       // A Worker the door was broadcast to while it ran (it takes no
-      // messages): Wine runs its program again as a child, which starts with
-      // the door (loader.c `wineserver_relaunch`). None in the SP build.
+      // messages): Wine runs its program again in its place, in a new Worker
+      // that starts with the door (loader.c `wineserver_relaunch`,
+      // `exec_fresh`). None in the SP build.
       door_missing: () => (this.#door || single.on ? 0 : 1),
+      // The next exec goes on in a new Worker and memory, the process's pid
+      // kept (shim `gex_exec_fresh`).
+      exec_fresh: () => { e.gex_exec_fresh?.(); },
       // The session mapping, a block of the server's memory (area +128,
       // +132), copied from directly by win32u: the
       // bytes copied, or -1 with no door session; the session's
