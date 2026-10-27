@@ -804,14 +804,18 @@ pub fn checked_calls(wasm: &[u8]) -> Result<Vec<u8>> {
 /// through a pointer of a type with more trailing parameters than it takes
 /// (GObject's class and instance initialisers, which `G_DEFINE_TYPE`
 /// defines with one and GLib calls with two; a `GFunc` that is `g_free`)
-/// gets the ones it takes, and one that returns a value called as
-/// returning none has it dropped. wasm traps on such a call.
+/// gets the ones it takes, one that returns a value called as returning
+/// none has it dropped, and one that returns none called as returning an
+/// `int` gives 0 (a caller through an unprototyped `int ()`, as bash's
+/// unwind-protect calls its `void` cleanups). wasm traps on such a call.
 ///
 /// Every `call_indirect` through table 0 of a type with parameters goes to
 /// a helper for its type: the call as it was when the table's function has
 /// that type (`ref.test` of a `table.get`, the only cost on that path),
 /// else the first type the function has of the call's parameters cut from
-/// the end, else the original call (which traps as before). The calls stay
+/// the end (with the call's result, then, for a call returning none, with
+/// an `i32` one, and for one returning `i32`, with none), else the
+/// original call (which traps as before). The calls stay
 /// `call_indirect`, so asyncify instruments the helpers like any other
 /// function. Needs `ref.test` (wasm GC) of the engine.
 pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
@@ -861,10 +865,17 @@ pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
     used.sort();
     // the types to add: per used type, its helper's (its parameters, the
     // index), then the shorter ones in the order they are tried
+    /// what a tried type's result needs: none, dropped, or a 0 made up
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fit {
+        Same,
+        Drop,
+        Zero,
+    }
     struct Helper {
         ty: u32,
         own: u32,
-        tries: Vec<(u32, u32, bool)>,
+        tries: Vec<(u32, u32, Fit)>,
     }
     let mut add: Vec<(Vec<wasmparser::ValType>, Vec<wasmparser::ValType>)> = Vec::new();
     let mut next = sigs.len() as u32;
@@ -879,13 +890,20 @@ pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
         let mut tries = Vec::new();
         for k in (0..p.len()).rev() {
             add.push((p[..k].to_vec(), r.clone()));
-            tries.push((next, k as u32, false));
+            tries.push((next, k as u32, Fit::Same));
             next += 1;
         }
         if r.is_empty() {
             for k in (0..=p.len()).rev() {
                 add.push((p[..k].to_vec(), vec![wasmparser::ValType::I32]));
-                tries.push((next, k as u32, true));
+                tries.push((next, k as u32, Fit::Drop));
+                next += 1;
+            }
+        }
+        if r == [wasmparser::ValType::I32] {
+            for k in (0..=p.len()).rev() {
+                add.push((p[..k].to_vec(), Vec::new()));
+                tries.push((next, k as u32, Fit::Zero));
                 next += 1;
             }
         }
@@ -929,21 +947,27 @@ pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
                 // function is read from the table for each test rather than
                 // kept in a local: asyncify keeps no reference-typed local.
                 let mut f = wasm_encoder::Function::new([]);
-                let call = |f: &mut wasm_encoder::Function, ty: u32, k: u32, drop: bool| {
+                let call = |f: &mut wasm_encoder::Function, ty: u32, k: u32, fit: Fit| {
                     f.instruction(&I::LocalGet(n)).instruction(&I::TableGet(0));
                     f.instruction(&I::RefTestNonNull(HeapType::Concrete(ty))).instruction(&I::If(BlockType::Empty));
                     for a in 0..k {
                         f.instruction(&I::LocalGet(a));
                     }
                     f.instruction(&I::LocalGet(n)).instruction(&I::CallIndirect { type_index: ty, table_index: 0 });
-                    if drop {
-                        f.instruction(&I::Drop);
+                    match fit {
+                        Fit::Same => {}
+                        Fit::Drop => {
+                            f.instruction(&I::Drop);
+                        }
+                        Fit::Zero => {
+                            f.instruction(&I::I32Const(0));
+                        }
                     }
                     f.instruction(&I::Return).instruction(&I::End);
                 };
-                call(&mut f, h.ty, n, false);
-                for &(ty, k, drop) in &h.tries {
-                    call(&mut f, ty, k, drop);
+                call(&mut f, h.ty, n, Fit::Same);
+                for &(ty, k, fit) in &h.tries {
+                    call(&mut f, ty, k, fit);
                 }
                 for a in 0..=n {
                     f.instruction(&I::LocalGet(a));
