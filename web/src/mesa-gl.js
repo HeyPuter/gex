@@ -529,8 +529,8 @@ export class MesaGlDevice {
       const words = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
       const elapsed = performance.now() - started;
       this.#submitMs += elapsed;
-      // A frame's readback (the NT host reads every frame back to blit it
-      // into the window): what the GPU -- SwiftShader, headless -- took.
+      // A frame's readback (a reply of 256 KiB or more): what the GPU --
+      // SwiftShader, headless -- took.
       if ((this.#module?._gex_gl_reply_len?.() ?? 0) >= 256 * 1024) {
         this.#readbacks++;
         this.#readbackMs += elapsed;

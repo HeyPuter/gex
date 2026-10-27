@@ -2536,7 +2536,7 @@ export class Gex {
     // The devices this process has -- process-wide flags in shared memory, so
     // only a *process* sets them. A thread answering for itself would turn a
     // GPU or network off underneath the threads using it. Before the kernel is
-    // built, which is when the device nodes are made and the vtest socket bound.
+    // built, which is when the device nodes are made.
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);

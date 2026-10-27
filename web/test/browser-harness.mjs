@@ -305,8 +305,8 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     }
     return decodePng(buf);
   };
-  // SwiftShader's WebGPU loses its device when the NT host hands the
-  // compositor GL frames directly (the canvas present path), so with the
+  // SwiftShader's WebGPU loses its device when a Windows program's GL
+  // frames go to the compositor directly (the canvas present path), so with the
   // software adapter a Windows program's frames are read back instead.
   if (soft && !/GEX_WIN_GL_READBACK/.test(query)) {
     query = /(^|&)env=/.test(query)
