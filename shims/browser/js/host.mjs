@@ -160,9 +160,11 @@ function imageExtent(child) {
 }
 /** How many content-keyed modules (`wasm:`) the page keeps for every
  *  process, and how many bytes of wasm they may add up to (their compiled
- *  code is larger still; python3.13 alone is 24 MiB of wasm). */
-const PAGE_MODULES = 64;
-const PAGE_MODULE_BYTES = 192 << 20;
+ *  code is larger still; python3.13 alone is 24 MiB of wasm). A program's
+ *  shared libraries are keyed so too: Konsole alone maps 152 of them, about
+ *  210 MiB, and a process exec'd again recompiles every one the page let go. */
+const PAGE_MODULES = 1024;
+const PAGE_MODULE_BYTES = 1024 << 20;
 /** The most unit modules the page keeps compiled for its Workers (`#cgenModules`). */
 const UNIT_PAGE_MODULES = 4096;
 /** The most unit-cache files the page keeps for its Workers (`#unitFiles`). */

@@ -4589,7 +4589,7 @@ export class Gex {
     // compile and its instantiation took.
     if (wasmdll && logNamed('wasmlib')) {
       const c = this.#fileModuleMs;
-      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'} w${Math.round(performance.timeOrigin) % 1e6}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     }
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${bridges} bridges)`);
     return bridges;
