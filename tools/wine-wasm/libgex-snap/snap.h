@@ -2,14 +2,15 @@
  * with GEX_SNAPSHOT=1, over the libc's GEX_SNAPSHOT hooks): threads stopped
  * for a session snapshot and started again from one.
  *
- * A call that can block goes through gex.syscall_b, the host's system call
- * under another name: the link's asyncify instruments what can reach it,
- * and the host may unwind the thread's frames there instead of making the
- * call (it was not made: its number and arguments stay in the thread's
- * context). The unwind stops at the thread's root, the thread parks until
- * it goes on in this session, and the rewind makes the call again. A
- * restored session's thread starts as a clone child on the same record, in
- * the memory the snapshot holds, and is rewound from there.
+ * The libc's system calls are the default build's, through gex.syscall:
+ * the link's asyncify instruments what can reach it, and while a snapshot
+ * is pending the host may unwind the thread's frames at a call that can
+ * block (__gex_snap_blocks) instead of making it (it was not made: its
+ * number and arguments stay in the thread's context). The unwind stops
+ * at the thread's root, the thread parks until it goes on in this
+ * session, and the rewind makes the call again. A restored session's
+ * thread starts as a clone child on the same record, in the memory the
+ * snapshot holds, and is rewound from there.
  *
  * The root is a wasm32 thread's driver (the libc's __gex_fork_drive:
  * drive32.c); for a wasm64 program's thread, the host's entry into the
@@ -22,7 +23,6 @@
 
 #define SNAP_IMPORT(name) __attribute__((__import_module__("gex"), __import_name__(name)))
 SNAP_IMPORT("syscall") void gex_syscall(int, long long);
-SNAP_IMPORT("syscall_b") void gex_syscall_b(int, long long);
 SNAP_IMPORT("snap_wanted") int gex_snap_wanted(void);
 /* the thread's record, and its roots: SNAP_DRIVER, SNAP_ENTRY or both (0:
  * none) */
@@ -64,7 +64,7 @@ struct driver {
  * stack pointer then, and the program's stack
  * pointer at the call-out the level runs in (`sp`, none for the first).
  * `nlv` levels are in use. */
-#define SNAP_LEVELS 8
+#define SNAP_LEVELS 16
 struct snap_level {
 	uint32_t route, idx, code, kind;
 	uint32_t sp, pad;

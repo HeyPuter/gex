@@ -176,6 +176,8 @@ function snapLength(m) {
 }
 /** A memory's nonzero 64 KiB pages, copied, as `{ length, runs }`, less
  *  the pages in `skip` (by offset). */
+/** A restored session's answer to a snapshot request. */
+const SNAP_RESTORED = 'a restored session takes no snapshot: a new one comes from a fresh boot that records';
 function snapTake(buffer, skip = null) {
   const P = 65536, length = buffer.byteLength;
   const words = new Int32Array(buffer, 0, length >>> 2);
@@ -689,6 +691,7 @@ export class ProcessHost {
    * `{ refused, stopMs }`.
    */
   async snapshot({ timeout = 10000, resume = true, sources = null } = {}) {
+    if (this.#restored) return { refused: SNAP_RESTORED, stopMs: 0 };
     const st = this.#stacks;
     if (!this.#kernel?.memory || !st?.snapWord) throw new Error('snapshot: no global kernel with a snapshot word');
     if (this.#pending.size) return { refused: `still starting: ${[...this.#pending.keys()].join(' ')}`, stopMs: 0 };
@@ -782,8 +785,14 @@ export class ProcessHost {
    * (it frees the snapshot's shim slots). Resolves with pid 1's status;
    * `onRunning(ms)` once every thread's Worker is up.
    */
+  /** Whether this session can take a snapshot: not once it is a restored
+   *  one (its programs run without the recording's code), so a page shows
+   *  no snapshot control then. */
+  get snapshotAllowed() { return !this.#restored; }
+  #restored = false;
   async restore({ kernel, memories, stores = new Map(), meta }, { onRunning, sources = null } = {}) {
     const t0 = performance.now();
+    this.#restored = true;
     watchLibraries();
     if (!this.#kernel?.memory) throw new Error('restore: no global kernel');
     if (kernel.refs?.length && (!sources || (sources.id ?? null) !== meta.bundle)) {

@@ -483,7 +483,7 @@ const entrySnapMods = new Map();
 const SNAP_TRACE = !!globalThis.process?.env?.GEX_SNAP_TRACE;
 /** A snapshot record's levels (libgex-snap/snap.h `nlv`, `lv`): the
  *  count's offset, the first level's and a level's size; and how many. */
-const SNAP_NLV = 24, SNAP_LV = 32, SNAP_LVS = 40, SNAP_LEVELS = 8;
+const SNAP_NLV = 24, SNAP_LV = 32, SNAP_LVS = 40, SNAP_LEVELS = 16;
 // A record's upper half where Wine's PE module of the snapshot flavour runs
 // in the thread (`#snapPeWin`): the PE levels' calls and the per-thread state
 // at their call-outs (a slot each), then its asyncify window, up to the
@@ -5753,21 +5753,24 @@ export class Gex {
   }
 
   /** A session snapshot's imports, for a program built with the snapshot
-   *  flavour (libgex's snapshot.c). Each thread's driver registers its
-   *  record (`snap_register`); a call that may block goes through
-   *  `syscall_b`, which unwinds the thread's frames to its driver instead
-   *  of making the call while the kernel's snapshot word asks threads to
-   *  stop, or when the shim left the call's wait for it
-   *  (`gex_snap_stopped`). The driver parks in `snap_park` until the word
-   *  is cleared, and rewinds: the rewound `syscall_b` makes the call. The
-   *  record holds the program's stack pointer at the call (+16), which the
-   *  unwind does not keep: the rewind puts it back. */
+   *  flavour (libgex-snap/). Each thread's driver registers its record
+   *  (`snap_register`). The program's system calls are the default build's
+   *  (`syscall`); a recording module's (it exports `__gex_snap_blocks`) are
+   *  wrapped: while the kernel's snapshot word asks threads to stop, a call
+   *  that can block unwinds the thread's frames to its driver instead of
+   *  being made, as it does when the shim left the call's wait for it
+   *  (`gex_snap_stopped`). The driver parks in `snap_park` until the word is
+   *  cleared, and rewinds: the rewound `syscall` makes the call. The record
+   *  holds the program's stack pointer at the call (+16), which the unwind
+   *  does not keep: the rewind puts it back. */
   #snapImports(asyncify, call, inst, mod = null) {
     this.#snapProg = inst;
+    const exp = mod ? WebAssembly.Module.exports(mod).map((x) => x.name) : [];
     // A wasm64 program of the flavour: its hooks and call-outs stop too.
-    const flavour = !single.on && !!mod && WebAssembly.Module.exports(mod).some((x) => x.name === '__gex_snap_resume64');
+    const flavour = !single.on && exp.includes('__gex_snap_resume64');
     this.#snapHooks = flavour;
     if (flavour) this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+    const recording = exp.includes('__gex_snap_blocks');
     const e = this.#shim.exports;
     const k = () => this.#kernel;
     const dv = () => new DataView(this.#memory.buffer);
@@ -5778,8 +5781,28 @@ export class Gex {
       this.#snapUnwinding = true;
       asyncify(1, rec);
     };
+    // (the context's words are 64-bit; the call's number is a long, an i64
+    // in a wasm64 program)
+    const w64 = exp.includes('__gex_snap_resume64');
+    const blocks = (ctx) => {
+      const n = dv().getBigUint64(Number(ctx) >>> 0, true);
+      return !!inst().exports.__gex_snap_blocks(w64 ? n : Number(BigInt.asIntN(32, n)));
+    };
+    const stops = (ctx) => {
+      const P = inst().exports;
+      if (!blocks(ctx)) return false;
+      if (!this.#snapRec && P.__gex_snap_ready) {
+        // The record's making makes calls of its own through the thread's
+        // context, which holds this call's number and arguments (words 0
+        // to 32): kept, and put back for the call the unwind leaves undone.
+        const at = Number(ctx) >>> 0, keep = new Uint8Array(this.#memory.buffer, at, 33 * 8).slice();
+        P.__gex_snap_ready();
+        new Uint8Array(this.#memory.buffer, at, 33 * 8).set(keep);
+      }
+      return !!this.#snapRec && this.#snapOk();
+    };
     return {
-      syscall_b: (ctx, pc) => {
+      ...(recording ? { syscall: (ctx, pc) => {
         const st = asyncify(0, 0);
         if (st === 2) {
           asyncify(4, 0);
@@ -5789,14 +5812,17 @@ export class Gex {
             sp.value = typeof sp.value === 'bigint' ? BigInt(v) : v | 0;
           }
         } else if (st !== 0) {
-          throw new Error(`gex.syscall_b in asyncify state ${st}`);
-        } else if (this.#snapRec && !this.#vforkDepth && k()?.k_snap_pending?.() && this.#snapOk()) {
+          throw new Error(`gex.syscall in asyncify state ${st}`);
+        } else if (!this.#vforkDepth && k()?.k_snap_pending?.() && stops(ctx)) {
           unwind();
           return;
         }
+        // (only a call that can block is one whose wait the shim leaves
+        // for the snapshot, undone: its number is read before the call)
+        const b = this.#snapRec && blocks(ctx);
         call(ctx, pc);
-        if (e.gex_snap_stopped?.()) unwind();
-      },
+        if (b && e.gex_snap_stopped?.()) unwind();
+      } } : {}),
       // No record for a posix_spawn child (`#vforkChild`): its parent's
       // memory map is not its to change.
       snap_wanted: () => (this.#vforkDepth ? 0 : 1),
@@ -6094,7 +6120,7 @@ export class Gex {
         pc = `0x${v.getBigUint64(c + 32 * 8, true).toString(16)} rax 0x${v.getBigUint64(c, true).toString(16)} ret 0x${v.getBigUint64(Number(rsp), true).toString(16)}`;
       } catch {}
       console.error(`[gex-snap] tid ${this.#threadTid}: not at a root (rec ${this.#snapRec}, root ${this.#snapRoot}, vfork ${this.#vforkDepth}, entry depth ${depth}, `
-        + `call-outs ${this.#callouts.length} [${this.#callouts.map((c) => c.ri).join(' ')}], nest ${this.#nest.length}, pc ${pc})`);
+        + `call-outs ${n}${n > SNAP_LEVELS ? `, past the record's ${SNAP_LEVELS} levels` : ''} [${this.#callouts.map((c) => c.ri).join(' ')}], nest ${this.#nest.length}, pc ${pc})`);
     }
     return 0;
   }
@@ -6383,7 +6409,6 @@ export class Gex {
         asyncify: (op) => { if (op === 0) return 0; throw new Error('gex.asyncify: no fork inside a door call'); },
         // A snapshot-flavour server's: a door call is never a snapshot's
         // stop (its thread has no record), so its calls are plain ones.
-        syscall_b: syscall,
         snap_wanted: () => 0,
         snap_register: () => {},
         snap_unwinding: () => 0,

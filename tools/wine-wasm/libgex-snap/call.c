@@ -144,29 +144,13 @@ static int blocks(long n)
 	return 0;
 }
 
-#ifdef __wasm64__
-/* A thread's record before its first call that can block (entry64.c): a
- * wasm64 thread's root makes none at its start. */
-void __gex_snap_ready(void);
-#else
-#define __gex_snap_ready() ((void)0)
-#endif
-
-/* The libc's system call (its __gex_sc), the context filled in: number in
- * the first slot, as both the i386 and the x86-64 conventions put it. */
-void __gex_snap_syscall(int x, long long pc)
+/* Whether the call numbered `n` is one a snapshot may stop a thread in:
+ * the host asks, at a system call while a snapshot is pending (the libc's
+ * calls are the default build's, through gex.syscall). */
+__attribute__((__visibility__("default"), __export_name__("__gex_snap_blocks")))
+int __gex_snap_blocks(long n)
 {
-	volatile unsigned long long *c = (volatile unsigned long long *)(unsigned long)x;
-	unsigned long long n = c[0];
-	if (blocks((long)n)) {
-		/* (its own calls leave the arguments as they were, not the
-		 * number: their results are in its slot) */
-		__gex_snap_ready();
-		c[0] = n;
-		gex_syscall_b(x, pc);
-	} else {
-		gex_syscall(x, pc);
-	}
+	return blocks(n);
 }
 
 void __gex_snap_init(struct snap *s)

@@ -22,9 +22,9 @@ CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib
 JOBS=${JOBS:-4}
 . "$HERE/flags.sh"
 # GEX_SNAPSHOT=1: the snapshot flavour, for pages that save and restore a
-# session (the libc's GEX_SNAPSHOT hooks and libgex-snap/: blocking calls
-# through gex.syscall_b, threads stopped and resumed by asyncify). wcc sees the
-# lib/gex-snapshot it leaves and instruments what reaches those calls. Its
+# session (the libc's GEX_SNAPSHOT hooks and libgex-snap/: threads stopped
+# at a call that can block and resumed by asyncify). wcc sees the
+# lib/gex-snapshot it leaves and instruments what reaches gex.syscall. Its
 # libc is asyncify's too, so it takes the legacy exception instructions.
 if [ -n "${GEX_SNAPSHOT:-}" ]; then
   GEX_WASM_LEGACY_EH=1
@@ -68,15 +68,25 @@ make -s -j"$JOBS" install-headers install-libs >/dev/null
 # it before libc.
 mkdir -p "$OUT/libgex-build"
 gobjs=
-# The snapshot flavour's part (libgex-snap/) only in its sysroot.
-snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/call.c $HERE/libgex-snap/drive32.c"
-for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s $snapsrc; do
+for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s; do
   o="$OUT/libgex-build/$(basename "$f").o"
   clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
   gobjs="$gobjs $o"
 done
-rm -f "$OUT/sysroot/lib/libgex.a"
+rm -f "$OUT/sysroot/lib/libgex.a" "$OUT/sysroot/lib/libgex-snap.a"
 llvm-ar crs "$OUT/sysroot/lib/libgex.a" $gobjs
+# The snapshot flavour's part (libgex-snap/) only in its sysroot, an archive
+# of its own that the link takes last: its data and table slots come after
+# the default build's, which keep their places.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  sobjs=
+  for f in "$HERE/libgex-snap/call.c" "$HERE/libgex-snap/drive32.c"; do
+    o="$OUT/libgex-build/$(basename "$f").o"
+    clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
+    sobjs="$sobjs $o"
+  done
+  llvm-ar crs "$OUT/sysroot/lib/libgex-snap.a" $sobjs
+fi
 
 # Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
 # host's x86 set taken down its i386 branches: gex-kernel serves the i386

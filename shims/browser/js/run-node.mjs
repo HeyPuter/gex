@@ -375,7 +375,7 @@ if (MEM64 && SHARED && kernel) {
 // GEX_SNAP_DELAY_MS (200); the run then ends (status 0), or goes on with
 // GEX_SNAP_RESUME=1. GEX_SNAP_IN=DIR: the run is DIR's snapshot, restored
 // (`ProcessHost.restore`), in place of the program. A refused snapshot ends
-// the run with status 3.
+// the run with status 3, as does asking a restored run for one (both set).
 const SNAP_OUT = process.env.GEX_SNAP_OUT, SNAP_AT = process.env.GEX_SNAP_AT, SNAP_IN = process.env.GEX_SNAP_IN;
 let snapSeen = '', snapTaken = false;
 function snapWatch(text) {

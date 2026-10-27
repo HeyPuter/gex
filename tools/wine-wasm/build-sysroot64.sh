@@ -33,9 +33,9 @@ done
 JOBS=${JOBS:-4}
 . "$HERE/flags64.sh"
 # GEX_SNAPSHOT=1: the snapshot flavour (as build-sysroot.sh's): the libc's
-# GEX_SNAPSHOT hook and libgex-snap/'s wasm64 root; wcc64 sees the
-# lib/gex-snapshot it leaves and instruments what reaches the blocking
-# calls, so everything here takes the legacy exception instructions.
+# GEX_SNAPSHOT hooks (the threads' runs) and libgex-snap/'s wasm64 roots;
+# wcc64 sees the lib/gex-snapshot it leaves and instruments what reaches
+# gex.syscall, so everything here takes the legacy exception instructions.
 if [ -n "${GEX_SNAPSHOT:-}" ]; then
   WASM64_CFLAGS="$(printf '%s' "$WASM64_CFLAGS" | sed 's/-wasm-use-legacy-eh=false/-wasm-use-legacy-eh=true/') -DGEX_SNAPSHOT"
 fi
@@ -66,15 +66,25 @@ cp -rL /usr/include/asm "$SR/asm"
 # libgex: the wasm32 runtime's setjmp and dlopen (data-model neutral C) and
 # the x86-64 signal-frame runner.
 gobjs=
-# The snapshot flavour's part (libgex-snap/) only in its sysroot.
-snapsrc=; [ -n "${GEX_SNAPSHOT:-}" ] && snapsrc="$HERE/libgex-snap/call.c $HERE/libgex-snap/entry64.c"
-for f in "$HERE/libgex/setjmp.c" "$HERE/libgex/dl.c" "$HERE/libgex64/signal.c" $snapsrc; do
+for f in "$HERE/libgex/setjmp.c" "$HERE/libgex/dl.c" "$HERE/libgex64/signal.c"; do
   o="$OUT/libgex-build/$(basename "$f").o"
   clang $WASM64_CFLAGS --sysroot="$OUT/sysroot" -isystem "$SR" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
   gobjs="$gobjs $o"
 done
-rm -f "$OUT/sysroot/lib/libgex.a"
+rm -f "$OUT/sysroot/lib/libgex.a" "$OUT/sysroot/lib/libgex-snap.a"
 llvm-ar crs "$OUT/sysroot/lib/libgex.a" $gobjs
+# The snapshot flavour's part (libgex-snap/) only in its sysroot, an archive
+# of its own that the link takes last: its data and table slots come after
+# the default build's, which keep their places.
+if [ -n "${GEX_SNAPSHOT:-}" ]; then
+  sobjs=
+  for f in "$HERE/libgex-snap/call.c" "$HERE/libgex-snap/entry64.c"; do
+    o="$OUT/libgex-build/$(basename "$f").o"
+    clang $WASM64_CFLAGS --sysroot="$OUT/sysroot" -isystem "$SR" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
+    sobjs="$sobjs $o"
+  done
+  llvm-ar crs "$OUT/sysroot/lib/libgex-snap.a" $sobjs
+fi
 
 cd "$OUT/crt-build"
 objs=

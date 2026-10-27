@@ -61,20 +61,25 @@ static void ready_as(int root)
 	gex_snap_register(s, root);
 }
 
+/* The calling thread's record made, before the host stops it in a call
+ * that can block: a thread whose record waits for its first such call. */
+__attribute__((__visibility__("default"), __export_name__("__gex_snap_ready")))
 void __gex_snap_ready(void)
 {
 	ready_as(SNAP_ENTRY);
 }
 
-/* A thread's function run until it returns, as the libc's thread start
- * runs it: the thread's other root, for a thread that waits with none of
+/* A thread's function (none: the main thread's libc start, crt1.c) run
+ * until it returns, as the libc's thread start runs it: the thread's other
+ * root, for a thread that waits with none of
  * the guest's code below it (a Unix-side thread of its own). An unwind the
  * snapshot began in it ends here: the record kept, parked, and the function
  * called again under the rewind. */
+int __gex_snap_libc_start(void *);
 __attribute__((__noinline__)) int __gex_snap_run_loop(int (*fn)(void *), void *arg)
 {
 	for (;;) {
-		int r = fn(arg);
+		int r = fn ? fn(arg) : __gex_snap_libc_start(arg);
 		struct snap *s = (struct snap *)(unsigned long)gex_snap_unwinding();
 		if (!s) return r;
 		gex_snap_asyncify(2, 0);

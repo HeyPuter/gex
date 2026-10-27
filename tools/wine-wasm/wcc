@@ -147,10 +147,10 @@ FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_threa
 
 
 # The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
-# leaves this file in its lib/): a program's blocking calls go through
-# gex.syscall_b, and a session snapshot unwinds a thread parked in one
-# (libgex-snap/snapshot.c). Only there: another
-# sysroot's programs are linked as before, byte for byte.
+# leaves this file in its lib/): asyncify also instruments what reaches
+# gex.syscall, and a session snapshot unwinds a thread at a call that can
+# block (libgex-snap/call.c). Only there: another sysroot's programs are
+# linked as before, byte for byte.
 SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
 if SNAPSHOT:
     FORK_ROOTS = FORK_ROOTS + ['__gex_snap_resume']
@@ -164,7 +164,7 @@ def finish(path):
     opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
     passes = []
     imps = imports(path)
-    points = [i for i in [('gex', 'fork_point')] + ([('gex', 'syscall_b')] if SNAPSHOT else []) if i in imps]
+    points = [i for i in [('gex', 'fork_point')] + ([('gex', 'syscall')] if SNAPSHOT else []) if i in imps]
     if points:
         names = ','.join(f'{m}.{n}' for m, n in points)
         passes += ['--asyncify', '--pass-arg=asyncify-imports@' + names]
@@ -204,9 +204,12 @@ if shared:
 # dlopen, __dlsym and vfork replace libc's; the setjmp runtime and the
 # signal frames are only there.
 libgex = [lib + '/libgex.a'] if os.path.exists(lib + '/libgex.a') else []
+# (the snapshot flavour's part last, its own archive: the default build's
+# data and table slots keep their places)
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
-    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
+    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a'] + \
+    ([lib + '/libgex-snap.a'] if SNAPSHOT else [])
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)
