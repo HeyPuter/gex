@@ -11,7 +11,7 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    the files it read, the runtime, a build step
                                    and a launcher (crates/gex-eject/README.md)
   gexc eject <wine32-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
-                                   the same for a wine32 page (Wine as wasm32)
+                                   the same for a Wine page (wine32, or wine64)
                                    recorded by tools/eject/record-wine32.mjs: its
                                    bundle, units and runtime, and the features
                                    the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
@@ -209,7 +209,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     &gex_eject::wine32::Wine32Options { web_src, unit_cache, features_off },
                 )?;
                 eprintln!(
-                    "{}: a wine32 page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
+                    "{}: a Wine page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
                     out.display(),
                     s.processes,
                     s.units,
@@ -270,7 +270,7 @@ fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
     if let Some(w) = &r.wine32 {
         eprintln!(
-            "{}: wine32 page built: {} page files, {} units; features off: {}",
+            "{}: Wine page built: {} page files, {} units; features off: {}",
             dir.display(),
             w.page_files,
             w.units,

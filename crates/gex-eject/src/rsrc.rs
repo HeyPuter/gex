@@ -443,8 +443,10 @@ pub(crate) const FLAVORS: [(bool, bool); 4] = [(true, false), (false, false), (t
 /// there as well as in their `:wine32kuser`. Each is computed once, with the
 /// process's fold set for the call and put back.
 fn abi_hash(kuser: bool) -> String {
-    static H: [std::sync::OnceLock<String>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
-    H[kuser as usize]
+    // Per guest memory width too: the header differs for a memory64 unit.
+    static H: [std::sync::OnceLock<String>; 4] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new(), std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    H[kuser as usize + 2 * gex_abi::mem64() as usize]
         .get_or_init(|| {
             let was = gex_abi::kuser_fold();
             gex_abi::set_kuser_fold(kuser);
@@ -479,6 +481,23 @@ pub(crate) fn key_with(image: &gex_ld::Image, (unguarded, kuser): (bool, bool)) 
     gex_key::unit_key(image, gex_cgen::image::FORMAT, &inputs, gex_cgen::image::UNIT_ABI_VERSION, gex_cgen::image::RECOVERY_INPUTS)
 }
 
+/// [`key_with`] for a unit built for a 32-bit (`mem64` false) or a 64-bit
+/// guest memory (`gexc cgen-image --mem64`): a 64-bit Wine page runs both, a
+/// program marked for memory64 and Wine's own processes beside it. The
+/// process's flavor is set for the call and put back.
+pub(crate) fn key_with_mem(image: &gex_ld::Image, g: (bool, bool), mem64: bool) -> String {
+    let was = gex_abi::mem_flavor();
+    gex_abi::set_mem_flavor(if mem64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 });
+    let k = key_with(image, g);
+    gex_abi::set_mem_flavor(was);
+    k
+}
+
+/// Every flavor a page may key a unit by, with the guest memory's width.
+pub(crate) fn flavors_mem() -> impl Iterator<Item = ((bool, bool), bool)> {
+    FLAVORS.into_iter().flat_map(|g| [(g, false), (g, true)])
+}
+
 /// A unit's key for its image trimmed: `None` unless this gexc computes
 /// `old` for the untrimmed image at the base the unit was built for (so the
 /// trimmed key is the one the page will compute) and every byte outside the
@@ -500,7 +519,7 @@ pub fn rekey(unit_wasm: &[u8], orig: &[u8], trimmed: &[u8], old: &str) -> Result
             eprintln!("[rsrc]   (unguarded, wine32kuser)={g:?} -> {}", key_with(&was, g));
         }
     }
-    let Some(g) = FLAVORS.into_iter().find(|&g| key_with(&was, g) == old) else { return Ok(None) };
+    let Some((g, m)) = flavors_mem().find(|&(g, m)| key_with_mem(&was, g, m) == old) else { return Ok(None) };
     let t = Tree { pe: &pe, data: orig, root: pe.dirs.get(2).map_or(0, |d| d.0) };
     for s in pe.sections.iter().filter(|s| !is_resource_section(&t, s)) {
         let r = s.raw_offset as usize..(s.raw_offset + s.raw_size) as usize;
@@ -509,5 +528,5 @@ pub fn rekey(unit_wasm: &[u8], orig: &[u8], trimmed: &[u8], old: &str) -> Result
         }
     }
     let pe2 = gex_ld::pe::parse(trimmed).map_err(|e| anyhow!("{e}"))?;
-    Ok(Some(key_with(&image(&pe2)?, g)))
+    Ok(Some(key_with_mem(&image(&pe2)?, g, m)))
 }

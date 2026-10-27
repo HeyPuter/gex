@@ -371,6 +371,74 @@ fn clean(p: &str) -> String {
     out.join("/")
 }
 
+/// A tar's user extended attributes (pax `SCHILY.xattr.user.*`, as `tar
+/// --xattrs` writes them): each entry's, by its path with a leading `/`,
+/// as (name, value) with the name from `user.`. The page sets them on its
+/// files (`web/src/tar.js` reads the same records): the memory64 mark on a
+/// program, Wine's DOS attributes on a prefix.
+pub fn xattrs(data: &[u8]) -> Result<BTreeMap<String, Vec<(String, String)>>> {
+    let mut out = BTreeMap::new();
+    let mut off = 0usize;
+    let mut long: Option<String> = None;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    while off + 512 <= data.len() {
+        let h = &data[off..off + 512];
+        if h.iter().all(|&c| c == 0) {
+            off += 512;
+            continue;
+        }
+        let size = octal(&h[124..136]);
+        let kind = h[156];
+        let body = off + 512;
+        let next = body + size.div_ceil(512) * 512;
+        if next > data.len() {
+            bail!("a tar entry runs past the end ({off:#x})");
+        }
+        match kind {
+            b'L' => long = Some(field(&data[body..body + size])),
+            b'x' => {
+                // Records are "LEN key=value\n", LEN counting the whole record.
+                let rec = &data[body..body + size];
+                let mut i = 0;
+                while i < rec.len() {
+                    let Some(sp) = rec[i..].iter().position(|&c| c == b' ') else { break };
+                    let Ok(n) = std::str::from_utf8(&rec[i..i + sp]).unwrap_or("").parse::<usize>() else { break };
+                    if n == 0 || i + n > rec.len() {
+                        break;
+                    }
+                    let kv = &rec[i + sp + 1..i + n - 1];
+                    if let Some(eq) = kv.iter().position(|&c| c == b'=') {
+                        let k = String::from_utf8_lossy(&kv[..eq]).into_owned();
+                        let v = String::from_utf8_lossy(&kv[eq + 1..]).into_owned();
+                        if k == "path" {
+                            long = Some(v);
+                        } else if let Some(name) = k.strip_prefix("SCHILY.xattr.").filter(|n| n.starts_with("user.")) {
+                            pending.push((name.to_string(), v));
+                        }
+                    }
+                    i += n;
+                }
+            }
+            b'g' | b'K' => {}
+            _ => {
+                let mut name = field(&h[0..100]);
+                let prefix = field(&h[345..500]);
+                if !prefix.is_empty() {
+                    name = format!("{prefix}/{name}");
+                }
+                if let Some(l) = long.take() {
+                    name = l;
+                }
+                if !pending.is_empty() {
+                    out.insert(format!("/{}", clean(&name)), std::mem::take(&mut pending));
+                }
+            }
+        }
+        off = next;
+    }
+    Ok(out)
+}
+
 impl<'a> Tar<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Tar<'a>> {
         let mut entries = BTreeMap::new();

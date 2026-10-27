@@ -113,7 +113,8 @@ const uncovered = new Map();
 const coverage = new Map();
 const errors = [];
 browser.on('Runtime.consoleAPICalled', (p) => {
-  const t = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
+  // A Worker's line the page relays carries the relay's tag first.
+  const t = p.args.map((a) => a.value ?? a.description ?? '').join(' ').replace(/^\[gex-console-error\] /, '');
   let m;
   if ((m = /^\[gex-record\] unit ([0-9a-f]{64}) (hit|miss) (.*)$/.exec(t))) {
     const was = units.get(m[1]);
