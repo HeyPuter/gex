@@ -358,6 +358,46 @@ export function releaseToken(channel, token) {
   return n;
 }
 
+/** Where `sceneMark` keeps each block's token and generation. */
+export function sceneMarks() {
+  return new Int32Array(2 * BLOCKS);
+}
+
+/** One view of each arena, for the checks made every frame. */
+const arenaViews = new WeakMap();
+function arenaView(channel) {
+  let a = arenaViews.get(channel.arena);
+  if (!a) arenaViews.set(channel.arena, (a = new Int32Array(channel.arena)));
+  return a;
+}
+
+/** Note what the compositor has just drawn (`readScene`'s `blocks`), for
+ *  `sceneStill`. */
+export function sceneMark(marks, blocks) {
+  marks.fill(0);
+  for (const b of blocks) {
+    marks[2 * b.block] = b.token;
+    marks[2 * b.block + 1] = b.gen;
+  }
+}
+
+/** Whether no block has been claimed, freed or published to since `sceneMark`,
+ *  and everything published has been acked: the scene `readScene` would
+ *  read is the one already drawn. Reads the arena only, and allocates
+ *  nothing. */
+export function sceneStill(channel, marks) {
+  const a = arenaView(channel);
+  for (let b = 0; b < BLOCKS; b++) {
+    const base = blockBase(b);
+    const token = Atomics.load(a, base + B_TOKEN);
+    if (token !== marks[2 * b]) return false;
+    if (!token) continue;
+    const gen = Atomics.load(a, base + B_GEN);
+    if (gen !== marks[2 * b + 1] || gen !== Atomics.load(a, base + B_ACK)) return false;
+  }
+  return true;
+}
+
 /** Say that everything published up to `gen` has been drawn. */
 export function ackBlock(channel, block, gen) {
   const a = new Int32Array(channel.arena);

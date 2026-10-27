@@ -22,6 +22,9 @@ import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 
 import {
   readScene,
+  sceneMarks,
+  sceneMark,
+  sceneStill,
   blockPixels,
   ackBlock,
   sendEvent,
@@ -1208,6 +1211,36 @@ class Compositor {
   #lastSig = null;
   #skipped = 0;
 
+  // An idle frame (`#still`): what the last frame that acked its blocks
+  // drew from -- each block's token and generation, the page's messages
+  // handled by then, the GL frames presented by then.
+  #marks = sceneMarks();
+  #touched = 1;
+  #markedTouch = 0;
+  #markedGl = -1;
+
+  /** Something from the page (input, a resize, a client gone): the next
+   *  frame reads the scene again. */
+  touch() {
+    this.#touched++;
+  }
+
+  /** Whether this frame would draw what the last one drew from: no block
+   *  claimed, freed or published to, every publish acked, no message from
+   *  the page and no new GL frame since. Then the frame reads nothing and
+   *  allocates nothing. */
+  #still() {
+    if (this.#touched !== this.#markedTouch) return false;
+    if ((glDevice?.presentedCount?.() ?? 0) !== this.#markedGl) return false;
+    return sceneStill(this.#channel, this.#marks);
+  }
+
+  #mark(blocks) {
+    sceneMark(this.#marks, blocks);
+    this.#markedTouch = this.#touched;
+    this.#markedGl = glDevice?.presentedCount?.() ?? 0;
+  }
+
   /** What the output shows, as a string: equal strings, equal pixels (a GL
    *  window's frame counted by its presented serial). */
   #signature() {
@@ -1268,6 +1301,7 @@ class Compositor {
     }
     this.#direct = { k: d.k, w: d.w, h: d.h, ox: d.ox, oy: d.oy };
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    this.#mark(blocks);
     if (d.gl.serial === this.#directSerial) {
       this.#skipped++;
       return;
@@ -1390,6 +1424,10 @@ class Compositor {
   }
 
   frame() {
+    if (this.#still()) {
+      this.#skipped++;
+      return;
+    }
     const { byKey, blocks } = this.#reconcile();
     this.#updateCursor(byKey);
     const d = this.#directTarget();
@@ -1398,12 +1436,14 @@ class Compositor {
       return;
     }
     if (this.#direct) this.#leaveDirect();
-    // Upload every surface whose content moved on.
+    // Upload every surface whose content moved on. One that could not be
+    // read yet is tried again next frame, which is then not an idle one.
+    let unread = false;
     for (const [k, s] of byKey) {
       if (s.role === ROLE_CURSOR) continue; // the page's cursor, not a texture
       const t = this.#textures.get(k);
       if (t && t.serial === s.serial) continue;
-      this.#upload(k, s);
+      if (!this.#upload(k, s)) unread = true;
     }
     // Nothing on the output changed (no new GL frame either): draw nothing,
     // so the canvas presents no new frame. A presented frame is a full
@@ -1412,6 +1452,7 @@ class Compositor {
     const sig = this.#signature();
     if (sig !== null && sig === this.#lastSig) {
       for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+      if (!unread) this.#mark(blocks);
       this.#skipped++;
       return;
     }
@@ -1442,6 +1483,7 @@ class Compositor {
     this.#painter.end();
     console.timeStamp('gex:drawn');
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    if (!unread) this.#mark(blocks);
     this.#frames++;
     if (this.#stats) {
       Atomics.store(this.#stats, 0, this.#frames);
@@ -2055,6 +2097,7 @@ async function serveGlRing() {
 }
 
 const onMessage = ({ data: m }) => {
+  comp?.touch();
   try {
     if (m.kind === 'init') {
       presentOverride = m.present ?? null;
