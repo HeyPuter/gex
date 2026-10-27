@@ -3100,6 +3100,9 @@ impl PathIo<'_> {
             } else {
                 self.ns.metadata(&p)?
             };
+            if flags & oflags::O_DIRECTORY != 0 && md.file_type != FileType::Directory {
+                return Err(Errno::ENOTDIR);
+            }
             Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
         } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
             // A name can be taken already: one left by a gex that was
@@ -3147,6 +3150,11 @@ impl PathIo<'_> {
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
             let h = self.ns.open(&p, flags, mode)?;
+            // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
+            // of whether a name is a directory)
+            if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
+                return Err(Errno::ENOTDIR);
+            }
             // And arm a placement, for an object nobody pinned. Only for a
             // shared object: the executable's own base is fixed by the
             // loader rather than reserved, and arming on every open would
@@ -14982,6 +14990,12 @@ mod tests {
             assert_eq!(nofollow, -(Errno::ELOOP.0 as i64), "O_NOFOLLOW on the link");
             let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, g(oflags::O_RDONLY | oflags::O_DIRECTORY), 0]);
             assert!(dir >= 3, "O_DIRECTORY: {dir}");
+            for (name, what) in [(0x20200u64, "a file"), (0x20300, "a link to a file")] {
+                let notdir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, name, g(oflags::O_RDONLY | oflags::O_DIRECTORY), 0]);
+                assert_eq!(notdir, -(Errno::ENOTDIR.0 as i64), "O_DIRECTORY on {what}");
+                let path = sys(&mut m, &mut k, nr::OPENAT, &[cwd, name, g(oflags::O_PATH | oflags::O_DIRECTORY), 0]);
+                assert_eq!(path, -(Errno::ENOTDIR.0 as i64), "O_PATH | O_DIRECTORY on {what}");
+            }
             // O_DIRECT set and read back, in the guest's spelling.
             const F_GETFL: u64 = 3;
             const F_SETFL: u64 = 4;
