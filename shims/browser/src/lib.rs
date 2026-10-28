@@ -2557,6 +2557,7 @@ pub extern "C" fn gex_set_pin_region(bytes: u64) {
 #[no_mangle]
 pub extern "C" fn gex_set_no_place_window(image_lo: u64, image_hi: u64) {
     gex_kernel::mem::set_no_place_window();
+    winspace::raise_native_ceiling();
     if let Some((lo, hi)) = no_place_island(image_lo, image_hi) {
         // Grown now: the loader writes the image without mapping through the
         // arena, and the memory reaches past it as soon as the arena does.
@@ -11349,7 +11350,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     }
     let dead: Option<Vec<(u64, u64)>> = dead
         .iter()
-        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_kernel::mem::arena_bottom()), hi.min(gex_abi::MMAP_TOP)))
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_kernel::mem::arena_bottom()), hi.min(if gex_kernel::mem::place_window() { gex_abi::MMAP_TOP } else { winspace::arena_ceiling() })))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem.lock().renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));

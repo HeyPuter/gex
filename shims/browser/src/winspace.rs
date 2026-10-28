@@ -14,8 +14,18 @@ pub(crate) use stub::*;
 
 #[cfg(not(feature = "shared-memory"))]
 mod stub {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// As the shared build's: `MMAP_TOP`, or all of the memory for a
+    /// process that translates nothing ([`raise_native_ceiling`]).
+    static ARENA_CEILING: AtomicU64 = AtomicU64::new(gex_abi::MMAP_TOP);
+
     pub(crate) fn arena_ceiling() -> u64 {
-        gex_abi::MMAP_TOP
+        ARENA_CEILING.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn raise_native_ceiling() {
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
     }
 
     pub(crate) fn windows_space() -> u64 {
@@ -68,6 +78,13 @@ mod imp {
 
     pub(crate) fn arena_ceiling() -> u64 {
         ARENA_CEILING.load(Ordering::Relaxed)
+    }
+
+    /// A process that translates nothing (no placement window) names no
+    /// code in the dispatch directory, so its arena may use all of the
+    /// memory rather than stop at the directory's reach.
+    pub(crate) fn raise_native_ceiling() {
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
     }
 
     /// The bottom of the shim's heap in an NT process: the top of the
