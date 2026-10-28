@@ -4,4 +4,5 @@
 set -eu
 cd "$(dirname "$0")"
 clang --target=x86_64-linux-gnu -O1 -g -fno-pic -fno-stack-protector -ffreestanding \
-    -nostdlib -static -fuse-ld=lld -Wl,-e,entry -Wl,--image-base=0x10000000 -o relayout.elf relayout.c
+    -fdebug-compilation-dir=. -nostdlib -static -fuse-ld=lld -Wl,-e,entry -Wl,--image-base=0x10000000 \
+    -o relayout.elf relayout.c
