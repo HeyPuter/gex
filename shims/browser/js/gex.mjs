@@ -3918,7 +3918,15 @@ export class Gex {
     await this.#catchUp();
     // And the function table's installs (a wasm32 program's module, units):
     // its entry is a bridge into one.
-    this.#cgenCatchUp();
+    try {
+      this.#cgenCatchUp();
+    } catch (err) {
+      // Gone while it caught up: another thread's execve took the process,
+      // and the old program's module went with it. The shim stops this
+      // thread at its first dispatch (`thread_gone`), which the execve waits for.
+      if (!this.#shim.exports.gex_thread_gone?.()) throw err;
+      _t(`gone while catching up (${err?.message ?? err})`);
+    }
     thread.spareSaid?.();
     return { entry, ctx: Number(thread.ctx) };
   }
