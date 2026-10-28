@@ -2591,8 +2591,8 @@ fn no_place_island(lo: u64, hi: u64) -> Option<(u64, u64)> {
 /// process without the placement window: a native wasm program whose image
 /// lies below its arena or in its first program's island. Anything else
 /// would map over the arena, so it goes on in a fresh memory.
-fn no_place_exec_fits(image: Option<(u64, u64)>) -> bool {
-    image.is_some_and(|(lo, hi)| no_place_island(lo, hi).is_none_or(|(lo, hi)| memmap::within_island(lo, hi)))
+fn no_place_exec_fits(image: Option<(u64, u64, u32)>) -> bool {
+    image.is_some_and(|(lo, hi, _)| no_place_island(lo, hi).is_none_or(|(lo, hi)| memmap::within_island(lo, hi)))
 }
 
 /// 1 when this process keeps the placement window, 0 when it gave it up (a
