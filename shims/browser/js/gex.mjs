@@ -3901,8 +3901,7 @@ export class Gex {
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
-    const execGen = this.#shim.exports.gex_exec_gen?.() ?? 0;
-    this.adoptGen = execGen;
+    this.adoptGen = this.#shim.exports.gex_exec_gen?.() ?? 0;
     // Gone before its Worker came up: the process exec'd (the other threads go
     // with the old program) or ended. Nothing to run, and nothing wrong.
     if (!entry) return { entry: 0n, ctx: Number(thread.ctx), gone: true };
@@ -3920,17 +3919,7 @@ export class Gex {
     await this.#catchUp();
     // And the function table's installs (a wasm32 program's module, units):
     // its entry is a bridge into one.
-    try {
-      this.#cgenCatchUp();
-    } catch (err) {
-      // Gone while it caught up: another thread's execve took the process
-      // (under way, or done: the thread is then marked gone), and the old
-      // program's module went with it. The shim stops this thread at its
-      // first dispatch or safepoint (`thread_gone`), which the execve waits for.
-      const e = this.#shim.exports;
-      if (!e.gex_thread_gone?.() && (e.gex_exec_gen?.() ?? 0) === execGen) throw err;
-      _t(`gone while catching up (${err?.message ?? err})`);
-    }
+    this.#cgenCatchUp();
     thread.spareSaid?.();
     return { entry, ctx: Number(thread.ctx) };
   }
