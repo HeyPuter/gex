@@ -377,14 +377,17 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
 }
 
 /// An exec's program's image span, relative to the caller's cwd, when it is
-/// a native wasm program ([`wasm_program_image`]).
+/// a native wasm program that runs no translated code ([`wasm_program_image`]).
 pub(crate) fn exec_wasm_image(h: &Host, path: &str) -> Option<(u64, u64, u32)> {
-    if path.starts_with('/') {
+    let image = if path.starts_with('/') {
         wasm_program_image(path)
     } else {
         let cwd = h.kernel.caller_cwd();
         wasm_program_image(&format!("{}/{path}", cwd.trim_end_matches('/')))
-    }
+    };
+    // One whose header asks for Windows space runs translated code, which
+    // the placement window serves.
+    image.filter(|&(_, _, flags)| flags & 3 == 0)
 }
 
 /// The span `[lowest, highest)` the loaded segments of the file at `path`

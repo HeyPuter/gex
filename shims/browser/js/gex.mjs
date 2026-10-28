@@ -1916,8 +1916,10 @@ export class Gex {
     // 2 GiB, and a 64-bit Wine maps past it.
     const wine = wine32ProgramFlags(elf);
     if (wine) this.#windowsSpace = -1;
-    this.#noPlace = wasmProgramImage(elf);
-    this.#nativeOnly = this.#noPlace !== null && (wasmProgramFlags(elf) & 3) === 0;
+    // Not one whose header asks for Windows space: it runs translated code,
+    // which the placement window serves.
+    this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
+    this.#nativeOnly = this.#noPlace !== null;
     this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
@@ -3169,7 +3171,7 @@ export class Gex {
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
     this.#noPlace = child.wasmImage ?? null;
-    this.#nativeOnly = !!child.wasmImage && (child.wasmFlags & 3) === 0;
+    this.#nativeOnly = !!child.wasmImage;
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool
@@ -3937,7 +3939,6 @@ export class Gex {
         const hi = Number(e.gex_vfork_exec_wasm?.(1) ?? 0n);
         return hi ? [Number(e.gex_vfork_exec_wasm(0)), hi] : null;
       })(),
-      wasmFlags: Number(e.gex_vfork_exec_wasm?.(2) ?? 0n),
       fds: part(1),
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
