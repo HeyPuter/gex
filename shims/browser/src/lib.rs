@@ -10045,12 +10045,10 @@ pub extern "C" fn gex_space_top() -> u32 {
 }
 
 /// In the compact space (`winspace::wine64_compact`) the window is the top
-/// of the island Wine's images are kept in (`winspace::WINE32_ISLAND`), above
+/// of the island Wine's images are kept in (`winspace::island`), above
 /// every image Wine places there and within 4 GiB of them, so that it does
 /// not pin the memory's length.
-const WINE64_PE_DATA_COMPACT: (u64, u64) = gex_abi::WINE64_COMPACT_PE_DATA;
-#[cfg(feature = "shared-memory")]
-const _: () = assert!(WINE64_PE_DATA_COMPACT.1 + 0x1_0000 == winspace::WINE32_ISLAND.1 && WINE64_PE_DATA_COMPACT.0 > winspace::WINE32_ISLAND.0);
+const WINE64_PE_DATA_COMPACT: (u64, u64) = winspace::WINE64_COMPACT_PE_DATA;
 
 /// The 64-bit Wine PE data window of this process's memory.
 pub(crate) fn wine64_pe_data() -> (u64, u64) {
@@ -10113,7 +10111,7 @@ pub(crate) fn wine32_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64
     // arena, a bottom-up anonymous mmap (Wine's 64 MiB heaps) took their
     // holes and the next pinned DLL found its base taken and relocated
     // (steam_api64, uxtheme, actxprxy: every one a unit miss).
-    let (lo, hi) = winspace::WINE32_ISLAND;
+    let (lo, hi) = winspace::island();
     mem.keep_fixed_only(lo, hi);
 }
 

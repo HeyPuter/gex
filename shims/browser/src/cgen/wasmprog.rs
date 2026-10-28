@@ -279,12 +279,13 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         if flags & FLAG_GUEST_X86_64 != 0 && !compact64 {
             crate::winspace::set_wine_split(true);
         }
-        let lo = crate::winspace::wine32_space().map_err(|e| format!("wine32: {e}"))?;
+        let lo = if compact64 {
+            crate::winspace::wine64_compact_space()
+        } else {
+            crate::winspace::wine32_space().map_err(|e| format!("wine32: {e}"))?
+        };
         if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_WINE32 != 0 {
             crate::winspace::wine32_kuser();
-        }
-        if compact64 {
-            crate::winspace::wine64_compact();
         }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
