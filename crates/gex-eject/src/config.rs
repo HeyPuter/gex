@@ -144,6 +144,11 @@ pub struct Config {
     /// program's first call) is a process start or more on the way to the
     /// window.
     pub services: Vec<(String, u32)>,
+    /// Wine pages: `"helpers": "strip"` leaves out of the site the Wine
+    /// helper processes a game does not need (crates/gex-eject/README.md,
+    /// "Helpers"); `"keep"`, the default for a config without the setting,
+    /// ships the prefix as recorded.
+    pub helpers_strip: bool,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (crates/gex-eject/README.md,
@@ -174,6 +179,7 @@ impl Default for Config {
             prune: None,
             resources_trim: false,
             services: Vec::new(),
+            helpers_strip: false,
             start: "{}".to_string(),
         }
     }
@@ -220,7 +226,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -422,6 +428,12 @@ impl Config {
             }
             Some(_) => bail!("{what}: \"services\" is an object of service names to start types"),
         };
+        c.helpers_strip = match v.get("helpers") {
+            None | Some(Json::Null) => false,
+            Some(Json::Str(x)) if x == "keep" => false,
+            Some(Json::Str(x)) if x == "strip" => true,
+            Some(_) => bail!("{what}: \"helpers\" is \"strip\" or \"keep\""),
+        };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
             Some(_) => Some(json::str_list(&v, "args", what)?),
@@ -452,6 +464,14 @@ mod tests {
         // Every feature named kept, which is what a config without them means.
         let all = crate::features::FEATURES.iter().map(|f| f.name.to_string()).collect();
         assert_eq!(Config::from_json(&template()).unwrap(), Config { features_on: all, ..Config::default() });
+    }
+
+    #[test]
+    fn reads_helpers() {
+        assert!(!Config::from_json("{}").unwrap().helpers_strip);
+        assert!(!Config::from_json(r#"{"helpers": "keep"}"#).unwrap().helpers_strip);
+        assert!(Config::from_json(r#"{"helpers": "strip"}"#).unwrap().helpers_strip);
+        assert!(Config::from_json(r#"{"helpers": true}"#).is_err());
     }
 
     #[test]

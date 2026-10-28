@@ -681,6 +681,26 @@ service the program asks about at start-up (a scanner service, say) can be
 `disabled` if the browser has no such device, at the cost of the features
 that need it.
 
+### Helpers
+
+`"helpers": "strip"` leaves out of the site the parts of Wine's start-up a
+game does not use. `gexc eject` writes it into a new Wine project's
+`user/eject.json`, except when the program is `explorer.exe` (a desktop
+shell, which runs these itself). `"keep"`, and a config without the
+setting, ship the prefix as recorded.
+
+- The services `PlugPlay`, `NDIS`, `nsiproxy` and `MountMgr` are set
+  `disabled`, the ones the prefix has (see "Services"). This takes
+  `plugplay.exe` and the `winedevice.exe` that hosts the drivers off the
+  start-up path. An entry in `"services"` for one of them wins.
+- `winemenubuilder.exe` is left out of the bundle, from the prefix and from
+  Wine's own directories, along with its unit. Wine starts it to write
+  desktop menu entries, which a page has none of; with no file, the start
+  fails at once and Wine goes on.
+
+`services.exe` and `rpcss.exe` stay: a program that makes a COM call starts
+`rpcss` through the service manager, and fails without it.
+
 ### Pruning
 
 A unit holds every function of its image, including the ones no execution

@@ -661,6 +661,74 @@ pub fn tar_put(data: &[u8], path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `data` (a tar) without the entries `drop` names (a file, link or
+/// directory entry, its path cleaned), each with its long-name and pax
+/// headers, and without a hard link to one of them. Returns the tar and the
+/// paths it left out.
+pub fn tar_drop(data: &[u8], drop: &dyn Fn(&str) -> bool) -> Result<(Vec<u8>, Vec<String>)> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut gone = Vec::new();
+    let mut off = 0usize;
+    let mut long: Option<String> = None;
+    // The long-name and pax headers before the entry they name.
+    let mut pending = 0usize..0usize;
+    let mut end = data.len();
+    while off + 512 <= data.len() {
+        let h = &data[off..off + 512];
+        if h.iter().all(|&c| c == 0) {
+            end = off;
+            break;
+        }
+        let size = octal(&h[124..136]);
+        let kind = h[156];
+        let body = off + 512;
+        let next = body + size.div_ceil(512) * 512;
+        if next > data.len() {
+            bail!("a tar entry runs past the end ({off:#x})");
+        }
+        if pending.is_empty() {
+            pending = off..off;
+        }
+        match kind {
+            b'L' => long = Some(field(&data[body..body + size])),
+            b'x' => {
+                let text = String::from_utf8_lossy(&data[body..body + size]);
+                for rec in text.lines() {
+                    if let Some(p) = rec.split_once(' ').and_then(|(_, kv)| kv.strip_prefix("path=")) {
+                        long = Some(p.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if matches!(kind, b'L' | b'x') {
+            pending.end = next;
+            off = next;
+            continue;
+        }
+        let mut name = field(&h[0..100]);
+        let prefix = field(&h[345..500]);
+        if !prefix.is_empty() {
+            name = format!("{prefix}/{name}");
+        }
+        if let Some(l) = long.take() {
+            name = l;
+        }
+        let name = clean(&name);
+        let to_gone = kind == b'1' && gone.contains(&clean(&field(&h[157..257])));
+        if drop(&name) || to_gone {
+            gone.push(name);
+        } else {
+            out.extend_from_slice(&data[pending.start..next]);
+        }
+        pending = next..next;
+        off = next;
+    }
+    let tail = (data.len() - end).max(1024);
+    out.resize(out.len() + tail, 0);
+    Ok((out, gone))
+}
+
 /// A header's size field and its checksum, for `size`.
 fn set_size(h: &mut [u8; 512], size: usize) {
     h[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
@@ -705,5 +773,39 @@ mod tar_put_tests {
         c[148..156].fill(b' ');
         let sum: u32 = c.iter().map(|&b| b as u32).sum();
         assert_eq!(octal(&h[148..156]) as u32, sum);
+    }
+
+    #[test]
+    fn drops_entries_and_their_links() {
+        let mut t = entry("pfx/", b"");
+        t.extend(entry("pfx/a.exe", b"aaa"));
+        let mut l: [u8; 512] = entry("pfx/system32/a.exe", b"")[..512].try_into().unwrap();
+        l[156] = b'1';
+        l[157..166].copy_from_slice(b"pfx/a.exe");
+        set_size(&mut l, 0);
+        t.extend_from_slice(&l);
+        // A long name before the entry it names goes with it.
+        let name = format!("pfx/{}/a.exe", "d".repeat(120));
+        let mut lh = [0u8; 512];
+        lh[..13].copy_from_slice(b"././@LongLink");
+        lh[156] = b'L';
+        set_size(&mut lh, name.len() + 1);
+        t.extend_from_slice(&lh);
+        let mut nb = name.clone().into_bytes();
+        nb.push(0);
+        nb.resize(512, 0);
+        t.extend(nb);
+        t.extend(entry(&name[..99], b"long"));
+        t.extend(entry("pfx/b.txt", b"bee"));
+        t.resize(t.len() + 1024, 0);
+        let (r, gone) = tar_drop(&t, &|p| p.ends_with("/a.exe") && !p.contains("system32")).unwrap();
+        assert_eq!(gone, vec!["pfx/a.exe".to_string(), "pfx/system32/a.exe".to_string(), name.clone()]);
+        let p = Tar::parse(&r).unwrap();
+        assert!(p.read("pfx/a.exe").is_none());
+        assert!(p.read("pfx/system32/a.exe").is_none());
+        assert!(p.read(&name).is_none());
+        assert_eq!(p.read("pfx/b.txt").unwrap(), b"bee");
+        // pfx/ and b.txt's header and body, and the end.
+        assert_eq!(r.len(), 512 * 3 + 1024);
     }
 }
