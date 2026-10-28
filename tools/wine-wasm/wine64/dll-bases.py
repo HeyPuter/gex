@@ -22,8 +22,10 @@ order given. Keep the list's order stable and only append to it
 assign: PATHS is one image per line, as the server names it (the unix path
 it opened: /wine64/lib/wine/x86_64-windows/x.dll in the page, the dist's own
 path natively). --map says where a path prefix is on this machine, to read
-the image's header. Programs, images without relocations (they cannot
-move) and paths not found are left out, each said once on stderr; a line
+the image's header. A game's program can be given too: one whose base is
+beyond the process's space is otherwise placed by what was mapped before
+it, which moves with the environment. Images without relocations (they
+cannot move) and paths not found are left out, each said once on stderr; a line
 already given is skipped. An image the band has no room left for is left
 out too (said on stderr) and placed as before. --lo starts the assignment
 higher in the band: a game's own DLLs go after the builtins (dll-pins.txt)
@@ -81,8 +83,8 @@ def assign(out, maps, lines, lo=LO):
             print(f'dll-bases: {p}: no PE32+ image at {host}, left out', file=sys.stderr)
             continue
         size, is_dll, movable = info
-        if not is_dll or not movable:
-            print(f'dll-bases: {p}: {"a program" if not is_dll else "no relocations"}, left at its own base', file=sys.stderr)
+        if not movable:
+            print(f'dll-bases: {p}: no relocations, left at its own base', file=sys.stderr)
             continue
         slot = (size + GRANULE - 1) // GRANULE * GRANULE
         if at + slot > (GAME_LO if lo < GAME_LO else HI):
