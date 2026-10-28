@@ -35,19 +35,223 @@ const AVAILABLE = 6;
 const CLOSE = 7;
 const DUP = 8;
 const PEEK = 9;
+const REFILL = 10;
 
 /** Bytes one send or recv carries. A larger send is cut (it returns the count,
  *  as a socket does); a recv takes at most this much. */
 const DATA_BYTES = 1 << 20;
 
-/** The control words and the data buffer a bridge is made of, or null where
- *  the page cannot serve one (no `Atomics.waitAsync`). */
+// Receive rings: what a stream receives, the page writes into a ring in
+// shared memory as it arrives, and a Worker's status, poll and recv read it
+// there, with no call to the page. A slot per open stream (none left: the
+// stream goes through the page's calls), its words at `SLOT_WORDS * slot`:
+const SLOTS = 64;
+const SLOT_WORDS = 8;
+const R_ID = 0; // the stream's id, 0 for a free slot
+const R_STATE = 1; // its state, as `status` returns it
+const R_HEAD = 2; // bytes ever written (wrapping)
+const R_TAIL = 3; // bytes ever taken (wrapping)
+const R_SPILL = 4; // 1: the page holds bytes past what the ring holds
+const R_LOCK = 5; // a reader's (or the page's) claim on the slot
+/** Bytes one ring holds; a power of two. */
+const RING = 256 << 10;
+/** Rings the data buffer grows by: it starts empty, so a page whose guest
+ *  opens no stream holds none. */
+const GROW_SLOTS = 4;
+const S_CONNECTING = 0;
+const S_OPEN = 1;
+const S_CLOSED = 2;
+const S_REFUSED = 3;
+
+/** The control words, the data buffer and the receive rings a bridge is
+ *  made of, or null where the page cannot serve one (no `Atomics.waitAsync`).
+ *  The rings' data grows as streams open (a growable SharedArrayBuffer;
+ *  without one, every stream goes through the page's calls). */
 export function makeNetChannel() {
   if (typeof Atomics.waitAsync !== 'function' || typeof SharedArrayBuffer !== 'function') return null;
+  let rxData = null;
+  try {
+    rxData = new SharedArrayBuffer(0, { maxByteLength: SLOTS * RING });
+    if (typeof rxData.grow !== 'function' || !rxData.growable) rxData = null;
+  } catch {
+    rxData = null;
+  }
   return {
     control: new SharedArrayBuffer(64),
     data: new SharedArrayBuffer(DATA_BYTES),
+    rx: rxData ? new SharedArrayBuffer(4 * SLOTS * SLOT_WORDS) : undefined,
+    rxData: rxData ?? undefined,
   };
+}
+
+/** The receive rings, as the page (`page`: it writes them, for
+ *  `WispNetwork`'s `rings`, net.js) or a Worker (it reads them) sees them. */
+export class Rings {
+  #w;
+  #d;
+  #page;
+  /** id -> slot (-1: none), checked against the slot's id at each use: a
+   *  stream gets its slot as it opens, and ids are never used again. */
+  #at = new Map();
+  #data;
+  constructor(channel, page = false) {
+    this.#w = new Int32Array(channel.rx);
+    // Length-tracking: it sees the buffer as it grows.
+    this.#d = new Uint8Array(channel.rxData);
+    this.#data = channel.rxData;
+    this.#page = page;
+  }
+
+  /** The page: a free slot for stream `id`, or -1. */
+  claim(id) {
+    const w = this.#w;
+    for (let k = 0; k < SLOTS; k++) {
+      const b = k * SLOT_WORDS;
+      if (Atomics.load(w, b + R_ID) !== 0) continue;
+      // Its ring's bytes, before any Worker can find the slot.
+      const need = Math.min(SLOTS, Math.ceil((k + 1) / GROW_SLOTS) * GROW_SLOTS) * RING;
+      if (this.#data.byteLength < need) this.#data.grow(need);
+      this.#locked(b, () => {
+        w[b + R_STATE] = S_CONNECTING;
+        w[b + R_HEAD] = 0;
+        w[b + R_TAIL] = 0;
+        w[b + R_SPILL] = 0;
+        Atomics.store(w, b + R_ID, id);
+      });
+      return k;
+    }
+    return -1;
+  }
+
+  /** The page: slot `k` free again, its stream closed by its last holder. */
+  release(k) {
+    const b = k * SLOT_WORDS;
+    this.#locked(b, () => Atomics.store(this.#w, b + R_ID, 0));
+  }
+
+  /** The slot's lock: a Worker waits for it, the page spins (no waiting on
+   *  its thread), and each holds it only for a copy. */
+  #locked(b, f) {
+    const w = this.#w, me = this.#page ? -1 : 1;
+    for (;;) {
+      const held = Atomics.compareExchange(w, b + R_LOCK, 0, me);
+      if (held === 0) break;
+      if (!this.#page) Atomics.wait(w, b + R_LOCK, held, 1);
+    }
+    try {
+      return f();
+    } finally {
+      Atomics.store(w, b + R_LOCK, 0);
+      if (!this.#page) Atomics.notify(w, b + R_LOCK);
+    }
+  }
+
+  setState(k, st) {
+    Atomics.store(this.#w, k * SLOT_WORDS + R_STATE, st);
+  }
+
+  setSpill(k, on) {
+    Atomics.store(this.#w, k * SLOT_WORDS + R_SPILL, on ? 1 : 0);
+  }
+
+  /** The page: as much of `bytes` as ring `k` has room for, written; how much. */
+  write(k, bytes) {
+    const w = this.#w, b = k * SLOT_WORDS;
+    const head = Atomics.load(w, b + R_HEAD) >>> 0;
+    const free = RING - ((head - (Atomics.load(w, b + R_TAIL) >>> 0)) >>> 0);
+    const n = Math.min(free, bytes.length);
+    if (n <= 0) return 0;
+    const at = head & (RING - 1), base = k * RING;
+    const first = Math.min(n, RING - at);
+    this.#d.set(bytes.subarray(0, first), base + at);
+    if (n > first) this.#d.set(bytes.subarray(first, n), base);
+    Atomics.store(w, b + R_HEAD, (head + n) | 0);
+    return n;
+  }
+
+  /** Stream `id`'s slot word base, or -1 when it has none. */
+  find(id) {
+    const w = this.#w;
+    const k = this.#at.get(id);
+    if (k === -1) return -1;
+    if (k !== undefined && Atomics.load(w, k * SLOT_WORDS + R_ID) === id) return k * SLOT_WORDS;
+    for (let j = 0; j < SLOTS; j++) {
+      if (Atomics.load(w, j * SLOT_WORDS + R_ID) === id) {
+        this.#at.set(id, j);
+        return j * SLOT_WORDS;
+      }
+    }
+    // Closed (its slot gone to another stream), or it never had one.
+    this.#at.set(id, -1);
+    return -1;
+  }
+
+  /** Bytes in the ring at `b`. */
+  queued(b) {
+    return ((Atomics.load(this.#w, b + R_HEAD) >>> 0) - (Atomics.load(this.#w, b + R_TAIL) >>> 0)) >>> 0;
+  }
+
+  spill(b) {
+    return Atomics.load(this.#w, b + R_SPILL) !== 0;
+  }
+
+  /** The stream's state; data that has arrived proves it came up. */
+  status(b) {
+    const st = Atomics.load(this.#w, b + R_STATE);
+    return st === S_CONNECTING && (this.queued(b) || this.spill(b)) ? S_OPEN : st;
+  }
+
+  ended(b) {
+    const st = Atomics.load(this.#w, b + R_STATE);
+    return st === S_CLOSED || st === S_REFUSED;
+  }
+
+  /** `recv` (`peek`: or `recv(MSG_PEEK)`) of stream `id`, as net.js's: the
+   *  bytes, else 0 once it ended and -1 while it may still receive;
+   *  undefined for a stream without a ring. `refill()` moves what the page
+   *  holds past the ring into it, called as the ring empties. */
+  recv(id, out, peek, refill) {
+    const b = this.find(id);
+    if (b < 0) return undefined;
+    if (!out.length) return 0;
+    if (!this.queued(b) && this.spill(b)) refill();
+    const n = this.copy(b, id, out, peek);
+    if (n < 0) return 0;
+    if (n && !peek && this.spill(b)) refill();
+    if (n) return n;
+    return this.ended(b) && !this.spill(b) ? 0 : -1;
+  }
+
+  /** Whether a read of stream `id` would not wait; undefined without a ring. */
+  available(id) {
+    const b = this.find(id);
+    if (b < 0) return undefined;
+    return this.queued(b) > 0 || this.spill(b) || this.ended(b);
+  }
+
+  /** Stream `id`'s state; undefined without a ring. */
+  statusOf(id) {
+    const b = this.find(id);
+    return b < 0 ? undefined : this.status(b);
+  }
+
+  /** Up to `out.length` bytes from the ring at `b` for stream `id` into
+   *  `out`, taken unless `peek`; how many, or -1 when the slot is no longer
+   *  the stream's. */
+  copy(b, id, out, peek) {
+    const w = this.#w;
+    return this.#locked(b, () => {
+      if (Atomics.load(w, b + R_ID) !== id) return -1;
+      const tail = Atomics.load(w, b + R_TAIL) >>> 0;
+      const n = Math.min(out.length, ((Atomics.load(w, b + R_HEAD) >>> 0) - tail) >>> 0);
+      const at = tail & (RING - 1), base = (b / SLOT_WORDS) * RING;
+      const first = Math.min(n, RING - at);
+      out.set(this.#d.subarray(base + at, base + at + first), 0);
+      if (n > first) out.set(this.#d.subarray(base, base + n - first), first);
+      if (!peek) Atomics.store(w, b + R_TAIL, (tail + n) | 0);
+      return n;
+    });
+  }
 }
 
 /** The page's half: run `net` (a `WispNetwork`) when a Worker asks. Returns a
@@ -57,6 +261,7 @@ export function serveNet(net, channel) {
   const data = new Uint8Array(channel.data);
   const dec = new TextDecoder();
   let active = true;
+  if (channel.rx && 'rings' in net) net.rings = new Rings(channel, true);
   const prevActivity = net.onActivity;
   net.onActivity = (...a) => {
     prevActivity?.apply(net, a);
@@ -81,6 +286,7 @@ export function serveNet(net, channel) {
         case CLOSE: net.close(id); break;
         case DUP: r = net.dup ? net.dup(id) : 0; break;
         case PEEK: r = net.peek ? net.peek(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))) : -2; break;
+        case REFILL: r = net.refill?.(id) ?? 0; break;
         default: r = -1;
       }
     } catch (e) {
@@ -107,6 +313,7 @@ export function serveNet(net, channel) {
   return () => {
     active = false;
     net.onActivity = prevActivity;
+    if (channel.rx && 'rings' in net) net.rings = null;
     Atomics.notify(ctl, STATE);
   };
 }
@@ -117,11 +324,13 @@ export class NetProxy {
   #data;
   #enc = new TextEncoder();
   #me;
+  #rings = null;
 
   constructor(channel, me = 1) {
     this.#ctl = new Int32Array(channel.control);
     this.#data = new Uint8Array(channel.data);
     this.#me = me || 1;
+    if (channel.rx) this.#rings = new Rings(channel);
   }
 
   /** The page's network event count (`ACTIVITY`), sampled before a wait. */
@@ -187,7 +396,9 @@ export class NetProxy {
     this.#run(req);
   }
 
-  status(id) { return this.#run(this.#call(STATUS, id)); }
+  status(id) {
+    return this.#rings?.statusOf(id) ?? this.#run(this.#call(STATUS, id));
+  }
 
   send(id, bytes) {
     const n = Math.min(bytes.length, DATA_BYTES);
@@ -197,18 +408,26 @@ export class NetProxy {
   }
 
   recv(id, out) {
+    const r = this.#rings?.recv(id, out, false, () => this.#refill(id));
+    if (r !== undefined) return r;
     return this.#run(this.#call(RECV, id, Math.min(out.length, DATA_BYTES)), (r) => {
       if (r > 0) out.set(this.#data.subarray(0, r), 0);
     });
   }
 
   peek(id, out) {
+    const r = this.#rings?.recv(id, out, true, () => this.#refill(id));
+    if (r !== undefined) return r;
     return this.#run(this.#call(PEEK, id, Math.min(out.length, DATA_BYTES)), (r) => {
       if (r > 0) out.set(this.#data.subarray(0, r), 0);
     });
   }
 
-  available(id) { return this.#run(this.#call(AVAILABLE, id)) === 1; }
+  #refill(id) { this.#run(this.#call(REFILL, id)); }
+
+  available(id) {
+    return this.#rings?.available(id) ?? this.#run(this.#call(AVAILABLE, id)) === 1;
+  }
 
   close(id) { this.#run(this.#call(CLOSE, id)); }
 

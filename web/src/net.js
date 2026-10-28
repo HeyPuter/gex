@@ -30,6 +30,9 @@ class Stream {
     // Descriptors holding the stream, across processes (`dup`): closed when
     // the last lets go, as a socket outlives one of its descriptors.
     this.refs = 1;
+    // Its receive ring's slot (`WispNetwork#rings`), or -1: `chunks` then
+    // holds only what arrived past what the ring had room for.
+    this.slot = -1;
   }
 
   take(out) {
@@ -78,6 +81,11 @@ export class WispNetwork {
   /** The page-served hosts (page-host.mjs `pageHosts`): name -> base URL. */
   #pageHosts = null;
 
+  /** Receive rings in shared memory (net-bridge.mjs `Rings`), set by
+   *  `serveNet`: each stream's bytes go into its ring as they arrive, and its
+   *  Workers read them there without asking the page. Null: none. */
+  rings = null;
+
   /** Called when a stream opens, receives or closes. The single-thread
    *  build wakes its parked fibers here (a guest waiting on a socket sleeps
    *  on the scheduler, not on this thread's event loop). */
@@ -122,7 +130,7 @@ export class WispNetwork {
       c.onerror = fail;
       c.onclose = () => {
         // Every stream on a dropped connection is gone with it.
-        for (const s of this.#streams.values()) if (!s.waiting) s.state = CLOSED;
+        for (const s of this.#streams.values()) if (!s.waiting) this.#state(s, CLOSED);
         if (this.#conn !== c) return;
         this.#conn = null;
         this.#onEvent('closed');
@@ -158,8 +166,16 @@ export class WispNetwork {
   open() {
     if (!this.#conn && !this.#redialing && !this.#pageHosts) return 0;
     const id = this.#next++;
-    this.#streams.set(id, new Stream(id));
+    const s = new Stream(id);
+    if (this.rings) s.slot = this.rings.claim(id);
+    this.#streams.set(id, s);
     return id;
+  }
+
+  /** Stream `s` in state `st`, in its ring too. */
+  #state(s, st) {
+    s.state = st;
+    if (s.slot >= 0) this.rings?.setState(s.slot, st);
   }
 
   /** The shim's `net_connect`: point an already-opened stream at a host. */
@@ -183,7 +199,7 @@ export class WispNetwork {
     try {
       w = this.#conn.create_stream(host, port, 'tcp');
     } catch {
-      s.state = REFUSED;
+      this.#state(s, REFUSED);
       return;
     }
     this.#wire(s, id, w, host, port);
@@ -194,7 +210,7 @@ export class WispNetwork {
     s.wisp = w;
     // The Wisp client reports the connection as open once the proxy has it.
     w.onopen = () => {
-      s.state = OPEN;
+      this.#state(s, OPEN);
       this.onActivity();
     };
     w.onmessage = (data) => {
@@ -225,24 +241,54 @@ export class WispNetwork {
         s.warned = true;
         console.warn(`[wisp] stream ${id}: ${s.buffered >> 20} MiB unread`);
       }
-      s.chunks.push(bytes);
-      s.buffered += bytes.length;
+      this.#take(s, bytes);
       this.onActivity();
     };
     w.onclose = () => {
-      s.state = s.state === CONNECTING ? REFUSED : CLOSED;
+      this.#state(s, s.state === CONNECTING ? REFUSED : CLOSED);
       this.onActivity();
     };
     w.onerror = () => {
-      s.state = s.state === CONNECTING ? REFUSED : CLOSED;
+      this.#state(s, s.state === CONNECTING ? REFUSED : CLOSED);
       this.onActivity();
     };
     // Some builds of the client open synchronously and never fire `onopen`.
-    if (w.open === true || s.wisp?.open === true) s.state = OPEN;
+    if (w.open === true || s.wisp?.open === true) this.#state(s, OPEN);
     this.#onEvent(`connect ${host}:${port}`);
   }
 
+  /** Bytes stream `s` received: into its ring as far as there is room
+   *  and nothing is held back already, the rest kept. */
+  #take(s, bytes) {
+    if (s.slot >= 0 && !s.chunks.length) bytes = bytes.subarray(this.rings.write(s.slot, bytes));
+    if (!bytes.length) return;
+    s.chunks.push(bytes);
+    s.buffered += bytes.length;
+    if (s.slot >= 0) this.rings.setSpill(s.slot, true);
+  }
+
+  /** What stream `id` holds past its ring, into the ring as far as there
+   *  is room (net-bridge.mjs `REFILL`). */
+  refill(id) {
+    const s = this.#streams.get(id);
+    if (!s || s.slot < 0) return 0;
+    while (s.chunks.length) {
+      const head = s.chunks[0];
+      const n = this.rings.write(s.slot, head);
+      s.buffered -= n;
+      if (n < head.length) {
+        s.chunks[0] = head.subarray(n);
+        break;
+      }
+      s.chunks.shift();
+    }
+    this.rings.setSpill(s.slot, s.chunks.length > 0);
+    return 1;
+  }
+
   status(id) {
+    const ring = this.rings?.statusOf(id);
+    if (ring !== undefined) return ring;
     const s = this.#streams.get(id);
     if (!s) return CLOSED;
     // Data that has arrived proves the connection came up, whatever the
@@ -270,6 +316,8 @@ export class WispNetwork {
   }
 
   recv(id, out) {
+    const ring = this.rings?.recv(id, out, false, () => this.refill(id));
+    if (ring !== undefined) return ring;
     const s = this.#streams.get(id);
     if (!s) return 0;
     if (!s.chunks.length) return s.state === CLOSED || s.state === REFUSED ? 0 : -1;
@@ -280,6 +328,8 @@ export class WispNetwork {
    *  readable stream socket (one byte, MSG_PEEK), to tell data from the far
    *  end having closed. */
   peek(id, out) {
+    const ring = this.rings?.recv(id, out, true, () => this.refill(id));
+    if (ring !== undefined) return ring;
     const s = this.#streams.get(id);
     if (!s) return 0;
     if (!s.chunks.length) return s.state === CLOSED || s.state === REFUSED ? 0 : -1;
@@ -287,6 +337,8 @@ export class WispNetwork {
   }
 
   available(id) {
+    const ring = this.rings?.available(id);
+    if (ring !== undefined) return ring;
     const s = this.#streams.get(id);
     if (!s) return true;
     return s.chunks.length > 0 || s.state === CLOSED || s.state === REFUSED;
@@ -312,5 +364,6 @@ export class WispNetwork {
       /* already gone */
     }
     this.#streams.delete(id);
+    if (s.slot >= 0) this.rings?.release(s.slot);
   }
 }
