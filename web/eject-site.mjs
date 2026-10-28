@@ -50,6 +50,8 @@ if (!project || !out) {
   process.exit(2);
 }
 const level = opt('--level', '19');
+// zstd's levels past 19 need --ultra.
+const zlev = Number(level) > 19 ? `--ultra -${level}` : `-${level}`;
 // --rest-frame MiB: the bundle split's lazy files as the rest bundle (one tar
 // in independent zstd frames of this size; restBundle), not one file each.
 // --rest-order FILE: guest paths, one a line, first in the tar in that order
@@ -87,7 +89,7 @@ function place(src, path, { plain = false } = {}) {
   }
   const bytes = readFileSync(src);
   const z = join(zcache, `${sha(bytes)}-${level}.zst`);
-  if (!existsSync(z)) execFileSync('zstd', [`-${level}`, '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
+  if (!existsSync(z)) execFileSync('zstd', [...zlev.split(' '), '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
   copyFileSync(z, `${dst}.zst`);
   if (plain) copyFileSync(src, dst);
   // `h`: the content, by which the page keeps the file across builds.
@@ -106,7 +108,7 @@ function coldPack(dir, path) {
   mkdirSync(z, { recursive: true });
   for (let i = 0; i < n; i++) copyFileSync(join(dir, `${i}.wasm`), join(z, `${i}.wasm`));
   // Thousands of small frames: many zstd processes at once, each a batch.
-  execFileSync('sh', ['-c', `ls | grep '\\.wasm$' | xargs -P 16 -n 256 zstd -${level} -q -f`], { cwd: z });
+  execFileSync('sh', ['-c', `ls | grep '\\.wasm$' | xargs -P 16 -n 256 zstd ${zlev} -q -f`], { cwd: z });
   const frames = [];
   const zl = new Uint32Array(n), ul = new Uint32Array(n);
   for (let i = 0; i < n; i++) {
@@ -118,7 +120,7 @@ function coldPack(dir, path) {
   mkdirSync(join(out, path), { recursive: true });
   writeFileSync(join(out, path, 'cold.bin'), Buffer.concat(frames));
   const raw = Buffer.concat([Buffer.from(new Uint32Array([n]).buffer), Buffer.from(zl.buffer), Buffer.from(ul.buffer)]);
-  const zi = execFileSync('zstd', [`-${level}`, '-q', '-c'], { input: raw });
+  const zi = execFileSync('zstd', [...zlev.split(' '), '-q', '-c'], { input: raw });
   const head = Buffer.alloc(4);
   head.writeUInt32LE(raw.length);
   writeFileSync(join(out, path, 'cold.idx'), Buffer.concat([head, zi]));
@@ -178,7 +180,7 @@ function restBundle(lazy, store) {
   const tarSize = at;
   flush(true);
   // Each frame on its own; many zstd processes at once.
-  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd -${level} -q -f`], { cwd: dir });
+  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd ${zlev} -q -f`], { cwd: dir });
   const frames = [];
   let off = 0;
   mkdirSync(join(out, 'project/build/web'), { recursive: true });
