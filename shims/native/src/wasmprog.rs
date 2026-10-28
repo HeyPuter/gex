@@ -74,6 +74,15 @@ pub(crate) fn flags(program: &Program) -> u32 {
         .unwrap_or(0)
 }
 
+/// Whether `wasm` imports a memory that is not a 64-bit one.
+fn imports_memory32(wasm: &[u8]) -> bool {
+    for p in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(wasmparser::Payload::ImportSection(r)) = p else { continue };
+        return r.into_iter().flatten().any(|i| matches!(i.ty, wasmparser::TypeRef::Memory(m) if !m.memory64));
+    }
+    false
+}
+
 /// If the program just placed is a native wasm32 one, install its module
 /// in the function table at its entries. Returns whether it was.
 pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, program: &Program) -> Result<bool> {
@@ -97,6 +106,13 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
         .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
         .to_vec();
+    // A wasm32 module imports a 32-bit memory: one host process is one
+    // memory flavour, so a run that started with a 64-bit memory (`--mem64`,
+    // or what an earlier run of its first program learned) cannot run it.
+    if gex_abi::mem64() && imports_memory32(&wasm) {
+        let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
+        bail!("{path}: a wasm32 program, which needs a 32-bit memory, and this run has a 64-bit one (run its first program with --mem32)");
+    }
     // 32-bit Wine's loader: refused when its inline probe reads another layout.
     if flags(program) & FLAG_GUEST_I386 != 0 {
         let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
