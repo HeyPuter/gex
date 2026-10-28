@@ -14650,7 +14650,7 @@ pub extern "C" fn gex_after_trap(installed: u32, wasmdll_have: u32, flags: u32) 
         || cgen::libprov::guest_calls_open()
         || gex_has_host() == 0
         || regview::count() > installed
-        || cgen::serve_due(units, units || fjit::on(), wasmdll_have)
+        || cgen::serve_due(units, wasmdll_have)
         || vfork::gex_vfork_ok() != -2
         || FORK.with(|f| f.get()[0]) != 0
         || THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0

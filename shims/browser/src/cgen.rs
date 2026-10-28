@@ -1049,13 +1049,15 @@ fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
 
 /// Whether JS's `#cgenServe` has anything to do (`gex_after_trap`): a
 /// program to publish, providers or re-bridges, a new process's rescan,
-/// the function table's log or late bindings to replay (`catch`: JS
-/// replays them, `wasmdll_have` of the bindings so far), or a unit
-/// wanted (`units`: JS serves them).
-pub(crate) fn serve_due(units: bool, catch: bool, wasmdll_have: u32) -> bool {
+/// the function table's log or late bindings to replay (`wasmdll_have` of
+/// the bindings so far: JS replays both in every mode, a wasm32 program's
+/// module coming through the log with units off), or a unit wanted
+/// (`units`: JS serves them).
+pub(crate) fn serve_due(units: bool, wasmdll_have: u32) -> bool {
     wasmprog::staged_any()
         || elfprov::due()
-        || (catch && (behind() || wasmdll::binds_len() > wasmdll_have))
+        || behind()
+        || wasmdll::binds_len() > wasmdll_have
         || (units && u_oldest(|st| st & U_CLAIMED != 0).is_some())
 }
 
