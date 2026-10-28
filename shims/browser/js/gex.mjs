@@ -2541,7 +2541,7 @@ export class Gex {
 
   /** The kernel, shim and guest instances on this Worker's memory: what
    *  `attach` starts with, and what `preattach` does ahead of a process. */
-  async #instantiate(shimWasm, guestWasm, _at = () => {}) {
+  async #instantiate(shimWasm, guestWasm, _at = () => {}, { stack = true } = {}) {
     await this.#startKernel();
     _at('kernel started');
     // A compiled `Module` if the host has one, bytes otherwise: passing a
@@ -2560,8 +2560,11 @@ export class Gex {
     _at('shim instantiated');
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own
-    // and must be told where it goes.
-    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+    // and must be told where it goes. Not yet for a runtime made ahead of
+    // its process (`preattach`): the stack is the arena's first claim, and
+    // how the arena is laid out is the process's (its start message's
+    // `?winesplit=1`, which arrives after).
+    if (stack) this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -2598,7 +2601,7 @@ export class Gex {
    * a forked child) leaves this Gex unused.
    */
   async preattach(shimWasm, guestWasm) {
-    await this.#instantiate(shimWasm, guestWasm);
+    await this.#instantiate(shimWasm, guestWasm, undefined, { stack: false });
     this.#preattached = true;
   }
 
@@ -2627,8 +2630,10 @@ export class Gex {
   async attach(shimWasm, guestWasm, { devices = true } = {}) {
     const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
     _at('start');
-    if (this.#preattached) this.#preattached = false;
-    else await this.#instantiate(shimWasm, guestWasm, _at);
+    if (this.#preattached) {
+      this.#preattached = false;
+      this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+    } else await this.#instantiate(shimWasm, guestWasm, _at);
     // The devices this process has -- process-wide flags in shared memory, so
     // only a *process* sets them. A thread answering for itself would turn a
     // GPU or network off underneath the threads using it. Before the kernel is
