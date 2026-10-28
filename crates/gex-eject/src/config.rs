@@ -149,6 +149,10 @@ pub struct Config {
     /// "Helpers"); `"keep"`, the default for a config without the setting,
     /// ships the prefix as recorded.
     pub helpers_strip: bool,
+    /// Wine pages: `"desktop": "none"` runs the program with no desktop
+    /// process (crates/gex-eject/README.md, "Desktop"); `"explorer"`, the
+    /// default for a config without the setting, keeps Wine's.
+    pub desktop_none: bool,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (crates/gex-eject/README.md,
@@ -180,6 +184,7 @@ impl Default for Config {
             resources_trim: false,
             services: Vec::new(),
             helpers_strip: false,
+            desktop_none: false,
             start: "{}".to_string(),
         }
     }
@@ -226,7 +231,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "desktop" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -434,6 +439,12 @@ impl Config {
             Some(Json::Str(x)) if x == "strip" => true,
             Some(_) => bail!("{what}: \"helpers\" is \"strip\" or \"keep\""),
         };
+        c.desktop_none = match v.get("desktop") {
+            None | Some(Json::Null) => false,
+            Some(Json::Str(x)) if x == "explorer" => false,
+            Some(Json::Str(x)) if x == "none" => true,
+            Some(_) => bail!("{what}: \"desktop\" is \"none\" or \"explorer\""),
+        };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
             Some(_) => Some(json::str_list(&v, "args", what)?),
@@ -472,6 +483,9 @@ mod tests {
         assert!(!Config::from_json(r#"{"helpers": "keep"}"#).unwrap().helpers_strip);
         assert!(Config::from_json(r#"{"helpers": "strip"}"#).unwrap().helpers_strip);
         assert!(Config::from_json(r#"{"helpers": true}"#).is_err());
+        assert!(!Config::from_json("{}").unwrap().desktop_none);
+        assert!(Config::from_json(r#"{"desktop": "none"}"#).unwrap().desktop_none);
+        assert!(Config::from_json(r#"{"desktop": "thread"}"#).is_err());
     }
 
     #[test]

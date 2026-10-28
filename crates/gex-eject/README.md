@@ -694,12 +694,36 @@ setting, ship the prefix as recorded.
   `plugplay.exe` and the `winedevice.exe` that hosts the drivers off the
   start-up path. An entry in `"services"` for one of them wins.
 - `winemenubuilder.exe` is left out of the bundle, from the prefix and from
-  Wine's own directories, along with its unit. Wine starts it to write
-  desktop menu entries, which a page has none of; with no file, the start
-  fails at once and Wine goes on.
+  Wine's own directories, along with its unit, and out of the prefix's
+  `RunServices`, where `wineboot --init` starts it each session to write
+  desktop menu entries, which a page has none of.
 
-`services.exe` and `rpcss.exe` stay: a program that makes a COM call starts
-`rpcss` through the service manager, and fails without it.
+`services.exe` stays: `wineboot` starts it, and a program that asks for a
+service (`rpcss` for COM between processes, say) goes through it.
+
+### Desktop
+
+`"desktop": "none"` runs the program with no desktop process: no
+`explorer.exe /desktop`, which Wine otherwise starts from the prefix's
+`RunServices` and again whenever a program finds no desktop window.
+`gexc eject` writes it into a new Wine project's `user/eject.json` with
+`"helpers": "strip"`. `"explorer"`, and a config without the setting, keep
+Wine's desktop.
+
+The build takes the desktop out of `RunServices` and starts the page with
+`WINEGEX_NO_DESKTOP=winewayland.drv`. With that, Wine's `win32u` gives
+every process the desktop window services get: the wineserver makes it and
+no thread owns it. Each process loads the display driver itself, which the
+desktop process would otherwise name, and sizes the desktop window to the
+screen, at its start and after a display mode change.
+
+What it is for: the desktop process is a process start, a Worker and its
+memory, and Wine's other processes wait for its window. A fullscreen game
+draws only its own windows. What goes with it: the desktop window has no
+window procedure (messages to it are dropped), and there is no shell
+(taskbar, tray), clipboard manager or local COM server registration
+(`ShellWindows`) that explorer would provide. A windowed program, or one
+that needs any of these, keeps `"explorer"`.
 
 ### Pruning
 

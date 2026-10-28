@@ -420,7 +420,9 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                resource the site's locale and DPI cannot load (\"whole\": every one); see \
                crates/gex-eject/README.md, \"Resources\". \"helpers\": \"strip\" leaves out the Wine \
                helper programs and services a game does not need (\"keep\": the prefix as recorded); \
-               see crates/gex-eject/README.md, \"Helpers\". \
+               see crates/gex-eject/README.md, \"Helpers\". \"desktop\": \"none\" runs the program \
+               with no desktop process, for a fullscreen game (\"explorer\": Wine's); see \
+               crates/gex-eject/README.md, \"Desktop\". \
                \"start\": defaults for the app library's start() \
                (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
@@ -435,6 +437,7 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
         // language already: whole until trimming earns its pass.
         ("resources", s(if wine64 { "whole" } else { "trim" })),
         ("helpers", s(if strip { "strip" } else { "keep" })),
+        ("desktop", s(if strip { "none" } else { "explorer" })),
         ("start", obj(vec![])),
     ]))
 }
@@ -658,6 +661,62 @@ fn set_services(v: &Json, web: &Path, services: &[(String, u32, bool)]) -> Resul
     write_file(&path, &bytes, false)?;
     eprintln!("gexc eject build: \"services\": {}", said.join(", "));
     Ok(())
+}
+
+/// `"desktop": "none"`: the display driver every process loads itself,
+/// with no desktop process to name it (Wine's `WINEGEX_NO_DESKTOP`).
+const NO_DESKTOP_DRIVER: &str = "winewayland.drv";
+
+/// `system.reg`'s text without `names`' values in its `RunServices` key,
+/// and the names it had.
+fn run_services_without(text: &str, names: &[&str]) -> (String, Vec<String>) {
+    let head = "[software\\\\microsoft\\\\windows\\\\currentversion\\\\runservices]";
+    let lower = text.to_ascii_lowercase();
+    let Some(at) = lower.find(head) else { return (text.to_string(), Vec::new()) };
+    let end = lower[at + head.len()..].find("\n[").map_or(lower.len(), |e| at + head.len() + e);
+    let mut out = String::with_capacity(text.len());
+    let mut gone = Vec::new();
+    let mut here = 0;
+    for line in text.split_inclusive('\n') {
+        let start = here;
+        here += line.len();
+        let value = line.to_ascii_lowercase();
+        if start > at && start < end {
+            if let Some(n) = names.iter().find(|n| value.starts_with(&format!("\"{}\"=", n.to_ascii_lowercase()))) {
+                gone.push(n.to_string());
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    (out, gone)
+}
+
+/// Takes `names` out of the prefix's `RunServices` (the programs
+/// `wineboot --init` starts each session) in web/rootfs.tar's `system.reg`.
+/// A name the key does not have is passed over. Returns the ones taken out.
+fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>> {
+    let what = crate::project::PROJECT_FILE;
+    let path = web.join("rootfs.tar");
+    let bytes = std::fs::read(&path)?;
+    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
+    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+    let want = format!("{prefix}/system.reg");
+    let text = {
+        let tar = crate::reach::Tar::parse(&bytes)?;
+        let reg = tar.read(&want).ok_or_else(|| anyhow!("the bundle has no {want}"))?;
+        String::from_utf8_lossy(reg).into_owned()
+    };
+    let (out, gone) = run_services_without(&text, names);
+    if gone.is_empty() {
+        return Ok(gone);
+    }
+    let new = crate::reach::tar_put(&bytes, &want, out.as_bytes())?;
+    // web/rootfs.tar may be a hard link to the project's bundle.
+    std::fs::remove_file(&path)?;
+    write_file(&path, &new, false)?;
+    eprintln!("gexc eject build: RunServices without {}", gone.join(", "));
+    Ok(gone)
 }
 
 /// A path's last component, either separator.
@@ -966,6 +1025,16 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     if !services.is_empty() {
         set_services(&v, &web, &services)?;
     }
+    let mut run_off = Vec::new();
+    if config.helpers_strip {
+        run_off.push("winemenubuilder");
+    }
+    if config.desktop_none {
+        run_off.push("desktop");
+    }
+    if !run_off.is_empty() {
+        drop_run_services(&v, &web, &run_off)?;
+    }
     let site_key = |k: &str| rekeyed.get(k).cloned().unwrap_or_else(|| k.to_string());
     let instrument = config.cold.as_deref() == Some("instrument");
     // `user/select.json` (`gexc units select`): the slots to ship, in place
@@ -1216,7 +1285,18 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         ("xattrs", Json::Obj(xattrs.into_iter().map(|(p, a)| (p, Json::Obj(a.into_iter().map(|(n, v)| (n, s(&v))).collect()))).collect())),
         ("exe", rec.get("exe").cloned().unwrap_or(Json::Null)),
         ("argv", rec.get("argv").cloned().unwrap_or(Json::Arr(Vec::new()))),
-        ("env", rec.get("env").cloned().unwrap_or(Json::Arr(Vec::new()))),
+        ("env", {
+            let mut env: Vec<Json> = match rec.get("env") {
+                Some(Json::Arr(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            // `"desktop": "none"`: no desktop process; each loads the driver.
+            if config.desktop_none {
+                env.retain(|e| !e.as_str().is_some_and(|x| x.starts_with("WINEGEX_NO_DESKTOP=")));
+                env.push(s(format!("WINEGEX_NO_DESKTOP={NO_DESKTOP_DRIVER}")));
+            }
+            Json::Arr(env)
+        }),
         ("cwd", rec.get("cwd").cloned().unwrap_or(s("/"))),
         ("mtimes", rec.get("mtimes").cloned().unwrap_or(json::b(false))),
         // The size the recording asked for ("fit": the page's), not the one
@@ -1263,6 +1343,20 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         false,
     )?;
     Ok(Wine32Report { features_off: off, page_files, units: units.len() })
+}
+
+#[cfg(test)]
+mod run_services_tests {
+    use super::*;
+
+    #[test]
+    fn takes_values_out_of_run_services_only() {
+        let reg = "[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunServices] 1\n#time=1\n\"winemenubuilder\"=\"a\"\n\"desktop\"=\"b\"\n\n[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunServicesOnce] 1\n\"desktop\"=\"c\"\n";
+        let (out, gone) = run_services_without(reg, &["desktop", "absent"]);
+        assert_eq!(gone, vec!["desktop".to_string()]);
+        assert!(out.contains("\"winemenubuilder\"=\"a\"\n\n"));
+        assert!(out.ends_with("RunServicesOnce] 1\n\"desktop\"=\"c\"\n"));
+    }
 }
 
 #[cfg(test)]
