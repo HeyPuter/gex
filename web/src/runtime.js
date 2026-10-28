@@ -14,6 +14,7 @@ import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { logNamed, logOn } from '../../shims/browser/js/log.mjs';
+import { startOptions } from '../../shims/browser/js/options.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
@@ -1086,6 +1087,8 @@ async function runProgramHere(
       kernel: kernel.module,
     }) : null,
     extra: {
+      // The switches every page takes (shims/browser/js/options.mjs).
+      ...startOptions('extra'),
       // In `extra` so every Worker gets it, not only pid 1: the interesting
       // process is the X server and the client it forks, not the demo's shell.
       heartbeat: heartbeat || undefined,
@@ -1093,11 +1096,6 @@ async function runProgramHere(
       lazyCache: lazyCache || undefined,
       restBundle: restBundle || undefined,
       identities: identities || undefined,
-      // How many traps a forked child takes before it stops waiting to be an
-      // `execve` and installs its parent's modules.
-      adoptAfter: typeof globalThis.GEX_ADOPT_AFTER === "number"
-        ? globalThis.GEX_ADOPT_AFTER
-        : undefined,
       // The closure's libraries, in `extra` so a forked child gets them too: a
       // child adopts its parent's dispatch directory but its own tables start
       // empty, so it must instantiate the modules itself for the directory to
@@ -1144,34 +1142,6 @@ async function runProgramHere(
       debugExit:
         !!globalThis.GEX_DEBUG_EXIT ||
         (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
-      // Label process/thread Worker exits without `debugExit`'s expensive
-      // mirroring of every guest write.
-      exitTrace: !!globalThis.GEX_EXIT_TRACE,
-      // The engine's wasm-frame stack for a trap, in every process. In `extra`
-      // because a trap that matters happens in a Worker, and a global set in
-      // the page is not visible there.
-      trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
-      // `?doorstats=1`: wineserver door call counts every 10 s.
-      // (a number past 1: the line's period in ms)
-      doorStats: globalThis.GEX_DOOR_STATS || undefined,
-      fcacheStats: globalThis.GEX_FCACHE_STATS || undefined,
-      // `?timescale=N&fixedtime=S` (benchmarks only): the monotonic clocks
-      // N times real speed, the wall clock starting at Unix time S.
-      timeScale: globalThis.GEX_TIME_SCALE || undefined,
-      fixedTime: globalThis.GEX_FIXED_TIME || undefined,
-      calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,
-      // `?straytrap=1`: native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
-      strayTrap: globalThis.GEX_STRAY_TRAP || undefined,
-      // `?winesplit=1`: 32-bit Wine's address space split at 2 GiB (nt::wine32_space), in every process.
-      wine32Split: globalThis.GEX_WINE32_SPLIT || undefined,
-      // `?nullguard=1`: the null guard, a debugging opt-in (gex_abi::null_guard).
-      nullGuard: globalThis.GEX_NULL_GUARD || undefined,
-      // `?mxcsr=1`: SSE under MXCSR, a per-program opt-in (gex_ir::mxcsr_exact).
-      mxcsr: globalThis.GEX_MXCSR || undefined,
-      // `?pinregion=BYTES`: an ejected project's libraries' region (gex_abi::set_pin_region).
-      pinRegion: globalThis.GEX_PIN_REGION || undefined,
-      // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
-      sehReport: globalThis.GEX_SEH_REPORT || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
@@ -1189,38 +1159,22 @@ async function runProgramHere(
       // miss stops the run, saying where).
       jit: globalThis.GEX_NO_JIT ? false : undefined,
       aot: globalThis.GEX_AOT ? true : undefined,
-      denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       // `?mem64=1`: every Worker of the process builds or joins a 64-bit memory.
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
       // `?fjit=1`: the function JIT in every process.
       fjit: globalThis.GEX_FJIT || undefined,
       // `?xcache=1`: the translation cache across page loads.
       xcache: xcacheName(),
-      // `?liftmax=N`: blocks one dispatch miss may lift (default 2048).
-      liftMax: globalThis.GEX_LIFT_MAX || undefined,
-      // `?inlinedispatch=1`: dispatch inline in every block, as before.
-      inlineDispatch: globalThis.GEX_INLINE_DISPATCH || undefined,
-      // `?xlatereport=N`: a translator progress line every N translations.
-      xlateReport: globalThis.GEX_XLATE_REPORT || undefined,
-      // `?t1fold=1`: tier-1's tee folding (gex-emit `set_t1_fold`).
-      t1Fold: globalThis.GEX_T1_FOLD || undefined,
       // `?unitcache=1`: compiled translation units shared by every process.
       unitCache: globalThis.GEX_UNIT_CACHE || undefined,
-      // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
-      wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
-      // `?provskip=export,...`: exports no provider binds (gex-cgen `set_skip`).
-      providerSkip: globalThis.GEX_PROVIDER_SKIP || undefined,
       // Provider sources from outside gex (`name\ntext` entries, NUL
       // between): an ejected project's, as GEX_PROVIDER_DIRS natively.
       providerSources: providerSources || globalThis.GEX_PROVIDER_SOURCES || undefined,
       // `dll=file,...`: stateful providers replacing Windows libraries, their
       // modules under the unit cache (cgen.rs `set_stateful`).
       stateful: stateful || globalThis.GEX_STATEFUL || undefined,
-      // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
-      fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
-      traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?dlchecked=1`: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
       dlChecked: flag('dlchecked') ? 1 : undefined,
       // `?jitdiag=1`: retire counts by page and call, and the watch on a page that keeps translating.
@@ -1231,11 +1185,6 @@ async function runProgramHere(
       // (shims/browser/js/log.mjs); every Worker is handed it.
       log: (globalThis.GEX_LOG ??= flag('log') || undefined) || undefined,
       preModules: preModules ?? undefined,
-      // `?forkskip=N`, in `extra` because the process that acts on it is a
-      // forked child, not the page's own.
-      forkSkip: typeof globalThis.GEX_FORK_SKIP_MIB === 'number'
-        ? globalThis.GEX_FORK_SKIP_MIB
-        : undefined,
       // Lightweight adopt-phase narration (no write-flood); see adoptProcess.
       adoptTrace:
         !!globalThis.GEX_ADOPT_TRACE ||
@@ -1360,12 +1309,9 @@ async function runProgramHere(
       // its own translated code does not expect.
       opts: {
         cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, mtimes, xattrs, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
-        // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
-        strace: globalThis.GEX_STRACE ? 1 : undefined,
-        // `?stracepid=N`: narrate that one process, which is affordable.
-        stracePid: globalThis.GEX_STRACE_PID || undefined,
-        // `?straceexe=NAME`: the process that execs NAME, whatever its pid.
-        straceExe: globalThis.GEX_STRACE_EXE || undefined,
+        // `?strace=1`, `?stracepid=N`, `?straceexe=NAME` (options.mjs): every
+        // child inherits them, see `#opts` in gex.mjs.
+        ...startOptions('opts'),
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.
         //

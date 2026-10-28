@@ -9,6 +9,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { loadRuntime, fetchBytes, runProgram } from './runtime.js';
 import { untar } from './tar.js';
 import { DEMOS } from './demos.js';
+import { pageOptions } from '../../shims/browser/js/options.mjs';
 
 const $ = (id) => document.getElementById(id);
 
@@ -284,18 +285,15 @@ for (const [event, describe] of [
   // The same switches the harness page has, through globals because the demos
   // call `runProgram` with their own arguments and there is no seam to pass one
   // through.
-  if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
+  // The switches every page takes (shims/browser/js/options.mjs).
+  pageOptions((k) => params.get(k));
   // `?recompile=N`: KiB of mapped text per object to statically recompile once
   // hot, 0 to arrive one dispatch miss at a time. On by default here, off under
   // `run-node.mjs` -- a difference that has to be switchable to attribute a
   // fault to one host.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
-  if (params.has('liftmax')) globalThis.GEX_LIFT_MAX = Number(params.get('liftmax'));
   // The page-wide unit cache is on unless `?unitcache=0`.
   globalThis.GEX_UNIT_CACHE = params.has('unitcache') ? Number(params.get('unitcache')) : 1;
-  if (params.has('t1fold')) globalThis.GEX_T1_FOLD = Number(params.get('t1fold'));
-  if (params.has('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(params.get('xlatereport'));
-  if (params.has('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(params.get('inlinedispatch'));
   // `?link=1`: keep the address space the guest's `ld.so` produced and start
   // the next process of the same program from it.
   if (params.has('link')) globalThis.GEX_LINK = Number(params.get('link'));
@@ -306,34 +304,6 @@ for (const [event, describe] of [
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
   }
-  if (params.get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
-  // `?strace=1`: narrate every syscall of every process, the shim's own
-  // `--strace`. A flood -- tens of thousands of lines a second -- but the only
-  // instrument that says what a process did *last* before it stopped, and the
-  // option is inherited by children, which is where the interesting ones are.
-  if (params.get('strace')) globalThis.GEX_STRACE = 1;
-  // `?stracepid=N`: the same narration for one process only -- a page survives
-  // a shell's syscalls, not a session's.
-  if (params.has('stracepid')) globalThis.GEX_STRACE_PID = Number(params.get('stracepid'));
-  // `?trapstack=1`: the engine's stack for a trap -- which names the shim
-  // function the fault was in -- without `?debug`'s mirroring of every guest
-  // write to the console. That mirroring is not free: it changed the timing
-  // enough to turn an `unreachable` in a forked apt method into a different
-  // fault, so the one switch could not be used to diagnose the other.
-  if (params.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
-  if (params.get('doorstats')) globalThis.GEX_DOOR_STATS = Number(params.get('doorstats')) || 1;
-  // `?forkskip=N`: a forked child does not copy any inherited region larger
-  // than N MiB, leaving those pages zero. A diagnostic, and a destructive one:
-  // if the guest reads one it gets zeros. It answers the question a real
-  // copy-on-write would answer for free -- how much of what a fork copies the
-  // child ever actually looks at. See `adoptProcess`.
-  if (params.has('forkskip')) globalThis.GEX_FORK_SKIP_MIB = Number(params.get('forkskip'));
-  // `?adopttrace=1`: narrate adopt phases only (no debugExit write-flood), fast
-  // enough to reach a deep fork and show where its adopt hangs.
-  if (params.get('adopttrace')) globalThis.GEX_ADOPT_TRACE = 1;
-  // `?attachtrace=1`: narrate a thread Worker's attach/adopt, to catch a
-  // stranded thread whose wasm instantiate never returns.
-  if (params.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);

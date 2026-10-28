@@ -43,6 +43,7 @@ import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
 import { spareMemories } from './lazy-fetch.mjs';
 import { pageHosts } from './page-host.mjs';
+import { envOptions } from './options.mjs';
 
 /** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
  *  a directory against this one. */
@@ -525,6 +526,9 @@ const host = new ProcessHost({
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
+    // The switches run-node.mjs takes from the environment, as the page from its
+    // URL (options.mjs).
+    ...envOptions(process.env, 'extra'),
     // Which memory every process gets; must match the artefacts chosen above.
     shared: SHARED,
     // GEX_CLOSURE names the stem a closure build wrote; each
@@ -549,29 +553,9 @@ const host = new ProcessHost({
     // GEX_WL_TRACE: narrate the wayland protocol (the wasm shim has no env, so
     // the host flips the switch via gex_set_wl_trace in the worker).
     wlTrace: process.env.GEX_WL_TRACE ? 1 : undefined,
-    attachTrace: !!process.env.GEX_ATTACH_TRACE,
     // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
-    denseDebug: !!process.env.GEX_DENSE_DEBUG,
-    // GEX_ADOPT_AFTER=N: traps a forked child takes before adopting its
-    // parent's modules (0: all of them at the fork). See `adoptAfterTraps`.
-    adoptAfter: process.env.GEX_ADOPT_AFTER !== undefined ? Number(process.env.GEX_ADOPT_AFTER) : undefined,
     mem64: MEM64,
-    // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
-    wasmDlls: process.env.GEX_WASM_DLLS || undefined,
-    calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
-    // GEX_STRAY_TRAP=1: as the page's ?straytrap=1 (cgen.rs STRAY_TRAP).
-    strayTrap: !!process.env.GEX_STRAY_TRAP,
-    // GEX_WINE32_SPLIT=1: as the page's ?winesplit=1 (winspace::wine32_space).
-    wine32Split: !!process.env.GEX_WINE32_SPLIT,
-    // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
-    nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
-    // GEX_MXCSR=1: as the page's ?mxcsr=1 (gex_ir::mxcsr_exact).
-    mxcsr: process.env.GEX_MXCSR === '1' || undefined,
-    // GEX_PIN_REGION=BYTES: as the page's ?pinregion= (gex_abi::set_pin_region).
-    pinRegion: process.env.GEX_PIN_REGION ? Number(process.env.GEX_PIN_REGION) : undefined,
-    // GEX_SEH_REPORT=1: as the page's ?sehreport=1.
-    sehReport: process.env.GEX_SEH_REPORT === '1' || undefined,
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
     // its start (a test-only switch).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
@@ -580,24 +564,16 @@ const host = new ProcessHost({
     testUd2Entry: process.env.GEX_TEST_UD2_ENTRY === '1' || undefined,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
-    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
-    // GEX_LIFT_MAX=N: blocks one dispatch miss may lift (default 2048).
-    liftMax: process.env.GEX_LIFT_MAX ? Number(process.env.GEX_LIFT_MAX) : undefined,
-    // GEX_INLINE_DISPATCH=1: dispatch inline in every block (gex-emit's old form).
-    inlineDispatch: process.env.GEX_INLINE_DISPATCH ? 1 : undefined,
-    // GEX_XLATE_REPORT=N: a translator progress line every N translations.
-    xlateReport: process.env.GEX_XLATE_REPORT ? Number(process.env.GEX_XLATE_REPORT) : undefined,
     // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
     // 2 folded call targets, 4 successors).
     discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
-    // GEX_T1_FOLD=1: tier-1's tee folding (gex-emit `set_t1_fold`).
-    t1Fold: process.env.GEX_T1_FOLD ? 1 : undefined,
     // Compiled translation units shared by every process, unless GEX_UNIT_CACHE=0.
     unitCache: process.env.GEX_UNIT_CACHE === '0' ? undefined : 1,
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     // GEX_LOG=1: gex's debug output (log.mjs); Workers see the environment too.
     log: process.env.GEX_LOG || undefined,
+    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
     // runs, saved under that name.
@@ -613,8 +589,6 @@ const host = new ProcessHost({
     // GEX_ELF_UNITS=name,...: shared objects that get their function-tier
     // unit from the cache at the bias they map at (the page's `?elfunits=`).
     elfUnits: process.env.GEX_ELF_UNITS || undefined,
-    // GEX_PROVIDER_SKIP=export,...: as natively (gex-cgen `set_skip`).
-    providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
     fillTime: !!process.env.GEX_FILL_TIME,
     // GEX_PROVIDER_DIRS=dir[:dir...]: provider sources from outside gex, as
     // natively (gex-cgen `add_sources`): every dir's *.c, named by stem.
@@ -623,12 +597,6 @@ const host = new ProcessHost({
     // libraries, their modules under the unit cache (cgen.rs `set_stateful`).
     stateful: process.env.GEX_STATEFUL || undefined,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
-    // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
-    trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,
-    // GEX_DOOR_STATS: wineserver door call counts every 10 s.
-    doorStats: process.env.GEX_DOOR_STATS ? Number(process.env.GEX_DOOR_STATS) || 1 : undefined,
-    // GEX_FCACHE_STATS=1: the function probe cache's misses, every 10 s.
-    fcacheStats: process.env.GEX_FCACHE_STATS ? 1 : undefined,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,
@@ -647,7 +615,6 @@ const host = new ProcessHost({
     // GEX_TRACE is the syscall log, large enough to want a question already
     // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
-    traceMisses: !!process.env.GEX_TRACE_MISSES,
     // GEX_DL_CHECKED_CALLS=1: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
     dlChecked: process.env.GEX_DL_CHECKED_CALLS === '1',
     // GEX_JIT_DIAG: retire counts by page and call, and the watch on a page that keeps translating.
@@ -905,8 +872,8 @@ try {
     opts: {
       strace,
       lazy,
-      // GEX_STRACE_PID=N: narrate that one process (a forked child too).
-      stracePid: process.env.GEX_STRACE_PID ? Number(process.env.GEX_STRACE_PID) : undefined,
+      // GEX_STRACE_PID=N: narrate that one process (a forked child too; options.mjs).
+      ...envOptions(process.env, 'opts'),
       mtimes,
       xattrs,
       // The debugging switches, in the run's own options as well as the boot

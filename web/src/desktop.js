@@ -16,13 +16,12 @@ import { loadRuntime, fetchBytes, runProgram } from './runtime.js';
 import { untar } from './tar.js';
 import { unzstd } from './zfetch.js';
 import { logOn } from '@gex/log.mjs';
+import { pageOptions } from '@gex/options.mjs';
 
 const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
-// `?strace=1` / `?stracepid=N`: narrate system calls (to the console), as
-// the other pages do.
-if (q.get('strace')) globalThis.GEX_STRACE = 1;
-if (q.has('stracepid')) globalThis.GEX_STRACE_PID = Number(q.get('stracepid'));
+// The switches every page takes (`?strace=1`, ...: options.mjs).
+pageOptions((k) => q.get(k));
 const T0 = performance.now();
 const marks = {};
 const mark = (k) => {

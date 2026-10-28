@@ -81,6 +81,7 @@ import { setFill, fillFile } from './lazy-fetch.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
+import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { logNamed, setLog } from './log.mjs';
@@ -421,11 +422,10 @@ async function handle(msg) {
   if (msg.kind === 'adopt') await forkBulkIn(msg.child);
   if (msg.kind === 'thread') await forkBulkIn(msg);
 
-  // How many traps a forked child takes before installing its parent's
-  // modules. Carried in the start message, not read off a global: the page's
-  // global is a different context, so `?adopt=N` selected nothing. Set before
-  // anything reads it.
-  if (msg.adoptAfter !== undefined) globalThis.GEX_ADOPT_AFTER = msg.adoptAfter;
+  // The page's switches (options.mjs), onto the globals this Worker's runtime
+  // reads: carried in the start message, since the page's globals are another
+  // context's. Set before anything reads them (`?adopt=N`).
+  workerOptions(msg);
   // Mark this Worker's console errors: Chrome logs every level as INFO, so a
   // fault is indistinguishable from progress once read outside, and a Worker
   // cannot reach the page's reporter. Guarded so it is applied once.
@@ -753,25 +753,6 @@ async function handle(msg) {
     // into a plain Error: the wasm frames say *where* a syscall trap happened.
     globalThis.GEX_TRAP_STACK = 1;
   }
-  // And on its own, because every trap that matters happens in a Worker and the
-  // switch for it was only ever set in the page. `?trapstack=1` set a global
-  // here that nothing in this Worker could see, so the one diagnostic that
-  // names the shim function a fault was in has never reached a forked child --
-  // and `?debug=1`, which does carry it, mirrors every guest write and changed
-  // the fault it was being used to look at.
-  if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
-  if (msg.doorStats) globalThis.GEX_DOOR_STATS = msg.doorStats;
-  if (msg.timeScale) globalThis.GEX_TIME_SCALE = msg.timeScale;
-  if (msg.fixedTime) globalThis.GEX_FIXED_TIME = msg.fixedTime;
-  if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
-  // Lightweight adopt-phase narration, without the debugExit write-flood: fast
-  // enough for a deep fork to reach where it hangs. See `adoptProcess`.
-  if (msg.adoptTrace) globalThis.GEX_ADOPT_TRACE = 1;
-  // `?attachtrace=1`: narrate a thread Worker's attach/adopt so a stranded
-  // thread (one whose wasm instantiate never completes) is visible. Off by
-  // default -- it is one line per phase per thread. See threads-worker note.
-  if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
-  if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
   // A 64-bit guest memory: the wasm64 shim's process.
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
   else delete globalThis.GEX_MEM64;
@@ -784,18 +765,6 @@ async function handle(msg) {
   if (msg.stateful) Gex.stateful = msg.stateful;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.identities) Gex.identities = msg.identities;
-  if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
-  if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
-  // `?winesplit=1`: a 32-bit Wine process takes the 2 GiB split, not the compact space.
-  if (msg.wine32Split) globalThis.GEX_WINE32_SPLIT = 1;
-  // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
-  if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
-  // `?mxcsr=1`: SSE under MXCSR (gex_ir::mxcsr_exact), a per-program opt-in.
-  if (msg.mxcsr) globalThis.GEX_MXCSR = 1;
-  // `?pinregion=BYTES`: the pin region (gex_abi::set_pin_region).
-  if (msg.pinRegion) globalThis.GEX_PIN_REGION = msg.pinRegion;
-  // `?sehreport=1`: crash reports name the SEH chain (a debugging opt-in).
-  if (msg.sehReport) globalThis.GEX_SEH_REPORT = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;

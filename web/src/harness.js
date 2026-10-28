@@ -7,6 +7,7 @@
 import { untar } from './tar.js';
 import { fetchBytes, runProgram } from './runtime.js';
 import { metadataSection } from '../../shims/browser/js/gex.mjs';
+import { pageOptions } from '../../shims/browser/js/options.mjs';
 
 /** An xterm-shaped object that keeps the bytes instead of drawing them. */
 function collector(rows = 40, cols = 120) {
@@ -102,10 +103,8 @@ export async function start() {
   // the next process of the same program from it, rather than linking again.
   const link = Number(params.get('link') ?? 0);
   if (params.get('debug')) globalThis.GEX_DEBUG_EXIT = 1;
-  // `?adopt=N`: how many traps a forked child takes before it stops waiting to
-  // be an execve and takes its parent's modules in bulk. 1 is the old eager
-  // behaviour, which is what a bisect needs.
-  if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
+  // The switches every page takes (shims/browser/js/options.mjs).
+  pageOptions((k) => params.get(k));
   // `GEX_TRAP_STACK`: the engine's own stack for a trap, which names the wasm
   // function it happened in -- the only thing that says which of the shim's own
   // functions was running when the fault is in the shim, not translated code.

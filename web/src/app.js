@@ -24,6 +24,7 @@ import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, worker
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
+import { pageOptions } from '../../shims/browser/js/options.mjs';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 
 /** Whether this build has the scene compositor: see runtime.js. */
@@ -995,48 +996,19 @@ function launchBuild(m, at) {
  * runtime.js and the Workers read. One list, for the library and the test page.
  */
 export function setGlobals(get, b = {}) {
+  // The switches every page takes (shims/browser/js/options.mjs).
+  pageOptions(get);
   // The guest's architecture: x86 unless the build says aarch64 (a Linux
   // tree of Debian's arm64 packages), which picks the aarch64 shim, seed and
   // kernel (runtime.js).
   globalThis.GEX_ARCH = b.arch === 'aarch64' ? 'aarch64' : 'x86';
-  if (get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
-  if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
-  // fcachestats=1: the function probe cache's misses, every 10 s (cgen.rs `fcache_stat`).
-  if (get('fcachestats')) globalThis.GEX_FCACHE_STATS = 1;
-  if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
-  if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
-  // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
-  if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
-  // winesplit=1: 32-bit Wine processes take the 2 GiB split (the shim's heap above
-  // 2 GiB), not the compact space: for a game that needs all of Windows' 2 GiB.
-  if (get('winesplit')) globalThis.GEX_WINE32_SPLIT = 1;
-  // nullguard=1: guest accesses below 64 KiB fault, as a null pointer's do
-  // natively (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the
-  // units are as without it; on, 2-8% slower in tier 1.
-  if (get('nullguard') === '1') globalThis.GEX_NULL_GUARD = 1;
-  // mxcsr=1: SSE honours MXCSR's rounding control in every tier
-  // (gex_ir::mxcsr_exact), for a program that needs it. Off, SSE rounds to
-  // nearest, and tier 1 and the units are as without it.
-  if (get('mxcsr') === '1') globalThis.GEX_MXCSR = 1;
-  // pinregion=BYTES: address space above the placement window for the
-  // project's libraries, each at its build's base (gex_abi::set_pin_region).
-  if (get('pinregion')) globalThis.GEX_PIN_REGION = Number(get('pinregion'));
-  // sehreport=1: a crash report names the SEH chain and a longjmp's jmp_buf.
-  if (get('sehreport') === '1') globalThis.GEX_SEH_REPORT = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
-  // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
-  if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));
-  if (get('fixedtime')) globalThis.GEX_FIXED_TIME = Number(get('fixedtime'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a 32-bit Wine program's start-up;
   // nt-page.js said why).
   const fjit = get('fjit');
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
-  if (get('wasmdlls')) globalThis.GEX_WASM_DLLS = get('wasmdlls');
   if (get('elfunits') && get('cgen') !== '0') globalThis.GEX_ELF_UNITS = get('elfunits');
-  // provskip=export,...: exports no provider binds, as GEX_PROVIDER_SKIP natively (units built with the same skip).
-  if (get('provskip')) globalThis.GEX_PROVIDER_SKIP = get('provskip');
-  if (get('fjitlibs')) globalThis.GEX_FJIT_LIBS = get('fjitlibs');
   if (get('pins')) globalThis.GEX_PINS = get('pins');
   if (get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (get('dense') === '2') globalThis.GEX_DENSE = 2;
@@ -1051,17 +1023,7 @@ export function setGlobals(get, b = {}) {
   if (get('cgenzst') === '1') globalThis.GEX_CGEN_ZST = 1;
   if (get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (get('aot')) globalThis.GEX_AOT = 1;
-  if (get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
-  if (get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
-  if (get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
-  if (get('strace')) globalThis.GEX_STRACE = 1;
-  if (get('stracepid')) globalThis.GEX_STRACE_PID = Number(get('stracepid'));
-  if (get('straceexe')) globalThis.GEX_STRACE_EXE = get('straceexe');
-  if (get('liftmax')) globalThis.GEX_LIFT_MAX = Number(get('liftmax'));
   globalThis.GEX_UNIT_CACHE = get('unitcache') !== null ? Number(get('unitcache')) : 1;
-  if (get('t1fold')) globalThis.GEX_T1_FOLD = Number(get('t1fold'));
-  if (get('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(get('xlatereport'));
-  if (get('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(get('inlinedispatch'));
 }
 
 async function fetchJson(url, what = url) {
