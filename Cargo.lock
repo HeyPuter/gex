@@ -840,6 +840,8 @@ dependencies = [
  "gex-ld",
  "gex-lift",
  "gex-lift-x86",
+ "gimli",
+ "object",
 ]
 
 [[package]]

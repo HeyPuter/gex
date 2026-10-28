@@ -9,6 +9,7 @@
 pub mod func;
 pub mod interp;
 pub mod pass;
+pub mod relayout;
 pub mod print;
 pub mod ssa;
 pub mod text;

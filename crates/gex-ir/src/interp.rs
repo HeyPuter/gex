@@ -147,10 +147,17 @@ pub fn run(f: &Function, seed: u64, m: &Model) -> Outcome {
 
 /// Run `f` from its entry with the given registers; `seed` fixes the
 /// contents of memory and what modelled calls do.
-pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outcome {
+pub fn run_from(f: &Function, seed: u64, regs: Vec<u64>, m: &Model) -> Outcome {
+    run_with_memory(f, seed, regs, m, &HashMap::new())
+}
+
+/// [`run_from`] on a memory that starts with `init` (anything else reads as
+/// the seed's hash). Bytes read from `init` are not
+/// [`Outcome::read_before_write`]s.
+pub fn run_with_memory(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model, init: &HashMap<u64, u8>) -> Outcome {
     assert_eq!(regs.len(), N_REGS);
     let spi = reg_index(m.sp);
-    let mut mem: HashMap<u64, u8> = HashMap::new();
+    let mut mem: HashMap<u64, u8> = init.clone();
     // Hash containers while running; ordered ones in the outcome.
     let mut written: HashMap<u64, u8> = HashMap::new();
     let mut rbw: std::collections::HashSet<u64> = std::collections::HashSet::new();
