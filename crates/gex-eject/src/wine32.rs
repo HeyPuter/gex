@@ -614,7 +614,9 @@ fn check_covered(v: &Json, dir: &Path) -> Result<()> {
             let pc = u.get("pc")?.as_str()?;
             let key = u.get("key").and_then(|k| k.as_str()).unwrap_or("");
             let at = u64::from_str_radix(pc.trim_start_matches("0x"), 16).ok();
-            if at.is_some_and(|a| has(key, a)) {
+            // Native Wine's return pad: the run leaves there rather than
+            // running code (the shim's `dispatch_miss`), so it needs no entry.
+            if at == Some(gex_kernel::win::tramp::NATIVE_RETURN_PAD) || at.is_some_and(|a| has(key, a)) {
                 return None;
             }
             let path = u.get("path").and_then(|p| p.as_str()).unwrap_or("?");
@@ -1133,6 +1135,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ok = Json::parse(r#"{"uncovered": []}"#).unwrap();
         assert!(check_covered(&ok, &dir).is_ok());
+        // Native Wine's return pad is never code to cover.
+        let pad = format!(r#"{{"uncovered": [{{"pc": "{:#x}", "key": "t", "path": "[the trampolines]"}}]}}"#, gex_kernel::win::tramp::NATIVE_RETURN_PAD);
+        assert!(check_covered(&Json::parse(&pad).unwrap(), &dir).is_ok());
         let bad = Json::parse(r#"{"uncovered": [{"pc": "0x612c52cd", "key": "k", "path": "/wine32/combase.dll"}]}"#).unwrap();
         let e = check_covered(&bad, &dir).unwrap_err().to_string();
         assert!(e.contains("0x612c52cd (/wine32/combase.dll)"), "{e}");
