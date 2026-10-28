@@ -78,14 +78,20 @@ fn put_staged(v: Option<Staged>) {
     }
 }
 
+/// The provider module numbers of the program and its libraries, for
+/// `cgen::on_exec` to kill at an `execve`: a Worker for a thread the new
+/// program starts would otherwise instantiate them too, and their active
+/// data segments would land over the new program's data at their old
+/// places.
+pub(crate) fn numbers() -> Vec<u32> {
+    lock(&PROGS).iter().map(|p| p.number).collect()
+}
+
 /// `execve`: the old program's modules (it and its libraries) are gone with
-/// it. Returns their provider module numbers, for `cgen::on_exec` to kill:
-/// a Worker for a thread the new program starts would otherwise
-/// instantiate them too, and their active data segments would land over
-/// the new program's data at their old places.
-pub(crate) fn on_exec() -> Vec<u32> {
+/// it.
+pub(crate) fn on_exec() {
     super::dylink::on_exec();
-    lock(&PROGS).drain(..).map(|p| p.number).collect()
+    lock(&PROGS).clear();
 }
 
 /// A program is staged for JS to publish (`gex_wasmprog_serve`).
@@ -342,10 +348,11 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let (regs, dirs, slots) = entry_bridges(&[entry, thread_entry]);
     let path = exe_path();
     super::dylink::static_published(number, info, &path, base, mem_base as u32);
-    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
-    let path = path.clone();
+    // The bytes before the record: a Worker catching up takes the record
+    // (`gex_cgen_pmod_ready`) as the sign that both are there.
     let lowered = is_lowered(&wasm);
-    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, key: None, path, lowered, from_file: false, gone: None });
+    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, key: None, path: path.clone(), lowered, from_file: false, gone: None });
+    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
 }
