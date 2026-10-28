@@ -26,6 +26,7 @@ import { restore, persist } from './persist.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { pageOptions } from '../../shims/browser/js/options.mjs';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
+import { checkOptions, sizeValue, showValue } from './start-options.js';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -47,6 +48,8 @@ const PIECES = {
  *   state     what a driver reads (phase, out, error, session, progress, ...)
  *   describe()    the desktop's windows, titles and pixels
  *   ready()   the start-up is over (with `ready: 'manual'`): progress 'ready'
+ * Rejects at once, before any fetch, on an option it does not know or a
+ * value of the wrong kind (start-options.js).
  * Rejects when the run cannot start (no cross-origin isolation, no WebGPU
  * for a build that needs it, a download that failed, an option for a piece
  * the build left out).
@@ -61,7 +64,7 @@ const PIECES = {
  *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
- *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
+ *   wisp       a Wisp proxy's URL (ws:// or wss://; a final slash is added): the
  *              guest's network (its TCP and DNS go over it); none by default
  *   pageHosts  {host: path or URL}: hosts the page answers itself, over plain
  *              HTTP (GET and HEAD), from the files under that path (relative
@@ -73,6 +76,8 @@ const PIECES = {
  *   compositor, gl, translation, hostx, mem64
  *              true asks for a runtime piece; an error if the build left it out.
  *              compositor: false draws windows straight into the page.
+ *              hostx: 'rootful' is one fullscreen X screen under the session's
+ *              own window manager.
  *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
@@ -90,7 +95,8 @@ const PIECES = {
  *              (a program whose first frame is not yet what the page waits for)
  */
 export async function start(opts = {}) {
-  const base = new URL(opts.baseUrl ?? new URL('.', import.meta.url), globalThis.location?.href);
+  checkOptions(opts);
+  const base =new URL(opts.baseUrl ?? new URL('.', import.meta.url), globalThis.location?.href);
   const at = (p) => (p ? new URL(String(p).replace(/^\//, ''), base).href : p);
   const state = { out: '', status: null, error: null, phase: 'loading' };
   globalThis.__nt = state;
@@ -880,6 +886,7 @@ async function begin(opts, base, at, state, meter) {
       settle(137);
     },
     resize(size = 'fit') {
+      if (!sizeValue(size)) throw new Error(`resize(${showValue(size)}): 'fit', {w, h} or 'WxH', in pixels`);
       [w, h] = sizeOf(size);
       if (desk) {
         desk.style.width = `${w}px`;
@@ -995,7 +1002,7 @@ function launchBuild(m, at) {
  * The runtime's globals from its switches (`get(name)`): what gex.mjs,
  * runtime.js and the Workers read. One list, for the library and the test page.
  */
-export function setGlobals(get, b = {}) {
+function setGlobals(get, b = {}) {
   // The switches every page takes (shims/browser/js/options.mjs).
   pageOptions(get);
   // The guest's architecture: x86 unless the build says aarch64 (a Linux

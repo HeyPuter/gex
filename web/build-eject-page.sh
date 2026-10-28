@@ -26,7 +26,7 @@ export default {
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true,
            rollupOptions: {
              input: { app: '$WEB/src/app.js' },
-             // A library: app.mjs keeps its exports (start, fromLaunch, setGlobals).
+             // A library: app.mjs keeps its exports (start, fromLaunch).
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: (c) => (c.name === 'app' ? 'app.mjs' : 'assets/[name]-[hash].js') },
            } },
