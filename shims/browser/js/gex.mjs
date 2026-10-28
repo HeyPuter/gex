@@ -70,7 +70,19 @@ export function packExports(bytes, extra, base) {
     return r;
   };
   const sleb = () => { let b; do { b = bytes[p++]; } while (b & 0x80); };
-  const str = () => { const n = leb(); const v = new TextDecoder().decode(bytes.subarray(p, p + n)); p += n; return v; };
+  // An ASCII name made here: TextDecoder takes each view as a garbage-collected
+  // object outside the JS heap, which a Worker parked in Atomics.wait never
+  // collects (a library's hundred thousand names were megabytes per Worker).
+  const str = () => {
+    const n = leb(), end = p + n;
+    let v = '';
+    for (let i = p; i < end; i++) {
+      if (bytes[i] >= 0x80) { v = DECODER.decode(bytes.slice(p, end)); break; }
+      v += String.fromCharCode(bytes[i]);
+    }
+    p = end;
+    return v;
+  };
   const VAL = new Set([0x7f, 0x7e, 0x7d, 0x7c, 0x7b, 0x70, 0x6f]);
   let globalImports = 0, tables = 0, tb = -1;
   const constGlobal = [];
