@@ -1334,14 +1334,6 @@ fn run_program_with(
             gex_abi::set_kuser_fold(true);
             gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
         }
-        // An x86-64 Wine running one of Wine's session programs in a wasm32
-        // memory: KUSER_SHARED_DATA and the entry page folded as the page
-        // does (its compact space), so its ntdll allocates bottom-up.
-        if f & wasmprog::FLAG_GUEST_X86_64 != 0 && !gex_abi::mem64() && opts.args.get(1).is_some_and(|a| gex_abi::wine_session_program(a)) {
-            gex_abi::set_kuser_fold(true);
-            gex_abi::set_kuser_fold_entry(true);
-            gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
-        }
         // The trampoline page (`gex_kernel::win`), which native Wine's gexrt
         // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
         // wrappers): the same bytes at the same address.
