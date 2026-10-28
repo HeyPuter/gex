@@ -7,12 +7,42 @@
 // (the JIT fallback: what the build never saw is translated), baseUrl,
 // onProgress(p) (the same progress as a 32-bit Wine page's start(): download, boot,
 // ready -- a program without windows is ready once it runs -- then exited
-// or failed; crates/gex-eject/README.md, "The loading screen").
+// or failed; crates/gex-eject/README.md, "The loading screen"). An unknown
+// option is an error that names it.
 import { launch } from './runtime/web/eject.mjs';
 
 const ABSENT = { compositor: 'a desktop', gl: 'OpenGL', hostx: 'an X server', mem64: 'a 64-bit guest memory' };
 
+// What this library reads, and what a 32-bit Wine page's start() also takes:
+// those are accepted and do nothing here (one page can start either kind).
+const OPTIONS = ['container', 'args', 'env', 'cwd', 'onLog', 'onExit', 'onProgress', 'strace', 'translation', 'baseUrl', ...Object.keys(ABSENT)];
+const WINE_ONLY = ['canvas', 'size', 'exe', 'uid', 'mtimes', 'persist', 'wisp', 'pageHosts', 'trapstack', 'debug', 'glLazy', 'launch', 'build', 'ready'];
+
+/** The option of `names` one edit or a case away (as web/src/start-options.js) from `k`, if any. */
+function nearName(k, names) {
+  const low = k.toLowerCase();
+  const near = (a, b) => {
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0;
+    while (i < a.length && a[i] === b[i]) i++;
+    const rest = (x, y) => a.slice(i + x) === b.slice(i + y);
+    return rest(1, 1) || rest(1, 0) || rest(0, 1) || (a[i] === b[i + 1] && a[i + 1] === b[i] && rest(2, 2));
+  };
+  return names.find((n) => n.toLowerCase() === low) ?? names.find((n) => near(low, n.toLowerCase())) ?? null;
+}
+
 export async function start(opts = {}) {
+  for (const k of Object.keys(opts)) {
+    if (OPTIONS.includes(k) || WINE_ONLY.includes(k)) continue;
+    const near = nearName(k, OPTIONS);
+    throw new Error(`start({ ${k} }): no such option${near ? `; did you mean ${near}?` : ''} (the options: ${OPTIONS.join(', ')})`);
+  }
+  if (opts.args != null && !(Array.isArray(opts.args) && opts.args.every((a) => typeof a === 'string'))) {
+    throw new Error(`start({ args }): an array of strings, not ${JSON.stringify(opts.args)}`);
+  }
+  if (opts.env != null && (Array.isArray(opts.env) ? !opts.env.every((e) => typeof e === 'string' && /^[^=]+=/.test(e)) : typeof opts.env !== 'object')) {
+    throw new Error(`start({ env }): ['NAME=value', ...] or {NAME: value}, not ${JSON.stringify(opts.env)}`);
+  }
   for (const [k, what] of Object.entries(ABSENT)) {
     if (opts[k] === true) throw new Error(`start({ ${k}: true }): a Linux program's web build has no ${what} (gex-eject's single-Worker runtime)`);
   }
