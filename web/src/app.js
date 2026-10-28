@@ -565,12 +565,16 @@ async function begin(opts, base, at, state, meter) {
   let lazy = [];
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
+  // A lazy file's mode, when the list has one (an executable: the kernel
+  // makes a lazy file 0644).
+  const lazyModes = {};
   if (b.lazy) {
     const m = await lazyList;
     // A path on this origin, not a URL: the kernel keeps a lazy file's
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
+    for (const f of m.files) if (f[4] !== undefined) lazyModes[f[0]] = f[4];
     // `BUNDLE#OFFSET`: a file in the site's rest bundle (lazy-fetch.mjs), its
     // offset kept as the URL's fragment.
     const href = (rel) => { const i = rel.indexOf('#'), p = i < 0 ? rel : rel.slice(0, i); return lazyBase + p.split('/').map(encodeURIComponent).join('/') + (i < 0 ? '' : rel.slice(i)); };
@@ -774,7 +778,7 @@ async function begin(opts, base, at, state, meter) {
     elf: exeBytes,
     files,
     dirs: tree.dirs,
-    modes: tree.modes,
+    modes: { ...lazyModes, ...tree.modes },
     hard,
     lazy,
     // A Wine prefix's `dosdevices/c:`, which Wine opens by that name.

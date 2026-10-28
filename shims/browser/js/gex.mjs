@@ -2201,6 +2201,7 @@ export class Gex {
       this.#bytes().set(p, pp);
       this.#bytes().set(u, up);
       this.#shim.exports.gex_add_lazy(pp, p.length, up, u.length, BigInt(size));
+      if (modes[path] !== undefined) this.#shim.exports.gex_chmod?.(pp, p.length, modes[path]);
       free?.(pp, p.length);
       free?.(up, u.length);
     }
