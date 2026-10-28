@@ -598,7 +598,7 @@ async function begin(opts, base, at, state, meter) {
   const exe = opts.exe ?? b.exe;
   // A copy, not a view: a view would keep the whole bundle alive.
   const exeBytes = (files[exe] ?? files[hard[exe]])?.slice();
-  if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
+  if (!exeBytes) throw new Error(opts.exe ? `start({ exe: ${JSON.stringify(exe)} }): not a file in the bundle` : `the build's program, ${exe}, is not in its bundle`);
   const args = [exe, ...(opts.args ?? b.argv ?? [])];
   const env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
