@@ -113,8 +113,9 @@ export function splitTree(x, read, store) {
 
 /** The tree as the tar TAR again: directories first, then the files, with
  *  `dedupe` identical files next to each other (zstd's window stores the
- *  second as a match). */
-export function pack({ x, readOnly, dirTimes }, tar, work, dedupe) {
+ *  second as a match). `order` (guest paths): those files first, in that
+ *  order (a recorded run's first reads), then the rest as before. */
+export function pack({ x, readOnly, dirTimes }, tar, work, dedupe, order = null) {
   const dirs = [];
   const byHash = new Map();
   const all = (d, rel) => {
@@ -128,8 +129,16 @@ export function pack({ x, readOnly, dirTimes }, tar, work, dedupe) {
     }
   };
   all(x, '');
+  let groups = [...byHash.values()];
+  if (order) {
+    // A group goes where its first-read member does.
+    const rank = new Map();
+    order.forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
+    const at = (g) => Math.min(...g.map((r) => rank.get(`/${r}`) ?? Infinity));
+    groups = groups.map((g, i) => [at(g), i, g]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map((e) => e[2]);
+  }
   const list = join(work, 'tar-list');
-  writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
+  writeFileSync(list, [...dirs, ...groups.flat()].join('\n') + '\n');
   for (const [p, mode] of readOnly) chmodSync(p, mode);
   // Deepest first; a directory removed since (none is) is skipped.
   for (const [p, at, mt] of [...dirTimes].reverse()) if (existsSync(p)) utimesSync(p, at, mt);

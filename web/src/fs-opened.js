@@ -11,7 +11,7 @@
  *  (fs-opened-worker.js), so two at once would share a stack. */
 let asking = Promise.resolve();
 
-/** The opened paths, sorted; `spec` is runtime.js's `globalKernel()`. */
+/** The opened paths, in the order of their first uses; `spec` is runtime.js's `globalKernel()`. */
 export function openedFiles(spec) {
   const ask = asking.then(() => askOnce(spec));
   asking = ask.catch(() => {});

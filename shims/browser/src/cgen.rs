@@ -1092,7 +1092,9 @@ pub extern "C" fn gex_cgen_set_record(on: i32) {
 /// image whose unit is published, `[gex-record] uncovered PC KEY PATH`, once
 /// per address. A run without translation needs a region entry there.
 pub(crate) fn record_uncovered(pc: u64) {
-    if !RECORD.load(Ordering::Relaxed) || knows(pc) {
+    // Native Wine's return pad is no code: a run without translation leaves
+    // there (lib.rs `dispatch_miss`).
+    if !RECORD.load(Ordering::Relaxed) || knows(pc) || pc == gex_kernel::win::tramp::NATIVE_RETURN_PAD {
         return;
     }
     static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
@@ -1933,6 +1935,9 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     // the web build needs as much as a tier-1 dispatch miss is.
     if hit.is_none() {
         note_web_entry(addr);
+        // A recording's as well (`record_uncovered`): code reached only this
+        // way never misses in tier-1's dispatch.
+        record_uncovered(addr);
     }
     // Nothing serves it: the function JIT makes it, if it is on.
     let served = hit.is_some();

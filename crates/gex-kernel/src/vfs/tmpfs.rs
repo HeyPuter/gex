@@ -115,6 +115,10 @@ fn note_capacity(before: usize, after: usize) {
 /// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
 pub const LAZY_MTIME: i64 = 0;
 
+/// The next first use's number ([`FileNode::read`]), shared by every
+/// tmpfs: a site's first bundle is in the order its files were first used.
+static READ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
@@ -135,8 +139,9 @@ pub struct FileNode {
     /// fetches, a write into it. Not an open, a `stat` or an `fstat`: Wine
     /// opens every SystemLink font to stat it and never reads one before the
     /// desktop. What a run needed of its bundle, which gex-eject's split
-    /// keeps in the bundle.
-    read: core::sync::atomic::AtomicBool,
+    /// keeps in the bundle. The first use's place among all files' first
+    /// uses ([`READ_SEQ`]), from 1; 0 for none yet.
+    read: core::sync::atomic::AtomicU64,
     /// Whether the program has made or changed the file since the root was
     /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
     /// rename. Not a time set (`utimensat`, which a program can aim at any
@@ -158,7 +163,7 @@ impl FileNode {
             ino,
             mtime: AtomicI64::new(now()),
             times: Mutex::new(Default::default()),
-            read: core::sync::atomic::AtomicBool::new(false),
+            read: core::sync::atomic::AtomicU64::new(0),
             written: core::sync::atomic::AtomicBool::new(false),
             changes: core::sync::atomic::AtomicU64::new(1),
         }
@@ -175,8 +180,9 @@ impl FileNode {
     /// Its bytes used ([`FileNode::read`]). A load first: a store to a line
     /// every Worker reads would bounce it at each read.
     fn mark_read(&self) {
-        if !self.read.load(Ordering::Relaxed) {
-            self.read.store(true, Ordering::Relaxed);
+        if self.read.load(Ordering::Relaxed) == 0 {
+            let n = READ_SEQ.fetch_add(1, Ordering::Relaxed);
+            let _ = self.read.compare_exchange(0, n, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
     fn mark_written(&self) {
@@ -850,18 +856,25 @@ impl TmpFs {
 
     /// Every file whose bytes something used ([`FileNode::read`]), by path
     /// (with its leading `/`; a hard-linked file under each of its names),
-    /// sorted. A recorded run's read set: gex-eject's bundle split keeps
-    /// these in the bundle and serves the rest as lazy files.
+    /// in the order of their first uses (by path among one file's names). A
+    /// recorded run's read set: gex-eject's bundle split keeps these in the
+    /// bundle and serves the rest as lazy files, and a site's first bundle
+    /// holds them in this order.
     pub fn read_set(&self) -> Vec<String> {
         let inner = self.inner.read().unwrap();
-        inner
+        let mut out: Vec<(u64, String)> = inner
             .nodes
             .iter()
             .filter_map(|(p, n)| match n {
-                Node::File(f) if f.read.load(Ordering::Relaxed) => Some(format!("/{p}")),
+                Node::File(f) => match f.read.load(Ordering::Relaxed) {
+                    0 => None,
+                    k => Some((k, format!("/{p}"))),
+                },
                 _ => None,
             })
-            .collect()
+            .collect();
+        out.sort();
+        out.into_iter().map(|(_, p)| p).collect()
     }
 
     pub fn add_dir(&self, path: &str) {
@@ -2276,8 +2289,11 @@ mod lazy_tests {
         fs.open("a/wrote", oflags::O_RDWR, 0).unwrap().write_at(1, b"q").unwrap();
         assert_eq!(
             fs.read_set(),
-            ["/a/lazy", "/a/mapped", "/a/pread", "/a/read", "/a/with", "/a/wrote"].map(String::from).to_vec()
+            ["/a/read", "/a/pread", "/a/lazy", "/a/with", "/a/mapped", "/a/wrote"].map(String::from).to_vec(),
+            "in the order of first use"
         );
+        fs.open("a/read", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(fs.read_set()[0], "/a/read", "a second use does not move it");
     }
 
     /// `written` lists what the program made or changed -- a create, a

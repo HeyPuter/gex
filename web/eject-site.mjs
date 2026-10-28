@@ -24,7 +24,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, openSync, writeSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
@@ -34,7 +34,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--level', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--level', '--late', '--boot-units', '--stable-from', '--rest-frame', '--rest-order', '--rest-paths'].includes(av[i - 1]));
 // --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -46,10 +46,17 @@ const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '
 // own directory) keeps the files whose bytes are DIR's in pieces of their
 // own, which a rebuild of the rest never changes.
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe] [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe] [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE] [--rest-frame MiB] [--rest-order FILE] [--rest-paths FILE] [--no-rest]');
   process.exit(2);
 }
 const level = opt('--level', '19');
+// --rest-frame MiB: the bundle split's lazy files as the rest bundle (one tar
+// in independent zstd frames of this size; restBundle), not one file each.
+// --rest-order FILE: guest paths, one a line, first in the tar in that order
+// (a run's later reads); the rest follow by path. --no-rest: one file each.
+const rest = !flag('--no-rest');
+const restFrame = Number(opt('--rest-frame', '8')) * 1048576;
+const restOrder = opt('--rest-order', null);
 // The project's launch (gex-eject's build/web/wine32.json). See `wine32Site` below.
 if (!existsSync(join(project, 'build/web/wine32.json'))) {
   console.error(`eject-site: ${project} has no build/web/wine32.json (a built 32-bit Wine project)`);
@@ -116,6 +123,77 @@ function coldPack(dir, path) {
   head.writeUInt32LE(raw.length);
   writeFileSync(join(out, path, 'cold.idx'), Buffer.concat([head, zi]));
   rmSync(z, { recursive: true, force: true });
+}
+
+/** The rest bundle: the bundle split's lazy files (`lazy`, [path, size,
+ *  hash, mtime], their bytes in `store` by hash) as one uncompressed tar,
+ *  each content once, in read order (--rest-order) and then by path, so files
+ *  read together sit together; its stream cut into frames of `restFrame`
+ *  bytes, each zstd-compressed on its own (one stream would have to be read
+ *  from its start), concatenated as project/build/web/rest.bin, and
+ *  rest.bin.json: `frame`, `frames` ([offset, length] of each in rest.bin),
+ *  `size` (the tar's). A lazy file's entry names `rest.bin#OFFSET`, OFFSET
+ *  its bytes in the tar, which the page reads by the frames over it
+ *  (lazy-fetch.mjs). Returns the lazy entries. */
+function restBundle(lazy, store) {
+  const rank = new Map();
+  if (restOrder) readPathList(restOrder).forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
+  const order = [...lazy].sort((a, b) => (rank.get(a[0]) ?? Infinity) - (rank.get(b[0]) ?? Infinity) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const dir = join(`${out.replace(/\/+$/, '')}.work`, 'rest');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  // The tar, written a frame at a time: frame k holds tar bytes [k * frame, (k + 1) * frame).
+  const where = new Map(); // hash -> its bytes' offset in the tar
+  let at = 0, k = 0, cur = [], curLen = 0;
+  const flush = (final) => {
+    while (curLen >= restFrame || (final && curLen > 0)) {
+      const all = Buffer.concat(cur);
+      const n = Math.min(restFrame, all.length);
+      writeFileSync(join(dir, String(k++).padStart(6, '0')), all.subarray(0, n));
+      cur = [all.subarray(n)];
+      curLen = all.length - n;
+    }
+  };
+  const put = (b) => { cur.push(b); curLen += b.length; at += b.length; if (curLen >= restFrame) flush(false); };
+  const header = (name, size) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, 'utf8');
+    h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124);
+    h.write('00000000000\0', 136);
+    h.fill(' ', 148, 156); h.write('0', 156); h.write('ustar\x0000', 257);
+    let sum = 0;
+    for (const c of h) sum += c;
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    return h;
+  };
+  for (const [, size, hash] of order) {
+    if (where.has(hash)) continue;
+    put(header(hash, size));
+    where.set(hash, at);
+    put(readFileSync(join(store, hash)));
+    if (size % 512) put(Buffer.alloc(512 - (size % 512)));
+  }
+  put(Buffer.alloc(1024));
+  const tarSize = at;
+  flush(true);
+  // Each frame on its own; many zstd processes at once.
+  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd -${level} -q -f`], { cwd: dir });
+  const frames = [];
+  let off = 0;
+  mkdirSync(join(out, 'project/build/web'), { recursive: true });
+  const fd = openSync(join(out, 'project/build/web/rest.bin'), 'w');
+  for (let i = 0; i < k; i++) {
+    const z = readFileSync(join(dir, `${String(i).padStart(6, '0')}.zst`));
+    frames.push([off, z.length]);
+    writeSync(fd, z);
+    off += z.length;
+  }
+  closeSync(fd);
+  writeFileSync(join(out, 'project/build/web/rest.bin.json'), JSON.stringify({ frame: restFrame, size: tarSize, frames }));
+  rmSync(dir, { recursive: true, force: true });
+  console.log(`eject-site: the rest bundle: ${lazy.length} files (${where.size} distinct), tar ${mb(tarSize)} MB, ${frames.length} frames of ${restFrame / 1048576} MiB, ${mb(off)} MB compressed`);
+  return lazy.map(([path, size, hash, mtime]) => [path, size, `rest.bin#${where.get(hash)}`, mtime]);
 }
 
 /** How many pieces each class of the bundle's files (stable, the rest) is
@@ -381,6 +459,12 @@ function wine32Site() {
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
   const split = wine32.bundle?.split ? new Set(wine32.bundle.read ?? []) : null;
+  // The bundle's files in the order the recorded run first read them.
+  const readOrder = split ? [...split] : null;
+  // --rest-paths FILE (guest paths, one a line): files the run read that
+  // still go to the rest bundle, not the bundle (a large file read by
+  // offset, such as a game's music, which the boot needs only a little of).
+  if (split && opt('--rest-paths', null)) for (const p of readPathList(opt('--rest-paths', null))) split.delete(p);
   // --late FILE: see the fill below.
   const late = opt('--late', null) ? readPathList(opt('--late', null)) : [];
   if (split) for (const p of late) split.delete(p);
@@ -405,11 +489,16 @@ function wine32Site() {
     if (flag('--prune')) pruneTree(x);
     if (split) {
       split.add(wine32.exe); // the page reads the loader from the bundle itself
-      const store = join(out, 'project/build/web/lazy');
+      const store = rest ? join(work, 'lazy-store') : join(out, 'project/build/web/lazy');
       const lazy = splitTree(x, split, store);
       lazyFiles = lazy.length;
       lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
+      if (rest) {
+        if (late.length) throw new Error('eject-site: --late and the rest bundle together: the fill names lazy files by URL');
+        const files = restBundle(lazy, store);
+        writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/', files }));
+      } else
       writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
       wine32.params = { ...(wine32.params ?? {}), lazy: '/project/build/web/lazy.json' };
       // --late FILE (guest paths, one a line, in the order wanted): files of
@@ -440,7 +529,7 @@ function wine32Site() {
     }
     tar = join(work, 'rootfs.tar');
     if (piecesOn) piecesIndex = pieces(x);
-    pack(tree, tar, work, flag('--dedupe'));
+    pack(tree, tar, work, flag('--dedupe'), readOrder);
   }
   // What the split leaves in the bundle (the run's read set) is all the
   // download has of it; nt.json carries the rest's manifest by URL.
@@ -563,7 +652,8 @@ function wine32Site() {
   page();
   const smallHash = createHash('sha256');
   // The lazy store is named by its content (lazy.json's hashes).
-  walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/')) return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
+  // So is the rest bundle (rest.bin.json names its frames' sizes).
+  walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/') || rel === 'project/build/web/rest.bin') return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
   const build = sha(JSON.stringify(files) + JSON.stringify(wine32) + smallHash.digest('hex')).slice(0, 12);
   writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
   writeHosting();
@@ -573,12 +663,13 @@ function wine32Site() {
   const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
   let small = 0;
   // Cold clusters are fetched on first call, not with the download.
-  let cold = 0;
+  let cold = 0, restBytes = 0;
   walk(out, (p, rel) => {
     if (rel.endsWith('/cold.bin')) cold += statSync(p).size;
+    else if (rel === 'project/build/web/rest.bin') restBytes = statSync(p).size;
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes, ...(restBytes ? { rest: restBytes } : {}) } : null, cold: cold || null }, null, 1));
   console.log(`${out}: wine32 build ${build}; features off: ${wine32.features_off.join(', ') || 'none'}; ${wine32.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
-    + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
+    + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand${restBytes ? `; the rest bundle ${mb(restBytes)} MB` : ''})` : ''));
 }

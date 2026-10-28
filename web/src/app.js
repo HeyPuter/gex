@@ -569,13 +569,20 @@ async function begin(opts, base, at, state, meter) {
   let lazy = [];
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
+  // A lazy file's mode, when the list has one (an executable: the kernel
+  // makes a lazy file 0644).
+  const lazyModes = {};
   if (b.lazy) {
     const m = await lazyList;
     // A path on this origin, not a URL: the kernel keeps a lazy file's
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
-    lazy = m.files.map(([path, size, rel]) => [path, size, lazyBase + rel.split('/').map(encodeURIComponent).join('/')]);
+    for (const f of m.files) if (f[4] !== undefined) lazyModes[f[0]] = f[4];
+    // `BUNDLE#OFFSET`: a file in the site's rest bundle (lazy-fetch.mjs), its
+    // offset kept as the URL's fragment.
+    const href = (rel) => { const i = rel.indexOf('#'), p = i < 0 ? rel : rel.slice(0, i); return lazyBase + p.split('/').map(encodeURIComponent).join('/') + (i < 0 ? '' : rel.slice(i)); };
+    lazy = m.files.map(([path, size, rel]) => [path, size, href(rel)]);
     for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
@@ -703,7 +710,7 @@ async function begin(opts, base, at, state, meter) {
         };
         w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
         setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
-        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE, versions: lazyVersions });
+        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE, versions: lazyVersions, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs') });
       });
       if (ready.ok) {
         lc.on = true;
@@ -778,7 +785,7 @@ async function begin(opts, base, at, state, meter) {
     elf: exeBytes,
     files,
     dirs: tree.dirs,
-    modes: tree.modes,
+    modes: { ...lazyModes, ...tree.modes },
     hard,
     lazy,
     // A Wine prefix's `dosdevices/c:`, which Wine opens by that name.
@@ -809,6 +816,7 @@ async function begin(opts, base, at, state, meter) {
     lateUnits,
     fill,
     lazyCache,
+    restBundle: lazy.some(([, , u]) => String(u).includes('#')),
     identities: b.identities ?? null,
     stateful: b.stateful ?? null,
     providerSources: b.providerSources ?? null,

@@ -808,6 +808,8 @@ async function handle(msg) {
   if (msg.fill) setFill(msg.fill);
   // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
+  // A rest bundle's files among the lazy ones (lazy-fetch.mjs `lazyReady`).
+  if (msg.restBundle) globalThis.GEX_REST_BUNDLE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   // The runtime made in the pool, when this process runs on a fresh memory

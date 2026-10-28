@@ -742,6 +742,10 @@ async function runProgramHere(
     // The page's cache of lazy files (app.js, lazy-cache.mjs): its control
     // buffer, handed to every Worker.
     lazyCache = null,
+    // Whether any lazy file is in a rest bundle (`BUNDLE#OFFSET`): only then
+    // does a Worker without the cache's owner load a decoder of its own
+    // (lazy-fetch.mjs `lazyReady`).
+    restBundle = false,
     // Units' keys and identities (`base:key:identity:path;...`), so a Worker
     // takes them instead of hashing each image it maps (cgen.rs `known`).
     identities = null,
@@ -1087,6 +1091,7 @@ async function runProgramHere(
       heartbeat: heartbeat || undefined,
       fill: fill || undefined,
       lazyCache: lazyCache || undefined,
+      restBundle: restBundle || undefined,
       identities: identities || undefined,
       // How many traps a forked child takes before it stops waiting to be an
       // `execve` and installs its parent's modules.

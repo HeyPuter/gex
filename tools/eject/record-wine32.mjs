@@ -28,7 +28,7 @@
 // varies (sort -u).
 
 import { spawn } from 'node:child_process';
-import { createReadStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
@@ -36,15 +36,18 @@ import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
-const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into', '--boot-units-out', '--boot-after'];
+const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into', '--boot-units-out', '--boot-after', '--console', '--play', '--keys', '--hold'];
 const [url, out] = av.filter((a, i) => !a.startsWith('--') && !named.includes(av[i - 1]));
 if (!url || !out) {
-  console.error('usage: node tools/eject/record-wine32.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION] [--boot-units-out FILE] [--boot-after S]');
+  console.error('usage: node tools/eject/record-wine32.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION] [--boot-units-out FILE] [--console FILE] [--boot-after S] [--play S [--keys T:KEY,...] [--hold MS]]');
   process.exit(2);
 }
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
 const timeout = Number(opt('--timeout', '400')) * 1000;
 const bootOut = opt('--boot-units-out', null);
+// --console FILE: every console line of the page and its Workers, timed.
+const consoleFile = opt('--console', null);
+const consoleT0 = Date.now();
 const bootAfter = Number(opt('--boot-after', '15'));
 const settle = Math.max(Number(opt('--settle', '5')), bootOut ? bootAfter : 0) * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -113,8 +116,11 @@ const uncovered = new Map();
 const coverage = new Map();
 const errors = [];
 browser.on('Runtime.consoleAPICalled', (p) => {
-  // A Worker's line the page relays carries the relay's tag first.
-  const t = p.args.map((a) => a.value ?? a.description ?? '').join(' ').replace(/^\[gex-console-error\] /, '');
+  const raw = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
+  if (consoleFile) appendFileSync(consoleFile, `${((Date.now() - consoleT0) / 1000).toFixed(1).padStart(7)} ${raw.trimEnd()}\n`);
+  // A Worker's console.error comes marked (shims/browser/js/worker.mjs), and
+  // the shim's own lines (cgen.rs `record_uncovered`) are errors.
+  const t = raw.replace(/^\[gex-console-error\] /, '');
   let m;
   if ((m = /^\[gex-record\] unit ([0-9a-f]{64}) (hit|miss) (.*)$/.exec(t))) {
     const was = units.get(m[1]);
@@ -139,7 +145,7 @@ browser.on('Runtime.consoleAPICalled', (p) => {
     // The page's own word for an image without a unit, with where it was
     // loaded: a unit is built for an image at a base (gexc cgen-image --pe-base).
     if ((m = /gex-(?:pe|nt): image (.*) at base (0x[0-9a-f]+): no function-tier unit \(key ([0-9a-f]{64})\)/.exec(t))) bases.set(m[3], m[2]);
-    if (p.type === 'error') errors.push(t.slice(0, 300));
+    if (p.type === 'error') errors.push(raw.slice(0, 300));
   }
 });
 browser.on('Target.attachedToTarget', async (p) => {
@@ -188,6 +194,40 @@ const pageUrl = await ev('location.href');
 // site then keeps its whole bundle.
 const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
 if (opened?.error) console.error(`record-wine32: no read set: ${opened.error}`);
+
+// --play S [--keys T:KEY,...] [--hold MS]: after the read set is taken (the
+// title's), S seconds more with KEY pressed (held MS ms, default 300) T s into
+// them, so the code a game runs past its title is in the recording too (its
+// units, the code no unit holds). KEY is a DOM key name (z, Enter, ArrowLeft,
+// Space) or click:X:Y, a click at X,Y on the page.
+const play = Number(opt('--play', '0')) * 1000;
+if (play) {
+  const hold = Number(opt('--hold', '300'));
+  const keys = (opt('--keys', '') ?? '').split(',').filter(Boolean).map((k) => {
+    const i = k.indexOf(':');
+    return { t: Number(k.slice(0, i)), key: k.slice(i + 1) === 'Space' ? ' ' : k.slice(i + 1) };
+  }).sort((a, b) => a.t - b.t);
+  const vks = { ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Enter: 13, Escape: 27, Shift: 16, Control: 17, ' ': 32 };
+  const p0 = Date.now();
+  for (const { t, key } of keys) {
+    await sleep(Math.max(0, p0 + t * 1000 - Date.now()));
+    if (key.startsWith('click:')) {
+      const [, x, y] = key.split(':').map(Number);
+      for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+        await browser.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 }, page).catch(() => {});
+        if (type === 'mousePressed') await sleep(hold);
+      }
+      continue;
+    }
+    const one = key.length === 1;
+    const vk = vks[key] ?? (one ? key.toUpperCase().charCodeAt(0) : 0);
+    const code = key === ' ' ? 'Space' : one ? (/[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : `Digit${key}`) : key;
+    await browser.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, ...(one ? { text: key } : {}) }, page).catch(() => {});
+    await sleep(hold);
+    await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk }, page).catch(() => {});
+  }
+  await sleep(Math.max(0, p0 + play - Date.now()));
+}
 
 /** Sorted slots as `a-b` runs. */
 function runs(v) {
