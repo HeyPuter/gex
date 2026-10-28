@@ -652,11 +652,15 @@ static ELF_UNITS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// executable segments).
 static ELF_PLACED: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new());
 
+/// The provider module numbers of the replaced libraries placed now: what
+/// an `execve` kills (`cgen::on_exec`).
+pub(crate) fn numbers() -> Vec<u32> {
+    lock(&LIBS).iter().filter_map(|l| l.number).collect()
+}
+
 /// `execve`: every replaced library of the old program is gone, and its
-/// addresses may hold the new program's code (see `cgen::on_exec`). Returns
-/// the provider module numbers that went with them.
-pub(crate) fn on_exec(old_code: &[(u64, u64)]) -> Vec<u32> {
-    let dead: Vec<u32> = lock(&LIBS).iter().filter_map(|l| l.number).collect();
+/// addresses may hold the new program's code (see `cgen::on_exec`).
+pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
     lock(&LIBS).clear();
     lock(&REPLACED).clear();
     THREAD_ENTRY.store(0, Ordering::Release);
@@ -664,7 +668,6 @@ pub(crate) fn on_exec(old_code: &[(u64, u64)]) -> Vec<u32> {
         m.clear();
     }
     forget_gone(old_code);
-    dead
 }
 
 /// Code no longer mapped executable (`cgen::on_retire`'s `gone`): an object

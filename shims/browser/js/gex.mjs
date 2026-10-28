@@ -3902,6 +3902,7 @@ export class Gex {
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     const execGen = this.#shim.exports.gex_exec_gen?.() ?? 0;
+    this.adoptGen = execGen;
     // Gone before its Worker came up: the process exec'd (the other threads go
     // with the old program) or ended. Nothing to run, and nothing wrong.
     if (!entry) return { entry: 0n, ctx: Number(thread.ctx), gone: true };
@@ -5498,6 +5499,16 @@ export class Gex {
           if (u < 0x40000000 && !single.on && e.gex_ftab_install_len) {
             this.#cgenDefer(u, e.gex_ftab_install_base(v) >>> 0, e.gex_ftab_install_len(v) >>> 0);
           }
+          else if (u >= 0x80000000) {
+            try {
+              this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
+            } catch (err) {
+              // A provider an execve is replacing: its install is killed
+              // before its record and bytes go (cgen.rs `on_exec`), so one
+              // whose bytes are gone is dead by now, and skipped.
+              if ((e.gex_ftab_install_unit(v) >>> 0) !== 0xffffffff) throw err;
+            }
+          }
           else this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
         }
       }
@@ -6913,6 +6924,10 @@ export class Gex {
    *  its entry list does. */
   #cgenServe() {
     const e = this.#shim.exports;
+    // A thread that went with its old program when another called `execve`
+    // (out of guest code, so the exec did not wait for it): what is staged
+    // and published now is the new program's, for that thread's Worker.
+    if (e.gex_thread_gone?.()) return;
     this.#wasmprogServe();
     // ELF libraries' export providers (cgen/elfprov.rs): provider-only units,
     // bound before the guest goes on (and, in a forked child, before it
@@ -9515,6 +9530,9 @@ export class Gex {
   #denseFillWorst = 0;
   /** The thread this Worker runs, when it was spawned for one (`adoptThread`). */
   #threadTid = 0;
+  /** A thread's: how many `execve`s its process had made when it was
+   *  adopted (`adoptThread`). */
+  adoptGen = undefined;
   #whoFills() {
     return `pid ${this.#shim.exports.gex_my_pid?.() ?? '?'} ${this.#threadTid ? `tid ${this.#threadTid}` : 'main thread'}`;
   }

@@ -1053,7 +1053,7 @@ async function handle(msg) {
         port.post({ kind: 'snap-attached' });
         gex.snapRelease();
       }
-      execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
+      execGen = gex.adoptGen ?? gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
       narrate(`[worker] pid ${msg.child?.pid}: adopt arrived`);
@@ -1304,7 +1304,11 @@ async function handle(msg) {
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
-    const exitMsg = {
+    // A thread of a program an `execve` replaced: the shim's state is the new
+    // program's (its heap and JIT state started again), so nothing more is
+    // read from it here.
+    const replaced = asThread && !carries && (gone || (ex.gex_exec_gen?.() ?? 0) !== execGen);
+    const exitMsg = replaced ? { kind: 'exit', status, guestMillis } : {
       kind: 'exit',
       status,
       threadGone: thread && !asThread ? true : undefined,

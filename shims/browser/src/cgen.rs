@@ -2890,11 +2890,13 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
 /// libraries, and of a wasm32 program and its libraries, are killed
 /// (`FuncMap::kill_module`) so a Worker started later does not instantiate
 /// them.
+///
+/// The installs are killed before the providers' records go: a Worker
+/// catching up that finds one's bytes gone then finds it dead too.
 pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
     on_retire_pages(old_code, old_code);
-    let mut dead = libprov::on_exec(old_code);
-    dead.extend(wasmprog::on_exec());
-    elfprov::on_exec();
+    let mut dead = libprov::numbers();
+    dead.extend(wasmprog::numbers());
     let memory = crate::guest_bytes();
     ftab(|m| {
         for &(start, end) in old_code {
@@ -2906,6 +2908,9 @@ pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
             m.kill_module(PROVIDER | n);
         }
     });
+    libprov::on_exec(old_code);
+    wasmprog::on_exec();
+    elfprov::on_exec();
 }
 
 fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
