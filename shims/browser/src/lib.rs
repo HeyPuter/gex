@@ -3156,8 +3156,14 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
         // A span at a time, from the same arena as the guest's mappings, each
         // growing the memory behind it. (It once claimed everything up to a
         // fixed 4 GiB ceiling at once, which is why the memory had to be 4 GiB.)
+        // The first spans small and doubling to `CHUNK`: a process's memory
+        // never shrinks, and most hold a few MiB of heap for their life.
         const CHUNK: u64 = 16 * 1024 * 1024;
-        let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
+        const FIRST: u64 = 1024 * 1024;
+        static SPANS: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+        let n = SPANS[BIG as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let chunk = (FIRST << n.min(CHUNK.trailing_zeros() - FIRST.trailing_zeros())).min(CHUNK);
+        let len = (_layout.size() as u64 + _layout.align() as u64).max(chunk);
         let len = len.next_multiple_of(65536);
         // A single allocation bigger than a chunk, said out loud. talc cannot
         // serve a request from two spans, so one of these claims a span of its
