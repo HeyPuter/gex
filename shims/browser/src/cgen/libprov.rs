@@ -615,6 +615,19 @@ pub extern "C" fn gex_libprov_guest_calls() -> i32 {
     GUEST_CALLS.with(|c| c.get())
 }
 
+/// Whether a provider's guest call is open on this Worker.
+pub(crate) fn guest_calls_open() -> bool {
+    GUEST_CALLS.with(|c| c.get()) > 0
+}
+
+/// Whether `rescan_if_new` or `elf_rescan_if_new` would rescan: this
+/// process is not the one they last ran for (a vfork child is its
+/// parent's, `elfprov::due`).
+pub(crate) fn rescan_due() -> bool {
+    let pid = crate::my_pid();
+    PID.load(Ordering::Acquire) != pid || (ELF_PID.load(Ordering::Acquire) != pid && !lock(&ELF_UNITS).is_empty())
+}
+
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_calls_set(v: i32) {
     GUEST_CALLS.with(|c| c.set(v));

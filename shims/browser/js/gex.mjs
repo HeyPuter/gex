@@ -1326,6 +1326,30 @@ export class Gex {
    */
   waits = { park: 0, turn: 0, nap: 0, net: 0 };
 
+  /**
+   * Traps after which the guest went straight on (`gex_after_trap` took the
+   * resume), and those that went through each step, by loop: the run loop,
+   * a call-out's and a native caller's system call.
+   */
+  traps = { loop: 0, loopFull: 0, callout: 0, calloutFull: 0, native: 0, nativeFull: 0 };
+
+  /**
+   * One question for a trap that left this side nothing to do: the resume
+   * address the shim took (its context then at `#afterTrapCtx`), or 0n when
+   * something waits (a fill, an install, a unit, a fork, a thread, a fault,
+   * a vfork child here, a parent's modules to adopt), nothing taken.
+   */
+  #afterTrap() {
+    const f = this.#shim.exports.gex_after_trap;
+    if (!f || this.#inherited.length || this.#vfork.length) return 0n;
+    return f(this.#installed, this.#wasmdllHave, this.#cgenMode & 3 ? 1 : 0);
+  }
+  #afterTrapAt = 0;
+  #afterTrapCtx() {
+    this.#afterTrapAt ||= this.#shim.exports.gex_after_trap_ctx() >>> 0;
+    return this.#dv().getUint32(this.#afterTrapAt, true);
+  }
+
   /** Resolves the network wait in progress (`#netWait`) on this Worker's own
    *  network's activity. */
   #netWake = null;
@@ -6873,10 +6897,17 @@ export class Gex {
         return;
       }
       const stop = p & ~(1n << 61n);
-      const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
-      const rc = e.gex_resume_ctx() >>> 0;
+      // Nothing waiting: the resume the shim took, and the call returns.
+      const quick = this.#afterTrap();
+      const next = BigInt.asUintN(64, quick !== 0n ? quick : BigInt(e.gex_resume_pc()));
+      const rc = quick !== 0n ? this.#afterTrapCtx() : e.gex_resume_ctx() >>> 0;
       if (next !== stop || (rc && rc !== (ctx >>> 0))) throw err;
       this.#progSpBack(psp0);
+      if (quick !== 0n) {
+        this.traps.native++;
+        return;
+      }
+      this.traps.nativeFull++;
       if (e.gex_jit_pending_len() >>> 0) {
         const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
         if (need) this.#growTables(need, 'call-out');
@@ -7402,6 +7433,16 @@ export class Gex {
           }
           e.gex_libprov_guest_calls_set(0);
         }
+        const quick = this.#afterTrap();
+        if (quick !== 0n) {
+          this.traps.loop++;
+          pc = quick;
+          const nextCtx = this.#afterTrapCtx();
+          if (nextCtx !== 0) ctx = nextCtx;
+          this.#armCensus();
+          continue;
+        }
+        this.traps.loopFull++;
         // A slot the shim wants written before the guest goes back to it: its
         // module is instantiated with passive segments, so the code is present
         // and simply not in the table. Filling here costs one segment; at
@@ -8293,36 +8334,43 @@ export class Gex {
             err.gexHandoff = true;
             throw err;
           }
-          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
-          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
-          this.#denseCatchUp();
-          if (e.gex_jit_pending_len() >>> 0) {
-            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
-            if (need) this.#growTables(need, 'call-out');
-          }
-          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
-          this.#catchUpSync();
-          this.#cgenServe();
-          // A fork from the guest code this call-out runs (a function-tier
-          // unit's libc calling `fork`): its child is started from here, as
-          // the run loop starts one, since the guest goes on in this loop and
-          // may wait for it. The child's image is taken before this returns.
-          this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-          this.#startThread();
-          // The fault hook as one of this loop's steps: on a stack that may
-          // suspend in the single-thread build (`#driveAsync`).
+          // Nothing waiting: the resume the shim took. Otherwise each step.
+          const quick = this.#afterTrap();
           let faulted = null;
-          const ft = this.#faultTake(ctx);
-          if (ft) {
-            try {
-              if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
-              else yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
-            } finally {
-              ft.spG.value = ft.cur;
+          let resumed = quick;
+          if (quick !== 0n) this.traps.callout++;
+          else {
+            this.traps.calloutFull++;
+            const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+            if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+            this.#denseCatchUp();
+            if (e.gex_jit_pending_len() >>> 0) {
+              const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+              if (need) this.#growTables(need, 'call-out');
             }
-            faulted = this.#faultPc(ctx);
+            while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+            this.#catchUpSync();
+            this.#cgenServe();
+            // A fork from the guest code this call-out runs (a function-tier
+            // unit's libc calling `fork`): its child is started from here, as
+            // the run loop starts one, since the guest goes on in this loop and
+            // may wait for it. The child's image is taken before this returns.
+            this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+            this.#startThread();
+            // The fault hook as one of this loop's steps: on a stack that may
+            // suspend in the single-thread build (`#driveAsync`).
+            const ft = this.#faultTake(ctx);
+            if (ft) {
+              try {
+                if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
+                else yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+              } finally {
+                ft.spG.value = ft.cur;
+              }
+              faulted = this.#faultPc(ctx);
+            }
+            resumed = e.gex_resume_pc();
           }
-          const resumed = e.gex_resume_pc();
           const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
           // business, down through every frame.
@@ -8331,7 +8379,7 @@ export class Gex {
             throw err;
           }
           pc = BigInt.asUintN(64, nextPc);
-          const rc = e.gex_resume_ctx() >>> 0;
+          const rc = quick !== 0n ? this.#afterTrapCtx() : e.gex_resume_ctx() >>> 0;
           if (rc && rc !== ctx) {
             // A resume on another thread's context is not this call-out's.
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);

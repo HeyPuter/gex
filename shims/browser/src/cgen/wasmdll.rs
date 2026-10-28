@@ -652,6 +652,10 @@ pub extern "C" fn gex_wasmdll_binds_len() -> u32 {
     BINDS_LEN.load(std::sync::atomic::Ordering::Acquire) as u32
 }
 
+pub(super) fn binds_len() -> u32 {
+    gex_wasmdll_binds_len()
+}
+
 /// Binding `i`'s bridges, `[table, slot]` flattened, as `gex_cgen_regs`.
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_bind_regs(i: u32, buf: u32, cap: u32) -> u32 {

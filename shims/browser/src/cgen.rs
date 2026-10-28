@@ -1047,6 +1047,18 @@ fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
     hints
 }
 
+/// Whether JS's `#cgenServe` has anything to do (`gex_after_trap`): a
+/// program to publish, providers or re-bridges, a new process's rescan,
+/// the function table's log or late bindings to replay (`catch`: JS
+/// replays them, `wasmdll_have` of the bindings so far), or a unit
+/// wanted (`units`: JS serves them).
+pub(crate) fn serve_due(units: bool, catch: bool, wasmdll_have: u32) -> bool {
+    wasmprog::staged_any()
+        || elfprov::due()
+        || (catch && (behind() || wasmdll::binds_len() > wasmdll_have))
+        || (units && u_oldest(|st| st & U_CLAIMED != 0).is_some())
+}
+
 /// The oldest unit waiting for its bytes, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_wanted() -> i32 {
@@ -3165,6 +3177,11 @@ pub extern "C" fn gex_fault_take(out: u32) -> u32 {
     // SAFETY: `out` is 16 bytes the host allocated in this module's memory.
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), std::ptr::with_exposed_provenance_mut::<u8>(out as usize), 16) };
     fault_hook()
+}
+
+/// Whether a fault is staged for the hook (`gex_after_trap`).
+pub(crate) fn fault_staged() -> bool {
+    FAULT_PENDING.with(|f| f.get()).is_some()
 }
 
 /// A native wasm32 program's signal hook . Recorded, as the fault

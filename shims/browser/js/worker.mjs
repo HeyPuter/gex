@@ -1393,6 +1393,7 @@ async function handle(msg) {
       cmdline: gex.cmdline,
       // How this process waited, by kind. See `Gex.waits`.
       waits: gex.waits,
+      traps: gex.traps,
       loader: gex.loader,
       // What a Worker pays before the guest runs: shim and guest module are
       // instantiated per Worker.

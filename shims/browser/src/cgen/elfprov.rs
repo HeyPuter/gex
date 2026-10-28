@@ -49,6 +49,15 @@ pub(crate) fn waiting() -> bool {
     QUEUE.with(|q| !q.borrow().is_empty()) || REBRIDGE.with(|v| !v.borrow().is_empty())
 }
 
+/// Whether `gex_elfprov_wanted` or the re-bridges have anything for JS: a
+/// unit queued, pairs waiting, or a new process's rescan here or in
+/// `libprov` (each rescan notes the process it ran for).
+pub(crate) fn due() -> bool {
+    waiting()
+        || (!crate::vfork::active()
+            && ((on() && PID.load(Ordering::Acquire) != crate::my_pid()) || super::libprov::rescan_due()))
+}
+
 /// The process the state above is for: a forked child's shim may start
 /// with its parent's copy, which describes the parent's table.
 static PID: AtomicI32 = AtomicI32::new(0);

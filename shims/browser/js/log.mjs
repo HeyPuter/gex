@@ -26,6 +26,9 @@
 //   GEX_LOG=nodlpack     no packing: every export kept, as before (only when named)
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)
+//   GEX_LOG=traps        per process at its end, how its Worker's traps went on:
+//                        straight on (`gex_after_trap`) or through each step
+//                        (only when named)
 //   GEX_LOG=a,b          several of those
 //   GEX_LOG=off          not even the default lines (tests that compare a
 //                        program's output with its native run)

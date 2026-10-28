@@ -14627,6 +14627,50 @@ pub extern "C" fn gex_resume_ctx() -> i32 {
     RESUME_CTX.with(|c| c.take()).unwrap_or(0) as i32
 }
 
+thread_local! {
+    /// The context `gex_after_trap` took with its resume (0: the same one).
+    static AFTER_TRAP_CTX: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// After a handoff, the whole of what the host would otherwise ask one
+/// export at a time: when nothing waits for it (a slot to fill, a dense
+/// module, translations to install, modules past its `installed`, a unit
+/// or provider to serve, a vfork, fork, thread or fault staged, an open
+/// provider call) and the process goes on, the resume is taken
+/// (`gex_resume_pc`, its context at `gex_after_trap_ctx`) and returned.
+/// Otherwise 0, with nothing taken, and the host goes through each.
+/// `flags` bit 0: the host serves units (`gex_cgen_wanted`).
+#[no_mangle]
+pub extern "C" fn gex_after_trap(installed: u32, wasmdll_have: u32, flags: u32) -> i64 {
+    let units = flags & 1 != 0;
+    let busy = exited()
+        || FILL_WANTED.with(|c| c.get()) >= 0
+        || dense::wanted()
+        || gex_jit_pending_len() != 0
+        || cgen::libprov::guest_calls_open()
+        || gex_has_host() == 0
+        || regview::count() > installed
+        || cgen::serve_due(units, units || fjit::on(), wasmdll_have)
+        || vfork::gex_vfork_ok() != -2
+        || FORK.with(|f| f.get()[0]) != 0
+        || THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
+        || cgen::fault_staged();
+    if busy {
+        return 0;
+    }
+    let pc = gex_resume_pc();
+    if pc != 0 {
+        AFTER_TRAP_CTX.with(|c| c.set(gex_resume_ctx() as u32));
+    }
+    pc
+}
+
+/// Where `gex_after_trap` leaves the context it took (a u32 of this Worker's).
+#[no_mangle]
+pub extern "C" fn gex_after_trap_ctx() -> u32 {
+    AFTER_TRAP_CTX.with(|c| c.as_ptr() as u32)
+}
+
 #[no_mangle]
 pub extern "C" fn gex_exit_code() -> i32 {
     // An end claimed and still under way in another Worker: `exited` is set

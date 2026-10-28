@@ -370,6 +370,11 @@ pub extern "C" fn gex_dense_want() -> u32 {
     WANT.with(|w| w.replace(0))
 }
 
+/// Whether `gex_dense_want` has an index to give (`gex_after_trap`).
+pub(crate) fn wanted() -> bool {
+    WANT.with(|w| w.get()) != 0
+}
+
 /// How many `blocks` entries registry module `i` holds (0: not a dense
 /// module, or one that died). A Worker leaves such a module to the miss that
 /// wants one of them (`gex_dense_want`) rather than installing it to catch up.

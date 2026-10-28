@@ -1750,6 +1750,12 @@ export class ProcessHost {
             typeof pid === 'number' ? pid : 0,
           );
         }
+        // How its Worker's traps went on (`Gex.traps`): straight on, or
+        // through each step.
+        if (m.traps && logNamed('traps')) {
+          const t = m.traps;
+          console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
+        }
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, guarded so the Node harness
         // (which prints its own) does not double up.
