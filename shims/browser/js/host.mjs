@@ -52,23 +52,32 @@ function forgetMemory(pid) {
 
 // A library or image loaded for the first time this session, said once
 // rather than once per process (each Wine process maps the same dozen DLLs).
-// Every Worker says what it installs on the 'gex-fetch' channel
-// (fetch-note.mjs `noteStatus`); this side keeps the set.
+// Every Worker says what it installs (fetch-note.mjs `noteStatus`): to its
+// host (`relayNote`), or on the 'gex-fetch' channel from a realm without
+// one; this side keeps the set.
 const libsSeen = new Set();
 let libChannel = null;
+function seeLibrary(st) {
+  if (!st || (st.kind !== 'module' && st.kind !== 'unit') || !st.path) return;
+  const path = String(st.path).replace(/^wasm(dll|prog):/, '');
+  if (libsSeen.has(path)) return;
+  libsSeen.add(path);
+  inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
+}
 function watchLibraries() {
   if (libChannel || typeof BroadcastChannel !== 'function') return;
   libChannel = new BroadcastChannel('gex-fetch');
   // Under Node an open channel keeps the event loop alive.
   libChannel.unref?.();
-  libChannel.onmessage = (ev) => {
-    const st = ev.data?.status;
-    if (!st || (st.kind !== 'module' && st.kind !== 'unit') || !st.path) return;
-    const path = String(st.path).replace(/^wasm(dll|prog):/, '');
-    if (libsSeen.has(path)) return;
-    libsSeen.add(path);
-    inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
-  };
+  libChannel.onmessage = (ev) => seeLibrary(ev.data?.status);
+}
+/** A Worker's note (fetch-note.mjs): seen here, and said on the channel for
+ *  the page (app.js `watchFetches`), which this side's own channel is not
+ *  handed back. */
+function relayNote(note) {
+  seeLibrary(note?.status);
+  watchLibraries();
+  try { libChannel?.postMessage(note); } catch {}
 }
 
 function crashed(what) {
@@ -1428,6 +1437,9 @@ export class ProcessHost {
         }
         break;
       }
+      case 'note':
+        relayNote(m.note);
+        break;
       case 'doorPublish': {
         // The wineserver's door: every Worker of
         // the session, now and later, gets the server's memory and module.

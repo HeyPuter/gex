@@ -80,7 +80,7 @@ async function forkBulkIn(child) {
 import { setFill, fillFile } from './lazy-fetch.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
-import { noteFetch, noteStatus } from './fetch-note.mjs';
+import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { logNamed, setLog } from './log.mjs';
@@ -161,6 +161,10 @@ const port = {
   },
   on: rawPort.on,
 };
+// What this Worker fetches and installs, to its host (fetch-note.mjs). Not
+// in the single-thread build, whose fibers share the page's realm (and the
+// last fiber's port would outlive none of them).
+if (!single.on) setNoteSink((note) => port.post({ kind: 'note', note }));
 
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
