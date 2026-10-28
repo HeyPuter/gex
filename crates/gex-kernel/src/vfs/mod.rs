@@ -407,6 +407,33 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         0
     }
 
+    /// A count that moves at every wakeup of this handle's object (each
+    /// notify of its [`Self::wait_queue`]): an edge-triggered epoll watch
+    /// (`EPOLLET`) reports again when it has moved, as Linux's does at each
+    /// wakeup of the file. A file or directory never wakes: always ready, it
+    /// is reported once. `None` where this kernel cannot see the count (an
+    /// object another kernel holds): such a watch answers as a
+    /// level-triggered one.
+    fn wakes(&self) -> Option<u64> {
+        match self.metadata() {
+            Ok(md) if matches!(md.file_type, FileType::Regular | FileType::Directory) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// An exceptional condition to report (`POLLPRI`, with `POLLERR`, which
+    /// is never masked): what `/proc/self/mountinfo` says after a mount
+    /// changed.
+    fn poll_pri(&self) -> bool {
+        false
+    }
+
+    /// A poll or epoll wait has just reported `revents` for this handle to
+    /// its caller: a condition reported once ([`Self::poll_pri`]) is spent.
+    fn poll_reported(&self, revents: u16) {
+        let _ = revents;
+    }
+
     /// How long until this handle becomes ready by the clock alone (a
     /// timerfd's next expiry, a sound device draining its buffer), for a
     /// waiter to bound its park by. `None` when only an event makes it ready.

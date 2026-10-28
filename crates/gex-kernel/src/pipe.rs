@@ -81,6 +81,11 @@ impl Pipe {
         self.queue.id()
     }
 
+    /// [`crate::wait::Queue::wakes`] of its queue.
+    pub fn wakes(&self) -> u64 {
+        self.queue.wakes()
+    }
+
 
     /// Note that another descriptor now refers to one end.
     pub fn open_end(&self, write: bool) {

@@ -120,6 +120,10 @@ impl FileHandle for EventFd {
         self.queue.id()
     }
 
+    fn wakes(&self) -> Option<u64> {
+        Some(self.queue.wakes())
+    }
+
     fn poll_writable(&self) -> bool {
         *self.count.lock().unwrap() < MAX
     }

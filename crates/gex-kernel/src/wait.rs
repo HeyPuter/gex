@@ -79,13 +79,21 @@ pub fn unchain(from: u32, to: u32) {
     }
 }
 
-/// One object's wait queue, freed with the object.
+/// One object's wait queue, freed with the object. It also counts its
+/// wakeups ([`Queue::wakes`]), with a host's queues or without.
 #[derive(Debug)]
-pub struct Queue(u32);
+pub struct Queue(u32, std::sync::atomic::AtomicU64);
 
 impl Queue {
     pub fn new() -> Queue {
-        Queue(HOOKS.get().map_or(0, |h| (h.new)()))
+        Queue(HOOKS.get().map_or(0, |h| (h.new)()), std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// How many times the object has been notified: an edge-triggered epoll
+    /// watch (`EPOLLET`) reports again when this has moved since it last
+    /// reported, as Linux's does at each wakeup of the file.
+    pub fn wakes(&self) -> u64 {
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The queue's number, for a waiter to register on; 0 when the host has
@@ -96,6 +104,7 @@ impl Queue {
 
     /// The object's readiness may have changed: wake whoever waits on it.
     pub fn notify(&self) {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         notify(self.0);
     }
 }
