@@ -1060,6 +1060,9 @@ fn run_program_with(
             {
                 let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
                 k.pins = std::sync::Arc::new(opts.pins.clone());
+                // The run's first program: what it learns about its address
+                // space is its image's (gexc `learn_mem`), not an exec'd one's.
+                k.mem.lock().set_learns(true);
                 k
             },
             // Filled when the process is first published (`publish_proc`).

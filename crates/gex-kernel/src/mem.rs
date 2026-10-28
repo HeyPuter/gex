@@ -364,6 +364,10 @@ pub struct MemoryMap {
     /// there. `None` for every M32 process, whose map behaves exactly as it
     /// always has.
     high: Option<(u64, u64)>,
+    /// Whether running out of address space here is noted in
+    /// [`ADDRESS_SPACE_SHORT`]: the map of the program a run started with
+    /// and its forks, not of another image one of them execs (a new map).
+    learns: bool,
     /// Ranges known to hold only zero bytes, sorted and disjoint: memory that
     /// has not been mapped with contents or writable since it was zeroed (a
     /// fresh process's, a reservation the kernel zeroed). Empty means nothing
@@ -521,9 +525,12 @@ const BAND_LARGE: u64 = 1 << 20;
 /// size or more: Windows' allocation granularity.
 const BAND_ALIGN: u64 = 64 << 10;
 
+/// The largest request a map that learns ([`MemoryMap::set_learns`]) could
+/// not place in an M32 memory: 0 if none ran short.
 pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Note that an M32 process ran out of address space asking for `len` bytes.
+/// Note that a learning M32 process ran out of address space asking for
+/// `len` bytes.
 pub fn note_address_space_short(len: u64) {
     ADDRESS_SPACE_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
 }
@@ -571,12 +578,19 @@ impl MemoryMap {
             // Every process of a host with a 64-bit guest memory has the
             // high arena.
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+            learns: false,
             clean: Vec::new(),
             fresh: None,
             take_end: 0,
             fixed_only: Vec::new(),
             log: MapLog::default(),
         }
+    }
+
+    /// Note this map's running out of address space for the next start of
+    /// its image ([`ADDRESS_SPACE_SHORT`]); an exec's new map does not.
+    pub fn set_learns(&mut self, on: bool) {
+        self.learns = on;
     }
 
     /// Start again with an empty map (an exec, a snapshot's restore): the
@@ -1009,7 +1023,7 @@ impl MemoryMap {
         };
         let start = take(want);
         if start == 0 {
-            if self.high.is_none() {
+            if self.high.is_none() && self.learns {
                 note_address_space_short(len);
             }
             return Err(Errno::ENOMEM);
@@ -1359,7 +1373,7 @@ impl MemoryMap {
 
         if self.banded {
             let Some(start) = self.place_banded(len, origin.is_none()) else {
-                if self.high.is_none() {
+                if self.high.is_none() && self.learns {
                     note_address_space_short(len);
                 }
                 return Err(Errno::ENOMEM);
@@ -1381,7 +1395,7 @@ impl MemoryMap {
                 continue;
             }
             if candidate < len || candidate - len < MMAP_BOTTOM {
-                if self.high.is_none() {
+                if self.high.is_none() && self.learns {
                     note_address_space_short(len);
                 }
                 return Err(Errno::ENOMEM);
@@ -2488,10 +2502,22 @@ mod tests {
     #[test]
     fn a_32_bit_memory_records_running_out_of_address_space() {
         let mut m = MemoryMap::new(0x40_0000);
+        m.set_learns(true);
         let a = m.mmap(0, 0x1000, prot::READ, 0, "x").unwrap();
         assert!(a < MMAP_TOP);
         assert_eq!(m.mmap(1 << 33, 0x1000, prot::READ, flags::FIXED, "f"), Err(Errno::ENOMEM));
         while m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").is_ok() {}
         assert!(ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed) >= 0x1fff_f000);
+    }
+
+    /// A map renewed by an exec (another image) does not learn, nor does a
+    /// new one, until asked.
+    #[test]
+    fn only_a_learning_map_records_running_out() {
+        let mut m = MemoryMap::new(0x40_0000);
+        m.set_learns(true);
+        m.renew(0x40_0000);
+        assert!(!m.learns);
+        assert!(!MemoryMap::new(0x40_0000).learns);
     }
 }
