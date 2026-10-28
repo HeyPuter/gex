@@ -21,6 +21,9 @@
 //                        started, caught up and given its thread (only when named)
 //   GEX_LOG=win          a line when a toplevel appears, first shows pixels and
 //                        is retitled, in the page's desktop (only when named)
+//   GEX_LOG=dlpack       a line per wasm32 library whose exports the page packs
+//                        (gex.mjs `packExports`): its size and time (only when named)
+//   GEX_LOG=nodlpack     no packing: every export kept, as before (only when named)
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)
 //   GEX_LOG=a,b          several of those
