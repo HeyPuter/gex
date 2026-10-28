@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { NodeNetwork } from './net-node.mjs';
+import { PageHostStream } from './page-host.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'gex-page-host-'));
 mkdirSync(join(dir, 'pool'));
@@ -68,8 +69,14 @@ if (three.id) net.close(three.id);
 const out = await exchange(`GET /../${dir.split('/').pop()}-outside HTTP/1.1\r\nHost: files.test\r\nConnection: close\r\n\r\n`);
 check(/^HTTP\/1\.1 404 /.test(out.got) && out.ended, 'a path out of the directory: 404', out.got);
 
-const post = await exchange('POST /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nContent-Length: 2\r\n\r\nhi');
-check(/^HTTP\/1\.1 405 [^]*Allow: GET, HEAD/.test(post.got) && post.ended, 'POST: 405, and the connection ends', post.got);
+const post = await exchange('POST /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nContent-Length: 2\r\n\r\nhi'
+  + 'GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\n\r\n');
+check(/^HTTP\/1\.1 405 [^]*Allow: GET, HEAD/.test(post.got) && post.ended && !/200/.test(post.got),
+  'POST: 405, and the connection ends, the request after it not answered', post.got);
+
+const part = await exchange('GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nRange: bytes=4-6\r\nConnection: close\r\n\r\n');
+check(/^HTTP\/1\.1 206 [^]*Content-Range: bytes 4-6\/12\r\n[^]*Content-Length: 3\r\n/.test(part.got) && part.got.endsWith('\r\n\r\nve '),
+  'a range: 206, those bytes', part.got);
 
 const ws = await exchange('GET /pool/a.txt HTTP/1.1\r\nHost: files.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
 check(/^HTTP\/1\.1 405 /.test(ws.got) && ws.ended, 'a WebSocket upgrade: 405', ws.got);
@@ -79,6 +86,25 @@ check(/twelve bytes$/.test(close.got) && /Connection: close/.test(close.got) && 
 
 const old = await exchange('GET /pool/a.txt HTTP/1.0\r\n\r\n');
 check(/twelve bytes$/.test(old.got) && old.ended, 'HTTP/1.0: answered, then closed', old.got);
+
+// The page's own `fetch`, which a browser refuses to run as a method of
+// anything but the global ("Illegal invocation").
+{
+  const real = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = function (url) {
+    if (this !== undefined && this !== globalThis) throw new TypeError('Illegal invocation');
+    seen = String(url);
+    return Promise.resolve(new Response('ok', { headers: { 'content-length': '2' } }));
+  };
+  const st = new PageHostStream('https://page.test/apt/');
+  let got = '';
+  st.onmessage = (b) => { got += new TextDecoder().decode(b); };
+  st.send(new TextEncoder().encode('GET /x HTTP/1.1\r\nHost: gex-site\r\n\r\n'));
+  for (let i = 0; i < 100 && !got.endsWith('ok'); i++) await new Promise((r) => setTimeout(r, 5));
+  globalThis.fetch = real;
+  check(/^HTTP\/1\.1 200 /.test(got) && seen === 'https://page.test/apt/x', "the page's fetch, called as the browser takes it", got);
+}
 
 rmSync(dir, { recursive: true, force: true });
 rmSync(join(dir, '..', `${dir.split('/').pop()}-outside`), { force: true });

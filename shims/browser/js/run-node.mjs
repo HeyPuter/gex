@@ -42,20 +42,18 @@ import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
 import { spareMemories } from './lazy-fetch.mjs';
+import { pageHosts } from './page-host.mjs';
 
-/** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as `[name, base]` pairs, a
- *  directory as a `file:` URL. */
+/** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
+ *  a directory against this one. */
 function pageHostsFromEnv(v) {
   if (!v) return undefined;
-  const out = [];
+  const map = {};
   for (const item of v.split(',')) {
     const at = item.indexOf('=');
-    if (at <= 0) continue;
-    const name = item.slice(0, at).toLowerCase(), to = item.slice(at + 1);
-    const base = /^[a-z]+:/i.test(to) ? to : pathToFileURL(resolve(to)).href;
-    out.push([name, base.endsWith('/') ? base : `${base}/`]);
+    if (at > 0) map[item.slice(0, at)] = item.slice(at + 1);
   }
-  return out.length ? out : undefined;
+  return pageHosts(map, pathToFileURL(`${process.cwd()}/`)) ?? undefined;
 }
 
 /** GEX_PROVIDER_DIRS as the shim takes it (`gex_provider_sources`). */
@@ -537,7 +535,8 @@ const host = new ProcessHost({
     // GEX_NETWORK gives the guest a network of real TCP sockets. Inherited:
     // apt fetches in a forked helper, so the one process needing a network was
     // the only one without one when this was not carried.
-    network: process.env.GEX_NETWORK ? true : process.env.GEX_PAGE_HOSTS ? 'hosts' : false,
+    network: !!(process.env.GEX_NETWORK || process.env.GEX_PAGE_HOSTS),
+    tcp: !!process.env.GEX_NETWORK,
     // GEX_PAGE_HOSTS=name=DIR_OR_URL,...: hosts answered from those files
     // (page-host.mjs), as a page's `pageHosts`; with no GEX_NETWORK, the
     // guest reaches only these.

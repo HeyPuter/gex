@@ -1029,7 +1029,7 @@ async function handle(msg) {
   // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
-    const net = new NodeNetwork({ pageHosts: msg.pageHosts ? new Map(msg.pageHosts) : null, tcp: msg.network === true });
+    const net = new NodeNetwork({ pageHosts: msg.pageHosts ?? null, tcp: !!msg.tcp });
     if (single.on) net.onActivity = () => sched.wake();
     gex.useNetwork(net);
   }
@@ -1048,7 +1048,7 @@ async function handle(msg) {
     // The site's Wisp client, imported only when a proxy was named.
     const { WispNetwork } = await import('../../../web/src/net.js');
     const net = new WispNetwork(msg.wispUrl ?? null, (e) => port.post({ kind: 'net', event: e }),
-      { pageHosts: msg.pageHosts ? new Map(msg.pageHosts) : null });
+      { pageHosts: msg.pageHosts ?? null });
     // Opened and waited for: constructing one only remembers the address, and
     // until the WebSocket has said hello `open` answers zero -- which the shim
     // turns into `ENETUNREACH`. A proxy that cannot be reached is not a reason
