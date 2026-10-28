@@ -12397,6 +12397,68 @@ mod tests {
         assert_eq!(wait(&mut k, &mut m, ep), vec![], "one-shot, spent again");
     }
 
+    /// `/proc/self/mountinfo` under epoll, as libmount's monitor watches it
+    /// (`EPOLLIN | EPOLLPRI | EPOLLET`): readable, reported once when added;
+    /// after a mount, reported again with `EPOLLPRI | EPOLLERR`, once; and
+    /// a level-triggered `poll` has the change reported to it once too.
+    #[test]
+    fn mountinfo_reports_a_mount_change() {
+        const POLLIN: u32 = 0x001;
+        const POLLPRI: u32 = 0x002;
+        const POLLERR: u32 = 0x008;
+        const ET: u64 = 1 << 31;
+        let (mut buf, mut k) = setup();
+        for d in ["/proc", "/mnt", "/mnt2"] {
+            k.vfs.mkdir(d, 0o755).unwrap();
+        }
+        let cell = Arc::new(crate::proclive::ProcCell::default());
+        let src = crate::proclive::KernelProcSource(Arc::clone(&cell));
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(src))));
+        k.publish_proc(&cell);
+        let mut m = GuestMem::new(&mut buf);
+        let at = k.ctx_addr;
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        let packed = gex_abi::X86;
+        let fd = open_at(&mut k, &mut m, "/proc/self/mountinfo", 0) as u64;
+        let ep = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        m.write_u32(0x20300, (POLLIN | POLLPRI) | ET as u32).unwrap();
+        m.write_u64(if packed { 0x20304 } else { 0x20308 }, 0x55).unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[ep, 1, fd, 0x20300]), 0);
+        let wait = |k: &mut Kernel, m: &mut GuestMem<'_>| -> Option<u32> {
+            match call(k, m, nr::EPOLL_PWAIT, &[ep, 0x20400, 4, 0, 0, 8]) {
+                0 => None,
+                1 => Some(m.read_u32(0x20400).unwrap()),
+                n => panic!("epoll_pwait: {n}"),
+            }
+        };
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN), "added");
+        assert_eq!(wait(&mut k, &mut m), None, "no change");
+        k.vfs.mount("/mnt", Arc::new(TmpFs::new()));
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN | POLLPRI | POLLERR), "a mount");
+        assert_eq!(wait(&mut k, &mut m), None, "the mount, reported");
+
+        // `poll`, level-triggered: the change once, then only readable.
+        let pollfd = 0x20500u64;
+        m.write_u32(pollfd, fd as u32).unwrap();
+        m.write_u32(pollfd + 4, POLLIN | POLLPRI).unwrap();
+        let ppoll = |k: &mut Kernel, m: &mut GuestMem<'_>| {
+            m.write_u64(0x20600, 0).unwrap();
+            m.write_u64(0x20608, 0).unwrap();
+            assert_eq!(call(k, m, nr::PPOLL, &[pollfd, 1, 0x20600, 0, 8]), 1);
+            m.read_u32(pollfd + 4).unwrap() >> 16
+        };
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN, "the mount, reported to epoll already");
+        k.vfs.mount("/mnt2", Arc::new(TmpFs::new()));
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN | POLLPRI | POLLERR, "another mount");
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN, "another mount, reported");
+        assert!(k.vfs.unmount("/mnt"));
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN | POLLPRI | POLLERR), "an unmount");
+    }
+
     /// Open `path` (`openat` from the working directory) with `flags`.
     fn open_at(k: &mut Kernel, m: &mut GuestMem<'_>, path: &str, flags: u64) -> i64 {
         put_str(m, 0x20000, path);

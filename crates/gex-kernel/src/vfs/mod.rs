@@ -952,6 +952,9 @@ pub struct VfsView {
     cur: gex_atomic::rcu::Published<Arc<Namespace>>,
     /// How many times the mount table has changed.
     mounts: std::sync::atomic::AtomicU64,
+    /// Notified at each change: a reader of `/proc/self/mountinfo` waits
+    /// on it.
+    changed: crate::wait::Queue,
 }
 
 impl VfsView {
@@ -959,6 +962,7 @@ impl VfsView {
         VfsView {
             cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS),
             mounts: std::sync::atomic::AtomicU64::new(0),
+            changed: crate::wait::Queue::new(),
         }
     }
 
@@ -977,6 +981,11 @@ impl VfsView {
     /// How many times the mount table has changed, now.
     pub fn mounts(&self) -> u64 {
         self.mounts.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The wait queue notified at each change of the mount table.
+    pub fn mounts_queue(&self) -> u32 {
+        self.changed.id()
     }
 
     /// Mount `fs` at `at` (absolute, or relative to the published
@@ -1019,6 +1028,7 @@ impl VfsView {
         // the count is never older than the count says (`Vfs::refresh`).
         if changed {
             self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.changed.notify();
         }
         changed
     }

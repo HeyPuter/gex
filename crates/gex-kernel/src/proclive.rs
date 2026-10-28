@@ -160,6 +160,9 @@ impl ProcSource for KernelProcSource {
     fn mount_table(&self) -> Vec<(String, &'static str)> {
         self.0.get().and_then(|l| l.vfs.upgrade()).map(|v| v.get().mount_table()).unwrap_or_default()
     }
+    fn mount_changes(&self) -> (u64, u32) {
+        self.0.get().and_then(|l| l.vfs.upgrade()).map_or((0, 0), |v| (v.mounts(), v.mounts_queue()))
+    }
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }

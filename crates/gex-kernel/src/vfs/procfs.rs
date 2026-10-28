@@ -8,6 +8,7 @@
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Live process state that `/proc` reports on.
@@ -53,6 +54,11 @@ pub trait ProcSource: Send + Sync {
     /// The process's mounts ([`crate::vfs::Namespace::mount_table`]).
     fn mount_table(&self) -> Vec<(String, &'static str)> {
         Vec::new()
+    }
+    /// How many times the mount table has changed, and the wait queue
+    /// notified at each change ([`crate::vfs::VfsView::mounts_queue`]).
+    fn mount_changes(&self) -> (u64, u32) {
+        (0, 0)
     }
 }
 
@@ -134,6 +140,47 @@ pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threa
 #[derive(Debug)]
 struct Generated {
     data: Vec<u8>,
+}
+
+/// `/proc/self/mountinfo` as opened: the table then, and, as Linux's, a
+/// wakeup at each later change of the mount table, which a wait reports
+/// as `POLLPRI` (with `POLLERR`) once. libmount's monitor waits on it,
+/// edge-triggered, for mounts that come and go.
+struct MountInfo {
+    file: Generated,
+    source: Arc<dyn ProcSource>,
+    /// The change count this reader last had reported to it.
+    seen: AtomicU64,
+}
+
+impl std::fmt::Debug for MountInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountInfo").field("seen", &self.seen).finish()
+    }
+}
+
+impl FileHandle for MountInfo {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.file.read_at(offset, buf)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        self.file.metadata()
+    }
+    fn wait_queue(&self) -> u32 {
+        self.source.mount_changes().1
+    }
+    fn wakes(&self) -> Option<u64> {
+        Some(self.source.mount_changes().0)
+    }
+    fn poll_pri(&self) -> bool {
+        self.source.mount_changes().0 != self.seen.load(Ordering::SeqCst)
+    }
+    fn poll_reported(&self, revents: u16) {
+        const POLLPRI: u16 = 0x002;
+        if revents & POLLPRI != 0 {
+            self.seen.store(self.source.mount_changes().0, Ordering::SeqCst);
+        }
+    }
 }
 
 impl FileHandle for Generated {
@@ -323,6 +370,17 @@ impl FileSystem for ProcFs {
             return Err(Errno::EISDIR);
         }
         let (path, tid) = self.canonical(path)?;
+        if path == "self/mountinfo" {
+            // The count before the table: a change after it is one this
+            // reader has not seen.
+            let (seen, _) = self.source.mount_changes();
+            let data = mountinfo(&self.source.mount_table()).into_bytes();
+            return Ok(Arc::new(MountInfo {
+                file: Generated { data },
+                source: Arc::clone(&self.source),
+                seen: AtomicU64::new(seen),
+            }));
+        }
         if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
         }
