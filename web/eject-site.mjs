@@ -34,7 +34,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--level', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--level', '--late', '--boot-units', '--stable-from', '--rest-frame', '--rest-order', '--rest-paths'].includes(av[i - 1]));
 // --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -46,7 +46,7 @@ const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '
 // own directory) keeps the files whose bytes are DIR's in pieces of their
 // own, which a rebuild of the rest never changes.
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe] [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--level N] [--strip] [--prune] [--dedupe] [--pieces] [--stable-from DIR]... [--late FILE] [--boot-units FILE] [--rest-frame MiB] [--rest-order FILE] [--rest-paths FILE] [--no-rest]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -457,6 +457,12 @@ function wine32Site() {
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
   const split = wine32.bundle?.split ? new Set(wine32.bundle.read ?? []) : null;
+  // The bundle's files in the order the recorded run first read them.
+  const readOrder = split ? [...split] : null;
+  // --rest-paths FILE (guest paths, one a line): files the run read that
+  // still go to the rest bundle, not the bundle (a large file read by
+  // offset, such as a game's music, which the boot needs only a little of).
+  if (split && opt('--rest-paths', null)) for (const p of readPathList(opt('--rest-paths', null))) split.delete(p);
   // --late FILE: see the fill below.
   const late = opt('--late', null) ? readPathList(opt('--late', null)) : [];
   if (split) for (const p of late) split.delete(p);
@@ -521,7 +527,7 @@ function wine32Site() {
     }
     tar = join(work, 'rootfs.tar');
     if (piecesOn) piecesIndex = pieces(x);
-    pack(tree, tar, work, flag('--dedupe'));
+    pack(tree, tar, work, flag('--dedupe'), readOrder);
   }
   // What the split leaves in the bundle (the run's read set) is all the
   // download has of it; nt.json carries the rest's manifest by URL.
