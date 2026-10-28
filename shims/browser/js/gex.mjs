@@ -2289,8 +2289,8 @@ export class Gex {
     }
     // Files fetched as they are read (`gex_add_lazy`): [path, size, url,
     // head], after the bundle's, which win -- unless the bundle's is the
-    // lazy file's head (`head` bytes of it), which the kernel then holds as
-    // the file's first chunks.
+    // lazy file's head (`head` bytes of it: its first chunks, maybe its last
+    // one too), which the kernel then holds as those chunks.
     for (const [path, size, url, head] of opts.lazy ?? []) {
       if (!this.#shim.exports.gex_add_lazy) break;
       if (files[path] !== undefined && !(head && files[path].length === head)) continue;

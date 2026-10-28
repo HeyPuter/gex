@@ -236,26 +236,42 @@ impl FileNode {
     /// and a whole number of chunks long, is that file's head: what a site's
     /// first bundle carries of a file read only in part before its first
     /// frame (a game's music, its first track's start), the rest left in the
-    /// rest bundle. The file becomes the lazy one with the head's chunks
-    /// already held, so those reads fetch nothing. Any other copy wins as is.
+    /// rest bundle. A copy a whole number of chunks and then the file's last,
+    /// partial chunk long is a head and that tail: an archive whose table is
+    /// at its end. The file becomes the lazy one with those chunks already
+    /// held, so those reads fetch nothing. Any other copy wins as is.
     fn seed_head(&self, size: u64, url: &str) {
         let mut lazy = self.lazy.lock().unwrap();
         if lazy.is_some() {
             return;
         }
         let mut data = self.data.lock().unwrap();
-        let head = data.len() as u64;
-        if head == 0 || head >= size || head % LAZY_CHUNK != 0 {
+        let have = data.len() as u64;
+        let last = size % LAZY_CHUNK;
+        let head = if have % LAZY_CHUNK == 0 {
+            have
+        } else if last != 0 && have % LAZY_CHUNK == last {
+            have - last
+        } else {
+            return;
+        };
+        if have == 0 || have >= size {
             return;
         }
-        let chunks: std::collections::HashMap<u64, Box<[u8]>> =
-            data.chunks(LAZY_CHUNK as usize).enumerate().map(|(k, c)| (k as u64, c.to_vec().into_boxed_slice())).collect();
+        let mut chunks: std::collections::HashMap<u64, Box<[u8]>> = data[..head as usize]
+            .chunks(LAZY_CHUNK as usize)
+            .enumerate()
+            .map(|(k, c)| (k as u64, c.to_vec().into_boxed_slice()))
+            .collect();
+        if have > head {
+            chunks.insert(size / LAZY_CHUNK, data[head as usize..].to_vec().into_boxed_slice());
+        }
         let was = data.capacity();
         *data = Vec::new();
         note_capacity(was, 0);
-        TMPFS_BYTES.fetch_add(head, core::sync::atomic::Ordering::Relaxed);
+        TMPFS_BYTES.fetch_add(have, core::sync::atomic::Ordering::Relaxed);
         self.changed();
-        *lazy = Some(Lazy { url: url.to_string(), size, chunks, held: head, ahead: 0 });
+        *lazy = Some(Lazy { url: url.to_string(), size, chunks, held: have, ahead: 0 });
     }
 
     /// Make a lazy file an ordinary one (all of it fetched), before a write
@@ -2249,6 +2265,10 @@ mod lazy_tests {
             HEAD_ASKED.lock().unwrap().push((offset, into.len() as u64));
             return counting(url, offset, into);
         }
+        if url == "/data/t" {
+            TAIL_ASKED.lock().unwrap().push((offset, into.len() as u64));
+            return counting(url, offset, into);
+        }
         if url == "/data/pe" {
             let img = PE.get().unwrap();
             ASKED.lock().unwrap().push((offset, into.len() as u64));
@@ -2418,6 +2438,8 @@ mod lazy_tests {
 
     /// Requests of `/data/h`, each `(offset, len)`.
     static HEAD_ASKED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+    /// Requests of `/data/t`, each `(offset, len)`.
+    static TAIL_ASKED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
     /// A bundled copy that is a lazy file's head, whole chunks long: the
     /// file is the lazy one at its full size, a read inside the head fetches
@@ -2445,6 +2467,31 @@ mod lazy_tests {
         assert!(b.iter().enumerate().all(|(k, &x)| x == ((2 * LAZY_CHUNK - 10 + k as u64) % 251) as u8));
         let mut tail = vec![0u8; 64];
         assert_eq!(h.read_at(size - 7, &mut tail).unwrap(), 7);
+    }
+
+    /// A copy of a whole chunk and then the file's last, partial one is its
+    /// head and tail: reads in either fetch nothing, a read between does.
+    #[test]
+    fn a_bundled_head_and_tail_seed_a_lazy_file() {
+        set_lazy_fetch(fake);
+        let size = 5 * LAZY_CHUNK + 7;
+        let byte = |i: u64| (i % 251) as u8;
+        let mut copy: Vec<u8> = (0..LAZY_CHUNK).map(byte).collect();
+        copy.extend((5 * LAZY_CHUNK..size).map(byte));
+        let fs = TmpFs::new();
+        fs.add_file("/m/arc", copy);
+        fs.add_lazy("/m/arc", size, "/data/t");
+        assert_eq!(FileSystem::metadata(&fs, "m/arc").unwrap().size, size);
+        let h = fs.open("m/arc", oflags::O_RDONLY, 0).unwrap();
+        let mut b = vec![0u8; 7];
+        assert_eq!(h.read_at(size - 7, &mut b).unwrap(), 7);
+        assert!(b.iter().enumerate().all(|(k, &x)| x == byte(size - 7 + k as u64)));
+        h.read_at(100, &mut b).unwrap();
+        assert!(b.iter().enumerate().all(|(k, &x)| x == byte(100 + k as u64)));
+        assert!(TAIL_ASKED.lock().unwrap().is_empty(), "a read in the head or tail fetched");
+        h.read_at(3 * LAZY_CHUNK, &mut b).unwrap();
+        assert_eq!(TAIL_ASKED.lock().unwrap().first().map(|r| r.0), Some(3 * LAZY_CHUNK));
+        assert!(b.iter().enumerate().all(|(k, &x)| x == byte(3 * LAZY_CHUNK + k as u64)));
     }
 
     /// Requests of `/data/r`, each `(offset, len)`.

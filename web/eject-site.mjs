@@ -471,10 +471,10 @@ function wine32Site() {
   // part the boot reads (the title's music start), which the kernel then
   // holds as already fetched (tmpfs.rs `seed_head`), so the boot asks the
   // rest bundle for nothing.
-  const heads = new Map(); // guest path -> head bytes
+  const heads = new Map(); // guest path -> {head bytes, tail}, then the bundled copy's length
   if (split && opt('--rest-paths', null)) {
-    for (const [p, n] of restPaths(readPathList(opt('--rest-paths', null)))) {
-      if (n) heads.set(p, n);
+    for (const [p, n, tail] of restPaths(readPathList(opt('--rest-paths', null)))) {
+      if (n || tail) heads.set(p, { head: n, tail });
       split.delete(p);
     }
   }
