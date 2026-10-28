@@ -14,8 +14,18 @@ pub(crate) use stub::*;
 
 #[cfg(not(feature = "shared-memory"))]
 mod stub {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// As the shared build's: `MMAP_TOP`, or all of the memory for a
+    /// process that translates nothing ([`raise_native_ceiling`]).
+    static ARENA_CEILING: AtomicU64 = AtomicU64::new(gex_abi::MMAP_TOP);
+
     pub(crate) fn arena_ceiling() -> u64 {
-        gex_abi::MMAP_TOP
+        ARENA_CEILING.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn raise_native_ceiling() {
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
     }
 
     pub(crate) fn windows_space() -> u64 {
@@ -70,6 +80,13 @@ mod imp {
         ARENA_CEILING.load(Ordering::Relaxed)
     }
 
+    /// A process that translates nothing (no placement window) names no
+    /// code in the dispatch directory, so its arena may use all of the
+    /// memory rather than stop at the directory's reach.
+    pub(crate) fn raise_native_ceiling() {
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
+    }
+
     /// The bottom of the shim's heap in an NT process: the top of the
     /// Windows user address space and above.
     pub(crate) const NT_HEAP_BASE: u64 = 0x8000_0000;
@@ -97,7 +114,7 @@ mod imp {
         }
         ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
         let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
-        let host_hi = taken.max(gex_abi::arena_bottom()).min(NT_HEAP_BASE);
+        let host_hi = taken.max(gex_kernel::mem::arena_bottom()).min(NT_HEAP_BASE);
         crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
         WINDOWS_LO.store(host_hi, Ordering::Relaxed);
         Ok(host_hi)

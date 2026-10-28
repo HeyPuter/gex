@@ -53,6 +53,36 @@ pub const CONTENT_NAMINGS: u32 = 4;
 /// translations by name (a translation cache across loads, a system-wide
 /// numbering of pages by identity) needs it, so with none it costs nothing.
 /// The host sets it; off until it does.
+/// Set when this process places no shared objects: it runs no translated
+/// code (a native wasm program), so it has no placement window and its arena
+/// starts at `MMAP_BOTTOM`. Set once per process before anything is taken
+/// from the arena; never cleared, since the arena may by then be in the
+/// window. Kept out of gex-abi, whose sources are in every unit's key.
+static NO_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Give up the placement window (and the pin region) for this process. See
+/// [`NO_PLACE`].
+pub fn set_no_place_window() {
+    NO_PLACE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process keeps the placement window: false once
+/// [`set_no_place_window`] has run, and then nothing may be placed in it.
+pub fn place_window() -> bool {
+    !NO_PLACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lowest address the growing arena hands out: above the placement window
+/// and the pin region (`gex_abi::arena_bottom`), or `MMAP_BOTTOM` for a
+/// process without them.
+pub fn arena_bottom() -> u64 {
+    if place_window() {
+        gex_abi::arena_bottom()
+    } else {
+        MMAP_BOTTOM
+    }
+}
+
 static CONTENT_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Code named by its bytes so far in this process: how many mappings, and
@@ -840,7 +870,7 @@ impl MemoryMap {
         if self.take.is_none() {
             return Ok(());
         }
-        let floor = gex_abi::arena_bottom();
+        let floor = arena_bottom();
         let ours = |m: &Self| end <= floor || m.in_arena(start.max(floor), end);
         if ours(self) {
             // Below the floor the memory may still need growing (the
@@ -951,8 +981,8 @@ impl MemoryMap {
             mib(anon),
             mib(none),
             mib(arena),
-            mib(MMAP_TOP - gex_abi::arena_bottom()),
-            gex_abi::arena_bottom(),
+            mib(MMAP_TOP - arena_bottom()),
+            arena_bottom(),
             MMAP_TOP,
             MMAP_BOTTOM,
             MMAP_TOP,
@@ -1776,6 +1806,52 @@ impl MemoryMap {
             }
         }
         (size, rss, anon)
+    }
+
+    /// What the map holds, for a debug line on a memory's growth: its
+    /// highest end, the bytes mapped no-access (reservations), writable
+    /// anonymous, file-backed and other, the unmapped holes below the
+    /// highest end, and the largest names by bytes.
+    pub fn growth_summary(&self) -> String {
+        const M: u64 = 1 << 20;
+        let (mut none, mut anon, mut file, mut other, mut mapped) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut by: std::collections::BTreeMap<(String, char), u64> = std::collections::BTreeMap::new();
+        let mut top = 0u64;
+        for v in &self.vmas {
+            let n = v.end - v.start;
+            mapped += n;
+            top = top.max(v.end);
+            let c = if v.prot == 0 {
+                none += n;
+                '-'
+            } else if v.code.is_some() || v.origin.is_some() {
+                file += n;
+                'f'
+            } else if v.prot & prot::WRITE != 0 {
+                anon += n;
+                'w'
+            } else {
+                other += n;
+                'r'
+            };
+            let name = if v.name.is_empty() { "[anon]".to_string() } else { v.name.rsplit('/').next().unwrap_or(&v.name).to_string() };
+            *by.entry((name, c)).or_default() += n;
+        }
+        let low = self.vmas.first().map_or(0, |v| v.start);
+        let mut big: Vec<_> = by.into_iter().collect();
+        big.sort_by(|a, b| b.1.cmp(&a.1));
+        let names: Vec<String> = big.iter().take(8).map(|((n, c), b)| format!("{n}({c}) {}", b / M)).collect();
+        format!(
+            "top {top:#x}, {} vmas: no-access {} MiB, rw anon {} MiB, file {} MiB, other {} MiB, holes {} MiB, arena {} MiB; largest: {}",
+            self.vmas.len(),
+            none / M,
+            anon / M,
+            file / M,
+            other / M,
+            top.saturating_sub(low).saturating_sub(mapped) / M,
+            self.arena.iter().map(|&(a, b)| b.saturating_sub(a)).sum::<u64>() / M,
+            names.join(", ")
+        )
     }
 
     pub fn proc_maps(&self) -> String {

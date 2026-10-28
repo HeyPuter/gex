@@ -268,6 +268,9 @@ pub fn claim_fixed(heap_base: u64) {
     claim(Kind::Guest, 0, gex_abi::DISPATCH_DIR_END, 0x0580_0000, "low layout: image, interpreter, break, stack");
     claim(Kind::BootStacks, 0, 0x0580_0000, 0x0600_0000, "gex_worker_init's bootstrap slices");
     claim(Kind::ShimData, 0, 0x0600_0000, heap_base, "shim data and bss");
+    if !gex_kernel::mem::place_window() {
+        return;
+    }
     claim(Kind::Guest, 0, gex_abi::PLACE_BOTTOM, gex_abi::PLACE_TOP, "placement window (shared objects)");
     if gex_abi::pin_region_top() > gex_abi::PLACE_TOP {
         claim(Kind::Guest, 0, gex_abi::PLACE_TOP, gex_abi::pin_region_top(), "pin region (a project's libraries)");

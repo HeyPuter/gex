@@ -64,9 +64,8 @@ pub extern "C" fn gex_set_dense(on: i32) {
     ON.store(on != 0, Ordering::Relaxed);
     NO_CATCHUP.store(on == 2, Ordering::Relaxed);
     dense::set(on != 0);
-    // The first dense table's map now; the others when a directory entry
-    // first names them (`note_entry`).
-    let _ = map(dense::FIRST_TABLE);
+    // Every table's map when a directory entry first names it
+    // (`note_entry`): a process that translates nothing has none.
 }
 
 #[no_mangle]
