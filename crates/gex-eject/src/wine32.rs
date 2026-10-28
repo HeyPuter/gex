@@ -41,6 +41,10 @@ use std::path::{Path, PathBuf};
 pub const SESSION: &str = "wine32-session.json";
 /// What makes a project a 32-bit Wine one.
 pub const KIND: &str = "wine32";
+/// A 64-bit Wine one (its loader under `x86_64-unix`): the same project and
+/// build, with the 64-bit trampolines, the memory64 runtime beside the
+/// 32-bit one, and the D3D device when the recorded page had it.
+pub const KIND64: &str = "wine64";
 /// What a build made before the rename wrote, still read.
 pub const KIND_OLD: &str = "w3";
 /// A recording's format, and the name recordings made before the rename carry.
@@ -49,6 +53,24 @@ pub const FORMAT_OLD: &str = "gex-w3-session";
 
 /// The runtime's wasm the page loads from `gex/` (web/build-eject-page.sh).
 const RUNTIME_WASM: &[&str] = &["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
+/// The memory64 runtime (`GEX_MEM64=1 shims/browser/build.sh`) a 64-bit Wine
+/// page runs a program marked for memory64 on.
+const RUNTIME_WASM_M64: &[&str] = &["gex_browser.x86.m64.shared.wasm", "seed.x86.m64.shared.wasm"];
+
+/// Whether a recorded page runs 64-bit Wine: its loader is Wine's
+/// `x86_64-unix` one.
+fn is_wine64(page: &Json) -> bool {
+    json::opt_str(page, "exe").is_some_and(|e| e.contains("/x86_64-unix/"))
+}
+
+/// The runtime wasm a page of this kind ships.
+fn runtime_wasm(wine64: bool) -> Vec<&'static str> {
+    let mut v = RUNTIME_WASM.to_vec();
+    if wine64 {
+        v.extend_from_slice(RUNTIME_WASM_M64);
+    }
+    v
+}
 
 /// Whether `record` holds a 32-bit Wine recording.
 pub fn is_recording(record: &Path) -> bool {
@@ -60,7 +82,7 @@ pub fn is_project(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join(crate::project::PROJECT_FILE))
         .ok()
         .and_then(|t| Json::parse(&t).ok())
-        .is_some_and(|v| matches!(v.get("kind").and_then(|k| k.as_str()), Some(KIND | KIND_OLD)))
+        .is_some_and(|v| matches!(v.get("kind").and_then(|k| k.as_str()), Some(KIND | KIND_OLD | KIND64)))
 }
 
 pub struct Wine32Options {
@@ -132,6 +154,34 @@ pub(crate) const TRAMPOLINES_PATH: &str = "[nt trampolines]";
 fn trampoline_keys() -> [String; 2] {
     let (image, _) = gex_kernel::win::trampoline_input(true);
     [false, true].map(|unguarded| crate::rsrc::key_with(&image, (unguarded, true)))
+}
+
+/// The keys a 64-bit Wine page may ask for the 64-bit NT trampoline page's unit by:
+/// `gexc cgen-image --nt-trampolines64`, with `--mem64` for a memory64 process
+/// and without for Wine's other processes, guarded or not.
+fn trampoline_keys64() -> Vec<String> {
+    let (image, _) = gex_kernel::win::trampoline_input(false);
+    crate::rsrc::flavors_mem().filter(|((_, kuser), _)| !kuser).map(|(g, m)| crate::rsrc::key_with_mem(&image, g, m)).collect()
+}
+
+/// Adds the 64-bit trampoline page's units the caches hold; none fails the eject.
+fn add_trampolines64(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> Result<()> {
+    let keys = trampoline_keys64();
+    let held = |k: &str| caches.iter().any(|c| c.join(k).join("c.wasm").is_file() && c.join(k).join("c.entries").is_file());
+    let found: Vec<&String> = keys.iter().filter(|k| held(k)).collect();
+    if found.is_empty() {
+        bail!(
+            "no unit of the 64-bit NT trampolines ({}) in the unit cache ({}): build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines64 [--mem64]",
+            keys.join(" or "),
+            caches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":")
+        );
+    }
+    for k in found {
+        if !units.iter().any(|(u, _)| u == k) {
+            units.push((k.clone(), TRAMPOLINES_PATH.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Adds the trampoline page's unit to `units`, each of its keys a cache in
@@ -230,10 +280,13 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     // The NT trampoline page's unit, which is no image's and so in no
     // recording's units: a 32-bit program's system calls go through it, and
     // an AOT-only page has no other code for them.
-    if class32(&bundle_bytes, &units)? {
+    let wine64 = is_wine64(page);
+    if wine64 {
+        add_trampolines64(&mut units, &o.unit_cache)?;
+    } else if class32(&bundle_bytes, &units)? {
         add_trampolines(&mut units, &o.unit_cache)?;
     }
-    for f in RUNTIME_WASM {
+    for f in runtime_wasm(wine64) {
         if !o.web_src.join("public/gex").join(f).is_file() {
             bail!("{}: no public/gex/{f}: build the shim and kernel first (shims/browser/build.sh, shims/kernel/build.sh)", o.web_src.display());
         }
@@ -276,6 +329,12 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     // page has no other code for them.
     for file in provider_files(&bundle_bytes, &units)? {
         let src = o.unit_cache.iter().map(|c| c.join(&file)).find(|p| p.is_file());
+        // A 64-bit page runs without a provider it is not given (the image's
+        // own code, translated): said, not refused.
+        if src.is_none() && wine64 {
+            eprintln!("gexc eject: no provider module {file} in the unit cache: the page runs the image's own code for it");
+            continue;
+        }
         let Some(src) = src else {
             bail!("no provider module {file} in the unit cache ({}): build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers",
                 o.unit_cache.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":"));
@@ -285,7 +344,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     }
     // The runtime: the browser shim, kernel and seed this page runs, and the
     // gexc that builds it.
-    for f in RUNTIME_WASM {
+    for f in runtime_wasm(wine64) {
         link_or_copy(&o.web_src.join("public/gex").join(f), &out.join("runtime/web/gex").join(f))?;
     }
     link_or_copy(runtime, &out.join("runtime/gexc"))?;
@@ -296,8 +355,8 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     sum.modules = modules.len();
     let web_src = std::fs::canonicalize(&o.web_src).unwrap_or_else(|_| o.web_src.clone());
     let project = obj(vec![
-        ("kind", s(KIND)),
-        ("about", s("A wine32 page (Wine as native wasm32) ejected by gexc eject; see crates/gex-eject/README.md, \"32-bit Wine pages\". Generated: rewritten by every eject.")),
+        ("kind", s(if wine64 { KIND64 } else { KIND })),
+        ("about", s("A Wine page (Wine's Unix side as native wasm) ejected by gexc eject; see crates/gex-eject/README.md, \"Wine pages\". Generated: rewritten by every eject.")),
         ("page", page.clone()),
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("bundle", obj(vec![("file", s("bundle/rootfs.tar")), ("sha256", s(&bundle_sha)), ("from", s(&bundle))])),
@@ -324,7 +383,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     write_file(&out.join("build.sh"), BUILD_SH.as_bytes(), true)?;
     write_file(&out.join(".gitignore"), b"/build/\n", false)?;
     if !out.join(crate::config::CONFIG_FILE).exists() {
-        write_file(&out.join(crate::config::CONFIG_FILE), template(&o.features_off).as_bytes(), false)?;
+        write_file(&out.join(crate::config::CONFIG_FILE), template(&o.features_off, wine64).as_bytes(), false)?;
     }
     // The page: the user's, an example to start from (app.mjs's start()).
     crate::web::write_shell(out)?;
@@ -341,7 +400,7 @@ exec runtime/gexc eject build .
 ";
 
 /// A 32-bit Wine project's `user/eject.json`: the features, the ones given off.
-fn template(off: &[String]) -> String {
+fn template(off: &[String], wine64: bool) -> String {
     json::write(&obj(vec![
         (
             "about",
@@ -366,7 +425,9 @@ fn template(off: &[String]) -> String {
         ),
         ("bundle", s("split")),
         ("cold", s(COLD_DEFAULT)),
-        ("resources", s("trim")),
+        // A 64-bit game's bundle is large and its own resources one
+        // language already: whole until trimming earns its pass.
+        ("resources", s(if wine64 { "whole" } else { "trim" })),
         ("start", obj(vec![])),
     ]))
 }
@@ -391,7 +452,8 @@ fn aot_only(config: &Config) -> Result<bool> {
 /// image as the site ships it (web/rootfs.tar, trimmed or not) at the base
 /// the unit was built for (found from the unit's addresses). A line is
 /// written only when the key this gexc computes for that image is the unit's
-/// own, so the page never takes a key its own hashing would not give.
+/// own, so the page never takes a key its own hashing would not give. A
+/// 64-bit memory's unit's base is written `m<base>` (the shim's `KNOWN`).
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
@@ -410,8 +472,9 @@ fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&st
             let addrs: std::collections::HashSet<u64> = unit.addresses().into_iter().collect();
             let base = crate::reach::find_base(&pe, &addrs)?;
             let image = gex_xlate::func::pe_input(&pe, base).ok()?.0;
-            crate::rsrc::FLAVORS.into_iter().find(|&g| crate::rsrc::key_with(&image, g) == site)?;
-            Some(format!("{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
+            let (_, m64) = crate::rsrc::flavors_mem().find(|&(g, m)| crate::rsrc::key_with_mem(&image, g, m) == site)?;
+            let flavor = if m64 { "m" } else { "" };
+            Some(format!("{flavor}{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
         })();
         match found {
             Some(l) => lines.push(l),
@@ -729,6 +792,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     let v = Json::parse(&std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?)
         .map_err(|e| anyhow!("{}: {e}", p.display()))?;
     let what = crate::project::PROJECT_FILE;
+    let wine64 = json::opt_str(&v, "kind").as_deref() == Some(KIND64);
     let (config, config_bytes) = Config::load(dir)?;
     crate::features::check(&config.features_off)?;
     let mut off = config.features_off.clone();
@@ -761,7 +825,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         bail!("{}/build-eject-page.sh failed ({st})", src.display());
     }
     // The runtime is the project's, not whatever the checkout has built since.
-    for f in RUNTIME_WASM {
+    for f in runtime_wasm(wine64) {
         let to = page.join("gex").join(f);
         let _ = std::fs::remove_file(&to);
         link_or_copy(&dir.join("runtime/web/gex").join(f), &to)?;
@@ -1057,8 +1121,17 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     } else {
         obj(vec![("split", json::b(false))])
     };
+    // The bundle's extended attributes (the memory64 mark on a program,
+    // Wine's DOS attributes): the site's bundle is rebuilt from a tree that
+    // does not keep them, so the launch file carries them to the page.
+    let xattrs = {
+        let bytes = std::fs::read(web.join("rootfs.tar"))?;
+        crate::reach::xattrs(&bytes)?
+    };
     let launch = obj(vec![
-        ("kind", s(KIND)),
+        ("kind", s(if wine64 { KIND64 } else { KIND })),
+        ("d3d", rec.get("d3d").cloned().unwrap_or(json::b(false))),
+        ("xattrs", Json::Obj(xattrs.into_iter().map(|(p, a)| (p, Json::Obj(a.into_iter().map(|(n, v)| (n, s(&v))).collect()))).collect())),
         ("exe", rec.get("exe").cloned().unwrap_or(Json::Null)),
         ("argv", rec.get("argv").cloned().unwrap_or(Json::Arr(Vec::new()))),
         ("env", rec.get("env").cloned().unwrap_or(Json::Arr(Vec::new()))),
@@ -1094,7 +1167,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     write_file(
         &dir.join("build/build.json"),
         json::write(&obj(vec![
-            ("kind", s(KIND)),
+            ("kind", s(if wine64 { KIND64 } else { KIND })),
             ("features_off", strs(&off)),
             ("config", s(sha256(&config_bytes))),
             ("session", v.get("session").cloned().unwrap_or(Json::Null)),

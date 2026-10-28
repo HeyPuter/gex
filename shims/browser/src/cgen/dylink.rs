@@ -15,7 +15,8 @@
 //! A binding list is one line per import, tab-separated:
 //!   `S mod name`            the Worker's own (memory, table, bases, stack
 //!                           pointer, asyncify globals, `gex.*`);
-//!   `G mod name value mut`  a global (`GOT.mem`, `GOT.func`, a missing one: 0);
+//!   `G mod name value mut [64]`  a global (`GOT.mem`, `GOT.func`, a missing
+//!                           one: 0), `i64` with the `64` column (a wasm64 module);
 //!   `E mod name module`     provider module `module`'s export `name`;
 //!   `L mod name slot`       a function through table slot `slot` (a module
 //!                           instantiated after this one);
@@ -181,10 +182,10 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             let (mo, na) = (&imp.module, &imp.name);
             let line = match b {
                 Bind::Shim => format!("S\t{mo}\t{na}"),
-                Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t{}", imp.ty),
+                Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
                 Bind::Export { module, name } => format!("E\t{mo}\t{na}\t{}\t{name}", p.module_of[module]),
                 Bind::Late { slot } => format!("L\t{mo}\t{na}\t{slot}"),
-                Bind::Missing(_) if imp.kind == Kind::Global => format!("G\t{mo}\t{na}\t0\t{}", imp.ty),
+                Bind::Missing(_) if imp.kind == Kind::Global => format!("G\t{mo}\t{na}\t0\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
                 Bind::Missing(msg) => {
                     let msg = if msg.is_empty() { format!("{}: undefined weak symbol {na} called", m.path) } else { msg };
                     format!("M\t{mo}\t{na}\tsymbol lookup error: {}", msg.replace(['\t', '\n'], " "))
@@ -301,9 +302,9 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
     let mut text = String::new();
     // undefined weak symbols: null, as ELF leaves them (a strong one stays
     // an import nothing gives, and instantiating says so)
-    for (mo, na, b) in info.static_weak_binds().unwrap_or_default() {
+    for (mo, na, b, wide) in info.static_weak_binds().unwrap_or_default() {
         text.push_str(&match b {
-            Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t1\n"),
+            Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t1{}\n", if wide { "\t64" } else { "" }),
             _ => format!("M\t{mo}\t{na}\tsymbol lookup error: {path}: undefined weak symbol {na} called\n"),
         });
     }

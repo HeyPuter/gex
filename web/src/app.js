@@ -599,7 +599,7 @@ async function begin(opts, base, at, state, meter) {
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
   // How it was started (gex-eject's 32-bit Wine recorder keeps this).
-  state.session = { exe, argv: args.slice(1), env, cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, params: Object.fromEntries(sq) };
+  state.session = { exe, argv: args.slice(1), env, cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
@@ -784,8 +784,9 @@ async function begin(opts, base, at, state, meter) {
     // A Wine prefix's `dosdevices/c:`, which Wine opens by that name.
     symlinks: tree.links ?? {},
     mtimes: mtimes ? { ...lazyMtimes, ...tree.mtimes } : undefined,
-    // Wine's DOS attributes on the prefix (`tar --xattrs`).
-    xattrs: tree.xattrs,
+    // Wine's DOS attributes on the prefix (`tar --xattrs`), and the launch
+    // file's (an ejected build's bundle keeps none itself).
+    xattrs: b.xattrs ? { ...b.xattrs, ...tree.xattrs } : tree.xattrs,
     env,
     args,
     cwd,
@@ -895,7 +896,7 @@ function mergeEnv(base = [], more = null) {
 }
 
 /**
- * The build's launch file (gex-eject: a 32-bit Wine page's, kind "wine32") as
+ * The build's launch file (gex-eject: a Wine page's, kind "wine32" or "wine64") as
  * the options `start` reads. Site paths in it (`/project/...`)
  * are under `at`'s base.
  */
@@ -927,8 +928,9 @@ function withStart(b, st) {
 
 function launchBuild(m, at) {
   const pack = `pack.json${m.build ? `?v=${m.build}` : ''}`;
-  // ("w3": a build made before the rename.)
-  if (m.kind === 'wine32' || m.kind === 'w3') {
+  // ("w3": a build made before the rename. "wine64": 64-bit Wine, the same
+  // launch with the D3D device when the recorded page had it.)
+  if (m.kind === 'wine32' || m.kind === 'w3' || m.kind === 'wine64') {
     const p = { ...(m.params ?? {}) };
     const lazy = p.lazy ?? null;
     delete p.lazy;
@@ -958,6 +960,10 @@ function launchBuild(m, at) {
       // boot, to compare).
       gl: !(m.features_off ?? []).includes('gl'),
       glLazy: m.gl_lazy ?? true,
+      d3d: !!m.d3d,
+      // The bundle's extended attributes (the memory64 mark on a program),
+      // which the site's rebuilt bundle does not carry itself.
+      xattrs: m.xattrs ?? null,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
@@ -971,7 +977,7 @@ function launchBuild(m, at) {
     };
   }
   if (m.unsupported) throw new Error(`gex-eject: this project has no web build: ${m.unsupported}`);
-  throw new Error(`gex-eject: the build's launch file is of kind ${JSON.stringify(m.kind)}, not a 32-bit Wine page's`);
+  throw new Error(`gex-eject: the build's launch file is of kind ${JSON.stringify(m.kind)}, not a Wine page's`);
 }
 
 /**
