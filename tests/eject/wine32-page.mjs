@@ -153,14 +153,32 @@ check(existsSync(join(site, 'app.mjs')), 'the site has the app library (app.mjs)
   scan(site);
   check(named.length === 0, `no nt.html in the site, and nothing names it${named.length ? ` (${named.slice(0, 4).join(', ')})` : ''}`);
 }
-// "bundle": "split": the files the recorded run never opened are lazy files,
-// each in the store under its hash.
+// "bundle": "split": the files the recorded run never opened are lazy files:
+// in the rest bundle (`rest.bin#OFFSET`, eject-site.mjs restBundle: its tar's
+// frames, rest.bin.json), or each in the store under its hash (--no-rest).
 if (nt.bundle?.split) {
   const lj = join(site, 'project/build/web/lazy.json');
   const m = existsSync(lj) ? JSON.parse(readFileSync(lj, 'utf8')) : null;
-  const missing = m ? m.files.filter((f) => !existsSync(join(site, m.base, f[2]))).length : -1;
+  const bundles = new Map();
+  const there = (f) => {
+    const cut = f[2].lastIndexOf('#');
+    if (cut < 0) return existsSync(join(site, m.base, f[2]));
+    const b = f[2].slice(0, cut), at = Number(f[2].slice(cut + 1));
+    if (!bundles.has(b)) {
+      const j = join(site, m.base, `${b}.json`);
+      const idx = existsSync(j) && existsSync(join(site, m.base, b)) ? JSON.parse(readFileSync(j, 'utf8')) : null;
+      const len = idx ? statSync(join(site, m.base, b)).size : 0;
+      // the frames cover the tar and lie in the file
+      const ok = idx && idx.frames.length === Math.ceil(idx.size / idx.frame) && idx.frames.every(([o, n]) => o + n <= len);
+      bundles.set(b, ok ? idx : null);
+    }
+    const idx = bundles.get(b);
+    return !!idx && at + f[1] <= idx.size;
+  };
+  const missing = m ? m.files.filter((f) => !there(f)).length : -1;
+  const where = bundles.size ? `the rest bundle ${[...bundles.keys()].join(', ')}` : 'the store';
   check(!!m && missing === 0 && nt.params?.lazy === '/project/build/web/lazy.json',
-    `bundle split: ${nt.bundle.read} read files in the bundle, ${m?.files.length ?? 'no'} lazy ones (${missing} missing from the store)`);
+    `bundle split: ${nt.bundle.read} read files in the bundle, ${m?.files.length ?? 'no'} lazy ones (${missing} missing from ${where})`);
 }
 if (off.includes('gl')) {
   const left = gexDir.filter((n) => n.startsWith('gex-wgpu-replay'));
@@ -171,7 +189,8 @@ if (off.includes('gl')) {
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
 let lazyReads = 0;
 const server = http.createServer((req, res) => {
-  if (req.url.includes('/build/web/lazy/')) lazyReads++;
+  // a lazy file from the store, or a frame of the rest bundle (a Range)
+  if (req.url.includes('/build/web/lazy/') || (req.url.includes('/build/web/rest.bin') && !req.url.includes('.json'))) lazyReads++;
   const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
   let p = shell && (path === '/' || path === '/index.html') ? shell : join(site, path);
   if (!p.startsWith(site) && p !== shell) { res.writeHead(403).end(); return; }
@@ -491,7 +510,7 @@ if (placedChecks) {
     }
     // A split bundle's lazy files work: printing's DLLs (winspool.drv,
     // compstui.dll) are not what a run to the window opens, so Ctrl+P reads
-    // them from the store before Paint says there is no printer.
+    // them from the store or the rest bundle before Paint says there is no printer.
     if (nt.bundle?.split) {
       const before = lazyReads;
       await key('p', 'KeyP', 80, 2);
