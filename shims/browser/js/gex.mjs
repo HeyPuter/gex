@@ -2117,11 +2117,13 @@ export class Gex {
       this.#shim.exports.gex_chmod?.(pp, p.length, modes[path]);
       free?.(pp, p.length);
     }
-    // Files fetched as they are read (`gex_add_lazy`): [path, size, url],
-    // after the bundle's, which win.
-    for (const [path, size, url] of opts.lazy ?? []) {
+    // Files fetched as they are read (`gex_add_lazy`): [path, size, url,
+    // head], after the bundle's, which win -- unless the bundle's is the
+    // lazy file's head (`head` bytes of it), which the kernel then holds as
+    // the file's first chunks.
+    for (const [path, size, url, head] of opts.lazy ?? []) {
       if (!this.#shim.exports.gex_add_lazy) break;
-      if (files[path] !== undefined) continue;
+      if (files[path] !== undefined && !(head && files[path].length === head)) continue;
       const p = enc.encode(path);
       const u = enc.encode(url);
       const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;

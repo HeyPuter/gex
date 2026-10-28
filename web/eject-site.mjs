@@ -27,7 +27,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, openSync, writeSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
+import { buildFill, extract, pack, placeHeads, pruneTree, readPathList, restPaths, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const av = process.argv.slice(2);
@@ -50,6 +50,8 @@ if (!project || !out) {
   process.exit(2);
 }
 const level = opt('--level', '19');
+// zstd's levels past 19 need --ultra.
+const zlev = Number(level) > 19 ? `--ultra -${level}` : `-${level}`;
 // --rest-frame MiB: the bundle split's lazy files as the rest bundle (one tar
 // in independent zstd frames of this size; restBundle), not one file each.
 // --rest-order FILE: guest paths, one a line, first in the tar in that order
@@ -87,7 +89,7 @@ function place(src, path, { plain = false } = {}) {
   }
   const bytes = readFileSync(src);
   const z = join(zcache, `${sha(bytes)}-${level}.zst`);
-  if (!existsSync(z)) execFileSync('zstd', [`-${level}`, '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
+  if (!existsSync(z)) execFileSync('zstd', [...zlev.split(' '), '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
   copyFileSync(z, `${dst}.zst`);
   if (plain) copyFileSync(src, dst);
   // `h`: the content, by which the page keeps the file across builds.
@@ -106,7 +108,7 @@ function coldPack(dir, path) {
   mkdirSync(z, { recursive: true });
   for (let i = 0; i < n; i++) copyFileSync(join(dir, `${i}.wasm`), join(z, `${i}.wasm`));
   // Thousands of small frames: many zstd processes at once, each a batch.
-  execFileSync('sh', ['-c', `ls | grep '\\.wasm$' | xargs -P 16 -n 256 zstd -${level} -q -f`], { cwd: z });
+  execFileSync('sh', ['-c', `ls | grep '\\.wasm$' | xargs -P 16 -n 256 zstd ${zlev} -q -f`], { cwd: z });
   const frames = [];
   const zl = new Uint32Array(n), ul = new Uint32Array(n);
   for (let i = 0; i < n; i++) {
@@ -118,7 +120,7 @@ function coldPack(dir, path) {
   mkdirSync(join(out, path), { recursive: true });
   writeFileSync(join(out, path, 'cold.bin'), Buffer.concat(frames));
   const raw = Buffer.concat([Buffer.from(new Uint32Array([n]).buffer), Buffer.from(zl.buffer), Buffer.from(ul.buffer)]);
-  const zi = execFileSync('zstd', [`-${level}`, '-q', '-c'], { input: raw });
+  const zi = execFileSync('zstd', [...zlev.split(' '), '-q', '-c'], { input: raw });
   const head = Buffer.alloc(4);
   head.writeUInt32LE(raw.length);
   writeFileSync(join(out, path, 'cold.idx'), Buffer.concat([head, zi]));
@@ -178,7 +180,7 @@ function restBundle(lazy, store) {
   const tarSize = at;
   flush(true);
   // Each frame on its own; many zstd processes at once.
-  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd -${level} -q -f`], { cwd: dir });
+  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd ${zlev} -q -f`], { cwd: dir });
   const frames = [];
   let off = 0;
   mkdirSync(join(out, 'project/build/web'), { recursive: true });
@@ -464,7 +466,18 @@ function wine32Site() {
   // --rest-paths FILE (guest paths, one a line): files the run read that
   // still go to the rest bundle, not the bundle (a large file read by
   // offset, such as a game's music, which the boot needs only a little of).
-  if (split && opt('--rest-paths', null)) for (const p of readPathList(opt('--rest-paths', null))) split.delete(p);
+  // A line "PATH HEAD" (HEAD in MiB) keeps the file's first HEAD MiB in the
+  // bundle as well, at its first-read place, as the lazy file's head: the
+  // part the boot reads (the title's music start), which the kernel then
+  // holds as already fetched (tmpfs.rs `seed_head`), so the boot asks the
+  // rest bundle for nothing.
+  const heads = new Map(); // guest path -> head bytes
+  if (split && opt('--rest-paths', null)) {
+    for (const [p, n] of restPaths(readPathList(opt('--rest-paths', null)))) {
+      if (n) heads.set(p, n);
+      split.delete(p);
+    }
+  }
   // --late FILE: see the fill below.
   const late = opt('--late', null) ? readPathList(opt('--late', null)) : [];
   if (split) for (const p of late) split.delete(p);
@@ -491,15 +504,17 @@ function wine32Site() {
       split.add(wine32.exe); // the page reads the loader from the bundle itself
       const store = rest ? join(work, 'lazy-store') : join(out, 'project/build/web/lazy');
       const lazy = splitTree(x, split, store);
+      placeHeads(x, lazy, store, heads);
+      const withHead = (files) => files.map((f) => heads.has(f[0]) ? [f[0], f[1], f[2], f[3], null, heads.get(f[0])] : f);
       lazyFiles = lazy.length;
       lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       if (rest) {
         if (late.length) throw new Error('eject-site: --late and the rest bundle together: the fill names lazy files by URL');
         const files = restBundle(lazy, store);
-        writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/', files }));
+        writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/', files: withHead(files) }));
       } else
-      writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
+      writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: withHead(lazy) }));
       wine32.params = { ...(wine32.params ?? {}), lazy: '/project/build/web/lazy.json' };
       // --late FILE (guest paths, one a line, in the order wanted): files of
       // the run's read set that left the bundle above for the background fill,
