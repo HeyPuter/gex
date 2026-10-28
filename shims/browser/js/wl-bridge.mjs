@@ -791,8 +791,12 @@ export class WlProxy {
    * the previous publish: the shim publishes on every scheduler turn and the
    * compositor draws once a frame, so several publishes commonly share one
    * frame and each carries only its own rectangle.
+   *
+   * The records are read out of `memory`, and the pixels they point at out of
+   * `pixels`: the same memory for a process's own shim, the X server's for
+   * hostx, whose records come from its Wayland server's module.
    */
-  publish(memory, ptr, count) {
+  publish(memory, ptr, count, pixels = memory) {
     // A block taken over as dead (no publish for 5 s: an idle process, not
     // only a killed one) is another process's now. Publishing into it put
     // this process's surfaces under that process's token, and the compositor
@@ -835,7 +839,7 @@ export class WlProxy {
       this.#a[dst + R_DAMAGE_W] = merged.w;
       this.#a[dst + R_DAMAGE_H] = merged.h;
     }
-    if (shm.length) this.#copyPixels(memory, shm);
+    if (shm.length) this.#copyPixels(pixels, shm);
     Atomics.store(this.#a, this.#base + B_COUNT, n);
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);

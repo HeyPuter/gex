@@ -892,7 +892,9 @@ export class HostX {
     if (hw.hw_dirty()) {
       const p = hw.hw_scratch(SLOTS * REC * 4);
       const n = hw.hw_scene(p, SLOTS);
-      this.#proxy.publish(this.#hwMem, p, n);
+      // The scene is in the Wayland server's memory, the windows' pixels in
+      // the X server's.
+      this.#proxy.publish(this.#hwMem, p, n, this.#x.wasmMemory);
       // The first few, then at 10, 100, 1000...: a scene that never leaves
       // here and a scene the page never draws look the same from the page, and
       // the interesting ones are at the start (a window appearing). A game
