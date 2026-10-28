@@ -615,7 +615,6 @@ const host = new ProcessHost({
     elfUnits: process.env.GEX_ELF_UNITS || undefined,
     // GEX_PROVIDER_SKIP=export,...: as natively (gex-cgen `set_skip`).
     providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
-    eagerBlocks: !!process.env.GEX_EAGER_BLOCKS,
     fillTime: !!process.env.GEX_FILL_TIME,
     // GEX_PROVIDER_DIRS=dir[:dir...]: provider sources from outside gex, as
     // natively (gex-cgen `add_sources`): every dir's *.c, named by stem.
@@ -623,7 +622,6 @@ const host = new ProcessHost({
     // GEX_STATEFUL=dll=file,...: stateful providers replacing Windows
     // libraries, their modules under the unit cache (cgen.rs `set_stateful`).
     stateful: process.env.GEX_STATEFUL || undefined,
-    relayAll: !!process.env.GEX_RELAY_ALL,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
     trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,

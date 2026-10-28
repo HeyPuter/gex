@@ -462,11 +462,6 @@ async function handle(msg) {
       }
     };
   }
-  // Set before anything reads it, for the same reason as `adoptAfter`:
-  // `forkModules()` runs in the Worker that builds the fork record, so the
-  // page's global never reached it. See task 145.
-  if (msg.forkMods !== undefined) globalThis.GEX_FORK_MODULES = msg.forkMods;
-
   // Everything the guest writes goes back to whoever started this, posted
   // rather than accumulated so a long run says what it is doing as it runs.
   // How many output messages this Worker has posted, and how many the host
@@ -803,9 +798,7 @@ async function handle(msg) {
   if (msg.sehReport) globalThis.GEX_SEH_REPORT = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
-  if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
-  if (msg.relayAll) globalThis.GEX_RELAY_ALL = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // Lazy files the page is filling in the background (app.js `fill`): their
   // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).

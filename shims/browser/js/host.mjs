@@ -170,7 +170,7 @@ const UNIT_MODULE_BYTES = 256 << 20;
 const PROCESS_MODULE_BYTES = 256 << 20;
 /** And the most modules it, or the page's unit cache, keeps: each module the
  *  main thread holds lengthens every collection there, and those hold up
- *  compiles on every Worker of the page. Not with `?relayall=1`. */
+ *  compiles on every Worker of the page. */
 const RELAY_MODULES = 512;
 /** A registry key's module size: `LENGTH:HASH:HASH` (or `u:LENGTH:...`). */
 const regKeyBytes = (k) => Number(String(k).replace(/^u:/, '').split(':')[0]) || 0;
@@ -387,7 +387,6 @@ export class ProcessHost {
   }
   #relayed = 0;
   #relayCensusAt = 0;
-  get #relayModules() { return this.#extra?.relayAll ? Infinity : RELAY_MODULES; }
 
   /** What a starting Worker gets: its process's modules and the page's. */
   #sharedFor(pid, withProcess, w = null) {
@@ -1581,7 +1580,7 @@ export class ProcessHost {
             this.#unitModules.set(m.key, m.mod);
             this.#poolModule(m.key, m.mod);
             this.#unitBytes += Number(m.key.split(':')[1]);
-            while ((this.#unitBytes > UNIT_MODULE_BYTES || this.#unitModules.size > this.#relayModules) && this.#unitModules.size > 1) {
+            while ((this.#unitBytes > UNIT_MODULE_BYTES || this.#unitModules.size > RELAY_MODULES) && this.#unitModules.size > 1) {
               const oldest = this.#unitModules.keys().next().value;
               this.#unitBytes -= Number(oldest.split(':')[1]);
               this.#unitModules.delete(oldest);
@@ -1592,7 +1591,7 @@ export class ProcessHost {
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
           cache.bytes = (cache.bytes ?? 0) + regKeyBytes(m.key);
-          while ((cache.bytes > PROCESS_MODULE_BYTES || cache.size > this.#relayModules) && cache.size > 1) {
+          while ((cache.bytes > PROCESS_MODULE_BYTES || cache.size > RELAY_MODULES) && cache.size > 1) {
             const oldest = cache.keys().next().value;
             cache.bytes -= regKeyBytes(oldest);
             cache.delete(oldest);

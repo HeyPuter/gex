@@ -30,9 +30,6 @@ const FTAB_SPARE_THREADED = 8192;
 // GEX_TEST_KEEP_PROBE (a test-only switch): a retirement leaves the probe
 // cache's entries (cgen.rs `gex_test_keep_probe`).
 const TEST_KEEP_PROBE = !!(globalThis.process?.env?.GEX_TEST_KEEP_PROBE);
-// GEX_UNITS_EAGER (a test's A/B): every Worker instantiates each unit when it
-// catches up, as before units were deferred (`#cgenDefer`).
-const UNITS_EAGER = !!(globalThis.GEX_UNITS_EAGER ?? globalThis.process?.env?.GEX_UNITS_EAGER);
 /** A test-only switch: both rooms this small, so one unit's
  *  install outruns a sleeping thread's table. */
 const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
@@ -276,8 +273,6 @@ const spareModules = () => Number(globalThis.GEX_TEST_SPARE_MODULES ?? globalThi
 
 function makeModuleStore() {
   if (typeof SharedArrayBuffer === 'undefined' || typeof SharedArrayBuffer.prototype.grow !== 'function') return null;
-  // Off, for comparing against the registry keeping its own bytes.
-  if (globalThis.GEX_NO_MODULE_STORE || globalThis.process?.env?.GEX_NO_MODULE_STORE) return null;
   for (const max of MODULE_STORE_MAX) {
     try {
       const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: max });
@@ -599,18 +594,6 @@ function growTable(table, delta, init, which) {
 
 /** `gex_abi::BOOT_STACK_COUNTER`: which bootstrap stack slice is next. */
 const BOOT_STACK_COUNTER = 0x00100000 - 192;
-/**
- * Whether a fork hands the child its parent's compiled modules (default 1).
- * `?forkmods=0` sends none and the child recompiles what it branches into.
- *
- * A function, not a module constant: a constant evaluates at import, before
- * the page sets the global.
- */
-function forkModules() {
-  const v = globalThis.GEX_FORK_MODULES;
-  return v === undefined ? 1 : Number(v);
-}
-
 function adoptAfterTraps() {
   // Traps a forked child takes before adopting its parent's modules in bulk.
   // Default 1: deferred -- it picks up what it branches into rather than
@@ -2195,7 +2178,7 @@ export class Gex {
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
       // The translator's knobs, for every process of the run: set only here,
       // a forked child (node under `bash -c`) ran with the defaults.
-      perMiss: opts.perMiss, liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
+      liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
       xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
@@ -2206,8 +2189,6 @@ export class Gex {
       if (!this.#shim.exports.gex_set_jit) throw new Error('this gex runtime cannot turn translation off');
       this.#shim.exports.gex_set_jit(0);
     }
-    // How many of an object's stored units one miss may take.
-    if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
     // How many blocks one dispatch miss lifts (default 2048).
     if (opts.liftMax) this.#shim.exports.gex_set_lift_max?.(opts.liftMax);
     if (opts.inlineDispatch) this.#shim.exports.gex_set_inline_dispatch?.(1);
@@ -3416,7 +3397,6 @@ export class Gex {
     if (o.checkSp) e.gex_set_check_sp?.(1);
     if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
     if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
-    if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
     if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
     if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
@@ -4246,13 +4226,11 @@ export class Gex {
       // instantiated -- an instantiated one is already in `#compiled`), and
       // `#compiled`. Carrying all of them keeps a grandchild from inheriting a
       // directory whose modules it lacks. `WebAssembly.Module` clones for free.
-      modules: forkModules()
-        ? [
-            ...this.#inherited,
-            ...this.#lazyInherited.filter((l) => !l.inst),
-            ...this.#compiled,
-          ]
-        : [],
+      modules: [
+        ...this.#inherited,
+        ...this.#lazyInherited.filter((l) => !l.inst),
+        ...this.#compiled,
+      ],
       opts: this.#opts,
       // The descriptors the child inherits, described rather than cloned: an
       // open file is an `Arc` in the parent's heap the child never sees.
@@ -5506,7 +5484,7 @@ export class Gex {
         if (u >= 0x80000000 && u !== 0xffffffff && e.gex_cgen_pmod_ready && !e.gex_cgen_pmod_ready(u - 0x80000000)) break;
         // Plain units deferred (`#cgenDefer`); providers and JIT modules now.
         if (u !== 0xffffffff) {
-          if (u < 0x40000000 && !single.on && !UNITS_EAGER && e.gex_ftab_install_len) {
+          if (u < 0x40000000 && !single.on && e.gex_ftab_install_len) {
             this.#cgenDefer(u, e.gex_ftab_install_base(v) >>> 0, e.gex_ftab_install_len(v) >>> 0);
           }
           else this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
@@ -7047,7 +7025,7 @@ export class Gex {
    *  the rest now. */
   #cgenPublish(u, key, path, got) {
     const e = this.#shim.exports;
-    if (u < 0x40000000 && !single.on && !UNITS_EAGER && e.gex_ftab_install_len) {
+    if (u < 0x40000000 && !single.on && e.gex_ftab_install_len) {
       if (!this.#sharedModules.has(`cgen:${key}`)) {
         this.#unitGot.set(key, got);
         this.#env.prefetchUnit?.(key);
@@ -9528,7 +9506,7 @@ export class Gex {
    *  again gets the engine's code for them while any Worker holds it. */
   #shareRegistry(i, key, mod) {
     const e = this.#shim.exports;
-    if (this.#dense && !globalThis.GEX_EAGER_BLOCKS && e.gex_registry_dense_n && (e.gex_registry_dense_n(i) >>> 0)) return;
+    if (this.#dense && e.gex_registry_dense_n && (e.gex_registry_dense_n(i) >>> 0)) return;
     this.#offerModule(key, mod, this.#registryRow(i).len);
   }
 
@@ -9541,11 +9519,11 @@ export class Gex {
    *  module costs a sibling little to compile from its bytes, less while any
    *  Worker holds the same bytes compiled. A native program or library
    *  (`wasm:`) is relayed at any size: the page keeps those for the
-   *  processes that run it next. `?relayall=1` relays every module. */
+   *  processes that run it next. */
   #offerModule(key, mod, bytes) {
     // Units go to the page whatever their size: the host keeps them for every
     // process, and a Worker without one fetches its bytes as well.
-    if (!(bytes >= RELAY_MIN_BYTES) && !globalThis.GEX_RELAY_ALL && !/^(wasm|cgen|cold):/.test(String(key))) {
+    if (!(bytes >= RELAY_MIN_BYTES) && !/^(wasm|cgen|cold):/.test(String(key))) {
       this.#relaySkipped++;
       return;
     }
@@ -9556,11 +9534,10 @@ export class Gex {
   /** Whether catching up skips registry module `i`: a dense module, which
    *  the first dispatch that wants one of its blocks instantiates here
    *  (`#denseCatchUp`), so a Worker holds only what its thread runs.
-   *  `blocks` is grown for it all the same, its entries the miss stub.
-   *  `?eagerblocks=1` instantiates everything as before. */
+   *  `blocks` is grown for it all the same, its entries the miss stub. */
   #leaveDense(i) {
     const e = this.#shim.exports;
-    if (!this.#dense || globalThis.GEX_EAGER_BLOCKS || !e.gex_registry_dense_n) return false;
+    if (!this.#dense || !e.gex_registry_dense_n) return false;
     if (!(e.gex_registry_dense_n(i) >>> 0)) return false;
     this.#denseLeft++;
     this.#growBlocks();

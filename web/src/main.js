@@ -290,7 +290,6 @@ for (const [event, describe] of [
   // `run-node.mjs` -- a difference that has to be switchable to attribute a
   // fault to one host.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
-  if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
   if (params.has('liftmax')) globalThis.GEX_LIFT_MAX = Number(params.get('liftmax'));
   // The page-wide unit cache is on unless `?unitcache=0`.
   globalThis.GEX_UNIT_CACHE = params.has('unitcache') ? Number(params.get('unitcache')) : 1;

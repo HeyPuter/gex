@@ -2658,8 +2658,7 @@ pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
 
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
-static PER_MISS_N: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(16);
+const PER_MISS_N: usize = 16;
 
 /// The most blocks one dispatch miss lifts (discovery follows successors,
 /// call returns and folded call targets breadth-first up to this). 1 lifts
@@ -2745,14 +2744,6 @@ pub extern "C" fn gex_set_inline_dispatch(on: i32) {
 pub extern "C" fn gex_set_lift_max(n: u32) {
     if n > 0 {
         LIFT_MAX.store(n as usize, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Set that, from the host.
-#[no_mangle]
-pub extern "C" fn gex_set_per_miss(n: u32) {
-    if n > 0 {
-        PER_MISS_N.store(n as usize, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -16617,7 +16608,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // Not an environment variable: `std::env::var` always fails
                 // on `wasm32-unknown-unknown`, which is why
                 // `GEX_DISPATCH_BALLAST` has never done anything in a page.
-                let per_miss = PER_MISS_N.load(std::sync::atomic::Ordering::Relaxed);
+                let per_miss = PER_MISS_N;
                 // All of it, when the object has been translated whole.
                 //
                 // The cap exists because a stored unit holds only what was

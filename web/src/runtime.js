@@ -1264,17 +1264,10 @@ async function runProgramHere(
       // value rather than the later one that dereferences it and traps. In
       // `extra` so every Worker enables it.
       checkSp: flag('checksp') ? 1 : undefined,
-      // `?eagerblocks=1` (debugging): every Worker instantiates every dense
-      // module of its process as it catches up, instead of each one when a
-      // dispatch first wants a block of it. In `extra` for every Worker.
-      eagerBlocks: flag('eagerblocks') ? 1 : undefined,
       // `?filltime=1` (debugging): every Worker says when a dense module a
       // dispatch waited for took longer than any before it. In `extra` for
       // every Worker.
       fillTime: flag('filltime') ? 1 : undefined,
-      // `?relayall=1` (debugging): every module a Worker compiles is handed to
-      // its siblings compiled, small ones too. In `extra` for every Worker.
-      relayAll: flag('relayall') ? 1 : undefined,
       // `?claimpages=0`: publish closure dir entries at the build's slot numbers
       // instead of per-process demand numbering — a diagnostic for the
       // many-object-closure wrong-dispatch crash. In `extra` for every Worker.
@@ -1296,14 +1289,6 @@ async function runProgramHere(
       // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
       // "produced no frame") to debug why a client's window is not shown.
       wlTrace: flag('wltrace') ? 1 : undefined,
-      // Whether a fork hands the child its parent's compiled modules. In `extra`
-      // (spread into every Worker message), not on `globalThis`: the list is
-      // built in the forking Worker, so a global set here is set in the page.
-      // See task 145.
-      forkMods:
-        globalThis.GEX_FORK_MODULES === undefined
-          ? undefined
-          : Number(globalThis.GEX_FORK_MODULES),
       // In `extra` so every forked command gets it, not just the shell that
       // starts the demo (which never sees `opts`).
       link: link || undefined,
@@ -1396,8 +1381,6 @@ async function runProgramHere(
         // `args[0]` is that program's path, which is exactly what `do_exec`
         // already uses to name an image it loads itself.
         program: closure?.program ?? args?.[0],
-        // `?permiss=N`: how many stored units one dispatch miss may take.
-        perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,
       },
     });
     return { status, host, tenv };

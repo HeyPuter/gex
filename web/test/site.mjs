@@ -267,15 +267,6 @@ const REPORTER = `
     const m = /[?&]recompile=([0-9]+)/.exec(location.search);
     if (m) globalThis.GEX_RECOMPILE_OBJECTS = Number(m[1]);
   }
-  // ?forkmods=0 stops a fork handing the child its parent's compiled
-  // modules. The child then compiles what it branches into from the shim
-  // registry it inherited in the image. See task 145: the list is unbounded,
-  // reaches 3,227 in one shell, and is structured-cloned whole on every
-  // fork, which is what puts the page into a V8 OOM at ~58 processes.
-  {
-    const m = /[?&]forkmods=([0-9]+)/.exec(location.search);
-    if (m) globalThis.GEX_FORK_MODULES = Number(m[1]);
-  }
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
   // The page's own reader gives the whole scrollback; the DOM query is the
