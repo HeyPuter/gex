@@ -325,11 +325,13 @@ impl Dwarf {
             src_size: 0,
             dst_size: 0,
             fields: Vec::new(),
+            tail: None,
         });
         let d = &dies[&t];
         let name = d.name.clone().unwrap_or_else(|| format!("die{t:#x}"));
         let mut fields = Vec::new();
         let (src_size, dst_size);
+        let mut tail = None;
         if d.tag == gimli::DW_TAG_structure_type {
             let mut dst = 0u64;
             let mut align = 1;
@@ -342,6 +344,11 @@ impl Dwarf {
                 let a = self.dst_align(k);
                 align = align.max(a);
                 dst = dst.next_multiple_of(a);
+                if let Kind::Array { elem, count: 0 } = k {
+                    // A flexible array member.
+                    tail = Some(elem);
+                    continue;
+                }
                 fields.push(Field {
                     src_off: m.member_off.unwrap_or(0),
                     dst_off: dst,
@@ -350,7 +357,11 @@ impl Dwarf {
                 dst += self.sizes(k).1;
             }
             src_size = d.byte_size.unwrap_or(0);
-            dst_size = dst.next_multiple_of(align);
+            dst_size = if tail.is_some() {
+                dst
+            } else {
+                dst.next_multiple_of(align)
+            };
         } else {
             let k = self.kind(dies, t);
             let (s, ds) = self.sizes(k);
@@ -367,6 +378,7 @@ impl Dwarf {
             src_size,
             dst_size,
             fields,
+            tail,
         };
         id
     }
@@ -428,6 +440,7 @@ struct World {
     pair: u64,
     pairs: u64,
     tab: u64,
+    vec: u64,
     head: u64,
     node_size: u64,
 }
@@ -458,6 +471,7 @@ impl World {
             pair: base + 0x2000,
             pairs: base + 0x3000,
             tab: base + 0x4000,
+            vec: base + 0x5000,
             head: if side == Side::Src {
                 head.src
             } else {
@@ -488,6 +502,12 @@ impl World {
         }
         for (i, &x) in [n[3], n[1], n[0]].iter().enumerate() {
             w.put_bytes(w.tab + i as u64 * ps, x, ps);
+        }
+        // struct vec { long len = 3; items = { n0, n1, n2 } }
+        let (v, items) = (w.vec, if side == Side::Src { 8 } else { 4 });
+        w.put_bytes(v, 3, ps);
+        for i in 0..3 {
+            w.put_bytes(v + items + i as u64 * ps, n[i], ps);
         }
         let h = w.head;
         w.put(o, head.layout, h, 1, n[2]);
@@ -665,6 +685,8 @@ fn check_all(ssa: bool) {
     ints("pair_key", &|w| vec![w.pairs, 2], 20);
     ints("count_between", &|w| vec![node(w, 0), node(w, 3)], 3);
     ptrs("name_of", &|w| vec![w.pair], "name");
+    ptrs("item", &|w| vec![w.vec, 1], "node[1]+0");
+    ints("last_key", &|w| vec![w.vec], KEYS[2]);
     ptrs("nth", &|w| vec![w.tab, 1], "node[1]+0");
     ptrs("first", &|_| vec![], "node[2]+0");
     ptrs("second", &|w| vec![node(w, 1)], "node[2]+0");

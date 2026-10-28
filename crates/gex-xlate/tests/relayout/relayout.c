@@ -16,6 +16,11 @@ struct pair {
     long weight;
 };
 
+struct vec {
+    long len;
+    struct node *items[];
+};
+
 struct node head;
 
 F long sum_keys(struct node *n) {
@@ -50,5 +55,9 @@ F struct node *second(struct node *n) { return n->next; }
 F long third_key(struct node *n) { return second(second(n))->key; }
 
 F long count_between(struct node *lo, struct node *hi) { return hi - lo; }
+
+F struct node *item(struct vec *v, long i) { return v->items[i]; }
+
+F long last_key(struct vec *v) { return v->items[v->len - 1]->key; }
 
 void entry(void) {}

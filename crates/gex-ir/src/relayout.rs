@@ -40,6 +40,12 @@ pub struct Layout {
     pub dst_size: u64,
     /// By source offset.
     pub fields: Vec<Field>,
+    /// A trailing array of this element type and unknown length (an
+    /// object's elements or characters), starting at `src_size` in the
+    /// source and `dst_size` in the destination. A pointer to such a
+    /// layout steps, and is indexed, by the element; the layout itself is
+    /// never an array element.
+    pub tail: Option<LayoutId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +130,23 @@ impl Abi {
             GuestReg::X(9),
         ],
     };
+
+    /// x86-64 Windows (MSVC).
+    pub const X86_64_WIN64: Abi = Abi {
+        sp: GuestReg::X(4),
+        ret: GuestReg::X(0),
+        // rbx rbp rsi rdi r12-r15
+        callee_saved: RegSet(
+            1 << 3 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15,
+        ),
+        call_sp_delta: 8,
+        arg_regs: &[
+            GuestReg::X(1),
+            GuestReg::X(2),
+            GuestReg::X(8),
+            GuestReg::X(9),
+        ],
+    };
 }
 
 /// What the pass did and what it could not do.
@@ -137,9 +160,39 @@ pub struct Report {
     pub arithmetic: usize,
     /// Global addresses moved.
     pub globals: usize,
-    /// Guest pc and what is wrong, for every access or value that may need
+    /// Guest pc, why, and what, for every access or value that may need
     /// relayout and was not relaid out.
-    pub untyped: Vec<(u64, String)>,
+    pub untyped: Vec<(u64, Why, String)>,
+}
+
+impl Report {
+    fn note(&mut self, why: Why, (pc, what): (u64, String)) {
+        self.untyped.push((pc, why, what));
+    }
+}
+
+/// Why something was not relaid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Why {
+    /// A memory access through a value nothing typed (a callee's result
+    /// the oracle does not describe, a value loaded from untyped memory).
+    Unknown,
+    /// A memory access at a constant address the oracle does not describe.
+    Static,
+    /// Through a pointer whose pointee is unknown.
+    Opaque,
+    /// Through a value that is a pointer on some paths and not on others,
+    /// or pointers to different types.
+    Conflict,
+    /// An access or step that lands between fields, or straddles fields
+    /// that move.
+    Misaligned,
+    /// An access that does not fit the field it falls in.
+    Field,
+    /// A vector, atomic or bulk access through a typed pointer.
+    Bulk,
+    /// A frame address passed to a callee.
+    FrameEscape,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +226,19 @@ struct Leaf {
 /// of `l`), or `None` for padding.
 fn leaf_at(o: &dyn LayoutOracle, l: LayoutId, off: i64) -> Option<Leaf> {
     let lay = o.layout(l);
+    if let Some(e) = lay.tail {
+        if off < 0 {
+            return None;
+        }
+        if off >= lay.src_size as i64 {
+            let (s, d) = (lay.src_size as i64, lay.dst_size as i64);
+            return leaf_at(o, e, off - s).map(|x| Leaf {
+                src: s + x.src,
+                dst: d + x.dst,
+                kind: x.kind,
+            });
+        }
+    }
     if lay.src_size == 0 {
         return None;
     }
@@ -213,6 +279,21 @@ fn leaf_at(o: &dyn LayoutOracle, l: LayoutId, off: i64) -> Option<Leaf> {
 /// leaf of unchanged size, or the end of an element.
 fn map_off(o: &dyn LayoutOracle, l: LayoutId, off: i64) -> Option<i64> {
     let lay = o.layout(l);
+    if let Some(e) = lay.tail {
+        if off < 0 {
+            return None;
+        }
+        if off >= lay.src_size as i64 {
+            return map_off(o, e, off - lay.src_size as i64).map(|x| lay.dst_size as i64 + x);
+        }
+        if off == 0 {
+            return Some(0);
+        }
+        let leaf = leaf_at(o, l, off)?;
+        let (ss, ds) = kind_sizes(o, leaf.kind);
+        let inner = off - leaf.src;
+        return (inner == 0 || ss == ds).then_some(leaf.dst + inner);
+    }
     if lay.src_size == 0 {
         return (off == 0).then_some(0);
     }
@@ -251,7 +332,11 @@ fn access(o: &dyn LayoutOracle, l: LayoutId, off: i64, sz: u32) -> Result<Access
             dst: leaf.dst,
             sz: MemSz::B4,
             signed: Some(false),
-            result: T::Ptr { l: p, d: 0 },
+            result: T::Ptr {
+                l: p,
+                d: 0,
+                ix: None,
+            },
         }),
         Kind::Scalar { signed, .. } if inner == 0 && sz as u64 == ss && ds < ss => Ok(Access {
             dst: leaf.dst,
@@ -293,6 +378,31 @@ fn access(o: &dyn LayoutOracle, l: LayoutId, off: i64, sz: u32) -> Result<Access
     }
 }
 
+/// An access of `sz` bytes at `off` from a pointer of type
+/// `Ptr { l, d, ix }`: its new offset from the (relaid-out) pointer, and how.
+fn locate(
+    o: &dyn LayoutOracle,
+    l: LayoutId,
+    d: i64,
+    ix: Option<i64>,
+    off: i64,
+    sz: u32,
+) -> Result<(i64, Access), String> {
+    let lay = o.layout(l);
+    match (ix, lay.tail) {
+        (Some(dd), Some(e)) => {
+            let a = access(o, e, d + off - lay.src_size as i64, sz)?;
+            Ok((lay.dst_size as i64 + a.dst - dd, a))
+        }
+        _ => {
+            let base = map_off(o, l, d)
+                .ok_or_else(|| format!("base {d} into {} is between fields", lay.name))?;
+            let a = access(o, l, d + off, sz)?;
+            Ok((a.dst - base, a))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The lattice
 // ---------------------------------------------------------------------------
@@ -309,7 +419,16 @@ enum T {
     /// A pointer into (an array of) layout `l`, at source offset `d` from
     /// an element's start (kept in `0..src_size`). `l` is `None` for a
     /// pointer to something unknown.
-    Ptr { l: Option<LayoutId>, d: i64 },
+    ///
+    /// For a layout with a [`Layout::tail`], `ix` is `Some(dd)` once an
+    /// index has been added: the pointer is then the object's start plus
+    /// `d` plus an unknown number of tail elements, and `dd` is the
+    /// destination's `d`. Offsets from it are positions in the tail.
+    Ptr {
+        l: Option<LayoutId>,
+        d: i64,
+        ix: Option<i64>,
+    },
     /// A known global's address: the constant `src`.
     Global { g: Global, src: u64 },
     /// The frame: the entry stack pointer plus `d`, or somewhere in the
@@ -321,10 +440,12 @@ enum T {
 
 fn norm(o: &dyn LayoutOracle, l: Option<LayoutId>, d: i64) -> T {
     let d = match l {
-        Some(l) if o.layout(l).src_size > 0 => d.rem_euclid(o.layout(l).src_size as i64),
+        Some(l) if o.layout(l).src_size > 0 && o.layout(l).tail.is_none() => {
+            d.rem_euclid(o.layout(l).src_size as i64)
+        }
         _ => d,
     };
-    T::Ptr { l, d }
+    T::Ptr { l, d, ix: None }
 }
 
 fn join(a: T, b: T) -> T {
@@ -407,12 +528,55 @@ impl Typing<'_> {
         }
     }
 
+    /// A pointer plus an index: into the tail for a layout with one.
+    fn indexed(&self, l: Option<LayoutId>, d: i64, ix: Option<i64>) -> T {
+        match (l, ix) {
+            (Some(x), None) if self.o.layout(x).tail.is_some() => match map_off(self.o, x, d) {
+                Some(dd) => T::Ptr { l, d, ix: Some(dd) },
+                None => T::Top,
+            },
+            _ => T::Ptr { l, d, ix },
+        }
+    }
+
+    /// An indexed tail pointer moved by `c` bytes: whole elements only.
+    fn ix_step(&self, l: LayoutId, d: i64, dd: i64, c: i64) -> T {
+        let (s, t) = elem_sizes(self.o, l);
+        if s != 0 && c % s == 0 {
+            T::Ptr {
+                l: Some(l),
+                d: d + c,
+                ix: Some(dd + c / s * t),
+            }
+        } else {
+            T::Top
+        }
+    }
+
     fn add(&self, a: T, b: T) -> T {
         use T::*;
         match (self.as_ptr(a), self.as_ptr(b)) {
             (Null, x) | (x, Null) => x,
-            (Ptr { l, d }, Const(c)) | (Const(c), Ptr { l, d }) => norm(self.o, l, d + c as i64),
-            (Ptr { l, d }, Int) | (Int, Ptr { l, d }) => T::Ptr { l, d },
+            (Ptr { l, d, ix: None }, Const(c)) | (Const(c), Ptr { l, d, ix: None }) => {
+                norm(self.o, l, d + c as i64)
+            }
+            (
+                Ptr {
+                    l: Some(l),
+                    d,
+                    ix: Some(dd),
+                },
+                Const(c),
+            )
+            | (
+                Const(c),
+                Ptr {
+                    l: Some(l),
+                    d,
+                    ix: Some(dd),
+                },
+            ) => self.ix_step(l, d, dd, c as i64),
+            (Ptr { l, d, ix }, Int) | (Int, Ptr { l, d, ix }) => self.indexed(l, d, ix),
             (Stack(Some(d)), Const(c)) | (Const(c), Stack(Some(d))) => Stack(Some(d + c as i64)),
             (Stack(_), Int)
             | (Int, Stack(_))
@@ -428,7 +592,15 @@ impl Typing<'_> {
         use T::*;
         match (self.as_ptr(a), self.as_ptr(b)) {
             (x, Null) => x,
-            (Ptr { l, d }, Const(c)) => norm(self.o, l, d - c as i64),
+            (Ptr { l, d, ix: None }, Const(c)) => norm(self.o, l, d - c as i64),
+            (
+                Ptr {
+                    l: Some(l),
+                    d,
+                    ix: Some(dd),
+                },
+                Const(c),
+            ) => self.ix_step(l, d, dd, (c as i64).wrapping_neg()),
             (Stack(Some(d)), Const(c)) => Stack(Some(d - c as i64)),
             (Stack(_), Const(_) | Int) => Stack(None),
             (Ptr { .. }, Ptr { .. }) | (Stack(_), Stack(_)) => Int,
@@ -472,7 +644,9 @@ impl Typing<'_> {
     /// is not.
     fn load(&self, addr: Value, offset: i64, sz: MemSz, ctx: &Ctx) -> Result<T, String> {
         match self.as_ptr(self.ty(addr)) {
-            T::Ptr { l: Some(l), d } => access(self.o, l, d + offset, sz.bytes()).map(|a| a.result),
+            T::Ptr { l: Some(l), d, ix } => {
+                locate(self.o, l, d, ix, offset, sz.bytes()).map(|(_, a)| a.result)
+            }
             T::Stack(Some(d)) if sz == MemSz::B8 => {
                 Ok(ctx.slots.get(&(d + offset)).copied().unwrap_or(T::Int))
             }
@@ -549,7 +723,7 @@ impl Typing<'_> {
                     Callee::Indirect(_) => None,
                 };
                 if let Some(Shape::Ptr(l)) = ret {
-                    out.regs.insert(self.abi.ret, T::Ptr { l, d: 0 });
+                    out.regs.insert(self.abi.ret, T::Ptr { l, d: 0, ix: None });
                 }
             }
             FTerm::Syscall { .. } => {
@@ -580,7 +754,7 @@ fn type_function<'a>(
     entry.regs.insert(abi.sp, T::Stack(Some(0)));
     for (r, s) in o.args(f.entry) {
         if let Shape::Ptr(l) = s {
-            entry.regs.insert(r, T::Ptr { l, d: 0 });
+            entry.regs.insert(r, T::Ptr { l, d: 0, ix: None });
         }
     }
     let n = f.blocks.len();
@@ -667,6 +841,10 @@ fn type_function<'a>(
 
 fn elem_sizes(o: &dyn LayoutOracle, l: LayoutId) -> (i64, i64) {
     let lay = o.layout(l);
+    let lay = match lay.tail {
+        Some(e) => o.layout(e),
+        None => lay,
+    };
     (lay.src_size as i64, lay.dst_size as i64)
 }
 
@@ -757,98 +935,105 @@ pub fn relayout(f: &mut Function, o: &dyn LayoutOracle, abi: &Abi) -> Report {
             // A pointer difference renamed to `tmp`, to be rescaled into `orig`.
             let mut diff: Option<(Value, Value, i64, i64)> = None;
             match &mut s {
-                Stmt::Def { dst, expr } => match expr {
-                    Expr::ConstI64(_) | Expr::ConstI32(_)
-                        if matches!(t.ty(*dst), T::Global { .. }) =>
-                    {
-                        let src = match expr {
-                            Expr::ConstI64(c) => *c,
-                            Expr::ConstI32(c) => *c as u64,
-                            _ => unreachable!(),
-                        };
-                        let T::Global { g, .. } = t.ty(*dst) else {
-                            unreachable!()
-                        };
-                        match map_off(o, g.layout, (src - g.src) as i64) {
-                            Some(d) => {
-                                let n = (g.dst as i64 + d) as u64;
-                                *expr = match expr {
-                                    Expr::ConstI64(_) => Expr::ConstI64(n),
-                                    _ => Expr::ConstI32(n as u32),
-                                };
-                                rep.globals += 1;
-                            }
-                            None => rep.untyped.push((
-                                pc,
-                                format!("address {src:#x} inside a global, between fields"),
-                            )),
-                        }
-                    }
-                    Expr::Load {
-                        addr,
-                        offset,
-                        sz,
-                        signed,
-                        ..
-                    } => match t.as_ptr(t.ty(*addr)) {
-                        T::Ptr { l: Some(l), d } => match access(o, l, d + *offset, sz.bytes()) {
-                            Ok(a) => {
-                                let base = map_off(o, l, d).unwrap_or(0);
-                                let new_off = a.dst - base;
-                                if new_off != *offset || a.sz != *sz {
-                                    rep.accesses += 1;
-                                } else {
-                                    rep.unchanged += 1;
+                Stmt::Def { dst, expr } => {
+                    match expr {
+                        Expr::ConstI64(_) | Expr::ConstI32(_)
+                            if matches!(t.ty(*dst), T::Global { .. }) =>
+                        {
+                            let src = match expr {
+                                Expr::ConstI64(c) => *c,
+                                Expr::ConstI32(c) => *c as u64,
+                                _ => unreachable!(),
+                            };
+                            let T::Global { g, .. } = t.ty(*dst) else {
+                                unreachable!()
+                            };
+                            match map_off(o, g.layout, (src - g.src) as i64) {
+                                Some(d) => {
+                                    let n = (g.dst as i64 + d) as u64;
+                                    *expr = match expr {
+                                        Expr::ConstI64(_) => Expr::ConstI64(n),
+                                        _ => Expr::ConstI32(n as u32),
+                                    };
+                                    rep.globals += 1;
                                 }
-                                if map_off(o, l, d).is_none() {
-                                    rep.untyped.push((
+                                None => rep.note(
+                                    Why::Misaligned,
+                                    (
                                         pc,
-                                        format!(
-                                            "base {d} into {} is between fields",
-                                            o.layout(l).name
-                                        ),
-                                    ));
-                                }
-                                *offset = new_off;
-                                if a.sz != *sz {
-                                    *sz = a.sz;
-                                    *signed = a.signed.unwrap_or(false);
+                                        format!("address {src:#x} inside a global, between fields"),
+                                    ),
+                                ),
+                            }
+                        }
+                        Expr::Load {
+                            addr,
+                            offset,
+                            sz,
+                            signed,
+                            ..
+                        } => match t.as_ptr(t.ty(*addr)) {
+                            T::Ptr { l: Some(l), d, ix } => {
+                                match locate(o, l, d, ix, *offset, sz.bytes()) {
+                                    Ok((new_off, a)) => {
+                                        if new_off != *offset || a.sz != *sz {
+                                            rep.accesses += 1;
+                                        } else {
+                                            rep.unchanged += 1;
+                                        }
+                                        *offset = new_off;
+                                        if a.sz != *sz {
+                                            *sz = a.sz;
+                                            *signed = a.signed.unwrap_or(false);
+                                        }
+                                    }
+                                    Err(e) => rep.note(Why::Field, (pc, e)),
                                 }
                             }
-                            Err(e) => rep.untyped.push((pc, e)),
+                            T::Ptr { l: None, .. } => rep.note(
+                                Why::Opaque,
+                                (pc, "load through a pointer to an unknown type".into()),
+                            ),
+                            T::Top => rep.note(
+                                Why::Conflict,
+                                (pc, "load through a value that may be a pointer".into()),
+                            ),
+                            T::Int | T::Null => rep.note(
+                                Why::Unknown,
+                                (pc, "load through a value of unknown type".into()),
+                            ),
+                            T::Const(c) => rep.note(
+                                Why::Static,
+                                (pc, format!("load at {c:#x}, not a known global")),
+                            ),
+                            _ => {}
                         },
-                        T::Ptr { l: None, .. } => rep
-                            .untyped
-                            .push((pc, "load through a pointer to an unknown type".into())),
-                        T::Top => rep
-                            .untyped
-                            .push((pc, "load through a value that may be a pointer".into())),
-                        _ => {}
-                    },
-                    Expr::Bin {
-                        op: op @ (BinOp::Add | BinOp::Sub),
-                        ty: Ty::I64,
-                        a,
-                        b,
-                    } => {
-                        let (ta, tb) = (t.as_ptr(t.ty(*a)), t.as_ptr(t.ty(*b)));
-                        let is_sub = *op == BinOp::Sub;
-                        // Pointer and step, either order for an add.
-                        let pick = match (ta, tb) {
-                            (T::Ptr { l, d }, x) if !matches!(x, T::Ptr { .. } | T::Null) => {
-                                Some((l, d, false, x))
-                            }
-                            (x, T::Ptr { l, d })
-                                if !is_sub && !matches!(x, T::Ptr { .. } | T::Null) =>
-                            {
-                                Some((l, d, true, x))
-                            }
-                            _ => None,
-                        };
-                        if let (T::Ptr { l: l1, .. }, T::Ptr { l: l2, .. }) = (ta, tb) {
-                            if is_sub {
-                                // A pointer difference, back to source units.
-                                match (l1, l2) {
+                        Expr::Bin {
+                            op: op @ (BinOp::Add | BinOp::Sub),
+                            ty: Ty::I64,
+                            a,
+                            b,
+                        } => {
+                            let (ta, tb) = (t.as_ptr(t.ty(*a)), t.as_ptr(t.ty(*b)));
+                            let is_sub = *op == BinOp::Sub;
+                            // Pointer and step, either order for an add.
+                            let pick = match (ta, tb) {
+                                (T::Ptr { l, d, ix }, x)
+                                    if !matches!(x, T::Ptr { .. } | T::Null) =>
+                                {
+                                    Some((l, d, ix, false, x))
+                                }
+                                (x, T::Ptr { l, d, ix })
+                                    if !is_sub && !matches!(x, T::Ptr { .. } | T::Null) =>
+                                {
+                                    Some((l, d, ix, true, x))
+                                }
+                                _ => None,
+                            };
+                            if let (T::Ptr { l: l1, .. }, T::Ptr { l: l2, .. }) = (ta, tb) {
+                                if is_sub {
+                                    // A pointer difference, back to source units.
+                                    match (l1, l2) {
                                     (Some(x), Some(y)) if x == y => {
                                         let (ss, ds) = elem_sizes(o, x);
                                         if ss != ds {
@@ -857,37 +1042,75 @@ pub fn relayout(f: &mut Function, o: &dyn LayoutOracle, abi: &Abi) -> Report {
                                             *dst = tmp;
                                         }
                                     }
-                                    _ => rep.untyped.push((
+                                    _ => rep.note(Why::Opaque, (
                                         pc,
                                         "difference of pointers to different or unknown types"
                                             .into(),
                                     )),
                                 }
-                            }
-                        } else if let Some((l, d, swapped, step)) = pick {
-                            let stepv = if swapped { *a } else { *b };
-                            match (l, step) {
-                                (Some(l), T::Const(c)) => {
-                                    let c = if is_sub {
-                                        (c as i64).wrapping_neg()
-                                    } else {
-                                        c as i64
-                                    };
-                                    match (map_off(o, l, d), map_off(o, l, d + c)) {
-                                        (Some(x), Some(y)) if y - x != c => {
-                                            let k = f.fresh();
-                                            let v = if is_sub {
-                                                (x - y) as u64
-                                            } else {
-                                                (y - x) as u64
-                                            };
-                                            out.push((
-                                                Stmt::Def {
-                                                    dst: k,
-                                                    expr: Expr::ConstI64(v),
-                                                },
-                                                pc,
-                                            ));
+                                }
+                            } else if let Some((l, d, ix, swapped, step)) = pick {
+                                let stepv = if swapped { *a } else { *b };
+                                match (l, step) {
+                                    (Some(l), T::Const(c)) => {
+                                        let c = if is_sub {
+                                            (c as i64).wrapping_neg()
+                                        } else {
+                                            c as i64
+                                        };
+                                        let dist = match ix {
+                                            None => {
+                                                match (map_off(o, l, d), map_off(o, l, d + c)) {
+                                                    (Some(x), Some(y)) => Some(y - x),
+                                                    _ => None,
+                                                }
+                                            }
+                                            Some(_) => {
+                                                let (s, t) = elem_sizes(o, l);
+                                                (s != 0 && c % s == 0).then(|| c / s * t)
+                                            }
+                                        };
+                                        match dist {
+                                            Some(n) if n != c => {
+                                                let k = f.fresh();
+                                                let v = if is_sub {
+                                                    n.wrapping_neg() as u64
+                                                } else {
+                                                    n as u64
+                                                };
+                                                out.push((
+                                                    Stmt::Def {
+                                                        dst: k,
+                                                        expr: Expr::ConstI64(v),
+                                                    },
+                                                    pc,
+                                                ));
+                                                if swapped {
+                                                    *a = k;
+                                                } else {
+                                                    *b = k;
+                                                }
+                                                rep.arithmetic += 1;
+                                            }
+                                            Some(_) => {}
+                                            _ => rep.note(
+                                                Why::Misaligned,
+                                                (
+                                                    pc,
+                                                    format!(
+                                                "step {c} from {d} in {} lands between fields",
+                                                o.layout(l).name
+                                            ),
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                    (Some(l), T::Int) => {
+                                        let (ss, ds) = elem_sizes(o, l);
+                                        if ss != ds {
+                                            let mut extra = Vec::new();
+                                            let k = rescale(f, &mut extra, pc, stepv, ss, ds);
+                                            out.extend(extra);
                                             if swapped {
                                                 *a = k;
                                             } else {
@@ -895,79 +1118,69 @@ pub fn relayout(f: &mut Function, o: &dyn LayoutOracle, abi: &Abi) -> Report {
                                             }
                                             rep.arithmetic += 1;
                                         }
-                                        (Some(_), Some(_)) => {}
-                                        _ => rep.untyped.push((
-                                            pc,
-                                            format!(
-                                                "step {c} from {d} in {} lands between fields",
-                                                o.layout(l).name
-                                            ),
-                                        )),
                                     }
+                                    (None, T::Const(_) | T::Int) => rep.note(
+                                        Why::Opaque,
+                                        (pc, "arithmetic on a pointer to an unknown type".into()),
+                                    ),
+                                    _ => {}
                                 }
-                                (Some(l), T::Int) => {
-                                    let (ss, ds) = elem_sizes(o, l);
-                                    if ss != ds {
-                                        let mut extra = Vec::new();
-                                        let k = rescale(f, &mut extra, pc, stepv, ss, ds);
-                                        out.extend(extra);
-                                        if swapped {
-                                            *a = k;
-                                        } else {
-                                            *b = k;
-                                        }
-                                        rep.arithmetic += 1;
-                                    }
-                                }
-                                (None, T::Const(_) | T::Int) => rep.untyped.push((
-                                    pc,
-                                    "arithmetic on a pointer to an unknown type".into(),
-                                )),
-                                _ => {}
                             }
                         }
-                    }
-                    Expr::VLoad { addr, .. }
-                    | Expr::Rmw { addr, .. }
-                    | Expr::CmpXchg { addr, .. } => {
-                        if matches!(t.as_ptr(t.ty(*addr)), T::Ptr { .. } | T::Top) {
-                            rep.untyped.push((
-                                pc,
-                                "vector or atomic access through a typed pointer".into(),
-                            ));
+                        Expr::VLoad { addr, .. }
+                        | Expr::Rmw { addr, .. }
+                        | Expr::CmpXchg { addr, .. } => {
+                            if matches!(t.as_ptr(t.ty(*addr)), T::Ptr { .. } | T::Top) {
+                                rep.note(
+                                    Why::Bulk,
+                                    (pc, "vector or atomic access through a typed pointer".into()),
+                                );
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Stmt::Store {
                     addr, offset, sz, ..
                 } => match t.as_ptr(t.ty(*addr)) {
-                    T::Ptr { l: Some(l), d } => match access(o, l, d + *offset, sz.bytes()) {
-                        Ok(a) => {
-                            let base = map_off(o, l, d).unwrap_or(0);
-                            let new_off = a.dst - base;
-                            if new_off != *offset || a.sz != *sz {
-                                rep.accesses += 1;
-                            } else {
-                                rep.unchanged += 1;
+                    T::Ptr { l: Some(l), d, ix } => {
+                        match locate(o, l, d, ix, *offset, sz.bytes()) {
+                            Ok((new_off, a)) => {
+                                if new_off != *offset || a.sz != *sz {
+                                    rep.accesses += 1;
+                                } else {
+                                    rep.unchanged += 1;
+                                }
+                                *offset = new_off;
+                                *sz = a.sz;
                             }
-                            *offset = new_off;
-                            *sz = a.sz;
+                            Err(e) => rep.note(Why::Field, (pc, e)),
                         }
-                        Err(e) => rep.untyped.push((pc, e)),
-                    },
-                    T::Ptr { l: None, .. } => rep
-                        .untyped
-                        .push((pc, "store through a pointer to an unknown type".into())),
-                    T::Top => rep
-                        .untyped
-                        .push((pc, "store through a value that may be a pointer".into())),
+                    }
+                    T::Ptr { l: None, .. } => rep.note(
+                        Why::Opaque,
+                        (pc, "store through a pointer to an unknown type".into()),
+                    ),
+                    T::Top => rep.note(
+                        Why::Conflict,
+                        (pc, "store through a value that may be a pointer".into()),
+                    ),
+                    T::Int | T::Null => rep.note(
+                        Why::Unknown,
+                        (pc, "store through a value of unknown type".into()),
+                    ),
+                    T::Const(c) => rep.note(
+                        Why::Static,
+                        (pc, format!("store at {c:#x}, not a known global")),
+                    ),
                     _ => {}
                 },
                 Stmt::VStore { addr, .. } => {
                     if matches!(t.as_ptr(t.ty(*addr)), T::Ptr { .. } | T::Top) {
-                        rep.untyped
-                            .push((pc, "vector or atomic access through a typed pointer".into()));
+                        rep.note(
+                            Why::Bulk,
+                            (pc, "vector or atomic access through a typed pointer".into()),
+                        );
                     }
                 }
                 Stmt::MemCopy { dst, src, .. } => {
@@ -975,14 +1188,12 @@ pub fn relayout(f: &mut Function, o: &dyn LayoutOracle, abi: &Abi) -> Report {
                         .iter()
                         .any(|v| matches!(t.as_ptr(t.ty(*v)), T::Ptr { .. } | T::Top))
                     {
-                        rep.untyped
-                            .push((pc, "block copy through a typed pointer".into()));
+                        rep.note(Why::Bulk, (pc, "block copy through a typed pointer".into()));
                     }
                 }
                 Stmt::MemFill { dst, .. } => {
                     if matches!(t.as_ptr(t.ty(*dst)), T::Ptr { .. } | T::Top) {
-                        rep.untyped
-                            .push((pc, "block fill through a typed pointer".into()));
+                        rep.note(Why::Bulk, (pc, "block fill through a typed pointer".into()));
                     }
                 }
                 _ => {}
@@ -1004,10 +1215,13 @@ pub fn relayout(f: &mut Function, o: &dyn LayoutOracle, abi: &Abi) -> Report {
         if let FTerm::Call { .. } = f.blocks[b].term {
             for r in abi.arg_regs {
                 if matches!(ctx.reg(*r), T::Stack(_)) {
-                    rep.untyped.push((
-                        f.blocks[b].term_pc,
-                        format!("frame address passed in {r:?}"),
-                    ));
+                    rep.note(
+                        Why::FrameEscape,
+                        (
+                            f.blocks[b].term_pc,
+                            format!("frame address passed in {r:?}"),
+                        ),
+                    );
                 }
             }
         }
