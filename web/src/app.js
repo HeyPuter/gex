@@ -808,6 +808,7 @@ async function begin(opts, base, at, state, meter) {
     lateUnits,
     fill,
     lazyCache,
+    restBundle: lazy.some(([, , u]) => String(u).includes('#')),
     identities: b.identities ?? null,
     stateful: b.stateful ?? null,
     providerSources: b.providerSources ?? null,

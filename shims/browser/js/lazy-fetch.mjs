@@ -83,12 +83,13 @@ let zstd = null;
 let zstdLoad = null;
 /** The decoder the rest bundle's reads need, loaded and set up (a read
  *  cannot wait for it: the Worker's guest runs synchronously). The Worker
- *  awaits this before its kernel starts. None where the page's lazy-file
- *  owner reads the rest bundle for every Worker (lazy-cache.mjs): a decoder
- *  is an engine memory reservation, and one in each of a desktop's Workers
- *  ran the page out of them. */
+ *  awaits this before its kernel starts. None where the site has no rest
+ *  bundle (the page says, `GEX_REST_BUNDLE`), or where the page's lazy-file
+ *  owner reads it for every Worker (lazy-cache.mjs): a decoder is an engine
+ *  memory reservation, and one in each of a desktop's Workers ran the page
+ *  out of them. */
 export function lazyReady() {
-  if (lazyCacheOn()) return Promise.resolve();
+  if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
   zstdLoad ??= import('../../../web/eject-site/vendor/zstddec-stream.mjs')
     .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
