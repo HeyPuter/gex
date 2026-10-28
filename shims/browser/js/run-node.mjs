@@ -506,7 +506,9 @@ const host = new ProcessHost({
     // overhead, GC). Off by default -- it slows the run and writes a file each.
     process.env.GEX_CPU_PROF
       ? { execArgv: ['--cpu-prof', '--cpu-prof-dir', process.env.GEX_CPU_PROF, '--cpu-prof-interval', '2000'] }
-      : undefined),
+      // GEX_WORKER_STACK_MB=<n>: each Worker's stack, in MiB (Node's default
+      // is larger than a browser's), to see code that runs out of it here.
+      : (process.env.GEX_WORKER_STACK_MB ? { resourceLimits: { stackSizeMb: Number(process.env.GEX_WORKER_STACK_MB) } } : undefined)),
   shim: shimWasm,
   guest: guestWasm,
   kernel,

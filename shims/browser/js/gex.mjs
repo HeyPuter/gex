@@ -463,6 +463,21 @@ const ENTRY_TRAMP = new Uint8Array([
   9, 7, 1, 0, 65, 0, 11, 1, 1,
   10, 26, 2, 10, 0, 32, 0, 32, 1, 32, 2, 18, 0, 11, 13, 0, 32, 0, 32, 1, 32, 2, 65, 0, 19, 0, 0, 11,
 ]);
+/** Whether this thread's stack has room for one more fault's dispatch, its
+ *  shim, hook and guest frames. A call that pushes STACK_ROOM's entries as
+ *  arguments needs that much stack below the caller's frame, and throws a
+ *  RangeError when it is not there, which is caught here: nothing the guest
+ *  or the shim was doing is unwound. */
+const STACK_ROOM = new Array(32768).fill(0);
+const stackSink = function () { return 1; };
+function stackRoom() {
+  try {
+    return Reflect.apply(stackSink, null, STACK_ROOM);
+  } catch (err) {
+    if (err instanceof RangeError) return 0;
+    throw err;
+  }
+}
 let entryTrampMod = null;
 /** The entry function's module, for a 64-bit function table (`t64`) and an
  *  i64 stack pointer (`s64`), compiled once each.
@@ -1990,6 +2005,9 @@ export class Gex {
           }
           return 1;
         },
+        // Room on this thread's stack for one more fault's dispatch (cgen.rs
+        // `fault_in_place`, inside another's).
+        stack_room: () => stackRoom(),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // This Worker's function table, short of what another Worker
@@ -8347,8 +8365,18 @@ export class Gex {
             this.#drainFork()?.catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
             this.#startThread();
             // The fault hook as one of this loop's steps: on a stack that may
-            // suspend in the single-thread build (`#driveAsync`).
+            // suspend in the single-thread build (`#driveAsync`). (Only here:
+            // a staged fault keeps the trap off the quick path.)
             const ft = this.#faultTake(ctx);
+            // Inside a fault's dispatch, which this call-out may lie within:
+            // with no room on the stack for another, the process ends, as
+            // its frames below cannot be left (`gex_fault_overflow`).
+            if (ft && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
+              ft.spG.value = ft.cur;
+              e.gex_fault_overflow(ft.code);
+              err.gexHandoff = true;
+              throw err;
+            }
             if (ft) {
               try {
                 if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];

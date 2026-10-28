@@ -2262,6 +2262,9 @@ extern "C" {
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
     fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
+    /// Whether the host's stack has room for one more fault's dispatch: 1
+    /// or 0.
+    fn stack_room() -> i32;
     /// Whether this Worker's thread may be stopped for a session snapshot
     /// where it waits now: 1 when its frames below the wait are its
     /// program's snapshot root and its own (a thread's driver, or the
@@ -3097,27 +3100,61 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
     }
     let gm = GuestMem::new(crate::guest_bytes());
     let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
-    let deep = FAULT_NEST.with(|n| {
+    let open = FAULT_NEST.with(|n| {
         let mut n = n.borrow_mut();
         while n.last().is_some_and(|&s| s < sp) {
             n.pop();
         }
-        if n.len() >= FAULT_NEST_MAX {
-            n.clear();
-            return true;
-        }
-        n.push(sp);
-        false
+        n.len()
     });
-    if deep {
-        crate::warn_line(&format!(
-            "gex: faults nested {FAULT_NEST_MAX} deep in their own dispatch (code {code:#010x}); this one is delivered from the run loop\n"
-        ));
+    // A delivery inside another's dispatch also needs the host's stack to
+    // have room for one more: a level's frames are as large as the code
+    // that faulted makes them, so the count alone does not bound them.
+    // SAFETY: a host import without arguments.
+    let short = open > 0 && unsafe { stack_room() } == 0;
+    if open >= FAULT_NEST_MAX || short {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        FAULT_NEST.with(|n| n.borrow_mut().clear());
+        // Said once: a handler that faults again does so on every delivery.
+        if !SAID.swap(true, Ordering::Relaxed) {
+            crate::warn_line(&format!(
+                "gex: faults nested {} deep in their own dispatch (code {code:#010x}{}); this one is delivered from the run loop\n",
+                open + 1,
+                if short { ", the host's stack short" } else { "" }
+            ));
+        }
         return false;
     }
+    FAULT_NEST.with(|n| n.borrow_mut().push(sp));
     // SAFETY: a host import taking scalars; nothing here holds a lock or a
     // borrow, since the hook's dispatch may unwind through this frame.
-    unsafe { fault_call(idx as i32, c as i32, code as i32, addr as i64, kind as i32, sp as i64) != 0 }
+    let ran = unsafe { fault_call(idx as i32, c as i32, code as i32, addr as i64, kind as i32, sp as i64) != 0 };
+    if !ran {
+        FAULT_NEST.with(|n| n.borrow_mut().pop());
+    }
+    ran
+}
+
+/// How many in-place deliveries may still be in their dispatch on this
+/// thread: the host asks before it delivers a staged fault inside a
+/// call-out, which may lie within them.
+#[no_mangle]
+pub extern "C" fn gex_fault_nesting() -> u32 {
+    FAULT_NEST.with(|n| n.borrow().len() as u32)
+}
+
+/// A staged fault that a call-out's loop cannot deliver (the host's stack
+/// has no room left for its dispatch, and the frames under it cannot be
+/// left): the process ends as one whose stack overflowed, said as a
+/// critical error. The host then unwinds to its run loop.
+#[no_mangle]
+pub extern "C" fn gex_fault_overflow(code: u32) {
+    FAULT_NEST.with(|n| n.borrow_mut().clear());
+    crate::warn_line(&format!(
+        "gex: a fault (code {code:#010x}) in its own dispatch nests past the host's stack: the process ends (stack overflow)\n"
+    ));
+    // STATUS_STACK_OVERFLOW's low byte, as `end_process` gives a parent.
+    let _ = crate::exit_process(0xfd);
 }
 
 /// Stage a fault for the host to give the hook (`gex_fault_take`); the
