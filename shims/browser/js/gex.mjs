@@ -8624,8 +8624,7 @@ export class Gex {
     const len = e.gex_jit_pending_len() >>> 0;
     if (len === 0) return;
     const bytes = this.#bytes().slice(ptr, ptr + len);
-    const key = moduleContentKey(bytes);
-    const ukey = this.#unitKey(bytes);
+    const [key, ukey] = this.#pendingKeys(bytes);
     this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', this.#unitGet(ukey), true);
     this.#unitShare(ukey);
     this.#noteExternal(bytes, key);
@@ -8649,8 +8648,8 @@ export class Gex {
    * processes it is installed in (gex_emit::dense::GLOBAL) -- else null.
    * `bytes` is a private copy; the word is put back.
    */
-  #unitKey(bytes) {
-    if (!globalThis.GEX_UNIT_CACHE || !(bytes instanceof Uint8Array)) return null;
+  #unitKey(bytes, always = false) {
+    if (!(always || globalThis.GEX_UNIT_CACHE) || !(bytes instanceof Uint8Array)) return null;
     const at = denseBaseAt(bytes);
     if (at < 0) return `u:${moduleContentKey(bytes)}`;
     const w = bytes.slice(at, at + 4);
@@ -8659,6 +8658,26 @@ export class Gex {
     bytes.set(w, at);
     return `u:${k}`;
   }
+
+  /** The pending module's content key and `#unitKey`, for its `bytes`: as
+   *  the shim keyed it when it queued the module (`gex_jit_pending_key`), so
+   *  no Worker hashes the bytes. GEX_CHECK_INSTALL hashes them too and says
+   *  where the two differ. */
+  #pendingKeys(bytes) {
+    const k = this.#shim.exports.gex_jit_pending_key;
+    const len = bytes.length;
+    const key = `${len}:${k(0) >>> 0}:${k(1) >>> 0}`;
+    const ukey = `u:${len}:${k(2) >>> 0}:${k(3) >>> 0}`;
+    if (globalThis.GEX_CHECK_INSTALL || globalThis.process?.env?.GEX_CHECK_INSTALL) {
+      const want = moduleContentKey(bytes);
+      const uwant = this.#unitKey(bytes, true);
+      const pid = this.#shim.exports.gex_my_pid?.() ?? '?';
+      if (key !== want || ukey !== uwant) console.error(`[install-check] pid ${pid}: pending keys ${key} ${ukey}, the bytes' ${want} ${uwant}`);
+      else if (!this.#keysChecked++) console.error(`[install-check] pid ${pid}: the pending keys match the bytes' (${ukey === `u:${key}` ? 'no dense section' : 'dense base word zeroed'})`);
+    }
+    return [key, globalThis.GEX_UNIT_CACHE ? ukey : null];
+  }
+  #keysChecked = 0;
 
   /** The compiled module for `ukey`, counted (`unitHits`), or null. */
   #unitGet(ukey) {
@@ -8731,10 +8750,9 @@ export class Gex {
     // and a served module ahead of the unit legitimately lacks the block.
     const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
     const bytes = this.#bytes().slice(ptr, ptr + len);
-    const key = moduleContentKey(bytes);
     // A module another process compiled (a served unit) comes from the
     // page's unit cache: instantiated, not compiled again.
-    const ukey = this.#unitKey(bytes);
+    const [key, ukey] = this.#pendingKeys(bytes);
     await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878', this.#unitGet(ukey));
     this.#unitShare(ukey);
     this.#noteExternal(bytes, key);

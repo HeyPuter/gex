@@ -3529,6 +3529,11 @@ struct PendingModule {
     slots: u64,
     /// Its dense elements, numbered (`dense::register`), published with it.
     dense: Option<gex_emit::dense::Section>,
+    /// Its bytes' content key, and the same with the dense base word zeroed
+    /// (the page's unit cache's key): `content_keys`, published with the
+    /// queue's front so no Worker hashes the bytes again.
+    key: u64,
+    unit_key: u64,
 }
 
 /// Queue a module for JavaScript to install, numbering its dense blocks;
@@ -3546,7 +3551,8 @@ fn push_pending(j: &mut Jit, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8
     if let Some(d) = &dense {
         j.module_dense.insert(d.base, d.span());
     }
-    j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
+    let (key, unit_key) = content_keys(&wasm, gex_emit::dense::locate(&wasm).map(|l| l.section.0));
+    j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense, key, unit_key });
 }
 
 /// `GEX_JIT_DIAG`: stale checks from a module numbered elsewhere whose id one
@@ -18719,6 +18725,14 @@ pub extern "C" fn gex_jit_pending_len() -> u32 {
     PENDING.with(|p| p[1].load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The pending module's content key (`moduleContentKey` in gex.mjs), word
+/// `i`: 0 and 1 its high and low halves, 2 and 3 those of the key with the
+/// dense base word zeroed (`Gex#unitKey`).
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_key(i: u32) -> u32 {
+    PENDING.with(|p| p.get(3 + i as usize).map_or(0, |w| w.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
 /// How many slots the dispatch table must hold for the pending module.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots() -> u32 {
@@ -18982,7 +18996,7 @@ pub extern "C" fn gex_jit_installed() {
             // take the front of the shared queue between this Worker's read and
             // this pop, so the note is checked against what was popped): keep
             // only where it is.
-            if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+            if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == done.key) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 j.registry_sums.push(Vec::new());
                 regview::publish_module(j.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some(off), key);
@@ -19003,7 +19017,7 @@ pub extern "C" fn gex_jit_installed() {
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             j.registry_sums.push(chunk_sums(&wasm));
-            regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None, content_key(&wasm));
+            regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None, done.key);
             j.registry.push(wasm);
             j.registry_ext.push(None);
             j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.span())));
@@ -19321,8 +19335,8 @@ fn set_exited(v: bool) {
 /// overwrite each other's `(ptr, len, slots)` between the JS length check and
 /// the pointer read, reaching `WebAssembly.compile` as an empty buffer.
 thread_local! {
-    static PENDING: [std::sync::atomic::AtomicU32; 3] =
-        const { [const { std::sync::atomic::AtomicU32::new(0) }; 3] };
+    static PENDING: [std::sync::atomic::AtomicU32; 7] =
+        const { [const { std::sync::atomic::AtomicU32::new(0) }; 7] };
 }
 
 /// Republish the head of the queue. Call after every push and pop.
@@ -19340,13 +19354,13 @@ fn publish_pending(j: &Jit) {
         j.pending.len() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    let (p, l, s) = j.pending.front().map_or((0, 0, 0), |m| {
-        (m.wasm.as_ptr() as u32, m.wasm.len() as u32, m.slots as u32)
+    let (p, l, s, k, u) = j.pending.front().map_or((0, 0, 0, 0, 0), |m| {
+        (m.wasm.as_ptr() as u32, m.wasm.len() as u32, m.slots as u32, m.key, m.unit_key)
     });
     PENDING.with(|pending| {
-        pending[0].store(p, std::sync::atomic::Ordering::Relaxed);
-        pending[1].store(l, std::sync::atomic::Ordering::Relaxed);
-        pending[2].store(s, std::sync::atomic::Ordering::Relaxed);
+        for (w, v) in pending.iter().zip([p, l, s, (k >> 32) as u32, k as u32, (u >> 32) as u32, u as u32]) {
+            w.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
     });
 }
 
@@ -19394,6 +19408,39 @@ fn content_key(bytes: &[u8]) -> u64 {
         step(words + i, x as u32);
     }
     ((a as u64) << 32) | b as u64
+}
+
+/// `content_key` of `bytes`, and of `bytes` with the four at `zero_at`
+/// zeroed (none: the same key twice), in one pass.
+fn content_keys(bytes: &[u8], zero_at: Option<usize>) -> (u64, u64) {
+    let z = zero_at.map_or(usize::MAX..usize::MAX, |at| at..at.saturating_add(4));
+    let (mut a, mut b, mut c, mut d): (u32, u32, u32, u32) = (0x811c_9dc5, 0x9e37_79b9, 0x811c_9dc5, 0x9e37_79b9);
+    let mut step = |i: usize, x: u32, y: u32| {
+        a = (a ^ x).wrapping_mul(0x0100_0193);
+        b = (b ^ x.wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+        b ^= b >> 13;
+        c = (c ^ y).wrapping_mul(0x0100_0193);
+        d = (d ^ y.wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+        d ^= d >> 13;
+    };
+    let words = bytes.len() / 4;
+    for i in 0..words {
+        let mut w: [u8; 4] = bytes[4 * i..4 * i + 4].try_into().unwrap();
+        let x = u32::from_le_bytes(w);
+        if z.start < 4 * i + 4 && 4 * i < z.end {
+            for (k, v) in w.iter_mut().enumerate() {
+                if z.contains(&(4 * i + k)) {
+                    *v = 0;
+                }
+            }
+        }
+        step(i, x, u32::from_le_bytes(w));
+    }
+    for (i, &x) in bytes[4 * words..].iter().enumerate() {
+        let y = if z.contains(&(4 * words + i)) { 0 } else { x as u32 };
+        step(words + i, x as u32, y);
+    }
+    (((a as u64) << 32) | b as u64, ((c as u64) << 32) | d as u64)
 }
 
 /// Whether the next `gex_jit_installed` keeps its module for joining Workers
