@@ -7755,11 +7755,53 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             Some(again) => pc = again,
             None => {
                 snap_carry_end();
+                growth_note();
                 enter_guest();
                 return;
             }
         }
     }
+}
+
+/// `GEX_DEBUG_GROWTH=1` in a process's environment (a debug switch): a
+/// line each time its memory has grown past another 64 MiB, after the call
+/// that grew it, with what the kernel's map holds and the shim's heap.
+fn growth_note() {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    // 0 not read yet, 1 off, 2 on.
+    static ON: AtomicU8 = AtomicU8::new(0);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let on = match ON.load(Ordering::Relaxed) {
+        0 => {
+            let on = crate::sigs::proc_home().envp().iter().any(|e| e == "GEX_DEBUG_GROWTH=1");
+            ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        v => v == 2,
+    };
+    if !on {
+        return;
+    }
+    let have = warch::memory_size(0) as u64 * 65536;
+    let step = have >> 26;
+    if SAID.fetch_max(step, Ordering::Relaxed) >= step {
+        return;
+    }
+    let classes: Vec<usize> = LIVE_BYTES.iter().map(|b| b.load(Ordering::Relaxed) >> 20).collect();
+    let live: usize = LIVE_BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+    let spent: Vec<u64> = ARENA_SPENT.iter().map(|b| b.load(Ordering::Relaxed) >> 20).collect();
+    let map = with_exec_lock(|h| h.kernel.mem.lock().growth_summary());
+    warn_line(&format!(
+        "[gex] growth pid {} {}: memory {} MiB; shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
+        my_pid(),
+        crate::sigs::proc_home().exe(),
+        have >> 20,
+        HEAP_REACH.load(Ordering::Relaxed) >> 20,
+        live >> 20,
+        classes,
+        spent,
+        HEAP_REFILLS.load(Ordering::Relaxed),
+    ));
 }
 
 thread_local! {

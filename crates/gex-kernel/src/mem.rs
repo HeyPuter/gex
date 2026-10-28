@@ -1778,6 +1778,52 @@ impl MemoryMap {
         (size, rss, anon)
     }
 
+    /// What the map holds, for a debug line on a memory's growth: its
+    /// highest end, the bytes mapped no-access (reservations), writable
+    /// anonymous, file-backed and other, the unmapped holes below the
+    /// highest end, and the largest names by bytes.
+    pub fn growth_summary(&self) -> String {
+        const M: u64 = 1 << 20;
+        let (mut none, mut anon, mut file, mut other, mut mapped) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut by: std::collections::BTreeMap<(String, char), u64> = std::collections::BTreeMap::new();
+        let mut top = 0u64;
+        for v in &self.vmas {
+            let n = v.end - v.start;
+            mapped += n;
+            top = top.max(v.end);
+            let c = if v.prot == 0 {
+                none += n;
+                '-'
+            } else if v.code.is_some() || v.origin.is_some() {
+                file += n;
+                'f'
+            } else if v.prot & prot::WRITE != 0 {
+                anon += n;
+                'w'
+            } else {
+                other += n;
+                'r'
+            };
+            let name = if v.name.is_empty() { "[anon]".to_string() } else { v.name.rsplit('/').next().unwrap_or(&v.name).to_string() };
+            *by.entry((name, c)).or_default() += n;
+        }
+        let low = self.vmas.first().map_or(0, |v| v.start);
+        let mut big: Vec<_> = by.into_iter().collect();
+        big.sort_by(|a, b| b.1.cmp(&a.1));
+        let names: Vec<String> = big.iter().take(8).map(|((n, c), b)| format!("{n}({c}) {}", b / M)).collect();
+        format!(
+            "top {top:#x}, {} vmas: no-access {} MiB, rw anon {} MiB, file {} MiB, other {} MiB, holes {} MiB, arena {} MiB; largest: {}",
+            self.vmas.len(),
+            none / M,
+            anon / M,
+            file / M,
+            other / M,
+            top.saturating_sub(low).saturating_sub(mapped) / M,
+            self.arena.iter().map(|&(a, b)| b.saturating_sub(a)).sum::<u64>() / M,
+            names.join(", ")
+        )
+    }
+
     pub fn proc_maps(&self) -> String {
         let mut s = String::new();
         for v in &self.vmas {
