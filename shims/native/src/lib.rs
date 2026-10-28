@@ -31,6 +31,17 @@ pub(crate) mod ftab;
 pub(crate) mod door;
 pub mod wayland;
 
+/// The most functions wasmtime takes in one module, and what a translated
+/// image has besides its blocks (imports, the dispatch helpers), rounded up.
+const WASMTIME_MAX_FUNCS: usize = 1_000_000;
+const WASMTIME_FUNCS_MARGIN: usize = 4096;
+
+/// [`WASMTIME_MAX_FUNCS`], or `GEX_IMAGE_MAX_FUNCS` (a test's, to take the
+/// path a program too big for one module takes without one that big).
+fn image_max_funcs() -> usize {
+    std::env::var("GEX_IMAGE_MAX_FUNCS").ok().and_then(|v| v.parse().ok()).unwrap_or(WASMTIME_MAX_FUNCS)
+}
+
 /// The decoder's mode (`gex_xlate::set_compat`) is one setting per process,
 /// and running an image sets it: a test that sets it or runs an image holds
 /// this for as long as it decodes.
@@ -893,7 +904,18 @@ fn run_program_with(
         #[cfg(not(feature = "translate"))]
         panic!("{} has no translator to translate the program image", env!("CARGO_PKG_NAME"));
         #[allow(unreachable_code)]
-        let (m, s) = gex_xlate::translate_image(image, xlate);
+        let (mut m, mut s) = gex_xlate::translate_image(image, xlate);
+        // An image with more blocks than wasmtime takes functions in one
+        // module (gcc's cc1): nothing ahead of time, all of it translated as
+        // it runs (the seed, which any guest can start from).
+        if m.n_blocks + WASMTIME_FUNCS_MARGIN > image_max_funcs() {
+            eprintln!(
+                "[gex] {} has {} blocks, more than one module holds: translating it as it runs",
+                opts.args.first().map_or("the program", String::as_str),
+                m.n_blocks
+            );
+            (m, s) = (gex_xlate::seed_module(true), Stats::default());
+        }
         if opts.verbose {
             eprintln!(
                 "[gex] translated {} blocks / {} instructions -> {} KiB wasm ({} dispatch \
