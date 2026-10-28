@@ -704,8 +704,11 @@ fn check_covered(v: &Json, dir: &Path) -> Result<()> {
 /// unit is keyed by its image and its base, and the loader may place an
 /// unpinned image elsewhere in another run (another process's layout, the
 /// order things map), which an AOT-only page has no unit for. Images that
-/// cannot move (no relocations) are left out.
-fn pin_bases(v: &Json, units: &[Json], web: &Path) -> Result<()> {
+/// cannot move (no relocations) are left out. Returns the file's guest path
+/// when it wrote it: every process's loader reads it, and the recorded run
+/// may not have (the file is new, or it had no pins), so a bundle split
+/// keeps it in the bundle.
+fn pin_bases(v: &Json, units: &[Json], web: &Path) -> Result<Option<String>> {
     let what = crate::project::PROJECT_FILE;
     let path = web.join("rootfs.tar");
     let bytes = std::fs::read(&path)?;
@@ -752,7 +755,7 @@ fn pin_bases(v: &Json, units: &[Json], web: &Path) -> Result<()> {
         add.push(format!("{base:#x} {}", on_drive(p)));
     }
     if add.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut text = old.clone();
     if !text.is_empty() && !text.ends_with('\n') {
@@ -767,7 +770,7 @@ fn pin_bases(v: &Json, units: &[Json], web: &Path) -> Result<()> {
     let _ = std::fs::remove_file(&path);
     write_file(&path, &out, false)?;
     eprintln!("gexc eject build: pinned {} images in {file}: {}", add.len(), add.join(", "));
-    Ok(())
+    Ok(Some(format!("/{file}")))
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -888,7 +891,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
         std::collections::HashMap::new()
     };
-    pin_bases(&v, units, &web)?;
+    let pins = pin_bases(&v, units, &web)?;
     if !config.services.is_empty() {
         set_services(&v, &web, &config.services)?;
     }
@@ -1114,7 +1117,13 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     // keeps in its bundle (web/eject-site.mjs).
     let bundle = if config.bundle_split {
         match v.get("files_read") {
-            Some(Json::Arr(read)) => obj(vec![("split", json::b(true)), ("read", Json::Arr(read.clone()))]),
+            Some(Json::Arr(read)) => {
+                let mut read = read.clone();
+                if let Some(p) = pins.filter(|p| !read.iter().any(|r| r.as_str() == Some(p))) {
+                    read.push(s(&p));
+                }
+                obj(vec![("split", json::b(true)), ("read", Json::Arr(read))])
+            }
             _ => bail!(
                 "user/eject.json says \"bundle\": \"split\", but the recording has no files_read \
                  (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")"
