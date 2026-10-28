@@ -350,30 +350,12 @@ gives `start()` an element runs the program
 arguments and `onExit`).
 
 **`start(options)`** resolves once the program runs, with
-`{ exited, kill(), resize(size), state, describe() }`. It rejects with a
-message when the run cannot start: no cross-origin isolation, no WebGPU for
-a build that draws with it, a download that failed, or an option for a
-piece the build left out (`start({ compositor: true })` on a
-`"compositor": false` build names `"features": {"compositor": true}` in
-user/eject.json). Options:
-
-| Option | What |
-| --- | --- |
-| `container` / `canvas` | the element the desktop fills (a canvas or a box is made in it), or the canvas to draw into |
-| `size` | `'fit'` (the container's size), `{w, h}` or `'WxH'` |
-| `args` | the program's arguments, an array, instead of the recorded ones |
-| `env` | more environment, `['K=V']` or `{K: V}`; a name given replaces the build's |
-| `cwd`, `exe` | the working directory, the program (a path in the bundle) |
-| `mtimes` | the bundle's file times for the guest |
-| `persist` | `false`, or `{dir, db}`: a guest directory kept in IndexedDB |
-| `strace` | `true` (every process) or a pid |
-| `trapstack` | a trap's wasm frames |
-| `debug` | any other runtime switch, `{name: value}` |
-| `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out); `compositor: false` draws the windows straight into the page in a build that has both |
-| `onLog(text)`, `onExit(status)` | the program's terminal output; its exit |
-| `onProgress(p)` | the start-up's progress, for the page's loading screen (below); none by default |
-| `ready` | `'frame'` (the default): the start-up is over at the first frame shown; `'manual'`: when the page calls the handle's `ready()` |
-| `baseUrl` | where app.mjs's files are (default: beside app.mjs) |
+`{ exited, kill(), resize(size), state, describe(), ready() }`. Its
+options, the handle and its errors are in `web/src/README.md`, beside the
+library's code. An unknown option or a wrong value is an error that names
+it, and so is an option for a piece the build left out
+(`start({ compositor: true })` on a `"compositor": false` build names
+`"features": {"compositor": true}` in user/eject.json).
 
 ### The loading screen
 
@@ -445,10 +427,8 @@ node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
 node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
 
-`app.mjs`'s `start()` takes `container` (its output goes to a `<pre>` there
-unless `onLog`), `args`, `env`, `cwd`, `strace`, `translation` (the JIT
-fallback) and `onExit`; `kill()` stops waiting for and hearing the run (it
-is on the page's thread), `resize()` does nothing (a terminal program).
+`app.mjs`'s `start()` is the Linux program's (`web/src/README.md`, "A Linux
+program's build").
 
 The page needs cross-origin isolation (gex's runtime uses
 `SharedArrayBuffer`); `serve.mjs` sends the two headers. Replacements are

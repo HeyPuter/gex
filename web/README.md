@@ -45,6 +45,7 @@ much longer than later ones. Stripping needs `wasm-tools`
 site: the library, its runtime and Mesa, zstd-compressed assets, and the
 headers the host must send. The site's `index.html` belongs to the project, so the
 library can be imported into a page of your own.
+Its API, `start()`, is in `src/README.md`.
 
 ## The desktop demo
 
