@@ -523,8 +523,18 @@ export class WlProxy {
   #ring = 0;
   #token;
   // Per surface, the damage published but not yet drawn, so several publishes
-  // between two frames accumulate rather than the last one winning.
-  #pending = new Map();
+  // between two frames accumulate rather than the last one winning: client,
+  // surface, x, y, w, h per entry, `#pendingN` of them. Typed arrays, as the
+  // rest of a publish's scratch, so a publish makes no garbage.
+  #pending = new Int32Array(SLOTS * 6);
+  #pendingN = 0;
+  /** The surfaces whose pixels this publish copies: their record's offset in
+   *  the arena, the buffer they were last copied into, and the damage. */
+  #shmDst = new Int32Array(SLOTS);
+  #shmMine = new Uint32Array(SLOTS);
+  #shmRect = new Int32Array(SLOTS * 4);
+  /** A view of the guest's memory, made again when it grows. */
+  #view = null;
 
   /**
    * `tokenFn` names this process in the arena -- its pid, which it does not
@@ -576,17 +586,18 @@ export class WlProxy {
    * them: the damaged rows, all of them for a surface with a new region, and
    * none for one whose serial was copied already.
    */
-  #copyPixels(memory, recs) {
+  #copyPixels(memory, count) {
     if (!this.#pixels) return;
     const a = this.#a;
     // A buffer that cannot take this publish's new regions is replaced by
     // one that can, with room to spare, and every surface is copied whole.
     // A first one is made for what this publish needs.
     {
-      const h = this.#buf && new Int32Array(this.#buf, 0, P_DATA >> 2);
+      const h = this.#buf && this.#bufHead();
       let more = 0;
       let all = 0;
-      for (const { dst } of recs) {
+      for (let k = 0; k < count; k++) {
+        const dst = this.#shmDst[k];
         const need = ((a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4) + 255) & ~255;
         all += need;
         if (!h) continue;
@@ -602,7 +613,8 @@ export class WlProxy {
         const want = P_DATA + all;
         const grown = Math.max(want + (want >> 2), this.#buf ? this.#buf.byteLength * 2 : 0);
         if (!this.#newBuffer(Math.min(grown, PIXELS_MAX)) && !this.#buf) {
-          for (const { dst } of recs) {
+          for (let k = 0; k < count; k++) {
+            const dst = this.#shmDst[k];
             a[dst + R_ADDR] = 0;
             a[dst + R_ADDR_HI] = 0;
           }
@@ -611,21 +623,22 @@ export class WlProxy {
       }
     }
     const buf = this.#buf;
-    const h = new Int32Array(buf, 0, P_DATA >> 2);
+    const h = this.#bufHead();
+    const find = (c, sf) => {
+      for (let e = 0; e < SLOTS; e++) {
+        const o = P_ENTRIES + e * PE;
+        if (h[o + 2] && h[o] === c && h[o + 1] === sf) return o;
+      }
+      return -1;
+    };
     while (Atomics.compareExchange(h, P_LOCK, 0, 1) !== 0);
     try {
       if (h[P_NEXT] < P_DATA) h[P_NEXT] = P_DATA;
-      const find = (c, sf) => {
-        for (let e = 0; e < SLOTS; e++) {
-          const o = P_ENTRIES + e * PE;
-          if (h[o + 2] && h[o] === c && h[o + 1] === sf) return o;
-        }
-        return -1;
-      };
       // The regions this publish needs; a buffer that cannot take the new
       // ones as well starts again from empty, every surface copied whole.
       let more = 0;
-      for (const { dst } of recs) {
+      for (let k = 0; k < count; k++) {
+        const dst = this.#shmDst[k];
         const o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
         const need = a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4;
         if (o < 0 || h[o + 3] < need) more += (need + 255) & ~255;
@@ -634,9 +647,11 @@ export class WlProxy {
         for (let e = 0; e < SLOTS * PE; e++) h[P_ENTRIES + e] = 0;
         h[P_NEXT] = P_DATA;
       }
-      const src = new Uint8Array(memory.buffer);
-      for (const { dst, rect, mine: last } of recs) {
-        const mine = last === this.#bufId;
+      const src = this.#bytesOf(memory);
+      for (let k = 0; k < count; k++) {
+        const dst = this.#shmDst[k];
+        const mine = this.#shmMine[k] === this.#bufId;
+        const rx = this.#shmRect[k * 4], ry = this.#shmRect[k * 4 + 1], rwd = this.#shmRect[k * 4 + 2], rht = this.#shmRect[k * 4 + 3];
         const w = a[dst + R_WIDTH];
         const ht = a[dst + R_HEIGHT];
         const need = w * ht * 4;
@@ -671,17 +686,29 @@ export class WlProxy {
         const serial = a[dst + R_SERIAL];
         if (whole || h[o + 4] !== serial) {
           let x = 0, y = 0, rw = w, rh = ht;
-          if (!whole && rect.w > 0 && rect.h > 0) {
-            x = Math.max(0, Math.min(rect.x, w));
-            y = Math.max(0, Math.min(rect.y, ht));
-            rw = Math.max(0, Math.min(rect.w, w - x));
-            rh = Math.max(0, Math.min(rect.h, ht - y));
+          if (!whole && rwd > 0 && rht > 0) {
+            x = Math.max(0, Math.min(rx, w));
+            y = Math.max(0, Math.min(ry, ht));
+            rw = Math.max(0, Math.min(rwd, w - x));
+            rh = Math.max(0, Math.min(rht, ht - y));
           }
-          const out = new Uint8Array(buf, at, need);
+          const out = this.#bufBytes;
           if (from + (y + rh - 1) * stride + (x + rw) * 4 <= src.length || rh === 0) {
-            for (let r = 0; r < rh; r++) {
-              const s0 = from + (y + r) * stride + x * 4;
-              out.set(src.subarray(s0, s0 + rw * 4), (y + r) * w * 4 + x * 4);
+            // Whole rows at once where both sides are packed alike.
+            if (rw === w && stride === w * 4) {
+              const s0 = from + y * stride;
+              out.set(src.subarray(s0, s0 + rh * stride), at + y * w * 4);
+            } else {
+              // A narrow damaged rectangle a word at a time: a view per row
+              // was most of an idle-ish desktop's garbage.
+              const aligned = ((from | stride) & 3) === 0;
+              const s32 = aligned ? this.#words(memory) : null, o32 = this.#bufWords;
+              for (let r = 0; r < rh; r++) {
+                const s0 = from + (y + r) * stride + x * 4;
+                const d0 = at + (y + r) * w * 4 + x * 4;
+                if (rw >= 64 || !aligned) out.set(src.subarray(s0, s0 + rw * 4), d0);
+                else for (let q = 0, sw = s0 >> 2, dw = d0 >> 2; q < rw; q++) o32[dw + q] = s32[sw + q];
+              }
             }
           }
           h[o + 4] = serial;
@@ -693,6 +720,26 @@ export class WlProxy {
     } finally {
       Atomics.store(h, P_LOCK, 0);
     }
+  }
+
+  /** The pixel buffer's header words, bytes and words, kept with the buffer. */
+  #bufHeadView = null;
+  #bufBytes = null;
+  #bufWords = null;
+  #bufHead() {
+    if (this.#bufHeadView?.buffer !== this.#buf) {
+      this.#bufHeadView = new Int32Array(this.#buf, 0, P_DATA >> 2);
+      this.#bufBytes = new Uint8Array(this.#buf);
+      this.#bufWords = new Int32Array(this.#buf);
+    }
+    return this.#bufHeadView;
+  }
+
+  /** `memory`'s bytes, a view kept while its buffer is the same. */
+  #byteView = null;
+  #bytesOf(memory) {
+    const v = this.#byteView;
+    return v && v.buffer === memory.buffer ? v : (this.#byteView = new Uint8Array(memory.buffer));
   }
 
   #tokenFn;
@@ -803,47 +850,72 @@ export class WlProxy {
     // read them out of the wrong memory. Claim another and publish there.
     if (this.#block >= 0 && Atomics.load(this.#a, this.#base + B_TOKEN) !== this.#token) {
       this.#block = -1;
-      this.#pending.clear();
+      this.#pendingN = 0;
     }
     if (!this.#ready()) return;
+    const a = this.#a;
     const n = Math.min(count, SLOTS);
-    const src = new Int32Array(memory.buffer, ptr, n * REC);
-    const gen = Atomics.load(this.#a, this.#base + B_GEN);
-    const drawn = Atomics.load(this.#a, this.#base + B_ACK) === gen;
-    if (drawn) this.#pending.clear();
-    const shm = [];
+    const src = this.#words(memory);
+    const gen = Atomics.load(a, this.#base + B_GEN);
+    const drawn = Atomics.load(a, this.#base + B_ACK) === gen;
+    if (drawn) this.#pendingN = 0;
+    const pend = this.#pending;
+    let shm = 0;
     for (let i = 0; i < n; i++) {
-      const o = i * REC;
-      const dst = this.#base + B_WORDS + o;
+      const o = (ptr >>> 2) + i * REC;
+      const dst = this.#base + B_WORDS + i * REC;
+      const client = src[o + R_CLIENT], surface = src[o + R_SURFACE];
       // The buffer this slot's surface was last published from, if it is the
       // same surface.
-      const same = this.#a[dst + R_CLIENT] === src[o + R_CLIENT] && this.#a[dst + R_SURFACE] === src[o + R_SURFACE];
-      const mine = same && this.#pixels ? this.#a[dst + R_ADDR_HI] >>> 0 : 0;
-      for (let w = 0; w < REC; w++) this.#a[dst + w] = src[o + w];
-      if (this.#pixels && recordAddr(this.#a, dst) && src[o + R_WIDTH] > 0 && src[o + R_HEIGHT] > 0) {
-        shm.push({ dst, mine, rect: { x: src[o + R_DAMAGE_X], y: src[o + R_DAMAGE_Y], w: src[o + R_DAMAGE_W], h: src[o + R_DAMAGE_H] } });
+      const same = a[dst + R_CLIENT] === client && a[dst + R_SURFACE] === surface;
+      const mine = same && this.#pixels ? a[dst + R_ADDR_HI] >>> 0 : 0;
+      for (let w = 0; w < REC; w++) a[dst + w] = src[o + w];
+      let x = src[o + R_DAMAGE_X], y = src[o + R_DAMAGE_Y], dw = src[o + R_DAMAGE_W], dh = src[o + R_DAMAGE_H];
+      if (this.#pixels && recordAddr(a, dst) && src[o + R_WIDTH] > 0 && src[o + R_HEIGHT] > 0) {
+        this.#shmDst[shm] = dst;
+        this.#shmMine[shm] = mine;
+        this.#shmRect[shm * 4] = x;
+        this.#shmRect[shm * 4 + 1] = y;
+        this.#shmRect[shm * 4 + 2] = dw;
+        this.#shmRect[shm * 4 + 3] = dh;
+        shm++;
       }
-      // Accumulate damage for a surface the compositor has not caught up with.
-      const key = `${src[o + R_CLIENT]}:${src[o + R_SURFACE]}`;
-      const held = drawn ? null : this.#pending.get(key);
-      const rect = {
-        x: src[o + R_DAMAGE_X],
-        y: src[o + R_DAMAGE_Y],
-        w: src[o + R_DAMAGE_W],
-        h: src[o + R_DAMAGE_H],
-      };
-      const merged = held ? mergeDamage(held, rect) : rect;
-      this.#pending.set(key, merged);
-      this.#a[dst + R_DAMAGE_X] = merged.x;
-      this.#a[dst + R_DAMAGE_Y] = merged.y;
-      this.#a[dst + R_DAMAGE_W] = merged.w;
-      this.#a[dst + R_DAMAGE_H] = merged.h;
+      // Accumulate damage for a surface the compositor has not caught up
+      // with (`mergeDamage`, w <= 0 meaning everything).
+      let e = 0;
+      while (e < this.#pendingN && !(pend[e * 6] === client && pend[e * 6 + 1] === surface)) e++;
+      if (e < this.#pendingN) {
+        const q = e * 6;
+        if (pend[q + 4] <= 0 || pend[q + 5] <= 0 || dw <= 0 || dh <= 0) {
+          x = 0; y = 0; dw = 0; dh = 0;
+        } else {
+          const r = Math.max(pend[q + 2] + pend[q + 4], x + dw), b = Math.max(pend[q + 3] + pend[q + 5], y + dh);
+          x = Math.min(pend[q + 2], x);
+          y = Math.min(pend[q + 3], y);
+          dw = r - x;
+          dh = b - y;
+        }
+      } else if (e < SLOTS) {
+        this.#pendingN++;
+      } else {
+        // More surfaces undrawn than a block holds: all of this one.
+        e = -1;
+        x = 0; y = 0; dw = 0; dh = 0;
+      }
+      if (e >= 0) {
+        const q = e * 6;
+        pend[q] = client; pend[q + 1] = surface;
+        pend[q + 2] = x; pend[q + 3] = y; pend[q + 4] = dw; pend[q + 5] = dh;
+      }
+      a[dst + R_DAMAGE_X] = x;
+      a[dst + R_DAMAGE_Y] = y;
+      a[dst + R_DAMAGE_W] = dw;
+      a[dst + R_DAMAGE_H] = dh;
     }
-    if (shm.length) this.#copyPixels(pixels, shm);
+    if (shm) this.#copyPixels(pixels, shm);
     Atomics.store(this.#a, this.#base + B_COUNT, n);
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);
-    console.timeStamp(`gex:publish ${n} b${this.#block}`);
     Atomics.add(this.#a, M_PUB, 1);
     Atomics.notify(this.#a, M_PUB);
     this.#wake?.();
@@ -862,17 +934,24 @@ export class WlProxy {
     // A stall longer than the ring drops the oldest events rather than
     // blocking: an input event no one took in a second is not worth having.
     if (head - tail > RING) tail = head - RING;
-    const out = new Int32Array(memory.buffer, ptr, max * EV);
+    if (tail === head) return 0;
+    const out = this.#words(memory);
+    const at = ptr >>> 2;
     let count = 0;
     while (tail < head && count < max) {
       const slot = base + K_WORDS + (tail % RING) * EV;
-      for (let w = 0; w < EV; w++) out[count * EV + w] = a[slot + w];
+      for (let w = 0; w < EV; w++) out[at + count * EV + w] = a[slot + w];
       tail++;
       count++;
     }
     Atomics.store(a, base + K_TAIL, tail);
-    if (count) console.timeStamp(`gex:poll ${count} b${this.#block}`);
     return count;
+  }
+
+  /** `memory`'s words, a view kept while its buffer is the same. */
+  #words(memory) {
+    const v = this.#view;
+    return v && v.buffer === memory.buffer ? v : (this.#view = new Int32Array(memory.buffer));
   }
 
   /** Whether this process's input ring holds an event. */
