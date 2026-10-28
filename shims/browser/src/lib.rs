@@ -9893,20 +9893,68 @@ pub(crate) fn wine64_unix_call_entry() -> u64 {
     wine64_entry_page() + 0x20
 }
 
-/// The top of a 64-bit Wine process's space in a 64-bit memory: no mapping
-/// ends above it. Wine places images and stacks top down from the top it
-/// finds, and the memory is as long as its highest mapping, so this, not
-/// [`gex_abi::LIMIT64`], is the memory's length from the process's start.
-/// A power of two above [`gex_abi::HIGH_ARENA_BASE`]: Wine finds the top by
-/// probing at powers of two, and the high arena's data lies below it.
+/// The default top of a 64-bit Wine process's space in a 64-bit memory: no
+/// mapping ends above it. Wine places images and stacks top down from the
+/// top (`gex.space_top`, else its probe at powers of two), and the memory is
+/// as long as its highest mapping, so the top, not [`gex_abi::LIMIT64`], is
+/// the memory's length from the process's start. The high arena's data lies
+/// below it.
 const WINE64_TOP_M64: u64 = 8 << 30;
 const _: () = assert!(WINE64_TOP_M64.is_power_of_two() && WINE64_TOP_M64 > gex_abi::HIGH_ARENA_BASE && WINE64_TOP_M64 <= gex_abi::LIMIT64);
 
-/// In a 64-bit memory (a twin install's 64-bit process)
-/// Wine places its images top down from [`WINE64_TOP_M64`], far above
-/// [`WINE64_PE_DATA`]: the window is the top of that space instead (below a
-/// 64 KiB guard), above every image and within 4 GiB of the first ones.
-const WINE64_PE_DATA_M64: (u64, u64) = (WINE64_TOP_M64 - 0x21_0000, WINE64_TOP_M64 - 0x1_0000);
+/// The lowest top `GEX_W64_TOP` may ask for: the high arena keeps at least
+/// 512 MiB.
+const WINE64_TOP_M64_MIN: u64 = (gex_abi::HIGH_ARENA_BASE + (512 << 20) + 0xffff) & !0xffff;
+
+/// This process's top in a 64-bit memory, set at its program's load
+/// ([`wine64_reserve_pe_data`]): [`WINE64_TOP_M64`], or `GEX_W64_TOP` from
+/// its environment. 0 until then (a forked child takes it from its
+/// environment at first use).
+static WINE64_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `GEX_W64_TOP`: a byte count (`0x` hex, or decimal with an optional `M`
+/// or `G` suffix), a multiple of 64 KiB in
+/// [`WINE64_TOP_M64_MIN`]..=[`gex_abi::LIMIT64`].
+fn wine64_top_from_env(envp: &[String]) -> u64 {
+    let Some(v) = envp.iter().rev().find_map(|e| e.strip_prefix("GEX_W64_TOP=")) else { return WINE64_TOP_M64 };
+    let v = v.trim();
+    let n = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()
+    } else if let Some(g) = v.strip_suffix(['G', 'g']) {
+        g.parse::<u64>().ok().and_then(|g| g.checked_mul(1 << 30))
+    } else if let Some(m) = v.strip_suffix(['M', 'm']) {
+        m.parse::<u64>().ok().and_then(|m| m.checked_mul(1 << 20))
+    } else {
+        v.parse::<u64>().ok()
+    };
+    match n {
+        Some(n) if n % 0x1_0000 == 0 && (WINE64_TOP_M64_MIN..=gex_abi::LIMIT64).contains(&n) => n,
+        _ => {
+            warn_line(&format!("gex: wine64: GEX_W64_TOP={v}: not a multiple of 64 KiB in {WINE64_TOP_M64_MIN:#x}..={:#x}, {WINE64_TOP_M64:#x} instead\n", gex_abi::LIMIT64));
+            WINE64_TOP_M64
+        }
+    }
+}
+
+/// This process's top in a 64-bit memory.
+pub(crate) fn wine64_top_m64() -> u64 {
+    match WINE64_TOP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let top = wine64_top_from_env(&crate::sigs::proc_home().envp());
+            WINE64_TOP.store(top, std::sync::atomic::Ordering::Relaxed);
+            top
+        }
+        top => top,
+    }
+}
+
+/// `gex.space_top()`: this process's top in 64 KiB units, which 64-bit
+/// Wine's ntdll takes as the end of its space instead of probing; 0 in a
+/// 32-bit memory.
+#[no_mangle]
+pub extern "C" fn gex_space_top() -> u32 {
+    if gex_abi::mem64() { (wine64_top_m64() >> 16) as u32 } else { 0 }
+}
 
 /// In the compact space (`winspace::wine64_compact`) the window is the top
 /// of the island Wine's images are kept in (`winspace::WINE32_ISLAND`), above
@@ -9919,7 +9967,12 @@ const _: () = assert!(WINE64_PE_DATA_COMPACT.1 + 0x1_0000 == winspace::WINE32_IS
 /// The 64-bit Wine PE data window of this process's memory.
 pub(crate) fn wine64_pe_data() -> (u64, u64) {
     if gex_abi::mem64() {
-        WINE64_PE_DATA_M64
+        // In a 64-bit memory (a twin install's 64-bit process) Wine places
+        // its images top down from the top, far above [`WINE64_PE_DATA`]:
+        // the window is the top of that space instead (below a 64 KiB
+        // guard), above every image and within 4 GiB of the first ones.
+        let top = wine64_top_m64();
+        (top - 0x21_0000, top - 0x1_0000)
     } else if winspace::wine64_compact_on() {
         WINE64_PE_DATA_COMPACT
     } else {
@@ -9929,11 +9982,14 @@ pub(crate) fn wine64_pe_data() -> (u64, u64) {
 
 /// Reserve [`wine64_pe_data`] (no access until the core's data is placed in
 /// it) and, in a 32-bit memory with the split, keep mmap below it; in a
-/// 64-bit memory, end the process's space at [`WINE64_TOP_M64`].
+/// 64-bit memory, end the process's space at its top ([`wine64_top_m64`],
+/// taken here from its environment).
 pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     use gex_kernel::mem::{flags, prot};
     if gex_abi::mem64() {
-        mem.set_high_arena(gex_abi::HIGH_ARENA_BASE, WINE64_TOP_M64);
+        let top = wine64_top_from_env(&crate::sigs::proc_home().envp());
+        WINE64_TOP.store(top, std::sync::atomic::Ordering::Relaxed);
+        mem.set_high_arena(gex_abi::HIGH_ARENA_BASE, top);
     }
     let (lo, hi) = wine64_pe_data();
     if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {
