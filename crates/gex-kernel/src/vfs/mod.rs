@@ -407,6 +407,33 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         0
     }
 
+    /// A count that moves at every wakeup of this handle's object (each
+    /// notify of its [`Self::wait_queue`]): an edge-triggered epoll watch
+    /// (`EPOLLET`) reports again when it has moved, as Linux's does at each
+    /// wakeup of the file. A file or directory never wakes: always ready, it
+    /// is reported once. `None` where this kernel cannot see the count (an
+    /// object another kernel holds): such a watch answers as a
+    /// level-triggered one.
+    fn wakes(&self) -> Option<u64> {
+        match self.metadata() {
+            Ok(md) if matches!(md.file_type, FileType::Regular | FileType::Directory) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// An exceptional condition to report (`POLLPRI`, with `POLLERR`, which
+    /// is never masked): what `/proc/self/mountinfo` says after a mount
+    /// changed.
+    fn poll_pri(&self) -> bool {
+        false
+    }
+
+    /// A poll or epoll wait has just reported `revents` for this handle to
+    /// its caller: a condition reported once ([`Self::poll_pri`]) is spent.
+    fn poll_reported(&self, revents: u16) {
+        let _ = revents;
+    }
+
     /// How long until this handle becomes ready by the clock alone (a
     /// timerfd's next expiry, a sound device draining its buffer), for a
     /// waiter to bound its park by. `None` when only an event makes it ready.
@@ -723,6 +750,11 @@ impl Moved {
 
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
+    /// Its type as `/proc/self/mountinfo` names it. tmpfs unless it says
+    /// otherwise, as `statfs` answers for every one.
+    fn fs_type(&self) -> &'static str {
+        "tmpfs"
+    }
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     fn metadata(&self, path: &str) -> Result<Metadata, Errno>;
@@ -875,6 +907,18 @@ pub(crate) fn writes(flags: u64) -> bool {
     acc == crate::fs::oflags::O_WRONLY || acc == crate::fs::oflags::O_RDWR
 }
 
+/// The id of the mount at `at` (`/proc/self/mountinfo`'s first field,
+/// `statx`'s `stx_mnt_id`): 1 for the root, and for another the same number
+/// wherever and whenever it is asked, a forked child's table and the
+/// table after other mounts come and go included.
+pub fn mount_id(at: &str) -> u64 {
+    if at == "/" {
+        return 1;
+    }
+    let h = at.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    2 + h % 0x3fff_fff0
+}
+
 /// Whether absolute `abs` is `at` or below it.
 fn within(abs: &str, at: &str) -> bool {
     abs.starts_with(at) && matches!(abs.as_bytes().get(at.len()), None | Some(b'/'))
@@ -908,6 +952,9 @@ pub struct VfsView {
     cur: gex_atomic::rcu::Published<Arc<Namespace>>,
     /// How many times the mount table has changed.
     mounts: std::sync::atomic::AtomicU64,
+    /// Notified at each change: a reader of `/proc/self/mountinfo` waits
+    /// on it.
+    changed: crate::wait::Queue,
 }
 
 impl VfsView {
@@ -915,6 +962,7 @@ impl VfsView {
         VfsView {
             cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS),
             mounts: std::sync::atomic::AtomicU64::new(0),
+            changed: crate::wait::Queue::new(),
         }
     }
 
@@ -933,6 +981,11 @@ impl VfsView {
     /// How many times the mount table has changed, now.
     pub fn mounts(&self) -> u64 {
         self.mounts.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The wait queue notified at each change of the mount table.
+    pub fn mounts_queue(&self) -> u32 {
+        self.changed.id()
     }
 
     /// Mount `fs` at `at` (absolute, or relative to the published
@@ -975,6 +1028,7 @@ impl VfsView {
         // the count is never older than the count says (`Vfs::refresh`).
         if changed {
             self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.changed.notify();
         }
         changed
     }
@@ -1116,6 +1170,18 @@ impl Namespace {
     fn list_others(&mut self) {
         let others: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
         self.others = others.join("\0");
+    }
+
+    /// Every mount, parents before what is mounted under them: where, and
+    /// its [`FileSystem::fs_type`].
+    pub fn mount_table(&self) -> Vec<(String, &'static str)> {
+        self.mounts.iter().map(|(at, fs)| (at.clone(), fs.fs_type())).collect()
+    }
+
+    /// [`mount_id`] of the mount holding `path`, by its name: a symlink on
+    /// the way into another mount is not followed (the root's, then).
+    pub fn mount_id_of(&self, path: &str) -> u64 {
+        self.mount_at(&normalize(path, &self.cwd)).map_or(1, |(at, _)| mount_id(at))
     }
 
     /// Whether something is mounted at exactly this path.

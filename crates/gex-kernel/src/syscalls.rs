@@ -2307,6 +2307,8 @@ impl FdIo<'_> {
                 // asked of the handle in `poll_revents`, every time, because
                 // a parked poll outlives the state it was built from.
                 writable: file.as_ref().is_some_and(|f| f.writable),
+                epoll: None,
+                edge: false,
             });
         }
         Some(out)
@@ -2371,6 +2373,8 @@ impl FdIo<'_> {
                 // asked of the handle in `poll_revents`, every time, because
                 // a parked poll outlives the state it was built from.
                 writable: file.as_ref().is_some_and(|f| f.writable),
+                        epoll: None,
+                        edge: false,
                     }
                 })
                 .collect(),
@@ -2378,7 +2382,7 @@ impl FdIo<'_> {
     }
 
     /// A set's registrations as the list the poll path understands.
-    fn epoll_pollfds(&self, set: &unix::EpollSet) -> Vec<PollFd> {
+    fn epoll_pollfds(&self, set: &Arc<unix::EpollSet>) -> Vec<PollFd> {
         set.watches()
             .iter()
             .filter_map(|w| {
@@ -2390,6 +2394,8 @@ impl FdIo<'_> {
                     events: (w.events & 0xffff) as u16,
                     handle: Some(Arc::clone(&file.handle)),
                     writable: file.writable,
+                    epoll: Some(Arc::clone(set)),
+                    edge: w.events & unix::epoll_flag::ET != 0,
                 })
             })
             .collect()
@@ -3310,9 +3316,6 @@ impl PathIo<'_> {
         Ok(bytes.len() as u64)
     }
 
-    /// The tree's one mount, by `statx`'s id (`stx_mnt_id`).
-    const STATX_ROOT_MNT_ID: u64 = 1;
-
     /// `statx`, how glibc stats a file on a modern kernel.
     ///
     /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
@@ -3327,15 +3330,18 @@ impl PathIo<'_> {
         buf: u64,
     ) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
-        let md = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            self.map.fds.get(dirfd)?.metadata()?
+        let (md, mnt_id) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            let f = self.map.fds.get(dirfd)?;
+            let id = if f.path.starts_with('/') { self.ns.mount_id_of(&f.path) } else { 1 };
+            (f.metadata()?, id)
         } else {
             let p = self.at_path(m, dirfd, path)?;
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
                 self.ns.metadata_nofollow(&p)?
             } else {
                 self.ns.metadata(&p)?
-            }
+            };
+            (md, self.ns.mount_id_of(&p))
         };
         let st = Kernel::stat_from(&md);
 
@@ -3351,13 +3357,13 @@ impl PathIo<'_> {
         // which parts it actually answered; claiming everything but the
         // birth time is what a Linux filesystem without one reports.
         const STATX_BASIC_STATS: u32 = 0x07ff;
-        // And the mount's id, as Linux has since 5.8 whether asked or not:
-        // the tree is one filesystem (`st_dev` is the same everywhere), so
-        // one mount. systemd's path lookups (chase) compare mount ids, and
-        // stop where a statx has none (sysusers found no dbus.conf).
+        // And the mount's id, as Linux has since 5.8 whether asked or not,
+        // the one /proc/self/mountinfo gives it. systemd's path lookups
+        // (chase) compare mount ids, and stop where a statx has none
+        // (sysusers found no dbus.conf).
         const STATX_MNT_ID: u32 = 0x1000;
         put32(&mut out, 0, STATX_BASIC_STATS | STATX_MNT_ID);
-        put64(&mut out, 144, Self::STATX_ROOT_MNT_ID);
+        put64(&mut out, 144, mnt_id);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.creds.uid());
@@ -7812,6 +7818,12 @@ pub struct PollFd {
     /// `None` for a descriptor that does not exist, which is `POLLNVAL`.
     pub handle: Option<Arc<dyn crate::vfs::FileHandle>>,
     pub writable: bool,
+    /// The epoll set this entry is a watch of (`epoll_wait`), which says
+    /// whether an edge-triggered or one-shot watch may report.
+    pub epoll: Option<Arc<unix::EpollSet>>,
+    /// An edge-triggered watch (`EPOLLET`): only for one is the handle's
+    /// wakeup count asked ([`crate::vfs::FileHandle::wakes`]).
+    pub edge: bool,
 }
 
 /// How a waiter wants its answer written back.
@@ -7854,6 +7866,32 @@ pub enum PollReport {
 
 /// What a `poll` entry would report right now.
 pub fn poll_revents(p: &PollFd) -> u16 {
+    poll_revents_at(p, edge_wakes(p)).0
+}
+
+/// An edge-triggered watch's handle's wakeup count; `None` for any other
+/// entry, which never needs it.
+fn edge_wakes(p: &PollFd) -> Option<u64> {
+    if p.edge {
+        p.handle.as_ref().and_then(|h| h.wakes())
+    } else {
+        None
+    }
+}
+
+/// [`poll_revents`], with the handle's wakeup count read once before its
+/// readiness (`FileHandle::wakes`), which an edge-triggered watch records
+/// when it reports: what it reports and that count.
+fn poll_revents_at(p: &PollFd, wakes: Option<u64>) -> (u16, Option<u64>) {
+    let r = poll_revents_level(p);
+    match &p.epoll {
+        Some(set) if r != 0 && !set.may_report(p.fd, wakes) => (0, wakes),
+        _ => (r, wakes),
+    }
+}
+
+/// What a level-triggered `poll` entry reports right now.
+fn poll_revents_level(p: &PollFd) -> u16 {
     const POLLIN: u16 = 0x001;
     const POLLOUT: u16 = 0x004;
     const POLLNVAL: u16 = 0x020;
@@ -7890,6 +7928,13 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     if p.events & POLLRDHUP != 0 && h.poll_rdhup() {
         r |= POLLRDHUP;
     }
+    // An exceptional condition: asked for, and with `POLLERR`, which never
+    // is (a mount changed, to a reader of `/proc/self/mountinfo`).
+    const POLLPRI: u16 = 0x002;
+    const POLLERR: u16 = 0x008;
+    if p.events & POLLPRI != 0 && h.poll_pri() {
+        r |= POLLPRI | POLLERR;
+    }
     r
 }
 
@@ -7914,6 +7959,9 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 let r = poll_revents(p);
                 if r != 0 {
                     ready += 1;
+                    if let Some(h) = &p.handle {
+                        h.poll_reported(r);
+                    }
                 }
                 m.write_u32(p.addr + 4, ((r as u32) << 16) | p.events as u32)?;
             }
@@ -7927,9 +7975,15 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 if n >= *max as u64 {
                     break;
                 }
-                let r = poll_revents(p);
+                let (r, wakes) = poll_revents_at(p, edge_wakes(p));
                 if r == 0 {
                     continue;
+                }
+                if let Some(set) = &p.epoll {
+                    set.reported(p.fd, wakes);
+                }
+                if let Some(h) = &p.handle {
+                    h.poll_reported(r);
                 }
                 let token = data
                     .iter()
@@ -11705,7 +11759,7 @@ mod tests {
 
     #[test]
     fn poll_skips_negative_descriptors() {
-        let slot = |fd| PollFd { addr: 0, fd, events: 1, handle: None, writable: false };
+        let slot = |fd| PollFd { addr: 0, fd, events: 1, handle: None, writable: false, epoll: None, edge: false };
         // An unused slot reports nothing; a closed descriptor is POLLNVAL.
         assert_eq!(poll_revents(&slot(-1)), 0);
         assert_eq!(poll_revents(&slot(7)), 0x020);
@@ -12261,6 +12315,148 @@ mod tests {
         let mut b = s.as_bytes().to_vec();
         b.push(0);
         m.write(addr, &b).unwrap();
+    }
+
+    /// `EPOLLET` as Linux has it: an edge-triggered watch reports at each
+    /// new wakeup of its file, not only when it goes from not ready to
+    /// ready -- a pipe written twice without a read reports twice -- and a
+    /// file that is always ready reports once. `EPOLLONESHOT` reports once
+    /// until `EPOLL_CTL_MOD` arms it again. libmount's mount monitor
+    /// watches `/proc/self/mountinfo` with `EPOLLET` and loops until a wait
+    /// reports nothing; as level-triggered, it never ended.
+    #[test]
+    fn epoll_edge_triggered_and_one_shot() {
+        const EPOLLIN: u64 = 0x001;
+        const ET: u64 = 1 << 31;
+        const ONESHOT: u64 = 1 << 30;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        let at = k.ctx_addr;
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        let packed = gex_abi::X86;
+        let ctl = |k: &mut Kernel, m: &mut GuestMem<'_>, ep: u64, op: u64, fd: u64, events: u64| {
+            m.write_u32(0x20300, events as u32).unwrap();
+            m.write_u64(if packed { 0x20304 } else { 0x20308 }, fd + 0x100).unwrap();
+            assert_eq!(call(k, m, nr::EPOLL_CTL, &[ep, op, fd, 0x20300]), 0);
+        };
+        // What one wait that does not block reports: (events, token) each.
+        let wait = |k: &mut Kernel, m: &mut GuestMem<'_>, ep: u64| -> Vec<(u32, u64)> {
+            let n = call(k, m, nr::EPOLL_PWAIT, &[ep, 0x20400, 8, 0, 0, 8]);
+            assert!(n >= 0, "epoll_pwait: {n}");
+            let size = if packed { 12 } else { 16 };
+            (0..n as u64)
+                .map(|i| {
+                    let e = 0x20400 + i * size;
+                    (m.read_u32(e).unwrap(), m.read_u64(e + if packed { 4 } else { 8 }).unwrap())
+                })
+                .collect()
+        };
+        m.write(0x21000, b"ab").unwrap();
+
+        // A pipe written twice without a read: two reports, then none.
+        assert_eq!(call(&mut k, &mut m, nr::PIPE2, &[0x20010, 0]), 0);
+        let (rfd, wfd) = (m.read_u32(0x20010).unwrap() as u64, m.read_u32(0x20014).unwrap() as u64);
+        let ep = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        ctl(&mut k, &mut m, ep, 1, rfd, EPOLLIN | ET);
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "an empty pipe");
+        assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
+        assert_eq!(wait(&mut k, &mut m, ep), vec![(EPOLLIN as u32, rfd + 0x100)], "the first write");
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "nothing new");
+        assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
+        assert_eq!(wait(&mut k, &mut m, ep), vec![(EPOLLIN as u32, rfd + 0x100)], "the second write, unread");
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "nothing new");
+        // Level-triggered, the same pipe reports at every wait.
+        ctl(&mut k, &mut m, ep, 3, rfd, EPOLLIN);
+        for _ in 0..2 {
+            assert_eq!(wait(&mut k, &mut m, ep).len(), 1, "level-triggered");
+        }
+        ctl(&mut k, &mut m, ep, 2, rfd, 0);
+
+        // A file always ready, edge-triggered: reported once, when added.
+        let f = open_at(&mut k, &mut m, "/f", 0o100 | 2) as u64;
+        ctl(&mut k, &mut m, ep, 1, f, EPOLLIN | ET);
+        assert_eq!(wait(&mut k, &mut m, ep), vec![(EPOLLIN as u32, f + 0x100)], "a file, added");
+        for _ in 0..3 {
+            assert_eq!(wait(&mut k, &mut m, ep), vec![], "a file, again");
+        }
+        ctl(&mut k, &mut m, ep, 2, f, 0);
+
+        // One-shot: reported once, written again and still not, until
+        // `EPOLL_CTL_MOD` arms it.
+        ctl(&mut k, &mut m, ep, 1, rfd, EPOLLIN | ONESHOT);
+        assert_eq!(wait(&mut k, &mut m, ep).len(), 1, "one-shot, armed");
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "one-shot, spent");
+        assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "one-shot, spent, written");
+        ctl(&mut k, &mut m, ep, 3, rfd, EPOLLIN | ONESHOT);
+        assert_eq!(wait(&mut k, &mut m, ep).len(), 1, "one-shot, armed again");
+        assert_eq!(wait(&mut k, &mut m, ep), vec![], "one-shot, spent again");
+    }
+
+    /// `/proc/self/mountinfo` under epoll, as libmount's monitor watches it
+    /// (`EPOLLIN | EPOLLPRI | EPOLLET`): readable, reported once when added;
+    /// after a mount, reported again with `EPOLLPRI | EPOLLERR`, once; and
+    /// a level-triggered `poll` has the change reported to it once too.
+    #[test]
+    fn mountinfo_reports_a_mount_change() {
+        const POLLIN: u32 = 0x001;
+        const POLLPRI: u32 = 0x002;
+        const POLLERR: u32 = 0x008;
+        const ET: u64 = 1 << 31;
+        let (mut buf, mut k) = setup();
+        for d in ["/proc", "/mnt", "/mnt2"] {
+            k.vfs.mkdir(d, 0o755).unwrap();
+        }
+        let cell = Arc::new(crate::proclive::ProcCell::default());
+        let src = crate::proclive::KernelProcSource(Arc::clone(&cell));
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(src))));
+        k.publish_proc(&cell);
+        let mut m = GuestMem::new(&mut buf);
+        let at = k.ctx_addr;
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        let packed = gex_abi::X86;
+        let fd = open_at(&mut k, &mut m, "/proc/self/mountinfo", 0) as u64;
+        let ep = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        m.write_u32(0x20300, (POLLIN | POLLPRI) | ET as u32).unwrap();
+        m.write_u64(if packed { 0x20304 } else { 0x20308 }, 0x55).unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[ep, 1, fd, 0x20300]), 0);
+        let wait = |k: &mut Kernel, m: &mut GuestMem<'_>| -> Option<u32> {
+            match call(k, m, nr::EPOLL_PWAIT, &[ep, 0x20400, 4, 0, 0, 8]) {
+                0 => None,
+                1 => Some(m.read_u32(0x20400).unwrap()),
+                n => panic!("epoll_pwait: {n}"),
+            }
+        };
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN), "added");
+        assert_eq!(wait(&mut k, &mut m), None, "no change");
+        k.vfs.mount("/mnt", Arc::new(TmpFs::new()));
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN | POLLPRI | POLLERR), "a mount");
+        assert_eq!(wait(&mut k, &mut m), None, "the mount, reported");
+
+        // `poll`, level-triggered: the change once, then only readable.
+        let pollfd = 0x20500u64;
+        m.write_u32(pollfd, fd as u32).unwrap();
+        m.write_u32(pollfd + 4, POLLIN | POLLPRI).unwrap();
+        let ppoll = |k: &mut Kernel, m: &mut GuestMem<'_>| {
+            m.write_u64(0x20600, 0).unwrap();
+            m.write_u64(0x20608, 0).unwrap();
+            assert_eq!(call(k, m, nr::PPOLL, &[pollfd, 1, 0x20600, 0, 8]), 1);
+            m.read_u32(pollfd + 4).unwrap() >> 16
+        };
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN, "the mount, reported to epoll already");
+        k.vfs.mount("/mnt2", Arc::new(TmpFs::new()));
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN | POLLPRI | POLLERR, "another mount");
+        assert_eq!(ppoll(&mut k, &mut m), POLLIN, "another mount, reported");
+        assert!(k.vfs.unmount("/mnt"));
+        assert_eq!(wait(&mut k, &mut m), Some(POLLIN | POLLPRI | POLLERR), "an unmount");
     }
 
     /// Open `path` (`openat` from the working directory) with `flags`.

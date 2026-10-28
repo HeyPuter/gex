@@ -14,7 +14,7 @@ use crate::errno::{Errno, SysResult};
 use crate::file::OpenFile;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// How much a stream socket buffers before a write blocks. Sized so a slow
@@ -50,6 +50,10 @@ struct Pipe {
     /// the guest writes waits for the host, so a write says so
     /// ([`take_host_sent`]).
     host_reads: AtomicBool,
+    /// How many times each end has been woken ([`Self::notify_reader`],
+    /// [`Self::notify_writer`]): the ends' `FileHandle::wakes`.
+    reader_wakes: AtomicU64,
+    writer_wakes: AtomicU64,
 }
 
 /// A guest wrote to (or closed) a host-serviced socket since the last
@@ -74,10 +78,12 @@ impl Pipe {
     }
 
     fn notify_reader(&self) {
+        self.reader_wakes.fetch_add(1, Ordering::SeqCst);
         crate::wait::notify(self.reader_q.load(Ordering::SeqCst));
     }
 
     fn notify_writer(&self) {
+        self.writer_wakes.fetch_add(1, Ordering::SeqCst);
         crate::wait::notify(self.writer_q.load(Ordering::SeqCst));
     }
 
@@ -665,6 +671,18 @@ impl FileHandle for UnixSocket {
         self.queue.id()
     }
 
+    fn wakes(&self) -> Option<u64> {
+        // Its own queue (a connection queued, a shutdown) and, connected,
+        // the two directions' ends it holds (bytes in, room out).
+        let own = self.queue.wakes();
+        Some(match &*self.role.lock().unwrap() {
+            Role::Connected { rx, tx, .. } => {
+                own + rx.reader_wakes.load(Ordering::SeqCst) + tx.writer_wakes.load(Ordering::SeqCst)
+            }
+            _ => own,
+        })
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
@@ -989,6 +1007,10 @@ impl FileHandle for UnixDgram {
         self.queue.id()
     }
 
+    fn wakes(&self) -> Option<u64> {
+        Some(self.queue.wakes())
+    }
+
     fn available(&self) -> Option<u64> {
         Some(self.inbox.lock().unwrap().front().map_or(0, |(d, _)| d.len() as u64))
     }
@@ -1019,6 +1041,8 @@ mod tests {
             events,
             handle: Some(Arc::clone(h) as Arc<dyn FileHandle>),
             writable: true,
+            epoll: None,
+            edge: false,
         };
         let (a, b) = UnixSocket::pair();
         b.send(b"last").unwrap();
@@ -1556,6 +1580,20 @@ pub struct Watch {
     pub data: u64,
     /// The watched descriptor's wait queue this set is chained onto, 0 none.
     pub source: u32,
+    /// Edge-triggered (`EPOLLET`): the descriptor's wakeup count
+    /// (`FileHandle::wakes`) when this watch last reported, `None` when it
+    /// has not since it was added or changed. It reports again only once
+    /// that count has moved.
+    pub seen: Option<u64>,
+    /// `EPOLLONESHOT`: false once it has reported, until `EPOLL_CTL_MOD`
+    /// arms it again.
+    pub armed: bool,
+}
+
+/// `epoll_event.events` bits that are not readiness.
+pub mod epoll_flag {
+    pub const ET: u32 = 1 << 31;
+    pub const ONESHOT: u32 = 1 << 30;
 }
 
 /// `epoll_ctl`'s operations.
@@ -1585,13 +1623,15 @@ impl EpollSet {
                     return Err(Errno::EEXIST);
                 }
                 crate::wait::chain(source, me);
-                w.push(Watch { fd, events, data, source });
+                w.push(Watch { fd, events, data, source, seen: None, armed: true });
                 Ok(0)
             }
             epoll_op::MOD => match w.iter_mut().find(|x| x.fd == fd) {
                 Some(x) => {
                     x.events = events;
                     x.data = data;
+                    x.seen = None;
+                    x.armed = true;
                     if source != 0 && x.source != source {
                         crate::wait::unchain(x.source, me);
                         crate::wait::chain(source, me);
@@ -1665,7 +1705,7 @@ impl EpollSet {
                 let fd = it.next()?.parse().ok()?;
                 let events = it.next()?.parse().ok()?;
                 let data = it.next()?.parse().ok()?;
-                Some(Watch { fd, events, data, source: 0 })
+                Some(Watch { fd, events, data, source: 0, seen: None, armed: true })
             })
             .collect()
     }
@@ -1675,6 +1715,41 @@ impl EpollSet {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether `fd`'s watch may report what its descriptor has ready now
+    /// (`wakes` its wakeup count, read before its readiness): a disarmed
+    /// one-shot watch may not; an edge-triggered one only if the count moved
+    /// since it last reported (or it never has), or the count is unknown
+    /// (`None`: answered as level-triggered); any other may.
+    pub fn may_report(&self, fd: i32, wakes: Option<u64>) -> bool {
+        let w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(x) = w.iter().find(|x| x.fd == fd) else {
+            return true;
+        };
+        if !x.armed {
+            return false;
+        }
+        if x.events & epoll_flag::ET == 0 {
+            return true;
+        }
+        match wakes {
+            None => true,
+            Some(k) => x.seen != Some(k),
+        }
+    }
+
+    /// `fd`'s watch has reported, at wakeup count `wakes`.
+    pub fn reported(&self, fd: i32, wakes: Option<u64>) {
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = w.iter_mut().find(|x| x.fd == fd) {
+            if x.events & epoll_flag::ET != 0 {
+                x.seen = wakes;
+            }
+            if x.events & epoll_flag::ONESHOT != 0 {
+                x.armed = false;
+            }
+        }
     }
 
     /// The set's own wait queue.
@@ -1708,6 +1783,10 @@ impl FileHandle for EpollSet {
 
     fn wait_queue(&self) -> u32 {
         self.queue.id()
+    }
+
+    fn wakes(&self) -> Option<u64> {
+        Some(self.queue.wakes())
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {

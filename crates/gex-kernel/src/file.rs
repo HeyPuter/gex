@@ -718,6 +718,10 @@ impl FileHandle for PipeEnd {
     fn wait_queue(&self) -> u32 {
         self.pipe.wait_queue()
     }
+
+    fn wakes(&self) -> Option<u64> {
+        Some(self.pipe.wakes())
+    }
 }
 
 impl Drop for PipeEnd {

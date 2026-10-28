@@ -180,6 +180,10 @@ impl FileHandle for TimerFd {
         self.queue.id()
     }
 
+    fn wakes(&self) -> Option<u64> {
+        Some(self.queue.wakes())
+    }
+
     fn ready_in_ns(&self) -> Option<u64> {
         let now = self.now_ns();
         let s = self.state.lock().unwrap();
