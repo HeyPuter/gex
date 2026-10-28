@@ -45,6 +45,9 @@
 
 import {
   readScene,
+  sceneMarks,
+  sceneMark,
+  sceneStill,
   ackBlock,
   releaseToken,
   sendEvent,
@@ -356,6 +359,7 @@ export class DomDesktop {
   /** The output's size from now on (app.js `resize()`): what a client asks
    *  for the screen's size sees this. Windows already up keep their places. */
   resizeOutput(w, h) {
+    this.#touched++;
     setOutputSize(this.#channel, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
   }
 
@@ -438,6 +442,7 @@ export class DomDesktop {
    * that point reads as zero -- a window that is simply blank, with nothing
    * to say for itself. */
   addMemory(token, memory, kernel) {
+    this.#touched++;
     setKernelMemory(this.#channel, kernel);
     // With pixel buffers in the channel the memory is neither sent nor read
     // (wl-bridge.mjs); without them, as before.
@@ -447,6 +452,7 @@ export class DomDesktop {
   /** A guest's new pixel buffer (wl-bridge.mjs `WlProxy`), `id` in its
    *  surfaces' records; the one it `replaces` is no longer read. */
   addPixels(token, id, buffer, replaces) {
+    this.#touched++;
     if (replaces) this.#pixelBufs.delete(replaces);
     if (id && buffer) this.#pixelBufs.set(id, { token, view: new Uint8Array(buffer) });
   }
@@ -477,6 +483,7 @@ export class DomDesktop {
   }
 
   dropMemory(token) {
+    this.#touched++;
     this.#memories.delete(token);
     for (const [id, p] of this.#pixelBufs) if (p.token === token) this.#pixelBufs.delete(id);
     // Its block in the arena too, as compositor-worker.js does: a process that
@@ -547,14 +554,34 @@ export class DomDesktop {
         this.#drawGl();
         this.#gl?.display?.();
       }
-      this.#reconcile();
+      if (!this.#still()) this.#reconcile();
     } catch (e) {
       console.error('[dom-desktop]', e);
     }
     this.#raf = requestAnimationFrame(() => this.#frame());
   }
 
+  // An idle frame (`#still`), as the scene compositor's: what the last
+  // reconcile drew from -- each block's token and generation, and the
+  // page's changes (`#touched`) by then.
+  #marks = sceneMarks();
+  #touched = 1;
+  #markedTouch = 0;
+  /** A window the last reconcile could not paint yet (its pixels had not
+   *  come): the next frame is not an idle one. */
+  #unpainted = false;
+
+  /** Whether this frame would reconcile what the last one did: no block
+   *  claimed, freed or published to, every publish acked, nothing from the
+   *  page and every window painted. Then it reads nothing and allocates
+   *  nothing. */
+  #still() {
+    return this.#touched === this.#markedTouch && !this.#unpainted && sceneStill(this.#channel, this.#marks);
+  }
+
   #reconcile() {
+    this.#unpainted = false;
+    const touched = this.#touched;
     const { surfaces, blocks } = readScene(this.#channel);
     const live = new Set();
     this.#records = surfaces;
@@ -604,6 +631,8 @@ export class DomDesktop {
       this.onwindowgone?.(win);
     }
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    sceneMark(this.#marks, blocks);
+    this.#markedTouch = touched;
   }
 
   #update(win, s) {
@@ -665,6 +694,7 @@ export class DomDesktop {
     // the page after its first publish, and an idle client commits no more,
     // so a commit taken without the memory would leave its window blank.
     if (mem) win.serial = s.serial;
+    else this.#unpainted = true;
     // Damage is a hint about what changed, not a promise that the rest is
     // already right. Paint the whole surface when there is nothing to go on:
     // the first frame, a commit that named no damage at all -- Xwayland does
