@@ -4,9 +4,16 @@
 // what it lacks (one ranged request a run of missing chunks), keeps it, and
 // writes the bytes into the kernel's memory. No service worker.
 //
+// A file in the site's rest bundle (`BUNDLE#OFFSET`, lazy-fetch.mjs) is read
+// here too: its frames fetched, decoded with the one decoder here and the
+// last few kept decoded, for every Worker. A decoder in each Worker was an
+// engine memory reservation in each, and a desktop's few hundred Workers ran
+// the page out of them.
+//
 // In: { ctl: SharedArrayBuffer, memory: the kernel's WebAssembly.Memory,
 //       cache: the Cache Storage name, versions: { URL path: version } of
-//       the lazy files (lazy-cache.mjs lazyVersion) }
+//       the lazy files (lazy-cache.mjs lazyVersion), zstd: the decoder's
+//       module URL, for a rest bundle }
 // Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
 //      now and then (bytes from the network, from the cache, since the last).
 
@@ -81,11 +88,73 @@ async function read(cache, url, from, len) {
   return out;
 }
 
+// The rest bundles: URL -> { frame, frames } from BUNDLE.json, as a promise.
+const bundles = new Map();
+// Decoded frames, `URL#k` -> promise of the bytes, most recently used last.
+const decoded = new Map();
+const FRAMES_KEPT = 4;
+let zstdUrl = null, zstd = null;
+async function decoder() {
+  zstd ??= import(zstdUrl).then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); return d; });
+  return zstd;
+}
+async function getRange(url, lo, hi) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
+      const body = new Uint8Array(await res.arrayBuffer());
+      if (res.status === 206 && body.length === hi - lo) return body;
+      if (res.status === 200 && body.length >= hi) return body.subarray(lo, hi);
+    } catch { /* again */ }
+  }
+  throw new Error(`${url} @${lo}: no answer`);
+}
+function frameOf(url, b, k) {
+  const key = `${url}#${k}`;
+  let f = decoded.get(key);
+  if (f) {
+    decoded.delete(key);
+  } else {
+    const [o, n] = b.frames[k];
+    f = Promise.all([getRange(url, o, o + n), decoder()]).then(([z, d]) => {
+      net += z.length;
+      return d.decode(z, k === b.frames.length - 1 ? 0 : b.frame);
+    });
+    f.catch(() => decoded.delete(key));
+  }
+  decoded.set(key, f);
+  while (decoded.size > FRAMES_KEPT) decoded.delete(decoded.keys().next().value);
+  return f;
+}
+/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). */
+async function bundleRead(href, from, len) {
+  const cut = href.lastIndexOf('#');
+  const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
+  let b = bundles.get(url);
+  if (!b) {
+    b = fetch(`${url}.json`).then((r) => r.json());
+    bundles.set(url, b);
+    b.catch(() => bundles.delete(url));
+  }
+  b = await b;
+  const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
+  const out = new Uint8Array(len);
+  for (let k = first, at = start; k <= last; k++) {
+    const f = await frameOf(url, b, k);
+    const a = at - k * b.frame, n = Math.min(f.length - a, start + len - at);
+    if (n <= 0) throw new Error(`${href} @${from}: short`);
+    out.set(f.subarray(a, a + n), at - start);
+    at += n;
+  }
+  return out;
+}
+
 self.onmessage = async ({ data: m }) => {
   const ctl = new Int32Array(m.ctl);
   const raw = new Uint8Array(m.ctl);
   const memory = m.memory;
   versions = m.versions ?? {};
+  zstdUrl = m.zstd ?? null;
   let cache = null;
   try {
     cache = await caches.open(m.cache);
@@ -115,7 +184,7 @@ self.onmessage = async ({ data: m }) => {
     const url = new TextDecoder().decode(raw.slice(HEAD + i * SLOT + 32, HEAD + i * SLOT + 32 + ul));
     let bytes = null;
     try {
-      bytes = await read(cache, url, from, len);
+      bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len) : await read(cache, url, from, len);
     } catch (e) {
       console.warn(`[lazy-cache] ${e?.message ?? e}`);
     }

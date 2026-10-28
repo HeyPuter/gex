@@ -52,6 +52,11 @@ export function makeControl() {
 
 let ctl = null;
 let raw = null;
+/** Whether this Worker has an owner to ask (`setLazyCache`). */
+export function lazyCacheOn() {
+  return ctl !== null;
+}
+
 /** A Worker's side: `c` is `{ ctl: SharedArrayBuffer }`. */
 export function setLazyCache(c) {
   if (!c?.ctl) return;

@@ -4,7 +4,7 @@
 // there anyway); it fills `len` bytes at `dst` in the kernel's memory.
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
-import { cachedRead } from './lazy-cache.mjs';
+import { cachedRead, lazyCacheOn } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
 // one after another in one stream, while the guest runs. `buf` (a
@@ -83,8 +83,12 @@ let zstd = null;
 let zstdLoad = null;
 /** The decoder the rest bundle's reads need, loaded and set up (a read
  *  cannot wait for it: the Worker's guest runs synchronously). The Worker
- *  awaits this before its kernel starts. */
+ *  awaits this before its kernel starts. None where the page's lazy-file
+ *  owner reads the rest bundle for every Worker (lazy-cache.mjs): a decoder
+ *  is an engine memory reservation, and one in each of a desktop's Workers
+ *  ran the page out of them. */
 export function lazyReady() {
+  if (lazyCacheOn()) return Promise.resolve();
   zstdLoad ??= import('../../../web/eject-site/vendor/zstddec-stream.mjs')
     .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
@@ -259,6 +263,12 @@ export function lazyFetch(memory) {
     }
     const done = noteFetch(href, len);
     if (href.includes('#')) {
+      // The owner's decoder, when the page has one; this Worker's own if not.
+      const c = cachedRead(absolute(href), from, dst, len);
+      if (c === len) {
+        done(len);
+        return len;
+      }
       const n = bundleRead(href, from, memory, dst, len);
       done(n > 0 ? n : 0);
       if (n < 0) console.error(`[lazy] ${href} @${from}+${len}: failed (rest bundle)`);

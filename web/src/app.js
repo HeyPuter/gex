@@ -706,7 +706,7 @@ async function begin(opts, base, at, state, meter) {
         };
         w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
         setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
-        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE, versions: lazyVersions });
+        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE, versions: lazyVersions, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs') });
       });
       if (ready.ok) {
         lc.on = true;
