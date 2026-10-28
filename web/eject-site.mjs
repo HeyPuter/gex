@@ -27,7 +27,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, openSync, writeSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
+import { buildFill, extract, pack, placeHeads, pruneTree, readPathList, restPaths, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const av = process.argv.slice(2);
@@ -464,7 +464,18 @@ function wine32Site() {
   // --rest-paths FILE (guest paths, one a line): files the run read that
   // still go to the rest bundle, not the bundle (a large file read by
   // offset, such as a game's music, which the boot needs only a little of).
-  if (split && opt('--rest-paths', null)) for (const p of readPathList(opt('--rest-paths', null))) split.delete(p);
+  // A line "PATH HEAD" (HEAD in MiB) keeps the file's first HEAD MiB in the
+  // bundle as well, at its first-read place, as the lazy file's head: the
+  // part the boot reads (the title's music start), which the kernel then
+  // holds as already fetched (tmpfs.rs `seed_head`), so the boot asks the
+  // rest bundle for nothing.
+  const heads = new Map(); // guest path -> head bytes
+  if (split && opt('--rest-paths', null)) {
+    for (const [p, n] of restPaths(readPathList(opt('--rest-paths', null)))) {
+      if (n) heads.set(p, n);
+      split.delete(p);
+    }
+  }
   // --late FILE: see the fill below.
   const late = opt('--late', null) ? readPathList(opt('--late', null)) : [];
   if (split) for (const p of late) split.delete(p);
@@ -491,15 +502,17 @@ function wine32Site() {
       split.add(wine32.exe); // the page reads the loader from the bundle itself
       const store = rest ? join(work, 'lazy-store') : join(out, 'project/build/web/lazy');
       const lazy = splitTree(x, split, store);
+      placeHeads(x, lazy, store, heads);
+      const withHead = (files) => files.map((f) => heads.has(f[0]) ? [f[0], f[1], f[2], f[3], null, heads.get(f[0])] : f);
       lazyFiles = lazy.length;
       lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       if (rest) {
         if (late.length) throw new Error('eject-site: --late and the rest bundle together: the fill names lazy files by URL');
         const files = restBundle(lazy, store);
-        writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/', files }));
+        writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/', files: withHead(files) }));
       } else
-      writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
+      writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: withHead(lazy) }));
       wine32.params = { ...(wine32.params ?? {}), lazy: '/project/build/web/lazy.json' };
       // --late FILE (guest paths, one a line, in the order wanted): files of
       // the run's read set that left the bundle above for the background fill,

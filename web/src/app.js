@@ -578,11 +578,13 @@ async function begin(opts, base, at, state, meter) {
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
-    for (const f of m.files) if (f[4] !== undefined) lazyModes[f[0]] = f[4];
+    for (const f of m.files) if (f[4] != null) lazyModes[f[0]] = f[4];
     // `BUNDLE#OFFSET`: a file in the site's rest bundle (lazy-fetch.mjs), its
     // offset kept as the URL's fragment.
     const href = (rel) => { const i = rel.indexOf('#'), p = i < 0 ? rel : rel.slice(0, i); return lazyBase + p.split('/').map(encodeURIComponent).join('/') + (i < 0 ? '' : rel.slice(i)); };
-    lazy = m.files.map(([path, size, rel]) => [path, size, href(rel)]);
+    // A file with a head (f[5], its bytes: eject-site.mjs --rest-paths) has
+    // those in the bundle too, under its path.
+    lazy = m.files.map(([path, size, rel, , , head]) => head ? [path, size, href(rel), head] : [path, size, href(rel)]);
     for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }

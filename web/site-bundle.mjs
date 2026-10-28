@@ -111,6 +111,33 @@ export function splitTree(x, read, store) {
   return lazy;
 }
 
+/** eject-site.mjs --rest-paths lines: `PATH`, or `PATH HEAD` (HEAD a
+ *  whole number of MiB), as [path, head bytes or 0]. */
+export const restPaths = (lines) => lines.map((l) => {
+  const m = /^(.*\S)\s+(\d+)$/.exec(l);
+  return m ? [m[1], Number(m[2]) * 1048576] : [l, 0];
+});
+
+/** The lazy files' heads (`heads`, guest path -> bytes) back in the tree
+ *  `x` at their paths, each the first bytes of its lazy copy in `store`,
+ *  with its time: a lazy file of the rest bundle whose start the boot reads
+ *  (the title's music) has that part in the bundle too, at its first-read
+ *  place, and the kernel holds it as the file's first chunks (tmpfs.rs
+ *  `seed_head`). A file no longer than its head has none (it is dropped from
+ *  `heads`). */
+export function placeHeads(x, lazy, store, heads) {
+  for (const [p, size, h, mtime] of lazy) {
+    const n = heads.get(p);
+    if (n === undefined) continue;
+    if (n >= size) { heads.delete(p); continue; }
+    const dst = join(x, p.slice(1));
+    writeFileSync(dst, readFileSync(join(store, h)).subarray(0, n));
+    utimesSync(dst, mtime, mtime);
+    console.log(`eject-site: ${p}: its first ${n / 1048576} MiB in the bundle as its head`);
+  }
+  for (const p of heads.keys()) if (!lazy.some((f) => f[0] === p)) heads.delete(p);
+}
+
 /** The tree as the tar TAR again: directories first, then the files, with
  *  `dedupe` identical files next to each other (zstd's window stores the
  *  second as a match). `order` (guest paths): those files first, in that
