@@ -84,6 +84,8 @@ thread_local! {
     /// The staged exec's memory (`exec_target`): 1 a 64-bit one, 0 a 32-bit
     /// one, -1 the parent's (a page that runs one flavour).
     static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
+    /// The staged exec's program's image span when it is a native wasm one.
+    static EXEC_WASM: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
     /// The vfork children suspended here while one of theirs runs, the
     /// innermost last.
     static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
@@ -367,8 +369,77 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     let state = state_bytes(&h.kernel, true);
     let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
     EXEC_MEM64.with(|c| c.set(mem64));
+    let wasm = exec_wasm_image(h, path);
+    EXEC_WASM.with(|c| c.set(wasm));
     EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
     h.kernel.fds.close_all();
+}
+
+/// An exec's program's image span, relative to the caller's cwd, when it is
+/// a native wasm program ([`wasm_program_image`]).
+pub(crate) fn exec_wasm_image(h: &Host, path: &str) -> Option<(u64, u64)> {
+    if path.starts_with('/') {
+        wasm_program_image(path)
+    } else {
+        let cwd = h.kernel.caller_cwd();
+        wasm_program_image(&format!("{}/{path}", cwd.trim_end_matches('/')))
+    }
+}
+
+/// The span `[lowest, highest)` the loaded segments of the file at `path`
+/// cover, when it is a native wasm program's container: an ELF of either
+/// class with `GEXWASM\0` 0x40 bytes below its entry, in a loaded segment's
+/// file bytes (`gex_ld::Image::is_wasm_program`, from the file rather than a
+/// loaded image). `None` for anything else, or unreadable.
+fn wasm_program_image(path: &str) -> Option<(u64, u64)> {
+    let home = crate::sigs::proc_home();
+    let mut head = [0u8; 64];
+    if home.read_file_at(path, 0, &mut head) != Some(64) || &head[..4] != b"\x7fELF" {
+        return None;
+    }
+    let e64 = match head[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u64;
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64;
+    let word = |b: &[u8], o: usize| if e64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) } else { u32_at(b, o) };
+    let at = word(&head, 24).wrapping_sub(0x40);
+    let (phoff, phent, phnum) = if e64 {
+        (word(&head, 32), u16_at(&head, 54), u16_at(&head, 56))
+    } else {
+        (word(&head, 28), u16_at(&head, 42), u16_at(&head, 44))
+    };
+    let need = if e64 { 56 } else { 32 };
+    if phent < need || phnum == 0 || phnum > 64 {
+        return None;
+    }
+    let mut ph = vec![0u8; (phent * phnum) as usize];
+    if home.read_file_at(path, phoff, &mut ph) != Some(ph.len()) {
+        return None;
+    }
+    let (mut lo, mut hi, mut header) = (u64::MAX, 0u64, false);
+    for p in ph.chunks_exact(phent as usize) {
+        if u32_at(p, 0) != 1 {
+            continue;
+        }
+        let (off, vaddr, filesz, memsz) = if e64 {
+            (word(p, 8), word(p, 16), word(p, 32), word(p, 40))
+        } else {
+            (word(p, 4), word(p, 8), word(p, 16), word(p, 20))
+        };
+        lo = lo.min(vaddr);
+        hi = hi.max(vaddr.saturating_add(memsz));
+        if !header && at >= vaddr && at.saturating_add(8) <= vaddr.saturating_add(filesz) {
+            let mut magic = [0u8; 8];
+            header = home.read_file_at(path, off + (at - vaddr), &mut magic) == Some(8) && &magic == crate::cgen::wasmprog::MAGIC;
+            if !header {
+                return None;
+            }
+        }
+    }
+    header.then_some((lo, hi))
 }
 
 /// [`exec_memory`] for an exec's path, relative to the caller's cwd.
@@ -565,6 +636,15 @@ pub(crate) fn wasm_memory64(wasm: &[u8]) -> Option<bool> {
         i = end;
     }
     None
+}
+
+/// Whether the staged exec's program is a native wasm one
+/// ([`exec_wasm_image`]): its memory gives up the placement window. `which`
+/// 0 the lowest address its image covers, 1 one past the highest; both 0
+/// when it is not one.
+#[no_mangle]
+pub extern "C" fn gex_vfork_exec_wasm(which: u32) -> u64 {
+    EXEC_WASM.with(|c| c.get()).map_or(0, |(lo, hi)| if which == 0 { lo } else { hi })
 }
 
 /// The staged exec's memory (`exec_memory`): 1 64-bit, 0 32-bit, -1 the

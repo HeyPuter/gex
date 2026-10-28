@@ -656,8 +656,33 @@ function slotsNeeded(meta) {
 const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
 
 function wine32ProgramFlags(elf) {
+  return (wasmProgramFlags(elf) ?? 0) & 3;
+}
+
+/** A native wasm program's image, `[lowest, highest)` of what its loaded
+ *  segments cover, or null when `elf` is not one (see `wasmProgramFlags`). */
+function wasmProgramImage(elf) {
+  if (wasmProgramFlags(elf) === null) return null;
+  const e64 = elf[4] === 2;
+  const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
+  const w = (o) => (e64 ? Number(dv.getBigUint64(o, true)) : dv.getUint32(o, true));
+  const phoff = w(e64 ? 32 : 28), phent = dv.getUint16(e64 ? 54 : 42, true), phnum = dv.getUint16(e64 ? 56 : 44, true);
+  let lo = Infinity, hi = 0;
+  for (let i = 0; i < phnum; i++) {
+    const p = phoff + i * phent;
+    if (p + (e64 ? 56 : 32) > elf.length || dv.getUint32(p, true) !== 1) continue;
+    const vaddr = w(p + (e64 ? 16 : 8)), memsz = w(p + (e64 ? 40 : 20));
+    lo = Math.min(lo, vaddr);
+    hi = Math.max(hi, vaddr + memsz);
+  }
+  return hi > 0 ? [lo, hi] : null;
+}
+
+/** A native wasm program's header flags (see `wine32ProgramFlags`), or null
+ *  when `elf` is not one: a translated program, or not an ELF. */
+function wasmProgramFlags(elf) {
   // ELF32 (32-bit Wine, i386 Wine) or ELF64 (64-bit Wine, x86-64 Wine: wasm-elf.py --elf64)
-  if (!(elf instanceof Uint8Array) || elf.length < 64 || elf[0] !== 0x7f || (elf[4] !== 1 && elf[4] !== 2)) return false;
+  if (!(elf instanceof Uint8Array) || elf.length < 64 || elf[0] !== 0x7f || (elf[4] !== 1 && elf[4] !== 2)) return null;
   const e64 = elf[4] === 2;
   const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
   const w = (o) => (e64 ? Number(dv.getBigUint64(o, true)) : dv.getUint32(o, true));
@@ -671,9 +696,9 @@ function wine32ProgramFlags(elf) {
     const h = off + (at - vaddr);
     const magic = String.fromCharCode(...elf.subarray(h, h + 7));
     // FLAG_GUEST_I386 (1) or FLAG_GUEST_X86_64 (2): Windows' address space
-    return magic === 'GEXWASM' ? dv.getUint32(h + 36, true) & 3 : 0;
+    return magic === 'GEXWASM' ? dv.getUint32(h + 36, true) : null;
   }
-  return 0;
+  return null;
 }
 
 /** The epoch every Worker's high-resolution clock shares, in nanoseconds:
@@ -1055,6 +1080,12 @@ export class Gex {
   #windowsSpace = 0;
   /** A 64-bit Wine program being loaded: its space is the 2 GiB split. */
   #wine64Split = false;
+  /** A process that runs no translated code (a native wasm program, a fork
+   *  child of one, an exec of one): no placement window, its arena from
+   *  `MMAP_BOTTOM` (`gex_set_no_place_window`, before the first claim).
+   *  Null for one with the window, else its program's image span, which the
+   *  arena steps over (`[0, 0]`: a fork child's, inherited). */
+  #noPlace = null;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -1230,6 +1261,7 @@ export class Gex {
       // `?pinregion=BYTES`: a project's libraries' region above the placement
       // window, before the first claim of arena (gex_abi::set_pin_region).
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
+      if (this.#noPlace) this.#shim.exports.gex_set_no_place_window?.(BigInt(this.#noPlace[0]), BigInt(this.#noPlace[1]));
       // `?sehreport=1`: crash reports name the SEH chain and a longjmp's jmp_buf.
       if (globalThis.GEX_SEH_REPORT) this.#shim.exports.gex_set_seh_report?.(1);
       // Which memory flavours the page runs: what an exec
@@ -1880,6 +1912,7 @@ export class Gex {
     // 2 GiB, and a 64-bit Wine maps past it.
     const wine = wine32ProgramFlags(elf);
     if (wine) this.#windowsSpace = -1;
+    this.#noPlace = wasmProgramImage(elf);
     this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
@@ -2452,7 +2485,7 @@ export class Gex {
     // and must be told where it goes. Not yet for a runtime made ahead of
     // its process (`preattach`): the stack is the arena's first claim, and
     // how the arena is laid out is the process's (its start message's
-    // `?winesplit=1`, which arrives after).
+    // `?winesplit=1`, which arrives after, and `#noPlace`).
     if (stack) this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
     const e = this.#shim.exports;
     this.#imports = {
@@ -3130,6 +3163,7 @@ export class Gex {
    */
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
+    this.#noPlace = child.wasmImage ?? null;
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool
@@ -3290,6 +3324,7 @@ export class Gex {
     };
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
+    this.#noPlace = child.placeWindow === 0 ? [0, 0] : null;
     this.#forkChild = true;
     this.#inheritedEnds = child.image.map((r) => [r.at, Math.max(r.end ?? 0, r.at + imageLen(r))]);
     await this.attach(shimWasm, guestWasm);
@@ -3889,6 +3924,12 @@ export class Gex {
       modules: [],
       opts: this.#opts,
       exec: part(0),
+      // A native wasm program's image: its fresh memory has no placement
+      // window (`#noPlace`).
+      wasmImage: (() => {
+        const hi = Number(e.gex_vfork_exec_wasm?.(1) ?? 0n);
+        return hi ? [Number(e.gex_vfork_exec_wasm(0)), hi] : null;
+      })(),
       fds: part(1),
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
@@ -3956,6 +3997,9 @@ export class Gex {
       // A 32-bit Wine process's Windows address space starts here (0: none); the
       // child splits its memory at the same line before its heap takes any.
       windowsSpace: e.gex_windows_space?.() ?? 0,
+      // Whether its memory has the placement window: the child's is laid out
+      // as its parent's (`#noPlace`).
+      placeWindow: e.gex_place_window?.() ?? 1,
       image: (() => {
         const t0 = performance.now();
         // The process's other threads out of guest code while the memory is

@@ -2548,6 +2548,60 @@ pub extern "C" fn gex_set_pin_region(bytes: u64) {
     gex_abi::set_pin_region(bytes);
 }
 
+/// A process that runs no translated code (a native wasm program, a fork
+/// child of one, an exec of one on a fresh memory) gives up the placement
+/// window (`gex_kernel::mem::set_no_place_window`), before this Worker takes
+/// anything from the arena: its arena starts at `MMAP_BOTTOM`. Its program's
+/// image, `[image_lo, image_hi)` (0, 0 for none: a fork child's, inherited),
+/// lies where the window was, so it is an island the arena steps over.
+#[no_mangle]
+pub extern "C" fn gex_set_no_place_window(image_lo: u64, image_hi: u64) {
+    gex_kernel::mem::set_no_place_window();
+    if let Some((lo, hi)) = no_place_island(image_lo, image_hi) {
+        // Grown now: the loader writes the image without mapping through the
+        // arena, and the memory reaches past it as soon as the arena does.
+        if grow_memory_to(hi) && memmap::claim_island(lo, hi, &ARENA_NEXT, "program image (no placement window)") {
+            IMAGE_ISLAND[0].store(lo, std::sync::atomic::Ordering::Relaxed);
+            IMAGE_ISLAND[1].store(hi, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// The island [`gex_set_no_place_window`] made for its program's image, or
+/// both 0: an in-place exec's next image is mapped there, so it is cleared as
+/// the fixed low layout is.
+static IMAGE_ISLAND: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `[start, end)` lies in [`IMAGE_ISLAND`].
+fn in_image_island(start: u64, end: u64) -> bool {
+    let lo = IMAGE_ISLAND[0].load(std::sync::atomic::Ordering::Relaxed);
+    let hi = IMAGE_ISLAND[1].load(std::sync::atomic::Ordering::Relaxed);
+    lo < hi && lo <= start && end <= hi
+}
+
+/// The island an image `[lo, hi)` needs in a process without the placement
+/// window: its part above `MMAP_BOTTOM`, in whole 64 KiB pages.
+fn no_place_island(lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let lo = lo.max(gex_abi::MMAP_BOTTOM) & !0xffff;
+    let hi = hi.checked_next_multiple_of(0x1_0000)?;
+    (hi > lo).then_some((lo, hi))
+}
+
+/// Whether an exec in place of a program whose image is `image` fits a
+/// process without the placement window: a native wasm program whose image
+/// lies below its arena or in its first program's island. Anything else
+/// would map over the arena, so it goes on in a fresh memory.
+fn no_place_exec_fits(image: Option<(u64, u64)>) -> bool {
+    image.is_some_and(|(lo, hi)| no_place_island(lo, hi).is_none_or(|(lo, hi)| memmap::within_island(lo, hi)))
+}
+
+/// 1 when this process keeps the placement window, 0 when it gave it up (a
+/// fork record's: the child's memory is laid out as its parent's).
+#[no_mangle]
+pub extern "C" fn gex_place_window() -> i32 {
+    gex_kernel::mem::place_window() as i32
+}
+
 /// Turn on gex-wayland protocol tracing (buffers, commits, "produced no frame")
 /// -- the shim has no env, so `GEX_WL_TRACE` can't reach the compositor here.
 #[no_mangle]
@@ -2814,11 +2868,11 @@ fn arena_take(len: u64) -> Option<u64> {
         // received signal 9" and nothing about memory at all.
         let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
         if inherited != 0 {
-            gex_abi::arena_bottom().max(inherited)
+            gex_kernel::mem::arena_bottom().max(inherited)
         } else {
             // Not forked: the memory is its own and nothing else is in it. Kept
             // as the floor rather than assumed, since the loader grows it.
-            gex_abi::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
+            gex_kernel::mem::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
         }
     } else {
         cur
@@ -3003,6 +3057,10 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // One inside an island already (the executables' slot, an inherited
     // region) is the guest's as it stands.
     let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
+    // A process without the placement window: its program's image island.
+    if !gex_kernel::mem::place_window() && memmap::within_island(start, end) {
+        return Some(gex_kernel::mem::BACKED_ISLAND);
+    }
     if winspace::wine32_compact()
         && (memmap::within_island(start, end)
             || cur != 0 && start >= cur && memmap::claim_island(start, end, &ARENA_NEXT, "guest fixed mapping above the arena"))
@@ -4743,8 +4801,8 @@ pub extern "C" fn gex_note_inherited(end: u64) {
 #[no_mangle]
 pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
     wine32_note_reach(end, "an inherited region", start, end);
-    if winspace::wine32_compact() && end > gex_abi::arena_bottom() && end <= winspace::arena_ceiling() {
-        let start = start.max(gex_abi::arena_bottom());
+    if winspace::wine32_compact() && end > gex_kernel::mem::arena_bottom() && end <= winspace::arena_ceiling() {
+        let start = start.max(gex_kernel::mem::arena_bottom());
         if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
             && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
         {
@@ -5638,8 +5696,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
         // And the layout they share. Only with a global kernel: without one
-        // this process is the whole system and has nobody to agree with.
-        kernel.place = Some(std::sync::Arc::new(SharedPlaces));
+        // this process is the whole system and has nobody to agree with. Not
+        // without the window, where the arena already is.
+        if gex_kernel::mem::place_window() {
+            kernel.place = Some(std::sync::Arc::new(SharedPlaces));
+        }
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
@@ -8628,9 +8689,14 @@ fn syscall_entry(ctx: i32, pc: i64) {
             // Or one the program asked to start afresh (`gex_exec_fresh`): Wine's
             // server starter, whose Worker has no door and whose memory the
             // program run again would not use.
+            // Or a process without the placement window (`gex_kernel::mem::place_window`)
+            // whose exec's image does not fit it (`no_place_exec_fits`): a
+            // translated program places its shared objects, so it gets a
+            // memory with the window.
             SyscallOutcome::Exec { path, argv, envp }
                 if vfork::exec_elsewhere(h, &path)
-                    || ((FORK_COPY.load(std::sync::atomic::Ordering::Relaxed) || EXEC_AFRESH.swap(false, std::sync::atomic::Ordering::Relaxed)) && cur() == 0) =>
+                    || ((FORK_COPY.load(std::sync::atomic::Ordering::Relaxed) || EXEC_AFRESH.swap(false, std::sync::atomic::Ordering::Relaxed)) && cur() == 0)
+                    || (!gex_kernel::mem::place_window() && cur() == 0 && !no_place_exec_fits(vfork::exec_wasm_image(h, &path))) =>
             {
                 h.exec_waited_since = None;
                 exec_away(h, &path, &argv, &envp)
@@ -10921,8 +10987,11 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
         // And the layout they share. Only with a global kernel: without one
-        // this process is the whole system and has nobody to agree with.
-        kernel.place = Some(std::sync::Arc::new(SharedPlaces));
+        // this process is the whole system and has nobody to agree with. Not
+        // without the window, where the arena already is.
+        if gex_kernel::mem::place_window() {
+            kernel.place = Some(std::sync::Arc::new(SharedPlaces));
+        }
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
@@ -11269,12 +11338,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if winspace::wine32_compact() {
         inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
     }
-    if inherited > gex_abi::arena_bottom() {
-        dead.push((gex_abi::arena_bottom(), inherited));
+    if inherited > gex_kernel::mem::arena_bottom() {
+        dead.push((gex_kernel::mem::arena_bottom(), inherited));
     }
     let dead: Option<Vec<(u64, u64)>> = dead
         .iter()
-        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::arena_bottom()), hi.min(gex_abi::MMAP_TOP)))
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_kernel::mem::arena_bottom()), hi.min(gex_abi::MMAP_TOP)))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem.lock().renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
@@ -11321,7 +11390,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             // pages stalled the exec indefinitely -- a bulk fill over this shared
             // memory commits every page and crawls, where the live low layout
             // clears in a blink.
-            if start >= gex_abi::arena_bottom() {
+            if start >= gex_kernel::mem::arena_bottom() && !in_image_island(start, end) {
                 continue;
             }
             let (a, b) = (start as usize, (end as usize).min(live).min(data.len()));
