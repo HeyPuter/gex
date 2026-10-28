@@ -12312,14 +12312,27 @@ fn object_identity(p: &Px<'_>, addr: u64) -> Option<u64> {
     Some(key)
 }
 
-/// The memory flavour in a code identity ([`object_identity`],
-/// [`page_identity`]): a 64-bit memory's translations import an i64 memory,
-/// so a 32-bit process of the same program must not be served them, in a
-/// page that runs both. Nothing is added for a 32-bit
-/// memory, whose keys stay as they were.
+/// The flavour in a code identity ([`object_identity`], [`page_identity`]):
+/// what makes this process's translation of the same bytes differ from
+/// another's. A 64-bit memory's translations import an i64 memory; a
+/// process with KUSER_SHARED_DATA folded (`gex_abi::kuser_fold`, and the
+/// entry page with it) reads its constant addresses elsewhere, and one
+/// without the fold reads them where Windows has them, past a compact
+/// space's end; the null guard and exact MXCSR change every block they
+/// touch. A process with none of these adds nothing, so its keys stay as
+/// they were.
 fn flavour_salt(h: &mut impl std::hash::Hasher) {
     if gex_abi::mem64() {
         h.write_u8(64);
+    }
+    if gex_abi::kuser_fold() {
+        h.write_u8(if gex_abi::kuser_fold_entry() { 33 } else { 32 });
+    }
+    if gex_emit::tier1::null_guard_on() {
+        h.write_u8(16);
+    }
+    if gex_ir::mxcsr_exact() {
+        h.write_u8(8);
     }
 }
 
