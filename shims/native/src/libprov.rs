@@ -32,7 +32,6 @@
 use super::*;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use wasmtime::AsContextMut;
 
 /// One stateful provider.
 #[derive(Clone, Debug)]
@@ -143,40 +142,6 @@ pub(crate) fn stack64(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Resu
         s.provider_sp64 = Some(g.clone());
     }
     Ok(g)
-}
-
-/// This store's exception tag for `gex.provider_throw` under a wasm64
-/// provider: `(i32)`, the throw's code. A throw is a wasm exception, so code
-/// the provider publishes at run time (Mono's wasm JIT, whose modules import
-/// it as `x.e`) catches it with `try_table`; `gex.provider_try` takes it as
-/// the pending exception when nothing in between did.
-pub(crate) fn tag(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result<wasmtime::Tag> {
-    if let Some(t) = cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_tag.clone()) {
-        return Ok(t);
-    }
-    let ft = wasmtime::FuncType::new(cx.engine(), [wasmtime::ValType::I32], []);
-    let t = wasmtime::Tag::new(&mut *cx, &wasmtime::TagType::new(ft)).map_err(anyhow::Error::from)?;
-    if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
-        s.provider_tag = Some(t.clone());
-    }
-    Ok(t)
-}
-
-/// The code of the pending `gex.provider_throw` exception, taken off the
-/// store; None (and the exception left pending) for any other tag.
-fn take_throw(caller: &mut Caller<'_, HostState>) -> Result<Option<i32>> {
-    let mut cx = caller.as_context_mut();
-    let Some(exn) = cx.take_pending_exception() else { return Ok(None) };
-    let ours = tag(&mut cx)?;
-    let t = exn.tag(&mut cx).map_err(anyhow::Error::from)?;
-    if !wasmtime::Tag::eq(&t, &ours, &cx) {
-        let _ = cx.throw::<()>(exn);
-        return Ok(None);
-    }
-    match exn.field(&mut cx, 0).map_err(anyhow::Error::from)? {
-        Val::I32(c) => Ok(Some(c)),
-        v => bail!("gex.provider_throw exception with payload {v:?}"),
-    }
 }
 
 /// Guest pages for a provider's own use.
@@ -612,6 +577,23 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::set_fault_hook(caller.data(), idx as u32);
     })?;
     // Diagnostics: text a provider writes to its stderr.
+    // A program's i386 code calling or jumping to `addr` runs the function
+    // at table index `idx` (gexcc's rt/i386.c, gex_i386_bind): bound like an
+    // export of the install holding the index. -1 for an index no install
+    // has.
+    linker.func_wrap(IMPORT_MODULE, "i386_bind", |caller: Caller<'_, HostState>, addr: i64, idx: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
+        let Some(jit) = caller.data().jit.as_ref() else { return Ok(-1) };
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        let shared = Arc::clone(&jit.shared);
+        let idx = idx as u32;
+        let found = {
+            let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.ftab.map.installs().iter().position(|i| idx >= i.base && idx < i.base + i.len).map(|k| (k as u32, sh.ftab.map.installs()[k].base))
+        };
+        let Some((install, base)) = found else { return Ok(-1) };
+        ftab::bind_pairs(&shared, &memory, install, &[(addr as u64 & 0xffff_ffff, idx - base)])?;
+        Ok(0)
+    })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
             if let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) {
@@ -658,33 +640,6 @@ fn asyncify(caller: &mut Caller<'_, HostState>, op: i32, arg: i32) -> Result<i32
 /// [`register`] for a 64-bit guest memory: the same functions with i64
 /// addresses, sizes and function-table indices.
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
-    crate::wasmjit::register64(linker)?;
-    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
-        let func = ftab::table_func(&mut caller, f as u32)?;
-        let typed = func.typed::<i64, ()>(&caller).context("gex.provider_try: the function is not void(void *)")?;
-        match typed.call(&mut caller, arg) {
-            Ok(()) => Ok(0),
-            Err(e) => {
-                if let Some(c) = take_throw(&mut caller)? {
-                    return Ok(c);
-                }
-                match e.downcast_ref::<Throw>() {
-                    Some(t) => Ok(t.0),
-                    None => Err(anyhow::Error::from(e)),
-                }
-            }
-        }
-    })()) })?;
-    // A wasm exception (see [`tag`]), returned as wasmtime's own error so it
-    // unwinds as one: through wasm frames to the nearest handler.
-    linker.func_wrap(IMPORT_MODULE, "provider_throw", |mut caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> {
-        let mut cx = caller.as_context_mut();
-        let t = crate::host(tag(&mut cx))?;
-        let ty = wasmtime::ExnType::from_tag_type(&t.ty(&cx))?;
-        let pre = wasmtime::ExnRefPre::new(&mut cx, ty);
-        let exn = wasmtime::ExnRef::new(&mut cx, &pre, &t, &[Val::I32(code)])?;
-        cx.throw(exn)
-    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter).
@@ -734,48 +689,9 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.ftab.map.installs().iter().find(|i| i.base as i64 == base).map_or(0, |i| i.len as i64)
     })?;
-    // The guest address of the function `name` exports from the first
-    // mapped Linux object that defines it (as RTLD_DEFAULT would find it), or
-    // 0: how a provider finds the guest's own dlopen/dlsym.
-    linker.func_wrap(IMPORT_MODULE, "provider_guest_sym", |mut caller: Caller<'_, HostState>, ptr: i64, len: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
-        let name = {
-            let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            let b = m.bytes();
-            let bytes = b.get(ptr as usize..(ptr as usize).saturating_add(len as usize)).ok_or_else(|| anyhow!("provider_guest_sym: bad name"))?;
-            String::from_utf8_lossy(bytes).into_owned()
-        };
-        Ok(guest_sym(caller.data_mut(), &name).unwrap_or(0) as i64)
-    })()) })?;
-    // Stopping the guest's threads around a provider runtime's collection
-    // (`GuestStop`).
-    linker.func_wrap(IMPORT_MODULE, "provider_thread_register", |caller: Caller<'_, HostState>, in_guest: i64, stop: i64| {
-        guest_stop().register(caller.data().thread.tid as u32, in_guest as u64, stop as u64);
-    })?;
     // A provider's guest call begins or ends: natively a blocking call waits
     // in place anyway (the browser keeps the count: cgen/libprov.rs).
     linker.func_wrap(IMPORT_MODULE, "provider_guest_call", |_caller: Caller<'_, HostState>, _delta: i32| {})?;
-    linker.func_wrap(IMPORT_MODULE, "provider_park", |caller: Caller<'_, HostState>| {
-        let mem = caller.data().memory.clone();
-        if let Some(m) = mem {
-            guest_stop().park_if_stopping(caller.data().thread.tid as u32, m.bytes(), true);
-        }
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_stop_guest", |caller: Caller<'_, HostState>| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
-        let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        guest_stop().stop(caller.data().thread.tid as u32, m.bytes());
-        Ok(())
-    })()) })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_start_guest", |caller: Caller<'_, HostState>| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
-        let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        guest_stop().start(m.bytes());
-        Ok(())
-    })()) })?;
-    // The end of the mapping holding guest stack pointer `sp` (a thread's
-    // stack top, for scanning it).
-    linker.func_wrap(IMPORT_MODULE, "provider_guest_stack_end", |mut caller: Caller<'_, HostState>, sp: i64| -> i64 {
-        let sp = sp as u64;
-        caller.data_mut().with_kernel(|k| k.mem.lock().vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)) as i64
-    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_code_page", |_caller: Caller<'_, HostState>| -> i64 {
         THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
     })?;
@@ -791,7 +707,7 @@ static ELF_INSTALLED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 /// After a Linux syscall that mapped executable code (`MapLog::new_code`):
 /// a shared object one of this process's stateful providers serves gets
 /// its exports bound to the provider, before anything can call them
-/// (Unity's `libmonobdwgc-2.0.so`, say). The library's
+/// (`libsqlite3.so.0`, say). The library's
 /// dynamic symbols say where each export is; its own code never runs.
 pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kernel::CodeMap]) -> Result<()> {
     if LIBS.get().is_none_or(|v| v.is_empty()) {
@@ -834,8 +750,7 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         // None of the replaced library's code may run, so the function JIT must not translate it
         // either: following a PLT's folded GOT load into it would publish the library's own code
-        // over the provider's bindings (a game under --fjit then ran Boehm's GC_exclude_static_roots
-        // forever).
+        // over the provider's bindings, and the program would run it.
         replaced_add(lo.wrapping_add(bias), hi.wrapping_add(bias));
         for lp in libs {
             CTORS.lock().unwrap_or_else(|e| e.into_inner()).extend(ctors.iter().filter(|&&v| v >= lo && v < hi).map(|&v| v.wrapping_add(bias)));
@@ -847,183 +762,6 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
         crate::ftab::catch_up(&mut *caller)?;
     }
     Ok(())
-}
-
-/// The dynamic symbols of a mapped object, by path: (name, value) of each
-/// defined function, and its executable segment's page-aligned vaddr.
-type ObjSyms = (std::collections::HashMap<String, u64>, u64);
-static OBJ_SYMS: Mutex<Option<std::collections::HashMap<String, Arc<ObjSyms>>>> = Mutex::new(None);
-
-/// [`provider_guest_sym`]'s search: every executable file mapping, lowest
-/// address first.
-fn guest_sym(state: &mut HostState, name: &str) -> Option<u64> {
-    let maps: Vec<(u64, String)> = state.with_kernel(|k| {
-        k.mem.lock().vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
-    });
-    let mut seen = std::collections::HashSet::new();
-    for (start, path) in maps {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let cached = OBJ_SYMS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&path).cloned();
-        let syms = match cached {
-            Some(s) => s,
-            None => {
-                let Some(bytes) = state.with_kernel(|k| k.read_file(&path)) else { continue };
-                let Ok(image) = gex_ld::elf::load(&bytes, 0) else { continue };
-                let Some(text) = image.segments.iter().find(|s| s.executable) else { continue };
-                let map = image.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value != 0).map(|y| (y.name.clone(), y.value)).collect();
-                let s = Arc::new((map, text.vaddr & !0xfff));
-                OBJ_SYMS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.clone(), Arc::clone(&s));
-                s
-            }
-        };
-        if let Some(v) = syms.0.get(name) {
-            return Some(start.wrapping_sub(syms.1).wrapping_add(*v));
-        }
-    }
-    None
-}
-
-/// Stopping a process's guest threads for a stateful provider's garbage
-/// collector: the threads running guest code are
-/// GC-safe to the runtime but still run; they stop at their next safepoint
-/// or syscall, with their registers written back, as Boehm stopped them.
-/// Each thread registers a word in the provider's memory saying whether it
-/// is in guest code, and the provider's own stop flag, which it checks
-/// before crossing into guest code (`provider_park`).
-pub(crate) struct GuestStop {
-    stopping: std::sync::atomic::AtomicBool,
-    state: Mutex<GuestStopState>,
-    cv: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct GuestStopState {
-    /// tid -> the provider's "in guest code" word for it.
-    threads: std::collections::HashMap<u32, u64>,
-    /// The provider's stop flag (one per process).
-    stop_word: u64,
-    /// Threads parked, and threads inside a syscall (stopped as far as the
-    /// collector is concerned; they park on the way out).
-    parked: std::collections::HashSet<u32>,
-    in_kernel: std::collections::HashSet<u32>,
-    /// The thread running the collection.
-    stopper: Option<u32>,
-}
-
-static GUEST_STOP: OnceLock<GuestStop> = OnceLock::new();
-
-pub(crate) fn guest_stop() -> &'static GuestStop {
-    GUEST_STOP.get_or_init(|| GuestStop { stopping: false.into(), state: Mutex::new(Default::default()), cv: std::sync::Condvar::new() })
-}
-
-fn word(mem: &[u8], addr: u64) -> u32 {
-    mem.get(addr as usize..addr as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
-}
-
-impl GuestStop {
-    fn register(&self, tid: u32, in_guest: u64, stop: u64) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.threads.insert(tid, in_guest);
-        st.stop_word = stop;
-    }
-
-    /// A thread that has ended: nothing to wait for.
-    pub(crate) fn forget(&self, tid: u32) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.threads.remove(&tid);
-        st.in_kernel.remove(&tid);
-        self.cv.notify_all();
-    }
-
-    /// Whether a collection is stopping the guest's threads (the fast path's test).
-    pub(crate) fn active(&self) -> bool {
-        self.stopping.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// At a safepoint or a syscall boundary in guest code (or from the
-    /// provider, `forced`): park while a collection runs.
-    pub(crate) fn park_if_stopping(&self, tid: u32, mem: &[u8], forced: bool) {
-        if !self.stopping.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&w) = st.threads.get(&tid) else { return };
-        if st.stopper == Some(tid) || (!forced && word(mem, w) == 0) {
-            return;
-        }
-        st.parked.insert(tid);
-        self.cv.notify_all();
-        while self.stopping.load(std::sync::atomic::Ordering::Acquire) {
-            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
-        }
-        st.parked.remove(&tid);
-    }
-
-    /// Around a syscall made from guest code: it counts as stopped.
-    pub(crate) fn enter_kernel(&self, tid: u32) {
-        if self.state.lock().unwrap_or_else(|e| e.into_inner()).threads.contains_key(&tid) {
-            self.state.lock().unwrap_or_else(|e| e.into_inner()).in_kernel.insert(tid);
-            self.cv.notify_all();
-        }
-    }
-
-    pub(crate) fn leave_kernel(&self, tid: u32, mem: &[u8]) {
-        {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !st.in_kernel.remove(&tid) {
-                return;
-            }
-        }
-        self.park_if_stopping(tid, mem, false);
-    }
-
-    fn stop(&self, me: u32, mem: &mut [u8]) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.stopper = Some(me);
-        if st.stop_word != 0 {
-            store_word(mem, st.stop_word, 1);
-        }
-        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let waiting: Vec<u32> = st
-                .threads
-                .iter()
-                .filter(|(&t, &w)| t != me && word(mem, w) != 0 && !st.parked.contains(&t) && !st.in_kernel.contains(&t))
-                .map(|(&t, _)| t)
-                .collect();
-            if waiting.is_empty() {
-                return;
-            }
-            if std::time::Instant::now() > deadline {
-                eprintln!("gex: provider stop-the-world: threads {waiting:?} never reached a safepoint; going on without them");
-                return;
-            }
-            st = self.cv.wait_timeout(st, std::time::Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner()).0;
-        }
-    }
-
-    fn start(&self, mem: &mut [u8]) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.stopper = None;
-        if st.stop_word != 0 {
-            store_word(mem, st.stop_word, 0);
-        }
-        self.stopping.store(false, std::sync::atomic::Ordering::SeqCst);
-        self.cv.notify_all();
-    }
-}
-
-/// Store a 32-bit word of guest memory, ordered with everything around it
-/// (the provider reads it with an atomic load).
-fn store_word(mem: &mut [u8], addr: u64, v: u32) {
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-    if let Some(b) = mem.get_mut(addr as usize..addr as usize + 4) {
-        b.copy_from_slice(&v.to_le_bytes());
-    }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Constructor and destructor addresses of the library being installed

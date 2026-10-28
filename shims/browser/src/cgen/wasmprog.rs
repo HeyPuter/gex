@@ -117,6 +117,11 @@ const FLAG_GUEST_X86_64: u32 = 2;
 /// `gex_abi::WINE32_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
 /// the process folds Windows' constant addresses there (`winspace::wine32_kuser`).
 const FLAG_KUSER_WINE32: u32 = 4;
+/// Header flag, with [`FLAG_GUEST_I386`]: the program's i386 code is its own
+/// (a JIT's, gexcc -fgex-guest-i386), not Windows': Linux's address space,
+/// only the trampoline page added (the return pad of its calls into the
+/// guest).
+const FLAG_LINUX_SPACE: u32 = 8;
 
 /// The running program's header has [`FLAG_GUEST_X86_64`] (64-bit Wine), set at
 /// every publish (a fork's child has its parent's, in its copy of memory).
@@ -242,7 +247,14 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // image: a fork's child has its parent's.
     let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
     GUEST_X86_64.store(flags & FLAG_GUEST_X86_64 != 0, Ordering::Relaxed);
-    if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
+    if flags & FLAG_LINUX_SPACE != 0 && relocate {
+        use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
+        let page = gex_kernel::win::trampoline_page();
+        if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
+            dst.copy_from_slice(&page);
+        }
+        crate::sigs::proc_home().mm().lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
+    } else if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
         use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
         let page = gex_kernel::win::trampoline_page();
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {

@@ -10,7 +10,7 @@ WINE_COMMIT := 02e614910991a7fd90784cca51601c710ed8a8e0
 # The musl fork the wasm32 sysroot is built from (build-sysroot.sh):
 # branch mw/gex-wasm32-slim.
 MUSL_REPO   := https://github.com/MercuryWorkshop/musl-wasm.git
-MUSL_COMMIT := fa2fd28eea0ce272daed4dd2df44379be4300788
+MUSL_COMMIT := aacfa4bb863afebc1806c91a678bac5de134c79b
 
 # The i386 PE DLLs that are not built as wasm32 skeletons come from the
 # host's Wine release, staged and checked against tools/nt-wine-11.15.manifest

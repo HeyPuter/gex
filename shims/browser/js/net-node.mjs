@@ -7,6 +7,24 @@
 // kernel, so blocking here would take the wasm stack and nothing would ever
 // deliver the bytes being waited for.
 import { createConnection } from 'node:net';
+import { readFile, stat } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { PageHostStream } from './page-host.mjs';
+
+/** `fetch`, and for a `file:` URL the file itself (a page-served host's
+ *  files in a directory): 404 where there is none. */
+async function fetchOrFile(url, init) {
+  if (!url.startsWith('file:')) return fetch(url, init);
+  const path = fileURLToPath(url);
+  try {
+    const st = await stat(path);
+    if (!st.isFile()) throw new Error('not a file');
+    const body = init?.method === 'HEAD' ? null : await readFile(path);
+    return new Response(body, { status: 200, headers: { 'content-length': String(st.size), 'last-modified': st.mtime.toUTCString() } });
+  } catch {
+    return new Response(null, { status: 404, headers: { 'content-length': '0' } });
+  }
+}
 
 /** Status codes the shim understands. */
 const CONNECTING = 0;
@@ -17,6 +35,17 @@ const CLOSED = 3;
 export class NodeNetwork {
   #sockets = new Map();
   #next = 1;
+  /** The page-served hosts (page-host.mjs), answered here, not over TCP. */
+  #pageHosts = null;
+
+  /** Whether a host not page-served is reached over TCP (else refused). */
+  #tcp;
+
+  /** `pageHosts`: a Map of host name to base URL (`file:` for a directory). */
+  constructor({ pageHosts = null, tcp = true } = {}) {
+    this.#pageHosts = pageHosts?.size ? pageHosts : null;
+    this.#tcp = tcp;
+  }
   /** Called on every socket event: the single-thread build wakes its parked
    *  fibers with it (as web/src/net.js's WispNetwork does). */
   onActivity = () => {};
@@ -31,6 +60,26 @@ export class NodeNetwork {
   connect(id, host, port) {
     const s = this.#sockets.get(id);
     if (!s) return;
+    const base = this.#pageHosts?.get(String(host).toLowerCase());
+    if (base) {
+      const p = new PageHostStream(base, fetchOrFile);
+      p.onmessage = (d) => {
+        s.rx.push(d);
+        this.onActivity();
+      };
+      p.onclose = () => {
+        s.eof = true;
+        this.onActivity();
+      };
+      s.sock = { write: (b) => p.send(new Uint8Array(b)), destroy: () => p.close() };
+      s.status = OPEN;
+      return;
+    }
+    if (!this.#tcp) {
+      s.status = REFUSED;
+      s.eof = true;
+      return;
+    }
     const sock = createConnection({ host, port }, () => {
       s.status = OPEN;
       this.onActivity();

@@ -26,7 +26,8 @@ container runs under (also read by the container itself at run time);
 GEXCC_BAKE_RUNNER the runner path linked into containers (empty: none);
 GEXCC_KEEP_WASM=1 keeps OUT.wasm beside a linked program; GEXCC_VERBOSE=1
 prints every command; GEXCC_NOFORK=1 is -fgex-no-fork (a link whose fork
-returns ENOSYS, with no asyncify: rt/nofork.c)."""
+returns ENOSYS, with no asyncify: rt/nofork.c). -fgex-guest-i386: a program
+that runs i386 code of its own (a JIT's: <gex/i386.h>, rt/i386.c)."""
 import atexit, os, re, shutil, subprocess, sys, tempfile
 
 TRIPLE = 'wasm32-unknown-linux-musl'
@@ -166,8 +167,12 @@ FPCAST = os.environ.get('GEXCC_FPCAST', '0') != '0' or '-fgex-fpcast-emu' in sys
 # A link that never forks (rt/nofork.c): -fgex-no-fork or GEXCC_NOFORK=1, at
 # link time. Off by default: fork there returns ENOSYS, and no asyncify.
 NOFORK = os.environ.get('GEXCC_NOFORK', '0') != '0' or '-fgex-no-fork' in sys.argv[1:]
+# A program that runs i386 code of its own (rt/i386.c): -fgex-guest-i386, at
+# link time. gex translates i386 in its process (the container's header
+# flags, wasm-elf.py --guest-i386 --linux-space).
+GUEST_I386 = '-fgex-guest-i386' in sys.argv[1:]
 args = [a for a in expand_rsp(sys.argv[1:])
-        if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu', '-fgex-no-fork')]
+        if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu', '-fgex-no-fork', '-fgex-guest-i386')]
 
 
 def in_sysroot(path):
@@ -1198,6 +1203,11 @@ if shared:
 
 # A program.
 objs = objs + NOFORK_O
+if GUEST_I386:
+    I386_O = os.path.join(LIBDIR, 'i386.o')
+    if not os.path.exists(I386_O):
+        die('-fgex-guest-i386: no %s (tools/gexcc/install.sh builds it with an x86 gexc)' % I386_O)
+    objs = objs + [I386_O]
 ins, missing = expand(inputs, set())
 # -L from archives' deps: they only feed resolve(), already applied
 ins = [x for x in ins if not x.startswith('-L')]
@@ -1331,6 +1341,8 @@ if 'GEXCC_BAKE_RUNNER' in os.environ:
         cont += ['--runner', os.environ['GEXCC_BAKE_RUNNER']]
 elif os.path.exists(rf):
     cont += ['--runner', open(rf).read().strip()]
+if GUEST_I386:
+    cont += ['--guest-i386', '--linux-space']
 r = run([sys.executable, os.path.join(LIBDIR, 'wasm-elf.py'), wasm, out] + cont)
 if r:
     sys.exit(r)

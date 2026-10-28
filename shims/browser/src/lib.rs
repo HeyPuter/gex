@@ -27,7 +27,7 @@
 #[cfg(target_arch = "wasm32")]
 use core::arch::wasm32 as warch;
 // The memory64 build: an x86-64 guest with a 64-bit
-// memory, for the Unity games on .NET.
+// memory.
 #[cfg(target_arch = "wasm64")]
 use core::arch::wasm64 as warch;
 
@@ -7992,13 +7992,6 @@ fn syscall_entry(ctx: i32, pc: i64) {
         gex_kernel::sync::set_thread_id(waitq::slot() as u32 + 1);
     }
     fjit::watch_check(pc as u64, "syscall");
-    // A guest thread in a syscall counts as stopped for a provider's
-    // collection (cgen/libprov.rs); it parks on its way back if one runs.
-    let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
-    let tracked_tid = if stop_tracked { my_tid() as u32 } else { 0 };
-    if stop_tracked {
-        cgen::libprov::syscall_enter(tracked_tid);
-    }
     // The call, read from its context once: its number and arguments as
     // its ABI gives them, and its canonical number. `ctx` is this thread's
     // context (the locked section below checks it against the thread's own
@@ -8792,9 +8785,6 @@ fn syscall_entry(ctx: i32, pc: i64) {
         };
         trace_line(&format!("[gex]   t{i} = {}{split}{clk}\n", x0 as i64));
     }
-    if stop == 0 && stop_tracked {
-        cgen::libprov::guest_again(tracked_tid);
-    }
     // A call to make again (`finish_wait`: a priority-inheritance lock still
     // held, a stream another thread got to first, an `accept` or `recvmsg`
     // whose wait is over) from a provider or a wasm32 program: it has no
@@ -8922,14 +8912,6 @@ fn clock_syscall(ctx: i32) -> bool {
     if unsafe { HEARTBEAT } != 0 && abi != 1 {
         count_syscall(census_nr, 0, 0);
         callers::note(census_nr, at, cgen::sp_index());
-    }
-    // A provider's collection running: park here, as the full path does on
-    // its way back to guest code.
-    if cgen::libprov::stop_active() {
-        let tid = my_tid();
-        if tid != 0 {
-            cgen::libprov::park_if_stopping(tid as u32, false);
-        }
     }
     // Narration, not a warning: a page test fails on any console error.
     if CLOCK_CALLS.fetch_add(1, Relaxed) == 0 {
@@ -15401,13 +15383,6 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 
 fn safepoint(ctx: i32, pc: i64) {
     fjit::watch_check(pc as u64, "safepoint");
-    // A stateful provider's collection stops guest threads here (its
-    // registers are in the context at a safepoint), and a thread that came
-    // back from a syscall through JS is running guest code again.
-    if cgen::libprov::any_registered() {
-        let tid = my_tid() as u32;
-        cgen::libprov::guest_again(tid);
-    }
     // A thread another thread's `execve` took the process from, still
     // running the old program's code (a loop that makes no syscall): it goes
     // here, as on Linux it would at once.
@@ -16107,7 +16082,6 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     open,
                     cgen::provider_calls_recent()
                 ));
-                warn_line(&format!("[gex] last lookups (address, index): {:x?}\n", cgen::lookups_recent()));
                 warn_line(&format!(
                     "[gex] last call-outs (target, return, sp wanted, depth, result, sp after): {:x?}; provider guest call open {}\n",
                     cgen::callouts_recent(),

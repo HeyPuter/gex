@@ -17,7 +17,6 @@ pub mod aot;
 pub mod aot_only;
 pub mod libprov;
 pub(crate) mod elfprov;
-pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
@@ -1327,8 +1326,12 @@ fn run_program_with(
     // 32-bit Wine's i386 Wine and 64-bit Wine's x86-64 Wine (FLAG_GUEST_X86_64) alike:
     // Windows' fixed addresses left free, and the trampoline page (its
     // x86-64 entries and the native return pad serve 64-bit Wine)
+    // A Linux program's own i386 code (FLAG_LINUX_SPACE) keeps Linux's
+    // address space and gets the trampoline page alone.
     if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
-        store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+        if wasmprog::flags(program) & wasmprog::FLAG_LINUX_SPACE == 0 {
+            store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+        }
         // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
         // constant addresses folded there, the old page and above a
         // named fault (`gex_abi::KUSER_GUARD`).
@@ -3170,7 +3173,6 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
         aot_only::bind_root(&mut store, &instance)?;
     }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
-    libprov::guest_stop().forget(thread.tid as u32);
     if matches!(stopped, Stopped::Exited(_)) && store.data().thread_only && !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
         crate::dylink::free_thread_tls(store.data_mut());
     }
@@ -4211,9 +4213,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             .unwrap_or_else(|e| e.into_inner())
                             .signal_pending_for(waiting_tid)
                 };
-                // Blocked in the kernel counts as stopped for a provider's
-                // collection; the thread parks on its way out if one runs.
-                libprov::guest_stop().enter_kernel(waiting_tid as u32);
                 // Blocked, the thread does not hold up a fork's copy; it
                 // waits for the copy before writing its result.
                 let gate = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
@@ -4224,7 +4223,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if let Some(g) = &gate {
                     g.enter();
                 }
-                libprov::guest_stop().leave_kernel(waiting_tid as u32, memory.bytes());
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
                     .data_mut()
@@ -5027,10 +5025,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A fork in another thread is copying the address space.
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
-            }
-            // A stateful provider's collection stops guest threads here.
-            if libprov::guest_stop().active() {
-                libprov::guest_stop().park_if_stopping(state.thread.tid as u32, gm.bytes, false);
             }
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
@@ -6830,7 +6824,7 @@ pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, s
 }
 
 /// The bytes around a faulting pc and the top of the guest stack (NT
-/// faults; RW debugging of Mono JIT code).
+/// faults; RW debugging of JIT code).
 fn trace_ring_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_TRACE_RING").is_some())

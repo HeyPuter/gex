@@ -129,9 +129,10 @@ self.onmessage = async (ev) => {
           });
         }
       } else delete opts.gl;
-      if (opts.networkUrl) {
+      if (opts.networkUrl || opts.pageHosts) {
         const { WispNetwork } = await import('./net.js');
-        const net = new WispNetwork(opts.networkUrl, (e) => self.postMessage({ kind: 'net', event: e }));
+        const net = new WispNetwork(opts.networkUrl ?? null, (e) => self.postMessage({ kind: 'net', event: e }),
+          { pageHosts: opts.pageHosts ? new Map(opts.pageHosts) : null });
         try {
           await net.start();
         } catch (e) {
@@ -140,6 +141,7 @@ self.onmessage = async (ev) => {
         opts.network = net;
       }
       delete opts.networkUrl;
+      delete opts.pageHosts;
       opts.onNetEvent = (e) => self.postMessage({ kind: 'net', event: e });
       const { status } = await runProgram(term, opts);
       self.postMessage({ kind: 'done', status });

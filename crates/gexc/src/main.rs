@@ -592,15 +592,11 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
     }
 }
 
-/// The guest memory for this run: `--mem64`/`--mem32`,
-/// else what an earlier run of the same image learned. `wide` is whether
-/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
-/// has a wasm32 memory.
 /// Native wasm libraries in place of guest ones, as stateful providers
 /// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` binds each
 /// module's `gexp_<export>` functions at
 /// that DLL's exports when it maps. A Linux shared object is named by its
-/// file name (`libmonobdwgc-2.0.so=mono.wasm`).
+/// file name (`libsqlite3.so.0=sqlite3.wasm`).
 fn set_wasm_libs() -> Result<()> {
     if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
         let libs = v
@@ -620,6 +616,10 @@ fn set_wasm_libs() -> Result<()> {
     Ok(())
 }
 
+/// The guest memory for this run: `--mem64`/`--mem32`,
+/// else what an earlier run of the same image learned. `wide` is whether
+/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
+/// has a wasm32 memory.
 fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
     if ra.mem64 == Some(true) && !wide {
         bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);

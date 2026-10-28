@@ -25,9 +25,16 @@ use wasmtime::{Engine, Module};
 /// batch keys on which blocks it held and almost never recurs.
 const DEFAULT_BUDGET: u64 = 4 << 30;
 
-/// Sweeping means listing the directory, so it is not done on every store.
-const STORES_BETWEEN_SWEEPS: u64 = 64;
+/// Sweeping means listing the directory and statting every entry (a
+/// shared cache holds hundreds of thousands), so it is not done on every
+/// store: the first store of a process sweeps, and later ones only when the
+/// size the last sweep found plus what this process stored since reaches the
+/// budget, or every this many stores (other processes store too).
+const STORES_BETWEEN_SWEEPS: u64 = 4096;
 static STORES: AtomicU64 = AtomicU64::new(0);
+/// The cache's size as of the last sweep plus this process's stores since,
+/// or `u64::MAX` before the first sweep.
+static ESTIMATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn budget() -> u64 {
     std::env::var("GEX_CACHE_MAX_BYTES")
@@ -40,10 +47,11 @@ fn budget() -> u64 {
 ///
 /// "Least recently used" is the metadata file's mtime, which
 /// [`load_or_compile`] refreshes on a hit. Evicts down to 80% of budget, not
-/// exactly to it, so a full cache does not sweep on every store.
-fn evict(dir: &Path, budget: u64) {
+/// exactly to it, so a full cache does not sweep on every store. Returns the
+/// size left.
+fn evict(dir: &Path, budget: u64) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return 0;
     };
     // (mtime, key, bytes) for each entry, sized as module plus metadata.
     let mut items: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
@@ -67,7 +75,7 @@ fn evict(dir: &Path, budget: u64) {
         items.push((when, key, wasm_len + meta_len));
     }
     if total <= budget {
-        return;
+        return total;
     }
     items.sort_by_key(|(when, _, _)| *when);
     let target = budget / 5 * 4;
@@ -79,6 +87,7 @@ fn evict(dir: &Path, budget: u64) {
         let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
         total = total.saturating_sub(size);
     }
+    total
 }
 
 /// SHA-256, from gex-key (the browser shim computes keys without wasmtime).
@@ -275,9 +284,16 @@ pub fn load_or_compile(
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
         // Not on every store: the sweep lists the whole directory, and with a
-        // quarter of a million entries that is not free.
-        if STORES.fetch_add(1, Ordering::Relaxed) % STORES_BETWEEN_SWEEPS == 0 {
-            evict(dir, budget());
+        // quarter of a million entries that is not free (a quarter of a
+        // translation-bound program's start, sweeping every 64th store).
+        let added = (metadata.len() + serialized.len()) as u64;
+        let n = STORES.fetch_add(1, Ordering::Relaxed);
+        let est = ESTIMATE.load(Ordering::Relaxed);
+        let budget = budget();
+        if est == u64::MAX || est.saturating_add(added) > budget || n % STORES_BETWEEN_SWEEPS == 0 {
+            ESTIMATE.store(evict(dir, budget), Ordering::Relaxed);
+        } else {
+            ESTIMATE.fetch_add(added, Ordering::Relaxed);
         }
     }
     Ok(Loaded {

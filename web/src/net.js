@@ -7,6 +7,7 @@
 
 import { client } from '@mercuryworkshop/wisp-js/client';
 import { logOn } from '@gex/log.mjs';
+import { PageHostStream } from '@gex/page-host.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -59,7 +60,8 @@ class Stream {
 }
 
 // A network for `Gex.useNetwork`. `wispUrl` must end in a slash (the Wisp
-// client insists). `meter` counts what the proxy delivers; see `onmessage`.
+// client insists), or be null for none: only the page-served hosts then.
+// `meter` counts what the proxy delivers; see `onmessage`.
 const meter = { n: 0, bytes: 0, last: 0 };
 
 export class WispNetwork {
@@ -73,15 +75,26 @@ export class WispNetwork {
   #drops = 0;
   /** `[id, host, port]` of connects made while redialling. */
   #waiting = [];
+  /** The page-served hosts (page-host.mjs `pageHosts`): name -> base URL. */
+  #pageHosts = null;
 
   /** Called when a stream opens, receives or closes. The single-thread
    *  build wakes its parked fibers here (a guest waiting on a socket sleeps
    *  on the scheduler, not on this thread's event loop). */
   onActivity = () => {};
 
-  constructor(wispUrl, onEvent = () => {}) {
-    this.#url = wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
+  /** `pageHosts`: a Map of host name to the base URL its files are
+   *  fetched under (page-host.mjs), answered here rather than over Wisp. */
+  constructor(wispUrl, onEvent = () => {}, { pageHosts = null } = {}) {
+    this.#url = wispUrl == null ? null : wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
     this.#onEvent = onEvent;
+    this.#pageHosts = pageHosts?.size ? pageHosts : null;
+  }
+
+  /** The page-served hosts, as `[name, base]` pairs: what a Worker that
+   *  makes a network of its own is given with the proxy's address. */
+  get pageHosts() {
+    return this.#pageHosts ? [...this.#pageHosts] : undefined;
   }
 
   /** The proxy this was pointed at, normalised. Each guest process (a Worker)
@@ -93,7 +106,7 @@ export class WispNetwork {
 
   /** Open the WebSocket. Resolves once the proxy has said hello. */
   async start() {
-    if (this.#conn) return;
+    if (this.#conn || this.#url == null) return;
     await new Promise((resolve, reject) => {
       const c = new client.ClientConnection(this.#url);
       const fail = (e) => reject(new Error(`wisp: ${e?.message || 'could not connect'}`));
@@ -143,7 +156,7 @@ export class WispNetwork {
   // -- the seven calls the shim makes --------------------------------------
 
   open() {
-    if (!this.#conn && !this.#redialing) return 0;
+    if (!this.#conn && !this.#redialing && !this.#pageHosts) return 0;
     const id = this.#next++;
     this.#streams.set(id, new Stream(id));
     return id;
@@ -153,6 +166,11 @@ export class WispNetwork {
   connect(id, host, port) {
     const s = this.#streams.get(id);
     if (!s) return;
+    const base = this.#pageHosts?.get(String(host).toLowerCase());
+    if (base) {
+      this.#wire(s, id, new PageHostStream(base), host, port);
+      return;
+    }
     if (!this.#conn) {
       // Redialling: the stream stays CONNECTING until the proxy is back.
       if (!this.#redialing) return;
@@ -168,6 +186,11 @@ export class WispNetwork {
       s.state = REFUSED;
       return;
     }
+    this.#wire(s, id, w, host, port);
+  }
+
+  /** Stream `s` carried by `w`: a Wisp stream, or a page-served host's. */
+  #wire(s, id, w, host, port) {
     s.wisp = w;
     // The Wisp client reports the connection as open once the proxy has it.
     w.onopen = () => {

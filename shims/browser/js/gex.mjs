@@ -48,119 +48,7 @@ const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
  *  a shim export taking a 64-bit address, as a BigInt. */
 const addrNum = (v) => (typeof v === 'bigint' ? Number(v) : v >>> 0);
 const addrBig = (v) => (typeof v === 'bigint' ? v : BigInt(v >>> 0));
-/** The global imports of a wasm module, as `module.name` -> WebAssembly.Global descriptor
- *  (JS cannot ask a Module for its imports' types). */
-function importedGlobals(bytes) {
-  const out = new Map();
-  let p = 8;
-  const leb = () => {
-    let r = 0, sh = 0, b;
-    do { b = bytes[p++]; r |= (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
-    return r;
-  };
-  const str = () => { const n = leb(); const s = new TextDecoder().decode(bytes.subarray(p, p + n)); p += n; return s; };
-  while (p < bytes.length) {
-    const id = bytes[p++];
-    const size = leb();
-    const end = p + size;
-    if (id === 2) {
-      const count = leb();
-      for (let i = 0; i < count; i++) {
-        const m = str(), n = str(), kind = bytes[p++];
-        if (kind === 0) leb();
-        else if (kind === 1) { p++; const f = leb(); leb(); if (f & 1) leb(); }
-        else if (kind === 2) { const f = leb(); leb(); if (f & 1) leb(); }
-        else if (kind === 3) {
-          const t = bytes[p++], mut = bytes[p++];
-          out.set(`${m}.${n}`, { value: { 0x7f: 'i32', 0x7e: 'i64', 0x7d: 'f32', 0x7c: 'f64' }[t] ?? 'i64', mutable: !!(mut & 1) });
-        } else if (kind === 4) { p++; leb(); }
-      }
-      return out;
-    }
-    p = end;
-  }
-  return out;
-}
 
-/** For each element of a PIC module's (first active) element segment, its function's type
- *  packed as the provider's JIT asks for it (`provider_jit_table` SIG, the native `wasmjit`):
- *  bits 0..4 the parameter count, 5..7 the result (0 none, 1 i32, 2 i64, 3 f32, 4 f64), then two
- *  bits per parameter from bit 8 (0 i32, 1 i64, 2 f32, 3 f64); -1 when not representable. */
-function elementSignatures(bytes) {
-  let p = 8;
-  const leb = () => {
-    let r = 0, sh = 0, b;
-    do { b = bytes[p++]; r += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
-    return r;
-  };
-  const skipStr = () => { const n = leb(); p += n; };
-  const vcode = { 0x7f: 0, 0x7e: 1, 0x7d: 2, 0x7c: 3 };
-  const types = [];
-  let importedFuncs = 0;
-  const funcTypes = [];
-  let elems = null;
-  while (p < bytes.length) {
-    const id = bytes[p++];
-    const size = leb();
-    const end = p + size;
-    if (id === 1) {
-      const n = leb();
-      for (let i = 0; i < n; i++) {
-        if (bytes[p] === 0x4e || bytes[p] === 0x4f || bytes[p] === 0x50) { types.push(-1); p = end; break; } // rec/sub: not ours
-        p++; // 0x60
-        const np = leb();
-        let packed = np > 28 ? -1 : np, ok = np <= 28;
-        for (let k = 0; k < np; k++) {
-          const c = vcode[bytes[p++]];
-          if (c === undefined) ok = false; else if (ok) packed += c * 2 ** (8 + 2 * k);
-        }
-        const nr = leb();
-        if (nr > 1) ok = false;
-        for (let k = 0; k < nr; k++) {
-          const c = vcode[bytes[p++]];
-          if (c === undefined) ok = false; else if (ok) packed += (c + 1) * 32;
-        }
-        types.push(ok ? packed : -1);
-      }
-    } else if (id === 2) {
-      const n = leb();
-      for (let i = 0; i < n; i++) {
-        skipStr(); skipStr();
-        const kind = bytes[p++];
-        if (kind === 0) { leb(); importedFuncs++; funcTypes.push(-2); }
-        else if (kind === 1) { p++; const f = leb(); leb(); if (f & 1) leb(); }
-        else if (kind === 2) { const f = leb(); leb(); if (f & 1) leb(); }
-        else if (kind === 3) { p += 2; }
-        else if (kind === 4) { p++; leb(); }
-      }
-    } else if (id === 3) {
-      const n = leb();
-      for (let i = 0; i < n; i++) funcTypes.push(leb());
-    } else if (id === 9 && !elems) {
-      const n = leb();
-      for (let i = 0; i < n && !elems; i++) {
-        const flags = leb();
-        if (flags === 0 || flags === 2) {
-          if (flags === 2) leb();
-          while (bytes[p] !== 0x0b) p++; // the offset expression
-          p++;
-          if (flags === 2) p++; // elemkind
-          const m = leb();
-          elems = [];
-          for (let k = 0; k < m; k++) elems.push(leb());
-        } else {
-          p = end; // other forms: not what a PIC module writes
-        }
-      }
-    }
-    p = end;
-  }
-  // Imported functions' types are not known here (their entries are -2 above): -1.
-  return (elems ?? []).map((fi) => {
-    const ti = funcTypes[fi];
-    return ti === undefined || ti < 0 ? -1 : (types[ti] ?? -1);
-  });
-}
 
 /** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
 const tIdx = (v) => (m64() ? BigInt(v) : v);
@@ -4782,11 +4670,6 @@ export class Gex {
       e.gex_wasmprog_release?.(prov);
       if (this.#wasmprogTls) this.#dlTlsInit(prov, inst, st, this.#wasmprogTls);
     }
-    // A wasm64 provider's slots' function types, for its JIT's `provider_jit_table` SIG.
-    if (libprov && !this.#provSigs.some((x) => x.base === base)) {
-      const bytes = new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0);
-      this.#provSigs.push({ base, sigs: elementSignatures(bytes) });
-    }
     // A deferred unit's bridges were written when it was deferred.
     const bridges = deferred ? 0 : this.#cgenBridges(regsOf, tables);
     st.instances.push(inst);
@@ -5090,17 +4973,6 @@ export class Gex {
     return this.#provStack64;
   }
 
-  /** This Worker's exception tag for a wasm64 provider's `provider_throw`: a wasm
-   *  exception, so code the provider publishes at run time (its JIT, which imports it)
-   *  can catch it with `try_table`, and `provider_try` takes it when nothing did. */
-  #provTag = null;
-  /** Traps seen unwinding provider guest calls (reported up to 16). */
-  #provLeaks = 0;
-  #providerTag() {
-    this.#provTag ??= new WebAssembly.Tag({ parameters: ['i32'] });
-    return this.#provTag;
-  }
-
   /** A native `__TRY`'s longjmp that reached the outermost run loop, its
    *  frame gone (cgen.rs `gex_handler_lost`): true when the shim raised the
    *  exception again with no handler, a fault the loop delivers. */
@@ -5142,186 +5014,30 @@ export class Gex {
           }
         }
       }
-      if (this.#provTag && err.is(this.#provTag)) return 'a wasm exception, the provider tag';
       return 'a wasm exception whose tag no module of this Worker exports';
     }
     return `a thrown ${typeof err}: ${String(err)}`;
   }
+
+  /** Traps seen abandoning provider guest calls (reported up to 16). */
+  #provLeaks = 0;
 
   /** What a replaced Linux library's wasm64 provider imports from `gex` (the native
    *  `libprov::register64`). Pointers and table indices
    *  are i64 (BigInt). */
   #providerImports64() {
     const e = this.#shim.exports;
-    const ftab = this.#cgen.ftab;
-    const tag = this.#providerTag();
     return {
-      provider_try: (f, arg) => {
-        // The guest calls a raise unwinds are no longer open.
-        const calls = e.gex_libprov_guest_calls();
-        try {
-          ftab.get(f)(arg);
-          return 0;
-        } catch (err) {
-          const open = e.gex_libprov_guest_calls();
-          e.gex_libprov_guest_calls_set(calls);
-          if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
-          // Anything else that unwinds a provider's guest calls abandons
-          // frames the guest will return into (their return addresses stay
-          // on its stack): say which trap, where it resumes, and from where.
-          if (open > calls && (this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
-            console.error(`[gex] a trap left through ${open - calls} provider guest call(s): ${err?.message ?? err}; ` +
-              `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
-          }
-          throw err;
-        }
-      },
-      provider_throw: (code) => {
-        throw new WebAssembly.Exception(tag, [code]);
-      },
       // The shim's export itself: a wasm-to-wasm call on every guest call.
       provider_guest_call: e.gex_libprov_guest_call,
       provider_missing: (addr) => e.gex_libprov_missing(addr),
       provider_thread_entry: () => e.gex_libprov_thread_entry(),
       provider_code_page: () => e.gex_libprov_thread_entry(),
       provider_stack: () => this.#provStackLo,
-      provider_guest_sym: (ptr, len) => e.gex_libprov_guest_sym(ptr, len),
-      provider_guest_stack_end: (sp) => e.gex_libprov_guest_stack_end(sp),
       provider_abi: (which) => e.gex_libprov_abi(which),
       provider_table_size: (base) => e.gex_libprov_table_size(base),
-      // Stopping the guest's threads around the runtime's collection (cgen/libprov.rs).
-      provider_thread_register: (inGuest, stop) => e.gex_libprov_thread_register(inGuest, stop),
-      provider_park: () => e.gex_libprov_park(),
-      provider_stop_guest: () => e.gex_libprov_stop(),
-      provider_start_guest: () => e.gex_libprov_start(),
-      // The runtime's wasm JIT (the native `wasmjit`): a range of the process's function
-      // table, and each method's module compiled once per process and instantiated in every
-      // Worker that runs it.
-      provider_jit_reserve: (n) => {
-        const base = e.gex_libprov_jit_reserve(BigInt(n));
-        this.#cgenCatchUp();
-        return base;
-      },
-      provider_jit_instantiate: (...a) => this.#jitInstantiate(...a),
-      provider_jit_table: (op, a, b) => {
-        a = BigInt(a);
-        if (op === 0) {
-          const f = this.#jitInstalled.get(a);
-          if (!f) return 0n;
-          ftab.set(a, f);
-          return 1n;
-        }
-        if (op === 1) {
-          const f = ftab.get(BigInt(b));
-          if (!f) throw new Error(`wasmjit: alias of an empty slot ${b}`);
-          ftab.set(a, f);
-          this.#jitInstalled.set(a, f);
-          return 0n;
-        }
-        if (op === 2) {
-          const f = ftab.get(a);
-          return f ? BigInt(f.length) : -1n;
-        }
-        // SIG: from the provider module's own types (JS cannot ask a function for them).
-        for (const { base, sigs } of this.#provSigs) {
-          const k = Number(a) - base;
-          if (k >= 0 && k < sigs.length) return BigInt(sigs[k]);
-        }
-        return -1n;
-      },
     };
   }
-
-  /** Wasm64 providers' table ranges and their slots' packed function types. */
-  #provSigs = [];
-
-  /** The functions this Worker's JIT instantiations installed, by table slot. */
-  #jitInstalled = new Map();
-
-  /** `gex.provider_jit_instantiate(bytes, len, cnames, consts, nconsts, slots, names, n,
-   *  errbuf, errcap)`: compile (once per process, by content) and instantiate a JIT module in
-   *  this Worker, installing its named exports at table slots. 1, or 0 with the reason in
-   *  errbuf. */
-  #jitInstantiate(bytes, len, cnames, consts, nconsts, slots, names, n, errbuf, errcap) {
-    const mem = new Uint8Array(this.#memory.buffer);
-    const N = Number;
-    try {
-      const wasm = mem.slice(N(bytes), N(bytes) + N(len));
-      let h = 0x811c9dc5;
-      for (let i = 0; i < wasm.length; i++) h = Math.imul(h ^ wasm[i], 16777619) >>> 0;
-      const name = `wasmjit:${wasm.length}:${h.toString(16)}`;
-      let mod = this.#sharedModules.get(name);
-      if (!mod) {
-        mod = new WebAssembly.Module(wasm);
-        this.#sharedModules.set(name, mod);
-        this.#offerModule(name, mod, wasm.byteLength);
-      }
-      const dv = new DataView(this.#memory.buffer);
-      const cv = new Map();
-      if (N(nconsts) > 0) {
-        const nb = mem.slice(N(cnames), N(cnames) + 256);
-        let at = 0;
-        for (let k = 0; k < N(nconsts); k++) {
-          let end = at;
-          while (end < nb.length && nb[end] !== 0) end++;
-          cv.set(new TextDecoder().decode(nb.subarray(at, end)), dv.getBigUint64(N(consts) + 8 * k, true));
-          at = end + 1;
-        }
-      }
-      const globals = importedGlobals(wasm);
-      const ftab = this.#cgen.ftab;
-      const imports = { m: { h: this.#memory }, f: { f: ftab }, s: {}, x: { e: this.#providerTag() }, h: {} };
-      for (const imp of WebAssembly.Module.imports(mod)) {
-        if (imp.module === 's') {
-          if (imp.name === 'p') {
-            imports.s.p = this.#providerStack64();
-            continue;
-          }
-          const v = cv.get(imp.name);
-          if (v === undefined) throw new Error(`no value for import s.${imp.name}`);
-          const g = globals.get(`s.${imp.name}`) ?? { value: 'i64', mutable: false };
-          imports.s[imp.name] = new WebAssembly.Global(g, g.value === 'i64' ? BigInt.asIntN(64, v) : Number(BigInt.asIntN(32, v)));
-        } else if (imp.module === 'h') {
-          const f = ftab.get(BigInt(imp.name));
-          if (!f) throw new Error(`import h.${imp.name}: table slot holds no function`);
-          imports.h[imp.name] = f;
-        }
-      }
-      const inst = new WebAssembly.Instance(mod, imports);
-      const k = N(n);
-      if (k > 0) {
-        const nb = mem.slice(N(names), N(names) + 64 * k);
-        const list = [];
-        let at = 0;
-        for (let i = 0; i < k; i++) {
-          let end = at;
-          while (end < nb.length && nb[end] !== 0) end++;
-          list.push(new TextDecoder().decode(nb.subarray(at, end)));
-          at = end + 1;
-        }
-        const todo = list.map((nm, i) => {
-          const f = inst.exports[nm];
-          if (typeof f !== 'function') throw new Error(`no export ${nm}`);
-          return [dv.getBigUint64(N(slots) + 8 * i, true), f];
-        });
-        for (const [slot, f] of todo) {
-          ftab.set(slot, f);
-          this.#jitInstalled.set(slot, f);
-        }
-      }
-      this.#jitInstances.push(inst);
-      return 1;
-    } catch (err) {
-      const cap = N(errcap);
-      if (N(errbuf) && cap > 0) {
-        const b = new TextEncoder().encode(String(err?.message ?? err)).subarray(0, cap - 1);
-        mem.set(b, N(errbuf));
-        mem[N(errbuf) + b.length] = 0;
-      }
-      return 0;
-    }
-  }
-  #jitInstances = [];
 
   /** What a stateful provider imports from `gex` (the native `libprov`). */
   #providerImports() {
@@ -6203,6 +5919,9 @@ export class Gex {
       asyncify,
       // The snapshot flavour's (libgex-snap/snapshot.c).
       ...this.#snapImports(asyncify, single.on ? this.#suspendingSyscall(sync, staged) : sync, inst, mod),
+      // -fgex-guest-i386 (gexcc's rt/i386.c): i386 code calling `addr` runs
+      // the program's function at table index `idx` (cgen/libprov.rs)
+      i386_bind: (addr, idx) => e.gex_libprov_i386_bind(addrBig(addr), idx >>> 0),
       fork_point: (rec) => {
         const st = asyncify(0, 0);
         if (st === 0) asyncify(1, rec);
@@ -7399,9 +7118,9 @@ export class Gex {
         this.#progSpBack(psp);
         const e = this.#shim.exports;
         // A trap that reached the run loop with a provider's guest call
-        // still open abandoned the provider's frames (see provider_try).
+        // still open abandoned the provider's frames.
         if ((e.gex_libprov_guest_calls?.() ?? 0) > 0) {
-          if ((this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
+          if (++this.#provLeaks <= 16) {
             console.error(`[gex] a trap reached the run loop with ${e.gex_libprov_guest_calls()} provider guest call(s) open: ${err?.message ?? err}; ` +
               `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
           }
