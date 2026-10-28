@@ -725,6 +725,31 @@ window procedure (messages to it are dropped), and there is no shell
 (`ShellWindows`) that explorer would provide. A windowed program, or one
 that needs any of these, keeps `"explorer"`.
 
+### Wineboot
+
+`"wineboot": "skip"` boots the session without `wineboot --init`, which
+Wine otherwise runs before the first program: one more process, and the
+services and helpers it starts. `"run"`, the default `gexc eject` writes,
+and a config without the setting, keep it.
+
+What wineboot makes that the prefix keeps is in the bundle already. What it
+makes afresh each session is not: its volatile keys, the hardware
+description (`HKLM\Hardware\Description\System`: processor, BIOS), the
+active computer name and the user's volatile environment. They come from
+the recording: a page run with `WINEGEX_RECORD_HARDWARE=1` in its
+environment has wineboot write them as `[gex-record] reg` lines, which
+`record-wine32.mjs` keeps as the session's `volatile_keys`. The build
+writes them into the prefix's `system.reg` and `user.reg` as ordinary keys
+and starts the page with `WINEGEX_NO_WINEBOOT=1`: the first process sets up
+the session's shared data and marks it booted itself. A recording without
+them is an error.
+
+What goes with it: no `services.exe`, so no service runs (a game that
+starts or asks one keeps `"run"`), no `RunServices`, `RunServicesOnce` or
+`RunOnce` entries, no prefix update, and no `KnownDlls` (the loader finds
+those DLLs by path). It goes with `"desktop": "none"`, which wineboot would
+otherwise start from `RunServices`.
+
 ### Pruning
 
 A unit holds every function of its image, including the ones no execution

@@ -115,6 +115,20 @@ const uncovered = new Map();
 // `gexc cgen-split instrument`): unit key -> the slots entered.
 const coverage = new Map();
 const errors = [];
+// What wineboot made that the prefix does not save (its volatile keys), when
+// the page's environment has WINEGEX_RECORD_HARDWARE=1: "ROOT\\PATH" ->
+// { name: [type, hex] }, for gexc eject's "wineboot": "skip".
+const volatileKeys = new Map();
+// One "[gex-record] reg ROOT\\PATH|NAME|TYPE|HEX" line: wineboot's, on the
+// program's stderr (the page's output, `__nt.out`, or a console mirroring it).
+const volatileKey = (t) => {
+  const m = /^\[gex-record\] reg ((?:HKLM|HKCU)\\[^|]*)\|([^|]*)\|(\d*)\|([0-9a-f]*)\s*$/.exec(t);
+  if (!m) return false;
+  let vals = volatileKeys.get(m[1]);
+  if (!vals) volatileKeys.set(m[1], (vals = {}));
+  if (m[3]) vals[m[2]] = [Number(m[3]), m[4]];
+  return true;
+};
 browser.on('Runtime.consoleAPICalled', (p) => {
   const raw = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
   if (consoleFile) appendFileSync(consoleFile, `${((Date.now() - consoleT0) / 1000).toFixed(1).padStart(7)} ${raw.trimEnd()}\n`);
@@ -139,6 +153,7 @@ browser.on('Runtime.consoleAPICalled', (p) => {
       const [a, b] = r.split('-').map(Number);
       for (let k = a; k <= (b ?? a); k++) set.add(k);
     }
+  } else if (volatileKey(t)) {
   } else if ((m = /^\[gex-record\] module (.*) (\S+)$/.exec(t))) {
     modules.set(m[1], m[2]);
   } else {
@@ -190,6 +205,9 @@ await sleep(settle);
 const sess = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.session ?? null)')) ?? 'null');
 if (!sess) { console.error('record-wine32: the page has no __nt.session (an nt-page.js from before the recorder)'); done(1); }
 const pageUrl = await ev('location.href');
+// wineboot's volatile keys, from the program output the page kept.
+for (const line of String((await ev("globalThis.__nt?.out ?? ''")) ?? '').split('\n')) volatileKey(line.trimEnd());
+
 // The run's read set. A page from before `__ntOpened` gives none, and the
 // site then keeps its whole bundle.
 const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
@@ -267,6 +285,7 @@ const session = {
   uncovered: [...uncovered].map(([pc, u]) => ({ pc, ...u })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,
+  ...(volatileKeys.size ? { volatile_keys: Object.fromEntries(volatileKeys) } : {}),
   // Which functions (slots of each unit's element segment) the run entered,
   // when its units were instrumented: `a-b` runs.
   ...(coverage.size ? { coverage: Object.fromEntries([...coverage].map(([k, set]) => [k, runs([...set].sort((x, y) => x - y))])) } : {}),
