@@ -49,6 +49,164 @@ const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
 const addrNum = (v) => (typeof v === 'bigint' ? Number(v) : v >>> 0);
 const addrBig = (v) => (typeof v === 'bigint' ? v : BigInt(v >>> 0));
 
+/** A wasm32 shared library or program (cgen/dylink.rs) rewritten so its
+ *  instance carries no function exports the page does not call by name:
+ *  each one costs every Worker an export wrapper, its name and a slot in
+ *  the exports object (KDE's libraries export about 150,000 functions and
+ *  call one in eight by name), and its constant globals likewise. A table
+ *  slot past the element segment the loader filled with an export (`X`)
+ *  is filled by an added element segment instead, and an import of a
+ *  dropped export comes from its slot or value (dylink.rs `E`). Kept: the
+ *  `__` and `asyncify_` names, `_start` and `main`, and anything not a
+ *  function or an immutable constant i32 global. `extra` is the binding list's
+ *  [slot, export], `base` the module's `__table_base`. Null when the
+ *  module is not of that shape (more than one table, fpcast thunks, no
+ *  i32 `env.__table_base`, a construct this reader does not know). */
+export function packExports(bytes, extra, base) {
+  let p = 8;
+  const leb = () => {
+    let r = 0, sh = 0, b;
+    do { b = bytes[p++]; r += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+    return r;
+  };
+  const sleb = () => { let b; do { b = bytes[p++]; } while (b & 0x80); };
+  const str = () => { const n = leb(); const v = new TextDecoder().decode(bytes.subarray(p, p + n)); p += n; return v; };
+  const VAL = new Set([0x7f, 0x7e, 0x7d, 0x7c, 0x7b, 0x70, 0x6f]);
+  let globalImports = 0, tables = 0, tb = -1;
+  const constGlobal = [];
+  let exp = null, elem = null, after = -1;
+  const secs = [];
+  while (p < bytes.length) {
+    const start = p;
+    const id = bytes[p++];
+    const size = leb();
+    const body = p, end = p + size;
+    secs.push([id, start, end]);
+    if (id === 2) {
+      const n = leb();
+      for (let i = 0; i < n; i++) {
+        const m = str(), f = str();
+        const kind = bytes[p++];
+        if (kind === 0) leb();
+        else if (kind === 1) { p++; const fl = leb(); leb(); if (fl & 1) leb(); tables++; }
+        else if (kind === 2) { const fl = leb(); leb(); if (fl & 1) leb(); }
+        else if (kind === 3) {
+          const vt = bytes[p++];
+          p++;
+          if (m === 'env' && f === '__table_base') { if (vt !== 0x7f) return null; tb = globalImports; }
+          if (!VAL.has(vt)) return null;
+          globalImports++;
+        } else if (kind === 4) { p++; leb(); }
+        else return null;
+      }
+    } else if (id === 4) {
+      tables += leb();
+    } else if (id === 6) {
+      const n = leb();
+      for (let i = 0; i < n; i++) {
+        if (!VAL.has(bytes[p++])) return null;
+        const mut = bytes[p++];
+        const e0 = p;
+        let ops = 0, plain = bytes[p] === 0x41;
+        for (;;) {
+          const op = bytes[p++];
+          if (op === 0x0b) break;
+          ops++;
+          if (op === 0x41 || op === 0x42) sleb();
+          else if (op === 0x23 || op === 0xd2) leb();
+          else if (op === 0x43) p += 4;
+          else if (op === 0x44) p += 8;
+          else if (op === 0xd0) p++;
+          else if (op === 0xfd && bytes[p] === 0x0c) p += 17;
+          else if (!(op >= 0x6a && op <= 0x6c) && !(op >= 0x7c && op <= 0x7e)) return null;
+        }
+        constGlobal.push(!mut && plain && ops === 1 && p > e0);
+      }
+    } else if (id === 7) {
+      exp = [];
+      const n = leb();
+      for (let i = 0; i < n; i++) {
+        const a = p;
+        const name = str();
+        const kind = bytes[p++];
+        const idx = leb();
+        exp.push({ name, kind, idx, a, b: p });
+      }
+    } else if (id === 9) {
+      elem = [body, end];
+    }
+    if (id === 7 || id === 8) after = secs.length;
+    p = end;
+  }
+  if (tables !== 1 || tb < 0 || !exp || after < 0) return null;
+  if (exp.some((x) => x.name.startsWith('__fpcast$'))) return null;
+  const funcOf = new Map(exp.filter((x) => x.kind === 0).map((x) => [x.name, x.idx]));
+  const keep = (x) => {
+    if (x.kind === 0) return x.name.startsWith('__') || x.name.startsWith('asyncify_') || x.name === '_start' || x.name === 'main';
+    if (x.kind === 3) return x.name.startsWith('__') || x.idx < globalImports || !constGlobal[x.idx - globalImports];
+    return true;
+  };
+  // The X slots as runs of consecutive slots: one segment each.
+  const runs = [];
+  for (const [slot, name] of [...extra].sort((a, b) => a[0] - b[0])) {
+    const f = funcOf.get(name);
+    const rel = slot - base;
+    if (f === undefined || rel < 0) return null;
+    const last = runs.at(-1);
+    if (last && last.rel + last.fs.length === rel) last.fs.push(f);
+    else runs.push({ rel, fs: [f] });
+  }
+  const out = [];
+  const u = (v) => { do { let b = v % 128; v = Math.floor(v / 128); if (v) b |= 0x80; out.push(b); } while (v); };
+  const s32 = (v) => { for (;;) { const b = v & 0x7f; v >>= 7; if ((v === 0 && !(b & 0x40)) || (v === -1 && (b & 0x40))) { out.push(b); return; } out.push(b | 0x80); } };
+  // Every section copied as it is, but for the exports (filtered) and
+  // the element section (the runs added after the module's own segments).
+  const parts = [bytes.subarray(0, 8)];
+  const flush = () => { if (out.length) { parts.push(Uint8Array.from(out)); out.length = 0; } };
+  const segs = () => {
+    for (const r of runs) {
+      out.push(0x00, 0x23);
+      u(tb);
+      if (r.rel) { out.push(0x41); s32(r.rel); out.push(0x6a); }
+      out.push(0x0b);
+      u(r.fs.length);
+      for (const f of r.fs) u(f);
+    }
+  };
+  const ours = () => { const at = out.length; segs(); return out.splice(at); };
+  secs.forEach(([id, start, end], i) => {
+    if (id === 7) {
+      const kept = exp.filter(keep);
+      const len = lebLen(kept.length) + kept.reduce((n, x) => n + x.b - x.a, 0);
+      out.push(7); u(len); u(kept.length);
+      flush();
+      for (const x of kept) parts.push(bytes.subarray(x.a, x.b));
+    } else if (id === 9 && runs.length) {
+      p = elem[0];
+      const n = leb();
+      const rest = bytes.subarray(p, elem[1]);
+      const add = ours();
+      out.push(9); u(lebLen(n + runs.length) + rest.length + add.length); u(n + runs.length);
+      flush();
+      parts.push(rest, Uint8Array.from(add));
+    } else {
+      parts.push(bytes.subarray(start, end));
+    }
+    if (i + 1 === after && !elem && runs.length) {
+      const add = ours();
+      out.push(9); u(lebLen(runs.length) + add.length); u(runs.length);
+      flush();
+      parts.push(Uint8Array.from(add));
+    }
+  });
+  flush();
+  const total = parts.reduce((a, b) => a + b.length, 0);
+  const r = new Uint8Array(total);
+  let o = 0;
+  for (const b of parts) { r.set(b, o); o += b.length; }
+  return r;
+}
+const lebLen = (v) => { let n = 1; while (v >= 128) { v = Math.floor(v / 128); n++; } return n; };
 
 /** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
 const tIdx = (v) => (m64() ? BigInt(v) : v);
@@ -4497,12 +4655,31 @@ export class Gex {
       return b;
     };
     let pbytes = null, pkey = null;
+    // A wasm32 program's or shared library's binding list (cgen/dylink.rs),
+    // read before its module is compiled: its exports are packed
+    // (`packExports`, a separate module key) unless GEX_LOG=nodlpack.
+    const bindText = wasmprog ? this.#wasmprogBindRead(prov) : '';
+    const xs = [];
+    for (const line of bindText.split('\n')) if (line.startsWith('X\t')) { const f = line.split('\t'); xs.push([Number(f[1]), f[2]]); }
+    let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
     if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
-      if (!this.#sharedModules.has(pkey)) pbytes = pcopy();
+      if (wasmprog && !w64 && !logNamed('nodlpack')) {
+        if (this.#sharedModules.has(`${pkey}:p`)) {
+          pkey = `${pkey}:p`;
+          packed = true;
+        } else if (!this.#sharedModules.has(pkey)) {
+          const raw = pcopy();
+          const t0 = performance.now();
+          pbytes = packExports(raw, xs, base);
+          if (logNamed('dlpack')) console.warn(`[dlpack] ${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: ${pbytes ? `${raw.length} -> ${pbytes.length} bytes, ${xs.length} slots` : 'not packed'} in ${(performance.now() - t0).toFixed(1)} ms`);
+          if (pbytes) { pkey = `${pkey}:p`; packed = true; } else pbytes = raw;
+        }
+      }
+      if (!packed && !this.#sharedModules.has(pkey)) pbytes ??= pcopy();
     } else if (wasmdll) {
       pbytes = pcopy();
       pkey = `wasm:${moduleContentKey(pbytes)}`;
@@ -4653,10 +4830,10 @@ export class Gex {
       });
     }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
-    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
+    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText) : [];
     // What a door instance needs to run this program again on its memory
     // (a wineserver: `#doorPublish`).
-    if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText };
+    if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText, packed };
     inst = new WebAssembly.Instance(mod, imports);
     if (peSnap) {
       this.#snapPe = { inst, state: imports.env.__asyncify_state };
@@ -4666,7 +4843,8 @@ export class Gex {
     // published it, which then runs it at once (`#spareWait`).
     if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
-      for (const [slot, name] of extra) {
+      // (a packed module's element segments filled them)
+      if (!packed) for (const [slot, name] of extra) {
         const f = inst.exports[name];
         if (!f) throw new Error(`wasm32 module ${prov}: ${name} is not exported`);
         st.ftab.set(tIdx(slot), f);
@@ -5361,21 +5539,9 @@ export class Gex {
   /** Apply provider module `prov`'s binding list (cgen/dylink.rs's format)
    *  to `imports`; the table slots to fill with exports after
    *  instantiation, as [slot, name]. */
-  #wasmprogBind(prov, imports, st) {
-    const e = this.#shim.exports;
-    if (!e.gex_wasmprog_binds) return [];
-    const n = e.gex_wasmprog_binds(prov, 0, 0) >>> 0;
-    this.#wasmprogBindText = '';
-    if (!n) return [];
-    const buf = e.gex_alloc(n) >>> 0;
-    let text;
-    try {
-      e.gex_wasmprog_binds(prov, buf, n);
-      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
-    } finally {
-      e.gex_free?.(buf, n);
-    }
+  #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov)) {
     this.#wasmprogBindText = text;
+    if (!text) return [];
     const extra = [];
     this.#wasmprogTls = null;
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
@@ -5399,7 +5565,13 @@ export class Gex {
         }
         case 'E': {
           const from = st.dyl.get(Number(f[3]));
-          const x = from?.exports[f[4]];
+          // a packed module's (`packExports`): from its slot or value
+          let x = from?.exports[f[4]];
+          if (x === undefined && from && f[5] && f[5] !== '-') {
+            x = f[5][0] === 'g'
+              ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(f[5].slice(1)) | 0)
+              : st.ftab.get(tIdx(Number(f[5])));
+          }
           if (x === undefined) throw new Error(`wasm32 module ${prov}: ${f[1]}.${f[2]}: ${f[4]} of module ${f[3]} is not instantiated in this Worker`);
           set(f[1], f[2], x);
           break;
@@ -5423,6 +5595,20 @@ export class Gex {
       }
     }
     return extra;
+  }
+
+  /** Provider module `prov`'s binding list, '' for none. */
+  #wasmprogBindRead(prov) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmprog_binds ? e.gex_wasmprog_binds(prov, 0, 0) >>> 0 : 0;
+    if (!n) return '';
+    const buf = e.gex_alloc(n) >>> 0;
+    try {
+      e.gex_wasmprog_binds(prov, buf, n);
+      return new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
   }
 
   /** The last binding list's `T size align` (a `dlopen`ed module's
@@ -6030,7 +6216,7 @@ export class Gex {
       return;
     }
     const door = {
-      memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? '',
+      memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? '', packed: !!info.packed,
       area, kickId, pid: dv.getInt32(area + 112, true), id: `${Date.now()}:${area}`,
     };
     if (globalThis.GEX_DOOR_TRACE) console.error(`[gex-door] wineserver pid ${door.pid} published its door (area ${area})`);
@@ -6169,7 +6355,7 @@ export class Gex {
       }
     }
     const inst = new WebAssembly.Instance(d.module, imports);
-    for (const [slot, name] of extra) table.set(slot, inst.exports[name]);
+    if (!d.packed) for (const [slot, name] of extra) table.set(slot, inst.exports[name]);
     // Its first call sets its context, thread pointer and TLS
     // (`__gex_thread_start` on the area's frame) and ends at the exit call.
     const ctx = v.dv.getUint32(a + 72, true);

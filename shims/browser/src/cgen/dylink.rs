@@ -17,12 +17,16 @@
 //!                           pointer, asyncify globals, `gex.*`);
 //!   `G mod name value mut [64]`  a global (`GOT.mem`, `GOT.func`, a missing
 //!                           one: 0), `i64` with the `64` column (a wasm64 module);
-//!   `E mod name module`     provider module `module`'s export `name`;
+//!   `E mod name module export at`  provider module `module`'s export
+//!                           `export`; `at` is its table slot (a function),
+//!                           `g` and its value (a constant global) or `-`,
+//!                           for a module whose exports the page packed;
 //!   `L mod name slot`       a function through table slot `slot` (a module
 //!                           instantiated after this one);
 //!   `M mod name message`    a function that throws `message`;
 //! then `X slot export` per table slot past the element segment to fill
-//! with an export after instantiation, and, for a `dlopen`ed module with
+//! with an export after instantiation (or, packed, by an element segment
+//! the page adds), and, for a `dlopen`ed module with
 //! thread-local data, `T size align`: each Worker gives it a block of its
 //! own as it instantiates it (`__wasm_init_tls`), libc's registry having
 //! laid out only the blocks of the modules the program started with.
@@ -183,7 +187,22 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             let line = match b {
                 Bind::Shim => format!("S\t{mo}\t{na}"),
                 Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
-                Bind::Export { module, name } => format!("E\t{mo}\t{na}\t{}\t{name}", p.module_of[module]),
+                // and where the page finds it when the module's exports
+                // are packed (gex.mjs `packExports`): a function's table
+                // slot, a constant global's value
+                Bind::Export { module, name } => {
+                    let d = &p.link.mods[module];
+                    let at = match d.info.exports.get(&name) {
+                        Some(x) if x.kind == Kind::Func => d.info.slots().1.get(&x.index).map(|s| (d.table_base + s).to_string()),
+                        Some(x) if x.kind == Kind::Global && x.index >= d.info.global_imports => d.info.global_init
+                            .get((x.index - d.info.global_imports) as usize)
+                            .copied()
+                            .flatten()
+                            .map(|v| format!("g{}", v as i32)),
+                        _ => None,
+                    };
+                    format!("E\t{mo}\t{na}\t{}\t{name}\t{}", p.module_of[module], at.as_deref().unwrap_or("-"))
+                }
                 Bind::Late { slot } => format!("L\t{mo}\t{na}\t{slot}"),
                 Bind::Missing(_) if imp.kind == Kind::Global => format!("G\t{mo}\t{na}\t0\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
                 Bind::Missing(msg) => {
