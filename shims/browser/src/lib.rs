@@ -6843,7 +6843,7 @@ static DIR_HIGH: [std::sync::atomic::AtomicU32; gex_abi::DISPATCH_TABLES] =
 /// Fold a base written to the directory into `DIR_HIGH`. The table is the entry's
 /// table field; the slot is its offset within that table, so the size the table
 /// must reach is that offset plus a page of slots.
-fn note_dir_high(base: u32) {
+pub(crate) fn note_dir_high(base: u32) {
     let t = gex_abi::dispatch_entry_table(base);
     let end = (base & gex_abi::DISPATCH_SLOT_MASK) + gex_abi::SLOTS_PER_PAGE as u32;
     if let Some(c) = DIR_HIGH.get(t) {

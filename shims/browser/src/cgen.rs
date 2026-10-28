@@ -1696,6 +1696,13 @@ pub extern "C" fn gex_provider_note(thrown: i32) {
     }
 }
 
+/// Whether provider `number`'s record is there: its install reaches the
+/// function table's log before the record does.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_ready(number: u32) -> i32 {
+    (lock(&PROVIDERS).len() > number as usize) as i32
+}
+
 /// Provider module `number`'s file, bridges and table need, as for a unit.
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_file(number: u32, buf: u32, cap: u32) -> u32 {
@@ -1729,6 +1736,10 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (page, base) in dirs {
             if j.page_table.lookup(page) == Some(base) {
+                // The table high-water a sibling Worker's out-of-bounds
+                // dispatch grows to (`gex_claimed_slots`), as `dir_note` keeps
+                // it for every other directory write.
+                crate::note_dir_high(base);
                 crate::dense::note_entry(base);
                 let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
             }

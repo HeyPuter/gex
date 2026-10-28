@@ -5258,6 +5258,10 @@ export class Gex {
     if (!len && !this.#cgen) return;
     const st = this.#cgenStore();
     if (st.have >= len) {
+      // The shim's count is per thread and starts again at 0 with a thread's
+      // fresh TLS (an execve from another thread): this Worker's table still
+      // holds what it replayed.
+      if (e.gex_ftab_behind()) e.gex_cgen_have(st.have);
       this.#wasmdllCatchUp();
       return;
     }
@@ -5270,6 +5274,9 @@ export class Gex {
       // A provider of a program an execve replaced (`FuncMap::kill_module`) is skipped.
       if (kind === 1) {
         const u = e.gex_ftab_install_unit(v) >>> 0;
+        // A provider another Worker is publishing: its record follows its
+        // install, and the next catch-up takes it from here.
+        if (u >= 0x80000000 && u !== 0xffffffff && e.gex_cgen_pmod_ready && !e.gex_cgen_pmod_ready(u - 0x80000000)) break;
         // Plain units deferred (`#cgenDefer`); providers and JIT modules now.
         if (u !== 0xffffffff) {
           if (u < 0x40000000 && !single.on && !UNITS_EAGER && e.gex_ftab_install_len) {
@@ -6713,7 +6720,12 @@ export class Gex {
       this.#cgenCatchUp();
       return;
     }
-    if (!(this.#cgenMode & 3) || !e.gex_cgen_wanted) return;
+    // A miss the shim called a catch-up (`gex_ftab_behind`) traps here with
+    // units off too: the log carries every installed provider.
+    if (!(this.#cgenMode & 3) || !e.gex_cgen_wanted) {
+      if (e.gex_ftab_behind?.()) this.#cgenCatchUp();
+      return;
+    }
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();
       // The image's indirect-call profile is part of its unit's key, as
