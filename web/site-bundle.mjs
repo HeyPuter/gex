@@ -111,29 +111,38 @@ export function splitTree(x, read, store) {
   return lazy;
 }
 
-/** eject-site.mjs --rest-paths lines: `PATH`, or `PATH HEAD` (HEAD a
- *  whole number of MiB), as [path, head bytes or 0]. */
+/** eject-site.mjs --rest-paths lines: `PATH`, `PATH HEAD` (HEAD a whole
+ *  number of MiB) or `PATH HEAD tail`, as [path, head bytes or 0, tail]. */
 export const restPaths = (lines) => lines.map((l) => {
-  const m = /^(.*\S)\s+(\d+)$/.exec(l);
-  return m ? [m[1], Number(m[2]) * 1048576] : [l, 0];
+  const m = /^(.*\S)\s+(\d+)(\s+tail)?$/.exec(l);
+  return m ? [m[1], Number(m[2]) * 1048576, !!m[3]] : [l, 0, false];
 });
 
-/** The lazy files' heads (`heads`, guest path -> bytes) back in the tree
- *  `x` at their paths, each the first bytes of its lazy copy in `store`,
- *  with its time: a lazy file of the rest bundle whose start the boot reads
- *  (the title's music) has that part in the bundle too, at its first-read
- *  place, and the kernel holds it as the file's first chunks (tmpfs.rs
- *  `seed_head`). A file no longer than its head has none (it is dropped from
- *  `heads`). */
+const LAZY_CHUNK = 1048576;
+
+/** The lazy files' heads (`heads`, guest path -> {head, tail}) back in the
+ *  tree `x` at their paths, each the first `head` bytes of its lazy copy in
+ *  `store` and, with `tail`, its last, partial chunk after them, with its
+ *  time: a lazy file of the rest bundle whose start the boot reads (the
+ *  title's music) or whose start and end (an archive's table at its end) has
+ *  those parts in the bundle too, at its first-read place, and the kernel
+ *  holds them as the file's chunks (tmpfs.rs `seed_head`). `heads` then maps
+ *  each to the copy's length; a file no shorter than its copy has none, and
+ *  a file a whole number of chunks long has no tail (both dropped). */
 export function placeHeads(x, lazy, store, heads) {
   for (const [p, size, h, mtime] of lazy) {
-    const n = heads.get(p);
-    if (n === undefined) continue;
-    if (n >= size) { heads.delete(p); continue; }
+    const want = heads.get(p);
+    if (want === undefined) continue;
+    const { head, tail } = typeof want === 'number' ? { head: want, tail: false } : want;
+    const t = tail ? size % LAZY_CHUNK : 0;
+    if (tail && !t) console.log(`eject-site: ${p}: a whole number of chunks long, so no tail`);
+    if (head + t >= size || (!head && !t)) { heads.delete(p); continue; }
+    const all = readFileSync(join(store, h));
     const dst = join(x, p.slice(1));
-    writeFileSync(dst, readFileSync(join(store, h)).subarray(0, n));
+    writeFileSync(dst, Buffer.concat([all.subarray(0, head), all.subarray(size - t)]));
     utimesSync(dst, mtime, mtime);
-    console.log(`eject-site: ${p}: its first ${n / 1048576} MiB in the bundle as its head`);
+    heads.set(p, head + t);
+    console.log(`eject-site: ${p}: its first ${head / 1048576} MiB${t ? ` and its last ${t} bytes` : ''} in the bundle`);
   }
   for (const p of heads.keys()) if (!lazy.some((f) => f[0] === p)) heads.delete(p);
 }
