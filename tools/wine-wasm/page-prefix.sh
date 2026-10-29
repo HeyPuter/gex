@@ -21,9 +21,41 @@ rm -rf "$out"
 # DLLs into the master prefix) are copied as what they point at. The user.
 # extended attributes go too: Wine keeps a file's DOS attributes in
 # user.DOSATTRIB (a folder's desktop.ini is hidden and system).
+#
+# The users' folders are copied without following any link: the install ran
+# as the build machine's user, whose profile Wine links to that user's own
+# folders (Downloads -> ~/Downloads, ...). Each link there becomes an empty
+# folder. Only Public and the page's user (PAGE_USER, default gex: the
+# install's user, renamed) are kept; anything else under users (another
+# user's profile, a profile with no name, files a run left) is not.
 mkdir -p "$out"; out=$(cd "$out" && pwd)
-tar -C "$src" --exclude=./dosdevices -h --xattrs --xattrs-include='user.*' -cf - . |
+user=${PAGE_USER:-gex}
+tar -C "$src" --exclude=./dosdevices --exclude=./drive_c/users -h --xattrs --xattrs-include='user.*' -cf - . |
     tar -C "$out" --xattrs --xattrs-include='user.*' -xpf -
+# The install's user: the profile the registry names (ProfileList).
+built=$(sed -n 's/^"ProfileImagePath"="C:\\\\users\\\\\([^"\\]*\)"$/\1/p' "$src/system.reg" | head -1)
+mkdir -p "$out/drive_c/users"
+for d in Public "$built" "$user"; do
+    [ -n "$d" ] && [ -d "$src/drive_c/users/$d" ] && [ ! -L "$src/drive_c/users/$d" ] || continue
+    to=$d; [ "$d" = "$built" ] && to=$user
+    mkdir -p "$out/drive_c/users/$to"
+    tar -C "$src/drive_c/users/$d" --xattrs --xattrs-include='user.*' -cf - . |
+        tar -C "$out/drive_c/users/$to" --xattrs --xattrs-include='user.*' -xpf -
+done
+find "$out/drive_c/users" -type l | while IFS= read -r l; do rm "$l"; mkdir "$l"; done
+# Its paths and name in the registry are the page user's (Shell Folders,
+# ProfileList, the saved environment).
+[ -z "$built" ] || [ "$built" = "$user" ] || python3 -I - "$built" "$user" "$out"/*.reg <<'PY'
+import re, sys
+built, user, regs = sys.argv[1], sys.argv[2], sys.argv[3:]
+# C:\users\NAME and \users\NAME (HOMEPATH) in a value, and USERNAME.
+pat = re.compile(r'(?<![\w\\:])((?:C:)?\\\\users\\\\)' + re.escape(built) + r'(?=\\\\|"|;)', re.I)
+name = re.compile(r'^("USERNAME"=")' + re.escape(built) + '"$', re.I | re.M)
+for r in regs:
+    s = open(r, encoding='utf-8', errors='surrogateescape').read()
+    t = name.sub(lambda m: m.group(1) + user + '"', pat.sub(lambda m: m.group(1) + user, s))
+    if t != s: open(r, 'w', encoding='utf-8', errors='surrogateescape').write(t)
+PY
 mkdir -p "$out/dosdevices"
 ln -s ../drive_c "$out/dosdevices/c:" && ln -s / "$out/dosdevices/z:"
 regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/wine32-session.reg")
@@ -78,4 +110,7 @@ for r in regs:
         s = s.replace(win(d), win(mount))
     if s != o: open(r, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 PY
+# Nothing in the template leads out of it but dosdevices' c: and z:.
+links=$(find "$out" -type l ! -path "$out/dosdevices/*")
+[ -z "$links" ] || { printf 'page-prefix: links left in %s:\n%s\n' "$out" "$links" >&2; exit 1; }
 echo "$out: $(du -sh "$out" | cut -f1)"

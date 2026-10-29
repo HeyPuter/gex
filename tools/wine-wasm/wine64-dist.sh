@@ -15,8 +15,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
 #               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
-#   pfx64-P     a win64 prefix (wineboot -i, native, no display)
-#   pfs64-P-R   it with 32-bit Wine's session applied (wine32-session.reg; R: that and
+#   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
+#   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (wine64-deps.sh:
 #               FreeType, libwayland, libxml2, xkbcommon, EGL headers;
@@ -142,12 +142,19 @@ N=$C/pe64-$P/install
 
 pfx_make() {
 	# The native Wine makes the prefix; a bare server of its own, no display.
+	# As the page's user (gex), with an empty home: the profile then has no
+	# link to the build machine's user folders (Downloads -> ~/Downloads).
+	mkdir -p home
 	env WINEPREFIX="$PWD/pfx" WINEARCH=win64 WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
+		USER=gex LOGNAME=gex HOME="$PWD/home" XDG_CONFIG_HOME="$PWD/home/.config" \
 		timeout 900 nice -n 10 "$N/bin/wine" wineboot -i
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
+	rm -rf home
 	grep -q '^#arch=win64' pfx/system.reg
 }
-log "win64 prefix ($P)"; step pfx64-$P pfx_make
+# -gex: made as user gex (before, as the build machine's user).
+PX=$P-gex
+log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 
 # The session 32-bit Wine's prefixes have (wine32-session.reg):
 # the 64-bit loader has no Unix side for MountMgr, winebus,
@@ -160,14 +167,14 @@ log "win64 prefix ($P)"; step pfx64-$P pfx_make
 # for a click.
 R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0) | sha256sum | cut -c1-10)
 pfs_make() {
-	cp -a "$C/pfx64-$P/pfx" pfx
+	cp -a "$C/pfx64-$PX/pfx" pfx
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
 	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
 }
-log "win64 prefix's session ($P, $R)"; step pfs64-$P-$R pfs_make
+log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
 deps64_build() {
 	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex-wine32}/dl" JOBS=$J nice -n 10 "$here/wine64-deps.sh" "$PWD" "$C/dl"
@@ -244,7 +251,7 @@ if [ "$M64" != 0 ]; then
 	if [ "${WINE64_M64_NATIVE:-0}" != 0 ]; then
 		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 	fi
-	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$P/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
+	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
 	[ "${WINE64_M64_NATIVE:-0}" = 0 ] || echo "WINE64_NATIVE=$NATIVE"
 	exit 0
 fi
@@ -278,7 +285,7 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	NATIVE=$C/pen64-$K-$NK-twin
 fi
 echo "WINE64_DIST=$DIST"
-echo "WINE64_PREFIX=$C/pfs64-$P-$R/pfx"
+echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"
 echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
