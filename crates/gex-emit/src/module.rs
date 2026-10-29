@@ -708,6 +708,8 @@ impl ModuleBuilder {
             "text base must be instruction-aligned"
         );
         let _ = text_size;
+        // The layout is baked into what this builds (`gex_abi::set_hosted_layout`).
+        gex_abi::note_translated();
 
         let mut m = Module::new();
         // The first parameter of every one of these is the register context.
@@ -1514,10 +1516,45 @@ impl ModuleBuilder {
                 crate::dense::emit_arm(&mut f, k as usize, 0, index, entry, self.block_ty, self.entry_ty);
                 continue;
             }
+            emit_table_guard(&mut f, 0, index, self.block_ty, k);
             f.local_get(0); // ctx argument for the target block
             f.local_get(index);
             f.return_call_indirect(self.block_ty, k);
         }
         f.finish()
     }
+}
+
+/// Hosted only (`gex_abi::hosted`): before calling slot `index` of dispatch
+/// table `k`, check it is inside this thread's table, and if not call slot 0
+/// of table 0, the miss stub, instead.
+///
+/// A hosted process's threads are the host's pthreads, each its own Worker
+/// with its own copy of the tables (a table can't be shared between Workers),
+/// and a Worker installs a translation only when it next misses
+/// (`shims/embed`). The directory is shared, so a Worker can read an entry a
+/// sibling published before it has grown its table to hold the slot. Fixed
+/// layout, that is an out-of-bounds trap the browser's run loop catches and
+/// recovers from; hosted, the caller below may be host C, which a trap would
+/// unwind through. The miss stub reads `ctx::LAST_TARGET` (already stored), and
+/// the host's miss handler installs what the Worker lacks and dispatches
+/// again. A slot inside the table that this Worker has not filled yet already
+/// holds the miss stub, which tables are grown with.
+pub fn emit_table_guard(f: &mut FuncBody, ctx: u32, index: u32, block_ty: u32, k: u32) {
+    if !table_guard() {
+        return;
+    }
+    f.local_get(index);
+    f.table_size(k);
+    f.byte(0x4f); // i32.ge_u
+    f.if_void();
+    f.local_get(ctx);
+    f.i32_const(0);
+    f.return_call_indirect(block_ty, 0);
+    f.end();
+}
+
+/// Whether dispatch carries [`emit_table_guard`]: hosted only.
+pub fn table_guard() -> bool {
+    gex_abi::hosted()
 }

@@ -591,6 +591,13 @@ impl FuncBody {
         self.u32(idx);
     }
 
+    /// `table.size table`.
+    pub fn table_size(&mut self, table: u32) {
+        self.byte(op::MISC_PREFIX);
+        self.u32(16);
+        self.u32(table);
+    }
+
     /// `memory.init seg mem`: copy from a passive data segment.
     pub fn memory_init(&mut self, seg: u32, mem: u32) {
         self.byte(op::MISC_PREFIX);
@@ -872,6 +879,9 @@ impl Module {
     pub fn import_guest_memory(&mut self, module: &str, name: &str, min: u64, max: u64) {
         let mem64 = gex_abi::mem64();
         let max = if mem64 { gex_abi::LIMIT64_PAGES } else { max };
+        // Hosted, the memory is the host's, at whatever size the host has
+        // grown it to; a minimum above that would not link.
+        let min = if gex_abi::hosted() { 0 } else { min };
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),

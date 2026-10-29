@@ -232,8 +232,11 @@ pub fn set_inline_dispatch(on: bool) {
 
 pub fn inline_dispatch() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
-        || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
+    (*ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
+        || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed))
+        // Hosted, every dispatch goes through the module's `enter`, which
+        // carries the table guard (`module::table_guard`).
+        && !gex_abi::hosted()
 }
 
 /// Fold `local.set x; local.get x` into `local.tee x` and strip the tees
@@ -258,6 +261,7 @@ fn t1_fold() -> bool {
 pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
         | (gex_ir::mxcsr_exact() as u8) << 4
+        | (gex_abi::hosted() as u8) << 5
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -268,7 +272,7 @@ pub fn knobs() -> u8 {
 pub fn null_guard_on() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| std::env::var_os("GEX_NULL_GUARD").is_some_and(|v| v != "0"));
-    (env || gex_abi::null_guard()) && !Emitter::no_guard()
+    (env || gex_abi::null_guard()) && !Emitter::no_guard() && !gex_abi::hosted()
 }
 
 /// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
@@ -1263,7 +1267,7 @@ impl<'a> Emitter<'a> {
     fn emit_sp_check(&mut self, pc: u64) {
         self.ctx_base();
         self.f.load(0x29, 3, ctx::SP as u32);
-        self.f.i64_const(gex_abi::STACK_TOP as i64);
+        self.f.i64_const(gex_abi::sp_check_limit() as i64);
         self.f.byte(0x5a); // i64.ge_u
         self.f.if_void();
         self.f.local_get(self.ctx_local);
@@ -2348,7 +2352,7 @@ impl<'a> Emitter<'a> {
     ) {
         self.f.local_get(a);
         self.f.addr_add_const(static_off);
-        self.f.addr_const(gex_abi::GUEST_FLOOR);
+        self.f.addr_const(gex_abi::guest_floor());
         self.f.addr_lt_u();
         self.f.if_void();
         self.flush_conditional();
@@ -2503,11 +2507,11 @@ impl<'a> Emitter<'a> {
         self.f.else_();
         {
             // The first one, out loud.
-            self.f.addr_const(gex_abi::SPLIT_LOCK + 4);
+            self.f.addr_const(gex_abi::split_lock() + 4);
             self.f.load(0x28, 2, 0); // i32.load
             self.f.byte(0x45); // i32.eqz
             self.f.if_void();
-            self.f.addr_const(gex_abi::SPLIT_LOCK + 4);
+            self.f.addr_const(gex_abi::split_lock() + 4);
             self.f.i32_const(1);
             self.f.store(0x36, 2, 0); // i32.store
             self.f.local_get(self.ctx_local);
@@ -2519,7 +2523,7 @@ impl<'a> Emitter<'a> {
             self.f.end();
             // Take the lock.
             self.f.loop_void();
-            self.f.addr_const(gex_abi::SPLIT_LOCK);
+            self.f.addr_const(gex_abi::split_lock());
             self.f.i32_const(0);
             self.f.i32_const(1);
             self.f.atomic(atomic_cmpxchg_op(Ty::I32, MemSz::B4), 2, 0);
@@ -2560,7 +2564,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             // Let it go.
-            self.f.addr_const(gex_abi::SPLIT_LOCK);
+            self.f.addr_const(gex_abi::split_lock());
             self.f.i32_const(0);
             self.f.atomic(atomic_store_op(Ty::I32, MemSz::B4), 2, 0);
         }
@@ -5529,6 +5533,7 @@ impl<'a> Emitter<'a> {
                 crate::dense::emit_arm(&mut self.f, k as usize, self.ctx_local, index, entry, self.cx.block_ty, self.cx.entry_ty);
                 continue;
             }
+            crate::module::emit_table_guard(&mut self.f, self.ctx_local, index, self.cx.block_ty, k);
             self.f.local_get(self.ctx_local);
             self.f.local_get(index);
             self.f.return_call_indirect(self.cx.block_ty, k);

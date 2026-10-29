@@ -4674,7 +4674,7 @@ impl<'a> Lifter<'a> {
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
 
-        let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
+        let scratch = self.b.const_i64(gex_abi::exclusive_scratch());
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
 
         let mon_value = self.b.read(GuestReg::MonValue);

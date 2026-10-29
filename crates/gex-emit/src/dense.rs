@@ -105,7 +105,9 @@ pub fn set(on: bool) {
 }
 
 pub fn on() -> bool {
-    ON.load(Ordering::Relaxed)
+    // Hosted, the slot maps would need relocating, and nothing hosted wants
+    // dense tables: a hosted process's guest code is a few libraries.
+    ON.load(Ordering::Relaxed) && !gex_abi::hosted()
 }
 
 /// Whether directory table `k` may be dense.

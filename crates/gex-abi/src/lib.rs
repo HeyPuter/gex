@@ -156,13 +156,26 @@ pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
 /// [`DISPATCH_DIR`] for M32, [`DISPATCH_DIR64`] for M64. Also [`page_gen`].
 #[inline]
 pub fn dispatch_dir() -> u64 {
-    if mem64() { DISPATCH_DIR64 } else { DISPATCH_DIR }
+    if mem64() {
+        DISPATCH_DIR64
+    } else {
+        match hosted_base() {
+            0 => DISPATCH_DIR,
+            b => b + hosted::DIR,
+        }
+    }
 }
 
 /// Pages [`dispatch_dir`] covers.
 #[inline]
 pub fn dispatch_max_pages() -> u64 {
-    if mem64() { DISPATCH_MAX_PAGES64 } else { DISPATCH_MAX_PAGES }
+    if mem64() {
+        DISPATCH_MAX_PAGES64
+    } else if hosted() {
+        hosted::MAX_PAGES
+    } else {
+        DISPATCH_MAX_PAGES
+    }
 }
 
 /// The [`PAGE_GEN`] words of this flavour (the directory, as for M32).
@@ -174,7 +187,14 @@ pub fn page_gen() -> u64 {
 /// The [`PATCHED_PAGES`] bits of this flavour.
 #[inline]
 pub fn patched_pages() -> u64 {
-    if mem64() { PATCHED_PAGES64 } else { PATCHED_PAGES }
+    if mem64() {
+        PATCHED_PAGES64
+    } else {
+        match hosted_base() {
+            0 => PATCHED_PAGES,
+            b => b + hosted::PATCHED,
+        }
+    }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -187,6 +207,188 @@ pub fn dispatch_dir_range() -> (u64, u64) {
 #[inline]
 pub fn patched_pages_range() -> (u64, u64) {
     (patched_pages(), patched_pages() + dispatch_max_pages() / 8)
+}
+
+// ---------------------------------------------------------------------------
+// Hosted layout
+// ---------------------------------------------------------------------------
+
+/// Where the runtime's fixed structures sit when gex is hosted in another
+/// program's memory (`shims/embed`): offsets into one block the host placed,
+/// instead of the low region from address zero.
+///
+/// The fixed layout assumes gex owns the memory: the reserved region, the
+/// dispatch directory, the image bases, the arena. A host that owns it (an
+/// emscripten program: data from 0x400, dlmalloc above) can't give any of
+/// those up, so everything translated code reads at a constant address moves
+/// into this block, and the rest of the layout -- image bases, stack, arena,
+/// the 2 GiB cap -- has no meaning: every object is position-independent and
+/// placed by the host's allocator, so code may sit anywhere below 4 GiB, and
+/// the directory covers all of it.
+///
+/// Nothing else changes: guest VA is still the linear-memory offset, and the
+/// M32 guard (`< GUEST_LIMIT`, else [`POISON_ADDR`]) is the host's whole
+/// memory, 0xFFFF_0000 bytes.
+pub mod hosted {
+    /// The fixed words, at the start: as the low region's, but packed.
+    /// `[u32; DISPATCH_TABLES]`, see [`super::BODY_LIMITS`].
+    pub const BODY_LIMITS: u64 = 0x000;
+    /// gex-emit's dense slot maps (`dense::MAPS`): unused, dense dispatch is
+    /// off hosted, but kept so the words keep their low-region order.
+    pub const DENSE_MAPS: u64 = 0x020;
+    /// See [`super::NEST_EXITS`].
+    pub const NEST_EXITS: u64 = 0x040;
+    /// See [`super::BOOT_STACK_COUNTER`].
+    pub const BOOT_STACK_COUNTER: u64 = 0x048;
+    /// See [`super::SPLIT_LOCK`]: the lock word, and the reported word after it.
+    pub const SPLIT_LOCK: u64 = 0x080;
+    /// See [`super::EXCLUSIVE_SCRATCH`].
+    pub const EXCLUSIVE_SCRATCH: u64 = 0x0c0;
+    /// The embedding's own words (its module log's length, ...), to the end of
+    /// the first page.
+    pub const EMBED: u64 = 0x400;
+    /// Return addresses a host gives the guest functions it calls, one
+    /// instruction each: never executable, so a return there always misses,
+    /// and the miss is how the host learns the call returned.
+    pub const PADS: u64 = 0x1000;
+    pub const PADS_BYTES: u64 = 0x1000;
+    /// Guest addresses that stand for host functions: executable, one
+    /// instruction each, each bound to the host function it names.
+    pub const THUNKS: u64 = 0x2000;
+    pub const THUNKS_BYTES: u64 = 0xe000;
+    /// See [`super::FCACHE`]: the same size.
+    pub const FCACHE: u64 = 0x1_0000;
+    /// See [`super::PATCHED_PAGES`]: one bit per page of [`MAX_PAGES`].
+    pub const PATCHED: u64 = 0x5_0000;
+    /// The dispatch directory, one `u32` per page of all 4 GiB.
+    pub const DIR: u64 = 0x10_0000;
+    /// Pages the hosted directory covers: the whole 32-bit memory.
+    pub const MAX_PAGES: u64 = (1 << 32) / super::DISPATCH_PAGE;
+    /// The block's size: 5 MiB.
+    pub const SIZE: u64 = DIR + MAX_PAGES * 4;
+    /// The block's alignment.
+    pub const ALIGN: u64 = 0x1_0000;
+
+    const _: () = {
+        assert!(BODY_LIMITS + 4 * super::DISPATCH_TABLES as u64 <= DENSE_MAPS);
+        assert!(DENSE_MAPS + 4 * super::DISPATCH_TABLES as u64 <= NEST_EXITS);
+        assert!(EXCLUSIVE_SCRATCH + 64 <= EMBED);
+        assert!(PADS + PADS_BYTES <= THUNKS && THUNKS + THUNKS_BYTES <= FCACHE);
+        assert!(FCACHE + super::FCACHE_BYTES <= PATCHED);
+        assert!(PATCHED + MAX_PAGES / 8 <= DIR);
+    };
+}
+
+/// The hosted block's base, or 0 for the fixed layout.
+static HOSTED_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The lowest address a hosted guest may name (the host's `GLOBAL_BASE`).
+static HOSTED_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set by the first translation: the layout is baked into everything
+/// translated after it, so it may not change once there is any.
+static TRANSLATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Host gex in another program's memory, with the runtime's fixed structures
+/// in the [`hosted::SIZE`]-byte block at `base` and nothing a guest may name
+/// below `floor`. Once per process, before anything is translated.
+pub fn set_hosted_layout(base: u64, floor: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    assert!(!mem64(), "a hosted layout is a 32-bit memory's");
+    assert!(base != 0 && base % hosted::ALIGN == 0, "hosted block {base:#x} not {:#x}-aligned", hosted::ALIGN);
+    assert!(base + hosted::SIZE <= GUEST_LIMIT, "hosted block {base:#x} past the memory");
+    assert!(!TRANSLATED.load(Relaxed), "set_hosted_layout after a translation");
+    assert!(!null_guard(), "no null guard hosted: the host's data starts at {floor:#x}");
+    HOSTED_FLOOR.store(floor, Relaxed);
+    HOSTED_BASE.store(base, Relaxed);
+}
+
+/// The hosted block's base, or 0 for the fixed layout.
+#[inline]
+pub fn hosted_base() -> u64 {
+    HOSTED_BASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether gex is hosted ([`set_hosted_layout`]).
+#[inline]
+pub fn hosted() -> bool {
+    hosted_base() != 0
+}
+
+/// What a translation's cache key must add for the layout it was made
+/// against: the hosted block's base (its addresses are baked into the code),
+/// or 0 for the fixed layout, whose keys add nothing.
+pub fn layout_key() -> u64 {
+    hosted_base()
+}
+
+/// Called by the translators as they begin a module: from now on the layout
+/// is fixed.
+#[inline]
+pub fn note_translated() {
+    TRANSLATED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn hosted_or(fixed: u64, offset: u64) -> u64 {
+    match hosted_base() {
+        0 => fixed,
+        b => b + offset,
+    }
+}
+
+/// [`FCACHE`] of this layout.
+#[inline]
+pub fn fcache() -> u64 {
+    hosted_or(FCACHE, hosted::FCACHE)
+}
+
+/// [`fcache_entry`] of this layout.
+#[inline]
+pub fn fcache_entry_at(a: u64) -> u64 {
+    fcache() + 8 * fcache_slot(a)
+}
+
+/// [`BODY_LIMITS`] of this layout.
+#[inline]
+pub fn body_limits() -> u64 {
+    hosted_or(BODY_LIMITS, hosted::BODY_LIMITS)
+}
+
+/// [`NEST_EXITS`] of this layout.
+#[inline]
+pub fn nest_exits() -> u64 {
+    hosted_or(NEST_EXITS, hosted::NEST_EXITS)
+}
+
+/// [`SPLIT_LOCK`] of this layout.
+#[inline]
+pub fn split_lock() -> u64 {
+    hosted_or(SPLIT_LOCK, hosted::SPLIT_LOCK)
+}
+
+/// [`EXCLUSIVE_SCRATCH`] of this layout.
+#[inline]
+pub fn exclusive_scratch() -> u64 {
+    hosted_or(EXCLUSIVE_SCRATCH, hosted::EXCLUSIVE_SCRATCH)
+}
+
+/// [`BOOT_STACK_COUNTER`] of this layout.
+#[inline]
+pub fn boot_stack_counter() -> u64 {
+    hosted_or(BOOT_STACK_COUNTER, hosted::BOOT_STACK_COUNTER)
+}
+
+/// [`GUEST_FLOOR`] of this layout: the host's data floor, hosted.
+#[inline]
+pub fn guest_floor() -> u64 {
+    if hosted() { HOSTED_FLOOR.load(core::sync::atomic::Ordering::Relaxed) } else { GUEST_FLOOR }
+}
+
+/// What a debug stack-pointer check (`GEX_CHECK_SP`) takes as the top of any
+/// guest stack: [`STACK_TOP`], or, hosted, where stacks are the host's
+/// allocations and can be anywhere, the top of the memory.
+#[inline]
+pub fn sp_check_limit() -> u64 {
+    if hosted() { GUEST_LIMIT } else { STACK_TOP }
 }
 
 /// Address used for effective addresses that do not fit in 32 bits. Chosen so
@@ -1075,6 +1277,7 @@ static NULL_GUARD_ON: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// tier 1 and a guest that reads through a null
 /// pointer is broken anyway.
 pub fn set_null_guard(on: bool) {
+    assert!(!on || !hosted(), "no null guard hosted: the host's data is below NULL_GUARD");
     NULL_GUARD_ON.store(on, core::sync::atomic::Ordering::Relaxed);
 }
 

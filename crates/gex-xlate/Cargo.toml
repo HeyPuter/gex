@@ -34,3 +34,5 @@ fjit = ["dep:gex-fjit", "dep:gex-cgen"]
 # The relayout test's layout oracle reads the fixture's DWARF.
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+# The hosted test walks what it translated.
+wasmparser = "0.219.2"

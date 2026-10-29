@@ -991,7 +991,7 @@ pub fn translate_object(
     let mut scanned: Vec<u64> = Vec::new();
     let seeds = if seeds.is_empty() {
         arch::sweep(
-            &|pc, buf| fetch_code_bytes(memory, executable, pc, buf),
+            &|pc, buf| fetch_code_bytes(GuestWindow::whole(memory), executable, pc, buf),
             lo,
             hi,
             &[],
@@ -1003,7 +1003,7 @@ pub fn translate_object(
     };
     stage("seeds", seeds.len());
     let (blocks, mut stats) = discover(
-        memory,
+        GuestWindow::whole(memory),
         lo,
         seeds,
         executable,
@@ -1136,8 +1136,42 @@ pub fn translate_runtime(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
+    translate_runtime_in(
+        GuestWindow::whole(memory),
+        entry,
+        executable,
+        known,
+        page_table,
+        limits,
+        max_blocks,
+        shared_memory,
+        intrinsics,
+    )
+}
+
+/// [`translate_runtime`] reading guest memory through a window: `window`
+/// holds guest addresses `[window.base, window.base + window.bytes.len())`,
+/// and only those are read (an instruction outside it is not fetchable, a
+/// load outside it does not fold).
+///
+/// For a host whose guest code may sit where a slice from address zero can't
+/// reach: a Rust slice is at most `isize::MAX` bytes, 2 GiB on wasm32, and
+/// can't start at address zero at all. A hosted embedding (`shims/embed`)
+/// hands over the mapping being translated.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_runtime_in(
+    window: GuestWindow<'_>,
+    entry: u64,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    page_table: PageTable,
+    limits: BlockLimits,
+    max_blocks: usize,
+    shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
+) -> (TranslatedModule, Stats) {
     translate_seeded(
-        memory,
+        window,
         entry,
         &[entry],
         executable,
@@ -1166,8 +1200,8 @@ fn function_stubs(
     let mut blocks: Vec<Block> = Vec::new();
     let mut have: HashSet<u64> = HashSet::new();
     for &e in entries {
-        if have.insert(e) && fetchable(memory, executable, e) && !known(e) {
-            blocks.push(lift_one(e, memory, executable, limits).0);
+        if have.insert(e) && fetchable(GuestWindow::whole(memory), executable, e) && !known(e) {
+            blocks.push(lift_one(e, GuestWindow::whole(memory), executable, limits).0);
         }
     }
     // As `translate_seeded`: blocks sharing a dispatch slot go together.
@@ -1177,9 +1211,9 @@ fn function_stubs(
         while i < blocks.len() {
             let lo = blocks[i].start & !(span - 1);
             for b in lo..lo + span {
-                if !have.contains(&b) && known(b) && fetchable(memory, executable, b) {
+                if !have.contains(&b) && known(b) && fetchable(GuestWindow::whole(memory), executable, b) {
                     have.insert(b);
-                    blocks.push(lift_one(b, memory, executable, limits).0);
+                    blocks.push(lift_one(b, GuestWindow::whole(memory), executable, limits).0);
                 }
             }
             i += 1;
@@ -1261,7 +1295,7 @@ pub fn translate_runtime_prebuilt(
 /// one module.
 #[allow(clippy::too_many_arguments)]
 fn translate_seeded(
-    memory: &[u8],
+    memory: GuestWindow<'_>,
     entry: u64,
     seeds: &[u64],
     executable: &(dyn Fn(u64) -> bool + Sync),
@@ -1334,7 +1368,7 @@ pub fn set_discover_skip(bits: u32) {
 /// module -- see [`emit_modules`].
 #[allow(clippy::too_many_arguments)]
 fn discover(
-    memory: &[u8],
+    memory: GuestWindow<'_>,
     entry: u64,
     seeds: &[u64],
     executable: &(dyn Fn(u64) -> bool + Sync),
@@ -1453,27 +1487,48 @@ fn discover(
     (collected, stats)
 }
 
+/// Guest memory as the runtime translator reads it: `bytes` holds guest
+/// addresses `[base, base + bytes.len())`. See [`translate_runtime_in`].
+#[derive(Clone, Copy)]
+pub struct GuestWindow<'a> {
+    pub bytes: &'a [u8],
+    pub base: u64,
+}
+
+impl<'a> GuestWindow<'a> {
+    /// A slice indexed by guest address: the window from zero.
+    pub fn whole(memory: &'a [u8]) -> GuestWindow<'a> {
+        GuestWindow { bytes: memory, base: 0 }
+    }
+
+    /// Where in `bytes` the `n` bytes at guest address `a` are, when all of
+    /// them are inside.
+    fn offset(&self, a: u64, n: usize) -> Option<usize> {
+        let off = usize::try_from(a.checked_sub(self.base)?).ok()?;
+        (off.checked_add(n)? <= self.bytes.len()).then_some(off)
+    }
+}
+
 /// Whether `pc` holds an instruction this translation may read.
-fn fetchable(memory: &[u8], executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
+fn fetchable(memory: GuestWindow<'_>, executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
     pc % INST_ALIGN == 0
         && executable(pc)
-        && pc as usize + INST_ALIGN as usize <= memory.len()
+        && memory.offset(pc, INST_ALIGN as usize).is_some()
 }
 
 /// Copy the instruction bytes at `pc` out of live memory, stopping at the
 /// first byte that is not executable, so a block never decodes past the end
 /// of a mapping.
 fn fetch_code_bytes(
-    memory: &[u8],
+    memory: GuestWindow<'_>,
     executable: &(dyn Fn(u64) -> bool + Sync),
     pc: u64,
     buf: &mut arch::FetchBuf,
 ) -> usize {
-    if !fetchable(memory, executable, pc) {
+    let Some(off) = memory.offset(pc, INST_ALIGN as usize).filter(|_| fetchable(memory, executable, pc)) else {
         return 0;
-    }
-    let off = pc as usize;
-    let mut n = (memory.len() - off).min(16);
+    };
+    let mut n = (memory.bytes.len() - off).min(16);
     // The first `INST_ALIGN` bytes are known executable; check the rest.
     let mut k = INST_ALIGN as usize;
     while k < n {
@@ -1483,7 +1538,7 @@ fn fetch_code_bytes(
         }
         k += 1;
     }
-    buf[..n].copy_from_slice(&memory[off..off + n]);
+    buf[..n].copy_from_slice(&memory.bytes[off..off + n]);
     n
 }
 
@@ -1530,26 +1585,28 @@ fn is_volatile(addr: u64) -> bool {
 /// its head only, which still catches a JIT reusing the region.
 const GUARD_MAX: usize = 256;
 
-/// How much of `memory` exists: on wasm, no more than the memory's current
-/// size (a guest slice names more than has been grown).
-fn live_len(memory: &[u8]) -> usize {
+/// One past the last guest address of `memory` that exists: on wasm, no
+/// more than the memory's current size (a guest slice names more than has
+/// been grown).
+fn live_end(memory: GuestWindow<'_>) -> u64 {
+    let end = memory.base + memory.bytes.len() as u64;
     #[cfg(target_arch = "wasm32")]
     {
-        ((core::arch::wasm32::memory_size(0) as u64) << 16).min(memory.len() as u64) as usize
+        ((core::arch::wasm32::memory_size(0) as u64) << 16).min(end)
     }
     #[cfg(target_arch = "wasm64")]
     {
-        ((core::arch::wasm64::memory_size(0) as u64) << 16).min(memory.len() as u64) as usize
+        ((core::arch::wasm64::memory_size(0) as u64) << 16).min(end)
     }
     #[cfg(not(target_family = "wasm"))]
     {
-        memory.len()
+        end
     }
 }
 
 fn lift_one(
     addr: u64,
-    memory: &[u8],
+    memory: GuestWindow<'_>,
     executable: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
 ) -> (Block, Option<u64>) {
@@ -1558,27 +1615,29 @@ fn lift_one(
     // trampoline next to code already running), and bytes read after the
     // decode would vouch for a translation of the earlier ones.
     let snapshot: Option<Vec<u8>> = is_volatile(addr).then(|| {
-        let lo = (addr as usize).min(memory.len());
-        let hi = lo.saturating_add(GUARD_MAX).min(memory.len());
-        memory[lo..hi].to_vec()
+        let len = memory.bytes.len();
+        let lo = addr.checked_sub(memory.base).map_or(len, |o| (o as usize).min(len));
+        let hi = lo.saturating_add(GUARD_MAX).min(len);
+        memory.bytes[lo..hi].to_vec()
     });
     let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
     // `memory` may span the whole nameable space (the page's guest slice):
     // only what the memory has grown to is read. A constant address in the
     // pages KUSER_SHARED_DATA folding moves reads them where they are.
-    let live = live_len(memory);
+    let live = live_end(memory);
     let read = |a: u64, bytes: u32| -> Option<u64> {
         let a = gex_abi::fold_kuser(a).unwrap_or(a);
-        let off = usize::try_from(a).ok()?;
-        if off.checked_add(bytes as usize)? > live {
+        if a.checked_add(bytes as u64)? > live {
             return None;
         }
+        let off = memory.offset(a, bytes as usize)?;
+        let m = memory.bytes;
         Some(match bytes {
-            1 => memory[off] as u64,
-            2 => u16::from_le_bytes(memory[off..off + 2].try_into().unwrap()) as u64,
-            4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
-            _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
+            1 => m[off] as u64,
+            2 => u16::from_le_bytes(m[off..off + 2].try_into().unwrap()) as u64,
+            4 => u32::from_le_bytes(m[off..off + 4].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(m[off..off + 8].try_into().unwrap()),
         })
     };
     if !gex_abi::X86 {
@@ -1714,7 +1773,7 @@ mod tests {
         }
         let seeds: Vec<u64> = (base..base + span).step_by(4).collect();
         let (blocks, _) = discover(
-            &memory,
+            GuestWindow::whole(&memory),
             base,
             &seeds,
             &|x| x >= base && x < base + span,
