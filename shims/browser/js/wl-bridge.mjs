@@ -210,8 +210,73 @@ const RING_WORDS = K_WORDS + RING * EV;
 const D_BYTES = 64 << 10;
 const D_WORDS = 1 + D_BYTES / 4;
 
-const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS;
+// The clipboard (one a page, every process's clients and the page's own):
+// a lock, a number that moves with each new text, who set it (0 the page,
+// 1 a guest client), the text's length, then its bytes (UTF-8).
+const C_LOCK = 0;
+const C_SERIAL = 1;
+const C_FROM = 2;
+const C_LEN = 3;
+const C_HEAD = 4;
+const C_BYTES = 1 << 20;
+const C_WORDS = C_HEAD + C_BYTES / 4;
+
+const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS + C_WORDS;
 const dragBase = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
+const clipBase = dragBase + D_WORDS;
+
+function clipLock(a) {
+  while (Atomics.compareExchange(a, clipBase + C_LOCK, 0, 1) !== 0) {
+    // Writers hold it for one copy of at most a megabyte.
+    if (typeof Atomics.wait === 'function' && !globalThis.document) Atomics.wait(a, clipBase + C_LOCK, 1, 1);
+  }
+}
+function clipUnlock(a) {
+  Atomics.store(a, clipBase + C_LOCK, 0);
+  Atomics.notify(a, clipBase + C_LOCK);
+}
+
+/** Put `bytes` on the clipboard, from the page (`from` 0) or a guest (1):
+ *  its new number. */
+function clipPut(a, bytes, from) {
+  const n = Math.min(bytes.length, C_BYTES);
+  clipLock(a);
+  new Uint8Array(a.buffer, (clipBase + C_HEAD) * 4, n).set(bytes.subarray(0, n));
+  Atomics.store(a, clipBase + C_LEN, n);
+  Atomics.store(a, clipBase + C_FROM, from);
+  const serial = (Atomics.add(a, clipBase + C_SERIAL, 1) + 1) >>> 0;
+  clipUnlock(a);
+  return serial;
+}
+
+/** The clipboard: `{ serial, from: 'page' | 'guest', text }` (serial 0:
+ *  nothing yet). */
+export function getClipboard(channel) {
+  const a = new Int32Array(channel.arena);
+  clipLock(a);
+  const serial = Atomics.load(a, clipBase + C_SERIAL) >>> 0;
+  const from = Atomics.load(a, clipBase + C_FROM) ? 'guest' : 'page';
+  const n = Math.min(Atomics.load(a, clipBase + C_LEN) >>> 0, C_BYTES);
+  const bytes = new Uint8Array(n);
+  bytes.set(new Uint8Array(a.buffer, (clipBase + C_HEAD) * 4, n));
+  clipUnlock(a);
+  return { serial, from, text: new TextDecoder().decode(bytes) };
+}
+
+/** The clipboard's number alone, cheap to poll. */
+export function clipboardSerial(channel) {
+  return Atomics.load(new Int32Array(channel.arena), clipBase + C_SERIAL) >>> 0;
+}
+
+/** The page's text on the clipboard: every client with a data device is
+ *  offered it. Its number. */
+export function setClipboard(channel, text) {
+  const a = new Int32Array(channel.arena);
+  const serial = clipPut(a, new TextEncoder().encode(String(text)), 0);
+  // Every process's pump offers it, idle ones too.
+  for (let b = 0; b < BLOCKS; b++) if (Atomics.load(a, blockBase(b) + B_TOKEN)) wakeBlock(channel, a, b);
+  return serial;
+}
 
 const blockBase = (b) => M_WORDS + b * BLOCK_WORDS;
 const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
@@ -1035,6 +1100,31 @@ export class WlProxy {
     return v && v.buffer === memory.buffer ? v : (this.#view = new Int32Array(memory.buffer));
   }
 
+  #clipSeen = 0;
+
+  /** The clipboard's number (`wl_clip_serial`). */
+  clipSerial() {
+    return (this.#clipSeen = Atomics.load(this.#a, clipBase + C_SERIAL) >>> 0);
+  }
+
+  /** The clipboard's text, up to `max` bytes into `ptr` of `memory`: its
+   *  whole length (`wl_clip_get`). */
+  clipGet(memory, ptr, max) {
+    const a = this.#a;
+    clipLock(a);
+    const n = Math.min(Atomics.load(a, clipBase + C_LEN) >>> 0, C_BYTES);
+    const k = Math.min(n, max);
+    new Uint8Array(memory.buffer, ptr, k).set(new Uint8Array(a.buffer, (clipBase + C_HEAD) * 4, k));
+    clipUnlock(a);
+    return n;
+  }
+
+  /** A client's selection onto the clipboard (`wl_clip_set`): its number,
+   *  which this process has then seen. */
+  clipSet(memory, ptr, len) {
+    return (this.#clipSeen = clipPut(this.#a, new Uint8Array(memory.buffer, ptr, len), 1));
+  }
+
   /** The page's drag data, up to `max` bytes into `ptr` of `memory`: its
    *  whole length. */
   dragData(memory, ptr, max) {
@@ -1055,8 +1145,10 @@ export class WlProxy {
 
   /** Whether this process's input ring holds an event. */
   inputPending() {
-    // A resized output is work for the pump as well (`outputSize`).
+    // A resized output is work for the pump as well (`outputSize`), and a
+    // new clipboard (`clipSerial`).
     if (this.#outSeen !== this.#outNow()) return true;
+    if (this.#clipSeen !== (Atomics.load(this.#a, clipBase + C_SERIAL) >>> 0)) return true;
     if (this.#block < 0) return false;
     const a = this.#a;
     return Atomics.load(a, this.#ring + K_HEAD) !== Atomics.load(a, this.#ring + K_TAIL);

@@ -121,6 +121,7 @@ export class Compositor {
       } else if (m.kind === 'lock-wanted') {
         // A press on a window whose client asks for a locked pointer: the
         // browser's lock, while the click's activation lasts.
+        if (m.late && navigator.userActivation && !navigator.userActivation.isActive) return;
         if (this.pointerLock && document.pointerLockElement !== this.#canvas) this.#canvas.requestPointerLock?.()?.catch?.(() => {});
       } else if (m.kind === 'lock-release') {
         if (this.#guestLock) document.exitPointerLock?.();

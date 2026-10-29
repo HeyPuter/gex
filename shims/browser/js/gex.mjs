@@ -2101,6 +2101,9 @@ export class Gex {
         // client says of it, for the page (wl-bridge.mjs `waitDrag`).
         wl_drag_data: (ptr, max) => this.#wl?.dragData(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         wl_drag_status: (serial, flags) => this.#wl?.dragStatus(serial >>> 0, flags >>> 0),
+        wl_clip_serial: () => this.#wl?.clipSerial?.() ?? 0,
+        wl_clip_get: (ptr, max) => this.#wl?.clipGet?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        wl_clip_set: (ptr, len) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0) ?? 0,
     };
   }
 

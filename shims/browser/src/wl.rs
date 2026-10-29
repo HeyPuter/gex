@@ -58,6 +58,31 @@ extern "C" {
     /// enter): [`DRAG_ACCEPTS`] and the other `DRAG_*` bits. Said when it
     /// changes, and once at the drop.
     fn wl_drag_status(serial: u32, flags: u32);
+    /// The page's clipboard (one for every process): its number, which
+    /// moves with each new text; its text, up to `max` bytes into `ptr`,
+    /// returning the whole length; and a client's new selection put there,
+    /// returning its number.
+    fn wl_clip_serial() -> u32;
+    fn wl_clip_get(ptr: u32, max: u32) -> u32;
+    fn wl_clip_set(ptr: u32, len: u32) -> u32;
+}
+
+/// The clipboard's text types, as offered to a client, best first; and the
+/// largest text carried.
+const CLIP_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"];
+const CLIP_MAX: usize = 1 << 20;
+
+/// The clipboard on one client's side (`Session::clip`).
+#[derive(Default)]
+struct SessionClip {
+    /// The page clipboard's number last offered to (or set by) this client.
+    seen: u32,
+    /// Its text, for the client's receives of the offer.
+    text: Vec<u8>,
+    /// Text still to write into a client's receive descriptor.
+    writes: Vec<(Arc<OpenFile>, usize)>,
+    /// The client's own selection being read: the read end and what came.
+    read: Option<(Arc<OpenFile>, Vec<u8>)>,
 }
 
 /// `wl_drag_status` bits: a drop now would be taken; the drop was handed
@@ -425,6 +450,8 @@ struct Session {
     /// The page's drag over this client: its serial, its data, and what was
     /// last said of it.
     drag: Option<SessionDrag>,
+    /// The clipboard, between this client and the page.
+    clip: SessionClip,
     /// Event bytes the socket had no room for yet, and how many have gone.
     out: Vec<u8>,
     sent: usize,
@@ -452,12 +479,103 @@ fn drag_data() -> Vec<u8> {
 }
 
 impl Session {
+    /// The clipboard, each pump: the page's new text offered to the client
+    /// (unless the client set it), the client's new selection asked for and
+    /// read, and receives written.
+    fn pump_clip(&mut self, out_fds: &mut Vec<Arc<OpenFile>>) {
+        // An X client's copy, through the X window manager (Xwayland's).
+        if let Some(text) = self.xwm.as_mut().and_then(|x| x.take_copied()) {
+            self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32) };
+        }
+        let device = self.client.has_data_device();
+        // The client's own selection: ask for its text over a pipe.
+        if let Some(change) = self.client.take_selection_change().filter(|_| device) {
+            self.clip.read = None;
+            if let Some((source, mimes)) = change {
+                let mime = CLIP_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m));
+                if let (Some(mime), Some(r)) = (mime, crate::global_pipes()) {
+                    let id = (r.new)(crate::my_pid());
+                    if id >= 0 {
+                        let end = |write: bool| {
+                            OpenFile::new(
+                                Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write, remote: r }),
+                                format!("pipe:[{id}]"),
+                                if write { 1 } else { 0 },
+                                !write,
+                                write,
+                            )
+                        };
+                        self.client.ask_source(source, mime);
+                        out_fds.push(end(true));
+                        self.clip.read = Some((end(false), Vec::new()));
+                    }
+                }
+            }
+        }
+        if let Some((file, got)) = self.clip.read.as_mut() {
+            let mut buf = [0u8; 16384];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => {
+                        // The whole text: the page's clipboard now.
+                        let text = std::mem::take(got);
+                        self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32) };
+                        self.clip.read = None;
+                        break;
+                    }
+                    Ok(n) => {
+                        if got.len() < CLIP_MAX {
+                            got.extend_from_slice(&buf[..n as usize]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // The page's new text, offered.
+        let serial = unsafe { wl_clip_serial() };
+        if serial != 0 && serial != self.clip.seen {
+            self.clip.seen = serial;
+            let mut buf = vec![0u8; CLIP_MAX];
+            let n = (unsafe { wl_clip_get(buf.as_mut_ptr() as u32, buf.len() as u32) } as usize).min(CLIP_MAX);
+            buf.truncate(n);
+            if let Some(x) = self.xwm.as_mut() {
+                x.set_clipboard(buf.clone());
+            }
+            self.clip.text = buf;
+            if device {
+                self.client.offer_selection(CLIP_MIMES);
+            }
+        }
+        // Receives, written as far as each descriptor takes.
+        let text = &self.clip.text;
+        self.clip.writes.retain_mut(|(file, at)| {
+            while *at < text.len() {
+                match file.write(&text[*at..]) {
+                    Ok(n) if n > 0 => *at += n as usize,
+                    Ok(_) => return false,
+                    Err(e) if e == gex_kernel::Errno::EAGAIN => return true,
+                    Err(_) => return false,
+                }
+            }
+            false
+        });
+    }
+
     /// The page's drag, after this turn's events and requests: the data
     /// written into each receive the client made (and that descriptor let
     /// go, so the client reads to its end), and what it says of the drag
     /// told to the page when that changed.
     fn answer_drag(&mut self) {
-        let receives = self.client.take_receives();
+        let mut receives = self.client.take_receives();
+        // The clipboard's: its text, written as the descriptor takes it.
+        let clip: Vec<_> = receives.iter().filter(|r| self.client.is_host_selection(r.offer)).cloned().collect();
+        receives.retain(|r| !self.client.is_host_selection(r.offer));
+        for r in clip {
+            if let Some(file) = self.fds.get_mut(r.fd as usize).and_then(Option::take) {
+                self.clip.writes.push((file, 0));
+            }
+        }
         let Some(d) = self.drag.as_mut() else {
             // No drag of the page's: nothing to send.
             for r in receives {
@@ -735,6 +853,8 @@ impl WaylandDevice {
                 }
             }
             s.answer_drag();
+            let mut clip_fds = Vec::new();
+            s.pump_clip(&mut clip_fds);
             // The X window manager, if this client is an X server. Connected
             // lazily: the socket only exists once Xwayland has bound it, which
             // is after its Wayland connection is up.
@@ -757,6 +877,10 @@ impl WaylandDevice {
             }
             if s.xwm.is_none() && s.xwm_tries % 64 == 1 && proc_cx.x_server {
                 s.xwm = crate::xwm::connect(&proc_cx);
+                // The clipboard as it is, for the manager to own.
+                if s.xwm.is_some() {
+                    s.clip.seen = 0;
+                }
                 if s.xwm.is_none() {
                     // Once, and only from the process that is the X server: a
                     // manager that cannot reach the server is the difference
@@ -780,6 +904,11 @@ impl WaylandDevice {
                 }
             }
             s.out.extend_from_slice(&s.client.take_outgoing());
+            // A descriptor for the client's source to write its selection
+            // into, riding with the `send` that asks for it.
+            if !clip_fds.is_empty() {
+                s.socket.stage_send(clip_fds);
+            }
             // A `wl_keyboard.keymap` event owes a readable descriptor for its
             // `h` argument. The compositor state machine cannot make one (it has
             // no kernel); here we back it with an in-memory file holding the xkb
@@ -1035,6 +1164,7 @@ impl HostListener for WaylandDevice {
             idx,
             fds: Vec::new(),
             drag: None,
+            clip: SessionClip::default(),
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),

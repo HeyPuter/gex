@@ -375,6 +375,8 @@ export class DomDesktop {
   pointerLock = false;
   onpointerlock = null;
   #locked = null;
+  /** The window the last press was on. */
+  #pressed = null;
   #onLockChange = () => {
     const el = document.pointerLockElement;
     const win = el ? [...this.#windows.values()].find((w) => w.canvas === el) ?? null : null;
@@ -689,6 +691,7 @@ export class DomDesktop {
       if (live.has(k)) continue;
       this.#windows.delete(k);
       this.#focusPrev = this.#focusPrev.filter((w) => w !== win);
+      if (this.#pressed === win) this.#pressed = null;
       if (this.#focus === win) {
         // Back to the window that had it before, or the client's next key goes
         // nowhere: Win32 does not activate anything when a menu, a tooltip or
@@ -751,8 +754,15 @@ export class DomDesktop {
       win.onfullscreen?.(fs);
     }
     // The client's lock asked for (taken at a click) or given up.
+    const wanted = !!win.wantsLock;
     win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
     if (!win.wantsLock && this.#locked === win) document.exitPointerLock?.();
+    // Asked for by the window last pressed, after the press (an X program's
+    // grab on a click): taken while that click's activation lasts.
+    if (win.wantsLock && !wanted && this.pointerLock && this.#pressed === win && !this.#locked
+        && navigator.userActivation?.isActive && document.pointerLockElement !== win.canvas) {
+      win.canvas.requestPointerLock?.()?.catch?.(() => {});
+    }
     const noInput = !takesPointer(s);
     if (noInput !== win.noInput) {
       win.noInput = noInput;
@@ -1004,6 +1014,7 @@ export class DomDesktop {
       if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
+      this.#pressed = win;
       if (this.#locked === win) {
         button(e, true, { t: Math.round(e.timeStamp) });
         return;

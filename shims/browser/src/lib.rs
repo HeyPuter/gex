@@ -1073,7 +1073,7 @@ extern "C" fn rp_new(pid: i32) -> i32 {
 /// closed under another, double-closing ends.
 static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-fn my_pid() -> i32 {
+pub(crate) fn my_pid() -> i32 {
     vfork::pid_here().unwrap_or_else(|| MY_PID.load(std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -1290,7 +1290,7 @@ pub extern "C" fn gex_audio_ring_addr() -> u32 {
 }
 
 /// Where a pipe's buffer goes, when there is a global kernel to put it in.
-fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
+pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }

@@ -137,6 +137,8 @@ struct State {
     live: Vec<u32>,
     /// Whether the scene changed since the page last took it.
     dirty: bool,
+    /// The page's clipboard text, for a manager not started yet.
+    clip: Option<Vec<u8>>,
 }
 
 impl State {
@@ -227,6 +229,7 @@ pub extern "C" fn hw_init(w: i32, h: i32) {
         fresh: Vec::new(),
         live: Vec::new(),
         dirty: true,
+        clip: None,
     });
 }
 
@@ -340,6 +343,9 @@ pub extern "C" fn hw_tick() {
             // first time round.
             let sock: Arc<dyn FileHandle> = Arc::clone(&st.wm) as Arc<dyn FileHandle>;
             st.xwm = gex_xwm::Xwm::start(sock);
+            if let (Some(xwm), Some(text)) = (st.xwm.as_mut(), st.clip.clone()) {
+                xwm.set_clipboard(text);
+            }
         }
         if let Some(xwm) = st.xwm.as_mut() {
             xwm.pump(&mut st.client);
@@ -483,12 +489,46 @@ pub extern "C" fn hw_input(ptr: u32, count: u32) {
                         st.client.placement_origin(surface, q[1], q[2]);
                     }
                 }
+                // The page's pointer lock on a surface (an X program's grab,
+                // which Xwayland made a locked pointer), and motion under it.
+                15 => st.client.pointer_locked(surface, q[1] != 0),
+                16 => st.client.pointer_relative(q[1], q[2], q[3] as u32),
                 _ => {}
             }
         }
         let events = st.client.take_outgoing();
         st.out.extend(events);
     });
+}
+
+/// The page's clipboard text (`len` bytes at `ptr`): the window manager
+/// takes the X clipboard and gives it to X programs that paste.
+#[no_mangle]
+pub extern "C" fn hw_clip_set(ptr: u32, len: u32) {
+    let text = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec();
+    with(|st| {
+        if let Some(xwm) = st.xwm.as_mut() {
+            xwm.set_clipboard(text.clone());
+        }
+        st.clip = Some(text);
+    });
+}
+
+/// An X program's copy since the last call, up to `max` bytes into `ptr`:
+/// its length, or -1 for none.
+#[no_mangle]
+pub extern "C" fn hw_clip_take(ptr: u32, max: u32) -> i32 {
+    with(|st| match st.xwm.as_mut().and_then(|x| x.take_copied()) {
+        Some(text) => {
+            let n = text.len().min(max as usize);
+            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, n) };
+            dst.copy_from_slice(&text[..n]);
+            st.clip = Some(text[..n].to_vec());
+            n as i32
+        }
+        None => -1,
+    })
+    .unwrap_or(-1)
 }
 
 /// The output size changed (the page's canvas was resized): Xwayland is told

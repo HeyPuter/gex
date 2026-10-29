@@ -487,6 +487,8 @@ class Compositor {
   /** Pointer lock (pointer.rs): the window a press asked the page to lock
    *  for, and the one the page's lock is now given to. */
   #lockWant = null;
+  /** The window whose content the last press was on. */
+  #pressKey = null;
   #lockKey = null;
 
   /** The page's pointer lock began or ended. */
@@ -845,8 +847,16 @@ class Compositor {
       const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;
       if (fs !== !!win.fullscreen) this.#fullscreen(k, win, fs);
       // A client's pointer lock asked for, or given up (pointer.rs).
+      const wanted = !!win.wantsLock;
       win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
       if (!win.wantsLock && this.#lockKey === k) post({ kind: 'lock-release' });
+      // Asked for by the window last pressed, after the press (an X
+      // program's grab on a click): the page takes it if that click's
+      // activation still lasts.
+      if (win.wantsLock && !wanted && this.#pressKey === k && !this.#lockKey) {
+        this.#lockWant = k;
+        post({ kind: 'lock-wanted', late: true });
+      }
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
       win.layer = s.layer;
@@ -1709,6 +1719,7 @@ class Compositor {
     }
     if (pressed) {
       const hit = this.#hit(this.#pointer.x, this.#pointer.y);
+      this.#pressKey = hit?.part === 'content' ? hit.key : null;
       if (hit?.part === 'content' && hit.win.wantsLock) {
         this.#lockWant = hit.key;
         post({ kind: 'lock-wanted' });

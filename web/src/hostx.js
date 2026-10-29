@@ -34,6 +34,8 @@ import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;
+/** The most clipboard text that crosses to and from X programs. */
+const X_CLIP = 256 << 10;
 /** errno values the transport answers with. */
 const EAGAIN = 11;
 const EBADF = 9;
@@ -856,6 +858,30 @@ export class HostX {
     m.set(key, (m.get(key) ?? 0) + n);
   }
 
+  /** The clipboard's number this server last saw or set. */
+  #clipSeen = 0;
+
+  /**
+   * The clipboard between the page and X programs, through the window
+   * manager: an X program's copy onto the page's clipboard, and the page's
+   * new text to the manager, which owns the X clipboard with it.
+   */
+  #clip() {
+    const hw = this.#hw;
+    const px = this.#proxy;
+    if (!hw.hw_clip_take || !px) return;
+    let p = hw.hw_scratch(X_CLIP);
+    const n = hw.hw_clip_take(p, X_CLIP);
+    if (n >= 0) this.#clipSeen = px.clipSet(this.#hwMem, p, n);
+    const serial = px.clipSerial();
+    if (serial && serial !== this.#clipSeen) {
+      this.#clipSeen = serial;
+      p = hw.hw_scratch(X_CLIP);
+      const len = px.clipGet(this.#hwMem, p, X_CLIP);
+      hw.hw_clip_set(p, Math.min(len, X_CLIP));
+    }
+  }
+
   /**
    * Between two turns of the server's loop: run the window manager, take the
    * page's input, publish the scene.
@@ -886,6 +912,8 @@ export class HostX {
       this.#out = { w: size.w, h: size.h };
       hw.hw_set_output(size.w, size.h);
     }
+
+    this.#clip();
 
     if (hw.hw_wants_input()) {
       const p = hw.hw_scratch(MAX_INPUT * EV * 4);

@@ -233,7 +233,20 @@ pointer constraints; Xwayland asks for an X program that grabs the pointer
 and hides it, as games do. The mouse's movement then reaches the program as
 relative motion, until Escape, `release()`, or the program letting go.
 `locked` says whether it holds; the events are `lock` and `unlock`. A program
-that asks for nothing never locks the pointer.
+that asks for nothing never locks the pointer. A program that asks just
+after the click that started it (an X game grabbing on a click) gets the
+lock while that click still counts as the user's gesture.
+
+`new Clipboard(sys, { sync })`: text copied and pasted between the page and
+the guest's programs. A Wayland program's selection, or an X program's
+CLIPBOARD (the X window manager owns and converts it for them), comes out as
+a `copy` event with `text`; `setText(text)` offers text to every program,
+and an X program that pastes gets it as UTF8_STRING or STRING. One program's
+copy reaches another as well. `text` is the last text either side set. With
+`sync` (the default) a copy also goes onto the browser's clipboard, and the
+browser's text comes in on a paste into the page and, where the browser
+allows reading it, when the page gets the focus. Text only, up to 1 MiB
+(256 KiB to and from X programs).
 
 ## Windows
 

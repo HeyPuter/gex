@@ -12,8 +12,12 @@
 //!   `wl_data_offer.receive`: a descriptor for the host to write the bytes
 //!   into, from [`Client::take_receives`].
 //! - **Sources** the client makes, with the types and actions it offers, and
-//!   the selection it sets: kept, so a clipboard can be built on them, and
-//!   not yet offered to anyone.
+//!   the selection it sets. A new selection is the host's to take
+//!   ([`Client::take_selection_change`]); it asks the source for its data
+//!   ([`Client::ask_source`]) with a descriptor of its own to read.
+//! - **The host's selection** (its clipboard): offered to the client as
+//!   `wl_data_device.selection` ([`Client::offer_selection`]); the client's
+//!   `receive`s of it come out of [`Client::take_receives`] like a drag's.
 //!
 //! A client's own drags (`start_drag`) are not carried: nothing takes them.
 
@@ -115,6 +119,10 @@ pub(crate) struct DataState {
     receives: Vec<Receive>,
     /// The source the client set as the selection, if it still exists.
     selection: Option<u32>,
+    /// `set_selection` was asked since the host last took it.
+    selection_changed: bool,
+    /// The host's selection, as last offered: the offer's id.
+    host_selection: Option<u32>,
     next_id: u32,
 }
 
@@ -163,6 +171,7 @@ impl Client {
             1 => {
                 let source = r.object().unwrap_or(0);
                 self.data.selection = (source != 0 && self.data.sources.contains_key(&source)).then_some(source);
+                self.data.selection_changed = true;
                 true
             }
             // release (version 2)
@@ -192,6 +201,7 @@ impl Client {
                 self.data.sources.remove(&object);
                 if self.data.selection == Some(object) {
                     self.data.selection = None;
+                    self.data.selection_changed = true;
                 }
                 self.delete_id(object);
                 true
@@ -394,6 +404,50 @@ impl Client {
     /// The descriptors waiting in [`Client::take_receives`].
     pub(crate) fn receive_fds(&self) -> impl Iterator<Item = u32> + '_ {
         self.data.receives.iter().map(|r| r.fd)
+    }
+
+    // -- the selection --------------------------------------------------------
+
+    /// The client's new selection since the last call: `Some(Some((source,
+    /// types)))` for a source, `Some(None)` when it cleared it.
+    pub fn take_selection_change(&mut self) -> Option<Option<(u32, Vec<String>)>> {
+        if !std::mem::take(&mut self.data.selection_changed) {
+            return None;
+        }
+        Some(self.data.selection.and_then(|s| self.data.sources.get(&s).map(|src| (s, src.mimes.clone()))))
+    }
+
+    /// Ask `source` for its data as `mime` (`wl_data_source.send`): the
+    /// descriptor it writes into must ride with these bytes, the next
+    /// staged on the socket.
+    pub fn ask_source(&mut self, source: u32, mime: &str) {
+        self.send(Writer::new(source, 1).string(mime));
+    }
+
+    /// Offer the host's selection, as `mimes`, to the client: a new offer
+    /// and `wl_data_device.selection` naming it. False with no data device.
+    pub fn offer_selection(&mut self, mimes: &[&str]) -> Option<u32> {
+        let (&device, &version) = self.data.devices.iter().min_by_key(|d| *d.0)?;
+        let offer = SERVER_IDS + self.data.next_id;
+        self.data.next_id += 1;
+        self.objects.insert(offer, Object::DataOffer);
+        self.send(Writer::new(device, 0).new_id(offer)); // data_offer
+        for m in mimes {
+            self.send(Writer::new(offer, 0).string(m));
+        }
+        self.send(Writer::new(device, 5).object(offer)); // selection
+        self.data.offers.insert(
+            offer,
+            Offer { version, mimes: mimes.iter().map(|m| m.to_string()).collect(), ..Default::default() },
+        );
+        self.data.host_selection = Some(offer);
+        Some(offer)
+    }
+
+    /// Whether `offer` is the host's selection (its receives are the
+    /// clipboard's, not a drag's).
+    pub fn is_host_selection(&self, offer: u32) -> bool {
+        self.data.host_selection == Some(offer)
     }
 
     /// The sources the client made, and the one it set as the selection.

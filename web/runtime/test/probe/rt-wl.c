@@ -1,7 +1,7 @@
 /* A Wayland window for the runtime's window tests: one xdg_toplevel of a
  * solid colour, titled from argv, that says on stdout what it hears.
  *
- *   rt-wl TITLE [maximize] [move] [lock]
+ *   rt-wl TITLE [maximize] [move] [lock] [copy TEXT] [paste]
  *
  * "drawn W H" for each frame, "configure W H STATES" for each configure
  * (STATES: m maximized, f fullscreen, r resizing, a activated), "focus" when
@@ -10,12 +10,17 @@
  * its own title bar would; with "maximize", to be maximized. With "lock",
  * it asks for a locked pointer (pointer constraints, persistent) and says
  * "locked", "unlocked" and "rel DX DY" (the movement so far, in whole
- * pixels) as they come. The compositor's close ends it with 0.
+ * pixels) as they come. With "copy TEXT", it sets TEXT as the selection
+ * when it gets the keyboard and says "copied" (and "sent" when asked for
+ * it); with "paste", it reads each selection offered to it as text and
+ * says "paste TEXT". The compositor's close ends it with 0.
  *
  * xdg-shell's interfaces are written out here (version 1), as
  * wayland-scanner would make them: there is no scanner in the toolchain. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,9 +187,75 @@ static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, ui
   (void)d; (void)k; (void)f; (void)s;
   close(fd);
 }
+/* -- the selection -------------------------------------------------------- */
+
+static struct wl_data_device_manager *ddm;
+static struct wl_data_device *data_device;
+static const char *copy_text;
+static int want_paste, paste_fd = -1, copied;
+static char paste_buf[65536];
+static size_t paste_len;
+
+static void src_target(void *d, struct wl_data_source *s, const char *m) {
+  (void)d; (void)s; (void)m;
+}
+static void src_send(void *d, struct wl_data_source *s, const char *mime, int32_t fd) {
+  (void)d; (void)s; (void)mime;
+  if (write(fd, copy_text, strlen(copy_text)) < 0) perror("write");
+  close(fd);
+  say("sent\n");
+}
+static void src_cancelled(void *d, struct wl_data_source *s) {
+  (void)d;
+  wl_data_source_destroy(s);
+}
+static const struct wl_data_source_listener src_listener = {src_target, src_send, src_cancelled, NULL, NULL, NULL};
+
+static void offer_offer(void *d, struct wl_data_offer *o, const char *m) {
+  (void)d; (void)o; (void)m;
+}
+static const struct wl_data_offer_listener offer_listener = {offer_offer, NULL, NULL};
+static void dd_offer(void *d, struct wl_data_device *dev, struct wl_data_offer *o) {
+  (void)d; (void)dev;
+  wl_data_offer_add_listener(o, &offer_listener, NULL);
+}
+static void dd_selection(void *d, struct wl_data_device *dev, struct wl_data_offer *o) {
+  (void)d; (void)dev;
+  if (!o || !want_paste) return;
+  int p[2];
+  if (pipe2(p, O_CLOEXEC) < 0) return;
+  wl_data_offer_receive(o, "text/plain;charset=utf-8", p[1]);
+  close(p[1]);
+  if (paste_fd >= 0) close(paste_fd);
+  paste_fd = p[0];
+  paste_len = 0;
+}
+static void dd_enter(void *d, struct wl_data_device *dev, uint32_t s, struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y,
+                     struct wl_data_offer *o) {
+  (void)d; (void)dev; (void)s; (void)sf; (void)x; (void)y; (void)o;
+}
+static void dd_leave(void *d, struct wl_data_device *dev) {
+  (void)d; (void)dev;
+}
+static void dd_motion(void *d, struct wl_data_device *dev, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
+  (void)d; (void)dev; (void)t; (void)x; (void)y;
+}
+static void dd_drop(void *d, struct wl_data_device *dev) {
+  (void)d; (void)dev;
+}
+static const struct wl_data_device_listener dd_listener = {dd_offer, dd_enter, dd_leave, dd_motion, dd_drop, dd_selection};
+
 static void kb_enter(void *d, struct wl_keyboard *k, uint32_t serial, struct wl_surface *sf, struct wl_array *keys) {
-  (void)d; (void)k; (void)serial; (void)sf; (void)keys;
+  (void)d; (void)k; (void)sf; (void)keys;
   say("focus\n");
+  if (copy_text && data_device && !copied) {
+    struct wl_data_source *src = wl_data_device_manager_create_data_source(ddm);
+    wl_data_source_add_listener(src, &src_listener, NULL);
+    wl_data_source_offer(src, "text/plain;charset=utf-8");
+    wl_data_device_set_selection(data_device, src, serial);
+    copied = 1;
+    say("copied\n");
+  }
 }
 static void kb_leave(void *d, struct wl_keyboard *k, uint32_t serial, struct wl_surface *sf) {
   (void)d; (void)k; (void)serial; (void)sf;
@@ -306,6 +377,8 @@ static void global(void *d, struct wl_registry *r, uint32_t name, const char *if
   } else if (!strcmp(iface, "xdg_wm_base")) {
     wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface, 1);
     wl_proxy_add_listener(wm_base, (void (**)(void))wm_base_listener, NULL);
+  } else if (!strcmp(iface, "wl_data_device_manager")) {
+    ddm = wl_registry_bind(r, name, &wl_data_device_manager_interface, 3);
   } else if (!strcmp(iface, "zwp_relative_pointer_manager_v1")) {
     rel_manager = wl_registry_bind(r, name, &zwp_relative_pointer_manager_v1_interface, 1);
   } else if (!strcmp(iface, "zwp_pointer_constraints_v1")) {
@@ -323,6 +396,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "maximize")) maximize = 1;
     else if (!strcmp(argv[i], "move")) move_on_press = 1;
     else if (!strcmp(argv[i], "lock")) want_lock = 1;
+    else if (!strcmp(argv[i], "paste")) want_paste = 1;
+    else if (!strcmp(argv[i], "copy") && i + 1 < argc) copy_text = argv[++i];
   }
   struct wl_display *dpy = wl_display_connect(NULL);
   if (!dpy) {
@@ -354,8 +429,37 @@ int main(int argc, char **argv) {
     wl_proxy_add_listener(lp, lp_listener, NULL);
     wl_surface_commit(surface);
   }
+  if ((copy_text || want_paste) && ddm && seat) {
+    data_device = wl_data_device_manager_get_data_device(ddm, seat);
+    wl_data_device_add_listener(data_device, &dd_listener, NULL);
+  }
   say("up\n");
-  while (running && wl_display_dispatch(dpy) >= 0) {
+  while (running) {
+    while (wl_display_prepare_read(dpy) != 0) wl_display_dispatch_pending(dpy);
+    wl_display_flush(dpy);
+    struct pollfd p[2] = {{wl_display_get_fd(dpy), POLLIN, 0}, {paste_fd, POLLIN, 0}};
+    if (poll(p, paste_fd >= 0 ? 2 : 1, -1) < 0) {
+      wl_display_cancel_read(dpy);
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+      if (wl_display_read_events(dpy) < 0) break;
+    } else {
+      wl_display_cancel_read(dpy);
+    }
+    if (wl_display_dispatch_pending(dpy) < 0) break;
+    if (paste_fd >= 0 && (p[1].revents & (POLLIN | POLLHUP))) {
+      ssize_t n = read(paste_fd, paste_buf + paste_len, sizeof paste_buf - 1 - paste_len);
+      if (n > 0) {
+        paste_len += (size_t)n;
+      } else if (n == 0 || errno != EAGAIN) {
+        paste_buf[paste_len] = 0;
+        say("paste %s\n", paste_buf);
+        close(paste_fd);
+        paste_fd = -1;
+      }
+    }
   }
   wl_display_disconnect(dpy);
   return 0;
