@@ -852,6 +852,28 @@ impl Client {
         self.default_size = (w, h);
     }
 
+    /// The output was resized after this client connected: the new size, and
+    /// `mode` then `done` on every `wl_output` it has bound, as a compositor
+    /// does when a monitor's mode changes. A client that sizes itself to the
+    /// output (Wine's desktop, Xwayland's root) learns of it no other way.
+    pub fn set_output_size(&mut self, w: i32, h: i32) {
+        if self.default_size == (w, h) {
+            return;
+        }
+        self.default_size = (w, h);
+        let mut outputs: Vec<u32> = self
+            .objects
+            .iter()
+            .filter_map(|(o, k)| matches!(k, Object::Output).then_some(*o))
+            .collect();
+        outputs.sort_unstable();
+        for id in outputs {
+            // mode(flags=current|preferred, width, height, refresh mHz), done
+            self.send(Writer::new(id, 1).uint(0b11).int(w).int(h).int(60000));
+            self.send(Writer::new(id, 2));
+        }
+    }
+
     /// `configure_bounds`: the output in surface units, less the frame the
     /// host draws around a window (a title bar and a border, `FRAME_*`).
     fn bounds(&self) -> (i32, i32) {
@@ -4495,5 +4517,44 @@ mod tests {
         c.receive(&Writer::new(22, 1).finish(), &[], &no_pool());
         assert_eq!(c.data_sources().1, None);
         assert!(c.failed.is_none());
+    }
+
+    #[test]
+    fn an_output_resize_reaches_every_bound_output() {
+        let mut c = Client::new();
+        c.set_default_size(1300, 713);
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &no_pool());
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        go(&mut c, Writer::new(2, 0).uint(4).string("wl_output").uint(3).new_id(4).finish());
+        go(&mut c, Writer::new(2, 0).uint(4).string("wl_output").uint(3).new_id(9).finish());
+        c.take_outgoing();
+        let mode = |out: &[(u32, u16, Vec<u8>)], id: u32| -> Vec<(i32, i32)> {
+            out.iter()
+                .filter(|(o, op, _)| *o == id && *op == 1)
+                .map(|(_, _, b)| {
+                    let w = |i: usize| i32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+                    (w(4), w(8))
+                })
+                .collect()
+        };
+        c.set_output_size(1000, 650);
+        let out = messages(&c.take_outgoing());
+        for id in [4, 9] {
+            assert_eq!(mode(&out, id), vec![(1000, 650)], "output {id}'s mode");
+            let m = out.iter().position(|(o, op, _)| *o == id && *op == 1).unwrap();
+            let d = out.iter().position(|(o, op, _)| *o == id && *op == 2).expect("no done");
+            assert!(d > m, "done before the mode");
+        }
+        c.set_output_size(1000, 650);
+        assert!(c.take_outgoing().is_empty(), "the same size again says nothing");
+        // A released output is told nothing; one bound later is told the new size.
+        c.receive(&Writer::new(9, 0).finish(), &[], &no_pool());
+        c.take_outgoing();
+        c.set_output_size(1300, 800);
+        let out = messages(&c.take_outgoing());
+        assert_eq!(mode(&out, 4), vec![(1300, 800)]);
+        assert!(mode(&out, 9).is_empty(), "a released output was told");
+        c.receive(&Writer::new(2, 0).uint(4).string("wl_output").uint(3).new_id(10).finish(), &[], &no_pool());
+        assert_eq!(mode(&messages(&c.take_outgoing()), 10), vec![(1300, 800)]);
     }
 }

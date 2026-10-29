@@ -2093,6 +2093,9 @@ export class Gex {
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         // Whether that ring holds anything, without draining it.
         wl_input_pending: () => (this.#wl?.inputPending() ? 1 : 0),
+        // The output's size now, packed (`WlProxy.outputSize`), 0 for none:
+        // the pump asks every turn and tells its clients when it changed.
+        wl_output_size: () => this.#wl?.outputSize?.() ?? 0,
     };
   }
 

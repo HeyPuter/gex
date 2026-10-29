@@ -491,10 +491,11 @@ pub extern "C" fn hw_input(ptr: u32, count: u32) {
     });
 }
 
-/// The output size changed (the page's canvas was resized).
+/// The output size changed (the page's canvas was resized): Xwayland is told
+/// with `mode` and `done` on its `wl_output`, sent on the next tick.
 #[no_mangle]
 pub extern "C" fn hw_set_output(w: i32, h: i32) {
-    with(|st| st.client.set_default_size(w.max(1), h.max(1)));
+    with(|st| st.client.set_output_size(w.max(1), h.max(1)));
 }
 
 /// Why the compositor threw the client out, if it did: the message into
