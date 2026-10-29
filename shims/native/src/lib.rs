@@ -507,6 +507,9 @@ struct JitShared {
     wine_pe_split: Vec<Arc<wasmdll::WinePe>>,
     /// Calls from one of Wine's modules of their own into another (`wasmdll::Late`).
     wine_pe_late: Vec<wasmdll::Late>,
+    /// Each function address a module of Wine's takes (`GOT.func`): its
+    /// slot, (ftab module number, offset from that module's table base).
+    wine_pe_canon: std::collections::HashMap<String, (u32, u32)>,
     /// The stateful modules' data addresses whose relocations this address
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
@@ -1312,6 +1315,7 @@ fn run_program_with(
                 wine_pe: None,
                 wine_pe_split: Vec::new(),
                 wine_pe_late: Vec::new(),
+                wine_pe_canon: std::collections::HashMap::new(),
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),

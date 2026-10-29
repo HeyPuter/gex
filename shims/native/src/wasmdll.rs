@@ -266,6 +266,8 @@ struct ParsedModule {
     slots: std::collections::HashMap<String, u32>,
     any_dll: std::collections::HashMap<String, u32>,
     data_exports: std::collections::HashMap<String, u32>,
+    /// With modules of their own (pelink's `gexw.modules`): each DLL's module file.
+    modules: std::collections::HashMap<String, String>,
     module: wasmtime::Module,
 }
 
@@ -306,6 +308,18 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
             }
         }
     }
+    let mut modules = std::collections::HashMap::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(c)) = payload {
+            if c.name() == "gexw.modules" {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    if let Some((d, f)) = line.split_once(' ') {
+                        modules.insert(d.to_string(), f.to_string());
+                    }
+                }
+            }
+        }
+    }
     let t1 = std::time::Instant::now();
     let cwasm = crate::libprov::cwasm_path(file, &wasm);
     let t2 = std::time::Instant::now();
@@ -327,6 +341,7 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
         slots,
         any_dll,
         data_exports: exported_offsets(&wasm)?,
+        modules,
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -591,88 +606,139 @@ fn install_module(
     let data = (data + a - 1) & !(a - 1);
     let module = pm.module.clone();
     let mut len = pm.n_names;
-    let mut extra_from = Vec::new();
+    let funcs_of = |m: &Module| -> Vec<String> {
+        m.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect()
+    };
+    let mine: std::collections::HashSet<String> = funcs_of(&module).into_iter().collect();
+    // The modules it calls into or takes function addresses of, installed
+    // first (no code of theirs runs until Wine loads their DLLs): its
+    // imports then bind to their functions directly, and a function
+    // address is the defining module's own. Only a cycle's far side is
+    // left to `Late` slots.
+    if core.is_some() {
+        thread_local! {
+            static BUSY: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut deps = std::collections::BTreeSet::new();
+        for imp in module.imports() {
+            if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func"), imp.name().split_once('!')) {
+                if let Some(f) = pm.modules.get(dll) {
+                    deps.insert(f.clone());
+                }
+            }
+        }
+        BUSY.with(|b| b.borrow_mut().push(file.to_path_buf()));
+        let r = (|| -> Result<()> {
+            for f in deps {
+                let path = file.with_file_name(&f);
+                let installed = {
+                    let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    s.wine_pe.iter().chain(s.wine_pe_split.iter()).any(|wp| wp.file.file_name() == path.file_name())
+                };
+                let busy = BUSY.with(|b| b.borrow().iter().any(|p| p.file_name() == path.file_name()));
+                if installed || busy || !path.is_file() {
+                    continue;
+                }
+                install_module(&path, core.clone(), is64, state, shared, engine, memory)?;
+            }
+            Ok(())
+        })();
+        BUSY.with(|b| b.borrow_mut().pop());
+        r?;
+    }
+    // what the core exports, and the functions every installed module exports
+    let (have_core, others) = {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let have_core: std::collections::HashSet<String> = match &core {
+            Some(c) => s.ftab.modules[c.module as usize].exports().map(|e| e.name().to_string()).collect(),
+            None => Default::default(),
+        };
+        let mut others = std::collections::HashMap::new();
+        for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()) {
+            for n in funcs_of(&s.ftab.modules[wp.module as usize]) {
+                others.entry(n).or_insert(wp.module);
+            }
+        }
+        (have_core, others)
+    };
     let mut imports = Vec::new();
     let mut lates = Vec::new();
-    if core.is_none() {
-        // the core's calls into modules of their own (kernelbase's of
-        // user32's MessageBoxIndirectW): through slots filled when they load
-        for imp in module.imports() {
-            let (m, name) = (imp.module().to_string(), imp.name().to_string());
-            let b = if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
-                lates.push((len, name.clone(), None));
-                len += 1;
-                crate::dylink::NBind::LateOwn(len - 1)
-            } else if m == "GOT.func" {
-                lates.push((len, name.clone(), None));
-                len += 1;
-                crate::dylink::NBind::OwnSlot(len - 1)
-            } else {
-                crate::dylink::NBind::Shim
-            };
-            imports.push((m, name, b));
-        }
-    }
-    if let Some(c) = &core {
-        let core_mod = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.modules[c.module as usize].clone();
-        let have: std::collections::HashSet<String> = core_mod.exports().map(|e| e.name().to_string()).collect();
-        let funcs: std::collections::HashSet<String> =
-            core_mod.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect();
-        // the functions the modules of their own installed so far export
-        let others: std::collections::HashMap<String, u32> = {
-            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-            s.wine_pe_split
-                .iter()
-                .flat_map(|wp| {
-                    let m = &s.ftab.modules[wp.module as usize];
-                    m.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| (e.name().to_string(), wp.module)).collect::<Vec<_>>()
-                })
-                .collect()
-        };
-        for imp in module.imports() {
-            let (m, name) = (imp.module().to_string(), imp.name().to_string());
-            let b = if m == "GOT.func" && funcs.contains(&name) {
-                extra_from.push((len, c.module, name.clone()));
-                len += 1;
-                crate::dylink::NBind::OwnSlot(len - 1)
-            } else if m == "env" && have.contains(&name) {
-                crate::dylink::NBind::Export { module: c.module, name: name.clone() }
-            } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
-                // another module of its own's: bound to it if it is installed,
-                // else a call through a slot filled when it is (`fill_late`)
-                match others.get(&name) {
-                    Some(&p) => crate::dylink::NBind::Export { module: p, name: name.clone() },
-                    None => {
-                        lates.push((len, name.clone(), None));
-                        len += 1;
-                        crate::dylink::NBind::LateOwn(len - 1)
-                    }
+    let mut gots = Vec::new(); // (import index, name), bound below
+    for imp in module.imports() {
+        let (m, name) = (imp.module().to_string(), imp.name().to_string());
+        let b = if m == "GOT.func" {
+            gots.push((imports.len(), name.clone()));
+            crate::dylink::NBind::Shim
+        } else if m == "env" && core.is_some() && have_core.contains(&name) {
+            crate::dylink::NBind::Export { module: core.as_ref().unwrap().module, name: name.clone() }
+        } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
+            // another module's: bound to it if it is installed, else a call
+            // through a slot filled when it is (`fill_late`; the core's calls
+            // into user32, say)
+            match others.get(&name) {
+                Some(&p) => crate::dylink::NBind::Export { module: p, name: name.clone() },
+                None => {
+                    lates.push((len, name.clone(), None));
+                    len += 1;
+                    crate::dylink::NBind::LateOwn(len - 1)
                 }
-            } else if m == "GOT.func" {
-                // the address of another module of its own's function: a
-                // slot of its own filled with it (now, or when that loads)
-                lates.push((len, name.clone(), others.get(&name).copied()));
-                len += 1;
-                crate::dylink::NBind::OwnSlot(len - 1)
-            } else {
-                crate::dylink::NBind::Shim
-            };
-            imports.push((m, name, b));
-        }
+            }
+        } else {
+            crate::dylink::NBind::Shim
+        };
+        imports.push((m, name, b));
     }
     let number = {
         let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
         let m = s.ftab.modules.len() as u32;
-        let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), extra_from, tls: None };
-        s.ftab.dylink.insert(m, Arc::new(binds));
-        // its calls into modules not yet installed; earlier modules' calls into it
-        s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider }));
-        if core.is_some() {
-            let mine: std::collections::HashSet<String> =
-                module.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect();
-            for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && mine.contains(&l.name)) {
-                l.provider = Some(m);
+        // A function's address (GOT.func), its own or another module's: one
+        // slot per function in the process. That is the defining module's
+        // own when its element segment has the function (it takes the
+        // address itself, and its code and data use that slot); else the
+        // slot of the first module naming it, filled in each store with the
+        // function once the defining module is instantiated there. The
+        // modules a module calls into are installed before it, so only a
+        // cycle's far side can miss the defining module's own slot.
+        for (i, name) in gots {
+            // the defining module's own slot for it, when its element segment has it
+            let own = if mine.contains(&name) { pm.slots.get(&name).copied() } else { None };
+            let theirs = others.get(&name).and_then(|&p| {
+                let k = s.wine_pe.iter().chain(s.wine_pe_split.iter()).find(|wp| wp.module == p)?.slots.get(&name).copied()?;
+                Some(s.ftab.map.installs().iter().find(|x| x.module == p)?.base + k)
+            });
+            let b = match (own, theirs, s.wine_pe_canon.get(&name).copied()) {
+                (Some(k), _, _) => crate::dylink::NBind::OwnSlot(k),
+                (None, Some(v), _) => crate::dylink::NBind::Global(v),
+                (None, None, c) => match c {
+                Some((owner, off)) => {
+                    let base = s.ftab.map.installs().iter().find(|x| x.module == owner).map(|x| x.base);
+                    match base {
+                        Some(base) => crate::dylink::NBind::Global(base + off),
+                        None => bail!("{}: {name}'s slot belongs to a module not yet published", file.display()),
+                    }
+                }
+                None => {
+                    let off = len;
+                    len += 1;
+                    s.wine_pe_canon.insert(name.clone(), (m, off));
+                    let provider = if mine.contains(&name) { Some(m) } else { others.get(&name).copied() };
+                    lates.push((off, name.clone(), provider));
+                    crate::dylink::NBind::OwnSlot(off)
+                }
+                },
+            };
+            if crate::wasm_trace() {
+                eprintln!("gex: wine PE: {}: &{name}: {:?}", file.display(), b);
             }
+            imports[i].2 = b;
+        }
+        let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), tls: None };
+        s.ftab.dylink.insert(m, Arc::new(binds));
+        // its calls and addresses into modules not yet installed; earlier
+        // modules' into it
+        s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider }));
+        for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && mine.contains(&l.name)) {
+            l.provider = Some(m);
         }
         m
     };

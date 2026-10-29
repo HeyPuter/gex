@@ -710,6 +710,7 @@ def link(dlls, out, gexrt, others=None):
     provided = set()
     # what each module defines, for the others' imports
     elsewhere = {n for g in objs for n in syms(objs[g], '--defined-only')} if SPLIT else set()
+    main_out = out
     def emit(g, out, gexrt):
         rsp = os.path.join(tmp, f'exports{g}.rsp')
         with open(rsp, 'w') as f:
@@ -836,6 +837,15 @@ def link(dlls, out, gexrt, others=None):
                 lines.append(f'{name} {hit[0]}!{hit[1]}')
         if lines:
             payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
+            with open(out, 'ab') as f:
+                f.write(bytes([0]) + enc_leb(len(payload)) + payload)
+        # With modules of their own: which module each DLL is in
+        # (`gexw.modules`, lines `dll file`), for gex to install the ones
+        # a module calls into before it
+        if SPLIT:
+            core_file = os.path.basename(out) if not g else os.path.basename(main_out)
+            mods = '\n'.join(f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls}))
+            payload = enc_name('gexw.modules') + mods.encode() + b'\n'
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
         if g or SPLIT:

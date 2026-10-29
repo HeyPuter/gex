@@ -28,10 +28,6 @@ pub(crate) struct Binds {
     pub imports: Vec<(String, String, NBind)>,
     /// Slots after the element segment: (table index, export) to fill.
     pub extra: Vec<(u32, String)>,
-    /// Slots after those, from the module's own table base: (offset, ftab
-    /// module number, export) to fill with another module's function (the
-    /// address of Wine's core's function a module of its own takes).
-    pub extra_from: Vec<(u32, u32, String)>,
     /// A `dlopen`ed module's thread-local block (size, alignment), which
     /// each store gives it as it instantiates the module ([`thread_tls`]).
     /// None for the modules a program starts with: libc's registry lays
@@ -43,7 +39,7 @@ pub(crate) struct Binds {
 pub(crate) enum NBind {
     Shim,
     Global(u32),
-    /// The module's own table base plus this (a slot of `Binds::extra_from`).
+    /// The module's own table base plus this (a slot after its own).
     OwnSlot(u32),
     /// A call through the module's own table base plus this, a slot filled
     /// once the module defining the function is instantiated in the store
@@ -187,7 +183,7 @@ fn publish(
         let pairs = pairs_of(i, m, &at);
         let module = p.module_of[i];
         s.ftab.stateful.insert(module, crate::libprov::Extras { memory_base: m.memory_base as u64 });
-        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra, extra_from: Vec::new(), tls }));
+        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra, tls }));
         s.ftab.modules.push(modules[i - from].clone());
         let (n, ok) = s.ftab.map.publish_at(m.table_base, len, module, gex_kernel::ftab::Tier::Unit, &pairs);
         if !ok {
@@ -625,19 +621,6 @@ pub(crate) fn after_instantiate(
             .get_func(&mut c, name)
             .ok_or_else(|| anyhow!("{}: {name} not exported", dy.path))?;
         table.set(&mut c, *slot as u64, wasmtime::Ref::Func(Some(f)))?;
-    }
-    for (off, from, name) in &dy.extra_from {
-        let other = c
-            .data()
-            .jit
-            .as_ref()
-            .and_then(|j| j.ftab.as_ref())
-            .and_then(|s| s.dyl.get(from).copied())
-            .ok_or_else(|| anyhow!("{}: {name}'s module is not instantiated in this thread", dy.path))?;
-        let f = other
-            .get_func(&mut c, name)
-            .ok_or_else(|| anyhow!("{}: {name} not exported", dy.path))?;
-        table.set(&mut c, (base + off) as u64, wasmtime::Ref::Func(Some(f)))?;
     }
     if let Some(s) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.dyl.insert(module, *inst);
