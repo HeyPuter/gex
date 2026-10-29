@@ -1473,14 +1473,16 @@ fn run_program_with(
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
-        return exec_program(
-            req,
-            opts,
-            xlate,
-            kernel,
-            Arc::clone(&spawn.proc_state),
-            spawn.wayland.clone(),
-        );
+        let (proc_state, wayland) = (Arc::clone(&spawn.proc_state), spawn.wayland.clone());
+        // The old image's memory goes before the new one runs: every holder
+        // of it is dropped here, or it stays resident for the new program's
+        // whole life.
+        drop(store);
+        drop(linker);
+        drop(spawn);
+        drop(memory);
+        drop(shared);
+        return exec_program(req, opts, xlate, kernel, proc_state, wayland);
     }
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
@@ -2675,7 +2677,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
         .spawn(move || {
-            let cleanup = Arc::clone(&child_cx);
+            // Weak: a child that execs drops this context, and its memory
+            // (the parent's copy) with it, while the new program runs.
+            let cleanup = Arc::downgrade(&child_cx);
+            let kernel = Arc::clone(&child_cx.kernel);
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
@@ -2688,9 +2693,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     // A process that dies takes its threads and descriptors
                     // with it: otherwise its threads park in a futex nobody
                     // wakes and its pipes never reach EOF for their readers.
-                    stop_other_threads(&cleanup, false);
-                    cleanup
-                        .kernel
+                    if let Some(cx) = cleanup.upgrade() {
+                        stop_other_threads(&cx, false);
+                    }
+                    kernel
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .fds
@@ -2710,7 +2716,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // Its descriptors close before its parent can see it gone, as on
             // Linux: a listening socket's port is free once `wait4` returns.
             {
-                let mut k = cleanup.kernel.lock().unwrap_or_else(|e| e.into_inner());
+                let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
                 k.fds.close_all();
             }
             procs.exit(pid, wstatus);
@@ -2831,15 +2837,13 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
                 env: req.envp.clone(),
                 ..cx.opts.clone()
             };
-            exec_program(
-                req,
-                &opts,
-                &cx.xlate,
-                kernel,
-                Arc::clone(&cx.proc_state),
-                cx.wayland.clone(),
-            )
-            .map(|(exit, _)| exit)
+            let (xlate, proc_state, wayland) = (cx.xlate.clone(), Arc::clone(&cx.proc_state), cx.wayland.clone());
+            // The copy of the parent's memory goes before the new program
+            // runs (`run_program_with`'s exec says why).
+            drop(store);
+            drop(linker);
+            drop(cx);
+            exec_program(req, &opts, &xlate, kernel, proc_state, wayland).map(|(exit, _)| exit)
         }
     }
 }
