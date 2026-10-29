@@ -1181,11 +1181,12 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // Loudly, as natively: a unit built at another base (or under another
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
-        "gex-pe: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
+        "gex-pe: image {} at base {:#x}: no function-tier unit (key {}, inputs {}), tier-1; build it with \
          {}gexc cgen-image <image> --pe-base {:#x}\n",
         x.path,
         x.base,
         x.key,
+        gex_cgen::image::inputs_id(),
         if gex_cgen::image::unguarded() { "" } else { "GEX_CGEN_GUARD=1 " },
         x.base
     ));
