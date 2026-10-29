@@ -437,6 +437,10 @@ fn install_shared(
     };
     let file = beside(&module_name);
     let core_file = beside(CORE_MODULE);
+    // one install at a time: two threads mapping skeletons of one module
+    // (or of modules installing a shared dependency) install it once
+    static INSTALLING: Mutex<()> = Mutex::new(());
+    let installing = INSTALLING.lock().unwrap_or_else(|e| e.into_inner());
     let same = |wp: &Arc<WinePe>, f: &std::path::Path| wp.file == f || wp.file.file_name() == f.file_name();
     let find = |f: &std::path::Path| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -452,6 +456,7 @@ fn install_shared(
         Some(wp) => wp,
         None => install_module(&file, if is_core { None } else { core.clone() }, pe.is64, state, shared, engine, memory)?,
     };
+    drop(installing);
 
     // This DLL's bindings: its own module's adapters, and for a `-import`
     // re-export the owner's, in whichever install has it (the core's, for a
