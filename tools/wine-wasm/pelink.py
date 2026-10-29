@@ -456,7 +456,14 @@ def link(dlls, out, gexrt, others=None):
         gdll = next((o for o in owner_of.get(tname, ()) if o != tdll), None)
         if tdll in native and gdll:
             guest_forward.setdefault(name, []).append((via, gdll, tname))
-    guest_binds = []  # (symbol, sig, i386 owner, export name)
+    guest_binds = []  # (symbol, sig, i386 owner, export name, group, importing DLL)
+    guest_sig = {}  # (group, dll.name) -> the signature its stub has
+    def guest_sym(mod, sym, have):
+        """The stub's symbol for `sym` as `mod` declares it: two DLLs in one
+        group declaring an import differently (user32's and gdi32's
+        NtGdiCreateHalftonePalette) each get a stub of their own."""
+        first = guest_sig.setdefault((grp(mod), sym), have)
+        return sym if first == have else f'{sym}~{have.replace(":", "_")}'
     own_cache = {}
     def own_defs(o):
         if o not in own_cache:
@@ -472,8 +479,8 @@ def link(dlls, out, gexrt, others=None):
         have = sigs[mod].get((name, 'undefined'))
         if not guest or not have or (pick in imports and imports.index(pick) < imports.index(guest)):
             return False
-        sym = f'{guest}.{name}'
-        guest_binds.append((f'gexw-guest!{sym}', have, guest, name, grp(mod)))
+        sym = guest_sym(mod, f'{guest}.{name}', have)
+        guest_binds.append((f'gexw-guest!{sym}', have, guest, name, grp(mod), mod))
         f.write(f'{name} gexw-guest {sym}\n')
         return True
 
@@ -486,6 +493,8 @@ def link(dlls, out, gexrt, others=None):
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'dll', ro, local, mod, ex, alias_file])
         mapfile = os.path.join(tmp, mod + '.map')
         with open(mapfile, 'w') as f:
+            # its entry point's binding of its static guest imports (winebuild)
+            f.write(f'wine_gexw_bind_imports gexw-bind {mod}\n')
             for name, owners in exporters.items():
                 # (a DLL may list an export its code takes from another DLL:
                 # kernel32's DebugBreak is kernelbase's)
@@ -497,8 +506,8 @@ def link(dlls, out, gexrt, others=None):
                 have = sigs[mod].get((name, 'undefined'))
                 if not defs and have and gown:
                     gdll = next((o for o in imports if o in gown), gown[0])
-                    sym = f'{gdll}.{name}'
-                    guest_binds.append((f'gexw-guest!{sym}', have, gdll, name, grp(mod)))
+                    sym = guest_sym(mod, f'{gdll}.{name}', have)
+                    guest_binds.append((f'gexw-guest!{sym}', have, gdll, name, grp(mod), mod))
                     f.write(f'{name} gexw-guest {sym}\n')
                     continue
                 owners = defs or owners
@@ -538,8 +547,11 @@ def link(dlls, out, gexrt, others=None):
                 if not have or name in forward_owner:
                     continue
                 via, gdll, gname = next((c for c in cands if c[0] in imports), cands[0])
-                sym = f'{gdll}.{gname}'
-                guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod)))
+                # (named as the importer names it: wasm-ld refuses one
+                # symbol imported under two names, comctl32's
+                # CreateCompatibleDC and gdi32's NtGdiCreateCompatibleDC)
+                sym = guest_sym(mod, f'{gdll}.{gname}' + ('' if name == gname else f'={name}'), have)
+                guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod), mod))
                 f.write(f'{name} gexw-guest {sym}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
@@ -581,14 +593,17 @@ def link(dlls, out, gexrt, others=None):
     # (LoadLibraryA, GetProcAddress) once and calls it -- a guest address,
     # so through the ICALL pass's exit stub, as a guest call. The stub's
     # signature is its callers'.
+    bound_groups = set()
     for g in objs if others and 'kernel32.dll' in native else ():
         undefined = {}  # name -> (sig, importing dll)
+        users = {}  # stub symbol -> the DLLs calling it
         for mod, ro, ex, imports in dlls:
             if grp(mod) != g:
                 continue
             for (n, k), v in sigs[mod].items():
                 if k == 'undefined' and n not in exporters and n not in forward_owner and '!' not in n:
                     undefined.setdefault(n, (v, mod, imports))
+                    users.setdefault(n, set()).add(mod)
         stubs = []  # (symbol, sig, owner, export name)
         for n, (sig, mod, imports) in sorted(undefined.items()):
             owners = owner_of.get(n)
@@ -596,6 +611,9 @@ def link(dlls, out, gexrt, others=None):
                 continue
             stubs.append((n, sig, next((o for o in imports if o in owners), owners[0]), n))
         stubs += sorted({b[:4] for b in guest_binds if b[4] == g})
+        for b in guest_binds:
+            if b[4] == g:
+                users.setdefault(b[0], set()).add(b[5])
         if any(b[4] == g for b in guest_binds):
             print(f'{out}: bound to i386 DLLs ahead of native ones: ' +
                   ', '.join(sorted({b[0].split('!', 1)[1] for b in guest_binds if b[4] == g})))
@@ -606,6 +624,8 @@ def link(dlls, out, gexrt, others=None):
                 own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
                 f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
                 f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
+                f.write(f'void *gexw_GetModuleHandleA(const char *) __asm__("{own("GetModuleHandleA")}!GetModuleHandleA");\n')
+                f.write(f'static void *gp[{len(stubs)}];\n')
                 stdcalls = {}
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
@@ -619,9 +639,11 @@ def link(dlls, out, gexrt, others=None):
                     types = ', '.join(ctype[c] for c in ps) or 'void'
                     args = ', '.join(f'a{i}' for i in range(len(ps)))
                     f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{sym}");\n')
+                    # (bound by its DLL's entry point when the owner is a
+                    # static import, else on first call, as a delay load)
                     f.write(f'{attr}{ctype[r]} g{k}({params}) {{\n'
-                            f'    static void *p;\n'
-                            f'    if (!p) p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
+                            f'    void *p = gp[{k}];\n'
+                            f'    if (!p) gp[{k}] = p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
                             f'    {"" if r == "v" else "return "}(({ctype[r]} (*)({types}))p)({args});\n}}\n')
                 # Their addresses taken, so the ICALL pass gives each an entry
                 # thunk: a native module may hand one to i386 code as a
@@ -631,10 +653,38 @@ def link(dlls, out, gexrt, others=None):
                 for k in range(len(stubs)):
                     f.write(f'    (void *)g{k},\n')
                 f.write('};\n')
+                # Each DLL's binding of the stubs it calls whose owner it
+                # imports statically (loaded and attached before it): at its
+                # process attach, with the loader lock held, as an import
+                # table is bound (winebuild's entry point calls it).
+                for i, (mod, _, _, _) in enumerate(d for d in dlls if grp(d[0]) == g):
+                    eager = set(EAGER.get(mod, []))
+                    mine = [(k, o, n) for k, (sym, _, o, n) in enumerate(stubs) if mod in users.get(sym, ()) and o in eager]
+                    f.write(f'void gb{i}(void) __asm__("gexw-bind!{mod}");\n')
+                    f.write(f'void gb{i}(void)\n{{\n')
+                    for o in sorted({o for _, o, _ in mine}):
+                        f.write(f'    {{ void *h = gexw_GetModuleHandleA("{o}");\n      if (h) {{\n')
+                        for k, _, n in (m for m in mine if m[1] == o):
+                            f.write(f'        if (!gp[{k}]) gp[{k}] = gexw_GetProcAddress(h, "{n}");\n')
+                        f.write('      }\n    }\n')
+                    f.write('}\n')
+                bound_groups.add(g)
             obj = os.path.join(tmp, f'guestimports{g}.o')
             subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
             objs[g].append(obj)
             print(f'{g or out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
+
+    # (a DLL in a group without guest-import stubs binds nothing)
+    for g in objs:
+        if g in bound_groups:
+            continue
+        src = os.path.join(tmp, f'guestbinds{g}.c')
+        with open(src, 'w') as f:
+            for i, (mod, _, _, _) in enumerate(d for d in dlls if grp(d[0]) == g):
+                f.write(f'void gb{i}(void) __asm__("gexw-bind!{mod}");\nvoid gb{i}(void) {{}}\n')
+        obj = os.path.join(tmp, f'guestbinds{g}.o')
+        subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
+        objs[g].append(obj)
 
     # Each module's load-time imports for Wine's PE loader on wasm32
     # (ntdll's fixup_imports asks __gexw_module_imports): only DLLs.
