@@ -28,10 +28,10 @@ for debugging and for building what a page loads ahead of time.
 - **wasm32 Linux programs.** `tools/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
-- **32-bit Windows programs, through Wine.** `tools/wine-wasm` builds
-  Wine's own Unix side as wasm32 for gex, plus a ready-to-run prefix.
-  The Windows code itself is translated like any other x86 code. 64-bit
-  Wine is in progress.
+- **Windows programs, through Wine.** `tools/wine-wasm` builds Wine's own
+  Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
+  itself is translated like any other x86 code. 32-bit Wine is the main
+  path; 64-bit Wine (`wine64.pins`) is newer and has seen fewer programs.
 - **Graphics.** `gex-wayland` is a Wayland compositor, and `gex-xwm` the X
   window manager that a rootless Xwayland needs. Wayland and X11 programs
   share one desktop. Xwayland can run as native WebAssembly in the page,
@@ -39,6 +39,10 @@ for debugging and for building what a page loads ahead of time.
   libEGL (`guest/gl`) to Mesa, which is compiled to WebAssembly and draws
   with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
   Desktop GL is supported up to 4.6.
+- **In the page, or ahead of time.** The same programs run in the browser
+  page (`web/`) and natively under `gexc`. An ejected project (below) runs
+  only what was built for it ahead of time, as a static site whose
+  JavaScript library a page of your own imports.
 
 ## How it works
 
@@ -101,6 +105,8 @@ for debugging and for building what a page loads ahead of time.
 | `tools/gexcc` | the wasm32 C/C++ compiler and its sysroot |
 | `tools/wine-wasm` | Wine for gex: dist, prefix, runner |
 | `tools/eject` | recording a Windows program for eject |
+| `tools/` (the rest) | generators for the GL transport and compatibility tables, staging the host's Wine PE files, profile and unit helpers |
+| `tests/` | the lifters' differential fuzzers, and page and eject tests that run under Node |
 | `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
 
 ## Building
@@ -135,7 +141,8 @@ $ node web/serve-dist.mjs 8088 --sp-port 8089
 The multi-process build gives each guest thread its own Worker on shared
 memory. It needs SharedArrayBuffer, so the page must be served with
 COOP/COEP headers. The single-thread build runs every thread as a fiber in
-one Worker, and works on any static host. See `web/README.md`.
+one Worker, and works on any static host. See `web/README.md` for the
+builds and `web/src/README.md` for the page's JavaScript API.
 
 Wine needs the x86 `gexc` at `target/x86/release/gexc`, as built above
 (or `GEXC=` naming another):
@@ -149,7 +156,8 @@ $ tools/wine-wasm/run.sh app.exe    # run a Windows program
 
 Each crate's own tests run with `cargo test -p <crate>`. `tests/diff-fuzz`
 and `tests/diff-fuzz-x86` fuzz the lifters instruction by instruction against
-QEMU.
+QEMU. The `check-*.mjs` scripts in `shims/browser/js` and the scripts in
+`tests/browser` and `tests/eject` run with `node`.
 
 ## Licence
 
