@@ -21,7 +21,7 @@ CORE="ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll vcruntime140
 # i386 the first certificate chain verification of a process took 10-30 s
 # natively, past a server's wait for the request; as wasm32 under 1 s.
 tlsmods=""; [ "${WINE32_TLS:-1}" != 0 ] && tlsmods=" crypt32.dll rsaenh.dll bcrypt.dll"
-PROGRAMS=${WINE32_PROGRAMS:-explorer.exe winewayland.drv opengl32.dll wineboot.exe services.exe winedevice.exe plugplay.exe rundll32.exe svchost.exe rpcss.exe conhost.exe$tlsmods}
+PROGRAMS=${WINE32_PROGRAMS:-explorer.exe winewayland.drv opengl32.dll wineboot.exe services.exe winedevice.exe plugplay.exe rundll32.exe svchost.exe rpcss.exe conhost.exe winsta.dll$tlsmods}
 # Every module built (wine-build.sh's make is -k): one that failed stops
 # the stage here, by name.
 for m in $CORE $PROGRAMS; do
