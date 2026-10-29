@@ -4924,7 +4924,9 @@ export class Gex {
         // static link leaves them, and a trap behind the null check.
         ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
-      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, m64()
+      // (i64 for a module built for wasm64, lowered or not: 64-bit Wine's
+      // wineboot.exe, a module of its own, names __original_main)
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, w64
         ? new WebAssembly.Global({ value: 'i64', mutable: true }, 0n)
         : new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
