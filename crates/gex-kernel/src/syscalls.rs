@@ -1259,6 +1259,11 @@ impl FdIo<'_> {
     /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
     pub fn eventfd2(&self, initval: u64, flags: u64) -> SysResult {
         use crate::eventfd::{flags as efd, EventFd};
+        // anything else is refused, as Linux does (Chromium's Mojo probes
+        // for eventfd2 with every bit set and expects EINVAL)
+        if flags & 0xffff_ffff & !(efd::SEMAPHORE | oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+            return Err(Errno::EINVAL);
+        }
         let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let file = OpenFile::new(
@@ -1378,6 +1383,16 @@ impl FdIo<'_> {
 
     pub fn memfd_create(&self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
         const MFD_CLOEXEC: u64 = 1;
+        // MFD_ALLOW_SEALING, MFD_HUGETLB (with its page size in bits 26-31),
+        // MFD_NOEXEC_SEAL and MFD_EXEC: anything else is refused, as Linux
+        // does, and callers probe for memfd_create with every bit set
+        // (Chromium's Mojo expects EINVAL)
+        const MFD_HUGETLB: u64 = 4;
+        let known = MFD_CLOEXEC | 2 | MFD_HUGETLB | 8 | 0x10 | if flags & MFD_HUGETLB != 0 { 0x3f << 26 } else { 0 };
+        let flags = flags & 0xffff_ffff;
+        if flags & !known != 0 {
+            return Err(Errno::EINVAL);
+        }
         let raw = m.read_cstr(name, 249)?;
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
