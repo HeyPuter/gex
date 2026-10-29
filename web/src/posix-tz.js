@@ -6,8 +6,11 @@
 // The rules are this year's transitions, as Intl gives them: none is a zone
 // on one offset; two (into the zone's daylight time and out) are a rule of
 // the form Mm.w.d/time, the week 5 ("last") when the day is in the month's
-// last seven. A year with another number of transitions (a rule changed)
-// is the offset now, without daylight time.
+// last seven. A year no such pair fits (a rule changed, or Morocco's: +01
+// but for a month around Ramadan, which moves with the moon and can come
+// twice in a year) is the offset the zone keeps for most of the year,
+// without daylight time: an hour off for the shorter part of it, never the
+// longer.
 
 const DAY = 86400e3;
 const formats = new Map();
@@ -91,9 +94,21 @@ function rule(t, before) {
   return `M${month + 1}.${week}.${local.getUTCDay()}${secs === 7200 ? '' : `/${hms(secs)}`}`;
 }
 
+/** The offset zone `zone` is at for the most time in year `year`, whose
+ *  transitions are `t`. */
+function mostOfYear(zone, year, t) {
+  const edges = [Date.UTC(year, 0, 1), ...t, Date.UTC(year + 1, 0, 1)];
+  const time = new Map();
+  for (let i = 0; i + 1 < edges.length; i++) {
+    const o = offsetAt(zone, edges[i]);
+    time.set(o, (time.get(o) ?? 0) + edges[i + 1] - edges[i]);
+  }
+  return [...time].reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+}
+
 /** Zone `zone` (an IANA name) as a POSIX TZ string for year `year` (this
  *  one's by default), or null when Intl does not know it. */
-export function posixTz(zone, year = new Date().getUTCFullYear(), now = Date.now()) {
+export function posixTz(zone, year = new Date().getUTCFullYear()) {
   let t;
   try {
     t = transitions(zone, year);
@@ -112,6 +127,6 @@ export function posixTz(zone, year = new Date().getUTCFullYear(), now = Date.now
       return `${name(std)}${off(std)}${name(dst)}${off(dst)},${rule(into, std)},${rule(out, dst)}`;
     }
   }
-  const now0 = offsetAt(zone, now);
-  return `${name(now0)}${off(now0)}`;
+  const most = mostOfYear(zone, year, t);
+  return `${name(most)}${off(most)}`;
 }
