@@ -1259,6 +1259,11 @@ impl FdIo<'_> {
     /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
     pub fn eventfd2(&self, initval: u64, flags: u64) -> SysResult {
         use crate::eventfd::{flags as efd, EventFd};
+        // anything else is refused, as Linux does (Chromium's Mojo probes
+        // for eventfd2 with every bit set and expects EINVAL)
+        if flags & 0xffff_ffff & !(efd::SEMAPHORE | oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+            return Err(Errno::EINVAL);
+        }
         let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let file = OpenFile::new(
