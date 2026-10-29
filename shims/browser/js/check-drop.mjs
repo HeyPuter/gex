@@ -11,6 +11,8 @@
  *   - the copy makes /tmp/drops/1, then /tmp/drops/2, with every folder and
  *     file, the bytes read back the same (one file over the write chunk);
  *   - files are 0644, a script ("#!") 0755, folders 0755;
+ *   - each file's modification time is its File's lastModified (to the
+ *     nanosecond), each folder's the newest of the files under it, an empty one's the drop's;
  *   - progress ends at {done = total, filesDone = files};
  *   - an aborted drop rejects as aborted and leaves no /tmp/drops/N;
  *   - a move into a folder that has a name already numbers it ("a (2).txt"),
@@ -61,7 +63,10 @@ function meta(p) {
   const n = put(p);
   if (k.k_fs_path_meta(0n, n, 4096n) < 0) return null;
   const v = new DataView(proc.buffer, 4096, 72);
-  return { type: v.getUint32(0, true), mode: v.getUint32(4, true) & 0o7777, size: Number(v.getBigUint64(8, true)) };
+  return {
+    type: v.getUint32(0, true), mode: v.getUint32(4, true) & 0o7777, size: Number(v.getBigUint64(8, true)),
+    mtime: Number(v.getBigInt64(24, true)), mtimeNs: v.getUint32(36, true),
+  };
 }
 function read(p) {
   const h = k.k_fs_open(0n, put(p), 0n, 0);
@@ -86,7 +91,9 @@ const tree = {
   'run.sh': '#!/bin/sh\necho hi\n',
   'big.bin': big,
 };
-const file = (name, body) => new File([body], name);
+// Each file's lastModified (Unix ms), as a browser gives a dropped file's.
+const TIMES = { 'hello.txt': 1700000000123, 'n.txt': 1710000000456, 'run.sh': 1690000000789, 'big.bin': 1600000000000 };
+const file = (name, body) => new File([body], name, { lastModified: TIMES[name] ?? 1650000000000 });
 // As Chromium's getAsFileSystemHandle gives a folder...
 const handleOf = (name, body) =>
   body instanceof Uint8Array || typeof body === 'string'
@@ -133,8 +140,10 @@ const answer = async (id) => {
 };
 send({ spec: { module, memory }, stackTop });
 
+const before = Math.floor(Date.now() / 1000);
 send({ id: 1, dir: null, root: '/tmp/drops', entries: byHandle });
 const a = await answer(1);
+const after = Math.floor(Date.now() / 1000);
 check(a.done?.path === '/tmp/drops/1', `first drop: ${JSON.stringify(a)}`);
 const last = out.filter((m) => m.id === 1 && m.progress).at(-1)?.progress;
 check(last && last.done === last.total && last.total === big.length + 16 + 2 + 18 && last.filesDone === 4 && last.files === 4,
@@ -148,6 +157,19 @@ for (const [p, type, mode] of want) {
   check(m && m.type === type && m.mode === mode, `${p}: ${JSON.stringify(m)}, want type ${type} mode ${mode.toString(8)}`);
 }
 check(read('/tmp/drops/1/d1/hello.txt')?.toString() === 'hello-from-host\n', 'hello.txt bytes');
+// Times: files their File's, folders the newest under them, an empty one the drop's.
+const secs = (ms) => Math.floor(ms / 1000);
+const times = [
+  ['d1/hello.txt', secs(TIMES['hello.txt'])], ['d1/sub/n.txt', secs(TIMES['n.txt'])], ['run.sh', secs(TIMES['run.sh'])],
+  ['big.bin', secs(TIMES['big.bin'])], ['d1/sub', secs(TIMES['n.txt'])], ['d1', secs(TIMES['n.txt'])], ['', secs(TIMES['n.txt'])],
+];
+for (const [p, t] of times) {
+  const m = meta(`/tmp/drops/1/${p}`.replace(/\/$/, ''));
+  check(m && m.mtime === t, `${p || '/tmp/drops/1'} mtime: ${m?.mtime}, want ${t}`);
+}
+check(meta('/tmp/drops/1/d1/hello.txt')?.mtimeNs === 123e6, `hello.txt mtime ns: ${meta('/tmp/drops/1/d1/hello.txt')?.mtimeNs}`);
+const em = meta('/tmp/drops/1/d1/empty')?.mtime;
+check(em >= before && em <= after, `an empty folder's mtime is the drop's: ${em}, want ${before}..${after}`);
 check(Buffer.compare(read('/tmp/drops/1/big.bin') ?? Buffer.alloc(0), Buffer.from(big)) === 0, 'big.bin bytes');
 
 send({ id: 2, dir: null, root: '/tmp/drops', entries: byEntry.slice(0, 2) });
@@ -163,6 +185,7 @@ check(meta('/tmp/drops/3') === null, 'an aborted drop leaves no /tmp/drops/3');
 // Moved beside a name already there.
 send({ id: 4, move: { from: '/tmp/drops/2', names: ['d1'], into: '/home/u/Desktop' } });
 check((await answer(4)).placed?.paths?.[0] === '/home/u/Desktop/d1', 'move into a new folder');
+check(meta('/home/u/Desktop/d1/hello.txt')?.mtime === secs(TIMES['hello.txt']), 'a moved file keeps its time');
 send({ id: 5, dir: null, root: '/tmp/drops', entries: [{ path: 'd1' }, { path: 'a.txt', file: file('a.txt', 'a') }] });
 const e = await answer(5);
 send({ id: 6, move: { from: e.done.path, names: ['d1', 'a.txt'], into: '/home/u/Desktop' } });
@@ -194,4 +217,4 @@ check(j.aborted && read('/home/u/Desktop/a.txt')?.toString() === 'a' && meta('/h
 send({ abort: 9 });
 
 if (failed) process.exit(1);
-console.log('check-drop: ok (two drops by handle and by entry, modes, progress, abort, numbered moves and drops into a folder)');
+console.log('check-drop: ok (two drops by handle and by entry, modes, times, progress, abort, numbered moves and drops into a folder)');

@@ -11,6 +11,9 @@
 // drop has twice. Directories are made
 // 0755, files 0644, or 0755 when they start as a program does ("\x7fELF" or
 // "#!"); ownership is the guest's one user's (the kernel keeps none).
+// Each file is stamped with its File's lastModified (the kernel has no
+// clock), and each folder the drop made with the newest time of the files
+// under it, or the drop's if there are none.
 //
 // Messages in:  { spec: { module, memory }, stackTop }        once, first;
 //               { id, dir, root, entries: [{ path, file? }] } a drop: `dir` the
@@ -64,6 +67,15 @@ const mkdir = (p, mode = 0o755) => k.k_fs_mkdir(BigInt(PATH_AT), putPath(p), mod
 const unlink = (p) => k.k_fs_unlink(BigInt(PATH_AT), putPath(p));
 const rmdir = (p) => k.k_fs_rmdir(BigInt(PATH_AT), putPath(p));
 const chmod = (p, mode) => k.k_fs_chmod(BigInt(PATH_AT), putPath(p), mode);
+const setMtime = (p, ms) => k.k_fs_set_mtime(BigInt(PATH_AT), putPath(p), BigInt(Math.floor(ms / 1000)));
+/** An open file's access and modification times, both `ms` (Unix ms). */
+function stamp(h, ms, nowMs) {
+  const s = BigInt(Math.floor(ms / 1000));
+  const ns = Math.round((ms - Math.floor(ms / 1000) * 1000) * 1e6);
+  return k.k_fs_set_times_fd(h, s, ns, s, ns, BigInt(Math.floor(nowMs / 1000)));
+}
+/** A File's time: its lastModified, or `nowMs` when it has none. */
+const fileTime = (f, nowMs) => (Number.isFinite(f.lastModified) && f.lastModified > 0 ? f.lastModified : nowMs);
 /** Whether anything (a file, a folder, a link) is at `p`. */
 const exists = (p) => k.k_fs_path_meta(BigInt(PATH_AT), putPath(p), BigInt(DATA_AT)) >= 0;
 
@@ -112,6 +124,15 @@ const startsAsProgram = (b) =>
 
 async function copy(m) {
   const t0 = performance.now();
+  const nowMs = Date.now();
+  // The newest time under each folder the drop made, by path.
+  const newest = new Map();
+  const touched = (path, ms) => {
+    for (let at = path.lastIndexOf('/'); at > 0; at = path.lastIndexOf('/', at - 1)) {
+      const dir = path.slice(0, at);
+      if (newest.has(dir)) newest.set(dir, Math.max(newest.get(dir), ms));
+    }
+  };
   const files = m.entries.filter((e) => e.file);
   const total = files.reduce((n, e) => n + e.file.size, 0);
   const top = newDir(m.dir, m.root);
@@ -148,6 +169,7 @@ async function copy(m) {
   const check = () => {
     if (aborted.has(m.id)) throw Object.assign(new Error('the drop was aborted'), { aborted: true });
   };
+  if (!m.dir) newest.set(top, -Infinity);
   try {
     progress('', true);
     for (const e of m.entries) {
@@ -156,7 +178,10 @@ async function copy(m) {
       if (!e.file) {
         const r = mkdir(path);
         if (r < 0 && r !== -EEXIST) throw new Error(`mkdir ${path}: errno ${-r}`);
-        if (r === 0) made.push([path, true]);
+        if (r === 0) {
+          made.push([path, true]);
+          newest.set(path, -Infinity);
+        }
         continue;
       }
       // O_EXCL: never a file that is there already (see `place`).
@@ -184,6 +209,10 @@ async function copy(m) {
           progress(e.path);
         }
         finished = true;
+        const ms = fileTime(e.file, nowMs);
+        const r = stamp(h, ms, nowMs);
+        if (r < 0) throw new Error(`set times ${path}: errno ${-r}`);
+        touched(path, ms);
       } finally {
         k.k_fs_close(h);
         // Stopped part way: the browser need not read the rest of the File.
@@ -192,6 +221,14 @@ async function copy(m) {
       if (program) chmod(path, 0o755);
       filesDone++;
       progress(e.path);
+    }
+    // The folders, deepest first, so each one's time is in its parent's
+    // (an empty one's, the drop's, is not).
+    for (const dir of [...newest.keys()].sort((a, b) => b.split('/').length - a.split('/').length)) {
+      const t = newest.get(dir);
+      const r = setMtime(dir, t > -Infinity ? t : nowMs);
+      if (r < 0) throw new Error(`set mtime ${dir}: errno ${-r}`);
+      if (t > -Infinity) touched(dir, t);
     }
   } catch (err) {
     for (const [p, dir] of made.reverse()) (dir ? rmdir : unlink)(p);
