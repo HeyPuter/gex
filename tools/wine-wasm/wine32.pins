@@ -5,7 +5,7 @@
 
 # The Wine fork: branch wasm32-w3-next.
 WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE_COMMIT := 8d0980f18a3f4cada4d4ee0d24c21cce6c9dc0d4
+WINE_COMMIT := 5ae68e95f71b4af62e080237b6a6d8172bc0b916
 
 # The musl fork the wasm32 sysroot is built from (build-sysroot.sh):
 # branch mw/gex-wasm32-slim.
