@@ -652,6 +652,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-embed"
+version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-emit",
+ "gex-xlate",
+]
+
+[[package]]
 name = "gex-emit"
 version = "0.0.1"
 dependencies = [
@@ -842,6 +851,7 @@ dependencies = [
  "gex-lift-x86",
  "gimli",
  "object",
+ "wasmparser 0.219.2",
 ]
 
 [[package]]

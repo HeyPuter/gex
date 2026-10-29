@@ -32,6 +32,7 @@ members = [
     "shims/browser",
     "shims/hostwl",
     "shims/native",
+    "shims/embed",
     "tests/diff-fuzz",
     "tests/diff-fuzz-x86",
 ]

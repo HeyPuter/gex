@@ -100,6 +100,7 @@ for debugging and for building what a page loads ahead of time.
 | `shims/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
 | `shims/hostwl` | the compositor for an X server that runs in the page |
 | `shims/native` | the native host, on wasmtime |
+| `shims/embed` | gex hosted in another program's wasm module: an emscripten host's memory, allocator and Workers (`gex_abi::hosted`) |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
 | `web/` | the page, its build, and the Mesa and Xwayland builds |
 | `tools/gexcc` | the wasm32 C/C++ compiler and its sysroot |
