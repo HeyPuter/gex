@@ -64,6 +64,41 @@ pub fn unit_key(image: &Image, format: &str, unit_inputs: &str, unit_abi_version
     sha256::hex(&h.finish())
 }
 
+/// One entry of an ejected site's `identities` (`base:key:identity:path`,
+/// joined by `;`): a unit's key and its image's identity at a base, for the
+/// processes of one flavour. The base is written after its flavour's marks:
+/// `m` for a 64-bit memory's, then `k` for a compact process's (the KUSER
+/// fold covering the entry page); neither is a hex digit. An unmarked key is a 32-bit memory's
+/// process's without the entry fold; one process takes only its own
+/// flavour's, since the flavours place an image at the same base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityLine<'a> {
+    pub mem64: bool,
+    pub compact: bool,
+    pub base: u64,
+    pub key: &'a str,
+    pub identity: &'a str,
+    pub path: &'a str,
+}
+
+impl<'a> IdentityLine<'a> {
+    /// The entry as the eject writes it.
+    pub fn write(&self) -> String {
+        let (m, c) = (if self.mem64 { "m" } else { "" }, if self.compact { "k" } else { "" });
+        format!("{m}{c}{:x}:{}:{}:{}", self.base, self.key, self.identity, self.path)
+    }
+
+    /// One `;`-separated entry; `None` for a malformed one.
+    pub fn parse(item: &'a str) -> Option<Self> {
+        let mut f = item.splitn(4, ':');
+        let (base, key, identity, path) = (f.next()?, f.next()?, f.next()?, f.next()?);
+        let (mem64, base) = base.strip_prefix('m').map_or((false, base), |b| (true, b));
+        let (compact, base) = base.strip_prefix('k').map_or((false, base), |b| (true, b));
+        let base = u64::from_str_radix(base, 16).ok()?;
+        Some(Self { mem64, compact, base, key, identity, path })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +166,18 @@ mod tests {
             assert_ne!(rec, "e586c60522f7c873ddc04a9652df01f404529981dbb33ec325609e23d972b437");
             assert_ne!(unit, "cfb86de8e01048b353148fa2d7afdff15a1263bbec2bfb80c7f35dbfaf3b0059");
         }
+    }
+
+    #[test]
+    fn identity_lines_keep_their_flavour() {
+        for (mem64, compact) in [(false, false), (true, false), (false, true), (true, true)] {
+            let l = IdentityLine { mem64, compact, base: 0x6b0c0000, key: "k1", identity: "i1", path: "/w/user32.dll" };
+            let w = l.write();
+            assert_eq!(IdentityLine::parse(&w), Some(l), "{w}");
+        }
+        // The marks are not hex digits, so a base beginning with one is not misread.
+        assert_eq!(IdentityLine::parse("k1f00000:k:i:/p").map(|l| (l.compact, l.base)), Some((true, 0x1f00000)));
+        assert_eq!(IdentityLine::parse("c1f00000:k:i:/p").map(|l| (l.compact, l.base)), Some((false, 0xc1f00000)));
+        assert_eq!(IdentityLine::parse("1f00000:k:i"), None);
     }
 }

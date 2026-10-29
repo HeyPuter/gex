@@ -229,23 +229,19 @@ const PROVIDER: u32 = 1 << 31;
 /// hashed as before. A key is a memory flavour's: one whose base is written
 /// `m<base>` is the 64-bit memory's, the others the 32-bit memory's, and a
 /// process takes only its own flavour's (a 64-bit Wine page runs both, an
-/// image at one base in each).
-static KNOWN: Mutex<Option<std::collections::HashMap<(u64, String), (String, String)>>> = Mutex::new(None);
+/// image at one base in each). Likewise a compact process's key (`k`,
+/// `gex_key::IdentityLine`) only a compact process takes, and an unmarked
+/// one only the others: the two place an image at the same pin.
+static KNOWN: Mutex<Option<std::collections::HashMap<(bool, u64, String), (String, String)>>> = Mutex::new(None);
 
 pub(crate) fn set_identities(spec: &str) {
     let mut m = std::collections::HashMap::new();
     for item in spec.split(';') {
-        let mut f = item.splitn(4, ':');
-        let (Some(base), Some(key), Some(id), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
-        let (m64, base) = match base.strip_prefix('m') {
-            Some(b) => (true, b),
-            None => (false, base),
-        };
-        if m64 != gex_abi::mem64() {
+        let Some(l) = gex_key::IdentityLine::parse(item) else { continue };
+        if l.mem64 != gex_abi::mem64() {
             continue;
         }
-        let Ok(base) = u64::from_str_radix(base, 16) else { continue };
-        m.insert((base, path.to_string()), (key.to_string(), id.to_string()));
+        m.insert((l.compact, l.base, l.path.to_string()), (l.key.to_string(), l.identity.to_string()));
     }
     *lock(&KNOWN) = Some(m);
 }
@@ -261,7 +257,8 @@ pub extern "C" fn gex_cgen_identities(ptr: u32, len: u32) {
 }
 
 fn known(base: u64, path: &str) -> Option<(String, String)> {
-    lock(&KNOWN).as_ref()?.get(&(base, path.to_string())).cloned()
+    let compact = gex_abi::kuser_fold() && gex_abi::kuser_fold_entry();
+    lock(&KNOWN).as_ref()?.get(&(compact, base, path.to_string())).cloned()
 }
 
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
