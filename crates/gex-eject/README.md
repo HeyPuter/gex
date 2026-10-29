@@ -548,6 +548,8 @@ when the recorder saw the window (the session's `files_read_title`), and
 everything read after it, a game's first level included, is a lazy file. The
 recording can then settle as long as its units need (`--settle`) without the
 bundle growing.
+A recording made before the recorder kept `files_read_title` has no title
+set: the build then warns and keeps the run's whole read set, as `"split"`.
 
 A game's window often opens well before its title menu, which then loads
 from lazy files a read at a time. `"title_after": S` cuts S seconds after the

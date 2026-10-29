@@ -792,6 +792,37 @@ fn base_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase()
 }
 
+/// The files a split bundle keeps, and the recording's key they came from.
+/// `"split"`: the run's `files_read`. `"title"`: those it had read by its
+/// title (`title_read_set`); a recording made before the recorder kept that
+/// set has none, and the bundle is then the split's, with a warning, so a
+/// project recorded earlier still builds with the default `gexc eject` writes.
+fn bundle_read_set(v: &Json, config: &Config) -> Result<(Option<Vec<Json>>, &'static str)> {
+    let whole = |v: &Json| match v.get("files_read") {
+        Some(Json::Arr(read)) => Some(read.clone()),
+        _ => None,
+    };
+    if !config.bundle_title {
+        return Ok((whole(v), "files_read"));
+    }
+    if config.title_after == 0 && !matches!(v.get("files_read_title"), Some(Json::Arr(_))) {
+        eprintln!(
+            "gexc eject build: warning: \"bundle\": \"title\", but the recording has no files_read_title \
+             (recorded before the recorder kept it): the bundle is the run's whole read set, as \"split\""
+        );
+        return Ok((whole(v), "files_read"));
+    }
+    let read = title_read_set(v, config.title_after, config.wineboot_skip)?.map(|(read, left)| {
+        eprintln!(
+            "gexc eject build: \"bundle\": \"title\"{}: {} files in the bundle, {left} images the run only opened left to be read later",
+            if config.title_after > 0 { format!(" {} s after the window", config.title_after) } else { String::new() },
+            read.len()
+        );
+        read
+    });
+    Ok((read, "files_read_title"))
+}
+
 /// What `"bundle": "title"` keeps: the files the run had read by its title
 /// window, or (`after` > 0) by that many seconds after it, from the
 /// recording's `files_read_at`; less the images no process loaded (an image
@@ -1416,23 +1447,8 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     // `"bundle": "split"`: the files the recorded run opened, which the site
     // keeps in its bundle (web/eject-site.mjs); `"title"`: those it opened up
     // to its title window.
-    let read_set = if config.bundle_title { "files_read_title" } else { "files_read" };
     let bundle = if config.bundle_split {
-        let read = if config.bundle_title {
-            title_read_set(&v, config.title_after, config.wineboot_skip)?.map(|(read, left)| {
-                eprintln!(
-                    "gexc eject build: \"bundle\": \"title\"{}: {} files in the bundle, {left} images the run only opened left to be read later",
-                    if config.title_after > 0 { format!(" {} s after the window", config.title_after) } else { String::new() },
-                    read.len()
-                );
-                read
-            })
-        } else {
-            match v.get(read_set) {
-                Some(Json::Arr(read)) => Some(read.clone()),
-                _ => None,
-            }
-        };
+        let (read, read_set) = bundle_read_set(&v, &config)?;
         match read {
             Some(read) => {
                 let mut read = read;
@@ -1555,6 +1571,26 @@ mod volatile_tests {
         assert!(later.contains(&"/g/menu.pkg".to_string()) && !later.contains(&"/g/level.pkg".to_string()));
         assert!(title_read_set(&Json::parse("{}").unwrap(), 0, false).unwrap().is_none());
         assert!(title_read_set(&Json::parse(r#"{"title_seconds": 1}"#).unwrap(), 5, false).is_err());
+    }
+
+    #[test]
+    fn a_title_bundle_of_an_older_recording_is_the_split() {
+        let title = Config::from_json(r#"{"bundle": "title"}"#).unwrap();
+        let names = |r: Option<Vec<Json>>| r.map(|r| r.iter().map(|p| p.as_str().unwrap().to_string()).collect::<Vec<_>>());
+        // recorded before the recorder kept the title's read set: the whole one, as "split"
+        for old in [r#"{"files_read": ["/w/a.dll", "/g/level.pkg"]}"#, r#"{"files_read": ["/w/a.dll", "/g/level.pkg"], "files_read_title": null}"#] {
+            let (read, key) = bundle_read_set(&Json::parse(old).unwrap(), &title).unwrap();
+            assert_eq!((names(read), key), (Some(vec!["/w/a.dll".to_string(), "/g/level.pkg".to_string()]), "files_read"));
+        }
+        // with it, the title's
+        let new = Json::parse(r#"{"files_read": ["/w/a.dll", "/g/level.pkg"], "files_read_title": ["/w/a.dll"]}"#).unwrap();
+        let (read, key) = bundle_read_set(&new, &title).unwrap();
+        assert_eq!((names(read), key), (Some(vec!["/w/a.dll".to_string()]), "files_read_title"));
+        // no read set at all: none, which the build refuses
+        assert!(bundle_read_set(&Json::parse("{}").unwrap(), &title).unwrap().0.is_none());
+        // "title_after" asks for the read times by name: still an error without them
+        let after = Config::from_json(r#"{"bundle": "title", "title_after": 30}"#).unwrap();
+        assert!(bundle_read_set(&Json::parse(r#"{"files_read": [], "title_seconds": 1}"#).unwrap(), &after).is_err());
     }
 
     #[test]
