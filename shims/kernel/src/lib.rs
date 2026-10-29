@@ -3091,6 +3091,18 @@ pub extern "C" fn k_fs_mkdir(path: gex_kmem::PAddr, path_len: u32, mode: u32) ->
     as_unit(rootfs().mkdir(&path_of(path, path_len), mode))
 }
 
+/// A directory put into the shared root with every missing one above it
+/// (`TmpFs::add_dir`): seeding, where [`k_fs_mkdir`] is a program's
+/// `mkdir` and wants the parent there.
+#[no_mangle]
+pub extern "C" fn k_fs_add_dir(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
+    let p = path_of(path, path_len);
+    if let Some((parent, _)) = p.rsplit_once('/') {
+        rootfs().add_dir(parent);
+    }
+    as_unit(rootfs().mkdir(&p, mode))
+}
+
 #[no_mangle]
 pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     as_unit(rootfs().rmdir(&path_of(path, path_len)))

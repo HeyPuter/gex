@@ -114,7 +114,7 @@ async function overlay({ url, name }) {
   let size = 0;
   for (const d of tree.dirs) {
     const [pp, pl] = put(d);
-    k.k_fs_mkdir(BigInt(pp), pl, 0o755);
+    (k.k_fs_add_dir ?? k.k_fs_mkdir)(BigInt(pp), pl, 0o755);
   }
   let status = '';
   // Files fetched from the page as the guest reads them (`k_fs_add_lazy`):
