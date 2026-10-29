@@ -92,6 +92,11 @@ pub(crate) fn install(
 /// offsets.
 pub(crate) struct WinePe {
     pub(crate) install: u32,
+    /// The module's file (a skeleton's `.wasmref` names it beside itself).
+    file: std::path::PathBuf,
+    /// Its function-table module number (`ftab` `modules`): what a
+    /// `--split` module's imports of the core are bound to.
+    module: u32,
     data: u64,
     pub(crate) slots: std::collections::HashMap<String, u32>,
     /// `gexp_<export>` slots by export name, whichever DLL owns them: a
@@ -134,7 +139,16 @@ impl WinePe {
 /// After an install's catch-up (the module instantiated, its data
 /// initialised): the writes that had to wait for it.
 pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) {
-    let Some(wp) = shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe.clone() else { return };
+    let all: Vec<Arc<WinePe>> = {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        s.wine_pe.iter().chain(s.wine_pe_split.iter()).cloned().collect()
+    };
+    for wp in all {
+        apply_pending_one(&wp, shared, memory);
+    }
+}
+
+fn apply_pending_one(wp: &Arc<WinePe>, shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) {
     let writes = std::mem::take(&mut *wp.pending.lock().unwrap_or_else(|e| e.into_inner()));
     for (at, bytes) in writes {
         if std::env::var_os("GEX_WASM_TRACE").is_some() {
@@ -145,8 +159,8 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
         }
     }
     if !wp.entries_bound.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        if let Err(e) = bind_entry_thunks(&wp, shared, memory) {
-            eprintln!("gex-pe: Wine's PE module: entry thunks: {e:#}");
+        if let Err(e) = bind_entry_thunks(wp, shared, memory) {
+            eprintln!("gex-pe: Wine's PE module {}: entry thunks: {e:#}", wp.file.display());
         }
     }
 }
@@ -395,60 +409,60 @@ fn install_shared(
         data_exports.push((idx, cstr(&mut p)?));
     }
 
-    // The module: installed once, at the first skeleton.
-    let existing = shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe.clone();
-    let (wp, first) = match existing {
-        Some(wp) => (wp, None),
-        None => {
-            let t0 = std::time::Instant::now();
-            let file = std::path::Path::new(path).with_file_name(&module_name);
-            // a twin install's memory64 module, beside it
-            let twin = std::path::Path::new(path).with_file_name(format!("{module_name}.m64"));
-            let file = if gex_abi::mem64() && twin.is_file() { twin } else { file };
-            let pm = parsed_module(&file, engine, t0, !pe.is64)?;
-            let (size, align) = (pm.size, pm.align);
-            let a = 1u64 << align;
-            // (an LLP64 module's above the images: a PE32+ export's RVA is
-            // added to its base in 64 bits, so data below an image's base
-            // would be past 4 GiB)
-            let data = if pe.is64 {
-                crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
-            } else {
-                crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?
-            };
-            let data = (data + a - 1) & !(a - 1);
-            let (slots, any_dll, module, n_names) = (pm.slots.clone(), pm.any_dll.clone(), pm.module.clone(), pm.n_names);
-            let data_exports_map = pm.data_exports.clone();
-            let wp = WinePe {
-                install: 0,
-                data,
-                slots,
-                any_dll,
-                data_exports: data_exports_map,
-                pending: Mutex::new(Vec::new()),
-                entries_bound: Default::default(),
-                ptr64: pe.is64,
-                mapped: Default::default(),
-            };
-            (Arc::new(wp), Some((module, n_names)))
-        }
+    // The module: installed once, at the first skeleton that names it. A
+    // DLL linked as a module of its own (`pelink.py --split`) binds its
+    // imports to the core's exports, the core (winepe.wasm beside it)
+    // installed first if no skeleton of its has been (a program's image
+    // maps before ntdll's).
+    let beside = |name: &str| {
+        let file = std::path::Path::new(path).with_file_name(name);
+        // a twin install's memory64 module, beside it
+        let twin = std::path::Path::new(path).with_file_name(format!("{name}.m64"));
+        if gex_abi::mem64() && twin.is_file() { twin } else { file }
+    };
+    let file = beside(&module_name);
+    let core_file = beside(CORE_MODULE);
+    let same = |wp: &Arc<WinePe>, f: &std::path::Path| wp.file == f || wp.file.file_name() == f.file_name();
+    let find = |f: &std::path::Path| {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        s.wine_pe.iter().chain(s.wine_pe_split.iter()).find(|wp| same(wp, f)).cloned()
+    };
+    let is_core = file.file_name() == core_file.file_name() || !core_file.is_file();
+    let core = match (find(&core_file), is_core) {
+        (Some(c), _) => Some(c),
+        (None, true) => None,
+        (None, false) => Some(install_module(&core_file, None, pe.is64, state, shared, engine, memory)?),
+    };
+    let wp = match find(&file) {
+        Some(wp) => wp,
+        None => install_module(&file, if is_core { None } else { core.clone() }, pe.is64, state, shared, engine, memory)?,
     };
 
-    // This DLL's bindings.
+    // This DLL's bindings: its own module's adapters, and for a `-import`
+    // re-export the owner's, in whichever install has it (the core's, for a
+    // module of its own).
     let slot = |n: &str| wp.slots.get(n).copied();
     let missing = slot(&format!("{dll}!gexp__missing"))
         .or_else(|| wp.slots.iter().find(|(k, _)| k.ends_with("!gexp__missing")).map(|(_, v)| *v))
         .ok_or_else(|| anyhow!("{path}: Wine's PE module has no gexp__missing"))?;
+    let other = core.as_ref().filter(|c| !Arc::ptr_eq(c, &wp));
     let mut pairs = Vec::new();
+    let mut other_pairs = Vec::new();
     for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
-        let k = e
+        let own = e
             .names
             .iter()
             .find_map(|n| slot(&format!("{dll}!gexp_{n}")))
             .or_else(|| slot(&format!("{dll}!gexp_#{}", e.ordinal)))
-            .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()))
-            .unwrap_or(missing);
-        pairs.push((base + e.rva as u64, k));
+            .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()));
+        match (own, other) {
+            (Some(k), _) => pairs.push((base + e.rva as u64, k)),
+            (None, Some(c)) => match e.names.iter().find_map(|n| c.any_dll.get(n).copied()) {
+                Some(k) => other_pairs.push((base + e.rva as u64, k)),
+                None => pairs.push((base + e.rva as u64, missing)),
+            },
+            (None, None) => pairs.push((base + e.rva as u64, missing)),
+        }
     }
     if let (Some(k), true) = (slot(&format!("{dll}!gexp__entry")), pe.entry_rva != 0) {
         pairs.push((base + pe.entry_rva as u64, k));
@@ -495,17 +509,105 @@ fn install_shared(
         }
     }
 
-    let n = pairs.len();
-    match first {
-        Some((module, len)) => {
-            let install = crate::ftab::publish_stateful(shared, memory, module, len, &pairs, crate::libprov::Extras { memory_base: wp.data })?;
-            let mut wp = Arc::try_unwrap(wp).ok().expect("WinePe not yet shared");
-            wp.install = install;
-            shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe = Some(Arc::new(wp));
-        }
-        None => crate::ftab::bind_pairs(shared, memory, wp.install, &pairs)?,
+    let n = pairs.len() + other_pairs.len();
+    crate::ftab::bind_pairs(shared, memory, wp.install, &pairs)?;
+    if let (false, Some(c)) = (other_pairs.is_empty(), other) {
+        crate::ftab::bind_pairs(shared, memory, c.install, &other_pairs)?;
+    }
+    if crate::wasm_trace() {
+        eprintln!("gex: wine PE: {dll}: {} exports bound in {}{}", n, file.display(), if other_pairs.is_empty() { String::new() } else { format!(" ({} re-exports in the core)", other_pairs.len()) });
     }
     Ok(n)
+}
+
+/// The core module's file name: the module a skeleton of a DLL linked as
+/// a module of its own finds beside itself.
+const CORE_MODULE: &str = "winepe.wasm";
+
+/// Install one of Wine's PE modules (every store instantiates it): its data
+/// allocated, and with `core` (a module of its own) its imports of the
+/// core bound to the core's exports: functions it calls to the core's
+/// functions, a core function's address it takes (`GOT.func`) to a slot
+/// after its own that each store fills with the core's function. The rest
+/// is left to the instantiation (memory, table, bases, `gex.*`). The core's
+/// own binds are empty: it is recorded per store as a dylink module, for
+/// the others to bind to.
+#[allow(clippy::too_many_arguments)]
+fn install_module(
+    file: &std::path::Path,
+    core: Option<Arc<WinePe>>,
+    is64: bool,
+    state: &mut HostState,
+    shared: &Arc<Mutex<JitShared>>,
+    engine: &Engine,
+    memory: &gex_mem::GuestMemory,
+) -> Result<Arc<WinePe>> {
+    let t0 = std::time::Instant::now();
+    let pm = parsed_module(file, engine, t0, !is64)?;
+    let (size, align) = (pm.size, pm.align);
+    let a = 1u64 << align;
+    // (an LLP64 module's above the images: a PE32+ export's RVA is
+    // added to its base in 64 bits, so data below an image's base
+    // would be past 4 GiB)
+    let data = if is64 {
+        crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
+    } else {
+        crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?
+    };
+    let data = (data + a - 1) & !(a - 1);
+    let module = pm.module.clone();
+    let mut len = pm.n_names;
+    let mut extra_from = Vec::new();
+    let mut imports = Vec::new();
+    if let Some(c) = &core {
+        let core_mod = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.modules[c.module as usize].clone();
+        let have: std::collections::HashSet<String> = core_mod.exports().map(|e| e.name().to_string()).collect();
+        let funcs: std::collections::HashSet<String> =
+            core_mod.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect();
+        for imp in module.imports() {
+            let (m, name) = (imp.module().to_string(), imp.name().to_string());
+            let b = if m == "GOT.func" && funcs.contains(&name) {
+                extra_from.push((len, c.module, name.clone()));
+                len += 1;
+                crate::dylink::NBind::OwnSlot(len - 1)
+            } else if m == "env" && have.contains(&name) {
+                crate::dylink::NBind::Export { module: c.module, name: name.clone() }
+            } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
+                crate::dylink::NBind::Missing(format!("{}: {name}: not in Wine's core module", file.display()))
+            } else {
+                crate::dylink::NBind::Shim
+            };
+            imports.push((m, name, b));
+        }
+    }
+    let number = {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let m = s.ftab.modules.len() as u32;
+        let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), extra_from, tls: None };
+        s.ftab.dylink.insert(m, Arc::new(binds));
+        m
+    };
+    let install = crate::ftab::publish_stateful(shared, memory, module, len, &[], crate::libprov::Extras { memory_base: data })?;
+    let wp = Arc::new(WinePe {
+        install,
+        file: file.to_path_buf(),
+        module: number,
+        data,
+        slots: pm.slots.clone(),
+        any_dll: pm.any_dll.clone(),
+        data_exports: pm.data_exports.clone(),
+        pending: Mutex::new(Vec::new()),
+        entries_bound: Default::default(),
+        ptr64: is64,
+        mapped: Default::default(),
+    });
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if core.is_none() {
+        s.wine_pe = Some(wp.clone());
+    } else {
+        s.wine_pe_split.push(wp.clone());
+    }
+    Ok(wp)
 }
 
 fn memory_u32(memory: &gex_mem::GuestMemory, addr: u64) -> Result<u32> {

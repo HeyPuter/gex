@@ -501,6 +501,10 @@ struct JitShared {
     /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
     /// at the first skeleton that names it, bound DLL by DLL.
     wine_pe: Option<Arc<wasmdll::WinePe>>,
+    /// Wine's DLLs linked as modules of their own (pelink.py --split),
+    /// each installed at the first skeleton that names it, its imports of
+    /// the core bound to `wine_pe`'s exports.
+    wine_pe_split: Vec<Arc<wasmdll::WinePe>>,
     /// The stateful modules' data addresses whose relocations this address
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
@@ -1304,6 +1308,7 @@ fn run_program_with(
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
+                wine_pe_split: Vec::new(),
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),

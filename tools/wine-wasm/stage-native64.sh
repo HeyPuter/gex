@@ -41,8 +41,14 @@ if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
         extras+=("$n")
     done
 fi
-PATH=$GEX_WASM64_SYSROOT/binaryen/bin:$PATH TMPDIR=$tmp python3 "$here/pelink.py" --wasm64 "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
+# WINE64_SPLIT_DLLS="DLL ...": those DLLs each linked as a module of their
+# own, DLL.wasm beside winepe.wasm (pelink.py --split), loaded when their
+# skeleton is; their imports of the core's DLLs bind to its exports.
+split=() splits=()
+for dll in ${WINE64_SPLIT_DLLS:-}; do split+=(--split "$dll.wasm" "$dll"); splits+=("$dll"); done
+PATH=$GEX_WASM64_SYSROOT/binaryen/bin:$PATH TMPDIR=$tmp python3 "$here/pelink.py" --wasm64 "${split[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
 cp "$tmp/winepe.wasm" "$out/winepe.wasm"
+for dll in "${splits[@]}"; do cp "$tmp/$dll.wasm" "$out/$dll.wasm"; done
 if [ ${#extras[@]} -gt 0 ]; then
     mkdir -p "$out/extra"
     for dll in "${extras[@]}"; do
@@ -50,8 +56,10 @@ if [ ${#extras[@]} -gt 0 ]; then
             --fake-module --wasm-shared winepe.wasm -F "$dll" -o "$out/extra/$dll"
     done
 fi
-for dll in "$@"; do
+for dll in "$@" "${splits[@]}"; do
     name=${dll%.*}
+    module=winepe.wasm
+    for x in "${splits[@]}"; do [ "$x" != "$dll" ] || module=$dll.wasm; done
     dir=$build/dlls/$name
     [ -d "$dir" ] || dir=$build/dlls/$dll
     [ -d "$dir" ] || dir=$build/programs/$name
@@ -62,6 +70,6 @@ for dll in "$@"; do
     if [ ! -f "$spec" ] && grep -q -- '-mwindows' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem windows); fi
     # shellcheck disable=SC2046
     "$winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$here/wcc64 -D_WIN32" "${kind[@]}" --fake-module \
-        --wasm-shared winepe.wasm -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
+        --wasm-shared "$module" -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
-echo "$out: ${*} native ($(du -h "$out/winepe.wasm" | cut -f1) module)"
+echo "$out: ${*} native ($(du -h "$out/winepe.wasm" | cut -f1) module)${splits:+, ${splits[*]} as modules of their own}"

@@ -562,11 +562,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         let name = String::from_utf8_lossy(b).into_owned();
         let Some(jit) = caller.data().jit.as_ref() else { return 0 };
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(wp) = sh.wine_pe.as_ref() else { return 0 };
-        match wp.slots.get(&name) {
-            Some(&k) => (sh.ftab.map.install(wp.install).base + k) as i32,
-            None => 0,
-        }
+        // the core's, or a module of its own's (`pelink.py --split`)
+        sh.wine_pe
+            .iter()
+            .chain(sh.wine_pe_split.iter())
+            .find_map(|wp| wp.slots.get(&name).map(|&k| (sh.ftab.map.install(wp.install).base + k) as i32))
+            .unwrap_or(0)
     })?;
     // A native wasm32 program's signal hook (`crate::SIGNAL_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {

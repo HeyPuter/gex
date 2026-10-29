@@ -271,7 +271,7 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
                 let dy = dylink.get(&inst.module).cloned();
                 let inst_i = instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied(), dy.as_deref())?;
                 if let Some(dy) = dy {
-                    crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.module, &inst_i, &dy)?;
+                    crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.base, inst.module, &inst_i, &dy)?;
                 }
                 if crate::wasm_trace() && t0.elapsed().as_millis() >= 10 {
                     eprintln!("gex: instantiated install {i} (base {}) in {:.3}s", inst.base, t0.elapsed().as_secs_f64());
@@ -388,7 +388,7 @@ fn instantiate(
         if module.imports().any(|i| i.module() == gex_abi::IMPORT_MODULE && i.name() == gex_dylink::DL_SIZE) {
             crate::dylink::define_checked(&mut c, &mut l)?;
         }
-        crate::dylink::define_imports(&mut c, &mut l, table, module, dy)?;
+        crate::dylink::define_imports(&mut c, &mut l, table, base, module, dy)?;
     }
     let inst = l.instantiate(&mut c, module).with_context(|| match dy {
         Some(d) => format!("instantiating {}", d.path),

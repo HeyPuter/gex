@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link Wine's PE side as one wasm module.
 
-    pelink.py [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
+    pelink.py [--split FILE DLL,...] [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
 
 For each DLL (all of them, or those named), the build left the DLL as one
@@ -38,6 +38,7 @@ DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
 WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
 M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
+SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
 
 
 def cc(*args):
@@ -167,6 +168,13 @@ def main():
             else:
                 sys.exit(f'unknown argument {args[i]}')
         return link(dlls, out, gexrt)
+    # --split FILE DLL,...: those DLLs linked as a module of their own, FILE
+    # beside OUT.wasm, not into it; its imports of the core's DLLs and of
+    # gexrt are the core's exports (pelink exports them).
+    while sys.argv[1] == '--split':
+        for d in sys.argv[3].split(','):
+            SPLIT[d] = sys.argv[2]
+        del sys.argv[1:4]
     # --extra NAME R.O EXPORTS IMPORTS (a comma list): a DLL built outside
     # the tree (dirk's d3d11.dll and dxgi.dll), linked in, in place of the
     # tree's own of that name.
@@ -179,7 +187,7 @@ def main():
     SRC = src
     WINE64 = WINE64 or makefile_var(os.path.join(build, 'Makefile'), 'HOST_ARCH') == ['wasm64']
     M64 = M64 or (WINE64 and '-mgex-memory64' in (makefile_var(os.path.join(build, 'Makefile'), 'CC') or []))
-    only = set(sys.argv[4:])
+    only = set(sys.argv[4:]) | (set(SPLIT) if sys.argv[4:] else set())
     # An IMPORTS entry names an import library, which is the module's base
     # name unless its Makefile says otherwise (IMPORTLIB = ntoskrnl for
     # ntoskrnl.exe, winspool for winspool.drv): without this, winedevice's
@@ -260,6 +268,94 @@ def main():
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
+def leb_at(b, i):
+    """An unsigned LEB128 at b[i]: (value, the index after it)."""
+    r = sh = 0
+    while True:
+        x = b[i]
+        i += 1
+        r |= (x & 0x7f) << sh
+        sh += 7
+        if not x & 0x80:
+            return r, i
+
+
+def name_imports(path):
+    """A --split module's function imports named by their symbols: wasm-ld
+    keeps an undefined symbol's original import name (env.strlen) though
+    pesym renamed the symbol (ucrtbase.dll!strlen); the name section has the
+    symbol's. gex binds each import to the core export of that name."""
+    b = open(path, 'rb').read()
+    secs, i = [], 8
+    while i < len(b):
+        sid = b[i]
+        size, j = leb_at(b, i + 1)
+        secs.append((sid, b[j:j + size]))
+        i = j + size
+    names = {}
+    for sid, body in secs:
+        if sid == 0:
+            n, j = leb_at(body, 0)
+            if body[j:j + n] != b'name':
+                continue
+            j += n
+            while j < len(body):
+                kind = body[j]
+                size, k = leb_at(body, j + 1)
+                if kind == 1:
+                    cnt, m = leb_at(body, k)
+                    for _ in range(cnt):
+                        idx, m = leb_at(body, m)
+                        ln, m = leb_at(body, m)
+                        names[idx] = body[m:m + ln].decode()
+                        m += ln
+                j = k + size
+    out = bytearray(b[:8])
+    for sid, body in secs:
+        if sid == 2:
+            cnt, j = leb_at(body, 0)
+            new = bytearray(enc_leb(cnt))
+            func = 0
+            for _ in range(cnt):
+                ml, k = leb_at(body, j)
+                mod = body[k:k + ml]
+                k += ml
+                fl, k2 = leb_at(body, k)
+                field = body[k2:k2 + fl]
+                k = k2 + fl
+                kind = body[k]
+                start = k
+                k += 1
+                if kind == 0:
+                    _, k = leb_at(body, k)
+                elif kind == 1:
+                    k += 1
+                    flags, k = leb_at(body, k)
+                    _, k = leb_at(body, k)
+                    if flags & 1:
+                        _, k = leb_at(body, k)
+                elif kind == 2:
+                    flags, k = leb_at(body, k)
+                    _, k = leb_at(body, k)
+                    if flags & 1:
+                        _, k = leb_at(body, k)
+                elif kind == 3:
+                    k += 2
+                elif kind == 4:
+                    k += 1
+                    _, k = leb_at(body, k)
+                if kind == 0:
+                    sym = names.get(func, '')
+                    if mod == b'env' and '!' in sym:
+                        field = sym.encode()
+                    func += 1
+                new += enc_leb(len(mod)) + mod + enc_leb(len(field)) + field + body[start:k]
+                j = k
+            body = bytes(new)
+        out += bytes([sid]) + enc_leb(len(body)) + body
+    open(path, 'wb').write(out)
+
+
 def link(dlls, out, gexrt, others=None):
 
     exporters = {}  # link name -> [dll, ...]
@@ -313,7 +409,11 @@ def link(dlls, out, gexrt, others=None):
                 forward_owner[name].append(via)
 
     tmp = tempfile.mkdtemp(prefix='pelink-')
-    objs = []
+    # Each module's objects: the core's (''), and a --split module's by its file name.
+    objs = {'': []}
+    grp = lambda m: SPLIT.get(m, '')
+    for g in set(SPLIT.values()):
+        objs[g] = []
 
     # Signatures: a forward whose callers declare the function otherwise
     # than its definition (kernel32's void EnterCriticalSection is ntdll's
@@ -328,7 +428,7 @@ def link(dlls, out, gexrt, others=None):
             seen = {v for m in sigs for (n, k), v in sigs[m].items() if n == name and k == 'undefined'}
             other = [v for v in seen if v != want]
             if want and other:
-                thunks.append((alias, other[0], f'{d}!{target}', want))
+                thunks.append((alias, other[0], f'{d}!{target}', want, grp(d)))
             else:
                 keep.append((alias, target))
         aliases[d] = keep
@@ -360,7 +460,7 @@ def link(dlls, out, gexrt, others=None):
         if not guest or not have or (pick in imports and imports.index(pick) < imports.index(guest)):
             return False
         sym = f'{guest}.{name}'
-        guest_binds.append((f'gexw-guest!{sym}', have, guest, name))
+        guest_binds.append((f'gexw-guest!{sym}', have, guest, name, grp(mod)))
         f.write(f'{name} gexw-guest {sym}\n')
         return True
 
@@ -397,7 +497,7 @@ def link(dlls, out, gexrt, others=None):
                 have, want = sigs[mod].get((name, 'undefined')), sigs[pick].get((name, 'defined'))
                 if have and want and have != want:
                     thunk = f'{mod}.{name}'
-                    thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want))
+                    thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want, grp(mod)))
                     f.write(f'{name} gexw-thunk {thunk}\n')
                     continue
                 f.write(f'{name} {pick}\n')
@@ -415,40 +515,44 @@ def link(dlls, out, gexrt, others=None):
         # not linked (services.exe, plugplay.exe).
         subprocess.check_call(['llvm-objcopy', '--remove-section=llvm.func_attr.annotate.gex.stdcall',
                                '--remove-section=reloc.llvm.func_attr.annotate.gex.stdcall', bound])
-        objs.append(bound)
+        objs[grp(mod)].append(bound)
 
-    if thunks:
-        ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
-        src = os.path.join(tmp, 'forwards.c')
-        with open(src, 'w') as f:
-            for k, (alias, have, target, want) in enumerate(thunks):
-                hr, hp = have.split(':')
-                wr, wp = want.split(':')
-                params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(hp)) or 'void'
-                tparams = ', '.join(ctype[c] for c in wp) or 'void'
-                args = ', '.join(f'a{i}' for i in range(len(wp)))
-                f.write(f'{ctype[wr]} t{k}({tparams}) __asm__("{target}");\n')
-                f.write(f'{ctype[hr]} f{k}({params}) __asm__("{alias}");\n')
-                call = f't{k}({args})'
-                if hr == 'v':
-                    body = f'{call};'
-                elif wr == 'v':
-                    body = f'{call}; return 0;'
-                else:
-                    body = f'return ({ctype[hr]}){call};'
-                f.write(f'{ctype[hr]} f{k}({params}) {{ {body} }}\n')
-        obj = os.path.join(tmp, 'forwards.o')
-        subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
-        objs.append(obj)
+    for g in objs:
+      gthunks = [t[:4] for t in thunks if t[4] == g]
+      if gthunks:
+          ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+          src = os.path.join(tmp, f'forwards{g}.c')
+          with open(src, 'w') as f:
+              for k, (alias, have, target, want) in enumerate(gthunks):
+                  hr, hp = have.split(':')
+                  wr, wp = want.split(':')
+                  params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(hp)) or 'void'
+                  tparams = ', '.join(ctype[c] for c in wp) or 'void'
+                  args = ', '.join(f'a{i}' for i in range(len(wp)))
+                  f.write(f'{ctype[wr]} t{k}({tparams}) __asm__("{target}");\n')
+                  f.write(f'{ctype[hr]} f{k}({params}) __asm__("{alias}");\n')
+                  call = f't{k}({args})'
+                  if hr == 'v':
+                      body = f'{call};'
+                  elif wr == 'v':
+                      body = f'{call}; return 0;'
+                  else:
+                      body = f'return ({ctype[hr]}){call};'
+                  f.write(f'{ctype[hr]} f{k}({params}) {{ {body} }}\n')
+          obj = os.path.join(tmp, f'forwards{g}.o')
+          subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
+          objs[g].append(obj)
 
     # Imports from DLLs that stay i386 code (msvcrt's user32 and advapi32
     # calls): a stub per name, which finds the export through kernel32
     # (LoadLibraryA, GetProcAddress) once and calls it -- a guest address,
     # so through the ICALL pass's exit stub, as a guest call. The stub's
     # signature is its callers'.
-    if others and 'kernel32.dll' in native:
+    for g in objs if others and 'kernel32.dll' in native else ():
         undefined = {}  # name -> (sig, importing dll)
         for mod, ro, ex, imports in dlls:
+            if grp(mod) != g:
+                continue
             for (n, k), v in sigs[mod].items():
                 if k == 'undefined' and n not in exporters and n not in forward_owner and '!' not in n:
                     undefined.setdefault(n, (v, mod, imports))
@@ -458,13 +562,13 @@ def link(dlls, out, gexrt, others=None):
             if not owners:
                 continue
             stubs.append((n, sig, next((o for o in imports if o in owners), owners[0]), n))
-        stubs += sorted(set(guest_binds))
-        if guest_binds:
+        stubs += sorted({b[:4] for b in guest_binds if b[4] == g})
+        if any(b[4] == g for b in guest_binds):
             print(f'{out}: bound to i386 DLLs ahead of native ones: ' +
-                  ', '.join(sorted({s.split('!', 1)[1] for s, _, _, _ in guest_binds})))
+                  ', '.join(sorted({b[0].split('!', 1)[1] for b in guest_binds if b[4] == g})))
         if stubs:
             ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
-            src = os.path.join(tmp, 'guestimports.c')
+            src = os.path.join(tmp, f'guestimports{g}.c')
             with open(src, 'w') as f:
                 own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
                 f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
@@ -494,10 +598,10 @@ def link(dlls, out, gexrt, others=None):
                 for k in range(len(stubs)):
                     f.write(f'    (void *)g{k},\n')
                 f.write('};\n')
-            obj = os.path.join(tmp, 'guestimports.o')
+            obj = os.path.join(tmp, f'guestimports{g}.o')
             subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
-            objs.append(obj)
-            print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
+            objs[g].append(obj)
+            print(f'{g or out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
 
     # Each module's load-time imports for Wine's PE loader on wasm32
     # (ntdll's fixup_imports asks __gexw_module_imports): only DLLs.
@@ -525,130 +629,194 @@ def link(dlls, out, gexrt, others=None):
                     '    }\n    return 0;\n}\n')
         obj = os.path.join(tmp, 'moduleimports.o')
         subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
-        objs.append(obj)
+        objs[''].append(obj)
 
-    rsp = os.path.join(tmp, 'exports.rsp')
-    with open(rsp, 'w') as f:
-        for d in data:
-            f.write(f'--export-if-defined={d}\n')
-        # gexrt's bounds of the entry-thunk pairs (gexw_entries)
-        f.write('--export-if-defined=__gexw_entries\n')
-        f.write('--export-if-defined=__gexw_entries_decl\n')
-    cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
-           '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
-           '--unresolved-symbols=import-dynamic', '-o', out,
-           f'@{rsp}'] + objs + [gexrt]
-    # compiler-rt's builtins (__multi3 and the like), from the toolchain's
-    # sysroot (tools/wine-wasm/build-sysroot.sh, build-sysroot64.sh)
-    sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')
-    if sysroot:
-        cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if WINE64 else 'wasm32')))
-    elif WINE64:
-        sys.exit('pelink: set GEX_WASM64_SYSROOT')
-    subprocess.check_call(cmd)
-    # What nothing defines (an export whose code is i386 assembly, say): a
-    # stub that traps, so one gap does not keep the module from
-    # instantiating. Listed.
-    imported = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
-    missing = set(re.findall(r'func\[\d+\] sig=\d+ <[^>]*> <- env\.(\S+)', imported))
-    callers = {}
-    for mod in sigs:
-        for (n, k), v in sigs[mod].items():
-            if k == 'undefined' and n in missing:
-                callers.setdefault(n, v)
-    # Only weakly referenced (msvcrt's crt_main asks whether the program
-    # defined __main_argc_argv or __original_main): left undefined, so the
-    # reference stays null. A trapping stub would make it non-null, and a
-    # program with the other form of main would call the trap.
-    strong = set()
-    for mod, ro, ex, imports in dlls:
-        nm = subprocess.run(['llvm-nm', '--undefined-only', ro], capture_output=True, text=True).stdout
-        strong |= {l.split()[-1] for l in nm.splitlines() if l.split()[:1] == ['U']}
-    callers = {n: v for n, v in callers.items() if n in strong}
-    gaps = sorted(callers.items())
-    if gaps:
-        ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
-        src = os.path.join(tmp, 'gaps.c')
-        with open(src, 'w') as f:
-            for k, (n, sig) in enumerate(gaps):
-                r, ps = sig.split(':')
-                params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
-                f.write(f'{ctype[r]} x{k}({params}) __asm__("{n}");\n')
-                f.write(f'{ctype[r]} x{k}({params}) {{ __builtin_trap(); }}\n')
-        obj = os.path.join(tmp, 'gaps.o')
-        subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
-        cmd.insert(cmd.index(gexrt), obj)
+    # The modules: the --split ones' imports of the core known first (their
+    # objects' undefined symbols less what they define), so the core exports
+    # them; then the core; then each --split module, its imports bound to
+    # the core's exports by gex when it is loaded.
+    def syms(paths, flag):
+        out = set()
+        for o in paths:
+            nm = subprocess.run(['llvm-nm', flag, o], capture_output=True, text=True).stdout
+            out |= {l.split()[-1] for l in nm.splitlines() if l.split()}
+        return out
+    shim = {'__indirect_function_table', '__memory_base', '__table_base', '__stack_pointer', '__table_base32', 'memory'}
+    needs = set()
+    for g in objs:
+        if g:
+            # its own bounds of the entry-thunk pairs (gexrt's are the core's)
+            src = os.path.join(tmp, f'entries{g}.c')
+            # (the data segments' names, in each object's linking section)
+            blobs = [open(o, 'rb').read() for o in objs[g]]
+            have = {sec for sec in ('gexw_entries', 'gexw_entries_decl')
+                    if any(enc_name(sec) in x for x in blobs)}
+            undef = syms(objs[g], '--undefined-only')
+            with open(src, 'w') as f:
+                # its own empty CRT initializer tables, as gexrt's are the
+                # core's (a program's mainCRTStartup walks them)
+                for t in ('xi', 'xc', 'xp', 'xt'):
+                    if f'__{t}_a' in undef or f'__{t}_z' in undef:
+                        f.write(f'void *__{t}_a[1] __attribute__((used));\n'
+                                f'extern void *__{t}_z[1] __attribute__((alias("__{t}_a")));\n')
+                for sec in ('gexw_entries', 'gexw_entries_decl'):
+                    # (none at all: a module none of whose functions is handed out)
+                    if sec not in have:
+                        f.write(f'const void *const __{sec}[2] __attribute__((used)) = {{ 0, 0 }};\n')
+                        continue
+                    f.write(f'extern const char __start_{sec}[], __stop_{sec}[];\n'
+                            f'const void *const __{sec}[2] __attribute__((used)) = {{ __start_{sec}, __stop_{sec} }};\n')
+            obj = os.path.join(tmp, f'entries{g}.o')
+            subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
+            objs[g].append(obj)
+            needs |= syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only') - shim
+    provided = set()
+    def emit(g, out, gexrt):
+        rsp = os.path.join(tmp, f'exports{g}.rsp')
+        with open(rsp, 'w') as f:
+            for d in data:
+                if grp(d.split('!', 1)[0]) == g:
+                    f.write(f'--export-if-defined={d}\n')
+            # what the --split modules import from the core
+            for n in sorted(needs):
+                f.write(f'--export-if-defined={n}\n')
+            # gexrt's bounds of the entry-thunk pairs (gexw_entries)
+            f.write('--export-if-defined=__gexw_entries\n')
+            f.write('--export-if-defined=__gexw_entries_decl\n')
+        cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
+               '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
+               '--unresolved-symbols=import-dynamic', '-o', out,
+               f'@{rsp}'] + objs[g] + ([gexrt] if gexrt else [])
+        # compiler-rt's builtins (__multi3 and the like), from the toolchain's
+        # sysroot (tools/wine-wasm/build-sysroot.sh, build-sysroot64.sh)
+        sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')
+        if sysroot:
+            cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if WINE64 else 'wasm32')))
+        elif WINE64:
+            sys.exit('pelink: set GEX_WASM64_SYSROOT')
         subprocess.check_call(cmd)
-        print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
-    # wcc compiles code without -D_WIN32 as Unix-side code, whose setjmp
-    # lowers onto the legacy exception instructions (for asyncify); that
-    # includes winebuild's glue, where an adapter of msvcrt's _setjmp calls
-    # a function clang lowers as setjmp. gex runs the standard instructions
-    # only, so the module is translated, as wcc's own links are.
-    opt = os.path.join(sysroot or '', 'binaryen', 'bin', 'wasm-opt')
-    opt = os.environ.get('GEX_WASM_OPT') or opt
-    if WINE64:
-        # lowered to wasm32 (wcc64's side modules: the one place an address
-        # becomes a memory index), optimised as they are; the memory64
-        # flavour left as it is, as wcc64 -mgex-memory64 leaves them
-        snap = not M64 and os.path.exists(os.path.join(sysroot or '', 'lib', 'gex-snapshot'))
-        # (the snapshot flavour's level root stays apart from the entry's C
-        # below it, which asyncify instruments)
-        apart = ['--no-inline=__gexw_entry_c'] if snap else []
-        subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
-                               '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
-                               '--enable-exception-handling', '--enable-reference-types', '--enable-memory64'] +
-                              ([] if M64 else ['--memory64-lowering']) + apart + ['-O2', '-o', out])
-        if snap:
-            # The snapshot flavour's (wcc64's sysroot): asyncify over the
-            # lowered module, what can reach a call-out by a type-correct
-            # call graph (forkreach.py), below gexrt's entry from the guest
-            # (each level's root, where an unwind ends: neither it nor its
-            # callers); its state and data the host's (relocatable), then
-            # the standard exception instructions.
-            dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
-            roots = ['__gexw_entry']
-            reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', '--ignore', ','.join(roots), dis, out, 'gex.call_out'] + roots,
-                                   capture_output=True, text=True)
-            passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.call_out', '--pass-arg=asyncify-relocatable']
-            if reach.returncode == 0:
-                lst = out + '.onlylist'
-                open(lst, 'w').write(reach.stdout.strip() + '\n')
-                passes += ['--pass-arg=asyncify-onlylist@@' + lst]
-            else:
-                passes += ['--pass-arg=asyncify-removelist@' + ','.join(roots)]
-            subprocess.check_call([opt, out, '-g', '--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals',
-                                   '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-exception-handling',
-                                   '--enable-reference-types'] + apart + passes + ['-O2', '--translate-to-exnref', '-o', out])
-            if reach.returncode == 0:
-                os.unlink(lst)
-    elif os.path.exists(opt):
-        subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
-                               '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
-                               '--enable-exception-handling', '--enable-reference-types',
-                               '--translate-to-exnref', '-o', out])
-    # The forwards, for gex to bind a -import re-export of a forwarded name
-    # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
-    # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
-    lines = []
-    for name, by in sorted(forwards.items()):
-        if name in exporters:
-            continue
-        # (the first forwarder that reaches a definition: kernel32's
-        # SetLastError names its own RtlSetLastWin32Error, which it imports)
-        hit = next((h for h in map(resolve_forward, by.values()) if h), None)
-        if hit:
-            lines.append(f'{name} {hit[0]}!{hit[1]}')
-    if lines:
-        payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
-        with open(out, 'ab') as f:
-            f.write(bytes([0]) + enc_leb(len(payload)) + payload)
-    undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
-    names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
-                   '__stack_pointer', '__memory_base', '__table_base'})
-    open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
-    print(f'{out}: {len(dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
-          f'(listed in {out}.undefined)')
+        # What nothing defines (an export whose code is i386 assembly, say): a
+        # stub that traps, so one gap does not keep the module from
+        # instantiating. Listed.
+        imported = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
+        missing = set(re.findall(r'func\[\d+\] sig=\d+ <[^>]*> <- env\.(\S+)', imported))
+        callers = {}
+        # (a --split module's imports the core exports are no gaps)
+        missing -= provided
+        for mod in sigs:
+            if grp(mod) != g:
+                continue
+            for (n, k), v in sigs[mod].items():
+                if k == 'undefined' and n in missing:
+                    callers.setdefault(n, v)
+        # Only weakly referenced (msvcrt's crt_main asks whether the program
+        # defined __main_argc_argv or __original_main): left undefined, so the
+        # reference stays null. A trapping stub would make it non-null, and a
+        # program with the other form of main would call the trap.
+        strong = set()
+        for mod, ro, ex, imports in dlls:
+            if grp(mod) != g:
+                continue
+            nm = subprocess.run(['llvm-nm', '--undefined-only', ro], capture_output=True, text=True).stdout
+            strong |= {l.split()[-1] for l in nm.splitlines() if l.split()[:1] == ['U']}
+        callers = {n: v for n, v in callers.items() if n in strong}
+        gaps = sorted(callers.items())
+        if gaps:
+            ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+            src = os.path.join(tmp, f'gaps{g}.c')
+            with open(src, 'w') as f:
+                for k, (n, sig) in enumerate(gaps):
+                    r, ps = sig.split(':')
+                    params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
+                    f.write(f'{ctype[r]} x{k}({params}) __asm__("{n}");\n')
+                    f.write(f'{ctype[r]} x{k}({params}) {{ __builtin_trap(); }}\n')
+            obj = os.path.join(tmp, f'gaps{g}.o')
+            subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
+            cmd.insert(cmd.index(f'@{rsp}') + 1, obj)
+            subprocess.check_call(cmd)
+            print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
+        # wcc compiles code without -D_WIN32 as Unix-side code, whose setjmp
+        # lowers onto the legacy exception instructions (for asyncify); that
+        # includes winebuild's glue, where an adapter of msvcrt's _setjmp calls
+        # a function clang lowers as setjmp. gex runs the standard instructions
+        # only, so the module is translated, as wcc's own links are.
+        opt = os.path.join(sysroot or '', 'binaryen', 'bin', 'wasm-opt')
+        opt = os.environ.get('GEX_WASM_OPT') or opt
+        if WINE64:
+            # lowered to wasm32 (wcc64's side modules: the one place an address
+            # becomes a memory index), optimised as they are; the memory64
+            # flavour left as it is, as wcc64 -mgex-memory64 leaves them
+            snap = not M64 and os.path.exists(os.path.join(sysroot or '', 'lib', 'gex-snapshot'))
+            # (the snapshot flavour's level root stays apart from the entry's C
+            # below it, which asyncify instruments)
+            apart = ['--no-inline=__gexw_entry_c'] if snap else []
+            subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
+                                   '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
+                                   '--enable-exception-handling', '--enable-reference-types', '--enable-memory64'] +
+                                  ([] if M64 else ['--memory64-lowering']) + apart + ['-O2', '-o', out])
+            if snap:
+                # The snapshot flavour's (wcc64's sysroot): asyncify over the
+                # lowered module, what can reach a call-out by a type-correct
+                # call graph (forkreach.py), below gexrt's entry from the guest
+                # (each level's root, where an unwind ends: neither it nor its
+                # callers); its state and data the host's (relocatable), then
+                # the standard exception instructions.
+                dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+                roots = ['__gexw_entry']
+                reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), '--quoted', '--ignore', ','.join(roots), dis, out, 'gex.call_out'] + roots,
+                                       capture_output=True, text=True)
+                passes = ['--asyncify', '--pass-arg=asyncify-imports@gex.call_out', '--pass-arg=asyncify-relocatable']
+                if reach.returncode == 0:
+                    lst = out + '.onlylist'
+                    open(lst, 'w').write(reach.stdout.strip() + '\n')
+                    passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+                else:
+                    passes += ['--pass-arg=asyncify-removelist@' + ','.join(roots)]
+                subprocess.check_call([opt, out, '-g', '--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals',
+                                       '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-exception-handling',
+                                       '--enable-reference-types'] + apart + passes + ['-O2', '--translate-to-exnref', '-o', out])
+                if reach.returncode == 0:
+                    os.unlink(lst)
+        elif os.path.exists(opt):
+            subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
+                                   '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
+                                   '--enable-exception-handling', '--enable-reference-types',
+                                   '--translate-to-exnref', '-o', out])
+        # The forwards, for gex to bind a -import re-export of a forwarded name
+        # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
+        # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
+        lines = []
+        for name, by in sorted(forwards.items()):
+            if name in exporters:
+                continue
+            # (the first forwarder that reaches a definition: kernel32's
+            # SetLastError names its own RtlSetLastWin32Error, which it imports)
+            hit = next((h for h in map(resolve_forward, by.values()) if h), None)
+            if hit and grp(hit[0]) == g:
+                lines.append(f'{name} {hit[0]}!{hit[1]}')
+        if lines:
+            payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
+            with open(out, 'ab') as f:
+                f.write(bytes([0]) + enc_leb(len(payload)) + payload)
+        if g:
+            name_imports(out)
+        undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
+        names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
+                       '__stack_pointer', '__memory_base', '__table_base'})
+        open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
+        print(f'{out}: {sum(grp(d[0]) == g for d in dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
+              f'(listed in {out}.undefined)')
+
+    emit('', out, gexrt)
+    exp = subprocess.run(['wasm-objdump', '-x', '-j', 'Export', out], capture_output=True, text=True).stdout
+    provided = set(re.findall(r'-> "([^"]+)"', exp))
+    if needs - provided:
+        print(f'{out}: --split modules import what the core does not export (another --split module\'s, or nobody\'s): '
+              + ' '.join(sorted(needs - provided)[:40]))
+    needs = set()
+    for g in objs:
+        if g:
+            emit(g, os.path.join(os.path.dirname(out), g), None)
 
 
 main()
