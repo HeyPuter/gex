@@ -13,7 +13,7 @@
 // tree's).
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, linkSync, copyFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, linkSync, copyFileSync, mkdtempSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -60,6 +60,27 @@ execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bi
 execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
 execFileSync('tar', ['--xattrs', '-cf', join(WORK, 'bb.tar'), '-C', tree, '.']);
 execFileSync('zstd', ['-q', '-f', '-3', join(WORK, 'bb.tar'), '-o', join(WORK, 'bb.tar.zst')]);
+// A Debian image and its apt repository (slim.html): RT_SLIM names the
+// directory (debian-slim.tar.zst, repo/), served at /__rt/slim/, with
+// repo.json listing the repository for the page's provider.
+rmSync(join(WORK, 'slim'), { force: true });
+if (process.env.RT_SLIM) {
+  symlinkSync(realpathSync(process.env.RT_SLIM), join(WORK, 'slim'));
+  const list = [];
+  const walk = (d, rel) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = `${rel}/${e.name}`;
+      if (e.isDirectory()) { list.push([p, 0, 'directory']); walk(join(d, e.name), p); }
+      else if (e.isFile()) list.push([p, statSync(join(d, e.name)).size, 'file']);
+    }
+  };
+  walk(join(process.env.RT_SLIM, 'repo'), '');
+  writeFileSync(join(WORK, 'slim-repo.json'), JSON.stringify(list));
+} else {
+  writeFileSync(join(WORK, 'slim-repo.json'), 'null');
+}
+// A lazy file's bytes (persist.html: never fetched for a snapshot).
+writeFileSync(join(WORK, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
 
 // -- the package -----------------------------------------------------------
 // For package.html: web/runtime/build.sh into the work directory.
@@ -82,7 +103,15 @@ const server = await createServer({
     name: 'rt-work',
     configureServer(s) {
       // The scratch files, at /__rt/NAME, with ranges (lazy files).
+      // How many times each /__rt/ file was asked for: /__rt/__hits?NAME.
+      const hits = new Map();
       s.middlewares.use('/__rt/', (req, res, next) => {
+        const name = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '');
+        if (name === '__hits') {
+          res.setHeader('Content-Type', 'application/json');
+          return res.end(JSON.stringify(hits.get(decodeURIComponent(req.url.split('?')[1] ?? '')) ?? 0));
+        }
+        hits.set(name, (hits.get(name) ?? 0) + 1);
         const f = join(WORK, decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, ''));
         if (!f.startsWith(WORK) || !existsSync(f) || !statSync(f).isFile()) return next();
         const all = readFileSync(f);

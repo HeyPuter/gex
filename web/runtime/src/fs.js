@@ -6,6 +6,7 @@
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
 import { PageFsHost } from './mount.js';
+import { applyRecords } from './persist.js';
 
 const norm = (p) => {
   if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);
@@ -86,6 +87,7 @@ export class Filesystem extends EventTarget {
   #sources = [];
   #pagefs = null;
   #mounts = new Map(); // path -> { mount, id }
+  #persist = null; // a Persist's hooks
 
   constructor(sys) {
     super();
@@ -104,6 +106,13 @@ export class Filesystem extends EventTarget {
        *  mounts made before boot, in place before pid 1's first program. */
       pageFs: () => this.#pagefs?.control,
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
+      /** A Persist on this filesystem (persist.js): one, made before boot. */
+      persist: (part, hooks) => {
+        i.attach('persistence', part, { beforeBoot: true });
+        this.#persist = hooks;
+        i.afterBoot(() => hooks.running(i));
+      },
+      persistArgs: () => this.#persist?.startArgs() ?? null,
     };
   }
 
@@ -185,6 +194,8 @@ export class Filesystem extends EventTarget {
     opts.lazy = [...lazy.values()];
     if (anyTime) opts.mtimes = mtimes;
     if (anyX) opts.xattrs = { ...(opts.xattrs ?? {}), ...xattrs };
+    // What a Persist kept, over all of it.
+    if (this.#persist) applyRecords(opts, await this.#persist.load());
     // The sources' bytes are pid 1's now.
     this.#sources.length = 0;
   }

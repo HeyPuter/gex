@@ -725,6 +725,180 @@ async function loop() {
   }
 }
 
+// -- persistence (persist.js) ----------------------------------------------
+// What the programs changed in the root, as records a store keeps: the tree
+// as seeded (`seed`, taken before pid 1's first program) against the tree
+// now, both from the kernel's node list (`k_fs_tree`, no file's bytes), and
+// against what the store holds (`known`: path -> stamp). A file's bytes are
+// read only when the program wrote it and it changed since it was last
+// stored, so a lazy file nobody wrote is never fetched for a snapshot.
+
+const TREE_ENTRY = 40;
+const KINDS = ['file', 'dir', 'symlink', 'socket'];
+const persist = { on: false, seed: null, known: new Map(), changes: new Map(), exclude: [], saves: 0 };
+
+function tree() {
+  for (let cap = 1 << 20; ; ) {
+    ensure(cap);
+    const n = k.k_fs_tree(0n, cap);
+    if (n === ERANGE) {
+      cap = new DataView(mem.buffer).getUint32(0, true) + (1 << 16);
+      continue;
+    }
+    if (n < 0) throw errno(n, 'the tree');
+    const b = view().slice(0, n);
+    const v = new DataView(b.buffer);
+    const out = new Map();
+    for (let at = 0; at + TREE_ENTRY <= n;) {
+      const pl = v.getUint32(at + 32, true), tl = v.getUint32(at + 36, true);
+      const path = `/${dec.decode(b.subarray(at + TREE_ENTRY, at + TREE_ENTRY + pl))}`;
+      out.set(path, {
+        kind: KINDS[b[at]] ?? 'file',
+        written: b[at + 1] === 1,
+        mode: v.getUint32(at + 4, true) & 0o7777,
+        size: Number(v.getBigUint64(at + 8, true)),
+        changes: v.getBigUint64(at + 16, true),
+        mtime: Number(v.getBigInt64(at + 24, true)),
+        target: tl ? dec.decode(b.subarray(at + TREE_ENTRY + pl, at + TREE_ENTRY + pl + tl)) : '',
+      });
+      at += TREE_ENTRY + pl + tl;
+    }
+    return out;
+  }
+}
+
+const within = (p, at) => p === at || p.startsWith(at === '/' ? '/' : `${at}/`);
+const excluded = (p) => p === '/' || persist.exclude.some((at) => within(p, at));
+const parentOf = (p) => p.replace(/\/[^/]*$/, '') || '/';
+
+/** FNV-1a over 32-bit words and the tail: a change detector, not a checksum. */
+function hash(d) {
+  let h = 0x811c9dc5;
+  const words = new Uint32Array(d.buffer, d.byteOffset, d.byteOffset % 4 ? 0 : d.length >>> 2);
+  for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+  for (let i = words.length * 4; i < d.length; i++) h = Math.imul(h ^ d[i], 0x01000193);
+  return (h >>> 0).toString(16);
+}
+
+/** A file's bytes by its own name (a tree path: no link on it). */
+function readRaw(path, size) {
+  const { at: [[p, n]] } = lay(path);
+  const h = k.k_fs_open(BigInt(p), n, 0n, 0);
+  if (h < 0) return null;
+  try {
+    const out = new Uint8Array(size);
+    ensure(READ_MAX);
+    let off = 0;
+    while (off < size) {
+      const r = k.k_fs_read(h, BigInt(off), 0n, Math.min(READ_MAX, size - off));
+      if (r <= 0) break;
+      out.set(view().subarray(0, r), off);
+      off += r;
+    }
+    return off === size ? out : out.slice(0, off);
+  } finally {
+    k.k_fs_close(h);
+  }
+}
+
+/** Start keeping track: `known`, what the store holds ([path, stamp]);
+ *  `exclude`, paths never kept. The seed is the tree now. */
+function persistStart({ known = [], exclude = [] }) {
+  persist.seed = tree();
+  persist.known = new Map(known);
+  persist.exclude = exclude;
+  persist.on = true;
+  if (k.k_fs_watch) {
+    const { at: [[p, n]] } = lay('/');
+    k.k_fs_watch(BigInt(p), n);
+  }
+  persist.saves = k.k_fs_saves ? k.k_fs_saves() : 0;
+  return true;
+}
+
+/** Whether a program finished a change since the last ask (`k_fs_saves`). */
+function persistChanged() {
+  const n = k.k_fs_saves ? k.k_fs_saves() : 0;
+  const moved = n !== persist.saves;
+  persist.saves = n;
+  return moved;
+}
+
+/** What changed since the store's last: `{ put: [record], drop: [path] }`;
+ *  a record is `{ path, kind, stamp, mode, mtime, data, target }`, kind
+ *  'file', 'dir', 'symlink', 'mode' (a seeded file's mode only) or 'gone'
+ *  (a seeded path deleted, and everything under it). */
+async function persistDiff() {
+  if (!persist.on) throw new Error('persistence is not started');
+  const cur = tree();
+  const seed = persist.seed;
+  const known = persist.known;
+  const put = [];
+  const keep = new Set();
+  const transfer = [];
+  let read = 0;
+  const has = (p, stamp) => known.get(p) === stamp && keep.add(p);
+  for (const [p, n] of cur) {
+    if (excluded(p) || n.kind === 'socket') continue;
+    const s = seed.get(p);
+    if (n.kind === 'file') {
+      const was = known.get(p);
+      // A file restored from the store and chmod'ed since: stored again.
+      const rewrite = was?.startsWith('f:') && !was.startsWith(`f:${n.mode.toString(8)}:`);
+      if (n.written || rewrite) {
+        if (!rewrite && known.has(p) && persist.changes.get(p) === n.changes) { keep.add(p); continue; }
+        const data = readRaw(p, n.size);
+        if (!data) continue;
+        const stamp = `f:${n.mode.toString(8)}:${data.length}:${hash(data)}`;
+        persist.changes.set(p, n.changes);
+        if (has(p, stamp)) continue;
+        put.push({ path: p, kind: 'file', stamp, mode: n.mode, mtime: n.mtime, data });
+        transfer.push(data.buffer);
+        // Let the page's messages through between big reads.
+        if ((read += data.length) > 8 << 20) { read = 0; await new Promise((r) => setTimeout(r, 0)); }
+      } else if (was?.startsWith('f:')) {
+        keep.add(p);
+      } else {
+        const stamp = `m:${n.mode.toString(8)}`;
+        if (has(p, stamp)) continue;
+        if (s?.kind === 'file' && s.mode !== n.mode) put.push({ path: p, kind: 'mode', stamp, mode: n.mode });
+      }
+    } else if (n.kind === 'dir') {
+      const stamp = `d:${n.mode.toString(8)}`;
+      if (has(p, stamp)) continue;
+      if (s?.kind === 'dir' && s.mode === n.mode) continue;
+      put.push({ path: p, kind: 'dir', stamp, mode: n.mode, mtime: n.mtime });
+    } else if (n.kind === 'symlink') {
+      const stamp = `l:${n.target}`;
+      if (has(p, stamp)) continue;
+      if (s?.kind === 'symlink' && s.target === n.target) continue;
+      put.push({ path: p, kind: 'symlink', stamp, target: n.target });
+    }
+  }
+  // Deleted: the topmost of what is gone, once.
+  for (const p of seed.keys()) {
+    if (cur.has(p) || excluded(p)) continue;
+    const up = parentOf(p);
+    if (up !== '/' && !cur.has(up) && seed.has(up)) continue;
+    if (!has(p, 'gone')) put.push({ path: p, kind: 'gone', stamp: 'gone' });
+  }
+  // Deleted before this load: still gone.
+  for (const [p, stamp] of known) if (stamp === 'gone' && !cur.has(p)) keep.add(p);
+  const putting = new Set(put.map((r) => r.path));
+  const drop = [...known.keys()].filter((p) => !keep.has(p) && !putting.has(p));
+  return { value: { put, drop }, transfer };
+}
+
+/** The store took a diff: what it now holds. */
+function persistStored({ put = [], drop = [] }) {
+  for (const p of drop) {
+    persist.known.delete(p);
+    persist.changes.delete(p);
+  }
+  for (const [p, stamp] of put) persist.known.set(p, stamp);
+  return true;
+}
+
 // -- the page's mounts (web/runtime fs.mount, shims/kernel pagefs.rs) -------
 
 function mount(path, id) {
@@ -744,12 +918,17 @@ function unmount(path) {
 // -- calls -----------------------------------------------------------------
 
 const ops = {
-  async start({ spec, stackTop, mounts = [] }) {
+  async start({ spec, stackTop, mounts = [], persist: keep = null }) {
     ({ k, mem } = await helperKernel(spec, stackTop, 32));
     kernelWords = new Int32Array(spec.memory.buffer);
     // The page's mounts made before boot, before pid 1 can connect (it runs
     // the tree's /etc/gex/boot once it has).
     for (const [path, id] of mounts) mount(path, id);
+    // The tree as seeded, before any program of the tree's runs.
+    if (keep) {
+      while (k.k_fs_populated && !k.k_fs_populated()) await new Promise((r) => setTimeout(r, 5));
+      persistStart(keep);
+    }
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
     const { at: [[a, an]] } = lay(NAME);
@@ -781,6 +960,10 @@ const ops = {
   watch: ({ path }) => addWatch(path),
   holdX: () => holdX(),
   mount: ({ path, id }) => mount(path, id),
+  persistStart: (m) => persistStart(m),
+  persistChanged: () => persistChanged(),
+  persistDiff: ({ exclude }) => { if (exclude) persist.exclude = exclude; return persistDiff(); },
+  persistStored: (m) => persistStored(m),
   unmount: ({ path }) => unmount(path),
   unwatch: ({ h }) => rmWatch(h),
 };
@@ -788,8 +971,10 @@ const ops = {
 const onMessage = async (m) => {
   if (m?.call === undefined) return;
   try {
-    const value = await ops[m.op](m);
-    const transfer = value instanceof Uint8Array ? [value.buffer] : [];
+    let value = await ops[m.op](m);
+    let transfer = value instanceof Uint8Array ? [value.buffer] : [];
+    // A call whose answer moves buffers says which: { value, transfer }.
+    if (m.op === 'persistDiff') ({ value, transfer } = value);
     post({ call: m.call, value }, transfer);
   } catch (e) {
     post({ call: m.call, error: { message: e?.message ?? String(e), code: e?.code, errno: e?.errno, stack: e?.stack } });

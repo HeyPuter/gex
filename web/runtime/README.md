@@ -107,6 +107,35 @@ throw errors with a `code` (`'ENOENT'`, `'EEXIST'`, ...) or an `errno`:
 A mount's own symlinks are not followed on the way through it, and a rename
 or a hard link between it and the rest of the tree is `EXDEV` (`mv` copies).
 
+## Persistence
+
+The root, kept across page loads: a `Persist` on the filesystem, made
+before boot, lays what it kept over the sources before pid 1's first
+program, and keeps what the programs change from then on: about a second
+after their changes settle, every 30 s, when the page is hidden or left,
+and at `shutdown()`. Files, directories, symlinks, modes and deletions of
+the sources' paths; never `/tmp`, `/proc`, `/sys`, `/dev`, `/run` or a
+mount (its provider keeps its own). A snapshot reads only the files a
+program wrote: a lazy file nobody wrote is never fetched for it.
+
+```js
+import { IdbPersist } from '@gex/runtime/persist/idb';
+const persist = new IdbPersist(fs, { db: 'my-tree' });  // before boot
+await sys.boot();
+```
+
+| Member | Does |
+| --- | --- |
+| `new IdbPersist(fs, { db, exclude, every, quiet })` | Kept in the IndexedDB database `db`, one per tree. `exclude`: more paths never kept; `every` (ms, default 30000), `quiet` (default 1000). |
+| `new Persist(fs, store, opts)` (`@gex/runtime/persist`) | Kept by a store of the page's: `load()` resolves the records it holds, `store({ put, drop })` takes new records and the paths whose records go, `reset()` forgets them. A record is `{ path, kind, stamp }` and, by kind, `'file'` (`data`, `mode`, `mtime`), `'dir'` (`mode`), `'symlink'` (`target`), `'mode'` (a source file's mode), `'gone'` (a source path deleted, with all under it); a store keeps it as it is. |
+| `save()` | Store what changed now: `{ stored, dropped, bytes }`. |
+| `reset()` | Forget what is kept; saving stops. The next load is the sources alone. |
+| `stats` | `{ saves, stored, dropped, bytes, last, error }`. |
+| Events | `stored` (`stored`, `dropped`, `bytes`), `error`. |
+
+A tree's sources must be the same at every load: what is kept is laid over
+them, path by path.
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the
@@ -188,4 +217,7 @@ built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`) and pid
 
 `node web/runtime/test/run.mjs` runs each test page here in headless Chromium
 against a vite dev server. `BUSYBOX` names a wasm32 busybox, which with its
-applets and `test/probe` is the test tree.
+applets and `test/probe` is the test tree. `RT_SLIM` names a directory with
+a Debian image (`debian-slim.tar.zst`) and its apt repository (`repo/`), for
+`slim.html`: apt install from the repository mounted from the page, reload,
+and the package is still there; without it that page is skipped.

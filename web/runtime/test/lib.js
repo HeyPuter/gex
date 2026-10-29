@@ -1,5 +1,17 @@
 // What the test pages share: `globalThis.__rt`, which run.mjs reads.
 export const rt = (globalThis.__rt = { done: false, ok: true, lines: [] });
+// A page that reloads itself (`reload`) keeps what it said before.
+try {
+  const kept = JSON.parse(sessionStorage.getItem('__rt') ?? 'null');
+  if (kept) Object.assign(rt, { ok: kept.ok, lines: kept.lines });
+} catch {}
+/** Reload the page with `search`, keeping the results so far. */
+export function reload(search) {
+  sessionStorage.setItem('__rt', JSON.stringify({ ok: rt.ok, lines: rt.lines }));
+  const u = new URL(location.href);
+  for (const [k, v] of new URLSearchParams(search)) u.searchParams.set(k, v);
+  location.href = u.href;
+}
 export const say = (s) => { rt.lines.push(String(s)); console.log(String(s)); };
 export function check(what, cond, detail = '') {
   if (!cond) rt.ok = false;

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The runtime API as an npm package (web/runtime/README.md): its modules built
-# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs) and
+# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs, persist*.mjs) and
 # their shared chunks and Workers beside them, and under gex/ the files a
 # system fetches: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
@@ -36,7 +36,7 @@ export default {
   define: { ...base.define, __GEX_RUNTIME_ASSETS__: JSON.stringify('./') },
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', persist: '$RT/src/persist.js', 'persist-idb': '$RT/src/persist/idb.js' },
              preserveEntrySignatures: 'strict',
              // Flat, so every module's import.meta.url finds gex/ at './'.
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
@@ -89,6 +89,8 @@ cat > "$OUT/package.json" <<PKG
     "./windows/host": "./windows-host.mjs",
     "./windows/single": "./windows-single.mjs",
     "./windows/compositor": "./windows-compositor.mjs",
+    "./persist": "./persist.mjs",
+    "./persist/idb": "./persist-idb.mjs",
     "./package.json": "./package.json"
   },
   "sideEffects": false

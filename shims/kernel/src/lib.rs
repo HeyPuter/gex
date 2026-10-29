@@ -2894,6 +2894,25 @@ pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
 /// with nothing written when `cap` will not hold them. A page's persist store
 /// (web/src/persist-worker.js) snapshots these and no others, so a snapshot
 /// never reads, or fetches, a file the program left alone.
+/// Every node of the shared root, without their bytes (`TmpFs::tree`): a
+/// persist store's diff. The length, or `-ERANGE` with the length needed in
+/// the first 4 bytes when `cap` is short.
+#[no_mangle]
+pub extern "C" fn k_fs_tree(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let b = rootfs().tree();
+    if b.len() as u32 > cap {
+        if cap >= 4 {
+            let n = (b.len() as u32).to_le_bytes();
+            unsafe { gex_kmem::push_checked(at, n.as_ptr(), 4) };
+        }
+        return -34; // ERANGE
+    }
+    if !b.is_empty() {
+        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    }
+    b.len() as i32
+}
+
 #[no_mangle]
 pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
     let mut b = rootfs().written().join("\n");
