@@ -542,6 +542,21 @@ without it means `"whole"`) ships only those files in the site's bundle:
   synchronously, the first time; the site's `serve.mjs` answers ranges (a
   host without them still works, sending the whole file per read).
 
+`"bundle": "title"`, the default `gexc eject` writes for a game, is the same
+split cut at the title window: the bundle holds only what the run had opened
+when the recorder saw the window (the session's `files_read_title`), and
+everything read after it, a game's first level included, is a lazy file. The
+recording can then settle as long as its units need (`--settle`) without the
+bundle growing.
+
+A game's window often opens well before its title menu, which then loads
+from lazy files a read at a time. `"title_after": S` cuts S seconds after the
+window instead, from the recording's `files_read_at` (when each file was
+first read; the recorder's `--shots` keeps a screenshot every 5 s, which
+tells the menu from the loading screen before it). A title bundle also leaves out
+the images the run opened and no process loaded, and wineboot when the site
+boots without it: they stay a fetch away.
+
 Nothing the program needs is lost: what the recording did not open is a
 fetch away. What it costs is a wait the first time an unrecorded path reads
 a file. Record the paths users take to bring them into the bundle.

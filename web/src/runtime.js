@@ -178,9 +178,16 @@ function xcacheName() {
   return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
 }
 
+let fetchOther = null;
+const otherBytes = (url) => (fetchOther ?? fetchBytes)(url);
+
 /** The page's copies, handed to the system Worker so the single build does
  *  not fetch the 5 MB shim a second time. */
 export function primeRuntime(r) {
+  // How the other memory's runtime is fetched when a process first needs it
+  // (`other` below): an ejected site's page goes through its pack, where it
+  // is compressed.
+  if (r?.fetchOther) fetchOther = r.fetchOther;
   if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
   if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
   // An ejected site's page fetches the kernel through its pack too (app.js).
@@ -1077,13 +1084,13 @@ async function runProgramHere(
     // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
     // only then, so a page that never asks loads nothing more.
     other: m64Infix() ? async () => ({
-      shim: await fetchBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
-      guest: await fetchBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
+      shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
+      guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
       // the one kernel module serves both flavours (gex-kmem)
       kernel: kernel.module,
     }) : kernel && guestArch() === 'x86' ? async () => ({
-      shim: await fetchBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
-      guest: await fetchBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
+      shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
+      guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
       kernel: kernel.module,
     }) : null,
     extra: {

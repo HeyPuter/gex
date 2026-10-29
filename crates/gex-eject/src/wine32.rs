@@ -376,6 +376,14 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         // The files the run opened (the recorder's `files_read`; null from an
         // older recorder): what `"bundle": "split"` keeps in the bundle.
         ("files_read", v.get("files_read").cloned().unwrap_or(Json::Null)),
+        // Those it had opened by its title window (`files_read_title`): what
+        // `"bundle": "title"` keeps.
+        ("files_read_title", v.get("files_read_title").cloned().unwrap_or(Json::Null)),
+        // When each file was first read, and when each image was first
+        // loaded: a cut later than the window (`"title_after"`), and the
+        // images it only opened, which it leaves out.
+        ("files_read_at", v.get("files_read_at").cloned().unwrap_or(Json::Null)),
+        ("images_loaded", v.get("images_loaded").cloned().unwrap_or(Json::Null)),
         // The functions the run called, per unit (the recorder's `coverage`,
         // from instrumented units: key -> slot ranges; null without): what
         // `"cold"` keeps in each unit's primary module.
@@ -420,7 +428,9 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                runtime the build keeps, false leaves one out (crates/gex-eject/README.md, \"Features\"); \
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
-               first reads one (\"whole\": everything in the bundle); see crates/gex-eject/README.md, \
+               first reads one (\"title\": only those it opened up to its title window, a game's \
+               default, with \"title_after\": seconds after the window to cut at instead, for a game whose \
+               title menu comes later; \"whole\": everything in the bundle); see crates/gex-eject/README.md, \
                \"The bundle split\". \"cold\": \"none\" ships every unit whole in one archive; a clustering \
                (\"chunk:256\", ...) splits off each unit's code the recording never ran and \
                fetches it on first call, \"instrument\" builds units that record the functions a \
@@ -441,7 +451,10 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
             "features",
             obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(f.name != "translation" && !off.iter().any(|x| x == f.name)))).collect()),
         ),
-        ("bundle", s("split")),
+        // A game's bundle is what it reads up to its title; everything after
+        // is fetched when first read.
+        ("bundle", s(if strip { "title" } else { "split" })),
+        ("title_after", json::n(0)),
         ("cold", s(COLD_DEFAULT)),
         // A 64-bit game's bundle is large and its own resources one
         // language already: whole until trimming earns its pass.
@@ -767,6 +780,66 @@ fn volatile_reg(keys: &[(String, Json)], root: &str) -> String {
 /// bundle's prefix, HKLM's into system.reg and HKCU's into user.reg, so a
 /// session booted without wineboot (Wine's `WINEGEX_NO_WINEBOOT`) has what
 /// it would have made. Returns how many keys.
+/// Files that are images Wine loads: one the recorded run opened and no
+/// process loaded (a DLL Wine looked at and passed over, or one only wineboot
+/// used) is left out of a title bundle.
+fn is_image(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    [".dll", ".exe", ".drv", ".sys", ".ocx", ".cpl", ".acm", ".ax", ".msstyles"].iter().any(|e| name.ends_with(e))
+}
+
+fn base_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase()
+}
+
+/// What `"bundle": "title"` keeps: the files the run had read by its title
+/// window, or (`after` > 0) by that many seconds after it, from the
+/// recording's `files_read_at`; less the images no process loaded (an image
+/// is loaded under any of its names, so by its file name), and wineboot when
+/// the site boots without it. The images left out are counted. None: the
+/// recording has no read set for this cut.
+fn title_read_set(v: &Json, after: u32, wineboot_skip: bool) -> Result<Option<(Vec<Json>, usize)>> {
+    let read: Vec<String> = if after > 0 {
+        let title = match v.get("title_seconds") {
+            Some(Json::Num(n)) => n.parse::<f64>().unwrap_or(0.0),
+            _ => bail!("\"title_after\" needs the recording's title_seconds"),
+        };
+        match v.get("files_read_at") {
+            Some(Json::Obj(at)) => at
+                .iter()
+                .filter(|(_, t)| matches!(t, Json::Num(n) if n.parse::<f64>().map_or(false, |t| t <= title + after as f64)))
+                .map(|(p, _)| p.clone())
+                .collect(),
+            _ => bail!(
+                "user/eject.json says \"title_after\": {after}, but the recording has no files_read_at \
+                 (record with a tools/eject/record-wine32.mjs that has the read times)"
+            ),
+        }
+    } else {
+        match v.get("files_read_title") {
+            Some(Json::Arr(a)) => a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect(),
+            _ => return Ok(None),
+        }
+    };
+    let loaded: Option<std::collections::HashSet<String>> = match v.get("images_loaded") {
+        Some(Json::Obj(kv)) => Some(kv.iter().map(|(p, _)| base_name(p)).collect()),
+        _ => None,
+    };
+    let mut left = 0;
+    let kept = read
+        .into_iter()
+        .filter(|p| {
+            let out = is_image(p)
+                && (loaded.as_ref().is_some_and(|l| !l.contains(&base_name(p)))
+                    || (wineboot_skip && base_name(p) == "wineboot.exe"));
+            left += out as usize;
+            !out
+        })
+        .map(|p| json::s(&p))
+        .collect();
+    Ok(Some((kept, left)))
+}
+
 fn put_volatile_keys(v: &Json, web: &Path) -> Result<usize> {
     let what = crate::project::PROJECT_FILE;
     let Some(Json::Obj(keys)) = v.get("volatile_keys") else {
@@ -1341,19 +1414,37 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         params.push(("fjit".to_string(), s("1")));
     }
     // `"bundle": "split"`: the files the recorded run opened, which the site
-    // keeps in its bundle (web/eject-site.mjs).
+    // keeps in its bundle (web/eject-site.mjs); `"title"`: those it opened up
+    // to its title window.
+    let read_set = if config.bundle_title { "files_read_title" } else { "files_read" };
     let bundle = if config.bundle_split {
-        match v.get("files_read") {
-            Some(Json::Arr(read)) => {
-                let mut read = read.clone();
+        let read = if config.bundle_title {
+            title_read_set(&v, config.title_after, config.wineboot_skip)?.map(|(read, left)| {
+                eprintln!(
+                    "gexc eject build: \"bundle\": \"title\"{}: {} files in the bundle, {left} images the run only opened left to be read later",
+                    if config.title_after > 0 { format!(" {} s after the window", config.title_after) } else { String::new() },
+                    read.len()
+                );
+                read
+            })
+        } else {
+            match v.get(read_set) {
+                Some(Json::Arr(read)) => Some(read.clone()),
+                _ => None,
+            }
+        };
+        match read {
+            Some(read) => {
+                let mut read = read;
                 if let Some(p) = pins.filter(|p| !read.iter().any(|r| r.as_str() == Some(p))) {
                     read.push(s(&p));
                 }
                 obj(vec![("split", json::b(true)), ("read", Json::Arr(read))])
             }
             _ => bail!(
-                "user/eject.json says \"bundle\": \"split\", but the recording has no files_read \
-                 (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")"
+                "user/eject.json says \"bundle\": \"{}\", but the recording has no {read_set} \
+                 (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")",
+                if config.bundle_title { "title" } else { "split" }
             ),
         }
     } else {
@@ -1441,6 +1532,30 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
 #[cfg(test)]
 mod volatile_tests {
     use super::*;
+
+    #[test]
+    fn a_title_bundle_leaves_out_what_no_process_loaded() {
+        let v = Json::parse(
+            r#"{"title_seconds": 40.5,
+                "files_read_title": ["/w/user32.dll", "/w/gdiplus.dll", "/w/sortdefault.nls", "/w/wineboot.exe", "/w/winepe.wasm"],
+                "files_read_at": {"/w/user32.dll": 30, "/w/gdiplus.dll": 31, "/w/sortdefault.nls": 32, "/w/wineboot.exe": 10,
+                                  "/w/winepe.wasm": 10, "/g/menu.pkg": 70, "/g/level.pkg": 200},
+                "images_loaded": {"/pfx/c/windows/system32/USER32.dll": 30, "/w/wineboot.exe": 10}}"#,
+        )
+        .unwrap();
+        let names = |r: Option<(Vec<Json>, usize)>| {
+            let (r, left) = r.unwrap();
+            let mut r: Vec<String> = r.iter().map(|p| p.as_str().unwrap().to_string()).collect();
+            r.sort();
+            (r, left)
+        };
+        assert_eq!(names(title_read_set(&v, 0, false).unwrap()), (vec!["/w/sortdefault.nls".into(), "/w/user32.dll".into(), "/w/wineboot.exe".into(), "/w/winepe.wasm".into()], 1));
+        assert_eq!(names(title_read_set(&v, 0, true).unwrap()).1, 2);
+        let (later, _) = names(title_read_set(&v, 40, true).unwrap());
+        assert!(later.contains(&"/g/menu.pkg".to_string()) && !later.contains(&"/g/level.pkg".to_string()));
+        assert!(title_read_set(&Json::parse("{}").unwrap(), 0, false).unwrap().is_none());
+        assert!(title_read_set(&Json::parse(r#"{"title_seconds": 1}"#).unwrap(), 5, false).is_err());
+    }
 
     #[test]
     fn writes_recorded_keys_as_ordinary_ones() {

@@ -39,7 +39,7 @@ const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; 
 const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into', '--boot-units-out', '--boot-after', '--console', '--play', '--keys', '--hold'];
 const [url, out] = av.filter((a, i) => !a.startsWith('--') && !named.includes(av[i - 1]));
 if (!url || !out) {
-  console.error('usage: node tools/eject/record-wine32.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION] [--boot-units-out FILE] [--console FILE] [--boot-after S] [--play S [--keys T:KEY,...] [--hold MS]]');
+  console.error('usage: node tools/eject/record-wine32.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION] [--boot-units-out FILE] [--console FILE] [--boot-after S] [--shots] [--play S [--keys T:KEY,...] [--hold MS]]');
   process.exit(2);
 }
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
@@ -115,6 +115,10 @@ const uncovered = new Map();
 // `gexc cgen-split instrument`): unit key -> the slots entered.
 const coverage = new Map();
 const errors = [];
+// Every image a process loaded, by its path, with when it was first loaded
+// (the page's "[gex] loaded PATH" line): what a bundle cut keeps of the
+// images the run only opened.
+const imagesLoaded = new Map();
 // What wineboot made that the prefix does not save (its volatile keys), when
 // the page's environment has WINEGEX_RECORD_HARDWARE=1: "ROOT\\PATH" ->
 // { name: [type, hex] }, for gexc eject's "wineboot": "skip".
@@ -156,6 +160,8 @@ browser.on('Runtime.consoleAPICalled', (p) => {
   } else if (volatileKey(t)) {
   } else if ((m = /^\[gex-record\] module (.*) (\S+)$/.exec(t))) {
     modules.set(m[1], m[2]);
+  } else if ((m = /^\[gex\] loaded (.*?)(?: \((?:with its unit|no unit)\))?\s*$/.exec(t))) {
+    if (!imagesLoaded.has(m[1])) imagesLoaded.set(m[1], Date.now());
   } else {
     // The page's own word for an image without a unit, with where it was
     // loaded: a unit is built for an image at a base (gexc cgen-image --pe-base).
@@ -201,7 +207,31 @@ if (!title) {
   done(1);
 }
 const atTitle = (Date.now() - t0) / 1000;
-await sleep(settle);
+// What the run had opened by its title window: a game eject's bundle
+// ("bundle": "title"), however long the recording settles after it.
+const readSet = async () => JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
+const openedTitle = await readSet();
+// While it settles: when each file was first read (seconds from the start,
+// to READ_STEP), for a cut later than the window ("title_after" in
+// user/eject.json). --shots: a screenshot at each look as well,
+// OUT/shots/T.png, which is how a game's title menu is told from the loading
+// screen before it.
+const READ_STEP = 5000;
+const shots = av.includes('--shots') ? join(out, 'shots') : null;
+if (shots) mkdirSync(shots, { recursive: true });
+const firstRead = new Map();
+const noteRead = (paths, at) => { if (Array.isArray(paths)) for (const f of paths) if (!firstRead.has(f)) firstRead.set(f, at); };
+noteRead(openedTitle, atTitle);
+for (const end = Date.now() + settle; Date.now() < end;) {
+  await sleep(Math.min(READ_STEP, end - Date.now()));
+  const at = +((Date.now() - t0) / 1000).toFixed(1);
+  noteRead(await readSet(), at);
+  if (shots) {
+    const png = (await browser.send('Page.captureScreenshot', { format: 'png' }, page).catch(() => null))?.data;
+    if (png) writeFileSync(join(shots, `${at.toFixed(1).padStart(6, '0')}.png`), Buffer.from(png, 'base64'));
+  }
+  console.log(`record-wine32: ${at} s: ${firstRead.size} files read`);
+}
 const sess = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.session ?? null)')) ?? 'null');
 if (!sess) { console.error('record-wine32: the page has no __nt.session (an nt-page.js from before the recorder)'); done(1); }
 const pageUrl = await ev('location.href');
@@ -210,7 +240,8 @@ for (const line of String((await ev("globalThis.__nt?.out ?? ''")) ?? '').split(
 
 // The run's read set. A page from before `__ntOpened` gives none, and the
 // site then keeps its whole bundle.
-const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
+const opened = await readSet();
+noteRead(opened, +((Date.now() - t0) / 1000).toFixed(1));
 if (opened?.error) console.error(`record-wine32: no read set: ${opened.error}`);
 
 // --play S [--keys T:KEY,...] [--hold MS]: after the read set is taken (the
@@ -285,6 +316,9 @@ const session = {
   uncovered: [...uncovered].map(([pc, u]) => ({ pc, ...u })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,
+  files_read_title: Array.isArray(openedTitle) ? openedTitle : null,
+  files_read_at: firstRead.size ? Object.fromEntries(firstRead) : null,
+  images_loaded: Object.fromEntries([...imagesLoaded].map(([path, at]) => [path, +((at - t0) / 1000).toFixed(2)])),
   ...(volatileKeys.size ? { volatile_keys: Object.fromEntries(volatileKeys) } : {}),
   // Which functions (slots of each unit's element segment) the run entered,
   // when its units were instrumented: `a-b` runs.
@@ -299,7 +333,8 @@ if (bootOut) {
 }
 console.log(`${out}/wine32-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
   + `${session.units.length} units (${session.unit_misses.length} images without one, ${session.uncovered.length} addresses no unit holds), ${session.modules.length} wasm modules`
-  + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
+  + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`
+  + `${session.files_read_title ? ` (${session.files_read_title.length} by the title)` : ''}`);
 // --coverage-into SESSION: a run of a site built with "cold": "instrument"
 // (crates/gex-eject/README.md, "Cold code") adds the functions it called to another
 // recording's coverage, the one the project is ejected from.
