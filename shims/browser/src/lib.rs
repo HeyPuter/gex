@@ -10147,8 +10147,10 @@ fn rebuild_carried(
 /// every other mapping. A PE32+ export's RVA is added to its DLL's base in
 /// 64 bits, so a data export below a skeleton's base would come out past
 /// 4 GiB (ws2_32's `__wine_unix_call_dispatcher` lookup did). Natively the
-/// data goes above 2 GiB; the page's guest ends below that.
-pub(crate) const WINE64_PE_DATA: (u64, u64) = (0x7fde_0000, 0x7ffe_0000);
+/// data goes above 2 GiB; the page's guest ends below that. 8 MiB: the
+/// core's and every Wine module of its own a process loads (the desktop's
+/// explorer, about 4.5 MiB).
+pub(crate) const WINE64_PE_DATA: (u64, u64) = (0x7f7e_0000, 0x7ffe_0000);
 
 /// 64-bit Wine: 64-bit native Wine's entry page, the page after KUSER_SHARED_DATA
 /// (its ntdll maps it at start). At its start, the pointer x86-64 system
@@ -10244,7 +10246,7 @@ pub(crate) fn wine64_pe_data() -> (u64, u64) {
         // the window is the top of that space instead (below a 64 KiB
         // guard), above every image and within 4 GiB of the first ones.
         let top = wine64_top_m64();
-        (top - 0x21_0000, top - 0x1_0000)
+        (top - 0x81_0000, top - 0x1_0000)
     } else if winspace::wine64_compact_on() {
         WINE64_PE_DATA_COMPACT
     } else {
