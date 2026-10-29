@@ -2499,8 +2499,13 @@ export class Gex {
     this.#tnAt('boot');
     // Dense block tables when the image module has `blocks` (the seed does;
     // a closure image, whose libraries dispatch classically, does not).
-    this.#dense = opts.dense !== false && !this.#nativeOnly && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
+    // What the children are given is the ask, not this program's answer: a
+    // native program that runs no guest code (`#nativeOnly`) numbers none,
+    // its fork children neither (theirs is a copy), but a program it execs
+    // that runs guest code does, and so do that program's children.
+    const denseAsked = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#dense = denseAsked && !this.#nativeOnly;
+    this.#opts.dense = denseAsked ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
