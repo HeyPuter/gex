@@ -297,6 +297,8 @@ extern "C" {
     fn k_wq_add(id: u32, slot: u32);
     fn k_wq_del(id: u32, slot: u32);
     fn k_wq_addr(id: u32) -> u32;
+    fn k_wq_hold() -> i32;
+    fn k_wq_release();
     /// The queue of a kernel object, by its id in the kernel's tables.
     fn k_pipe_queue(id: i32) -> u32;
     fn k_sock_queue(id: i32) -> u32;
@@ -11256,6 +11258,9 @@ fn end_process_once(home: &sigs::Home, code: i32) {
     // global kernel and only learns of a close from `Drop` -- otherwise the
     // reader waits forever for an EOF nobody sends. A thread still inside a
     // call on one keeps its description until the call ends.
+    // Every hang-up at once (`k_wq_hold`): a waiter on several of the
+    // descriptors sees them all at its next look.
+    hold_wakes();
     if let Some(fds) = fds_free() {
         fds.close_all();
     }
@@ -11275,6 +11280,7 @@ fn end_process_once(home: &sigs::Home, code: i32) {
             }
         }
     }
+    release_wakes();
     // The status last, so a parent's `wait4` finds the descriptors closed.
     publish_exit(pid, code);
     // Nothing to hand the stack to: other processes are other Workers already
@@ -19234,6 +19240,7 @@ pub extern "C" fn gex_abandon(code: i32) {
     // no longer exists and the parent's `read` never returns: the run wedges
     // one process further along than the one that died, which is the shape
     // that made a lifter fault in a forked child look like a hang in `apt`.
+    hold_wakes();
     if let Some(fds) = fds_free() {
         fds.close_all();
     }
@@ -19244,6 +19251,7 @@ pub extern "C" fn gex_abandon(code: i32) {
             k_pty_forget(pid);
         }
     }
+    release_wakes();
     publish_exit(pid, code);
 }
 
@@ -20007,4 +20015,24 @@ pub extern "C" fn gex_set_exc_trace(on: i32) {
 /// A line on the guest's standard error (delivered in order with its output).
 pub(crate) fn stderr_line(s: &str) {
     unsafe { write(2, s.as_ptr() as usize, s.len() as u32) };
+}
+
+/// A process's end holds this Worker's wakes while it closes its
+/// descriptors (`k_wq_hold`), and [`release_wakes`] sends them.
+fn hold_wakes() {
+    // SAFETY: no arguments.
+    unsafe {
+        if k_present() != 0 {
+            k_wq_hold();
+        }
+    }
+}
+
+fn release_wakes() {
+    // SAFETY: no arguments.
+    unsafe {
+        if k_present() != 0 {
+            k_wq_release();
+        }
+    }
 }

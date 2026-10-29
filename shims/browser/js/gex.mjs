@@ -3282,6 +3282,10 @@ export class Gex {
         k.k_futex_wake(addr);
         sched.checkSlots();
       };
+      out.k_wq_release = () => {
+        k.k_wq_release();
+        sched.checkSlots();
+      };
     }
     return out;
   }
