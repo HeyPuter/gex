@@ -765,6 +765,10 @@ def link(dlls, out, gexrt, others=None):
                     if f'__{t}_a' in undef or f'__{t}_z' in undef:
                         f.write(f'void *__{t}_a[1] __attribute__((used));\n'
                                 f'extern void *__{t}_z[1] __attribute__((alias("__{t}_a")));\n')
+                # a C destructor's registration (wldap32's), which nothing in
+                # the core defines: none runs, as none did linked into it
+                if '__cxa_atexit' in undef:
+                    f.write('int __cxa_atexit(void (*f)(void *), void *a, void *d) { return 0; }\n')
                 for sec in ('gexw_entries', 'gexw_entries_decl'):
                     # (none at all: a module none of whose functions is handed out)
                     if sec not in have:
