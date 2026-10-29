@@ -158,10 +158,14 @@ fn trampoline_keys() -> [String; 2] {
 
 /// The keys a 64-bit Wine page may ask for the 64-bit NT trampoline page's unit by:
 /// `gexc cgen-image --nt-trampolines64`, with `--mem64` for a memory64 process
-/// and without for Wine's other processes, guarded or not.
+/// and without for Wine's other processes, and with `--wine64-compact` (a
+/// wasm32 memory) for a process in the compact space, guarded or not.
 fn trampoline_keys64() -> Vec<String> {
     let (image, _) = gex_kernel::win::trampoline_input(false);
-    crate::rsrc::flavors_mem().filter(|((_, kuser), _)| !kuser).map(|(g, m)| crate::rsrc::key_with_mem(&image, g, m)).collect()
+    let mut keys: Vec<String> =
+        crate::rsrc::flavors_mem().filter(|((_, kuser), _)| !kuser).map(|(g, m)| crate::rsrc::key_with_mem(&image, g, m)).collect();
+    keys.extend([false, true].map(|unguarded| crate::rsrc::key_with_entry(&image, (unguarded, true), true)));
+    keys
 }
 
 /// Adds the 64-bit trampoline page's units the caches hold; none fails the eject.
@@ -171,7 +175,7 @@ fn add_trampolines64(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> R
     let found: Vec<&String> = keys.iter().filter(|k| held(k)).collect();
     if found.is_empty() {
         bail!(
-            "no unit of the 64-bit NT trampolines ({}) in the unit cache ({}): build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines64 [--mem64]",
+            "no unit of the 64-bit NT trampolines ({}) in the unit cache ({}): build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines64 [--mem64 | --wine64-compact]",
             keys.join(" or "),
             caches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":")
         );
@@ -1500,6 +1504,21 @@ mod tests {
         let recorded2 = Json::parse(r#"[{"key":"cc","path":"[nt trampolines]","at":1.25}]"#).unwrap();
         let j2 = units_json(recorded2.as_arr().unwrap(), &units[2..]);
         assert_eq!(j2.as_arr().unwrap()[0].get("at").cloned(), Some(json::Json::Num("1.25".into())));
+    }
+
+    #[test]
+    fn a_wine64_eject_ships_the_compact_trampoline_unit() {
+        let _fold = FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let (image, _) = gex_kernel::win::trampoline_input(false);
+        let keys = trampoline_keys64();
+        // `--wine64-compact`'s keys (KUSER fold and entry page), guarded or not,
+        // beside the plain and memory64 ones, and none of them 32-bit Wine's fold alone.
+        for unguarded in [false, true] {
+            let compact = crate::rsrc::key_with_entry(&image, (unguarded, true), true);
+            assert!(keys.contains(&compact), "{compact} not in {keys:?}");
+            assert!(!keys.contains(&crate::rsrc::key_with(&image, (unguarded, true))));
+        }
+        assert_eq!(keys.len(), 6);
     }
 
     #[test]

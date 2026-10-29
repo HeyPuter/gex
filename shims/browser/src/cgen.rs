@@ -720,6 +720,9 @@ fn wine32_forget(base: u64, size: u64) {
     }
 }
 
+/// Whether the trampoline page this address space asked for is 32-bit Wine's.
+static TRAMPOLINES32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The trampoline page's unit (and, for i386, its unix-call provider:
 /// [`place`]) for a 32-bit Wine process, with the first image it places: the page is
 /// in memory from the start, and Wine's unix calls and syscalls all go
@@ -730,6 +733,7 @@ fn wine32_trampolines(class32: bool) {
     if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
+    TRAMPOLINES32.store(class32, Ordering::Relaxed);
     let (image, _) = gex_kernel::win::trampoline_input(class32);
     place(&image, "[the trampolines]", image.bias, true, None);
     if crate::tracing() {
@@ -1128,6 +1132,21 @@ pub extern "C" fn gex_cgen_base(u: u32) -> u64 {
     lock(&UNITS).get(u as usize).map_or(0, |x| x.base)
 }
 
+/// The `gexc cgen-image` flags that build the trampoline page's unit this
+/// process asks for: 32-bit Wine's (KUSER fold), a 64-bit Wine process's in
+/// the compact space (fold and entry page) or in memory64, or another's.
+fn trampolines_build() -> &'static str {
+    if TRAMPOLINES32.load(Ordering::Relaxed) {
+        if gex_abi::kuser_fold() { "--wine32-kuser --nt-trampolines32" } else { "--nt-trampolines32" }
+    } else if gex_abi::kuser_fold() && gex_abi::kuser_fold_entry() {
+        "--nt-trampolines64 --wine64-compact"
+    } else if gex_abi::mem64() {
+        "--nt-trampolines64 --mem64"
+    } else {
+        "--nt-trampolines64"
+    }
+}
+
 /// The path of the image unit `u` is for, for messages.
 #[no_mangle]
 pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
@@ -1155,8 +1174,10 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     if x.path.starts_with('[') {
         crate::warn_line(&format!(
             "gex-pe: missing unit: {} (key {}) has no function-tier unit, so every call through it misses into tier-1; \
-             build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines32\n",
-            x.path, x.key
+             build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image {}\n",
+            x.path,
+            x.key,
+            trampolines_build()
         ));
         return 0;
     }
