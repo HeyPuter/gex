@@ -402,6 +402,11 @@ impl FuncBody {
         }
     }
 
+    /// The two addresses on the stack added.
+    pub fn addr_add(&mut self) {
+        self.byte(if gex_abi::mem64() { 0x7c } else { 0x6a }); // i64.add / i32.add
+    }
+
     /// `& k`.
     pub fn addr_and_const(&mut self, k: i64) {
         if gex_abi::mem64() {

@@ -376,7 +376,12 @@ fn slot_word(pc: u64) -> Option<&'static AtomicU32> {
     if page >= gex_abi::dispatch_max_pages() {
         return None;
     }
-    let entry = word(gex_abi::dispatch_dir() + 4 * page).load(Ordering::Acquire);
+    // In the directory of the mode this thread runs in.
+    let dir = crate::dir_word(gex_abi::page_key(pc, crate::thread_alt()));
+    if dir == u64::MAX {
+        return None;
+    }
+    let entry = word(dir).load(Ordering::Acquire);
     let k = gex_abi::dispatch_entry_table(entry);
     if entry == 0 || !dense::table(k) {
         return None;

@@ -4066,7 +4066,7 @@ export class Gex {
     this.#vforkDepth++;
     e.gex_snap_enable?.(0);
     try {
-      this.#guest.exports.enter(ctx, entry);
+      this.#enterOf(ctx, entry)(ctx, entry);
     } catch (err) {
       if (!e.gex_handoff?.()) {
         why = 'crash';
@@ -6996,7 +6996,7 @@ export class Gex {
       // native frame down to the innermost loop, live ones included.
       if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
-        const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + this.#ctxSp(), true);
+        const sp = this.#liveSp(Number(ctx));
         if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
           err.gexNativeLeft = true;
           throw err;
@@ -7350,7 +7350,7 @@ export class Gex {
           await this.#enterP(ctx, pc);
           this.#where = 'trap';
         }
-        else this.#guest.exports.enter(ctx, pc);
+        else this.#enterOf(ctx, pc)(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
         if (globalThis.GEX_DEBUG_EXIT) {
@@ -8046,11 +8046,30 @@ export class Gex {
   #enterPOf = null;
   /** `enter`, on a stack of its own. */
   #enterP(ctx, pc) {
-    if (this.#enterPOf !== this.#guest) {
-      this.#enterPf = WebAssembly.promising(this.#guest.exports.enter);
-      this.#enterPOf = this.#guest;
+    const f = this.#enterOf(ctx, pc);
+    if (this.#enterPOf !== f) {
+      this.#enterPf = WebAssembly.promising(f);
+      this.#enterPOf = f;
     }
     return this.#enterPf(ctx, pc);
+  }
+
+  // The `enter` of a module of the process's other mode (gex_abi::ALT_PAGE: a
+  // WoW64 thread's 32-bit code), which dispatches through that mode's
+  // directory, and the directory it was installed against.
+  #altEnter = null;
+  #altEnterDir = 0n;
+  /** The `enter` to run `ctx`'s thread at `pc` by: the program's, or, while
+   *  its CS names the process's other mode, a module of that mode's. With
+   *  none yet, the miss there translates and installs one, and traps to
+   *  come back (the caller's loop resumes at `pc`). */
+  #enterOf(ctx, pc) {
+    const e = this.#shim.exports;
+    if (!e.gex_ctx_alt?.(ctx)) return this.#guest.exports.enter;
+    if (this.#altEnter && this.#altEnterDir === BigInt(e.gex_alt_dir())) return this.#altEnter;
+    this.#altEnter = null;
+    e.gex_dispatch_miss(ctx, BigInt.asIntN(64, BigInt(pc)));
+    return this.#altEnter ?? this.#guest.exports.enter;
   }
   #parkPf = null;
   /** `gex_park`, on a stack of its own (it suspends in `k_ws_park`). */
@@ -8284,7 +8303,7 @@ export class Gex {
       let v;
       try {
         const [op, a, b, c, d, x] = r.value;
-        v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
+        v = op === 'enter' ? this.#enterOf(a, b)(a, b) : a(b, c, d, x);
       } catch (err) {
         // A nested loop never yields to the event loop (a Wine thread's
         // whole life can be one call-out): an instrumented unit's hits go
@@ -8442,7 +8461,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && this.#liveSp(ctx) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -8510,7 +8529,7 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
-          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
+          const sp = this.#liveSp(ctx);
           // Native Wine's return pad, reached with nobody's watch or miss
           // taking it (cgen.rs `native_return_stray`): the guest went on
           // past this call-out to a native caller's return (an exception
@@ -8599,6 +8618,15 @@ export class Gex {
     return { f, idx: hook, rsp, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }
 
+  /** The stack pointer of the stack call-outs are made on, which a call-out's
+   *  caller's frame is or is not unwound past: RSP, but in code of the
+   *  process's other mode (a WoW64 thread's 32-bit code, on its 32-bit
+   *  stack) R14, which holds the 64-bit one there (`#hookStack`). */
+  #liveSp(ctx) {
+    const alt = !!this.#shim.exports.gex_ctx_alt?.(ctx);
+    return new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp() + (alt ? 10 * 8 : 0), true);
+  }
+
   /** The program's stack pointer moved below the guest's for a hook's C
    *  frames: { spG, cur } (the caller puts `spG` back to `cur`). */
   #hookStack(ctx) {
@@ -8606,16 +8634,24 @@ export class Gex {
     // frame does, with room for the exception frame it builds there.
     const spG = this.#wasmprogStack();
     const cur = spG.value;
+    // In code of the process's other mode (a WoW64 process's 32-bit code)
+    // the 64-bit stack, which R14 holds while the 32-bit one is in RSP (the
+    // WoW64 CPU's convention): the 32-bit stack may be nearly full, and a
+    // fault there is dispatched on the 64-bit one, a little below R14 (the
+    // native shim's WOW64_DISPATCH_ROOM, 16 KiB, keeps these frames under it).
+    const alt = !!this.#shim.exports.gex_ctx_alt?.(ctx);
+    const at = ctx + this.#ctxSp() + (alt ? 10 * 8 : 0);
+    const room = alt ? 0x4000 : 0;
     // An i64 stack pointer (a 64-bit memory, or a lowered LP64 program)
     // takes the guest's whole 64-bit one: a thread stack above 4 GiB cut to
     // its low 32 bits put the hook's frames, and the exception record it
     // writes, over whatever lives there, the runtime's own heap included.
     if (typeof cur === 'bigint') {
-      const rsp = this.#dv().getBigUint64(ctx + this.#ctxSp(), true);
+      const rsp = this.#dv().getBigUint64(at, true) - BigInt(room);
       const low = cur !== 0n && cur < rsp ? cur : rsp;
       spG.value = (low - 4096n) & ~15n;
     } else {
-      const esp = this.#dv().getUint32(ctx + this.#ctxSp(), true);
+      const esp = (this.#dv().getUint32(at, true) - room) >>> 0;
       const c32 = Number(cur) >>> 0;
       // 0: the program has not set it yet, as for an i64 one.
       const low = c32 !== 0 && c32 < esp ? c32 : esp;
@@ -9071,6 +9107,12 @@ export class Gex {
     // A runtime module imports its dense base (gex_emit::dense::GLOBAL)
     // whether or not it has dense blocks; set below when it has.
     imports.dense_base = 0;
+    // The other mode's directory (gex_abi::ALT_PAGE: a WoW64 thread's 32-bit
+    // code), which only a module of that mode imports; 0 until the process
+    // has one, and then no module needs it.
+    // Above 4 GiB in a wasm64 process: the global is address-typed.
+    const altDir = BigInt(e.gex_alt_dir?.() ?? 0);
+    if (altDir) imports.alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, altDir) : new WebAssembly.Global({ value: 'i32' }, Number(altDir) | 0);
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {
@@ -9143,6 +9185,12 @@ export class Gex {
             `${grew} slots grown on retry after: ${first.message}`,
         );
       }
+    }
+    // A module of the other mode: its `enter` is where this thread's loops go
+    // in while its CS names that mode (`#enterOf`).
+    if (altDir && this.#altEnterDir !== altDir && WebAssembly.Module.imports(mod).some((i) => i.name === 'alt_dir')) {
+      this.#altEnter = inst.exports.enter;
+      this.#altEnterDir = altDir;
     }
     // Write the module's blocks into the tables. Its element segments are
     // passive, so instantiating wrote nothing -- deliberate, because a module

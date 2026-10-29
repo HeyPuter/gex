@@ -5276,9 +5276,9 @@ impl<'a> Emitter<'a> {
     fn load_dir_entry(&mut self) {
         match self.cx.alt_dir {
             Some(g) => {
-                self.f.global_get(g);
-                self.f.byte(0x6a); // i32.add
                 self.f.addr_i32();
+                self.f.global_get(g);
+                self.f.addr_add();
                 self.f.load64(0x28, 2, 0);
             }
             None => {

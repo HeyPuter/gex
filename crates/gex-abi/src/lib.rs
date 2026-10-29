@@ -919,7 +919,8 @@ pub mod imports {
     /// gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
 
-    /// An immutable `i32` global: the guest address of the process's other
+    /// An immutable global in the memory's index type (`i32`, `i64` under
+    /// memory64): the guest address of the process's other
     /// directory ([`crate::ALT_PAGE`]). Imported only by a module of code
     /// translated in the mode the process's own class is not (a WoW64
     /// process's 32-bit code); every other module is as it was.

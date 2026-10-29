@@ -820,11 +820,11 @@ impl ModuleBuilder {
         // a global of its own at index 0.
         let alt = page_table.alt();
         assert!(!alt || linkage == Linkage::Shared, "other-mode code is translated at run time only");
-        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling && !alt)
+        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
             .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
         // Code in the process's other mode: its directory is given at
         // instantiation, where the process allocated it.
-        let alt_dir = alt.then(|| m.import_global(IMPORT_MODULE, imports::ALT_DIR, ValType::I32));
+        let alt_dir = alt.then(|| m.import_global(IMPORT_MODULE, imports::ALT_DIR, if gex_abi::mem64() { ValType::I64 } else { ValType::I32 }));
 
         let entry_ty = if crate::dense::on() {
             m.func_type(FuncType::new(vec![p, ValType::I32], vec![]))
@@ -1488,9 +1488,9 @@ impl ModuleBuilder {
         f.byte(0x6c); // i32.mul
         match self.alt_dir {
             Some(g) => {
-                f.global_get(g);
-                f.byte(0x6a); // i32.add
                 f.addr_i32();
+                f.global_get(g);
+                f.addr_add();
                 f.load64(0x28, 2, 0);
             }
             None => {

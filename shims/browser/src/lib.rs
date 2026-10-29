@@ -7923,6 +7923,11 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // A system call from the other mode's code (int 0x80, syscall or
+    // sysenter in a WoW64 thread's 32-bit code): no such gate, #GP.
+    if gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0)) {
+        gp_fault(ctx, pc as u64 & 0x00ff_ffff_ffff_ffff);
+    }
     leave_guest();
     let mut pc = pc;
     loop {
@@ -11420,6 +11425,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // The other directory was the old program's mapping, and the new
+    // program starts in its own mode.
+    ALT_DIR.store(0, std::sync::atomic::Ordering::Release);
+    if gex_abi::X86 {
+        let _ = GuestMem::new(guest_bytes()).write_u32(my_ctx() + ctx::CS as u64, 0);
+    }
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
     // and the moment it execs every one describes a program that is gone.
@@ -15345,10 +15356,21 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     }
     // A far transfer: the selector checked, the thread's mode set; any
     // other selector is #GP, an access violation.
+    // A change of mode leaves the block's module, whose directory is the old
+    // mode's: JavaScript's loop goes on at the target through a module of
+    // the new mode's (`gex.mjs` `#enter`).
     if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_FAR {
         let mut gm = GuestMem::new(guest_bytes());
+        let cs_at = ctx as u32 as u64 + ctx::CS as u64;
+        let before = gm.read_u32(cs_at).unwrap_or(0);
         if let Err(sel) = gex_kernel::x86::serve_far(&mut gm, ctx as u32 as u64, val as u64) {
             far_fault(sel, ctx, pc as u64);
+        }
+        let after = gm.read_u32(cs_at).unwrap_or(0);
+        if cs_alt(before) != cs_alt(after) {
+            set_resume(val as u64 & 0xffff_ffff);
+            set_resume_ctx(ctx as u32 as u64);
+            trap();
         }
     }
     // `cmpxchg16b`, under the host's lock.
@@ -15361,12 +15383,87 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     }
 }
 
+/// The process's other directory (`gex_abi::ALT_PAGE`: a WoW64 thread's
+/// 32-bit code), mapped the first time a thread runs code in that mode; 0
+/// until then. The process's own, in shared memory, so every Worker of it
+/// sees one.
+static ALT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where JavaScript's `alt_dir` import points: 0 until there is one.
+#[no_mangle]
+pub extern "C" fn gex_alt_dir() -> u64 {
+    ALT_DIR.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the thread at `ctx` runs code in the process's other mode: which
+/// `enter` JavaScript's loops go in by (`gex.mjs` `#enterOf`).
+#[no_mangle]
+pub extern "C" fn gex_ctx_alt(ctx: i32) -> i32 {
+    (gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))) as i32
+}
+
+/// Whether this thread runs code in the mode its process's own class is
+/// not (`ctx::CS`): a WoW64 process's 32-bit code.
+pub(crate) fn thread_alt() -> bool {
+    gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0))
+}
+
+/// Whether `cs` (a `ctx::CS` value) is the process's other mode.
+fn cs_alt(cs: u32) -> bool {
+    let own = gex_xlate::default_compat();
+    ctx::cs_compat(cs, own) != own
+}
+
+/// The guest address of a page key's directory word (`gex_abi::page_key`):
+/// the process's directory, or the other one. `u64::MAX`, which no access
+/// reaches, for the other mode's page while it has no directory.
+pub(crate) fn dir_word(key: u64) -> u64 {
+    gex_abi::dir_entry_addr(key, ALT_DIR.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(u64::MAX)
+}
+
+/// [`ALT_DIR`], mapped now if it is not yet: top-down below 4 GiB, out of a
+/// 32-bit program's way, else wherever the map has room.
+fn ensure_alt_dir(px: &Px<'_>) -> u64 {
+    use gex_kernel::mem::{flags, prot};
+    let have = ALT_DIR.load(std::sync::atomic::Ordering::Acquire);
+    if have != 0 {
+        return have;
+    }
+    let len = (gex_abi::alt_dir_bytes() + 0xffff) & !0xffff;
+    let name = "[gex other-mode dispatch]";
+    let mut gm = GuestMem::new(guest_bytes());
+    let mut at = (0x1_0000_0000u64.saturating_sub(len + 0x10_0000)) & !0xffff;
+    let mut got = None;
+    while at >= 0x8000_0000 && got.is_none() {
+        got = px.mm.mmap_anon(&mut gm, at, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name).ok();
+        at -= 0x10_0000;
+    }
+    let got = got.or_else(|| px.mm.mmap_anon(&mut gm, 0, len, prot::READ | prot::WRITE, 0, false, name).ok()).unwrap_or(0);
+    match ALT_DIR.compare_exchange(0, got, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+        Ok(_) => got,
+        Err(other) => other,
+    }
+}
+
 /// A far transfer to a selector that names no user code segment: the #GP
 /// Windows delivers as an access violation, SIGSEGV here.
 fn far_fault(sel: u16, ctx: i32, pc: u64) -> ! {
-    let _ = ctx;
-    warn_line(&format!("gex: a far transfer to selector {sel:#x}, which is no code segment, in block {pc:#x}: an access violation\n"));
-    set_exit(128 + 11);
+    let _ = sel;
+    gp_fault(ctx, pc)
+}
+
+/// #GP in the block at `pc`: an access violation to the process's fault
+/// hook (Wine's ntdll.so), else SIGSEGV for the guest's handler.
+fn gp_fault(ctx: i32, pc: u64) -> ! {
+    let c = ctx as u32 as u64;
+    if cgen::fault_hook() != 0 {
+        let _ = GuestMem::new(guest_bytes()).write_u64(c + ctx::PC as u64, pc);
+        cgen::fault_stage(0xc000_0005, 0, 0);
+        set_resume(pc);
+        set_resume_ctx(c);
+        trap();
+    }
+    branch_fault(pc);
     trap();
 }
 
@@ -15421,12 +15518,13 @@ fn heal_dirs(start: u64) {
     let healed: Vec<(u64, u32, u32)> = with_jit_only(|j| {
         let mut gm = GuestMem::new(guest_bytes());
         let mut out = Vec::new();
-        for page in [first, first + 1] {
-            if page >= gex_abi::dispatch_max_pages() {
+        // Both modes' keys of the two pages.
+        for page in [first, first + 1, first | gex_abi::ALT_PAGE, (first + 1) | gex_abi::ALT_PAGE] {
+            if gex_abi::key_page(page).0 >= gex_abi::dispatch_max_pages() {
                 continue;
             }
             let Some(base) = j.page_table.lookup(page) else { continue };
-            let at = gex_abi::dispatch_dir() + page * 4;
+            let at = dir_word(page);
             let dir = gm.read_u32(at).unwrap_or(u32::MAX);
             if dir != base {
                 dense::note_entry(base);
@@ -15723,7 +15821,13 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
-            j.translated.retain(|&a| a < lo || a >= hi);
+            // Either mode's blocks of it.
+            j.translated.retain(|&a| !(lo..hi).contains(&(a & !gex_abi::ALT_ADDR)));
+            let key = page | gex_abi::ALT_PAGE;
+            if j.page_table.forget(key).is_some() {
+                j.retired_pages.insert(key);
+                let _ = gm.write_u32(dir_word(key), 0);
+            }
             xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
@@ -16228,6 +16332,10 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         trap();
     }
     LAST_MISS_PC.with(|c| c.set(pc));
+    // Code in the process's other mode (a WoW64 thread's 32-bit code): its
+    // own translations, in its own directory, never a unit's, a function's
+    // or a dense block's.
+    let alt = thread_alt();
     watch_mem("miss");
     stack_tripwire("a dispatch miss");
     miss_count(0);
@@ -16311,7 +16419,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // relocated after mapping; cgen.rs `wine32_miss`): JS serves its unit, then
     // the guest goes on at this pc. Before the function JIT, which would
     // otherwise take the image's code first.
-    if cgen::wine32_miss(pc) {
+    if !alt && cgen::wine32_miss(pc) {
         miss_way(pc, 8);
         set_resume(pc);
         set_resume_ctx(my_ctx());
@@ -16320,15 +16428,17 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // An ejected project's training run: a pc of a unit image no function
     // holds is a web entry, whether the function JIT (below) or tier-1 then
     // runs it (the AOT-only run would stop here).
-    if cgen::entry_log() && !cgen::knows(pc) {
+    if !alt && cgen::entry_log() && !cgen::knows(pc) {
         crate::cgen::note_web_entry(pc);
     }
     // A recording: the same pcs, named with their unit, before the function
     // JIT or tier-1 takes them.
-    cgen::record_uncovered(pc);
+    if !alt {
+        cgen::record_uncovered(pc);
+    }
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
-    if fjit::serve(pc) {
+    if !alt && fjit::serve(pc) {
         miss_way(pc, 6);
         miss_count(4);
         if in_place(_ctx, pc) {
@@ -16340,7 +16450,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     // An address an ELF export provider (or a replaced library's provider)
     // holds whose slot lost its bridge.
-    if cgen::elfprov::rebridge(pc) {
+    if !alt && cgen::elfprov::rebridge(pc) {
         miss_way(pc, 7);
         set_resume(pc);
         set_resume_ctx(my_ctx());
@@ -16482,7 +16592,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // with its slots unwritten? Filling one page is microseconds against
     // seconds to recompile the object around it, so this must sit above the
     // recompile check below. Once per page: an unfillable page falls through.
-    if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+    if !alt && FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
         // Once per *span*, not per page: a fill writes `FILL_SPAN` slots around
         // the one that missed, so a branch elsewhere on the page must ask again,
         // while a second ask for one span would loop for ever.
@@ -16509,10 +16619,12 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // An ejected project's training run (`run.mjs --record-entries`): code
     // inside an image with a unit, entered where the unit has no entry, is
     // what the web build's region entries must cover.
-    crate::cgen::note_web_entry(pc as u64);
+    if !alt {
+        crate::cgen::note_web_entry(pc as u64);
+    }
     // AOT-only, a pc the function table has (published by another Worker
     // after this one last caught up): catch up and dispatch again.
-    if aot() && cgen::knows(pc) {
+    if !alt && aot() && cgen::knows(pc) {
         thread_local! {
             static AGAIN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
         }
@@ -16604,7 +16716,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Past the fill and a closure library still claims this page: everything
     // looks right (pin took, module covers it, directory names it) yet the
     // block is lifted, so count how much the closure fails to save.
-    if gex_closure_owner(gex_abi::dispatch_page(pc)) >= 0 {
+    if !alt && gex_closure_owner(gex_abi::dispatch_page(pc)) >= 0 {
         let n = with_jit_only(|j| {
             j.lift_in_closure += 1;
             j.lift_in_closure
@@ -16655,7 +16767,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
     }
-    if maybe_recompile_at(pc) {
+    if !alt && maybe_recompile_at(pc) {
         miss_way(pc, 12);
         // The same resume the ordinary path uses: come back at the address
         // that missed, once JavaScript has instantiated what was queued and
@@ -16710,7 +16822,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The page table is keyed by dispatch page, which is an index; the
         // identity is asked about an address, because that is what names a
         // mapping.
-        let page = gex_abi::dispatch_page(pc);
+        // The page key: the page, with `ALT_PAGE` for the other mode's.
+        let page = gex_abi::page_key(pc, alt);
+        if alt {
+            ensure_alt_dir(px);
+        }
         if j.page_table.lookup(page).is_some() {
             j.reuse_have += 1;
         }
@@ -16767,7 +16883,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     ));
                 }
             }
-            let ident = page_identity(px, page * gex_abi::DISPATCH_PAGE);
+            // Nothing is shared of the other mode's code: modules are
+            // stored and served by page identity, which has no mode.
+            let ident = if alt { None } else { page_identity(px, page * gex_abi::DISPATCH_PAGE) };
             if ident.is_none() {
                 j.reuse_noident += 1;
             }
@@ -17116,7 +17234,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&a) || crate::cgen::provider_serves(a),
+            &|a| known.contains(&gex_abi::addr_key(a, alt)) || (!alt && crate::cgen::provider_serves(a)),
             table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
@@ -17151,7 +17269,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let fresh: Vec<u64> = unit
             .exported_blocks
             .iter()
-            .map(|(a, _)| *a)
+            .map(|(a, _)| gex_abi::addr_key(*a, alt))
             .filter(|a| known.insert(*a))
             .collect();
         *jitout::BOX.0.borrow_mut() = Some((std::mem::take(&mut unit.page_table), known, intr));
@@ -17242,7 +17360,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // Not into the store if code was retired while it lifted: it may hold
         // the old bytes, and another process would be served them.
         let stale = retired_since.as_ref().is_some_and(|r| !r.is_empty());
-        let mod_id = if stale { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
+        let mod_id = if stale || alt { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
         if mod_id == 0 {
             j.store_full += 1;
         } else {
@@ -17265,7 +17383,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 ));
             }
         }
-        for (page, base) in &unit.covered {
+        for (page, base) in unit.covered.iter().filter(|_| !alt) {
             if let Some(key) = page_identity(px, *page * gex_abi::DISPATCH_PAGE) {
                 record_shared_slot(j, px.pid, *page, key, *base);
                 if mod_id != 0 {
@@ -17293,8 +17411,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             note_installed(j, mod_id, unit.covered.iter().map(|(p, _)| *p));
         }
         for (addr, _) in &unit.exported_blocks {
-            j.translated.insert(*addr);
-            j.provider.insert(*addr, unit.module_id);
+            j.translated.insert(gex_abi::addr_key(*addr, alt));
+            j.provider.insert(gex_abi::addr_key(*addr, alt), unit.module_id);
         }
         // The base this unit gave the faulting page, captured before `wasm`
         // is moved. `dir_entries` holds only *freshly allocated* pages, so a
@@ -17317,8 +17435,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         {
             let gm = GuestMem::new(guest_bytes());
             for &(p, b) in &unit.covered {
-                if p < gex_abi::dispatch_max_pages()
-                    && gm.read_u32(gex_abi::dispatch_dir() + p * 4).unwrap_or(1) == 0
+                if gex_abi::key_page(p).0 < gex_abi::dispatch_max_pages()
+                    && gm.read_u32(dir_word(p)).unwrap_or(1) == 0
                     && !dirs.iter().any(|(q, _)| *q == p)
                 {
                     dirs.push((p, b));
@@ -17333,7 +17451,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // dispatch path load-bearing for apt/closures). Only when it differs.
         if let Some(base) = fault_base {
             let mut gm = GuestMem::new(guest_bytes());
-            let at = gex_abi::dispatch_dir() + page * 4;
+            let at = dir_word(page);
             if gm.read_u32(at).unwrap_or(0) != base {
                 dir_note(page, base, "miss-reconcile-covered");
                 let _ = gm.write_u32(at, base);
@@ -17409,6 +17527,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }))
         }
     };
+    // The other mode's code: installed now (JavaScript keeps a module of
+    // that mode to enter by), then the loop goes on at `pc` through it, for
+    // the shared miss stub dispatches through the process's own directory.
+    if translated && alt {
+        in_place(_ctx, pc);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     if translated && in_place(_ctx, pc) {
         return gex_emit::module::DISPATCH_MISS_REDISPATCH;
     }
@@ -17842,8 +17969,10 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
         if end <= start {
             continue;
         }
-        j.translated.retain(|a| *a < start || *a >= end);
-        j.provider.retain(|a, _| *a < start || *a >= end);
+        // Either mode's (`gex_abi::ALT_ADDR`).
+        let gone = |a: u64| (start..end).contains(&(a & !gex_abi::ALT_ADDR));
+        j.translated.retain(|a| !gone(*a));
+        j.provider.retain(|a, _| !gone(*a));
         // The stale-check bound counts translations of one code's block, so
         // new code at those addresses starts from 0 (a block a page before
         // `start` may run onto it): Wine's ACM codecs, loaded and unloaded
@@ -17895,6 +18024,17 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
                 // translation.
                 IDENT_SNAPSHOT.0.borrow_mut().clear();
                 let _ = j.page_table.base(page);
+            }
+            // The same page's code in the other mode, if any (never dense).
+            let key = page | gex_abi::ALT_PAGE;
+            if j.page_table.forget(key).is_some() {
+                j.retired_pages.insert(key);
+                let at = dir_word(key);
+                if at != u64::MAX {
+                    // SAFETY: as the process's own directory's word above.
+                    let entry = unsafe { (*(at as usize as *const AtomicU32)).swap(0, Ordering::AcqRel) };
+                    j.base_pages.remove(&entry);
+                }
             }
         }
     }
@@ -19215,7 +19355,7 @@ pub extern "C" fn gex_jit_installed() {
                 }
             }
             dir_note(page, base, "install-done");
-            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
+            let _ = gm.write_u32(dir_word(page), base);
             j.base_pages.insert(base, page);
         }
         if let Some(d) = &done.dense {

@@ -4908,6 +4908,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     return far_fault(&mut caller, sel, pc as u64);
                 }
                 let after = gm.read_u32(cs_at).unwrap_or(0);
+                // GEX_TRACE_FAR: each far transfer, with the stacks around it
+                // (RSP, and R14, a WoW64 thread's other one).
+                static TRACE_FAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE_FAR.get_or_init(|| std::env::var_os("GEX_TRACE_FAR").is_some()) {
+                    let x = |r: u64| gm.read_u64(ctx as u32 as u64 + ctx::X as u64 + 8 * r).unwrap_or(0);
+                    eprintln!(
+                        "gex: far tid {} at {pc:#x} to {:#x}:{:#x}, cs {before:#x} -> {after:#x}, rsp {:#x}, r14 {:#x}",
+                        caller.data().thread.tid,
+                        (v as u64 >> 32) & 0xffff,
+                        v as u64 & 0xffff_ffff,
+                        x(4),
+                        x(14)
+                    );
+                }
                 if cs_alt(before) != cs_alt(after) {
                     let target = v as u64 & 0xffff_ffff;
                     let state = caller.data_mut();
@@ -5140,7 +5154,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // (longjmp, an exception) is abandoned: its caller leaves.
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
-                let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
+                // In code of the process's other mode the stack the call-outs
+                // were made on is not RSP: a WoW64 thread's 32-bit code runs
+                // on its 32-bit stack, the 64-bit one's pointer in R14
+                // (`hook_stack`), which is what has or has not unwound.
+                let sp_reg = if thread_alt(&caller) { 14 } else { sp_index() };
+                let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_reg) as u64).unwrap_or(0);
                 // Not at a function's own address under a native caller (the
                 // bridge's poll there): leaving would hand the function back
                 // with the PC its body left for, which the bridge takes as
@@ -5758,8 +5777,11 @@ fn install_unit(
         };
         let g = wasmtime::Global::new(
             cx.as_context_mut(),
-            wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Const),
-            Val::I32(alt_dir as u32 as i32),
+            wasmtime::GlobalType::new(
+                if gex_abi::mem64() { wasmtime::ValType::I64 } else { wasmtime::ValType::I32 },
+                wasmtime::Mutability::Const,
+            ),
+            if gex_abi::mem64() { Val::I64(alt_dir as i64) } else { Val::I32(alt_dir as u32 as i32) },
         )?;
         linker.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::imports::ALT_DIR, g)?;
     }
@@ -6122,6 +6144,26 @@ fn native_sp(d: &HostState) -> Option<wasmtime::Global> {
     s.provider_sp64.clone().or_else(|| s.provider_sp.clone())
 }
 
+/// The guest stack pointer a hook's native frames go below. In code of the
+/// process's other mode (a WoW64 process's 32-bit code) that is the 64-bit
+/// stack, which R14 holds while the 32-bit one is in RSP (the WoW64 CPU's
+/// convention, Windows' and Wine's): the 32-bit stack may be nearly full,
+/// and the fault is dispatched on the 64-bit one, a little below R14
+/// ([`WOW64_DISPATCH_ROOM`] keeps the hook's frames under that).
+fn hook_stack(caller: &Caller<'_, HostState>, mem: &[u8], ctx_addr: u64) -> u64 {
+    let x = |r: u64| read_u64(mem, (ctx_addr + ctx::X as u64 + 8 * r) as usize) & 0xffff_ffff;
+    if thread_alt(caller) {
+        x(14).saturating_sub(WOW64_DISPATCH_ROOM)
+    } else {
+        x(4)
+    }
+}
+
+/// The room left below a WoW64 thread's 64-bit stack pointer for the
+/// exception frame the hook builds there for a fault in 32-bit code, and
+/// wow64's copy of it.
+const WOW64_DISPATCH_ROOM: u64 = 0x4000;
+
 /// [`native_sp`]'s value as an address, whichever its width.
 fn sp_get(cx: impl wasmtime::AsContextMut, g: &wasmtime::Global) -> u64 {
     match g.get(cx) {
@@ -6151,7 +6193,7 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
@@ -6227,7 +6269,7 @@ fn guest_unix_call(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
@@ -6269,9 +6311,10 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
         let gm = GuestMem::new(memory.bytes());
         let cs = gm.read_u32(ctx_addr + ctx::CS as u64).unwrap_or(0);
         let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+        let r14 = gm.read_u64(ctx_addr + ctx::X as u64 + 8 * 14).unwrap_or(0);
         let src = gm.read_u64(ctx_addr + ctx::LAST_SOURCE as u64).unwrap_or(0);
         let last = gm.read_u64(ctx_addr + ctx::LAST_TARGET as u64).unwrap_or(0);
-        eprintln!("gex: guest fault {code:#x} at {pc:#x} (address {addr:#x}, kind {kind}), cs {cs:#x}, sp {sp:#x}, last target {last:#x} from block {src:#x}");
+        eprintln!("gex: guest fault {code:#x} at {pc:#x} (address {addr:#x}, kind {kind}), cs {cs:#x}, sp {sp:#x}, r14 {r14:#x}, last target {last:#x} from block {src:#x}");
         let bt = wasmtime::WasmBacktrace::force_capture(&*caller);
         for fr in bt.frames().iter().take(12) {
             eprintln!("gex:   {}", fr.func_name().unwrap_or("?"));
@@ -6299,7 +6342,7 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             let new = (cur.min(esp).saturating_sub(4096)) & !15;
             sp_set(&mut *caller, g, new)?;
             Some(cur)
