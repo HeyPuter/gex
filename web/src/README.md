@@ -69,6 +69,54 @@ The handle `start()` resolves with:
 | `ready()` | with `ready: 'manual'`: the start-up is over |
 | `describe()` | the desktop's windows, their titles and pixels |
 | `state` | `phase`, `out` (the output so far), `status`, `error`, `progress` |
+| `drop(data, opts)` | files and folders dropped on the page, copied into the guest (below) |
+| `dragOver(x, y)` | the window at a point of the page, `{title, ...}` or `null` |
+| `dragLeave()` | the drag left the desktop |
+
+### Dropped files
+
+```js
+desk.addEventListener('dragover', (e) => e.preventDefault());
+desk.addEventListener('drop', (e) => {
+  e.preventDefault();
+  // In the handler, before any await: the browser empties
+  // e.dataTransfer once the event is over.
+  app.drop(e.dataTransfer, {
+    x: e.clientX, y: e.clientY,
+    fallback: '/home/user/.wine/drive_c/users/user/Desktop',
+    onProgress: ({ done, total, filesDone, files }) => { /* ... */ },
+  }).then((r) => console.log(`copied to ${r.paths.join(', ')}`));
+});
+```
+
+`drop` copies the tree, with its folders, into a guest directory (`dir`,
+or a new `/tmp/drops/N`). A name the drop has twice is numbered too. The copy runs in a Worker, so the
+page does not stop while it runs. `data` is a DataTransfer, its `items`, a
+FileList or an array of Files.
+
+| Option | What |
+| --- | --- |
+| `x`, `y` | where it was dropped, the event's `clientX` and `clientY` |
+| `dir` | the guest directory to copy into: absolute, without `..`, not `/`, made if missing. Nothing there is written over: a name it has already gets ` (2)`, ` (3)`, ... |
+| `fallback` | a guest directory the copy moves into when no window takes the drop. A name already there gets ` (2)`, ` (3)`, ... |
+| `signal` | an AbortSignal: stops the copy (or the wait for a kernel stack, at most 30 s) and removes what it wrote |
+| `onProgress(p)` | `{done, total}` bytes and `{filesDone, files}` so far, and the file `name` being copied |
+
+It resolves with:
+
+- `path`: the directory it made;
+- `files` and `bytes`: how many files it copied, and their total size;
+- `ms`: how long the copy took;
+- `window`: the window at `x, y`, or `null`;
+- `accepted`: whether that window took the drop;
+- `paths`: where the top-level files and folders are now.
+
+`accepted` is always `false` for now, because the drop is not yet handed to
+the window. So with `fallback`, the files always end up in that directory.
+
+Files are 0644, or 0755 when one starts like a program (`\x7fELF` or
+`#!`); folders are 0755; the owner is the guest's user. The single-thread
+build has no `drop`. A drop with no files or folders in it rejects.
 
 ## A Linux program's build
 

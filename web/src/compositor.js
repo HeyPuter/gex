@@ -123,7 +123,7 @@ export class Compositor {
         // second one drawn into the frame.
         this.#canvas.style.cursor = m.css;
         this.#cursorCss = m.css;
-      } else if (m.kind === 'describe' || m.kind === 'wgsl-cache' || m.kind === 'readout') {
+      } else if (m.kind === 'describe' || m.kind === 'wgsl-cache' || m.kind === 'readout' || m.kind === 'window-at') {
         this.#pending.get(m.id)?.(m.kind === 'wgsl-cache' ? { blob: m.blob, stats: m.stats } : m.state);
         this.#pending.delete(m.id);
       } else if (m.kind === 'error') {
@@ -351,6 +351,25 @@ export class Compositor {
     const px = r.px;
     for (let i = 0; i < px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.subarray(i, i + 0x8000));
     return { w: r.w, h: r.h, b64: btoa(s) };
+  }
+
+  /** The window at a point of the page (`clientX`, `clientY`: viewport CSS
+   *  pixels, as a pointer or drag event has them): {key, client, block,
+   *  surface, title, x, y}, the point in its surface in the units its
+   *  pointer motion has (surface-local, as a drag's wl_data_device.motion
+   *  will be); or null. */
+  windowAt(clientX, clientY) {
+    const r = this.#canvas.getBoundingClientRect();
+    const x = Math.round((clientX - r.left) * (this.#canvas.width / Math.max(1, r.width)));
+    const y = Math.round((clientY - r.top) * (this.#canvas.height / Math.max(1, r.height)));
+    const id = this.#next++;
+    return new Promise((resolve) => {
+      this.#pending.set(id, resolve);
+      this.#worker.postMessage({ kind: 'window-at', id, x, y });
+      setTimeout(() => {
+        if (this.#pending.delete(id)) resolve(null);
+      }, 2000);
+    });
   }
 
   /** `{ pixels: false }`: everything but `lit`/`brightest`/`hash`, which

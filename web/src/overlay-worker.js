@@ -4,9 +4,8 @@
 // `pkgs/NAME.tar.zst` -- the program's closure minus the base rootfs, built by
 // the debdemo repository -- and writing its files straight into the global kernel's
 // filesystem while the guest runs. That is this Worker: an instance of the
-// global kernel of its own (as `persist-worker.js` is), calling `k_fs_*`
-// with the bytes in a scratch "process" memory. A Worker and not the page
-// because the kernel's locks may wait, and the page's thread cannot.
+// global kernel of its own (kernel-helper.js), calling `k_fs_*` with the
+// bytes in a scratch "process" memory.
 //
 // The tar's `var/lib/gex-overlay/NAME.status` holds the dpkg status stanzas
 // of what it adds; they are appended to /var/lib/dpkg/status, so a later
@@ -15,7 +14,7 @@
 // Message in: { spec: { module, memory }, stackTop, url, name }
 // Messages out: { progress, got, total }, { done, files, bytes, ms }, { error }
 
-import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { helperKernel } from './kernel-helper.js';
 import { untar } from './tar.js';
 import { isZstd, unzstd } from './zfetch.js';
 
@@ -26,20 +25,7 @@ let view = null;
 
 async function kernel(spec, stackTop) {
   if (k) return;
-  let inst;
-  for (const shared of [true, false]) {
-    mem = new WebAssembly.Memory({ initial: 16, maximum: 65535, shared });
-    try {
-      inst = await WebAssembly.instantiate(spec.module, {
-        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory) },
-      });
-      break;
-    } catch (e) {
-      if (!shared) throw e;
-    }
-  }
-  k = inst.exports;
-  if (stackTop && k.__stack_pointer) k.__stack_pointer.value = stackTop | 0;
+  ({ k, mem } = await helperKernel(spec, stackTop));
 }
 
 function bytes(need) {

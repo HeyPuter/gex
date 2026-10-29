@@ -27,6 +27,7 @@ import { logOn } from '../../shims/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 import { checkOptions, sizeValue, showValue } from './start-options.js';
+import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -48,6 +49,10 @@ const PIECES = {
  *   state     what a driver reads (phase, out, error, session, progress, ...)
  *   describe()    the desktop's windows, titles and pixels
  *   ready()   the start-up is over (with `ready: 'manual'`): progress 'ready'
+ *   drop(data, {x, y, dir, fallback, signal, onProgress})
+ *             files and folders dropped on the page, copied into the guest
+ *             (see `drop` below)
+ *   dragOver(x, y), dragLeave()   a drag over the desktop (see below)
  * Rejects at once, before any fetch, on an option it does not know or a
  * value of the wrong kind (start-options.js).
  * Rejects when the run cannot start (no cross-origin isolation, no WebGPU
@@ -765,6 +770,7 @@ async function begin(opts, base, at, state, meter) {
   };
   let sys = null;
   let desktop = null;
+  let dropper = null;
   let settle;
   meter.phase('boot');
   meter.watchFetches(lazyNames, b.unitNames ?? {});
@@ -875,6 +881,11 @@ async function begin(opts, base, at, state, meter) {
       }
     }
   }, 50);
+  // The window at a page point, for drop and dragOver.
+  const windowAt = async (x, y) => {
+    const w = (await (desktop ?? sys?.compositor)?.windowAt?.(x, y)) ?? null;
+    return w && { title: w.title, client: w.client, surface: w.surface, x: w.x, y: w.y };
+  };
   return {
     exited,
     state,
@@ -898,6 +909,62 @@ async function begin(opts, base, at, state, meter) {
       return { w, h };
     },
     describe: () => globalThis.__gexCompositor?.describe?.() ?? null,
+    /**
+     * Files and folders dropped on the page, copied into the guest's
+     * filesystem with their tree, in a Worker (the page does not wait on it).
+     * Call it in the drop event's handler, before anything there awaits,
+     * with the event's `dataTransfer`: a browser empties a DataTransfer once
+     * its event is over. `data` may also be its `items`, a FileList or an
+     * array of Files.
+     *   x, y        where it was dropped (the event's clientX and clientY):
+     *               the window there is named in the result
+     *   dir         the guest directory to copy into (absolute, made if
+     *               missing); default a new /tmp/drops/N
+     *   fallback    a guest directory the copy moves into when no window
+     *               takes the drop (a program's desktop folder, say)
+     *   signal      an AbortSignal: stops the copy and takes back what it wrote
+     *   onProgress({done, total, files, filesDone, name})   bytes and files so far
+     * Resolves {path, files, bytes, ms, window, accepted, paths}: the
+     * directory the copy made, its files and bytes; `window` the window at
+     * x, y ({title, client, surface, x, y} with the point in it) or null;
+     * `accepted` whether that window took the drop (always false for now:
+     * the drop is not yet handed to the window); `paths` where the top-level
+     * files and folders are now (in `fallback`, if they moved).
+     * Ownership is the guest's user's, files 0644 (0755 for one that starts
+     * as a program does), folders 0755. Not in the single-thread build.
+     */
+    drop(data, opts = {}) {
+      // Read now, before any await: see above.
+      try {
+        checkDrop(data, opts);
+      } catch (e) {
+        return Promise.reject(e);
+      }
+      const items = dropItems(data);
+      const { x, y, dir = null, fallback = null, signal, onProgress } = opts ?? {};
+      if (!sys?.host || !sys.kernel) return Promise.reject(new Error('drop(): the guest is not running, or this is the single-thread build'));
+      return (async () => {
+        signal?.throwIfAborted();
+        const at = x !== undefined && y !== undefined ? windowAt(x, y) : Promise.resolve(null);
+        const entries = await walk(items, signal);
+        if (!entries.length) throw new Error('drop(): nothing in it to copy (no files or folders)');
+        dropper ??= new Dropper(sys);
+        const { names, ...r } = await dropper.copy(entries, { dir: dir ? dir.replace(/\/+$/, '') : null, signal, onProgress });
+        const window = await at;
+        const accepted = false;
+        let paths = names.map((n) => `${r.path}/${n}`);
+        if (!accepted && fallback) ({ paths } = await dropper.move(r.path, names, fallback.replace(/\/+$/, '')));
+        return { ...r, window, accepted, paths };
+      })();
+    },
+    /** A drag over the desktop at x, y (an event's clientX and clientY):
+     *  resolves the window there, as `drop` names it, or null. */
+    async dragOver(x, y) {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`dragOver(${showValue(x)}, ${showValue(y)}): a point's clientX and clientY`);
+      return windowAt(x, y);
+    },
+    /** The drag left the desktop. */
+    dragLeave() {},
     ready() {
       meter.phase('first-frame');
       meter.phase('ready');
