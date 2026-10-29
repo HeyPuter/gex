@@ -19,6 +19,7 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
+import { zstdLoader } from './zstd-loader.js';
 import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browser/js/lazy-cache.mjs';
 import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
@@ -1092,18 +1093,6 @@ async function packedEntry(url, { pack, base }) {
   return e ? { ...e, build } : null;
 }
 
-/** The decoder (zstddec's streaming build), loaded only when something is
- *  packed. Fed a network chunk at a time: its memory never shrinks. */
-function zstdLoader(src) {
-  let p = null;
-  return () => (p ??= (async () => {
-    const { ZSTDDecoder } = await import(/* @vite-ignore */ src);
-    const d = new ZSTDDecoder();
-    await d.init();
-    return d;
-  })());
-}
-
 /*
  * The site's pieces (eject-site.mjs --pieces: project/build/web/pieces/ID,
  * the bundle's file bytes and the units' archives, each named by its
@@ -1292,8 +1281,18 @@ async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into
   const res = got.res;
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
   const bad = (msg) => Object.assign(new Error(msg), got.cached ? { fromCache: got } : {});
-  // Decoded as it arrives: the decode is done when the download is.
+  // Decoded as it arrives: the decode is done when the download is. The
+  // decoder is given back when this is done (`zstdLoader`).
   const d = await f.zstd();
+  try {
+    return await decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, bad });
+  } finally {
+    f.zstd.release?.();
+  }
+}
+
+/** `fetchPackedOnce`'s decode, as the download arrives, into a buffer of `size`. */
+async function decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, bad }) {
   const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
   const emit = (part) => {
