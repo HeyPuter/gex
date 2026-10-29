@@ -1,10 +1,15 @@
-//! Native wasm32 Wine DLLs in the browser: the native host's `wasmdll`, shared mode. Wine's PE side is one
-//! module (pelink.py) behind a skeleton per DLL (a `.wasmref` section names
-//! it). The first skeleton to map installs it as a stateful provider (its
-//! data from the NT allocator, `PROVIDER | number` in the function table);
-//! every later one binds its exports to slots of the same install
+//! Native wasm32 Wine DLLs in the browser: the native host's `wasmdll`, shared mode. Wine's PE side is a
+//! core module, winepe.wasm, and DLLs linked as modules of their own
+//! (pelink.py `--split`), behind a skeleton per DLL (a `.wasmref` section
+//! names its module). The first skeleton naming a module installs it as a
+//! stateful provider (its data from the NT allocator, `PROVIDER | number`
+//! in the function table), the core and the modules it imports from first;
+//! each skeleton binds its exports to slots of the install
 //! (`FuncMap::bind`), whose tier-1 bridges every Worker writes as it
-//! catches up (`gex_wasmdll_binds_len` and friends, `BINDS`).
+//! catches up (`gex_wasmdll_binds_len` and friends, `BINDS`). A module's
+//! imports of the others are a binding list JS applies at each
+//! instantiation (`gex_wasmdll_binds`), the slots between them that wait on
+//! a later module filled per Worker (`gex_wasmdll_lates`).
 //!
 //! The protocol with `gex.mjs` (`#cgenProviders`, `#wasmdllCatchUp`):
 //!   - a unit's provider `i` with `gex_cgen_provider_wasmdll(u, i)` set is
@@ -21,12 +26,15 @@
 use super::*;
 use std::collections::HashMap;
 
-/// Wine's PE module, once its first skeleton mapped.
+/// One of Wine's PE modules, once its first skeleton mapped: the core
+/// (winepe.wasm), or a DLL linked as a module of its own (`pelink.py
+/// --split`).
 struct WinePe {
     /// Its provider module number (`PROVIDERS`).
     number: u32,
-    /// Its function-table install.
+    /// Its function-table install, and that install's first slot.
     install: u32,
+    base: u32,
     /// Its data (`__memory_base`).
     data: u64,
     slots: HashMap<String, u32>,
@@ -55,9 +63,44 @@ struct WinePe {
     /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16 (as natively).
     ptr64: bool,
+    /// The name its skeletons' `.wasmref` gives it.
+    name: String,
+    /// Its exports, and which of them are functions.
+    exports: std::collections::HashSet<String>,
+    funcs: std::collections::HashSet<String>,
+    /// Its imports of the other modules, as a binding list (cgen/dylink.rs's
+    /// format: `G`, `E`, `L`), which JS applies at each instantiation.
+    binds: String,
 }
 
-static WINE_PE: Mutex<Option<WinePe>> = Mutex::new(None);
+/// A call or function address from one module into a function another
+/// defines that was not installed when it was: the function-table slot
+/// `slot`, past the importer's own, which each Worker fills once both are
+/// instantiated there (`gex_wasmdll_lates`).
+struct Late {
+    importer: u32,
+    slot: u32,
+    name: String,
+    provider: Option<u32>,
+}
+
+struct WinePes {
+    /// In install order: the core first when DLLs are split.
+    mods: Vec<WinePe>,
+    late: Vec<Late>,
+    /// A function's one address across the modules (`GOT.func`) when its
+    /// defining module's element segment has no slot for it: the slot of
+    /// the first module that named it.
+    canon: std::collections::BTreeMap<String, u32>,
+    /// The lowest of the PE32+ data window handed out so far.
+    data_low: u64,
+}
+
+static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Vec::new(), canon: std::collections::BTreeMap::new(), data_low: 0 });
+
+/// The core module's file name: the module a skeleton of a DLL linked as
+/// a module of its own finds beside itself.
+const CORE_MODULE: &str = "winepe.wasm";
 
 /// Bridges for addresses bound into the install after it was published.
 struct Bind {
@@ -183,91 +226,60 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
 fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, String> {
     let sec = pe.sections.iter().find(|s| s.name == ".wasmref").ok_or("no .wasmref")?;
     let (module_name, dll, data_list) = wasmref(&crate::guest_bytes()[..], base, sec)?;
+    let dir = path.rsplit_once('/').map(|(d, _)| d.to_string());
     let mut g = lock(&WINE_PE);
-    let first = g.is_none();
-    if first {
-        let file = match path.rsplit_once('/') {
-            Some((dir, _)) => format!("{dir}/{module_name}"),
-            None => module_name.clone(),
-        };
-        // A twin install (wine64-dist.sh WINE64_TWIN=1): a
-        // process with a 64-bit memory loads the memory64 build's module,
-        // beside the other as `<module>.m64`, under the same skeletons.
-        let ns = crate::sigs::proc_home().ns();
-        let twin = format!("{file}.m64");
-        let (file, wasm) = match gex_abi::mem64().then(|| gex_kernel::win::read_guest_file(&ns, &twin).ok()).flatten() {
-            Some(w) => (twin, w),
-            None => {
-                let w = gex_kernel::win::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
-                (file, w)
-            }
-        };
-        // The module's memory must be this process's: a wasm32 one in a
-        // 64-bit memory fails to instantiate (a LinkError, deep in the
-        // runtime), so it is said here, with what is missing.
-        if let Some(m64) = crate::vfork::wasm_memory64(&wasm[..wasm.len().min(4 << 20)]) {
-            if m64 != gex_abi::mem64() {
-                return Err(format!(
-                    "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
-                    if m64 { 64 } else { 32 },
-                    if m64 { 32 } else { 64 },
-                    if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: wine64-dist.sh WINE64_TWIN=1)" }
-                ));
-            }
+    let before = g.mods.len();
+    // The module: installed once, at the first skeleton that names it. A
+    // DLL linked as a module of its own (`pelink.py --split`) binds its
+    // imports to the core's exports, the core (winepe.wasm beside it)
+    // installed first if no skeleton of its has been (a program's image
+    // maps before ntdll's).
+    let find = |g: &WinePes, name: &str| g.mods.iter().position(|w| w.name == name);
+    let core = match find(&g, CORE_MODULE) {
+        Some(c) => Some(c),
+        None if module_name == CORE_MODULE => None,
+        None => match read_module(dir.as_deref(), CORE_MODULE) {
+            Ok(m) => Some(install_module(&mut g, dir.as_deref(), CORE_MODULE, m, None, pe.is64, &mut Vec::new())?),
+            // no core beside it: this module is Wine's whole PE side
+            Err(_) => None,
+        },
+    };
+    let idx = match find(&g, &module_name) {
+        Some(i) => i,
+        None => {
+            let m = read_module(dir.as_deref(), &module_name)?;
+            let c = core.filter(|_| module_name != CORE_MODULE);
+            install_module(&mut g, dir.as_deref(), &module_name, m, c, pe.is64, &mut Vec::new())?
         }
-        // 32-bit Wine's PE module: refused when its inline probe reads another layout
-        // (gexrt's `gex_ftab_idx`; 64-bit Wine's wasm64 gexrt has no probe).
-        if !pe.is64 {
-            if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
-                return Err(e);
-            }
-        }
-        let (size, align) = dylink_memory(&wasm)?;
-        let a = 1u64 << align;
-        // (an LLP64 module's above the images: see `crate::wine64_pe_data`)
-        let data = if pe.is64 {
-            alloc_pe_data_window((size as u64).max(16) + a, "[wine PE data]")?
-        } else {
-            provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
-        };
-        let data = (data + a - 1) & !(a - 1);
-        let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
-        let mut slots = HashMap::new();
-        let mut any_dll = HashMap::new();
-        for (k, n) in names.iter().enumerate() {
-            if let Some(n) = n {
-                if let Some((_, export)) = n.split_once("!gexp_") {
-                    any_dll.entry(export.to_string()).or_insert(k as u32);
-                }
-                slots.insert(n.clone(), k as u32);
-            }
-        }
-        for (name, target) in forwards(&wasm) {
-            if let Some((d, f)) = target.split_once('!') {
-                if let Some(&k) = slots.get(&format!("{d}!gexp_{f}")) {
-                    any_dll.entry(name).or_insert(k);
-                }
-            }
-        }
-        let data_exports = exported_offsets(&wasm)?;
-        let number = lock(&PROVIDERS).len() as u32;
-        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, file, key: None, installed: false, mapped: Default::default(), ptr64: pe.is64 });
-    }
-    let wp = g.as_mut().expect("Wine's PE module");
+    };
+    let fresh = g.mods.len() > before;
+    let other = core.filter(|&c| c != idx);
+
+    // This DLL's bindings: its own module's adapters, and for a `-import`
+    // re-export the owner's, in whichever install has it (the core's, for
+    // a module of its own).
+    let wp = &g.mods[idx];
     let slot = |n: &str| wp.slots.get(n).copied();
     let missing = slot(&format!("{dll}!gexp__missing"))
         .or_else(|| wp.slots.iter().find(|(k, _)| k.ends_with("!gexp__missing")).map(|(_, v)| *v))
         .ok_or("Wine's PE module has no gexp__missing")?;
     let mut pairs = Vec::new();
+    let mut other_pairs = Vec::new();
     for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
-        let k = e
+        let own = e
             .names
             .iter()
             .find_map(|n| slot(&format!("{dll}!gexp_{n}")))
             .or_else(|| slot(&format!("{dll}!gexp_#{}", e.ordinal)))
-            .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()))
-            .unwrap_or(missing);
-        pairs.push((base + e.rva as u64, k));
+            .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()));
+        match (own, other) {
+            (Some(k), _) => pairs.push((base + e.rva as u64, k)),
+            (None, Some(c)) => match e.names.iter().find_map(|n| g.mods[c].any_dll.get(n).copied()) {
+                Some(k) => other_pairs.push((base + e.rva as u64, k)),
+                None => pairs.push((base + e.rva as u64, missing)),
+            },
+            (None, None) => pairs.push((base + e.rva as u64, missing)),
+        }
     }
     if let (Some(k), true) = (slot(&format!("{dll}!gexp__entry")), pe.entry_rva != 0) {
         pairs.push((base + pe.entry_rva as u64, k));
@@ -277,26 +289,27 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 
     // Data exports: the skeleton's export address table pointed at the
     // module's data (32-bit RVAs wrap to any address).
-    let dir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
-    if dir != 0 && !data_list.is_empty() {
+    let edir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
+    if edir != 0 && !data_list.is_empty() {
         let mut gm = GuestMem::new(crate::guest_bytes());
-        let functions = gm.read_u32(base + dir as u64 + 28).map_err(|_| "export directory outside memory")? as u64;
-        for (idx, link) in &data_list {
+        let functions = gm.read_u32(base + edir as u64 + 28).map_err(|_| "export directory outside memory")? as u64;
+        for (i, link) in &data_list {
             let Some(off) = wp.data_exports.get(&format!("{dll}!{link}")) else {
                 crate::warn_line(&format!("gex-pe: {path}: data export {link} is not in Wine's PE module\n"));
                 continue;
             };
             let target = (wp.data + *off as u64).wrapping_sub(base) as u32;
-            let _ = gm.write_u32(base + functions + 4 * *idx as u64, target);
+            let _ = gm.write_u32(base + functions + 4 * *i as u64, target);
         }
     }
     // winecrt0's base of this DLL: the skeleton's (after the module's data
-    // initialisation: at its install for the first DLL, now for later ones)
+    // initialisation: at its first instantiation, or now once it had one)
+    let wp = &mut g.mods[idx];
     let first_mapping = wp.mapped.insert(dll.clone());
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         let at = wp.data + *off as u64;
         let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
-        if first {
+        if !wp.installed {
             wp.pending.push((at, bytes));
         } else if let Some(dst) = crate::guest_bytes().get_mut(at as usize..at as usize + bytes.len()) {
             dst.copy_from_slice(&bytes);
@@ -307,26 +320,299 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     if first_mapping && dll == "ntdll.dll" && !wp.ptr64 {
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {
-                wp.pending.push((wp.data + *off as u64, bytes));
+                let at = wp.data + *off as u64;
+                if !wp.installed {
+                    wp.pending.push((at, bytes));
+                } else if let Some(dst) = crate::guest_bytes().get_mut(at as usize..at as usize + bytes.len()) {
+                    dst.copy_from_slice(&bytes);
+                }
             }
         }
     }
-
-    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
-    crate::warn_line(&format!("gex-pe: native wasm32 module for {path}: {} entries\n", pairs.len()));
-    if first {
-        let len = gex_cgen::provider::slot_names(&wp.wasm).map_err(|e| e.to_string())?.len() as u32;
-        wp.install = ftab(|m| m.publish(len, PROVIDER | wp.number, Tier::Unit, &pairs));
-        clear(&addrs);
-        let (regs, dirs, slots) = bridges(&addrs);
-        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data });
-        Ok(wp.number as i32)
-    } else {
-        let install = wp.install;
-        drop(g);
-        bind(install, &pairs);
-        Ok(-2)
+    crate::warn_line(&format!("gex-pe: native wasm32 module for {path}: {} entries\n", pairs.len() + other_pairs.len()));
+    let install = wp.install;
+    let other_install = other.map(|c| g.mods[c].install);
+    let last = g.mods.last().map(|w| w.number).unwrap_or(0);
+    drop(g);
+    bind(install, &pairs);
+    if let Some(oi) = other_install {
+        bind(oi, &other_pairs);
     }
+    // A module installed here: JS catches up (which instantiates it, and
+    // the modules installed before it), then `gex_cgen_pmod_installed` and
+    // `gex_wasmdll_installed`.
+    Ok(if fresh { last as i32 } else { -2 })
+}
+
+/// A module's bytes, beside the skeleton: a twin install's
+/// (wine64-dist.sh WINE64_TWIN=1) memory64 build `<module>.m64` in a
+/// process with a 64-bit memory. The file it was read from too.
+fn read_module(dir: Option<&str>, name: &str) -> Result<(String, Vec<u8>), String> {
+    let file = match dir {
+        Some(d) => format!("{d}/{name}"),
+        None => name.to_string(),
+    };
+    let ns = crate::sigs::proc_home().ns();
+    let twin = format!("{file}.m64");
+    Ok(match gex_abi::mem64().then(|| gex_kernel::win::read_guest_file(&ns, &twin).ok()).flatten() {
+        Some(w) => (twin, w),
+        None => {
+            let w = gex_kernel::win::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+            (file, w)
+        }
+    })
+}
+
+/// What install_module reads of a module besides its slots: its imports
+/// (module, name, a function's, a global's i64 and mutability), exports
+/// (name, a function's), and `gexw.modules` (DLL -> module file).
+struct Shape {
+    imports: Vec<(String, String, bool, Option<(bool, bool)>)>,
+    exports: Vec<(String, bool)>,
+    modules: HashMap<String, String>,
+}
+
+fn shape(wasm: &[u8]) -> Result<Shape, String> {
+    let e = |e: wasmparser::BinaryReaderError| e.to_string();
+    let mut s = Shape { imports: Vec::new(), exports: Vec::new(), modules: HashMap::new() };
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(e)? {
+            wasmparser::Payload::ImportSection(r) => {
+                for imp in r {
+                    let imp = imp.map_err(e)?;
+                    let (func, global) = match imp.ty {
+                        wasmparser::TypeRef::Func(_) => (true, None),
+                        wasmparser::TypeRef::Global(g) => (false, Some((g.content_type == wasmparser::ValType::I64, g.mutable))),
+                        _ => (false, None),
+                    };
+                    s.imports.push((imp.module.to_string(), imp.name.to_string(), func, global));
+                }
+            }
+            wasmparser::Payload::ExportSection(r) => {
+                for x in r {
+                    let x = x.map_err(e)?;
+                    s.exports.push((x.name.to_string(), x.kind == wasmparser::ExternalKind::Func));
+                }
+            }
+            wasmparser::Payload::CustomSection(c) if c.name() == "gexw.modules" => {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    if let Some((d, f)) = line.split_once(' ') {
+                        s.modules.insert(d.to_string(), f.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(s)
+}
+
+/// Install one of Wine's PE modules (`file`, `wasm` read by
+/// [`read_module`]) as a stateful provider: its data allocated, and with
+/// `core` (a module of its own) its imports of the other modules bound, as
+/// natively (shims/native wasmdll.rs `install_module`): the modules it calls
+/// into first (eagerly, `busy` the ones being installed), then functions
+/// it calls to their exports, a function's address (`GOT.func`) to the
+/// defining module's own slot, or to one slot per function in the process
+/// that each Worker fills (`Late`). Its index in `g.mods`.
+fn install_module(
+    g: &mut WinePes,
+    dir: Option<&str>,
+    name: &str,
+    (file, wasm): (String, Vec<u8>),
+    core: Option<usize>,
+    is64: bool,
+    busy: &mut Vec<String>,
+) -> Result<usize, String> {
+    // The module's memory must be this process's: a wasm32 one in a
+    // 64-bit memory fails to instantiate (a LinkError, deep in the
+    // runtime), so it is said here, with what is missing.
+    if let Some(m64) = crate::vfork::wasm_memory64(&wasm[..wasm.len().min(4 << 20)]) {
+        if m64 != gex_abi::mem64() {
+            return Err(format!(
+                "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
+                if m64 { 64 } else { 32 },
+                if m64 { 32 } else { 64 },
+                if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: wine64-dist.sh WINE64_TWIN=1)" }
+            ));
+        }
+    }
+    // 32-bit Wine's PE module: refused when its inline probe reads another layout
+    // (gexrt's `gex_ftab_idx`; 64-bit Wine's wasm64 gexrt has no probe).
+    if !is64 {
+        if let Some(e) = super::wasmprog::abi_refusal(&wasm, &format!("Wine's PE module {file}")) {
+            return Err(e);
+        }
+    }
+    let sh = shape(&wasm)?;
+    // The modules it calls into or takes function addresses of, installed
+    // first (no code of theirs runs until Wine loads their DLLs): its
+    // imports then bind to their functions directly. Only a cycle's far
+    // side is left to `Late` slots.
+    if core.is_some() {
+        let mut deps = std::collections::BTreeSet::new();
+        for (m, n, _, _) in &sh.imports {
+            if let (true, Some((d, _))) = (m == "env" || m == "GOT.func", n.split_once('!')) {
+                if let Some(f) = sh.modules.get(d) {
+                    deps.insert(f.clone());
+                }
+            }
+        }
+        busy.push(name.to_string());
+        for f in deps {
+            if g.mods.iter().any(|w| w.name == f) || busy.contains(&f) {
+                continue;
+            }
+            let Ok(m) = read_module(dir, &f) else { continue };
+            if let Err(e) = install_module(g, dir, &f, m, core, is64, busy) {
+                busy.pop();
+                return Err(e);
+            }
+        }
+        busy.pop();
+    }
+
+    let (size, align) = dylink_memory(&wasm)?;
+    let a = 1u64 << align;
+    // (an LLP64 module's above the images: see `crate::wine64_pe_data`)
+    let data = if is64 {
+        alloc_pe_data_window(&mut g.data_low, (size as u64).max(16) + a, "[wine PE data]")?
+    } else {
+        provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
+    };
+    let data = (data + a - 1) & !(a - 1);
+    let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
+    let mut slots = HashMap::new();
+    let mut any_dll = HashMap::new();
+    for (k, n) in names.iter().enumerate() {
+        if let Some(n) = n {
+            if let Some((_, export)) = n.split_once("!gexp_") {
+                any_dll.entry(export.to_string()).or_insert(k as u32);
+            }
+            slots.insert(n.clone(), k as u32);
+        }
+    }
+    for (name, target) in forwards(&wasm) {
+        if let Some((d, f)) = target.split_once('!') {
+            if let Some(&k) = slots.get(&format!("{d}!gexp_{f}")) {
+                any_dll.entry(name).or_insert(k);
+            }
+        }
+    }
+    let data_exports = exported_offsets(&wasm)?;
+    let exports: std::collections::HashSet<String> = sh.exports.iter().map(|(n, _)| n.clone()).collect();
+    let funcs: std::collections::HashSet<String> = sh.exports.iter().filter(|(_, f)| *f).map(|(n, _)| n.clone()).collect();
+    let number = lock(&PROVIDERS).len() as u32;
+
+    // Its imports of the other modules, the binding list's lines but for
+    // slots of its own, known once it is published.
+    enum B {
+        Export(u32),
+        Late(u32),
+        Own(u32),
+        Abs(u32),
+    }
+    let mut len = names.len() as u32;
+    let mut binds: Vec<(usize, B)> = Vec::new();
+    let mut lates: Vec<(u32, String, Option<u32>)> = Vec::new();
+    let mut canon_new: Vec<(String, u32)> = Vec::new();
+    {
+        let others = |n: &str| g.mods.iter().find(|w| w.funcs.contains(n));
+        for (i, (m, n, func, global)) in sh.imports.iter().enumerate() {
+            let b = if m == "GOT.func" && global.is_some() {
+                let own = if funcs.contains(n) { slots.get(n).copied() } else { None };
+                let theirs = others(n).and_then(|w| Some(w.base + *w.slots.get(n)?));
+                match (own, theirs, g.canon.get(n).copied()) {
+                    (Some(k), _, _) => B::Own(k),
+                    (None, Some(v), _) => B::Abs(v),
+                    (None, None, Some(v)) => B::Abs(v),
+                    // a weak name nothing defines (the C mains Wine's crt_main
+                    // names): JS's null
+                    (None, None, None) if !n.contains('!') && !funcs.contains(n) && others(n).is_none() => continue,
+                    (None, None, None) => {
+                        let off = len;
+                        len += 1;
+                        canon_new.push((n.clone(), off));
+                        let provider = if funcs.contains(n) { Some(number) } else { others(n).map(|w| w.number) };
+                        lates.push((off, n.clone(), provider));
+                        B::Own(off)
+                    }
+                }
+            } else if m == "env" && core.is_some_and(|c| g.mods[c].exports.contains(n)) {
+                B::Export(g.mods[core.unwrap()].number)
+            } else if m == "env" && *func && n.contains('!') {
+                // another module's: bound to it if it is installed, else a
+                // call through a slot filled when it is (the core's calls
+                // into user32, say)
+                match others(n) {
+                    Some(w) => B::Export(w.number),
+                    None => {
+                        lates.push((len, n.clone(), None));
+                        len += 1;
+                        B::Late(len - 1)
+                    }
+                }
+            } else {
+                continue;
+            };
+            binds.push((i, b));
+        }
+    }
+
+    g.mods.push(WinePe {
+        number,
+        install: 0,
+        base: 0,
+        data,
+        slots,
+        any_dll,
+        data_exports,
+        pending: Vec::new(),
+        wasm,
+        file,
+        key: None,
+        installed: false,
+        mapped: Default::default(),
+        ptr64: is64,
+        name: name.to_string(),
+        exports,
+        funcs,
+        binds: String::new(),
+    });
+    let idx = g.mods.len() - 1;
+    let install = ftab(|m| m.publish(len, PROVIDER | number, Tier::Unit, &[]));
+    let base = ftab(|m| m.install(install).base);
+    let (regs, dirs, nslots) = bridges(&[]);
+    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{}", g.mods[idx].file), regs, dirs, slots: nslots, memory_base: data });
+
+    let mut text = String::new();
+    for (i, b) in binds {
+        let (m, n, _, global) = &sh.imports[i];
+        let g64 = |v: u32| {
+            let (w, mutable) = global.unwrap_or((true, true));
+            format!("G\t{m}\t{n}\t{v}\t{}\t{}\n", mutable as u8, if w { 64 } else { 32 })
+        };
+        text += &match b {
+            B::Export(p) => format!("E\t{m}\t{n}\t{p}\t{n}\t-\n"),
+            B::Late(off) => format!("L\t{m}\t{n}\t{}\n", base + off),
+            B::Own(off) => g64(base + off),
+            B::Abs(v) => g64(v),
+        };
+    }
+    for (n, off) in canon_new {
+        g.canon.insert(n, base + off);
+    }
+    let funcs_now = g.mods[idx].funcs.clone();
+    for l in g.late.iter_mut().filter(|l| l.provider.is_none() && funcs_now.contains(&l.name)) {
+        l.provider = Some(number);
+    }
+    g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider }));
+    let wp = &mut g.mods[idx];
+    wp.install = install;
+    wp.base = base;
+    wp.binds = text;
+    crate::trace_line(&format!("gex: wine PE: {} installed as module {number} at slot {base}, {len} slots\n", wp.file));
+    Ok(idx)
 }
 
 /// The executable sections of every skeleton mapped: `ud2` stubs, never
@@ -349,9 +635,12 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
     if gone.is_empty() {
         return;
     }
-    let Some(install) = lock(&WINE_PE).as_ref().map(|w| w.install) else { return };
+    let installs = installs();
+    if installs.is_empty() {
+        return;
+    }
     let bound: Vec<u64> = ftab(|m| {
-        gone.iter().flat_map(|&(s, e)| m.range(s, e).filter(|(_, f)| f.install == install).map(|(a, _)| a).collect::<Vec<_>>()).collect()
+        gone.iter().flat_map(|&(s, e)| m.range(s, e).filter(|(_, f)| installs.contains(&f.install)).map(|(a, _)| a).collect::<Vec<_>>()).collect()
     });
     let skeletons = lock(&SKELETON_CODE).clone();
     // Only where nothing is mapped now (Wine releases a view as a PROT_NONE
@@ -395,8 +684,8 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
 /// image whose sections are not page-aligned into anonymous memory, so a
 /// live skeleton is often anonymous too.)
 pub(crate) fn binding_is_stale(pc: u64) -> bool {
-    let Some(install) = lock(&WINE_PE).as_ref().map(|w| w.install) else { return false };
-    if !ftab(|m| m.get(pc).is_some_and(|f| f.install == install)) {
+    let installs = installs();
+    if installs.is_empty() || !ftab(|m| m.get(pc).is_some_and(|f| installs.contains(&f.install))) {
         return false;
     }
     let gm = crate::GuestMem::new(crate::guest_bytes());
@@ -413,7 +702,7 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
         }
     };
     let memory = crate::guest_bytes();
-    let gone: Vec<u64> = ftab(|m| m.range(lo, hi).filter(|(a, f)| f.install == install && !stub(*a)).map(|(a, _)| a).collect());
+    let gone: Vec<u64> = ftab(|m| m.range(lo, hi).filter(|(a, f)| installs.contains(&f.install) && !stub(*a)).map(|(a, _)| a).collect());
     ftab(|m| {
         for &a in &gone {
             m.retire(a);
@@ -422,6 +711,11 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
     });
     crate::trace_line(&format!("gex: {} native bindings in {lo:#x}..{hi:#x} outlived their skeleton; forgotten\n", gone.len()));
     true
+}
+
+/// The function-table installs of Wine's PE modules.
+fn installs() -> Vec<u32> {
+    lock(&WINE_PE).mods.iter().map(|w| w.install).collect()
 }
 
 /// Whether `pc` is in a mapped skeleton's executable sections.
@@ -518,16 +812,20 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
-/// A PE32+ core's data, at the top of [`crate::wine64_pe_data`] (reserved at
-/// the x86-64 split), zeroed.
-fn alloc_pe_data_window(size: u64, name: &str) -> Result<u64, String> {
+/// A PE32+ module's data, from the top of [`crate::wine64_pe_data`] (reserved at
+/// the x86-64 split) down, below `low` (the last one's, 0 for none), zeroed.
+fn alloc_pe_data_window(low: &mut u64, size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
-    let (lo, hi) = crate::wine64_pe_data();
+    let (lo, mut hi) = crate::wine64_pe_data();
+    if *low != 0 {
+        hi = hi.min(*low);
+    }
     let len = (size + 0xffff) & !0xffff;
-    if len > hi - lo {
+    if hi < lo || len > hi - lo {
         return Err(format!("{name}: {len:#x} bytes do not fit the wine64 PE data window"));
     }
     let at = hi - len;
+    *low = at;
     let a = crate::sigs::proc_home()
         .mm()
         .lock()
@@ -566,7 +864,7 @@ pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
     if let Some((p, _)) = super::wasmprog::wasm(number).or_else(|| super::libprov::wasm(number)) {
         return p;
     }
-    lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
+    lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
 }
 
 #[no_mangle]
@@ -574,30 +872,41 @@ pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
     if let Some(n) = super::wasmprog::len(number).or_else(|| super::libprov::wasm(number).map(|(_, n)| n)) {
         return n;
     }
-    lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
+    lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
 }
 
 /// Wine's PE module's content key when it is provider module `number`.
 pub(super) fn wasm_key(number: u32) -> Option<(u64, u64)> {
     let mut g = lock(&WINE_PE);
-    let w = g.as_mut().filter(|w| w.number == number)?;
+    let w = g.mods.iter_mut().find(|w| w.number == number)?;
     Some(*w.key.get_or_insert_with(|| super::wasmprog::file_key(&w.file, &w.wasm)))
 }
 
-/// The publishing Worker instantiated Wine's PE module (its data is
-/// initialised and relocated): ntdll's boot variables, then the entry
-/// thunks (once).
+/// The publishing Worker instantiated Wine's PE modules it installed (their
+/// data is initialised and relocated): ntdll's boot variables, then the
+/// entry thunks (once each).
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_installed() {
-    let (install, data, entries, pending, w) = {
+    let todo: Vec<_> = {
         let mut g = lock(&WINE_PE);
-        let Some(wp) = g.as_mut() else { return };
-        let pending = std::mem::take(&mut wp.pending);
-        let first = !std::mem::replace(&mut wp.installed, true);
-        let entries = first.then(|| wp.data_exports.get("__gexw_entries").copied()).flatten();
-        let decl = wp.data_exports.get("__gexw_entries_decl").copied();
-        (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 })
+        g.mods
+            .iter_mut()
+            .filter(|w| !w.installed)
+            .map(|wp| {
+                wp.installed = true;
+                let pending = std::mem::take(&mut wp.pending);
+                let entries = wp.data_exports.get("__gexw_entries").copied();
+                let decl = wp.data_exports.get("__gexw_entries_decl").copied();
+                (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 })
+            })
+            .collect()
     };
+    for (install, data, entries, pending, w) in todo {
+        installed_one(install, data, entries, pending, w);
+    }
+}
+
+fn installed_one(install: u32, data: u64, entries: Option<(u32, Option<u32>)>, pending: Vec<(u64, Vec<u8>)>, w: u64) {
     let mem = crate::guest_bytes();
     for (at, bytes) in pending {
         if let Some(dst) = mem.get_mut(at as usize..at as usize + bytes.len()) {
@@ -644,6 +953,32 @@ pub extern "C" fn gex_wasmdll_installed() {
         }
     }
     bind(install, &pairs);
+}
+
+/// Provider module `number`'s binding list when it is one of Wine's PE
+/// modules with imports of the others (cgen/dylink.rs's format: `G`, `E`,
+/// `L`), copied to `buf` up to `cap`; its length, 0 for none.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_binds(number: u32, buf: u32, cap: u32) -> u32 {
+    let g = lock(&WINE_PE);
+    let Some(w) = g.mods.iter().find(|w| w.number == number) else { return 0 };
+    // (a buffer from the shim's heap, above the guest's limit)
+    super::put_str(&w.binds, buf, cap)
+}
+
+/// The `Late` slots whose provider is installed, as lines `slot importer
+/// provider name` (provider module numbers), copied to `buf` up to `cap`;
+/// their length. A Worker fills each slot once it has both modules.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_lates(buf: u32, cap: u32) -> u32 {
+    let g = lock(&WINE_PE);
+    let mut text = String::new();
+    for l in &g.late {
+        if let Some(p) = l.provider {
+            text += &format!("{}\t{}\t{p}\t{}\n", l.slot, l.importer, l.name);
+        }
+    }
+    super::put_str(&text, buf, cap)
 }
 
 /// How many late bindings there are: a Worker writes each one's bridges.
@@ -789,13 +1124,8 @@ pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
     let mem = crate::guest_bytes();
     let Some(b) = mem.get(ptr as usize..(ptr as usize).saturating_add(len as usize)) else { return 0 };
     let name = String::from_utf8_lossy(b).into_owned();
-    let (install, k) = {
-        let g = lock(&WINE_PE);
-        let Some(wp) = g.as_ref() else { return 0 };
-        let Some(&k) = wp.slots.get(&name) else { return 0 };
-        (wp.install, k)
-    };
-    ftab(|m| m.install(install).base) + k
+    let g = lock(&WINE_PE);
+    g.mods.iter().find_map(|wp| Some(wp.base + *wp.slots.get(&name)?)).unwrap_or(0)
 }
 
 /// `gex.code_changed(addr, len)` (32-bit Wine: Wine's NtFlushInstructionCache): the

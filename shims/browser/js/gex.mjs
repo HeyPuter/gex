@@ -5021,10 +5021,18 @@ export class Gex {
     }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText) : [];
+    // One of Wine's PE modules with imports of the others (a DLL linked as
+    // a module of its own, or the core calling into one): its binding list.
+    const peMod = wasmdll && !wasmprog && !libprov;
+    if (peMod) this.#wasmdllBind(prov, imports, st);
     // What a door instance needs to run this program again on its memory
     // (a wineserver: `#doorPublish`).
     if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText, packed };
     inst = new WebAssembly.Instance(mod, imports);
+    if (peMod) {
+      st.dyl.set(prov, inst);
+      this.#wasmdllLate(st);
+    }
     if (peSnap) {
       this.#snapPe = { inst, state: imports.env.__asyncify_state };
       this.#snapSplit();
@@ -5813,6 +5821,84 @@ export class Gex {
       }
     }
     return extra;
+  }
+
+  /** Wine's PE module `prov`'s binding list (cgen/wasmdll.rs, the format of
+   *  cgen/dylink.rs: `G`, `E`, `L`) applied to `imports`. A call through a
+   *  slot (`L`) whose module this Worker has not instantiated yet catches
+   *  up first. */
+  #wasmdllBind(prov, imports, st) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmdll_binds ? e.gex_wasmdll_binds(prov, 0, 0) >>> 0 : 0;
+    if (!n) return;
+    const buf = e.gex_alloc(n) >>> 0;
+    let text;
+    try {
+      e.gex_wasmdll_binds(prov, buf, n);
+      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+    const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const f = line.split('\t');
+      switch (f[0]) {
+        case 'G':
+          set(f[1], f[2], f[5] === '64'
+            ? new WebAssembly.Global({ value: 'i64', mutable: f[4] === '1' }, BigInt(f[3]))
+            : new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0));
+          break;
+        case 'E': {
+          const x = st.dyl.get(Number(f[3]))?.exports[f[4]];
+          if (x === undefined) throw new Error(`Wine's PE module ${prov}: ${f[2]}: module ${f[3]} is not instantiated in this Worker`);
+          set(f[1], f[2], x);
+          break;
+        }
+        case 'L': {
+          const slot = tIdx(Number(f[3])), t = st.ftab;
+          set(f[1], f[2], (...a) => {
+            // (an unfilled slot holds the miss stub, slot 0's)
+            let fn = t.get(slot);
+            if (!fn || fn === t.get(tIdx(0))) {
+              this.#cgenCatchUp();
+              this.#wasmdllLate(st);
+              fn = t.get(slot);
+              if (!fn || fn === t.get(tIdx(0))) throw new Error(`${f[2]}: its module is not installed`);
+            }
+            return fn(...a);
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  /** Fill the slots between Wine's PE modules (cgen/wasmdll.rs `Late`)
+   *  whose two sides this Worker has instantiated. */
+  #wasmdllLate(st) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmdll_lates ? e.gex_wasmdll_lates(0, 0) >>> 0 : 0;
+    if (!n) return;
+    const buf = e.gex_alloc(n) >>> 0;
+    let text;
+    try {
+      e.gex_wasmdll_lates(buf, n);
+      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const [slot, importer, provider, name] = line.split('\t');
+      const p = st.dyl.get(Number(provider));
+      if (!p || !st.dyl.has(Number(importer))) continue;
+      const i = tIdx(Number(slot));
+      const had = st.ftab.get(i);
+      if (had && had !== st.ftab.get(tIdx(0))) continue;
+      const f = p.exports[name];
+      if (typeof f === 'function') st.ftab.set(i, f);
+    }
   }
 
   /** Provider module `prov`'s binding list, '' for none. */
