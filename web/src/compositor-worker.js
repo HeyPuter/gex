@@ -2054,7 +2054,9 @@ async function startGl(m, canvas) {
   glFrames = textureCanvas();
   glTarget = glFrames.canvas;
   // Emscripten looks a canvas up by selector, and a worker has no document.
-  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
+  // Nothing else is in it (a dev server's client, seeing a document, lists
+  // its styles).
+  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget, querySelectorAll: () => [] };
   const { MesaGlDevice } = await import('./mesa-gl.js');
   glDevice = await MesaGlDevice.create(glTarget, {
     url: m.url,

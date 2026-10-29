@@ -203,6 +203,25 @@ button.onclick = () => new WebAudio(sys);
 | `close()` | Stop playing. |
 | Events | `running`, once the context plays. |
 
+## GL
+
+The guest's OpenGL, OpenGL ES, Vulkan and (with `d3d`) Direct3D run on the
+host's Mesa over WebGPU and draw into the windows' own surfaces. A
+`MesaGl` is made before boot, beside a windows class. Mesa is about 20 MB
+before compression. It is fetched when a program first opens its GL, or
+at `start()`, not at boot.
+
+```js
+import { MesaGl } from '@gex/runtime/gl';
+const gl = new MesaGl(sys);      // before boot
+```
+
+| Member | Does |
+| --- | --- |
+| `new MesaGl(sys, { eager, d3d, source })` | `eager`: start Mesa at boot. `d3d`: the Direct3D device too (a Mesa built with it). `source(name)`: Mesa's files from the page (`gex-wgpu-replay.js`, `.wasm`, `.deferred.wasm`) as bytes, or null to fetch them from `baseUrl`. |
+| `start()` | Start Mesa now; resolves its description. A program's first GL call shares the same start. |
+| Events | `started` (`description`), `failed` (`error`), for starts through `start()`. |
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the
