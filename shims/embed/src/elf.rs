@@ -79,6 +79,31 @@ impl<'a> Elf<'a> {
         self.symbols().into_iter().find(|(n, _)| *n == name.as_bytes()).map(|(_, v)| v)
     }
 
+    /// The functions the image exports (`.dynsym`'s defined `STT_FUNC`s): name and value.
+    pub fn exported_functions(&self) -> Vec<(&'a [u8], u64)> {
+        let (shoff, shn, shsz) = (self.u64(40) as usize, self.u16(60) as usize, self.u16(58) as usize);
+        let sec = |i: usize| shoff + i * shsz;
+        let mut out = Vec::new();
+        for i in 0..shn {
+            let s = sec(i);
+            if s + shsz > self.b.len() || self.u32(s + 4) != 11 {
+                continue;
+            }
+            let (off, size, link) = (self.u64(s + 24) as usize, self.u64(s + 32) as usize, self.u32(s + 40) as usize);
+            let strtab = self.u64(sec(link) + 24) as usize;
+            for k in 0..size / 24 {
+                let e = off + k * 24;
+                let (name, info, shndx, value) = (self.u32(e) as usize, self.b[e + 4], self.u16(e + 6), self.u64(e + 8));
+                if shndx == 0 || name == 0 || info & 0xf != 2 {
+                    continue;
+                }
+                let n = &self.b[strtab + name..];
+                out.push((&n[..n.iter().position(|&c| c == 0).unwrap_or(0)], value));
+            }
+        }
+        out
+    }
+
     /// Every defined symbol, `.symtab`'s then `.dynsym`'s: name and value.
     pub fn symbols(&self) -> Vec<(&'a [u8], u64)> {
         let (shoff, shn, shsz) = (self.u64(40) as usize, self.u16(60) as usize, self.u16(58) as usize);

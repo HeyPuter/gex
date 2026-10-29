@@ -46,6 +46,31 @@ static uint64_t callx(uint64_t pc, uint64_t a, uint64_t b, uint64_t c, uint64_t 
     return k.rx[0];
 }
 
+// liblog's sink (native/guest/src/liblog.c: __aw_log_write(prio, tag, msg)).
+static void host_log(uint32_t ctx, uint32_t user) {
+    (void)user;
+    printf("     [guest log %d] %s: %s\n", (int)gex_ctx_x(ctx, 0), (const char*)(uintptr_t)gex_ctx_x(ctx, 1),
+           (const char*)(uintptr_t)gex_ctx_x(ctx, 2));
+}
+
+// M1's start: an app's library loaded against the image, its constructors run (APP_LIBS embedded at /data/app/lib).
+static void app_library(void) {
+    FILE* f = fopen("/data/app/lib/libDoodleJump.so", "rb");
+    if (!f) return;
+    fclose(f);
+    static const char* stubs[] = {"libandroid.so", "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so",
+                                  "libOpenSLES.so", "libjnigraphics.so", "libnativewindow.so"};
+    for (unsigned i = 0; i < sizeof stubs / sizeof *stubs; i++) gex_embed_provide(stubs[i], 0, 0, gex_embed_missing);
+    gex_provided log = {"__aw_log_write", host_log, 0};
+    gex_embed_provide("liblog.so", &log, 1, 0);
+    uint64_t h = gex_embed_dlopen("/data/app/lib/libDoodleJump.so", RTLD_NOW);
+    if (!h) printf("     dlopen: %s\n", (const char*)(uintptr_t)gex_embed_dlerror());
+    CHECK("dlopen libDoodleJump.so (its constructors ran)", h != 0);
+    if (!h) return;
+    CHECK("dlsym a JNI method", sym(h, "Java_com_limasky_doodlejumpandroid_MainApplication_initializeNativeAudio") != 0);
+    CHECK("dlsym JNI_OnLoad (none)", gex_embed_dlsym(h, "JNI_OnLoad") == 0);
+}
+
 static void* second(void* arg) {
     (void)arg;
     // The first guest call on this thread adopts it into bionic.
@@ -107,6 +132,8 @@ int main(int argc, char** argv) {
     pthread_t t;
     pthread_create(&t, 0, second, 0);
     pthread_join(t, 0);
+
+    app_library();
 
     printf("bionictest: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

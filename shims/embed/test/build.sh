@@ -34,6 +34,9 @@ FLAGS="-O3 -pthread -fwasm-exceptions -msimd128 -mnontrapping-fptoint
 "$EMSDK/emscripten/emcc" $FLAGS embedtest.c "$LIB" -o out/embedtest.js "$@"
 echo "embedtest: out/embedtest.wasm ($(stat -c%s out/embedtest.wasm) bytes)"
 if [ -d "$GUEST" ]; then
-    "$EMSDK/emscripten/emcc" $FLAGS --embed-file "$GUEST@/system" bionictest.c "$LIB" -o out/bionictest.js "$@"
+    # APP_LIBS: a directory of an app's arm64-v8a libraries, at /data/app/lib (bionictest loads libDoodleJump.so).
+    APP=""
+    [ -n "${APP_LIBS:-}" ] && APP="--embed-file $APP_LIBS@/data/app/lib"
+    "$EMSDK/emscripten/emcc" $FLAGS -sINITIAL_MEMORY=128MB --embed-file "$GUEST@/system" $APP bionictest.c "$LIB" -o out/bionictest.js "$@"
     echo "bionictest: out/bionictest.wasm ($(stat -c%s out/bionictest.wasm) bytes)"
 fi

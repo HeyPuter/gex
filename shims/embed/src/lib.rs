@@ -160,6 +160,35 @@ pub extern "C" fn gex_embed_dlerror() -> u32 {
     call::call_x(loader().dlerror, &[]) as u32
 }
 
+/// One function of a library the host provides (`gex_embed.h`'s `gex_provided`).
+#[repr(C)]
+pub struct Provided {
+    pub name: *const core::ffi::c_char,
+    pub f: HostFn,
+    pub user: u32,
+}
+
+/// When a library named `soname` is mapped executable, bind its functions to the host's: each of `fns` by name, and,
+/// unless `missing` is null, every other function it exports to `missing` (which gets "soname!symbol" as its user
+/// value; `gex_embed_missing` logs it once and returns 0). Before the library is loaded.
+#[no_mangle]
+pub extern "C" fn gex_embed_provide(soname: *const core::ffi::c_char, fns: *const Provided, n: u32, missing: Option<HostFn>) {
+    // SAFETY: the caller's strings and table.
+    let soname = unsafe { std::ffi::CStr::from_ptr(soname) }.to_string_lossy().into_owned();
+    let table = if n == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(fns, n as usize) } };
+    let fns = table
+        .iter()
+        .map(|p| (unsafe { std::ffi::CStr::from_ptr(p.name) }.to_string_lossy().into_owned(), p.f, p.user))
+        .collect();
+    overlay::provide(&soname, fns, missing);
+}
+
+/// A `missing` for `gex_embed_provide`: says which function, once, and returns 0.
+#[no_mangle]
+pub extern "C" fn gex_embed_missing(ctx: u32, label: u32) {
+    overlay::missing(ctx, label)
+}
+
 /// Say every guest system call on stderr.
 #[no_mangle]
 pub extern "C" fn gex_embed_set_trace(on: i32) {

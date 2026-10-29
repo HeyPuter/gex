@@ -22,10 +22,53 @@ pub fn closed(fd: i32) {
     }
 }
 
+/// A library whose functions are the host's (`gex_embed_provide`).
+struct Provider {
+    fns: HashMap<String, (crate::imports::HostFn, u32)>,
+    /// For every exported function the table doesn't name; none: only the named ones are bound.
+    missing: Option<crate::imports::HostFn>,
+}
+
+static PROVIDERS: Mutex<Option<HashMap<String, Provider>>> = Mutex::new(None);
+
+/// When a library named `soname` is mapped executable, bind its functions to the host's: the table's, by name, and,
+/// with `missing`, every other function it exports, to `missing` with the name ("soname!symbol", NUL-terminated,
+/// never freed) as its user value.
+pub fn provide(soname: &str, fns: Vec<(String, crate::imports::HostFn, u32)>, missing: Option<crate::imports::HostFn>) {
+    let fns = fns.into_iter().map(|(n, f, u)| (n, (f, u))).collect();
+    PROVIDERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(soname.to_string(), Provider { fns, missing });
+}
+
+/// A library a provider stands for was mapped at load bias `bias`.
+fn bind_provided(soname: &str, e: &crate::elf::Elf, bias: u64) {
+    let guard = PROVIDERS.lock().unwrap();
+    let Some(p) = guard.as_ref().and_then(|m| m.get(soname)) else { return };
+    let (mut bound, mut missing) = (0, 0);
+    for (name, value) in e.exported_functions() {
+        let Ok(name) = std::str::from_utf8(name) else { continue };
+        if let Some(&(f, user)) = p.fns.get(name) {
+            crate::bind(bias + value, f, user);
+            bound += 1;
+        } else if let Some(m) = p.missing {
+            let label = format!("{soname}!{name}\0").leak();
+            crate::bind(bias + value, m, label.as_ptr() as usize as u32);
+            missing += 1;
+        }
+    }
+    for name in p.fns.keys() {
+        if !e.exported_functions().iter().any(|(n, _)| *n == name.as_bytes()) {
+            crate::host::log(&format!("gex-embed: {soname} has no {name} to bind\n"));
+        }
+    }
+    crate::host::log(&format!("gex-embed: {soname} at {bias:#x}: {bound} functions bound to the host, {missing} to the missing handler\n"));
+}
+
 /// `fd` (`path`) was just mapped executable at `addr`, from file offset `off`.
 pub fn exec_mapped(fd: i32, addr: u64, off: u64) {
     let Some(path) = PATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned()) else { return };
-    if !path.ends_with("/libc.so") {
+    let soname = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let provided = PROVIDERS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&soname));
+    if soname != "libc.so" && !provided {
         return;
     }
     let Ok(bytes) = crate::elf::read_file(&path) else { return };
@@ -33,6 +76,12 @@ pub fn exec_mapped(fd: i32, addr: u64, off: u64) {
     // The segment this offset is the start of gives the load bias.
     let Some(seg) = e.phdrs().into_iter().find(|p| p.kind == 1 && p.offset & !(crate::vm::PAGE - 1) == off) else { return };
     let bias = addr - (seg.vaddr & !(crate::vm::PAGE - 1));
+    if provided {
+        bind_provided(&soname, &e, bias);
+    }
+    if soname != "libc.so" {
+        return;
+    }
     let syms = e.symbols();
     let mut redirected = 0;
     for (name, value) in &syms {
@@ -133,5 +182,16 @@ extern "C" fn h_valloc(c: u32, _: u32) {
 }
 
 extern "C" fn h_zero(c: u32, _: u32) {
+    cpu::set_x(c, 0, 0);
+}
+
+/// The default for a provided library's functions the host has no implementation of: say which, once, and return 0.
+pub extern "C" fn missing(c: u32, label: u32) {
+    static SEEN: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+    if SEEN.lock().unwrap().get_or_insert_with(Default::default).insert(label) {
+        // SAFETY: the NUL-terminated label `bind_provided` made.
+        let name = unsafe { std::ffi::CStr::from_ptr(label as usize as *const core::ffi::c_char) };
+        crate::host::log(&format!("gex-embed: {} is not implemented (returns 0)\n", name.to_string_lossy()));
+    }
     cpu::set_x(c, 0, 0);
 }

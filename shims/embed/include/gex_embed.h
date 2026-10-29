@@ -27,6 +27,31 @@ typedef void (*gex_host_fn)(uint32_t ctx, uint32_t user);
 /* The guest address that, called, runs `f`. */
 uint64_t gex_embed_thunk(gex_host_fn f, uint32_t user);
 
+/* Start the guest on this thread: bionic's linker64 at `linker`, loading `exe` (a program that only has libc loaded).
+ * This thread is the guest's main thread after. 0, or -1 with the reason logged. */
+int gex_embed_boot(const char *linker, const char *exe);
+
+/* The guest's dlopen, dlsym and dlerror (the linker's, in the default namespace). */
+uint64_t gex_embed_dlopen(const char *path, int flags);
+uint64_t gex_embed_dlsym(uint64_t handle, const char *name);
+uint32_t gex_embed_dlerror(void);
+
+/* A library whose functions are the host's: when one named `soname` is mapped executable, each of `fns` is bound by
+ * name, and, unless `missing` is null, every other function it exports is bound to `missing`, with "soname!symbol"
+ * as its user value. Before the library is loaded. */
+typedef struct gex_provided {
+    const char *name;
+    gex_host_fn fn;
+    uint32_t user;
+} gex_provided;
+void gex_embed_provide(const char *soname, const gex_provided *fns, uint32_t n, gex_host_fn missing);
+
+/* A `missing` for gex_embed_provide: says which function, once, and returns 0. */
+void gex_embed_missing(uint32_t ctx, uint32_t label);
+
+/* Say every guest system call on stderr. */
+void gex_embed_set_trace(int on);
+
 /* A guest call's arguments and results, by the AAPCS64. */
 typedef struct gex_call {
     uint64_t x[8];
