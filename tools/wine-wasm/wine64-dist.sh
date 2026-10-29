@@ -97,6 +97,12 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 S=$( { echo "$DH"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
+# WINE64_WOW64=1: WoW64, 32-bit programs in the 64-bit process: the PE side
+# built for i386 too (lib/wine/i386-windows from this commit, whose
+# __wine_unix_call codes are this Unix side's) and a wow64 prefix
+# (syswow64). P gets -wow64; the default build is unchanged.
+WOW=${WINE64_WOW64:-0}; ARCHS=x86_64
+WS=; if [ "$WOW" != 0 ]; then P=$P-wow64; ARCHS=i386,x86_64; WS=-wow64; fi
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -135,20 +141,20 @@ log "raster fonts ($F)"; step fon-$F fon_make
 # what a new commit changed: git touches only the files it rewrites), and
 # its install copied into pe64-P. A pin bump that changes one DLL took
 # about 40 minutes from scratch. WINE64_PE_FRESH=1 starts that tree over.
-WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)
+WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)$WS
 pe_build() {
 	local out=$PWD
 	(
 		flock 9
 		[ "${WINE64_PE_FRESH:-0}" = 1 ] && rm -rf "$WK"
 		mkdir -p "$WK"; cd "$WK"
-		[ -f Makefile ] || "$W/configure" --enable-archs=x86_64 --with-wine-tools="$T" --disable-tests $without
+		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without
 		nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
 		rm -rf install; nice -n 10 make install prefix="$WK/install"
 		cp -a --reflink=auto install "$out/install"
 	) 9>"$WK.lock"
 }
-log "x86_64 PE DLLs ($P)"; step pe64-$P pe_build
+log "$ARCHS PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
 
 pfx_make() {
@@ -221,6 +227,7 @@ dist_make() {
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
 	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
+	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
@@ -230,7 +237,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F)"; step dist64-$K-$S-f$F dist_make
+log "install ($K, $S, $F$WS)"; step dist64-$K-$S-f$F$WS dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -262,7 +269,7 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F
+DIST=$C/dist64-$K-$S-f$F$WS
 NATIVE=$C/pen64-$K-$NK/native
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
