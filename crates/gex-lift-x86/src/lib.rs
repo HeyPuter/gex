@@ -296,13 +296,10 @@ impl<'a> Lifter<'a> {
                 let m = self.k32(0xff);
                 self.b.bin(BinOp::And, Ty::I32, v, m)
             }
-            // %cs names the block's mode (`ctx::CS` is always it); the data
-            // selectors read 0.
-            Reg::Seg(Seg::Cs) => {
-                let cs = if self.wa() == Width::D { gex_abi::ctx::CS_COMPAT } else { gex_abi::ctx::CS_LONG };
-                self.k32(cs)
+            Reg::Seg(seg) => {
+                let sel = self.sel_of(seg);
+                self.k32(sel)
             }
-            Reg::Seg(_) => self.k32(0),
             // Vector and x87 registers are read by their own paths.
             Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => self.k64(0),
         }
@@ -867,8 +864,7 @@ impl<'a> Lifter<'a> {
             Op::Push => {
                 let v = match i.op0() {
                     Operand::Imm(imm) => self.k(ty, (imm as u64) & w.mask()),
-                    Operand::Reg(Reg::Seg(Seg::Cs)) => self.cur_cs(w),
-                    Operand::Reg(Reg::Seg(_)) => self.k(ty, 0),
+                    Operand::Reg(Reg::Seg(seg)) => self.sel_val(seg, w),
                     o => self.rd(o, w),
                 };
                 self.push(w, v);
@@ -1394,7 +1390,7 @@ impl<'a> Lifter<'a> {
                 if i.op == Op::CallFar {
                     // The caller's selector, then the return offset, each a
                     // slot of the operand width.
-                    let cs = self.cur_cs(w);
+                    let cs = self.sel_val(Seg::Cs, w);
                     self.push(w, cs);
                     let ret = if w == Width::Q { self.k64(next) } else { self.k(ty_of(w), next & 0xffff_ffff) };
                     self.push(w, ret);
@@ -2664,12 +2660,30 @@ impl<'a> Lifter<'a> {
 
     /// The selector of the code being lifted, as a far call pushes it:
     /// 0x23 in 32-bit code, 0x33 in 64-bit code.
-    fn cur_cs(&mut self, w: Width) -> Value {
-        let cs = if self.wa() == Width::D { gex_abi::ctx::CS_COMPAT } else { gex_abi::ctx::CS_LONG };
+    /// [`Self::sel_of`] at width `w`.
+    fn sel_val(&mut self, seg: Seg, w: Width) -> Value {
+        let sel = self.sel_of(seg) as u64;
         if w == Width::Q {
-            self.k64(cs as u64)
+            self.k64(sel)
         } else {
-            self.k(ty_of(w), cs as u64)
+            self.k(ty_of(w), sel)
+        }
+    }
+
+    /// What a segment register reads in this block, as under Linux: %cs
+    /// names the block's mode (`ctx::CS` is always it), %ss the user data
+    /// segment, as do %ds and %es in 32-bit code (64-bit code leaves them
+    /// null); %fs and %gs read null, their bases being set apart from them.
+    /// Loads are not kept, so each reads the same everywhere in a mode.
+    fn sel_of(&self, seg: Seg) -> u32 {
+        const USER_DS: u32 = 0x2b;
+        let compat = self.wa() == Width::D;
+        match seg {
+            Seg::Cs if compat => gex_abi::ctx::CS_COMPAT,
+            Seg::Cs => gex_abi::ctx::CS_LONG,
+            Seg::Ss => USER_DS,
+            Seg::Ds | Seg::Es if compat => USER_DS,
+            _ => 0,
         }
     }
 
