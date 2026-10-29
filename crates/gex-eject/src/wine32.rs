@@ -376,6 +376,10 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         // from instrumented units: key -> slot ranges; null without): what
         // `"cold"` keeps in each unit's primary module.
         ("coverage", v.get("coverage").cloned().unwrap_or(Json::Null)),
+        // What wineboot made that the prefix does not save (the recorder's
+        // `volatile_keys`, from a page run with WINEGEX_RECORD_HARDWARE=1;
+        // null without): what `"wineboot": "skip"` writes into the prefix.
+        ("volatile_keys", v.get("volatile_keys").cloned().unwrap_or(Json::Null)),
         ("page_source", s(web_src.display().to_string())),
         ("session", s(sha256(text.as_bytes()))),
     ]);
@@ -422,7 +426,9 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                helper programs and services a game does not need (\"keep\": the prefix as recorded); \
                see crates/gex-eject/README.md, \"Helpers\". \"desktop\": \"none\" runs the program \
                with no desktop process, for a fullscreen game (\"explorer\": Wine's); see \
-               crates/gex-eject/README.md, \"Desktop\". \
+               crates/gex-eject/README.md, \"Desktop\". \"wineboot\": \"skip\" boots the session \
+               without wineboot, from a recording made with WINEGEX_RECORD_HARDWARE=1 (\"run\": \
+               Wine's); see crates/gex-eject/README.md, \"Wineboot\". \
                \"start\": defaults for the app library's start() \
                (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
@@ -438,6 +444,7 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
         ("resources", s(if wine64 { "whole" } else { "trim" })),
         ("helpers", s(if strip { "strip" } else { "keep" })),
         ("desktop", s(if strip { "none" } else { "explorer" })),
+        ("wineboot", s("run")),
         ("start", obj(vec![])),
     ]))
 }
@@ -717,6 +724,79 @@ fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>
     write_file(&path, &new, false)?;
     eprintln!("gexc eject build: RunServices without {}", gone.join(", "));
     Ok(gone)
+}
+
+/// The `.reg` text of the recording's volatile keys under `root` ("HKLM"
+/// or "HKCU"), as ordinary keys: each value as `hex(TYPE):`, a key with no
+/// values still named. `CurrentControlSet` is written as the registry's
+/// link to it, `ControlSet001`, which a prefix file names.
+fn volatile_reg(keys: &[(String, Json)], root: &str) -> String {
+    let mut out = String::new();
+    let mut names: Vec<&(String, Json)> = keys.iter().filter(|(k, _)| k.split('\\').next() == Some(root)).collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, vals) in names {
+        let mut path = k[root.len()..].trim_start_matches('\\').to_string();
+        if path.get(..25).is_some_and(|p| p.eq_ignore_ascii_case("System\\CurrentControlSet\\")) {
+            path = format!("System\\ControlSet001\\{}", &path[25..]);
+        }
+        out.push_str(&format!("[{}] 0\n", path.replace('\\', "\\\\")));
+        if let Json::Obj(vals) = vals {
+            for (name, val) in vals {
+                let Json::Arr(tv) = val else { continue };
+                let (Some(Json::Num(t)), Some(Json::Str(hex))) = (tv.first(), tv.get(1)) else { continue };
+                let Ok(t) = t.parse::<u32>() else { continue };
+                let bytes: Vec<&str> = (0..hex.len() / 2).map(|i| &hex[2 * i..2 * i + 2]).collect();
+                let name = if name.is_empty() {
+                    "@".to_string()
+                } else {
+                    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+                };
+                out.push_str(&format!("{name}=hex({t:x}):{}\n", bytes.join(",")));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `"wineboot": "skip"`: the recording's volatile keys written into the
+/// bundle's prefix, HKLM's into system.reg and HKCU's into user.reg, so a
+/// session booted without wineboot (Wine's `WINEGEX_NO_WINEBOOT`) has what
+/// it would have made. Returns how many keys.
+fn put_volatile_keys(v: &Json, web: &Path) -> Result<usize> {
+    let what = crate::project::PROJECT_FILE;
+    let Some(Json::Obj(keys)) = v.get("volatile_keys") else {
+        bail!(
+            "user/eject.json says \"wineboot\": \"skip\", but the recording has no volatile keys: record the page \
+             with WINEGEX_RECORD_HARDWARE=1 in its environment (crates/gex-eject/README.md, \"Wineboot\")"
+        )
+    };
+    let path = web.join("rootfs.tar");
+    let mut bytes = std::fs::read(&path)?;
+    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
+    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+    for (root, file) in [("HKLM", "system.reg"), ("HKCU", "user.reg")] {
+        let add = volatile_reg(keys, root);
+        if add.is_empty() {
+            continue;
+        }
+        let want = format!("{prefix}/{file}");
+        let mut text = {
+            let tar = crate::reach::Tar::parse(&bytes)?;
+            let reg = tar.read(&want).ok_or_else(|| anyhow!("the bundle has no {want}"))?;
+            String::from_utf8_lossy(reg).into_owned()
+        };
+        if !text.ends_with("\n\n") {
+            text.push('\n');
+        }
+        text.push_str(&add);
+        bytes = crate::reach::tar_put(&bytes, &want, text.as_bytes())?;
+    }
+    // web/rootfs.tar may be a hard link to the project's bundle.
+    std::fs::remove_file(&path)?;
+    write_file(&path, &bytes, false)?;
+    eprintln!("gexc eject build: {} volatile keys from the recording in the prefix", keys.len());
+    Ok(keys.len())
 }
 
 /// A path's last component, either separator.
@@ -1035,6 +1115,9 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     if !run_off.is_empty() {
         drop_run_services(&v, &web, &run_off)?;
     }
+    if config.wineboot_skip {
+        put_volatile_keys(&v, &web)?;
+    }
     let site_key = |k: &str| rekeyed.get(k).cloned().unwrap_or_else(|| k.to_string());
     let instrument = config.cold.as_deref() == Some("instrument");
     // `user/select.json` (`gexc units select`): the slots to ship, in place
@@ -1295,6 +1378,12 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
                 env.retain(|e| !e.as_str().is_some_and(|x| x.starts_with("WINEGEX_NO_DESKTOP=")));
                 env.push(s(format!("WINEGEX_NO_DESKTOP={NO_DESKTOP_DRIVER}")));
             }
+            // `"wineboot": "skip"`: the session boots without it (and the
+            // recording's ask for its keys, there being none to make).
+            if config.wineboot_skip {
+                env.retain(|e| !e.as_str().is_some_and(|x| x.starts_with("WINEGEX_NO_WINEBOOT=") || x.starts_with("WINEGEX_RECORD_HARDWARE=")));
+                env.push(s("WINEGEX_NO_WINEBOOT=1"));
+            }
             Json::Arr(env)
         }),
         ("cwd", rec.get("cwd").cloned().unwrap_or(s("/"))),
@@ -1343,6 +1432,28 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         false,
     )?;
     Ok(Wine32Report { features_off: off, page_files, units: units.len() })
+}
+
+#[cfg(test)]
+mod volatile_tests {
+    use super::*;
+
+    #[test]
+    fn writes_recorded_keys_as_ordinary_ones() {
+        let v = Json::parse(
+            r#"{"volatile_keys": {
+                "HKLM\\Hardware\\Description\\System\\CentralProcessor": {},
+                "HKLM\\System\\CurrentControlSet\\Control\\ComputerName\\ActiveComputerName": {"ComputerName": [1, "47000000"]},
+                "HKCU\\Volatile Environment": {"USERNAME": [1, "670000"]}}}"#,
+        )
+        .unwrap();
+        let Some(Json::Obj(keys)) = v.get("volatile_keys") else { panic!() };
+        let m = volatile_reg(keys, "HKLM");
+        assert!(m.contains("[Hardware\\\\Description\\\\System\\\\CentralProcessor] 0\n\n"));
+        assert!(m.contains("[System\\\\ControlSet001\\\\Control\\\\ComputerName\\\\ActiveComputerName] 0\n\"ComputerName\"=hex(1):47,00,00,00\n"));
+        assert!(!m.contains("Volatile"));
+        assert_eq!(volatile_reg(keys, "HKCU"), "[Volatile Environment] 0\n\"USERNAME\"=hex(1):67,00,00\n\n");
+    }
 }
 
 #[cfg(test)]

@@ -153,6 +153,11 @@ pub struct Config {
     /// process (crates/gex-eject/README.md, "Desktop"); `"explorer"`, the
     /// default for a config without the setting, keeps Wine's.
     pub desktop_none: bool,
+    /// Wine pages: `"wineboot": "skip"` boots the session without wineboot,
+    /// its volatile keys written into the prefix from the recording
+    /// (crates/gex-eject/README.md, "Wineboot"); `"run"`, the default for a
+    /// config without the setting, runs it as Wine does.
+    pub wineboot_skip: bool,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (crates/gex-eject/README.md,
@@ -185,6 +190,7 @@ impl Default for Config {
             services: Vec::new(),
             helpers_strip: false,
             desktop_none: false,
+            wineboot_skip: false,
             start: "{}".to_string(),
         }
     }
@@ -231,7 +237,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "desktop" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "desktop" | "wineboot" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -445,6 +451,12 @@ impl Config {
             Some(Json::Str(x)) if x == "none" => true,
             Some(_) => bail!("{what}: \"desktop\" is \"none\" or \"explorer\""),
         };
+        c.wineboot_skip = match v.get("wineboot") {
+            None | Some(Json::Null) => false,
+            Some(Json::Str(x)) if x == "run" => false,
+            Some(Json::Str(x)) if x == "skip" => true,
+            Some(_) => bail!("{what}: \"wineboot\" is \"skip\" or \"run\""),
+        };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
             Some(_) => Some(json::str_list(&v, "args", what)?),
@@ -486,6 +498,9 @@ mod tests {
         assert!(!Config::from_json("{}").unwrap().desktop_none);
         assert!(Config::from_json(r#"{"desktop": "none"}"#).unwrap().desktop_none);
         assert!(Config::from_json(r#"{"desktop": "thread"}"#).is_err());
+        assert!(!Config::from_json("{}").unwrap().wineboot_skip);
+        assert!(Config::from_json(r#"{"wineboot": "skip"}"#).unwrap().wineboot_skip);
+        assert!(Config::from_json(r#"{"wineboot": "off"}"#).is_err());
     }
 
     #[test]
