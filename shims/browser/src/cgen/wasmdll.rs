@@ -256,18 +256,19 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
     };
     let fresh = g.mods.len() > before;
-    let other = core.filter(|&c| c != idx);
+    // the core first, then the other modules of their own
+    let others: Vec<usize> = core.into_iter().chain(0..g.mods.len()).filter(|&c| c != idx).collect();
 
     // This DLL's bindings: its own module's adapters, and for a `-import`
-    // re-export the owner's, in whichever install has it (the core's, for
-    // a module of its own).
+    // re-export the owner's, in whichever install has it (the core's, or
+    // another module of its own: advapi32's OpenSCManagerW is sechost's).
     let wp = &g.mods[idx];
     let slot = |n: &str| wp.slots.get(n).copied();
     let missing = slot(&format!("{dll}!gexp__missing"))
         .or_else(|| wp.slots.iter().find(|(k, _)| k.ends_with("!gexp__missing")).map(|(_, v)| *v))
         .ok_or("Wine's PE module has no gexp__missing")?;
     let mut pairs = Vec::new();
-    let mut other_pairs = Vec::new();
+    let mut other_pairs: Vec<Vec<(u64, u32)>> = vec![Vec::new(); others.len()];
     for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
         let own = e
             .names
@@ -275,13 +276,12 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             .find_map(|n| slot(&format!("{dll}!gexp_{n}")))
             .or_else(|| slot(&format!("{dll}!gexp_#{}", e.ordinal)))
             .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()));
-        match (own, other) {
-            (Some(k), _) => pairs.push((base + e.rva as u64, k)),
-            (None, Some(c)) => match e.names.iter().find_map(|n| g.mods[c].any_dll.get(n).copied()) {
-                Some(k) => other_pairs.push((base + e.rva as u64, k)),
+        match own {
+            Some(k) => pairs.push((base + e.rva as u64, k)),
+            None => match others.iter().enumerate().find_map(|(i, &c)| e.names.iter().find_map(|n| g.mods[c].any_dll.get(n).copied()).map(|k| (i, k))) {
+                Some((i, k)) => other_pairs[i].push((base + e.rva as u64, k)),
                 None => pairs.push((base + e.rva as u64, missing)),
             },
-            (None, None) => pairs.push((base + e.rva as u64, missing)),
         }
     }
     if let (Some(k), true) = (slot(&format!("{dll}!gexp__entry")), pe.entry_rva != 0) {
@@ -332,14 +332,14 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             }
         }
     }
-    crate::warn_line(&format!("gex-pe: native wasm32 module for {path}: {} entries\n", pairs.len() + other_pairs.len()));
+    crate::warn_line(&format!("gex-pe: native wasm32 module for {path}: {} entries\n", pairs.len() + other_pairs.iter().map(Vec::len).sum::<usize>()));
     let install = wp.install;
-    let other_install = other.map(|c| g.mods[c].install);
+    let other_installs: Vec<u32> = others.iter().map(|&c| g.mods[c].install).collect();
     let last = g.mods.last().map(|w| w.number).unwrap_or(0);
     drop(g);
     bind(install, &pairs);
-    if let Some(oi) = other_install {
-        bind(oi, &other_pairs);
+    for (oi, p) in other_installs.iter().zip(&other_pairs).filter(|(_, p)| !p.is_empty()) {
+        bind(*oi, p);
     }
     // A module installed here: JS catches up (which instantiates it, and
     // the modules installed before it), then `gex_cgen_pmod_installed` and

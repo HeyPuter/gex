@@ -459,15 +459,18 @@ fn install_shared(
     drop(installing);
 
     // This DLL's bindings: its own module's adapters, and for a `-import`
-    // re-export the owner's, in whichever install has it (the core's, for a
-    // module of its own).
+    // re-export the owner's, in whichever install has it (the core's, or
+    // another module of its own: advapi32's OpenSCManagerW is sechost's).
     let slot = |n: &str| wp.slots.get(n).copied();
     let missing = slot(&format!("{dll}!gexp__missing"))
         .or_else(|| wp.slots.iter().find(|(k, _)| k.ends_with("!gexp__missing")).map(|(_, v)| *v))
         .ok_or_else(|| anyhow!("{path}: Wine's PE module has no gexp__missing"))?;
-    let other = core.as_ref().filter(|c| !Arc::ptr_eq(c, &wp));
+    let others: Vec<Arc<WinePe>> = {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        core.iter().chain(s.wine_pe_split.iter()).filter(|c| !Arc::ptr_eq(c, &wp)).cloned().collect()
+    };
     let mut pairs = Vec::new();
-    let mut other_pairs = Vec::new();
+    let mut other_pairs: Vec<Vec<(u64, u32)>> = vec![Vec::new(); others.len()];
     for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
         let own = e
             .names
@@ -475,13 +478,12 @@ fn install_shared(
             .find_map(|n| slot(&format!("{dll}!gexp_{n}")))
             .or_else(|| slot(&format!("{dll}!gexp_#{}", e.ordinal)))
             .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()));
-        match (own, other) {
-            (Some(k), _) => pairs.push((base + e.rva as u64, k)),
-            (None, Some(c)) => match e.names.iter().find_map(|n| c.any_dll.get(n).copied()) {
-                Some(k) => other_pairs.push((base + e.rva as u64, k)),
+        match own {
+            Some(k) => pairs.push((base + e.rva as u64, k)),
+            None => match others.iter().enumerate().find_map(|(i, c)| e.names.iter().find_map(|n| c.any_dll.get(n).copied()).map(|k| (i, k))) {
+                Some((i, k)) => other_pairs[i].push((base + e.rva as u64, k)),
                 None => pairs.push((base + e.rva as u64, missing)),
             },
-            (None, None) => pairs.push((base + e.rva as u64, missing)),
         }
     }
     if let (Some(k), true) = (slot(&format!("{dll}!gexp__entry")), pe.entry_rva != 0) {
@@ -529,13 +531,14 @@ fn install_shared(
         }
     }
 
-    let n = pairs.len() + other_pairs.len();
+    let re = other_pairs.iter().map(Vec::len).sum::<usize>();
+    let n = pairs.len() + re;
     crate::ftab::bind_pairs(shared, memory, wp.install, &pairs)?;
-    if let (false, Some(c)) = (other_pairs.is_empty(), other) {
-        crate::ftab::bind_pairs(shared, memory, c.install, &other_pairs)?;
+    for (c, p) in others.iter().zip(&other_pairs).filter(|(_, p)| !p.is_empty()) {
+        crate::ftab::bind_pairs(shared, memory, c.install, p)?;
     }
     if crate::wasm_trace() {
-        eprintln!("gex: wine PE: {dll}: {} exports bound in {}{}", n, file.display(), if other_pairs.is_empty() { String::new() } else { format!(" ({} re-exports in the core)", other_pairs.len()) });
+        eprintln!("gex: wine PE: {dll}: {} exports bound in {}{}", n, file.display(), if re == 0 { String::new() } else { format!(" ({re} re-exports in other modules)") });
     }
     Ok(n)
 }
