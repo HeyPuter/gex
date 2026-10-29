@@ -155,6 +155,14 @@ pub extern "C" fn gex_embed_dlsym(handle: u64, name: *const core::ffi::c_char) -
     call::call_x(loader().dlsym, &[handle, name as usize as u64, 0])
 }
 
+/// The default namespace's library search path (`android_update_LD_LIBRARY_PATH`): colon-separated directories
+/// searched, after the system's, for libraries `gex_embed_dlopen` loads by name -- an app's own (`libc++_shared.so`
+/// beside its libraries).
+#[no_mangle]
+pub extern "C" fn gex_embed_set_library_path(paths: *const core::ffi::c_char) {
+    call::call_x(loader().update_library_path, &[paths as usize as u64]);
+}
+
 /// The guest's `dlerror()`: a string in guest (so the host's) memory, or null.
 #[no_mangle]
 pub extern "C" fn gex_embed_dlerror() -> u32 {

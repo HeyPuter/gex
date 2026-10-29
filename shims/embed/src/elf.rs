@@ -209,6 +209,7 @@ pub struct Loader {
     pub dlopen: u64,
     pub dlsym: u64,
     pub dlerror: u64,
+    pub update_library_path: u64,
 }
 
 pub static LOADER: std::sync::OnceLock<Loader> = std::sync::OnceLock::new();
@@ -251,7 +252,12 @@ pub fn boot(linker: &str, exe: &str) -> Result<(), String> {
     crate::thread::become_main();
     let l = Elf::parse(&lb)?;
     let sym = |n: &str| l.symbol(n).map(|v| le.bias + v).ok_or_else(|| format!("{linker} has no {n}"));
-    let loader = Loader { dlopen: sym("__loader_dlopen")?, dlsym: sym("__loader_dlsym")?, dlerror: sym("__loader_dlerror")? };
+    let loader = Loader {
+        dlopen: sym("__loader_dlopen")?,
+        dlsym: sym("__loader_dlsym")?,
+        dlerror: sym("__loader_dlerror")?,
+        update_library_path: sym("__loader_android_update_LD_LIBRARY_PATH")?,
+    };
     let mut sp_at_entry = 0;
     call::run(
         le.entry,

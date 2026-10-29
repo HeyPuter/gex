@@ -36,6 +36,10 @@ uint64_t gex_embed_dlopen(const char *path, int flags);
 uint64_t gex_embed_dlsym(uint64_t handle, const char *name);
 uint32_t gex_embed_dlerror(void);
 
+/* The default namespace's library search path (android_update_LD_LIBRARY_PATH): colon-separated directories searched
+ * for libraries loaded by name, an app's own among them. */
+void gex_embed_set_library_path(const char *paths);
+
 /* A library whose functions are the host's: when one named `soname` is mapped executable, each of `fns` is bound by
  * name, and, unless `missing` is null, every other function it exports is bound to `missing`, with "soname!symbol"
  * as its user value. Before the library is loaded. */
