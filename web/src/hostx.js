@@ -323,9 +323,12 @@ export class HostX {
   /** The server's arguments, with the descriptors this Worker made. */
   #argv(msg) {
     // Where guest X clients connect. Both spellings, because libxcb tries the
-    // abstract name first and falls back to the path.
-    const listen = ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0']
-      .map((name) => this.#listenOn(name))
+    // abstract name first and falls back to the path. Or the sockets the
+    // starter bound already (`listen`, global kernel socket ids), where a
+    // client may be waiting.
+    const listen = (msg.listen
+      ? msg.listen.map((id) => { this.#watch(id); return this.#reserve({ kind: 'listen', id }); })
+      : ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0'].map((name) => this.#listenOn(name)))
       .filter((fd) => fd >= 0);
     if (!listen.length) throw new Error('the X display name is already taken');
 

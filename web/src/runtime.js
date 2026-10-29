@@ -678,6 +678,91 @@ export async function runProgram(term, opts) {
   return runProgramHere(term, opts);
 }
 
+/**
+ * The X server in the page (`hostX`, web/src/hostx.js): a Worker holding
+ * Xwayland and the compositor beside it, or a fiber of this realm in the
+ * single-thread build. Resolves once it listens: on display :0's names, or
+ * on `listen`, sockets of the global kernel bound already (a caller that
+ * held :0 until a client came). `compositor()` is the page's compositor,
+ * which takes the server's memory and pixels.
+ */
+async function startXServer({ kernel, wlChannel, compositor, term, rootful = false, listen }) {
+  let xServer;
+  // The single-thread build: the server is a fiber of
+  // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
+  // waits suspend. The same messages, without a Worker between.
+  const xDir = assetUrl(single.on ? '/gex/xwayland-st/' : '/gex/xwayland/');
+  if (single.on) {
+    const { HostX } = await import('./hostx.js');
+    let deliver = null;
+    const hx = new HostX((m) => deliver?.({ data: m }));
+    xServer = {
+      set onmessage(f) { deliver = f; },
+      postMessage: (m) => hx.start(m).catch((err) => {
+        hx.log(`[hostx] ${err?.stack || err}`);
+        deliver?.({ data: { kind: 'failed', why: String(err?.message || err) } });
+      }),
+      terminate() {},
+    };
+  } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module', name: 'xwayland' });
+  // Waited for below: a guest that starts before the display is listening
+  // gets "Can't open display" and dies, and the display here is a name in the
+  // global kernel that only exists once the server has bound it.
+  let listening = null;
+  const up = new Promise((resolve) => (listening = resolve));
+  const countX = !!flag('hostxcount');
+  xServer.onmessage = (e) => {
+    const m = e.data;
+    if (m.kind === 'log') {
+      term.writeln(m.text);
+      // `?hostxcount=1`: to the console too, timed, for a harness.
+      if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
+    } else if (m.kind === 'win') console.log(`[win] ${m.text}`);
+    else if (m.kind === 'wl-memory') compositor()?.addMemory(m.token, m.memory, m.kernel);
+    else if (m.kind === 'wl-pixels') compositor()?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
+    else if (m.kind === 'ready') listening(true);
+    else if (m.kind === 'failed') {
+      term.writeln(`gex: the X server failed: ${m.why}`);
+      listening(false);
+    }
+  };
+  xServer.postMessage({
+    kind: 'start',
+    xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
+    hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
+    keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
+    // Its memory is a wasm32 one, also under `?mem64=1`: the kernel module
+    // serves both (gex-kmem, lazy-fetch.mjs `processMemories`).
+    kernel: { module: kernel.module, memory: kernel.memory, spare: kernel.spare },
+    wlChannel,
+    // A name in the scene arena that no guest pid can collide with: pids
+    // count up from 1, and this is 'xwl1' as ASCII.
+    token: 0x78776c31,
+    display: ':0',
+    listen,
+    // `hostX: 'rootful'`: one fullscreen X screen with no window manager of
+    // the compositor's, for a session that runs its own (KWin, ...).
+    rootful: rootful || undefined,
+    // `?xverbose=N`: the X server's own log, which is the only thing that
+    // says what it told a client.
+    verbose: globalThis.GEX_HOSTX_VERBOSE || Number(pageParams().get('xverbose')) || undefined,
+    trace: globalThis.GEX_HOSTX_TRACE || undefined,
+    wlTrace: flag('wltrace') ? 1 : undefined,
+    count: flag('hostxcount') ? 1 : undefined,
+    // GEX_LOG=win: a line as a client's named window is first mapped.
+    win: logNamed('win') ? 1 : undefined,
+  });
+  // Two modules and a kernel to instantiate; a slow machine takes a few
+  // seconds. A run that goes ahead without the display is worse than one that
+  // says so.
+  const ok = await Promise.race([
+    up,
+    new Promise((r) => setTimeout(() => r('timeout'), 60000)),
+  ]);
+  if (ok === 'timeout') term.writeln('gex: the X server did not come up in 60s');
+  return xServer;
+}
+
 async function runProgramHere(
   term,
   {
@@ -993,77 +1078,7 @@ async function runProgramHere(
   let xServer = null;
   if (hostX && wlChannel) {
     if (!kernel) throw new Error('the host X server needs the global kernel');
-    // The single-thread build: the server is a fiber of
-    // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
-    // waits suspend. The same messages, without a Worker between.
-    const xDir = assetUrl(single.on ? '/gex/xwayland-st/' : '/gex/xwayland/');
-    if (single.on) {
-      const { HostX } = await import('./hostx.js');
-      let deliver = null;
-      const hx = new HostX((m) => deliver?.({ data: m }));
-      xServer = {
-        set onmessage(f) { deliver = f; },
-        postMessage: (m) => hx.start(m).catch((err) => {
-          hx.log(`[hostx] ${err?.stack || err}`);
-          deliver?.({ data: { kind: 'failed', why: String(err?.message || err) } });
-        }),
-        terminate() {},
-      };
-    } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module', name: 'xwayland' });
-    // Waited for below: a guest that starts before the display is listening
-    // gets "Can't open display" and dies, and the display here is a name in the
-    // global kernel that only exists once the server has bound it.
-    let listening = null;
-    const up = new Promise((resolve) => (listening = resolve));
-    const countX = !!flag('hostxcount');
-    xServer.onmessage = (e) => {
-      const m = e.data;
-      if (m.kind === 'log') {
-        term.writeln(m.text);
-        // `?hostxcount=1`: to the console too, timed, for a harness.
-        if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
-      } else if (m.kind === 'win') console.log(`[win] ${m.text}`);
-      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
-      else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
-      else if (m.kind === 'ready') listening(true);
-      else if (m.kind === 'failed') {
-        term.writeln(`gex: the X server failed: ${m.why}`);
-        listening(false);
-      }
-    };
-    xServer.postMessage({
-      kind: 'start',
-      xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
-      hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
-      keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
-      // Its memory is a wasm32 one, also under `?mem64=1`: the kernel module
-      // serves both (gex-kmem, lazy-fetch.mjs `processMemories`).
-      kernel: { module: kernel.module, memory: kernel.memory, spare: kernel.spare },
-      wlChannel,
-      // A name in the scene arena that no guest pid can collide with: pids
-      // count up from 1, and this is 'xwl1' as ASCII.
-      token: 0x78776c31,
-      display: ':0',
-      // `hostX: 'rootful'`: one fullscreen X screen with no window manager of
-      // the compositor's, for a session that runs its own (KWin, ...).
-      rootful: hostX === 'rootful' || undefined,
-      // `?xverbose=N`: the X server's own log, which is the only thing that
-      // says what it told a client.
-      verbose: globalThis.GEX_HOSTX_VERBOSE || Number(pageParams().get('xverbose')) || undefined,
-      trace: globalThis.GEX_HOSTX_TRACE || undefined,
-      wlTrace: flag('wltrace') ? 1 : undefined,
-      count: flag('hostxcount') ? 1 : undefined,
-      // GEX_LOG=win: a line as a client's named window is first mapped.
-      win: logNamed('win') ? 1 : undefined,
-    });
-    // Two modules and a kernel to instantiate; a slow machine takes a few
-    // seconds. A run that goes ahead without the display is worse than one that
-    // says so.
-    const ok = await Promise.race([
-      up,
-      new Promise((r) => setTimeout(() => r('timeout'), 60000)),
-    ]);
-    if (ok === 'timeout') term.writeln('gex: the X server did not come up in 60s');
+    xServer = await startXServer({ kernel, wlChannel, compositor: () => compositor, term, rootful: hostX === 'rootful' });
   }
 
   const host = new ProcessHost({
@@ -1301,7 +1316,13 @@ async function runProgramHere(
     if (sharedTty) Promise.resolve(sharedTty.resize(rows, cols)).catch(() => {});
     else host.resize(rows, cols);
   });
-  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl, wlChannel });
+  // `startX(listen)`: the X server for a page that starts it itself (the
+  // runtime API: on display :0's first client), on sockets it bound.
+  const startX = wlChannel && kernel && !xServer
+    ? (listen) => (xStarted ??= startXServer({ kernel, wlChannel, compositor: () => compositor, term, listen }).then((x) => { xServer = x; return x; }))
+    : null;
+  let xStarted = null;
+  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl, wlChannel, startX });
   try {
     const status = await host.start({
       elf,
