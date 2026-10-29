@@ -45,6 +45,10 @@ pub(crate) enum NBind {
     Global(u32),
     /// The module's own table base plus this (a slot of `Binds::extra_from`).
     OwnSlot(u32),
+    /// A call through the module's own table base plus this, a slot filled
+    /// once the module defining the function is instantiated in the store
+    /// (`wasmdll::fill_late`); until then a catch-up first.
+    LateOwn(u32),
     /// An export of the module with this ftab module number.
     Export {
         module: u32,
@@ -571,6 +575,23 @@ pub(crate) fn define_imports(
                 });
                 l.define(&mut *c, m, name, f)?;
             }
+            (NBind::LateOwn(o), wasmtime::ExternType::Func(ft)) => {
+                let (slot, label) = ((base + *o) as u64, format!("{}: {name}", dy.path));
+                // empty until filled
+                table.set(&mut *c, slot, wasmtime::Ref::Func(None))?;
+                let f = wasmtime::Func::new(&mut *c, ft.clone(), move |mut caller, args, rets| {
+                    let mut f = table.get(&mut caller, slot);
+                    if !matches!(f, Some(wasmtime::Ref::Func(Some(_)))) {
+                        crate::ftab::catch_up(&mut caller).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?;
+                        f = table.get(&mut caller, slot);
+                    }
+                    match f {
+                        Some(wasmtime::Ref::Func(Some(f))) => f.call(&mut caller, args, rets),
+                        _ => Err(wasmtime::Error::msg(format!("{label}: called before the module defining it was loaded"))),
+                    }
+                });
+                l.define(&mut *c, m, name, f)?;
+            }
             (NBind::Missing(msg), wasmtime::ExternType::Func(ft)) => {
                 let msg = if msg.is_empty() {
                     format!("{}: undefined weak symbol {name} called", dy.path)
@@ -621,6 +642,7 @@ pub(crate) fn after_instantiate(
     if let Some(s) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.dyl.insert(module, *inst);
     }
+    crate::wasmdll::fill_late(&mut c, table, base, module)?;
     if let Some((size, align)) = dy.tls {
         thread_tls(&mut c, module, inst, size, align).with_context(|| format!("{}: its thread-local block", dy.path))?;
     }

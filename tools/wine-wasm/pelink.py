@@ -398,6 +398,7 @@ def link(dlls, out, gexrt, others=None):
     # the function, an alias the defining DLL gets (pesym.py dll ALIASES).
     aliases = {}  # defining dll -> [(alias, name there)]
     forward_owner = {}  # export name -> forwarding dll (the name is bound to dll!name)
+    unresolved = []  # (export name, forwarding dll, forward) no native DLL defines
     for name, by in forwards.items():
         if name in exporters:
             continue
@@ -407,6 +408,8 @@ def link(dlls, out, gexrt, others=None):
                 aliases.setdefault(hit[0], []).append((f'{via}!{name}', hit[1]))
                 forward_owner.setdefault(name, [])
                 forward_owner[name].append(via)
+            else:
+                unresolved.append((name, via, fwd))
 
     tmp = tempfile.mkdtemp(prefix='pelink-')
     # Each module's objects: the core's (''), and a --split module's by its file name.
@@ -443,6 +446,16 @@ def link(dlls, out, gexrt, others=None):
             parts = line.split()
             if len(parts) >= 2 and parts[1] in ('func', 'forward'):
                 owner_of.setdefault(parts[0], []).append(omod)
+    # A forward to what the native DLL itself takes from an i386 one
+    # (user32's BeginPaint is win32u's NtUserBeginPaint): that DLL's export,
+    # through a guest stub.
+    guest_forward = {}  # export name -> [(forwarding dll, i386 dll, its export)]
+    for name, via, fwd in unresolved:
+        tdll, _, tname = fwd.partition('.')
+        tdll = tdll.lower() + ('' if '.' in tdll else '.dll')
+        gdll = next((o for o in owner_of.get(tname, ()) if o != tdll), None)
+        if tdll in native and gdll:
+            guest_forward.setdefault(name, []).append((via, gdll, tname))
     guest_binds = []  # (symbol, sig, i386 owner, export name)
     own_cache = {}
     def own_defs(o):
@@ -476,7 +489,19 @@ def link(dlls, out, gexrt, others=None):
             for name, owners in exporters.items():
                 # (a DLL may list an export its code takes from another DLL:
                 # kernel32's DebugBreak is kernelbase's)
-                owners = [o for o in owners if (name, 'defined') in sigs[o]] or owners
+                defs = [o for o in owners if (name, 'defined') in sigs[o]]
+                # listed but defined by none of them: an export that is the
+                # DLL's own import from an i386 DLL (user32's
+                # NtUserRegisterTouchPadCapable, win32u's), bound there
+                gown = owner_of.get(name, ())
+                have = sigs[mod].get((name, 'undefined'))
+                if not defs and have and gown:
+                    gdll = next((o for o in imports if o in gown), gown[0])
+                    sym = f'{gdll}.{name}'
+                    guest_binds.append((f'gexw-guest!{sym}', have, gdll, name, grp(mod)))
+                    f.write(f'{name} gexw-guest {sym}\n')
+                    continue
+                owners = defs or owners
                 if mod in owners:
                     continue  # its own: already resolved inside it
                 # (its own C runtime first, which its import list does not
@@ -508,6 +533,14 @@ def link(dlls, out, gexrt, others=None):
                 if bind_guest(f, mod, imports, name, pick):
                     continue
                 f.write(f'{name} {pick}\n')
+            for name, cands in guest_forward.items():
+                have = sigs[mod].get((name, 'undefined'))
+                if not have or name in forward_owner:
+                    continue
+                via, gdll, gname = next((c for c in cands if c[0] in imports), cands[0])
+                sym = f'{gdll}.{gname}'
+                guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod)))
+                f.write(f'{name} gexw-guest {sym}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
         # The ICALL pass's stdcall annotations are for the compiler only;
@@ -643,6 +676,10 @@ def link(dlls, out, gexrt, others=None):
         return out
     shim = {'__indirect_function_table', '__memory_base', '__table_base', '__stack_pointer', '__table_base32', 'memory'}
     needs = set()
+    # (and the core's of them, which they export)
+    if SPLIT:
+        needs |= {n for n in syms(objs[''], '--undefined-only') - syms(objs[''], '--defined-only')
+                  if '!' in n and grp(n.split('!', 1)[0])}
     for g in objs:
         if g:
             # its own bounds of the entry-thunk pairs (gexrt's are the core's)
@@ -671,6 +708,8 @@ def link(dlls, out, gexrt, others=None):
             objs[g].append(obj)
             needs |= syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only') - shim
     provided = set()
+    # what each module defines, for the others' imports
+    elsewhere = {n for g in objs for n in syms(objs[g], '--defined-only')} if SPLIT else set()
     def emit(g, out, gexrt):
         rsp = os.path.join(tmp, f'exports{g}.rsp')
         with open(rsp, 'w') as f:
@@ -701,8 +740,9 @@ def link(dlls, out, gexrt, others=None):
         imported = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         missing = set(re.findall(r'func\[\d+\] sig=\d+ <[^>]*> <- env\.(\S+)', imported))
         callers = {}
-        # (a --split module's imports the core exports are no gaps)
-        missing -= provided
+        # (a --split module's imports the core exports are no gaps, nor what
+        # another module defines: bound when both are loaded)
+        missing -= provided | elsewhere
         for mod in sigs:
             if grp(mod) != g:
                 continue
@@ -798,7 +838,7 @@ def link(dlls, out, gexrt, others=None):
             payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
-        if g:
+        if g or SPLIT:
             name_imports(out)
         undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
@@ -813,7 +853,7 @@ def link(dlls, out, gexrt, others=None):
     if needs - provided:
         print(f'{out}: --split modules import what the core does not export (another --split module\'s, or nobody\'s): '
               + ' '.join(sorted(needs - provided)[:40]))
-    needs = set()
+    # each module exports what the others import of it
     for g in objs:
         if g:
             emit(g, os.path.join(os.path.dirname(out), g), None)

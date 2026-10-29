@@ -520,6 +520,40 @@ fn install_shared(
     Ok(n)
 }
 
+/// A call from one of Wine's modules of their own into a function another
+/// one defines that was not installed when the caller was: through the
+/// slot `off` after the caller's own, filled in each store once both are
+/// instantiated there.
+pub(crate) struct Late {
+    importer: u32,
+    off: u32,
+    name: String,
+    provider: Option<u32>,
+}
+
+/// After `module`'s instantiation in a store (at table base `base`): the
+/// `Late` slots it is either side of whose other side this store has.
+pub(crate) fn fill_late(c: &mut wasmtime::StoreContextMut<'_, HostState>, table: wasmtime::Table, base: u32, module: u32) -> Result<()> {
+    let Some(sh) = c.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) else { return Ok(()) };
+    let todo: Vec<(u32, u32, u32, String, u32)> = {
+        let s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let mine: Vec<&Late> = s.wine_pe_late.iter().filter(|l| l.provider.is_some() && (l.importer == module || l.provider == Some(module))).collect();
+        if mine.is_empty() {
+            return Ok(());
+        }
+        let base_of = |m: u32| if m == module { Some(base) } else { s.ftab.map.installs().iter().find(|i| i.module == m).map(|i| i.base) };
+        mine.iter().filter_map(|l| Some((l.importer, l.off, l.provider?, l.name.clone(), base_of(l.importer)?))).collect()
+    };
+    for (importer, off, provider, name, ibase) in todo {
+        let dyl = |c: &wasmtime::StoreContextMut<'_, HostState>, m: u32| c.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.dyl.get(&m).copied());
+        let (Some(_), Some(p)) = (dyl(c, importer), dyl(c, provider)) else { continue };
+        if let Some(f) = p.get_func(&mut *c, &name) {
+            table.set(&mut *c, (ibase + off) as u64, wasmtime::Ref::Func(Some(f)))?;
+        }
+    }
+    Ok(())
+}
+
 /// The core module's file name: the module a skeleton of a DLL linked as
 /// a module of its own finds beside itself.
 const CORE_MODULE: &str = "winepe.wasm";
@@ -559,11 +593,42 @@ fn install_module(
     let mut len = pm.n_names;
     let mut extra_from = Vec::new();
     let mut imports = Vec::new();
+    let mut lates = Vec::new();
+    if core.is_none() {
+        // the core's calls into modules of their own (kernelbase's of
+        // user32's MessageBoxIndirectW): through slots filled when they load
+        for imp in module.imports() {
+            let (m, name) = (imp.module().to_string(), imp.name().to_string());
+            let b = if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
+                lates.push((len, name.clone(), None));
+                len += 1;
+                crate::dylink::NBind::LateOwn(len - 1)
+            } else if m == "GOT.func" {
+                lates.push((len, name.clone(), None));
+                len += 1;
+                crate::dylink::NBind::OwnSlot(len - 1)
+            } else {
+                crate::dylink::NBind::Shim
+            };
+            imports.push((m, name, b));
+        }
+    }
     if let Some(c) = &core {
         let core_mod = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.modules[c.module as usize].clone();
         let have: std::collections::HashSet<String> = core_mod.exports().map(|e| e.name().to_string()).collect();
         let funcs: std::collections::HashSet<String> =
             core_mod.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect();
+        // the functions the modules of their own installed so far export
+        let others: std::collections::HashMap<String, u32> = {
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.wine_pe_split
+                .iter()
+                .flat_map(|wp| {
+                    let m = &s.ftab.modules[wp.module as usize];
+                    m.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| (e.name().to_string(), wp.module)).collect::<Vec<_>>()
+                })
+                .collect()
+        };
         for imp in module.imports() {
             let (m, name) = (imp.module().to_string(), imp.name().to_string());
             let b = if m == "GOT.func" && funcs.contains(&name) {
@@ -573,7 +638,22 @@ fn install_module(
             } else if m == "env" && have.contains(&name) {
                 crate::dylink::NBind::Export { module: c.module, name: name.clone() }
             } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
-                crate::dylink::NBind::Missing(format!("{}: {name}: not in Wine's core module", file.display()))
+                // another module of its own's: bound to it if it is installed,
+                // else a call through a slot filled when it is (`fill_late`)
+                match others.get(&name) {
+                    Some(&p) => crate::dylink::NBind::Export { module: p, name: name.clone() },
+                    None => {
+                        lates.push((len, name.clone(), None));
+                        len += 1;
+                        crate::dylink::NBind::LateOwn(len - 1)
+                    }
+                }
+            } else if m == "GOT.func" {
+                // the address of another module of its own's function: a
+                // slot of its own filled with it (now, or when that loads)
+                lates.push((len, name.clone(), others.get(&name).copied()));
+                len += 1;
+                crate::dylink::NBind::OwnSlot(len - 1)
             } else {
                 crate::dylink::NBind::Shim
             };
@@ -585,6 +665,15 @@ fn install_module(
         let m = s.ftab.modules.len() as u32;
         let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), extra_from, tls: None };
         s.ftab.dylink.insert(m, Arc::new(binds));
+        // its calls into modules not yet installed; earlier modules' calls into it
+        s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider }));
+        if core.is_some() {
+            let mine: std::collections::HashSet<String> =
+                module.exports().filter(|e| matches!(e.ty(), wasmtime::ExternType::Func(_))).map(|e| e.name().to_string()).collect();
+            for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && mine.contains(&l.name)) {
+                l.provider = Some(m);
+            }
+        }
         m
     };
     let install = crate::ftab::publish_stateful(shared, memory, module, len, &[], crate::libprov::Extras { memory_base: data })?;
