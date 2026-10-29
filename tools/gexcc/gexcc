@@ -936,6 +936,7 @@ def finish_shared(wasm, sos, lib):
         if run([opt, wasm, '-g', '--strip-dwarf'] + feats + (['--enable-gc'] if lenient else [])
                + ['--translate-to-exnref', '-o', wasm]):
             die('wasm-opt failed')
+        split_relocs(wasm)
         if lib:
             # its summary: nothing in it reaches fork
             txt = os.path.join(tmp, 'forkreach.txt')
@@ -980,12 +981,21 @@ def finish_shared(wasm, sos, lib):
     passes += ['--translate-to-exnref']
     if run([opt, wasm, '-g', '--strip-dwarf'] + feats + (['--enable-gc'] if lenient else []) + passes + ['-o', wasm]):
         die('wasm-opt failed')
+    split_relocs(wasm)
     if lib:
         txt = os.path.join(tmp, 'forkreach.txt')
         names = open(summ).read().split() if os.path.exists(summ) else []
         open(txt, 'w').write('gex.forkreach 1\n' + ''.join(n + '\n' for n in names))
         if run([DYLINK, 'section', wasm, 'gex.forkreach', txt, wasm]):
             die('gex-dylink section failed')
+
+
+def split_relocs(wasm):
+    """wasm-ld's data relocation function in pieces when it is too large
+    for an engine to compile (gex-dylink split-relocs); after wasm-opt,
+    whose inliner would join them again."""
+    if run([DYLINK, 'split-relocs', wasm, wasm]):
+        die('gex-dylink split-relocs failed')
 
 
 def no_fork_point(wasm):

@@ -1010,6 +1010,219 @@ pub fn lenient_calls(wasm: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A data relocation function's body past this many bytes is split: V8 and
+/// wasmparser refuse a function body past 7654321 bytes, and one large body
+/// is compiled by one thread.
+const SPLIT_ABOVE: usize = 1 << 20;
+/// The size of each piece it is split into.
+const SPLIT_PIECE: usize = 256 << 10;
+
+/// The relocation functions wasm-ld writes (`__wasm_apply_data_relocs`,
+/// `__wasm_apply_global_relocs`), when one is past [`SPLIT_ABOVE`] bytes,
+/// as calls to pieces appended as new functions of the same type. A large
+/// program's data relocations grow past what an engine compiles (Chromium's
+/// is 8 MB). Their bodies are independent stores of constants and globals'
+/// sums; a body with anything else is left whole. `None`: nothing to split.
+pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
+    use wasmparser::{Operator as O, Payload as P};
+    let names = ["__wasm_apply_data_relocs", "__wasm_apply_global_relocs"];
+    let mut nimp = 0u32;
+    let mut functypes: Vec<u32> = Vec::new();
+    let mut nparams: Vec<(usize, usize)> = Vec::new();
+    let mut targets: HashMap<u32, String> = HashMap::new();
+    // per function to split: its pieces' byte ranges in `wasm`, and its locals' bytes
+    let mut pieces: HashMap<u32, (Vec<std::ops::Range<usize>>, std::ops::Range<usize>)> = HashMap::new();
+    let mut fi = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            P::TypeSection(r) => {
+                for t in r.into_iter_err_on_gc_types() {
+                    let t = t?;
+                    nparams.push((t.params().len(), t.results().len()));
+                }
+            }
+            P::ImportSection(r) => {
+                for i in r {
+                    if matches!(i?.ty, wasmparser::TypeRef::Func(_)) {
+                        nimp += 1;
+                    }
+                }
+            }
+            P::FunctionSection(r) => {
+                for t in r {
+                    functypes.push(t?);
+                }
+            }
+            P::ExportSection(r) => {
+                for e in r {
+                    let e = e?;
+                    if e.kind == wasmparser::ExternalKind::Func && names.contains(&e.name) {
+                        targets.insert(e.index, e.name.to_string());
+                    }
+                }
+            }
+            P::CodeSectionEntry(body) => {
+                let idx = nimp + fi;
+                fi += 1;
+                let range = body.range();
+                if !targets.contains_key(&idx) || range.len() <= SPLIT_ABOVE {
+                    continue;
+                }
+                let ty = functypes[(idx - nimp) as usize] as usize;
+                if nparams.get(ty) != Some(&(0, 0)) {
+                    continue;
+                }
+                let locals = body.get_locals_reader()?;
+                let code_at = locals.original_position();
+                let mut ops = body.get_operators_reader()?;
+                let mut depth = 0i32;
+                let mut cuts = vec![ops.original_position()];
+                let mut ok = true;
+                while !ops.eof() {
+                    let at = ops.original_position();
+                    if depth == 0 && at - cuts[cuts.len() - 1] >= SPLIT_PIECE {
+                        cuts.push(at);
+                    }
+                    depth += match ops.read()? {
+                        O::I32Const { .. } | O::I64Const { .. } | O::GlobalGet { .. } => 1,
+                        O::I32Add | O::I64Add => -1,
+                        O::I32Store { .. } | O::I64Store { .. } => -2,
+                        O::End if ops.eof() => {
+                            cuts.push(at);
+                            0
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                }
+                if ok && depth == 0 {
+                    let rs = cuts.windows(2).map(|w| w[0]..w[1]).collect();
+                    pieces.insert(idx, (rs, range.start..code_at));
+                }
+            }
+            _ => {}
+        }
+    }
+    if pieces.is_empty() {
+        return Ok(None);
+    }
+    // the pieces, numbered after every function, in function order
+    let mut order: Vec<u32> = pieces.keys().copied().collect();
+    order.sort();
+    let mut next = nimp + functypes.len() as u32;
+    let mut first: HashMap<u32, u32> = HashMap::new();
+    for i in &order {
+        first.insert(*i, next);
+        next += pieces[i].0.len() as u32;
+    }
+    let added = next - nimp - functypes.len() as u32;
+    let section = |out: &mut Vec<u8>, id: u8, body: &[u8]| {
+        out.push(id);
+        leb(out, body.len() as u32);
+        out.extend_from_slice(body);
+    };
+    let mut out = wasm[..8].to_vec();
+    let mut code = Vec::new();
+    let mut fi = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let payload = payload?;
+        match &payload {
+            P::FunctionSection(_) => {
+                let mut b = Vec::new();
+                leb(&mut b, functypes.len() as u32 + added);
+                for t in &functypes {
+                    leb(&mut b, *t);
+                }
+                for i in &order {
+                    for _ in &pieces[i].0 {
+                        leb(&mut b, functypes[(i - nimp) as usize]);
+                    }
+                }
+                section(&mut out, 3, &b);
+            }
+            P::CodeSectionStart { .. } => {}
+            P::CodeSectionEntry(body) => {
+                let idx = nimp + fi;
+                fi += 1;
+                let mut f = Vec::new();
+                if let Some((rs, _)) = pieces.get(&idx) {
+                    f.push(0);
+                    for k in 0..rs.len() as u32 {
+                        f.push(0x10);
+                        leb(&mut f, first[&idx] + k);
+                    }
+                    f.push(0x0b);
+                } else {
+                    f.extend_from_slice(&wasm[body.range()]);
+                }
+                leb(&mut code, f.len() as u32);
+                code.extend_from_slice(&f);
+                if fi as usize == functypes.len() {
+                    let mut b = Vec::new();
+                    leb(&mut b, functypes.len() as u32 + added);
+                    b.extend_from_slice(&code);
+                    for i in &order {
+                        let (rs, locals) = &pieces[i];
+                        for r in rs {
+                            let mut f = wasm[locals.clone()].to_vec();
+                            f.extend_from_slice(&wasm[r.clone()]);
+                            f.push(0x0b);
+                            leb(&mut b, f.len() as u32);
+                            b.extend_from_slice(&f);
+                        }
+                    }
+                    section(&mut out, 10, &b);
+                }
+            }
+            P::CustomSection(c) if c.name() == "name" => {
+                let mut b = Vec::new();
+                leb(&mut b, 4);
+                b.extend_from_slice(b"name");
+                let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+                while !r.eof() {
+                    let id = r.read_u8()?;
+                    let len = r.read_var_u32()? as usize;
+                    let sub = r.read_bytes(len)?;
+                    if id != 1 {
+                        b.push(id);
+                        leb(&mut b, len as u32);
+                        b.extend_from_slice(sub);
+                        continue;
+                    }
+                    let mut sr = wasmparser::BinaryReader::new(sub, 0);
+                    let n = sr.read_var_u32()?;
+                    let mut s = Vec::new();
+                    leb(&mut s, n + added);
+                    s.extend_from_slice(&sub[sr.current_position()..]);
+                    for i in &order {
+                        for k in 0..pieces[i].0.len() as u32 {
+                            let nm = format!("{}.{k}", targets[i]);
+                            leb(&mut s, first[i] + k);
+                            leb(&mut s, nm.len() as u32);
+                            s.extend_from_slice(nm.as_bytes());
+                        }
+                    }
+                    b.push(1);
+                    leb(&mut b, s.len() as u32);
+                    b.extend_from_slice(&s);
+                }
+                section(&mut out, 0, &b);
+            }
+            _ => {
+                if let Some((id, range)) = payload.as_section() {
+                    section(&mut out, id, &wasm[range]);
+                }
+            }
+        }
+    }
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&out)
+        .context("split relocations: the rewritten module does not validate")?;
+    Ok(Some(out))
+}
+
 /// Add (or replace) a custom section at the end of a module.
 pub fn set_custom_section(wasm: &[u8], name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = wasm[..8].to_vec();
