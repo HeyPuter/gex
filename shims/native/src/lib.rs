@@ -438,10 +438,11 @@ struct Jit {
     ftab: Option<ftab::Store>,
 }
 
-/// How long `JitShared::registry` is (stored after every push, under its
-/// lock): `catch_up_in_caller`'s check without the lock. A hint only: one
-/// process's in a forked child may be longer than the child's registry,
-/// which costs that check its lock, as before.
+/// At least as long as every process's `JitShared::registry` (raised after
+/// every push, under its lock): `catch_up_in_caller`'s check without the
+/// lock. One host runs several processes, each with its own registry, so it
+/// only ever rises: a store behind its own registry must never read it as
+/// short. A longer registry elsewhere costs that check its lock.
 static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One runtime-translated module, kept so another thread's store can
@@ -5482,7 +5483,7 @@ fn publish_unit(
         }
     }
     sh.registry.push(Arc::clone(&unit));
-    crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
+    crate::REGISTRY_LEN.fetch_max(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
     sh.calls += 1;
     Ok(unit)
