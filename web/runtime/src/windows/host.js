@@ -5,6 +5,7 @@
 // into their own canvases, input taken from each.
 
 import { INTERNAL, internals } from '../internal.js';
+import { xOnDemand } from './x11.js';
 
 const KINDS = { 1: 'toplevel', 2: 'popup', 3: 'subsurface' };
 /** `DomDesktop.STATE_*`. */
@@ -174,15 +175,7 @@ export class HostWindows extends EventTarget {
     i.attach('windows', this, { beforeBoot: true });
     this.#i = i;
     this.#size = this.#fit(width, height, scale);
-    // X11 programs: the runtime's X server, started for the first of them on
-    // display :0, which the runtime's Worker holds until then.
-    i.afterBoot(async (sys) => {
-      if (!sys.startX) return;
-      const ids = await i.io().call('holdX');
-      i.on('x-wanted', () => {
-        sys.startX(ids).catch((e) => i.say(`gex: the X server would not start: ${e?.message ?? e}\n`));
-      });
-    });
+    xOnDemand(i);
     i.beforeBoot((opts) => {
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts

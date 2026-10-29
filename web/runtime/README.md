@@ -133,6 +133,25 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `appId` | `null` for now. |
 | Events | `title`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
 
+### SingleCanvas (`@gex/runtime/windows/single`)
+
+`new SingleCanvas(sys, { container })`: the windows drawn straight into one
+positioned element, unframed, the first at its corner, popups over their
+parents, a window its client places (Wine's) where it says. The element's size
+is the output's; call `resized()` after changing it. For a page that is one
+program (a game, a Win32 program that draws its own frames). `env`,
+`describe()` and a `change` event as windows come and go.
+
+### CompositorWindows (`@gex/runtime/windows/compositor`)
+
+`new CompositorWindows(sys, { canvas, scale })`: the whole desktop in one
+canvas, drawn by gex's scene compositor on WebGPU in a Worker: frames, title
+bars, stacking, the cursor. `env`, `resize(width, height)` (device pixels),
+`describe()`.
+
+`process.windows()` is for HostWindows; the other two keep their windows to
+themselves.
+
 ## Building
 
 `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, and

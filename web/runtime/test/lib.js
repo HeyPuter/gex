@@ -28,7 +28,7 @@ export function testDebug() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function until(fn, what, ms = 20000) {
   for (const t0 = performance.now(); performance.now() - t0 < ms;) {
-    const v = fn();
+    const v = await fn();
     if (v) return v;
     await sleep(25);
   }
