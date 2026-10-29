@@ -296,6 +296,12 @@ impl<'a> Lifter<'a> {
                 let m = self.k32(0xff);
                 self.b.bin(BinOp::And, Ty::I32, v, m)
             }
+            // %cs names the block's mode (`ctx::CS` is always it); the data
+            // selectors read 0.
+            Reg::Seg(Seg::Cs) => {
+                let cs = if self.wa() == Width::D { gex_abi::ctx::CS_COMPAT } else { gex_abi::ctx::CS_LONG };
+                self.k32(cs)
+            }
             Reg::Seg(_) => self.k32(0),
             // Vector and x87 registers are read by their own paths.
             Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => self.k64(0),
@@ -861,6 +867,7 @@ impl<'a> Lifter<'a> {
             Op::Push => {
                 let v = match i.op0() {
                     Operand::Imm(imm) => self.k(ty, (imm as u64) & w.mask()),
+                    Operand::Reg(Reg::Seg(Seg::Cs)) => self.cur_cs(w),
                     Operand::Reg(Reg::Seg(_)) => self.k(ty, 0),
                     o => self.rd(o, w),
                 };

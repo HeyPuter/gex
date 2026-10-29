@@ -4063,6 +4063,9 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
 /// A far transfer to a selector that is no code segment: #GP, which the
 /// guest sees as an access violation (Wine's hook) or SIGSEGV.
 fn far_fault(caller: &mut Caller<'_, HostState>, sel: u16, pc: u64) -> Result<()> {
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        eprintln!("gex: far transfer to selector {sel:#x} in block {pc:#x}: #GP");
+    }
     gp_fault(caller, pc, format!("a far transfer to selector {sel:#x}, which is no code segment"))
 }
 
@@ -6260,6 +6263,20 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     let Some(hook) = fault_hook_of(caller.data()) else { return Ok(false) };
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
+    // GEX_TRACE_GUEST_FAULT: each fault the hook is given, with the
+    // thread's mode and stack, and the wasm frames that raised it.
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        let gm = GuestMem::new(memory.bytes());
+        let cs = gm.read_u32(ctx_addr + ctx::CS as u64).unwrap_or(0);
+        let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+        let src = gm.read_u64(ctx_addr + ctx::LAST_SOURCE as u64).unwrap_or(0);
+        let last = gm.read_u64(ctx_addr + ctx::LAST_TARGET as u64).unwrap_or(0);
+        eprintln!("gex: guest fault {code:#x} at {pc:#x} (address {addr:#x}, kind {kind}), cs {cs:#x}, sp {sp:#x}, last target {last:#x} from block {src:#x}");
+        let bt = wasmtime::WasmBacktrace::force_capture(&*caller);
+        for fr in bt.frames().iter().take(12) {
+            eprintln!("gex:   {}", fr.func_name().unwrap_or("?"));
+        }
+    }
     {
         let mut gm = GuestMem::new(memory.bytes());
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
