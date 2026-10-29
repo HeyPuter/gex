@@ -90,9 +90,10 @@ desk.addEventListener('drop', (e) => {
 ```
 
 `drop` copies the tree, with its folders, into a guest directory (`dir`,
-or a new `/tmp/drops/N`). A name the drop has twice is numbered too. The copy runs in a Worker, so the
-page does not stop while it runs. `data` is a DataTransfer, its `items`, a
-FileList or an array of Files.
+or a new `/tmp/drops/N`). A name the drop has twice gets ` (2)`, ` (3)`,
+and so on. The copy runs in a Worker, so the page does not stop while it
+runs. `data` is a DataTransfer, its `items`, a FileList or an array of
+Files.
 
 | Option | What |
 | --- | --- |
