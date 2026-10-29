@@ -134,6 +134,16 @@ async function copy(m) {
     }
     return `${names.get(head)}${i < 0 ? '' : path.slice(i)}`;
   };
+  // A top-level name something else made after `freeName` looked: the
+  // entry takes the next free one, once.
+  const replace = (path) => {
+    if (path.includes('/')) return null;
+    const n = freeName(top, path, taken);
+    taken.add(n);
+    names.set(path, n);
+    placed[placed.length - 1] = n;
+    return `${top}/${n}`;
+  };
   // What this drop made, to take back if it does not finish.
   const made = [];
   let done = 0;
@@ -152,15 +162,24 @@ async function copy(m) {
     progress('', true);
     for (const e of m.entries) {
       check();
-      const path = `${top}/${place(e.path)}`;
+      let path = `${top}/${place(e.path)}`;
       if (!e.file) {
-        const r = mkdir(path);
+        let r = mkdir(path);
+        if (r === -EEXIST) {
+          const again = replace(e.path);
+          if (again) r = mkdir((path = again));
+        }
         if (r < 0 && r !== -EEXIST) throw new Error(`mkdir ${path}: errno ${-r}`);
         if (r === 0) made.push([path, true]);
         continue;
       }
       // O_EXCL: never a file that is there already (see `place`).
-      const h = k.k_fs_open(BigInt(PATH_AT), putPath(path), BigInt(O_WRONLY | O_CREAT | O_EXCL), 0o644);
+      const open = (p) => k.k_fs_open(BigInt(PATH_AT), putPath(p), BigInt(O_WRONLY | O_CREAT | O_EXCL), 0o644);
+      let h = open(path);
+      if (h === -EEXIST) {
+        const again = replace(e.path);
+        if (again) h = open((path = again));
+      }
       if (h < 0) throw new Error(`open ${path}: errno ${-h}`);
       made.push([path, false]);
       let off = 0;

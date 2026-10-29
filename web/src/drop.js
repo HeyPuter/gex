@@ -141,7 +141,7 @@ export class Dropper {
     this.#sys = sys;
   }
 
-  #start(signal) {
+  async #start(signal) {
     this.#ready ??= (async () => {
       const host = this.#sys.host;
       let stackTop;
@@ -176,10 +176,17 @@ export class Dropper {
     this.#ready.catch(() => { this.#ready = null; });
     if (!signal) return this.#ready;
     // An abort while it waits ends this drop's wait, not the start.
-    return Promise.race([this.#ready, new Promise((_, no) => {
-      if (signal.aborted) no(signal.reason);
-      signal.addEventListener('abort', () => no(signal.reason), { once: true });
-    })]);
+    let stop;
+    const aborted = new Promise((_, no) => {
+      stop = () => no(signal.reason);
+      if (signal.aborted) stop();
+      signal.addEventListener('abort', stop, { once: true });
+    });
+    try {
+      return await Promise.race([this.#ready, aborted]);
+    } finally {
+      signal.removeEventListener('abort', stop);
+    }
   }
 
   /** Send `m` to the Worker; resolves with its answer. */
