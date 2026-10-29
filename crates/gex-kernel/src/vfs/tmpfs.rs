@@ -513,6 +513,20 @@ struct Inner {
 }
 
 impl Inner {
+    /// Whether a name can be made at `path`: the directory it would be in
+    /// is there (ENOENT) and is a directory (ENOTDIR), as on Linux. A
+    /// `mkdir -p` (Qt's `mkpath`) tries the whole path first and makes the
+    /// parents only on ENOENT: made without them, the parent was missing
+    /// from every listing and every walk up (`realpath`, `..`).
+    fn parent_ok(&self, path: &str) -> Result<(), Errno> {
+        let parent = path.rfind('/').map_or("", |i| &path[..i]);
+        match self.nodes.get(parent) {
+            Some(Node::Dir) => Ok(()),
+            Some(_) => Err(Errno::ENOTDIR),
+            None => Err(Errno::ENOENT),
+        }
+    }
+
     /// `chmod` on `path`: its mode kept only where it is not the default.
     fn chmod(&mut self, path: &str, mode: u32) -> Result<(), Errno> {
         let default = match self.nodes.get(path) {
@@ -1699,6 +1713,7 @@ impl FileSystem for TmpFs {
         if inner.nodes.contains_key(path) {
             return Err(Errno::EEXIST);
         }
+        inner.parent_ok(path)?;
         let mode = mode & 0o7777;
         if mode != Metadata::dir().mode {
             inner.modes.insert(path.to_string(), mode);
@@ -1772,6 +1787,7 @@ impl FileSystem for TmpFs {
         if inner.nodes.contains_key(to) {
             return Err(Errno::EEXIST);
         }
+        inner.parent_ok(to)?;
         let ino = inner.inos.get(from).copied().unwrap_or(1);
         // Two names for one inode, so one mode: `/usr/bin/perl` is a hard
         // link and has to be as executable as `perl5.36.0` is.
@@ -1797,6 +1813,7 @@ impl FileSystem for TmpFs {
         if inner.nodes.contains_key(path) {
             return Err(Errno::EADDRINUSE);
         }
+        inner.parent_ok(path)?;
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
@@ -1810,6 +1827,7 @@ impl FileSystem for TmpFs {
         if inner.nodes.contains_key(path) {
             return Err(Errno::EEXIST);
         }
+        inner.parent_ok(path)?;
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
@@ -1860,6 +1878,30 @@ mod tests {
         let again = fs.open("f", O_RDWR | O_TRUNC, 0o644).unwrap();
         assert!(again.changes() > c2, "O_TRUNC is a change, seen through every handle");
         assert_eq!(h.changes(), again.changes());
+    }
+
+    /// A name is made only in a directory that is there: `mkdir`, `symlink`,
+    /// `link` and a socket's bind say ENOENT for a missing parent and
+    /// ENOTDIR for a parent that is a file, so a `mkdir -p` that tries the
+    /// whole path first makes the parents (and a listing of each shows the
+    /// next). Seeding's `add_dir` makes them itself.
+    #[test]
+    fn a_name_needs_its_parent_directory() {
+        let fs = TmpFs::new();
+        fs.add_file("root/.config/kwinrc", b"x".to_vec());
+        assert_eq!(FileSystem::mkdir(&fs, "root/.local/state", 0o755), Err(Errno::ENOENT));
+        assert_eq!(FileSystem::mkdir(&fs, "root/.config/kwinrc/x", 0o755), Err(Errno::ENOTDIR));
+        assert_eq!(fs.symlink("t", "root/.local/l"), Err(Errno::ENOENT));
+        assert_eq!(fs.link("root/.config/kwinrc", "root/.local/h"), Err(Errno::ENOENT));
+        assert_eq!(fs.mksocket("root/.local/s"), Err(Errno::ENOENT));
+        // what `mkpath` does after the ENOENT
+        FileSystem::mkdir(&fs, "root/.local", 0o700).unwrap();
+        FileSystem::mkdir(&fs, "root/.local/state", 0o700).unwrap();
+        let names = |d: &str| fs.open(d, 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).filter(|n| n != "." && n != "..").collect::<Vec<_>>();
+        assert!(names("root").contains(&".local".to_string()));
+        assert_eq!(names("root/.local"), vec!["state".to_string()]);
+        fs.add_dir("/srv/a/b");
+        assert_eq!(names("srv/a"), vec!["b".to_string()]);
     }
 
     #[test]

@@ -365,6 +365,7 @@ extern "C" {
     fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_add_dir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
     fn k_fs_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
@@ -6204,7 +6205,7 @@ pub extern "C" fn gex_add_dir(path: u32, path_len: u32) {
     // SAFETY: as `gex_add_file` -- scalars, no borrow held.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            unsafe { k_fs_mkdir(gex_kernel::PAddr::from(path), path_len, 0o755) };
+            unsafe { k_fs_add_dir(gex_kernel::PAddr::from(path), path_len, 0o755) };
         }
         return;
     }
