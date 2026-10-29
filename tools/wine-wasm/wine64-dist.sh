@@ -100,9 +100,19 @@ TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
 # WINE64_WOW64=1: WoW64, 32-bit programs in the 64-bit process: the PE side
 # built for i386 too (lib/wine/i386-windows from this commit, whose
 # __wine_unix_call codes are this Unix side's) and a wow64 prefix
-# (syswow64). P gets -wow64; the default build is unchanged.
-WOW=${WINE64_WOW64:-0}; ARCHS=x86_64
-WS=; if [ "$WOW" != 0 ]; then P=$P-wow64; ARCHS=i386,x86_64; WS=-wow64; fi
+# (syswow64). P gets -wow64-F (F: the i386 CFLAGS below); the default
+# build is unchanged.
+# The i386 side's CFLAGS: -mpreferred-stack-boundary=2 (configure's, with
+# -msse2) makes MinGW GCC 12 fail on a 64-bit integer to float conversion
+# (an internal compiler error in oleaut32's VarR4FromUI8), so the stack is
+# kept 16-byte aligned and only an incoming 4-byte alignment assumed, which
+# is all the i386 ABI promises a callee.
+WOW=${WINE64_WOW64:-0}; ARCHS=x86_64; CF32=()
+WS=; if [ "$WOW" != 0 ]; then
+	CF32=(i386_CFLAGS="-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2")
+	WS=-wow64-$(echo "${CF32[*]}" | sha256sum | cut -c1-6); P=$P$WS; ARCHS=i386,x86_64
+	S=$S-wow64  # the Unix side registers its libraries' WoW64 tables (link-wine64.sh)
+fi
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -148,7 +158,7 @@ pe_build() {
 		flock 9
 		[ "${WINE64_PE_FRESH:-0}" = 1 ] && rm -rf "$WK"
 		mkdir -p "$WK"; cd "$WK"
-		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without
+		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
 		nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
 		rm -rf install; nice -n 10 make install prefix="$WK/install"
 		cp -a --reflink=auto install "$out/install"
@@ -212,7 +222,7 @@ b64_build() {
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
 		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
 	mkdir -p out
-	WINE64_MEM64=$M64 WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
+	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 

@@ -216,5 +216,20 @@ if [ -n "$M64" ]; then
 	"$HERE/wcc64" $M64 -O2 -c -o gexwine64/dl64.o "$HERE/libgex/dl.c" || exit 1
 	objs="$objs gexwine64/dl64.o"
 fi
+# WINE64_WOW64=1: a WoW64 process's 32-bit DLLs call each library's
+# __wine_unix_call_wow64_funcs, which ntdll asks dlopen's registry for (as
+# for __wine_unix_call_funcs): registered for every library whose objects
+# define one.
+if [ "${WINE64_WOW64:-0}" != 0 ]; then
+	wow=$(llvm-nm --defined-only --extern-only $objs 2>/dev/null | awk '$3 ~ /__wine_unix_call_wow64_funcs$/ { print $3 }' | sort -u)
+	for r in $reg; do
+		case $r in
+		*:data:__wine_unix_call_funcs=*)
+			w=${r##*=}; w=${w%__wine_unix_call_funcs}__wine_unix_call_wow64_funcs
+			if grep -qx "$w" <<< "$wow"; then reg="$reg ${r%%:*}:data:__wine_unix_call_wow64_funcs=$w"
+			else echo "link-wine64: ${r%%:*} has no __wine_unix_call_wow64_funcs (no WoW64 calls)" >&2; fi ;;
+		esac
+	done
+fi
 python3 "$HERE/dlreg.py" $reg > gexwine64/reg.c
 "$HERE/wcc64" $M64 -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexwine64/reg.c $objs $libs
