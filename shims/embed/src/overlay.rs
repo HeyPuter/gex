@@ -68,16 +68,20 @@ pub fn exec_mapped(fd: i32, addr: u64, off: u64) {
     let Some(path) = PATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned()) else { return };
     let soname = path.rsplit('/').next().unwrap_or(&path).to_string();
     let provided = PROVIDERS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&soname));
-    if soname != "libc.so" && !provided {
-        // Where every other library's code went, for reading a fault's addresses against.
-        crate::host::log(&format!("gex-embed: {path}: code at {addr:#x} (file offset {off:#x})\n"));
-        return;
-    }
     let Ok(bytes) = crate::elf::read_file(&path) else { return };
     let Ok(e) = crate::elf::Elf::parse(&bytes) else { return };
-    // The segment this offset is the start of gives the load bias.
-    let Some(seg) = e.phdrs().into_iter().find(|p| p.kind == 1 && p.offset & !(crate::vm::PAGE - 1) == off) else { return };
+    // The executable segment this offset is the start of gives the load bias. (Only executable ones: a small library's
+    // code can share its first page of the file with the read-only segment before it.)
+    let Some(seg) = e.phdrs().into_iter().find(|p| p.kind == 1 && p.flags & 1 != 0 && p.offset & !(crate::vm::PAGE - 1) == off)
+    else {
+        return;
+    };
     let bias = addr - (seg.vaddr & !(crate::vm::PAGE - 1));
+    // Where the code went, for naming addresses (diag).
+    crate::diag::mapped(addr, bias + seg.vaddr + seg.memsz, &path, bias);
+    if soname != "libc.so" && !provided {
+        return;
+    }
     if provided {
         bind_provided(&soname, &e, bias);
     }

@@ -22,6 +22,7 @@
 mod alloc;
 mod call;
 mod cpu;
+mod diag;
 mod elf;
 mod host;
 mod imports;

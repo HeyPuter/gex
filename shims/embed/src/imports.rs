@@ -28,12 +28,8 @@ pub extern "C" fn dispatch_miss(_c: i32, pc: i64) -> i32 {
 }
 
 pub extern "C" fn illegal(c: i32, pc: i64, raw: i32) {
-    crate::host::fatal(&format!(
-        "illegal instruction {raw:#010x} at {:#x} (sp {:#x}, x30 {:#x})",
-        pc,
-        crate::cpu::x(c as u32, 31),
-        crate::cpu::x(c as u32, 30)
-    ));
+    crate::cpu::set_u64(c as u32, gex_abi::ctx::PC, pc as u64);
+    crate::host::fatal(&format!("illegal instruction {raw:#010x}\n{}", crate::diag::backtrace(c as u32)));
 }
 
 pub extern "C" fn breakpoint(c: i32, pc: i64, imm: i32) {
@@ -41,7 +37,10 @@ pub extern "C" fn breakpoint(c: i32, pc: i64, imm: i32) {
         gex_abi::imports::BRK_TRACE | gex_abi::imports::BRK_TRAP_PC => {
             crate::host::log(&format!("gex-embed: at {pc:#x} x0 {:#x} sp {:#x}\n", crate::cpu::x(c as u32, 0), crate::cpu::x(c as u32, 31)));
         }
-        _ => crate::host::fatal(&format!("brk #{imm} at {pc:#x}")),
+        _ => {
+            crate::cpu::set_u64(c as u32, gex_abi::ctx::PC, pc as u64);
+            crate::host::fatal(&format!("brk #{imm}\n{}", crate::diag::backtrace(c as u32)))
+        }
     }
 }
 

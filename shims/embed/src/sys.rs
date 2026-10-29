@@ -30,7 +30,7 @@ pub fn syscall(c: u32) {
         78 => readlinkat(&a),
         93 | 94 => exit(nr, a[0] as i32),
         96 => crate::thread::current().tid as i64,
-        129..=131 => kill(nr, &a),
+        129..=131 | 240 => kill(nr, &a),
         132 => sigaltstack(a[1]),
         134 => {
             // rt_sigaction: recorded nowhere; gex delivers no signals hosted.
@@ -120,16 +120,14 @@ fn exit(nr: i64, code: i32) -> i64 {
 }
 
 fn kill(nr: i64, a: &[u64; 6]) -> i64 {
-    let sig = if nr == 131 { a[2] } else { a[1] };
+    // kill(pid, sig), tkill(tid, sig), tgkill(tgid, tid, sig), rt_tgsigqueueinfo(tgid, tid, sig, info): bionic's
+    // abort() raises SIGABRT with the last.
+    let sig = if nr == 131 || nr == 240 { a[2] } else { a[1] };
     if sig == 0 {
         return 0;
     }
     let t = crate::thread::current();
-    crate::host::fatal(&format!(
-        "the guest raised signal {sig} (pc {:#x}, x30 {:#x})",
-        cpu::get_u64(t.ctx, ctx::PC),
-        cpu::x(t.ctx, 30)
-    ));
+    crate::host::fatal(&format!("the guest raised signal {sig}\n{}", crate::diag::backtrace(t.ctx)));
 }
 
 fn sigaltstack(old: u64) -> i64 {

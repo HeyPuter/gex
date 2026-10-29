@@ -163,7 +163,9 @@ pub fn miss(pc: u64) -> i32 {
         return DISPATCH_MISS_REDISPATCH;
     }
     let Some((lo, hi)) = range_of(exec, pc) else {
-        crate::host::fatal(&format!("a jump to {pc:#x}, which is not executable"));
+        drop(g);
+        let t = crate::thread::current();
+        crate::host::fatal(&format!("a jump to {pc:#x}, which is not executable\n{}", crate::diag::backtrace(t.ctx)));
     };
     // The mapping being translated, and nothing else: a slice of the host's memory from zero can't exist (it would
     // start at a null pointer, and be longer than isize::MAX).
