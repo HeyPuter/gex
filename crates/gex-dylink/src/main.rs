@@ -7,6 +7,9 @@
 //!   gex-dylink fpcast-post IN OUT       export gets a thunk, exported after
 //!   gex-dylink lenient-calls IN OUT     indirect calls with trailing arguments
 //!                                       cut as C makes them (lenient_calls)
+//!   gex-dylink split-relocs IN OUT      a relocation function too large for
+//!                                       an engine as calls to pieces
+//!                                       (split_relocs); OUT unchanged IN if none
 //!   gex-dylink info FILE                print dylink.0, NEEDED and the table plan
 use gex_dylink::*;
 
@@ -26,6 +29,10 @@ fn main() -> Result<()> {
         }
         Some("lenient-calls") if a.len() == 4 => {
             std::fs::write(&a[3], lenient_calls(&read(&a[2])?)?)?;
+        }
+        Some("split-relocs") if a.len() == 4 => {
+            let w = read(&a[2])?;
+            std::fs::write(&a[3], split_relocs(&w)?.unwrap_or(w))?;
         }
         Some("section") if a.len() == 6 => {
             let out = set_custom_section(&read(&a[2])?, &a[3], &read(&a[4])?)?;
@@ -65,7 +72,7 @@ fn main() -> Result<()> {
                 println!("forkreach: {} exports may fork", f.may_fork.len());
             }
         }
-        _ => bail!("usage: gex-dylink selfbind IN OUT | lenient-calls IN OUT | section IN NAME DATA OUT | info FILE"),
+        _ => bail!("usage: gex-dylink selfbind IN OUT | lenient-calls IN OUT | split-relocs IN OUT | section IN NAME DATA OUT | info FILE"),
     }
     Ok(())
 }
