@@ -2,9 +2,13 @@
 # M-embed: gex-embed linked into an emscripten program with android-wasm's flags (its loader/IkvmWasm.csproj and the
 # runtime pack's emcc-default.rsp / emcc-link.rsp), with test/guest.s as the guest. Build gex-embed first (../build.sh).
 # EMSDK names android-wasm's statics/emsdk. Run: node out/embedtest.js [high]
+#
+# And, when GUEST names a guest system image (android-wasm's native/guest/build.sh: out/guest/system), bionictest:
+# linker64 booted, libm and libc called. Run: node out/bionictest.js [trace]
 set -e
 cd "$(dirname "$0")"
 EMSDK=${EMSDK:-$(cd ../../../../android-wasm/statics/emsdk && pwd)}
+GUEST=${GUEST:-../../../../android-wasm/out/guest/system}
 export EM_CONFIG="$EMSDK/emscripten/.emscripten"
 LIB=../../../target/embed/wasm32-unknown-unknown/release/libgex_embed.a
 mkdir -p out
@@ -22,9 +26,14 @@ with open(sys.argv[3], 'w') as h:
         if kind in 'Tt' and not name.startswith('$'):
             h.write('#define OFF_%s %du\n' % (name, int(addr, 16)))
 PY
-"$EMSDK/emscripten/emcc" -O3 -pthread -fwasm-exceptions -msimd128 -mnontrapping-fptoint \
-    -sWASMFS -sMAXIMUM_MEMORY=4294901760 -sMALLOC=dlmalloc -sSUPPORT_LONGJMP=wasm \
-    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sSTACK_SIZE=5MB -sWASM_BIGINT -Wno-pthreads-mem-growth \
-    -sPTHREAD_POOL_SIZE=4 -sPROXY_TO_PTHREAD -sEXIT_RUNTIME -sENVIRONMENT=node,worker \
-    -I../include -Iout --js-library ../js/gex_embed.js embedtest.c "$LIB" -o out/embedtest.js "$@"
+FLAGS="-O3 -pthread -fwasm-exceptions -msimd128 -mnontrapping-fptoint
+    -sWASMFS -sMAXIMUM_MEMORY=4294901760 -sMALLOC=dlmalloc -sSUPPORT_LONGJMP=wasm
+    -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sSTACK_SIZE=5MB -sWASM_BIGINT -Wno-pthreads-mem-growth
+    -sPTHREAD_POOL_SIZE=4 -sPROXY_TO_PTHREAD -sEXIT_RUNTIME -sENVIRONMENT=node,worker
+    -I../include -Iout --js-library ../js/gex_embed.js ../c/gex_embed_sys.c"
+"$EMSDK/emscripten/emcc" $FLAGS embedtest.c "$LIB" -o out/embedtest.js "$@"
 echo "embedtest: out/embedtest.wasm ($(stat -c%s out/embedtest.wasm) bytes)"
+if [ -d "$GUEST" ]; then
+    "$EMSDK/emscripten/emcc" $FLAGS --embed-file "$GUEST@/system" bionictest.c "$LIB" -o out/bionictest.js "$@"
+    echo "bionictest: out/bionictest.wasm ($(stat -c%s out/bionictest.wasm) bytes)"
+fi

@@ -74,6 +74,9 @@ var LibraryGexEmbed = {
       if (e instanceof WebAssembly.RuntimeError) {
         const q = (off) => '0x' + (BigInt(HEAPU32[(ctx + off) >> 2]) | (BigInt(HEAPU32[(ctx + off + 4) >> 2]) << 32n)).toString(16);
         err(`gex-embed: ${e.message} in guest code: pc ${q(256)} last target ${q(352)} x30 ${q(240)} sp ${q(248)}`);
+        let regs = '';
+        for (let i = 0; i < 30; i++) regs += ` x${i}=${q(i * 8)}`;
+        err(`gex-embed:${regs}`);
       }
       throw e;
     }

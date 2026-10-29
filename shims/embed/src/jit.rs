@@ -85,6 +85,35 @@ pub fn map_exec(lo: u64, hi: u64) {
     })
 }
 
+/// `[lo, hi)` is no longer executable: drop it from the ranges, and retire what was translated there (its pages'
+/// directory entries go to zero, so every Worker's next branch there misses).
+pub fn unmap_exec(lo: u64, hi: u64) {
+    with(|j| {
+        let mut out = Vec::with_capacity(j.exec.len() + 1);
+        for &(a, b) in &j.exec {
+            if b <= lo || a >= hi {
+                out.push((a, b));
+                continue;
+            }
+            if a < lo {
+                out.push((a, lo));
+            }
+            if b > hi {
+                out.push((hi, b));
+            }
+        }
+        j.exec = out;
+        j.known.retain(|&a| a < lo || a >= hi);
+        j.intrinsics.retain(|&a, _| a < lo || a >= hi);
+        let dir = gex_abi::dispatch_dir();
+        for p in lo / gex_abi::DISPATCH_PAGE..hi.div_ceil(gex_abi::DISPATCH_PAGE) {
+            j.page_table.forget(p);
+            // SAFETY: the directory's entry for page `p`, in the hosted block.
+            unsafe { &*((dir + p * 4) as usize as *const AtomicU32) }.store(0, Ordering::Release);
+        }
+    })
+}
+
 /// Serve `pc` with `k` instead of translating what is there. Before anything reaches `pc`.
 pub fn add_intrinsic(pc: u64, k: Intrinsic) {
     with(|j| {

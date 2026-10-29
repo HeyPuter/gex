@@ -22,12 +22,15 @@
 mod alloc;
 mod call;
 mod cpu;
+mod elf;
 mod host;
 mod imports;
 mod jit;
 mod layout;
+mod overlay;
 mod sys;
 mod thread;
+mod vm;
 
 pub use call::Call;
 pub use imports::HostFn;
@@ -96,17 +99,71 @@ pub extern "C" fn gex_embed_map_exec(addr: u64, len: u64) {
     jit::map_exec(addr, addr + len);
 }
 
+/// A host function's id, for `Intrinsic::Replace`.
+fn host_fn(f: HostFn, user: u32) -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(id < layout::THUNKS, "out of host functions");
+    imports::set_host_fn(id, f, user);
+    id
+}
+
+/// Guest code reaching `pc` runs host function `f` instead, and returns to `x30`.
+pub(crate) fn bind(pc: u64, f: HostFn, user: u32) {
+    jit::add_intrinsic(pc, gex_xlate::Intrinsic::Replace(host_fn(f, user)));
+}
+
 /// A guest address that, called, runs host function `f` with `user`: `f` reads the AAPCS64 arguments from the
 /// context and writes its results there, and the guest carries on at `x30`.
 #[no_mangle]
 pub extern "C" fn gex_embed_thunk(f: HostFn, user: u32) -> u64 {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    assert!(id < layout::THUNKS, "out of host-function thunks");
-    imports::set_host_fn(id, f, user);
+    let id = host_fn(f, user);
     let pc = layout::thunk(id);
     jit::add_intrinsic(pc, gex_xlate::Intrinsic::Replace(id));
     pc
+}
+
+/// Start the guest on this thread: bionic's linker64 at `linker`, loading the program at `exe` (one whose only
+/// purpose is to have libc loaded). This thread is the guest's main thread after. 0, or -1 with the reason logged.
+#[no_mangle]
+pub extern "C" fn gex_embed_boot(linker: *const core::ffi::c_char, exe: *const core::ffi::c_char) -> i32 {
+    // SAFETY: the caller's strings.
+    let (l, e) = unsafe { (std::ffi::CStr::from_ptr(linker), std::ffi::CStr::from_ptr(exe)) };
+    match elf::boot(&l.to_string_lossy(), &e.to_string_lossy()) {
+        Ok(()) => 0,
+        Err(m) => {
+            host::log(&format!("gex-embed: boot: {m}\n"));
+            -1
+        }
+    }
+}
+
+fn loader() -> &'static elf::Loader {
+    elf::LOADER.get().expect("gex_embed_boot first")
+}
+
+/// The guest's `dlopen(path, flags)`, in the default namespace.
+#[no_mangle]
+pub extern "C" fn gex_embed_dlopen(path: *const core::ffi::c_char, flags: i32) -> u64 {
+    call::call_x(loader().dlopen, &[path as usize as u64, flags as u64, 0])
+}
+
+/// The guest's `dlsym(handle, name)`.
+#[no_mangle]
+pub extern "C" fn gex_embed_dlsym(handle: u64, name: *const core::ffi::c_char) -> u64 {
+    call::call_x(loader().dlsym, &[handle, name as usize as u64, 0])
+}
+
+/// The guest's `dlerror()`: a string in guest (so the host's) memory, or null.
+#[no_mangle]
+pub extern "C" fn gex_embed_dlerror() -> u32 {
+    call::call_x(loader().dlerror, &[]) as u32
+}
+
+/// Say every guest system call on stderr.
+#[no_mangle]
+pub extern "C" fn gex_embed_set_trace(on: i32) {
+    sys::TRACE.store(on != 0, Ordering::Relaxed);
 }
 
 /// Call the guest function at `pc` on this thread with `c`'s arguments; its results are left in `c`.

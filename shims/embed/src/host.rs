@@ -13,14 +13,9 @@ mod imp {
         pub fn abort() -> !;
         pub fn exit(code: i32) -> !;
         pub fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
-        pub fn pthread_self() -> usize;
         pub fn fma(a: f64, b: f64, c: f64) -> f64;
+        pub fn getentropy(p: *mut u8, n: usize) -> i32;
         pub fn fmaf(a: f32, b: f32, c: f32) -> f32;
-    }
-
-    /// A thread id for the guest: the pthread's, which is unique among live threads.
-    pub unsafe fn gettid() -> u32 {
-        pthread_self() as u32
     }
 
     /// One line on the host's stderr. Rust's own stderr is a no-op on `wasm32-unknown-unknown`, so without this a
@@ -43,6 +38,13 @@ mod imp {
             log(&format!("gex-embed: {info}\n"));
             unsafe { abort() }
         }));
+    }
+
+    /// Random bytes.
+    pub fn random(out: &mut [u8]) {
+        for c in out.chunks_mut(256) {
+            unsafe { getentropy(c.as_mut_ptr(), c.len()) };
+        }
     }
 
     /// The monotonic clock, in nanoseconds.
@@ -75,9 +77,7 @@ mod imp {
     pub fn now_ns() -> u64 {
         0
     }
-    pub unsafe fn gettid() -> u32 {
-        0
-    }
+    pub fn random(_: &mut [u8]) {}
     pub mod js {
         pub unsafe fn gexjs_sync(_: u32) -> u32 {
             unimplemented!("gex-embed runs translated code only as wasm")

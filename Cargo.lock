@@ -657,6 +657,7 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-emit",
+ "gex-ld",
  "gex-xlate",
 ]
 

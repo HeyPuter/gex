@@ -13,3 +13,4 @@ crate-type = ["staticlib", "rlib"]
 gex-abi.workspace = true
 gex-xlate.workspace = true
 gex-emit.workspace = true
+gex-ld.workspace = true
