@@ -826,6 +826,8 @@ fn cgen_splice(
             limits: opts.limits,
             ..Default::default()
         };
+        // The image's mode for everything below, recovery to emission.
+        let _mode = compat_scope(image.class32);
         let prog = match pe {
             Some(seeds) => func::recover_pe(image, seeds, &ropts),
             None => func::recover(image, None, &ropts),
@@ -870,6 +872,7 @@ fn fjit_splice(
         ..Default::default()
     };
     let started = std::time::Instant::now();
+    let _mode = compat_scope(image.class32);
     let prog = match pe {
         Some(seeds) => func::recover_pe(image, seeds, &ropts),
         None => func::recover(image, None, &ropts),
@@ -1194,6 +1197,8 @@ fn function_stubs(
         return Err(format!("none of the {} function entries is translatable", entries.len()));
     }
     blocks.sort_by_key(|b| b.start);
+    let mut page_table = page_table;
+    page_table.set_alt(other_mode());
     let mut builder = ModuleBuilder::with_pages(blocks[0].start, 0, Linkage::Shared, page_table, shared_memory);
     let mut out: Vec<(Block, u32)> = Vec::new();
     for block in blocks {
@@ -1277,6 +1282,9 @@ fn translate_seeded(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
+    // Code in the process's other mode: its own pages and directory.
+    let mut page_table = page_table;
+    page_table.set_alt(other_mode());
     let (mut blocks, mut stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
     );
@@ -1555,6 +1563,29 @@ pub fn compat_scope(compat: bool) -> CompatScope {
             gex_isa_x86::Mode::Long
         }),
     }
+}
+
+/// Whether the code this thread translates is in the mode the process's own
+/// class is not (a WoW64 process's 32-bit code): its pages are keyed
+/// `gex_abi::ALT_PAGE` and its modules read the other directory.
+pub fn other_mode() -> bool {
+    arch::compat() != default_compat()
+}
+
+/// The process default [`set_compat`] set, whatever this thread has open.
+pub fn default_compat() -> bool {
+    #[cfg(feature = "x86")]
+    {
+        gex_isa_x86::default_mode() == gex_isa_x86::Mode::Compat
+    }
+    #[cfg(not(feature = "x86"))]
+    false
+}
+
+/// The mode code under the thread's selector (`ctx::CS`) is translated in:
+/// a scope for one translation the thread's own code asked for.
+pub fn cs_scope(cs: u32) -> CompatScope {
+    compat_scope(gex_abi::ctx::cs_compat(cs, default_compat()))
 }
 
 pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {

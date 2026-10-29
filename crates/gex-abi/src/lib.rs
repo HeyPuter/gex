@@ -421,6 +421,28 @@ pub mod ctx {
     /// fact cannot read it back from there.
     pub const LAST_SYSCALL: usize = 45 * 8;
 
+    /// x86 only: the thread's code selector, a `u32`. 0 is the process's
+    /// own class (an x86-64 process's code is 64-bit, an i386 one's
+    /// 32-bit); a WoW64 process's threads switch with far transfers and
+    /// `iret` to [`CS_COMPAT`] (32-bit) and [`CS_LONG`] (64-bit), as
+    /// Windows' selectors name them. Code is translated in the mode it names.
+    pub const CS: usize = 47 * 8;
+    /// 32-bit user code (Windows' WoW64 selector; i386 Windows' 0x1b is
+    /// taken as the same).
+    pub const CS_COMPAT: u32 = 0x23;
+    /// 64-bit user code.
+    pub const CS_LONG: u32 = 0x33;
+
+    /// Whether code under selector `cs` is 32-bit, `default` being the
+    /// process's own class (`cs` 0).
+    pub const fn cs_compat(cs: u32, default: bool) -> bool {
+        match cs {
+            0 => default,
+            0x23 | 0x1b => true,
+            _ => false,
+        }
+    }
+
     /// `v0`–`v31`, the SIMD/FP register file, 16 bytes each. On x86-64 the
     /// first sixteen are `xmm0`–`xmm15`.
     pub const V: usize = 48 * 8;
@@ -591,6 +613,58 @@ pub const fn dispatch_entry_table(entry: u32) -> usize {
 #[inline]
 pub const fn dispatch_entry_base(entry: u32) -> u32 {
     entry & DISPATCH_SLOT_MASK
+}
+
+/// The bit a page number carries in a page key (gex-emit's `PageTable`,
+/// a module's directory entries) for code translated in the mode the
+/// process's own class is not: a WoW64 process's 32-bit code (or a 32-bit
+/// process's 64-bit code). Such a page's entry is in a directory of its
+/// own, allocated when the process first runs code in that mode and named
+/// by [`imports::ALT_DIR`], so the same address reached in both modes never
+/// shares a block, a slot or an entry.
+pub const ALT_PAGE: u64 = 1 << 40;
+
+/// The bit an address carries in a set of translated addresses for code in
+/// the process's other mode ([`ALT_PAGE`]'s, for addresses).
+pub const ALT_ADDR: u64 = 1 << 63;
+
+/// `pc` as such a set keys it.
+#[inline]
+pub const fn addr_key(pc: u64, alt: bool) -> u64 {
+    pc | if alt { ALT_ADDR } else { 0 }
+}
+
+/// Where a page key's directory entry is: in the process's directory, or
+/// in the other one at `alt_dir` (`None` while there is none).
+#[inline]
+pub fn dir_entry_addr(key: u64, alt_dir: u64) -> Option<u64> {
+    let (page, alt) = key_page(key);
+    if page >= dispatch_max_pages() {
+        return None;
+    }
+    match (alt, alt_dir) {
+        (false, _) => Some(dispatch_dir() + page * 4),
+        (true, 0) => None,
+        (true, d) => Some(d + page * 4),
+    }
+}
+
+/// Bytes of the other directory: as many pages as the process's own.
+#[inline]
+pub fn alt_dir_bytes() -> u64 {
+    dispatch_max_pages() * 4
+}
+
+/// The page key for `pc` in its mode (`alt`: the process's other one).
+#[inline]
+pub const fn page_key(pc: u64, alt: bool) -> u64 {
+    dispatch_page(pc) | if alt { ALT_PAGE } else { 0 }
+}
+
+/// A page key's page number and whether it is the other mode's.
+#[inline]
+pub const fn key_page(key: u64) -> (u64, bool) {
+    (key & !ALT_PAGE, key & ALT_PAGE != 0)
 }
 
 /// Directory index for a guest address.
@@ -844,6 +918,12 @@ pub mod imports {
     /// index to re-enter. With no translator this traps; with one it drives
     /// gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
+
+    /// An immutable `i32` global: the guest address of the process's other
+    /// directory ([`crate::ALT_PAGE`]). Imported only by a module of code
+    /// translated in the mode the process's own class is not (a WoW64
+    /// process's 32-bit code); every other module is as it was.
+    pub const ALT_DIR: &str = "alt_dir";
 
     /// The function tier calling code it does not hold. Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
     /// i32`: everything is written back and `ctx::PC = target`; the host runs

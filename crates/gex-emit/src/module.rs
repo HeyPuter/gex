@@ -110,6 +110,10 @@ pub struct PageTable {
     refill: Option<std::sync::Arc<Refill>>,
     /// Number pages by identity: see [`Identity`].
     identity: Option<std::sync::Arc<Identity>>,
+    /// A module built from this table is of code in the process's other
+    /// mode ([`gex_abi::ALT_PAGE`]): its pages are keyed with that bit and
+    /// its lookups read the other directory. Per clone, not shared.
+    alt: bool,
 }
 
 /// One base per page *identity*, system-wide.
@@ -183,6 +187,16 @@ impl Default for PageTable {
 }
 
 impl PageTable {
+    /// Build modules of code in the process's other mode from this clone
+    /// (see the field).
+    pub fn set_alt(&mut self, alt: bool) {
+        self.alt = alt;
+    }
+
+    pub fn alt(&self) -> bool {
+        self.alt
+    }
+
     /// Start allocating above the reserved miss span.
     pub fn new() -> PageTable {
         PageTable::from_entries(&[], MISS_SLOTS)
@@ -465,6 +479,7 @@ impl PageTable {
             ),
             refill: None,
             identity: None,
+            alt: false,
         };
         // The mark says where allocation carries on, so the table holding it
         // has to be long enough for the page it will hand out next.
@@ -625,6 +640,10 @@ pub struct ModuleBuilder {
     profile: Option<ProfileFns>,
     /// The imported global holding this module's dense base, if any.
     dense_global: Option<u32>,
+    /// The imported global naming the other directory
+    /// ([`gex_abi::imports::ALT_DIR`]), for a module of code in the
+    /// process's other mode.
+    alt_dir: Option<u32>,
 }
 
 /// The helpers a profiled module defines. See `crate::profile`.
@@ -799,8 +818,13 @@ impl ModuleBuilder {
         // process, and a module another process compiled is reused as it is
         // (`crate::dense::GLOBAL`). Not with profiling, whose module defines
         // a global of its own at index 0.
-        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
+        let alt = page_table.alt();
+        assert!(!alt || linkage == Linkage::Shared, "other-mode code is translated at run time only");
+        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling && !alt)
             .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
+        // Code in the process's other mode: its directory is given at
+        // instantiation, where the process allocated it.
+        let alt_dir = alt.then(|| m.import_global(IMPORT_MODULE, imports::ALT_DIR, ValType::I32));
 
         let entry_ty = if crate::dense::on() {
             m.func_type(FuncType::new(vec![p, ValType::I32], vec![]))
@@ -834,6 +858,7 @@ impl ModuleBuilder {
             demand_fill: false,
             profile: None,
             dense_global,
+            alt_dir,
         };
 
         if profiling {
@@ -896,7 +921,7 @@ impl ModuleBuilder {
 
     /// Allocate the table slots for a page, if it has none yet.
     fn page_base(&mut self, addr: u64) -> u32 {
-        let page = dispatch_page(addr);
+        let page = gex_abi::page_key(addr, self.alt_dir.is_some());
         let fresh = self.page_table.lookup(page).is_none();
         let base = self.page_table.base(page);
         if fresh {
@@ -972,9 +997,10 @@ impl ModuleBuilder {
             let mut page_bases: HashMap<u64, u32> = HashMap::new();
             for (b, _) in &self.pending {
                 let last = b.end.max(b.start + 1) - 1;
+                let alt = if self.alt_dir.is_some() { gex_abi::ALT_PAGE } else { 0 };
                 for page in dispatch_page(b.start)..=dispatch_page(last) {
-                    if let Some(e) = self.page_table.lookup(page) {
-                        page_bases.insert(page, e);
+                    if let Some(e) = self.page_table.lookup(page | alt) {
+                        page_bases.insert(page | alt, e);
                     }
                 }
             }
@@ -999,6 +1025,7 @@ impl ModuleBuilder {
                 page_bases: Some(&page_bases),
                 module_id,
                 dense_global: self.dense_global,
+                alt_dir: self.alt_dir,
                 loop_heads: Some(&heads),
                 enter: Some(self.dispatch),
             };
@@ -1130,8 +1157,9 @@ impl ModuleBuilder {
                 // offsets are constants: one segment per page, filled by the
                 // engine at instantiation.
                 let mut by_page: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
+                let alt = self.alt_dir.is_some();
                 for (addr, f) in std::mem::take(&mut self.exports_by_addr) {
-                    by_page.entry(dispatch_page(addr)).or_default().push((addr, f));
+                    by_page.entry(gex_abi::page_key(addr, alt)).or_default().push((addr, f));
                     exported_blocks.push((addr, String::new()));
                 }
                 // One segment per page, not one per contiguous run: a run per
@@ -1458,8 +1486,18 @@ impl ModuleBuilder {
         f.byte(0xa7); // i32.wrap_i64
         f.i32_const(4);
         f.byte(0x6c); // i32.mul
-        f.addr_i32();
-        f.load64(0x28, 2, gex_abi::dispatch_dir());
+        match self.alt_dir {
+            Some(g) => {
+                f.global_get(g);
+                f.byte(0x6a); // i32.add
+                f.addr_i32();
+                f.load64(0x28, 2, 0);
+            }
+            None => {
+                f.addr_i32();
+                f.load64(0x28, 2, gex_abi::dispatch_dir());
+            }
+        }
         f.i32_const(0);
         f.local_get(page);
         f.i64_const(gex_abi::dispatch_max_pages() as i64);

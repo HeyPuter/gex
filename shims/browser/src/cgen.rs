@@ -2208,7 +2208,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // The stack once the guest has returned: the caller's, past the return
     // address (and whatever a stdcall callee pops, allowed for below).
     let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
-    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::arch::compat() { 4 } else { 8 };
+    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::default_compat() { 4 } else { 8 };
     let want = sp + delta;
     let span = callout_span(ret as u64, _need as u32);
     let cb = CB_DEPTH.with(|d| d.get());

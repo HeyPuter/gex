@@ -469,6 +469,7 @@ fn regions_from(
     }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
+    let _mode = gex_xlate::compat_scope(image.class32);
     let code = region_code(image);
     let (mut starts, _) = func::seeds(&code, None, false);
     for &(a, src) in seed_starts {
@@ -829,6 +830,8 @@ fn prepare_with(
     verbose: bool,
     pv: &Provided,
 ) -> Result<std::path::PathBuf> {
+    // The image's mode on this thread, recovery to emission.
+    let _mode = gex_xlate::compat_scope(image.class32);
     if verbose {
         report_hints(image);
     }

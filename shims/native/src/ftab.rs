@@ -825,6 +825,11 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
     if !libs_allow(caller, addr) {
         return None;
     }
+    // Functions are of the process's own mode: the other mode's code (a
+    // WoW64 thread's 32-bit code) stays on tier-1, in its own directory.
+    if crate::thread_alt(caller) {
+        return None;
+    }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let mm = k.mem.lock();
         let v = mm.vmas();
@@ -852,7 +857,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         ro,
         wx,
         provided: crate::elfprov::provided(sh),
-        class32: gex_abi::X86 && gex_xlate::arch::compat(),
+        class32: gex_abi::X86 && gex_xlate::default_compat(),
         epoch,
         queued_at: std::time::Instant::now(),
         cache: caller.data().jit.as_ref().and_then(|jit| jit.cache.clone()),
@@ -1021,7 +1026,8 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
     let c = ctx as u32 as u64;
     let target = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
     let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
-    let delta = match (gex_abi::X86, gex_xlate::arch::compat()) {
+    // A function's frame, so the process's own mode.
+    let delta = match (gex_abi::X86, gex_xlate::default_compat()) {
         (false, _) => 0,
         (true, false) => 8,
         (true, true) => 4,

@@ -206,6 +206,15 @@ pub fn mnemonic(i: &Inst) -> String {
         Loopne => "loopne".into(),
         Call => "call".into(),
         Ret => "ret".into(),
+        JmpFar => "ljmp".into(),
+        CallFar => "lcall".into(),
+        RetFar => "lret".into(),
+        Iret => match w {
+            Width::W => "iret",
+            Width::D => "iretd",
+            _ => "iretq",
+        }
+        .into(),
         Leave => "leave".into(),
         Enter => "enter".into(),
         Pusha => if w == Width::W { "pushaw" } else { "pushal" }.into(),

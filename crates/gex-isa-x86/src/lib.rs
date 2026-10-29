@@ -405,6 +405,18 @@ pub enum Op {
     Loopne,
     Call,
     Ret,
+    /// Far `jmp`/`call` (`ea`, `9a`, `ff /5`, `ff /3`): a selector and an
+    /// offset, the width the offset's. Either two immediates (offset, then
+    /// selector; 32-bit code only) or one memory operand holding the offset
+    /// and then the selector. A WoW64 process changes mode through them.
+    JmpFar,
+    CallFar,
+    /// `retf` (`cb`, `ca imm16`): pops the offset and the selector at the
+    /// width, then the immediate's bytes.
+    RetFar,
+    /// `iret`/`iretd`/`iretq`: pops the offset, the selector and the flags at
+    /// the width; in 64-bit mode the stack pointer and the stack segment too.
+    Iret,
     Leave,
     Enter,
     /// `pusha`/`pushad` and `popa`/`popad`: 32-bit code only.

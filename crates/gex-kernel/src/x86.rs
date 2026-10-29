@@ -33,6 +33,26 @@ pub const SYSREG_CMPXCHG16B: i32 = -102;
 /// `GEX_TRACE_INSNS` (`gex_lift_x86::sysreg::TRACE`): the value is the pc.
 pub const SYSREG_TRACE: i32 = -103;
 
+/// A far transfer (`gex_lift_x86::sysreg::FAR`): the value is `offset |
+/// selector << 32`. See [`serve_far`].
+pub const SYSREG_FAR: i32 = -104;
+
+/// A far `jmp`/`call`/`ret` or `iret` to `selector:offset`: a user code
+/// selector (64-bit 0x33, 32-bit 0x23 or 0x1b) becomes the thread's
+/// `ctx::CS`, and the translated code goes on at the offset in that mode.
+/// Any other selector is the #GP Windows reports as an access violation:
+/// `Err` with the selector, and the context is left as it was.
+pub fn serve_far(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), u16> {
+    let sel = (v >> 32) as u16;
+    match sel as u32 {
+        ctx::CS_LONG | ctx::CS_COMPAT | 0x1b => {
+            let _ = m.write_u32(ctx_addr + ctx::CS as u64, sel as u32);
+            Ok(())
+        }
+        _ => Err(sel),
+    }
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {

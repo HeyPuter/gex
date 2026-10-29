@@ -15343,6 +15343,14 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, val as u64);
     }
+    // A far transfer: the selector checked, the thread's mode set; any
+    // other selector is #GP, an access violation.
+    if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_FAR {
+        let mut gm = GuestMem::new(guest_bytes());
+        if let Err(sel) = gex_kernel::x86::serve_far(&mut gm, ctx as u32 as u64, val as u64) {
+            far_fault(sel, ctx, pc as u64);
+        }
+    }
     // `cmpxchg16b`, under the host's lock.
     if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
         if (val as u64) < gex_abi::GUEST_FLOOR {
@@ -15351,6 +15359,15 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, val as u64);
     }
+}
+
+/// A far transfer to a selector that names no user code segment: the #GP
+/// Windows delivers as an access violation, SIGSEGV here.
+fn far_fault(sel: u16, ctx: i32, pc: u64) -> ! {
+    let _ = ctx;
+    warn_line(&format!("gex: a far transfer to selector {sel:#x}, which is no code segment, in block {pc:#x}: an access violation\n"));
+    set_exit(128 + 11);
+    trap();
 }
 
 /// A guest access into the runtime's own low memory (below
@@ -17092,6 +17109,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
     // A provider's address counts as known: a miss there is bridged again
     // (`cgen::provider_serves`), its bytes may be a `ud2` stub.
+    // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
+    let cs = if gex_abi::X86 { GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
+    let _mode = gex_xlate::cs_scope(cs);
     let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
