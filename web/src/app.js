@@ -29,6 +29,7 @@ import { logOn } from '../../shims/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 import { checkOptions, sizeValue, showValue } from './start-options.js';
+import { posixTz } from './posix-tz.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 import { pageUser } from './wine-user.js';
 import { PageDrag } from './drag.js';
@@ -609,7 +610,7 @@ async function begin(opts, base, at, state, meter) {
   const exeBytes = (files[exe] ?? files[hard[exe]])?.slice();
   if (!exeBytes) throw new Error(opts.exe ? `start({ exe: ${JSON.stringify(exe)} }): not a file in the bundle` : `the build's program, ${exe}, is not in its bundle`);
   const args = [exe, ...(opts.args ?? b.argv ?? [])];
-  const env = mergeEnv(b.env, opts.env);
+  let env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
   // The wineserver's periodic registry saves only for a prefix the visit
@@ -618,17 +619,29 @@ async function begin(opts, base, at, state, meter) {
   pageUser(env);
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
-  // A zoneinfo name (':' = a file under /usr/share/zoneinfo, which Wine also
-  // maps to its Windows zone).
-  if (!env.some((e) => e.startsWith('TZ='))) {
+  // As a POSIX TZ string with this year's rules (posix-tz.js), which the
+  // libc reads without zoneinfo files (a bundle has none). A zoneinfo name
+  // in the build's own env (`TZ=:<zone>`, the recording page's zone, which
+  // its recorder kept) gives way to it: it names a file the bundle lacks.
+  // None for a build that sets its zone itself: `tz: false` in its build
+  // options, or GEX_KDE_TZ in its env (the KDE image ships zoneinfo, links
+  // /etc/localtime and drops TZ; Qt would take a rule string for a zone id).
+  let pageTz = null;
+  const ownZone = b.tz === false || env.some((e) => e.startsWith('GEX_KDE_TZ='));
+  if (!ownZone && !mergeEnv([], opts.env).some((e) => e.startsWith('TZ='))) {
     let zone = null;
     try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* none */ }
-    if (zone) env.push(`TZ=:${zone}`);
+    const tz = zone ? posixTz(zone) : null;
+    if (tz && !env.some((e) => e.startsWith('TZ=') && !e.startsWith('TZ=:'))) {
+      pageTz = `TZ=${tz}`;
+      env = [...env.filter((e) => !e.startsWith('TZ=')), pageTz];
+    }
   }
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
-  // How it was started (gex-eject's 32-bit Wine recorder keeps this).
-  state.session = { exe, argv: args.slice(1), env, cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
+  // How it was started (gex-eject's 32-bit Wine recorder keeps this), less
+  // the viewer's time zone.
+  state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
@@ -1071,6 +1084,8 @@ function launchBuild(m, at) {
       // The bundle's extended attributes (the memory64 mark on a program),
       // which the site's rebuilt bundle does not carry itself.
       xattrs: m.xattrs ?? null,
+      // nt.json `tz: false`: the build sets its own zone (no page TZ).
+      tz: m.tz ?? true,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
