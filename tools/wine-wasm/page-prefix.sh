@@ -30,13 +30,38 @@ regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/wine32-session.reg")
 python3 "$here/reg-apply.py" "$out/system.reg" "${regs[@]}"
 stat -c %Y "$dist/share/wine/wine.inf" > "$out/.update-timestamp"
 if [ -n "${GRAPHICS:-}" ]; then
-    if [ -f "$out/user.reg" ] && grep -q '^"Graphics"=' "$out/user.reg"; then
-        sed -i "s/^\"Graphics\"=.*/\"Graphics\"=\"$GRAPHICS\"/" "$out/user.reg"
-    else
-        # the prefix's own architecture (win32 for 32-bit Wine, win64 for 64-bit Wine)
-        arch=$(sed -n 's/^#arch=//p' "$out/system.reg" | head -1)
-        printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=%s\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' "${arch:-win32}" "$GRAPHICS" >> "$out/user.reg"
-    fi
+    # "Graphics" in [Software\\Wine\\Drivers] and in no other key: a user.reg
+    # whose value sits under another key (DllOverrides) keeps Wine's default
+    # driver list. A user.reg without the key gets it at its end, and none
+    # at all a whole file.
+    arch=$(sed -n 's/^#arch=//p' "$out/system.reg" | head -1)
+    python3 -I - "$out/user.reg" "$GRAPHICS" "${arch:-win32}" <<'PY'
+import os, sys
+path, graphics, arch = sys.argv[1:]
+key, value = '[Software\\\\Wine\\\\Drivers]', f'"Graphics"="{graphics}"'
+if not os.path.exists(path):
+    open(path, 'w').write('WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n'
+                          f'#arch={arch}\n\n{key} 1791289000\n{value}\n')
+    sys.exit()
+lines = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
+# The value after the key's line and its options (#time=...).
+out, here, placed = [], None, False
+for line in lines:
+    if here == key and not placed and not line.startswith('#'):
+        out.append(value); placed = True
+    if line.startswith('['):
+        here = line.split('] ', 1)[0] + ']' if '] ' in line else line
+    if not line.startswith('"Graphics"='):
+        out.append(line)
+if here == key and not placed:
+    out.append(value); placed = True
+if not placed:
+    while out and out[-1] == '':
+        out.pop()
+    out += ['', f'{key} 1791289000', value, '']
+text = '\n'.join(out)
+open(path, 'w', encoding='utf-8', errors='surrogateescape').write(text)
+PY
 fi
 # The install ran on DIST at its host path, and the registry names files
 # there (the fonts in share/wine/fonts): in the page the dist is at its mount
