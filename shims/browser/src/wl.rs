@@ -46,6 +46,9 @@ extern "C" {
     fn wl_poll_input(ptr: u32, max: u32) -> u32;
     /// Whether this process's input ring holds an event, without taking it.
     fn wl_input_pending() -> u32;
+    /// The output's size now, as the page's compositor last set it: width in
+    /// the high 16 bits, height in the low, or 0 when it has said nothing.
+    fn wl_output_size() -> u32;
 }
 
 /// The floor under [`WaylandDevice::needs_pump`]: whatever it does not look
@@ -196,6 +199,21 @@ pub extern "C" fn gex_set_wl_output(w: i32, h: i32) {
 
 fn output_size() -> (i32, i32) {
     unsafe { OUTPUT }
+}
+
+/// The output's size as the page has it now, kept in [`OUTPUT`] for clients
+/// that connect later. Read every pump: the page's viewport is resized while
+/// clients run, and a client sized to the output has to hear of it.
+fn current_output() -> (i32, i32) {
+    if have_wl() {
+        // SAFETY: a host import taking nothing.
+        let v = unsafe { wl_output_size() };
+        let (w, h) = ((v >> 16) as i32, (v & 0xffff) as i32);
+        if w > 0 && h > 0 {
+            gex_set_wl_output(w, h);
+        }
+    }
+    output_size()
 }
 
 static OUTPUT_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
@@ -428,6 +446,12 @@ impl WaylandDevice {
         self.inner.last_pump.store(crate::now_ns(), std::sync::atomic::Ordering::Relaxed);
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut sent_any = false;
+        // A resized output: `mode` and `done` on every bound `wl_output`
+        // (nothing when the size is what each client was told).
+        let (out_w, out_h) = current_output();
+        for s in sessions.iter_mut() {
+            s.client.set_output_size(out_w, out_h);
+        }
         // Compositor input and control for this turn, addressed by client: a
         // process can host Xwayland and a native client at once, and an event
         // for one must not reach the other.

@@ -214,9 +214,17 @@ export function makeWlChannel() {
 /** Tell the guests how large the output is, so a toplevel is configured to it. */
 export function setOutputSize(channel, w, h, scale) {
   const a = new Int32Array(channel.arena);
+  const was = [Atomics.load(a, M_OUT_W), Atomics.load(a, M_OUT_H)];
   Atomics.store(a, M_OUT_W, w | 0);
   Atomics.store(a, M_OUT_H, h | 0);
   if (scale) Atomics.store(a, M_SCALE, Math.max(1, scale | 0));
+  // A resize, not the first size: every process with a block takes a turn,
+  // whose pump tells its clients (`WlProxy.outputSize`). One whose threads
+  // are all parked would otherwise hear of it only at its next wake.
+  if (!was[0] || (was[0] === (w | 0) && was[1] === (h | 0))) return;
+  for (let b = 0; b < BLOCKS; b++) {
+    if (Atomics.load(a, blockBase(b) + B_TOKEN)) wakeBlock(channel, a, b);
+  }
 }
 
 /**
@@ -440,6 +448,11 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   // process parked, nothing drains the ring otherwise. The thread that wakes
   // takes a scheduler turn, whose compositor pump delivers the event and
   // notifies the client's reader in turn.
+  wakeBlock(channel, a, block);
+}
+
+/** Notify the wait queue of the process that holds `block`. */
+function wakeBlock(channel, a, block) {
   const q = Atomics.load(a, blockBase(block) + B_WAKE);
   const slots = Atomics.load(a, blockBase(block) + B_SLOTS);
   const k = channel.kernelMemory;
@@ -956,9 +969,29 @@ export class WlProxy {
 
   /** Whether this process's input ring holds an event. */
   inputPending() {
+    // A resized output is work for the pump as well (`outputSize`).
+    if (this.#outSeen !== this.#outNow()) return true;
     if (this.#block < 0) return false;
     const a = this.#a;
     return Atomics.load(a, this.#ring + K_HEAD) !== Atomics.load(a, this.#ring + K_TAIL);
+  }
+
+  /**
+   * The output's size now, as the compositor last set it (`setOutputSize`):
+   * width in the high half, height in the low, for the shim's pump, which
+   * tells its clients when it changes (`wl_output_size`).
+   */
+  outputSize() {
+    this.#outSeen = this.#outNow();
+    return this.#outSeen;
+  }
+
+  /** The size `outputSize` last gave the pump. */
+  #outSeen = 0;
+
+  #outNow() {
+    const a = this.#a;
+    return ((Atomics.load(a, M_OUT_W) & 0xffff) << 16 | (Atomics.load(a, M_OUT_H) & 0xffff)) >>> 0;
   }
 
   /** Give the block back, so a later process can have it. */

@@ -123,6 +123,7 @@ enum Ev {
 /// 50.5  dragmove 320 210     # and moves; the screen's hit test picks the window
 /// 51    drop                 # released: the window under it takes it or refuses it
 /// 52    dragleave            # (or cancelled)
+/// 60    output 1000 650      # the output is resized: every client is told
 /// ```
 ///
 /// `window W H` in place of `frames N` starts the clock once a placed window
@@ -141,6 +142,9 @@ struct Input {
     seen: u64,
     /// `window W H`: the clock starts once a placed window this size is up.
     window: Option<(u32, u32)>,
+    /// `output W H` lines: the output's new size, and when. Apart from the
+    /// events, which wait for a client that takes input; a resize does not.
+    outputs: Vec<(f64, i32, i32)>,
 }
 
 /// Paths as a text/uri-list: `file://` URIs, CRLF after each, with every
@@ -187,6 +191,7 @@ impl Input {
         let mut drags = Vec::new();
         let mut after = 1;
         let mut window = None;
+        let mut outputs = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -239,6 +244,7 @@ impl Input {
                 Some("dragmove") => events.push((t, Ev::DragMove(num(2)?, num(3)?), l)),
                 Some("drop") => events.push((t, Ev::Drop, l)),
                 Some("dragleave") => events.push((t, Ev::DragLeave, l)),
+                Some("output") => outputs.push((t, num(2)?.max(1), num(3)?.max(1))),
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
                     events.push((t + 0.1, Ev::Key(key(2)?, false), l));
@@ -247,9 +253,10 @@ impl Input {
             }
         }
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        outputs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
         let start = if after == 0 && window.is_none() { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, drags, next: 0, start, after, seen: 0, window })
+        Ok(Input { events, drags, next: 0, start, after, seen: 0, window, outputs })
     }
 }
 
@@ -329,6 +336,25 @@ impl Wayland {
             inp.next += 1;
         }
         due
+    }
+
+    /// The output's size, after any scripted resize now due (`output W H`).
+    /// Only what clients are told: frames are still written at the size the
+    /// compositor started with.
+    fn output_size(&self) -> (i32, i32) {
+        let mut g = self.inner.input.lock().unwrap();
+        if let Some(inp) = g.as_mut() {
+            if let Some(start) = inp.start {
+                let now = start.elapsed().as_secs_f64();
+                let due = inp.outputs.iter().take_while(|o| o.0 <= now).count();
+                if let Some(&(_, w, h)) = inp.outputs[..due].last() {
+                    eprintln!("[gex] input at {now:.1} s: the output is now {w}x{h}");
+                    *self.inner.size.lock().unwrap() = (w, h);
+                }
+                inp.outputs.drain(..due);
+            }
+        }
+        *self.inner.size.lock().unwrap()
     }
 
     /// Composite on the GPU rather than handing single frames to the host.
@@ -480,7 +506,13 @@ impl Wayland {
         } else {
             Vec::new()
         };
+        // Read every turn: a resized output is `mode` and `done` on every
+        // bound `wl_output` (nothing when a client was told this size).
+        let (out_w, out_h) = self.output_size();
         let mut sessions = self.inner.sessions.lock().unwrap();
+        for s in sessions.iter_mut() {
+            s.client.set_output_size(out_w, out_h);
+        }
         let mut produced = Vec::new();
         sessions.retain_mut(|s| {
             let mut gone = false;

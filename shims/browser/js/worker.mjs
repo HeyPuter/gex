@@ -911,6 +911,20 @@ async function handle(msg) {
       } catch (e) { console.error(`[cov] dump failed: ${e.message}`); }
     };
     let count = 0;
+    const outputPlan = (globalThis.process?.env?.GEX_WL_STUB_OUTPUT ?? '').split(',').filter(Boolean).map((e) => {
+      const [, w, h, at] = /^(\d+)x(\d+)(?:@(\d+))?$/.exec(e.trim()) ?? [];
+      return { size: ((w & 0xffff) << 16 | (h & 0xffff)) >>> 0, at: +(at ?? 0) };
+    });
+    let outputStart = null;
+    let outputSeen = 0;
+    const outputNow = () => {
+      if (!outputPlan.length) return 0;
+      outputStart ??= performance.now();
+      const t = performance.now() - outputStart;
+      let size = 0;
+      for (const p of outputPlan) if (p.at <= t) size = p.size;
+      return size;
+    };
     const stubLog = !!globalThis.process?.env?.GEX_WL_STUB_LOG;
     const stubSum = !!globalThis.process?.env?.GEX_WL_STUB_SUM;
     gex.useWl({
@@ -987,8 +1001,13 @@ async function handle(msg) {
       },
       pollInput() { return 0; },
       // No input here, ever (`wl_input_pending`, which the shim asks of every
-      // compositor since the pump learned to wait for a client's input).
-      inputPending() { return false; },
+      // compositor since the pump learned to wait for a client's input) --
+      // only a resize, as the page's proxy says one (`WlProxy.inputPending`).
+      inputPending() { return outputNow() !== outputSeen; },
+      // GEX_WL_STUB_OUTPUT=1300x713,1000x650@2000,...: the output's size, and
+      // what it becomes that many ms after the pump first asks, for a test of
+      // a resize reaching connected clients. Unset: none, as before.
+      outputSize() { outputSeen = outputNow(); return outputSeen; },
     });
   }
 
