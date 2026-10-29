@@ -418,23 +418,17 @@ def link(dlls, out, gexrt, others=None):
     for g in set(SPLIT.values()):
         objs[g] = []
 
-    # Signatures: a forward whose callers declare the function otherwise
+    # Signatures: a caller of a forward declaring the function otherwise
     # than its definition (kernel32's void EnterCriticalSection is ntdll's
-    # NTSTATUS RtlEnterCriticalSection) gets a thunk, not an alias: wasm
-    # calls must match exactly.
+    # NTSTATUS RtlEnterCriticalSection) goes through a thunk of its own
+    # (below): wasm calls must match exactly, and two callers may disagree
+    # (psapi's adapter from the .spec takes words where iphlpapi's
+    # K32GetModuleFileNameExW takes pointers).
     thunks = []
-    for d in list(aliases):
-        keep = []
+    fwd_def = {}  # alias -> (its definition dll!name, that signature)
+    for d in aliases:
         for alias, target in aliases[d]:
-            want = sigs[d].get((target, 'defined'))
-            name = alias.split('!', 1)[1]
-            seen = {v for m in sigs for (n, k), v in sigs[m].items() if n == name and k == 'undefined'}
-            other = [v for v in seen if v != want]
-            if want and other:
-                thunks.append((alias, other[0], f'{d}!{target}', want, grp(d)))
-            else:
-                keep.append((alias, target))
-        aliases[d] = keep
+            fwd_def[alias] = (f'{d}!{target}', sigs[d].get((target, 'defined')))
     # Exports of the DLLs that stay i386 code, for imports a native module
     # takes from one of them (below, and the stubs further down).
     native = {mod for mod, _, _, _ in dlls}
@@ -540,6 +534,13 @@ def link(dlls, out, gexrt, others=None):
             for name, vias in forward_owner.items():
                 pick = next((o for o in [mod] + imports if o in vias), vias[0])
                 if bind_guest(f, mod, imports, name, pick):
+                    continue
+                target, want = fwd_def.get(f'{pick}!{name}', (None, None))
+                have = sigs[mod].get((name, 'undefined'))
+                if have and want and have != want:
+                    thunk = f'{mod}.{name}'
+                    thunks.append((f'gexw-thunk!{thunk}', have, target, want, grp(mod)))
+                    f.write(f'{name} gexw-thunk {thunk}\n')
                     continue
                 f.write(f'{name} {pick}\n')
             for name, cands in guest_forward.items():
