@@ -53,7 +53,7 @@ for (const name of readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), '
 }
 // And what busybox has no applet for (probe/rt-probe.c), and a Wayland and
 // an X11 window (probe/rt-wl.c, rt-x11.c).
-execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-probe'), join(HERE, 'probe/rt-probe.c')], { stdio: 'inherit' });
+execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-probe'), join(HERE, 'probe/rt-probe.c'), '-lm'], { stdio: 'inherit' });
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-wl'), join(HERE, 'probe/rt-wl.c'), '-lwayland-client', '-lffi'], { stdio: 'inherit' });
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-x11'), join(HERE, 'probe/rt-x11.c'), '-lX11', '-lxcb', '-lXau', '-lXdmcp'], { stdio: 'inherit' });
 // An extended attribute, which the tar carries (tar --xattrs).
@@ -141,7 +141,7 @@ log(`vite on ${PORT}, work ${WORK}`);
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const profile = join(WORK, 'profile');
 const chrome = spawn(CHROME, [
-  '--headless=new', `--remote-debugging-port=${CPORT}`, `--user-data-dir=${profile}`,
+  '--headless=new', `--remote-debugging-port=${CPORT}`, `--user-data-dir=${profile}`, '--autoplay-policy=no-user-gesture-required',
   '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
   '--use-angle=swiftshader', '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
 ], { stdio: ['ignore', 'ignore', VERBOSE ? 'inherit' : 'ignore'] });

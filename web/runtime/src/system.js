@@ -10,10 +10,15 @@
 
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
+import { NetSwitch } from './netswitch.js';
+import { GuestConnection } from './connection.js';
 
 /** Where pid 1's program is in the guest: under /run, which nothing
  *  persists. */
 const INIT_PATH = '/run/gex/init';
+/** `gex-host NAME JSON`: a guest's call to the page (`hostCalls`), gex-init
+ *  under another name. */
+const HOST_CALL_PATH = '/usr/bin/gex-host';
 /** Where the runtime's files (gex/...) are: beside the package's modules
  *  in a build (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__`), the
  *  tree's web/public in place. Not a literal, so a bundler does not take
@@ -121,6 +126,8 @@ export class System extends EventTarget {
   #nextHandle = 1;
   #booting = null;
   #arch = null;
+  #net = new NetSwitch();
+  #hostCalls = new Map();
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
@@ -160,6 +167,8 @@ export class System extends EventTarget {
        *  (a part's own: 'watch', ...). */
       on: (ev, fn) => (this.#listeners.get(ev) ?? this.#listeners.set(ev, []).get(ev)).push(fn),
       io: () => this.#io,
+      /** The guest's network from now on (net.js). */
+      network: (backend) => this.#net.set(backend),
       sys: () => this.#sys,
       get phase() { return self.#state.phase; },
       opts: this.#opts,
@@ -221,10 +230,16 @@ export class System extends EventTarget {
       cwd: '/',
       uid: 0,
       tty: true,
+      // Every Worker reaches the network through the page; which network
+      // is the page's to set, any time (net.js).
+      network: this.#net,
+      // `/dev/dsp` plays once the page makes a WebAudio (audio.js).
+      playAudio: false,
     };
     for (const fn of this.#beforeBoot) await fn(opts);
     opts.files[INIT_PATH] = init;
     opts.modes[INIT_PATH] = 0o755;
+    if (!opts.files[HOST_CALL_PATH] && !opts.symlinks[HOST_CALL_PATH]) opts.symlinks[HOST_CALL_PATH] = INIT_PATH;
 
     // The translated architecture, beside which wasm32 programs (gex-init
     // among them) run: the global kernel is built for one (its syscall ABI,
@@ -308,9 +323,83 @@ export class System extends EventTarget {
       }
     } else if (m.ev === 'log') this.#say(`${m.text}\n`);
     else if (m.ev === 'init-gone') this.#say('gex: pid 1 closed the runtime\'s connection\n');
+    else if (m.ev === 'host-call') this.#hostCall(m);
     else for (const fn of this.#listeners.get(m.ev) ?? []) fn(m);
   }
   #listeners = new Map();
+
+  async #hostCall({ id, name, json }) {
+    let ok = true;
+    let text;
+    try {
+      const fn = this.#hostCalls.get(name);
+      if (!fn) throw new Error(`no host call ${name}`);
+      let arg;
+      try {
+        arg = json.trim() ? JSON.parse(json) : null;
+      } catch {
+        throw new Error(`${name}: not JSON: ${json.slice(0, 200)}`);
+      }
+      const v = await fn(arg);
+      text = v === undefined ? 'null' : JSON.stringify(v);
+    } catch (e) {
+      ok = false;
+      text = String(e?.message ?? e);
+    }
+    this.#io?.send('hostReply', { id, ok, text });
+  }
+
+  /**
+   * The page's functions a guest program calls: `gex-host NAME JSON` (or
+   * the JSON on its standard input) runs `fn(value)` here and prints what
+   * it returns (resolves), as JSON, on its standard output; a throw is
+   * printed on its standard error and it exits 1.
+   */
+  get hostCalls() {
+    const calls = this.#hostCalls;
+    return {
+      register(name, fn) {
+        if (typeof name !== 'string' || !name || /[\0\s]/.test(name)) throw new TypeError('hostCalls.register: a name without spaces');
+        if (typeof fn !== 'function') throw new TypeError('hostCalls.register: a function');
+        calls.set(name, fn);
+        return () => { if (calls.get(name) === fn) calls.delete(name); };
+      },
+      unregister(name) {
+        calls.delete(name);
+      },
+      names: () => [...calls.keys()],
+    };
+  }
+
+  /** Into the guest: `connectGuest(port)`, a connection to what a program
+   *  listens on at 127.0.0.1:`port` (TCP), as `{ readable, writable,
+   *  close() }`; it rejects with ECONNREFUSED when nothing listens. */
+  get net() {
+    return {
+      connectGuest: (port, { host = '127.0.0.1' } = {}) => this.#connectGuest(port, host),
+    };
+  }
+
+  async #connectGuest(port, host) {
+    this.#running('connectGuest');
+    if (!['127.0.0.1', 'localhost', '0.0.0.0'].includes(host)) throw new Error(`connectGuest: only the guest's own 127.0.0.1, not ${host}`);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new TypeError(`connectGuest: no port ${port}`);
+    const h = this.#nextHandle++;
+    const io = this.#io;
+    const c = new GuestConnection({
+      write: (bytes) => io.send('write', { h, bytes }, [bytes.buffer]),
+      closeStdin: () => io.send('closeStdin', { h }),
+      release: () => { io.send('release', { h }); this.#procs.delete(h); },
+    });
+    this.#procs.set(h, c);
+    try {
+      await io.call('connectGuest', { h, port });
+    } catch (e) {
+      this.#procs.delete(h);
+      throw e;
+    }
+    return c;
+  }
 
   #running(what) {
     if (this.#state.phase !== 'running') throw new Error(`${what}: the system is ${this.#state.phase}, not running`);

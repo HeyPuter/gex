@@ -77,7 +77,7 @@ function lay(...parts) {
 // -- files -----------------------------------------------------------------
 
 function errno(n, what) {
-  const names = { 2: 'ENOENT', 13: 'EACCES', 17: 'EEXIST', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 39: 'ENOTEMPTY', 9: 'EBADF', 28: 'ENOSPC', 18: 'EXDEV', 40: 'ELOOP', 36: 'ENAMETOOLONG' };
+  const names = { 111: 'ECONNREFUSED', 2: 'ENOENT', 13: 'EACCES', 17: 'EEXIST', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 39: 'ENOTEMPTY', 9: 'EBADF', 28: 'ENOSPC', 18: 'EXDEV', 40: 'ELOOP', 36: 'ENAMETOOLONG' };
   const code = names[-n] ?? `errno ${-n}`;
   return Object.assign(new Error(`${code}: ${what}`), { code, errno: -n });
 }
@@ -405,7 +405,26 @@ async function spawnNow({ h, argv, env = [], cwd = '', uid = -1, gid = -1, stdio
   return { h, pid: a.pid };
 }
 
+/** A connection of the page's to what a program listens on at
+ *  127.0.0.1:`port` (the global kernel's name for the port, net.rs
+ *  `tcp_name`): its bytes moved as a program's pipes are. */
+function connectGuest({ h, port }) {
+  const { at: [[p, n]] } = lay(`\0gex-tcp:${port}`);
+  const id = k.k_sock_connect(BigInt(p), n);
+  if (id < 0) throw errno(id === -2 ? -111 : id, `127.0.0.1:${port}`);
+  const ends = { h, pty: -1, stdin: -1, stdout: -1, stderr: -1, sock: id, writes: [], closeIn: false, pid: 0 };
+  handles.set(h, ends);
+  watch(k.k_sock_queue(id));
+  pump();
+  return true;
+}
+
 function closeEnds(e) {
+  if (e.sock >= 0) {
+    unwatch(k.k_sock_queue(e.sock));
+    k.k_sock_close(e.sock);
+    e.sock = -1;
+  }
   if (e.pty >= 0) {
     if (e.ptyReading) unwatch(k.k_pty_queue(e.pty));
     k.k_pty_close_end(e.pty, 1, HOST);
@@ -531,6 +550,86 @@ function readWatches() {
   return true;
 }
 
+// -- host calls (gex-host NAME JSON: gex-init.c host_call) ---------------------
+
+const hostCalls = { listener: -1, conns: new Map(), next: 1 };
+
+function listenHostCalls() {
+  const { at: [[p, n]] } = lay('\0gex-host');
+  const id = k.k_sock_bind(BigInt(p), n);
+  if (id < 0) throw errno(id, 'the host-call socket');
+  hostCalls.listener = id;
+  watch(k.k_sock_queue(id));
+}
+
+/** New callers, and what they sent: a call to the page once whole. */
+function passHostCalls() {
+  let moved = false;
+  if (hostCalls.listener < 0) return false;
+  for (;;) {
+    const c = k.k_sock_accept(hostCalls.listener);
+    if (c < 0) break;
+    hostCalls.conns.set(hostCalls.next++, { sock: c, buf: new Uint8Array(0), asked: false, out: null });
+    watch(k.k_sock_queue(c));
+    moved = true;
+  }
+  ensure(READ_MAX);
+  for (const [id, c] of hostCalls.conns) {
+    if (!c.asked) {
+      for (;;) {
+        const n = k.k_sock_read(c.sock, 0n, 65536);
+        if (n === EAGAIN) break;
+        if (n <= 0) { c.out = new Uint8Array(0); break; }
+        const b = new Uint8Array(c.buf.length + n);
+        b.set(c.buf);
+        b.set(view().subarray(0, n), c.buf.length);
+        c.buf = b;
+        moved = true;
+      }
+      if (c.buf.length >= 4) {
+        const len = new DataView(c.buf.buffer).getUint32(0, true);
+        if (c.buf.length >= 4 + len) {
+          const body = c.buf.subarray(4, 4 + len);
+          const z = body.indexOf(0);
+          c.asked = true;
+          post({ ev: 'host-call', id, name: dec.decode(body.subarray(0, z < 0 ? body.length : z)), json: z < 0 ? '' : dec.decode(body.subarray(z + 1)) });
+          moved = true;
+        }
+      }
+    }
+    if (c.out) {
+      while (c.out.length) {
+        const piece = c.out.subarray(0, READ_MAX);
+        view().set(piece, 0);
+        const n = k.k_sock_write(c.sock, 0n, piece.length);
+        if (n === EAGAIN || n === 0) break;
+        if (n < 0) { c.out = c.out.subarray(c.out.length); break; }
+        c.out = c.out.subarray(n);
+        moved = true;
+      }
+      if (!c.out.length) {
+        unwatch(k.k_sock_queue(c.sock));
+        k.k_sock_close(c.sock);
+        hostCalls.conns.delete(id);
+        moved = true;
+      }
+    }
+  }
+  return moved;
+}
+
+function hostReply({ id, ok, text }) {
+  const c = hostCalls.conns.get(id);
+  if (!c) return;
+  const body = enc.encode(text);
+  const out = new Uint8Array(5 + body.length);
+  new DataView(out.buffer).setUint32(0, body.length, true);
+  out[4] = ok ? 0 : 1;
+  out.set(body, 5);
+  c.out = out;
+  pump();
+}
+
 // -- X display :0 -----------------------------------------------------------
 
 /** Display :0's names, held for the X server until a client comes: then the
@@ -562,7 +661,7 @@ function xWanted() {
 /** One pass over everything that can move without waiting. True if
  *  anything did. */
 function pass() {
-  let moved = readWatches() | xWanted();
+  let moved = readWatches() | xWanted() | passHostCalls();
   if (init.conn < 0 && init.listener >= 0) {
     const c = k.k_sock_accept(init.listener);
     if (c >= 0) {
@@ -608,9 +707,50 @@ function pass() {
   return moved;
 }
 
+/** A connection's turn (`connectGuest`). */
+function pumpSock(e) {
+  let moved = false;
+  for (;;) {
+    const n = k.k_sock_read(e.sock, 0n, READ_MAX);
+    if (n > 0) {
+      const bytes = view().slice(0, n);
+      post({ ev: 'data', h: e.h, fd: 1, bytes }, [bytes.buffer]);
+      moved = true;
+      continue;
+    }
+    if (n === EAGAIN) break;
+    // The program closed it (0), or it failed.
+    post({ ev: 'end', h: e.h, fd: 1 });
+    closeEnds(e);
+    handles.delete(e.h);
+    return true;
+  }
+  while (e.writes.length) {
+    const b = e.writes[0];
+    const piece = b.subarray(0, READ_MAX);
+    view().set(piece, 0);
+    const n = k.k_sock_write(e.sock, 0n, piece.length);
+    if (n === EAGAIN || n === 0) break;
+    if (n < 0) {
+      e.writes.length = 0;
+      break;
+    }
+    moved = true;
+    if (n < b.length) e.writes[0] = b.subarray(n);
+    else e.writes.shift();
+  }
+  if (e.closeIn && !e.writes.length && !e.shut) {
+    e.shut = true;
+    k.k_sock_shutdown(e.sock, 1);
+    moved = true;
+  }
+  return moved;
+}
+
 function pump1(e) {
   let moved = false;
   ensure(READ_MAX);
+  if (e.sock >= 0) return pumpSock(e);
   // Output: the terminal's master, or the two pipes.
   const outs = e.pty >= 0 ? (e.ptyReading ? [['pty', 1]] : []) : [['stdout', 1], ['stderr', 2]];
   for (const [f, fd] of outs) {
@@ -931,6 +1071,7 @@ const ops = {
     }
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
+    listenHostCalls();
     const { at: [[a, an]] } = lay(NAME);
     init.listener = k.k_sock_bind(BigInt(a), an);
     if (init.listener < 0) throw errno(init.listener, 'binding the runtime socket');
@@ -959,6 +1100,10 @@ const ops = {
   addTree: ({ tree }) => addTree(tree),
   watch: ({ path }) => addWatch(path),
   holdX: () => holdX(),
+  connectGuest: (m) => connectGuest(m),
+  hostReply: (m) => hostReply(m),
+  // Where `/dev/dsp`'s rings are (shims/kernel/src/audio.rs), made if not yet.
+  audioRing: () => (k.k_audio_ring ? k.k_audio_ring() >>> 0 : 0),
   mount: ({ path, id }) => mount(path, id),
   persistStart: (m) => persistStart(m),
   persistChanged: () => persistChanged(),

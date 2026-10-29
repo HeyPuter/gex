@@ -138,27 +138,49 @@ let started = false;
 
 /** Play the ring at `at` in the global kernel's `memory` (a shared
  *  WebAssembly.Memory). Once per page; later calls do nothing. */
-export function startAudio({ memory, at, clock = true, latency = 'interactive', loop = false }) {
-  if (started || !at || !memory || typeof AudioContext !== 'function' || typeof AudioWorkletNode !== 'function') return;
-  if (typeof SharedArrayBuffer !== 'function' || !(memory.buffer instanceof SharedArrayBuffer)) return;
-  started = true;
+export function startAudio(opts) {
+  if (started) return;
+  if (playAudio(opts)) started = true;
+}
+
+/** Whether audio can play here: an AudioWorklet and shared memory. */
+export function canPlayAudio(memory) {
+  return typeof AudioContext === 'function' && typeof AudioWorkletNode === 'function'
+    && typeof SharedArrayBuffer === 'function' && memory?.buffer instanceof SharedArrayBuffer;
+}
+
+/** A player of the ring (`startAudio`): `{ ctx, ready, info, close() }`,
+ *  or null where audio cannot play. Every player is its own context; the
+ *  rings are read by one at a time. */
+export function playAudio({ memory, at, clock = true, latency = 'interactive', loop = false, context = null }) {
+  if (!at || !canPlayAudio(memory)) return null;
   // `?audiolatency=S`: the context's latency hint in seconds (the browser
   // picks its nearest; 0 asks for its smallest), for measuring.
-  let ctx;
-  try {
-    ctx = new AudioContext({ latencyHint: latency });
-  } catch {
-    ctx = new AudioContext({ latencyHint: 'interactive' });
+  // `context`: one the caller made (in a gesture's handler, so it may run).
+  let ctx = context;
+  if (!ctx) {
+    try {
+      ctx = new AudioContext({ latencyHint: latency });
+    } catch {
+      ctx = new AudioContext({ latencyHint: 'interactive' });
+    }
   }
   const info = { ctx, last: null, history: [] };
   globalThis.__gexAudio = info;
   const resume = () => {
     if (ctx.state !== 'running') ctx.resume().catch(() => {});
   };
-  for (const ev of ['pointerdown', 'mousedown', 'keydown', 'touchend']) addEventListener(ev, resume, { capture: true, passive: true });
+  const gestures = ['pointerdown', 'mousedown', 'keydown', 'touchend'];
+  for (const ev of gestures) addEventListener(ev, resume, { capture: true, passive: true });
   resume();
   const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
-  ctx.audioWorklet.addModule(url).then(() => {
+  info.close = () => {
+    for (const ev of gestures) removeEventListener(ev, resume, { capture: true });
+    info.node?.disconnect();
+    if (globalThis.__gexAudio === info) globalThis.__gexAudio = null;
+    return ctx.close().catch(() => {});
+  };
+  info.ready = ctx.audioWorklet.addModule(url).then(() => {
     URL.revokeObjectURL(url);
     const node = new AudioWorkletNode(ctx, 'gex-dsp', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
     node.port.onmessage = (e) => {
@@ -175,5 +197,10 @@ export function startAudio({ memory, at, clock = true, latency = 'interactive', 
     node.port.postMessage({ latencyUs: Math.round(1e6 * ((ctx.baseLatency ?? 0) + (ctx.outputLatency ?? 0))) });
     node.connect(ctx.destination);
     info.node = node;
-  }).catch((err) => console.warn('[gex] audio: the player did not start:', err?.message ?? err));
+  }, (err) => {
+    console.warn('[gex] audio: the player did not start:', err?.message ?? err);
+    throw err;
+  });
+  info.ready.catch(() => {});
+  return info;
 }

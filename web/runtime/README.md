@@ -136,6 +136,73 @@ await sys.boot();
 A tree's sources must be the same at every load: what is kept is laid over
 them, path by path.
 
+## Network
+
+Where the guest's connections out go: one `Network` per system, made before
+or after boot. Until there is one a program's connection fails as
+unreachable. TCP only; a program's name lookups reach the network as the
+name.
+
+```js
+import { Wisp } from '@gex/runtime/net/wisp';
+new Wisp(sys);                                   // wss://anura.pro/
+new Wisp(sys, { url: 'wss://wisp.example/' });
+```
+
+| Member | Does |
+| --- | --- |
+| `new Wisp(sys, { url })` (`@gex/runtime/net/wisp`) | Over a Wisp proxy, default `wss://anura.pro/`: one WebSocket, dialled again when it drops. Events `open`, `closed`. |
+| `new Network(sys, { connect(host, port) })` (`@gex/runtime/net`) | The page's own: `connect` returns (or resolves) `{ readable, writable }`, a ReadableStream and a WritableStream of bytes; a throw or rejection refuses the connection. The page closing its readable ends the program's reads; the program closing its socket closes the writable. A program's `shutdown(SHUT_WR)` does not reach the page (Wisp has no half close). |
+| `ready` | Resolves once connections go through it. |
+| Events | `connect` (`host`, `port`). |
+
+Into the guest, `sys.net.connectGuest(port)` connects to what a program
+listens on at `127.0.0.1:port`. It resolves `{ readable, writable, close() }`
+and a `close` event; closing the writable is a half close, which the
+program reads as the end. It rejects with `ECONNREFUSED` when nothing
+listens.
+
+## Host calls
+
+The page's functions a guest program calls. `gex-host NAME JSON` (or
+`gex-host NAME` with the JSON on its standard input) runs the function
+with the parsed value, and prints what it returns, as JSON, on its
+standard output. A throw is printed on its standard error and it exits 1.
+
+```js
+const off = sys.hostCalls.register('notify', ({ title }) => { showToast(title); return true; });
+// guest: gex-host notify '{"title":"built"}'   -> true
+```
+
+| Member | Does |
+| --- | --- |
+| `register(name, fn)` | `fn(value)` may return a promise. Returns a function that unregisters it. |
+| `unregister(name)`, `names()` | |
+
+`/usr/bin/gex-host` is the runtime's own unless the tree has one.
+
+## Audio
+
+What programs play on `/dev/dsp` (and ALSA, Pulse or Wine over it) comes
+out of the page through an AudioWorklet once there is a `WebAudio`; until
+then it is played to nobody at the wall clock's pace. Browsers start audio
+only after a user gesture, so make it in a gesture's handler (or the first
+pointer or key event after it resumes the context). One per system, made
+any time.
+
+```js
+import { WebAudio } from '@gex/runtime/audio';
+button.onclick = () => new WebAudio(sys);
+```
+
+| Member | Does |
+| --- | --- |
+| `new WebAudio(sys, { latency })` | `latency`: the AudioContext's hint ('interactive', 'playback', or seconds). |
+| `ready`, `context` | Resolves once the player is set up; its AudioContext. |
+| `stats` | The player's last report (about twice a second): `backlog` (ms queued, `avg`, `min`, `max`), `base` and `output` (the context's latencies, ms), `rms`, `underruns`. |
+| `close()` | Stop playing. |
+| Events | `running`, once the context plays. |
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the

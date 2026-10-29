@@ -838,6 +838,9 @@ async function runProgramHere(
     // The directories the page serves (web/runtime fs.mount, page-fs.mjs):
     // their control buffer, handed to every Worker.
     pageFs = null,
+    // Whether `/dev/dsp` plays here on its own (false: web/runtime WebAudio
+    // plays it when the page makes one).
+    playAudio = true,
     // Whether any lazy file is in a rest bundle (`BUNDLE#OFFSET`): only then
     // does a Worker without the cache's owner load a decoder of its own
     // (lazy-fetch.mjs `lazyReady`).
@@ -1301,7 +1304,7 @@ async function runProgramHere(
       // Pid 1 has copied `files` into the kernel's filesystem.
       else if (m.kind === 'files-loaded') onFilesLoaded?.();
       // Where `/dev/dsp`'s output is: played from the first gesture on.
-      else if (m.kind === 'audio') startAudio({ ...m, clock: flag('audioclock') !== '0', latency: audioLatency(), loop: flag('audioloop') === '1' });
+      else if (m.kind === 'audio' && playAudio) startAudio({ ...m, clock: flag('audioclock') !== '0', latency: audioLatency(), loop: flag('audioloop') === '1' });
     },
   });
 
