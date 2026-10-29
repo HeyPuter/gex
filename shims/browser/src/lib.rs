@@ -9587,13 +9587,14 @@ pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
     *CHILD_STATE.0.borrow_mut() = shim_slice(ptr, len).to_vec();
 }
 
-/// The signal state, umask and resource limits a process passes on: to a
-/// fork's child (`pending` false), or with its pending signals across an
-/// exec that starts in another Worker.
+/// The signal state, umask, resource limits and identity a process passes
+/// on: to a fork's child (`pending` false), or with its pending signals
+/// across an exec that starts in another Worker. The identity is the
+/// process's own, so a `setuid` before an exec holds after it.
 fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let sig = k.signals.to_bytes(pending);
     let limits = k.rlimits.get();
-    let mut v = Vec::with_capacity(8 + sig.len() + limits.len() * 16);
+    let mut v = Vec::with_capacity(16 + sig.len() + limits.len() * 16);
     v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     v.extend_from_slice(&sig);
     v.extend_from_slice(&k.proc_fs.umask().to_le_bytes());
@@ -9601,6 +9602,8 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
+    v.extend_from_slice(&k.creds.uid().to_le_bytes());
+    v.extend_from_slice(&k.creds.gid().to_le_bytes());
     v
 }
 
@@ -9611,7 +9614,7 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
     let mut limits = k.rlimits.get();
-    if rest.len() != 4 + limits.len() * 16 {
+    if rest.len() != 4 + limits.len() * 16 + 8 {
         return;
     }
     k.signals = sig;
@@ -9624,6 +9627,9 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
     k.rlimits.set(limits);
+    let at = 4 + limits.len() * 16;
+    k.creds.set_uid(u32::from_le_bytes(rest[at..at + 4].try_into().unwrap()));
+    k.creds.set_gid(u32::from_le_bytes(rest[at + 4..at + 8].try_into().unwrap()));
 }
 
 #[no_mangle]
@@ -11619,9 +11625,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         direct_argv.as_deref().unwrap_or(argv),
         envp,
         *b"gexdeterministic",
+        // The process's, which a `setuid` before the exec changed.
         gex_ld::Identity {
-            uid: unsafe { IDENTITY.0 },
-            gid: unsafe { IDENTITY.1 },
+            uid: h.kernel.creds.uid(),
+            gid: h.kernel.creds.gid(),
             interp_base,
             entry_hook: hook,
         },
