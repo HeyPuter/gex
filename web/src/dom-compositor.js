@@ -536,6 +536,38 @@ export class DomDesktop {
     return [...this.#windows.values()];
   }
 
+  /** The window at a point of the page (`clientX`, `clientY`: viewport CSS
+   *  pixels): {key, client, block, surface, title, x, y}, the point in its
+   *  surface in the units its pointer motion has (surface-local, as a drag's
+   *  wl_data_device.motion will be) and the title of the toplevel it is
+   *  part of; or null. As the compositor's `windowAt`; the browser's hit
+   *  test, as the pointer's. */
+  windowAt(clientX, clientY) {
+    const wins = [...this.#windows.values()];
+    for (const el of document.elementsFromPoint(clientX, clientY)) {
+      const win = wins.find((w) => w.canvas === el || w.glCanvas === el);
+      if (!win) continue;
+      let top = win;
+      for (let i = 0; top.parent && i < 16; i++) {
+        const up = wins.find((w) => w.token === top.token && w.client === top.client && w.surface === top.parent);
+        if (!up) break;
+        top = up;
+      }
+      const r = el.getBoundingClientRect();
+      return {
+        key: win.key,
+        client: win.client,
+        block: win.block,
+        surface: win.surface,
+        title: top.title || '',
+        // As the pointer's motion has them (#attach: offsetX, offsetY).
+        x: Math.round(clientX - r.left),
+        y: Math.round(clientY - r.top),
+      };
+    }
+    return null;
+  }
+
   /** The window keys go to (null: none), for a harness. */
   focused() {
     return this.#focus;

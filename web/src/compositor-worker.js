@@ -1827,6 +1827,30 @@ class Compositor {
    * pipeline. Sampled every fourth pixel, because this is asked for once a
    * second at most and the answer only has to be nonzero.
    */
+  /** The window at a point of the output, for the page (`windowAt`): its
+   *  surface and the point in it, and the title of the toplevel it is part
+   *  of; null over no window's content (the desktop, or a frame's title). */
+  windowAt(x, y) {
+    const hit = this.#hit(x, y);
+    if (!hit || hit.part !== 'content') return null;
+    let top = hit.win;
+    for (let i = 0; top.parent && i < 16; i++) {
+      const up = this.#windows.get(`${top.token}:${top.client}:${top.parent}`);
+      if (!up) break;
+      top = up;
+    }
+    const k = hit.win.cs || 1;
+    return {
+      key: hit.key,
+      client: hit.win.client,
+      block: hit.win.block,
+      surface: hit.win.surface,
+      title: top.title || '',
+      x: Math.floor(hit.local.x / k),
+      y: Math.floor(hit.local.y / k),
+    };
+  }
+
   async describe({ pixels = true } = {}) {
     const wins = [...this.#windows.values()].filter((w) => w.role === ROLE_TOPLEVEL);
     let lit = pixels ? 0 : null;
@@ -2157,6 +2181,8 @@ const onMessage = ({ data: m }) => {
     } else if (m.kind === 'readout') {
       // The composited output, read back (RGBA rows, top first): what a test saves as a picture.
       Promise.resolve(comp?.readout?.() ?? null).then((r) => post({ kind: 'readout', id: m.id, state: r }, r ? [r.px.buffer] : []));
+    } else if (m.kind === 'window-at') {
+      post({ kind: 'window-at', id: m.id, state: comp?.windowAt(m.x, m.y) ?? null });
     } else if (m.kind === 'describe') {
       Promise.resolve(comp?.describe({ pixels: m.pixels !== false }) ?? null).then((state) => post({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {
