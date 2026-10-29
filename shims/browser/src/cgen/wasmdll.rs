@@ -71,6 +71,9 @@ struct WinePe {
     /// Its imports of the other modules, as a binding list (cgen/dylink.rs's
     /// format: `G`, `E`, `L`), which JS applies at each instantiation.
     binds: String,
+    /// Its `L` binds' thunks: a module whose function `k` calls the `k`th
+    /// `L` line's slot (`late_thunks`), empty for none.
+    thunks: Vec<u8>,
 }
 
 /// A call or function address from one module into a function another
@@ -368,15 +371,23 @@ fn read_module(dir: Option<&str>, name: &str) -> Result<(String, Vec<u8>), Strin
 /// (name, a function's), and `gexw.modules` (DLL -> module file).
 struct Shape {
     imports: Vec<(String, String, bool, Option<(bool, bool)>)>,
+    /// Each import's function type, beside `imports`.
+    import_types: Vec<Option<wasmparser::FuncType>>,
     exports: Vec<(String, bool)>,
     modules: HashMap<String, String>,
 }
 
 fn shape(wasm: &[u8]) -> Result<Shape, String> {
     let e = |e: wasmparser::BinaryReaderError| e.to_string();
-    let mut s = Shape { imports: Vec::new(), exports: Vec::new(), modules: HashMap::new() };
+    let mut s = Shape { imports: Vec::new(), import_types: Vec::new(), exports: Vec::new(), modules: HashMap::new() };
+    let mut types = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload.map_err(e)? {
+            wasmparser::Payload::TypeSection(r) => {
+                for t in r.into_iter_err_on_gc_types() {
+                    types.push(t.map_err(e)?);
+                }
+            }
             wasmparser::Payload::ImportSection(r) => {
                 for imp in r {
                     let imp = imp.map_err(e)?;
@@ -386,6 +397,10 @@ fn shape(wasm: &[u8]) -> Result<Shape, String> {
                         _ => (false, None),
                     };
                     s.imports.push((imp.module.to_string(), imp.name.to_string(), func, global));
+                    s.import_types.push(match imp.ty {
+                        wasmparser::TypeRef::Func(t) => types.get(t as usize).cloned(),
+                        _ => None,
+                    });
                 }
             }
             wasmparser::Payload::ExportSection(r) => {
@@ -578,6 +593,7 @@ fn install_module(
         exports,
         funcs,
         binds: String::new(),
+        thunks: Vec::new(),
     });
     let idx = g.mods.len() - 1;
     let install = ftab(|m| m.publish(len, PROVIDER | number, Tier::Unit, &[]));
@@ -586,6 +602,7 @@ fn install_module(
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{}", g.mods[idx].file), regs, dirs, slots: nslots, memory_base: data });
 
     let mut text = String::new();
+    let mut thunks: Vec<(wasmparser::FuncType, u32)> = Vec::new();
     for (i, b) in binds {
         let (m, n, _, global) = &sh.imports[i];
         let g64 = |v: u32| {
@@ -594,7 +611,11 @@ fn install_module(
         };
         text += &match b {
             B::Export(p) => format!("E\t{m}\t{n}\t{p}\t{n}\t-\n"),
-            B::Late(off) => format!("L\t{m}\t{n}\t{}\n", base + off),
+            B::Late(off) => {
+                let Some(ty) = sh.import_types[i].clone() else { return Err(format!("{m}.{n}: an import of another module's function without a type")) };
+                thunks.push((ty, base + off));
+                format!("L\t{m}\t{n}\t{}\t{}\n", base + off, thunks.len() - 1)
+            }
             B::Own(off) => g64(base + off),
             B::Abs(v) => g64(v),
         };
@@ -611,6 +632,7 @@ fn install_module(
     wp.install = install;
     wp.base = base;
     wp.binds = text;
+    wp.thunks = if thunks.is_empty() { Vec::new() } else { late_thunks(&thunks) };
     crate::trace_line(&format!("gex: wine PE: {} installed as module {number} at slot {base}, {len} slots\n", wp.file));
     Ok(idx)
 }
@@ -964,6 +986,76 @@ pub extern "C" fn gex_wasmdll_binds(number: u32, buf: u32, cap: u32) -> u32 {
     let Some(w) = g.mods.iter().find(|w| w.number == number) else { return 0 };
     // (a buffer from the shim's heap, above the guest's limit)
     super::put_str(&w.binds, buf, cap)
+}
+
+/// Provider module `number`'s `L` thunks (`late_thunks`) into `buf` up to
+/// `cap`; their length, 0 for none.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_thunks(number: u32, buf: u32, cap: u32) -> u32 {
+    let g = lock(&WINE_PE);
+    let Some(w) = g.mods.iter().find(|w| w.number == number) else { return 0 };
+    let n = w.thunks.len().min(cap as usize);
+    // (a buffer from the shim's heap, above the guest's limit)
+    crate::shim_slice_mut(buf, n as u32).copy_from_slice(&w.thunks[..n]);
+    w.thunks.len() as u32
+}
+
+/// A module of thunks for calls into a module not yet installed (`L`): its
+/// function `k` (exported as `k`) calls `slots[k]`'s table entry, with
+/// `call_indirect` once the Worker has filled it (its imported global `r.k`
+/// set), else JS's import `s.k`, which catches up first. In wasm, so a
+/// call through it keeps no JS frame below the callee: the single-thread
+/// build suspends the whole stack at a blocking call, which a JS frame
+/// would refuse.
+fn late_thunks(slots: &[(wasmparser::FuncType, u32)]) -> Vec<u8> {
+    use wasm_encoder as we;
+    let vt = |v: &wasmparser::ValType| match v {
+        wasmparser::ValType::I32 => we::ValType::I32,
+        wasmparser::ValType::I64 => we::ValType::I64,
+        wasmparser::ValType::F32 => we::ValType::F32,
+        wasmparser::ValType::F64 => we::ValType::F64,
+        wasmparser::ValType::V128 => we::ValType::V128,
+        _ => we::ValType::I32,
+    };
+    let t64 = gex_abi::mem64();
+    let n = slots.len() as u32;
+    let mut types = we::TypeSection::new();
+    let mut imports = we::ImportSection::new();
+    let mut funcs = we::FunctionSection::new();
+    let mut exports = we::ExportSection::new();
+    let mut code = we::CodeSection::new();
+    imports.import("t", "t", we::TableType { element_type: we::RefType::FUNCREF, table64: t64, minimum: 0, maximum: None, shared: false });
+    for (k, (ty, _)) in slots.iter().enumerate() {
+        types.ty().function(ty.params().iter().map(vt), ty.results().iter().map(vt));
+        imports.import("s", &k.to_string(), we::EntityType::Function(k as u32));
+        imports.import("r", &k.to_string(), we::GlobalType { val_type: we::ValType::I32, mutable: true, shared: false });
+    }
+    for (k, (ty, slot)) in slots.iter().enumerate() {
+        let k = k as u32;
+        funcs.function(k);
+        exports.export(&k.to_string(), we::ExportKind::Func, n + k);
+        let mut f = we::Function::new([]);
+        let np = ty.params().len() as u32;
+        f.instruction(&we::Instruction::GlobalGet(k));
+        f.instruction(&we::Instruction::I32Eqz);
+        f.instruction(&we::Instruction::If(we::BlockType::Empty));
+        for p in 0..np {
+            f.instruction(&we::Instruction::LocalGet(p));
+        }
+        f.instruction(&we::Instruction::Call(k));
+        f.instruction(&we::Instruction::Return);
+        f.instruction(&we::Instruction::End);
+        for p in 0..np {
+            f.instruction(&we::Instruction::LocalGet(p));
+        }
+        f.instruction(&if t64 { we::Instruction::I64Const(*slot as i64) } else { we::Instruction::I32Const(*slot as i32) });
+        f.instruction(&we::Instruction::CallIndirect { type_index: k, table_index: 0 });
+        f.instruction(&we::Instruction::End);
+        code.function(&f);
+    }
+    let mut m = we::Module::new();
+    m.section(&types).section(&imports).section(&funcs).section(&exports).section(&code);
+    m.finish()
 }
 
 /// The `Late` slots whose provider is installed, as lines `slot importer

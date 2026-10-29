@@ -5840,6 +5840,7 @@ export class Gex {
       e.gex_free?.(buf, n);
     }
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
+    const late = {}, lines = [];
     for (const line of text.split('\n')) {
       if (!line) continue;
       const f = line.split('\t');
@@ -5856,21 +5857,47 @@ export class Gex {
           break;
         }
         case 'L': {
-          const slot = tIdx(Number(f[3])), t = st.ftab;
-          set(f[1], f[2], (...a) => {
-            // (an unfilled slot holds the miss stub, slot 0's)
-            let fn = t.get(slot);
-            if (!fn || fn === t.get(tIdx(0))) {
+          // a call through a slot filled once the module it calls into is
+          // instantiated here (#wasmdllLate): a wasm thunk (cgen/wasmdll.rs
+          // `late_thunks`) calls the slot once filled, and before that this,
+          // which catches up first
+          const slot = tIdx(Number(f[3])), t = st.ftab, k = f[4];
+          const ready = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+          const filled = () => { const fn = t.get(slot); return fn && fn !== t.get(tIdx(0)) ? fn : null; };
+          (st.lateReady ??= new Map()).set(Number(f[3]), [...(st.lateReady.get(Number(f[3])) ?? []), ready]);
+          if (filled()) ready.value = 1;
+          (late.s ??= {})[k] = (...a) => {
+            let fn = filled();
+            if (!fn) {
               this.#cgenCatchUp();
               this.#wasmdllLate(st);
-              fn = t.get(slot);
-              if (!fn || fn === t.get(tIdx(0))) throw new Error(`${f[2]}: its module is not installed`);
+              fn = filled();
+              if (!fn) throw new Error(`${f[2]}: its module is not installed`);
             }
+            ready.value = 1;
             return fn(...a);
-          });
+          };
+          (late.r ??= {})[k] = ready;
+          lines.push([f[1], f[2], k]);
           break;
         }
       }
+    }
+    if (lines.length) {
+      let mod = this.#wasmdllThunkMods.get(prov);
+      if (!mod) {
+        const n = e.gex_wasmdll_thunks(prov, 0, 0) >>> 0;
+        const tb = e.gex_alloc(n) >>> 0;
+        try {
+          e.gex_wasmdll_thunks(prov, tb, n);
+          mod = new WebAssembly.Module(this.#bytes().slice(tb, tb + n));
+        } finally {
+          e.gex_free?.(tb, n);
+        }
+        this.#wasmdllThunkMods.set(prov, mod);
+      }
+      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s: late.s, r: late.r }).exports;
+      for (const [m, name, k] of lines) set(m, name, x[k]);
     }
   }
 
@@ -5897,7 +5924,10 @@ export class Gex {
       const had = st.ftab.get(i);
       if (had && had !== st.ftab.get(tIdx(0))) continue;
       const f = p.exports[name];
-      if (typeof f === 'function') st.ftab.set(i, f);
+      if (typeof f === 'function') {
+        st.ftab.set(i, f);
+        for (const r of st.lateReady?.get(Number(slot)) ?? []) r.value = 1;
+      }
     }
   }
 
@@ -6494,6 +6524,8 @@ export class Gex {
 
   /** This process's wasm32 program as installed (`#cgenInstall`). */
   #wasmprogInfo = null;
+  /** Wine's PE modules' `L` thunk modules, by provider number (#wasmdllBind). */
+  #wasmdllThunkMods = new Map();
   /** The binding list `#wasmprogBind` read last (for `#wasmprogInfo`). */
   #wasmprogBindText = '';
   /** The session's door server, and this Worker's instance on it. */
