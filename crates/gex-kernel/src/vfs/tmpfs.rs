@@ -258,20 +258,21 @@ impl FileNode {
         if have == 0 || have >= size {
             return;
         }
-        let mut chunks: std::collections::HashMap<u64, Box<[u8]>> = data[..head as usize]
+        // Kept for good: the rest bundle at `url` does not carry them.
+        let mut chunks: std::collections::HashMap<u64, (Box<[u8]>, u64)> = data[..head as usize]
             .chunks(LAZY_CHUNK as usize)
             .enumerate()
-            .map(|(k, c)| (k as u64, c.to_vec().into_boxed_slice()))
+            .map(|(k, c)| (k as u64, (c.to_vec().into_boxed_slice(), SEEDED)))
             .collect();
         if have > head {
-            chunks.insert(size / LAZY_CHUNK, data[head as usize..].to_vec().into_boxed_slice());
+            chunks.insert(size / LAZY_CHUNK, (data[head as usize..].to_vec().into_boxed_slice(), SEEDED));
         }
         let was = data.capacity();
         *data = Vec::new();
         note_capacity(was, 0);
         TMPFS_BYTES.fetch_add(have, core::sync::atomic::Ordering::Relaxed);
         self.changed();
-        *lazy = Some(Lazy { url: url.to_string(), size, chunks, held: have, ahead: 0 });
+        *lazy = Some(Lazy { url: url.to_string(), size, chunks, held: have, ahead: 0, reads: 0 });
     }
 
     /// Make a lazy file an ordinary one (all of it fetched), before a write
@@ -315,6 +316,13 @@ const LAZY_CHUNK: u64 = 1 << 20;
 /// 22 MB DLL fetched (24 s at 0.7 MB/s) for a look at its headers and an
 /// icon.
 const LAZY_READAHEAD: u64 = 15;
+/// The most of a lazy file's bytes kept: past it, the chunks read longest
+/// ago go (a lazy file is never written; a chunk read again is fetched
+/// again). A game's data reads its gigabytes once, mostly.
+const LAZY_HELD_MAX: u64 = if cfg!(test) { 8 << 20 } else { 256 << 20 };
+/// A lazy file's chunk that came with a bundle ([`FileNode::seed_head`]),
+/// as its last use: it is kept, since the file's URL does not carry it.
+const SEEDED: u64 = u64::MAX;
 
 /// A file whose bytes live elsewhere (a URL) and arrive a chunk at a time,
 /// as they are read: a game's gigabytes of data served to a page.
@@ -322,10 +330,14 @@ const LAZY_READAHEAD: u64 = 15;
 struct Lazy {
     url: String,
     size: u64,
-    chunks: std::collections::HashMap<u64, Box<[u8]>>,
+    /// Each chunk held, and the read that last used it ([`SEEDED`]: one
+    /// seeded from a bundle, never evicted).
+    chunks: std::collections::HashMap<u64, (Box<[u8]>, u64)>,
     held: u64,
     /// The readahead of the last sequential miss, in chunks (0: none yet).
     ahead: u64,
+    /// Reads so far: the clock of the chunks' last uses.
+    reads: u64,
 }
 
 impl Lazy {
@@ -340,10 +352,14 @@ impl Lazy {
         }
         let end = (offset + buf.len() as u64).min(self.size);
         self.fetch(offset / LAZY_CHUNK, (end - 1) / LAZY_CHUNK, ahead)?;
+        self.reads += 1;
         let mut at = offset;
         while at < end {
             let k = at / LAZY_CHUNK;
-            let chunk = &self.chunks[&k];
+            let (chunk, used) = self.chunks.get_mut(&k).expect("fetched");
+            if *used != SEEDED {
+                *used = self.reads;
+            }
             let from = (at - k * LAZY_CHUNK) as usize;
             let n = ((end - at) as usize).min(chunk.len() - from);
             let o = (at - offset) as usize;
@@ -384,13 +400,26 @@ impl Lazy {
             for k in c..=stop {
                 let a = ((k - c) * LAZY_CHUNK) as usize;
                 let b = (a + LAZY_CHUNK as usize).min(run.len());
-                self.chunks.insert(k, run[a..b].to_vec().into_boxed_slice());
+                self.chunks.insert(k, (run[a..b].to_vec().into_boxed_slice(), self.reads));
                 self.held += (b - a) as u64;
                 TMPFS_BYTES.fetch_add((b - a) as u64, core::sync::atomic::Ordering::Relaxed);
             }
+            self.evict(first, last.max(stop));
             c = stop + 1;
         }
         Ok(())
+    }
+
+    /// Past [`LAZY_HELD_MAX`], the chunks used longest ago go, never one of
+    /// `keep_first..=keep_last` (the read being served needs them, however
+    /// many) nor a [`SEEDED`] one.
+    fn evict(&mut self, keep_first: u64, keep_last: u64) {
+        while self.held > LAZY_HELD_MAX {
+            let Some(k) = self.chunks.iter().filter(|(k, (_, used))| *used != SEEDED && !(keep_first..=keep_last).contains(*k)).min_by_key(|(_, (_, used))| *used).map(|(k, _)| *k) else { return };
+            let (c, _) = self.chunks.remove(&k).expect("listed");
+            self.held -= c.len() as u64;
+            TMPFS_BYTES.fetch_sub(c.len() as u64, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// `posix_fadvise` of this lazy file: `WILLNEED` fetches the chunks of
@@ -854,7 +883,7 @@ impl TmpFs {
         inner.set_ino(path.clone(), ino);
         let f = FileNode::new(Vec::new(), ino);
         f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
-        *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0 });
+        *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
     }
 
@@ -890,7 +919,7 @@ impl TmpFs {
             }
             if let Ok(l) = f.lazy.try_lock() {
                 if let Some(l) = l.as_ref() {
-                    for (k, c) in l.chunks.iter() {
+                    for (k, (c, _)) in l.chunks.iter() {
                         out.push((1, c.as_ptr() as usize, c.len(), k * LAZY_CHUNK, l.url.clone()));
                     }
                 }
@@ -2269,13 +2298,16 @@ mod lazy_tests {
             TAIL_ASKED.lock().unwrap().push((offset, into.len() as u64));
             return counting(url, offset, into);
         }
+        if url == "/data/q" {
+            *FETCHES_Q.lock().unwrap() += 1;
+        }
         if url == "/data/pe" {
             let img = PE.get().unwrap();
             ASKED.lock().unwrap().push((offset, into.len() as u64));
             into.copy_from_slice(&img[offset as usize..offset as usize + into.len()]);
             return true;
         }
-        assert_eq!(url, "/data/f");
+        assert!(url == "/data/f" || url == "/data/q", "{url}");
         for (k, b) in into.iter_mut().enumerate() {
             *b = ((offset + k as u64) % 251) as u8;
         }
@@ -2494,6 +2526,32 @@ mod lazy_tests {
         assert!(b.iter().enumerate().all(|(k, &x)| x == byte(3 * LAZY_CHUNK + k as u64)));
     }
 
+
+    /// A seeded head's chunks stay past the budget: the file's URL does
+    /// not carry them.
+    #[test]
+    fn a_seeded_head_is_never_evicted() {
+        set_lazy_fetch(fake);
+        let max = LAZY_HELD_MAX / LAZY_CHUNK;
+        let size = (max + 10) * LAZY_CHUNK;
+        let fs = TmpFs::new();
+        fs.add_file("/m/big", (0..2 * LAZY_CHUNK).map(|i| (i % 251) as u8).collect());
+        fs.add_lazy("/m/big", size, "/data/q");
+        let h = fs.open("m/big", oflags::O_RDONLY, 0).unwrap();
+        let mut b = vec![0u8; 16];
+        for k in (2..max + 10).step_by(2) {
+            h.read_at(k * LAZY_CHUNK, &mut b).unwrap();
+        }
+        let was = *FETCHES_Q.lock().unwrap();
+        h.read_at(100, &mut b).unwrap();
+        h.read_at(LAZY_CHUNK + 100, &mut b).unwrap();
+        assert_eq!(*FETCHES_Q.lock().unwrap(), was, "a seeded chunk was fetched");
+        assert_eq!(b[0], ((LAZY_CHUNK + 100) % 251) as u8);
+    }
+
+    /// How many requests of `/data/q` there were.
+    static FETCHES_Q: Mutex<u32> = Mutex::new(0);
+
     /// Requests of `/data/r`, each `(offset, len)`.
     static RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
     fn counting(url: &str, offset: u64, into: &mut [u8]) -> bool {
@@ -2524,6 +2582,51 @@ mod lazy_tests {
         let runs: Vec<(u64, u64)> = RUNS.lock().unwrap().iter().map(|&(o, n)| (o / LAZY_CHUNK, n / LAZY_CHUNK)).collect();
         // (start chunk, chunks): the read's own, then 1, 2, 4, 8 ahead
         assert_eq!(runs, vec![(0, 1), (1, 2), (3, 3), (6, 5), (11, 9), (30, 1)]);
+    }
+
+    /// Past the budget, the chunks read longest ago go, and one read again
+    /// is fetched again; a read larger than the budget is still served whole.
+    #[test]
+    fn lazy_chunks_past_the_budget_go_least_recent_first() {
+        set_lazy_fetch(fake);
+        let fs = TmpFs::new();
+        let max = LAZY_HELD_MAX / LAZY_CHUNK;
+        fs.add_lazy("/r/g", (max + 40) * LAZY_CHUNK, "/data/q");
+        let h = fs.open("r/g", 0, 0).unwrap();
+        let mut b = vec![0u8; 16];
+        let at = |k: u64| k * LAZY_CHUNK + 7;
+        // Every other chunk, so no read is sequential (no readahead).
+        let mut k = 0;
+        while k < 2 * (max + 4) {
+            h.read_at(at(k), &mut b).unwrap();
+            assert_eq!(b[0], (at(k) % 251) as u8);
+            if k == 2 * (max - 1) {
+                // chunk 0 used again, the last before the budget is reached
+                h.read_at(at(0), &mut b).unwrap();
+            }
+            k += 2;
+        }
+        let held = |fs: &TmpFs| {
+            let inner = fs.inner.read().unwrap();
+            let Some(Node::File(f)) = inner.nodes.get("r/g") else { panic!() };
+            let l = f.lazy.lock().unwrap();
+            let l = l.as_ref().unwrap();
+            let mut keys: Vec<u64> = l.chunks.keys().copied().collect();
+            keys.sort();
+            (l.held, keys)
+        };
+        let (bytes, keys) = held(&fs);
+        assert_eq!(bytes, max * LAZY_CHUNK);
+        // max + 4 chunks read: the four used longest ago went, 0 (read again) not.
+        assert!(keys.contains(&0) && !keys.contains(&2) && !keys.contains(&4) && !keys.contains(&8) && keys.contains(&10));
+        let was = *FETCHES_Q.lock().unwrap();
+        h.read_at(at(2), &mut b).unwrap();
+        assert_eq!(b[0], (at(2) % 251) as u8);
+        assert_eq!(*FETCHES_Q.lock().unwrap(), was + 1, "an evicted chunk is fetched again");
+        // A read past the budget keeps every chunk it reads until it is served.
+        let mut big = vec![0u8; ((max + 2) * LAZY_CHUNK) as usize];
+        assert_eq!(h.read_at(LAZY_CHUNK, &mut big).unwrap(), big.len() as u64);
+        assert!(big.iter().enumerate().step_by(4093).all(|(i, &v)| v == ((LAZY_CHUNK + i as u64) % 251) as u8));
     }
 
     #[test]
