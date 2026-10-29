@@ -235,7 +235,10 @@ relative motion, until Escape, `release()`, or the program letting go.
 `locked` says whether it holds; the events are `lock` and `unlock`. A program
 that asks for nothing never locks the pointer. A program that asks just
 after the click that started it (an X game grabbing on a click) gets the
-lock while that click still counts as the user's gesture.
+lock while that click still counts as the user's gesture. Xwayland locks
+the pointer for an X program only when the program hides the cursor with
+XFixes (`XFixesHideCursor`). A grab with a blank cursor image only confines
+the pointer, so it gets no relative motion.
 
 `new Clipboard(sys, { sync })`: text copied and pasted between the page and
 the guest's programs. A Wayland program's selection, or an X program's
