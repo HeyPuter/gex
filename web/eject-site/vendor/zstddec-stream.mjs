@@ -31,6 +31,11 @@ var ZSTDDecoder = class {
 		else init = WebAssembly.instantiate(Buffer.from(wasm, "base64"), IMPORT_OBJECT).then(this._init);
 		return init;
 	}
+	/** gex: let the instance and its memory go (a wasm memory never shrinks); the next
+	 *  init() makes a new one. Every stream must have ended. */
+	dispose() {
+		instance = heap = heapView = init = void 0;
+	}
 	_init(result) {
 		instance = result.instance;
 		IMPORT_OBJECT.env.emscripten_notify_memory_growth(0);
