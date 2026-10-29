@@ -17,3 +17,36 @@ export async function main(fn) {
   rt.done = true;
 }
 export const timeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what}: timed out after ${ms} ms`)), ms))]);
+
+/** The runtime's debug switches for a test page: vite dev's Workers need
+ *  workergraph=0; `?arch=` (run.mjs RT_ARCH) picks the translated arch. */
+export function testDebug() {
+  const arch = new URLSearchParams(location.search).get('arch');
+  return { workergraph: '0', ...(arch ? { arch } : {}) };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export async function until(fn, what, ms = 20000) {
+  for (const t0 = performance.now(); performance.now() - t0 < ms;) {
+    const v = fn();
+    if (v) return v;
+    await sleep(25);
+  }
+  throw new Error(`${what}: not within ${ms} ms`);
+}
+
+/** A program's stdout as lines, as they come. */
+export function lines(p, stream = p.stdout) {
+  const got = [];
+  (async () => {
+    const dec = new TextDecoder();
+    let buf = '';
+    for (const r = stream.getReader(); ;) {
+      const { value, done } = await r.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      for (let i; (i = buf.indexOf('\n')) >= 0;) { got.push(buf.slice(0, i)); buf = buf.slice(i + 1); }
+    }
+  })();
+  return got;
+}

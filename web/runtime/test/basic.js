@@ -2,12 +2,15 @@
 import { System } from '../src/index.js';
 import { Filesystem } from '../src/fs.js';
 import { main, say, check, eq, timeout } from './lib.js';
+import { testDebug } from './lib.js';
 
 main(async () => {
-  const sys = new System({ baseUrl: '/', debug: { workergraph: '0' } });
+  const sys = new System({ baseUrl: '/', debug: testDebug() });
   const fs = new Filesystem(sys);
   fs.addTar('/__rt/bb.tar.zst');
   fs.addFiles({ '/etc/hello': 'hello from addFiles\n' });
+  fs.addFiles({ '/etc/gex/boot': '#!/bin/sh\necho booted > /tmp/booted\n' }, { mode: 0o755 });
+  check('a second System throws', (() => { try { new System(); return false; } catch (e) { return /one system/.test(e.message); } })());
   check('a second Filesystem throws', (() => { try { new Filesystem(sys); return false; } catch { return true; } })());
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');
@@ -15,6 +18,7 @@ main(async () => {
   eq('state', sys.state.phase, 'running');
 
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
+  eq('/etc/gex/boot ran', await fs.readFile('/tmp/booted', { encoding: 'utf-8' }), 'booted\n');
   let t = performance.now();
   const r = await timeout(sys.run(['sh', '-c', 'echo out; echo err >&2; cat /etc/hello; exit 3'], { env }), 30000, 'run');
   say(`run in ${(performance.now() - t).toFixed(0)} ms`);

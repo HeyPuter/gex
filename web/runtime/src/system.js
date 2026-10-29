@@ -21,6 +21,46 @@ const INIT_PATH = '/run/gex/init';
 const ASSETS = typeof __GEX_RUNTIME_ASSETS__ === 'string' ? __GEX_RUNTIME_ASSETS__ : '../../public/';
 const DEFAULT_BASE = () => new URL(ASSETS, import.meta.url).href;
 
+/** Whether this page has made its system. */
+let made = false;
+
+/** ELF's machine numbers, as the guest's programs are built for them. */
+const EM = { 62: 'x86', 183: 'aarch64' };
+
+/**
+ * The guest architecture a tree's programs are built for: the machine of the
+ * first native program found among the usual ones (a gexcc program, wasm32,
+ * runs on either and says nothing), or null.
+ */
+export function treeArch({ files, symlinks = {}, hard = {} }) {
+  const resolve = (p) => {
+    for (let i = 0; i < 16; i++) {
+      if (hard[p]) p = hard[p];
+      const l = symlinks[p];
+      if (l === undefined) return p;
+      p = l.startsWith('/') ? l : `${p.slice(0, p.lastIndexOf('/'))}/${l}`;
+      const out = [];
+      for (const part of p.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') out.pop();
+        else out.push(part);
+      }
+      p = `/${out.join('/')}`;
+    }
+    return p;
+  };
+  const machine = (b) => (b && b.length > 20 && b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46 && b[4] === 2 ? EM[b[18] | (b[19] << 8)] ?? null : null);
+  for (const p of ['/bin/sh', '/usr/bin/sh', '/bin/bash', '/usr/bin/env', '/sbin/init', '/bin/busybox', '/usr/bin/busybox']) {
+    const m = machine(files[resolve(p)]);
+    if (m) return m;
+  }
+  for (const b of Object.values(files)) {
+    const m = machine(b);
+    if (m) return m;
+  }
+  return null;
+}
+
 /** A Worker that answers calls, for the runtime's helpers. */
 export class Rpc {
   #w; #next = 1; #calls = new Map();
@@ -80,6 +120,7 @@ export class System extends EventTarget {
   #early = new Map(); // pid -> exit status heard before the pid was known
   #nextHandle = 1;
   #booting = null;
+  #arch = null;
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
@@ -92,6 +133,9 @@ export class System extends EventTarget {
     for (const k of Object.keys(arguments[0] ?? {})) {
       if (!['baseUrl', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
+    // The page runtime keeps its state in the page's globals.
+    if (made) throw new Error('System: a page runs one system; this page already made one');
+    made = true;
     this.#opts = { baseUrl: String(baseUrl ?? DEFAULT_BASE()), debug: { ...debug } };
     const self = this;
     this[INTERNAL] = {
@@ -155,20 +199,11 @@ export class System extends EventTarget {
     }
     // The page runtime takes its switches and asset base from these
     // (web/src/page-env.js, page-globals.js); never the page's URL.
-    const { arch = 'aarch64', ...switches } = this.#opts.debug;
+    const { arch: wantArch, ...switches } = this.#opts.debug;
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(switches)) if (v !== undefined && v !== false && k !== 'console') q.set(k, v === true ? '1' : String(v));
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
-    const { setGlobals } = await import('../../src/page-globals.js');
-    setGlobals((name) => q.get(name), { arch });
-    const { runProgram, primeRuntime, runtimeUrls } = await import('../../src/runtime.js');
-    // Under Node (the runtime's tests) there is no fetch of a file URL.
-    if (globalThis.process?.versions?.node && !globalThis.document) {
-      const u = runtimeUrls();
-      const get = (x) => bytesOf(new URL(x, globalThis.GEX_ASSET_BASE).href);
-      primeRuntime({ shimBytes: await get(u.shimBytes), seedBytes: await get(u.seedBytes), kernelBytes: await get(u.kernelBytes), fetchOther: get });
-    }
     const { assetUrl } = await import('../../src/page-env.js');
 
     const init = await bytesOf(assetUrl('/gex/gex-init'), 'gex-init');
@@ -190,6 +225,24 @@ export class System extends EventTarget {
     for (const fn of this.#beforeBoot) await fn(opts);
     opts.files[INIT_PATH] = init;
     opts.modes[INIT_PATH] = 0o755;
+
+    // The translated architecture, beside which wasm32 programs (gex-init
+    // among them) run: the global kernel is built for one (its syscall ABI,
+    // struct layouts, signal frame), so it is chosen here, from the tree's
+    // programs. A tree with none yet (wasm32 only, its native packages to
+    // come) gets aarch64, Debian's arm64 being the usual second
+    // architecture of a wasm32 tree. A program of the other one does not run.
+    const arch = wantArch ?? treeArch(opts) ?? 'aarch64';
+    const { setGlobals } = await import('../../src/page-globals.js');
+    setGlobals((name) => q.get(name), { arch });
+    const { runProgram, primeRuntime, runtimeUrls } = await import('../../src/runtime.js');
+    // Under Node (the runtime's tests) there is no fetch of a file URL.
+    if (globalThis.process?.versions?.node && !globalThis.document) {
+      const u = runtimeUrls();
+      const get = (x) => bytesOf(new URL(x, globalThis.GEX_ASSET_BASE).href);
+      primeRuntime({ shimBytes: await get(u.shimBytes), seedBytes: await get(u.seedBytes), kernelBytes: await get(u.kernelBytes), fetchOther: get });
+    }
+    this.#arch = arch;
 
     const term = {
       rows: 24,
@@ -294,6 +347,7 @@ export class System extends EventTarget {
         this.#procs.delete(h);
         io.send('release', { h });
       },
+      windows: (pid) => this.#parts.get('windows')?.[INTERNAL]?.of?.(pid) ?? [],
     });
     this.#procs.set(h, p);
     io.call('spawn', {
@@ -373,6 +427,7 @@ export class System extends EventTarget {
     const host = this.#sys?.host;
     return {
       phase: this.#state.phase,
+      arch: this.#arch,
       processes: [...this.#procs.values()].map((p) => ({ pid: p.pid, argv: p.argv })),
       pids: host?.pids ?? [],
       threads: host?.threads ?? 0,

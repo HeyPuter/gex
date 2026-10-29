@@ -51,10 +51,10 @@ export class Process extends EventTarget {
   #exitedResolve; #exitedReject;
   #pendingKills = [];
 
-  constructor({ argv, stdio, encoding, write, closeStdin, resize, kill, release }) {
+  constructor({ argv, stdio, encoding, write, closeStdin, resize, kill, release, windows }) {
     super();
     this.argv = [...argv];
-    this.#io = { write, closeStdin, resize, kill, release };
+    this.#io = { write, closeStdin, resize, kill, release, windows };
     this.started = new Promise((res, rej) => { this.#startedResolve = res; this.#startedReject = rej; });
     this.exited = new Promise((res, rej) => { this.#exitedResolve = res; this.#exitedReject = rej; });
     // Nobody need wait on both.
@@ -144,8 +144,8 @@ export class Process extends EventTarget {
     else this.#io.kill(this.#pid, signal);
   }
 
-  /** The windows this program has open (HostWindows). */
+  /** The windows this program has open (HostWindows' GuestWindows). */
   windows() {
-    return this[INTERNAL].windows?.() ?? [];
+    return this.#pid === null ? [] : this.#io.windows?.(this.#pid) ?? [];
   }
 }

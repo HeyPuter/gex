@@ -4,7 +4,7 @@ Linux programs in a web page: a kernel, the programs it runs, and their files.
 A page builds a `System`, gives it a filesystem, boots it, and runs programs in
 it with a terminal or with pipes. Windows, persistence, network, sound and GL
 are parts of their own, each a class that takes the system as its first
-argument. This first version has the system and its filesystem.
+argument.
 
 ```js
 import { System } from '@gex/runtime';
@@ -30,18 +30,26 @@ term.onData((d) => sh.pty.write(d));
 - The runtime fetches its files from `gex/`, beside its modules. A bundler
   copies the package as it is. `new System({ baseUrl })` names another place,
   the directory that holds `gex/`.
-- One system per page.
+- One system per page: a second `new System()` throws.
+- A system runs wasm32 programs (built with gexcc) and the programs of one
+  translated architecture, x86-64 or aarch64, which it takes from the tree's
+  programs at boot (`/bin/sh` first); aarch64 when the tree has none. The
+  kernel is built for one, so this is fixed for the system's life: a program
+  of the other one fails to start (`ENOEXEC`).
+- At boot, before the first program, pid 1 runs the tree's `/etc/gex/boot`
+  when it has one (as root; it must end, and what it starts goes on): where
+  a tree starts its daemons.
 
 ## System
 
 | Member | Does |
 | --- | --- |
-| `new System({ baseUrl, debug })` | A system, not started. `debug` holds the runtime's debug switches (`{ strace: 1 }`, `{ console: true }` to log pid 1's console, `{ arch: 'x86' }` for an x86-64 guest; aarch64 is the default). |
+| `new System({ baseUrl, debug })` | A system, not started; a page makes one. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log pid 1's console); they are not a stable API. |
 | `boot()` | Starts the kernel and pid 1. Parts that work before boot (the filesystem) must be made before it. |
 | `spawn(argv, opts)` | Starts a program and returns its `Process` at once. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). |
 | `state` | `{ phase, error, console }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what pid 1 and the runtime say. |
-| `describe()` | `{ phase, processes, pids, threads, memory }`. |
+| `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
 | `shutdown()` | Ends every program and the kernel. |
 
 ## Process
@@ -64,7 +72,7 @@ files are written into the running tree.
 | Member | Does |
 | --- | --- |
 | `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url], ...]` or the URL of such a list (JSON); their URLs must be on the page's own origin and answer range requests. |
-| `addFiles({ path: data })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text). |
+| `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |
 | `stat(path, { follow })` | `{ type, mode, size, ino, mtime, nlink }`; `follow: false` does not follow a last symlink. |
@@ -73,6 +81,57 @@ files are written into the running tree.
 | `watch(path, fn)` | `fn({ type, path })` for each change to a directory's entries or to a file, by a program or the page: `create`, `change` (a write finished), `attrib`, `delete`, `move-out` and `move-in` (one rename's halves share a `cookie`), and `gone` when `path` itself went. Returns a function that stops it. |
 
 Errors carry `code` (`'ENOENT'`, ...) and `errno`.
+
+## Windows
+
+One windows part per system, made before boot. A program finds the
+compositor through its environment: add the part's `env` to `spawn`'s.
+
+X11 programs' windows come as any other: with windows, display `:0` is the
+runtime's own X server (Xwayland, rootless, gex's window manager framing
+nothing), started when the first X client connects, which waits for it. The
+tree needs only the clients' libraries.
+
+### HostWindows (`@gex/runtime/windows/host`)
+
+Each guest window is handed to the page to frame and place, as a desktop's
+window manager does.
+
+```js
+const hw = new HostWindows(sys, { width: 1280, height: 720 });
+hw.addEventListener('window', ({ window: w }) => {
+  if (w.kind === 'toplevel' && w.decorations === 'host') frame(w);   // a title bar, w.canvas inside
+  else desktop.append(w.canvas);                                      // popups: at w.x, w.y over w.parent
+});
+await sys.boot();
+sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
+```
+
+| Member | Does |
+| --- | --- |
+| `new HostWindows(sys, { width, height, scale })` | The output programs see as their screen, in CSS pixels (default the viewport) and device pixels per CSS pixel (default `devicePixelRatio`, rounded). |
+| `setOutputSize(width, height, scale)` | When the page's desktop changes size. |
+| `env` | `{ XDG_RUNTIME_DIR, WAYLAND_DISPLAY, DISPLAY }` for `spawn`. |
+| `windows()`, `focused` | Every window; the one with the keyboard. |
+| `keyEvent(e, pressed)` | A `keydown`/`keyup` heard elsewhere (the frame), for the window with the keyboard. |
+| `window` event | `{ window }`: a new `GuestWindow`. A `cursor` event (`css`) when the client's cursor changes; it is also set on every window's canvas. |
+
+`process.windows()` lists a process's windows.
+
+**GuestWindow**
+
+| Member | Does |
+| --- | --- |
+| `canvas` | Its pixels, CSS-sized to the window. Focusable: keys go to the window whose canvas has the page's focus; pointer and wheel input are its own. |
+| `kind` | `'toplevel'`, `'popup'` (a menu, a tooltip: never framed, drawn above its parent and outside its frame) or `'subsurface'`. |
+| `parent`, `pid`, `title`, `width`, `height` | |
+| `decorations` | `'host'` (frame it), `'client'` (it draws its own: a Win32 window under Wine) or `'none'`. |
+| `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
+| `place(x, y)` | Where the page put it on the output; call after each move (X windows' menus read it). |
+| `resize(w, h)`, `setStates({ maximized, fullscreen, resizing }, w, h)` | Ask for a size, with states. |
+| `focus()`, `close()` | The keyboard; a polite close. |
+| `appId` | `null` for now. |
+| Events | `title`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
 
 ## Building
 

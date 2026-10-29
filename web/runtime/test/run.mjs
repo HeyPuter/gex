@@ -9,7 +9,8 @@
 // GEXCC (gexcc, to build gex-init into web/public/gex when it is missing or
 // older than its source), CHROME, RT_PORT (vite; Chromium's is RT_PORT+1),
 // RT_TIMEOUT (seconds per page, default 120), RT_WORK (scratch directory),
-// RT_VERBOSE=1 (every console line).
+// RT_VERBOSE=1 (every console line), RT_ARCH (the translated arch, else the
+// tree's).
 
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, linkSync, copyFileSync, mkdtempSync } from 'node:fs';
@@ -50,8 +51,11 @@ copyFileSync(BUSYBOX, join(tree, 'bin/busybox'));
 for (const name of readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean)) {
   linkSync(join(tree, 'bin/busybox'), join(tree, 'bin', name));
 }
-// And what busybox has no applet for (probe/rt-probe.c).
+// And what busybox has no applet for (probe/rt-probe.c), and a Wayland and
+// an X11 window (probe/rt-wl.c, rt-x11.c).
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-probe'), join(HERE, 'probe/rt-probe.c')], { stdio: 'inherit' });
+execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-wl'), join(HERE, 'probe/rt-wl.c'), '-lwayland-client', '-lffi'], { stdio: 'inherit' });
+execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-x11'), join(HERE, 'probe/rt-x11.c'), '-lX11', '-lxcb', '-lXau', '-lXdmcp'], { stdio: 'inherit' });
 // An extended attribute, which the tar carries (tar --xattrs).
 execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
 execFileSync('tar', ['--xattrs', '-cf', join(WORK, 'bb.tar'), '-C', tree, '.']);
@@ -154,7 +158,7 @@ async function runPage(page) {
   }));
   await cdp.send('Runtime.enable', {}, sessionId);
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
-  const url = `http://127.0.0.1:${PORT}/runtime/test/${page}`;
+  const url = `http://127.0.0.1:${PORT}/runtime/test/${page}${process.env.RT_ARCH ? `?arch=${process.env.RT_ARCH}` : ''}`;
   log(`${page}: ${url}`);
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url }, sessionId);

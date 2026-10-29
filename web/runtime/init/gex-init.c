@@ -282,10 +282,30 @@ static void reap(void) {
   }
 }
 
+/* The tree's own start, `/etc/gex/boot` when it has one (a system's
+ * daemons: dbus, ...): run once, as root, before the first program, its
+ * output on the console. It must end; what it starts goes on. */
+static void boot(void) {
+  static char *const argv[] = {"/etc/gex/boot", NULL};
+  static char *const envp[] = {"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", NULL};
+  if (access(argv[0], X_OK) < 0) return;
+  pid_t pid;
+  int err = posix_spawn(&pid, argv[0], NULL, NULL, argv, envp);
+  if (err) {
+    fprintf(stderr, "gex-init: %s: %s\n", argv[0], strerror(err));
+    return;
+  }
+  int st;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  if (WIFSIGNALED(st)) fprintf(stderr, "gex-init: %s: killed by signal %d\n", argv[0], WTERMSIG(st));
+  else if (WEXITSTATUS(st)) fprintf(stderr, "gex-init: %s: exit %d\n", argv[0], WEXITSTATUS(st));
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--as")) return as_user(argc, argv);
   if (argc > 0 && argv[0][0] == '/') self_path = argv[0];
   signal(SIGPIPE, SIG_IGN);
+  boot();
   if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) < 0) return 1;
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);

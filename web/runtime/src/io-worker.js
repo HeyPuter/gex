@@ -531,12 +531,38 @@ function readWatches() {
   return true;
 }
 
+// -- X display :0 -----------------------------------------------------------
+
+/** Display :0's names, held for the X server until a client comes: then the
+ *  page is told (`x-wanted`) and starts it on these sockets. */
+const xhold = { ids: [], asked: false };
+
+function holdX() {
+  for (const name of ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0']) {
+    const { at: [[p, n]] } = lay(name);
+    const id = k.k_sock_bind(BigInt(p), n);
+    if (id < 0) throw errno(id, `X display :0 (${JSON.stringify(name)})`);
+    xhold.ids.push(id);
+    watch(k.k_sock_queue(id));
+  }
+  return xhold.ids;
+}
+
+function xWanted() {
+  if (xhold.asked || !xhold.ids.some((id) => k.k_sock_pending(id) > 0)) return false;
+  xhold.asked = true;
+  // The server watches them from now on.
+  for (const id of xhold.ids) unwatch(k.k_sock_queue(id));
+  post({ ev: 'x-wanted' });
+  return true;
+}
+
 // -- the loop --------------------------------------------------------------
 
 /** One pass over everything that can move without waiting. True if
  *  anything did. */
 function pass() {
-  let moved = readWatches();
+  let moved = readWatches() | xWanted();
   if (init.conn < 0 && init.listener >= 0) {
     const c = k.k_sock_accept(init.listener);
     if (c >= 0) {
@@ -734,6 +760,7 @@ const ops = {
   chmod: ({ path, mode }) => chmod(path, mode),
   addTree: ({ tree }) => addTree(tree),
   watch: ({ path }) => addWatch(path),
+  holdX: () => holdX(),
   unwatch: ({ h }) => rmWatch(h),
 };
 

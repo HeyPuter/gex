@@ -99,14 +99,16 @@ export class Filesystem extends EventTarget {
   }
 
   /** Single files: `{ '/path': bytes | Blob | URL | string }` (a string is
-   *  the file's text). */
-  addFiles(map) {
+   *  the file's text), each of `mode` (default 0644). */
+  addFiles(map, { mode } = {}) {
     const p = (async () => {
       const files = {};
+      const modes = {};
       for (const [path, v] of Object.entries(map)) {
         files[norm(path)] = typeof v === 'string' ? new TextEncoder().encode(v) : await bytesOf(v, path);
+        if (mode !== undefined) modes[norm(path)] = mode;
       }
-      return { files, dirs: [], links: {}, hard: {}, modes: {}, lazy: [] };
+      return { files, dirs: [], links: {}, hard: {}, modes, lazy: [] };
     })();
     return this.#add(p);
   }
