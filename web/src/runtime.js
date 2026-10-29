@@ -835,6 +835,9 @@ async function runProgramHere(
     // The page's cache of lazy files (app.js, lazy-cache.mjs): its control
     // buffer, handed to every Worker.
     lazyCache = null,
+    // The directories the page serves (web/runtime fs.mount, page-fs.mjs):
+    // their control buffer, handed to every Worker.
+    pageFs = null,
     // Whether any lazy file is in a rest bundle (`BUNDLE#OFFSET`): only then
     // does a Worker without the cache's owner load a decoder of its own
     // (lazy-fetch.mjs `lazyReady`).
@@ -1116,6 +1119,7 @@ async function runProgramHere(
       heartbeat: heartbeat || undefined,
       fill: fill || undefined,
       lazyCache: lazyCache || undefined,
+      pageFs: pageFs || undefined,
       restBundle: restBundle || undefined,
       identities: identities || undefined,
       // The closure's libraries, in `extra` so a forked child gets them too: a

@@ -80,6 +80,7 @@ async function forkBulkIn(child) {
 import { setFill, fillFile } from './lazy-fetch.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
+import { setPageFs } from './page-fs.mjs';
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
@@ -774,6 +775,8 @@ async function handle(msg) {
   if (msg.fill) setFill(msg.fill);
   // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
+  // The directories the page serves (web/runtime fs.mount, page-fs.mjs).
+  if (msg.pageFs) setPageFs(msg.pageFs);
   // A rest bundle's files among the lazy ones (lazy-fetch.mjs `lazyReady`).
   if (msg.restBundle) globalThis.GEX_REST_BUNDLE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for

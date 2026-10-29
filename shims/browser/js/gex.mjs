@@ -12,6 +12,7 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { kernelThread, lazyFetch, lazyReady, processMemories } from "./lazy-fetch.mjs";
+import { pageFs } from './page-fs.mjs';
 import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logQuiet } from "./log.mjs";
@@ -3058,7 +3059,7 @@ export class Gex {
     _k('instantiate');
     await lazyReady();
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory) },
+      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory), page_fs: pageFs(memory) },
     });
     _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is

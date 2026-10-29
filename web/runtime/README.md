@@ -82,6 +82,31 @@ files are written into the running tree.
 
 Errors carry `code` (`'ENOENT'`, ...) and `errno`.
 
+### Mounts
+
+`fs.mount(path, provider)` serves a directory from the page's own filesystem
+(a desktop's files, OPFS, IndexedDB, the network), before boot or while the
+system runs: every program sees it at once, those already running too, over
+whatever the tree has there (back at `unmount`). It returns a `Mount`
+(`path`, `ready`, `unmount()`, an `unmounted` event); `fs.unmount(path)` and
+`fs.mounts()` too. A program's call on it waits for the provider's promise,
+in its own thread only.
+
+The provider's methods take paths inside it (`/`, `/a/b`), are async, and
+throw errors with a `code` (`'ENOENT'`, `'EEXIST'`, ...) or an `errno`:
+
+| Method | Does |
+| --- | --- |
+| `stat(path)` | `{ type: 'file' \| 'directory' \| 'symlink', size, mode, mtime (ms or a Date), ino }` (`mode`, `ino` optional) |
+| `readdir(path)` | `[{ name, type }]`, or names (each is then stat'ed) |
+| `open(path, { read, write, create, truncate, exclusive, append, mode })` | A handle, any value, for the three below |
+| `read(handle, offset, length)`, `write(handle, offset, bytes)`, `close(handle)` | Bytes; a count |
+| `mkdir(path, mode)`, `unlink(path)`, `rename(from, to)` | |
+| `lstat`, `rmdir`, `truncate(path, length, handle)`, `chmod(path, mode)`, `utimes(path, mtime)`, `readlink(path)`, `symlink(target, path)` | Optional. Without `chmod` and `utimes` those calls succeed and change nothing; without the others they fail |
+
+A mount's own symlinks are not followed on the way through it, and a rename
+or a hard link between it and the rest of the tree is `EXDEV` (`mv` copies).
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the

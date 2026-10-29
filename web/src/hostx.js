@@ -29,6 +29,7 @@
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
 import { isZstd, unzstd } from './zfetch.js';
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { pageFs } from '../../shims/browser/js/page-fs.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
@@ -254,7 +255,7 @@ export class HostX {
         ? msg.kernel.module
         : await WebAssembly.compile(msg.kernel.module);
       const inst = await WebAssembly.instantiate(mod, {
-        env: { memory: msg.kernel.memory, ...processMemories(this.#x.wasmMemory, false, msg.kernel.spare), lazy_fetch: lazyFetch(msg.kernel.memory) },
+        env: { memory: msg.kernel.memory, ...processMemories(this.#x.wasmMemory, false, msg.kernel.spare), lazy_fetch: lazyFetch(msg.kernel.memory), page_fs: pageFs(msg.kernel.memory) },
       });
       // Every Worker in the kernel needs its own stack slice: wasm-ld gives
       // each instance the same `__stack_pointer`, so two Workers sharing one

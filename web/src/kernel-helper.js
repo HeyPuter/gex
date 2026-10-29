@@ -5,6 +5,7 @@
 // the page because the kernel's locks may wait, and the page's thread cannot.
 
 import { kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { pageFs, setPageFs } from '../../shims/browser/js/page-fs.mjs';
 
 /**
  * Instantiate the kernel `spec` ({module, memory}: runtime.js's
@@ -16,13 +17,15 @@ import { kernelThread, lazyFetch, processMemories } from '../../shims/browser/js
 export async function helperKernel(spec, stackTop, pages = 16) {
   // The process memory as the kernel build declares it: shared (the page's
   // build) or not; a memory import's sharedness is part of its type.
+  // The page's mounts (web/runtime fs.mount), when it serves any.
+  if (spec.pageFs) setPageFs(spec.pageFs);
   let inst;
   let mem;
   for (const shared of [true, false]) {
     mem = new WebAssembly.Memory({ initial: pages, maximum: 65535, shared });
     try {
       inst = await WebAssembly.instantiate(spec.module, {
-        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory) },
+        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory), page_fs: pageFs(spec.memory) },
       });
       break;
     } catch (e) {

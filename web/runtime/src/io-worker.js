@@ -725,12 +725,31 @@ async function loop() {
   }
 }
 
+// -- the page's mounts (web/runtime fs.mount, shims/kernel pagefs.rs) -------
+
+function mount(path, id) {
+  const { at: [[a, an]] } = lay(path);
+  const r = k.k_pagefs_mount(BigInt(a), an, id);
+  if (r < 0) throw errno(r, `mounting ${path}`);
+  return true;
+}
+
+function unmount(path) {
+  const { at: [[a, an]] } = lay(path);
+  const r = k.k_pagefs_unmount(BigInt(a), an);
+  if (r < 0) throw errno(r, `unmounting ${path}`);
+  return true;
+}
+
 // -- calls -----------------------------------------------------------------
 
 const ops = {
-  async start({ spec, stackTop }) {
+  async start({ spec, stackTop, mounts = [] }) {
     ({ k, mem } = await helperKernel(spec, stackTop, 32));
     kernelWords = new Int32Array(spec.memory.buffer);
+    // The page's mounts made before boot, before pid 1 can connect (it runs
+    // the tree's /etc/gex/boot once it has).
+    for (const [path, id] of mounts) mount(path, id);
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
     const { at: [[a, an]] } = lay(NAME);
@@ -761,6 +780,8 @@ const ops = {
   addTree: ({ tree }) => addTree(tree),
   watch: ({ path }) => addWatch(path),
   holdX: () => holdX(),
+  mount: ({ path, id }) => mount(path, id),
+  unmount: ({ path }) => unmount(path),
   unwatch: ({ h }) => rmWatch(h),
 };
 

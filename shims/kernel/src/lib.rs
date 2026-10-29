@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use gex_kernel::proc::ProcTable;
 
 mod audio;
+mod pagefs;
 mod wait;
 
 /// Stacks, one per Worker. Every Worker instantiates this module and shares its
@@ -2676,7 +2677,11 @@ fn as_unit(r: Result<(), gex_kernel::errno::Errno>) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
     let p = path_of(path, path_len);
-    match rootfs().open(&p, flags, mode) {
+    let opened = match pagefs::find(&p) {
+        Some((m, rel)) => m.open(&rel, flags, mode),
+        None => rootfs().open(&p, flags, mode),
+    };
+    match opened {
         Ok(h) => install_handle(h),
         Err(e) => -e.0,
     }
@@ -2689,7 +2694,11 @@ pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mo
 pub extern "C" fn k_fs_open_now(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
     use gex_kernel::fs::oflags::{O_CREAT, O_TRUNC};
     let p = path_of(path, path_len);
-    match rootfs().open(&p, flags, mode) {
+    let opened = match pagefs::find(&p) {
+        Some((m, rel)) => m.open(&rel, flags, mode),
+        None => rootfs().open(&p, flags, mode),
+    };
+    match opened {
         Ok(h) => {
             if flags & (O_CREAT | O_TRUNC) != 0 {
                 let _ = h.set_mtime(now);
@@ -2919,7 +2928,11 @@ pub extern "C" fn k_fs_saves() -> u32 {
 /// for anything an open would refuse.
 #[no_mangle]
 pub extern "C" fn k_fs_path_meta(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr) -> i32 {
-    match with_path(path, path_len, true, |p| rootfs().metadata(p)) {
+    let r = with_path(path, path_len, true, |p| match pagefs::find(p) {
+        Some((m, rel)) => m.metadata(&rel),
+        None => rootfs().metadata(p),
+    });
+    match r {
         Ok(m) => {
             let b = remote::encode_meta(&m, 0);
             unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
@@ -2944,6 +2957,9 @@ pub extern "C" fn k_fs_walk(
     at: gex_kmem::PAddr,
     cap: u32,
 ) -> i32 {
+    if pagefs::any() {
+        return page_walk(path, path_len, mounts, mounts_len, follow, at, cap);
+    }
     // No link on the path (most lookups): the answer is the path itself,
     // written back as it came, with nothing built.
     let plain = with_path(path, path_len, false, |abs| {
@@ -2984,6 +3000,9 @@ pub extern "C" fn k_fs_walk(
 /// of the caller's `mounts`.
 #[no_mangle]
 pub extern "C" fn k_fs_walk_meta(path: gex_kmem::PAddr, path_len: u32, mounts: gex_kmem::PAddr, mounts_len: u32, at: gex_kmem::PAddr) -> i32 {
+    if pagefs::any() {
+        return page_walk_meta(path, path_len, mounts, mounts_len, at);
+    }
     let r = with_path(path, path_len, false, |abs| with_path(mounts, mounts_len, false, |mounts| rootfs().walk_metadata(abs, mounts)));
     match r {
         Ok(Some(m)) => {
@@ -2998,7 +3017,11 @@ pub extern "C" fn k_fs_walk_meta(path: gex_kmem::PAddr, path_len: u32, mounts: g
 
 #[no_mangle]
 pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr, cap: u32) -> i32 {
-    match with_path(path, path_len, true, |p| rootfs().read_link(p)) {
+    let r = with_path(path, path_len, true, |p| match pagefs::find(p) {
+        Some((m, rel)) => m.read_link(&rel),
+        None => rootfs().read_link(p),
+    });
+    match r {
         Ok(t) => {
             let b = t.as_bytes();
             if b.len() as u32 > cap {
@@ -3011,6 +3034,71 @@ pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_k
         }
         Err(e) => -e.0,
     }
+}
+
+/// [`k_fs_walk`] with the page's mounts (`pagefs`): the walk stops at a
+/// mount point of theirs as at the caller's own, and a path in one is the
+/// answer as it is (its own names are the page's to resolve).
+fn page_walk(path: gex_kmem::PAddr, path_len: u32, mounts: gex_kmem::PAddr, mounts_len: u32, follow: u32, at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let abs = path_of_raw(path, path_len);
+    let own = path_of_raw(mounts, mounts_len);
+    match rootfs().walk(&abs, follow != 0, &pagefs::with_points(&own)) {
+        Ok(w) => {
+            let b = w.path.as_bytes();
+            if b.len() as u32 > cap {
+                return -36; // ENAMETOOLONG
+            }
+            if !b.is_empty() {
+                unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+            }
+            let at_mount = w.at_mount && gex_kernel::vfs::within_any(&w.path, &own);
+            b.len() as i32 | if at_mount { gex_kernel::vfs::remote::WALK_AT_MOUNT } else { 0 }
+        }
+        Err(e) => -e.0,
+    }
+}
+
+/// [`k_fs_walk_meta`] with the page's mounts, as [`page_walk`].
+fn page_walk_meta(path: gex_kmem::PAddr, path_len: u32, mounts: gex_kmem::PAddr, mounts_len: u32, at: gex_kmem::PAddr) -> i32 {
+    let abs = path_of_raw(path, path_len);
+    let own = path_of_raw(mounts, mounts_len);
+    let r = rootfs().walk(&abs, true, &pagefs::with_points(&own)).and_then(|w| {
+        if w.at_mount && gex_kernel::vfs::within_any(&w.path, &own) {
+            return Ok(None);
+        }
+        match pagefs::find(&w.path) {
+            Some((m, rel)) => m.metadata(&rel).map(Some),
+            None => rootfs().metadata(w.path.trim_start_matches('/')).map(Some),
+        }
+    });
+    match r {
+        Ok(Some(m)) => {
+            let b = remote::encode_meta(&m, 0);
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+            0
+        }
+        Ok(None) => remote::WALK_META_AT_MOUNT,
+        Err(e) => -e.0,
+    }
+}
+
+/// Mount the page's filesystem `id` at `path`, for every process at once,
+/// over whatever the root has there (a directory is made for it).
+#[no_mangle]
+pub extern "C" fn k_pagefs_mount(path: gex_kmem::PAddr, path_len: u32, id: u32) -> i32 {
+    let p = path_of(path, path_len);
+    if p.is_empty() {
+        return -16; // EBUSY: the root stays the root
+    }
+    rootfs().add_dir(&p);
+    pagefs::mount(&p, id);
+    0
+}
+
+/// Unmount what the page mounted at `path`: 0, or `-EINVAL` for nothing there.
+#[no_mangle]
+pub extern "C" fn k_pagefs_unmount(path: gex_kmem::PAddr, path_len: u32) -> i32 {
+    if pagefs::unmount(&path_of(path, path_len)) { 0 } else { -22 }
 }
 
 // ---------------------------------------------------------------------------
@@ -3083,12 +3171,20 @@ pub extern "C" fn k_inotify_queue(id: i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn k_fs_unlink(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    as_unit(rootfs().unlink(&path_of(path, path_len)))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.unlink(&rel));
+    }
+    as_unit(rootfs().unlink(&p))
 }
 
 #[no_mangle]
 pub extern "C" fn k_fs_mkdir(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
-    as_unit(rootfs().mkdir(&path_of(path, path_len), mode))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.mkdir(&rel, mode));
+    }
+    as_unit(rootfs().mkdir(&p, mode))
 }
 
 /// A directory put into the shared root with every missing one above it
@@ -3105,14 +3201,23 @@ pub extern "C" fn k_fs_add_dir(path: gex_kmem::PAddr, path_len: u32, mode: u32) 
 
 #[no_mangle]
 pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    as_unit(rootfs().rmdir(&path_of(path, path_len)))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.rmdir(&rel));
+    }
+    as_unit(rootfs().rmdir(&p))
 }
 
 #[no_mangle]
 pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, noreplace: u32) -> i32 {
     // Bit 0 is RENAME_NOREPLACE; above it, the holds the caller has taken
     // (`remote::Remote::rename2`).
-    as_unit(rootfs().rename2_as(&path_of(from, from_len), &path_of(to, to_len), noreplace & 1 != 0, noreplace >> 1))
+    let (from, to) = (path_of(from, from_len), path_of(to, to_len));
+    match (pagefs::find(&from), pagefs::find(&to)) {
+        (None, None) => as_unit(rootfs().rename2_as(&from, &to, noreplace & 1 != 0, noreplace >> 1)),
+        (Some((a, f)), Some((b, t))) if std::sync::Arc::ptr_eq(&a, &b) => as_unit(a.rename2(&f, &t, noreplace & 1 != 0)),
+        _ => -18, // EXDEV
+    }
 }
 
 /// Directories renamed in the root so far (`remote::Remote::rename_epoch`):
@@ -3156,7 +3261,11 @@ pub extern "C" fn k_fs_fchmod(handle: i32, mode: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn k_fs_chmod(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
-    as_unit(rootfs().chmod(&path_of(path, path_len), mode))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.chmod(&rel, mode));
+    }
+    as_unit(rootfs().chmod(&p, mode))
 }
 
 /// An extended-attribute call (`remote::Remote::xattr`): on open `handle`,
@@ -3194,7 +3303,11 @@ pub extern "C" fn k_fs_xattr(
             }
             return Err(gex_kernel::errno::Errno::EOPNOTSUPP);
         }
-        rootfs().xattr(&path_of(path, path_len), o)
+        let p = path_of(path, path_len);
+        if pagefs::find(&p).is_some() {
+            return Err(gex_kernel::errno::Errno::EOPNOTSUPP);
+        }
+        rootfs().xattr(&p, o)
     };
     let r = match op {
         xattr_op::GET => call(XattrOp::Get { name: &name, buf: &mut bytes }),
@@ -3217,13 +3330,21 @@ pub extern "C" fn k_fs_xattr(
 /// A path's modification time: `utimensat`, or a bundle's file times.
 #[no_mangle]
 pub extern "C" fn k_fs_set_mtime(path: gex_kmem::PAddr, path_len: u32, secs: i64) -> i32 {
-    as_unit(rootfs().set_mtime(&path_of(path, path_len), secs))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.set_mtime(&rel, secs));
+    }
+    as_unit(rootfs().set_mtime(&p, secs))
 }
 
 /// `utimensat` with nanoseconds (`remote::Remote::set_times`).
 #[no_mangle]
 pub extern "C" fn k_fs_set_times(path: gex_kmem::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
-    as_unit(rootfs().set_times_now(&path_of(path, path_len), remote::time_of(a_s, a_ns), remote::time_of(m_s, m_ns), now))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.set_times(&rel, remote::time_of(a_s, a_ns), remote::time_of(m_s, m_ns)));
+    }
+    as_unit(rootfs().set_times_now(&p, remote::time_of(a_s, a_ns), remote::time_of(m_s, m_ns), now))
 }
 
 /// `futimens` (`remote::Remote::set_times_fd`).
@@ -3247,12 +3368,20 @@ pub extern "C" fn k_fs_touch(handle: i32, secs: i64) -> i32 {
 /// directory and reach nothing).
 #[no_mangle]
 pub extern "C" fn k_fs_symlink(target: gex_kmem::PAddr, target_len: u32, path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    as_unit(rootfs().symlink(&path_of_raw(target, target_len), &path_of(path, path_len)))
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.symlink(&path_of_raw(target, target_len), &rel));
+    }
+    as_unit(rootfs().symlink(&path_of_raw(target, target_len), &p))
 }
 
 #[no_mangle]
 pub extern "C" fn k_fs_link(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) -> i32 {
-    as_unit(rootfs().link(&path_of(from, from_len), &path_of(to, to_len)))
+    let (from, to) = (path_of(from, from_len), path_of(to, to_len));
+    if pagefs::find(&from).is_some() || pagefs::find(&to).is_some() {
+        return -18; // EXDEV
+    }
+    as_unit(rootfs().link(&from, &to))
 }
 
 /// Put a socket node at a path, so the name can be *seen*, not only connected
@@ -3260,7 +3389,11 @@ pub extern "C" fn k_fs_link(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::
 /// to exist before running a client.
 #[no_mangle]
 pub extern "C" fn k_fs_mksocket(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    rootfs().add_socket(&path_of(path, path_len));
+    let p = path_of(path, path_len);
+    if pagefs::find(&p).is_some() {
+        return -1; // EPERM
+    }
+    rootfs().add_socket(&p);
     0
 }
 

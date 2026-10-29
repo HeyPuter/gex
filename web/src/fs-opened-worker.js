@@ -6,6 +6,7 @@
 // one at a time, so two of these never share it.
 
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { pageFs } from '../../shims/browser/js/page-fs.mjs';
 
 const SCRATCH = 0x1000;
 
@@ -16,7 +17,7 @@ self.onmessage = async (e) => {
     for (const shared of [true, false]) {
       mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
       try {
-        inst = await WebAssembly.instantiate(e.data.module, { env: { memory: e.data.memory, ...processMemories(mem), lazy_fetch: lazyFetch(e.data.memory) } });
+        inst = await WebAssembly.instantiate(e.data.module, { env: { memory: e.data.memory, ...processMemories(mem), lazy_fetch: lazyFetch(e.data.memory), page_fs: pageFs(e.data.memory) } });
         break;
       } catch (err) {
         if (!shared) throw err;

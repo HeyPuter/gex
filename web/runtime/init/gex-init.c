@@ -305,7 +305,6 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--as")) return as_user(argc, argv);
   if (argc > 0 && argv[0][0] == '/') self_path = argv[0];
   signal(SIGPIPE, SIG_IGN);
-  boot();
   if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) < 0) return 1;
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -317,6 +316,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "gex-init: the page's runtime is not listening\n");
     return 1;
   }
+  /* Once the page listens: its mounts are in place by then. */
+  boot();
   say("R\n");
   size_t cap = 1 << 16;
   unsigned char *buf = malloc(cap);

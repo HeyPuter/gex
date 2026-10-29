@@ -5,6 +5,7 @@
 // files can be read and written from the page.
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
+import { PageFsHost } from './mount.js';
 
 const norm = (p) => {
   if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);
@@ -62,18 +63,47 @@ function lazyPath(href) {
   return u.pathname + u.search + u.hash;
 }
 
+/** A directory the page serves (`Filesystem.mount`). Events: `unmounted`. */
+export class Mount extends EventTarget {
+  #fs;
+
+  constructor(fs, path, provider) {
+    super();
+    this.#fs = fs;
+    /** Where it is in the guest's tree. */
+    this.path = path;
+    this.provider = provider;
+  }
+
+  /** Take it out of the tree ([`Filesystem.unmount`]). */
+  unmount() {
+    return this.#fs.unmount(this.path);
+  }
+}
+
 export class Filesystem extends EventTarget {
   #sys;
   #sources = [];
+  #pagefs = null;
+  #mounts = new Map(); // path -> { mount, id }
 
   constructor(sys) {
     super();
     const i = internals(sys, 'Filesystem');
     i.attach('filesystem', this, { beforeBoot: true });
     this.#sys = i;
-    i.beforeBoot((opts) => this.#seed(opts));
+    i.beforeBoot((opts) => {
+      // Every Worker gets the page's filesystems' control buffer, so a
+      // mount made after boot reaches the programs already running.
+      opts.pageFs = this.#host().control;
+      return this.#seed(opts);
+    });
     this[INTERNAL] = {
       sources: () => this.#sources,
+      /** For the runtime's Worker's start: its control buffer, and the
+       *  mounts made before boot, in place before pid 1's first program. */
+      pageFs: () => this.#pagefs?.control,
+      mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
     };
   }
 
@@ -157,6 +187,62 @@ export class Filesystem extends EventTarget {
     if (anyX) opts.xattrs = { ...(opts.xattrs ?? {}), ...xattrs };
     // The sources' bytes are pid 1's now.
     this.#sources.length = 0;
+  }
+
+  #host() {
+    return (this.#pagefs ??= new PageFsHost());
+  }
+
+  /**
+   * Serve `path` from `provider`, the page's own filesystem, for every
+   * program, before boot or while the system runs. Over whatever the tree
+   * has there, which comes back at `unmount`. A guest call on it waits, in
+   * its own thread only, for the provider's promise. The provider's methods
+   * take paths inside it (`/`, `/a/b`) and throw errors with a `code`
+   * ('ENOENT', ...): `stat(path)` -> `{ type: 'file' | 'directory' |
+   * 'symlink', size, mode, mtime (ms or a Date), ino }`; `readdir(path)` ->
+   * `[{ name, type }]` or names; `open(path, { read, write, create,
+   * truncate, exclusive, append, mode })` -> a handle (anything);
+   * `read(handle, offset, length)` -> bytes; `write(handle, offset, bytes)`
+   * -> count; `close(handle)`; `mkdir(path, mode)`, `unlink(path)`,
+   * `rename(from, to)`; and when it has them `lstat`, `rmdir`,
+   * `truncate(path, length, handle)`, `chmod(path, mode)`, `utimes(path,
+   * mtime)`, `readlink(path)`, `symlink(target, path)`. Returns a `Mount`.
+   */
+  mount(path, provider) {
+    const at = norm(path);
+    if (at === '/') throw new Error('mount: the root is the system\'s own');
+    for (const m of ['stat', 'readdir', 'open', 'read', 'close']) {
+      if (typeof provider?.[m] !== 'function') throw new TypeError(`mount: the provider has no ${m}()`);
+    }
+    if (this.#mounts.has(at)) throw new Error(`mount: ${at} is mounted already`);
+    if (!['new', 'booting', 'running'].includes(this.#sys.phase)) throw new Error(`mount: the system is ${this.#sys.phase}`);
+    const id = this.#host().add(provider);
+    const mount = new Mount(this, at, provider);
+    this.#mounts.set(at, { mount, id });
+    if (this.#sys.phase === 'running') {
+      mount.ready = this.#sys.io().call('mount', { path: at, id }).then(() => mount);
+    } else {
+      mount.ready = Promise.resolve(mount);
+    }
+    return mount;
+  }
+
+  /** Take the mount at `path` out of the tree: what was there before shows
+   *  again, and its files still open fail. */
+  async unmount(path) {
+    const at = norm(path);
+    const m = this.#mounts.get(at);
+    if (!m) throw Object.assign(new Error(`unmount: nothing mounted at ${at}`), { code: 'EINVAL' });
+    this.#mounts.delete(at);
+    if (this.#sys.phase === 'running') await this.#sys.io().call('unmount', { path: at });
+    this.#pagefs.remove(m.id);
+    m.mount.dispatchEvent(new Event('unmounted'));
+  }
+
+  /** Every mount, as `[Mount]`. */
+  mounts() {
+    return [...this.#mounts.values()].map((m) => m.mount);
   }
 
   // -- the running tree ----------------------------------------------------

@@ -267,7 +267,8 @@ export class System extends EventTarget {
         if (this.#state.phase !== 'booting') return;
         const stackTop = s.host.takeKernelStack('runtime');
         if (stackTop === undefined) return void setTimeout(go, 10);
-        io.call('start', { spec: { module: s.kernel.module, memory: s.kernel.memory }, stackTop })
+        const fsi = this.#parts.get('filesystem')?.[INTERNAL];
+        io.call('start', { spec: { module: s.kernel.module, memory: s.kernel.memory, pageFs: fsi?.pageFs?.() }, stackTop, mounts: fsi?.mounts?.() ?? [] })
           .then(() => io.call('ready'))
           .then(up.resolve, up.reject);
       };
