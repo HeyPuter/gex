@@ -2,8 +2,9 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 711 claimable, 149 withheld for missing entry
- * points, out of the registry's whole extension set. A host
+ * 710 claimable, 150 withheld for missing entry
+ * points or behaviour the wire cannot give (WITHHELD), out of the
+ * registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
  */
@@ -25,7 +26,6 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_AMD_interleaved_elements",
     "GL_AMD_multi_draw_indirect",
     "GL_AMD_occlusion_query_event",
-    "GL_AMD_pinned_memory",
     "GL_AMD_program_binary_Z400",
     "GL_AMD_query_buffer_object",
     "GL_AMD_sample_positions",
