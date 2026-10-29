@@ -154,11 +154,15 @@ $(BUILD)/.done-$(WINE_ID): $(TOOLS)/.done-$(WINE_ID) $(DEPS)/.done | $(GL_O)
 	$(NICE) $(WINE32)/wine32/wine-build.sh wasm $(WINE_SRC) $(TOOLS) $(BUILD) $(DEPS)
 	rm -f $(BUILD)/.done-* && touch $@
 
+# The dist: the loader, the server, the staged PE side and Wine's raster
+# fonts (wine-fon.sh; the tools build, without FreeType, makes none).
 $(DIST)/.done: $(BUILD)/.done-$(WINE_ID) $(GL_O)
 	rm -rf $(DIST).tmp $(BARE).tmp
 	$(NICE) $(WINE32)/wine32/link-loader.sh $(BUILD) $(WINE_SRC) $(BUILD)/gexwine32-obj $(DEPS) $(GL_O) $(DIST).tmp
 	JOBS=$(WINE32_JOBS) $(NICE) $(WINE32)/link-wineserver.sh $(BUILD) $(WINE_SRC) $(BUILD)/gexwine32-server $(DIST).tmp
 	$(NICE) $(WINE32)/wine32/stage.sh $(BUILD) $(WINE_SRC) $(DIST).tmp $(BARE).tmp
+	rm -rf $(DIST).fon && JOBS=$(WINE32_JOBS) $(NICE) $(WINE32)/wine-fon.sh $(WINE_SRC) $(TOOLS)/include $(C)/dl $(DIST).fon
+	mv $(DIST).fon/*.fon $(DIST).tmp/share/wine/fonts/ && rmdir $(DIST).fon
 	$(if $(filter 0,$(WINE32_MONO)),,$(WINE32)/wine32/mono.sh $(C)/dl $(DIST).tmp)
 	rm -rf $(DIST) $(BARE) && mv $(BARE).tmp $(BARE) && mv $(DIST).tmp $(DIST)
 	@echo "$(DIST_KEY) wine=$(WINE_ID) musl=$(MUSL_COMMIT) src=$(WINE_SRC)" > $(DIST)/.wine32-build
