@@ -113,6 +113,9 @@ export function untar(buf, root = '') {
     } else if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
+      // The archive's own top (`./`) names the directory it unpacks into,
+      // which exists already: only its time is taken.
+      else if (/^(\.\/?)?$/.test(name)) mtimes[root || '/'] = octal(b, off + 136, 12);
       // its time too: a cache built over a directory (KDE's ksycoca) is
       // stale when the directory looks newer
       if (p) mtimes[p] = octal(b, off + 136, 12);
