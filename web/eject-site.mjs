@@ -77,13 +77,14 @@ const sha = (b) => createHash('sha256').update(b).digest('hex');
 /** Put `src` at site path `path`: compressed (FILE.zst) when large.
  *  `plain` keeps the file itself beside its .zst, for a reader that does not
  *  go through the pack. */
-function place(src, path, { plain = false } = {}) {
+function place(src, path, { plain = false, packed = false } = {}) {
   const dst = join(out, path);
   mkdirSync(dirname(dst), { recursive: true });
   const size = statSync(src).size;
   // A unit's files are fetched one by one whatever their size, and wasm and
-  // entry lists halve or better under zstd: packed from 4 KiB.
-  if (size < (/\/units\//.test(path) ? 4096 : 65536)) {
+  // entry lists halve or better under zstd: packed from 4 KiB. `packed`:
+  // whatever its size, for a file the page reads only through the pack.
+  if (!packed && size < (/\/units\//.test(path) ? 4096 : 65536)) {
     copyFileSync(src, dst);
     return;
   }
@@ -531,16 +532,22 @@ function wine32Site() {
         fillDemand.push(...fl.demand);
         if (bootUnitsList) console.log(`eject-site: --boot-units: ${fillDemand.length} units in the fill, compiled when first mapped`);
         const entries = fl.files, off = fl.bytes.length, fillBytes = fl.bytes;
-        const fb = join(work, 'fill.bin');
-        writeFileSync(fb, fillBytes);
-        // With --pieces, named by its bytes like a piece, which the page keeps
-        // in its cache (fill-worker.js): a later visit, or a build that left
-        // the fill alone, does not download it again.
-        const fillSite = piecesOn ? `project/build/web/pieces/f${sha(fillBytes).slice(0, 32)}.bin` : 'project/build/web/fill.bin';
-        place(fb, fillSite);
-        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: `/${fillSite}`, size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
-        wine32.params.fill = '/project/build/web/fill.json';
-        console.log(`eject-site: the fill: ${fl.lateFiles} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
+        // Nothing for it (every unit the boot's, no late file): no fill.
+        if (!entries.length) console.log('eject-site: the fill: nothing to put in it, none written');
+        else {
+          const fb = join(work, 'fill.bin');
+          writeFileSync(fb, fillBytes);
+          // With --pieces, named by its bytes like a piece, which the page keeps
+          // in its cache (fill-worker.js): a later visit, or a build that left
+          // the fill alone, does not download it again.
+          const fillSite = piecesOn ? `project/build/web/pieces/f${sha(fillBytes).slice(0, 32)}.bin` : 'project/build/web/fill.bin';
+          // The page reads the fill through the pack only (app.js `fill`),
+          // however small.
+          place(fb, fillSite, { packed: true });
+          writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: `/${fillSite}`, size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
+          wine32.params.fill = '/project/build/web/fill.json';
+          console.log(`eject-site: the fill: ${fl.lateFiles} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
+        }
       }
     }
     tar = join(work, 'rootfs.tar');
@@ -671,6 +678,11 @@ function wine32Site() {
   // So is the rest bundle (rest.bin.json names its frames' sizes).
   walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/') || rel === 'project/build/web/rest.bin') return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
   const build = sha(JSON.stringify(files) + JSON.stringify(wine32) + smallHash.digest('hex')).slice(0, 12);
+  // What the page reads only through the pack is in it.
+  if (wine32.params?.fill) {
+    const fl = JSON.parse(readFileSync(join(out, wine32.params.fill), 'utf8'));
+    if (!files[fl.url]) throw new Error(`eject-site: the fill ${fl.url} is not in the pack`);
+  }
   writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
   writeHosting();
   noTestPage();
