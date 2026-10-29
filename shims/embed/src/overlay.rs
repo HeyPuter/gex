@@ -69,6 +69,8 @@ pub fn exec_mapped(fd: i32, addr: u64, off: u64) {
     let soname = path.rsplit('/').next().unwrap_or(&path).to_string();
     let provided = PROVIDERS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&soname));
     if soname != "libc.so" && !provided {
+        // Where every other library's code went, for reading a fault's addresses against.
+        crate::host::log(&format!("gex-embed: {path}: code at {addr:#x} (file offset {off:#x})\n"));
         return;
     }
     let Ok(bytes) = crate::elf::read_file(&path) else { return };
