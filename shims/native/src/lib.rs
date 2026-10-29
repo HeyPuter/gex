@@ -5369,8 +5369,9 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 
 /// Replay anything this store has not seen, cheaply enough to call often: the
 /// check is a length comparison, and the registry is append-only so a store
-/// catches up by walking forward from its own watermark.
-fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
+/// catches up by walking forward from its own watermark. Whether it replayed
+/// anything.
+fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let behind = match caller.data().jit.as_ref() {
         // Nothing published past this store's watermark: no lock (every
         // syscall and safepoint comes through here).
@@ -5382,9 +5383,9 @@ fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
         None => false,
     };
     if behind {
-        replay_registry(caller)?;
+        return replay_registry(caller);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
@@ -6276,8 +6277,9 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             refresh_callouts(&mut *caller)?;
             continue;
         }
-        if is_stale_table_trap(&e) {
-            catch_up_in_caller(caller)?;
+        // Only a trap the catch-up answered is retried: with nothing replayed
+        // the slot is not stale, and retrying would trap there forever.
+        if is_stale_table_trap(&e) && catch_up_in_caller(caller)? {
             refresh_callouts(&mut *caller)?;
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
