@@ -41,7 +41,9 @@ extern "C" {
     /// time), 2 axis(axis, value, time), 3 key(code, pressed, time),
     /// 4 modifiers(depressed, latched, locked, group), 5 the pointer left this
     /// client, 6 keyboard focus, 7 configure(width, height, activated),
-    /// 8 close, 9 dismiss popup. Coordinates are surface-local pixels;
+    /// 8 close, 9 dismiss popup, 10 moved(x, y), 11 drag enter(x, y, serial),
+    /// 12 drag motion(x, y, time), 13 drop(serial), 14 drag leave.
+    /// Coordinates are surface-local pixels;
     /// button/key codes are Linux `BTN_*`/evdev numbers.
     fn wl_poll_input(ptr: u32, max: u32) -> u32;
     /// Whether this process's input ring holds an event, without taking it.
@@ -49,7 +51,24 @@ extern "C" {
     /// The output's size now, as the page's compositor last set it: width in
     /// the high 16 bits, height in the low, or 0 when it has said nothing.
     fn wl_output_size() -> u32;
+    /// The host drag's data (its text/uri-list), which the page sets before
+    /// it sends the enter: up to `max` bytes into `ptr`; the whole length.
+    fn wl_drag_data(ptr: u32, max: u32) -> u32;
+    /// What the client says of the host's drag `serial` (the page's, from its
+    /// enter): [`DRAG_ACCEPTS`] and the other `DRAG_*` bits. Said when it
+    /// changes, and once at the drop.
+    fn wl_drag_status(serial: u32, flags: u32);
 }
+
+/// `wl_drag_status` bits: a drop now would be taken; the drop was handed
+/// over (or refused, without [`DRAG_TAKEN`]); the client took it; it said it
+/// is done with it.
+const DRAG_ACCEPTS: u32 = 1;
+const DRAG_ANSWERED: u32 = 2;
+const DRAG_TAKEN: u32 = 4;
+const DRAG_FINISHED: u32 = 8;
+/// The most bytes of drag data taken from the page (its arena's room).
+const DRAG_DATA_MAX: usize = 64 * 1024;
 
 /// The floor under [`WaylandDevice::needs_pump`]: whatever it does not look
 /// at still gets a pump at least this often.
@@ -82,6 +101,13 @@ enum InputEvent {
     /// server, so that a menu the client positions in X coordinates lands
     /// where the window now is.
     Moved { client: u32, surface: u32, x: i32, y: i32 },
+    /// The page's drag of host files: enters a surface at a point (`serial`
+    /// the page's number for it), moves on it, is dropped (its data is the
+    /// page's, `wl_drag_data`), leaves.
+    DragEnter { client: u32, surface: u32, x: i32, y: i32, serial: u32 },
+    DragMotion { client: u32, x: i32, y: i32, time: u32 },
+    Drop { client: u32, serial: u32 },
+    DragLeave { client: u32 },
 }
 
 impl InputEvent {
@@ -100,7 +126,11 @@ impl InputEvent {
             | InputEvent::Configure { client, .. }
             | InputEvent::Close { client, .. }
             | InputEvent::DismissPopup { client, .. }
-            | InputEvent::Moved { client, .. } => client,
+            | InputEvent::Moved { client, .. }
+            | InputEvent::DragEnter { client, .. }
+            | InputEvent::DragMotion { client, .. }
+            | InputEvent::Drop { client, .. }
+            | InputEvent::DragLeave { client } => client,
         }
     }
 }
@@ -159,6 +189,10 @@ fn poll_input() -> Vec<InputEvent> {
                 8 => InputEvent::Close { client, surface },
                 9 => InputEvent::DismissPopup { client, surface },
                 10 => InputEvent::Moved { client, surface, x: q[1], y: q[2] },
+                11 => InputEvent::DragEnter { client, surface, x: q[1], y: q[2], serial: q[3] as u32 },
+                12 => InputEvent::DragMotion { client, x: q[1], y: q[2], time: q[3] as u32 },
+                13 => InputEvent::Drop { client, serial: q[1] as u32 },
+                14 => InputEvent::DragLeave { client },
                 _ => return None,
             })
         })
@@ -376,13 +410,90 @@ struct Session {
     /// addresses it: surface ids are per-client, so two clients in one process
     /// can both own a surface 3.
     idx: u32,
-    fds: Vec<Arc<OpenFile>>,
+    /// `None` once given back: a drag's receive descriptor, closed so the
+    /// client reads to its end.
+    fds: Vec<Option<Arc<OpenFile>>>,
+    /// The page's drag over this client: its serial, its data, and what was
+    /// last said of it.
+    drag: Option<SessionDrag>,
     /// Event bytes the socket had no room for yet, and how many have gone.
     out: Vec<u8>,
     sent: usize,
     /// Where requests are read into, kept rather than a fresh zeroed 64 KiB
     /// each pump (as the native host's `wayland.rs`).
     rbuf: Vec<u8>,
+}
+
+/// The page's drag over one client (`Session::drag`).
+struct SessionDrag {
+    serial: u32,
+    /// Its text/uri-list, from the page at the enter: a client may read it
+    /// then, to decide whether it takes the drag (Wine does).
+    data: Vec<u8>,
+    /// The `DRAG_*` bits last said (`wl_drag_status`).
+    said: u32,
+}
+
+/// The page's drag data (`wl_drag_data`), as much as it set.
+fn drag_data() -> Vec<u8> {
+    let mut buf = vec![0u8; DRAG_DATA_MAX];
+    let n = unsafe { wl_drag_data(buf.as_mut_ptr() as u32, buf.len() as u32) } as usize;
+    buf.truncate(n.min(DRAG_DATA_MAX));
+    buf
+}
+
+impl Session {
+    /// The page's drag, after this turn's events and requests: the data
+    /// written into each receive the client made (and that descriptor let
+    /// go, so the client reads to its end), and what it says of the drag
+    /// told to the page when that changed.
+    fn answer_drag(&mut self) {
+        let receives = self.client.take_receives();
+        let Some(d) = self.drag.as_mut() else {
+            // No drag of the page's: nothing to send.
+            for r in receives {
+                if let Some(f) = self.fds.get_mut(r.fd as usize) {
+                    *f = None;
+                }
+            }
+            return;
+        };
+        let data = &d.data;
+        for r in receives {
+            let Some(file) = self.fds.get_mut(r.fd as usize).and_then(Option::take) else { continue };
+            if r.mime != "text/uri-list" {
+                continue;
+            }
+            let mut at = 0;
+            while at < data.len() {
+                match file.write(&data[at..]) {
+                    Ok(n) if n > 0 => at += n as usize,
+                    _ => break,
+                }
+            }
+            if at < data.len() {
+                unsafe { crate::write_stderr(&format!("[wl] dnd: sent {at} of {} bytes\n", data.len())) };
+            }
+        }
+        let st = self.client.drag_status();
+        let mut flags = d.said & (DRAG_ANSWERED | DRAG_TAKEN);
+        if let Some(st) = &st {
+            if st.takes() {
+                flags |= DRAG_ACCEPTS;
+            }
+            if st.finished {
+                flags |= DRAG_FINISHED;
+            }
+        }
+        if flags != d.said {
+            d.said = flags;
+            unsafe { wl_drag_status(d.serial, flags) };
+        }
+        // Over once refused, or done with: the data goes with it.
+        if (flags & DRAG_ANSWERED != 0 && flags & DRAG_TAKEN == 0) || flags & DRAG_FINISHED != 0 {
+            self.drag = None;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -485,7 +596,7 @@ impl WaylandDevice {
                     Err(_) => break,
                 };
                 let first = s.fds.len();
-                s.fds.extend(s.socket.take_received());
+                s.fds.extend(s.socket.take_received().into_iter().map(Some));
                 let tokens: Vec<u32> = (first..s.fds.len()).map(|i| i as u32).collect();
                 let view = PoolView {
                     maps: &proc_cx.maps,
@@ -581,9 +692,38 @@ impl WaylandDevice {
                                 s.client.placement_origin(surface, x, y);
                             }
                         }
+                        // Host files, as a text/uri-list with copy (as the
+                        // native compositor's scripted drag).
+                        InputEvent::DragEnter { surface, x, y, serial, .. } => {
+                            let ok = s.client.drag_enter(surface, x, y, &["text/uri-list"], gex_wayland::data::DND_COPY);
+                            if ok {
+                                s.drag = Some(SessionDrag { serial, data: drag_data(), said: 0 });
+                            } else {
+                                // No data device, or no such surface: refused now.
+                                s.drag = None;
+                                unsafe { wl_drag_status(serial, DRAG_ANSWERED) };
+                            }
+                        }
+                        InputEvent::DragMotion { x, y, time, .. } => s.client.drag_motion(x, y, time),
+                        InputEvent::Drop { serial, .. } => {
+                            let taken = s.client.drag_drop();
+                            match s.drag.as_mut().filter(|d| d.serial == serial) {
+                                Some(d) => d.said |= DRAG_ANSWERED | if taken { DRAG_TAKEN } else { 0 },
+                                None => unsafe { wl_drag_status(serial, DRAG_ANSWERED) },
+                            }
+                            if let Some(d) = s.drag.as_ref() {
+                                // Said now, whatever the client says next.
+                                unsafe { wl_drag_status(d.serial, d.said) };
+                            }
+                        }
+                        InputEvent::DragLeave { .. } => {
+                            s.client.drag_leave();
+                            s.drag = None;
+                        }
                     }
                 }
             }
+            s.answer_drag();
             // The X window manager, if this client is an X server. Connected
             // lazily: the socket only exists once Xwayland has bound it, which
             // is after its Wayland connection is up.
@@ -883,6 +1023,7 @@ impl HostListener for WaylandDevice {
             xwm: None,
             idx,
             fds: Vec::new(),
+            drag: None,
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),
@@ -894,12 +1035,12 @@ impl HostListener for WaylandDevice {
 struct PoolView<'a, 'm> {
     maps: &'a gex_kernel::syscalls::SharedMapView,
     mem: &'a GuestMem<'m>,
-    fds: &'a [Arc<OpenFile>],
+    fds: &'a [Option<Arc<OpenFile>>],
 }
 
 impl Buffers for PoolView<'_, '_> {
     fn locate(&self, fd: u32) -> Option<(u64, u64)> {
-        let file = self.fds.get(fd as usize)?;
+        let file = self.fds.get(fd as usize)?.as_ref()?;
         // The client mapped its pool MAP_SHARED, so the mapping *is* the
         // pool: its address in guest memory is where the pixels are, live,
         // and the compositor reads them from there. This is why a frame is
@@ -911,7 +1052,7 @@ impl Buffers for PoolView<'_, '_> {
     }
 
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
-        let file = self.fds.get(fd as usize)?;
+        let file = self.fds.get(fd as usize)?.as_ref()?;
         // Mapped shared, so the live pixels are in the guest's memory; the
         // file's own bytes are what was there before it drew.
         let map = self.maps.of(file)?;

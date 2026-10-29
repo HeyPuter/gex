@@ -135,6 +135,19 @@ export const EV_CONFIGURE = 7;
 export const EV_CLOSE = 8;
 export const EV_DISMISS_POPUP = 9;
 export const EV_MOVED = 10;
+/** The page's drag of host files (web/src/drag.js): enters a surface at
+ *  (x, y) with the page's serial for it (its data is `setDragData`'s),
+ *  moves (x, y, time), is dropped (serial), leaves. */
+export const EV_DRAG_ENTER = 11;
+export const EV_DRAG_MOTION = 12;
+export const EV_DROP = 13;
+export const EV_DRAG_LEAVE = 14;
+/** What the guest says of a drag (`B_DRAG`): a drop now would be taken; the
+ *  drop was answered; taken; the client is done with it. */
+export const DRAG_ACCEPTS = 1;
+export const DRAG_ANSWERED = 2;
+export const DRAG_TAKEN = 4;
+export const DRAG_FINISHED = 8;
 
 // -- layout -----------------------------------------------------------------
 //
@@ -173,6 +186,9 @@ const B_ACK = 4;
  * this block's ring. */
 const B_WAKE = 5;
 const B_SLOTS = 6;
+/** The page's drag, as the guest last said of it (`wl_drag_status`):
+ *  `serial << 4 | DRAG_*`. Notified when it changes. */
+const B_DRAG = 7;
 const B_WORDS = 8;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
@@ -182,7 +198,13 @@ const K_TAIL = 1;
 const K_WORDS = 2;
 const RING_WORDS = K_WORDS + RING * EV;
 
-const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
+// The page's drag data (one drag at a time a page): its length in bytes,
+// then the bytes, a text/uri-list, set before the drag's enter is sent.
+const D_BYTES = 64 << 10;
+const D_WORDS = 1 + D_BYTES / 4;
+
+const TOTAL_WORDS = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS) + D_WORDS;
+const dragBase = M_WORDS + BLOCKS * (BLOCK_WORDS + RING_WORDS);
 
 const blockBase = (b) => M_WORDS + b * BLOCK_WORDS;
 const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
@@ -423,6 +445,44 @@ export function ackBlock(channel, block, gen) {
 /** The global kernel's memory, for `sendEvent`'s wake. One per page. */
 export function setKernelMemory(channel, memory) {
   if (memory && !channel.kernelMemory) channel.kernelMemory = memory;
+}
+
+/** The page's drag data: `text` (a text/uri-list) for the drag whose
+ *  enter follows. False when it does not fit. */
+export function setDragData(channel, text) {
+  const b = new TextEncoder().encode(text);
+  if (b.length > D_BYTES) return false;
+  const a = new Int32Array(channel.arena);
+  new Uint8Array(channel.arena, (dragBase + 1) * 4, D_BYTES).set(b);
+  Atomics.store(a, dragBase, b.length);
+  return true;
+}
+
+/** What block `block`'s guest last said of the page's drag:
+ *  {serial, flags} (`DRAG_*`). */
+export function dragState(channel, block) {
+  const v = Atomics.load(new Int32Array(channel.arena), blockBase(block) + B_DRAG) >>> 0;
+  return { serial: v >>> 4, flags: v & 15 };
+}
+
+/** Resolves with block `block`'s word for drag `serial` once `want(flags)`
+ *  holds, or null after `ms`. */
+export async function waitDrag(channel, block, serial, want, ms) {
+  const a = new Int32Array(channel.arena);
+  const at = blockBase(block) + B_DRAG;
+  const end = performance.now() + ms;
+  for (;;) {
+    const v = Atomics.load(a, at);
+    if (v >>> 4 === serial >>> 0 && want(v & 15)) return v & 15;
+    const left = end - performance.now();
+    if (left <= 0) return null;
+    if (typeof Atomics.waitAsync === 'function' && channel.arena instanceof SharedArrayBuffer) {
+      const r = Atomics.waitAsync(a, at, v, Math.min(left, 100));
+      if (r.async) await r.value;
+    } else {
+      await new Promise((res) => setTimeout(res, Math.min(left, 20)));
+    }
+  }
 }
 
 /** Write one event into a process's ring, for its guest to pick up. */
@@ -807,6 +867,7 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_COUNT, 0);
         Atomics.store(this.#a, base + B_GEN, 0);
         Atomics.store(this.#a, base + B_ACK, 0);
+        Atomics.store(this.#a, base + B_DRAG, 0);
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
         // The last process's regions are not this one's: its surfaces may
         // have the same numbers.
@@ -965,6 +1026,24 @@ export class WlProxy {
   #words(memory) {
     const v = this.#view;
     return v && v.buffer === memory.buffer ? v : (this.#view = new Int32Array(memory.buffer));
+  }
+
+  /** The page's drag data, up to `max` bytes into `ptr` of `memory`: its
+   *  whole length. */
+  dragData(memory, ptr, max) {
+    const a = this.#a;
+    const n = Math.min(Atomics.load(a, dragBase) >>> 0, D_BYTES);
+    new Uint8Array(memory.buffer, ptr, Math.min(n, max)).set(new Uint8Array(a.buffer, (dragBase + 1) * 4, Math.min(n, max)));
+    return n;
+  }
+
+  /** What the client says of the page's drag `serial` (`DRAG_*`), for the
+   *  page (`dragState`, `waitDrag`). */
+  dragStatus(serial, flags) {
+    if (this.#block < 0) return;
+    const at = this.#base + B_DRAG;
+    Atomics.store(this.#a, at, ((serial << 4) | (flags & 15)) | 0);
+    Atomics.notify(this.#a, at);
   }
 
   /** Whether this process's input ring holds an event. */

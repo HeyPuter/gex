@@ -1301,7 +1301,7 @@ async function runProgramHere(
     if (sharedTty) Promise.resolve(sharedTty.resize(rows, cols)).catch(() => {});
     else host.resize(rows, cols);
   });
-  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl });
+  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl, wlChannel });
   try {
     const status = await host.start({
       elf,

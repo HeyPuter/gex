@@ -2096,6 +2096,10 @@ export class Gex {
         // The output's size now, packed (`WlProxy.outputSize`), 0 for none:
         // the pump asks every turn and tells its clients when it changed.
         wl_output_size: () => this.#wl?.outputSize?.() ?? 0,
+        // The page's drag of host files: its data at the drop, and what the
+        // client says of it, for the page (wl-bridge.mjs `waitDrag`).
+        wl_drag_data: (ptr, max) => this.#wl?.dragData(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        wl_drag_status: (serial, flags) => this.#wl?.dragStatus(serial >>> 0, flags >>> 0),
     };
   }
 

@@ -112,8 +112,15 @@ It resolves with:
 - `accepted`: whether that window took the drop;
 - `paths`: where the top-level files and folders are now.
 
-`accepted` is always `false` for now, because the drop is not yet handed to
-the window. So with `fallback`, the files always end up in that directory.
+Once copied, the files are dragged to the window and dropped there, as a
+Linux desktop drops files: its program is offered their paths (a
+`text/uri-list`) and says whether it takes them. A program that does not
+take files there, or no window at the point, leaves `accepted` false, and
+with `fallback` the files move to that directory. A taken drop's files stay
+where they were copied: the program reads them from there.
+
+`dragOver` does not tell the window: a browser names a drag's files only at
+its drop, and a program decides on the files.
 
 Files are 0644, or 0755 when one starts like a program (`\x7fELF` or
 `#!`); folders are 0755; the owner is the guest's user. The single-thread

@@ -31,6 +31,7 @@ import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 import { checkOptions, sizeValue, showValue } from './start-options.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 import { pageUser } from './wine-user.js';
+import { PageDrag } from './drag.js';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -890,10 +891,16 @@ async function begin(opts, base, at, state, meter) {
       }
     }
   }, 50);
-  // The window at a page point, for drop and dragOver.
-  const windowAt = async (x, y) => {
-    const w = (await (desktop ?? sys?.compositor)?.windowAt?.(x, y)) ?? null;
-    return w && { title: w.title, client: w.client, surface: w.surface, x: w.x, y: w.y };
+  // The window at a page point, for drop and dragOver: the compositor's hit
+  // (with its block, which the drag's events go to) and what the page is told.
+  const hitAt = async (x, y) => (await (desktop ?? sys?.compositor)?.windowAt?.(x, y)) ?? null;
+  const winOf = (w) => w && { title: w.title, client: w.client, surface: w.surface, x: w.x, y: w.y };
+  // The drag to guest windows (drag.js), made on first use.
+  let drag = null;
+  const pageDrag = async () => {
+    if (drag || !sys?.wlChannel) return drag;
+    drag = new PageDrag(sys.wlChannel, await import('@gex/wl-bridge.mjs'));
+    return drag;
   };
   return {
     exited,
@@ -936,8 +943,8 @@ async function begin(opts, base, at, state, meter) {
      * Resolves {path, files, bytes, ms, window, accepted, paths}: the
      * directory the copy made, its files and bytes; `window` the window at
      * x, y ({title, client, surface, x, y} with the point in it) or null;
-     * `accepted` whether that window took the drop (always false for now:
-     * the drop is not yet handed to the window); `paths` where the top-level
+     * `accepted` whether that window's program took the drop (offered the
+     * copied paths as a text/uri-list); `paths` where the top-level
      * files and folders are now (in `fallback`, if they moved).
      * Ownership is the guest's user's, files 0644 (0755 for one that starts
      * as a program does), folders 0755. Not in the single-thread build.
@@ -954,23 +961,29 @@ async function begin(opts, base, at, state, meter) {
       if (!sys?.host || !sys.kernel) return Promise.reject(new Error('drop(): the guest is not running, or this is the single-thread build'));
       return (async () => {
         signal?.throwIfAborted();
-        const at = x !== undefined && y !== undefined ? windowAt(x, y) : Promise.resolve(null);
+        const at = x !== undefined && y !== undefined ? hitAt(x, y) : Promise.resolve(null);
         const entries = await walk(items, signal);
         if (!entries.length) throw new Error('drop(): nothing in it to copy (no files or folders)');
         dropper ??= new Dropper(sys);
         const { names, ...r } = await dropper.copy(entries, { dir: dir ? dir.replace(/\/+$/, '') : null, signal, onProgress });
-        const window = await at;
-        const accepted = false;
         let paths = names.map((n) => `${r.path}/${n}`);
+        // Dragged to the window once copied: its program reads where they
+        // are as the drag enters, to decide whether it takes them.
+        const hit = await at;
+        const d = hit ? await pageDrag() : null;
+        const accepted = d ? await d.drop(hit, paths) : false;
+        const window = winOf(hit);
         if (!accepted && fallback) ({ paths } = await dropper.move(r.path, names, fallback.replace(/\/+$/, '')));
         return { ...r, window, accepted, paths };
       })();
     },
     /** A drag over the desktop at x, y (an event's clientX and clientY):
-     *  resolves the window there, as `drop` names it, or null. */
+     *  resolves the window there, as `drop` names it, or null. Not told to
+     *  the window: a browser names a drag's files only at its drop, and a
+     *  program decides on them (see `drop`). */
     async dragOver(x, y) {
       if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`dragOver(${showValue(x)}, ${showValue(y)}): a point's clientX and clientY`);
-      return windowAt(x, y);
+      return winOf(await hitAt(x, y));
     },
     /** The drag left the desktop. */
     dragLeave() {},
