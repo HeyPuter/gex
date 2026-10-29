@@ -137,6 +137,11 @@ const SPARE_MAX = 8;
  *  Worker has it. Node only, with `--expose-gc`. */
 const TEST_FORK_RECORDS = !!globalThis.process?.env?.GEX_TEST_FORK_RECORDS;
 const RECYCLE_BYTES = 768 << 20;
+/** How long kept memories wait for a fork child after the last exit: then
+ *  they go. A page that forks keeps forking within seconds (a shell, a
+ *  build); one that does not (a Wine game: wineboot exits, then nothing
+ *  forks) would otherwise hold up to RECYCLE_BYTES of touched pages for good. */
+const RECYCLE_KEEP_MS = 15_000;
 
 /** How far a fork record's image reaches: what its child's memory grows to. */
 function imageExtent(child) {
@@ -532,8 +537,10 @@ export class ProcessHost {
   /// Exited processes' memories, zeroed (`Gex#recycleMemory`), for fork
   /// children to adopt into: their pages are touched, where a new memory's
   /// first touch was most of the cost of copying a fork's image in. Kept
-  /// newest last, up to RECYCLE_COUNT and RECYCLE_BYTES.
+  /// newest last, up to RECYCLE_COUNT and RECYCLE_BYTES, for RECYCLE_KEEP_MS
+  /// after the last one came.
   #recycled = [];
+  #recycleTimer = null;
   /** TEST_FORK_RECORDS: each fork child's record, weakly, by pid. */
   #forkRecords = new Map();
   /** TEST_FORK_RECORDS: said a moment after the child's Worker has its
@@ -895,6 +902,8 @@ export class ProcessHost {
   #saveGate;
 
   #end() {
+    clearTimeout(this.#recycleTimer);
+    this.#recycled.length = 0;
     for (const w of this.#workers.values()) w.terminate();
     this.#workers.clear();
     // Including the warm ones nobody claimed.
@@ -1331,9 +1340,18 @@ export class ProcessHost {
   }
 
   /** Keep an exited process's zeroed memory for a fork child, dropping the
-   *  oldest past RECYCLE_COUNT or RECYCLE_BYTES. */
+   *  oldest past RECYCLE_COUNT or RECYCLE_BYTES, and all of them once
+   *  RECYCLE_KEEP_MS passes with no exit. */
   #keepMemory(mem) {
     this.#recycled.push(mem);
+    clearTimeout(this.#recycleTimer);
+    this.#recycleTimer = setTimeout(() => {
+      narrate(`[host] ${this.#recycled.length} kept memories let go: no exit in ${RECYCLE_KEEP_MS / 1000} s`);
+      this.#recycled.length = 0;
+      this.#recycleTimer = null;
+    }, RECYCLE_KEEP_MS);
+    // Node: not a reason to stay up.
+    this.#recycleTimer.unref?.();
     let bytes = this.#recycled.reduce((n, x) => n + x.buffer.byteLength, 0);
     while (this.#recycled.length > RECYCLE_COUNT || (this.#recycled.length > 1 && bytes > RECYCLE_BYTES)) {
       bytes -= this.#recycled.shift().buffer.byteLength;
