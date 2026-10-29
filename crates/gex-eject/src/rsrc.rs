@@ -461,7 +461,14 @@ fn abi_hash(kuser: bool) -> String {
 /// `gex_cgen::image::image_key` for the page's flavor (see [`FLAVORS`]). The
 /// composition is `image::unit_inputs`'s, which [`rekey`] checks against a
 /// recorded key for every image.
-pub(crate) fn key_with(image: &gex_ld::Image, (unguarded, kuser): (bool, bool)) -> String {
+pub(crate) fn key_with(image: &gex_ld::Image, g: (bool, bool)) -> String {
+    key_with_entry(image, g, false)
+}
+
+/// [`key_with`], with the fold covering the entry page after KUSER_SHARED_DATA
+/// too when `entry` and the flavor folds (`gexc cgen-image --wine64-compact`:
+/// a 64-bit Wine process in the compact space).
+pub(crate) fn key_with_entry(image: &gex_ld::Image, (unguarded, kuser): (bool, bool), entry: bool) -> String {
     let mut inputs = format!("{}:{}", gex_cgen::image::UNIT_INPUTS, abi_hash(kuser));
     if unguarded {
         inputs.push_str(":unguarded");
@@ -474,6 +481,9 @@ pub(crate) fn key_with(image: &gex_ld::Image, (unguarded, kuser): (bool, bool)) 
     }
     if kuser {
         inputs.push_str(":wine32kuser");
+    }
+    if kuser && entry {
+        inputs.push_str(":kuserentry");
     }
     if gex_abi::mem64() {
         inputs.push_str(":mem64");
