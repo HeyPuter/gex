@@ -23,6 +23,7 @@ import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browse
 import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
+import { noRegSave } from './wine-env.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
@@ -608,6 +609,9 @@ async function begin(opts, base, at, state, meter) {
   const env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
+  // The wineserver's periodic registry saves only for a prefix the visit
+  // keeps (wine-env.js).
+  noRegSave(env, keep);
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
   // A zoneinfo name (':' = a file under /usr/share/zoneinfo, which Wine also
