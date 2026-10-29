@@ -242,13 +242,21 @@ ntdll_native() {
 [ "$M64" != 0 ] || { log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native; }
 
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
-NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+# WINE64_SPLIT_DLLS="DLL ...": those linked as modules of their own beside
+# the core (stage-native64.sh); part of N
+SP=${WINE64_SPLIT_DLLS:-}
+NK=$( { echo "$S $D${SP:+ split $SP}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
 	local b=$C/b64-$K-$S t
 	t="libs/gexrt/libgexrt.a"
 	for dll in $D; do t="$t dlls/${dll%.dll}/wasm64-windows/$dll"; done
+	for dll in $SP; do
+		if [ -d "$b/dlls/${dll%.*}" ]; then t="$t dlls/${dll%.*}/wasm64-windows/$dll"
+		elif [ -d "$b/dlls/$dll" ]; then t="$t dlls/$dll/wasm64-windows/$dll"
+		else t="$t programs/${dll%.*}/wasm64-windows/$dll"; fi
+	done
 	# shellcheck disable=SC2086
 	( cd "$b" && nice -n 10 make -j"$J" $t ) || return 1
 	# shellcheck disable=SC2086
