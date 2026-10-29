@@ -549,6 +549,14 @@ everything read after it, a game's first level included, is a lazy file. The
 recording can then settle as long as its units need (`--settle`) without the
 bundle growing.
 
+A game's window often opens well before its title menu, which then loads
+from lazy files a read at a time. `"title_after": S` cuts S seconds after the
+window instead, from the recording's `files_read_at` (when each file was
+first read; the recorder's `--shots` keeps a screenshot every 5 s, which
+tells the menu from the loading screen before it). A title bundle also leaves out
+the images the run opened and no process loaded, and wineboot when the site
+boots without it: they stay a fetch away.
+
 Nothing the program needs is lost: what the recording did not open is a
 fetch away. What it costs is a wait the first time an unrecorded path reads
 a file. Record the paths users take to bring them into the bundle.

@@ -115,6 +115,11 @@ pub struct Config {
     /// a recording that settles longer, for its units, keeps the bundle the
     /// title's; everything read after it is a lazy file.
     pub bundle_title: bool,
+    /// `"title_after"`: seconds after the title window that `"bundle":
+    /// "title"` cuts at, for a game whose title menu comes up well after its
+    /// window (from the recording's `files_read_at`). 0, the default, cuts
+    /// at the window.
+    pub title_after: u32,
     /// 32-bit Wine pages: `"cold"`, how the units' code the recording never ran is
     /// split off (gex_split): a clustering (`"chunk:256"`, `"graph:64"`,
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
@@ -190,6 +195,7 @@ impl Default for Config {
             features_on: Vec::new(),
             bundle_split: false,
             bundle_title: false,
+            title_after: 0,
             cold: None,
             prune: None,
             resources_trim: false,
@@ -243,7 +249,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "desktop" | "wineboot" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "helpers" | "desktop" | "wineboot" | "start" | "title_after") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -402,6 +408,11 @@ impl Config {
             Some(Json::Str(x)) if x == "title" => (true, true),
             Some(_) => bail!("{what}: \"bundle\" is \"whole\", \"split\" or \"title\""),
         };
+        c.title_after = match v.get("title_after") {
+            None | Some(Json::Null) => 0,
+            Some(Json::Num(n)) => n.parse().map_err(|_| anyhow!("{what}: \"title_after\" is whole seconds"))?,
+            Some(_) => bail!("{what}: \"title_after\" is whole seconds"),
+        };
         c.cold = match v.get("cold") {
             None | Some(Json::Null) => None,
             Some(Json::Str(x)) if x == "none" => None,
@@ -518,6 +529,10 @@ mod tests {
         assert_eq!(cut(r#"{"bundle": "split"}"#).unwrap(), (true, false));
         assert_eq!(cut(r#"{"bundle": "title"}"#).unwrap(), (true, true));
         assert!(cut(r#"{"bundle": "first-frame"}"#).is_err());
+        assert_eq!(Config::from_json("{}").unwrap().title_after, 0);
+        assert_eq!(Config::from_json(r#"{"bundle": "title", "title_after": 75}"#).unwrap().title_after, 75);
+        assert!(Config::from_json(r#"{"title_after": "75"}"#).is_err());
+        assert!(Config::from_json(r#"{"title_after": 7.5}"#).is_err());
     }
 
     #[test]
