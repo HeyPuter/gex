@@ -15,6 +15,7 @@
 //! `wl_output`, and the `xdg_shell` trio. Shared memory only: no `linux-dmabuf`
 //! or `wl_drm`, so a client insisting on a GPU buffer finds none.
 
+pub mod data;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -472,8 +473,8 @@ const GLOBALS: &[(&str, u32)] = &[
     // client that chooses its own size chooses one that fits.
     ("xdg_wm_base", 4),
     // GTK expects these during display init; without them it defers/abandons
-    // seat setup (never binds wl_seat) and loops on GDK_IS_SEAT. Minimal: their
-    // requests are accepted and ignored (no real clipboard/DnD or subsurfaces).
+    // seat setup (never binds wl_seat) and loops on GDK_IS_SEAT. The data
+    // device takes drags from the host (data.rs); there is no clipboard yet.
     ("wl_data_device_manager", 3),
     ("wl_subcompositor", 1),
     // Server-side decorations, which is what makes this a compositor rather
@@ -516,7 +517,12 @@ enum Object {
     XdgToplevel { xdg_surface: u32 },
     Positioner,
     XdgPopup { xdg_surface: u32 },
-    DataDeviceManager,
+    /// `wl_data_device_manager`, and the version it was bound at, which its
+    /// devices and their offers have (data.rs).
+    DataDeviceManager { version: u32 },
+    DataDevice,
+    DataSource,
+    DataOffer,
     Subcompositor,
     Subsurface { surface: u32 },
     Viewporter,
@@ -525,9 +531,6 @@ enum Object {
     Decoration { surface: u32 },
     PlacementManager,
     Placement { surface: u32 },
-    /// An object whose requests we accept and ignore (data devices/sources,
-    /// subsurfaces) -- present so GTK's init completes, does nothing observable.
-    Stub,
 }
 
 /// An `xdg_positioner`: where a popup wants to be, expressed the way the
@@ -787,6 +790,8 @@ pub struct Client {
     /// A keyboard was created and owes a `keymap` event whose fd the host must
     /// attach: this is the payload, taken once by [`Client::take_keymap`].
     pending_keymap: Option<Vec<u8>>,
+    /// Data devices, sources and offers (data.rs).
+    data: data::DataState,
 }
 
 /// Wayland's error codes on `wl_display`.
@@ -837,6 +842,7 @@ impl Client {
             pointer_on: None,
             keyboard_on: None,
             pending_keymap: None,
+            data: data::DataState::default(),
         }
     }
 
@@ -899,6 +905,7 @@ impl Client {
             }
         }
         out.extend(self.surfaces.values().filter_map(|s| s.shown_fd));
+        out.extend(self.receive_fds());
         out
     }
 
@@ -994,25 +1001,13 @@ impl Client {
                 Object::PlacementManager => self.placement_manager(opcode, &mut r),
                 Object::Placement { surface } => self.placement(object, surface, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
-                Object::DataDeviceManager => {
-                    // create_data_source(id) = 0, get_data_device(id, seat) = 1;
-                    // both make a new object whose requests we then ignore.
-                    match opcode {
-                        0 | 1 => {
-                            if let Some(id) = r.new_id() {
-                                self.objects.insert(id, Object::Stub);
-                            }
-                            true
-                        }
-                        _ => true,
-                    }
-                }
+                Object::DataDeviceManager { version } => self.data_device_manager(version, opcode, &mut r),
+                Object::DataDevice => self.data_device(object, opcode, &mut r),
+                Object::DataSource => self.data_source(object, opcode, &mut r),
+                Object::DataOffer => self.data_offer(object, opcode, &mut r),
                 Object::Subcompositor => self.subcompositor(opcode, &mut r),
                 Object::Viewporter => self.viewporter(object, opcode, &mut r),
                 Object::Viewport { surface } => self.viewport(object, surface, opcode, &mut r),
-                // Data devices/sources and subsurfaces: none of their requests
-                // creates a child object, so just accept and ignore everything.
-                Object::Stub => true,
                 Object::Positioner => self.positioner(object, opcode, &mut r),
                 Object::Region => self.region(object, opcode, &mut r),
                 Object::Buffer(_) => {
@@ -1226,7 +1221,7 @@ impl Client {
                 self.wm_base_version = version.min(4);
             }
             "wl_data_device_manager" => {
-                self.objects.insert(id, Object::DataDeviceManager);
+                self.objects.insert(id, Object::DataDeviceManager { version: version.min(3) });
             }
             "wl_subcompositor" => {
                 self.objects.insert(id, Object::Subcompositor);
@@ -4405,5 +4400,100 @@ mod tests {
         assert!(c.take_outgoing().is_empty(), "nothing until it is whole");
         c.receive(&bytes[5..], &[], &no_pool());
         assert!(!c.take_outgoing().is_empty());
+    }
+
+    /// After `with_seat`, a data device (21) from a manager bound at `version`.
+    fn with_data_device(version: u32) -> Client {
+        let mut c = with_seat();
+        c.receive(
+            &Writer::new(2, 0).uint(6).string("wl_data_device_manager").uint(version).new_id(20).finish(),
+            &[],
+            &no_pool(),
+        );
+        c.receive(&Writer::new(20, 1).new_id(21).object(12).finish(), &[], &no_pool());
+        let _ = c.take_outgoing();
+        c
+    }
+
+    #[test]
+    fn a_host_drag_offers_its_types_enters_and_drops_once_accepted() {
+        let mut c = with_data_device(2);
+        assert!(c.has_data_device());
+        assert!(c.drag_enter(6, 3, 4, &["text/uri-list"], data::DND_COPY));
+        let msgs = messages(&c.take_outgoing());
+        let offer = 0xff00_0000;
+        assert_eq!((msgs[0].0, msgs[0].1), (21, 0), "data_offer first");
+        assert!(msgs.iter().any(|(o, op, _)| *o == offer && *op == 0), "offer(mime)");
+        assert!(!msgs.iter().any(|(o, op, _)| *o == offer && *op == 1), "no source_actions below v3");
+        let enter = msgs.iter().find(|(o, op, _)| *o == 21 && *op == 1).expect("enter");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(&enter.2, &mut fds);
+        let serial = r.uint().unwrap();
+        assert_eq!(r.object(), Some(6));
+        assert_eq!(r.fixed().map(|f| f.to_int()), Some(3));
+        assert_eq!(r.fixed().map(|f| f.to_int()), Some(4));
+        assert_eq!(r.object(), Some(offer));
+        assert!(!c.drag_status().unwrap().takes());
+        c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
+        assert!(c.drag_status().unwrap().takes());
+        c.receive(&Writer::new(offer, 1).string("text/uri-list").finish(), &[55], &no_pool());
+        assert!(c.fds_in_use().contains(&55), "a receive's fd is held until the host takes it");
+        assert_eq!(c.take_receives(), vec![data::Receive { offer, mime: "text/uri-list".into(), fd: 55 }]);
+        c.drag_motion(5, 6, 7);
+        assert!(messages(&c.take_outgoing()).iter().any(|(o, op, _)| *o == 21 && *op == 3), "motion");
+        assert!(c.drag_drop());
+        assert!(messages(&c.take_outgoing()).iter().any(|(o, op, _)| *o == 21 && *op == 4), "drop");
+        c.receive(&Writer::new(offer, 2).finish(), &[], &no_pool());
+        let st = c.drag_status().unwrap();
+        assert!(st.dropped && st.finished, "{st:?}");
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+    }
+
+    #[test]
+    fn a_drop_the_client_does_not_take_is_a_leave() {
+        let mut c = with_data_device(2);
+        c.drag_enter(6, 0, 0, &["text/uri-list"], data::DND_COPY);
+        let serial = c.drag_serial().unwrap();
+        c.receive(&Writer::new(0xff00_0000, 0).uint(serial).string("").finish(), &[], &no_pool());
+        let _ = c.take_outgoing();
+        assert!(!c.drag_drop());
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 21 && *op == 2), "leave");
+        assert!(!msgs.iter().any(|(o, op, _)| *o == 21 && *op == 4), "no drop");
+        assert!(c.drag_status().is_none());
+    }
+
+    #[test]
+    fn a_version_3_client_chooses_an_action() {
+        let mut c = with_data_device(3);
+        c.drag_enter(6, 0, 0, &["text/uri-list"], data::DND_COPY | data::DND_MOVE);
+        let offer = 0xff00_0000;
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == offer && *op == 1), "source_actions");
+        let serial = c.drag_serial().unwrap();
+        c.receive(&Writer::new(offer, 0).uint(serial).string("text/uri-list").finish(), &[], &no_pool());
+        assert!(!c.drag_status().unwrap().takes(), "no action yet");
+        c.receive(&Writer::new(offer, 4).uint(data::DND_COPY | data::DND_MOVE).uint(data::DND_MOVE).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        let action = msgs.iter().find(|(o, op, _)| *o == offer && *op == 2).expect("action");
+        assert_eq!(u32::from_le_bytes(action.2[..4].try_into().unwrap()), data::DND_MOVE);
+        assert!(c.drag_status().unwrap().takes());
+        assert!(c.drag_drop());
+        c.receive(&Writer::new(offer, 3).finish(), &[], &no_pool());
+        assert!(c.drag_status().unwrap().finished);
+    }
+
+    #[test]
+    fn a_source_and_the_selection_are_kept() {
+        let mut c = with_data_device(3);
+        c.receive(&Writer::new(20, 0).new_id(22).finish(), &[], &no_pool());
+        c.receive(&Writer::new(22, 0).string("text/plain").finish(), &[], &no_pool());
+        c.receive(&Writer::new(21, 1).object(22).uint(1).finish(), &[], &no_pool());
+        let (sources, sel) = c.data_sources();
+        assert_eq!(sources[&22].mimes, vec!["text/plain".to_string()]);
+        assert_eq!(sel, Some(22));
+        c.receive(&Writer::new(22, 1).finish(), &[], &no_pool());
+        assert_eq!(c.data_sources().1, None);
+        assert!(c.failed.is_none());
     }
 }

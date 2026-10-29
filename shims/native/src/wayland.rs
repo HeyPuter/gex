@@ -51,6 +51,10 @@ struct Session {
     /// of what a Wine game's threads spent their CPU on; keeping it made such
     /// a game more than ten times faster.
     rbuf: Vec<u8>,
+    /// The scripted drag over this client: its text/uri-list, and what the
+    /// client last said of it (printed when it changes).
+    drag: Option<String>,
+    drag_said: Option<gex_wayland::data::DragStatus>,
 }
 
 /// The compositor, as the guest sees it: a name that accepts connections.
@@ -91,6 +95,12 @@ enum Ev {
     Key(u32, bool),
     /// Scroll: axis (0 vertical, 1 horizontal) and wl_fixed pixels.
     Axis(u32, i32),
+    /// A drag from the host at a point, of the script's Nth file list
+    /// (`Input::drags`); its moves; its release; its cancel.
+    Drag(i32, i32, usize),
+    DragMove(i32, i32),
+    Drop,
+    DragLeave,
 }
 
 /// A script of input events at times (seconds) after the compositor's Nth
@@ -109,6 +119,10 @@ enum Ev {
 /// 42    scroll 100           # pixels down (negative: up); 100 is a wheel notch
 /// 43    scroll 2.5 x 40      # 40 events of 2.5 px, 1/60 s apart (a trackpad)
 /// 44    hscroll -100         # pixels right (negative: left), `x N` as scroll
+/// 50    drag 300 200 /a /b   # a drag of files (text/uri-list) from the host enters here
+/// 50.5  dragmove 320 210     # and moves; the screen's hit test picks the window
+/// 51    drop                 # released: the window under it takes it or refuses it
+/// 52    dragleave            # (or cancelled)
 /// ```
 ///
 /// `window W H` in place of `frames N` starts the clock once a placed window
@@ -118,6 +132,8 @@ enum Ev {
 /// Coordinates are the focused surface's pixels.
 struct Input {
     events: Vec<(f64, Ev, String)>,
+    /// Each `drag` line's files, as the text/uri-list the host offers.
+    drags: Vec<String>,
     next: usize,
     start: Option<std::time::Instant>,
     /// Frames to see before the clock starts, and how many have been.
@@ -125,6 +141,24 @@ struct Input {
     seen: u64,
     /// `window W H`: the clock starts once a placed window this size is up.
     window: Option<(u32, u32)>,
+}
+
+/// Paths as a text/uri-list: `file://` URIs, CRLF after each, with every
+/// byte outside RFC 3986's unreserved set and `/` percent-encoded.
+pub fn uri_list(paths: &[&str]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        out.push_str("file://");
+        for &b in p.as_bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Linux `KEY_*` codes for the names a script may use (else a number).
@@ -150,6 +184,7 @@ impl Input {
     fn load(path: &str) -> Result<Input, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let mut events = Vec::new();
+        let mut drags = Vec::new();
         let mut after = 1;
         let mut window = None;
         for (n, line) in text.lines().enumerate() {
@@ -194,6 +229,16 @@ impl Input {
                         events.push((t + i as f64 / 60.0, Ev::Axis(axis, (px * 256.0).round() as i32), l.clone()));
                     }
                 }
+                Some("drag") => {
+                    if w.len() < 5 {
+                        return Err(bad());
+                    }
+                    drags.push(uri_list(&w[4..]));
+                    events.push((t, Ev::Drag(num(2)?, num(3)?, drags.len() - 1), l));
+                }
+                Some("dragmove") => events.push((t, Ev::DragMove(num(2)?, num(3)?), l)),
+                Some("drop") => events.push((t, Ev::Drop, l)),
+                Some("dragleave") => events.push((t, Ev::DragLeave, l)),
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
                     events.push((t + 0.1, Ev::Key(key(2)?, false), l));
@@ -204,7 +249,7 @@ impl Input {
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
         let start = if after == 0 && window.is_none() { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, next: 0, start, after, seen: 0, window })
+        Ok(Input { events, drags, next: 0, start, after, seen: 0, window })
     }
 }
 
@@ -263,6 +308,11 @@ impl Wayland {
             eprintln!("[gex] input: the script's clock starts with a {w}x{h} window up");
             inp.start = Some(std::time::Instant::now());
         }
+    }
+
+    /// The script's Nth drag's text/uri-list.
+    fn drag_list(&self, n: usize) -> Option<String> {
+        self.inner.input.lock().unwrap().as_ref()?.drags.get(n).cloned()
     }
 
     /// The scripted events now due (`GEX_WL_INPUT`), with their time in ms.
@@ -474,6 +524,9 @@ impl Wayland {
                     Ev::Button(b, down) => s.client.pointer_button(b, down, ms),
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
                     Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
+                    Ev::Drag(..) | Ev::DragMove(..) | Ev::Drop | Ev::DragLeave => {
+                        eprintln!("[gex] input: a drag needs placed windows (gex_window_placement_v1)");
+                    }
                 }
             }
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
@@ -486,8 +539,20 @@ impl Wayland {
                     Routed::Key(k, down, ms) => s.client.keyboard_key(k, down, ms),
                     Routed::KeyboardFocus(surface) => s.client.keyboard_focus(surface),
                     Routed::KeyboardLeave => s.client.keyboard_focus(0),
+                    Routed::DragEnter(surface, x, y, n) => {
+                        s.drag = self.drag_list(n);
+                        let ok = s.client.drag_enter(surface, x, y, &["text/uri-list"], gex_wayland::data::DND_COPY);
+                        eprintln!("[gex] dnd: enter {}:{surface} at {x},{y}{}", s.id, if ok { "" } else { ": the client has no data device" });
+                    }
+                    Routed::DragMotion(x, y, ms) => s.client.drag_motion(x, y, ms),
+                    Routed::Drop => {
+                        let taken = s.client.drag_drop();
+                        eprintln!("[gex] dnd: drop on {}: {}", s.id, if taken { "taken" } else { "refused" });
+                    }
+                    Routed::DragLeave => s.client.drag_leave(),
                 }
             }
+            s.answer_drag();
             routed.retain(|r| r.0 != s.id);
             // A window that asked to be fullscreen (a rootful Xwayland, a
             // nested compositor) is given the whole output, and one that took
@@ -576,6 +641,8 @@ struct Screen {
     /// Who has the keyboard (by `activate`) and the pointer (by hit test).
     focus: Option<Key>,
     pointer: Option<Key>,
+    /// The scripted drag: which file list, and the surface it is over.
+    drag: Option<(usize, Option<Key>)>,
     /// Sessions owed a keyboard leave: the keyboard went to another client.
     leaves: Vec<u64>,
     /// The window list last printed.
@@ -595,6 +662,12 @@ enum Routed {
     /// The keyboard to this surface (the screen chose it, no client did).
     KeyboardFocus(u32),
     KeyboardLeave,
+    /// The host's drag: enters a surface at a point with the script's Nth
+    /// file list, moves on it, is dropped, leaves.
+    DragEnter(u32, i32, i32, usize),
+    DragMotion(i32, i32, u32),
+    Drop,
+    DragLeave,
 }
 
 impl Screen {
@@ -714,6 +787,26 @@ impl Screen {
                         out.push((sid, Routed::Button(b, down, ms)));
                     }
                 }
+                Ev::Drag(x, y, n) => {
+                    if let Some((_, Some(old))) = self.drag.take() {
+                        out.push((old.0, Routed::DragLeave));
+                    }
+                    self.drag = Some((n, None));
+                    self.drag_to(x, y, ms, &mut out);
+                }
+                Ev::DragMove(x, y) => self.drag_to(x, y, ms, &mut out),
+                Ev::Drop => {
+                    if let Some((_, Some(k))) = self.drag.take() {
+                        out.push((k.0, Routed::Drop));
+                    } else {
+                        eprintln!("[gex] input: drop over no window");
+                    }
+                }
+                Ev::DragLeave => {
+                    if let Some((_, Some(k))) = self.drag.take() {
+                        out.push((k.0, Routed::DragLeave));
+                    }
+                }
                 Ev::Axis(axis, v) => {
                     if let Some((sid, _)) = self.pointer {
                         out.push((sid, Routed::Axis(axis, v, ms)));
@@ -740,6 +833,27 @@ impl Screen {
             }
         }
         out
+    }
+
+    /// The scripted drag is at a screen point: it enters the window there
+    /// (leaving the one it was over) or moves on it.
+    fn drag_to(&mut self, x: i32, y: i32, ms: u32, out: &mut Vec<(u64, Routed)>) {
+        let Some((n, over)) = self.drag else { return };
+        let hit = self.hit(x, y);
+        eprintln!("[gex] input: drag at {x},{y} is over {:?}", hit.map(|h| h.0));
+        match (over, hit) {
+            (Some(o), Some((k, lx, ly))) if o == k => out.push((k.0, Routed::DragMotion(lx, ly, ms))),
+            (o, h) => {
+                if let Some(o) = o {
+                    out.push((o.0, Routed::DragLeave));
+                }
+                if let Some((k, lx, ly)) = h {
+                    out.push((k.0, Routed::Origin(k.1, x - lx, y - ly)));
+                    out.push((k.0, Routed::DragEnter(k.1, lx, ly, n)));
+                }
+                self.drag = Some((n, h.map(|h| h.0)));
+            }
+        }
     }
 
     /// What to draw, bottom to top: windows nobody placed centred, as
@@ -801,11 +915,43 @@ impl HostListener for Wayland {
             out: Vec::new(),
             sent: 0,
             rbuf: Vec::new(),
+            drag: None,
+            drag_said: None,
         });
     }
 }
 
 impl Session {
+    /// The drag's data to every client that asked (`wl_data_offer.receive`):
+    /// written into its descriptor, which is then closed. And what the client
+    /// says of the drag, when that changes.
+    fn answer_drag(&mut self) {
+        for r in self.client.take_receives() {
+            let file = self.fds.remove(&r.fd);
+            self.fresh.retain(|t| *t != r.fd);
+            let (Some(file), Some(data)) = (file, self.drag.as_ref().filter(|_| r.mime == "text/uri-list")) else {
+                eprintln!("[gex] dnd: nothing to send as {}", r.mime);
+                continue;
+            };
+            let mut at = 0;
+            while at < data.len() {
+                match file.write(&data.as_bytes()[at..]) {
+                    Ok(n) if n > 0 => at += n as usize,
+                    _ => break,
+                }
+            }
+            eprintln!("[gex] dnd: sent {at} of {} bytes as {}", data.len(), r.mime);
+        }
+        let st = self.client.drag_status();
+        if st != self.drag_said {
+            if let Some(st) = &st {
+                eprintln!("[gex] dnd: {}:{} accepts {:?}, action {}{}{}", self.id, st.surface, st.accepted, st.action,
+                    if st.dropped { ", dropped" } else { "" }, if st.finished { ", finished" } else { "" });
+            }
+            self.drag_said = st;
+        }
+    }
+
     /// Drop every descriptor the compositor has finished with: no pool, no
     /// buffer and no surface on screen names it, and it is not one still
     /// waiting for the message that uses it.
