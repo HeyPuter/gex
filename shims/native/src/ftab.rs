@@ -58,6 +58,29 @@ pub(crate) struct Shared {
     pub process: Process,
 }
 
+impl Shared {
+    /// A forked child's own copy, for a child that may change its link map
+    /// (`dylink`): the modules installed so far, at the same table indices
+    /// and data addresses as in the memory it was copied from, under an
+    /// identity of its own.
+    pub(crate) fn fork_copy(&self) -> Shared {
+        Shared {
+            map: self.map.clone(),
+            modules: self.modules.clone(),
+            runtime: self.runtime.clone(),
+            checks: self.checks.clone(),
+            tier1_only: self.tier1_only.clone(),
+            epoch: self.epoch,
+            queued: Default::default(),
+            stateful: self.stateful.clone(),
+            dylink: self.dylink.clone(),
+            dyproc: self.dyproc.clone(),
+            providers: self.providers.clone(),
+            process: Process::default(),
+        }
+    }
+}
+
 /// A guest process's identity for the run-time translator, unique for the
 /// run; the translator forgets the process when the last reference goes.
 pub(crate) struct Process(pub u64);

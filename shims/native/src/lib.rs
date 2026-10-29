@@ -508,6 +508,31 @@ struct JitShared {
     calls: usize,
 }
 
+impl JitShared {
+    /// A forked child's own copy (`fork_process`): what the child's memory,
+    /// a copy of this address space's, was installed and relocated with.
+    fn fork_copy(&self) -> JitShared {
+        JitShared {
+            page_table: self.page_table.clone(),
+            translated: self.translated.clone(),
+            registry: self.registry.clone(),
+            slot_owner: self.slot_owner.clone(),
+            remiss: Default::default(),
+            retired_pages: self.retired_pages.clone(),
+            stale_blocks: self.stale_blocks,
+            provider: self.provider.clone(),
+            ftab: self.ftab.fork_copy(),
+            wasm_program: self.wasm_program,
+            wine_pe: self.wine_pe.clone(),
+            relocated: Arc::new(Mutex::new(self.relocated.lock().unwrap_or_else(|e| e.into_inner()).clone())),
+            trampolines: self.trampolines,
+            elf_units: self.elf_units.clone(),
+            blocks: 0,
+            calls: 0,
+        }
+    }
+}
+
 impl HostState {
     /// Run `f` with the shared kernel locked and describing this thread.
     ///
@@ -2566,6 +2591,22 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
+    // A program with shared libraries gets its own function table and link
+    // map: a library the child dlopens is mapped and initialised in the
+    // child's memory only, so the parent and its later children must not
+    // find it loaded. Taken before the memory is copied: a dlopen in between
+    // leaves the child with the data and no link-map entry, and the child
+    // loads it again if it asks. Every other process shares the parent's
+    // (the modules are the same code at the same addresses).
+    let jit_shared = cx.jit_shared.as_ref().map(|s| {
+        let s0 = s.lock().unwrap_or_else(|e| e.into_inner());
+        if s0.ftab.dyproc.is_some() {
+            Arc::new(Mutex::new(s0.fork_copy()))
+        } else {
+            Arc::clone(s)
+        }
+    });
+
     let shared = wasmtime::SharedMemory::new(
         &cx.engine,
         guest_memory_type(),
@@ -2652,10 +2693,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         xlate: cx.xlate.clone(),
         kernel: Arc::new(Mutex::new(child_kernel)),
         proc_state: child_proc,
-        // The registry is shared: the modules are the same code at the same
-        // addresses, and instantiating one against a different memory is
-        // exactly what the import is for.
-        jit_shared: cx.jit_shared.clone(),
+        jit_shared,
         limits: cx.limits,
         prof_proc: profile::fork_process(&cx.prof_proc),
         fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
