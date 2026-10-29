@@ -619,8 +619,12 @@ async function begin(opts, base, at, state, meter) {
   // libc reads without zoneinfo files (a bundle has none). A zoneinfo name
   // in the build's own env (`TZ=:<zone>`, the recording page's zone, which
   // its recorder kept) gives way to it: it names a file the bundle lacks.
+  // None for a build that sets its zone itself: `tz: false` in its build
+  // options, or GEX_KDE_TZ in its env (the KDE image ships zoneinfo, links
+  // /etc/localtime and drops TZ; Qt would take a rule string for a zone id).
   let pageTz = null;
-  if (!mergeEnv([], opts.env).some((e) => e.startsWith('TZ='))) {
+  const ownZone = b.tz === false || env.some((e) => e.startsWith('GEX_KDE_TZ='));
+  if (!ownZone && !mergeEnv([], opts.env).some((e) => e.startsWith('TZ='))) {
     let zone = null;
     try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* none */ }
     const tz = zone ? posixTz(zone) : null;
@@ -1062,6 +1066,8 @@ function launchBuild(m, at) {
       // The bundle's extended attributes (the memory64 mark on a program),
       // which the site's rebuilt bundle does not carry itself.
       xattrs: m.xattrs ?? null,
+      // nt.json `tz: false`: the build sets its own zone (no page TZ).
+      tz: m.tz ?? true,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
