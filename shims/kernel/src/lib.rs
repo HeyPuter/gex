@@ -1554,19 +1554,17 @@ pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
 /// the same layout every time; the first process pays for it and leaves the
 /// result here for the rest.
 ///
-/// A fixed arena and index, allocating nothing: every Worker shares this
-/// module's allocator state as well as its data, so a heap grown from two
-/// Workers at once is untrustworthy -- storing from a child once trapped the
-/// parent. The bytes go at a bump offset in `.bss` and the index is an array.
-const SNAP_ARENA_BYTES: usize = 48 * 1024 * 1024;
+/// Each image is its own heap block, allocated when it is stored, up to
+/// [`SNAP_BUDGET`] bytes in all: a static arena would be zero-filled, and so
+/// made resident, by the module's start before anything is stored. Nothing is
+/// ever freed or moved, so an image's address stays good once indexed.
+const SNAP_BUDGET: usize = 48 * 1024 * 1024;
 const SNAP_MAX: usize = 64;
 
-static mut SNAP_ARENA: [u8; SNAP_ARENA_BYTES] = [0; SNAP_ARENA_BYTES];
-
-/// `(key, offset, len)` for each image kept, and how much of the arena is
-/// spent. Zero-keyed entries are free.
+/// `(key, address, len)` for each image kept, and how many bytes they take.
+/// Zero-keyed entries are free.
 struct Snaps {
-    at: [(u64, u32, u32); SNAP_MAX],
+    at: [(u64, usize, u32); SNAP_MAX],
     used: usize,
     n: usize,
 }
@@ -1583,8 +1581,9 @@ fn snaps() -> &'static Mutex<Snaps> {
     })
 }
 
-/// Keep the linked image of `key`. Silently declines when the arena is full or
-/// the key is already known: first to finish linking wins.
+/// Keep the linked image of `key`. Silently declines when the budget is spent,
+/// the kernel's memory cannot hold it, or the key is already known: first to
+/// finish linking wins.
 ///
 /// SAFETY: `ptr` names the calling process's memory, pulled across not read. See
 /// `k_mod_store`.
@@ -1597,20 +1596,24 @@ pub unsafe extern "C" fn k_snap_store(key: u64, ptr: gex_kmem::PAddr, len: u32) 
     if s.at[..s.n].iter().any(|(k, _, _)| *k == key) {
         return;
     }
-    let at = s.used;
-    let Some(end) = at.checked_add(len as usize) else { return };
-    if end > SNAP_ARENA_BYTES {
+    let Some(end) = s.used.checked_add(len as usize) else { return };
+    if end > SNAP_BUDGET {
         return;
     }
-    // SAFETY: the range is inside the arena, and the lock this holds is the
-    // only thing that hands out arena offsets.
-    let dst = unsafe { (&raw mut SNAP_ARENA).cast::<u8>().add(at) };
-    if !unsafe { gex_kmem::pull_checked(dst, ptr, len) } {
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(len as usize).is_err() {
         return;
     }
+    // SAFETY: `len` bytes of reserved capacity, written whole before the
+    // length covers them.
+    if !unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), ptr, len) } {
+        return;
+    }
+    unsafe { buf.set_len(len as usize) };
+    let at = Box::leak(buf.into_boxed_slice()).as_ptr() as usize;
     s.used = end;
     let n = s.n;
-    s.at[n] = (key, at as u32, len);
+    s.at[n] = (key, at, len);
     s.n = n + 1;
 }
 
@@ -1630,16 +1633,15 @@ pub extern "C" fn k_snap_len(key: u64) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn k_snap_get(key: u64, at: gex_kmem::PAddr, cap: u32) -> u32 {
     let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, off, len)) = s.at[..s.n].iter().find(|(k, _, _)| *k == key) else {
+    let Some(&(_, src, len)) = s.at[..s.n].iter().find(|(k, _, _)| *k == key) else {
         return 0;
     };
     if len > cap {
         return 0;
     }
-    // SAFETY: the range was written by `k_snap_store` under this same lock
-    // and nothing ever moves or frees it.
-    let src = unsafe { (&raw const SNAP_ARENA).cast::<u8>().add(off as usize) };
-    if !unsafe { gex_kmem::push_checked(at, src, len) } {
+    // SAFETY: `len` bytes written by `k_snap_store` under this same lock, and
+    // nothing ever moves or frees them.
+    if !unsafe { gex_kmem::push_checked(at, src as *const u8, len) } {
         return 0;
     }
     len
