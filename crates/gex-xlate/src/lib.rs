@@ -592,8 +592,12 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
     seen.extend(frontier.iter().copied());
     let show_illegal = std::env::var_os("GEX_SHOW_ILLEGAL").is_some();
 
+    let compat = arch::compat();
     while !frontier.is_empty() {
         let lifted = gex_emit::par::map(&frontier, &|&addr| {
+            // The lifting threads decode in this thread's mode (an image's
+            // own, `set_thread_compat`), not only the process default.
+            let _mode = compat_scope(compat);
             // A recognised library function is emitted as the shim's intrinsic
             // (a `memory.copy`/`memory.fill`) instead of lifting its own code --
             // the same substitution `discover` (the runtime path) does. Without
@@ -703,6 +707,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
         }
         fill.sort_unstable();
         let lifted = gex_emit::par::map(&fill, &|&addr| {
+            let _mode = compat_scope(compat);
             if let Some(&k) = opts.intrinsics.get(&addr) {
                 return intrinsic::block(addr, k);
             }
@@ -1367,11 +1372,13 @@ fn discover(
     // past the seeds (0: no limit). An experiment: 63% of the blocks node's
     // start-up lifts never run, and the deeper the level the fewer run.
     let max_depth = (DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed) >> 16) & 0xff;
+    let compat = arch::compat();
     while !frontier.is_empty() && stats.blocks < max_blocks && (max_depth == 0 || u32::from(depth) <= max_depth) {
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
         let lifted = gex_emit::par::map(&frontier, &|&a| {
+            let _mode = compat_scope(compat);
             match intrinsics.get(&a) {
                 // Not lifted at all, so discovery never walks into the
                 // function's body and the module never carries it.
@@ -1501,8 +1508,10 @@ fn fetch_code_bytes(
 static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether the code this translator sees is 32-bit (i386 compatibility
-/// mode). One setting per process: a 32-bit program is 32-bit throughout.
-/// On the AArch64 guest there is no such mode and this is a no-op.
+/// mode), as the process default: a 32-bit program is 32-bit throughout.
+/// Code of the other class in the same process is translated under
+/// [`set_thread_compat`] or [`compat_scope`]. Clears this thread's own
+/// setting. On the AArch64 guest there is no such mode and this is a no-op.
 pub fn set_compat(compat: bool) {
     #[cfg(feature = "x86")]
     gex_isa_x86::set_mode(if compat {
@@ -1512,6 +1521,40 @@ pub fn set_compat(compat: bool) {
     });
     #[cfg(not(feature = "x86"))]
     let _ = compat;
+}
+
+/// Whether the code this thread translates next is 32-bit, until the next
+/// call on this thread or [`set_compat`] there: what translating one image
+/// sets (`image.class32`). Other threads keep their own, so two threads
+/// translating images of different classes (a WoW64 process) do not race.
+pub fn set_thread_compat(compat: bool) {
+    #[cfg(feature = "x86")]
+    gex_isa_x86::set_thread_mode(if compat {
+        gex_isa_x86::Mode::Compat
+    } else {
+        gex_isa_x86::Mode::Long
+    });
+    #[cfg(not(feature = "x86"))]
+    let _ = compat;
+}
+
+/// [`set_thread_compat`] for as long as the scope lives; dropping it restores
+/// what this thread had before.
+#[must_use = "the mode holds only while the scope is alive"]
+pub struct CompatScope {
+    #[cfg(feature = "x86")]
+    _scope: gex_isa_x86::ModeScope,
+}
+
+pub fn compat_scope(compat: bool) -> CompatScope {
+    CompatScope {
+        #[cfg(feature = "x86")]
+        _scope: gex_isa_x86::ModeScope::enter(if compat {
+            gex_isa_x86::Mode::Compat
+        } else {
+            gex_isa_x86::Mode::Long
+        }),
+    }
 }
 
 pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {

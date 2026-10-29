@@ -576,9 +576,7 @@ fn regions_from(
 /// `[disp32]` is absolute, not relative to the next instruction.
 #[cfg(feature = "translate")]
 fn region_code(image: &gex_ld::Image) -> gex_xlate::func::Code<'_> {
-    if image.class32 != gex_xlate::arch::compat() {
-        gex_xlate::set_compat(image.class32);
-    }
+    gex_xlate::set_thread_compat(image.class32);
     gex_xlate::func::Code::with_elf(image, None)
 }
 
