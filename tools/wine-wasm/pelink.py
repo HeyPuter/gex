@@ -694,6 +694,19 @@ def link(dlls, out, gexrt, others=None):
         src = os.path.join(tmp, 'moduleimports.c')
         with open(src, 'w') as f:
             f.write('static const char *const gexw_imports[] = {\n')
+            # what each module needs loaded and initialised first, through
+            # its static imports
+            below = {}
+            def needs_first(m):
+                if m not in below:
+                    below[m] = set()
+                    todo = [d for d in EAGER.get(m, []) if d != m]
+                    while todo:
+                        d = todo.pop()
+                        if d not in below[m]:
+                            below[m].add(d)
+                            todo += EAGER.get(d, [])
+                return below[m]
             for mod in sorted(EAGER):
                 # Delay imports too, after them, but only native ones: an
                 # i386 one is reached through a guest-import stub, which
@@ -702,7 +715,12 @@ def link(dlls, out, gexrt, others=None):
                 # after it off the bases their units were built for).
                 native_mods = {m for m, _, _, _ in dlls}
                 deps = [d for d in EAGER[mod] if d in known and d != mod]
-                deps += [d for d in DELAY.get(mod, []) if d in native_mods and d != mod and d not in deps]
+                # (not one that itself needs the module first: ucrtbase's
+                # user32 put user32 and the DLLs it imports ahead of the C
+                # runtime they call, whose lock table was not made yet, and
+                # its _lock recursed until the stack ran out)
+                deps += [d for d in DELAY.get(mod, []) if d in native_mods and d != mod and d not in deps
+                         and mod not in needs_first(d)]
                 f.write('    "%s", "%s",\n' % (mod, ''.join(d + '\\0' for d in deps)))
             f.write('    0\n};\n')
             f.write('const char *__gexw_module_imports(const unsigned short *name)\n{\n'
