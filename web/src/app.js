@@ -28,6 +28,7 @@ import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
 import { checkOptions, sizeValue, showValue } from './start-options.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
+import { pageUser } from './wine-user.js';
 
 /** Whether this build has the scene compositor: see runtime.js. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
@@ -608,6 +609,7 @@ async function begin(opts, base, at, state, meter) {
   const env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
+  pageUser(env);
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
   // A zoneinfo name (':' = a file under /usr/share/zoneinfo, which Wine also
