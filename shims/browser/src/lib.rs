@@ -16794,6 +16794,22 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         let mut keep: Vec<(u64, u32)> = Vec::new();
                         for (p, b) in d {
                             if !gex_abi::X86 {
+                                // A page not mapped executable here holds no
+                                // code of this process: its blocks would stay
+                                // installed under whatever is mapped there
+                                // later, which retires nothing (no executable
+                                // mapping was replaced), and run in its place.
+                                let exec = px.mm.lock().vma_at(*p * gex_abi::DISPATCH_PAGE).is_some_and(|v| {
+                                    v.prot & gex_kernel::mem::prot::EXEC != 0
+                                });
+                                if !exec {
+                                    if tracing() {
+                                        trace_line(&format!(
+                                            "[gex] serve: page {p:#x} base {b:#x} holds no code here, entry dropped\n"
+                                        ));
+                                    }
+                                    continue;
+                                }
                                 // The same check for a page this process can
                                 // name: an object another process had at the
                                 // same address (libXfixes where this process
