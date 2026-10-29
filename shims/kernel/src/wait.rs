@@ -166,7 +166,23 @@ pub fn free_queue(id: u32) {
     unsafe { (*std::ptr::addr_of_mut!(FREE)).push(id) };
 }
 
+/// The Worker whose wakes are held ([`k_wq_hold`]): its `k_ws_self` plus
+/// one, 0 for none. One holder at a time; another Worker's wakes go out as
+/// they come.
+static HOLDER: AtomicI32 = AtomicI32::new(0);
+/// The slots the holder's wakes are for, sent at [`k_wq_release`].
+static HELD: [AtomicU32; WORDS] = [const { AtomicU32::new(0) }; WORDS];
+
 fn wake_slot(s: usize) {
+    let h = HOLDER.load(SeqCst);
+    if h != 0 && h == k_ws_self() + 1 {
+        HELD[s / 32].fetch_or(1 << (s % 32), SeqCst);
+        return;
+    }
+    send_wake(s);
+}
+
+fn send_wake(s: usize) {
     let w = &SLOT_WORDS.0[s];
     w.fetch_add(1, SeqCst);
     NOTIFIES.fetch_add(1, SeqCst);
@@ -292,6 +308,33 @@ pub extern "C" fn k_wq_chain(from: u32, to: u32) {
 #[no_mangle]
 pub extern "C" fn k_wq_unchain(from: u32, to: u32) {
     unchain(from, to);
+}
+
+/// Hold this Worker's wakes until [`k_wq_release`]: a process's end closes
+/// all its descriptors, and a waiter on several of them (Wine's server, on a
+/// process's socket and its threads' request pipes) sees every hang-up at
+/// its next look, as when Linux closes them in one exit, not the first one
+/// alone while the rest are still open. 1 if held, 0 if another Worker
+/// holds them (this one's wakes then go out as they come).
+#[no_mangle]
+pub extern "C" fn k_wq_hold() -> i32 {
+    HOLDER.compare_exchange(0, k_ws_self() + 1, SeqCst, SeqCst).is_ok() as i32
+}
+
+/// Send the wakes [`k_wq_hold`] held, if this Worker holds them.
+#[no_mangle]
+pub extern "C" fn k_wq_release() {
+    if HOLDER.compare_exchange(k_ws_self() + 1, 0, SeqCst, SeqCst).is_err() {
+        return;
+    }
+    for (wi, w) in HELD.iter().enumerate() {
+        let mut bits = w.swap(0, SeqCst);
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            send_wake(wi * 32 + b);
+        }
+    }
 }
 
 /// Register slot `slot` on queue `id`.
