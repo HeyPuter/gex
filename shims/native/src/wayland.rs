@@ -369,6 +369,14 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
+        // The placement log ([wl-place]) for every batch, written or not:
+        // under `--wayland-out null` and GEX_PPM_EVERY too.
+        {
+            let mut screen = self.inner.screen.lock().unwrap();
+            if screen.active() {
+                screen.list();
+            }
+        }
         // `GEX_PPM_GL_ONLY=1`: only gex-gl's presented frames are written
         // (`present_external`), not client buffers -- with a GL game on
         // Xwayland, the X window's own buffer is black and would take the
@@ -380,10 +388,7 @@ impl Wayland {
         // Before the GPU read-back, so a skipped frame costs nothing.
         let Some(path) = self.frame_path(&prefix) else { return };
         let mut gpu = self.inner.gpu.lock().unwrap();
-        let mut screen = self.inner.screen.lock().unwrap();
-        if screen.active() {
-            screen.list();
-        }
+        let screen = self.inner.screen.lock().unwrap();
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
             let drawn = if screen.active() { c.draw_at(&screen.items()) } else { c.draw(frames) };
             match drawn.and_then(|()| c.read_back()) {
