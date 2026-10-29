@@ -118,6 +118,12 @@ export class Compositor {
     worker.addEventListener('message', ({ data: m }) => {
       if (m.kind === 'direct') {
         this.#setDirect(m.w ? { w: m.w, h: m.h } : null);
+      } else if (m.kind === 'lock-wanted') {
+        // A press on a window whose client asks for a locked pointer: the
+        // browser's lock, while the click's activation lasts.
+        if (this.pointerLock && document.pointerLockElement !== this.#canvas) this.#canvas.requestPointerLock?.()?.catch?.(() => {});
+      } else if (m.kind === 'lock-release') {
+        if (this.#guestLock) document.exitPointerLock?.();
       } else if (m.kind === 'cursor') {
         // The client's cursor, as the browser's own: one pointer, never a
         // second one drawn into the frame.
@@ -159,6 +165,12 @@ export class Compositor {
   #cursorCss = 'none';
   #pointerLock = false;
   #locked = null; // the virtual pointer while the pointer is locked
+  /** Pointer lock for clients that ask for it (web/runtime PointerLock):
+   *  whether a press on such a window takes the browser's lock, and
+   *  `onpointerlock(on)` as it is taken and let go. */
+  pointerLock = false;
+  onpointerlock = null;
+  #guestLock = false;
 
   /** The GL frame became the canvas (`d` = its size) or stopped being it.
    *  Fitted to the viewport, letterboxed, centred. */
@@ -210,7 +222,25 @@ export class Compositor {
     // history navigation.
     const navHere = new Set();
 
+    const onLockChange = () => {
+      const on = this.pointerLock && document.pointerLockElement === this.#canvas;
+      if (on === this.#guestLock) return;
+      this.#guestLock = on;
+      post({ kind: 'pointer-lock', on, time: now() });
+      this.onpointerlock?.(on);
+    };
+    document.addEventListener('pointerlockchange', onLockChange);
+    this.#detach.push(() => document.removeEventListener('pointerlockchange', onLockChange));
     const onMove = (e) => {
+      if (this.#guestLock) {
+        // Device pixels, as the output's are.
+        const r = this.#canvas.getBoundingClientRect();
+        const k = this.#canvas.width / Math.max(1, r.width);
+        const dx = Math.round(e.movementX * k * 256);
+        const dy = Math.round(e.movementY * k * 256);
+        if (dx || dy) post({ kind: 'pointer-relative', dx, dy, time: now() });
+        return;
+      }
       const { x, y } = this.#at(e);
       post({ kind: 'pointer-move', x, y, time: now() });
     };
@@ -226,8 +256,10 @@ export class Compositor {
       const button = BTN[e.button];
       if (button === undefined) return;
       if (e.button >= 3) navHere.add(e.button);
-      const { x, y } = this.#at(e);
-      post({ kind: 'pointer-move', x, y, time: now() });
+      if (!this.#guestLock) {
+        const { x, y } = this.#at(e);
+        post({ kind: 'pointer-move', x, y, time: now() });
+      }
       post({ kind: 'pointer-button', button, pressed: true, time: now() });
       e.preventDefault();
     };

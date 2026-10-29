@@ -64,7 +64,10 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  EV_POINTER_LOCK,
+  EV_RELATIVE,
   F_FULLSCREEN,
+  F_POINTER_LOCK,
   ROLE_TOPLEVEL,
   ROLE_POPUP,
   ROLE_SUBSURFACE,
@@ -366,6 +369,22 @@ export class DomDesktop {
   #glGone = false;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
+  /** Pointer lock (web/runtime PointerLock): whether a click on a window
+   *  whose client asks for a locked pointer takes the browser's lock, and
+   *  `onpointerlock(win | null)` as it is taken and let go. */
+  pointerLock = false;
+  onpointerlock = null;
+  #locked = null;
+  #onLockChange = () => {
+    const el = document.pointerLockElement;
+    const win = el ? [...this.#windows.values()].find((w) => w.canvas === el) ?? null : null;
+    if (win === this.#locked) return;
+    const t = Math.round(performance.now());
+    if (this.#locked) sendEvent(this.#channel, this.#locked.block, EV_POINTER_LOCK, 0, 0, t, 0, this.#locked.client, this.#locked.surface);
+    this.#locked = win;
+    if (win) sendEvent(this.#channel, win.block, EV_POINTER_LOCK, 1, 0, t, 0, win.client, win.surface);
+    this.onpointerlock?.(win);
+  };
 
   static create(mount, channel, { width, height } = {}) {
     const d = new DomDesktop();
@@ -375,6 +394,7 @@ export class DomDesktop {
     const h = height || mount.clientHeight || 760;
     setOutputSize(channel, w, h);
     d.#listen();
+    document.addEventListener('pointerlockchange', d.#onLockChange);
     d.#running = true;
     d.#raf = requestAnimationFrame(() => d.#frame());
     return d;
@@ -526,6 +546,8 @@ export class DomDesktop {
 
   stop() {
     this.#running = false;
+    document.removeEventListener('pointerlockchange', this.#onLockChange);
+    if (this.#locked) document.exitPointerLock?.();
     if (this.#raf) cancelAnimationFrame(this.#raf);
     this.#raf = 0;
     for (const win of this.#windows.values()) win.onclosed?.();
@@ -728,6 +750,9 @@ export class DomDesktop {
       win.fullscreen = fs;
       win.onfullscreen?.(fs);
     }
+    // The client's lock asked for (taken at a click) or given up.
+    win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
+    if (!win.wantsLock && this.#locked === win) document.exitPointerLock?.();
     const noInput = !takesPointer(s);
     if (noInput !== win.noInput) {
       win.noInput = noInput;
@@ -964,12 +989,28 @@ export class DomDesktop {
                 p.t, 0, win.client, win.surface);
     };
     c.addEventListener('pointermove', (e) => {
+      // Locked: movement only, which the client's relative pointer takes.
+      if (this.#locked === win) {
+        if (e.movementX || e.movementY) {
+          sendEvent(this.#channel, win.block, EV_RELATIVE, Math.round(e.movementX * 256), Math.round(e.movementY * 256),
+            Math.round(e.timeStamp), 0, win.client, win.surface);
+        }
+        if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, { t: Math.round(e.timeStamp) });
+        return;
+      }
       const p = at(e);
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
       if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
+      if (this.#locked === win) {
+        button(e, true, { t: Math.round(e.timeStamp) });
+        return;
+      }
+      if (this.pointerLock && win.wantsLock && document.pointerLockElement !== c) {
+        c.requestPointerLock?.()?.catch?.(() => {});
+      }
       const p = at(e);
       this.focus(win);
       // A pointer that is no longer active makes this throw, and a window

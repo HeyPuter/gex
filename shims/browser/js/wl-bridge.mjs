@@ -122,6 +122,9 @@ export const F_EXTERNAL = 2;
 /** The client set an input region (`R_INPUT_X`..): without it the whole
  *  surface takes the pointer. */
 export const F_INPUT_REGION = 128;
+/** A client asked to lock the pointer to this surface
+ *  (`zwp_locked_pointer_v1`): the page locks it when it can. */
+export const F_POINTER_LOCK = 1 << 31;
 
 /** Event kinds the compositor writes into a process's ring. */
 export const EV_MOTION = 0;
@@ -142,6 +145,10 @@ export const EV_DRAG_ENTER = 11;
 export const EV_DRAG_MOTION = 12;
 export const EV_DROP = 13;
 export const EV_DRAG_LEAVE = 14;
+/** The page's pointer lock on a surface: a1 1 began, 0 ended. */
+export const EV_POINTER_LOCK = 15;
+/** Movement under the lock: a1, b1 in 1/256 pixel, c1 the time (ms). */
+export const EV_RELATIVE = 16;
 /** What the guest says of a drag (`B_DRAG`): a drop now would be taken; the
  *  drop was answered; taken; the client is done with it. */
 export const DRAG_ACCEPTS = 1;

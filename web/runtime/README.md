@@ -222,6 +222,19 @@ const gl = new MesaGl(sys);      // before boot
 | `start()` | Start Mesa now; resolves its description. A program's first GL call shares the same start. |
 | Events | `started` (`description`), `failed` (`error`), for starts through `start()`. |
 
+## Input
+
+The input a browser holds back until the page asks for it, from
+`@gex/runtime/input`. Each is made any time, one per system.
+
+`new PointerLock(sys)`: a click on a window whose program asks for a locked
+pointer takes the browser's pointer lock. The program asks through Wayland's
+pointer constraints; Xwayland asks for an X program that grabs the pointer
+and hides it, as games do. The mouse's movement then reaches the program as
+relative motion, until Escape, `release()`, or the program letting go.
+`locked` says whether it holds; the events are `lock` and `unlock`. A program
+that asks for nothing never locks the pointer.
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the

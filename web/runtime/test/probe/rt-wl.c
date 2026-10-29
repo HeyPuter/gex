@@ -1,14 +1,16 @@
 /* A Wayland window for the runtime's window tests: one xdg_toplevel of a
  * solid colour, titled from argv, that says on stdout what it hears.
  *
- *   rt-wl TITLE [maximize] [move]
+ *   rt-wl TITLE [maximize] [move] [lock]
  *
  * "drawn W H" for each frame, "configure W H STATES" for each configure
  * (STATES: m maximized, f fullscreen, r resizing, a activated), "focus" when
  * it gets the keyboard, "key CODE" for each key pressed and "button" for
  * each press. With "move", a press asks to be moved (xdg_toplevel.move), as
- * its own title bar would; with "maximize", to be maximized. The
- * compositor's close ends it with 0.
+ * its own title bar would; with "maximize", to be maximized. With "lock",
+ * it asks for a locked pointer (pointer constraints, persistent) and says
+ * "locked", "unlocked" and "rel DX DY" (the movement so far, in whole
+ * pixels) as they come. The compositor's close ends it with 0.
  *
  * xdg-shell's interfaces are written out here (version 1), as
  * wayland-scanner would make them: there is no scanner in the toolchain. */
@@ -197,6 +199,52 @@ static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s, uint32_t a, uint
 static void kb_repeat(void *d, struct wl_keyboard *k, int32_t r, int32_t de) {
   (void)d; (void)k; (void)r; (void)de;
 }
+/* -- pointer constraints and relative pointer, version 1 ----------------- */
+
+extern const struct wl_interface zwp_relative_pointer_manager_v1_interface, zwp_relative_pointer_v1_interface,
+    zwp_pointer_constraints_v1_interface, zwp_locked_pointer_v1_interface;
+static const struct wl_interface *ctypes[] = {
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    &zwp_relative_pointer_v1_interface, &wl_pointer_interface,                  /* 6: get_relative_pointer */
+    &zwp_locked_pointer_v1_interface, &wl_surface_interface, &wl_pointer_interface, &wl_region_interface, NULL,
+    /* 8: lock_pointer */
+};
+static const struct wl_message rpm_requests[] = {{"destroy", "", ctypes}, {"get_relative_pointer", "no", ctypes + 6}};
+const struct wl_interface zwp_relative_pointer_manager_v1_interface = {
+    "zwp_relative_pointer_manager_v1", 1, 2, rpm_requests, 0, NULL};
+static const struct wl_message rp_requests[] = {{"destroy", "", ctypes}};
+static const struct wl_message rp_events[] = {{"relative_motion", "uuffff", ctypes}};
+const struct wl_interface zwp_relative_pointer_v1_interface = {"zwp_relative_pointer_v1", 1, 1, rp_requests, 1, rp_events};
+static const struct wl_message pc_requests[] = {
+    {"destroy", "", ctypes}, {"lock_pointer", "noo?ou", ctypes + 8}, {"confine_pointer", "noo?ou", ctypes + 8}};
+const struct wl_interface zwp_pointer_constraints_v1_interface = {"zwp_pointer_constraints_v1", 1, 3, pc_requests, 0, NULL};
+static const struct wl_message lp_requests[] = {
+    {"destroy", "", ctypes}, {"set_cursor_position_hint", "ff", ctypes}, {"set_region", "?o", ctypes + 11}};
+static const struct wl_message lp_events[] = {{"locked", "", ctypes}, {"unlocked", "", ctypes}};
+const struct wl_interface zwp_locked_pointer_v1_interface = {"zwp_locked_pointer_v1", 1, 3, lp_requests, 2, lp_events};
+
+static void *rel_manager, *constraints;
+static struct wl_pointer *pointer;
+static int want_lock;
+static double rel_x, rel_y;
+
+static void lp_locked(void *d, void *l) {
+  (void)d; (void)l;
+  say("locked\n");
+}
+static void lp_unlocked(void *d, void *l) {
+  (void)d; (void)l;
+  say("unlocked\n");
+}
+static void (*lp_listener[])(void) = {(void (*)(void))lp_locked, (void (*)(void))lp_unlocked};
+static void rp_motion(void *d, void *p, uint32_t hi, uint32_t lo, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t ux, wl_fixed_t uy) {
+  (void)d; (void)p; (void)hi; (void)lo; (void)ux; (void)uy;
+  rel_x += wl_fixed_to_double(dx);
+  rel_y += wl_fixed_to_double(dy);
+  say("rel %d %d\n", (int)rel_x, (int)rel_y);
+}
+static void (*rp_listener[])(void) = {(void (*)(void))rp_motion};
+
 static const struct wl_keyboard_listener kb_listener = {kb_keymap, kb_enter, kb_leave, kb_key, kb_mods, kb_repeat};
 
 static void p_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
@@ -238,7 +286,10 @@ static void seat_caps(void *d, struct wl_seat *s, uint32_t caps) {
   if (done) return;
   done = 1;
   if (caps & WL_SEAT_CAPABILITY_KEYBOARD) wl_keyboard_add_listener(wl_seat_get_keyboard(s), &kb_listener, NULL);
-  if (caps & WL_SEAT_CAPABILITY_POINTER) wl_pointer_add_listener(wl_seat_get_pointer(s), &p_listener, NULL);
+  if (caps & WL_SEAT_CAPABILITY_POINTER) {
+    pointer = wl_seat_get_pointer(s);
+    wl_pointer_add_listener(pointer, &p_listener, NULL);
+  }
 }
 static void seat_name(void *d, struct wl_seat *s, const char *n) {
   (void)d; (void)s; (void)n;
@@ -255,6 +306,10 @@ static void global(void *d, struct wl_registry *r, uint32_t name, const char *if
   } else if (!strcmp(iface, "xdg_wm_base")) {
     wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface, 1);
     wl_proxy_add_listener(wm_base, (void (**)(void))wm_base_listener, NULL);
+  } else if (!strcmp(iface, "zwp_relative_pointer_manager_v1")) {
+    rel_manager = wl_registry_bind(r, name, &zwp_relative_pointer_manager_v1_interface, 1);
+  } else if (!strcmp(iface, "zwp_pointer_constraints_v1")) {
+    constraints = wl_registry_bind(r, name, &zwp_pointer_constraints_v1_interface, 1);
   }
 }
 static void global_remove(void *d, struct wl_registry *r, uint32_t name) {
@@ -267,6 +322,7 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "maximize")) maximize = 1;
     else if (!strcmp(argv[i], "move")) move_on_press = 1;
+    else if (!strcmp(argv[i], "lock")) want_lock = 1;
   }
   struct wl_display *dpy = wl_display_connect(NULL);
   if (!dpy) {
@@ -286,6 +342,18 @@ int main(int argc, char **argv) {
   wl_proxy_add_listener(toplevel, (void (**)(void))toplevel_listener, NULL);
   wl_proxy_marshal(toplevel, 2, title);
   wl_surface_commit(surface);
+  if (want_lock) {
+    wl_display_roundtrip(dpy);
+    if (!rel_manager || !constraints || !pointer) {
+      fprintf(stderr, "rt-wl: no pointer constraints or relative pointer\n");
+      return 1;
+    }
+    void *rp = wl_proxy_marshal_constructor(rel_manager, 1, &zwp_relative_pointer_v1_interface, NULL, pointer);
+    wl_proxy_add_listener(rp, rp_listener, NULL);
+    void *lp = wl_proxy_marshal_constructor(constraints, 1, &zwp_locked_pointer_v1_interface, NULL, surface, pointer, NULL, 2);
+    wl_proxy_add_listener(lp, lp_listener, NULL);
+    wl_surface_commit(surface);
+  }
   say("up\n");
   while (running && wl_display_dispatch(dpy) >= 0) {
   }

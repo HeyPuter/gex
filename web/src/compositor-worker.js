@@ -35,6 +35,7 @@ import {
   ROLE_CURSOR,
   F_CONFIGURE_PENDING,
   F_FULLSCREEN,
+  F_POINTER_LOCK,
   EV_MOTION,
   EV_BUTTON,
   EV_AXIS,
@@ -46,6 +47,8 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  EV_POINTER_LOCK,
+  EV_RELATIVE,
   waitPublish,
   releaseToken,
 } from '@gex/wl-bridge.mjs';
@@ -481,6 +484,27 @@ class Compositor {
   /** The placed window a held button belongs to (see `pointerMove`). */
   #grab = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
+  /** Pointer lock (pointer.rs): the window a press asked the page to lock
+   *  for, and the one the page's lock is now given to. */
+  #lockWant = null;
+  #lockKey = null;
+
+  /** The page's pointer lock began or ended. */
+  pointerLock(on, time) {
+    const prev = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (prev) sendEvent(this.#channel, prev.block, EV_POINTER_LOCK, 0, 0, time, 0, prev.client, prev.surface);
+    this.#lockKey = on ? this.#lockWant : null;
+    const win = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (win) sendEvent(this.#channel, win.block, EV_POINTER_LOCK, 1, 0, time, 0, win.client, win.surface);
+  }
+
+  /** Movement under the lock, in device pixels (1/256). */
+  pointerRelative(dx, dy, time) {
+    const win = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (!win) return;
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_RELATIVE, Math.round(dx / k), Math.round(dy / k), time, 0, win.client, win.surface);
+  }
   #drag = null;
   /** An interactive resize: the window, the edges being dragged
    *  (`EDGE_*`), and where the pointer and the window started. */
@@ -820,6 +844,9 @@ class Compositor {
       }
       const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;
       if (fs !== !!win.fullscreen) this.#fullscreen(k, win, fs);
+      // A client's pointer lock asked for, or given up (pointer.rs).
+      win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
+      if (!win.wantsLock && this.#lockKey === k) post({ kind: 'lock-release' });
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
       win.layer = s.layer;
@@ -879,6 +906,7 @@ class Compositor {
       }
       this.#windows.delete(k);
       this.#order = this.#order.filter((o) => o !== k);
+      if (this.#lockKey === k) post({ kind: 'lock-release' });
       // The keyboard goes to whatever is now on top, and that window is told
       // so -- a focus that is only a variable here leaves every client
       // believing it is inactive.
@@ -1673,6 +1701,19 @@ class Compositor {
   }
 
   pointerButton(button, pressed, time) {
+    // Under the lock every button is the locked window's.
+    const locked = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (locked) {
+      sendEvent(this.#channel, locked.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, locked.client, locked.surface);
+      return;
+    }
+    if (pressed) {
+      const hit = this.#hit(this.#pointer.x, this.#pointer.y);
+      if (hit?.part === 'content' && hit.win.wantsLock) {
+        this.#lockWant = hit.key;
+        post({ kind: 'lock-wanted' });
+      }
+    }
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
@@ -2170,6 +2211,10 @@ const onMessage = ({ data: m }) => {
       comp?.resize(m.width, m.height);
     } else if (m.kind === 'pointer-move') {
       comp?.pointerMove(m.x, m.y, m.time);
+    } else if (m.kind === 'pointer-lock') {
+      comp?.pointerLock(m.on, m.time);
+    } else if (m.kind === 'pointer-relative') {
+      comp?.pointerRelative(m.dx, m.dy, m.time);
     } else if (m.kind === 'pointer-button') {
       comp?.pointerButton(m.button, m.pressed, m.time);
     } else if (m.kind === 'pointer-axis') {

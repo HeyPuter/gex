@@ -192,6 +192,7 @@ async function runPage(page) {
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url }, sessionId);
   let shown = 0;
+  let sent = 0;
   let result = null;
   while (Date.now() - t0 < TIMEOUT) {
     await sleep(250);
@@ -199,6 +200,16 @@ async function runPage(page) {
     const v = r?.result?.value ? JSON.parse(r.result.value) : null;
     if (!v) continue;
     for (; shown < v.lines.length; shown++) process.stdout.write(`${page}: ${v.lines[shown]}\n`);
+    // Real input the page asks for (lib.js `input`): what a user gesture
+    // needs, as pointer lock does.
+    if ((v.input?.length ?? 0) < sent) sent = v.input?.length ?? 0; // reloaded
+    if ((v.input?.length ?? 0) > sent) {
+      for (; sent < v.input.length; sent++) {
+        const { method, ...params } = v.input[sent];
+        await cdp.send(method, params, sessionId).catch((e) => log(`${page}: ${method}: ${e?.message ?? e}`));
+      }
+      await cdp.send('Runtime.evaluate', { expression: `globalThis.__rt.inputDone = ${sent}` }, sessionId).catch(() => {});
+    }
     if (v.done) { result = v; break; }
   }
   for (const f of off) f();

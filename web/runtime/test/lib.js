@@ -1,5 +1,5 @@
 // What the test pages share: `globalThis.__rt`, which run.mjs reads.
-export const rt = (globalThis.__rt = { done: false, ok: true, lines: [] });
+export const rt = (globalThis.__rt = { done: false, ok: true, lines: [], input: [], inputDone: 0 });
 // A page that reloads itself (`reload`) keeps what it said before.
 try {
   const kept = JSON.parse(sessionStorage.getItem('__rt') ?? 'null');
@@ -62,3 +62,18 @@ export function lines(p, stream = p.stdout) {
   })();
   return got;
 }
+
+/** Real input through the browser (run.mjs sends each with CDP): `events`
+ *  are `{ method: 'Input.dispatchMouseEvent', ... }` and the like. Resolves
+ *  once they are sent. */
+export async function input(...events) {
+  rt.input.push(...events);
+  const want = rt.input.length;
+  await until(() => rt.inputDone >= want, 'the test runner sending input', 10000);
+}
+
+/** A real click at page coordinates `(x, y)`. */
+export const click = (x, y) => input(
+  { method: 'Input.dispatchMouseEvent', type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 },
+  { method: 'Input.dispatchMouseEvent', type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 },
+);

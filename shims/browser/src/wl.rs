@@ -108,6 +108,11 @@ enum InputEvent {
     DragMotion { client: u32, x: i32, y: i32, time: u32 },
     Drop { client: u32, serial: u32 },
     DragLeave { client: u32 },
+    /// The page's pointer lock on a surface began or ended (a client's
+    /// `zwp_locked_pointer_v1` asked for it), and the movement under it,
+    /// in 1/256 pixel.
+    PointerLock { client: u32, surface: u32, on: bool },
+    Relative { client: u32, dx: i32, dy: i32, time: u32 },
 }
 
 impl InputEvent {
@@ -130,7 +135,9 @@ impl InputEvent {
             | InputEvent::DragEnter { client, .. }
             | InputEvent::DragMotion { client, .. }
             | InputEvent::Drop { client, .. }
-            | InputEvent::DragLeave { client } => client,
+            | InputEvent::DragLeave { client }
+            | InputEvent::PointerLock { client, .. }
+            | InputEvent::Relative { client, .. } => client,
         }
     }
 }
@@ -193,6 +200,8 @@ fn poll_input() -> Vec<InputEvent> {
                 12 => InputEvent::DragMotion { client, x: q[1], y: q[2], time: q[3] as u32 },
                 13 => InputEvent::Drop { client, serial: q[1] as u32 },
                 14 => InputEvent::DragLeave { client },
+                15 => InputEvent::PointerLock { client, surface, on: q[1] != 0 },
+                16 => InputEvent::Relative { client, dx: q[1], dy: q[2], time: q[3] as u32 },
                 _ => return None,
             })
         })
@@ -647,6 +656,8 @@ impl WaylandDevice {
                             s.client.keyboard_modifiers(depressed, latched, locked, group)
                         }
                         InputEvent::PointerClear { .. } => s.client.pointer_clear(),
+                        InputEvent::PointerLock { surface, on, .. } => s.client.pointer_locked(surface, on),
+                        InputEvent::Relative { dx, dy, time, .. } => s.client.pointer_relative(dx, dy, time),
                         InputEvent::KeyboardFocus { surface, .. } => {
                             s.client.keyboard_focus(surface);
                             if surface != 0 && s.client.is_x11(surface) {
