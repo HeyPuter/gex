@@ -27,10 +27,12 @@
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
 #               in the loader; WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD)
-#   dist64-K-S-twin  with WINE64_TWIN=1, that install plus the memory64
+#   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
+#               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
+#   dist64-K-S-fF-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
-#               share/wine, and etc/ssl/certs/ca-certificates.crt (crypt32's
+#   dist64-K-S-fF  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
 #   pen64-K-N   the native PE core : WINE64_NATIVE_DLLS (default ntdll,
@@ -119,6 +121,15 @@ tools_build() {
 }
 log "tools ($TP)"; step tools-$TP tools_build
 T=$C/tools-$TP
+
+# Wine's raster fonts, the fixed-pitch ones a console window picks (the
+# tools build, without FreeType, makes no sfnt2fon)
+F=$( { git -C "$W" ls-tree -r HEAD fonts tools/sfnt2fon; cat "$here/wine-fon.sh"; grep '^FREETYPE_' "$here/wine32.pins"; } | sha256sum | cut -c1-10)
+fon_make() {
+	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex-wine32}/dl" JOBS=$J nice -n 10 \
+		"$here/wine-fon.sh" "$W" "$T/include" "$C/dl" "$PWD/fon"
+}
+log "raster fonts ($F)"; step fon-$F fon_make
 
 # Built incrementally in one tree per Wine checkout and tools (make sees
 # what a new commit changed: git touches only the files it rewrites), and
@@ -212,13 +223,14 @@ dist_make() {
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
-	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them)
-	mkdir -p share/wine/fonts && cp -f "$W"/fonts/*.ttf share/wine/fonts/
+	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
+	# the .ttf and the raster .fon made from them
+	mkdir -p share/wine/fonts && cp -f "$W"/fonts/*.ttf "$C/fon-$F"/fon/*.fon share/wine/fonts/
 	ln -sfn ../../share "$d/lib/wine/share"
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S)"; step dist64-$K-$S dist_make
+log "install ($K, $S, $F)"; step dist64-$K-$S-f$F dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -242,7 +254,7 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S
+DIST=$C/dist64-$K-$S-f$F
 NATIVE=$C/pen64-$K-$NK/native
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
@@ -274,8 +286,8 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 		rm -f .done
 		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
 	}
-	log "twin install ($K, $S)"; step dist64-$K-$S-twin twin_make
-	DIST=$C/dist64-$K-$S-twin
+	log "twin install ($K, $S, $F)"; step dist64-$K-$S-f$F-twin twin_make
+	DIST=$C/dist64-$K-$S-f$F-twin
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done
