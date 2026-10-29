@@ -288,6 +288,8 @@ export class MesaGlDevice {
   #forgetLater = [];
   /** Window canvases named or dropped while a submit was suspended. */
   #canvasLater = [];
+  /** A display asked for while a submit was suspended: run after it. */
+  #displayLater = false;
   #lastPresented = 0;
   #lastProduced = 0;
   static #reported = false;
@@ -617,7 +619,20 @@ export class MesaGlDevice {
     };
 
     this.#busy = true;
-    const done = (rc) => { this.#idle(); return finish(rc); };
+    const done = (rc) => {
+      this.#idle();
+      const out = finish(rc);
+      // After the reply is in the ring: the guest goes on while this copies.
+      // The counters too, while the module is free: they are read cached
+      // mid-submit, and a check landing in the next one must see this frame.
+      if (this.#displayLater) {
+        this.#displayLater = false;
+        this.display();
+        this.presentedCount();
+        this.producedCount();
+      }
+      return out;
+    };
     // The frame names only, on one line. A thrown stack is dozens of long
     // URLs; the harness captures a reflowing terminal and mangles them, which
     // is how the function under util_blitter_blit stayed unnamed. Names alone
@@ -767,8 +782,14 @@ export class MesaGlDevice {
     // it holds a lock. musl catches that ("pthread mutex deadlock detected"),
     // the throw unwinds to the guest as a failed ioctl, and the queued batch
     // is discarded: GL objects created in it are lost, and the damage shows up
-    // much later somewhere unrelated. A frame skipped here costs one present.
-    if (this.#busy) return 0;
+    // much later somewhere unrelated. So a display asked for mid-submit runs
+    // when the submit ends instead: skipping it outright starved a guest that
+    // submits back to back, whose every animation frame landed inside a
+    // submit -- frames kept coming and none was shown.
+    if (this.#busy) {
+      this.#displayLater = true;
+      return 0;
+    }
     return this.#module?._gex_gl_display?.() ?? 0;
   }
 
