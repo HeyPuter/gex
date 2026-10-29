@@ -201,6 +201,10 @@ if (!title) {
   done(1);
 }
 const atTitle = (Date.now() - t0) / 1000;
+// What the run had opened by its title window: a game eject's bundle
+// ("bundle": "title"), however long the recording settles after it.
+const readSet = async () => JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
+const openedTitle = await readSet();
 await sleep(settle);
 const sess = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.session ?? null)')) ?? 'null');
 if (!sess) { console.error('record-wine32: the page has no __nt.session (an nt-page.js from before the recorder)'); done(1); }
@@ -210,7 +214,7 @@ for (const line of String((await ev("globalThis.__nt?.out ?? ''")) ?? '').split(
 
 // The run's read set. A page from before `__ntOpened` gives none, and the
 // site then keeps its whole bundle.
-const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
+const opened = await readSet();
 if (opened?.error) console.error(`record-wine32: no read set: ${opened.error}`);
 
 // --play S [--keys T:KEY,...] [--hold MS]: after the read set is taken (the
@@ -285,6 +289,7 @@ const session = {
   uncovered: [...uncovered].map(([pc, u]) => ({ pc, ...u })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,
+  files_read_title: Array.isArray(openedTitle) ? openedTitle : null,
   ...(volatileKeys.size ? { volatile_keys: Object.fromEntries(volatileKeys) } : {}),
   // Which functions (slots of each unit's element segment) the run entered,
   // when its units were instrumented: `a-b` runs.
@@ -299,7 +304,8 @@ if (bootOut) {
 }
 console.log(`${out}/wine32-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
   + `${session.units.length} units (${session.unit_misses.length} images without one, ${session.uncovered.length} addresses no unit holds), ${session.modules.length} wasm modules`
-  + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
+  + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`
+  + `${session.files_read_title ? ` (${session.files_read_title.length} by the title)` : ''}`);
 // --coverage-into SESSION: a run of a site built with "cold": "instrument"
 // (crates/gex-eject/README.md, "Cold code") adds the functions it called to another
 // recording's coverage, the one the project is ejected from.

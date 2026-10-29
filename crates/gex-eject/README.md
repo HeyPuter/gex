@@ -542,6 +542,13 @@ without it means `"whole"`) ships only those files in the site's bundle:
   synchronously, the first time; the site's `serve.mjs` answers ranges (a
   host without them still works, sending the whole file per read).
 
+`"bundle": "title"`, the default `gexc eject` writes for a game, is the same
+split cut at the title window: the bundle holds only what the run had opened
+when the recorder saw the window (the session's `files_read_title`), and
+everything read after it, a game's first level included, is a lazy file. The
+recording can then settle as long as its units need (`--settle`) without the
+bundle growing.
+
 Nothing the program needs is lost: what the recording did not open is a
 fetch away. What it costs is a wait the first time an unrecorded path reads
 a file. Record the paths users take to bring them into the bundle.

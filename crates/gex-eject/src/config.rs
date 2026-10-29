@@ -110,6 +110,11 @@ pub struct Config {
     /// from the host when a guest first reads them; `"whole"` (the default
     /// for a config without the setting) ships everything.
     pub bundle_split: bool,
+    /// `"bundle": "title"`: a split whose bundle is what the recorded run
+    /// opened up to its title window (the recorder's `files_read_title`), so
+    /// a recording that settles longer, for its units, keeps the bundle the
+    /// title's; everything read after it is a lazy file.
+    pub bundle_title: bool,
     /// 32-bit Wine pages: `"cold"`, how the units' code the recording never ran is
     /// split off (gex_split): a clustering (`"chunk:256"`, `"graph:64"`,
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
@@ -184,6 +189,7 @@ impl Default for Config {
             features_off: Vec::new(),
             features_on: Vec::new(),
             bundle_split: false,
+            bundle_title: false,
             cold: None,
             prune: None,
             resources_trim: false,
@@ -389,11 +395,12 @@ impl Config {
             }
             Some(_) => bail!("{what}: \"features\" is not an object of true and false"),
         };
-        c.bundle_split = match v.get("bundle") {
-            None | Some(Json::Null) => false,
-            Some(Json::Str(x)) if x == "whole" => false,
-            Some(Json::Str(x)) if x == "split" => true,
-            Some(_) => bail!("{what}: \"bundle\" is \"whole\" or \"split\""),
+        (c.bundle_split, c.bundle_title) = match v.get("bundle") {
+            None | Some(Json::Null) => (false, false),
+            Some(Json::Str(x)) if x == "whole" => (false, false),
+            Some(Json::Str(x)) if x == "split" => (true, false),
+            Some(Json::Str(x)) if x == "title" => (true, true),
+            Some(_) => bail!("{what}: \"bundle\" is \"whole\", \"split\" or \"title\""),
         };
         c.cold = match v.get("cold") {
             None | Some(Json::Null) => None,
@@ -501,6 +508,16 @@ mod tests {
         assert!(!Config::from_json("{}").unwrap().wineboot_skip);
         assert!(Config::from_json(r#"{"wineboot": "skip"}"#).unwrap().wineboot_skip);
         assert!(Config::from_json(r#"{"wineboot": "off"}"#).is_err());
+    }
+
+    #[test]
+    fn reads_the_bundle_cut() {
+        let cut = |j: &str| Config::from_json(j).map(|c| (c.bundle_split, c.bundle_title));
+        assert_eq!(cut("{}").unwrap(), (false, false));
+        assert_eq!(cut(r#"{"bundle": "whole"}"#).unwrap(), (false, false));
+        assert_eq!(cut(r#"{"bundle": "split"}"#).unwrap(), (true, false));
+        assert_eq!(cut(r#"{"bundle": "title"}"#).unwrap(), (true, true));
+        assert!(cut(r#"{"bundle": "first-frame"}"#).is_err());
     }
 
     #[test]

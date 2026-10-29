@@ -372,6 +372,9 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         // The files the run opened (the recorder's `files_read`; null from an
         // older recorder): what `"bundle": "split"` keeps in the bundle.
         ("files_read", v.get("files_read").cloned().unwrap_or(Json::Null)),
+        // Those it had opened by its title window (`files_read_title`): what
+        // `"bundle": "title"` keeps.
+        ("files_read_title", v.get("files_read_title").cloned().unwrap_or(Json::Null)),
         // The functions the run called, per unit (the recorder's `coverage`,
         // from instrumented units: key -> slot ranges; null without): what
         // `"cold"` keeps in each unit's primary module.
@@ -416,7 +419,8 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                runtime the build keeps, false leaves one out (crates/gex-eject/README.md, \"Features\"); \
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
-               first reads one (\"whole\": everything in the bundle); see crates/gex-eject/README.md, \
+               first reads one (\"title\": only those it opened up to its title window, a game's \
+               default; \"whole\": everything in the bundle); see crates/gex-eject/README.md, \
                \"The bundle split\". \"cold\": \"none\" ships every unit whole in one archive; a clustering \
                (\"chunk:256\", ...) splits off each unit's code the recording never ran and \
                fetches it on first call, \"instrument\" builds units that record the functions a \
@@ -437,7 +441,9 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
             "features",
             obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(f.name != "translation" && !off.iter().any(|x| x == f.name)))).collect()),
         ),
-        ("bundle", s("split")),
+        // A game's bundle is what it reads up to its title; everything after
+        // is fetched when first read.
+        ("bundle", s(if strip { "title" } else { "split" })),
         ("cold", s(COLD_DEFAULT)),
         // A 64-bit game's bundle is large and its own resources one
         // language already: whole until trimming earns its pass.
@@ -1337,9 +1343,11 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         params.push(("fjit".to_string(), s("1")));
     }
     // `"bundle": "split"`: the files the recorded run opened, which the site
-    // keeps in its bundle (web/eject-site.mjs).
+    // keeps in its bundle (web/eject-site.mjs); `"title"`: those it opened up
+    // to its title window.
+    let read_set = if config.bundle_title { "files_read_title" } else { "files_read" };
     let bundle = if config.bundle_split {
-        match v.get("files_read") {
+        match v.get(read_set) {
             Some(Json::Arr(read)) => {
                 let mut read = read.clone();
                 if let Some(p) = pins.filter(|p| !read.iter().any(|r| r.as_str() == Some(p))) {
@@ -1348,8 +1356,9 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
                 obj(vec![("split", json::b(true)), ("read", Json::Arr(read))])
             }
             _ => bail!(
-                "user/eject.json says \"bundle\": \"split\", but the recording has no files_read \
-                 (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")"
+                "user/eject.json says \"bundle\": \"{}\", but the recording has no {read_set} \
+                 (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")",
+                if config.bundle_title { "title" } else { "split" }
             ),
         }
     } else {
