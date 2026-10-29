@@ -508,7 +508,7 @@ async function begin(opts, base, at, state, meter) {
   // which packing does not shrink) waited 90 ms behind the bundle and the fill.
   const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
     [k, await fetchShared(url, fetcher, { priority: 'high' })]))
-    .then((kv) => primeRuntime(Object.fromEntries(kv)));
+    .then((kv) => primeRuntime({ ...Object.fromEntries(kv), fetchOther: (url) => fetchShared(url, fetcher) }));
   const trees = [];
   const buffers = [];
   // The pieces, four at a time, beside the bundle's archive.
