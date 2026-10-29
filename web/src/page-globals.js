@@ -5,8 +5,8 @@ import { pageOptions } from '../../shims/browser/js/options.mjs';
 
 /**
  * The runtime's globals from its switches (`get(name)`): what gex.mjs,
- * runtime.js and the Workers read. One list, for the library and the test page; its own module so a test
- * can drive it without a page (gexdev tests/page-switches).
+ * runtime.js and the Workers read. One list, for the library and the test
+ * page; its own module so a test can drive it without a page.
  */
 export function setGlobals(get, b = {}) {
   // The switches every page takes (shims/browser/js/options.mjs).
@@ -17,8 +17,8 @@ export function setGlobals(get, b = {}) {
   globalThis.GEX_ARCH = b.arch === 'aarch64' ? 'aarch64' : 'x86';
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
-  // The function JIT: off by default (it doubles a 32-bit Wine program's start-up;
-  // nt-page.js said why).
+  // The function JIT: off by default (it doubles a 32-bit Wine program's
+  // start-up).
   const fjit = get('fjit');
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
   if (get('elfunits') && get('cgen') !== '0') globalThis.GEX_ELF_UNITS = get('elfunits');
