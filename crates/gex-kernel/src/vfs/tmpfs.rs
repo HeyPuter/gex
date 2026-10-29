@@ -2301,13 +2301,16 @@ mod lazy_tests {
         if url == "/data/q" {
             *FETCHES_Q.lock().unwrap() += 1;
         }
+        if url == "/data/s" {
+            *FETCHES_S.lock().unwrap() += 1;
+        }
         if url == "/data/pe" {
             let img = PE.get().unwrap();
             ASKED.lock().unwrap().push((offset, into.len() as u64));
             into.copy_from_slice(&img[offset as usize..offset as usize + into.len()]);
             return true;
         }
-        assert!(url == "/data/f" || url == "/data/q", "{url}");
+        assert!(url == "/data/f" || url == "/data/q" || url == "/data/s", "{url}");
         for (k, b) in into.iter_mut().enumerate() {
             *b = ((offset + k as u64) % 251) as u8;
         }
@@ -2536,21 +2539,26 @@ mod lazy_tests {
         let size = (max + 10) * LAZY_CHUNK;
         let fs = TmpFs::new();
         fs.add_file("/m/big", (0..2 * LAZY_CHUNK).map(|i| (i % 251) as u8).collect());
-        fs.add_lazy("/m/big", size, "/data/q");
+        fs.add_lazy("/m/big", size, "/data/s");
         let h = fs.open("m/big", oflags::O_RDONLY, 0).unwrap();
         let mut b = vec![0u8; 16];
         for k in (2..max + 10).step_by(2) {
             h.read_at(k * LAZY_CHUNK, &mut b).unwrap();
         }
-        let was = *FETCHES_Q.lock().unwrap();
+        let was = *FETCHES_S.lock().unwrap();
         h.read_at(100, &mut b).unwrap();
         h.read_at(LAZY_CHUNK + 100, &mut b).unwrap();
-        assert_eq!(*FETCHES_Q.lock().unwrap(), was, "a seeded chunk was fetched");
+        assert_eq!(*FETCHES_S.lock().unwrap(), was, "a seeded chunk was fetched");
         assert_eq!(b[0], ((LAZY_CHUNK + 100) % 251) as u8);
     }
 
-    /// How many requests of `/data/q` there were.
+    /// How many requests of `/data/q` there were: only
+    /// `lazy_chunks_past_the_budget_go_least_recent_first` reads it (the
+    /// tests run in parallel, so each counted URL has one reader).
     static FETCHES_Q: Mutex<u32> = Mutex::new(0);
+    /// How many requests of `/data/s` there were: only
+    /// `a_seeded_head_is_never_evicted` reads it.
+    static FETCHES_S: Mutex<u32> = Mutex::new(0);
 
     /// Requests of `/data/r`, each `(offset, len)`.
     static RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
