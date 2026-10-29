@@ -53,9 +53,18 @@ mod stub {
     /// No exe slot to keep in this build.
     pub(crate) const WINE32_ISLAND: (u64, u64) = (0, 0);
 
-    pub(crate) fn wine32_kuser() {}
+    pub(crate) fn island() -> (u64, u64) {
+        WINE32_ISLAND
+    }
 
-    pub(crate) fn wine64_compact() {}
+    /// As the shared build's; no process takes the compact space here.
+    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (0x195f_0000, 0x197f_0000);
+
+    pub(crate) fn wine64_compact_space() -> u64 {
+        0
+    }
+
+    pub(crate) fn wine32_kuser() {}
 
     pub(crate) fn wine64_compact_on() -> bool {
         false
@@ -137,7 +146,24 @@ mod imp {
         }
         WINE32_COMPACT.store(true, Ordering::Relaxed);
         WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
-        keep_exe_slot();
+        keep_exe_slot(DLL_BAND_END);
+        WINE32_COMPACT_LO
+    }
+
+    /// A 64-bit Wine process in the compact space ([`wine64_compact`]), as
+    /// [`wine32_windows_space`] but with the shorter island
+    /// ([`WINE64_COMPACT_ISLAND_END`]): the builtins' pins, then the images
+    /// no pin names and the PE data window, so that the arena steps over no
+    /// more than that. Not in a process that has its space already.
+    pub(crate) fn wine64_compact_space() -> u64 {
+        let lo = WINDOWS_LO.load(Ordering::Relaxed);
+        if lo != 0 {
+            return lo;
+        }
+        WINE32_COMPACT.store(true, Ordering::Relaxed);
+        WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
+        keep_exe_slot(WINE64_COMPACT_ISLAND_END);
+        wine64_compact();
         WINE32_COMPACT_LO
     }
 
@@ -182,12 +208,14 @@ mod imp {
     /// reservation keeps 0x10000-0x05000000 for executables at 0x400000 and
     /// 0x01000000. Low, so that a process's memory reaches about 0.3 GiB for
     /// its images, not the 1.5 GiB of the old band at 0x60000000.
-    fn keep_exe_slot() {
+    /// `end`: [`DLL_BAND_END`], or [`WINE64_COMPACT_ISLAND_END`] for 64-bit
+    /// Wine's compact space.
+    fn keep_exe_slot(end: u64) {
         // Not if the heap is there already (then images relocate, and every
         // pinned DLL misses its unit: said once, it is a rare, costly event).
-        if !crate::memmap::claim_island(EXE_SLOT, DLL_BAND_END, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)") {
+        if !crate::memmap::claim_island(EXE_SLOT, end, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)") {
             warn_line(&format!(
-                "gex: wine32: the exe slot and DLL band [{EXE_SLOT:#x}, {DLL_BAND_END:#x}) are not kept (arena cursor {:#x}); pinned images will relocate\n",
+                "gex: wine32: the exe slot and DLL band [{EXE_SLOT:#x}, {end:#x}) are not kept (arena cursor {:#x}); pinned images will relocate\n",
                 ARENA_NEXT.load(Ordering::Acquire)
             ));
         }
@@ -196,6 +224,32 @@ mod imp {
     /// [`keep_exe_slot`]'s island, `[EXE_SLOT, DLL_BAND_END)`: where only a
     /// mapping that names its address goes (`wine32_address_space`).
     pub(crate) const WINE32_ISLAND: (u64, u64) = (EXE_SLOT, DLL_BAND_END);
+
+    /// 64-bit Wine's compact space: where Wine places the images no pin
+    /// names (the native PE core's skeletons, the program itself), top-down,
+    /// as its ntdll's `gex_compact_images_lo`/`_hi` say. The bottom of the
+    /// band's part for a game's own DLLs (0x19000000 up,
+    /// tools/wine-wasm/wine64/dll-bases.py), which Wine's own programs never
+    /// load; the builtins' pins stay below it.
+    pub(crate) const WINE64_COMPACT_IMAGES: (u64, u64) = (0x1900_0000, 0x195f_0000);
+    /// The window its native PE core's data goes in, just above the images (a
+    /// data export's RVA is its offset from the skeleton's base, so every
+    /// skeleton is below it), and low, so that the memory need not be long
+    /// and every guest access to it is under `gex_abi::KUSER_GUARD`.
+    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (WINE64_COMPACT_IMAGES.1, WINE64_COMPACT_IMAGES.1 + 0x20_0000);
+    /// The end of 64-bit Wine's compact island, a 64 KiB guard above the window.
+    const WINE64_COMPACT_ISLAND_END: u64 = WINE64_COMPACT_PE_DATA.1 + 0x1_0000;
+    const _: () = assert!(WINE64_COMPACT_ISLAND_END < DLL_BAND_END && WINE64_COMPACT_IMAGES.0 > DLL_BAND);
+
+    /// This process's island: [`WINE32_ISLAND`], or the shorter one of
+    /// 64-bit Wine's compact space.
+    pub(crate) fn island() -> (u64, u64) {
+        if wine64_compact_on() {
+            (EXE_SLOT, WINE64_COMPACT_ISLAND_END)
+        } else {
+            WINE32_ISLAND
+        }
+    }
     /// The pinned DLLs' band, [0x11000000, 0x20000000):
     /// tools/wine-wasm/wine32/dll-bases.py lays them out from its start and
     /// asserts they end below its end.
@@ -267,7 +321,7 @@ mod imp {
         if lo & !(WINE32_KUSER_BIT | WINE64_COMPACT_BIT) == WINE32_COMPACT_LO {
             WINE32_COMPACT.store(true, Ordering::Relaxed);
             WINDOWS_LO.store(WINE32_COMPACT_LO, Ordering::Relaxed);
-            keep_exe_slot();
+            keep_exe_slot(if lo & WINE64_COMPACT_BIT != 0 { WINE64_COMPACT_ISLAND_END } else { DLL_BAND_END });
             if lo & WINE64_COMPACT_BIT != 0 {
                 wine64_compact();
             } else if lo & WINE32_KUSER_BIT != 0 {
