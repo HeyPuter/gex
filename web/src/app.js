@@ -706,11 +706,13 @@ async function begin(opts, base, at, state, meter) {
   }
   // The lazy files kept in the page's cache (lazy-cache.mjs): one Worker
   // owns it and every Worker's read of a lazy file asks it first. Needs
-  // shared memory (the SP build reads lazy files from the network) and a
-  // Cache Storage that holds (`?lazycache=0` turns it off).
+  // shared memory and a Cache Storage that holds (`?lazycache=0` turns it
+  // off). The single-thread build reads lazy files from the network, even on
+  // a cross-origin isolated page: its kernel is the system Worker's own, and
+  // the owner would write each read's bytes into this page's kernel memory.
   let lazyCache = null;
   const lazyVersions = Object.fromEntries(lazy.map(([path, size, url]) => [url, lazyVersion(size, lazyMtimes[path])]));
-  if (lazy.length && typeof SharedArrayBuffer === 'function' && sw.lazycache !== '0') {
+  if (lazy.length && typeof SharedArrayBuffer === 'function' && !singleMode() && sw.lazycache !== '0') {
     const k = await globalKernel();
     if (k?.memory) {
       const ctl = lazyCacheControl();
