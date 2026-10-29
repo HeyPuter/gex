@@ -4652,41 +4652,10 @@ pub extern "C" fn gex_worker_init() -> u32 {
         give: || gex_worker_promise_done(),
     });
     let Some(i) = slot_claim() else { return 0 };
-    let mut base = SLOT_BASE[i].load(Ordering::Acquire);
-    if base == 0 {
-        // This slot's own span of arena. The cursor is atomic and the bytes
-        // above it belong to nobody, so two Workers arriving together get two
-        // spans without a lock between them.
-        arena_note(2, (slots::STACK + slots::TLS) as u64);
-        let Some(b) = arena_take((slots::STACK + slots::TLS) as u64) else {
-            slot_free(i);
-            return 0;
-        };
-        base = b;
-        SLOT_BASE[i].store(base, Ordering::Release);
-        // SAFETY: as below; the claims name the span once, when it is taken.
-        unsafe {
-            extern "C" {
-                static __heap_base: u8;
-            }
-            memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
-        }
-        // An M64 memory's dense directory is read by every
-        // dispatch, so the memory covers it from the start (V8 commits
-        // lazily: untouched pages of it cost nothing).
-        if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
-            slot_free(i);
-            return 0;
-        }
-        memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
-        memmap::claim(
-            memmap::Kind::Tls,
-            i as u32,
-            base + slots::STACK as u64,
-            base + (slots::STACK + slots::TLS) as u64,
-            "thread-locals",
-        );
-    }
+    let Some(base) = slot_span(i) else {
+        slot_free(i);
+        return 0;
+    };
     // SAFETY: `base` is this Worker's alone -- its bit in `SLOT_USED` says so
     // until `gex_worker_release` -- and the memory behind it has been grown to
     // cover it.
@@ -4708,19 +4677,112 @@ pub extern "C" fn gex_worker_init() -> u32 {
     }
 }
 
-/// The first free slot, claimed.
+/// Held while a slot's span of arena is taken and claimed.
+#[cfg(feature = "shared-memory")]
+static SPAN_TAKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Slot `i`'s span of arena (its stack and thread-locals), taken the first
+/// time it is wanted; `None` when the arena cannot give it (out of memory).
+#[cfg(feature = "shared-memory")]
+fn slot_span(i: usize) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let base = SLOT_BASE[i].load(Ordering::Acquire);
+    if base != 0 {
+        return Some(base);
+    }
+    // One taker at a time: a thread's `clone` (`thread_runner_take`) and a
+    // Worker's claim may want the same slot's span at once. The take is short
+    // and never waits, so a spin.
+    while SPAN_TAKING.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+    let got = slot_span_locked(i);
+    SPAN_TAKING.store(false, Ordering::Release);
+    got
+}
+
+#[cfg(feature = "shared-memory")]
+fn slot_span_locked(i: usize) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let base = SLOT_BASE[i].load(Ordering::Acquire);
+    if base != 0 {
+        return Some(base);
+    }
+    arena_note(2, (slots::STACK + slots::TLS) as u64);
+    let base = arena_take((slots::STACK + slots::TLS) as u64)?;
+    SLOT_BASE[i].store(base, Ordering::Release);
+    // SAFETY: as in `gex_worker_init`; the claims name the span once, when it
+    // is taken.
+    unsafe {
+        extern "C" {
+            static __heap_base: u8;
+        }
+        memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+    }
+    memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
+    memmap::claim(
+        memmap::Kind::Tls,
+        i as u32,
+        base + slots::STACK as u64,
+        base + (slots::STACK + slots::TLS) as u64,
+        "thread-locals",
+    );
+    // An M64 memory's dense directory is read by every
+    // dispatch, so the memory covers it from the start (V8 commits
+    // lazily: untouched pages of it cost nothing).
+    if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
+        return None;
+    }
+    Some(base)
+}
+
+/// Whether `n` free slots have their spans: those a `clone` promised wait
+/// for none, so out of memory refuses the thread (`EAGAIN`) rather than
+/// leaving it to a Worker that finds no stack and never runs it. Takes the
+/// spans missing, while the arena gives them.
+#[cfg(feature = "shared-memory")]
+fn spans_ready(n: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    let free = |i: usize| SLOT_USED[i / 64].load(Ordering::Acquire) & (1u64 << (i % 64)) == 0;
+    let mut ready = (0..slots::COUNT).filter(|&i| free(i) && SLOT_BASE[i].load(Ordering::Acquire) != 0).count() as u32;
+    for i in 0..slots::COUNT {
+        if ready >= n {
+            return true;
+        }
+        if free(i) && SLOT_BASE[i].load(Ordering::Acquire) == 0 {
+            if slot_span(i).is_none() {
+                return false;
+            }
+            ready += 1;
+        }
+    }
+    ready >= n
+}
+
+/// A free slot, claimed: one whose span is taken if there is one (a thread
+/// `clone` promised a slot is owed one, `spans_ready`), else the first.
 #[cfg(feature = "shared-memory")]
 fn slot_claim() -> Option<usize> {
     use std::sync::atomic::Ordering;
-    for (w, word) in SLOT_USED.iter().enumerate() {
-        loop {
-            let used = word.load(Ordering::Acquire);
-            let b = (!used).trailing_zeros() as usize;
-            if b >= 64 {
-                break;
-            }
-            if word.compare_exchange(used, used | 1 << b, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                return Some(w * 64 + b);
+    for spanned in [true, false] {
+        for (w, word) in SLOT_USED.iter().enumerate() {
+            loop {
+                let used = word.load(Ordering::Acquire);
+                let mut avail = !used;
+                if spanned {
+                    for b in 0..64 {
+                        if avail & (1 << b) != 0 && SLOT_BASE.get(w * 64 + b).is_none_or(|x| x.load(Ordering::Acquire) == 0) {
+                            avail &= !(1 << b);
+                        }
+                    }
+                }
+                let b = avail.trailing_zeros() as usize;
+                if b >= 64 {
+                    break;
+                }
+                if word.compare_exchange(used, used | 1 << b, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return Some(w * 64 + b);
+                }
             }
         }
     }
@@ -4733,7 +4795,7 @@ fn slot_free(i: usize) {
 }
 
 /// Promise a slot to a thread `clone` is making, or refuse: every slot is
-/// held or already promised. A thread made without one would get no stack
+/// held or already promised, or the arena has no span for its stack. A thread made without one would get no stack
 /// when its Worker starts and never run. Counting held and promised slots
 /// apart can count a thread twice while its Worker claims (its bit is set
 /// before `gex_worker_promise_done`), which errs towards refusing; it never
@@ -4748,6 +4810,10 @@ fn thread_runner_take() -> bool {
             return false;
         }
         if PROMISED.compare_exchange(promised, promised + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if !spans_ready(promised + 1) {
+                gex_worker_promise_done();
+                return false;
+            }
             return true;
         }
     }
