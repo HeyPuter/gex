@@ -496,9 +496,14 @@ pub(crate) fn key_with_entry(image: &gex_ld::Image, (unguarded, kuser): (bool, b
 /// program marked for memory64 and Wine's own processes beside it. The
 /// process's flavor is set for the call and put back.
 pub(crate) fn key_with_mem(image: &gex_ld::Image, g: (bool, bool), mem64: bool) -> String {
+    key_with_mem_entry(image, g, mem64, false)
+}
+
+/// [`key_with_mem`] with [`key_with_entry`]'s `entry`.
+pub(crate) fn key_with_mem_entry(image: &gex_ld::Image, g: (bool, bool), mem64: bool, entry: bool) -> String {
     let was = gex_abi::mem_flavor();
     gex_abi::set_mem_flavor(if mem64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 });
-    let k = key_with(image, g);
+    let k = key_with_entry(image, g, entry);
     gex_abi::set_mem_flavor(was);
     k
 }
@@ -506,6 +511,15 @@ pub(crate) fn key_with_mem(image: &gex_ld::Image, g: (bool, bool), mem64: bool) 
 /// Every flavor a page may key a unit by, with the guest memory's width.
 pub(crate) fn flavors_mem() -> impl Iterator<Item = ((bool, bool), bool)> {
     FLAVORS.into_iter().flat_map(|g| [(g, false), (g, true)])
+}
+
+/// [`flavors_mem`], each with whether the fold covers the entry page too
+/// (only a folding flavor's: a compact 64-bit Wine process's).
+pub(crate) fn flavors_mem_entry() -> impl Iterator<Item = ((bool, bool), bool, bool)> {
+    flavors_mem().flat_map(|(g, m)| {
+        let compact = g.1.then_some((g, m, true));
+        std::iter::once((g, m, false)).chain(compact)
+    })
 }
 
 /// A unit's key for its image trimmed: `None` unless this gexc computes

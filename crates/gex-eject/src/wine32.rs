@@ -482,12 +482,21 @@ fn aot_only(config: &Config) -> Result<bool> {
     Ok(!on && !cold_jit)
 }
 
+/// A unit's `identities` entry: `None` unless `key` is the image's at one of
+/// the page's flavours, which the entry is marked with.
+fn identity_line(image: &gex_ld::Image, base: u64, key: &str, identity: &str, path: &str) -> Option<String> {
+    let (_, mem64, compact) =
+        crate::rsrc::flavors_mem_entry().find(|&(g, m, e)| crate::rsrc::key_with_mem_entry(image, g, m, e) == key)?;
+    Some(gex_key::IdentityLine { mem64, compact, base, key, identity, path }.write())
+}
+
 /// The site's `identities` (`base:key:identity:path;...`): for each unit, its
 /// image as the site ships it (web/rootfs.tar, trimmed or not) at the base
 /// the unit was built for (found from the unit's addresses). A line is
 /// written only when the key this gexc computes for that image is the unit's
 /// own, so the page never takes a key its own hashing would not give. A
-/// 64-bit memory's unit's base is written `m<base>` (the shim's `KNOWN`).
+/// 64-bit memory's and a compact process's are marked (`gex_key::IdentityLine`,
+/// the shim's `KNOWN`).
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
@@ -506,9 +515,8 @@ fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&st
             let addrs: std::collections::HashSet<u64> = unit.addresses().into_iter().collect();
             let base = crate::reach::find_base(&pe, &addrs)?;
             let image = gex_xlate::func::pe_input(&pe, base).ok()?.0;
-            let (_, m64) = crate::rsrc::flavors_mem().find(|&(g, m)| crate::rsrc::key_with_mem(&image, g, m) == site)?;
-            let flavor = if m64 { "m" } else { "" };
-            Some(format!("{flavor}{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
+            let identity = gex_key::image_identity(&image);
+            identity_line(&image, base, &site, identity.trim_start_matches("image:"), &path)
         })();
         match found {
             Some(l) => lines.push(l),
@@ -1781,6 +1789,26 @@ mod tests {
             assert!(!keys.contains(&crate::rsrc::key_with(&image, (unguarded, true))));
         }
         assert_eq!(keys.len(), 6);
+    }
+
+    #[test]
+    fn a_wine64_compact_ejects_identities_select_the_compact_unit() {
+        let _fold = FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let (image, _) = gex_kernel::win::trampoline_input(false);
+        let parse = |l: &str| gex_key::IdentityLine::parse(l).map(|l| (l.mem64, l.compact, l.key.to_string()));
+        for unguarded in [false, true] {
+            // A compact process's unit is marked so, and only a compact process takes it.
+            let compact = crate::rsrc::key_with_entry(&image, (unguarded, true), true);
+            let l = identity_line(&image, 0x7b000000, &compact, "id", "/w/user32.dll").unwrap();
+            assert_eq!(parse(&l), Some((false, true, compact)), "{l}");
+            // The plain and 32-bit Wine fold units at the same base are not.
+            for kuser in [false, true] {
+                let plain = crate::rsrc::key_with(&image, (unguarded, kuser));
+                let l = identity_line(&image, 0x7b000000, &plain, "id", "/w/user32.dll").unwrap();
+                assert_eq!(parse(&l), Some((false, false, plain)), "{l}");
+            }
+        }
+        assert_eq!(identity_line(&image, 0x7b000000, "not-a-key", "id", "/p"), None);
     }
 
     #[test]
