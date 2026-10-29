@@ -27,14 +27,20 @@ install)
   ${WINE32_MINGW_CC:-clang --target=i686-w64-mingw32 -fuse-ld=lld} -O2 -s -Wl,--no-insert-timestamp \
     -o "$out.tmp/drive_c/launch.exe" "$here/launch.c" || { echo "wine32/prefix: launch.c failed to build" >&2; exit 1; }
   log=$out.log
+  # As the page's user (gex), with an empty home: the profile Wine makes then
+  # has no link to the build machine's user folders (Downloads -> ~/Downloads).
+  home=$out.tmp-home; rm -rf "$home"; mkdir -p "$home"
   (cd "$out.tmp/drive_c" && timeout -k 10 "${WINE32_INSTALL_TIMEOUT:-3600}" "$gexc" run --env WINEPREFIX="$out.tmp" \
+    --env USER=gex --env LOGNAME=gex --env HOME="$home" \
     --env WINEDEBUG=+wineboot --env WINEDLLOVERRIDES=mscoree,mshtml= \
     "$dist/lib/wine/i386-unix/wine" ./launch.exe 'C:\windows\system32\wineboot.exe -u') > "$log" 2>&1 || true
   n=$(grep -c 'Cryptography\\\\Defaults\\\\Provider' "$out.tmp/system.reg" 2>/dev/null || true)
   e=$(grep -a '^child exit' "$log" | tr -d '\r' | tail -1)
   (cd "$out.tmp/drive_c" && timeout -k 10 600 "$gexc" run --env WINEPREFIX="$out.tmp" --env WINEDEBUG=-all \
+    --env USER=gex --env LOGNAME=gex --env HOME="$home" \
     "$dist/lib/wine/i386-unix/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f) >> "$log" 2>&1 || true
   grep -q '^"ShowCrashDialog"=dword:00000000' "$out.tmp/user.reg" || e="$e, no ShowCrashDialog"
+  rm -rf "$home"
   if [ "${n:-0}" -gt 0 ] && [ "$e" = "child exit 0" ]; then
     rm -f "$out.tmp/drive_c/launch.exe"; rm -rf "$out" && mv "$out.tmp" "$out"
     echo "wine32/prefix: installed $out ($n crypto provider keys)"

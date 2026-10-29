@@ -35,6 +35,9 @@ TMPDIR=$tmp "$T/stage-native.sh" "$B" "$F" "$P" $CORE $PROGRAMS
 # No links into the shared x86 prefix: wineboot writes system32 through them.
 find "$P" -type l -lname "$x86/*" -print0 | while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
 mkdir -p "$P/dosdevices" && ln -sfn ../drive_c "$P/dosdevices/c:" && ln -sfn / "$P/dosdevices/z:"
+# No user folders: the host's staged prefix's are its own runs' (a game's
+# saves, the host user's profile). The install makes the page user's afresh.
+rm -rf "$P/drive_c/users"
 dd=$D/lib/wine/i386-windows; mkdir -p "$dd" "$D/share/wine"
 for f in "$P"/drive_c/windows/system32/*; do [ -f "$f" ] && cp -p "$f" "$dd/"; done
 # The in-process parts find nls/ beside the executable's directory
