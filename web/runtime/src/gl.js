@@ -27,7 +27,7 @@ export class MesaGl extends EventTarget {
     i.devices(async (dev) => {
       if (!dev.compositor) throw new Error('MesaGl draws into the windows: make HostWindows, CompositorWindows or SingleCanvas too');
       dev.glChannel = await dev.rt.openGlChannel(d3d);
-      this.#start = dev.rt.glStarter(dev.compositor, dev.glChannel, { dom: dev.dom, source }, dev.term);
+      this.#start = dev.rt.glStarter(dev.compositor, dev.glChannel, { dom: dev.dom, source, ...(i.preset.glBackend ? { backend: i.preset.glBackend } : {}) }, dev.term);
       if (!eager) dev.rt.glOnFirstRequest(dev.glChannel, this.#start);
     }, 1);
     i.afterBoot(() => {

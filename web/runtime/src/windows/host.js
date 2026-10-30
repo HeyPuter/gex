@@ -175,7 +175,8 @@ export class HostWindows extends EventTarget {
     i.attach('windows', this, { beforeBoot: true });
     this.#i = i;
     this.#size = this.#fit(width, height, scale);
-    xOnDemand(i);
+    const x = {};
+    xOnDemand(i, x);
     i.devices(async (dev) => {
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts
@@ -189,6 +190,7 @@ export class HostWindows extends EventTarget {
     });
     const self = this;
     this[INTERNAL] = {
+      x,
       byKey: (k) => self.#wins.get(k) ?? null,
       of: (pid) => [...self.#wins.values()].filter((w) => w.pid === pid),
       shutdown: () => {

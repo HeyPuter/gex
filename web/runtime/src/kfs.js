@@ -13,6 +13,8 @@ const READ_MAX = 4 << 20;
 /** A tar's or a file's bytes go to the kernel in parts of this. */
 const PART = 16 << 20;
 const META_BYTES = 72;
+/** gex-kernel vfs::remote::xattr_op::SET. */
+const XATTR_SET = 1;
 const TYPES = ['file', 'directory', 'symlink', 'chardev', 'fifo', 'socket'];
 /** The most bytes one batch carries to the Worker. */
 const BATCH_BYTES = 32 << 20;
@@ -215,6 +217,63 @@ export class Files {
     }
     await batched(k, list, (r, c) => {
       if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+    });
+    return n;
+  }
+
+  /** A program's image as a page's untarred bundle has it (web/src/tar.js
+   *  `untar`; a preset's, web/src/run-program.js), in the order a program's
+   *  own loading of it took: empty directories, files with their modes,
+   *  directories' modes, lazy files (`[path, size, url, head]`; a bundled
+   *  file wins over a lazy one unless it is that file's first `head` bytes),
+   *  hard links, symbolic links, file times (seconds) and extended
+   *  attributes. The count of files laid. */
+  async layImage({ files = {}, modes = {}, dirs = [], lazy = [], hard = {}, symlinks = {}, mtimes, xattrs }) {
+    const k = this.#k;
+    const list = [];
+    for (const p of dirs) list.push({ f: 'k_fs_add_dir', a: [{ in: p }, 0o755] });
+    let n = 0;
+    for (const [p, data] of Object.entries(files)) {
+      const d = typeof data === 'string' ? enc.encode(data) : data;
+      list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
+      for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
+      if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      n++;
+    }
+    // Directories' modes once their files are in (a read-only one keeps
+    // its mode: Wine reports it read only).
+    for (const p of dirs) if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+    for (const [p, size, url, head] of lazy) {
+      if (files[p] !== undefined && !(head && files[p].length === head)) continue;
+      list.push({ f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
+      if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      n++;
+    }
+    await batched(k, list.splice(0), (r, c) => {
+      if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+    });
+    // Hard links after their targets: one inode with two names, as the host
+    // had it; a copy where the kernel would not link.
+    const copies = [];
+    await batched(k, Object.entries(hard).map(([p, target]) => ({ f: 'k_fs_link', a: [{ in: target }, { in: p }], p, target })), (r, c) => {
+      if (r < 0 && files[c.target] !== undefined) copies.push(c);
+    });
+    for (const { p, target } of copies) {
+      const d = files[target];
+      list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
+      for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
+    }
+    for (const [p, target] of Object.entries(hard)) if (modes[target] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[target]] });
+    for (const [p, target] of Object.entries(symlinks)) list.push({ f: 'k_fs_symlink', a: [{ in: target }, { in: p }] });
+    for (const [p, secs] of Object.entries(mtimes ?? {})) list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(Math.trunc(secs))] });
+    for (const [p, attrs] of Object.entries(xattrs ?? {})) {
+      for (const [name, value] of Object.entries(attrs)) {
+        const v = value instanceof Uint8Array ? value : enc.encode(String(value));
+        list.push({ f: 'k_fs_xattr', a: [-1, { in: p }, XATTR_SET, { in: name }, { in: v }, 0] });
+      }
+    }
+    await batched(k, list, (r, c) => {
+      if (c.f === 'k_fs_add' && r < 0) throw errno(r, c.a[0].in);
     });
     return n;
   }

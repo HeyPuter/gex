@@ -116,6 +116,12 @@ export class System extends EventTarget {
    *  it runs. */
   #init = null;
   #initProcess = null;
+  /** What a preset over the system adds that the API does not offer
+   *  (web/src/run-program.js): the processes' host's options (an ejected
+   *  build's units, fill and lazy cache, a closure), each exec's (the
+   *  recompile and link switches), the Workers' messages, and whether the
+   *  runtime keeps its routine lines. */
+  #preset = { host: {}, exec: {}, onMessage: [], loud: false };
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
@@ -188,6 +194,7 @@ export class System extends EventTarget {
       say: (text) => this.#say(text),
       /** The page-fs channel: the page's mounts and host calls. */
       pageFs: () => this.#pageFs,
+      preset: this.#preset,
     };
   }
 
@@ -238,7 +245,7 @@ export class System extends EventTarget {
     // Quiet unless asked: a page embedding the runtime hears errors and rare
     // events, not gex's routine lines (each process started, each library
     // loaded). `log` names debug output (shims/browser/js/log.mjs).
-    const asked = q.has('log') || globalThis.GEX_LOG !== undefined || !!globalThis.process?.env?.GEX_LOG;
+    const asked = this.#preset.loud || q.has('log') || globalThis.GEX_LOG !== undefined || !!globalThis.process?.env?.GEX_LOG;
     if (!asked) q.set('log', 'quiet');
     // The options the switches stand for.
     if (this.#opts.units) {
@@ -291,7 +298,8 @@ export class System extends EventTarget {
       // after boot reaches the programs already running, and each reaches
       // /dev/gex-host. Every Worker reaches the network through the page;
       // which network is the page's to set, any time (net.js).
-      kernel, pageFs: this.#pageFs.control, uid: 0, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
+      uid: 0, ...this.#preset.host,
+      kernel, pageFs: this.#pageFs.control, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
     }, {
       onOutput: (fd, text) => this.#say(text),
       // The compositor lets go of an exited process's memory.
@@ -303,13 +311,14 @@ export class System extends EventTarget {
       onMessage: (m) => {
         if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
         else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
+        for (const fn of this.#preset.onMessage) fn(m);
       },
     });
     this.#sys = {
       host, kernel, term, rt, compositor, wlChannel: dev.wlChannel,
       // Pid 1 is the kernel's: each process starts here, a child of it, from
       // its exec record (host.mjs `spawnExec`).
-      spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: rt.execOptions({ uid, gid }) }),
+      spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
       /** `fn()` when the system stops. */
       onStop: (fn) => stops.push(fn),
       stop: () => {
@@ -333,9 +342,12 @@ export class System extends EventTarget {
       // With no environment given, Linux's for an init: HOME and TERM.
       const [argv, o] = this.#init;
       const p = this.#initProcess = this.#spawn(argv, { env: ['HOME=/', 'TERM=linux'], ...o }, true);
-      p.exited.then((st) => {
+      p.exited.then(async (st) => {
         if (this.#state.phase !== 'running') return;
         this.#state.init = st;
+        // What it wrote last still comes: its output's end, unless a
+        // program it left holds that open (a second at most).
+        await Promise.race([p[INTERNAL].drained(), new Promise((r) => setTimeout(r, 1000))]);
         this.shutdown();
       }, (e) => {
         if (this.#state.phase !== 'running') return;
@@ -365,7 +377,7 @@ export class System extends EventTarget {
       watch: (m) => this.#event('watch', m),
       xWanted: () => this.#event('x-wanted', {}),
     });
-    for (const l of layers) await this.#files.lay(l);
+    for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
     if (records.length) await this.#files.restore(records);
     await k.r('k_fs_populate_done');
     if (this.#opts.xcache) await this.#xcacheRestore(s, k);

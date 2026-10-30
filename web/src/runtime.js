@@ -678,9 +678,25 @@ async function runInSystemWorker(term, opts) {
   }
 }
 
+/**
+ * Run one program, `opts.args[0]`, as pid 1 of a system of its own, its
+ * terminal `term` (an xterm, or anything with its `write`, `onData`,
+ * `onResize`, `rows` and `cols`): a preset over the runtime API
+ * (run-program.js). The single-thread build runs the whole system in one
+ * Worker (system-worker.js, `runSingle` there). Resolves `{ status }` when
+ * the program ends.
+ */
 export async function runProgram(term, opts) {
-  if (singleMode() && !single.on) return runInSystemWorker(term, opts);
-  return runProgramHere(term, opts);
+  if (single.on) return runSingle(term, opts);
+  if (singleMode()) return runInSystemWorker(term, opts);
+  const { runPreset } = await import('./run-program.js');
+  return runPreset(term, opts);
+}
+
+/** `/dev/dsp`'s output, played from the first gesture on: a Worker's
+ *  'audio' message (worker.mjs). */
+export function audioFrom(m) {
+  startAudio({ ...m, clock: flag('audioclock') !== '0', latency: audioLatency(), loop: flag('audioloop') === '1' });
 }
 
 /**
@@ -1076,7 +1092,13 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
   return { wlChannel, compositor, dom: false };
 }
 
-async function runProgramHere(
+/**
+ * The single-thread build's run, in its system Worker (single.on): pid 1
+ * loads the program and its files itself, the terminal is the page's line
+ * discipline. Only the single-thread build has it; every other page runs
+ * through the runtime API (run-program.js).
+ */
+async function runSingle(
   term,
   {
     elf,

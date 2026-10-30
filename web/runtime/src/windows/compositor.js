@@ -25,8 +25,10 @@ export class CompositorWindows extends EventTarget {
       Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, say: (t) => dev.say(`${t}\n`) }));
       this.#c = dev.compositor;
     });
-    xOnDemand(i);
+    const x = {};
+    xOnDemand(i, x);
     this[INTERNAL] = {
+      x,
       of: () => [],
       shutdown: () => this.#c?.stop(),
     };

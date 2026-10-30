@@ -50,6 +50,7 @@ export class Process extends EventTarget {
   #startedResolve; #startedReject;
   #exitedResolve; #exitedReject;
   #pendingKills = [];
+  #drained = null;
 
   constructor({ argv, stdio, encoding, read, unread, write, closeStdin, resize, kill, release, windows }) {
     super();
@@ -117,6 +118,11 @@ export class Process extends EventTarget {
           this.#settle();
         }
       },
+      /** Resolves once its output has all come (its ends let go). */
+      drained: () => (this.#released ? Promise.resolve() : new Promise((r) => {
+        const before = this.#drained;
+        this.#drained = () => { before?.(); r(); };
+      })),
       exit: ({ code, signal, shutdown }) => {
         if (this.#status) return;
         this.#status = { code, signal: signal ? signalName(signal) : null };
@@ -137,6 +143,7 @@ export class Process extends EventTarget {
     }
     if (this.#ends <= 0 && !this.#released) {
       this.#released = true;
+      this.#drained?.();
       this.#io.release();
     }
   }

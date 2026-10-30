@@ -3,17 +3,19 @@
 // runtime.js `startXServer`) started on those sockets, where the client
 // waits.
 
-/** Arm it for a system's internals `i`, once the system runs. */
-export function xOnDemand(i) {
+/** Arm it for a system's internals `i`, once the system runs. `x`: what a
+ *  preset asks of the server (web/src/run-program.js): `rootful`, one
+ *  fullscreen X screen under the session's own window manager (hostx.js). */
+export function xOnDemand(i, x = {}) {
   i.afterBoot(async (sys) => {
     if (!sys.wlChannel) return;
     const ids = await i.programs().holdX();
-    let x = null;
+    let server = null;
     i.on('x-wanted', () => {
-      x ??= sys.rt.startXServer({ kernel: sys.kernel, wlChannel: sys.wlChannel, compositor: () => sys.compositor, term: sys.term, listen: ids });
-      x.catch((e) => i.say(`gex: the X server would not start: ${e?.message ?? e}\n`));
+      server ??= sys.rt.startXServer({ kernel: sys.kernel, wlChannel: sys.wlChannel, compositor: () => sys.compositor, term: sys.term, listen: ids, rootful: !!x.rootful });
+      server.catch((e) => i.say(`gex: the X server would not start: ${e?.message ?? e}\n`));
     });
     // Its Worker's `main` never returns: ending the system ends the Worker.
-    sys.onStop(() => x?.then((w) => w.terminate(), () => {}));
+    sys.onStop(() => server?.then((w) => w.terminate(), () => {}));
   });
 }

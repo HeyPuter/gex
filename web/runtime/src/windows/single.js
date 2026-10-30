@@ -22,10 +22,14 @@ export class SingleCanvas extends EventTarget {
     const i = internals(sys, 'SingleCanvas');
     this.#container = container;
     i.attach('windows', this, { beforeBoot: true });
+    // What a preset asks (web/src/run-program.js): the X server's kind, and
+    // `onDesktop(desktop, bare)` when the desktop is made.
+    const x = {};
     i.devices(async (dev) => {
       const { bareDesktop } = await import('../../../src/bare-desktop.js');
       const onDesktop = (d) => {
         this.#d = bareDesktop(d, container);
+        x.onDesktop?.(d, this.#d);
         d.onwindowgone = () => this.dispatchEvent(new Event('change'));
         const onwindow = d.onwindow;
         d.onwindow = (w) => {
@@ -35,8 +39,9 @@ export class SingleCanvas extends EventTarget {
       };
       Object.assign(dev, await dev.rt.openWayland({ wl: container, onDesktop, say: (t) => dev.say(`${t}\n`) }));
     });
-    xOnDemand(i);
+    xOnDemand(i, x);
     this[INTERNAL] = {
+      x,
       of: () => [],
       shutdown: () => this.#d?.stop(),
     };

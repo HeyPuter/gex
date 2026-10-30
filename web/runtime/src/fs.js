@@ -101,6 +101,9 @@ export class Filesystem extends EventTarget {
         i.afterBoot(() => hooks.running(i));
       },
       persistArgs: () => this.#persist?.startArgs() ?? null,
+      /** A program's image as an untarred bundle has it (kfs.js
+       *  `layImage`): a preset's (web/src/run-program.js), not the API's. */
+      addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
     };
   }
 
@@ -152,7 +155,7 @@ export class Filesystem extends EventTarget {
       layer.catch(() => {});
       return layer.then(() => {});
     }
-    return layer.then((l) => this.#files('addTar').lay(l)).then(() => {});
+    return layer.then((l) => (l.image ? this.#files('addTar').layImage(l) : this.#files('addTar').lay(l))).then(() => {});
   }
 
   /** For boot: the layers, in order (later wins), and what a Persist kept,

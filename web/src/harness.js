@@ -129,7 +129,10 @@ export async function start() {
       : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
     if (files[abs]) files[path] = files[abs];
   }
-  const elf = files[shell];
+  // Hard links are names of one file: the tree's, as a tar keeps them.
+  const hard = tree.hard ?? {};
+  const fileOf = (p) => files[p] ?? files[hard[p]];
+  const elf = fileOf(shell);
   if (!elf) throw new Error(`the rootfs has no ${shell}`);
 
   // The closure, when the driver was given one: the image module, every
@@ -185,7 +188,7 @@ export async function start() {
   if (params.get('program')) {
     const path = params.get('program');
     const argv = [path, ...(params.getAll('arg') || [])];
-    const exe = files[path];
+    const exe = fileOf(path);
     if (!exe) throw new Error(`the rootfs has no ${path}`);
     const began = performance.now();
     let status = -1;
@@ -196,6 +199,9 @@ export async function start() {
       const running = runProgram(io.term, {
         elf: exe,
         files,
+        hard,
+        dirs: tree.dirs,
+        modes: tree.modes,
         args: argv,
         cwd: '/',
         tty: false,
@@ -238,6 +244,9 @@ export async function start() {
   const done = runProgram(io.term, {
     elf,
     files,
+    hard,
+    dirs: tree.dirs,
+    modes: tree.modes,
     args: [shell, '-i'],
     cwd: '/',
     tty: true,
