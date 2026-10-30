@@ -190,6 +190,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
                 providers: provided,
                 identity: String::new(),
                 key_base: String::new(),
+            alt: false,
             });
             units.len() - 1
         };

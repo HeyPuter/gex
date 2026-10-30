@@ -510,6 +510,29 @@ pub(crate) fn table_func(cx: &mut Caller<'_, HostState>, idx: u32) -> Result<was
     }
 }
 
+thread_local! {
+    /// What this thread publishes is of the process's other mode
+    /// ([`OtherMode`]).
+    static PUBLISH_ALT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, every install this thread publishes is of the process's other
+/// mode (`Shared::alt_installs`), and its bridges go in the other directory:
+/// a WoW64 process's i386 image's unit and providers (`pe_units`).
+pub(crate) struct OtherMode(bool);
+
+impl OtherMode {
+    pub(crate) fn enter(alt: bool) -> Self {
+        OtherMode(PUBLISH_ALT.with(|c| c.replace(alt)))
+    }
+}
+
+impl Drop for OtherMode {
+    fn drop(&mut self) {
+        PUBLISH_ALT.with(|c| c.set(self.0));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_pairs_at(
     sh: &Arc<Mutex<JitShared>>,
@@ -541,6 +564,10 @@ fn publish_pairs_at(
         );
         s.ftab.modules.push(module);
         let n = s.ftab.map.publish(len, m, tier, pairs);
+        // before its bridges, which go in that mode's directory
+        if PUBLISH_ALT.with(|c| c.get()) {
+            s.ftab.alt_installs.insert(n);
+        }
         if !checks.is_empty() {
             s.ftab.checks.insert(n, checks.clone());
         }

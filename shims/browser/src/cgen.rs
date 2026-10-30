@@ -149,6 +149,10 @@ struct Unit {
     identity: String,
     /// The key before the profile's part (`key` adds it).
     key_base: String,
+    /// An image of the process's other mode (a WoW64 process's i386 one):
+    /// its entries and its providers' are bridged in the other directory,
+    /// which that mode's code dispatches through.
+    alt: bool,
 }
 
 /// One export provider for a placed image.
@@ -645,7 +649,7 @@ pub(crate) fn wine32_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> 
     if !on() {
         return false;
     }
-    wine32_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64 && !other_mode_pe(pe));
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
     if !wine32_matches(&image, base, pe, true) {
         wine32_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
@@ -717,6 +721,19 @@ fn wine32_forget(base: u64, size: u64) {
     }
 }
 
+/// Whether `image` is of the process's other mode: i386 code in an x86-64
+/// process (WoW64), translated in compat mode and dispatched through the
+/// other directory.
+fn other_mode_image(image: &gex_ld::Image) -> bool {
+    gex_abi::X86 && image.class32 != gex_xlate::default_compat()
+}
+
+/// [`other_mode_image`] for a PE image: a PE32 one in an x86-64 process. Its
+/// process's trampolines are still the 64-bit ones.
+fn other_mode_pe(pe: &gex_ld::pe::PeImage) -> bool {
+    gex_abi::X86 && !pe.is64 && !gex_xlate::default_compat()
+}
+
 /// Whether the trampoline page this address space asked for is 32-bit Wine's.
 static TRAMPOLINES32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -780,7 +797,7 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
             }
         },
     };
-    wine32_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64 && !other_mode_pe(&pe));
     let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
     if !wine32_matches(&image, d.base, &pe, false) {
         crate::warn_line(&format!("gex-wine32: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
@@ -871,6 +888,12 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             groups: Vec::new(),
         }];
     }
+    // Its bridges go in the other directory, which the process may not have
+    // yet (no thread has run that mode's code).
+    let alt = other_mode_image(image);
+    if alt {
+        crate::with_px(|px| crate::ensure_alt_dir(px));
+    }
     let identity = match known {
         Some((_, id)) => id,
         None => gex_key::image_identity(image).trim_start_matches("image:").to_string(),
@@ -888,6 +911,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         dirs: Vec::new(),
         slots: 0,
         providers,
+        alt,
     });
     let at = PLACING_AT.with(|c| c.replace(0));
     if at != 0 {
@@ -1217,7 +1241,8 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, nslots) = bridges(&addrs);
+    let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
+    let (regs, dirs, nslots) = bridges_mode(&addrs, alt);
     {
         let mut units = lock(&UNITS);
         let Some(x) = units.get_mut(u as usize) else {
@@ -1254,6 +1279,10 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
 pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
     let mut units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return -1 };
+    // Region entries are tier-1 modules of the process's own mode.
+    if x.alt {
+        return -1;
+    }
     let r = Unit {
         identity: x.identity.clone(),
         key_base: format!("regions/{}", x.key),
@@ -1266,6 +1295,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
         dirs: Vec::new(),
         slots: 0,
         providers: Vec::new(),
+        alt: false,
     };
     units.push(r);
     (units.len() - 1) as i32
@@ -1291,8 +1321,13 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
     let mut units = lock(&UNITS);
     let mut pages = Vec::new();
     let mut paths = Vec::new();
+    let alt = us.first().and_then(|&u| units.get(u)).is_some_and(|x| x.alt);
     for &u in &us {
         let Some(x) = units.get(u) else { return -1 };
+        // One module's entries are bridged in one directory.
+        if x.alt != alt {
+            return -1;
+        }
         pages.extend(x.pages.iter().copied());
         paths.push(x.path.rsplit(['/', '\\']).next().unwrap_or("").to_string());
     }
@@ -1309,6 +1344,7 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
         dirs: Vec::new(),
         slots: 0,
         providers: Vec::new(),
+        alt,
     });
     (units.len() - 1) as i32
 }
@@ -1482,7 +1518,8 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, slots) = bridges(&addrs);
+    let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
+    let (regs, dirs, slots) = bridges_mode(&addrs, alt);
     crate::trace_line(&format!("gex-pe: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
@@ -1639,11 +1676,12 @@ pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
     gex_kernel::clock_ns(crate::browser_clock, clk as u64) as i64
 }
 
-/// `gex.nt_qpc()`: the nt_qpc provider's clock. That provider binds only
-/// to a PE ntdll, which no process here has: always 0.
+/// `gex.nt_qpc()`: the nt_qpc provider's clock, for an i386 PE ntdll (a
+/// WoW64 process's): what 64-bit Wine's NtQueryPerformanceCounter reads
+/// (`monotonic_counter`: CLOCK_BOOTTIME in 100 ns units), so the two agree.
 #[no_mangle]
 pub extern "C" fn gex_nt_qpc() -> i64 {
-    0
+    (gex_kernel::clock_ns(crate::browser_clock, 7) / 100) as i64
 }
 
 /// Provider module `number`'s data (`__memory_base`), 0 when stateless.

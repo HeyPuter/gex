@@ -595,6 +595,10 @@ fn install_regions(
     cache: Option<&(std::path::PathBuf, String)>,
     memory: &gex_mem::GuestMemory,
 ) -> Result<()> {
+    // Region entries are tier-1 modules of the process's own mode.
+    if other_mode(&p.pe) {
+        return Ok(());
+    }
     let Some(dir) = regions_dir(&pl.path) else { return Ok(()) };
     let path = dir.join("c.wasm");
     let Ok(wasm) = std::fs::read(&path) else { return Ok(()) };
@@ -1899,6 +1903,13 @@ fn spawn_elf_build(path: &str, base: u64) {
 // unit in the background for the next run (off by default: Wine's DLLs get
 // theirs at staging, `$W/cgen-wine32.sh`).
 
+/// Whether `pe` is of the process's other mode: a PE32 image in an x86-64
+/// process (WoW64), whose code runs in compat mode and dispatches through
+/// the other directory.
+fn other_mode(pe: &gex_ld::pe::PeImage) -> bool {
+    gex_abi::X86 && !pe.is64 && !gex_xlate::default_compat()
+}
+
 /// The unit for an i386 image Wine's PE loader mapped at `base`, installed
 /// if one was built. Never fatal: an image whose mapped code differs from
 /// its unit's (or with none) stays on tier-1.
@@ -1921,7 +1932,8 @@ pub(crate) fn wine32_image(caller: &mut Caller<'_, HostState>, path: &str, base:
     if which == 0 || mode() == Mode::Off {
         return Ok(());
     }
-    wine32_trampolines(caller, !pe.is64)?;
+    // A WoW64 process's trampolines are its 64-bit ones.
+    wine32_trampolines(caller, !pe.is64 && !other_mode(&pe))?;
     if (which == 1 && !path.contains("/lib/wine/")) || is_wasm_skeleton(&pe) {
         return Ok(());
     }
@@ -2030,6 +2042,13 @@ fn wine32_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) ->
         }
         return Ok(());
     }
+    // A WoW64 process's i386 image: its unit and providers are of the
+    // other mode, bridged in that mode's directory.
+    let alt = other_mode(&p.pe);
+    if alt {
+        crate::ensure_alt_dir(caller, &shared)?;
+    }
+    let _mode = crate::ftab::OtherMode::enter(alt);
     {
         let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
         install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;

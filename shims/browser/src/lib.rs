@@ -16628,8 +16628,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // 32-bit Wine/64-bit Wine: the first miss in an image left until now (mapped unread, or
     // relocated after mapping; cgen.rs `wine32_miss`): JS serves its unit, then
     // the guest goes on at this pc. Before the function JIT, which would
-    // otherwise take the image's code first.
-    if !alt && cgen::wine32_miss(pc) {
+    // otherwise take the image's code first. In either mode: a WoW64
+    // process's i386 images are placed as the other mode's (`cgen::place`).
+    if cgen::wine32_miss(pc) {
         miss_way(pc, 8);
         set_resume(pc);
         set_resume_ctx(my_ctx());
@@ -16642,10 +16643,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         crate::cgen::note_web_entry(pc);
     }
     // A recording: the same pcs, named with their unit, before the function
-    // JIT or tier-1 takes them.
-    if !alt {
-        cgen::record_uncovered(pc);
-    }
+    // JIT or tier-1 takes them, in either mode.
+    cgen::record_uncovered(pc);
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if !alt && fjit::serve(pc) {

@@ -416,9 +416,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
     })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
-    // The `nt_qpc` provider's counter: it binds only to an ntdll that is a
-    // PE image, which a 32-bit Wine prefix's (a wasm32 skeleton) is not.
-    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { 0 })?;
+    // The `nt_qpc` provider's counter, for an i386 PE ntdll (a WoW64
+    // process's): what 64-bit Wine's NtQueryPerformanceCounter reads
+    // (`monotonic_counter`: CLOCK_BOOTTIME in 100 ns units).
+    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { (gex_kernel::clock_ns(gex_kernel::system_clock, 7) / 100) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter).

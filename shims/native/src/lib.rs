@@ -5284,7 +5284,7 @@ pub(crate) fn thread_alt(caller: &Caller<'_, HostState>) -> bool {
 /// The process's other directory (`gex_abi::ALT_PAGE`), made the first time
 /// a thread runs code in that mode: top-down below 4 GiB, out of a 32-bit
 /// program's way, zero (every page a miss) until code there is translated.
-fn ensure_alt_dir(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
+pub(crate) fn ensure_alt_dir(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
     ensure_alt_dir_in(caller.data_mut(), shared)
 }
 
@@ -5346,10 +5346,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         return Ok(true);
     }
 
+    // 32-bit Wine: an image Wine relocated gets its function-tier unit at its first
+    // miss (`pe_units::wine32_image`); in either mode, a WoW64 process's i386
+    // images being the other mode's (`ftab::serve_alt` below serves them).
+    pe_units::wine32_miss(caller, pc)?;
     if !alt {
-        // 32-bit Wine: an image Wine relocated gets its function-tier unit at its first
-        // miss (`pe_units::wine32_image`).
-        pe_units::wine32_miss(caller, pc)?;
         // A function the table holds, or the run-time translator can make,
         // serves this address: tier-1 reaches it through the bridge.
         if ftab::serve(caller, pc)? {
