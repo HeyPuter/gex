@@ -16630,7 +16630,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         miss_way(pc, 4);
         miss_count(3);
         dense::want(pc);
-        if in_place(_ctx, pc) {
+        // The other mode's block: as its translation below, the loop goes
+        // on through a module of that mode (the trap, whose catch-up
+        // installs it), for a redispatch in place would look it up in the
+        // process's own directory, miss again and translate it again.
+        if !alt && in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
         if unsafe { TRACE_MISSES } {
