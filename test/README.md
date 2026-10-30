@@ -80,6 +80,7 @@ export default async function (t) {
 | Field | |
 |---|---|
 | `hosts` | Where it can run (default `['browser']`). |
+| `arches` | The arches it runs on (default both, `['a64', 'x86']`). |
 | `images` | The images it needs (fixtures/images.mjs): made in the work directory before any test runs. Without one, the test is skipped. |
 | `timeout` | Seconds for the whole test, every phase (default 120). |
 | `html` | The page's elements (browser), added to its body before the test runs. |
@@ -90,7 +91,7 @@ A page or process runs one test, so each makes its own System.
 
 | | |
 |---|---|
-| `t.check(what, cond, detail)`, `t.eq(what, got, want)` | A check: a line, `ok` or `FAIL`. A failed check does not stop the test. |
+| `t.check(what, cond, detail)`, `t.eq(what, got, want, more)` | A check: a line, `ok` or `FAIL`. A failed check does not stop the test. |
 | `t.say(text)` | A line of output. |
 | `t.until(fn, what, ms)`, `t.timeout(promise, ms, what)` | Wait for a truthy `fn()`, or for a promise, else throw. |
 | `t.lines(process, stream)` | A stream's text as lines, as they come (a process's stdout by default). |

@@ -47,7 +47,7 @@ for (const a of arches) if (!ARCHES[a]) throw new Error(`--arch: a64 or x86, not
 function metaOf(file) {
   const m = /^export const meta = (\{[\s\S]*?\n?\});$/m.exec(readFileSync(file, 'utf8'));
   if (!m) throw new Error(`${file}: no \`export const meta = { ... };\``);
-  return { hosts: ['browser'], images: [], timeout: 120, ...new Function(`return (${m[1]});`)() };
+  return { hosts: ['browser'], arches: Object.keys(ARCHES), images: [], timeout: 120, ...new Function(`return (${m[1]});`)() };
 }
 const all = [];
 for (const group of readdirSync(TESTS).sort()) {
@@ -62,7 +62,7 @@ const tests = all.filter((x) => (!groups || groups.includes(x.group))
   && (!positionals.length || positionals.some((p) => p === x.name || p === x.name.split('/')[1])));
 if (positionals.length && !tests.length) throw new Error(`no test ${positionals.join(' ')}`);
 const jobs = [];
-for (const test of tests) for (const host of hosts) for (const arch of arches) if (test.meta.hosts.includes(host)) jobs.push({ test, host, arch });
+for (const test of tests) for (const host of hosts) for (const arch of arches) if (test.meta.hosts.includes(host) && test.meta.arches.includes(arch)) jobs.push({ test, host, arch });
 if (o.list) {
   for (const j of jobs) console.log(`${j.test.name} ${j.host} ${j.arch}`);
   process.exit(0);

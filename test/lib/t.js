@@ -26,7 +26,8 @@ export function makeT({ host, arch, phase = 1, state = null, res, emit }) {
       emit(`${cond ? 'ok' : 'FAIL'} ${what}${!cond && detail ? `: ${detail}` : ''}`);
       return cond;
     },
-    eq: (what, got, want) => t.check(what, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`),
+    /** `more`: said too when it fails (a log's tail). */
+    eq: (what, got, want, more = '') => t.check(what, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}${more ? ` (${more})` : ''}`),
     /** End the test as skipped, saying why. */
     skip(why) {
       throw new Skip(why);

@@ -18,6 +18,8 @@ process.once('message', async ({ arch, phase, state, res, work }) => {
     baseUrl: PUBLIC,
     debug: (more = {}) => ({ ...(arch ? { arch } : {}), ...more }),
     work: (name) => pathToFileURL(join(work, name)).href,
+    /** The work directory itself (lib/guest.mjs keeps its builds there). */
+    workDir: work,
     hits: browserOnly('t.hits'),
     reload(next = null) {
       process.send({ reload: next, res });
