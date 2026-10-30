@@ -21,16 +21,16 @@ export class MesaGl extends EventTarget {
     super();
     const i = internals(sys, 'MesaGl');
     i.attach('gl', this, { beforeBoot: true });
-    i.beforeBoot((opts) => {
-      if (!i.part('windows')) throw new Error('MesaGl draws into the windows: make HostWindows, CompositorWindows or SingleCanvas too');
-      opts.gl = 'compositor';
-      opts.glLazy = !eager;
-      opts.d3d = !!d3d;
-      if (source) opts.glSource = source;
-    });
-    i.afterBoot((s) => {
-      this.#start = s.startGl;
-      // Started at boot, or by a program's first GL call.
+    // The GL ring the guest's /dev/gex-gl talks over, served by Mesa in the
+    // compositor: started here at boot (`eager`), or by `start`, or by a
+    // program's first GL call.
+    i.devices(async (dev) => {
+      if (!dev.compositor) throw new Error('MesaGl draws into the windows: make HostWindows, CompositorWindows or SingleCanvas too');
+      dev.glChannel = await dev.rt.openGlChannel(d3d);
+      this.#start = dev.rt.glStarter(dev.compositor, dev.glChannel, { dom: dev.dom, source }, dev.term);
+      if (!eager) dev.rt.glOnFirstRequest(dev.glChannel, this.#start);
+    }, 1);
+    i.afterBoot(() => {
       if (eager) this.start();
     });
   }

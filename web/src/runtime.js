@@ -451,7 +451,7 @@ let kernelSpec = null;
  * same shape as a machine whose GPU has fallen over, and better than
  * pretending the session is broken.
  */
-async function startHostGl(compositor, glChannel, opts, term) {
+export async function startHostGl(compositor, glChannel, opts, term) {
   try {
     return await compositor.hostGl(glChannel, opts);
   } catch (e) {
@@ -469,7 +469,7 @@ async function startHostGl(compositor, glChannel, opts, term) {
   }
 }
 
-async function loadKernel() {
+export async function loadKernel() {
   if (kernelSpec !== null) return kernelSpec || null;
   // Test for `SharedArrayBuffer` directly, not `crossOriginIsolated`: it is
   // what is actually needed, and asking for the constructor works under Node
@@ -686,7 +686,7 @@ export async function runProgram(term, opts) {
  * held :0 until a client came). `compositor()` is the page's compositor,
  * which takes the server's memory and pixels.
  */
-async function startXServer({ kernel, wlChannel, compositor, term, rootful = false, listen }) {
+export async function startXServer({ kernel, wlChannel, compositor, term, rootful = false, listen }) {
   let xServer;
   // The single-thread build: the server is a fiber of
   // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
@@ -763,6 +763,314 @@ async function startXServer({ kernel, wlChannel, compositor, term, rootful = fal
   return xServer;
 }
 
+/** The exec options every process takes from the page (`?strace=1`, the
+ *  heartbeat, the link cache, recompilation), with its user. */
+export function execOptions({ uid = 0, gid = uid } = {}) {
+  return { ...startOptions('opts'), recompileObjects: defaultRecompile(), heartbeat: defaultHeartbeat(), link: defaultLink(), uid, gid };
+}
+const defaultRecompile = () => (typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number' ? globalThis.GEX_RECOMPILE_OBJECTS : 0);
+const defaultHeartbeat = () => globalThis.GEX_HEARTBEAT ?? 0;
+const defaultLink = () => Number(globalThis.GEX_LINK ?? 0);
+
+/** `start()` for the host's Mesa on `compositor` (a DOM desktop's window
+ *  canvases when `dom`, else the scene compositor's), once however often it
+ *  is called: resolves Mesa's description, or null if it would not start. */
+export function glStarter(compositor, glChannel, { dom, backend = 'wgpu', source = null }, term) {
+  const opts = dom ? { api: 'core', backend, source }
+    : { api: 'core', backend, canvasBlit: pageParams().get('glcanvas') === '1', source };
+  let started = null;
+  return () => (started ??= startHostGl(compositor, glChannel, opts, term));
+}
+
+/**
+ * The process host every guest process runs under (host.mjs): its Worker
+ * pool, the runtime's modules, and the switches each Worker takes (`extra`).
+ * `o` is what of `runProgram`'s options it needs, and the channels made for
+ * the page's devices; `on` its callbacks (ProcessHost's `onOutput`,
+ * `onExit`, `readStdin`, `onMessage`).
+ */
+export async function makeProcessHost({
+  kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
+  restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
+  closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
+  netChannel = null, network = null, winsize,
+}, on) {
+  const { shimBytes, seedBytes } = await loadRuntime();
+  const makeGuestWorker = await guestWorkerFactory();
+  return new ProcessHost({
+  makeWorker: makeGuestWorker,
+  // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
+  // Worker of its own, off this thread.
+  unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
+    ? lateFirst(lateUnits, unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD))) : null,
+  shim: shimBytes,
+  // The closure's image module in place of the seed: it holds the program's
+  // own text, already lifted.
+  guest: closure?.image ?? seedBytes,
+  kernel,
+  // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
+  // needs it (host.mjs `#other`: 64-bit Wine's wineserver, a wasm32 module).
+  // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
+  // program an exec asks one for (its GEX_MEM64=1, or its
+  // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
+  // only then, so a page that never asks loads nothing more.
+  other: m64Infix() ? async () => ({
+    shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
+    guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
+    // the one kernel module serves both flavours (gex-kmem)
+    kernel: kernel.module,
+  }) : kernel && guestArch() === 'x86' ? async () => ({
+    shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
+    guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
+    kernel: kernel.module,
+  }) : null,
+  extra: {
+    // The switches every page takes (shims/browser/js/options.mjs).
+    ...startOptions('extra'),
+    // In `extra` so every Worker gets it, not only pid 1: the interesting
+    // process is the X server and the client it forks, not the demo's shell.
+    heartbeat: heartbeat || undefined,
+    fill: fill || undefined,
+    lazyCache: lazyCache || undefined,
+    pageFs: pageFs || undefined,
+    restBundle: restBundle || undefined,
+    identities: identities || undefined,
+    // The closure's libraries, in `extra` so a forked child gets them too: a
+    // child adopts its parent's dispatch directory but its own tables start
+    // empty, so it must instantiate the modules itself for the directory to
+    // point at.
+    closure: closure?.libs,
+    // `?trace=1` turns on the shim's narration in every process.
+    trace: flag('trace') ? 1 : undefined,
+    // `?hot=1` asks every process to dump its hottest back edges when it ends.
+    hot: flag('hot') ? 1 : undefined,
+    // `?wholepage=1` fills an image page entirely on the first ask instead
+    // of the 32-slot span around the miss. An experiment for #136: it says
+    // whether the closure has the blocks an exec'd process lifts anyway.
+    wholePage: flag('wholepage') ? 1 : undefined,
+    // `?vforktrace=1`: each posix_spawn child run in its parent's Worker
+    // (shims/browser/src/vfork.rs), on the console.
+    vforkTrace: flag('vforktrace') ? 1 : undefined,
+    trapPc: flag('trappc') ? Number.parseInt(flag('trappc'), 16) : undefined,
+    // Every process gets a memory two Workers can hold, so a `clone` asking
+    // for a thread can be given one. `worker.mjs` passes this to the `Gex`
+    // constructor as `shared`. A guest's threads are Workers -- the only
+    // shape the shim has now.
+    shared: true,
+    // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
+    // reach the page's GlDevice.
+    glChannel: glChannel ?? undefined,
+    // The Wayland ring's shared buffers, so a Worker that binds the
+    // compositor can carry its frames to the page's canvas. Like glChannel.
+    wlChannel: wlChannel ?? undefined,
+    // The page's network, served to every Worker over shared memory
+    // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
+    netChannel: netChannel ?? undefined,
+    // The single-thread build's fibers share this realm, and so the one
+    // Wisp connection itself.
+    wispNet: single.on ? network ?? undefined : undefined,
+    wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
+    pageHosts: netChannel || single.on ? undefined : network?.pageHosts,
+    winsize,
+    // Every guest write mirrored to the console and a crash narrated where it
+    // happens, since a Worker that falls over takes its last messages with it.
+    debugExit:
+      !!globalThis.GEX_DEBUG_EXIT ||
+      (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
+    // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
+    dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
+    // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
+    // a program image), read from the server's `/gex-cgen/` (a unit
+    // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
+    // `?cgenurl=` (an ejected project's build/web/cgen) instead.
+    // Otherwise the export providers the dist carries (gex/cgen/providers/),
+    // with no units; `?providers=0` runs glibc's
+    // own code translated instead.
+    // Absolute: a Worker started from a blob URL has no base to resolve a path against.
+    cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined }
+      : flag('providers') === '0' ? undefined
+      : { mode: 8, url: assetUrl('/gex/cgen') },
+    // `?aot=1`: an ejected project's run, with no run-time translation (a
+    // miss stops the run, saying where).
+    jit: globalThis.GEX_NO_JIT ? false : undefined,
+    aot: globalThis.GEX_AOT ? true : undefined,
+    // `?mem64=1`: every Worker of the process builds or joins a 64-bit memory.
+    mem64: globalThis.GEX_MEM64 ? 1 : undefined,
+    // `?fjit=1`: the function JIT in every process.
+    fjit: globalThis.GEX_FJIT || undefined,
+    // `?xcache=1`: the translation cache across page loads.
+    xcache: xcacheName(),
+    // `?unitcache=1`: compiled translation units shared by every process.
+    unitCache: globalThis.GEX_UNIT_CACHE || undefined,
+    // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
+    elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+    // Provider sources from outside gex (`name\ntext` entries, NUL
+    // between): an ejected project's, as GEX_PROVIDER_DIRS natively.
+    providerSources: providerSources || globalThis.GEX_PROVIDER_SOURCES || undefined,
+    // `dll=file,...`: stateful providers replacing Windows libraries, their
+    // modules under the unit cache (cgen.rs `set_stateful`).
+    stateful: stateful || globalThis.GEX_STATEFUL || undefined,
+    // `?dlchecked=1`: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
+    dlChecked: flag('dlchecked') ? 1 : undefined,
+    // `?jitdiag=1`: retire counts by page and call, and the watch on a page that keeps translating.
+    jitDiag: flag('jitdiag') ? 1 : undefined,
+    // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
+    shareTrace: flag('sharetrace') ? 1 : undefined,
+    // `?log=1` (or `?log=record,...`): gex's debug output, off by default
+    // (shims/browser/js/log.mjs); every Worker is handed it.
+    log: (globalThis.GEX_LOG ??= flag('log') || undefined) || undefined,
+    preModules: preModules ?? undefined,
+    // Lightweight adopt-phase narration (no write-flood); see adoptProcess.
+    adoptTrace:
+      !!globalThis.GEX_ADOPT_TRACE ||
+      (typeof process !== 'undefined' && !!process.env?.GEX_ADOPT_TRACE),
+    // Thread-Worker attach/adopt narration: pinpoints a stranded thread whose
+    // wasm instantiate never completes (threads-worker-per-thread residual).
+    attachTrace:
+      !!globalThis.GEX_ATTACH_TRACE ||
+      (typeof process !== 'undefined' && !!process.env?.GEX_ATTACH_TRACE),
+    // KiB of mapped text per object to statically recompile once hot. Eight
+    // megabytes is the largest that works today (above it the graphics rootfs
+    // meets #73) and covers every library these demos run except Mesa's
+    // software rasteriser, which nothing here wants.
+    recompileObjects,
+    // `?nointrinsics=1` translates glibc's own memcpy/memcmp/memset instead
+    // of substituting the shim's, to tell a substitution fault from a codegen
+    // one. In `extra` so every process gets it.
+    noIntrinsics: flag('nointrinsics') ? 1 : undefined,
+    // `?pregrow=1`: grow guest memory to a large floor up front. Tests whether
+    // a concurrent memory.grow is what stalls a spawned thread's wasm
+    // instantiate (native-wayland-gtk-thread-stall). In `extra` so every
+    // Worker sets it before running.
+    pregrow: flag('pregrow') ? 1 : undefined,
+    // `?checksp=1` checks `sp` at the top of every block, so a corrupt (e.g.
+    // sign-extended) stack pointer names the block that ARRIVES with the bad
+    // value rather than the later one that dereferences it and traps. In
+    // `extra` so every Worker enables it.
+    checkSp: flag('checksp') ? 1 : undefined,
+    // `?filltime=1` (debugging): every Worker says when a dense module a
+    // dispatch waited for took longer than any before it. In `extra` for
+    // every Worker.
+    fillTime: flag('filltime') ? 1 : undefined,
+    // `?claimpages=0`: publish closure dir entries at the build's slot numbers
+    // instead of per-process demand numbering — a diagnostic for the
+    // many-object-closure wrong-dispatch crash. In `extra` for every Worker.
+    claimPages:
+      flag('claimpages') != null
+        ? (flag('claimpages') === '0' ? 0 : 1)
+        : (closureBuildNumbered ? 0 : undefined),
+    // `?intrinsicmask=N` enables only some substitution families, to bisect
+    // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
+    // In `extra` so every process gets it.
+    intrinsicMask: flag('intrinsicmask') == null ? undefined : parseInt(flag('intrinsicmask'), 10) >>> 0,
+    // `?copyloop=1` emits memcpy as a forward byte loop, to tell a
+    // `memory.copy` fault from a bad-argument one. In `extra` for every process.
+    copyLoop: flag('copyloop') ? 1 : undefined,
+    // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
+    // where aligned, so V8 cannot move them across the guest's fences. In
+    // `extra` for every Worker.
+    coherentLoads: tso() ? 1 : undefined,
+    // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
+    // "produced no frame") to debug why a client's window is not shown.
+    wlTrace: flag('wltrace') ? 1 : undefined,
+    // In `extra` so every forked command gets it, not just the shell that
+    // starts the demo (which never sees `opts`).
+    link: link || undefined,
+    // Who the guest is, in `extra` so a forked child gets it.
+    uid,
+    gid: uid,
+  },
+    ...on,
+  });
+}
+
+/** The page's network served to every Worker (net-bridge.mjs), or null. A
+ *  WebSocket in the guest's own Worker delivers on that Worker's event loop,
+ *  which a wasm32 program waiting in a syscall never gives back. */
+export async function openNet(network) {
+  if (!network || !globalThis.crossOriginIsolated) return null;
+  const { makeNetChannel, serveNet } = await import('@gex/net-bridge.mjs');
+  const channel = makeNetChannel();
+  if (channel) serveNet(network, channel);
+  return channel;
+}
+
+/** The GL ring the guest's /dev/gex-gl talks over (gl-bridge.mjs); `d3d`:
+ *  /dev/gex-d3d too. */
+export async function openGlChannel(d3d = false) {
+  if (!globalThis.crossOriginIsolated) {
+    throw new Error('the guest GL needs a cross-origin isolated page (SharedArrayBuffer bridge).');
+  }
+  const { makeGlChannel } = await import('@gex/gl-bridge.mjs');
+  const channel = makeGlChannel();
+  channel.d3d = !!d3d;
+  return channel;
+}
+
+/** `start()` once the guest first opens its GL (gl-bridge.mjs STATE): a GL
+ *  program started from a shell, not from the embedder, would otherwise
+ *  make its first request into a ring nothing serves, wait thirty seconds
+ *  for the answer, and die. */
+export function glOnFirstRequest(glChannel, start) {
+  if (!glChannel?.control || typeof Atomics.waitAsync !== 'function') return;
+  const ctl = new Int32Array(glChannel.control);
+  let started = false;
+  (async () => {
+    while (!started) {
+      const st = Atomics.load(ctl, 0);
+      if (st === 1) {
+        console.warn('[gex] the guest opened its GL: starting Mesa');
+        started = true;
+        start(); // idempotent: the embedder may have started it already
+        break;
+      }
+      const w = Atomics.waitAsync(ctl, 0, st, 5000);
+      if (w.async) await w.value;
+    }
+  })();
+}
+
+/**
+ * The Wayland compositor. The protocol state machine runs in each guest
+ * process (the Rust shim, next to the client's memory, which is the only
+ * place that can read a wl_shm pool); the scene, the output and the input
+ * live in one worker that owns a WebGPU device. What crosses between them is
+ * a shared arena of surface descriptors -- never a frame. `wl` a canvas (the
+ * scene compositor) or an element (DomDesktop: windows as DOM elements,
+ * decorations in the page's own HTML). `{ wlChannel, compositor, dom }`.
+ */
+export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop = null, say = () => {} }) {
+  if (!globalThis.crossOriginIsolated) {
+    throw new Error('the Wayland compositor needs a cross-origin isolated page (SharedArrayBuffer bridge).');
+  }
+  const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
+  const wlChannel = makeWlChannel();
+  const element = typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
+  if (element) {
+    const { DomDesktop } = await import('./dom-compositor.js');
+    const compositor = DomDesktop.create(element, wlChannel, { width: element.clientWidth, height: element.clientHeight });
+    globalThis.__gexDesktop = compositor;
+    // The page lays the windows out (bare-desktop.js, say) before any appears.
+    onDesktop?.(compositor);
+    // A GL device that dies mid-session leaves black windows and no other
+    // sign; say it where the session's other trouble is reported.
+    compositor.onglfailed = (why) => {
+      say(`gex: the guest's OpenGL is gone: ${why}`);
+      say('gex: GL windows will be blank; everything else still runs');
+    };
+    return { wlChannel, compositor, dom: true };
+  }
+  if (typeof wl.getContext !== 'function') return { wlChannel, compositor: null, dom: false };
+  // A build without the scene compositor (gex-eject's `"compositor": false`)
+  // has no compositor.js: the page passes an element instead (above).
+  if (!GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
+  setOutputSize(wlChannel, wl.width, wl.height, Math.max(1, Math.round(wlScale)));
+  const { Compositor } = await import('./compositor.js');
+  const compositor = await Compositor.create(wl, wlChannel, wlInput || wl, { scale: wlScale });
+  globalThis.__gexCompositor = compositor;
+  return { wlChannel, compositor, dom: false };
+}
+
 async function runProgramHere(
   term,
   {
@@ -828,7 +1136,7 @@ async function runProgramHere(
     uid,
     // Every N safepoints, print the guest pc -- the only instrument for
     // locating what is slow in a page.
-    heartbeat = globalThis.GEX_HEARTBEAT ?? 0,
+    heartbeat = defaultHeartbeat(),
     // Lazy files the page fills in the background (app.js `fill`), handed to
     // every Worker (lazy-fetch.mjs `setFill`).
     fill = null,
@@ -873,9 +1181,7 @@ async function runProgramHere(
     // `apt-get update` dead at its 77th process. Bulk recompilation only ever
     // helped a run that is long *and* library-bound, and it is one query
     // parameter away for such a run: `?recompile=8192`.
-    recompileObjects = typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
-      ? globalThis.GEX_RECOMPILE_OBJECTS
-      : 0,
+    recompileObjects = defaultRecompile(),
     // A closure built ahead of time by `gexc build --closure`: the image
     // module, every library beside it, and the layout they were placed at.
     closure = null,
@@ -892,7 +1198,7 @@ async function runProgramHere(
     // Keep the address space the guest's dynamic linker produced, so the next
     // process of the same program starts at its own entry with every
     // relocation already applied.
-    link = Number(globalThis.GEX_LINK ?? 0),
+    link = defaultLink(),
     // Function-tier modules compiled ahead of the run (an ejected project's
     // page compiles its units while the bundle downloads), as [name, Module]
     // pairs every Worker takes instead of fetching and compiling its own.
@@ -955,39 +1261,14 @@ async function runProgramHere(
   let glChannel = null;
   let glServe = null;
   let startGl = null;
-  let glStarted = null;
-  // `glLazy`, and the guest asks first: a GL program started from a shell,
-  // not from the embedder's launcher, makes its first request into a ring
-  // nothing serves yet -- and waits thirty seconds for the answer, then
-  // dies. Its first request starts Mesa (gl-bridge.mjs STATE).
-  const startGlOnFirstRequest = () => {
-    if (!glChannel?.control || typeof Atomics.waitAsync !== 'function') return;
-    const ctl = new Int32Array(glChannel.control);
-    (async () => {
-      while (!glStarted) {
-        const st = Atomics.load(ctl, 0);
-        if (st === 1) {
-          console.warn('[gex] the guest opened its GL: starting Mesa');
-          startGl();
-          break;
-        }
-        const w = Atomics.waitAsync(ctl, 0, st, 5000);
-        if (w.async) await w.value;
-      }
-    })();
-  };
   if (gl && single.on) {
     // The single-thread build: no ring. Each process's `gl_submit` calls the
     // compositor's Mesa in this realm on its own memory (compositor-worker.js
     // `glInRealm`), started by the system Worker.
     glChannel = { inRealm: true, d3d: !!d3d };
   } else if (gl) {
-    if (!globalThis.crossOriginIsolated) {
-      throw new Error('the GL demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
-    }
-    const { makeGlChannel, serveGl } = await import('@gex/gl-bridge.mjs');
-    glChannel = makeGlChannel();
-    glChannel.d3d = !!d3d;
+    glChannel = await openGlChannel(d3d);
+    const { serveGl } = await import('@gex/gl-bridge.mjs');
     // `gl: 'compositor'` means the device is not here at all: the compositor's
     // worker hosts it, so its frames are textures in the context that draws
     // the scene. Nothing on this side serves the ring in that case -- see
@@ -1004,12 +1285,7 @@ async function runProgramHere(
   // shared memory. A WebSocket in the guest's own Worker delivers on that
   // Worker's event loop, which a wasm32 program waiting in a syscall never
   // gives back.
-  let netChannel = null;
-  if (network && globalThis.crossOriginIsolated) {
-    const { makeNetChannel, serveNet } = await import('@gex/net-bridge.mjs');
-    netChannel = makeNetChannel();
-    if (netChannel) serveNet(network, netChannel);
-  }
+  const netChannel = await openNet(network);
 
   // The Wayland compositor. The protocol state machine runs in each guest
   // process (the Rust shim, next to the client's memory, which is the only
@@ -1023,58 +1299,16 @@ async function runProgramHere(
     // system Worker before this run (system-worker.js).
     ({ channel: wlChannel, compositor } = wl.inRealm);
   } else if (wl) {
-    if (!globalThis.crossOriginIsolated) {
-      throw new Error('the Wayland demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
-    }
-    const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
-    wlChannel = makeWlChannel();
-    // An element that is not a canvas asks for the other compositor: windows
-    // as DOM elements, decorations in the page's own HTML. Same arena, same
-    // input ring, same protocol -- only the drawing is different.
-    const element = wl && typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
-    if (element) {
-      const { DomDesktop } = await import('./dom-compositor.js');
-      compositor = DomDesktop.create(element, wlChannel, { width: element.clientWidth, height: element.clientHeight });
-      globalThis.__gexDesktop = compositor;
-      // The page lays the windows out (bare-desktop.js, say) before any appears.
-      onDesktop?.(compositor);
-      // A GL device that dies mid-session leaves black windows and no other
-      // sign; say it where the session's other trouble is reported.
-      compositor.onglfailed = (why) => {
-        term.writeln(`gex: the guest's OpenGL is gone: ${why}`);
-        term.writeln('gex: GL windows will be blank; everything else still runs');
-      };
-      // The GL goes onto the window's own canvas here rather than into a
-      // scene: see `DomDesktop.hostGl`.
-      if (gl === 'compositor' && glChannel) {
-        const opts = { api: 'core', backend: glBackend, source: glSource };
-        startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
-        if (!glLazy) await startGl();
-        else startGlOnFirstRequest();
-      }
-    }
-    const canvas = typeof wl?.getContext === 'function' ? wl : null;
-    // A build without the scene compositor (gex-eject's `"compositor": false`)
-    // has no compositor.js: the page passes an element instead (above).
-    if (canvas && !GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
-    if (canvas && GEX_COMPOSITOR) {
-      setOutputSize(wlChannel, canvas.width, canvas.height, Math.max(1, Math.round(wlScale)));
-      const { Compositor } = await import('./compositor.js');
-      compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas, { scale: wlScale });
-      globalThis.__gexCompositor = compositor;
-      if (gl === 'compositor' && glChannel) {
-        const opts = {
-          api: 'core',
-          backend: glBackend,
-          canvasBlit: pageParams().get('glcanvas') === '1',
-          source: glSource,
-        };
-        // `glLazy`: Mesa (about 20 MB before compression) is fetched when
-        // the embedder first asks (`onSystem`'s `startGl`), not at boot.
-        startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
-        if (!glLazy) await startGl();
-        else startGlOnFirstRequest();
-      }
+    let dom;
+    ({ wlChannel, compositor, dom } = await openWayland({ wl, wlInput, wlScale, onDesktop, say: (t) => term.writeln(t) }));
+    if (gl === 'compositor' && glChannel && compositor) {
+      // The GL goes onto a DOM window's own canvas (`DomDesktop.hostGl`), or
+      // into the scene compositor's. `glLazy`: Mesa (about 20 MB before
+      // compression) is fetched when the embedder first asks (`onSystem`'s
+      // `startGl`) or the guest does, not at boot.
+      startGl = glStarter(compositor, glChannel, { dom, backend: glBackend, source: glSource }, term);
+      if (!glLazy) await startGl();
+      else glOnFirstRequest(glChannel, startGl);
     }
   }
 
@@ -1087,193 +1321,15 @@ async function runProgramHere(
     xServer = await startXServer({ kernel, wlChannel, compositor: () => compositor, term, rootful: hostX === 'rootful' });
   }
 
-  const host = new ProcessHost({
-    makeWorker: makeGuestWorker,
-    // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
-    // Worker of its own, off this thread.
-    unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
-      ? lateFirst(lateUnits, unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD))) : null,
-    shim: shimBytes,
-    // The closure's image module in place of the seed: it holds the program's
-    // own text, already lifted.
-    guest: closure?.image ?? seedBytes,
-    kernel,
-    // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
-    // needs it (host.mjs `#other`: 64-bit Wine's wineserver, a wasm32 module).
-    // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
-    // program an exec asks one for (its GEX_MEM64=1, or its
-    // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
-    // only then, so a page that never asks loads nothing more.
-    other: m64Infix() ? async () => ({
-      shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
-      guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
-      // the one kernel module serves both flavours (gex-kmem)
-      kernel: kernel.module,
-    }) : kernel && guestArch() === 'x86' ? async () => ({
-      shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
-      guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
-      kernel: kernel.module,
-    }) : null,
-    extra: {
-      // The switches every page takes (shims/browser/js/options.mjs).
-      ...startOptions('extra'),
-      // In `extra` so every Worker gets it, not only pid 1: the interesting
-      // process is the X server and the client it forks, not the demo's shell.
-      heartbeat: heartbeat || undefined,
-      fill: fill || undefined,
-      lazyCache: lazyCache || undefined,
-      pageFs: pageFs || undefined,
-      restBundle: restBundle || undefined,
-      identities: identities || undefined,
-      // The closure's libraries, in `extra` so a forked child gets them too: a
-      // child adopts its parent's dispatch directory but its own tables start
-      // empty, so it must instantiate the modules itself for the directory to
-      // point at.
-      closure: closure?.libs,
-      // `?trace=1` turns on the shim's narration in every process.
-      trace: flag('trace') ? 1 : undefined,
-      // `?hot=1` asks every process to dump its hottest back edges when it ends.
-      hot: flag('hot') ? 1 : undefined,
-      // `?wholepage=1` fills an image page entirely on the first ask instead
-      // of the 32-slot span around the miss. An experiment for #136: it says
-      // whether the closure has the blocks an exec'd process lifts anyway.
-      wholePage: flag('wholepage') ? 1 : undefined,
-      // `?vforktrace=1`: each posix_spawn child run in its parent's Worker
-      // (shims/browser/src/vfork.rs), on the console.
-      vforkTrace: flag('vforktrace') ? 1 : undefined,
-      trapPc: flag('trappc') ? Number.parseInt(flag('trappc'), 16) : undefined,
-      // Every process gets a memory two Workers can hold, so a `clone` asking
-      // for a thread can be given one. `worker.mjs` passes this to the `Gex`
-      // constructor as `shared`. A guest's threads are Workers -- the only
-      // shape the shim has now.
-      shared: true,
-      // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
-      // reach the page's GlDevice.
-      glChannel: glChannel ?? undefined,
-      // The Wayland ring's shared buffers, so a Worker that binds the
-      // compositor can carry its frames to the page's canvas. Like glChannel.
-      wlChannel: wlChannel ?? undefined,
-      // The page's network, served to every Worker over shared memory
-      // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
-      netChannel: netChannel ?? undefined,
-      // The single-thread build's fibers share this realm, and so the one
-      // Wisp connection itself.
-      wispNet: single.on ? network ?? undefined : undefined,
-      wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
-      pageHosts: netChannel || single.on ? undefined : network?.pageHosts,
-      // Only when there is no shared terminal to hold the size. With one this
-      // must not be sent: it is captured at `runProgram` time and every Worker
-      // writes it on startup, so a process forked after a resize would reset the
-      // terminal to its boot size.
-      winsize: sharedTty ? undefined : { rows: term.rows, cols: term.cols },
-      // Every guest write mirrored to the console and a crash narrated where it
-      // happens, since a Worker that falls over takes its last messages with it.
-      debugExit:
-        !!globalThis.GEX_DEBUG_EXIT ||
-        (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
-      // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
-      dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
-      // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
-      // a program image), read from the server's `/gex-cgen/` (a unit
-      // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
-      // `?cgenurl=` (an ejected project's build/web/cgen) instead.
-      // Otherwise the export providers the dist carries (gex/cgen/providers/),
-      // with no units; `?providers=0` runs glibc's
-      // own code translated instead.
-      // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-      cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined }
-        : flag('providers') === '0' ? undefined
-        : { mode: 8, url: assetUrl('/gex/cgen') },
-      // `?aot=1`: an ejected project's run, with no run-time translation (a
-      // miss stops the run, saying where).
-      jit: globalThis.GEX_NO_JIT ? false : undefined,
-      aot: globalThis.GEX_AOT ? true : undefined,
-      // `?mem64=1`: every Worker of the process builds or joins a 64-bit memory.
-      mem64: globalThis.GEX_MEM64 ? 1 : undefined,
-      // `?fjit=1`: the function JIT in every process.
-      fjit: globalThis.GEX_FJIT || undefined,
-      // `?xcache=1`: the translation cache across page loads.
-      xcache: xcacheName(),
-      // `?unitcache=1`: compiled translation units shared by every process.
-      unitCache: globalThis.GEX_UNIT_CACHE || undefined,
-      // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
-      elfUnits: globalThis.GEX_ELF_UNITS || undefined,
-      // Provider sources from outside gex (`name\ntext` entries, NUL
-      // between): an ejected project's, as GEX_PROVIDER_DIRS natively.
-      providerSources: providerSources || globalThis.GEX_PROVIDER_SOURCES || undefined,
-      // `dll=file,...`: stateful providers replacing Windows libraries, their
-      // modules under the unit cache (cgen.rs `set_stateful`).
-      stateful: stateful || globalThis.GEX_STATEFUL || undefined,
-      // `?dlchecked=1`: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
-      dlChecked: flag('dlchecked') ? 1 : undefined,
-      // `?jitdiag=1`: retire counts by page and call, and the watch on a page that keeps translating.
-      jitDiag: flag('jitdiag') ? 1 : undefined,
-      // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
-      shareTrace: flag('sharetrace') ? 1 : undefined,
-      // `?log=1` (or `?log=record,...`): gex's debug output, off by default
-      // (shims/browser/js/log.mjs); every Worker is handed it.
-      log: (globalThis.GEX_LOG ??= flag('log') || undefined) || undefined,
-      preModules: preModules ?? undefined,
-      // Lightweight adopt-phase narration (no write-flood); see adoptProcess.
-      adoptTrace:
-        !!globalThis.GEX_ADOPT_TRACE ||
-        (typeof process !== 'undefined' && !!process.env?.GEX_ADOPT_TRACE),
-      // Thread-Worker attach/adopt narration: pinpoints a stranded thread whose
-      // wasm instantiate never completes (threads-worker-per-thread residual).
-      attachTrace:
-        !!globalThis.GEX_ATTACH_TRACE ||
-        (typeof process !== 'undefined' && !!process.env?.GEX_ATTACH_TRACE),
-      // KiB of mapped text per object to statically recompile once hot. Eight
-      // megabytes is the largest that works today (above it the graphics rootfs
-      // meets #73) and covers every library these demos run except Mesa's
-      // software rasteriser, which nothing here wants.
-      recompileObjects,
-      // `?nointrinsics=1` translates glibc's own memcpy/memcmp/memset instead
-      // of substituting the shim's, to tell a substitution fault from a codegen
-      // one. In `extra` so every process gets it.
-      noIntrinsics: flag('nointrinsics') ? 1 : undefined,
-      // `?pregrow=1`: grow guest memory to a large floor up front. Tests whether
-      // a concurrent memory.grow is what stalls a spawned thread's wasm
-      // instantiate (native-wayland-gtk-thread-stall). In `extra` so every
-      // Worker sets it before running.
-      pregrow: flag('pregrow') ? 1 : undefined,
-      // `?checksp=1` checks `sp` at the top of every block, so a corrupt (e.g.
-      // sign-extended) stack pointer names the block that ARRIVES with the bad
-      // value rather than the later one that dereferences it and traps. In
-      // `extra` so every Worker enables it.
-      checkSp: flag('checksp') ? 1 : undefined,
-      // `?filltime=1` (debugging): every Worker says when a dense module a
-      // dispatch waited for took longer than any before it. In `extra` for
-      // every Worker.
-      fillTime: flag('filltime') ? 1 : undefined,
-      // `?claimpages=0`: publish closure dir entries at the build's slot numbers
-      // instead of per-process demand numbering — a diagnostic for the
-      // many-object-closure wrong-dispatch crash. In `extra` for every Worker.
-      claimPages:
-        flag('claimpages') != null
-          ? (flag('claimpages') === '0' ? 0 : 1)
-          : (closureBuildNumbered ? 0 : undefined),
-      // `?intrinsicmask=N` enables only some substitution families, to bisect
-      // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
-      // In `extra` so every process gets it.
-      intrinsicMask: flag('intrinsicmask') == null ? undefined : parseInt(flag('intrinsicmask'), 10) >>> 0,
-      // `?copyloop=1` emits memcpy as a forward byte loop, to tell a
-      // `memory.copy` fault from a bad-argument one. In `extra` for every process.
-      copyLoop: flag('copyloop') ? 1 : undefined,
-      // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
-      // where aligned, so V8 cannot move them across the guest's fences. In
-      // `extra` for every Worker.
-      coherentLoads: tso() ? 1 : undefined,
-      // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
-      // "produced no frame") to debug why a client's window is not shown.
-      wlTrace: flag('wltrace') ? 1 : undefined,
-      // In `extra` so every forked command gets it, not just the shell that
-      // starts the demo (which never sees `opts`).
-      link: link || undefined,
-      // Who the guest is, in `extra` so a forked child gets it.
-      uid,
-      gid: uid,
-    },
+  const host = await makeProcessHost({
+    kernel, closure, lateUnits, heartbeat, fill, lazyCache, pageFs, restBundle, identities, providerSources,
+    stateful, recompileObjects, closureBuildNumbered, link, uid, preModules, glChannel, wlChannel, netChannel, network,
+    // Only when there is no shared terminal to hold the size. With one this
+    // must not be sent: it is captured at `runProgram` time and every Worker
+    // writes it on startup, so a process forked after a resize would reset the
+    // terminal to its boot size.
+    winsize: sharedTty ? undefined : { rows: term.rows, cols: term.cols },
+  }, {
     onOutput: (fd, text, pid, m) => {
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
       term.write(text);

@@ -3,8 +3,9 @@
 // persistence, sound, GL -- is a class of its own that takes the system as
 // its first argument (web/runtime/README.md).
 //
-// Built on the page runtime (web/src/runtime.js `runProgram`), with no
-// program of its own for pid 1 unless `boot` is given one. Each program
+// Built from the page runtime's pieces (web/src/runtime.js: the kernel, the
+// processes' host, the devices), with no program of its own for pid 1
+// unless `boot` is given one. Each program
 // `spawn` asks for starts in a Worker of its own from an exec record
 // (host.mjs `spawnExec`). The page reaches the kernel through its exports
 // (kernel.js, over a kernel-call Worker): the programs' terminals and pipes
@@ -135,8 +136,10 @@ export class System extends EventTarget {
   #files = null;
   #programs = null;
   #changes = null;
-  #sys = null; // runProgram's onSystem: { host, kernel, tty, compositor, startGl }
-  #run = null;
+  /** The running system: { host, kernel, term, rt, compositor, wlChannel,
+   *  spawnExec, onStop, stop }. */
+  #sys = null;
+  #devices = [];
   #procs = new Map(); // handle -> Process
   #byPid = new Map(); // pid -> Process
   #early = new Map(); // pid -> exit status heard before the pid was known
@@ -177,10 +180,17 @@ export class System extends EventTarget {
         else (this.#parts.get(kind) ?? this.#parts.set(kind, []).get(kind)).push(part);
       },
       part: (kind) => this.#parts.get(kind) ?? null,
-      /** `fn(opts)` adds to runProgram's options before boot (awaited). */
+      /** `fn(opts)` adds to the boot's options (the filesystem's layers)
+       *  before the kernel is chosen (awaited). */
       beforeBoot: (fn) => this.#beforeBoot.push(fn),
-      /** `fn(sys)` once the system runs, with runProgram's `onSystem` view;
-       *  at once if it already does. */
+      /** `fn(dev)` makes the part's device once the kernel is loaded and
+       *  before any process (awaited): `dev` holds the runtime (`rt`,
+       *  web/src/runtime.js), `kernel`, `term`, `say`, and what earlier
+       *  parts made (`wlChannel`, `compositor`, `dom`, `glChannel`). Stage
+       *  0 the windows, 1 what uses them (GL), whichever part was made first. */
+      devices: (fn, stage = 0) => this.#devices.push({ fn, stage }),
+      /** `fn(sys)` once the system runs (`#sys`); at once if it already
+       *  does. */
       afterBoot: (fn) => {
         if (this.#state.phase === 'running') return fn(this.#sys);
         this.#afterBoot.push(fn);
@@ -252,26 +262,10 @@ export class System extends EventTarget {
     for (const [k, v] of Object.entries(switches)) if (v !== undefined && v !== false && k !== 'console') q.set(k, v === true ? '1' : String(v));
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
-    const { assetUrl } = await import('../../src/page-env.js');
+    await import('../../src/page-env.js');
 
-    const opts = {
-      // No program: pid 1 is the kernel's.
-      elf: null,
-      // The filesystem's (fs.js).
-      layers: [],
-      records: [],
-      env: [],
-      uid: 0,
-      // Every Worker reaches the network through the page; which network
-      // is the page's to set, any time (net.js).
-      network: this.#net,
-      // Every Worker gets the page-fs channel's control buffer: a mount
-      // made after boot reaches the programs already running, and each
-      // reaches /dev/gex-host.
-      pageFs: this.#pageFs.control,
-      // `/dev/dsp` plays once the page makes a WebAudio (audio.js).
-      playAudio: false,
-    };
+    // The filesystem's layers and persistence's records (fs.js).
+    const opts = { layers: [], records: [] };
     for (const fn of this.#beforeBoot) await fn(opts);
 
     // The translated architecture, beside which wasm32 programs run: the global kernel is built for one (its syscall ABI,
@@ -282,47 +276,68 @@ export class System extends EventTarget {
     const arch = wantArch ?? (await layersArch(opts.layers)) ?? 'aarch64';
     const { setGlobals } = await import('../../src/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
-    const { runProgram, primeRuntime, runtimeUrls } = await import('../../src/runtime.js');
+    const rt = await import('../../src/runtime.js');
     // Under Node (the runtime's tests) there is no fetch of a file URL.
     if (globalThis.process?.versions?.node && !globalThis.document) {
-      const u = runtimeUrls();
+      const u = rt.runtimeUrls();
       const get = (x) => bytesOf(new URL(x, globalThis.GEX_ASSET_BASE).href);
-      primeRuntime({ shimBytes: await get(u.shimBytes), seedBytes: await get(u.seedBytes), kernelBytes: await get(u.kernelBytes), fetchOther: get });
+      rt.primeRuntime({ shimBytes: await get(u.shimBytes), seedBytes: await get(u.seedBytes), kernelBytes: await get(u.kernelBytes), fetchOther: get });
     }
     this.#arch = arch;
+    globalThis.__gexTso = await rt.detectTso();
+    const kernel = await rt.loadKernel();
+    if (!kernel) throw new Error('the kernel would not load');
 
-    const term = {
-      rows: 24,
-      cols: 80,
-      write: (d) => this.#say(typeof d === 'string' ? d : new TextDecoder().decode(d)),
-      writeln: (s) => this.#say(`${s}\n`),
-      onData: () => ({ dispose() {} }),
-      onResize: () => ({ dispose() {} }),
-      focus() {},
-    };
-    let up;
-    const started = new Promise((resolve, reject) => { up = { resolve, reject }; });
-    opts.onSystem = (s) => {
-      this.#sys = s;
-      const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-      const { layers, records } = opts;
-      opts.layers = opts.records = null;
-      this.#start(s, layers, records, fsi).then(up.resolve, up.reject);
-    };
-    this.#run = runProgram(term, opts);
-    this.#run.then(() => {
-      if (this.#state.phase === 'running' || this.#state.phase === 'booting') {
-        this.#state.phase = 'stopped';
-        up.reject(new Error(`the system stopped before it was up: ${this.#state.console.slice(-400)}`));
-        this.dispatchEvent(new Event('stopped'));
-      }
-    }, (e) => {
-      this.#state.phase = 'failed';
-      this.#state.error = String(e?.stack ?? e);
-      up.reject(e);
-      this.dispatchEvent(new Event('stopped'));
+    // What the runtime says (the X server, Mesa), on the console.
+    const term = { write: (d) => this.#say(String(d)), writeln: (t) => this.#say(`${t}\n`) };
+    // The page's devices, each made by the part that owns it (windows: the
+    // compositor and its channel; MesaGl: the GL ring), before the processes'
+    // host, which hands their channels to every Worker.
+    const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null };
+    for (const { fn } of this.#devices.sort((a, b) => a.stage - b.stage)) await fn(dev);
+    const { compositor } = dev;
+    const netChannel = await rt.openNet(this.#net);
+    const stops = [];
+    const host = await rt.makeProcessHost({
+      // Every Worker gets the page-fs channel's control buffer: a mount made
+      // after boot reaches the programs already running, and each reaches
+      // /dev/gex-host. Every Worker reaches the network through the page;
+      // which network is the page's to set, any time (net.js).
+      kernel, pageFs: this.#pageFs.control, uid: 0, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
+    }, {
+      onOutput: (fd, text) => this.#say(text),
+      // The compositor lets go of an exited process's memory.
+      onExit: (m, pid) => {
+        if (typeof pid === 'number') compositor?.dropMemory?.(pid);
+      },
+      // No program reads the page's console: each has its own pipes or pty.
+      readStdin: () => new Promise(() => {}),
+      onMessage: (m) => {
+        if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
+        else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
+      },
     });
-    await started;
+    this.#sys = {
+      host, kernel, term, rt, compositor, wlChannel: dev.wlChannel,
+      // Pid 1 is the kernel's: each process starts here, a child of it, from
+      // its exec record (host.mjs `spawnExec`).
+      spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: rt.execOptions({ uid, gid }) }),
+      /** `fn()` when the system stops. */
+      onStop: (fn) => stops.push(fn),
+      stop: () => {
+        for (const fn of stops.splice(0)) try { fn(); } catch {}
+        host.stop();
+      },
+    };
+    const fsi = this.#parts.get('filesystem')?.[INTERNAL];
+    const { layers, records } = opts;
+    opts.layers = opts.records = null;
+    try {
+      await this.#start(this.#sys, layers, records, fsi);
+    } catch (e) {
+      this.#sys.stop();
+      throw e;
+    }
     this.#state.phase = 'running';
     if (this.#init) {
       // Pid 1, before anything else runs. When it ends, so does the system,
@@ -593,8 +608,7 @@ export class System extends EventTarget {
     this.#procs.clear();
     this.#byPid.clear();
     for (const parts of this.#parts.values()) for (const part of [parts].flat()) await part?.[INTERNAL]?.shutdown?.();
-    this.#sys?.halt?.();
-    try { await this.#run; } catch {}
+    this.#sys?.stop();
     this.#kernel?.terminate();
     this.dispatchEvent(new Event('stopped'));
   }

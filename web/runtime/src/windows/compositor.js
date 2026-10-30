@@ -20,11 +20,11 @@ export class CompositorWindows extends EventTarget {
     if (typeof canvas?.getContext !== 'function') throw new TypeError('CompositorWindows: a canvas');
     const i = internals(sys, 'CompositorWindows');
     i.attach('windows', this, { beforeBoot: true });
-    i.beforeBoot((opts) => {
-      opts.wl = canvas;
-      opts.wlScale = Math.max(1, Math.round(scale ?? globalThis.devicePixelRatio ?? 1));
+    i.devices(async (dev) => {
+      const wlScale = Math.max(1, Math.round(scale ?? globalThis.devicePixelRatio ?? 1));
+      Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, say: (t) => dev.say(`${t}\n`) }));
+      this.#c = dev.compositor;
     });
-    i.afterBoot((s) => { this.#c = s.compositor; });
     xOnDemand(i);
     this[INTERNAL] = {
       of: () => [],

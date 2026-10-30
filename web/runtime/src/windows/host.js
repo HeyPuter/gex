@@ -176,7 +176,7 @@ export class HostWindows extends EventTarget {
     this.#i = i;
     this.#size = this.#fit(width, height, scale);
     xOnDemand(i);
-    i.beforeBoot((opts) => {
+    i.devices(async (dev) => {
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts
       // them, and keys come from their canvases.
@@ -185,8 +185,7 @@ export class HostWindows extends EventTarget {
       m.dataset.gexDesktop = '';
       document.body.append(m);
       this.#mount = m;
-      opts.wl = m;
-      opts.onDesktop = (d) => this.#start(d);
+      Object.assign(dev, await dev.rt.openWayland({ wl: m, onDesktop: (d) => this.#start(d), say: (t) => dev.say(`${t}\n`) }));
     });
     const self = this;
     this[INTERNAL] = {
