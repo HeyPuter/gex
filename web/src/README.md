@@ -2,7 +2,9 @@
 
 An ejected program's web build is a library, `app.mjs`, beside its files.
 `app.js` here builds into it for a 32-bit Wine build, and
-`crates/gex-eject/src/app.mjs` is the one for a Linux program. The page
+`crates/gex-eject/src/app.mjs` is the one for a Linux program. The Wine
+build's `start()` is a preset over the runtime API (`../runtime/README.md`):
+`run-program.js` makes its System, filesystem, windows and GL. The page
 that imports it is yours:
 
 ```html

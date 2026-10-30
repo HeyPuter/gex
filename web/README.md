@@ -1,6 +1,9 @@
 # web
 
-The page that runs gex in a browser, and the builds of what it loads:
+gex in a browser: the runtime API (`runtime/`, the `@gex/runtime`
+package, `runtime/README.md`), gex's test page (`index.html`,
+`src/harness.js`), the library an ejected program ships, and the builds of
+what they load:
 
 - the browser shim, the shared kernel module and the seed, from
   `shims/browser` and `shims/kernel` (`build-assets.sh`);
@@ -44,4 +47,5 @@ much longer than later ones. Stripping needs `wasm-tools`
 site: the library, its runtime and Mesa, zstd-compressed assets, and the
 headers the host must send. The site's `index.html` belongs to the project, so the
 library can be imported into a page of your own.
-Its API, `start()`, is in `src/README.md`.
+Its API, `start()`, is in `src/README.md`. It is a preset over the runtime
+API (`src/run-program.js`).

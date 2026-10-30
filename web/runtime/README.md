@@ -183,7 +183,7 @@ processes and memory.
 
 | Member | Does |
 | --- | --- |
-| `new System({ baseUrl, units, xcache, debug })` | A system, not started; a page makes one. `units`: the URL of a directory of compiled function-tier units (a unit cache, as `gexc cgen-image` writes it); each image mapped at the base its unit was built for runs from it, the rest are translated as they run. `{ url, require: true }` makes a program image without one fail to start. `xcache: true` keeps the translated code across loads, in the origin's private file system (under Node, the directory GEX_XCACHE_DIR names): the next load of the same runtime with the same switches starts with it, and code whose file changed since is translated again. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. The runtime is quiet by default: the browser's console hears its errors and rare events, not a line per program started or library loaded; `debug: { log: '1' }` brings those back, `{ log: 'debug' }` adds the runtime's narration. |
+| `new System({ baseUrl, units, xcache, debug })` | A system, not started; a page makes one. `units`: the URL of a directory of compiled function-tier units (a unit cache, as `gexc cgen-image` writes it); each image mapped at the base its unit was built for runs from it, the rest are translated as they run. `{ url, require: true }` makes a program image without one fail to start. `xcache: true` keeps the translated code across loads, in the origin's private file system (on the Node test host, the directory GEX_XCACHE_DIR names): the next load of the same runtime with the same switches starts with it, and code whose file changed since is translated again. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. The runtime is quiet by default: the browser's console hears its errors and rare events, not a line per program started or library loaded; `debug: { log: '1' }` brings those back, `{ log: 'debug' }` adds the runtime's narration. |
 | `boot(argv, opts)` | Starts the kernel and lays the filesystem's sources into its root. Parts that work before boot (the filesystem) must be made before it. With arguments, `spawn`'s, the program that is pid 1 (see above); without, pid 1 is the kernel's. |
 | `spawn(argv, opts)` | Starts a program and returns its `Process` at once; throws when the system has an init. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). It reads both outputs as they come, so a program never waits on it. |
@@ -484,7 +484,9 @@ themselves.
 under `gex/` the shim, kernel and seed of each guest architecture the tree has
 built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
 GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`). The
-package is for pages; under Node, use the runtime from its sources.
+package is for browser pages only. Node runs the runtime from its sources
+as a test host (`test/run.mjs --host node`), not as a host the API
+supports.
 
 ## Tests
 

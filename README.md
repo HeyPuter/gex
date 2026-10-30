@@ -106,6 +106,7 @@ for debugging and for building what a page loads ahead of time.
 | `tools/wine-wasm` | Wine for gex: dist, prefix, runner |
 | `tools/eject` | recording a Windows program for eject |
 | `tools/` (the rest) | generators for the GL transport and compatibility tables, staging the host's Wine PE files, profile and unit helpers |
+| `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
 | `tests/` | the lifters' differential fuzzers, and page and eject tests that run under Node |
 | `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
 
@@ -141,8 +142,10 @@ $ node web/serve-dist.mjs 8088 --sp-port 8089
 The multi-process build gives each guest thread its own Worker on shared
 memory. It needs SharedArrayBuffer, so the page must be served with
 COOP/COEP headers. The single-thread build runs every thread as a fiber in
-one Worker, and works on any static host. See `web/README.md` for the
-builds and `web/src/README.md` for the page's JavaScript API.
+one Worker, and works on any static host. The dist's page is gex's test
+page. See `web/README.md` for the builds, `web/runtime/README.md` for the
+runtime API (`@gex/runtime`, for browser pages) and `web/src/README.md`
+for an ejected program's `start()`, a preset over that API.
 
 Wine needs the x86 `gexc` at `target/x86/release/gexc`, as built above
 (or `GEXC=` naming another):
@@ -154,7 +157,8 @@ $ tools/wine-wasm/run.sh app.exe    # run a Windows program
 
 ## Tests
 
-Each crate's own tests run with `cargo test -p <crate>`. `tests/diff-fuzz`
+The runtime's tests run with `node test/run.mjs` (`test/README.md`). Each
+crate's own tests run with `cargo test -p <crate>`. `tests/diff-fuzz`
 and `tests/diff-fuzz-x86` fuzz the lifters instruction by instruction against
 QEMU. The `check-*.mjs` scripts in `shims/browser/js` and the scripts in
 `tests/browser` and `tests/eject` run with `node`.
