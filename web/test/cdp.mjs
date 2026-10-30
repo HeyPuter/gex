@@ -1,7 +1,7 @@
 // A minimal Chrome DevTools Protocol client, zero dependencies (Node's global
-// `WebSocket`, v22+). Enough to drive the persistent browser `drive.mjs` keeps
-// warm: one connection, request/response correlation, event subscription, and
-// -- the reason this exists rather than a `--headless URL` spawn -- FLAT
+// `WebSocket`, v22+). Enough to drive a persistent browser: one connection,
+// request/response correlation, event subscription, and -- the reason this
+// exists rather than a `--headless URL` spawn -- FLAT
 // auto-attach, so a dedicated Worker's console and exceptions arrive on this
 // same socket tagged with a `sessionId`. gex runs every guest process in a
 // Worker, so a trap that matters happens THERE; without flat mode it is

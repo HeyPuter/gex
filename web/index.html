@@ -2,49 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>gex — AArch64 Linux in the browser</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>▚</text></svg>" />
+    <title>gex test page</title>
   </head>
   <body>
-    <div id="app">
-      <header class="site-header">
-        <h1>gex</h1>
-        <p>AArch64 Linux programs, recompiled to WebAssembly and run in your browser.</p>
-      </header>
-
-      <main>
-        <header class="demo-header">
-          <div>
-            <h2 id="demo-title">—</h2>
-            <p id="demo-blurb"></p>
-          </div>
-          <div class="actions" id="actions"></div>
-        </header>
-
-        <section class="stage">
-          <div id="terminal"></div>
-          <div id="overlay" class="overlay hidden">
-            <div class="overlay-card">
-              <p id="overlay-text">working</p>
-            </div>
-          </div>
-        </section>
-
-        <footer class="status-line">
-          <span id="status">ready</span>
-          <span class="hint" id="hint"></span>
-          <span>engine: <b id="stat-engine">—</b></span>
-          <span>translated: <b id="stat-blocks">—</b></span>
-          <span>network: <b id="stat-net">off</b></span>
-        </footer>
-      </main>
-
-      <nav aria-label="Demos">
-        <h2>Demos</h2>
-        <ol id="demos"></ol>
-      </nav>
-    </div>
-    <script type="module" src="/src/main.js"></script>
+    <!-- Boots the runtime once and answers commands over HTTP:
+         web/test/harness.mjs drives it (src/harness.js). -->
+    <script type="module">
+      import { start } from '/src/harness.js';
+      start();
+    </script>
   </body>
 </html>

@@ -44,7 +44,7 @@ const ECHO = 0x8;
 //
 // One set per guest architecture: the lifter is compiled into the shim, the
 // seed's `enter` stub and the kernel's syscall ABI are per-arch too. The
-// x86-64 set carries an `.x86` infix; `?arch=x86` (see main.js) selects it.
+// x86-64 set carries an `.x86` infix; `GEX_ARCH = 'x86'` selects it.
 export function guestArch() {
   return globalThis.GEX_ARCH === 'x86' ? 'x86' : 'aarch64';
 }
@@ -571,7 +571,7 @@ export function singleMode() {
 }
 
 /** What of the page's state the system Worker needs: its query and every
- *  `GEX_*` switch a demo or `main.js` set. */
+ *  `GEX_*` switch the page set. */
 function pageGlobals() {
   const out = { GEX_PAGE_SEARCH: pageSearch() };
   for (const k of Object.keys(globalThis)) {
@@ -655,7 +655,7 @@ async function runInSystemWorker(term, opts) {
       w.postMessage({
         kind: 'run',
         globals: pageGlobals(),
-        // Already fetched by the page (main.js loadRuntime): copied, not
+        // Already fetched by the page (loadRuntime): copied, not
         // fetched again by the Worker.
         runtime: shimBytes ? { shimBytes, seedBytes } : undefined,
         rows: term.rows,
