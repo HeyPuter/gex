@@ -142,8 +142,8 @@ translates little. `units` points a system at compiled function-tier units
 for a tree's hot images (`gexc cgen-image`), which start at full speed with
 no translation.
 
-**What a desktop can see.** `state` and its events (`running`, `console`,
-`stopped`) for a status area, and `describe()` for a task manager's
+**What a desktop can see.** `state` and the system's events (`running`,
+`console`, `stopped`) for a status area, and `describe()` for a task manager's
 processes and memory.
 
 ## The page
@@ -183,12 +183,13 @@ processes and memory.
 
 | Member | Does |
 | --- | --- |
-| `new System({ baseUrl, units, xcache, debug })` | A system, not started; a page makes one. `units`: the URL of a directory of compiled function-tier units (a unit cache, as `gexc cgen-image` writes it); each image mapped at the base its unit was built for runs from it, the rest are translated as they run. `{ url, require: true }` makes a program image without one fail to start. `xcache: true` keeps the translated code across loads, in the origin's private file system (under Node, the directory GEX_XCACHE_DIR names): the next load of the same runtime with the same switches starts with it, and code whose file changed since is translated again. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. |
+| `new System({ baseUrl, units, xcache, debug })` | A system, not started; a page makes one. `units`: the URL of a directory of compiled function-tier units (a unit cache, as `gexc cgen-image` writes it); each image mapped at the base its unit was built for runs from it, the rest are translated as they run. `{ url, require: true }` makes a program image without one fail to start. `xcache: true` keeps the translated code across loads, in the origin's private file system (under Node, the directory GEX_XCACHE_DIR names): the next load of the same runtime with the same switches starts with it, and code whose file changed since is translated again. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. The runtime is quiet by default: the browser's console hears its errors and rare events, not a line per program started or library loaded; `debug: { log: '1' }` brings those back, `{ log: 'debug' }` adds the runtime's narration. |
 | `boot(argv, opts)` | Starts the kernel and lays the filesystem's sources into its root. Parts that work before boot (the filesystem) must be made before it. With arguments, `spawn`'s, the program that is pid 1 (see above); without, pid 1 is the kernel's. |
 | `spawn(argv, opts)` | Starts a program and returns its `Process` at once; throws when the system has an init. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). It reads both outputs as they come, so a program never waits on it. |
 | `init` | The init's `Process`, or null without one. |
-| `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what the runtime says. |
+| `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. |
+| Events | On the system itself (`sys.addEventListener`): `running` when it boots, `stopped` when it ends, `console` (`text`) for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
 | `shutdown()` | Ends every program and the kernel. |
 
