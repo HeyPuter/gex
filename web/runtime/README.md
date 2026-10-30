@@ -22,6 +22,130 @@ sh.pty.addEventListener('data', (e) => term.write(e.data));
 term.onData((d) => sh.pty.write(d));
 ```
 
+## In a web desktop
+
+How a web desktop (AnuraOS, say) runs Linux and Windows programs through
+the runtime. Its windows go to the desktop's own window manager, and its root
+stays across loads. Each step is one of the parts below; the reference sections
+say the rest.
+
+**Serve it.** Serve the package's directory as it is, `gex/` included, from
+the desktop's own origin. Every page that makes a system must be served with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. Anything the page loads from
+another origin (an iframe, an image) then needs CORP or CORS. Keep one
+`System` for the desktop's life: a page has one.
+
+**Give it a tree.** A root is one or more tars laid at `/`. A large tree
+should be lazy: a list of files fetched from the desktop's origin when a program
+first reads them, so boot fetches only what boot reads. A tree with an
+aarch64 or x86-64 program gets that architecture beside wasm32 (see The
+page). A Debian tree of wasm32 packages with arm64 beside them (as
+debdemo builds one) runs apt as it comes, over the network below.
+
+```js
+import { System } from '@gex/runtime';
+import { Filesystem } from '@gex/runtime/fs';
+import { IdbPersist } from '@gex/runtime/persist/idb';
+import { Wisp } from '@gex/runtime/net/wisp';
+import { HostWindows } from '@gex/runtime/windows/host';
+
+const sys = new System({ xcache: true });              // translated code kept across loads
+const fs = new Filesystem(sys);
+fs.addTar('/gex-trees/debian.tar.zst', { lazy: '/gex-trees/debian-lazy.json' });
+new IdbPersist(fs, { db: 'debian' });                  // the root, kept
+new Wisp(sys);                                         // connections out (wss://anura.pro/)
+const hw = new HostWindows(sys, { width: innerWidth, height: innerHeight });
+await sys.boot();
+```
+
+**Keep the root.** The `IdbPersist` keeps what programs change (installed
+packages, a home directory) and lays it back over the same tars at the next
+load. The tars must be the same at every load, so give a new tree a new
+`db`. Saves are a second after changes settle, every 30 s, and when the tab
+is hidden: a desktop need not call `save()`, though it may before it unloads.
+`/tmp`, `/run` and mounts are never kept.
+
+**Terminals.** A terminal is a `spawn` with a `pty`; its `data` events go to the
+desktop's terminal widget and its keys come back with `pty.write`. Resize
+with `pty.resize(cols, rows)`. Nothing is inherited, so give every program its
+`env`.
+
+```js
+const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/root', TERM: 'xterm-256color', LANG: 'C.UTF-8', ...hw.env };
+const sh = sys.spawn(['bash', '-l'], { pty: { cols: 80, rows: 24 }, env, cwd: '/root' });
+sh.pty.addEventListener('data', (e) => term.write(e.data));
+term.onData((d) => sh.pty.write(d));
+sh.exited.then(() => closeTerminalWindow());
+```
+
+**Windows.** With `HostWindows`, each guest window, Wayland or X11, arrives
+as a `window` event carrying a `GuestWindow`. Its `canvas` goes into one of
+the desktop's frames:
+- `decorations: 'host'`: the desktop draws the title bar (`title`, and the
+  `title` event).
+- `'client'`: the window draws its own (a Win32 window under Wine). Place it
+  bare, where its `x` and `y` say when it is `placed`.
+- Popups and subsurfaces are never framed: put them at `x`, `y` over their
+  `parent`.
+
+Then wire it to the desktop's window manager:
+- **Moves:** after each move the frame makes, call `place(x, y)`.
+- **Resizes:** forward them with `resize(w, h)` or `setStates(...)`, and size
+  the frame on `resized`.
+- **Close:** the frame's close button calls `close()`. Drop the frame on
+  `closed`.
+- **Client-side frames:** `request` events (`move`, `resize`, `maximize`,
+  ...) are the window asking the desktop's manager to act.
+
+An X11 program needs nothing more: `DISPLAY` is in `hw.env`, and the
+runtime starts its X server for the first client. When the desktop's work
+area changes, call `hw.setOutputSize(width, height)`.
+
+**The desktop's files.** `fs.mount('/mnt/desktop', provider)` shows a
+directory of the desktop's own filesystem to every program, while it runs
+(Mounts says what a provider implements). A mount is the desktop's to keep:
+persistence leaves it out.
+
+**Calls out of the guest.** To let a program open a URL in the desktop's
+browser, or show a notification, register a host call. A guest script then
+uses it as `xdg-open` would.
+
+```js
+sys.hostCalls.register('open-url', ({ url }) => { openBrowserWindow(url); return true; });
+// guest: /usr/local/bin/xdg-open
+//   exec 3<>/dev/gex-host; printf 'open-url\0{"url":"%s"}' "$1" >&3; cat <&3 > /dev/null
+```
+
+**Sound, GL, input.**
+- Sound: make a `WebAudio` in the first click's handler. Browsers hold audio
+  until a gesture.
+- GL: a `MesaGl` made before boot gives programs OpenGL and Vulkan in their
+  windows. Mesa is fetched when the first program opens GL.
+- Input: `PointerLock`, `Clipboard` and `Gamepads` give programs a locked
+  pointer, the browser's clipboard and controllers.
+
+**Windows programs.** Wine is a tree too: its install (lazy: it is large)
+and a prefix, laid beside the Linux tree. A Windows program is then
+`wine 'C:\path\prog.exe'`, with `WINEPREFIX` naming the prefix. The
+first Wine program starts Wine's server and the services Wine runs; the
+next ones reuse them while they last. Its windows come as any other, framed by the program
+itself (`decorations: 'client'`) and `placed`. Persistence keeps the
+prefix's changes with the rest of the root. Each 64-bit Wine process takes a
+memory of about 2 GiB (most of it reserved, not touched), so a desktop
+running several Windows programs at once should expect the tab's address
+space to reach well past 8 GiB.
+
+**Start time.** `xcache: true` keeps translated code across loads in the
+origin's private file system, so a second start of the same programs
+translates little. `units` points a system at compiled function-tier units
+for a tree's hot images (`gexc cgen-image`), which start at full speed with
+no translation.
+
+**What a desktop can see.** `state` and its events (`running`, `console`,
+`stopped`) for a status area, and `describe()` for a task manager's
+processes and memory.
+
 ## The page
 
 - Programs run in Workers on a shared memory, so the page must be
@@ -357,9 +481,12 @@ themselves.
 
 `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, and
 under `gex/` the shim, kernel and seed of each guest architecture the tree has
-built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`).
+built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
+GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`). The
+package is for pages; under Node, use the runtime from its sources.
 
 ## Tests
 
-The runtime's tests are gex's test runner's `core`, `windows`, `gl` and
-`image` groups (test/README.md): `node test/run.mjs --group core,windows,gl,image`.
+The runtime's tests are gex's test runner's `core`, `windows`, `gl`,
+`image` and `wine` groups (test/README.md): `node test/run.mjs --group core,windows,gl,image,wine`.
+`--package DIR` runs the browser's against a built package.
