@@ -1319,6 +1319,13 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
 pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    bridges_mode(addrs, false)
+}
+
+/// [`bridges`] in the process's other mode (`alt`: a WoW64 process's i386
+/// Wine modules): the pages keyed with `gex_abi::ALT_PAGE`, in the other
+/// directory, which code in that mode dispatches through.
+pub(crate) fn bridges_mode(addrs: &[u64], alt: bool) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     crate::with_jit_only(|j| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         // Every page the entries are on, numbered here or before: the
@@ -1329,10 +1336,10 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // on a block whose next page had no entry).
         let mut pages: std::collections::BTreeMap<u64, u32> = Default::default();
         for &a in addrs {
-            let page = a / gex_abi::DISPATCH_PAGE;
-            if page >= gex_abi::dispatch_max_pages() {
+            if a / gex_abi::DISPATCH_PAGE >= gex_abi::dispatch_max_pages() {
                 continue;
             }
+            let page = gex_abi::page_key(a, alt);
             let base = match j.page_table.lookup(page) {
                 Some(b) => b,
                 None => crate::number_by_identity(j, page),
@@ -1364,7 +1371,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
                 regs.extend_from_slice(&[t, slot]);
             }
         }
-        j.translated.extend(addrs.iter().copied());
+        j.translated.extend(addrs.iter().map(|&a| gex_abi::addr_key(a, alt)));
         (regs, pages.into_iter().collect(), j.page_table.slots())
     })
 }
@@ -1774,7 +1781,8 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
                 // it for every other directory write.
                 crate::note_dir_high(base);
                 crate::dense::note_entry(base);
-                let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
+                // (a page key of the other mode's: its directory's word)
+                let _ = gm.write_u32(crate::dir_word(page), base);
             }
         }
     });
@@ -2209,7 +2217,9 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // The stack once the guest has returned: the caller's, past the return
     // address (and whatever a stdcall callee pops, allowed for below).
     let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
-    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::default_compat() { 4 } else { 8 };
+    // (in the mode the thread runs in: a WoW64 thread's 32-bit code, an i386
+    // Wine module's guest call into it)
+    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::default_compat() != crate::thread_alt() { 4 } else { 8 };
     let want = sp + delta;
     let span = callout_span(ret as u64, _need as u32);
     let cb = CB_DEPTH.with(|d| d.get());

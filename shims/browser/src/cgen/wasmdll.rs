@@ -63,6 +63,11 @@ struct WinePe {
     /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16 (as natively).
     ptr64: bool,
+    /// A module of the process's other mode (an ILP32 module in an x86-64
+    /// process: WoW64's i386 Wine): its addresses are bound in the other
+    /// directory (`ALT_INSTALLS`), and it binds only to modules of its own
+    /// mode, whose names are the 64-bit side's too (as natively).
+    alt: bool,
     /// The name its skeletons' `.wasmref` gives it.
     name: String,
     /// Its exports, and which of them are functions.
@@ -85,6 +90,8 @@ struct Late {
     slot: u32,
     name: String,
     provider: Option<u32>,
+    /// The importer's mode (`WinePe::ptr64`): only a module of that mode provides it.
+    ptr64: bool,
 }
 
 struct WinePes {
@@ -93,8 +100,8 @@ struct WinePes {
     late: Vec<Late>,
     /// A function's one address across the modules (`GOT.func`) when its
     /// defining module's element segment has no slot for it: the slot of
-    /// the first module that named it.
-    canon: std::collections::BTreeMap<String, u32>,
+    /// the first module that named it. By that module's mode and the name.
+    canon: std::collections::BTreeMap<(bool, String), u32>,
     /// The lowest of the PE32+ data window handed out so far.
     data_low: u64,
 }
@@ -104,6 +111,16 @@ static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Ve
 /// The core module's file name: the module a skeleton of a DLL linked as
 /// a module of its own finds beside itself.
 const CORE_MODULE: &str = "winepe.wasm";
+
+/// The installs of the process's other mode (`WinePe::alt`), whose bridges
+/// go into the other directory (`bind`).
+static ALT_INSTALLS: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether a Wine module of this pointer size is of the process's other
+/// mode: an ILP32 one (32-bit Wine's, PE32 skeletons) in an x86-64 process.
+fn module_alt(is64: bool) -> bool {
+    gex_abi::X86 && !is64 && !gex_xlate::default_compat()
+}
 
 /// Bridges for addresses bound into the install after it was published.
 struct Bind {
@@ -237,7 +254,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // imports to the core's exports, the core (winepe.wasm beside it)
     // installed first if no skeleton of its has been (a program's image
     // maps before ntdll's).
-    let find = |g: &WinePes, name: &str| g.mods.iter().position(|w| w.name == name);
+    let find = |g: &WinePes, name: &str| g.mods.iter().position(|w| w.ptr64 == pe.is64 && w.name == name);
     let core = match find(&g, CORE_MODULE) {
         Some(c) => Some(c),
         None if module_name == CORE_MODULE => None,
@@ -257,7 +274,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     };
     let fresh = g.mods.len() > before;
     // the core first, then the other modules of their own
-    let others: Vec<usize> = core.into_iter().chain(0..g.mods.len()).filter(|&c| c != idx).collect();
+    let others: Vec<usize> = core.into_iter().chain(0..g.mods.len()).filter(|&c| c != idx && g.mods[c].ptr64 == pe.is64).collect();
 
     // This DLL's bindings: its own module's adapters, and for a `-import`
     // re-export the owner's, in whichever install has it (the core's, or
@@ -460,6 +477,10 @@ fn install_module(
         }
     }
     let sh = shape(&wasm)?;
+    let alt = module_alt(is64);
+    if alt {
+        crate::with_px(|px| crate::ensure_alt_dir(px));
+    }
     // The modules it calls into or takes function addresses of, installed
     // first (no code of theirs runs until Wine loads their DLLs): its
     // imports then bind to their functions directly. Only a cycle's far
@@ -482,7 +503,7 @@ fn install_module(
         }
         busy.push(name.to_string());
         for f in deps {
-            if g.mods.iter().any(|w| w.name == f) || busy.contains(&f) {
+            if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) {
                 continue;
             }
             let Ok(m) = read_module(dir, &f) else { continue };
@@ -539,12 +560,12 @@ fn install_module(
     let mut lates: Vec<(u32, String, Option<u32>)> = Vec::new();
     let mut canon_new: Vec<(String, u32)> = Vec::new();
     {
-        let others = |n: &str| g.mods.iter().find(|w| w.funcs.contains(n));
+        let others = |n: &str| g.mods.iter().find(|w| w.ptr64 == is64 && w.funcs.contains(n));
         for (i, (m, n, func, global)) in sh.imports.iter().enumerate() {
             let b = if m == "GOT.func" && global.is_some() {
                 let own = if funcs.contains(n) { slots.get(n).copied() } else { None };
                 let theirs = others(n).and_then(|w| Some(w.base + *w.slots.get(n)?));
-                match (own, theirs, g.canon.get(n).copied()) {
+                match (own, theirs, g.canon.get(&(is64, n.clone())).copied()) {
                     (Some(k), _, _) => B::Own(k),
                     (None, Some(v), _) => B::Abs(v),
                     (None, None, Some(v)) => B::Abs(v),
@@ -596,6 +617,7 @@ fn install_module(
         installed: false,
         mapped: Default::default(),
         ptr64: is64,
+        alt,
         name: name.to_string(),
         exports,
         funcs,
@@ -604,6 +626,9 @@ fn install_module(
     });
     let idx = g.mods.len() - 1;
     let install = ftab(|m| m.publish(len, PROVIDER | number, Tier::Unit, &[]));
+    if alt {
+        lock(&ALT_INSTALLS).insert(install);
+    }
     let base = ftab(|m| m.install(install).base);
     let (regs, dirs, nslots) = bridges(&[]);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{}", g.mods[idx].file), regs, dirs, slots: nslots, memory_base: data });
@@ -628,13 +653,13 @@ fn install_module(
         };
     }
     for (n, off) in canon_new {
-        g.canon.insert(n, base + off);
+        g.canon.insert((is64, n), base + off);
     }
     let funcs_now = g.mods[idx].funcs.clone();
-    for l in g.late.iter_mut().filter(|l| l.provider.is_none() && funcs_now.contains(&l.name)) {
+    for l in g.late.iter_mut().filter(|l| l.provider.is_none() && l.ptr64 == is64 && funcs_now.contains(&l.name)) {
         l.provider = Some(number);
     }
-    g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider }));
+    g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider, ptr64: is64 }));
     let wp = &mut g.mods[idx];
     wp.install = install;
     wp.base = base;
@@ -882,7 +907,8 @@ pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
     ftab(|m| m.bind(install, pairs));
     let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
     clear(&addrs);
-    let (regs, dirs, slots) = bridges(&addrs);
+    let alt = lock(&ALT_INSTALLS).contains(&install);
+    let (regs, dirs, slots) = super::bridges_mode(&addrs, alt);
     binds_push(Bind { regs, dirs, slots });
 }
 
@@ -1224,7 +1250,8 @@ pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
     let Some(b) = mem.get(ptr as usize..(ptr as usize).saturating_add(len as usize)) else { return 0 };
     let name = String::from_utf8_lossy(b).into_owned();
     let g = lock(&WINE_PE);
-    g.mods.iter().find_map(|wp| Some(wp.base + *wp.slots.get(&name)?)).unwrap_or(0)
+    // (of the process's own mode: the caller is a Unix side's)
+    g.mods.iter().filter(|wp| !wp.alt).find_map(|wp| Some(wp.base + *wp.slots.get(&name)?)).unwrap_or(0)
 }
 
 /// `gex.code_changed(addr, len)` (32-bit Wine: Wine's NtFlushInstructionCache): the

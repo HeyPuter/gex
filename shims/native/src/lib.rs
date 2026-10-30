@@ -508,8 +508,9 @@ struct JitShared {
     /// Calls from one of Wine's modules of their own into another (`wasmdll::Late`).
     wine_pe_late: Vec<wasmdll::Late>,
     /// Each function address a module of Wine's takes (`GOT.func`): its
-    /// slot, (ftab module number, offset from that module's table base).
-    wine_pe_canon: std::collections::HashMap<String, (u32, u32)>,
+    /// slot, (ftab module number, offset from that module's table base), by
+    /// the taking module's mode (`WinePe::ptr64`) and the function's name.
+    wine_pe_canon: std::collections::HashMap<(bool, String), (u32, u32)>,
     /// The stateful modules' data addresses whose relocations this address
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
@@ -5361,6 +5362,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     };
     if alt {
         ensure_alt_dir(caller, &shared)?;
+        // An i386 Wine module's function bound there (WoW64's 32-bit
+        // builtins as native modules): its bridge, in the other directory.
+        if ftab::serve_alt(caller, pc)? {
+            return Ok(true);
+        }
     }
     remiss(caller, &shared, key)?;
     // Not serialised: misses on several threads translate concurrently, each
@@ -5397,7 +5403,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // `ud2` stub).
     let known = |a: u64| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        s.translated.contains(&gex_abi::addr_key(a, alt)) || (!alt && ftab::serves(&s, memory.bytes(), a))
+        s.translated.contains(&gex_abi::addr_key(a, alt)) || ftab::serves(&s, memory.bytes(), a, alt)
     };
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
@@ -5822,8 +5828,9 @@ fn install_unit(
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cx.as_context().data().callouts.is_empty() {
+        let alt_dir = unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0).then(|| other_dir(&cx));
         let slots: std::collections::HashSet<Slot> =
-            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a)).collect();
+            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a, alt_dir)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
     let instance = linker
@@ -5970,13 +5977,17 @@ impl Slot {
 
 /// The slot dispatch reaches `pc` through, as the directory says now: in
 /// the miss span when its page has no entry.
-fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<Slot> {
-    let page = pc / gex_abi::DISPATCH_PAGE;
-    if page >= gex_abi::dispatch_max_pages() {
-        return None;
-    }
-    let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).ok()?;
+/// `alt_dir`: in the process's other directory (code of the other mode: a
+/// WoW64 thread's 32-bit code), `None` for its own.
+fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64, alt_dir: Option<u64>) -> Option<Slot> {
+    let at = gex_abi::dir_entry_addr(gex_abi::page_key(pc, alt_dir.is_some()), alt_dir.unwrap_or(0))?;
+    let entry = GuestMem::new(memory.bytes()).read_u32(at).ok()?;
     Some(Slot { table: gex_abi::dispatch_entry_table(entry), index: gex_abi::dispatch_index(pc, entry) })
+}
+
+/// The process's other directory (`gex_abi::ALT_PAGE`; 0 while there is none).
+fn other_dir(cx: &impl wasmtime::AsContext<Data = HostState>) -> u64 {
+    cx.as_context().data().jit.as_ref().map_or(0, |j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir)
 }
 
 /// The per-store stub a watched slot holds (`call_out`), made once.
@@ -5996,6 +6007,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let at = if gex_abi::X86 || !gex_emit::tier1::inline_dispatch() { ctx::LAST_TARGET } else { ctx::PC };
         let target = gm.read_u64(c + at as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
+        let mode_dir = thread_alt(&caller).then(|| other_dir(&caller));
         let state = caller.data_mut();
         let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);
         let signal = match hit {
@@ -6003,7 +6015,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
             None => {
                 // Another address in the slot, or the same return for a
                 // deeper frame (recursion): what the slot held runs it.
-                let slot = dispatch_slot_of(&memory, target);
+                let slot = dispatch_slot_of(&memory, target, mode_dir);
                 let old = state.callouts.iter().rev().find_map(|co| match &co.slot {
                     Some((s, r)) if Some(*s) == slot => r.as_func().flatten().cloned(),
                     _ => None,
@@ -6060,9 +6072,10 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
     let sizes: Vec<u64> = tables.iter().map(|t| t.size(cx.as_context_mut())).collect();
     let n = cx.as_context().data().callouts.len();
     for i in 0..n {
-        let ret = cx.as_context().data().callouts[i].ret;
-        // (only a page with an entry of its own: the miss slots are shared)
-        let want = dispatch_slot_of(&memory, ret).filter(|s| !s.is_miss() && sizes.get(s.table).is_some_and(|&n| s.index < n));
+        let (ret, alt) = (cx.as_context().data().callouts[i].ret, cx.as_context().data().callouts[i].alt);
+        // (only a page with an entry of its own: the miss slots are shared;
+        // in the directory of the mode the call-out was made in)
+        let want = dispatch_slot_of(&memory, ret, alt.then(|| other_dir(cx))).filter(|s| !s.is_miss() && sizes.get(s.table).is_some_and(|&n| s.index < n));
         let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
         if have.is_some() && have != want {
             // The return moved: put the old slot back, unless another
@@ -6521,7 +6534,17 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // An AOT-only process translates nothing (`aot_only`).
     if ret != 0 && !crate::aot_only::enabled() {
         let page = ret / gex_abi::DISPATCH_PAGE;
-        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(1);
+        // (in the directory of the thread's mode: a WoW64 thread's 32-bit
+        // native code returns to 32-bit code)
+        let alt = thread_alt(caller);
+        if alt {
+            let shared = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)).ok_or_else(|| anyhow!("no translation state"))?;
+            ensure_alt_dir(caller, &shared)?;
+        }
+        let dir = alt.then(|| other_dir(&*caller));
+        let entry = |m: &gex_mem::GuestMemory| {
+            gex_abi::dir_entry_addr(gex_abi::page_key(ret, alt), dir.unwrap_or(0)).and_then(|a| GuestMem::new(m.bytes()).read_u32(a).ok()).unwrap_or(1)
+        };
         if page < gex_abi::dispatch_max_pages() && entry(&memory) == 0 {
             translate_and_install(caller, ret)?;
             if entry(&memory) == 0 && std::env::var_os("GEX_WINE32_TRACE").is_some() {

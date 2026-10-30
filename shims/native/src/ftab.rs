@@ -52,6 +52,11 @@ pub(crate) struct Shared {
     /// not retire them (the bytes are not what runs). A game's mod sandbox
     /// may overwrite a hundred or more of a DLL's entry points.
     pub providers: std::collections::HashSet<u32>,
+    /// Installs of the process's other mode (`wasmdll::WinePe::alt`: an i386
+    /// Wine module in an x86-64 process): code in that mode calls their
+    /// addresses, so they are served, and their bridges are, in the other
+    /// dispatch directory (`gex_abi::ALT_PAGE`), never in the process's own.
+    pub alt_installs: std::collections::HashSet<u32>,
     /// Which guest process this is, for the run-time translator
     /// (`ftab::Request::process`): one per process image, shared with a
     /// forked child until it `execve`s.
@@ -555,11 +560,15 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
     let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
     let mut dirs: Vec<(u64, u32)> = pages.to_vec();
     let mut slots = Vec::with_capacity(entries.len());
+    let mut keys = Vec::with_capacity(entries.len());
     for &a in entries {
-        let page = a / gex_abi::DISPATCH_PAGE;
-        if page >= gex_abi::dispatch_max_pages() {
+        if a / gex_abi::DISPATCH_PAGE >= gex_abi::dispatch_max_pages() {
             continue;
         }
+        // in the directory of the mode the function's callers run in
+        let alt = binding_alt(&s, a);
+        keys.push(gex_abi::addr_key(a, alt));
+        let page = gex_abi::page_key(a, alt);
         let base = match s.page_table.lookup(page) {
             Some(b) => b,
             None => {
@@ -577,7 +586,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
         }
         slots.push(gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32));
     }
-    s.translated.extend(entries.iter().copied());
+    s.translated.extend(keys);
     let unit = Arc::new(CompiledUnit {
         module: None,
         exported_blocks: Vec::new(),
@@ -623,8 +632,15 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 /// providers (a Detours hook in a 32-bit Wine builtin's skeleton): lifted, the
 /// untouched exports beside the hook ran their `ud2` stubs
 /// (c000001d).
-pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64) -> bool {
-    !s.ftab.tier1_only.contains(&addr) && s.ftab.map.get(addr).is_some_and(|f| current(s, memory, addr, f))
+pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64, alt: bool) -> bool {
+    !s.ftab.tier1_only.contains(&addr)
+        && s.ftab.map.get(addr).is_some_and(|f| s.ftab.alt_installs.contains(&f.install) == alt && current(s, memory, addr, f))
+}
+
+/// Whether the function bound at `addr` is one of the process's other mode
+/// (`Shared::alt_installs`).
+pub(crate) fn binding_alt(s: &JitShared, addr: u64) -> bool {
+    !s.ftab.alt_installs.is_empty() && s.ftab.map.get(addr).is_some_and(|f| s.ftab.alt_installs.contains(&f.install))
 }
 
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
@@ -1003,7 +1019,7 @@ pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool>
     let known = {
         let sh = shared(caller)?;
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
-        if s.ftab.tier1_only.contains(&pc) {
+        if s.ftab.tier1_only.contains(&pc) || binding_alt(&s, pc) {
             return Ok(false);
         }
         s.ftab.map.get(pc).is_some()
@@ -1020,6 +1036,24 @@ pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool>
     Ok(true)
 }
 
+/// [`serve`] for a miss in the process's other mode (a WoW64 thread's 32-bit
+/// code): only a function of that mode bound there (an i386 Wine module's
+/// export or entry thunk) serves it, through a bridge in the other
+/// directory. Nothing is translated for it.
+pub(crate) fn serve_alt(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    let sh = shared(caller)?;
+    {
+        let s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let memory = caller.data().memory.as_ref().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        if !serves(&s, memory.bytes(), pc, true) {
+            return Ok(false);
+        }
+    }
+    publish_bridges(&sh, &[pc], &[])?;
+    replay_registry(caller)?;
+    Ok(true)
+}
+
 /// Index 1: code no function holds, under the `F_body` contract -- tier-1
 /// run nested until the guest returns to `ret` (the call-out).
 fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -> Result<i32> {
@@ -1028,8 +1062,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
     let c = ctx as u32 as u64;
     let target = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
     let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
-    // A function's frame, so the process's own mode.
-    let delta = match (gex_abi::X86, gex_xlate::default_compat()) {
+    // A function's frame, in the mode the thread runs in (a WoW64 thread's
+    // 32-bit code: the native i386 module's guest call into it).
+    let delta = match (gex_abi::X86, gex_xlate::default_compat() != crate::thread_alt(caller)) {
         (false, _) => 0,
         (true, false) => 8,
         (true, true) => 4,

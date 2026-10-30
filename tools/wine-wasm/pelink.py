@@ -452,6 +452,10 @@ def link(dlls, out, gexrt, others=None):
         gdll = next((o for o in owner_of.get(tname, ()) if o != tdll), None)
         if tdll in native and gdll:
             guest_forward.setdefault(name, []).append((via, gdll, tname))
+        # a forward into a DLL that stays i386 (a native kernel32's HeapAlloc
+        # is ntdll's RtlAllocateHeap, ntdll translated): its stub calls that
+        elif tdll not in native and tdll in owner_of.get(tname, ()):
+            guest_forward.setdefault(name, []).append((via, tdll, tname))
     guest_binds = []  # (symbol, sig, i386 owner, export name, group, importing DLL)
     guest_sig = {}  # (group, dll.name) -> the signature its stub has
     def guest_sym(mod, sym, have):
@@ -725,6 +729,52 @@ def link(dlls, out, gexrt, others=None):
                 f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
                 f.write(f'void *gexw_GetModuleHandleA(const char *) __asm__("{own("GetModuleHandleA")}!GetModuleHandleA");\n')
                 f.write(f'static void *gp[{len(stubs)}];\n')
+                # An i386 ntdll (a WoW64 process's, its native kernelbase
+                # beside it): its exports found by walking the loader's list
+                # and ntdll's export directory, which calls nothing. Through
+                # kernelbase, GetModuleHandleA and GetProcAddress call ntdll's
+                # RtlInitAnsiString and the like: stubs not bound yet, which
+                # bound themselves through GetModuleHandleA again.
+                guest_ntdll = not WINE64 and 'ntdll.dll' not in native
+                if guest_ntdll:
+                    f.write('''void *__wine_wasm_current_teb(void);
+static void *gexw_ntdll_proc(const char *name)
+{
+    static unsigned char *base;
+    unsigned char *nt, *exp;
+    unsigned int *names, *funcs, lo, hi;
+    unsigned short *ords;
+    if (!base) {
+        unsigned char *peb = *(unsigned char **)((unsigned char *)__wine_wasm_current_teb() + 0x30);
+        unsigned char *head = *(unsigned char **)(peb + 0x0c) + 0x0c, *e;
+        for (e = *(unsigned char **)head; e && e != head; e = *(unsigned char **)e) {
+            const unsigned short *n = *(const unsigned short **)(e + 0x30);
+            const char *want = "ntdll.dll";
+            int i;
+            if (*(unsigned short *)(e + 0x2c) != 18) continue;
+            for (i = 0; i < 9 && (n[i] | 0x20) == (want[i] | 0x20); i++);
+            if (i == 9) { base = *(unsigned char **)(e + 0x18); break; }
+        }
+        if (!base) return 0;
+    }
+    nt = base + *(unsigned int *)(base + 0x3c);
+    exp = base + *(unsigned int *)(nt + 0x78);
+    names = (unsigned int *)(base + *(unsigned int *)(exp + 0x20));
+    funcs = (unsigned int *)(base + *(unsigned int *)(exp + 0x1c));
+    ords = (unsigned short *)(base + *(unsigned int *)(exp + 0x24));
+    lo = 0; hi = *(unsigned int *)(exp + 0x18);
+    while (lo < hi) {
+        unsigned int mid = (lo + hi) / 2;
+        const unsigned char *a = base + names[mid], *b = (const unsigned char *)name;
+        while (*a && *a == *b) a++, b++;
+        if (*a == *b) return base + funcs[ords[mid]];
+        if (*a < *b) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+''')
+                resolve = lambda owner, n: (f'gexw_ntdll_proc("{n}")' if guest_ntdll and owner == 'ntdll.dll'
+                                            else f'gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}")')
                 stdcalls = {}
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
@@ -742,7 +792,7 @@ def link(dlls, out, gexrt, others=None):
                     # static import, else on first call, as a delay load)
                     f.write(f'{attr}{ctype[r]} g{k}({params}) {{\n'
                             f'    void *p = gp[{k}];\n'
-                            f'    if (!p) gp[{k}] = p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
+                            f'    if (!p) gp[{k}] = p = {resolve(owner, n)};\n'
                             f'    {"" if r == "v" else "return "}(({ctype[r]} (*)({types}))p)({args});\n}}\n')
                 # Their addresses taken, so the ICALL pass gives each an entry
                 # thunk: a native module may hand one to i386 code as a
@@ -762,6 +812,10 @@ def link(dlls, out, gexrt, others=None):
                     f.write(f'void gb{i}(void) __asm__("gexw-bind!{mod}");\n')
                     f.write(f'void gb{i}(void)\n{{\n')
                     for o in sorted({o for _, o, _ in mine}):
+                        if guest_ntdll and o == 'ntdll.dll':
+                            for k, _, n in (m for m in mine if m[1] == o):
+                                f.write(f'    if (!gp[{k}]) gp[{k}] = gexw_ntdll_proc("{n}");\n')
+                            continue
                         f.write(f'    {{ void *h = gexw_GetModuleHandleA("{o}");\n      if (h) {{\n')
                         for k, _, n in (m for m in mine if m[1] == o):
                             f.write(f'        if (!gp[{k}]) gp[{k}] = gexw_GetProcAddress(h, "{n}");\n')

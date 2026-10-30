@@ -562,10 +562,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         let name = String::from_utf8_lossy(b).into_owned();
         let Some(jit) = caller.data().jit.as_ref() else { return 0 };
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-        // the core's, or a module of its own's (`pelink.py --split`)
+        // the core's, or a module of its own's (`pelink.py --split`), of
+        // the process's own mode (the caller is a Unix side's)
         sh.wine_pe
             .iter()
             .chain(sh.wine_pe_split.iter())
+            .filter(|wp| !wp.alt)
             .find_map(|wp| wp.slots.get(&name).map(|&k| (sh.ftab.map.install(wp.install).base + k) as i32))
             .unwrap_or(0)
     })?;

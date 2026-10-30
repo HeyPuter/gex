@@ -111,6 +111,12 @@ pub(crate) struct WinePe {
     /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16.
     ptr64: bool,
+    /// A module of the process's other mode (an ILP32 module, 32-bit Wine's,
+    /// in an x86-64 process: WoW64): its addresses are bound in the other
+    /// dispatch directory (`ftab::Shared::alt_installs`), and it binds only to
+    /// modules of its own mode, whose names (`kernel32.dll!CreateFileW`) are
+    /// the 64-bit side's too.
+    pub(crate) alt: bool,
     /// The DLLs whose skeleton has been mapped: a later mapping of one (an
     /// image view, LoadLibraryEx as an image resource) binds its exports
     /// but writes none of the variables, which belong to the loaded DLL.
@@ -444,7 +450,7 @@ fn install_shared(
     let same = |wp: &Arc<WinePe>, f: &std::path::Path| wp.file == f || wp.file.file_name() == f.file_name();
     let find = |f: &std::path::Path| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        s.wine_pe.iter().chain(s.wine_pe_split.iter()).find(|wp| same(wp, f)).cloned()
+        s.wine_pe.iter().chain(s.wine_pe_split.iter()).find(|wp| wp.ptr64 == pe.is64 && same(wp, f)).cloned()
     };
     let is_core = file.file_name() == core_file.file_name() || !core_file.is_file();
     let core = match (find(&core_file), is_core) {
@@ -467,7 +473,7 @@ fn install_shared(
         .ok_or_else(|| anyhow!("{path}: Wine's PE module has no gexp__missing"))?;
     let others: Vec<Arc<WinePe>> = {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        core.iter().chain(s.wine_pe_split.iter()).filter(|c| !Arc::ptr_eq(c, &wp)).cloned().collect()
+        core.iter().chain(s.wine_pe_split.iter()).filter(|c| !Arc::ptr_eq(c, &wp) && c.ptr64 == wp.ptr64).cloned().collect()
     };
     let mut pairs = Vec::new();
     let mut other_pairs: Vec<Vec<(u64, u32)>> = vec![Vec::new(); others.len()];
@@ -552,6 +558,8 @@ pub(crate) struct Late {
     off: u32,
     name: String,
     provider: Option<u32>,
+    /// The importer's mode (`WinePe::ptr64`): only a module of that mode provides it.
+    ptr64: bool,
 }
 
 /// After `module`'s instantiation in a store (at table base `base`): the
@@ -577,6 +585,12 @@ pub(crate) fn fill_late(c: &mut wasmtime::StoreContextMut<'_, HostState>, table:
     Ok(())
 }
 
+/// Whether a Wine module of this pointer size is of the process's other
+/// mode: an ILP32 one (32-bit Wine's, PE32 skeletons) in an x86-64 process.
+fn module_alt(is64: bool) -> bool {
+    gex_abi::X86 && !is64 && !gex_xlate::default_compat()
+}
+
 /// The core module's file name: the module a skeleton of a DLL linked as
 /// a module of its own finds beside itself.
 const CORE_MODULE: &str = "winepe.wasm";
@@ -600,6 +614,10 @@ fn install_module(
     memory: &gex_mem::GuestMemory,
 ) -> Result<Arc<WinePe>> {
     let t0 = std::time::Instant::now();
+    let alt = module_alt(is64);
+    if alt {
+        crate::ensure_alt_dir_in(state, shared)?;
+    }
     let pm = parsed_module(file, engine, t0, !is64)?;
     let (size, align) = (pm.size, pm.align);
     let a = 1u64 << align;
@@ -649,7 +667,7 @@ fn install_module(
                 let path = file.with_file_name(&f);
                 let installed = {
                     let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    s.wine_pe.iter().chain(s.wine_pe_split.iter()).any(|wp| wp.file.file_name() == path.file_name())
+                    s.wine_pe.iter().chain(s.wine_pe_split.iter()).any(|wp| wp.ptr64 == is64 && wp.file.file_name() == path.file_name())
                 };
                 let busy = BUSY.with(|b| b.borrow().iter().any(|p| p.file_name() == path.file_name()));
                 if installed || busy || !path.is_file() {
@@ -670,7 +688,7 @@ fn install_module(
             None => Default::default(),
         };
         let mut others = std::collections::HashMap::new();
-        for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()) {
+        for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()).filter(|wp| wp.ptr64 == is64) {
             for n in funcs_of(&s.ftab.modules[wp.module as usize]) {
                 others.entry(n).or_insert(wp.module);
             }
@@ -722,7 +740,7 @@ fn install_module(
                 let k = s.wine_pe.iter().chain(s.wine_pe_split.iter()).find(|wp| wp.module == p)?.slots.get(&name).copied()?;
                 Some(s.ftab.map.installs().iter().find(|x| x.module == p)?.base + k)
             });
-            let b = match (own, theirs, s.wine_pe_canon.get(&name).copied()) {
+            let b = match (own, theirs, s.wine_pe_canon.get(&(is64, name.clone())).copied()) {
                 (Some(k), _, _) => crate::dylink::NBind::OwnSlot(k),
                 (None, Some(v), _) => crate::dylink::NBind::Global(v),
                 (None, None, c) => match c {
@@ -736,7 +754,7 @@ fn install_module(
                 None => {
                     let off = len;
                     len += 1;
-                    s.wine_pe_canon.insert(name.clone(), (m, off));
+                    s.wine_pe_canon.insert((is64, name.clone()), (m, off));
                     let provider = if mine.contains(&name) { Some(m) } else { others.get(&name).copied() };
                     lates.push((off, name.clone(), provider));
                     crate::dylink::NBind::OwnSlot(off)
@@ -752,13 +770,16 @@ fn install_module(
         s.ftab.dylink.insert(m, Arc::new(binds));
         // its calls and addresses into modules not yet installed; earlier
         // modules' into it
-        s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider }));
-        for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && mine.contains(&l.name)) {
+        s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider, ptr64: is64 }));
+        for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && l.ptr64 == is64 && mine.contains(&l.name)) {
             l.provider = Some(m);
         }
         m
     };
     let install = crate::ftab::publish_stateful(shared, memory, module, len, &[], crate::libprov::Extras { memory_base: data })?;
+    if alt {
+        shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.alt_installs.insert(install);
+    }
     let wp = Arc::new(WinePe {
         install,
         file: file.to_path_buf(),
@@ -770,10 +791,13 @@ fn install_module(
         pending: Mutex::new(Vec::new()),
         entries_bound: Default::default(),
         ptr64: is64,
+        alt,
         mapped: Default::default(),
     });
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if core.is_none() {
+    // (`wine_pe` is the core of the process's own mode; the other mode's
+    // core is with the modules of their own)
+    if core.is_none() && !alt {
         s.wine_pe = Some(wp.clone());
     } else {
         s.wine_pe_split.push(wp.clone());
