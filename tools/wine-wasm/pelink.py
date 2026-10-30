@@ -85,6 +85,14 @@ def spec_path(src, top, d, mod):
     return os.path.join(src, top, d, mod + '.spec')
 
 
+def owner_spec(src, owner):
+    """The .spec of a DLL by its file name: dlls/X/ for X.dll, dlls/X.drv/
+    for one whose directory keeps its extension."""
+    stem = owner.rsplit('.', 1)[0]
+    p = spec_path(src, 'dlls', stem, owner)
+    return p if os.path.exists(p) else spec_path(src, 'dlls', owner, owner)
+
+
 def spec_varargs(spec):
     """The names a .spec exports as varargs (cdecl, the variadic arguments
     after the fixed ones on the stack)."""
@@ -489,7 +497,7 @@ def link(dlls, out, gexrt, others=None):
     own_cache = {}
     def own_defs(o):
         if o not in own_cache:
-            own_cache[o] = spec_own(spec_path(SRC, 'dlls', o, o)) if SRC else set()
+            own_cache[o] = spec_own(owner_spec(SRC, o)) if SRC else set()
         return own_cache[o]
     def bind_guest(f, mod, imports, name, pick):
         """An i386 DLL the module imports explicitly, ahead of the native
@@ -800,8 +808,8 @@ static void *gexw_ntdll_proc(const char *name)
                 stdcalls, varargs = {}, {}
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
-                        stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
-                        varargs[owner] = spec_varargs(spec_path(SRC, 'dlls', owner.rsplit('.', 1)[0], owner)) if SRC and not WINE64 else set()
+                        stdcalls[owner] = spec_stdcalls(owner_spec(SRC, owner)) if SRC else set()
+                        varargs[owner] = spec_varargs(owner_spec(SRC, owner)) if SRC and not WINE64 else set()
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
                     # (x64 has one convention)
