@@ -5581,23 +5581,25 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
     if n <= REMISS_LIMIT {
         return Ok(());
     }
-    let page = pc / gex_abi::DISPATCH_PAGE;
-    let dir = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
+    // (`pc` is a key: the other mode's carries `gex_abi::ALT_ADDR`)
+    let (addr, alt) = (pc & !gex_abi::ALT_ADDR, pc & gex_abi::ALT_ADDR != 0);
+    let page = gex_abi::page_key(addr, alt);
+    let dir = gex_abi::dir_entry_addr(page, sh.alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(u32::MAX);
     let base = sh.page_table.lookup(page);
-    let slot = base.map(|b| b as u64 + ((pc % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
+    let slot = base.map(|b| b as u64 + ((addr % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
     let owner = base.and_then(|b| sh.slot_owner.get(&b).copied());
     let units: Vec<usize> = sh
         .registry
         .iter()
         .enumerate()
-        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == pc))
+        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == addr))
         .map(|(i, _)| i)
         .collect();
     let retired = sh.retired_pages.get(&page).copied().unwrap_or(0);
     let sources = sh.remiss[&pc].1;
     let (n_units, stale) = (sh.registry.len(), sh.stale_blocks);
     drop(sh);
-    let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(pc, 1, prot::WRITE));
+    let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::WRITE));
     eprintln!(
         "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}",
         (units.first(), units.last())
