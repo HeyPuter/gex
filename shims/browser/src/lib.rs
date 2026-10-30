@@ -15607,6 +15607,19 @@ pub(crate) fn thread_alt() -> bool {
     gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0))
 }
 
+thread_local! {
+    /// This thread's call-outs waiting for one of WoW64's stops
+    /// (`gex_kernel::win::tramp::any_stack`), which JS opens.
+    static WOW64_WAITS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// JS opened (`delta` 1) or closed (-1) a call-out waiting for one of
+/// WoW64's stops: `dispatch_miss` names an arrival there with none open.
+#[no_mangle]
+pub extern "C" fn gex_wow64_waits(delta: i32) {
+    WOW64_WAITS.with(|w| w.set(w.get() + delta));
+}
+
 /// Whether `cs` (a `ctx::CS` value) is the process's other mode.
 fn cs_alt(cs: u32) -> bool {
     let own = gex_xlate::default_compat();
@@ -16580,6 +16593,17 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
+    }
+    // WoW64's stops with no call-out of this thread waiting there (their
+    // watch takes any arrival one waits for; JS counts them,
+    // `gex_wow64_waits`): 32-bit code reached 64-bit code's entry with no
+    // wow64cpu run to take it. Named, not the filler's breakpoint.
+    if gex_abi::X86
+        && (pc == gex_kernel::win::tramp::WOW64_STOP_SYSCALL || pc == gex_kernel::win::tramp::WOW64_STOP_UNIX)
+        && WOW64_WAITS.with(|w| w.get()) <= 0
+    {
+        warn_line(&format!("gex: 32-bit code reached WoW64's stop {pc:#x} with no wow64cpu run waiting for it\n"));
+        end_process(0xc000_0005);
     }
     // Native Wine's return pad, reached past the call-outs waiting: they
     // leave (`cgen::native_return_stray`), and it is not translated.

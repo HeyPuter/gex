@@ -4592,6 +4592,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
             }
+            // WoW64's stops with no call-out waiting there (their watch takes
+            // any arrival one waits for): 32-bit code reached 64-bit code's
+            // entry with no wow64cpu run to take it. Named, not the filler's
+            // breakpoint.
+            if wow64_stray(&caller, pc) {
+                eprintln!("gex: 32-bit code reached WoW64's stop {pc:#x} with no wow64cpu run waiting for it");
+                caller.data_mut().exit = Some(Exit::Signal { signal: signal::SIGSEGV, pc, detail: format!("WoW64 stop {pc:#x} reached with no run waiting"), internal: true });
+                return Err(StopExecution.into());
+            }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
                 // Installed in this store: the miss stub dispatches again
@@ -5279,6 +5288,14 @@ pub(crate) fn thread_alt(caller: &Caller<'_, HostState>) -> bool {
     let cs = read_u64(memory.bytes(), (caller.data().thread.ctx_addr + ctx::CS as u64) as usize) as u32;
     let own = gex_xlate::default_compat();
     gex_abi::ctx::cs_compat(cs, own) != own
+}
+
+/// Whether `pc` is one of WoW64's stops (`win::tramp::WOW64_STOP_SYSCALL`)
+/// that no call-out of this thread waits for.
+fn wow64_stray(caller: &Caller<'_, HostState>, pc: u64) -> bool {
+    use gex_kernel::win::tramp;
+    matches!(pc, tramp::WOW64_STOP_SYSCALL | tramp::WOW64_STOP_UNIX)
+        && !caller.data().callouts.iter().any(|co| tramp::returns_at(co.ret, pc))
 }
 
 /// The process's other directory (`gex_abi::ALT_PAGE`), made the first time
@@ -6016,7 +6033,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
         let mode_dir = thread_alt(&caller).then(|| other_dir(&caller));
         let state = caller.data_mut();
-        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);
+        let hit = state.callouts.iter().rposition(|co| gex_kernel::win::tramp::returns_at(co.ret, target) && sp >= co.sp_want && sp <= co.sp_want.saturating_add(co.span));
         let signal = match hit {
             Some(i) => CalloutSignal::Return(i),
             None => {
@@ -6531,8 +6548,13 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
     let args = gex_abi::ftab::need_args(need).filter(|_| pad);
-    let unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
-    let span = args.unwrap_or(CALLOUT_UNWOUND);
+    let mut unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
+    let mut span = args.unwrap_or(CALLOUT_UNWOUND);
+    // WoW64's stops: reached with the stack anywhere, never unwound past.
+    let mut sp_want = sp_want;
+    if gex_kernel::win::tramp::any_stack(ret) {
+        (sp_want, span, unwound) = (0, u64::MAX, u64::MAX);
+    }
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
     // translate it first (32-bit Wine: the trampoline page's NATIVE_RETURN_PAD, which

@@ -84,6 +84,31 @@ pub mod tramp {
     /// rising past its arguments means the guest left them (a catch block
     /// continuing in an outer frame).
     pub const NATIVE_RETURN_PAD: u64 = super::TRAMPOLINES_END - 0xf;
+    /// WoW64's stops (wow64cpu built as native code, gexrt's `__gexw_run32`):
+    /// where 32-bit code reaches 64-bit code, filler no code has. Its system
+    /// call thunk (`BTCpuGetBopCode`) and its unix call one
+    /// (`__wine_get_unix_opcode`), which share a dispatch slot: a call-out
+    /// waiting for the first returns at either ([`returns_at`]), with the
+    /// stack wherever the 32-bit code has it.
+    pub const WOW64_STOP_SYSCALL: u64 = super::TRAMPOLINES_END - 0xc;
+    pub const WOW64_STOP_UNIX: u64 = super::TRAMPOLINES_END - 0x9;
+    /// The return address of a system call native 32-bit ntdll makes
+    /// (gexrt's `__gexw_syscall`), where 32-bit state wow64 set (an APC, a
+    /// context it continued) comes back to it.
+    pub const WOW64_RETURN_MARK: u64 = super::TRAMPOLINES_END - 0x6;
+
+    /// Whether a call-out waiting for `ret` returns when the guest reaches
+    /// `pc`.
+    pub const fn returns_at(ret: u64, pc: u64) -> bool {
+        pc == ret || (ret == WOW64_STOP_SYSCALL && pc == WOW64_STOP_UNIX)
+    }
+
+    /// Whether a call-out waiting for `ret` takes it with any stack pointer
+    /// (WoW64's stops: the 32-bit code reaches them from wherever it is,
+    /// never by a return), and never reads the stack as unwound past it.
+    pub const fn any_stack(ret: u64) -> bool {
+        ret == WOW64_STOP_SYSCALL || ret == WOW64_RETURN_MARK
+    }
 }
 
 /// Where the trampoline page's code continues after its system call

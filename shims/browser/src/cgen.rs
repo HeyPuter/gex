@@ -2534,7 +2534,7 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
     let cb = CB_DEPTH.with(|d| d.get());
     let hit = CALLOUTS.with(|c| {
         let v = c.borrow();
-        v.iter().rposition(|&(r, w, d, span)| d == cb && r == pc && sp >= w && sp <= w + span)
+        v.iter().rposition(|&(r, w, d, span)| d == cb && gex_kernel::win::tramp::returns_at(r, pc) && sp >= w && sp <= w.saturating_add(span))
     });
     match hit {
         Some(i) => {

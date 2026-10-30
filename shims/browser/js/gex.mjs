@@ -395,6 +395,15 @@ const NATIVE_UNWOUND = 512n;
 /** Where a native caller's `run_until` goes after a stray return to its
  *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
 const STRAY_PC = NATIVE_RETURN_PAD + 1n;
+/** gex-kernel `tramp::WOW64_STOP_SYSCALL`, `WOW64_STOP_UNIX` and
+ *  `WOW64_RETURN_MARK`: where WoW64's 32-bit code reaches 64-bit code. A
+ *  call-out waiting for the first returns at either of the first two
+ *  (`tramp::returns_at`); one waiting for a stop or the mark takes it with
+ *  the stack anywhere (`tramp::any_stack`). */
+const WOW64_STOP_SYSCALL = 0x3ffff4n;
+const WOW64_STOP_UNIX = 0x3ffff7n;
+const WOW64_RETURN_MARK = 0x3ffffan;
+const returnsAt = (ret, pc) => pc === ret || (ret === WOW64_STOP_SYSCALL && pc === WOW64_STOP_UNIX);
 /** A thread `clone` made that could not be handed to the host. */
 function threadNotStarted(who, err) {
   console.error(`[${who}] starting a thread: ${err?.message ?? err}`);
@@ -8358,7 +8367,7 @@ export class Gex {
     let i = -1;
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
       const c = this.#callouts[k];
-      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
+      if (returnsAt(c.ret, target) && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
     }
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
@@ -8590,6 +8599,15 @@ export class Gex {
     const span = e.gex_callout_span?.() ?? -1n;
     c.span = span >= 0n ? span : CALLOUT_UNWOUND;
     c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
+    // WoW64's stops: reached with the stack anywhere, never unwound past
+    // (a spWant of 0 is never read as unwound). The shim counts them for
+    // its stray-arrival rule (`gex_wow64_waits`).
+    const anyStack = c.ret === WOW64_STOP_SYSCALL || c.ret === WOW64_RETURN_MARK;
+    if (anyStack) {
+      c.spWant = 0n;
+      c.span = c.unwound = (1n << 64n) - 1n;
+      e.gex_wow64_waits?.(1);
+    }
     this.#callouts.push(c);
     this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');
@@ -8776,6 +8794,7 @@ export class Gex {
         }
       }
     } finally {
+      if (anyStack) e.gex_wow64_waits?.(-1);
       e.gex_callout_leave_ok?.(0);
       this.#unwatch(c);
       this.#callouts.pop();
