@@ -3189,6 +3189,9 @@ thread_local! {
     /// A guest fault staged for the hook: (NTSTATUS code, address, kind:
     /// Windows' ExceptionInformation[0], 0 read, 1 write, 8 execute).
     static FAULT_PENDING: std::cell::Cell<Option<(u32, u64, u32)>> = const { std::cell::Cell::new(None) };
+    /// A signal frame staged for the signal hook: (the pc the signal
+    /// interrupted, the stack pointer the hook's C frames go below).
+    static SIGNAL_PENDING: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// How many faults may be delivered in place one inside another's
@@ -3271,21 +3274,51 @@ fn hook_sp(c: u64) -> Option<u64> {
 /// wow64's copy of it (Wine's dispatch fits in the 8 KiB below R14).
 const WOW64_DISPATCH_ROOM: u64 = 0x4000;
 
+/// What became of a signal frame given to the signal hook ([`signal_hook`]).
+pub(crate) enum SignalHooked {
+    /// The process has no hook: the frame's handler is guest code.
+    No,
+    /// The hook ran here, and the context is where its sigreturn left it.
+    Ran,
+    /// Staged for the host ([`gex_signal_take`]), which runs the hook
+    /// before the thread goes on: the caller traps out.
+    Staged,
+}
+
 /// Run the signal frame the kernel just built at a safepoint for the thread
 /// at `c` through the process's signal hook (native Wine's handlers are wasm
 /// functions, not guest code), its C frames below the guest's stack
-/// (`hook_sp`): true when it ran, and the context is where the hook's
-/// sigreturn left it. False when the process has no hook or this build
-/// cannot call it here. `interrupted` is the pc the signal interrupted.
-pub(crate) fn signal_in_place(c: u64, interrupted: u64) -> bool {
+/// (`hook_sp`). Where this build cannot call it here (the single-thread
+/// one: a handler that blocks needs a frame that may suspend), the frame is
+/// staged for the host instead, as a fault is. `interrupted` is the pc the
+/// signal interrupted.
+pub(crate) fn signal_hook(c: u64, interrupted: u64) -> SignalHooked {
     let idx = SIGNAL_HOOK.load(Ordering::Relaxed);
     if idx == 0 {
-        return false;
+        return SignalHooked::No;
     }
-    let Some(sp) = hook_sp(c) else { return false };
+    let Some(sp) = hook_sp(c) else { return SignalHooked::No };
     // SAFETY: a host import taking scalars; nothing here holds a lock or a
     // borrow.
-    unsafe { signal_call(idx as i32, c as i32, interrupted as u32 as i32, sp as i64) != 0 }
+    if unsafe { signal_call(idx as i32, c as i32, interrupted as u32 as i32, sp as i64) } != 0 {
+        return SignalHooked::Ran;
+    }
+    SIGNAL_PENDING.with(|s| s.set(Some((interrupted, sp))));
+    SignalHooked::Staged
+}
+
+/// The staged signal frame, taken: the hook's table index (0: none
+/// staged), with the interrupted pc and the stack pointer its C frames go
+/// below at `out` (two u64s, little-endian).
+#[no_mangle]
+pub extern "C" fn gex_signal_take(out: u32) -> u32 {
+    let Some((pc, sp)) = SIGNAL_PENDING.with(|s| s.take()) else { return 0 };
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&pc.to_le_bytes());
+    b[8..].copy_from_slice(&sp.to_le_bytes());
+    // SAFETY: `out` is 16 bytes the host allocated in this module's memory.
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), std::ptr::with_exposed_provenance_mut::<u8>(out as usize), 16) };
+    SIGNAL_HOOK.load(Ordering::Relaxed)
 }
 
 /// How many in-place deliveries may still be in their dispatch on this
@@ -3371,15 +3404,16 @@ pub extern "C" fn gex_fault_take(out: u32) -> u32 {
     fault_hook()
 }
 
-/// Whether a fault is staged for the hook (`gex_after_trap`).
+/// Whether a fault, or a signal frame, is staged for its hook
+/// (`gex_after_trap`).
 pub(crate) fn fault_staged() -> bool {
-    FAULT_PENDING.with(|f| f.get()).is_some()
+    FAULT_PENDING.with(|f| f.get()).is_some() || SIGNAL_PENDING.with(|s| s.get()).is_some()
 }
 
 /// A native wasm32 program's signal hook: the function that runs the
 /// signal frames the kernel leaves on the guest's stack (libgex's
 /// `__gex_signal_frames(ctx, pc)`), for a signal that arrives while the
-/// thread runs guest code (`signal_in_place`).
+/// thread runs guest code (`signal_hook`).
 static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[no_mangle]

@@ -16255,12 +16255,12 @@ fn safepoint(ctx: i32, pc: i64) {
             // resume, so no kernel.
             gex_kernel::signal::Delivery::Resume(target) => {
                 // A handler that is a wasm function (native Wine's) runs
-                // through the process's signal hook, here; the guest goes
-                // on where its sigreturn put the context.
-                let target = if cgen::signal_in_place(ctx_addr, pc as u64) {
-                    GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(target)
-                } else {
-                    target
+                // through the process's signal hook, here or, staged, at the
+                // host before the thread goes on; the guest goes on where its
+                // sigreturn put the context.
+                let target = match cgen::signal_hook(ctx_addr, pc as u64) {
+                    cgen::SignalHooked::Ran => GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(target),
+                    cgen::SignalHooked::Staged | cgen::SignalHooked::No => target,
                 };
                 if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
                     let mut r = run.lock().unwrap_or_else(|e| e.into_inner());

@@ -2043,10 +2043,10 @@ export class Gex {
           return 1;
         },
         // A signal frame the kernel built at a safepoint, run through the
-        // process's signal hook (cgen.rs `signal_in_place`: native Wine's
+        // process's signal hook (cgen.rs `signal_hook`: native Wine's
         // handlers are wasm functions), its C frames below the guest's stack
         // pointer `sp` as `fault_call`'s are. 0: not here (the single-thread
-        // build).
+        // build: the shim stages the frame then, `#signalTake`).
         signal_call: (idx, ctx, pc, sp) => {
           if (single.on) return 0;
           const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
@@ -7549,8 +7549,8 @@ export class Gex {
           const h = hook;
           hook = null;
           try {
-            if (single.on) await this.#promisingOf(h.f)(ctx, h.code, h.addr, h.kind);
-            else h.f(ctx, h.code, h.addr, h.kind);
+            if (single.on) await this.#promisingOf(h.f)(ctx, ...h.args);
+            else h.f(ctx, ...h.args);
           } finally {
             h.spG.value = h.cur;
           }
@@ -8731,7 +8731,7 @@ export class Gex {
             // Inside a fault's dispatch, which this call-out may lie within:
             // with no room on the stack for another, the process ends, as
             // its frames below cannot be left (`gex_fault_overflow`).
-            if (ft && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
+            if (ft && !ft.sig && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
               ft.spG.value = ft.cur;
               e.gex_fault_overflow(ft.code);
               err.gexHandoff = true;
@@ -8739,8 +8739,8 @@ export class Gex {
             }
             if (ft) {
               try {
-                if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
-                else yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+                if (this.#snapHooks && !ft.sig) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
+                else yield ['call', ft.f, ctx, ...ft.args];
               } finally {
                 ft.spG.value = ft.cur;
               }
@@ -8838,8 +8838,9 @@ export class Gex {
   }
 
   /** The staged fault, taken, and the stack made ready for the hook: { f,
-   *  code, addr, kind, spG, cur } (the caller calls `f(ctx, code, addr,
-   *  kind)` and puts `spG` back to `cur`), or null with none staged. */
+   *  code, addr, kind, args, spG, cur } (the caller calls `f(ctx, ...args)`,
+   *  args being `code, addr, kind`, and puts `spG` back to `cur`), or a
+   *  staged signal frame (`#signalTake`), or null with neither staged. */
   #faultTake(ctx) {
     const e = this.#shim.exports;
     if (!e.gex_fault_take) return null;
@@ -8847,7 +8848,7 @@ export class Gex {
     let hook, code, addr, kind;
     try {
       hook = e.gex_fault_take(buf) >>> 0;
-      if (!hook) return null;
+      if (!hook) return this.#signalTake(buf);
       const dv = new DataView(this.#memory.buffer);
       code = dv.getUint32(buf, true);
       addr = dv.getBigUint64(buf + 4, true);
@@ -8862,7 +8863,27 @@ export class Gex {
     // 64-bit Wine's hook (signal_wasm64.c) takes the address as a 64-bit integer
     // (above 4 GiB in a 64-bit memory), 32-bit Wine's (signal_wasm32.c) as 32 bits.
     const wide = e.gex_guest_x86_64?.() === 1;
-    return { f, idx: hook, rsp, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+    const a = wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0;
+    return { f, idx: hook, rsp, code: code | 0, addr: a, kind: kind | 0, args: [code | 0, a, kind | 0], spG, cur };
+  }
+
+  /** A signal frame the shim staged for the process's signal hook (cgen.rs
+   *  `signal_hook`, in the single-thread build), taken into `buf` (16
+   *  bytes, `#faultTake`'s): { f, sig, args, spG, cur } as `#faultTake`'s,
+   *  the hook's C frames below the stack pointer the shim named (as
+   *  `signal_call` puts them), or null with none staged. */
+  #signalTake(buf) {
+    const e = this.#shim.exports;
+    const hook = (e.gex_signal_take?.(buf) ?? 0) >>> 0;
+    if (!hook) return null;
+    const dv = new DataView(this.#memory.buffer);
+    const pc = dv.getBigUint64(buf, true);
+    const sp = dv.getBigUint64(buf + 8, true);
+    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    if (!f) throw new Error(`gex: the guest signal hook (function ${hook}) is not in this Worker's table`);
+    const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+    const cur = this.#belowGuest(spG, sp);
+    return { f, idx: hook, sig: true, args: [Number(BigInt.asUintN(32, pc)) | 0], spG, cur };
   }
 
   /** The stack pointer of the stack call-outs are made on, which a call-out's
