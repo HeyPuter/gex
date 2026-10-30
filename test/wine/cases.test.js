@@ -21,6 +21,8 @@ const CASES = [
   ['seh', 77, /^(ok [^\n]*\n)+top-level filter saw e00000ff\n0 failures\n?$/, 'seh.exe'],
   ['seh-traps', 0, allOk, 'seh.exe', ['traps']],
   ['fiber', 0, allOk, 'fiber.exe'],
+  // Built with clang-cl for the MSVC ABI.
+  ['msvc_cxxeh', 0, allOk, 'msvc_cxxeh.exe'],
   // USER with no display (Wine's null driver).
   ['user_win', 0, allOk, 'user_win.exe', [], true],
   ['wndproc_seh', 0, allOk, 'wndproc_seh.exe', [], true],

@@ -261,6 +261,29 @@ export const images = {
         // line): built once per variant, as NAME with those flags.
         const dll = /gex-nt-shared/.test(text);
         const variants = [...text.matchAll(/gex-nt-variant: *(\S+)(.*)/g)].map((m) => [m[1], m[2].trim().split(/\s+/).filter(Boolean)]);
+        // `gex-nt-msvc: DEF...`: the MSVC ABI, built with clang-cl and linked
+        // with lld-link against import libraries made from those .def files
+        // (x64), no MSVC headers or libraries.
+        const msvc = /gex-nt-msvc: *(.*)/.exec(text)?.[1].trim().split(/\s+/);
+        if (msvc) {
+          try {
+            const tmp = join(work, 'win-progs-msvc');
+            mkdirSync(tmp, { recursive: true });
+            const llvm = (t) => (existsSync(`/usr/lib/llvm-22/bin/${t}`) ? `/usr/lib/llvm-22/bin/${t}` : t);
+            const libs = msvc.map((d) => {
+              const lib = join(tmp, d.replace(/(-x64)?\.def$/, '.lib'));
+              execFileSync(llvm('llvm-dlltool'), ['-m', 'i386:x86-64', '-d', join(src, d), '-l', lib], { stdio: ['ignore', 'ignore', 'pipe'] });
+              return lib;
+            });
+            const obj = join(tmp, 'main.obj');
+            execFileSync(llvm('clang-cl'), ['--target=x86_64-pc-windows-msvc', '/O1', '/GS-', '/EHa', '/c', join(src, f), `/Fo${obj}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+            execFileSync(llvm('lld-link'), ['/nodefaultlib', '/entry:entry', '/subsystem:console', '/dynamicbase', '/Brepro', obj, ...libs, `/out:${join(dir, arch, f.replace(/\.[a-z]+$/, '.exe'))}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+          } catch (e) {
+            failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
+          }
+          rmSync(join(work, 'win-progs-msvc'), { recursive: true, force: true });
+          continue;
+        }
         for (const [name, flags] of variants.length ? variants : [[f.replace(/\.[a-z]+$/, ''), []]]) {
           try {
             execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), ...flags, '-o', join(dir, arch, `${name}.${dll ? 'dll' : 'exe'}`), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
