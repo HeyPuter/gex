@@ -589,8 +589,8 @@ pub(crate) fn fill_late(c: &mut wasmtime::StoreContextMut<'_, HostState>, table:
 /// other mode (wasm32 i386 Wine calling the lowered wasm64 side, or back):
 /// an export of the exact wasm type, never a slot (as the page's,
 /// shims/browser cgen/wasmdll.rs). WoW64's native i386 ntdll makes its
-/// system calls through the first.
-const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32"];
+/// system calls and Unix calls through them.
+const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32", "wow64cpu.dll!__wine_gex_unix_call32"];
 
 /// The wasm type of `module`'s `env` import `name` (or its export, `export`).
 fn cross_mode_type(module: &wasmtime::Module, name: &str, export: bool) -> Result<String> {

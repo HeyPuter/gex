@@ -442,8 +442,8 @@ fn shape(wasm: &[u8]) -> Result<Shape, String> {
 /// The C functions a module may import from a module of the process's
 /// other mode (wasm32 i386 Wine calling the lowered wasm64 side, or back):
 /// an export of the exact wasm type, never a slot. WoW64's native i386
-/// ntdll makes its system calls through the first.
-pub(crate) const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32"];
+/// ntdll makes its system calls and Unix calls through them.
+pub(crate) const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32", "wow64cpu.dll!__wine_gex_unix_call32"];
 
 /// The type of the function `wasm` exports as `name`.
 fn export_func_type(wasm: &[u8], name: &str) -> Option<wasmparser::FuncType> {
