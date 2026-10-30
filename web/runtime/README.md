@@ -87,7 +87,7 @@ files are written into the running tree.
 
 | Member | Does |
 | --- | --- |
-| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url], ...]` or the URL of such a list (JSON); their URLs must be on the page's own origin and answer range requests. |
+| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without) or the URL of such a list (JSON; or `{ base, files }`, each url relative to `base`); their URLs must be on the page's own origin and answer range requests. |
 | `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |

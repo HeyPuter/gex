@@ -36,23 +36,23 @@ async function lazyList(lazy) {
   let base = globalThis.location?.href;
   if (typeof lazy === 'string' || lazy instanceof URL) {
     base = new URL(lazy, globalThis.location?.href).href;
-    const res = await fetch(base);
-    if (!res.ok) throw new Error(`lazy list ${lazy}: ${res.status}`);
-    list = await res.json();
+    list = JSON.parse(new TextDecoder().decode(await bytesOf(base, 'lazy list')));
   }
   if (!Array.isArray(list)) {
     if (list?.files) {
       const b = new URL(list.base ?? './', base);
-      return list.files.map(([p, size, rel]) => [p, size, new URL(rel, b).href]);
+      return list.files.map(([p, size, rel, mode]) => [p, size, new URL(rel, b).href, mode]);
     }
     throw new TypeError('lazy: a list of [path, size, url] or its URL');
   }
-  return list.map(([p, size, url]) => [p, size, new URL(url, base).href]);
+  return list.map(([p, size, url, mode]) => [p, size, new URL(url, base).href, mode]);
 }
 
 /** A same-origin URL as the path the kernel keeps for a lazy file. */
 function lazyPath(href) {
   const u = new URL(href, globalThis.location?.href);
+  // Under Node (the runtime's own tests), a file URL is a host path.
+  if (u.protocol === 'file:') return decodeURIComponent(u.pathname);
   if (globalThis.location && u.origin !== globalThis.location.origin) {
     throw new Error(`lazy file ${href}: only the page's own origin can be read lazily`);
   }
@@ -114,8 +114,10 @@ export class Filesystem extends EventTarget {
    * A tar (bytes, a Blob, a stream, or a URL; zstd or not) laid over the
    * root at `at` (default '/'). Before boot it is one more layer; after, it
    * is written into the running tree. `lazy`: files fetched as they are
-   * first read, `[[path, size, url], ...]` or the URL of such a list, laid
-   * with the tar (`src` may then be null).
+   * first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without
+   * one) or the URL of such a list, laid with the tar (`src` may then be
+   * null). A list at a URL may be `{ base, files }`, each url relative to
+   * `base`, itself relative to the list.
    */
   addTar(src, { at = '/', lazy } = {}) {
     const p = (async () => {
@@ -123,7 +125,7 @@ export class Filesystem extends EventTarget {
       return {
         tar: src == null ? null : await tarBytes(src),
         at: norm(at),
-        lazy: lz.map(([p, size, url]) => [under(at, p), size, lazyPath(url)]),
+        lazy: lz.map(([p, size, url, mode]) => [under(at, p), size, lazyPath(url), mode]),
       };
     })();
     return this.#add(p);

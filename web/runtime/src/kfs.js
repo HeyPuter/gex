@@ -186,7 +186,7 @@ export class Files {
 
   /** A layer (fs.js) into the root, over whatever is there: a tar (its
    *  bytes, unpacked in the kernel as they come, pagetar.rs) laid at `at`,
-   *  single files with their modes, lazy files (`[path, size, url]`).
+   *  single files with their modes, lazy files (`[path, size, url, mode]`).
    *  Seeding, not a program's writes: persistence does not take it. The
    *  count of files laid. */
   async lay({ tar, at = '/', files = {}, modes = {}, lazy = [] }) {
@@ -208,8 +208,9 @@ export class Files {
       if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
       n++;
     }
-    for (const [p, size, url] of lazy) {
+    for (const [p, size, url, mode] of lazy) {
       list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
+      if (mode !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, mode] });
       n++;
     }
     await batched(k, list, (r, c) => {

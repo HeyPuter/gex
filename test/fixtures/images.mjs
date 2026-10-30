@@ -9,6 +9,14 @@
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, web/runtime/build.sh.
+//   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
+//            built with MinGW for x64/ and x86/; win-progs.json says which
+//            did not build, and why.
+//   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
+//            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
+//            GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at
+//            /pfx; files over 64 KiB are lazy, served from wine64/ in the
+//            work directory (fixtures/wine/pack.py).
 //   gl-probes  gl-probes-ARCH.tar: the guest GL (guest/gl/build.sh) and each
 //            self-checking probe in guest/gl/probes built against it
 //            (/probes/NAME), with a loader and libc: x86-64 glibc with gcc and
@@ -39,7 +47,7 @@ const PROBES = {
 
 /** What each image leaves in the work directory: with `--prebuilt`, an
  *  image whose files are not there is missing. */
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'] };
 
 export const images = {
   async busybox(work) {
@@ -177,6 +185,70 @@ export const images = {
       execFileSync('tar', ['-cf', join(work, `gl-probes-${a}.tar`), '-C', tree, '.']);
     }
     writeFileSync(join(work, 'gl-probes.json'), JSON.stringify(expect, null, 1));
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
+  async wine64(work) {
+    const dist = process.env.GEX_TEST_WINE64_DIST;
+    const pfx = process.env.GEX_TEST_WINE64_PREFIX;
+    if (!dist || !pfx) return 'set GEX_TEST_WINE64_DIST and GEX_TEST_WINE64_PREFIX (tools/wine-wasm/wine64-dist.sh)';
+    if (!existsSync(join(dist, 'lib/wine/x86_64-unix/wine'))) return `no Wine loader in ${dist}`;
+    const h = createHash('sha256').update(realpathSync(dist)).update(realpathSync(pfx));
+    for (const f of [join(dist, 'lib/wine/x86_64-unix/wine'), join(dist, 'lib/wine/x86_64-unix/ntdll.so'), join(pfx, 'system.reg'), join(ROOT, 'tools/wine-wasm/page-prefix.sh')]) {
+      if (existsSync(f)) h.update(f).update(String(statSync(f).mtimeMs)).update(String(statSync(f).size));
+    }
+    h.update(readFileSync(new URL(import.meta.url))).update(readFileSync(join(import.meta.dirname, 'wine/pack.py')));
+    const key = h.digest('hex');
+    const keyFile = join(work, 'wine64.key');
+    if (existsSync(join(work, 'wine64.tar')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    const dir = join(work, 'wine64');
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    // The page's prefix: the installed one made current for the dist, its
+    // links resolved (tools/wine-wasm/page-prefix.sh).
+    execFileSync('bash', [join(ROOT, 'tools/wine-wasm/page-prefix.sh'), pfx, dist, join(dir, 'pfx')], { stdio: ['ignore', 'ignore', 'pipe'] });
+    symlinkSync(realpathSync(dist), join(dir, 'dist'));
+    // Small files in the tar; the rest fetched as read, from the work
+    // directory (the dist through its link).
+    execFileSync('python3', ['-I', join(import.meta.dirname, 'wine/pack.py'), join(work, 'wine64.tar'), join(work, 'wine64-lazy.json'), './wine64/',
+      `${realpathSync(dist)}=/wine64,dist`, `${join(dir, 'pfx')}=/pfx,pfx`], { stdio: ['ignore', 'ignore', 'pipe'] });
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
+  async 'win-progs'(work) {
+    // Each source's compiler from its `gex-nt-cc:` line (ARCH the triple's
+    // arch), MinGW gcc otherwise.
+    const src = join(import.meta.dirname, 'wine/src');
+    const h = createHash('sha256');
+    const names = readdirSync(src).filter((f) => /\.(c|cpp)$/.test(f)).sort();
+    for (const f of names) h.update(f).update(readFileSync(join(src, f)));
+    h.update(readFileSync(new URL(import.meta.url)));
+    const key = h.digest('hex');
+    const keyFile = join(work, 'win-progs.key');
+    if (existsSync(join(work, 'win-progs.tar')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    const dir = join(work, 'win-progs');
+    rmSync(dir, { recursive: true, force: true });
+    const failed = {};
+    for (const [arch, triple] of [['x64', 'x86_64'], ['x86', 'i686']]) {
+      mkdirSync(join(dir, arch), { recursive: true });
+      for (const f of names) {
+        const text = readFileSync(join(src, f), 'utf8');
+        const cc = (/gex-nt-cc: *(.*)/.exec(text)?.[1].replace(/\*\/\s*$/, "").trim().replaceAll('ARCH', triple) ?? `${triple}-w64-mingw32-gcc`).split(/\s+/);
+        // std::thread needs MinGW's POSIX thread model, where the default is win32.
+        if (/-g\+\+$/.test(cc[0]) && existsSync(`/usr/bin/${cc[0]}-posix`)) cc[0] += '-posix';
+        // One that does not build is missing, and said so (win-progs.json);
+        // the others are still made.
+        try {
+          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', '-o', join(dir, arch, f.replace(/\.[a-z]+$/, '.exe')), join(src, f)], { stdio: ['ignore', 'ignore', 'pipe'] });
+        } catch (e) {
+          failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
+        }
+      }
+    }
+    writeFileSync(join(work, 'win-progs.json'), JSON.stringify({ failed }, null, 1));
+    execFileSync('tar', ['-cf', join(work, 'win-progs.tar'), '-C', dir, '.']);
     writeFileSync(keyFile, key);
     return null;
   },

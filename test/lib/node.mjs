@@ -11,6 +11,9 @@ import { makeT, runTest } from './t.js';
 const file = process.argv[2];
 const PUBLIC = pathToFileURL(join(import.meta.dirname, '../../web/public/')).href;
 
+// A lazy file's URL is a host path here (shims/browser/js/lazy-fetch.mjs).
+process.env.GEX_NODE_LAZY = '1';
+
 process.once('message', async ({ arch, phase, state, res, work, gpu, timed }) => {
   const t = makeT({ host: 'node', arch, gpu, timed, phase, state, res, emit: (line) => process.send({ line }) });
   const browserOnly = (what) => () => { throw new Error(`${what}: browser host only`); };
