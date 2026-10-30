@@ -435,10 +435,13 @@ fn install_shared(
     // imports to the core's exports, the core (winepe.wasm beside it)
     // installed first if no skeleton of its has been (a program's image
     // maps before ntdll's).
+    // beside the image's file itself, a link to it followed (when the link
+    // names a host path)
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let beside = |name: &str| {
-        let file = std::path::Path::new(path).with_file_name(name);
+        let file = real.with_file_name(name);
         // a twin install's memory64 module, beside it
-        let twin = std::path::Path::new(path).with_file_name(format!("{name}.m64"));
+        let twin = real.with_file_name(format!("{name}.m64"));
         if gex_abi::mem64() && twin.is_file() { twin } else { file }
     };
     let file = beside(&module_name);

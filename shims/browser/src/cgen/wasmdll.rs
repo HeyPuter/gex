@@ -246,7 +246,10 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
 fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, String> {
     let sec = pe.sections.iter().find(|s| s.name == ".wasmref").ok_or("no .wasmref")?;
     let (module_name, dll, data_list) = wasmref(&crate::guest_bytes()[..], base, sec)?;
-    let dir = path.rsplit_once('/').map(|(d, _)| d.to_string());
+    // beside the image's file itself: a prefix's system32 and syswow64 name
+    // the dist's skeletons by links (soju's bundles)
+    let real = crate::sigs::proc_home().ns().canonical(path);
+    let dir = real.rsplit_once('/').map(|(d, _)| d.to_string());
     let mut g = lock(&WINE_PE);
     let before = g.mods.len();
     // The module: installed once, at the first skeleton that names it. A
