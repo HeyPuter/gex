@@ -85,6 +85,28 @@ def spec_path(src, top, d, mod):
     return os.path.join(src, top, d, mod + '.spec')
 
 
+def spec_varargs(spec):
+    """The names a .spec exports as varargs (cdecl, the variadic arguments
+    after the fixed ones on the stack)."""
+    out = set()
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) >= 3 and parts[1] == 'varargs':
+            rest = [t for t in parts[2:] if not t.startswith('-')]
+            if rest:
+                out.add(rest[0].split('(', 1)[0])
+    return out
+
+
+# The words of a variadic call's buffer passed on to an i386 varargs export:
+# its callee pops none, so the ones past its arguments are only read.
+VARARGS_WORDS = 16
+
+
 def spec_stdcalls(spec):
     """The names a .spec exports as stdcall."""
     out = set()
@@ -775,10 +797,11 @@ static void *gexw_ntdll_proc(const char *name)
 ''')
                 resolve = lambda owner, n: (f'gexw_ntdll_proc("{n}")' if guest_ntdll and owner == 'ntdll.dll'
                                             else f'gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}")')
-                stdcalls = {}
+                stdcalls, varargs = {}, {}
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
                         stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
+                        varargs[owner] = spec_varargs(spec_path(SRC, 'dlls', owner.rsplit('.', 1)[0], owner)) if SRC and not WINE64 else set()
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
                     # (x64 has one convention)
@@ -787,6 +810,13 @@ static void *gexw_ntdll_proc(const char *name)
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
                     args = ', '.join(f'a{i}' for i in range(len(ps)))
+                    # A variadic call: wasm32 hands over the variadic arguments
+                    # as a pointer to a buffer, the last parameter; the i386
+                    # callee takes them on the stack after the fixed ones.
+                    if n in varargs[owner] and ps and ps[-1] == 'i':
+                        types = ', '.join([ctype[c] for c in ps[:-1]] + ['int'] * VARARGS_WORDS)
+                        args = ', '.join([f'a{i}' for i in range(len(ps) - 1)] +
+                                         [f'((const int *)a{len(ps) - 1})[{j}]' for j in range(VARARGS_WORDS)])
                     f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{sym}");\n')
                     # (bound by its DLL's entry point when the owner is a
                     # static import, else on first call, as a delay load)
