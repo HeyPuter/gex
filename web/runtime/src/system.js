@@ -43,59 +43,22 @@ function machine(b, at = 0) {
 }
 
 /**
- * The guest architecture a tar's programs are built for: the machine of
- * what `/bin/sh` is, its links followed, read from the headers up to the
- * entry that decides it, with no file's bytes but an ELF header read; else
- * of the first native program in it. Null for none.
+ * The guest architecture a tar's programs are built for: the machine of its
+ * first native (non-wasm32) ELF, read from the headers up to that entry,
+ * with no file's bytes but an ELF header read. Null for none: a wasm32 tree
+ * whose native packages are still to come.
  */
 function tarArch(tarEntries, b) {
-  const links = new Map(); // path -> [target, hard]
-  const files = new Map(); // path -> where its bytes start
-  const resolve = (p) => {
-    let todo = p.split('/');
-    let cur = [];
-    for (let hops = 0; todo.length;) {
-      const x = todo.shift();
-      if (!x || x === '.') continue;
-      if (x === '..') {
-        cur.pop();
-        continue;
-      }
-      cur.push(x);
-      const l = links.get(`/${cur.join('/')}`);
-      if (!l) continue;
-      if (++hops > 40) return null;
-      const [t, hard] = l;
-      cur.pop();
-      todo = [...(t.startsWith('/') || hard ? [] : cur), ...t.split('/'), ...todo];
-      cur = [];
-    }
-    return `/${cur.join('/')}`;
-  };
-  let want = '/bin/sh';
   let found = null;
-  let first = null;
-  tarEntries(b, ({ name, type, body, link }) => {
-    const p = `/${name.split("/").filter((x) => x && x !== ".").join("/")}`;
-    if (type === '2' || type === '1') {
-      links.set(p, [link, type === '1']);
-      want = resolve('/bin/sh');
-    } else if (type === '0' || type === '\0' || type === '7') {
-      files.set(p, body);
-      first ??= machine(b, body);
-    }
-    if (want && files.has(want)) {
-      found = machine(b, files.get(want));
-      return true;
-    }
-    return false;
+  tarEntries(b, ({ type, body }) => {
+    if (type === '0' || type === '\0' || type === '7') found = machine(b, body);
+    return !!found;
   });
-  return found ?? first;
+  return found;
 }
 
-/** [`tarArch`] of single files (`{ path: bytes }`). */
+/** [`tarArch`] of single files (`{ path: bytes }`), in the order given. */
 function filesArch(files = {}) {
-  for (const p of ['/bin/sh', '/usr/bin/sh']) if (machine(files[p])) return machine(files[p]);
   for (const d of Object.values(files)) if (machine(d)) return machine(d);
   return null;
 }
@@ -268,11 +231,13 @@ export class System extends EventTarget {
     const opts = { layers: [], records: [] };
     for (const fn of this.#beforeBoot) await fn(opts);
 
-    // The translated architecture, beside which wasm32 programs run: the global kernel is built for one (its syscall ABI,
-    // struct layouts, signal frame), so it is chosen here, from the tree's
-    // programs. A tree with none yet (wasm32 only, its native packages to
-    // come) gets aarch64, Debian's arm64 being the usual second
-    // architecture of a wasm32 tree. A program of the other one does not run.
+    // The translated architecture, beside which wasm32 programs run: the
+    // global kernel is built for one (its syscall ABI, struct layouts, signal
+    // frame), so it is chosen here, from the tree's first native program; a
+    // wasm32 /bin/sh says nothing. A tree with none yet (wasm32 only, its
+    // native packages to come) gets aarch64, Debian's arm64 being the usual
+    // second architecture of a wasm32 tree, so apt can install them later.
+    // A program of the other one does not run.
     const arch = wantArch ?? (await layersArch(opts.layers)) ?? 'aarch64';
     const { setGlobals } = await import('../../src/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
