@@ -293,6 +293,11 @@ pub(crate) fn install_shared(
             .shared,
     );
     for (module, meta) in units {
+        // Code in the process's other mode: its directory, before the
+        // entries go in.
+        if meta.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0) {
+            super::ensure_alt_dir_in(store.data_mut(), &shared)?;
+        }
         let unit = Arc::new(super::CompiledUnit {
             module: Some(module),
             exported_blocks: Vec::new(),

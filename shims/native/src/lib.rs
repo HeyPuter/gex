@@ -5262,11 +5262,17 @@ pub(crate) fn thread_alt(caller: &Caller<'_, HostState>) -> bool {
 /// a thread runs code in that mode: top-down below 4 GiB, out of a 32-bit
 /// program's way, zero (every page a miss) until code there is translated.
 fn ensure_alt_dir(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
+    ensure_alt_dir_in(caller.data_mut(), shared)
+}
+
+/// [`ensure_alt_dir`] for a store's state (an ejected project's prebuilt
+/// modules of that mode, installed before the program runs).
+pub(crate) fn ensure_alt_dir_in(state: &mut HostState, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
     let have = shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir;
     if have != 0 {
         return Ok(have);
     }
-    let at = libprov::alloc_above_code(caller.data_mut(), gex_abi::alt_dir_bytes(), "[gex other-mode dispatch]")?;
+    let at = libprov::alloc_above_code(state, gex_abi::alt_dir_bytes(), "[gex other-mode dispatch]")?;
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     if sh.alt_dir == 0 {
         sh.alt_dir = at;

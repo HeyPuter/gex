@@ -969,7 +969,7 @@ impl ModuleBuilder {
         // The profile region: one record per block, laid out in the order the
         // blocks were added, and the helpers that read and write it.
         let profile_emit = self.profile.map(|p| {
-            let region = crate::profile::layout(self.pending.iter().map(|(b, _)| b));
+            let region = crate::profile::layout(self.pending.iter().map(|(b, _)| b), self.alt_dir.is_some());
             let seg = self.m.passive_data(region.init.clone());
             self.m.define_func(p.f_entry, crate::profile::body_entry(p.global));
             self.m.define_func(p.f_indirect, crate::profile::body_indirect(p.global));

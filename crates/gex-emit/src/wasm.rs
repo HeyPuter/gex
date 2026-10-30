@@ -1261,9 +1261,11 @@ impl Module {
     }
 
     /// Define a global (none are imported), returning its index.
+    /// A defined global: its index follows the imported ones'.
     pub fn add_global(&mut self, ty: ValType, mutable: bool, init: i64) -> u32 {
+        let imported = self.imports.iter().filter(|i| matches!(i.kind, ImportKind::Global { .. })).count() as u32;
         self.globals.push((ty, mutable, init));
-        self.globals.len() as u32 - 1
+        imported + self.globals.len() as u32 - 1
     }
 
     pub fn set_start(&mut self, func: u32) {

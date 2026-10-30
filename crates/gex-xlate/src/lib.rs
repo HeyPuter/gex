@@ -740,16 +740,15 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
 /// [`ModuleBuilder`] the whole-image emitters share.
 fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
     let (text_lo, text_hi) = image.text_range;
-    let mut builder = if opts.first_slot == 0 {
+    // An image's code in the process's other mode (gex-eject's seeds of a
+    // WoW64 program's 32-bit code): that mode's pages and directory.
+    let alt = other_mode();
+    let mut builder = if opts.first_slot == 0 && !alt {
         ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory)
     } else {
-        ModuleBuilder::with_pages(
-            text_lo,
-            text_hi - text_lo,
-            opts.linkage,
-            gex_emit::module::PageTable::from_entries(&[], opts.first_slot),
-            opts.shared_memory,
-        )
+        let mut pages = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+        pages.set_alt(alt);
+        ModuleBuilder::with_pages(text_lo, text_hi - text_lo, opts.linkage, pages, opts.shared_memory)
     };
     builder.set_demand_fill(opts.demand_fill);
     builder
@@ -935,7 +934,8 @@ pub fn translate_image_split(
     }
     // Split through the proven runtime splitter, threaded from this object's
     // starting slot and emitting the closure's passive segments (`demand_fill`).
-    let page_table = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+    let mut page_table = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+    page_table.set_alt(other_mode());
     let modules = emit_modules(
         collected,
         image.text_range.0,
