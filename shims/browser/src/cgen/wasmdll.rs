@@ -439,6 +439,60 @@ fn shape(wasm: &[u8]) -> Result<Shape, String> {
     Ok(s)
 }
 
+/// The C functions a module may import from a module of the process's
+/// other mode (wasm32 i386 Wine calling the lowered wasm64 side, or back):
+/// an export of the exact wasm type, never a slot. WoW64's native i386
+/// ntdll makes its system calls through the first.
+pub(crate) const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32"];
+
+/// The type of the function `wasm` exports as `name`.
+fn export_func_type(wasm: &[u8], name: &str) -> Option<wasmparser::FuncType> {
+    let mut types = Vec::new();
+    let mut funcs: Vec<u32> = Vec::new();
+    let mut index = None;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.ok()? {
+            wasmparser::Payload::TypeSection(r) => {
+                for t in r.into_iter_err_on_gc_types() {
+                    types.push(t.ok()?);
+                }
+            }
+            wasmparser::Payload::ImportSection(r) => {
+                for imp in r {
+                    if let wasmparser::TypeRef::Func(t) = imp.ok()?.ty {
+                        funcs.push(t);
+                    }
+                }
+            }
+            wasmparser::Payload::FunctionSection(r) => {
+                for t in r {
+                    funcs.push(t.ok()?);
+                }
+            }
+            wasmparser::Payload::ExportSection(r) => {
+                for x in r {
+                    let x = x.ok()?;
+                    if x.name == name && x.kind == wasmparser::ExternalKind::Func {
+                        index = Some(x.index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    types.get(*funcs.get(index? as usize)? as usize).cloned()
+}
+
+/// A cross-mode import `name` of type `want` bound to `provider`'s export:
+/// the types must match exactly.
+fn cross_mode_check(name: &str, want: Option<&wasmparser::FuncType>, provider: &WinePe) -> Result<(), String> {
+    let have = export_func_type(&provider.wasm, name);
+    if want.is_some() && want == have.as_ref() {
+        return Ok(());
+    }
+    Err(format!("{name}: imported as {want:?}, {} exports it as {have:?}", provider.file))
+}
+
 /// Install one of Wine's PE modules (`file`, `wasm` read by
 /// [`read_module`]) as a stateful provider: its data allocated, and with
 /// `core` (a module of its own) its imports of the other modules bound, as
@@ -589,8 +643,14 @@ fn install_module(
                 // another module's: bound to it if it is installed, else a
                 // call through a slot filled when it is (the core's calls
                 // into user32, say)
-                match others(n) {
-                    Some(w) => B::Export(w.number),
+                let cross = CROSS_MODE.contains(&n.as_str());
+                match others(n).or_else(|| if cross { g.mods.iter().find(|w| w.ptr64 != is64 && w.funcs.contains(n)) } else { None }) {
+                    Some(w) => {
+                        if w.ptr64 != is64 {
+                            cross_mode_check(n, sh.import_types[i].as_ref(), w)?;
+                        }
+                        B::Export(w.number)
+                    }
                     None => {
                         lates.push((len, n.clone(), None));
                         len += 1;
@@ -658,8 +718,21 @@ fn install_module(
         g.canon.insert((is64, n), base + off);
     }
     let funcs_now = g.mods[idx].funcs.clone();
-    for l in g.late.iter_mut().filter(|l| l.provider.is_none() && l.ptr64 == is64 && funcs_now.contains(&l.name)) {
-        l.provider = Some(number);
+    for k in 0..g.late.len() {
+        let l = &g.late[k];
+        if l.provider.is_some() || !funcs_now.contains(&l.name) {
+            continue;
+        }
+        if l.ptr64 != is64 {
+            if !CROSS_MODE.contains(&l.name.as_str()) {
+                continue;
+            }
+            let importer = g.mods.iter().find(|w| w.number == l.importer).ok_or("a late bind's importer is gone")?;
+            let sh = shape(&importer.wasm)?;
+            let want = sh.imports.iter().zip(sh.import_types).find(|((m, n, _, _), _)| m == "env" && *n == l.name).and_then(|(_, t)| t);
+            cross_mode_check(&l.name, want.as_ref(), &g.mods[idx])?;
+        }
+        g.late[k].provider = Some(number);
     }
     g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider, ptr64: is64 }));
     let wp = &mut g.mods[idx];

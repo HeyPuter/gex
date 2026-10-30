@@ -585,6 +585,26 @@ pub(crate) fn fill_late(c: &mut wasmtime::StoreContextMut<'_, HostState>, table:
     Ok(())
 }
 
+/// The C functions a module may import from a module of the process's
+/// other mode (wasm32 i386 Wine calling the lowered wasm64 side, or back):
+/// an export of the exact wasm type, never a slot (as the page's,
+/// shims/browser cgen/wasmdll.rs). WoW64's native i386 ntdll makes its
+/// system calls through the first.
+const CROSS_MODE: &[&str] = &["wow64cpu.dll!__wine_gex_syscall32"];
+
+/// The wasm type of `module`'s `env` import `name` (or its export, `export`).
+fn cross_mode_type(module: &wasmtime::Module, name: &str, export: bool) -> Result<String> {
+    let ty = if export {
+        module.exports().find(|e| e.name() == name).map(|e| e.ty())
+    } else {
+        module.imports().find(|i| i.module() == "env" && i.name() == name).map(|i| i.ty())
+    };
+    match ty {
+        Some(wasmtime::ExternType::Func(f)) => Ok(format!("{:?} -> {:?}", f.params().collect::<Vec<_>>(), f.results().collect::<Vec<_>>())),
+        _ => bail!("{name}: no function of that name to bind across modes"),
+    }
+}
+
 /// Whether a Wine module of this pointer size is of the process's other
 /// mode: an ILP32 one (32-bit Wine's, PE32 skeletons) in an x86-64 process.
 fn module_alt(is64: bool) -> bool {
@@ -683,19 +703,25 @@ fn install_module(
         r?;
     }
     // what the core exports, and the functions every installed module exports
-    let (have_core, others) = {
+    let (have_core, others, cross) = {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
         let have_core: std::collections::HashSet<String> = match &core {
             Some(c) => s.ftab.modules[c.module as usize].exports().map(|e| e.name().to_string()).collect(),
             None => Default::default(),
         };
         let mut others = std::collections::HashMap::new();
-        for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()).filter(|wp| wp.ptr64 == is64) {
+        let mut cross = std::collections::HashMap::new();
+        for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()) {
             for n in funcs_of(&s.ftab.modules[wp.module as usize]) {
-                others.entry(n).or_insert(wp.module);
+                if wp.ptr64 == is64 {
+                    others.entry(n).or_insert(wp.module);
+                } else if CROSS_MODE.contains(&n.as_str()) {
+                    let ty = cross_mode_type(&s.ftab.modules[wp.module as usize], &n, true)?;
+                    cross.entry(n).or_insert((wp.module, ty, wp.file.display().to_string()));
+                }
             }
         }
-        (have_core, others)
+        (have_core, others, cross)
     };
     let mut imports = Vec::new();
     let mut lates = Vec::new();
@@ -711,9 +737,16 @@ fn install_module(
             // another module's: bound to it if it is installed, else a call
             // through a slot filled when it is (`fill_late`; the core's calls
             // into user32, say)
-            match others.get(&name) {
-                Some(&p) => crate::dylink::NBind::Export { module: p, name: name.clone() },
-                None => {
+            match (others.get(&name), cross.get(&name)) {
+                (Some(&p), _) => crate::dylink::NBind::Export { module: p, name: name.clone() },
+                (None, Some((p, ty, file))) => {
+                    let want = cross_mode_type(&module, &name, false)?;
+                    if want != *ty {
+                        bail!("{name}: imported as {want}, {file} exports it as {ty}");
+                    }
+                    crate::dylink::NBind::Export { module: *p, name: name.clone() }
+                }
+                (None, None) => {
                     lates.push((len, name.clone(), None));
                     len += 1;
                     crate::dylink::NBind::LateOwn(len - 1)
@@ -773,8 +806,22 @@ fn install_module(
         // its calls and addresses into modules not yet installed; earlier
         // modules' into it
         s.wine_pe_late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: m, off, name, provider, ptr64: is64 }));
-        for l in s.wine_pe_late.iter_mut().filter(|l| l.provider.is_none() && l.importer != m && l.ptr64 == is64 && mine.contains(&l.name)) {
-            l.provider = Some(m);
+        for k in 0..s.wine_pe_late.len() {
+            let l = &s.wine_pe_late[k];
+            if l.provider.is_some() || l.importer == m || !mine.contains(&l.name) {
+                continue;
+            }
+            if l.ptr64 != is64 {
+                if !CROSS_MODE.contains(&l.name.as_str()) {
+                    continue;
+                }
+                let want = cross_mode_type(&s.ftab.modules[l.importer as usize], &l.name, false)?;
+                let have = cross_mode_type(&module, &l.name, true)?;
+                if want != have {
+                    bail!("{}: imported as {want}, {} exports it as {have}", l.name, file.display());
+                }
+            }
+            s.wine_pe_late[k].provider = Some(m);
         }
         m
     };
