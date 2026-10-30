@@ -213,8 +213,8 @@ int main(int argc, char **argv) {
     code = 0;
     __try { ((void (*)(void))(void *)data_bytes)(); }
     __except (code = GetExceptionCode(),
-              kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
-              where = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+              kind = ((EXCEPTION_POINTERS *)GetExceptionInformation())->ExceptionRecord->ExceptionInformation[0],
+              where = ((EXCEPTION_POINTERS *)GetExceptionInformation())->ExceptionRecord->ExceptionInformation[1],
               EXCEPTION_EXECUTE_HANDLER) {}
     CHECK("executing data is an access violation", code == EXCEPTION_ACCESS_VIOLATION && kind == 8 && where == (ULONG_PTR)data_bytes);
 #endif
