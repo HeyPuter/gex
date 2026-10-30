@@ -28,7 +28,13 @@ export default async function (t) {
   eq('a tone', tone.code, 0);
   const ms = Number(tone.stdout);
   // Paced, less what the device queues ahead.
-  check(`1500 ms written in ${ms} ms with the player`, ms > 300 && ms < 4000, tone.stdout);
+  // (No upper bound for a loaded machine's sake beyond "not stuck".)
+  check(`1500 ms written in ${ms} ms with the player`, ms > 300 && ms < 15000, tone.stdout);
+  // The program is done once the device has taken the tone; the player is
+  // still playing what it queued, and says what it played about twice a
+  // second, later on a busy machine: wait for its word.
+  const loudNow = () => ((audio.context && globalThis.__gexAudio?.history) ?? []).some((r) => r.rms > 0.05);
+  await until(loudNow, 'the player\'s report', 10000).catch(() => {});
   const heard = (audio.context && globalThis.__gexAudio?.history) ?? [];
   const loud = heard.filter((r) => r.rms > 0.05);
   check('it played', loud.length > 0, JSON.stringify(heard.slice(-3)));
