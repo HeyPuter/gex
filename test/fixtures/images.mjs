@@ -257,12 +257,16 @@ export const images = {
         if (/-g\+\+$/.test(cc[0]) && existsSync(`/usr/bin/${cc[0]}-posix`)) cc[0] += '-posix';
         // One that does not build is missing, and said so (win-progs.json);
         // the others are still made.
-        try {
-          // `gex-nt-shared`: a DLL.
-          const dll = /gex-nt-shared/.test(text);
-          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), '-o', join(dir, arch, f.replace(/\.[a-z]+$/, dll ? '.dll' : '.exe')), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
-        } catch (e) {
-          failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
+        // `gex-nt-shared`: a DLL. `gex-nt-variant: NAME FLAGS...` (one a
+        // line): built once per variant, as NAME with those flags.
+        const dll = /gex-nt-shared/.test(text);
+        const variants = [...text.matchAll(/gex-nt-variant: *(\S+)(.*)/g)].map((m) => [m[1], m[2].trim().split(/\s+/).filter(Boolean)]);
+        for (const [name, flags] of variants.length ? variants : [[f.replace(/\.[a-z]+$/, ''), []]]) {
+          try {
+            execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), ...flags, '-o', join(dir, arch, `${name}.${dll ? 'dll' : 'exe'}`), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
+          } catch (e) {
+            failed[`${arch}/${variants.length ? `${name}.c` : f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
+          }
         }
       }
     }
