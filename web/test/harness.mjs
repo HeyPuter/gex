@@ -20,14 +20,18 @@ import { tmpdir } from 'node:os';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
-const DIST = join(WEB, 'dist');
+// `GEX_DIST=web/dist-sp GEX_NO_COI=1`: the single-thread build's dist, served
+// without cross-origin isolation (no SharedArrayBuffer: the page runs the
+// whole system in one Worker).
+const DIST = process.env.GEX_DIST ? resolvePath(process.env.GEX_DIST) : join(WEB, 'dist');
+const NO_COI = process.env.GEX_NO_COI === '1';
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const PORT = Number(process.env.GEX_HARNESS_PORT || 39900);
 
 // The kernel's memory is a SharedArrayBuffer, which needs cross-origin
 // isolation. Every response needs these headers, not just the document, or the
 // harness silently runs a one-process world.
-const ISOLATED = {
+const ISOLATED = NO_COI ? { 'cross-origin-resource-policy': 'cross-origin' } : {
   'cross-origin-opener-policy': 'same-origin',
   'cross-origin-embedder-policy': 'require-corp',
   'cross-origin-resource-policy': 'cross-origin',
@@ -54,9 +58,7 @@ async function serveStatic(req, res) {
     res.writeHead(200, {
       'content-type': TYPES[extname(file)] || 'application/octet-stream',
       // Cross-origin isolation for SharedArrayBuffer; see ISOLATED above.
-      'cross-origin-opener-policy': 'same-origin',
-      'cross-origin-embedder-policy': 'require-corp',
-      'cross-origin-resource-policy': 'cross-origin',
+      ...ISOLATED,
     });
     res.end(body);
   } catch {
@@ -68,9 +70,7 @@ async function serveStatic(req, res) {
 function streamRootfs(root, res) {
   res.writeHead(200, {
     'content-type': 'application/x-tar',
-    'cross-origin-opener-policy': 'same-origin',
-    'cross-origin-embedder-policy': 'require-corp',
-    'cross-origin-resource-policy': 'cross-origin',
+    ...ISOLATED,
   });
   // `-h` so symlinks arrive as their target's bytes; a dangling link (Debian
   // has several) must not stop the stream.
@@ -316,8 +316,9 @@ async function start(args) {
       '--disable-gpu',
       `--user-data-dir=${profile}`,
       // The page needs a SharedArrayBuffer; the headers are served above, and
-      // this keeps a bare IP origin from being treated as insecure.
-      '--enable-features=SharedArrayBuffer',
+      // this keeps a bare IP origin from being treated as insecure. Not for
+      // the single-thread build, which must have none.
+      ...(NO_COI ? [] : ['--enable-features=SharedArrayBuffer']),
       '--enable-logging=stderr',
       '--v=0',
       url,
