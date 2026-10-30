@@ -431,11 +431,21 @@ def link(dlls, out, gexrt, others=None):
     aliases = {}  # defining dll -> [(alias, name there)]
     forward_owner = {}  # export name -> forwarding dll (the name is bound to dll!name)
     unresolved = []  # (export name, forwarding dll, forward) no native DLL defines
+    # A name some DLL defines and another forwards elsewhere (unicows' own
+    # DefWindowProcW, user32's forward to ntdll's NtdllDefWindowProc_W) is
+    # bound by the forward where the module imports the forwarding DLL
+    # first (fwd_first, below; gdi32's GetCharWidthW, its own GetCharWidth32W,
+    # and unicows' GetCharWidthW too); forwards to one of the defining DLLs
+    # are left to the direct binding.
+    shadowed = {}  # export name -> {forwarding dll}
     for name, by in forwards.items():
-        if name in exporters:
-            continue
         for via, fwd in by.items():
             hit = resolve_forward(fwd)
+            if name in exporters:
+                if hit and hit[0] in exporters[name]:
+                    continue
+                if hit:
+                    shadowed.setdefault(name, set()).add(via)
             if hit:
                 aliases.setdefault(hit[0], []).append((f'{via}!{name}', hit[1]))
                 forward_owner.setdefault(name, [])
@@ -543,6 +553,20 @@ def link(dlls, out, gexrt, others=None):
     delay_eager = {}  # module -> delay imports it still loads first (a data import, an unknown signature)
     direct_refs = {}  # group -> the DLLs its code is bound to directly
 
+    def fwd_first(mod, imports, name):
+        """`name` is the module's through a forwarding DLL it imports ahead
+        of every DLL defining it, or through a forward when it imports
+        neither."""
+        vias = shadowed.get(name)
+        if not vias or mod in vias or mod in exporters[name]:
+            return False
+        first = next((o for o in EAGER.get(mod, []) + imports
+                      if o in vias or o in exporters[name]), None)
+        # (none of them: the forward's definition rather than whichever DLL
+        # defines the name first, xaudio2's lstrcpynW kernelbase's, not
+        # unicows')
+        return first is None or first in vias
+
     for mod, ro, ex, imports in dlls:
         local = os.path.join(tmp, mod + '.l.o')
         alias_file = os.path.join(tmp, mod + '.aliases')
@@ -555,6 +579,8 @@ def link(dlls, out, gexrt, others=None):
             # its entry point's binding of its static guest imports (winebuild)
             f.write(f'wine_gexw_bind_imports gexw-bind {mod}\n')
             for name, owners in exporters.items():
+                if fwd_first(mod, imports, name):
+                    continue  # bound by its forward, below
                 # (a DLL may list an export its code takes from another DLL:
                 # kernel32's DebugBreak is kernelbase's)
                 defs = [o for o in owners if (name, 'defined') in sigs[o]]
@@ -577,6 +603,13 @@ def link(dlls, out, gexrt, others=None):
                 # tables, and wineboot's fstat of a file it had just opened
                 # failed)
                 pick = next((o for o in EAGER.get(mod, []) + imports if o in owners), owners[0])
+                # (none of the DLLs it imports defines it, and one forwards it
+                # to an i386 DLL: bound through that, below, as when no native
+                # DLL defined the name; combase's PostThreadMessageW is
+                # user32's forward to win32u, not unicows' own)
+                if pick not in EAGER.get(mod, []) + imports and any(
+                        v in EAGER.get(mod, []) + imports for v in forwards.get(name, {})):
+                    continue
                 # An i386 DLL the module imports explicitly, ahead of the
                 # native owner, is the one the name comes from, as an import
                 # library's link order has it (winedevice's ZwLoadDriver is
@@ -628,6 +661,8 @@ def link(dlls, out, gexrt, others=None):
             # names only forwarded (kernel32's EnterCriticalSection is
             # ntdll's RtlEnterCriticalSection, under kernel32.dll!EnterCriticalSection)
             for name, vias in forward_owner.items():
+                if name in exporters and not fwd_first(mod, imports, name):
+                    continue  # bound to its definition, above
                 pick = next((o for o in [mod] + imports if o in vias), vias[0])
                 if bind_guest(f, mod, imports, name, pick):
                     continue
