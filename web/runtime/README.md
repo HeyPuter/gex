@@ -361,9 +361,5 @@ built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`).
 
 ## Tests
 
-`node web/runtime/test/run.mjs` runs each test page here in headless Chromium
-against a vite dev server. `BUSYBOX` names a wasm32 busybox, which with its
-applets and `test/probe` is the test tree. `RT_SLIM` names a directory with
-a Debian image (`debian-slim.tar.zst`) and its apt repository (`repo/`), for
-`slim.html`: apt install from the repository mounted from the page, reload,
-and the package is still there; without it that page is skipped.
+The runtime's tests are gex's test runner's `core`, `windows`, `gl` and
+`image` groups (test/README.md): `node test/run.mjs --group core,windows,gl,image`.
