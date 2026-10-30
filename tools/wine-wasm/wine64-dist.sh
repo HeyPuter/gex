@@ -15,6 +15,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
 #               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
+#   wwl32-P     with WINE64_WOW64=1, the i386 PE winewayland.drv (a tree of
+#               its own: the 32-bit side's display driver)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
@@ -32,6 +34,8 @@
 #   dist64-K-S-fF-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
 #   dist64-K-S-fF  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
+#               the name gets -wwl)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -167,6 +171,21 @@ pe_build() {
 log "$ARCHS PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
 
+# WoW64: the 32-bit side's display driver, which a 32-bit process's user32
+# loads from lib/wine/i386-windows. Its PE half needs no Wayland libraries,
+# but the PE tree's configure (--without-wayland: no host libraries) leaves
+# the whole module out, and enabling the module there has `make` build its
+# Unix half as well, which cannot build without them. A tree of its own,
+# configured with the module enabled, makes the i386 PE file alone; the
+# Unix half is the loader's (link-wine64.sh, with its WoW64 table).
+wwl32_build() {
+	"$W/configure" --enable-archs=i386 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv
+}
+WD=; if [ "$WOW" != 0 ]; then
+	log "i386 winewayland.drv ($P)"; step wwl32-$P wwl32_build; WD=-wwl
+fi
+
 pfx_make() {
 	# The native Wine makes the prefix; a bare server of its own, no display.
 	# As the page's user (gex), with an empty home: the profile then has no
@@ -238,6 +257,7 @@ dist_make() {
 	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
+	[ "$WOW" = 0 ] || cp -p "$C/wwl32-$P/dlls/winewayland.drv/i386-windows/winewayland.drv" lib/wine/i386-windows/
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
@@ -247,7 +267,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F$WS)"; step dist64-$K-$S-f$F$WS dist_make
+log "install ($K, $S, $F$WS$WD)"; step dist64-$K-$S-f$F$WS$WD dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -279,7 +299,7 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F$WS
+DIST=$C/dist64-$K-$S-f$F$WS$WD
 NATIVE=$C/pen64-$K-$NK/native
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
