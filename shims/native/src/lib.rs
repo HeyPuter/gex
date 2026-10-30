@@ -4126,12 +4126,14 @@ fn alt_enter_for(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<w
     if caller.data().alt_enter.is_none() {
         translate_and_install(caller, pc)?;
     }
-    caller
-        .data()
-        .alt_enter
-        .clone()
-        .map(Some)
-        .ok_or_else(|| anyhow!("no translation in the thread's mode for 0x{pc:x}"))
+    if let Some(e) = caller.data().alt_enter.clone() {
+        return Ok(Some(e));
+    }
+    // Nothing of that mode translated in this store, the thread entering
+    // it at a function bound there (a WoW64 thread's first 32-bit code,
+    // LdrInitializeThunk in a native i386 ntdll): the other mode's runtime
+    // dispatches through its directory as well.
+    ftab::enter_alt(&mut *caller).map(Some)
 }
 
 /// [`alt_enter_for`] from a loop that holds the store, not a caller.
@@ -4164,7 +4166,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { let r = (|| -> anyhow::Result<()> {
             // A system call from the other mode's code (int 0x80, syscall or
             // sysenter in a WoW64 thread's 32-bit code): no such gate, #GP.
-            if gex_abi::X86 && thread_alt(&caller) {
+            // (Not gexrt's own call from a native i386 Wine module, marked
+            // native: NATIVE_LEFT, below.)
+            if gex_abi::X86 && thread_alt(&caller) && pc as u64 & NATIVE_SYSCALL == 0 {
                 return gp_fault(&mut caller, pc as u64 & !NATIVE_SYSCALL, "a system call from code in the process's other mode".into());
             }
             // A Unix call from guest code under Wine's own Unix side (32-bit Wine).

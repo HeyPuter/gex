@@ -623,8 +623,10 @@ fn install_module(
     let a = 1u64 << align;
     // (an LLP64 module's above the images: a PE32+ export's RVA is
     // added to its base in 64 bits, so data below an image's base
-    // would be past 4 GiB)
-    let data = if is64 {
+    // would be past 4 GiB; and an i386 module's in a 64-bit process,
+    // whose 64-bit side finds ntdll's data exports so, wow64's
+    // Wow64Transition)
+    let data = if is64 || alt {
         crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
     } else {
         crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?

@@ -35,6 +35,7 @@ use wasm_encoder::{
 pub const RESOLVE: &str = "resolve";
 pub const ROOT: &str = "root";
 pub const BRIDGE: &str = "bridge";
+pub const ENTER: &str = "enter";
 
 /// The `F_body` type, as every emitter declares it.
 pub fn body_params() -> [ValType; 4] {
@@ -142,6 +143,7 @@ fn module_in(alt: bool) -> Vec<u8> {
     types.ty().function([ValType::I32, ValType::I64], []); // 2: safepoint
     types.ty().function([ValType::I32], []); // 3: root, bridge, a block
     types.ty().function([ValType::I32, ValType::I64, ValType::I32, ValType::I64], []); // 4: cache_op
+    types.ty().function([ValType::I32, ValType::I64], []); // 5: enter
     m.section(&types);
     let mut imports = ImportSection::new();
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::exports::MEMORY, EntityType::Memory(memory_type()));
@@ -172,11 +174,17 @@ fn module_in(alt: bool) -> Vec<u8> {
     funcs.function(3); // 5 root
     funcs.function(3); // 6 bridge
     funcs.function(3); // 7 dispatch
+    if alt {
+        funcs.function(5); // 8 enter
+    }
     m.section(&funcs);
     let mut exports = ExportSection::new();
     exports.export(RESOLVE, ExportKind::Func, 4);
     exports.export(ROOT, ExportKind::Func, 5);
     exports.export(BRIDGE, ExportKind::Func, 6);
+    if alt {
+        exports.export(ENTER, ExportKind::Func, 8);
+    }
     m.section(&exports);
     let ctxm = |off: usize, align: u32| MemArg { offset: off as u64, align, memory_index: 0 };
     // ctx = local 0; the safepoint countdown, as tier-1's, polling at PC.
@@ -358,6 +366,25 @@ fn module_in(alt: bool) -> Vec<u8> {
 
     // dispatch(ctx): tier-1's indirect dispatch on LAST_TARGET.
     code.function(&crate::splice::dispatch_function_in(3, 1, alt.then_some(0)));
+
+    // enter(ctx, pc), the other mode's only: the host's way in at `pc`, as
+    // a translated module's `enter` (its PC and target recorded, then
+    // dispatch), for a thread that enters that mode at a function bound
+    // there before any of its code is translated. (The page's dense
+    // rewrite of the own mode's module expects dispatch last.)
+    if alt {
+        let mut f = Function::new([]);
+        for off in [ctx::PC, ctx::LAST_TARGET] {
+            f.instruction(&I::LocalGet(0));
+            crate::splice::widen_addr(&mut f);
+            f.instruction(&I::LocalGet(1));
+            f.instruction(&I::I64Store(ctxm(off, 3)));
+    }
+        f.instruction(&I::LocalGet(0));
+        f.instruction(&I::ReturnCall(DISPATCH));
+        f.instruction(&I::End);
+        code.function(&f);
+    }
     m.section(&code);
     m.finish()
 }

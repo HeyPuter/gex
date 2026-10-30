@@ -517,8 +517,10 @@ fn install_module(
 
     let (size, align) = dylink_memory(&wasm)?;
     let a = 1u64 << align;
-    // (an LLP64 module's above the images: see `crate::wine64_pe_data`)
-    let data = if is64 {
+    // (an LLP64 module's above the images: see `crate::wine64_pe_data`;
+    // and an i386 module's in a 64-bit process, whose 64-bit side finds
+    // ntdll's data exports so, wow64's Wow64Transition)
+    let data = if is64 || alt {
         alloc_pe_data_window(&mut g.data_low, (size as u64).max(16) + a, "[wine PE data]")?
     } else {
         provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?

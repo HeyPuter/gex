@@ -92,6 +92,9 @@ pub(crate) struct Store {
     /// The other mode's bridge (`runtime::module_alt`), made at its first
     /// bridge in the other directory.
     pub bridge_alt: Option<wasmtime::Func>,
+    /// Its `enter`: the run loop's way into the other mode before any of
+    /// that mode's code is translated in this store (`alt_enter_for`).
+    pub enter_alt: Option<wasmtime::Func>,
     /// The run loop (`gex_cgen::runtime::ROOT`), which an AOT-only process
     /// enters through (`aot_only::bind_root`).
     pub root: wasmtime::Func,
@@ -242,7 +245,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
     Ok(())
 }
 
@@ -1119,7 +1122,7 @@ pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots
 
 /// Make this store's other-mode bridge (`runtime::module_alt`), once the
 /// process has its other directory.
-fn ensure_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> {
+pub(crate) fn ensure_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> {
     let jit = cx.as_context().data().jit.as_ref().unwrap();
     if jit.ftab.as_ref().is_some_and(|st| st.bridge_alt.is_some()) {
         return Ok(());
@@ -1164,14 +1167,25 @@ fn ensure_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> {
     )?;
     l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::imports::ALT_DIR, g)?;
     let inst = l.instantiate(cx.as_context_mut(), &rm).context("instantiating the other mode's runtime module")?;
-    let bridge = inst
-        .get_func(cx.as_context_mut(), gex_cgen::runtime::BRIDGE)
-        .ok_or_else(|| anyhow!("the other mode's runtime module exports no bridge"))?;
+    let get = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, n: &str| {
+        inst.get_func(&mut *cx, n).ok_or_else(|| anyhow!("the other mode's runtime module exports no {n}"))
+    };
     let mut c = cx.as_context_mut();
+    let bridge = get(&mut c, gex_cgen::runtime::BRIDGE)?;
+    let enter = get(&mut c, gex_cgen::runtime::ENTER)?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab.as_mut().unwrap().bridge_alt = Some(bridge);
+    let st = jit.ftab.as_mut().unwrap();
+    st.bridge_alt = Some(bridge);
+    st.enter_alt = Some(enter);
     Ok(())
+}
+
+/// The other mode's runtime `enter`, made now if this store has none.
+pub(crate) fn enter_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<wasmtime::Func> {
+    ensure(cx.as_context_mut())?;
+    ensure_alt(cx.as_context_mut())?;
+    Ok(cx.as_context().data().jit.as_ref().unwrap().ftab.as_ref().unwrap().enter_alt.clone().unwrap())
 }
 
 /// Retire the run-time translations whose entries lie in the retired
