@@ -500,8 +500,16 @@ fn translate_root(addr: u64) -> Option<u32> {
             }
         }
     };
+    // The memory as far as it exists now: `guest_bytes` spans the whole
+    // address space, and recovery reads the slots of `call [addr]` and `jmp
+    // [addr]` straight from it. A slot past the memory's end (Wine's system
+    // call stubs' `call [0x7ffe1000]`, in a process whose memory stops below
+    // the shared user data) is then out of bounds: a trap in the shim,
+    // which the thread took for a fault at its last PC.
+    let mem = crate::guest_bytes();
+    let mem = &mem[..(crate::warch::memory_size(0) as usize).saturating_mul(65536).min(mem.len())];
     let t0 = crate::now_ns();
-    let wasm = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32);
+    let wasm = jit.translate_skipping(0, mem, addr, &executable, &served, &read_only, &volatile, &pg, class32);
     TRANSLATE_NS.fetch_add(crate::now_ns().saturating_sub(t0), Ordering::Relaxed);
     crate::note_kuser_folds(addr);
     if let Some(w) = &wasm {
