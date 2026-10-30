@@ -285,6 +285,14 @@ async function runPage(test, arch, say, timeout) {
     if (sid === sessionId) return; // the page's own lines come through __t
     if (o.verbose || /\b(FAIL|Error|error|trap|panic)\b/.test(text)) process.stderr.write(`${test.name}: ${names.get(sid)}: ${text}\n`);
   }));
+  // A renderer that dies (out of memory, say) answers nothing again: the
+  // run ends there, not at its timeout.
+  let crashed = null;
+  let onCrash;
+  const crash = new Promise((r) => { onCrash = r; });
+  const died = (what) => { crashed ??= what; onCrash(); };
+  off.push(cdp.on('Inspector.targetCrashed', (p, sid) => { if (sid === sessionId) died('the page crashed'); }));
+  off.push(cdp.on('Target.targetCrashed', (p) => { if (p.targetId === targetId) died(`the page crashed (${p.status}, error ${p.errorCode})`); }));
   off.push(cdp.on('Runtime.exceptionThrown', (p, sid) => {
     if (mine.has(sid)) say(`${names.get(sid)}: exception ${p.exceptionDetails?.exception?.description ?? p.exceptionDetails?.text}`);
   }));
@@ -297,6 +305,8 @@ async function runPage(test, arch, say, timeout) {
     await cdp.send('Runtime.runIfWaitingForDebugger', {}, p.sessionId).catch(() => {});
   }));
   await cdp.send('Runtime.enable', {}, sessionId);
+  await cdp.send('Inspector.enable', {}, sessionId).catch(() => {});
+  await cdp.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
   const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}) });
   const t0 = Date.now();
@@ -313,9 +323,13 @@ async function runPage(test, arch, say, timeout) {
     return path;
   };
   const poll = 'JSON.stringify(globalThis.__t ? (({ done, lines, asks, res, result, skip }) => ({ done, lines, asks, res, result, skip }))(globalThis.__t) : null)';
-  while (Date.now() - t0 < timeout) {
+  while (Date.now() - t0 < timeout && !crashed) {
     await sleep(sent ? 50 : 250);
-    const r = await cdp.send('Runtime.evaluate', { expression: poll, returnByValue: true }, sessionId).catch(() => null);
+    const r = await Promise.race([
+      cdp.send('Runtime.evaluate', { expression: poll, returnByValue: true }, sessionId).catch(() => null),
+      sleep(30000).then(() => null),
+      crash.then(() => null),
+    ]);
     const now = r?.result?.value ? JSON.parse(r.result.value) : null;
     if (!now) continue;
     v = now;
@@ -326,16 +340,17 @@ async function runPage(test, arch, say, timeout) {
     for (; sent < v.asks.length; sent++) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
-      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } } : await cdp.send(method, params, sessionId).then(
+      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
-      );
+      ), crash.then(() => ({ error: crashed }))]);
+      if (crashed) break;
       await cdp.send('Runtime.evaluate', { expression: `globalThis.__t.replies[${sent}] = ${JSON.stringify(reply)}` }, sessionId).catch(() => {});
     }
     if (v.done) break;
   }
   // What the page showed when it failed.
-  if (!v?.done || v.result === 'FAIL') {
+  if (!crashed && (!v?.done || v.result === 'FAIL')) {
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId).catch(() => null);
     if (shot?.data) save('fail.png', shot.data);
   }
@@ -344,7 +359,7 @@ async function runPage(test, arch, say, timeout) {
   await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
   const res = v?.res ?? { checks: 0, fail: [], times: {} };
   if (!v?.done) {
-    const what = `timed out after ${timeout / 1000} s`;
+    const what = crashed ?? `timed out after ${timeout / 1000} s`;
     say(`FAIL ${what}`);
     return { result: 'FAIL', ...res, fail: [...res.fail, what] };
   }
