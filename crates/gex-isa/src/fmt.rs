@@ -1057,6 +1057,8 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 (VAcrossOp::Add, false) => "addv",
                 (VAcrossOp::Add, true) if arr.float => "faddp",
                 (VAcrossOp::Add, true) => "addp",
+                (VAcrossOp::AddL { signed: true }, _) => "saddlv",
+                (VAcrossOp::AddL { signed: false }, _) => "uaddlv",
                 (VAcrossOp::SMax, _) => "smaxv",
                 (VAcrossOp::SMin, _) => "sminv",
                 (VAcrossOp::UMax, _) => "umaxv",
@@ -1074,9 +1076,11 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 scalar: false,
                 ..arr
             };
+            // The long sums are written to an element twice as wide.
+            let wide = matches!(op, VAcrossOp::AddL { .. });
             format!(
                 "{m} {}{}, v{}.{}",
-                lane_letter(arr.lane_bytes),
+                lane_letter(arr.lane_bytes << wide as u32),
                 vd.0,
                 vn.0,
                 src.suffix()

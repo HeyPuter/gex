@@ -2276,6 +2276,7 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
         (0b11010, 0) => VAcrossOp::SMin,
         (0b11010, _) => VAcrossOp::UMin,
         (0b11011, 0) => VAcrossOp::Add,
+        (0b00011, _) => VAcrossOp::AddL { signed: u == 0 },
         _ => return Inst::Unknown { raw },
     };
     let lane_bytes = match bits(raw, 23, 22) {
@@ -2990,6 +2991,24 @@ mod tests {
         }
         // sqdmulh s0, s1, v2.s[1]
         assert!(!matches!(d(0x5fa2c020), Inst::VByElement { .. }));
+    }
+
+    #[test]
+    fn add_long_across_lanes() {
+        // `cnt` then `uaddlv` is how clang spells a popcount.
+        for (raw, text) in [
+            (0x2e303800, "uaddlv h0, v0.8b"),
+            (0x6e303841, "uaddlv h1, v2.16b"),
+            (0x4e703883, "saddlv s3, v4.8h"),
+            (0x0e703883, "saddlv s3, v4.4h"),
+            (0x6eb038c5, "uaddlv d5, v6.4s"),
+        ] {
+            let inst = d(raw);
+            assert!(matches!(inst, Inst::VAcross { op: VAcrossOp::AddL { .. }, .. }), "{raw:#x}: {inst:?}");
+            assert_eq!(crate::fmt::disasm(&inst, 0), text);
+        }
+        // There are only two word lanes in the 64-bit form: uaddlv d5, v6.2s
+        assert!(matches!(d(0x2eb038c5), Inst::Undefined { .. }));
     }
 
     #[test]

@@ -136,6 +136,17 @@ int main(int argc, char** argv) {
     memcpy(&r, &c.rv[0][0], 8);
     CHECK("fmla d0, d1, v2.d[1]", r == 13.0 && c.rv[0][1] == 0, 1);
 
+    CHECK("popcount", call2(at(OFF_popcount), 0xf00f00000000ff01ull, 0), 17);
+    int16_t hs[8] = {-32768, -32768, -1, 7, 32767, -100, 3, -32768};
+    uint32_t ws[4] = {0xffffffffu, 0xffffffffu, 5, 0x80000000u};
+    memset(&c, 0, sizeof c);
+    memcpy(&c.v[0][0], hs, 16);
+    memcpy(&c.v[1][0], ws, 16);
+    gex_embed_call(at(OFF_addlv), &c);
+    CHECK("saddlv s0, v0.8h", c.rv[0][0], (uint32_t)(-32768 * 3 - 1 + 7 + 32767 - 100 + 3));
+    CHECK("saddlv zeroes the rest", c.rv[0][1], 0);
+    CHECK("uaddlv d1, v1.4s", c.rv[1][0], 0xffffffffull * 2 + 5 + 0x80000000ull);
+
     uint64_t stack[2] = {1000, 20000};
     memset(&c, 0, sizeof c);
     c.x[0] = 7;

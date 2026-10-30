@@ -59,6 +59,22 @@ fmla_lane:
     fmla d0, d1, v2.d[1]
     ret
 
+// popcount(x0), as clang writes it: cnt, then uaddlv.
+.globl popcount
+popcount:
+    fmov d0, x0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    ret
+
+// The sum of v0's eight signed halfwords, and of v1's four unsigned words.
+.globl addlv
+addlv:
+    saddlv s0, v0.8h
+    uaddlv d1, v1.4s
+    ret
+
 // x0 + the ninth and tenth arguments, which are on the stack.
 .globl stack_args
 stack_args:

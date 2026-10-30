@@ -1361,6 +1361,9 @@ pub enum VWidenOp {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VAcrossOp {
     Add,
+    /// `saddlv`/`uaddlv`: the sum in an element twice the lanes' width, so it
+    /// cannot wrap (`cnt` then `uaddlv` is a popcount).
+    AddL { signed: bool },
     SMax,
     SMin,
     UMax,

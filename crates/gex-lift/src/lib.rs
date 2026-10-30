@@ -2197,9 +2197,8 @@ impl<'a> Lifter<'a> {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
                 // leave the answer in lane 0.
-                let lane = Self::lane_of(arr);
                 let bin = match op {
-                    VAcrossOp::Add => VLaneBinOp::Add,
+                    VAcrossOp::Add | VAcrossOp::AddL { .. } => VLaneBinOp::Add,
                     // As with the three-same forms, the `nm` variants share a
                     // lowering with the plain ones: wasm's max/min already
                     // propagate NaN like FMAX, and differ from FMAXNM only when
@@ -2210,10 +2209,45 @@ impl<'a> Lifter<'a> {
                     VAcrossOp::UMin => VLaneBinOp::MinU,
                 };
                 let mut acc = self.b.read(GuestReg::V128(vn.0));
-                let lb = arr.lane_bytes;
-                // The scalar pairwise forms reduce the two lanes of their
-                // source, not the one lane of their destination.
-                let mut span = if arr.scalar { 2 } else { arr.lanes() };
+                let (lb, mut span) = if let VAcrossOp::AddL { signed } = op {
+                    // Widen first, then sum at twice the width: the low half
+                    // of the lanes, plus the high half in the 128-bit form,
+                    // leaves eight bytes' worth of source lanes to reduce.
+                    let from = Self::lane_of(arr);
+                    let extend = |s: &mut Self, op| {
+                        s.b.def(Expr::VCvt {
+                            op,
+                            from,
+                            a: acc,
+                            b: None,
+                        })
+                    };
+                    let low = extend(self, VCvtOp::ExtendLow { signed });
+                    let wide = arr.lane_bytes * 2;
+                    acc = if arr.q {
+                        let high = extend(self, VCvtOp::ExtendHigh { signed });
+                        self.b.def(Expr::VLaneBin {
+                            op: VLaneBinOp::Add,
+                            lane: Self::lane_of(VArr {
+                                lane_bytes: wide,
+                                ..arr
+                            }),
+                            a: low,
+                            b: high,
+                        })
+                    } else {
+                        low
+                    };
+                    (wide, 8 / arr.lane_bytes)
+                } else {
+                    // The scalar pairwise forms reduce the two lanes of their
+                    // source, not the one lane of their destination.
+                    (arr.lane_bytes, if arr.scalar { 2 } else { arr.lanes() })
+                };
+                let lane = Self::lane_of(VArr {
+                    lane_bytes: lb,
+                    ..arr
+                });
                 while span > 1 {
                     let half = span / 2;
                     // Bring the upper half of the live range down.
