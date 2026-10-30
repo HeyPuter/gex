@@ -48,6 +48,8 @@ term.onData((d) => sh.pty.write(d));
   through what the init starts: terminals, windows, `/dev/gex-host`.
   `sys.init` is its `Process`. When it ends, the system stops, and
   `state.init` says how it ended.
+- A page makes one `System` (a second throws), for now: the page runtime
+  keeps its kernel and switches in page-wide state.
 - Nothing runs at boot but the `init`. Without one, a tree's own start (its
   daemons) is the page's first `spawn`s, made once `boot()` resolves.
 
