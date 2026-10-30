@@ -11,8 +11,9 @@ export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 /** `env`: more of Wine's environment; `parts(sys, fs)`: the page's other
  *  classes, made before boot; `system`: more of System's options (`units`,
  *  `xcache`) and `debug` its switches; `wow64`: 32-bit programs through WoW64 (the
- *  install's i386-windows), with no display (the null graphics driver). */
-export async function bootWine(t, { env = {}, parts, wow64 = false, system = {}, debug = {} } = {}) {
+ *  install's i386-windows); `nullDriver`: USER with no display (Wine's null
+ *  graphics driver; WoW64's default). */
+export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {} } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
   const fs = new Filesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
@@ -23,8 +24,8 @@ export async function bootWine(t, { env = {}, parts, wow64 = false, system = {},
   const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1', WINEGEX_DOOR: '0' }), ...env };
   if (wow64) {
     try { await fs.stat('/wine64/lib/wine/i386-windows'); } catch { t.skip('the Wine install has no lib/wine/i386-windows: not a WoW64 build'); }
-    await fs.writeFile('/pfx/user.reg', '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="null"\n', { append: true });
   }
+  if (nullDriver) await fs.writeFile('/pfx/user.reg', '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="null"\n', { append: true });
   /** Copy test program or DLL `exe` (in /progs/ARCH) into C:\. */
   async function put(exe, arch = 'x64') {
     const why = failed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.c')}`] ?? failed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.cpp')}`];

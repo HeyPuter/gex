@@ -235,7 +235,7 @@ export const images = {
     const src = join(import.meta.dirname, 'wine/src');
     const h = createHash('sha256');
     const names = readdirSync(src).filter((f) => /\.(c|cpp)$/.test(f)).sort();
-    for (const f of names) h.update(f).update(readFileSync(join(src, f)));
+    for (const f of readdirSync(src).sort()) h.update(f).update(readFileSync(join(src, f)));
     h.update(readFileSync(new URL(import.meta.url)));
     const key = h.digest('hex');
     const keyFile = join(work, 'win-progs.key');

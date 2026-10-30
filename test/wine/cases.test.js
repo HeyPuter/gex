@@ -20,11 +20,23 @@ const CASES = [
   ['exitproc', 33, /^worker exiting\natexit ran\n?$/, 'exitproc.exe'],
   ['seh', 77, /^(ok [^\n]*\n)+top-level filter saw e00000ff\n0 failures\n?$/, 'seh.exe'],
   ['seh-traps', 0, allOk, 'seh.exe', ['traps']],
+  ['fiber', 0, allOk, 'fiber.exe'],
+  // USER with no display (Wine's null driver).
+  ['user_win', 0, allOk, 'user_win.exe', [], true],
+  ['wndproc_seh', 0, allOk, 'wndproc_seh.exe', [], true],
+  ['wndproc_uncaught', 0, allOk, 'wndproc_uncaught.exe', [], true],
+  ['nestsp', 0, allOk, 'nestsp.exe', [], true],
+  ['qpcmono', 0, allOk, 'qpcmono.exe'],
+  // 2000 writes a case: on the page every read is a server request.
+  ['seqrace', 0, allOk, 'seqrace.exe', ['2000', '7']],
+  ['authattrs', 0, allOk, 'authattrs.exe'],
+  ['rpccom', 0, allOk, 'rpccom.exe'],
+  ['dwrite', 0, allOk, 'dwrite.exe'],
 ];
 
 export default async function (t) {
-  const [name, code, out, exe, args = []] = CASES[t.phase - 1];
-  const w = await bootWine(t);
+  const [name, code, out, exe, args = [], nullDriver = false] = CASES[t.phase - 1];
+  const w = await bootWine(t, { nullDriver });
   const r = await t.time(name, () => w.run(exe, args)).catch((e) => ({ code: -1, stdout: '', stderr: String(e.message) }));
   t.check(`${name}: exit ${code}, its output`, r.code === code && out.test(r.stdout), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
   await w.sys.shutdown();
