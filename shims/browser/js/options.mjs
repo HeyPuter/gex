@@ -34,8 +34,8 @@ export const OPTIONS = [
   // A return to native Wine's pad past open call-outs stays a breakpoint
   // (cgen.rs STRAY_TRAP).
   ['strayTrap',      'GEX_STRAY_TRAP',       'straytrap',     'GEX_STRAY_TRAP',        'flag',   'extra', true],
-  // 32-bit Wine processes take the 2 GiB split (the shim's heap above 2 GiB),
-  // not the compact space: for a game that needs all of Windows' 2 GiB.
+  // Wine processes take the 2 GiB split (the shim's heap above 2 GiB), not
+  // the compact space: for a game that needs all of Windows' 2 GiB.
   ['wine32Split',    'GEX_WINE32_SPLIT',     'winesplit',     'GEX_WINE32_SPLIT',      'flag',   'extra', true],
   // Guest accesses below 64 KiB fault, as a null pointer's do natively
   // (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the units are

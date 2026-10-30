@@ -220,10 +220,6 @@ pub extern "C" fn gex_wasmprog_serve() -> i32 {
     }
 }
 
-fn wine64_session_program(argv: &[String]) -> bool {
-    argv.get(1).is_some_and(|exe| gex_abi::wine_session_program(exe))
-}
-
 /// Whether the ntdll beside 64-bit Wine's loader `exe` is the native PE
 /// core's skeleton, whose KUSER_SHARED_DATA reads ask gex where it is
 /// (`gex.kuser_address`): an x86-64 ntdll reads it through a pointer at
@@ -272,18 +268,17 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // 32-bit Wine's compact address space (`winspace::wine32_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
-        // Or the 2 GiB split, for a site that asks (`?winesplit=1`), and
-        // always for a 64-bit (64-bit Wine) process: the compact space ends at 2 GiB,
-        // and a 64-bit Wine maps past it (a 64-bit game's page ran out of
-        // memory at 2 GiB with it). Except Wine's own session programs in
-        // a wasm32 memory with the native PE core's ntdll, which use little
-        // and stay in the compact space (`winspace::wine64_compact`); not in
-        // a process that has its space already (an exec in the same memory
-        // keeps it).
+        // Or the 2 GiB split, for a site that asks (`?winesplit=1`: a game
+        // whose views and the shim's heap do not fit together under 2 GiB).
+        // A 64-bit Wine process in a wasm32 memory takes the compact space
+        // too (`winspace::wine64_compact`) when its ntdll is the native PE
+        // core's, which asks gex where KUSER_SHARED_DATA is; with another
+        // ntdll, the split. Not in a process that has its space already (an
+        // exec in the same memory keeps it).
         let compact64 = flags & FLAG_GUEST_X86_64 != 0
             && !gex_abi::mem64()
+            && !crate::winspace::split_asked()
             && crate::winspace::windows_space() == 0
-            && wine64_session_program(&crate::sigs::proc_home().argv())
             && wine64_native_ntdll(&crate::sigs::proc_home().exe());
         if flags & FLAG_GUEST_X86_64 != 0 && !compact64 {
             crate::winspace::set_wine_split(true);

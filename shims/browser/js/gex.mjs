@@ -1247,8 +1247,6 @@ export class Gex {
   /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
-  /** A 64-bit Wine program being loaded: its space is the 2 GiB split. */
-  #wine64Split = false;
   /** A process that runs no translated code (a native wasm program, a fork
    *  child of one, an exec of one): no placement window, its arena from
    *  `MMAP_BOTTOM` (`gex_set_no_place_window`, before the first claim).
@@ -1446,7 +1444,7 @@ export class Gex {
       // the first claim: the 2 GiB split at its parent's line, or 32-bit Wine's
       // compact space (nothing grown; inherited regions become islands).
       // `?winesplit=1` before the space is taken: the split, not the compact one.
-      if (globalThis.GEX_WINE32_SPLIT || this.#wine64Split) this.#shim.exports.gex_set_wine_split?.(1);
+      if (globalThis.GEX_WINE32_SPLIT) this.#shim.exports.gex_set_wine_split?.(1);
       // `?nullguard=1` before anything is translated (gex_abi::null_guard).
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
       // `?mxcsr=1` before anything is translated: SSE under MXCSR (gex_ir::mxcsr_exact).
@@ -2114,14 +2112,11 @@ export class Gex {
     // A 32-bit Wine program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
     // Windows DLLs load (0x10000000).
-    // A 64-bit one (64-bit Wine) the 2 GiB split: 32-bit Wine's compact space ends at
-    // 2 GiB, and a 64-bit Wine maps past it.
     const wine = wine32ProgramFlags(elf);
     if (wine) this.#windowsSpace = -1;
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
-    this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
