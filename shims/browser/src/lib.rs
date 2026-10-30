@@ -273,6 +273,10 @@ impl net::NetStack for WispNet {
 extern "C" {
     /// Is there a global kernel behind these calls at all?
     fn k_present() -> i32;
+    /// Host calls (/dev/gex-host, shims/kernel `k_host_open`): whether the
+    /// page answers them, and a new open, a global kernel handle.
+    fn k_host_calls_served() -> i32;
+    fn k_host_open() -> i32;
     /// The machine's synthetic DNS answers (`gex_kernel::net::share_names`):
     /// the address for a name, allocated on first asking; and the name an
     /// address was given for, into `out` (its length, or -1 for none).
@@ -1911,6 +1915,24 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
         if crate::gl::have_d3d() {
             devfs.add("gex-d3d", crate::gl::GlDevice::new());
+        }
+    }
+    // `/dev/gex-host`: calls to the page, where it answers them. Each open is
+    // a handle in the global kernel, so the call crosses fork and exec.
+    if unsafe { k_present() } != 0 && unsafe { k_host_calls_served() } != 0 {
+        if let Some(root) = global_root() {
+            let remote = root.remote();
+            devfs.add_per_open(
+                gex_kernel::vfs::hostcall::NAME,
+                Arc::new(move || match unsafe { k_host_open() } {
+                    id if id >= 0 => gex_kernel::vfs::remote::adopt(remote, id),
+                    _ => gex_kernel::vfs::hostcall::open(gex_kernel::vfs::hostcall::HostCalls {
+                        call: |_, _| Err(gex_kernel::errno::Errno::ENODEV),
+                        read: |_, _, _| Ok(0),
+                        done: |_| {},
+                    }),
+                }),
+            );
         }
     }
     // Game controllers: the page's, in the global kernel's table

@@ -6,8 +6,7 @@
 //   node web/runtime/test/run.mjs [PAGE...]      (default: every *.html here)
 //
 // Env: BUSYBOX (a wasm32 busybox; the test tree is it and its applets),
-// GEXCC (gexcc, to build gex-host into web/public/gex when it is missing or
-// older than its source), CHROME, RT_PORT (vite; Chromium's is RT_PORT+1),
+// GEXCC (gexcc, for the test programs), CHROME, RT_PORT (vite; Chromium's is RT_PORT+1),
 // RT_TIMEOUT (seconds per page, default 120), RT_WORK (scratch directory),
 // RT_VERBOSE=1 (every console line), RT_ARCH (the translated arch, else the
 // tree's).
@@ -31,15 +30,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const WORK = process.env.RT_WORK || mkdtempSync(join(tmpdir(), 'gex-rt-'));
 mkdirSync(WORK, { recursive: true });
-
-// -- gex-host --------------------------------------------------------------
-const HOSTCALL_SRC = join(WEB, 'runtime/host/gex-host.c');
-const HOSTCALL = join(WEB, 'public/gex/gex-host');
-if (!existsSync(HOSTCALL) || statSync(HOSTCALL).mtimeMs < statSync(HOSTCALL_SRC).mtimeMs) {
-  const cc = process.env.GEXCC || 'gexcc';
-  log(`building ${HOSTCALL}`);
-  execFileSync(cc, ['-O2', '-Wall', '-o', HOSTCALL, HOSTCALL_SRC], { stdio: 'inherit' });
-}
 
 // -- the test tree: busybox and its applets --------------------------------
 const BUSYBOX = process.env.BUSYBOX;

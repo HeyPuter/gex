@@ -6,7 +6,6 @@
 // files can be read and written from the page.
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
-import { PageFsHost } from './mount.js';
 import { applyRecords } from './records.js';
 
 const norm = (p) => {
@@ -86,7 +85,6 @@ export class Mount extends EventTarget {
 export class Filesystem extends EventTarget {
   #sys;
   #sources = [];
-  #pagefs = null;
   #mounts = new Map(); // path -> { mount, id }
   #persist = null; // a Persist's hooks
 
@@ -95,17 +93,11 @@ export class Filesystem extends EventTarget {
     const i = internals(sys, 'Filesystem');
     i.attach('filesystem', this, { beforeBoot: true });
     this.#sys = i;
-    i.beforeBoot((opts) => {
-      // Every Worker gets the page's filesystems' control buffer, so a
-      // mount made after boot reaches the programs already running.
-      opts.pageFs = this.#host().control;
-      return this.#seed(opts);
-    });
+    i.beforeBoot((opts) => this.#seed(opts));
     this[INTERNAL] = {
       sources: () => this.#sources,
-      /** For the runtime's Worker's start: its control buffer, and the
-       *  mounts made before boot, in place before the first program. */
-      pageFs: () => this.#pagefs?.control,
+      /** For the runtime's Worker's start: the mounts made before boot,
+       *  in place before the first program. */
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
       /** A Persist on this filesystem (persist.js): one, made before boot. */
       persist: (part, hooks) => {
@@ -202,7 +194,7 @@ export class Filesystem extends EventTarget {
   }
 
   #host() {
-    return (this.#pagefs ??= new PageFsHost());
+    return this.#sys.pageFs();
   }
 
   /**
@@ -248,7 +240,7 @@ export class Filesystem extends EventTarget {
     if (!m) throw Object.assign(new Error(`unmount: nothing mounted at ${at}`), { code: 'EINVAL' });
     this.#mounts.delete(at);
     if (this.#sys.phase === 'running') await this.#sys.io().call('unmount', { path: at });
-    this.#pagefs.remove(m.id);
+    this.#host().remove(m.id);
     m.mount.dispatchEvent(new Event('unmounted'));
   }
 

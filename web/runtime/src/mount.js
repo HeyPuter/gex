@@ -1,12 +1,13 @@
-// The page's side of `fs.mount`: the requests guest calls make on a mounted
-// directory (shims/kernel/src/pagefs.rs, shims/browser/js/page-fs.mjs),
-// answered from the page's provider. They arrive in slots of a
-// SharedArrayBuffer; the page waits for them with Atomics.waitAsync and
-// answers each as its provider's promise settles, many at once.
+// The page's side of the page-fs channel (shims/kernel/src/pagefs.rs,
+// shims/browser/js/page-fs.mjs): the requests guest calls make on a
+// directory `fs.mount` serves, answered from the page's provider, and a
+// guest's calls to the page through /dev/gex-host (System `hostCalls`).
+// They arrive in slots of a SharedArrayBuffer; the page waits for them with
+// Atomics.waitAsync and answers each as its promise settles, many at once.
 
 import { HEAD, SLOT, SLOTS, DATA, ASKED, TAKEN, DONE, makePageFsControl } from '../../../shims/browser/js/page-fs.mjs';
 
-const OP = { STAT: 1, LSTAT: 2, READDIR: 3, OPEN: 4, READ: 5, WRITE: 6, CLOSE: 7, MKDIR: 8, UNLINK: 9, RMDIR: 10, RENAME: 11, TRUNCATE: 12, CHMOD: 13, UTIMES: 14, READLINK: 15, SYMLINK: 16 };
+const OP = { STAT: 1, LSTAT: 2, READDIR: 3, OPEN: 4, READ: 5, WRITE: 6, CLOSE: 7, MKDIR: 8, UNLINK: 9, RMDIR: 10, RENAME: 11, TRUNCATE: 12, CHMOD: 13, UTIMES: 14, READLINK: 15, SYMLINK: 16, HOSTCALL: 17, HOSTREAD: 18, HOSTDONE: 19 };
 const O = { ACCMODE: 3, WRONLY: 1, RDWR: 2, CREAT: 0o100, EXCL: 0o200, TRUNC: 0o1000, APPEND: 0o2000 };
 const ERRNO = {
   EPERM: 1, ENOENT: 2, EIO: 5, EBADF: 9, EAGAIN: 11, ENOMEM: 12, EACCES: 13, EBUSY: 16, EEXIST: 17, EXDEV: 18,
@@ -51,7 +52,8 @@ function putStat(dv, at, st) {
   dv.setBigUint64(at + 24, BigInt(Number.isFinite(ino) && ino > 0 ? Math.floor(ino) : 0), true);
 }
 
-/** The page's filesystems and the requests for them. One per system. */
+/** The page's filesystems, its host calls, and the requests for them. One
+ *  per system. */
 export class PageFsHost {
   #ctl;
   #i32;
@@ -63,11 +65,18 @@ export class PageFsHost {
   #seen = 0;
   #listings = new Map(); // `${id}:${path}` -> names, for a listing read in pages
   #serving = false;
+  /** `(name, json) => Promise<{ ok, text }>`: a guest's call to the page. */
+  #hostCall;
+  /** Answers longer than one slot, read in parts: id -> bytes. */
+  #answers = new Map();
+  #nextAnswer = 1;
 
-  constructor() {
+  constructor(hostCall) {
     this.#ctl = makePageFsControl();
     this.#i32 = new Int32Array(this.#ctl);
     this.#u8 = new Uint8Array(this.#ctl);
+    this.#hostCall = hostCall;
+    this.#serve();
   }
 
   /** What every Worker is handed (runtime.js `pageFs`). */
@@ -149,6 +158,17 @@ export class PageFsHost {
     const path = req.length > p ? text() : '';
     const path2 = req.length > p ? text() : '';
     const data = req.subarray(p);
+    if (op === OP.HOSTCALL) return this.#call1(data);
+    if (op === OP.HOSTREAD) {
+      const a = this.#answers.get(handle);
+      if (!a) throw fail('EBADF');
+      const b = a.subarray(offset, offset + len);
+      return [b.length, b];
+    }
+    if (op === OP.HOSTDONE) {
+      this.#answers.delete(handle);
+      return [0, null];
+    }
     const fs = op === OP.READ || op === OP.WRITE || op === OP.CLOSE ? this.#mounts.get(this.#handles.get(handle)?.id) : this.#mounts.get(id);
     if (!fs) throw fail('ENODEV');
     const statBytes = (st) => {
@@ -223,6 +243,30 @@ export class PageFsHost {
 
   #bytes(b) {
     return [b.length, b];
+  }
+
+  /** A host call (pagefs.rs `host_call`): `NAME\0JSON` in, the answer's
+   *  whole length out, and a u32 id then the answer's first part; the
+   *  rest read by id (HOSTREAD) until the guest lets it go (HOSTDONE). The
+   *  answer is a status byte (0 done, 1 failed) and the JSON or the
+   *  error's text. */
+  async #call1(req) {
+    const z = req.indexOf(0);
+    const name = new TextDecoder().decode(req.subarray(0, z < 0 ? req.length : z));
+    const json = z < 0 ? '' : new TextDecoder().decode(req.subarray(z + 1));
+    const { ok, text } = await this.#hostCall(name, json);
+    const body = new TextEncoder().encode(text);
+    const answer = new Uint8Array(1 + body.length);
+    answer[0] = ok ? 0 : 1;
+    answer.set(body, 1);
+    const id = this.#nextAnswer++;
+    // As much as one answer brings back (pagefs.rs CHUNK).
+    const first = answer.subarray(0, 128 << 10);
+    if (first.length < answer.length) this.#answers.set(id, answer);
+    const out = new Uint8Array(4 + first.length);
+    new DataView(out.buffer).setUint32(0, id, true);
+    out.set(first, 4);
+    return [answer.length, out];
   }
 
   async #open(fs, id, path, flags, mode) {

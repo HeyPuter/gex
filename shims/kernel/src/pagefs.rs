@@ -49,6 +49,14 @@ pub const CHMOD: u32 = 13;
 pub const UTIMES: u32 = 14;
 pub const READLINK: u32 = 15;
 pub const SYMLINK: u32 = 16;
+/// A program's call to the page (/dev/gex-host): `NAME\0JSON` as the data,
+/// the answer's whole length as the result, and a u32 id then the answer's
+/// first part as its bytes.
+pub const HOSTCALL: u32 = 17;
+/// More of answer `handle`, `len` bytes from `offset`.
+pub const HOSTREAD: u32 = 18;
+/// The program is done with answer `handle`.
+pub const HOSTDONE: u32 = 19;
 
 /// The most one request carries or one answer brings back: a read or a write
 /// is cut into calls of this much (the host's slot holds it).
@@ -179,6 +187,42 @@ impl Req {
     fn unit(&self) -> Result<(), Errno> {
         self.call(&mut []).map(|_| ())
     }
+}
+
+/// Whether the page answers host calls (`k_host_calls_serve`).
+static HOST_CALLS: AtomicBool = AtomicBool::new(false);
+
+pub fn serve_host_calls() {
+    HOST_CALLS.store(true, Ordering::Release);
+}
+
+pub fn host_calls() -> bool {
+    HOST_CALLS.load(Ordering::Acquire)
+}
+
+/// Make the host call `req` (`NAME\0JSON`): the answer's id, its whole
+/// length, and its first part, written into `first` (how much is in the
+/// length and `first`'s size, `CHUNK` at most).
+pub fn host_call(req: &[u8], first: &mut [u8]) -> Result<(u32, usize), Errno> {
+    if req.len() > CHUNK {
+        return Err(Errno::E2BIG);
+    }
+    let mut out = vec![0u8; 4 + CHUNK.min(first.len())];
+    let total = Req::new(HOSTCALL, 0).paths("", "").data(req).call(&mut out)?;
+    let id = u32_at(&out, 0);
+    let n = total.min(out.len() - 4);
+    first[..n].copy_from_slice(&out[4..4 + n]);
+    Ok((id, total))
+}
+
+/// More of answer `id`, from `offset`: how much was written into `buf`.
+pub fn host_call_read(id: u32, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+    let want = buf.len().min(CHUNK);
+    Req::new(HOSTREAD, 0).handle(id).len(want as u32).offset(offset).call(&mut buf[..want]).map(|n| n.min(want))
+}
+
+pub fn host_call_done(id: u32) {
+    let _ = Req::new(HOSTDONE, 0).handle(id).unit();
 }
 
 /// `/x/y`, as the page names a path in its filesystem.

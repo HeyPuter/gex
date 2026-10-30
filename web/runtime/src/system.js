@@ -14,9 +14,8 @@ import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
 import { GuestConnection } from './connection.js';
+import { PageFsHost } from './mount.js';
 
-/** `gex-host NAME JSON`: a guest's call to the page (`hostCalls`). */
-const HOST_CALL_PATH = '/usr/bin/gex-host';
 /** Where the runtime's files (gex/...) are: beside the package's modules
  *  in a build (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__`), the
  *  tree's web/public in place. Not a literal, so a bundler does not take
@@ -126,10 +125,11 @@ export class System extends EventTarget {
   #arch = null;
   #net = new NetSwitch();
   #hostCalls = new Map();
+  #pageFs = null;
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
-   * gex-host, ...); default beside the package. `debug`: the runtime's
+   * ...); default beside the package. `debug`: the runtime's
    * switches, `{name: value}` as gex's test pages take `?name=value`;
    * unstable, for debugging only.
    */
@@ -142,6 +142,7 @@ export class System extends EventTarget {
     if (made) throw new Error('System: a page runs one system; this page already made one');
     made = true;
     this.#opts = { baseUrl: String(baseUrl ?? DEFAULT_BASE()), debug: { ...debug } };
+    this.#pageFs = new PageFsHost((name, json) => this.#hostCall(name, json));
     const self = this;
     this[INTERNAL] = {
       system: this,
@@ -171,6 +172,8 @@ export class System extends EventTarget {
       get phase() { return self.#state.phase; },
       opts: this.#opts,
       say: (text) => this.#say(text),
+      /** The page-fs channel: the page's mounts and host calls. */
+      pageFs: () => this.#pageFs,
     };
   }
 
@@ -213,7 +216,6 @@ export class System extends EventTarget {
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     const { assetUrl } = await import('../../src/page-env.js');
 
-    const hostCall = await bytesOf(assetUrl('/gex/gex-host'), 'gex-host');
     const opts = {
       // No program: pid 1 is the kernel's.
       elf: null,
@@ -228,14 +230,14 @@ export class System extends EventTarget {
       // Every Worker reaches the network through the page; which network
       // is the page's to set, any time (net.js).
       network: this.#net,
+      // Every Worker gets the page-fs channel's control buffer: a mount
+      // made after boot reaches the programs already running, and each
+      // reaches /dev/gex-host.
+      pageFs: this.#pageFs.control,
       // `/dev/dsp` plays once the page makes a WebAudio (audio.js).
       playAudio: false,
     };
     for (const fn of this.#beforeBoot) await fn(opts);
-    if (!opts.files[HOST_CALL_PATH] && !opts.symlinks[HOST_CALL_PATH]) {
-      opts.files[HOST_CALL_PATH] = hostCall;
-      opts.modes[HOST_CALL_PATH] = 0o755;
-    }
 
     // The translated architecture, beside which wasm32 programs run: the global kernel is built for one (its syscall ABI,
     // struct layouts, signal frame), so it is chosen here, from the tree's
@@ -275,7 +277,7 @@ export class System extends EventTarget {
       const fsi = this.#parts.get('filesystem')?.[INTERNAL];
       const { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs } = opts;
       this.#io.call('start', {
-        spec: { module: s.kernel.module, memory: s.kernel.memory, pageFs: fsi?.pageFs?.() },
+        spec: { module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control },
         tree: { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs },
         mounts: fsi?.mounts?.() ?? [],
         persist: fsi?.persistArgs?.(),
@@ -317,14 +319,12 @@ export class System extends EventTarget {
         if (this.#early.size > 4096) this.#early.delete(this.#early.keys().next().value);
       }
     } else if (m.ev === 'log') this.#say(`${m.text}\n`);
-    else if (m.ev === 'host-call') this.#hostCall(m);
     else for (const fn of this.#listeners.get(m.ev) ?? []) fn(m);
   }
   #listeners = new Map();
 
-  async #hostCall({ id, name, json }) {
-    let ok = true;
-    let text;
+  /** A guest's call (/dev/gex-host, mount.js `#call1`): `{ ok, text }`. */
+  async #hostCall(name, json) {
     try {
       const fn = this.#hostCalls.get(name);
       if (!fn) throw new Error(`no host call ${name}`);
@@ -335,19 +335,18 @@ export class System extends EventTarget {
         throw new Error(`${name}: not JSON: ${json.slice(0, 200)}`);
       }
       const v = await fn(arg);
-      text = v === undefined ? 'null' : JSON.stringify(v);
+      return { ok: true, text: v === undefined ? 'null' : JSON.stringify(v) };
     } catch (e) {
-      ok = false;
-      text = String(e?.message ?? e);
+      return { ok: false, text: String(e?.message ?? e) };
     }
-    this.#io?.send('hostReply', { id, ok, text });
   }
 
   /**
-   * The page's functions a guest program calls: `gex-host NAME JSON` (or
-   * the JSON on its standard input) runs `fn(value)` here and prints what
-   * it returns (resolves), as JSON, on its standard output; a throw is
-   * printed on its standard error and it exits 1.
+   * The page's functions a guest program calls through /dev/gex-host: it
+   * opens the device, writes `NAME\0JSON` (the JSON may be empty), and
+   * reads the answer from the same descriptor: a status byte, 0 when
+   * `fn(value)` returned (its value follows, as JSON) and 1 when it threw
+   * (its message follows). Each open is one call.
    */
   get hostCalls() {
     const calls = this.#hostCalls;

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod devfs;
 pub mod evdev;
+pub mod hostcall;
 // Passthrough to the host's own filesystem; the browser gets `opfs`/`httpfs`
 // instead.
 #[cfg(unix)]

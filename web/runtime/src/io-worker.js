@@ -526,9 +526,9 @@ function spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 
   }
   handles.set(h, ends);
   programs.set(pid, h);
-  // vfork.rs `stage_exec_parts`: the path, how many arguments, the
-  // arguments, an empty field, the environment.
-  const exec = enc.encode([prog, String(argv.length), ...argv, '', ...env].map((x) => `${x}\0`).join(''));
+  // vfork.rs `stage_exec_parts`: the path, then the arguments and the
+  // environment, each after its length.
+  const exec = enc.encode([prog, String(argv.length), ...argv, String(env.length), ...env].map((x) => `${x}\0`).join(''));
   pump();
   return { h, pid, exec, fds: enc.encode(`${fds.join('\n')}\n`), cwd: cwd || '/', wasmImage: wasmImage(prog) };
 }
@@ -709,86 +709,6 @@ function readWatches() {
   return true;
 }
 
-// -- host calls (gex-host NAME JSON: host/gex-host.c) ---------------------------
-
-const hostCalls = { listener: -1, conns: new Map(), next: 1 };
-
-function listenHostCalls() {
-  const { at: [[p, n]] } = lay('\0gex-host');
-  const id = k.k_sock_bind(BigInt(p), n);
-  if (id < 0) throw errno(id, 'the host-call socket');
-  hostCalls.listener = id;
-  watch(k.k_sock_queue(id));
-}
-
-/** New callers, and what they sent: a call to the page once whole. */
-function passHostCalls() {
-  let moved = false;
-  if (hostCalls.listener < 0) return false;
-  for (;;) {
-    const c = k.k_sock_accept(hostCalls.listener);
-    if (c < 0) break;
-    hostCalls.conns.set(hostCalls.next++, { sock: c, buf: new Uint8Array(0), asked: false, out: null });
-    watch(k.k_sock_queue(c));
-    moved = true;
-  }
-  ensure(READ_MAX);
-  for (const [id, c] of hostCalls.conns) {
-    if (!c.asked) {
-      for (;;) {
-        const n = k.k_sock_read(c.sock, 0n, 65536);
-        if (n === EAGAIN) break;
-        if (n <= 0) { c.out = new Uint8Array(0); break; }
-        const b = new Uint8Array(c.buf.length + n);
-        b.set(c.buf);
-        b.set(view().subarray(0, n), c.buf.length);
-        c.buf = b;
-        moved = true;
-      }
-      if (c.buf.length >= 4) {
-        const len = new DataView(c.buf.buffer).getUint32(0, true);
-        if (c.buf.length >= 4 + len) {
-          const body = c.buf.subarray(4, 4 + len);
-          const z = body.indexOf(0);
-          c.asked = true;
-          post({ ev: 'host-call', id, name: dec.decode(body.subarray(0, z < 0 ? body.length : z)), json: z < 0 ? '' : dec.decode(body.subarray(z + 1)) });
-          moved = true;
-        }
-      }
-    }
-    if (c.out) {
-      while (c.out.length) {
-        const piece = c.out.subarray(0, READ_MAX);
-        view().set(piece, 0);
-        const n = k.k_sock_write(c.sock, 0n, piece.length);
-        if (n === EAGAIN || n === 0) break;
-        if (n < 0) { c.out = c.out.subarray(c.out.length); break; }
-        c.out = c.out.subarray(n);
-        moved = true;
-      }
-      if (!c.out.length) {
-        unwatch(k.k_sock_queue(c.sock));
-        k.k_sock_close(c.sock);
-        hostCalls.conns.delete(id);
-        moved = true;
-      }
-    }
-  }
-  return moved;
-}
-
-function hostReply({ id, ok, text }) {
-  const c = hostCalls.conns.get(id);
-  if (!c) return;
-  const body = enc.encode(text);
-  const out = new Uint8Array(5 + body.length);
-  new DataView(out.buffer).setUint32(0, body.length, true);
-  out[4] = ok ? 0 : 1;
-  out.set(body, 5);
-  c.out = out;
-  pump();
-}
-
 // -- X display :0 -----------------------------------------------------------
 
 /** Display :0's names, held for the X server until a client comes: then the
@@ -820,7 +740,7 @@ function xWanted() {
 /** One pass over everything that can move without waiting. True if
  *  anything did. */
 function pass() {
-  let moved = readWatches() | xWanted() | passHostCalls();
+  let moved = readWatches() | xWanted();
   for (const e of handles.values()) moved = pump1(e) || moved;
   // Exits last: what a program wrote before it ended reaches the page
   // before its end does.
@@ -1171,11 +1091,13 @@ const ops = {
     seed(tree);
     // The page's mounts made before boot, in place before the first program.
     for (const [path, id] of mounts) mount(path, id);
+    // The page answers host calls (System `hostCalls`): every process gets a
+    // /dev/gex-host.
+    k.k_host_calls_serve();
     // The tree as seeded, before any program of the tree's runs.
     if (keep) persistStart(keep);
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
-    listenHostCalls();
     // What /proc/1 says of pid 1.
     const { at: [[a, an]] } = lay('init\ninit\0');
     k.k_proc_set_info(INIT, BigInt(a), an);
@@ -1211,7 +1133,6 @@ const ops = {
   watch: ({ path }) => addWatch(path),
   holdX: () => holdX(),
   connectGuest: (m) => connectGuest(m),
-  hostReply: (m) => hostReply(m),
   // Where `/dev/dsp`'s rings are (shims/kernel/src/audio.rs), made if not yet.
   audioRing: () => (k.k_audio_ring ? k.k_audio_ring() >>> 0 : 0),
   // The game controllers' table (shims/kernel/src/joy.rs), and a change in

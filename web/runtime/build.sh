@@ -5,7 +5,7 @@
 # system fetches: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
 # shims/browser/build.sh), the aarch64 export providers, the X server
-# (web/build-xwayland-wasm.sh), and the guest's call to the page (gex-host, built here with gexcc). The modules find gex/ beside themselves;
+# (web/build-xwayland-wasm.sh). The modules find gex/ beside themselves;
 # `new System({ baseUrl })` points elsewhere.
 #
 #   web/runtime/build.sh DIR
@@ -15,12 +15,6 @@ RT=$(cd "$(dirname "$0")" && pwd)
 WEB=$(dirname "$RT")
 PUB=$WEB/public/gex
 mkdir -p "$OUT"
-
-# The guest's call to the page.
-HOSTCALL=$PUB/gex-host
-if [ ! -f "$HOSTCALL" ] || [ "$RT/host/gex-host.c" -nt "$HOSTCALL" ]; then
-    "${GEXCC:-gexcc}" -O2 -Wall -o "$HOSTCALL" "$RT/host/gex-host.c"
-fi
 
 CONFIG=$(mktemp --suffix=.mjs -p "$WEB")
 trap 'rm -f "$CONFIG"' EXIT
@@ -47,7 +41,6 @@ CFG
 (cd "$WEB" && node_modules/.bin/vite build --config "$CONFIG")
 
 mkdir -p "$OUT/gex"
-cp "$HOSTCALL" "$OUT/gex/gex-host"
 n=0
 for infix in "" .x86; do
     if [ -f "$PUB/gex_browser$infix.shared.wasm" ] && [ -f "$PUB/gex_kernel$infix.wasm" ] && [ -f "$PUB/seed$infix.shared.wasm" ]; then

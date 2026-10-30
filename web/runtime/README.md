@@ -168,22 +168,23 @@ listens.
 
 ## Host calls
 
-The page's functions a guest program calls. `gex-host NAME JSON` (or
-`gex-host NAME` with the JSON on its standard input) runs the function
-with the parsed value, and prints what it returns, as JSON, on its
-standard output. A throw is printed on its standard error and it exits 1.
+The page's functions a guest program calls. A program opens
+`/dev/gex-host`, writes `NAME`, a NUL and the JSON value (in one write or
+several), then reads from the same descriptor to its end: a status byte, 0
+when the function returned and 1 when it threw, then what it returned, as
+JSON, or the error's text. The first read makes the call; each open is one
+call, and many may be open at once.
 
 ```js
 const off = sys.hostCalls.register('notify', ({ title }) => { showToast(title); return true; });
-// guest: gex-host notify '{"title":"built"}'   -> true
+// guest: exec 3<>/dev/gex-host; printf 'notify\0{"title":"built"}' >&3; cat <&3
+//        -> "\0true"
 ```
 
 | Member | Does |
 | --- | --- |
 | `register(name, fn)` | `fn(value)` may return a promise. Returns a function that unregisters it. |
 | `unregister(name)`, `names()` | |
-
-`/usr/bin/gex-host` is the runtime's own unless the tree has one.
 
 ## Audio
 
@@ -344,9 +345,7 @@ themselves.
 
 `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, and
 under `gex/` the shim, kernel and seed of each guest architecture the tree has
-built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`) and
-`gex-host`, a guest's call to the page (`web/runtime/host`, built with
-`gexcc`).
+built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`).
 
 ## Tests
 

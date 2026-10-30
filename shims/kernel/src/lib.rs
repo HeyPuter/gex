@@ -3122,6 +3122,39 @@ pub extern "C" fn k_pagefs_unmount(path: gex_kmem::PAddr, path_len: u32) -> i32 
 }
 
 // ---------------------------------------------------------------------------
+// Host calls: a program's calls to the page (/dev/gex-host,
+// gex_kernel::vfs::hostcall), over the page-fs channel.
+
+/// The page answers host calls from now on: a process started after this has
+/// a /dev/gex-host.
+#[no_mangle]
+pub extern "C" fn k_host_calls_serve() {
+    pagefs::serve_host_calls();
+}
+
+/// Whether the page answers host calls.
+#[no_mangle]
+pub extern "C" fn k_host_calls_served() -> i32 {
+    pagefs::host_calls() as i32
+}
+
+/// Open /dev/gex-host: a handle here, so a fork's child and an exec'd program
+/// that inherit the descriptor write and read the one call. `-ENOENT` where
+/// the page answers none.
+#[no_mangle]
+pub extern "C" fn k_host_open() -> i32 {
+    if !pagefs::host_calls() {
+        return -2;
+    }
+    use gex_kernel::vfs::hostcall;
+    fn call(req: &[u8], first: &mut [u8]) -> Result<(u32, u64, usize), gex_kernel::errno::Errno> {
+        let (id, total) = pagefs::host_call(req, first)?;
+        Ok((id, total as u64, total.min(first.len()).min(pagefs::CHUNK)))
+    }
+    install_handle(hostcall::open(hostcall::HostCalls { call, read: pagefs::host_call_read, done: pagefs::host_call_done }))
+}
+
+// ---------------------------------------------------------------------------
 // inotify: instances beside the tree every process shares, so they hear its
 // changes whoever makes them (gex_kernel::inotify). Ids, counts or negated
 // errnos; addresses in the caller's memory.

@@ -56,7 +56,7 @@ export interface SystemState {
 }
 
 export interface HostCalls {
-  /** `fn(value)` for `gex-host NAME JSON`; returns a function that unregisters it. */
+  /** `fn(value)` for a guest's call NAME on /dev/gex-host; returns a function that unregisters it. */
   register(name: string, fn: (value: unknown) => unknown): () => void;
   unregister(name: string): void;
   names(): string[];

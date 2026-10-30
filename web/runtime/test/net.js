@@ -1,6 +1,6 @@
 // The guest's network (a page's own Network), the page's connections into
 // the guest (sys.net.connectGuest) and the guest's calls to the page
-// (hostCalls, gex-host).
+// (hostCalls, /dev/gex-host).
 import { System } from '../src/index.js';
 import { Filesystem } from '../src/fs.js';
 import { Network } from '../src/net.js';
@@ -81,20 +81,27 @@ main(async () => {
   const off = sys.hostCalls.register('add', ({ a, b }) => a + b);
   sys.hostCalls.register('slow', async (v) => { await new Promise((r) => setTimeout(r, 200)); return { echoed: v }; });
   sys.hostCalls.register('fails', () => { throw new Error('it failed'); });
-  const add = await run(['gex-host', 'add', '{"a":1,"b":2}']);
-  eq('gex-host add', [add.code, add.stdout], [0, '3\n']);
-  const slow = await run(['gex-host', 'slow'], { input: '["from stdin"]' });
-  eq('gex-host with the JSON on stdin, answered later', [slow.code, slow.stdout], [0, '{"echoed":["from stdin"]}\n']);
-  const fails = await run(['gex-host', 'fails', '{}']);
-  eq('a throw is the program\'s error', [fails.code, fails.stdout, fails.stderr], [1, '', 'it failed\n']);
-  const unknown = await run(['gex-host', 'nope', '{}']);
-  check('an unknown name fails', unknown.code === 1 && /no host call nope/.test(unknown.stderr), JSON.stringify(unknown));
-  const bad = await run(['gex-host', 'add', '{not json']);
-  check('bad JSON fails', bad.code === 1 && /not JSON/.test(bad.stderr), JSON.stringify(bad));
-  const many = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => run(['gex-host', 'add', JSON.stringify({ a: i, b: 10 })])));
-  eq('calls at once', many.map((r) => r.stdout), ['11\n', '12\n', '13\n', '14\n', '15\n', '16\n']);
+  sys.hostCalls.register('big', () => 'x'.repeat(300000));
+  // One call per open of /dev/gex-host: the request written, then the
+  // answer read to its end, a status byte (0 done, 1 failed) first.
+  const call = (req, opts) => run(['sh', '-c', `exec 3<>/dev/gex-host; ${req} >&3; cat <&3`], opts);
+  const ask = (name, json) => call(`printf '%s\\000%s' '${name}' '${json}'`);
+  const add = await ask('add', '{"a":1,"b":2}');
+  eq('a call to add', [add.code, add.stdout], [0, '\x003']);
+  const slow = await call("{ printf 'slow\\000'; cat; }", { input: '["from stdin"]' });
+  eq('a request in several writes, answered later', [slow.code, slow.stdout], [0, '\x00{"echoed":["from stdin"]}']);
+  const fails = await ask('fails', '{}');
+  eq('a throw is the answer\'s error', [fails.code, fails.stdout], [0, '\x01it failed']);
+  const unknown = await ask('nope', '{}');
+  check('an unknown name fails', unknown.stdout.startsWith('\x01') && /no host call nope/.test(unknown.stdout), JSON.stringify(unknown));
+  const bad = await ask('add', '{not json');
+  check('bad JSON fails', bad.stdout.startsWith('\x01') && /not JSON/.test(bad.stdout), JSON.stringify(bad));
+  const big = await run(['sh', '-c', "exec 3<>/dev/gex-host; printf 'big\\000' >&3; cat <&3 | wc -c"]);
+  eq('an answer longer than one part', [big.code, big.stdout.trim()], [0, String(1 + 300002)]);
+  const many = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => ask('add', JSON.stringify({ a: i, b: 10 }))));
+  eq('calls at once', many.map((r) => r.stdout), ['\x0011', '\x0012', '\x0013', '\x0014', '\x0015', '\x0016']);
   off();
-  eq('unregistered', sys.hostCalls.names(), ['slow', 'fails']);
+  eq('unregistered', sys.hostCalls.names(), ['slow', 'fails', 'big']);
 
   await sys.shutdown();
 });
