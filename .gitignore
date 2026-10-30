@@ -3,7 +3,6 @@ target/
 web/node_modules/
 web/dist/
 web/dist-sp/
-web/dist-demo/
 web/public/gex/
 web/public/rootfs/
 web/public/closure/

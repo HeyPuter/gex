@@ -224,7 +224,7 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
         GEX_CC="$(command -v aarch64-linux-gnu-gcc)" "$ROOT/guest/glx-init/build.sh" "$WORK/glx-init" >/dev/null 2>&1 &&
             cp "$WORK/glx-init/glx-init" "$WORK/glx-init/egl-init" "$PUB/fs/glibc/" || true
     elif [ -x "$HOME/toolchains/zig/zig" ]; then
-        # zig cc for aarch64 glibc, as web/build-demo.sh does.
+        # zig cc for aarch64 glibc.
         mkdir -p "$PUB/fs/glibc"
         printf '#!/bin/sh\nexec %s cc -target aarch64-linux-gnu.2.36 "$@"\n' "$HOME/toolchains/zig/zig" > "$WORK/aarch64-gnu-cc"
         chmod +x "$WORK/aarch64-gnu-cc"

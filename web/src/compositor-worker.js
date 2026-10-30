@@ -1,5 +1,3 @@
-// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
-import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //

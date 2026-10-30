@@ -5,8 +5,6 @@
 // editing is the guest's choice (ICANON in its termios), and the page has to
 // follow it or every keystroke appears twice.
 
-// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
-import './zfetch.js';
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
@@ -1215,8 +1213,7 @@ async function runProgramHere(
     // Called once the system is up and before pid 1 starts, with what an
     // embedder needs to act on the running system from outside the guest:
     // the process host (kernel stack slices), the global kernel, the shared
-    // terminal and the compositor. The demo desktop's launcher adds files
-    // with it (web/src/overlay-worker.js) and types commands to pid 1.
+    // terminal and the compositor.
     onSystem = null,
     // With `gl: 'compositor'`: start the host's Mesa only when `startGl`
     // (handed to `onSystem`) is called -- a desktop whose first windows
