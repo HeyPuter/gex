@@ -3725,6 +3725,11 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// The pages each of `installed_mods` covers, by page: a page retired
+    /// takes its modules out of `installed_mods`, so the same code mapped
+    /// there again is served from the store rather than lifted and stored
+    /// once more.
+    mods_on_page: std::collections::HashMap<u64, Vec<u32>>,
     /// Per object, how many of the kernel's modules for it (in its order) are
     /// all in `installed_mods`: a miss reads the list from there on, not from
     /// the start. See `shared_modules_of_object`.
@@ -10971,6 +10976,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         ever_threaded: false,
         shared: Default::default(),
         installed_mods: Default::default(),
+        mods_on_page: Default::default(),
         obj_cursor: Default::default(),
         dense_base: Default::default(),
         module_dense: Default::default(),
@@ -11747,6 +11753,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // writes the same blocks into the same slots, and its compile is shared
     // by content key.
     h.jit.installed_mods.clear();
+    h.jit.mods_on_page.clear();
     // The new program and its interpreter, placed by gex's loader rather than
     // mapped by the guest, announced as their `mmap`s would have been: the
     // syscall's return serves their units before the interpreter's first
@@ -15577,6 +15584,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 return;
             }
             j.retired_pages.insert(page);
+            forget_installed_on(j, page);
             let home = if jit_diag() { sigs::home() } else { None };
             note_page_retired(
                 home.as_ref().map(|h| h.mm()),
@@ -16775,7 +16783,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let mut dirs: Vec<(u64, u32)> = Vec::new();
                     let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
-                        j.installed_mods.insert(*id);
+                        note_installed(j, *id, d.iter().map(|(p, _)| *p));
                         slots = slots.max(*s);
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
@@ -17151,7 +17159,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         if mod_id != 0 {
-            j.installed_mods.insert(mod_id);
+            note_installed(j, mod_id, unit.covered.iter().map(|(p, _)| *p));
         }
         for (addr, _) in &unit.exported_blocks {
             j.translated.insert(*addr);
@@ -17722,6 +17730,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
+            forget_installed_on(j, page);
             let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
@@ -17758,6 +17767,29 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             }
         }
     }
+}
+
+/// Stored module `id`, covering `pages`, is in this Worker's tables.
+fn note_installed(j: &mut Jit, id: u32, pages: impl Iterator<Item = u64>) {
+    if !j.installed_mods.insert(id) {
+        return;
+    }
+    for p in pages {
+        let on = j.mods_on_page.entry(p).or_default();
+        if !on.contains(&id) {
+            on.push(id);
+        }
+    }
+}
+
+/// `page` retired: the stored modules covering it no longer run here, and
+/// are served again when its code is (the object's cursor starts over).
+fn forget_installed_on(j: &mut Jit, page: u64) {
+    let Some(ids) = j.mods_on_page.remove(&page) else { return };
+    for id in ids {
+        j.installed_mods.remove(&id);
+    }
+    j.obj_cursor.clear();
 }
 
 /// Note the pages an installed runtime module has blocks on (`dense_on_page`).
