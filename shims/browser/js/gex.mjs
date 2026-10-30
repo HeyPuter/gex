@@ -4609,11 +4609,15 @@ export class Gex {
     if (this.#cgen) return this.#cgen;
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
-    let rm = this.#sharedModules.get('ftab-runtime');
+    // By its bytes: the map outlives the process in a pooled Worker, and
+    // another process's runtime module (dense or not) imports other tables.
+    const rptr = e.gex_ftab_runtime_ptr() >>> 0;
+    const rbytes = this.#bytes().slice(rptr, rptr + (e.gex_ftab_runtime_len() >>> 0));
+    const rkey = `ftab-runtime:${moduleContentKey(rbytes)}`;
+    let rm = this.#sharedModules.get(rkey);
     if (!rm) {
-      const ptr = e.gex_ftab_runtime_ptr() >>> 0;
-      rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_len() >>> 0)));
-      this.#sharedModules.set('ftab-runtime', rm);
+      rm = new WebAssembly.Module(rbytes);
+      this.#sharedModules.set(rkey, rm);
     }
     // A table64 beside a 64-bit memory: every module of such a process (units, translations,
     // providers) addresses its function table with i64.
