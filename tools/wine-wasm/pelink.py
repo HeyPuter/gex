@@ -34,6 +34,8 @@ import tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
+# DLLs a program's activation context may redirect (to comctl32_v6.dll)
+ACTCTX_DLLS = ('comctl32.dll',)
 DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
 WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
@@ -517,6 +519,15 @@ def link(dlls, out, gexrt, others=None):
                 # library's link order has it (winedevice's ZwLoadDriver is
                 # ntoskrnl.exe's, not ntdll's private NtLoadDriver alias).
                 if bind_guest(f, mod, imports, name, pick):
+                    continue
+                # A program's comctl32 is the one its manifest's activation
+                # context names (comctl32_v6 for notepad), which its loader
+                # binds: a call bound to comctl32 itself reached a copy that
+                # was never attached in that process (its subclass atom 0).
+                if pick in ACTCTX_DLLS and mod.endswith('.exe') and have:
+                    sym = guest_sym(mod, f'{pick}.{name}', have)
+                    guest_binds.append((f'gexw-guest!{sym}', have, pick, name, grp(mod), mod))
+                    f.write(f'{name} gexw-guest {sym}\n')
                     continue
                 # a caller declaring the function otherwise than its
                 # definition (an adapter from the .spec: user32's
