@@ -9,8 +9,9 @@ import { Filesystem } from '../../web/runtime/src/fs.js';
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 
 /** `env`: more of Wine's environment; `parts(sys, fs)`: the page's other
- *  classes, made before boot. */
-export async function bootWine(t, { env = {}, parts } = {}) {
+ *  classes, made before boot; `wow64`: 32-bit programs through WoW64 (the
+ *  install's i386-windows), with no display (the null graphics driver). */
+export async function bootWine(t, { env = {}, parts, wow64 = false } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   const fs = new Filesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
@@ -18,16 +19,24 @@ export async function bootWine(t, { env = {}, parts } = {}) {
   const more = parts?.(sys, fs);
   await t.timeout(sys.boot(), 120000, 'boot');
   const failed = JSON.parse(await (await fetchWork(t, 'win-progs.json')).text()).failed;
-  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...env };
-  /** Run test program `exe` (in /progs/ARCH) from C:\. */
-  async function run(exe, args = [], { arch = 'x64', timeout = 300000, env: e = {} } = {}) {
+  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1', WINEGEX_DOOR: '0' }), ...env };
+  if (wow64) {
+    try { await fs.stat('/wine64/lib/wine/i386-windows'); } catch { t.skip('the Wine install has no lib/wine/i386-windows: not a WoW64 build'); }
+    await fs.writeFile('/pfx/user.reg', '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="null"\n', { append: true });
+  }
+  /** Copy test program `exe` (in /progs/ARCH) into C:\. */
+  async function put(exe, arch = 'x64') {
     const why = failed[`${arch}/${exe.replace(/\.exe$/, '.c')}`] ?? failed[`${arch}/${exe.replace(/\.exe$/, '.cpp')}`];
     if (why) throw new Error(`${arch}/${exe} did not build: ${why}`);
     await fs.writeFile(`/pfx/drive_c/${exe}`, await fs.readFile(`/progs/${arch}/${exe}`));
+  }
+  /** Run test program `exe` (in /progs/ARCH) from C:\. */
+  async function run(exe, args = [], { arch = 'x64', timeout = 300000, env: e = {} } = {}) {
+    await put(exe, arch);
     const r = await t.timeout(sys.run([WINE, `C:\\${exe}`, ...args], { env: { ...wineEnv, ...e }, cwd: '/pfx/drive_c' }), timeout, exe);
     return { ...r, stdout: r.stdout.replace(/\r/g, '') };
   }
-  return { sys, fs, run, env: wineEnv, more };
+  return { sys, fs, run, put, env: wineEnv, more };
 }
 
 function fetchWork(t, name) {

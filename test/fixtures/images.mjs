@@ -10,7 +10,8 @@
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, web/runtime/build.sh.
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
-//            built with MinGW for x64/ and x86/; win-progs.json says which
+//            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
+//            `gex-nt-arch:` and `gex-nt-libs:` lines); win-progs.json says which
 //            did not build, and why.
 //   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
 //            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
@@ -236,12 +237,17 @@ export const images = {
       for (const f of names) {
         const text = readFileSync(join(src, f), 'utf8');
         const cc = (/gex-nt-cc: *(.*)/.exec(text)?.[1].replace(/\*\/\s*$/, "").trim().replaceAll('ARCH', triple) ?? `${triple}-w64-mingw32-gcc`).split(/\s+/);
+        // `gex-nt-arch: x86|x64`: built for that one only; `gex-nt-libs:`
+        // after the source, where the linker wants libraries.
+        const only = /gex-nt-arch: *(\w+)/.exec(text)?.[1];
+        if (only && only !== arch) continue;
+        const libs = (/gex-nt-libs: *(.*)/.exec(text)?.[1].replace(/\*\/\s*$/, '').trim() ?? '').split(/\s+/).filter(Boolean);
         // std::thread needs MinGW's POSIX thread model, where the default is win32.
         if (/-g\+\+$/.test(cc[0]) && existsSync(`/usr/bin/${cc[0]}-posix`)) cc[0] += '-posix';
         // One that does not build is missing, and said so (win-progs.json);
         // the others are still made.
         try {
-          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', '-o', join(dir, arch, f.replace(/\.[a-z]+$/, '.exe')), join(src, f)], { stdio: ['ignore', 'ignore', 'pipe'] });
+          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', '-o', join(dir, arch, f.replace(/\.[a-z]+$/, '.exe')), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
         } catch (e) {
           failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
         }
