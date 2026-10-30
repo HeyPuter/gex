@@ -59,6 +59,12 @@ fmla_lane:
     fmla d0, d1, v2.d[1]
     ret
 
+// Zero the 64-byte block holding x0, as bionic's memset does past its first block.
+.globl zva
+zva:
+    dc zva, x0
+    ret
+
 // popcount(x0), as clang writes it: cnt, then uaddlv.
 .globl popcount
 popcount:

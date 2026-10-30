@@ -136,6 +136,13 @@ int main(int argc, char** argv) {
     memcpy(&r, &c.rv[0][0], 8);
     CHECK("fmla d0, d1, v2.d[1]", r == 13.0 && c.rv[0][1] == 0, 1);
 
+    static unsigned char zbuf[192] __attribute__((aligned(64)));
+    memset(zbuf, 0xff, sizeof zbuf);
+    call2(at(OFF_zva), (uint64_t)(uintptr_t)(zbuf + 64 + 7), 0);
+    int right = 0;
+    for (int i = 0; i < 192; i++) right += zbuf[i] == (i >= 64 && i < 128 ? 0 : 0xff);
+    CHECK("dc zva zeroes its block, and only it", right, 192);
+
     CHECK("popcount", call2(at(OFF_popcount), 0xf00f00000000ff01ull, 0), 17);
     int16_t hs[8] = {-32768, -32768, -1, 7, 32767, -100, 3, -32768};
     uint32_t ws[4] = {0xffffffffu, 0xffffffffu, 5, 0x80000000u};

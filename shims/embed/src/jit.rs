@@ -103,15 +103,28 @@ pub fn unmap_exec(lo: u64, hi: u64) {
             }
         }
         j.exec = out;
-        j.known.retain(|&a| a < lo || a >= hi);
         j.intrinsics.retain(|&a, _| a < lo || a >= hi);
-        let dir = gex_abi::dispatch_dir();
-        for p in lo / gex_abi::DISPATCH_PAGE..hi.div_ceil(gex_abi::DISPATCH_PAGE) {
-            j.page_table.forget(p);
-            // SAFETY: the directory's entry for page `p`, in the hosted block.
-            unsafe { &*((dir + p * 4) as usize as *const AtomicU32) }.store(0, Ordering::Release);
-        }
+        retire(j, lo, hi);
     })
+}
+
+/// The code in `[lo, hi)` was rewritten (`ic ivau`, from a guest JIT): retire what was translated from its pages, so
+/// the next branch there translates the new code. It stays executable.
+pub fn invalidate(lo: u64, hi: u64) {
+    with(|j| retire(j, lo, hi))
+}
+
+/// Forget the translations of `[lo, hi)`'s pages and zero their directory entries, so every Worker's next branch
+/// there misses, and the miss translates into fresh slots.
+fn retire(j: &mut Jit, lo: u64, hi: u64) {
+    let (first, end) = (lo / gex_abi::DISPATCH_PAGE, hi.div_ceil(gex_abi::DISPATCH_PAGE));
+    j.known.retain(|&a| a < first * gex_abi::DISPATCH_PAGE || a >= end * gex_abi::DISPATCH_PAGE);
+    let dir = gex_abi::dispatch_dir();
+    for p in first..end {
+        j.page_table.forget(p);
+        // SAFETY: the directory's entry for page `p`, in the hosted block.
+        unsafe { &*((dir + p * 4) as usize as *const AtomicU32) }.store(0, Ordering::Release);
+    }
 }
 
 /// Serve `pc` with `k` instead of translating what is there. Before anything reaches `pc`.

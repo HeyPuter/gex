@@ -66,7 +66,21 @@ pub extern "C" fn sysreg_write(c: i32, pc: i64, reg: i32, val: i64) {
     }
 }
 
-pub extern "C" fn cache_op(_c: i32, _pc: i64, _op: i32, _addr: i64) {}
+pub extern "C" fn cache_op(_c: i32, _pc: i64, op: i32, addr: i64) {
+    let addr = addr as u64;
+    match op {
+        // `dc zva`: zero the block holding `addr`, as DCZID_EL0 says it is long. bionic's memset zeroes all but its
+        // first and last stretch this way.
+        gex_abi::cache_op::DC_ZVA => {
+            let start = addr & !(gex_abi::DCZID_BLOCK_BYTES - 1);
+            // SAFETY: guest memory is this program's, and the block is the guest's to write.
+            unsafe { core::ptr::write_bytes(start as usize as *mut u8, 0, gex_abi::DCZID_BLOCK_BYTES as usize) };
+        }
+        gex_abi::cache_op::IC_INVALIDATE => crate::jit::invalidate(addr, addr + 1),
+        // Cleans and barriers: the memory is coherent.
+        _ => {}
+    }
+}
 
 pub extern "C" fn safepoint(c: i32, _pc: i64) {
     crate::cpu::set_u32(c as u32, ctx::SAFEPOINT_COUNTER, SAFEPOINT_INTERVAL);
