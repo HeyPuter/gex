@@ -301,6 +301,7 @@ async function start(args) {
     (args.hot ? '&hot=1' : '') +
     (args.adopt ? `&adopt=${encodeURIComponent(args.adopt)}` : '') +
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
+    (args.query ? `&${args.query}` : '') +
     (args.closure ? '&closure=1' : '') +
     (args.program ? `&program=${encodeURIComponent(args.program)}` : '') +
     // The one-shot path awaits only the guest, so a wedge never reports without
@@ -386,6 +387,8 @@ for (let i = 0; i < rest.length; i++) {
   else if (rest[i] === '--debug') flags.debug = true;
   else if (rest[i] === '--hot') flags.hot = true;
   else if (rest[i] === '--wisp') flags.wisp = rest[++i];
+  // More of the page's switches, as a URL query (`log=debug&xcache=1`).
+  else if (rest[i] === '--query') flags.query = rest[++i];
   // How long to let a command run before giving up and returning what it
   // printed. Default fifteen minutes -- right for `apt-get update`, wrong for
   // chasing a hang.
@@ -458,7 +461,7 @@ if (verb === 'start') {
 } else {
   console.error(
     'usage: harness.mjs start|run|ready|reload|stop|once [--root DIR] [--shell PATH]\n' +
-      '                   [--trace] [--debug] [--recompile KIB] [--wisp URL]\n' +
+      '                   [--trace] [--debug] [--recompile KIB] [--wisp URL] [--query Q]\n' +
       '                   [--closure STEM] [--wait MS] [cmd...]',
   );
   process.exit(2);
