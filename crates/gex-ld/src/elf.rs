@@ -237,6 +237,64 @@ impl DynSym {
 /// its entry (`tools/wine-wasm/wasm-elf.py`; shims' `wasmprog`).
 pub const WASM32_MAGIC: &[u8; 8] = b"GEXWASM\0";
 
+/// The span `[lowest, highest)` the loaded segments of a file cover, and the
+/// flags of its header, when it is a native wasm program's container: an ELF
+/// of either class with [`WASM32_MAGIC`] 0x40 bytes below its entry, in a
+/// loaded segment's file bytes ([`Image::is_wasm_program`], from the file
+/// rather than a loaded image). The flags are the header's (offset 36) when
+/// it has them, else 0. `read(offset, buf)` reads the file, answering the
+/// count read. `None` for anything else, or unreadable.
+pub fn wasm_program_span(read: &mut dyn FnMut(u64, &mut [u8]) -> Option<usize>) -> Option<(u64, u64, u32)> {
+    let mut head = [0u8; 64];
+    if read(0, &mut head) != Some(64) || &head[..4] != b"\x7fELF" {
+        return None;
+    }
+    let e64 = match head[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u64;
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64;
+    let word = |b: &[u8], o: usize| if e64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) } else { u32_at(b, o) };
+    let at = word(&head, 24).wrapping_sub(0x40);
+    let (phoff, phent, phnum) = if e64 {
+        (word(&head, 32), u16_at(&head, 54), u16_at(&head, 56))
+    } else {
+        (word(&head, 28), u16_at(&head, 42), u16_at(&head, 44))
+    };
+    let need = if e64 { 56 } else { 32 };
+    if phent < need || phnum == 0 || phnum > 64 {
+        return None;
+    }
+    let mut ph = vec![0u8; (phent * phnum) as usize];
+    if read(phoff, &mut ph) != Some(ph.len()) {
+        return None;
+    }
+    let (mut lo, mut hi, mut header) = (u64::MAX, 0u64, None);
+    for p in ph.chunks_exact(phent as usize) {
+        if u32_at(p, 0) != 1 {
+            continue;
+        }
+        let (off, vaddr, filesz, memsz) = if e64 {
+            (word(p, 8), word(p, 16), word(p, 32), word(p, 40))
+        } else {
+            (word(p, 4), word(p, 8), word(p, 16), word(p, 20))
+        };
+        lo = lo.min(vaddr);
+        hi = hi.max(vaddr.saturating_add(memsz));
+        if header.is_none() && at >= vaddr && at.saturating_add(8) <= vaddr.saturating_add(filesz) {
+            let mut h = [0u8; 40];
+            let n = read(off + (at - vaddr), &mut h)?;
+            if n < 8 || &h[..8] != WASM32_MAGIC {
+                return None;
+            }
+            header = Some(if n >= 40 { u32::from_le_bytes(h[36..40].try_into().unwrap()) } else { 0 });
+        }
+    }
+    header.map(|flags| (lo, hi, flags))
+}
+
 impl Image {
     /// Whether this is a native wasm32 program's container: an i386 image
     /// with [`WASM32_MAGIC`] 0x40 bytes below the entry.

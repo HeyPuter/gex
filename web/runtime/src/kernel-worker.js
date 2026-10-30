@@ -10,7 +10,7 @@
 // Messages in: `{ call, op: 'start', spec }` (instantiate, on the kernel's
 // linked stack, the one no process's Worker is given; answered with the
 // exports' names), and
-// `{ call, op: 'calls', list }`, a batch run in order:
+// `{ call, op: 'calls', groups }`, batches run in order, each one:
 //
 //   list: [{ f: 'k_fs_open', a: [args...], stop }]
 //
@@ -26,8 +26,8 @@
 //                            when `big`)
 // `stop`: a negative result ends the batch there.
 //
-// Answered `{ call, value: [{ r, out: [bytes...] }] }`, one per call made, or
-// `{ call, error }`.
+// Answered `{ call, value: [[{ r, out: [bytes...] }]] }`, a list per batch
+// with one per call made, or `{ call, error }`.
 
 import { helperKernel } from '../../src/kernel-helper.js';
 
@@ -105,7 +105,16 @@ const ops = {
     // Its exports' names: what this kernel build has.
     return { value: Object.keys(k).filter((n) => typeof k[n] === 'function') };
   },
-  calls: ({ list }) => calls(list),
+  calls({ groups }) {
+    const value = [];
+    const transfer = [];
+    for (const list of groups) {
+      const r = calls(list);
+      value.push(r.value);
+      transfer.push(...r.transfer);
+    }
+    return { value, transfer };
+  },
 };
 
 const onMessage = async (m) => {

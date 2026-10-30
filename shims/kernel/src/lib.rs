@@ -22,6 +22,8 @@ use gex_kernel::proc::ProcTable;
 mod audio;
 mod joy;
 mod pagefs;
+mod pagespawn;
+mod pagetar;
 mod wait;
 
 /// Stacks, one per Worker. Every Worker instantiates this module and shares its

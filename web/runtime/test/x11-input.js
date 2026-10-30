@@ -54,7 +54,7 @@ main(async () => {
 
   // An X program's copy, out to the page.
   const writer = await start('xwriter', 'copy', 'from X');
-  check('it owns the clipboard', writer.out.includes('copied'), JSON.stringify(writer.out));
+  check('it owns the clipboard', await until(() => writer.out.includes('copied'), 'copied', 10000).then(() => true, () => false), JSON.stringify(writer.out));
   await until(() => copies.length, 'the X copy', 10000)
     .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(writer.out)}`); });
   eq('an X program\'s copy comes out', copies, ['from X']);

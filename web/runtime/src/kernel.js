@@ -1,7 +1,9 @@
 // The page's side of the global kernel: its exports called by name through
 // the kernel-call Worker (kernel-worker.js), and its wait queues waited on
 // here, with Atomics.waitAsync on the kernel's own memory, which the page
-// shares.
+// shares. One wait slot is moved by every queue the page watches; a caller
+// takes `seq()` before a call that may find nothing to do and, when it
+// does, waits for `changed(seq)` and calls again.
 
 const ERRNO = { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 11: 'EAGAIN', 13: 'EACCES', 17: 'EEXIST', 18: 'EXDEV', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 28: 'ENOSPC', 36: 'ENAMETOOLONG', 39: 'ENOTEMPTY', 40: 'ELOOP', 111: 'ECONNREFUSED' };
 
@@ -21,10 +23,17 @@ async function makeWorker() {
 export class Kernel {
   #w; #next = 1; #calls = new Map();
   #memory;
-  /** This side's wait slot, made at the first `watch`. */
+  #names = new Set();
+  /** Batches asked for in this turn of the page, sent together. */
+  #pending = null;
+  #dead = false;
+  /** This side's wait slot, made at the first `watch`, and its queues. */
   #slot = -1;
   #slotWord = 0;
-  #names = new Set();
+  #queues = new Set();
+  /** Waiting for the slot to move: `[seq, resolve]`. */
+  #waiters = [];
+  #ticking = false;
 
   /** A Worker with the kernel `spec` ({ module, memory, pageFs }). */
   static async start(spec) {
@@ -48,11 +57,7 @@ export class Kernel {
       if (m.error) c.reject(Object.assign(new Error(m.error.message), { workerStack: m.error.stack }));
       else c.resolve(m.value);
     };
-    const fail = (e) => {
-      const err = new Error(`the kernel Worker failed: ${e?.message ?? e}`);
-      for (const c of this.#calls.values()) c.reject(err);
-      this.#calls.clear();
-    };
+    const fail = (e) => this.#fail(new Error(`the kernel Worker failed: ${e?.message ?? e}`));
     if (worker.addEventListener) {
       worker.addEventListener('message', (e) => on(e.data));
       worker.addEventListener('error', fail);
@@ -62,7 +67,13 @@ export class Kernel {
     }
   }
 
+  #fail(err) {
+    for (const c of this.#calls.values()) c.reject(err);
+    this.#calls.clear();
+  }
+
   #rpc(op, args) {
+    if (this.#dead) return Promise.reject(new Error('the kernel is stopped'));
     const call = this.#next++;
     return new Promise((resolve, reject) => {
       this.#calls.set(call, { resolve, reject });
@@ -70,7 +81,9 @@ export class Kernel {
     });
   }
 
-  /** A batch (kernel-worker.js): `[{ r, out }]`, one per call made. */
+  /** A batch (kernel-worker.js): `[{ r, out }]`, one per call made. Every
+   *  batch asked for in one turn of the page goes to the Worker in one
+   *  message. */
   calls(list) {
     // A view of part of a larger buffer (a file in a tar) is sent as a copy
     // of that part: posted as it is, the whole buffer would be copied.
@@ -83,7 +96,19 @@ export class Kernel {
         }
       }
     }
-    return this.#rpc('calls', { list });
+    if (!this.#pending) {
+      const p = this.#pending = { groups: [], done: [] };
+      queueMicrotask(() => {
+        this.#pending = null;
+        this.#rpc('calls', { groups: p.groups }).then(
+          (v) => p.done.forEach(([res], i) => res(v[i])),
+          (e) => p.done.forEach(([, rej]) => rej(e)),
+        );
+      });
+    }
+    const p = this.#pending;
+    p.groups.push(list);
+    return new Promise((res, rej) => p.done.push([res, rej]));
   }
 
   /** One call: `{ r, out }`. */
@@ -101,9 +126,10 @@ export class Kernel {
     return new Int32Array(this.#memory.buffer);
   }
 
-  /** Wake this side when wait queue `queue` moves. */
+  /** Move this side's wait slot when wait queue `queue` moves. */
   async watch(queue) {
-    if (!queue) return;
+    if (!queue || this.#queues.has(queue)) return;
+    this.#queues.add(queue);
     if (this.#slot < 0) {
       const [{ r: slot }, { r: addr }] = await this.calls([{ f: 'k_ws_alloc' }, { f: 'k_ws_addr', a: [{ ref: 0 }] }]);
       if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
@@ -114,22 +140,49 @@ export class Kernel {
   }
 
   async unwatch(queue) {
-    if (queue && this.#slot >= 0) await this.r('k_wq_del', queue, this.#slot);
+    if (!this.#queues.delete(queue) || this.#dead) return;
+    await this.r('k_wq_del', queue, this.#slot).catch(() => {});
   }
 
-  /** Where this side's wait slot is now: what `sleep` waits to move. */
+  /** Where the wait slot is now. Taken before a call that may find nothing
+   *  to do, then given to `changed`, so a move in between is not missed. */
   seq() {
     return this.#slot < 0 ? 0 : Atomics.load(this.words(), this.#slotWord);
   }
 
-  /** Until a watched queue moves from `seq`, `ms` pass, or `kicked` settles. */
-  async sleep(seq, ms, kicked) {
-    if (this.#slot < 0) return kicked;
-    const w = Atomics.waitAsync(this.words(), this.#slotWord, seq, ms);
-    if (w.async) await Promise.race([w.value, kicked]);
+  /** When a watched queue has moved since `seq` (at the latest after 30 s,
+   *  or when the kernel stops: the caller looks again). */
+  changed(seq) {
+    if (this.#dead || this.seq() !== seq) return Promise.resolve();
+    return new Promise((res) => {
+      this.#waiters.push([seq, res]);
+      this.#tick();
+    });
+  }
+
+  async #tick() {
+    if (this.#ticking) return;
+    this.#ticking = true;
+    while (this.#waiters.length && !this.#dead) {
+      const now = this.seq();
+      const still = this.#waiters.filter(([s, res]) => s === now || void res());
+      this.#waiters = still;
+      if (!still.length) break;
+      const w = Atomics.waitAsync(this.words(), this.#slotWord, now, 30000);
+      if (w.async && (await w.value) === 'timed-out') this.#waiters.splice(0).forEach(([, res]) => res());
+    }
+    this.#ticking = false;
+  }
+
+  /** Every `changed` now: their callers look again. */
+  kick() {
+    this.#waiters.splice(0).forEach(([, res]) => res());
   }
 
   terminate() {
+    this.#dead = true;
     this.#w.terminate();
+    this.#fail(new Error('the kernel is stopped'));
+    this.#waiters.splice(0).forEach(([, res]) => res());
   }
 }

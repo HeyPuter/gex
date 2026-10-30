@@ -1,11 +1,10 @@
 // `Filesystem`: the guest's root, one per system. Before boot it is the tars
-// and files a page adds, laid one over another in the order added, seeded
-// into the kernel's root at boot (kfs.js `seed`).
+// and files a page adds, laid one over another in the order added into the
+// kernel's root at boot (kfs.js `lay`).
 // After boot, a tar or files are written into the live tree, and the guest's
 // files can be read and written from the page.
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
-import { applyRecords } from './records.js';
 
 const norm = (p) => {
   if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);
@@ -22,14 +21,11 @@ const under = (at, p) => norm(`${at}/${p}`);
 /** zstd's frame magic. */
 const isZstd = (b) => b.length > 4 && b[0] === 0x28 && b[1] === 0xb5 && b[2] === 0x2f && b[3] === 0xfd;
 
-async function decodeTar(src) {
-  let bytes = await bytesOf(src, 'tar');
-  if (isZstd(bytes)) {
-    const { unzstd } = await import('../../src/zfetch.js');
-    bytes = await unzstd(bytes);
-  }
-  const { untar } = await import('../../src/tar.js');
-  return untar(bytes);
+async function tarBytes(src) {
+  const bytes = await bytesOf(src, 'tar');
+  if (!isZstd(bytes)) return bytes;
+  const { unzstd } = await import('../../src/zfetch.js');
+  return unzstd(bytes);
 }
 
 /** A lazy list: `[[path, size, url], ...]`, or the URL of one as JSON (an
@@ -123,9 +119,12 @@ export class Filesystem extends EventTarget {
    */
   addTar(src, { at = '/', lazy } = {}) {
     const p = (async () => {
-      const tree = src == null ? { files: {}, dirs: [], links: {}, hard: {}, modes: {} } : await decodeTar(src);
       const lz = lazy ? await lazyList(lazy) : [];
-      return rebase(tree, norm(at), lz);
+      return {
+        tar: src == null ? null : await tarBytes(src),
+        at: norm(at),
+        lazy: lz.map(([p, size, url]) => [under(at, p), size, lazyPath(url)]),
+      };
     })();
     return this.#add(p);
   }
@@ -140,56 +139,25 @@ export class Filesystem extends EventTarget {
         files[norm(path)] = typeof v === 'string' ? new TextEncoder().encode(v) : await bytesOf(v, path);
         if (mode !== undefined) modes[norm(path)] = mode;
       }
-      return { files, dirs: [], links: {}, hard: {}, modes, lazy: [] };
+      return { files, modes };
     })();
     return this.#add(p);
   }
 
-  #add(tree) {
+  #add(layer) {
     if (this.#sys.phase === 'new' || this.#sys.phase === 'booting') {
-      this.#sources.push(tree);
-      tree.catch(() => {});
-      return tree.then(() => {});
+      this.#sources.push(layer);
+      layer.catch(() => {});
+      return layer.then(() => {});
     }
-    return tree.then((t) => this.#files('addTar').addTree(t));
+    return layer.then((l) => this.#files('addTar').lay(l)).then(() => {});
   }
 
-  /** The layers, in order, as runProgram's options: later wins. */
+  /** For boot: the layers, in order (later wins), and what a Persist kept,
+   *  laid over them. */
   async #seed(opts) {
-    const files = opts.files, links = opts.symlinks, hard = opts.hard, modes = opts.modes;
-    const lazy = new Map(opts.lazy.map((l) => [l[0], l]));
-    const dirs = new Set(opts.dirs);
-    const mtimes = {};
-    const xattrs = {};
-    let anyTime = false, anyX = false;
-    for (const src of this.#sources) {
-      const t = await src;
-      const take = (p) => {
-        delete files[p];
-        delete links[p];
-        delete hard[p];
-        lazy.delete(p);
-        delete xattrs[p];
-      };
-      for (const d of t.dirs ?? []) dirs.add(d);
-      for (const [p, d] of Object.entries(t.files ?? {})) { take(p); files[p] = d; }
-      for (const [p, l] of Object.entries(t.links ?? {})) { take(p); links[p] = l; }
-      for (const [p, l] of Object.entries(t.hard ?? {})) { take(p); hard[p] = l; }
-      for (const l of t.lazy ?? []) { take(l[0]); lazy.set(l[0], l); }
-      Object.assign(modes, t.modes ?? {});
-      if (t.mtimes && Object.keys(t.mtimes).length) { anyTime = true; Object.assign(mtimes, t.mtimes); }
-      if (t.xattrs && Object.keys(t.xattrs).length) { anyX = true; Object.assign(xattrs, t.xattrs); }
-    }
-    // A hard link whose target a later layer replaced by something else
-    // than a file links nothing.
-    for (const [p, target] of Object.entries(hard)) if (!files[target]) delete hard[p];
-    opts.dirs = [...dirs];
-    opts.lazy = [...lazy.values()];
-    if (anyTime) opts.mtimes = mtimes;
-    if (anyX) opts.xattrs = { ...(opts.xattrs ?? {}), ...xattrs };
-    // What a Persist kept, over all of it.
-    if (this.#persist) applyRecords(opts, await this.#persist.load());
-    // The sources' bytes are the boot's now.
+    opts.layers = await Promise.all(this.#sources);
+    opts.records = this.#persist ? await this.#persist.load() : [];
     this.#sources.length = 0;
   }
 
@@ -336,19 +304,3 @@ export class Filesystem extends EventTarget {
   #watching = null;
 }
 
-/** A tree's paths under `at`, its lazy files added. */
-function rebase(t, at, lazy) {
-  const re = (p) => under(at, p);
-  const map = (o) => Object.fromEntries(Object.entries(o ?? {}).map(([p, v]) => [re(p), v]));
-  const hard = Object.fromEntries(Object.entries(t.hard ?? {}).map(([p, v]) => [re(p), re(v)]));
-  return {
-    files: map(t.files),
-    dirs: (t.dirs ?? []).map(re),
-    links: map(t.links),
-    hard,
-    modes: map(t.modes),
-    mtimes: t.mtimes && Object.keys(t.mtimes).length ? map(t.mtimes) : undefined,
-    xattrs: t.xattrs && Object.keys(t.xattrs).length ? map(t.xattrs) : undefined,
-    lazy: lazy.map(([p, size, url]) => [re(p), size, lazyPath(url)]),
-  };
-}

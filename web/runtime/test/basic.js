@@ -47,6 +47,22 @@ main(async () => {
   const w = await timeout(sys.run(['wc', '-c'], { env, input: big }), 30000, 'wc');
   eq('300 kB through a pipe', w.stdout.trim(), String(big.length));
 
+  // Output nobody reads: the program waits on its full pipe, then ends once
+  // the page reads it all.
+  const full = sys.spawn(['head', '-c', '1000000', '/dev/zero'], { env });
+  const early = await Promise.race([full.exited.then(() => 'ended'), new Promise((r) => setTimeout(() => r('waiting'), 1500))]);
+  eq('a program waits for its output to be read', early, 'waiting');
+  let got = 0;
+  for (const r = full.stdout.getReader(); ;) {
+    const { value, done } = await timeout(r.read(), 30000, 'head');
+    if (done) break;
+    got += value.length;
+  }
+  eq('then ends, all of it read', [got, (await full.exited).code], [1000000, 0]);
+  const yes = sys.spawn(['yes'], { env });
+  await yes.stdout.cancel();
+  eq('output cancelled: SIGPIPE', (await timeout(yes.exited, 30000, 'yes')).signal, 'SIGPIPE');
+
   const cwd = await sys.run(['pwd'], { env, cwd: '/tmp' });
   eq('cwd', cwd.stdout, '/tmp\n');
   const id = await sys.run(['rt-probe', 'ids'], { env, uid: 1000, gid: 100 });

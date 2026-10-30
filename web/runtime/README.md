@@ -62,7 +62,7 @@ term.onData((d) => sh.pty.write(d));
 | `new System({ baseUrl, debug })` | A system, not started; a page makes one. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. |
 | `boot(argv, opts)` | Starts the kernel and lays the filesystem's sources into its root. Parts that work before boot (the filesystem) must be made before it. With arguments, `spawn`'s, the program that is pid 1 (see above); without, pid 1 is the kernel's. |
 | `spawn(argv, opts)` | Starts a program and returns its `Process` at once; throws when the system has an init. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
-| `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). |
+| `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). It reads both outputs as they come, so a program never waits on it. |
 | `init` | The init's `Process`, or null without one. |
 | `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
@@ -76,7 +76,7 @@ term.onData((d) => sh.pty.write(d));
 | `started` | Resolves with the pid; rejects when the program could not start (`no such program`, with `errno`). |
 | `exited` | Resolves with `{ code, signal }`: a program killed by a signal has `signal` set (`'SIGTERM'`) and `code` 128 plus its number. An `exit` event too. |
 | `pty` | With a terminal: `write(data)` (a string or bytes, any size), `resize(cols, rows)` (the program hears `SIGWINCH`), and `data` events (bytes, or strings with an `encoding`). |
-| `stdin`, `stdout`, `stderr` | Without a terminal: a `WritableStream` and two `ReadableStream`s of bytes. |
+| `stdin`, `stdout`, `stderr` | Without a terminal: a `WritableStream` and two `ReadableStream`s of bytes. The outputs are read from the program's pipes as the page reads the streams: a program whose output nobody reads waits when its pipe is full (64 KiB), as on Linux and in Node, and may never end. Read both, cancel one you do not want (the program then gets `EPIPE`, or `SIGPIPE`), or spawn it `detached`. A terminal's output is always read, into `data` events. An init (`boot(argv)`) has pipes too, unless `detached`: read them. |
 | `kill(signal)` | `'SIGTERM'` by default; a name or a number. |
 
 ## Filesystem

@@ -67,6 +67,21 @@ export function treeArch({ files, symlinks = {}, hard = {} }) {
   return null;
 }
 
+/** [`treeArch`] of the layers laid at the root (fs.js), later ones over
+ *  earlier ones: their tars read for that alone. */
+async function layersArch(layers) {
+  const { untar } = await import('../../src/tar.js');
+  const t = { files: {}, symlinks: {}, hard: {} };
+  for (const l of layers) {
+    if (l.at && l.at !== '/') continue;
+    const u = l.tar ? untar(l.tar.byteOffset === 0 && l.tar.byteLength === l.tar.buffer.byteLength ? l.tar.buffer : l.tar.slice().buffer) : { files: l.files };
+    Object.assign(t.files, u.files ?? {});
+    Object.assign(t.symlinks, u.links ?? {});
+    Object.assign(t.hard, u.hard ?? {});
+  }
+  return treeArch(t);
+}
+
 /** `spawn`'s and `boot`'s arguments, checked: `[argv, opts]`. One parser,
  *  so the two take the same. */
 function programArgs(what, argv, opts = {}) {
@@ -213,12 +228,9 @@ export class System extends EventTarget {
     const opts = {
       // No program: pid 1 is the kernel's.
       elf: null,
-      files: {},
-      dirs: [],
-      modes: {},
-      hard: {},
-      symlinks: {},
-      lazy: [],
+      // The filesystem's (fs.js).
+      layers: [],
+      records: [],
       env: [],
       uid: 0,
       // Every Worker reaches the network through the page; which network
@@ -238,7 +250,7 @@ export class System extends EventTarget {
     // programs. A tree with none yet (wasm32 only, its native packages to
     // come) gets aarch64, Debian's arm64 being the usual second
     // architecture of a wasm32 tree. A program of the other one does not run.
-    const arch = wantArch ?? treeArch(opts) ?? 'aarch64';
+    const arch = wantArch ?? (await layersArch(opts.layers)) ?? 'aarch64';
     const { setGlobals } = await import('../../src/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
     const { runProgram, primeRuntime, runtimeUrls } = await import('../../src/runtime.js');
@@ -264,9 +276,9 @@ export class System extends EventTarget {
     opts.onSystem = (s) => {
       this.#sys = s;
       const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-      const { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs } = opts;
-      opts.files = null;
-      this.#start(s, { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs }, fsi).then(up.resolve, up.reject);
+      const { layers, records } = opts;
+      opts.layers = opts.records = null;
+      this.#start(s, layers, records, fsi).then(up.resolve, up.reject);
     };
     this.#run = runProgram(term, opts);
     this.#run.then(() => {
@@ -304,24 +316,26 @@ export class System extends EventTarget {
     return this;
   }
 
-  /** The kernel's first instance (kernel.js), from the page: the boot tree
-   *  seeded into the root before the first program, the page's mounts, host
-   *  calls, persistence's seed, pid 1; then the kernel's stacks handed to
-   *  the processes' host (gex.mjs `kernelStacks`). */
-  async #start(s, tree, fsi) {
+  /** The kernel's first instance (kernel.js), from the page: the
+   *  filesystem's layers and what persistence kept laid into the root before
+   *  the first program, the page's mounts, host calls, persistence's seed,
+   *  pid 1; then the kernel's stacks handed to the processes' host (gex.mjs
+   *  `kernelStacks`). */
+  async #start(s, layers, records, fsi) {
     const k = await Kernel.start({ module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control });
     this.#kernel = k;
     this.#files = new Files(k);
     this.#changes = new Changes(k, this.#files);
     this.#programs = new Programs(k, this.#files, {
-      data: (h, fd, bytes) => this.#procs.get(h)?.[INTERNAL].stream({ ev: 'data', h, fd, bytes }),
-      end: (h, fd) => this.#procs.get(h)?.[INTERNAL].stream({ ev: 'end', h, fd }),
+      data: (h, bytes) => this.#procs.get(h)?.[INTERNAL].data(bytes),
+      end: (h) => this.#procs.get(h)?.[INTERNAL].data(null),
       exit: (m) => this.#exit(m),
       watch: (m) => this.#event('watch', m),
       xWanted: () => this.#event('x-wanted', {}),
-      log: (text) => this.#say(`${text}\n`),
     });
-    await this.#files.seed(tree);
+    for (const l of layers) await this.#files.lay(l);
+    if (records.length) await this.#files.restore(records);
+    await k.r('k_fs_populate_done');
     for (const [path, id] of fsi?.mounts?.() ?? []) await this.#files.mount(path, id);
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
@@ -416,6 +430,7 @@ export class System extends EventTarget {
     const h = this.#nextHandle++;
     const pr = this.#programs;
     const c = new GuestConnection({
+      read: () => pr.read(h),
       write: (bytes) => pr.write(h, bytes),
       closeStdin: () => pr.closeStdin(h),
       release: () => { pr.release(h).catch(() => {}); this.#procs.delete(h); },
@@ -466,6 +481,8 @@ export class System extends EventTarget {
       argv,
       stdio,
       encoding: opts.pty?.encoding,
+      read: (fd) => pr.read(h, fd),
+      unread: (fd) => quiet(pr.unread(h, fd)),
       write: (bytes) => pr.write(h, bytes),
       closeStdin: () => pr.closeStdin(h),
       resize: (cols, rows) => quiet(pr.resize(h, cols, rows)),

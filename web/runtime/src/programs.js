@@ -1,9 +1,9 @@
 // The page's programs, from outside every guest process, through the kernel's
 // exports (kernel.js): each one's process, its terminal or pipes (the page's
 // ends held under pid 0, which no process has), the exec record its Worker
-// starts from (host.mjs `spawnExec`), the bytes between those ends and the
-// page, and its exit. Also what else the page waits on in the kernel: its
-// file watches (inotify) and the X display it holds for the server.
+// starts from (host.mjs `spawnExec`), and its exit. Also what else the page
+// waits on in the kernel: its file watches (inotify) and the X display it
+// holds for the server.
 //
 // Pid 1 is the kernel's own when the page names no init (`k_init_virtual`):
 // a program the page starts is its child, in a session of its own, collected
@@ -11,8 +11,10 @@
 // the kernel lets it go as it ends. With an init, that program is pid 1, the
 // child of nobody (parent 0), and the page starts nothing else.
 //
-// One loop moves everything that can move, a batch of calls a pass, and
-// sleeps on the kernel's wait queues (Atomics.waitAsync) when nothing can.
+// A pipe or a connection is read when the page asks (`read`) and written as
+// the program takes it (`write`): a program whose output nobody reads stops
+// when its pipe is full, as on Linux. A terminal is read as it fills, into
+// `data`. Each waits on its own queue's moves (kernel.js `changed`).
 
 import { errno } from './kernel.js';
 
@@ -22,35 +24,28 @@ const EAGAIN = -11;
 const INIT = 1;
 /** The pid the page's own ends are held under: no process has it. */
 const HOST = 0;
-const O_WRONLY = 1, O_RDWR = 2;
 const READ_MAX = 1 << 18;
 const IN = { MODIFY: 0x2, ATTRIB: 0x4, CLOSE_WRITE: 0x8, MOVED_FROM: 0x40, MOVED_TO: 0x80, CREATE: 0x100, DELETE: 0x200, DELETE_SELF: 0x400, MOVE_SELF: 0x800, IGNORED: 0x8000 };
 const WATCH_MASK = IN.ATTRIB | IN.CLOSE_WRITE | IN.MOVED_FROM | IN.MOVED_TO | IN.CREATE | IN.DELETE | IN.DELETE_SELF | IN.MOVE_SELF;
+const winsize = (cols, rows) => (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n);
 
 export class Programs {
   #k;
   #files;
   #on;
-  /** Pid 1 is a program (`boot(argv)`). */
-  #realInit = false;
-  /** Each program's or connection's ends, by handle. */
-  #handles = new Map();
+  /** Each program's or connection's ends, by handle: a promise, made when
+   *  the page asks for it, of `{ h, pid, pty, stdin, stdout, stderr, sock,
+   *  queues }` (ids, -1 for none), or null when it never got any. */
+  #ends = new Map();
   /** The page's programs, pid -> handle. */
   #programs = new Map();
-  /** One inotify instance for every watch the page has. */
-  #watches = { id: -1, byWd: new Map(), byH: new Map(), next: 1 };
-  /** Display :0's sockets, held for the X server until a client comes. */
-  #x = { ids: [], asked: false };
-  #kick = null;
-  /** Input the page gave a handle before its program's process was made:
-   *  h -> { writes, closeIn }, taken up when it is. */
-  #early = new Map();
-  /** Asked to go round (`pump`) since the pass began. */
-  #dirty = false;
-  #looping = false;
+  /** The page's watches, by handle: `{ id, queue, open }`, an inotify
+   *  instance each. */
+  #watches = new Map();
+  #nextWatch = 1;
 
-  /** `on`: { data(h, fd, bytes), end(h, fd), exit({ pid, code, signal }),
-   *  watch({ h, type, name, cookie }), xWanted(), log(text) }. */
+  /** `on`: { data(h, bytes), end(h), exit({ pid, code, signal }),
+   *  watch({ h, type, name, cookie }), xWanted() }. */
   constructor(kernel, files, on) {
     this.#k = kernel;
     this.#files = files;
@@ -59,203 +54,191 @@ export class Programs {
 
   /** At boot: pid 1 (a program, `init`, or the kernel's own). */
   async start({ init }) {
-    this.#realInit = init;
     const list = [];
     if (!init) list.push({ f: 'k_init_virtual', a: [1] }, { f: 'k_proc_set_info', a: [INIT, { in: 'init\ninit\0' }] });
     list.push({ f: 'k_proc_queue', a: [INIT] });
     const res = await this.#k.calls(list);
     // Moved when a child of pid 1 ends, and when pid 1 itself does.
-    await this.#k.watch(res[res.length - 1].r);
-    this.#loop();
+    const queue = res[res.length - 1].r;
+    await this.#k.watch(queue);
+    this.#reap(init ? { f: 'k_wait', a: [0, INIT, 0] } : { f: 'k_wait', a: [INIT, -1, 0] });
   }
 
-  /** The program `file` names: itself with a slash in it (from `cwd` when
-   *  relative), else the first executable of that name on `env`'s PATH
-   *  (or the usual one). A negative errno when there is none. */
-  async #find(file, env, cwd) {
-    const usable = async (p) => {
+  /** Collect what ends, for good. */
+  async #reap(wait) {
+    const k = this.#k;
+    for (;;) {
+      const seq = k.seq();
+      let res;
       try {
-        const st = await this.#files.stat(p);
-        if (st.type !== 'file') return -13;
-        return st.mode & 0o111 ? 0 : -13;
-      } catch (e) {
-        return -(e.errno ?? 2);
+        res = await k.calls([wait, wait, wait, wait]);
+      } catch {
+        return;
       }
-    };
-    if (file.includes('/')) {
-      const p = file.startsWith('/') ? file : `${(cwd || '/').replace(/\/+$/, '')}/${file}`;
-      const r = await usable(p);
-      return r < 0 ? r : p;
+      const ended = res.filter(({ r }) => r);
+      for (const { r } of ended) await this.#exited(Number(r >> 32n), Number(r & 0xffffffffn));
+      if (!ended.length) await k.changed(seq);
     }
-    const kv = env.find((e) => e.startsWith('PATH='));
-    const path = kv ? kv.slice(5) : '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
-    let best = -2;
-    for (const d of path.split(':')) {
-      const p = d ? `${d.replace(/\/+$/, '')}/${file}` : file;
-      const r = await usable(p);
-      if (r === 0) return p;
-      if (r === -13) best = -13;
-    }
-    return best;
   }
 
-  /** `len` bytes of the file `path` at `off`, fewer at its end; null when
-   *  it cannot be read. */
-  async #readAt(path, off, len) {
-    const [{ r: h }, rd] = await this.#k.calls([
-      { f: 'k_fs_open', a: [{ in: path }, 0n, 0], stop: true },
-      { f: 'k_fs_read', a: [{ ref: 0 }, BigInt(off), { out: len }] },
-      { f: 'k_fs_close', a: [{ ref: 0 }] },
-    ]);
-    if (h < 0 || rd.r < 0) return null;
-    return rd.out[0];
+  /** `pid` has ended with wait status `st`: what its terminal still holds
+   *  first, then its exit, to the page. */
+  async #exited(pid, st) {
+    const h = this.#programs.get(pid);
+    this.#programs.delete(pid);
+    const e = h === undefined ? null : await this.#ends.get(h);
+    if (e?.reading) {
+      const flushed = new Promise((r) => { e.flushed = r; });
+      this.#k.kick();
+      await flushed;
+    }
+    const sig = st & 0x7f;
+    this.#on.exit({ pid, code: sig ? 128 + sig : (st >> 8) & 0xff, signal: sig });
   }
 
-  /** A native wasm program's image span `[lowest, highest)`, when the file
-   *  at `path` is one that runs no translated code, for its memory (the
-   *  shim's vfork.rs `exec_wasm_image`, read here from the file): an ELF
-   *  with `GEXWASM` 0x40 bytes below its entry, in a loaded segment, and no
-   *  Windows address space asked for in the header's flags. Else null. */
-  async #wasmImage(path) {
-    const head = await this.#readAt(path, 0, 64);
-    if (!head || head.length < 64 || head[0] !== 0x7f || head[1] !== 0x45 || (head[4] !== 1 && head[4] !== 2)) return null;
-    const e64 = head[4] === 2;
-    const word = (dv, o) => (e64 ? Number(dv.getBigUint64(o, true)) : dv.getUint32(o, true));
-    const hv = new DataView(head.buffer, head.byteOffset);
-    const at = word(hv, 24) - 0x40;
-    const phoff = word(hv, e64 ? 32 : 28), phent = hv.getUint16(e64 ? 54 : 42, true), phnum = hv.getUint16(e64 ? 56 : 44, true);
-    if (phent < (e64 ? 56 : 32) || !phnum || phnum > 64) return null;
-    const ph = await this.#readAt(path, phoff, phent * phnum);
-    if (!ph || ph.length < phent * phnum) return null;
-    const pv = new DataView(ph.buffer, ph.byteOffset);
-    let lo = Infinity, hi = 0, flags = null;
-    for (let i = 0; i < phnum; i++) {
-      const p = i * phent;
-      if (pv.getUint32(p, true) !== 1) continue;
-      const off = word(pv, p + (e64 ? 8 : 4)), vaddr = word(pv, p + (e64 ? 16 : 8));
-      const filesz = word(pv, p + (e64 ? 32 : 16)), memsz = word(pv, p + (e64 ? 40 : 20));
-      lo = Math.min(lo, vaddr);
-      hi = Math.max(hi, vaddr + memsz);
-      if (flags === null && at >= vaddr && at + 8 <= vaddr + filesz) {
-        const h = await this.#readAt(path, off + (at - vaddr), 40);
-        if (!h || h.length < 8 || dec.decode(h.subarray(0, 7)) !== 'GEXWASM' || h[7] !== 0) return null;
-        flags = h.length >= 40 ? new DataView(h.buffer, h.byteOffset).getUint32(36, true) : 0;
-      }
-    }
-    return flags !== null && (flags & 3) === 0 ? [lo, hi] : null;
-  }
 
   /** Make a program's process: its pid (pid 1's child, leading a session of
    *  its own; pid 1 for the init), its descriptors held for it in the
    *  kernel, and the exec record its Worker starts from. `{ pid, exec, fds,
-   *  cwd, wasmImage }`, or `{ error }` (an errno). */
-  async spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 24, init = false }) {
-    const prog = await this.#find(argv[0], env, cwd);
-    if (typeof prog === 'number') {
-      this.#early.delete(h);
-      return { error: -prog };
-    }
-    const wasmImage = await this.#wasmImage(prog);
+   *  cwd, wasmImage }`, or `{ error }` (an errno). Its ends can be asked for
+   *  (`read`, `write`) from now on. */
+  spawn(o) {
+    const made = this.#spawn(o);
+    this.#ends.set(o.h, made.then((m) => m.ends ?? null, () => null));
+    return made.then(({ ends, ...m }) => m);
+  }
+
+  async #spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 24, init = false }) {
     const k = this.#k;
-    const pid = init ? INIT : await k.r('k_spawn', INIT);
-    const e = { h, pty: -1, ptyReading: false, stdin: -1, stdout: -1, stderr: -1, sock: -1, writes: [], closeIn: false, pid };
-    const fds = [];
-    const queues = [];
-    if (stdio === 'pty') {
-      const id = (await k.r('k_pty_open_master', HOST)) >> 16;
-      const list = [{ f: 'k_pty_set_lock', a: [id, 0] }, { f: 'k_pty_set_winsize', a: [id, (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n)] }];
-      for (const fd of [0, 1, 2]) {
-        list.push({ f: 'k_pty_open_end', a: [id, 0, pid] });
-        fds.push(`${fd} 0 ${O_RDWR} 0 pty:[${id}:s]`);
-      }
-      // Its controlling terminal, with its group in the foreground, as a
-      // session leader's open of the slave makes it (syscalls.rs `open_pty`).
-      list.push({ f: 'k_pty_set_sid', a: [id, pid] }, { f: 'k_pty_set_fg', a: [id, pid] }, { f: 'k_pty_queue', a: [id] });
-      if (!init) list.unshift({ f: 'k_setsid', a: [pid] });
-      const res = await k.calls(list);
-      e.pty = id;
-      e.ptyReading = true;
-      queues.push(res[res.length - 1].r);
-    } else if (stdio === 'null') {
-      if (!init) await k.r('k_setsid', pid);
-      for (const fd of [0, 1, 2]) fds.push(`${fd} 0 ${O_RDWR} 0 /dev/null`);
-    } else {
-      // Three pipes. The far end's first reference becomes the program's;
-      // this side keeps the near one.
-      const ids = (await k.calls([{ f: 'k_pipe_new', a: [HOST] }, { f: 'k_pipe_new', a: [HOST] }, { f: 'k_pipe_new', a: [HOST] }])).map((x) => x.r);
-      const list = init ? [] : [{ f: 'k_setsid', a: [pid] }];
-      [[0, 'stdin'], [1, 'stdout'], [2, 'stderr']].forEach(([fd, mine], i) => {
-        const id = ids[i];
-        const childWrites = fd !== 0 ? 1 : 0;
-        list.push({ f: 'k_pipe_open_end', a: [id, childWrites, pid] }, { f: 'k_pipe_close_end', a: [id, childWrites, HOST] }, { f: 'k_pipe_queue', a: [id] });
-        fds.push(`${fd} 0 ${childWrites ? O_WRONLY : 0} 0 pipe:[${id}]`);
-        e[mine] = id;
-      });
-      const res = await k.calls(list);
-      for (const r of res.filter((_, i) => list[i].f === 'k_pipe_queue')) queues.push(r.r);
-    }
-    for (const q of queues) await k.watch(q);
-    this.#adopt(e);
-    this.#programs.set(pid, h);
-    // vfork.rs `stage_exec_parts`: the path, then the arguments and the
-    // environment, each after its length.
-    const exec = enc.encode([prog, String(argv.length), ...argv, String(env.length), ...env].map((x) => `${x}\0`).join(''));
-    this.pump();
-    return { pid, exec, fds: enc.encode(`${fds.join('\n')}\n`), cwd: cwd || '/', wasmImage };
+    const spec = enc.encode([stdio, cols, rows, init ? 1 : 0, cwd, argv.length, ...argv, env.length, ...env].map((x) => `${x}\0`).join(''));
+    const { r, out: [b] } = await k.call('k_page_spawn', { in: spec }, { out: spec.length + (16 << 10) });
+    if (r < 0) return { error: -r };
+    // pagespawn.rs: twelve words, the image span, the exec record, the
+    // descriptors.
+    const v = new DataView(b.buffer, b.byteOffset, b.length);
+    const w = (i) => v.getInt32(i * 4, true);
+    const e = { h, pid: w(0), pty: w(1), stdin: w(2), stdout: w(3), stderr: w(4), sock: -1 };
+    e.queues = e.pty >= 0 ? [w(5)] : e.stdin >= 0 ? [w(5), w(6), w(7)] : [];
+    for (const q of e.queues) await k.watch(q);
+    this.#programs.set(e.pid, h);
+    if (e.pty >= 0) this.#readPty(e);
+    const wasmImage = w(8) ? [Number(v.getBigUint64(48, true)), Number(v.getBigUint64(56, true))] : null;
+    const exec = b.slice(64, 64 + w(9));
+    const fds = b.slice(64 + w(9), 64 + w(9) + w(10));
+    return { pid: e.pid, exec, fds, cwd: cwd || '/', wasmImage, ends: e };
   }
 
   /** A program whose Worker never started: what was held for it let go,
    *  and its exit (127, as an exec that failed) collected as any. */
   async abandon(pid) {
     await this.#k.calls([{ f: 'k_pipe_forget', a: [pid] }, { f: 'k_pty_forget', a: [pid] }, { f: 'k_exit', a: [pid, 127] }]);
-    this.pump();
   }
 
   /** A connection of the page's to what a program listens on at
    *  127.0.0.1:`port` (the global kernel's name for the port, net.rs
-   *  `tcp_name`): its bytes moved as a program's pipes are. */
+   *  `tcp_name`): read and written as a program's pipes are. */
   async connectGuest(h, port) {
-    const id = await this.#k.r('k_sock_connect', { in: `\0gex-tcp:${port}` });
-    if (id < 0) throw errno(id === -2 ? -111 : id, `127.0.0.1:${port}`);
-    this.#adopt({ h, pty: -1, stdin: -1, stdout: -1, stderr: -1, sock: id, writes: [], closeIn: false, pid: 0 });
-    await this.#k.watch(await this.#k.r('k_sock_queue', id));
-    this.pump();
+    const made = (async () => {
+      const id = await this.#k.r('k_sock_connect', { in: `\0gex-tcp:${port}` });
+      if (id < 0) throw errno(id === -2 ? -111 : id, `127.0.0.1:${port}`);
+      const q = await this.#k.r('k_sock_queue', id);
+      await this.#k.watch(q);
+      return { h, pid: 0, pty: -1, stdin: -1, stdout: -1, stderr: -1, sock: id, queues: [q] };
+    })();
+    this.#ends.set(h, made.catch(() => null));
+    await made;
   }
 
-  /** Handle `e` is ready: what the page gave it before is its now. */
-  #adopt(e) {
-    const early = this.#early.get(e.h);
-    this.#early.delete(e.h);
-    if (early) {
-      e.writes.push(...early.writes);
-      e.closeIn = early.closeIn;
+  /** The next bytes the program wrote to `fd` (1 or 2; a connection has one
+   *  way in), when it writes them; null at their end. */
+  async read(h, fd = 1) {
+    const e = await this.#ends.get(h);
+    const id = e ? (e.sock >= 0 ? e.sock : fd === 2 ? e.stderr : e.stdout) : -1;
+    if (id < 0) return null;
+    const f = e.sock >= 0 ? 'k_sock_read' : 'k_pipe_read';
+    for (const k = this.#k; ;) {
+      const seq = k.seq();
+      const { r, out } = await k.call(f, id, { out: READ_MAX }).catch(() => ({ r: -9 }));
+      if (r > 0) return out[0];
+      if (r === EAGAIN) {
+        await k.changed(seq);
+        continue;
+      }
+      // The program closed it (0), or it failed.
+      if (e.sock < 0) await this.#close(e, fd === 2 ? 'stderr' : 'stdout');
+      return null;
     }
-    this.#handles.set(e.h, e);
   }
 
-  /** What `h` is, or, while its process is still being made, where its
-   *  input waits. */
-  #input(h) {
-    const e = this.#handles.get(h);
-    if (e) return e;
-    if (!this.#early.has(h)) this.#early.set(h, { writes: [], closeIn: false });
-    return this.#early.get(h);
+  /** Output `fd` no longer read: the program's writes to it fail (EPIPE). */
+  async unread(h, fd) {
+    const e = await this.#ends.get(h);
+    if (e?.sock < 0) await this.#close(e, fd === 2 ? 'stderr' : 'stdout');
   }
 
-  write(h, bytes) {
-    this.#input(h).writes.push(bytes);
-    this.pump();
+  /** `bytes` to the program, as it takes them; dropped when nobody reads
+   *  them any more. */
+  async write(h, bytes) {
+    const e = await this.#ends.get(h);
+    if (!e) return;
+    const k = this.#k;
+    if (e.pty >= 0) {
+      await k.r('k_pty_write', e.pty, 1, { in: bytes }).catch(() => {});
+      return;
+    }
+    const id = e.sock >= 0 ? e.sock : e.stdin;
+    const f = e.sock >= 0 ? 'k_sock_write' : 'k_pipe_write';
+    for (let b = bytes; b.length && id >= 0;) {
+      const seq = k.seq();
+      const r = await k.r(f, id, { in: b.subarray(0, READ_MAX) }).catch(() => -9);
+      if (r === EAGAIN || r === 0) await k.changed(seq);
+      else if (r < 0) return;
+      else b = b.subarray(r);
+    }
   }
 
-  closeStdin(h) {
-    this.#input(h).closeIn = true;
-    this.pump();
+  /** The end of what the page writes: the program reads end of file. */
+  async closeStdin(h) {
+    const e = await this.#ends.get(h);
+    if (e?.sock >= 0) await this.#k.r('k_sock_shutdown', e.sock, 1).catch(() => {});
+    else if (e) await this.#close(e, 'stdin');
+  }
+
+  /** A terminal is read as it fills, into `data`, to its end (the program
+   *  and whatever it left hang up). An exit is told once what came before
+   *  it has been (`flushed`). */
+  async #readPty(e) {
+    const k = this.#k;
+    e.reading = true;
+    for (;;) {
+      const seq = k.seq();
+      const flushed = e.flushed;
+      const { r, out } = await k.call('k_pty_read', e.pty, 1, { out: READ_MAX }).catch(() => ({ r: -9 }));
+      if (r > 0) {
+        this.#on.data(e.h, out[0]);
+        continue;
+      }
+      if (flushed) {
+        e.flushed = null;
+        flushed();
+      }
+      if (r === EAGAIN) {
+        await k.changed(seq);
+        continue;
+      }
+      // The terminal hung up (EIO), or was let go. The master stays held for
+      // the page's writes and size until it lets go.
+      e.reading = false;
+      e.flushed?.();
+      await k.unwatch(e.queues[0]);
+      this.#on.end(e.h);
+      return;
+    }
   }
 
   async resize(h, cols, rows) {
-    const e = this.#handles.get(h);
-    if (!e || e.pty < 0) return;
-    await this.#k.r('k_pty_set_winsize', e.pty, (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n));
+    const e = await this.#ends.get(h);
+    if (e?.pty >= 0) await this.#k.r('k_pty_set_winsize', e.pty, winsize(cols, rows));
   }
 
   async kill(pid, signal) {
@@ -265,81 +248,82 @@ export class Programs {
 
   /** Handles done with: ends closed. */
   async release(h) {
-    this.#early.delete(h);
-    const e = this.#handles.get(h);
+    const e = await this.#ends.get(h);
+    this.#ends.delete(h);
     if (!e) return;
-    this.#handles.delete(h);
-    await this.#closeEnds(e);
-  }
-
-  async #closeEnds(e) {
-    const list = [];
-    const unwatch = [];
     if (e.sock >= 0) {
-      unwatch.push({ f: 'k_sock_queue', a: [e.sock] });
-      list.push({ f: 'k_sock_close', a: [e.sock] });
+      await this.#k.unwatch(e.queues[0]);
+      await this.#k.r('k_sock_close', e.sock);
       e.sock = -1;
     }
     if (e.pty >= 0) {
-      if (e.ptyReading) unwatch.push({ f: 'k_pty_queue', a: [e.pty] });
-      list.push({ f: 'k_pty_close_end', a: [e.pty, 1, HOST] });
+      if (e.reading) await this.#k.unwatch(e.queues[0]);
+      await this.#k.r('k_pty_close_end', e.pty, 1, HOST);
       e.pty = -1;
     }
-    if (e.stdin >= 0) {
-      unwatch.push({ f: 'k_pipe_queue', a: [e.stdin] });
-      list.push({ f: 'k_pipe_close_end', a: [e.stdin, 1, HOST] });
-      e.stdin = -1;
-    }
-    for (const f of ['stdout', 'stderr']) {
-      if (e[f] >= 0) {
-        unwatch.push({ f: 'k_pipe_queue', a: [e[f]] });
-        list.push({ f: 'k_pipe_close_end', a: [e[f], 0, HOST] });
-        e[f] = -1;
-      }
-    }
-    for (const { r } of unwatch.length ? await this.#k.calls(unwatch) : []) await this.#k.unwatch(r);
-    if (list.length) await this.#k.calls(list);
+    for (const f of ['stdin', 'stdout', 'stderr']) await this.#close(e, f);
+  }
+
+  /** The page's end of pipe `f` of `e` closed. */
+  async #close(e, f) {
+    const id = e[f];
+    if (id < 0) return;
+    e[f] = -1;
+    const i = ['stdin', 'stdout', 'stderr'].indexOf(f);
+    await this.#k.unwatch(e.queues[i]);
+    await this.#k.r('k_pipe_close_end', id, f === 'stdin' ? 1 : 0, HOST).catch(() => {});
   }
 
   // -- watches (fs.js `watch`) ---------------------------------------------
 
+  /** A watch on `path`: an inotify instance of its own, read as it fills. */
   async addWatch(path) {
-    const w = this.#watches;
-    if (w.id < 0) {
-      const id = await this.#k.r('k_inotify_create');
-      if (id < 0) throw errno(id, 'inotify');
-      w.id = id;
-      await this.#k.watch(await this.#k.r('k_inotify_queue', id));
+    const k = this.#k;
+    const id = await k.r('k_inotify_create');
+    if (id < 0) throw errno(id, 'inotify');
+    const [{ r: wd }, { r: queue }] = await k.calls([
+      { f: 'k_inotify_add_watch', a: [id, { in: await this.#files.real(path) }, WATCH_MASK] },
+      { f: 'k_inotify_queue', a: [id] },
+    ]);
+    if (wd < 0) {
+      await k.r('k_inotify_close', id);
+      throw errno(wd, path);
     }
-    const wd = await this.#k.r('k_inotify_add_watch', w.id, { in: await this.#files.real(path) }, WATCH_MASK);
-    if (wd < 0) throw errno(wd, path);
-    const h = w.next++;
-    // Two watches on one path share a descriptor, as inotify's do.
-    const hs = w.byWd.get(wd) ?? new Set();
-    hs.add(h);
-    w.byWd.set(wd, hs);
-    w.byH.set(h, wd);
+    await k.watch(queue);
+    const h = this.#nextWatch++;
+    const w = { id, queue, open: true };
+    this.#watches.set(h, w);
+    (async () => {
+      while (w.open) {
+        const seq = k.seq();
+        const { r, out } = await k.call('k_inotify_read', id, { out: 65536 }).catch(() => ({ r: -9 }));
+        if (r > 0) {
+          if (this.#watchEvents(h, out[0])) await this.rmWatch(h);
+        } else if (r === EAGAIN || r === 0) {
+          await k.changed(seq);
+        } else {
+          return;
+        }
+      }
+    })();
     return h;
   }
 
   async rmWatch(h) {
-    const w = this.#watches;
-    const wd = w.byH.get(h);
-    if (wd === undefined) return;
-    w.byH.delete(h);
-    const hs = w.byWd.get(wd);
-    hs?.delete(h);
-    if (hs && !hs.size) {
-      w.byWd.delete(wd);
-      await this.#k.r('k_inotify_rm_watch', w.id, wd);
-    }
+    const w = this.#watches.get(h);
+    if (!w) return;
+    this.#watches.delete(h);
+    w.open = false;
+    await this.#k.unwatch(w.queue);
+    await this.#k.r('k_inotify_close', w.id).catch(() => {});
   }
 
-  #watchEvents(b) {
-    const w = this.#watches;
+  /** Watch `h`'s events, to the page. True when what it watched is gone. */
+  #watchEvents(h, b) {
     const d = new DataView(b.buffer, b.byteOffset, b.length);
+    let gone = false;
     for (let at = 0; at + 16 <= b.length;) {
-      const wd = d.getInt32(at, true), mask = d.getUint32(at + 4, true), cookie = d.getUint32(at + 8, true), len = d.getUint32(at + 12, true);
+      const mask = d.getUint32(at + 4, true), cookie = d.getUint32(at + 8, true), len = d.getUint32(at + 12, true);
       const raw = b.subarray(at + 16, at + 16 + len);
       const z = raw.indexOf(0);
       const name = dec.decode(z < 0 ? raw : raw.subarray(0, z));
@@ -352,15 +336,11 @@ export class Programs {
         : mask & IN.MOVED_TO ? 'move-in'
         : mask & (IN.DELETE_SELF | IN.MOVE_SELF | IN.IGNORED) ? 'gone'
         : null;
-      if (!type) continue;
-      const hs = w.byWd.get(wd);
-      if (!hs) continue;
-      for (const h of hs) this.#on.watch({ h, type, name, cookie });
-      if (type === 'gone') {
-        for (const h of hs) w.byH.delete(h);
-        w.byWd.delete(wd);
-      }
+      if (!type || gone) continue;
+      this.#on.watch({ h, type, name, cookie });
+      gone = type === 'gone';
     }
+    return gone;
   }
 
   // -- X display :0 ----------------------------------------------------------
@@ -368,182 +348,26 @@ export class Programs {
   /** Hold display :0's names for the X server; when a client comes the page
    *  is told (`xWanted`) and starts it on these sockets. */
   async holdX() {
+    const k = this.#k;
     const list = ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0'].map((name) => ({ f: 'k_sock_bind', a: [{ in: name }] }));
-    const ids = (await this.#k.calls(list)).map(({ r }, i) => {
+    const ids = (await k.calls(list)).map(({ r }, i) => {
       if (r < 0) throw errno(r, `X display :0 (${JSON.stringify(list[i].a[0].in)})`);
       return r;
     });
-    this.#x.ids = ids;
-    for (const { r } of await this.#k.calls(ids.map((id) => ({ f: 'k_sock_queue', a: [id] })))) await this.#k.watch(r);
-    this.pump();
+    const queues = (await k.calls(ids.map((id) => ({ f: 'k_sock_queue', a: [id] })))).map((x) => x.r);
+    for (const q of queues) await k.watch(q);
+    (async () => {
+      for (;;) {
+        const seq = k.seq();
+        const res = await k.calls(ids.map((id) => ({ f: 'k_sock_pending', a: [id] }))).catch(() => null);
+        if (!res) return;
+        if (res.some(({ r }) => r > 0)) break;
+        await k.changed(seq);
+      }
+      // The server watches the sockets from now on.
+      for (const q of queues) await k.unwatch(q);
+      this.#on.xWanted();
+    })();
     return ids;
-  }
-
-  // -- the loop ----------------------------------------------------------------
-
-  /** Something to do from the page: the loop goes round now rather than at
-   *  its next wake. */
-  pump() {
-    this.#dirty = true;
-    if (this.#kick) {
-      const f = this.#kick;
-      this.#kick = null;
-      f();
-    }
-  }
-
-  async #loop() {
-    if (this.#looping) return;
-    this.#looping = true;
-    for (;;) {
-      const seq = this.#k.seq();
-      this.#dirty = false;
-      let moved;
-      try {
-        moved = await this.#pass();
-      } catch (e) {
-        this.#on.log(`gex: the runtime's loop: ${e?.stack ?? e}`);
-        moved = false;
-      }
-      if (moved || this.#dirty) continue;
-      const kicked = new Promise((r) => { this.#kick = r; });
-      await this.#k.sleep(seq, 30000, kicked);
-      this.#kick = null;
-    }
-  }
-
-  /** One pass over everything that can move without waiting, in one batch.
-   *  True if anything did. */
-  async #pass() {
-    const list = [];
-    const then = [];
-    for (const e of this.#handles.values()) this.#ask(e, list, then);
-    const w = this.#watches;
-    if (w.id >= 0) {
-      list.push({ f: 'k_inotify_read', a: [w.id, { out: 65536 }] });
-      then.push(({ r, out }) => (r > 0 ? (this.#watchEvents(out[0]), true) : false));
-    }
-    if (!this.#x.asked) {
-      for (const id of this.#x.ids) {
-        list.push({ f: 'k_sock_pending', a: [id] });
-        then.push(({ r }) => {
-          if (r <= 0 || this.#x.asked) return false;
-          this.#x.asked = true;
-          this.#xWanted();
-          return true;
-        });
-      }
-    }
-    // Exits last: what a program wrote before it ended reaches the page
-    // before its end does.
-    const reaps = list.length;
-    for (let i = 0; i < 4; i++) list.push(this.#realInit ? { f: 'k_wait', a: [0, INIT, 0] } : { f: 'k_wait', a: [INIT, -1, 0] });
-    const res = await this.#k.calls(list);
-    let moved = false;
-    for (let i = 0; i < reaps; i++) moved = (await then[i](res[i])) || moved;
-    for (let i = reaps; i < res.length; i++) {
-      const r = res[i].r;
-      if (!r) continue;
-      moved = true;
-      await this.#exited(Number(r >> 32n), Number(r & 0xffffffffn));
-    }
-    return moved;
-  }
-
-  async #xWanted() {
-    // The server watches the sockets from now on.
-    for (const { r } of await this.#k.calls(this.#x.ids.map((id) => ({ f: 'k_sock_queue', a: [id] })))) await this.#k.unwatch(r);
-    this.#on.xWanted();
-  }
-
-  /** What `e` can move: its output read, its input written. */
-  #ask(e, list, then) {
-    if (e.sock >= 0) {
-      list.push({ f: 'k_sock_read', a: [e.sock, { out: READ_MAX }] });
-      then.push(({ r, out }) => {
-        if (r > 0) return this.#on.data(e.h, 1, out[0]), true;
-        if (r === EAGAIN) return false;
-        // The program closed it (0), or it failed.
-        this.#on.end(e.h, 1);
-        this.#handles.delete(e.h);
-        return this.#closeEnds(e).then(() => true);
-      });
-    } else {
-      const outs = e.pty >= 0 ? (e.ptyReading ? [['pty', 1]] : []) : [['stdout', 1], ['stderr', 2]];
-      for (const [f, fd] of outs) {
-        const id = e[f];
-        if (id < 0) continue;
-        list.push(f === 'pty' ? { f: 'k_pty_read', a: [id, 1, { out: READ_MAX }] } : { f: 'k_pipe_read', a: [id, { out: READ_MAX }] });
-        then.push(async ({ r, out }) => {
-          if (r > 0) return this.#on.data(e.h, fd, out[0]), true;
-          if (r === EAGAIN) return false;
-          // End of file (0), or the terminal hung up (EIO). A terminal's
-          // master stays held for the page's writes and size until it lets go.
-          if (f === 'pty') {
-            e.ptyReading = false;
-            await this.#k.unwatch(await this.#k.r('k_pty_queue', id));
-          } else {
-            e[f] = -1;
-            await this.#k.unwatch(await this.#k.r('k_pipe_queue', id));
-            await this.#k.r('k_pipe_close_end', id, 0, HOST);
-          }
-          this.#on.end(e.h, fd);
-          return true;
-        });
-      }
-    }
-    // Input: the first piece waiting.
-    if (e.writes.length) {
-      const b = e.writes[0];
-      const piece = b.subarray(0, READ_MAX);
-      const call = e.sock >= 0 ? { f: 'k_sock_write', a: [e.sock, { in: piece }] }
-        : e.pty >= 0 ? { f: 'k_pty_write', a: [e.pty, 1, { in: b }] }
-        : e.stdin >= 0 ? { f: 'k_pipe_write', a: [e.stdin, { in: piece }] } : null;
-      if (!call) {
-        e.writes.length = 0;
-      } else {
-        list.push(call);
-        then.push(({ r }) => {
-          if (call.f === 'k_pty_write') return e.writes.shift(), true;
-          if (r === EAGAIN || r === 0) return false;
-          // Nobody reads it any more (EPIPE): what is left is dropped.
-          if (r < 0) return (e.writes.length = 0), false;
-          if (r < b.length) e.writes[0] = b.subarray(r);
-          else e.writes.shift();
-          return true;
-        });
-      }
-    }
-    if (e.closeIn && !e.writes.length) {
-      if (e.sock >= 0 && !e.shut) {
-        e.shut = true;
-        list.push({ f: 'k_sock_shutdown', a: [e.sock, 1] });
-        then.push(() => true);
-      } else if (e.sock < 0 && e.stdin >= 0) {
-        const id = e.stdin;
-        e.stdin = -1;
-        list.push({ f: 'k_pipe_queue', a: [id] }, { f: 'k_pipe_close_end', a: [id, 1, HOST] });
-        then.push(({ r }) => this.#k.unwatch(r).then(() => true), () => true);
-      }
-    }
-  }
-
-  /** `pid` has ended with wait status `st`: the rest of its output first,
-   *  then its exit, to the page. */
-  async #exited(pid, st) {
-    const h = this.#programs.get(pid);
-    this.#programs.delete(pid);
-    const e = h === undefined ? null : this.#handles.get(h);
-    for (let more = !!e; more;) {
-      const list = [];
-      const then = [];
-      this.#ask(e, list, then);
-      if (!list.length) break;
-      const res = await this.#k.calls(list);
-      more = false;
-      for (let i = 0; i < res.length; i++) more = (await then[i](res[i])) || more;
-    }
-    const sig = st & 0x7f;
-    this.#on.exit({ pid, code: sig ? 128 + sig : (st >> 8) & 0xff, signal: sig });
   }
 }

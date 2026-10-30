@@ -45,13 +45,13 @@ export class Process extends EventTarget {
   #status = null;
   #ends = 0;
   #decoder = null;
-  #out = null;
-  #err = null;
+  /** Why it never started. */
+  #failed = null;
   #startedResolve; #startedReject;
   #exitedResolve; #exitedReject;
   #pendingKills = [];
 
-  constructor({ argv, stdio, encoding, write, closeStdin, resize, kill, release, windows }) {
+  constructor({ argv, stdio, encoding, read, unread, write, closeStdin, resize, kill, release, windows }) {
     super();
     this.argv = [...argv];
     this.#io = { write, closeStdin, resize, kill, release, windows };
@@ -72,8 +72,25 @@ export class Process extends EventTarget {
         close: () => closeStdin(),
         abort: () => closeStdin(),
       });
-      this.stdout = new ReadableStream({ start: (c) => { this.#out = c; } });
-      this.stderr = new ReadableStream({ start: (c) => { this.#err = c; } });
+      // Read as the page reads them: a program whose output nobody reads
+      // stops when its pipe is full.
+      const output = (fd) => new ReadableStream({
+        pull: async (c) => {
+          const b = this.#failed ? null : await read(fd);
+          if (b) return c.enqueue(b);
+          if (this.#failed) return c.error(this.#failed);
+          c.close();
+          this.#ends--;
+          this.#settle();
+        },
+        cancel: () => {
+          unread(fd);
+          this.#ends--;
+          this.#settle();
+        },
+      }, { highWaterMark: 0 });
+      this.stdout = output(1);
+      this.stderr = output(2);
       this.#ends = 2;
     }
     const io = this.#io;
@@ -87,18 +104,15 @@ export class Process extends EventTarget {
         const e = typeof err === 'number'
           ? Object.assign(new Error(`${this.argv[0]}: ${err === 2 ? 'no such program' : err === 13 ? 'permission denied' : err === 8 ? 'not a program gex can run' : `could not start (errno ${err})`}`), { errno: err })
           : err;
+        this.#failed = e;
         this.#startedReject(e);
         this.#exitedReject(e);
-        this.#out?.error(e);
-        this.#err?.error(e);
         this.dispatchEvent(Object.assign(new Event('error'), { error: e }));
       },
-      stream: (m) => {
-        if (m.ev === 'data') {
-          if (this.pty) this.pty.dispatchEvent(new DataEvent(this.#decoder ? this.#decoder.decode(m.bytes, { stream: true }) : m.bytes));
-          else (m.fd === 2 ? this.#err : this.#out)?.enqueue(m.bytes);
-        } else {
-          if (!this.pty) (m.fd === 2 ? this.#err : this.#out)?.close();
+      /** The terminal's output (null at its end). */
+      data: (bytes) => {
+        if (bytes) this.pty?.dispatchEvent(new DataEvent(this.#decoder ? this.#decoder.decode(bytes, { stream: true }) : bytes));
+        else {
           this.#ends--;
           this.#settle();
         }
@@ -106,10 +120,7 @@ export class Process extends EventTarget {
       exit: ({ code, signal, shutdown }) => {
         if (this.#status) return;
         this.#status = { code, signal: signal ? signalName(signal) : null };
-        if (shutdown) {
-          this.#ends = 0;
-          try { this.#out?.close(); this.#err?.close(); } catch {}
-        }
+        if (shutdown) this.#ends = 0;
         this.#settle();
       },
     };

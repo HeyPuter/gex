@@ -1,17 +1,17 @@
 // The guest's files from the page: the kernel's `k_fs_*` exports through the
-// kernel-call Worker (kernel.js), for the Filesystem (fs.js), the boot tree
-// and persistence.
+// kernel-call Worker (kernel.js), for the Filesystem (fs.js), the layers it
+// lays into the root and persistence.
 
 import { errno } from './kernel.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const ERANGE = -34;
-/** `remote::xattr_op::SET`. */
-const XATTR_SET = 1;
 // Linux open flags.
 const O_WRONLY = 1, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000, O_DIRECTORY = 0o200000, O_NOFOLLOW = 0o400000;
 const READ_MAX = 4 << 20;
+/** A tar's or a file's bytes go to the kernel in parts of this. */
+const PART = 16 << 20;
 const META_BYTES = 72;
 const TYPES = ['file', 'directory', 'symlink', 'chardev', 'fifo', 'socket'];
 /** The most bytes one batch carries to the Worker. */
@@ -184,88 +184,58 @@ export class Files {
     if (r < 0) throw errno(r, path);
   }
 
-  /** A tree (web/src/tar.js `untar`'s shape) into the live filesystem:
-   *  directories, files, modes, hard and symbolic links, lazy files. Over
-   *  whatever is there: what a path held is unlinked first (a symlink in
-   *  the way would be written through). */
-  async addTree(t) {
-    let files = 0, bytes = 0;
-    const parent = (p) => p.slice(0, p.lastIndexOf('/')) || '/';
-    const made = new Set();
+  /** A layer (fs.js) into the root, over whatever is there: a tar (its
+   *  bytes, unpacked in the kernel as they come, pagetar.rs) laid at `at`,
+   *  single files with their modes, lazy files (`[path, size, url]`).
+   *  Seeding, not a program's writes: persistence does not take it. The
+   *  count of files laid. */
+  async lay({ tar, at = '/', files = {}, modes = {}, lazy = [] }) {
+    const k = this.#k;
+    let n = 0;
+    if (tar) {
+      const id = await k.r('k_fs_tar_open', { in: at });
+      const list = [];
+      for (let off = 0; off < tar.length; off += PART) list.push({ f: 'k_fs_tar_feed', a: [id, { in: tar.subarray(off, off + PART) }] });
+      await batched(k, list);
+      n += await k.r('k_fs_tar_close', id);
+    }
     const list = [];
-    const mkdirs = (d, mode = 0o755) => {
-      let p = '';
-      for (const part of d.split('/').filter(Boolean)) {
-        p += `/${part}`;
-        if (made.has(p)) continue;
-        made.add(p);
-        list.push({ f: 'k_fs_mkdir', a: [{ in: p }, p === d ? mode : 0o755] });
-      }
-    };
-    const dirOf = (p) => mkdirs(parent(p));
-    const fail = new Set(['k_fs_add', 'k_fs_add_lazy']);
-    for (const d of t.dirs ?? []) mkdirs(d, t.modes?.[d] ?? 0o755);
-    for (const [p, data] of Object.entries(t.files ?? {})) {
-      dirOf(p);
-      const d = typeof data === 'string' ? enc.encode(data) : data;
-      list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_add', a: [{ in: p }, { in: d }] });
-      files++;
-      bytes += d.length;
-    }
-    for (const [p, m] of Object.entries(t.modes ?? {})) list.push({ f: 'k_fs_chmod', a: [{ in: p }, m] });
-    for (const [p, target] of Object.entries(t.hard ?? {})) {
-      dirOf(p);
-      list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_link', a: [{ in: target }, { in: p }] });
-    }
-    for (const [p, target] of Object.entries(t.links ?? {})) {
-      dirOf(p);
-      list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_symlink', a: [{ in: target }, { in: p }] });
-    }
-    for (const [p, size, url] of t.lazy ?? []) {
-      dirOf(p);
-      list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
-      files++;
-    }
-    for (const [p, secs] of Object.entries(t.mtimes ?? {})) list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(secs)] });
-    xattrCalls(list, t.xattrs);
-    await batched(this.#k, list, (r, c) => {
-      if (fail.has(c.f) && r < 0) throw errno(r, c.a[0].in);
-    });
-    return { files, bytes };
-  }
-
-  /** The tree the system boots with (the Filesystem's layers), into the
-   *  empty root, in gex.mjs `load`'s order: empty directories, files,
-   *  directories' modes, lazy files, hard links, symbolic links, times,
-   *  extended attributes. Seeding, not a program's writes (a persist diff
-   *  does not take it). */
-  async seed({ files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes = {}, xattrs = {} }) {
-    const PART = 16 << 20;
-    const list = [];
-    for (const d of dirs) list.push({ f: 'k_fs_add_dir', a: [{ in: d }, 0o755] });
-    const chmod = (p, m) => list.push({ f: 'k_fs_chmod', a: [{ in: p }, m] });
     for (const [p, data] of Object.entries(files)) {
       const d = typeof data === 'string' ? enc.encode(data) : data;
       // A large file in parts, so the Worker's memory never holds a whole one.
       list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
       for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
-      if (modes[p] !== undefined) chmod(p, modes[p]);
+      if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      n++;
     }
-    for (const d of dirs) if (modes[d] !== undefined) chmod(d, modes[d]);
-    for (const [p, size, url, head] of lazy) {
-      // The bundle's file wins, unless it is the lazy file's head.
-      if (files[p] !== undefined && !(head && files[p].length === head)) continue;
-      list.push({ f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
-      if (modes[p] !== undefined) chmod(p, modes[p]);
+    for (const [p, size, url] of lazy) {
+      list.push({ f: 'k_fs_unlink', a: [{ in: p }] }, { f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
+      n++;
     }
-    for (const [p, target] of Object.entries(hard)) {
-      list.push({ f: 'k_fs_link', a: [{ in: target }, { in: p }] });
-      if (modes[target] !== undefined) chmod(p, modes[target]);
+    await batched(k, list, (r, c) => {
+      if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+    });
+    return n;
+  }
+
+  /** What a store kept (persist.js's records), over the tree: deletions,
+   *  then the rest, parents first. */
+  async restore(records) {
+    for (const r of records) if (r.kind === 'gone') await this.rm(r.path, { recursive: true, force: true });
+    const list = [];
+    for (const r of records.filter((x) => x.kind !== 'gone').sort((a, b) => a.path.length - b.path.length)) {
+      const p = { in: r.path };
+      if (r.kind === 'file') {
+        list.push({ f: 'k_fs_add', a: [p, { in: r.data instanceof Uint8Array ? r.data : new Uint8Array(r.data ?? []) }] }, { f: 'k_fs_chmod', a: [p, r.mode ?? 0o644] });
+        if (r.mtime) list.push({ f: 'k_fs_set_mtime', a: [p, BigInt(Math.trunc(r.mtime))] });
+      } else if (r.kind === 'dir') {
+        list.push({ f: 'k_fs_add_dir', a: [p, r.mode ?? 0o755] }, { f: 'k_fs_chmod', a: [p, r.mode ?? 0o755] });
+      } else if (r.kind === 'symlink') {
+        list.push({ f: 'k_fs_unlink', a: [p] }, { f: 'k_fs_symlink', a: [{ in: r.target }, p] });
+      } else if (r.kind === 'mode') {
+        list.push({ f: 'k_fs_chmod', a: [p, r.mode] });
+      }
     }
-    for (const [p, target] of Object.entries(symlinks)) list.push({ f: 'k_fs_symlink', a: [{ in: target }, { in: p }] });
-    for (const [p, secs] of Object.entries(mtimes ?? {})) list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(Math.trunc(secs))] });
-    xattrCalls(list, xattrs);
-    list.push({ f: 'k_fs_populate_done' });
     await batched(this.#k, list);
   }
 
@@ -300,15 +270,6 @@ export class Files {
   async unmount(path) {
     const r = await this.#k.r('k_pagefs_unmount', { in: path });
     if (r < 0) throw errno(r, `unmounting ${path}`);
-  }
-}
-
-function xattrCalls(list, xattrs) {
-  for (const [p, attrs] of Object.entries(xattrs ?? {})) {
-    for (const [name, value] of Object.entries(attrs)) {
-      const v = typeof value === 'string' ? enc.encode(value) : value;
-      list.push({ f: 'k_fs_xattr', a: [-1, { in: p }, XATTR_SET, { in: name }, { in: v }, 0] });
-    }
   }
 }
 
