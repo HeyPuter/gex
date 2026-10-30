@@ -20,7 +20,7 @@ export default async function (t) {
   globalThis.GEX_ASSET_BASE = t.baseUrl;
   setGlobals((n) => sw[n] ?? null, { arch: dbg.arch ?? 'aarch64' });
   const tree = untar(await unzstd(await bytesOf(t.work('bb.tar.zst'))));
-  const lazyUrl = new URL(t.work('lazy.bin'));
+  const lazyUrl = new URL(t.work('lazy-program.bin'));
   const lazyAt = lazyUrl.protocol === 'file:' ? decodeURIComponent(lazyUrl.pathname) : lazyUrl.pathname;
 
   let out = '';

@@ -9,7 +9,7 @@ export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120 };
 const DB = 'rt-persist-test';
 
 export default async function (t) {
-  const { say, check, eq, timeout, hits } = t;
+  const { say, check, eq, timeout, until, hits } = t;
   const phase = t.phase;
   if (phase === 1) {
     await new Promise((r, j) => { const q = indexedDB.deleteDatabase(DB); q.onsuccess = r; q.onerror = j; });
@@ -29,6 +29,10 @@ export default async function (t) {
   const out = async (cmd) => (await sh(cmd)).stdout;
 
   if (phase === 1) {
+    // Every save of its own from here (on a busy machine the changes below
+    // can be more than `quiet` apart, and then saved in more than one).
+    const saves = [];
+    p.addEventListener('stored', (e) => saves.push({ at: performance.now(), stored: e.stored }));
     const r = await sh([
       'echo kept > /root/new.txt',
       'printf "#!/bin/sh\\necho ran\\n" > /root/run.sh && chmod 755 /root/run.sh',
@@ -42,9 +46,14 @@ export default async function (t) {
     ].join(' && '));
     eq('changes made', r.code, 0);
     const before = await hits('lazy.bin');
-    // A save of its own, about a second after the changes settle.
-    const ev = await timeout(new Promise((res) => p.addEventListener('stored', (e) => res(e), { once: true })), 30000, 'stored');
-    check(`stored after the changes settled (${ev.stored} records)`, ev.stored > 0);
+    // Saves of its own, the last about a second after the changes settle:
+    // nine records in one save on a quiet machine. On a busy one, a pause in
+    // the commands above longer than `quiet` saves what came before it, in
+    // more than one save, and then eight (a directory deleted in two saves
+    // is one record less): wait for those and for the saves to stop.
+    const n = () => saves.reduce((a, e) => a + e.stored, 0);
+    await until(() => n() >= 8 && performance.now() - saves.at(-1).at > 3000, 'stored', 30000).catch(() => {});
+    check(`stored after the changes settled (${n()} records in ${saves.length} saves)`, n() >= 8);
     const s = await p.save();
     eq('a second save has nothing new', [s.stored, s.dropped], [0, 0]);
     eq('the lazy file was not fetched to save it', await hits('lazy.bin'), before);
@@ -66,9 +75,16 @@ export default async function (t) {
     eq('a mount is not kept (its provider keeps it)', (await sh('ls /mnt/m/y')).code !== 0, true);
     eq('the lazy file is still there', (await fs.stat('/opt/lazy.bin')).size, size);
     // Change what was restored: a rewrite, a delete.
+    // (On a busy machine the two changes can be a second apart, and the
+    // save of its own then stores the first: count what every save stored.)
+    let auto = { stored: 0, dropped: 0 };
+    const onStored = (e) => { auto = { stored: auto.stored + e.stored, dropped: auto.dropped + e.dropped }; };
+    p.addEventListener('stored', onStored);
     await sh('echo changed > /root/new.txt && rm /root/link');
     const s = await p.save();
-    check(`a save after restoring (${s.stored} stored, ${s.dropped} dropped)`, s.stored === 2 && s.dropped === 0);
+    p.removeEventListener('stored', onStored);
+    // (`stored` is said by every save that stored something, this one too.)
+    check(`a save after restoring (${s.stored} stored, ${s.dropped} dropped; ${auto.stored} and ${auto.dropped} in all)`, auto.stored === 2 && auto.dropped === 0);
     await sys.shutdown();
     return t.reload();
   }

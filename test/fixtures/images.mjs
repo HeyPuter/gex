@@ -4,7 +4,8 @@
 //
 //   busybox  bb.tar.zst: BUSYBOX (a wasm32 busybox) and its applets, the probe
 //            programs (probe/*.c, built with GEXCC or gexcc), /etc/xattr with
-//            an extended attribute; and lazy.bin, a lazy file's bytes. Kept
+//            an extended attribute; and lazy.bin and lazy-program.bin, a lazy
+//            file's bytes (one test's each). Kept
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
@@ -72,6 +73,9 @@ export const images = {
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
+    // The same for core/runprogram, which reads it: core/persist counts the
+    // fetches of lazy.bin (none) while the two may run at once.
+    writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.

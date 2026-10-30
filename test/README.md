@@ -126,7 +126,7 @@ A page or process runs one test, so each makes its own System.
 
 fixtures/images.mjs:
 
-- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin`, a lazy file's bytes.
+- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin` and `lazy-program.bin`, a lazy file's bytes (core/persist's and core/runprogram's).
 - `slim`: GEX_TEST_SLIM's image and repository, with `slim-repo.json` listing the repository.
 - `package`: `pkg/`, the runtime package (web/runtime/build.sh).
 - `wine64`: `wine64.tar` and `wine64-lazy.json`. They hold 64-bit Wine's install (GEX_TEST_WINE64_DIST, wine64-dist.sh's WINE64_DIST) at /wine64 and a page prefix made from GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at /pfx. Files over 64 KiB are lazy, served from `wine64/` in the work directory (fixtures/wine/pack.py). A link in the install that points out of it (a dist made of links into another) is packed as what it points at.
