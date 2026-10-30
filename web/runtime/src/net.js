@@ -4,7 +4,7 @@
 // `connect(host, port)` resolving a duplex: `{ readable, writable }`, a
 // ReadableStream and a WritableStream of bytes.
 
-import { internals } from './internal.js';
+import { NET_BACKEND, NET_EVENT, internals } from './internal.js';
 
 /** A connection's two streams as a Wisp stream is (web/src/net.js). */
 class DuplexWire {
@@ -72,13 +72,11 @@ export class Network extends EventTarget {
     super();
     const { connect } = options;
     if (new.target === Network && typeof connect !== 'function') throw new TypeError('Network: { connect(host, port) }');
-    /** What it was made with. */
-    this.options = { ...options };
     const i = internals(sys, 'Network');
     i.attach('network', this);
     this.#ready = (async () => {
       const { WispNetwork } = await import('../../src/net.js');
-      const backend = this.makeBackend(WispNetwork, connect);
+      const backend = this[NET_BACKEND](WispNetwork, connect);
       this.#backend = backend;
       i.network(backend);
       // A proxy that cannot be reached yet is tried again, less often.
@@ -103,14 +101,14 @@ export class Network extends EventTarget {
 
   /** The shim's network over this one: a subclass's (Wisp) or the page's
    *  `connect`. */
-  makeBackend(WispNetwork, connect) {
-    return new WispNetwork(null, (e) => this.event(e), {
+  [NET_BACKEND](WispNetwork, connect) {
+    return new WispNetwork(null, (e) => this[NET_EVENT](e), {
       dial: (host, port) => new DuplexWire(connect(host, port)),
     });
   }
 
   /** WispNetwork's events ('connect HOST:PORT', 'open', 'closed'), as ours. */
-  event(e) {
+  [NET_EVENT](e) {
     const m = /^connect (.*):(\d+)$/.exec(e);
     if (m) this.dispatchEvent(Object.assign(new Event('connect'), { host: m[1], port: Number(m[2]) }));
     else this.dispatchEvent(new Event(e));

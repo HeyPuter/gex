@@ -2,6 +2,7 @@
 // streams share), gex's own network client (web/src/net.js).
 
 import { Network } from '../net.js';
+import { NET_BACKEND, NET_EVENT } from '../internal.js';
 
 /** The proxy a page gets when it names none. */
 export const DEFAULT_WISP = 'wss://anura.pro/';
@@ -12,13 +13,18 @@ export class Wisp extends Network {
    *  `connect` (`host`, `port`). */
   constructor(sys, { url = DEFAULT_WISP } = {}) {
     super(sys, { url: String(url) });
+    this.#url = String(url);
   }
 
+  // Set before Network makes its backend: that waits for a module import.
+  #url;
+
+  /** The proxy. */
   get url() {
-    return this.options.url;
+    return this.#url;
   }
 
-  makeBackend(WispNetwork) {
-    return new WispNetwork(this.options.url, (e) => this.event(e));
+  [NET_BACKEND](WispNetwork) {
+    return new WispNetwork(this.url, (e) => this[NET_EVENT](e));
   }
 }

@@ -16,7 +16,14 @@ export declare const SIGNALS: Readonly<{
 export interface SystemOptions {
   /** The directory that holds `gex/` (default: beside the modules). */
   baseUrl?: string;
-  /** Switches for debugging (`{ strace: 1 }`, `{ console: true }`); not a stable API. */
+  /** Compiled function-tier units for the tree's images (`gexc cgen-image`'s
+   *  cache): a URL, or `{ url, require }`, where `require` fails an image
+   *  that has none. */
+  units?: string | URL | { url: string | URL; require?: boolean };
+  /** Keep translated code across loads (the origin's private file system). */
+  xcache?: boolean;
+  /** Switches for debugging (`{ strace: 1 }`, `{ console: true }`, `{ log: '1' }`
+   *  for the runtime's default lines); not a stable API. */
   debug?: Record<string, unknown>;
 }
 
