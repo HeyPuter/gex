@@ -135,13 +135,32 @@ async function runNode(test, arch, say, timeout) {
   let res = { checks: 0, fail: [], times: {} };
   const until = Date.now() + timeout;
   for (let phase = 1, state = null; ;) {
-    const child = fork(join(TESTS, 'lib/node.mjs'), [test.file], { stdio: ['ignore', o.verbose ? 'inherit' : 'ignore', 'pipe', 'ipc'] });
+    const child = fork(join(TESTS, 'lib/node.mjs'), [test.file], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
     let err = '';
-    child.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
+    // What the runtime says, for `t.logs`: its Workers write to the process's
+    // own descriptors, not through anything the test could catch.
+    const logs = [];
+    const keep = (d, part) => {
+      const lines = (part + d).split('\n');
+      const rest = lines.pop();
+      if (logs.length < 100000) logs.push(...lines);
+      return rest;
+    };
+    let outPart = '';
+    let errPart = '';
+    child.stdout.on('data', (d) => {
+      outPart = keep(d, outPart);
+      if (o.verbose) process.stdout.write(d);
+    });
+    child.stderr.on('data', (d) => {
+      err = (err + d).slice(-4000);
+      errPart = keep(d, errPart);
+    });
     const m = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve({ timeout: true }), Math.max(0, until - Date.now()));
       child.on('message', (msg) => {
         if (msg.line !== undefined) return say(msg.line);
+        if (msg.logs) return child.send({ logs: logs.filter((l) => new RegExp(msg.logs.re, msg.logs.flags).test(l)) });
         clearTimeout(timer);
         resolve(msg);
       });
@@ -236,11 +255,15 @@ async function startBrowser() {
     '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
   ], { stdio: ['ignore', 'ignore', o.verbose ? 'inherit' : 'ignore'] });
   let ws = null;
-  for (let i = 0; i < 100 && !ws; i++) {
+  // A minute: a loaded machine starts it slowly.
+  for (let i = 0; i < 600 && !ws; i++) {
     ws = await browserWsUrl(PORT + 1);
     if (!ws) await sleep(100);
   }
-  if (!ws) throw new Error('chromium did not come up');
+  if (!ws) {
+    chrome.kill('SIGKILL');
+    throw new Error('chromium did not come up');
+  }
   return { server, chrome, cdp: await Cdp.connect(ws) };
 }
 
@@ -253,9 +276,13 @@ async function runPage(test, arch, say, timeout) {
   const names = new Map([[sessionId, 'page']]);
   const mine = new Set([sessionId]);
   const off = [];
+  // The page's and its Workers' console this phase, for `t.logs`.
+  const logs = [];
   off.push(cdp.on('Runtime.consoleAPICalled', (p, sid) => {
-    if (!mine.has(sid) || sid === sessionId) return; // the page's own lines come through __t
+    if (!mine.has(sid)) return;
     const text = (p.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ');
+    if (logs.length < 100000) logs.push(text);
+    if (sid === sessionId) return; // the page's own lines come through __t
     if (o.verbose || /\b(FAIL|Error|error|trap|panic)\b/.test(text)) process.stderr.write(`${test.name}: ${names.get(sid)}: ${text}\n`);
   }));
   off.push(cdp.on('Runtime.exceptionThrown', (p, sid) => {
@@ -295,10 +322,11 @@ async function runPage(test, arch, say, timeout) {
     for (; shown < v.lines.length; shown++) say(v.lines[shown]);
     // What the page asks of the browser (`t.cdp`): real input, which a user
     // gesture needs, and screenshots. Each answer goes back by its index.
-    if (v.asks.length < sent) sent = v.asks.length; // a new phase
+    if (v.asks.length < sent) { sent = v.asks.length; logs.length = 0; } // a new phase
     for (; sent < v.asks.length; sent++) {
       const { method, save: name, ...params } = v.asks[sent];
-      const reply = await cdp.send(method, params, sessionId).then(
+      // Not CDP: the console lines that match (`t.logs`).
+      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } } : await cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
       );

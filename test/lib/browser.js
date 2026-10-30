@@ -51,6 +51,12 @@ Object.assign(t, {
       return r.result;
     });
   },
+  /** The lines the runtime logged this phase (the page's and every
+   *  Worker's console) that match `re`. */
+  async logs(re = /./) {
+    const [r] = await t.cdp({ method: '__logs', re: re.source, flags: re.flags.replace('g', '') });
+    return r.lines;
+  },
   /** Real input through the browser: `{ method: 'Input.dispatchMouseEvent',
    *  ... }` and the like. Resolves once they are sent. */
   async input(...events) {
