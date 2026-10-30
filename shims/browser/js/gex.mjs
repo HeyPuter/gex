@@ -845,8 +845,9 @@ function slotsNeeded(meta) {
  * Wine's loader, 32-bit Wine): its GEXWASM header sits 0x40 bytes before the entry
  * point (cgen/wasmprog.rs), with the flags at offset 36.
  */
-/** clang's names for a C main (see the PE module's instantiation). */
-const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
+/** clang's names for a C main, and WinMain, which Wine's crt_main also
+ * references weakly (see the PE module's instantiation). */
+const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main', 'WinMain'];
 
 function wine32ProgramFlags(elf) {
   return (wasmProgramFlags(elf) ?? 0) & 3;
@@ -4960,8 +4961,8 @@ export class Gex {
         __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered || (wasmdll && m64()) ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
-        // clang's three names for a C main: Wine's crt_main references all
-        // of them weakly and a position-independent module (32-bit Wine's PE module)
+        // clang's three names for a C main, and WinMain: Wine's crt_main
+        // references all of them weakly and a position-independent module (32-bit Wine's PE module)
         // keeps the undefined ones as imports. Null through `GOT.func`, as a
         // static link leaves them, and a trap behind the null check.
         ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
