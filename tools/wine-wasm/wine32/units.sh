@@ -62,7 +62,12 @@ todo=$(mktemp); trap 'rm -f "$todo"' EXIT
 declare -A flag
 while read -r p b in; do
   [ -z "${flag[$in]+x}" ] || continue
-  key=$(grep -aom1 "$p at \(base \)\?$b: no function-tier unit (key [0-9a-f]*" "$log" | sed 's/.*(key //')
+  # (that id's line: an image both kinds load, at one base, has a key per id)
+  if [ "$in" = - ]; then
+    key=$(grep -aom1 "$p at \(base \)\?$b: no function-tier unit (key [0-9a-f]*" "$log" | sed 's/.*(key //')
+  else
+    key=$(grep -aom1 "$p at base $b: no function-tier unit (key [0-9a-f]*, inputs $in" "$log" | sed 's/.*(key //; s/,.*//')
+  fi
   f=$(file "$p")
   [ -n "$key" ] && [ -n "$f" ] && [ -f "$f" ] || continue
   for fl in plain --wine32-kuser --wine64-compact --mem64; do
