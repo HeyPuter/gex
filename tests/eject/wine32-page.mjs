@@ -72,7 +72,7 @@ const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if
 const ntPath = join(site, 'project/build/web/nt.json');
 if (!check(existsSync(ntPath), `${ntPath} exists`)) process.exit(1);
 const nt = JSON.parse(readFileSync(ntPath, 'utf8'));
-check(nt.kind === 'wine32', `the site is a wine32 page (kind ${nt.kind})`);
+check(nt.kind === 'wine32' || nt.kind === 'wine64', `the site is a Wine page (kind ${nt.kind})`);
 const off = nt.features_off ?? [];
 const assets = existsSync(join(site, 'assets')) ? readdirSync(join(site, 'assets')) : [];
 const gexDir = existsSync(join(site, 'gex')) ? readdirSync(join(site, 'gex')) : [];
