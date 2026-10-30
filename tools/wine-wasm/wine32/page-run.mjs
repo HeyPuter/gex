@@ -19,6 +19,7 @@
 // /wine32/lib/wine/i386-unix/wine; 64-bit Wine's is /wine/lib/wine/x86_64-unix/wine),
 // WINE32_PAGE_GL (0: no GL, the page loads no Mesa), WINE32_PAGE_Q (the page's query flags, default
 // &cgen=1), WINE32_PAGE_SHOT (DIR: the compositor's last frame as DIR/end.ppm).
+// WINE32_PAGE_OUT (FILE: the program's whole output; stdout gets its last 3000 characters).
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -72,6 +73,7 @@ if (process.env.WINE32_PAGE_SHOT) {
     }
   } catch { /* no picture is no failure */ }
 }
+if (s?.out && process.env.WINE32_PAGE_OUT) writeFileSync(process.env.WINE32_PAGE_OUT, s.out);
 if (s?.out) console.log(s.out.slice(-3000));
 const seen = new Set();
 for (const l of consoleLines) {

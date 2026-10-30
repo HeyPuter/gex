@@ -176,7 +176,7 @@ if [ -n "$page" ]; then
       d=$st/pfx/drive_c/windows/${a%%:*}; b=$dist/lib/wine/${a#*:}-windows
       [ -d "$d" ] && [ -d "$b" ] || continue
       find "$d" -type f | while IFS= read -r f; do
-        n=${f##*/}; [ -f "$b/$n" ] && cmp -s "$f" "$b/$n" && ln -sfn "/$mnt/lib/wine/${a#*:}-windows/$n" "$f"
+        n=${f##*/}; [ -f "$b/$n" ] && cmp -s "$f" "$b/$n" && ln -sfn "/$mnt/lib/wine/${a#*:}-windows/$n" "$f" || true
       done
     done
   fi
