@@ -1843,9 +1843,9 @@ export class ProcessHost {
           console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
         }
         // The page passes no `onExit`, so these per-process numbers were
-        // computed and thrown away. Printed here, guarded so the Node harness
-        // (which prints its own) does not double up.
-        if (typeof window !== 'undefined' && m.millis !== undefined && logOn('debug')) {
+        // computed and thrown away. Printed here, except under run-node
+        // (`ownExitLines`), which prints its own.
+        if (!this.#extra?.ownExitLines && m.millis !== undefined && logOn('debug')) {
           // How long the process existed, against what it can account for.
           const lived = this.#asked.has(pid)
             ? Math.round(performance.now() - this.#asked.get(pid))
