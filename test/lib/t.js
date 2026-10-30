@@ -28,6 +28,16 @@ export function makeT({ host, arch, gpu = false, timed = false, phase = 1, state
       emit(`${cond ? 'ok' : 'FAIL'} ${what}${!cond && detail ? `: ${detail}` : ''}`);
       return cond;
     },
+    /** A check known to fail today, `why` saying where that is tracked: its
+     *  failure is said (KNOWN) and listed in the result's `known`, but the
+     *  test does not fail of it; once it passes it says so, for the mark to
+     *  go. */
+    known(what, cond, detail = '', why = '') {
+      res.checks++;
+      if (!cond) (res.known ??= []).push(what);
+      emit(cond ? `ok ${what} (a known failure no more: drop the mark)` : `KNOWN ${what}${detail ? `: ${detail}` : ''}${why ? ` (${why})` : ''}`);
+      return cond;
+    },
     /** `more`: said too when it fails (a log's tail). */
     eq: (what, got, want, more = '') => t.check(what, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}${more ? ` (${more})` : ''}`),
     /** A colour within `tol` of `want` in every channel (`[r, g, b]` or

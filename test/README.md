@@ -102,6 +102,7 @@ A page or process runs one test, so each makes its own System.
 | `t.until(fn, what, ms)`, `t.timeout(promise, ms, what)` | Wait for a truthy `fn()`, or for a promise, else throw. |
 | `t.lines(process, stream)` | A stream's text as lines, as they come (a process's stdout by default). |
 | `t.time(name, fn)`, `t.record(name, value)` | `fn`'s ms, or any number, in the result's `times`. |
+| `t.known(what, cond, detail, why)` | A check known to fail today, `why` saying who has it: a failure is a `KNOWN` line, listed in the result's `known`, and does not fail the test. A pass says the mark can go. |
 | `t.skip(why)` | End the test as skipped. |
 | `t.host`, `t.arch` | The host, and the translated arch (`aarch64`, `x86`). |
 | `t.gpu`, `t.timed` | Whether the run is on a GPU (`--gpu`), and a timed one (`--timed`). |
@@ -116,6 +117,7 @@ A page or process runs one test, so each makes its own System.
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
 | `t.logs(re)` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). |
+| `t.peakRss()` | The peak RSS in KiB of this phase's process (node), or of the page's renderer when it is the only renderer holding over 256 MiB (browser; null otherwise). |
 
 ## Images
 

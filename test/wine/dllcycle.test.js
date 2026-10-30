@@ -5,7 +5,8 @@
 // loads the 24 once, phase 2 four times over. Between the two, each further
 // load may cost under 4096 dispatch slots (the runtime's exit lines, under
 // `log: 'debug'`) and under 18 MiB of the run's peak RSS
-// (each load currently keeps about 13 MiB): an unloaded image's
+// (each load currently keeps about 13 MiB), and under 0.5 MiB of the
+// kernel's memory (known to fail: about 2.3 MiB): an unloaded image's
 // translations must go with it.
 import { bootWine, exitStats } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
@@ -30,18 +31,26 @@ export default async function (t) {
   const stats = await exitStats(t);
   const left = Math.min(...stats.map((s) => s.slotsLeftK).filter((n) => n >= 0));
   const dc = stats.filter((s) => /dllcycle/.test(s.cmd));
-  t.record(`${name} kernel MiB`, Math.max(...stats.map((s) => s.kernelMib).filter((n) => n >= 0)));
+  const kernel = Math.max(...stats.map((s) => s.kernelMib).filter((n) => n >= 0));
+  t.record(`${name} kernel MiB`, kernel);
   t.record(`${name} memory MiB`, Math.max(...dc.map((s) => s.memoryMib)));
   t.record(`${name} ftab`, Math.max(...dc.map((s) => s.tables?.[1] ?? 0)));
   t.record(`${name} slots left k`, left);
   if (rss) t.record(`${name} peak rss KiB`, rss);
-  if (t.phase < ROUNDS.length) return t.reload({ left, rss });
+  if (t.phase < ROUNDS.length) return t.reload({ left, rss, kernel });
   const further = 24 * (rounds - ROUNDS[0]);
   const per = Math.round((t.state.left - left) * 1000 / further);
   t.check(`dispatch slots per further load: ${per} (${t.state.left}k -> ${left}k left over ${further} loads), want under 4096`, per < 4096, `${per}`);
   if (!rss || !t.state.rss) t.record('peak RSS unknown (other renderers ran)', 1);
   else {
     const mib = (rss - t.state.rss) / 1024 / further;
+    t.record('peak RSS MiB per further load', Number(mib.toFixed(2)));
     t.check(`peak RSS per further load: ${mib.toFixed(1)} MiB (${t.state.rss} -> ${rss} KiB), want under 18`, mib < 18, mib.toFixed(1));
   }
+  // The kernel's memory, which holds the store of translated modules and
+  // only grows: the same 24 images again should add next to nothing.
+  const store = (kernel - t.state.kernel) / further;
+  t.record('kernel MiB per further load', Number(store.toFixed(2)));
+  t.known(`kernel memory per further load: ${store.toFixed(2)} MiB (${t.state.kernel} -> ${kernel} MiB), want under 0.5`, store < 0.5, store.toFixed(2),
+    'the module store grows on every reload of the same image: KC');
 }
