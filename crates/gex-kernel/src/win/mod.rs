@@ -109,6 +109,12 @@ pub mod tramp {
     pub const fn any_stack(ret: u64) -> bool {
         ret == WOW64_STOP_SYSCALL || ret == WOW64_RETURN_MARK
     }
+
+    /// Whether `pc` is one of WoW64's stops, which no code jumps to: reached
+    /// with no call-out of the thread waiting there, it is a stray arrival.
+    pub const fn wow64_stop(pc: u64) -> bool {
+        pc == WOW64_STOP_SYSCALL || pc == WOW64_STOP_UNIX || pc == WOW64_RETURN_MARK
+    }
 }
 
 /// Where the trampoline page's code continues after its system call

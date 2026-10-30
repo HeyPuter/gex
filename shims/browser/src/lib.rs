@@ -16599,7 +16599,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // `gex_wow64_waits`): 32-bit code reached 64-bit code's entry with no
     // wow64cpu run to take it. Named, not the filler's breakpoint.
     if gex_abi::X86
-        && (pc == gex_kernel::win::tramp::WOW64_STOP_SYSCALL || pc == gex_kernel::win::tramp::WOW64_STOP_UNIX)
+        && gex_kernel::win::tramp::wow64_stop(pc)
         && WOW64_WAITS.with(|w| w.get()) <= 0
     {
         warn_line(&format!("gex: 32-bit code reached WoW64's stop {pc:#x} with no wow64cpu run waiting for it\n"));

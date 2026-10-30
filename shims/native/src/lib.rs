@@ -5290,11 +5290,11 @@ pub(crate) fn thread_alt(caller: &Caller<'_, HostState>) -> bool {
     gex_abi::ctx::cs_compat(cs, own) != own
 }
 
-/// Whether `pc` is one of WoW64's stops (`win::tramp::WOW64_STOP_SYSCALL`)
-/// that no call-out of this thread waits for.
+/// Whether `pc` is one of WoW64's stops (`win::tramp::wow64_stop`) that no
+/// call-out of this thread waits for.
 fn wow64_stray(caller: &Caller<'_, HostState>, pc: u64) -> bool {
     use gex_kernel::win::tramp;
-    matches!(pc, tramp::WOW64_STOP_SYSCALL | tramp::WOW64_STOP_UNIX)
+    tramp::wow64_stop(pc)
         && !caller.data().callouts.iter().any(|co| tramp::returns_at(co.ret, pc))
 }
 
