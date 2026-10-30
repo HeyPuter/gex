@@ -128,7 +128,8 @@ export default async function (t) {
     t.check('and as a resized event', seen.some(([k, a, b]) => k === 'resized' && a === 300 && b === 200), JSON.stringify(seen));
     // A desktop's work area change.
     hw.setOutputSize(1024, 700);
-    t.check('setOutputSize does not throw', true);
+    await t.until(() => out.some((l) => l === 'root 1024 700'), 'the new output size').catch(() => {});
+    t.check('setOutputSize(w, h) reaches the X client as its root\'s size', out.some((l) => l === 'root 1024 700'), JSON.stringify(out.filter((l) => l.startsWith('root'))));
     // The frame's close button: a polite close, the window's closed event,
     // the client's end.
     w.close();

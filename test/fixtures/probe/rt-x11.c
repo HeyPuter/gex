@@ -14,8 +14,9 @@
  * for a hidden cursor: a blank cursor image is still a cursor) and warps it
  * to the window's middle, as a game's mouse look does, and each motion after says "look DX DY" (the
  * distance from the middle, warped back each time). With "where", each
- * ConfigureNotify says "at X Y W H": where the window is on the root (as the
- * page placed it) and its size. */
+ * ConfigureNotify of its window says "at X Y W H": where the window is on
+ * the root (as the page placed it) and its size; and the root's, when the
+ * output changes size, "root W H" (once at the start too). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,11 @@ int main(int argc, char **argv) {
   Atom prop = XInternAtom(dpy, "RT_PASTE", False);
   XSetWMProtocols(dpy, w, &del, 1);
   XSelectInput(dpy, w, ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | PointerMotionMask);
+  if (where) {
+    XSelectInput(dpy, RootWindow(dpy, scr), StructureNotifyMask);
+    printf("root %d %d\n", DisplayWidth(dpy, scr), DisplayHeight(dpy, scr));
+    fflush(stdout);
+  }
   XMapWindow(dpy, w);
   for (;;) {
     XEvent e;
@@ -60,6 +66,8 @@ int main(int argc, char **argv) {
         XSetSelectionOwner(dpy, clipboard, w, CurrentTime);
         printf("%s\n", XGetSelectionOwner(dpy, clipboard) == w ? "copied" : "not copied");
       }
+    } else if (e.type == ConfigureNotify && where && e.xconfigure.window == RootWindow(dpy, scr)) {
+      printf("root %d %d\n", e.xconfigure.width, e.xconfigure.height);
     } else if (e.type == ConfigureNotify && where) {
       int x, y;
       Window child;
