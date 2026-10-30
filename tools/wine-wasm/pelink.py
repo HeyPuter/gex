@@ -911,6 +911,15 @@ static void *gexw_ntdll_proc(const char *name)
                     if any(enc_name(sec) in x for x in blobs)}
             undef = syms(objs[g], '--undefined-only')
             with open(src, 'w') as f:
+                # the gex ABI its objects were built for (gex_abi.h's gex.abi
+                # section, which only gexrt's objects include, and gexrt is the
+                # core's): the Wine tree's, as the core's
+                if not any(b'gex.abi' in x for x in blobs):
+                    hdr = open(os.path.join(SRC, 'include', 'wine', 'gex', 'gex_abi.h')).read()
+                    abi = re.search(r'#define GEX_NATIVE_ABI (\d+)u', hdr)
+                    if abi:
+                        f.write(f'__asm__(".section .custom_section.gex.abi,\\"\\",@\\n.int32 {abi.group(1)}\\n'
+                                f'.section .text,\\"\\",@\\n");\n')
                 # its own empty CRT initializer tables, as gexrt's are the
                 # core's (a program's mainCRTStartup walks them)
                 for t in ('xi', 'xc', 'xp', 'xt'):
