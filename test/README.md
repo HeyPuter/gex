@@ -20,6 +20,9 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--verbose` | Every check line, the guest's console and Chromium's. |
 | `--work DIR` | The work directory (default a fresh temporary one, deleted after). Its images are kept and reused while their inputs are unchanged. |
 | `--port N` | vite's port (default 5411); Chromium's debugging port is N+1. |
+| `--gpu` | Chromium on the machine's GPU (Vulkan), not SwiftShader. |
+| `--timed` | Only the tests whose `meta.timed` is true, which no other run includes; refused outside bench.sh (GBENCH_RUN), and implies `--gpu`. |
+| `--prebuilt` | Use the images already in `--work` as they are, building none (a bench host, with a work directory synced from where the images were built). |
 | `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
@@ -85,6 +88,7 @@ export default async function (t) {
 | `images` | The images it needs (fixtures/images.mjs): made in the work directory before any test runs. Without one, the test is skipped. |
 | `timeout` | Seconds for the whole test, every phase (default 120). |
 | `html` | The page's elements (browser), added to its body before the test runs. |
+| `timed` | A timing test: run by `--timed` only (default false). |
 
 A page or process runs one test, so each makes its own System.
 
@@ -100,6 +104,7 @@ A page or process runs one test, so each makes its own System.
 | `t.time(name, fn)` | `fn`'s ms, in the result's `times`. |
 | `t.skip(why)` | End the test as skipped. |
 | `t.host`, `t.arch` | The host, and the translated arch (`aarch64`, `x86`). |
+| `t.gpu`, `t.timed` | Whether the run is on a GPU (`--gpu`), and a timed one (`--timed`). |
 | `t.baseUrl`, `t.debug(more)` | A System's `baseUrl` and `debug` on this host. |
 | `t.work(name)` | A work directory file as a URL (http on the browser host, file on node). |
 | `t.reload(state)` | Run the test again in a fresh page or process, as phase `t.phase + 1` with `t.state = state`; the checks so far are kept. |
@@ -118,3 +123,4 @@ fixtures/images.mjs:
 - `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin`, a lazy file's bytes.
 - `slim`: GEX_TEST_SLIM's image and repository, with `slim-repo.json` listing the repository.
 - `package`: `pkg/`, the runtime package (web/runtime/build.sh).
+- `gl-probes`: `gl-probes-x86.tar` and `gl-probes-a64.tar`, the guest GL and the self-checking probes in guest/gl/probes built against it (x86-64 glibc with gcc; aarch64 musl with ~/toolchains/aarch64-linux-musl-cross, when it is there). Also `gl-probes.json`: each probe's last line from a run on the host's own Mesa, which the guest's run must print, and the GL version it needs. Needs the host's EGL and GL and third_party/opengl-registry.

@@ -18,7 +18,7 @@ const emit = (s) => {
   g.lines.push(s);
   console.log(s);
 };
-const t = makeT({ host: 'browser', arch: q.get('arch'), phase: kept?.phase ?? 1, state: kept?.state ?? null, res, emit });
+const t = makeT({ host: 'browser', arch: q.get('arch'), gpu: q.has('gpu'), timed: q.has('timed'), phase: kept?.phase ?? 1, state: kept?.state ?? null, res, emit });
 
 Object.assign(t, {
   /** The runtime's assets, as a System's `baseUrl`. */

@@ -11,8 +11,8 @@ import { makeT, runTest } from './t.js';
 const file = process.argv[2];
 const PUBLIC = pathToFileURL(join(import.meta.dirname, '../../web/public/')).href;
 
-process.once('message', async ({ arch, phase, state, res, work }) => {
-  const t = makeT({ host: 'node', arch, phase, state, res, emit: (line) => process.send({ line }) });
+process.once('message', async ({ arch, phase, state, res, work, gpu, timed }) => {
+  const t = makeT({ host: 'node', arch, gpu, timed, phase, state, res, emit: (line) => process.send({ line }) });
   const browserOnly = (what) => () => { throw new Error(`${what}: browser host only`); };
   Object.assign(t, {
     baseUrl: PUBLIC,

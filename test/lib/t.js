@@ -13,10 +13,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * what the one before handed `reload`; `res`: `{ checks, fail, times }`, kept
  * across phases; `emit(line)`: a line of output.
  */
-export function makeT({ host, arch, phase = 1, state = null, res, emit }) {
+export function makeT({ host, arch, gpu = false, timed = false, phase = 1, state = null, res, emit }) {
   const t = {
     host,
     arch,
+    gpu,
+    timed,
     phase,
     state,
     say: (s) => emit(String(s)),

@@ -2,8 +2,11 @@
  * none: the most this page's adapter supports, which decides which of the GL
  * probes can run here at all. */
 #include <EGL/egl.h>
-#include <GL/gl.h>
 #include <stdio.h>
+
+/* GL's own header is not in every guest's toolchain; this is all of it used. */
+#define GL_VERSION 0x1F02
+extern const unsigned char *glGetString(unsigned int name);
 
 int main(void) {
     EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);

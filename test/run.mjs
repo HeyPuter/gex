@@ -2,7 +2,7 @@
 //
 //   node test/run.mjs [--group G,...] [--host browser|node|both] [--arch a64,x86]
 //                     [--jobs N] [--allow-skip] [--verbose] [--work DIR] [--artefacts DIR]
-//                     [--port N] [TEST...]
+//                     [--port N] [--gpu] [--timed] [--prebuilt] [TEST...]
 //
 // One JSON line per test, host and arch on stdout; what a person reads on
 // stderr. Exit 0 only when every test is ok (and skips, with --allow-skip).
@@ -34,12 +34,18 @@ const { values: o, positionals } = parseArgs({
     port: { type: 'string', default: process.env.GEX_TEST_PORT || '5411' },
     artefacts: { type: 'string', default: process.env.GEX_TEST_ARTEFACTS },
     list: { type: 'boolean', default: false },
+    gpu: { type: 'boolean', default: false },
+    timed: { type: 'boolean', default: false },
+    prebuilt: { type: 'boolean', default: false },
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hosts = o.host === 'both' ? HOSTS : [o.host];
 if (!hosts.every((h) => HOSTS.includes(h))) throw new Error(`--host: browser, node or both, not ${o.host}`);
+// Timing only on a bench host, through bench.sh (which sets GBENCH_RUN).
+if (o.timed && !process.env.GBENCH_RUN) throw new Error('--timed: timed runs happen only under bench.sh');
+const gpu = o.gpu || o.timed;
 const arches = o.arch.split(',');
 for (const a of arches) if (!ARCHES[a]) throw new Error(`--arch: a64 or x86, not ${a}`);
 
@@ -49,7 +55,7 @@ for (const a of arches) if (!ARCHES[a]) throw new Error(`--arch: a64 or x86, not
 function metaOf(file) {
   const m = /^export const meta = (\{[\s\S]*?\n?\});$/m.exec(readFileSync(file, 'utf8'));
   if (!m) throw new Error(`${file}: no \`export const meta = { ... };\``);
-  return { hosts: ['browser'], arches: Object.keys(ARCHES), images: [], timeout: 120, ...new Function(`return (${m[1]});`)() };
+  return { hosts: ['browser'], arches: Object.keys(ARCHES), images: [], timeout: 120, timed: false, ...new Function(`return (${m[1]});`)() };
 }
 const all = [];
 for (const group of readdirSync(TESTS).sort()) {
@@ -60,7 +66,7 @@ for (const group of readdirSync(TESTS).sort()) {
   }
 }
 const groups = o.group?.split(',');
-const tests = all.filter((x) => (!groups || groups.includes(x.group))
+const tests = all.filter((x) => (!groups || groups.includes(x.group)) && x.meta.timed === o.timed
   && (!positionals.length || positionals.some((p) => p === x.name || p === x.name.split('/')[1])));
 if (positionals.length && !tests.length) throw new Error(`no test ${positionals.join(' ')}`);
 const jobs = [];
@@ -76,7 +82,7 @@ mkdirSync(WORK, { recursive: true });
 // Screenshots (`t.screenshot`, and one of every browser test that fails).
 const ARTEFACTS = o.artefacts || join(WORK, 'artefacts');
 const missing = new Map();
-for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
+for (const name of o.prebuilt ? [] : new Set(jobs.flatMap((j) => j.test.meta.images))) {
   if (!images[name]) throw new Error(`no image ${name} (test/fixtures/images.mjs)`);
   const why = await images[name](WORK).catch((e) => String(e?.message ?? e));
   if (why) {
@@ -138,7 +144,7 @@ async function runNode(test, arch, say, timeout) {
         resolve(msg);
       });
       child.on('exit', (code, sig) => { clearTimeout(timer); resolve({ exited: sig ?? code }); });
-      child.send({ arch, phase, state, res, work: WORK });
+      child.send({ arch, phase, state, res, work: WORK, gpu, timed: o.timed });
     });
     child.kill('SIGKILL');
     if (m.res) res = m.res;
@@ -222,7 +228,10 @@ async function startBrowser() {
   const chrome = spawn(process.env.CHROME || '/usr/bin/chromium', [
     '--headless=new', `--remote-debugging-port=${PORT + 1}`, `--user-data-dir=${profile}`, '--autoplay-policy=no-user-gesture-required',
     '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
-    '--use-angle=swiftshader', '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
+    // The machine's GPU (--gpu), else SwiftShader. ANGLE and WebGPU on one
+    // backend either way: a canvas both read needs that.
+    ...(gpu ? ['--use-angle=vulkan', '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader']),
+    '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
   ], { stdio: ['ignore', 'ignore', o.verbose ? 'inherit' : 'ignore'] });
   let ws = null;
   for (let i = 0; i < 100 && !ws; i++) {
@@ -260,7 +269,7 @@ async function runPage(test, arch, say, timeout) {
   }));
   await cdp.send('Runtime.enable', {}, sessionId);
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
-  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch });
+  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}) });
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url: `http://127.0.0.1:${o.port}/__t/page?${q}` }, sessionId);
   let shown = 0;
