@@ -101,7 +101,7 @@ A page or process runs one test, so each makes its own System.
 | `t.say(text)` | A line of output. |
 | `t.until(fn, what, ms)`, `t.timeout(promise, ms, what)` | Wait for a truthy `fn()`, or for a promise, else throw. |
 | `t.lines(process, stream)` | A stream's text as lines, as they come (a process's stdout by default). |
-| `t.time(name, fn)` | `fn`'s ms, in the result's `times`. |
+| `t.time(name, fn)`, `t.record(name, value)` | `fn`'s ms, or any number, in the result's `times`. |
 | `t.skip(why)` | End the test as skipped. |
 | `t.host`, `t.arch` | The host, and the translated arch (`aarch64`, `x86`). |
 | `t.gpu`, `t.timed` | Whether the run is on a GPU (`--gpu`), and a timed one (`--timed`). |

@@ -31,7 +31,7 @@ export default async function (t) {
   const have = Number(m[1]) * 100 + Number(m[2]) * 10;
   t.say(`GL ${m[1]}.${m[2]}`);
   const left = [];
-  for (const [name, { want, needs }] of Object.entries(expect)) {
+  for (const [name, { want, needs }] of Object.entries(expect).filter(([n]) => n !== 'gles-gears')) {
     if (needs > have) {
       left.push(`${name} (${needs})`);
       continue;

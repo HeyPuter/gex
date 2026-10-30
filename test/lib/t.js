@@ -46,6 +46,10 @@ export function makeT({ host, arch, gpu = false, timed = false, phase = 1, state
       }
       throw new Error(`${what}: not within ${ms} ms`);
     },
+    /** A number in the result's `times` as `name`. */
+    record(name, value) {
+      res.times[name] = value;
+    },
     /** `fn`'s ms, in the result's `times` as `name`. */
     async time(name, fn) {
       const t0 = performance.now();
