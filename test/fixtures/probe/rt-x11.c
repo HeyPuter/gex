@@ -5,7 +5,7 @@
  * the window manager asks it to close (WM_DELETE_WINDOW), which ends it
  * with 0.
  *
- *   rt-x11 TITLE [copy TEXT] [paste] [look]
+ *   rt-x11 TITLE [copy TEXT] [paste] [look] [where]
  *
  * With "copy TEXT" it owns the clipboard with TEXT once mapped ("copied",
  * and "sent" each time it is asked); with "paste", each button press asks
@@ -13,7 +13,9 @@
  * press grabs the pointer, hides it (XFixes, which is what Xwayland takes
  * for a hidden cursor: a blank cursor image is still a cursor) and warps it
  * to the window's middle, as a game's mouse look does, and each motion after says "look DX DY" (the
- * distance from the middle, warped back each time). */
+ * distance from the middle, warped back each time). With "where", each
+ * ConfigureNotify says "at X Y W H": where the window is on the root (as the
+ * page placed it) and its size. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,11 +28,12 @@
 int main(int argc, char **argv) {
   const char *title = argc > 1 ? argv[1] : "rt-x11";
   const char *copy = NULL;
-  int paste = 0, look = 0, looking = 0;
+  int paste = 0, look = 0, looking = 0, where = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "copy") && i + 1 < argc) copy = argv[++i];
     else if (!strcmp(argv[i], "paste")) paste = 1;
     else if (!strcmp(argv[i], "look")) look = 1;
+    else if (!strcmp(argv[i], "where")) where = 1;
   }
   Display *dpy = XOpenDisplay(NULL);
   if (!dpy) {
@@ -57,6 +60,11 @@ int main(int argc, char **argv) {
         XSetSelectionOwner(dpy, clipboard, w, CurrentTime);
         printf("%s\n", XGetSelectionOwner(dpy, clipboard) == w ? "copied" : "not copied");
       }
+    } else if (e.type == ConfigureNotify && where) {
+      int x, y;
+      Window child;
+      XTranslateCoordinates(dpy, w, RootWindow(dpy, scr), 0, 0, &x, &y, &child);
+      printf("at %d %d %d %d\n", x, y, e.xconfigure.width, e.xconfigure.height);
     } else if (e.type == KeyPress) {
       printf("key %u\n", e.xkey.keycode);
     } else if (e.type == ButtonPress) {
