@@ -129,6 +129,22 @@ BUILDS_ON = {
 }
 
 
+# Extensions whose commands are all here but whose behaviour cannot be: the
+# wire to the host carries what the guest sends, and nothing on the host side
+# can see the guest's memory.
+#
+# GL_AMD_pinned_memory makes a buffer's storage the application's own memory
+# (glBufferData through GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD). The host would
+# be handed an address in another process's memory, so the buffer is a copy
+# at best, and every later write through the application's pointer -- or
+# through a map of the buffer, which is that pointer -- never reaches it.
+# Nothing fails: the draws simply read stale data. Wine's wow64 opengl32
+# backs persistent maps for 32-bit programs with it when it is listed.
+WITHHELD = {
+    "GL_AMD_pinned_memory",
+}
+
+
 def command_aliases(registry: pathlib.Path) -> dict[str, str]:
     """Commands the registry declares to be another command under a new name."""
     root = ElementTree.parse(registry).getroot()
@@ -184,6 +200,7 @@ def generate(registry: pathlib.Path, library: pathlib.Path) -> tuple[str, str]:
     claimable = {name for name, required in commands.items()
                  if required <= available}
     claimable -= {name for name, base in BUILDS_ON.items() if base not in claimable}
+    claimable -= WITHHELD
     claimable = sorted(claimable)
     withheld = len(commands) - len(claimable)
     lines = [
@@ -192,7 +209,8 @@ def generate(registry: pathlib.Path, library: pathlib.Path) -> tuple[str, str]:
         " * Extensions the guest may repeat from the host: every command the",
         " * Khronos registry says they require is exported by this library.",
         f" * {len(claimable)} claimable, {withheld} withheld for missing entry",
-        " * points, out of the registry's whole extension set. A host",
+        " * points or behaviour the wire cannot give (WITHHELD), out of the",
+        " * registry's whole extension set. A host",
         " * extension absent from this table is not advertised to the guest,",
         " * which is why adding a driver capability can need a rebuild here.",
         " */",
