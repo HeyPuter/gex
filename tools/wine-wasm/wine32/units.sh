@@ -50,17 +50,17 @@ build() { # FILE BASE FLAG...: the last line of cgen-image's report
   nice -n 19 "$G" cgen-image "$f" --pe-base "$b" "$@" --jobs $J 2>&1 | tail -1 | cut -c1-140
 }
 todo=$(mktemp); trap 'rm -f "$todo"' EXIT
-# PATH BASE INPUTS (the page's inputs id of the process it ran in, "-" when
+# PATH BASE INPUTS KEY (the page's inputs id of the process it ran in and the key it asked, "-" when
 # the line names none)
 { sed -n 's/^unitless: \(\S*\) \(0x[0-9a-f]*\).*/\1 \2 -/p' "$log"
-  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*, inputs \([0-9a-f]*\).*/\1 \2 \3/p' "$log"
+  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key \([0-9a-f]*\), inputs \([0-9a-f]*\).*/\1 \2 \4 \3/p' "$log"
   sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*)/\1 \2 -/p' "$log"
   sed -n 's/^gex-\(w3\|wine32\): \(\/\S*\) at \(0x[0-9a-f]*\): no function-tier unit.*/\2 \3 -/p' "$log"; } |
-  sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
+  sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 " -" } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
 # The flavour, per inputs id (a 64-bit Wine's WoW64 processes and its other
 # ones differ), from the first image of that id whose key the log names.
 declare -A flag
-while read -r p b in; do
+while read -r p b in _; do
   [ -z "${flag[$in]+x}" ] || continue
   # (that id's line: an image both kinds load, at one base, has a key per id)
   if [ "$in" = - ]; then
@@ -78,16 +78,27 @@ done < "$todo"
 for in in "${!flag[@]}"; do echo "wine32/units: inputs $in: ${flag[$in]}"; done
 # an image whose run named no inputs id: the one flavour found, or plain
 any=plain; [ ${#flag[@]} = 1 ] && any=${flag[*]}
+# A named key the id's flavour does not make is tried in the others: one
+# inputs id can cover processes of both kinds (a 64-bit Wine's session
+# programs in the compact space and its other 64-bit processes), so an image
+# both load at one base has a key per kind under one id.
 one() {
-  local p=$1 b=$2 in=$3 f fl
+  local p=$1 b=$2 in=$3 key=$4 f fl r
   fl=${flag[$in]:-$any}
   f=$(file "$p")
   [ -n "$f" ] || { echo "wine32/units: unmapped $p"; return; }
   [ -f "$f" ] || { echo "wine32/units: missing $f ($p)"; return; }
-  echo "$p $b: $(build "$f" "$b" ${fl#plain})"
+  r=$(build "$f" "$b" ${fl#plain})
+  if [ "$key" != - ] && [ ! -d "$U/$key" ]; then
+    for o in plain --wine32-kuser --wine64-compact --mem64; do
+      [ $o = "$fl" ] && continue
+      r=$(build "$f" "$b" ${o#plain}); [ -d "$U/$key" ] && break
+    done
+  fi
+  echo "$p $b: $r"
 }
-{ while read -r p b in; do
-    one "$p" "$b" "$in" &
+{ while read -r p b in key; do
+    one "$p" "$b" "$in" "$key" &
     while [ "$(jobs -r | wc -l)" -ge 4 ]; do wait -n; done
   done < "$todo"; wait; }
 # The NT trampoline page's unit, which the page places with the first image:
