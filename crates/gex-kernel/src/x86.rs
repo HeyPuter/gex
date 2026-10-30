@@ -53,6 +53,33 @@ pub fn serve_far(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), u16>
     }
 }
 
+/// The pointer of the stack a WoW64 thread's 64-bit code runs on (where
+/// Wine's call-outs are made, and which a longjmp or an exception unwinds),
+/// for the thread at `ctx_addr`; `alt` says it runs code of the process's
+/// other mode, `wow64` that the process runs any.
+///
+/// Outside a WoW64 process that is RSP. In 32-bit code it is R14, where the
+/// WoW64 CPU keeps it while the 32-bit stack is in RSP. Its transitions
+/// switch the two a few instructions away from the far transfer, so for
+/// those instructions 64-bit code runs on the 32-bit stack (`syscall_32to64`
+/// before its `movq %r14,%rsp`): an RSP off the 64-bit stack the TEB (GS)
+/// names, with R14 on it, is that, and R14 is the answer there too.
+pub fn wow64_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool) -> u64 {
+    let reg = |r: u8| m.read_u64(ctx_addr + ctx::x(r) as u64).unwrap_or(0);
+    let (rsp, r14) = (reg(4), reg(14));
+    if alt {
+        return r14;
+    }
+    if !wow64 {
+        return rsp;
+    }
+    // NT_TIB: StackBase at 8, StackLimit at 16.
+    let teb = m.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+    let (Ok(base), Ok(limit)) = (m.read_u64(teb + 8), m.read_u64(teb + 16)) else { return rsp };
+    let on = |sp: u64| limit < base && sp >= limit && sp <= base;
+    if !on(rsp) && on(r14) { r14 } else { rsp }
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {

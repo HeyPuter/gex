@@ -2015,20 +2015,28 @@ export class Gex {
           if (single.on) return 0;
           const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
-          const cur = spG.value;
-          const wide = typeof cur === 'bigint';
-          if (wide) {
-            const rsp = BigInt.asUintN(64, sp);
-            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
-          } else {
-            const esp = Number(sp & 0xffffffffn);
-            const c32 = Number(cur) >>> 0;
-            spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
-          }
+          const cur = this.#belowGuest(spG, sp);
           try {
             const a = this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0;
             if (this.#snapHooks) this.#snapHookCall(f, idx >>> 0, ctx, code, a, kind, BigInt.asUintN(64, sp));
             else f(ctx, code, a, kind);
+          } finally {
+            spG.value = cur;
+          }
+          return 1;
+        },
+        // A signal frame the kernel built at a safepoint, run through the
+        // process's signal hook (cgen.rs `signal_in_place`: native Wine's
+        // handlers are wasm functions), its C frames below the guest's stack
+        // pointer `sp` as `fault_call`'s are. 0: not here (the single-thread
+        // build).
+        signal_call: (idx, ctx, pc, sp) => {
+          if (single.on) return 0;
+          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+          const cur = this.#belowGuest(spG, sp);
+          try {
+            f(ctx, pc);
           } finally {
             spG.value = cur;
           }
@@ -8619,12 +8627,29 @@ export class Gex {
   }
 
   /** The stack pointer of the stack call-outs are made on, which a call-out's
-   *  caller's frame is or is not unwound past: RSP, but in code of the
-   *  process's other mode (a WoW64 thread's 32-bit code, on its 32-bit
-   *  stack) R14, which holds the 64-bit one there (`#hookStack`). */
+   *  caller's frame is or is not unwound past: RSP, but in a WoW64 process
+   *  the 64-bit stack's wherever the WoW64 CPU keeps it (R14 in 32-bit code
+   *  and around its transitions: the shim's `gex_live_sp`). */
   #liveSp(ctx) {
-    const alt = !!this.#shim.exports.gex_ctx_alt?.(ctx);
-    return new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp() + (alt ? 10 * 8 : 0), true);
+    const e = this.#shim.exports;
+    if (e.gex_live_sp) return BigInt.asUintN(64, BigInt(e.gex_live_sp(ctx)));
+    return new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
+  }
+
+  /** Move native Wine's C stack pointer `spG` 4 KiB below the guest's
+   *  stack pointer `sp` (an i64), unless it is already lower, for a hook
+   *  called in place (`fault_call`, `signal_call`): the value it had. */
+  #belowGuest(spG, sp) {
+    const cur = spG.value;
+    if (typeof cur === 'bigint') {
+      const rsp = BigInt.asUintN(64, sp);
+      spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+    } else {
+      const esp = Number(sp & 0xffffffffn);
+      const c32 = Number(cur) >>> 0;
+      spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
+    }
+    return cur;
   }
 
   /** The program's stack pointer moved below the guest's for a hook's C

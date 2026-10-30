@@ -2281,6 +2281,10 @@ extern "C" {
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
     fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
+    /// Call the signal hook `idx` (`void(int ctx, unsigned pc)`) here, its
+    /// C frames below the guest's stack pointer `sp`: 1; 0 when this build
+    /// cannot.
+    fn signal_call(idx: i32, ctx: i32, pc: i32, sp: i64) -> i32;
     /// Whether the host's stack has room for one more fault's dispatch: 1
     /// or 0.
     fn stack_room() -> i32;
@@ -3122,8 +3126,7 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
     if idx == 0 {
         return false;
     }
-    let gm = GuestMem::new(crate::guest_bytes());
-    let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
+    let Some(sp) = hook_sp(c) else { return false };
     let open = FAULT_NEST.with(|n| {
         let mut n = n.borrow_mut();
         while n.last().is_some_and(|&s| s < sp) {
@@ -3157,6 +3160,42 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
         FAULT_NEST.with(|n| n.borrow_mut().pop());
     }
     ran
+}
+
+/// The guest stack pointer a hook's C frames go below, for the thread at
+/// `c`. In code of the process's other mode (a WoW64 process's 32-bit code)
+/// that is the 64-bit stack, which R14 holds while the 32-bit one is in RSP
+/// (the WoW64 CPU's convention): the 32-bit stack may be nearly full, and
+/// the hook's work is done on the 64-bit one, a little below R14
+/// ([`WOW64_DISPATCH_ROOM`]), as `gex.mjs` `#hookStack` puts it.
+fn hook_sp(c: u64) -> Option<u64> {
+    let gm = GuestMem::new(crate::guest_bytes());
+    if crate::thread_alt() {
+        return gm.read_u64(c + gex_abi::ctx::x(14) as u64).ok().map(|r14| (r14 & 0xffff_ffff).saturating_sub(WOW64_DISPATCH_ROOM));
+    }
+    gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).ok()
+}
+
+/// The room left below a WoW64 thread's 64-bit stack pointer for the
+/// exception frame the hook builds there for a fault in 32-bit code, and
+/// wow64's copy of it (Wine's dispatch fits in the 8 KiB below R14).
+const WOW64_DISPATCH_ROOM: u64 = 0x4000;
+
+/// Run the signal frame the kernel just built at a safepoint for the thread
+/// at `c` through the process's signal hook (native Wine's handlers are wasm
+/// functions, not guest code), its C frames below the guest's stack
+/// (`hook_sp`): true when it ran, and the context is where the hook's
+/// sigreturn left it. False when the process has no hook or this build
+/// cannot call it here. `interrupted` is the pc the signal interrupted.
+pub(crate) fn signal_in_place(c: u64, interrupted: u64) -> bool {
+    let idx = SIGNAL_HOOK.load(Ordering::Relaxed);
+    if idx == 0 {
+        return false;
+    }
+    let Some(sp) = hook_sp(c) else { return false };
+    // SAFETY: a host import taking scalars; nothing here holds a lock or a
+    // borrow.
+    unsafe { signal_call(idx as i32, c as i32, interrupted as u32 as i32, sp as i64) != 0 }
 }
 
 /// How many in-place deliveries may still be in their dispatch on this
@@ -3247,8 +3286,10 @@ pub(crate) fn fault_staged() -> bool {
     FAULT_PENDING.with(|f| f.get()).is_some()
 }
 
-/// A native wasm32 program's signal hook . Recorded, as the fault
-/// hook is; the page does not run signal frames through it yet .
+/// A native wasm32 program's signal hook: the function that runs the
+/// signal frames the kernel leaves on the guest's stack (libgex's
+/// `__gex_signal_frames(ctx, pc)`), for a signal that arrives while the
+/// thread runs guest code (`signal_in_place`).
 static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[no_mangle]

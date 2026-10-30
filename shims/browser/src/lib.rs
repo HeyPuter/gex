@@ -15402,6 +15402,22 @@ pub extern "C" fn gex_ctx_alt(ctx: i32) -> i32 {
     (gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))) as i32
 }
 
+/// The pointer of the stack the thread at `ctx` makes and takes call-outs
+/// on, which a call-out's caller's frame is or is not unwound past: RSP, but
+/// in a WoW64 process the 64-bit stack's wherever the WoW64 CPU keeps it
+/// (`gex_kernel::x86::wow64_live_sp`; `gex.mjs` `#liveSp`).
+#[no_mangle]
+pub extern "C" fn gex_live_sp(ctx: i32) -> i64 {
+    let gm = GuestMem::new(guest_bytes());
+    let c = ctx as u32 as u64;
+    if !gex_abi::X86 {
+        return gm.read_u64(c + ctx::x(cgen::sp_index()) as u64).unwrap_or(0) as i64;
+    }
+    let alt = cs_alt(gm.read_u32(c + ctx::CS as u64).unwrap_or(0));
+    let wow64 = ALT_DIR.load(std::sync::atomic::Ordering::Acquire) != 0;
+    gex_kernel::x86::wow64_live_sp(&gm, c, alt, wow64) as i64
+}
+
 /// Whether this thread runs code in the mode its process's own class is
 /// not (`ctx::CS`): a WoW64 process's 32-bit code.
 pub(crate) fn thread_alt() -> bool {
@@ -16035,6 +16051,14 @@ fn safepoint(ctx: i32, pc: i64) {
             // The thread runs on at the handler: its own run state and
             // resume, so no kernel.
             gex_kernel::signal::Delivery::Resume(target) => {
+                // A handler that is a wasm function (native Wine's) runs
+                // through the process's signal hook, here; the guest goes
+                // on where its sigreturn put the context.
+                let target = if cgen::signal_in_place(ctx_addr, pc as u64) {
+                    GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(target)
+                } else {
+                    target
+                };
                 if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
                     let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
                     r.pc = target;

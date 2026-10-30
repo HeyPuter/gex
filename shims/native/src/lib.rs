@@ -5154,12 +5154,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // (longjmp, an exception) is abandoned: its caller leaves.
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
-                // In code of the process's other mode the stack the call-outs
-                // were made on is not RSP: a WoW64 thread's 32-bit code runs
-                // on its 32-bit stack, the 64-bit one's pointer in R14
-                // (`hook_stack`), which is what has or has not unwound.
-                let sp_reg = if thread_alt(&caller) { 14 } else { sp_index() };
-                let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_reg) as u64).unwrap_or(0);
+                // In a WoW64 process the stack the call-outs were made on is
+                // not always RSP: 32-bit code runs on its 32-bit stack, the
+                // 64-bit one's pointer in R14 (`hook_stack`), which is what
+                // has or has not unwound (`wow64_live_sp`).
+                let sp = if gex_abi::X86 {
+                    let wow64 = caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir != 0);
+                    gex_kernel::x86::wow64_live_sp(&GuestMem::new(memory.bytes()), ctx_addr, thread_alt(&caller), wow64)
+                } else {
+                    GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0)
+                };
                 // Not at a function's own address under a native caller (the
                 // bridge's poll there): leaving would hand the function back
                 // with the PC its body left for, which the bridge takes as
