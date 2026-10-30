@@ -1818,6 +1818,13 @@ export class ProcessHost {
           }
           break;
         }
+        // The wineserver ended: its door goes with it. A program started
+        // after it starts a server of its own (Wine's loader asks
+        // `door_missing`), and one would otherwise wait for a dead server.
+        if (this.#door && pid === this.#door.pid) {
+          this.#door = null;
+          for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
+        }
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
