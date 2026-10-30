@@ -117,7 +117,11 @@ export const images = {
     const reg = join(ROOT, 'third_party/opengl-registry/api');
     if (!existsSync(reg)) return 'third_party/opengl-registry is not checked out';
     const probes = join(ROOT, 'guest/gl/probes');
-    const names = readdirSync(probes).filter((f) => /^gl4\d-.*-probe\.c$/.test(f)).map((f) => f.slice(0, -2));
+    // GEX_TEST_GL_PROBES: more probe sources (paths, `:` between), kept
+    // outside gex, built and checked as these are.
+    const src = Object.fromEntries(readdirSync(probes).filter((f) => /^gl4\d-.*-probe\.c$/.test(f)).map((f) => [f.slice(0, -2), join(probes, f)]));
+    for (const p of (process.env.GEX_TEST_GL_PROBES ?? '').split(':').filter(Boolean)) src[p.replace(/^.*\//, '').replace(/\.c$/, '')] = p;
+    const names = Object.keys(src).sort();
     const version = join(ROOT, 'test/fixtures/programs/gl-version.c');
     const musl = join(homedir(), 'toolchains/aarch64-linux-musl-cross');
     const h = createHash('sha256');
@@ -126,7 +130,7 @@ export const images = {
       if (statSync(p).isFile()) h.update(f).update(readFileSync(p));
     }
     h.update(readFileSync(join(ROOT, 'crates/gex-gl/src/proto.rs')));
-    for (const n of names) h.update(n).update(readFileSync(join(probes, `${n}.c`)));
+    for (const n of names) h.update(n).update(readFileSync(src[n]));
     h.update(readFileSync(version));
     const gears = join(probes, 'gles-gears.c');
     h.update(readFileSync(gears));
@@ -148,18 +152,17 @@ export const images = {
     const expect = {};
     mkdirSync(join(dir, 'native'), { recursive: true });
     for (const n of names) {
-      const src = join(probes, `${n}.c`);
       const ref = join(dir, 'native', n);
       let line = null;
       try {
-        run('cc', ['-O2', `-I${reg}`, '-o', ref, src, '-lEGL', '-lGL', '-lm']);
+        run('cc', ['-O2', `-I${reg}`, '-o', ref, src[n], '-lEGL', '-lGL', '-lm']);
         const out = execFileSync(ref, { encoding: 'utf8', timeout: 60000, env: { ...process.env, EGL_PLATFORM: 'surfaceless', LIBGL_ALWAYS_SOFTWARE: '1', GEX_NATIVE_REFERENCE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
         line = out.split('\n').filter((l) => l.trim()).pop() ?? null;
       } catch {
         line = null;
       }
       // The GL the probe needs: its highest `#version` or the context it asks for.
-      const text = readFileSync(src, 'utf8');
+      const text = readFileSync(src[n], 'utf8');
       const glsl = [...text.matchAll(/#version (\d+)(?! es)/g)].map((m) => Number(m[1]));
       const ctx = text.match(/EGL_CONTEXT_MAJOR_VERSION, *(\d+)[^]*?EGL_CONTEXT_MINOR_VERSION, *(\d+)/);
       const needs = Math.max(0, ...glsl, ctx ? Number(ctx[1]) * 100 + Number(ctx[2]) * 10 : 0);
@@ -191,7 +194,7 @@ export const images = {
         copyFileSync(realpathSync(from), join(tree, to));
       }
       const link = [`-L${gl}`, '-l:libEGL.so.1', '-l:libGL.so.1', '-lm'];
-      for (const n of names) run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes', n), join(probes, `${n}.c`), ...link]);
+      for (const n of names) run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes', n), src[n], ...link]);
       run(x.cc, ['-O2', `-I${inc}`, '-o', join(tree, 'probes/gl-version'), version, ...link]);
       run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-gears'), gears, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-lm']);
       execFileSync('tar', ['-cf', join(work, `gl-probes-${a}.tar`), '-C', tree, '.']);

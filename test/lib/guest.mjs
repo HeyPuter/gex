@@ -45,7 +45,7 @@ export function guest(t) {
     return path;
   };
   const tool = (cmd) => which(cmd) ?? t.skip(`no ${cmd}`);
-  const gexc = need(process.env.GEXC || join(ROOT, x86 ? 'target/x86/release/gexc' : 'target/release/gexc'), 'gexc');
+  const gexc = need(process.env[x86 ? 'GEXC_X86' : 'GEXC_A64'] || process.env.GEXC || join(ROOT, x86 ? 'target/x86/release/gexc' : 'target/release/gexc'), 'gexc');
   /** `cmd(out)` once per `key`, its output kept in the work directory. */
   const cached = (key, name, cmd) => {
     const out = join(cache, `${createHash('sha256').update(key).digest('hex').slice(0, 16)}-${name}`);
