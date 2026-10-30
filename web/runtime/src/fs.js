@@ -6,7 +6,7 @@
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
 import { PageFsHost } from './mount.js';
-import { applyRecords } from './persist.js';
+import { applyRecords } from './records.js';
 
 const norm = (p) => {
   if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);

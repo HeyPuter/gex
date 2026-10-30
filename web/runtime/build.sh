@@ -84,22 +84,25 @@ cat > "$OUT/package.json" <<PKG
   "license": "AGPL-3.0-only",
   "type": "module",
   "exports": {
-    ".": "./index.mjs",
-    "./fs": "./fs.mjs",
-    "./windows/host": "./windows-host.mjs",
-    "./windows/single": "./windows-single.mjs",
-    "./windows/compositor": "./windows-compositor.mjs",
-    "./persist": "./persist.mjs",
-    "./persist/idb": "./persist-idb.mjs",
-    "./net": "./net.mjs",
-    "./net/wisp": "./net-wisp.mjs",
-    "./audio": "./audio.mjs",
-    "./gl": "./gl.mjs",
-    "./input": "./input.mjs",
+    ".": { "types": "./index.d.ts", "default": "./index.mjs" },
+    "./fs": { "types": "./fs.d.ts", "default": "./fs.mjs" },
+    "./windows/host": { "types": "./windows-host.d.ts", "default": "./windows-host.mjs" },
+    "./windows/single": { "types": "./windows-single.d.ts", "default": "./windows-single.mjs" },
+    "./windows/compositor": { "types": "./windows-compositor.d.ts", "default": "./windows-compositor.mjs" },
+    "./persist": { "types": "./persist.d.ts", "default": "./persist.mjs" },
+    "./persist/idb": { "types": "./persist-idb.d.ts", "default": "./persist-idb.mjs" },
+    "./net": { "types": "./net.d.ts", "default": "./net.mjs" },
+    "./net/wisp": { "types": "./net-wisp.d.ts", "default": "./net-wisp.mjs" },
+    "./audio": { "types": "./audio.d.ts", "default": "./audio.mjs" },
+    "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },
+    "./input": { "types": "./input.d.ts", "default": "./input.mjs" },
     "./package.json": "./package.json"
   },
+  "types": "./index.d.ts",
   "sideEffects": false
 }
 PKG
 [ ! -f "$RT/README.md" ] || cp "$RT/README.md" "$OUT/README.md"
+# The declarations (types/), one beside each module.
+cp "$RT"/types/*.d.ts "$OUT/"
 echo "web/runtime/build.sh: $OUT"

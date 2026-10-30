@@ -199,6 +199,14 @@ impl FileSystem for DevFs {
         if let (Some(list), "pts") = (self.pts.as_ref(), path) {
             return Ok(Arc::new(PtsDir { numbers: list() }));
         }
+        if super::evdev::have_joy() {
+            if path == "input" {
+                return Ok(Arc::new(InputDir));
+            }
+            if let Some(pad) = super::evdev::node(path) {
+                return super::evdev::open(pad);
+            }
+        }
         Err(Errno::ENOENT)
     }
 
@@ -230,6 +238,14 @@ impl FileSystem for DevFs {
         if path == "pts" && self.pts.is_some() {
             return Ok(Metadata::dir());
         }
+        if super::evdev::have_joy() {
+            if path == "input" {
+                return Ok(Metadata { mtime: super::evdev::dir_mtime(), ..Metadata::dir() });
+            }
+            if let Some(md) = super::evdev::node(path).and_then(super::evdev::metadata) {
+                return Ok(md);
+            }
+        }
         if let Some(md) = self.pts_node(path) {
             return Ok(md);
         }
@@ -246,6 +262,15 @@ impl FileSystem for DevFs {
             });
         }
         Err(Errno::ENOENT)
+    }
+
+    /// No inotify on `/dev/input`: a program without udev then watches
+    /// its mtime instead (see `evdev`).
+    fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
+        if super::evdev::is_input_dir(path) {
+            return Err(Errno::EACCES);
+        }
+        self.metadata(path).map(|m| (None, m.file_type == FileType::Directory))
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -268,6 +293,29 @@ struct DevDir {
     extra: Vec<String>,
     /// Whether `ptmx` and `pts` exist.
     pts: bool,
+}
+
+/// `/dev/input`: the connected game controllers (`evdev`).
+#[derive(Debug)]
+struct InputDir;
+
+impl FileHandle for InputDir {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EISDIR)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mtime: super::evdev::dir_mtime(), ..Metadata::dir() })
+    }
+    fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
+        let mut out = vec![
+            DirEntry { name: ".".into(), file_type: FileType::Directory, ino: 1 },
+            DirEntry { name: "..".into(), file_type: FileType::Directory, ino: 1 },
+        ];
+        for name in super::evdev::names() {
+            out.push(DirEntry { name, file_type: FileType::CharDevice, ino: 1 });
+        }
+        Ok(out)
+    }
 }
 
 /// `/dev/pts`: one character device per pseudoterminal in use.
@@ -327,6 +375,9 @@ impl FileHandle for DevDir {
                 file_type: FileType::CharDevice,
                 ino: 1,
             });
+        }
+        if super::evdev::have_joy() {
+            out.push(DirEntry { name: "input".into(), file_type: FileType::Directory, ino: 1 });
         }
         if self.pts {
             out.push(DirEntry { name: "ptmx".into(), file_type: FileType::CharDevice, ino: crate::pty::PTMX_INO });

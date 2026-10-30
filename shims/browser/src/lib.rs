@@ -478,6 +478,9 @@ extern "C" {
     fn k_audio_close(stream: u32);
     fn k_audio_info(stream: u32, now_ms: u32, out: gex_kernel::PAddr) -> i32;
     fn k_audio_capture_pos() -> u32;
+    fn k_joy_read(pad: u32, out: gex_kernel::PAddr) -> i32;
+    fn k_joy_queue() -> u32;
+    fn k_joy_changed() -> u32;
     fn k_audio_capture(pos: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32) -> i64;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
@@ -1909,6 +1912,19 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         if crate::gl::have_d3d() {
             devfs.add("gex-d3d", crate::gl::GlDevice::new());
         }
+    }
+    // Game controllers: the page's, in the global kernel's table
+    // (shims/kernel `joy.rs`), as /dev/input/eventN.
+    if unsafe { k_present() } != 0 {
+        fn joy_read(pad: u32, out: &mut [u32; gex_kernel::vfs::evdev::PAD_WORDS]) -> bool {
+            unsafe { k_joy_read(pad, out.as_mut_ptr() as usize as gex_kernel::PAddr) == 0 }
+        }
+        gex_kernel::vfs::evdev::set_joy_host(gex_kernel::vfs::evdev::JoyHost {
+            read: joy_read,
+            queue: || unsafe { k_joy_queue() },
+            changed: || unsafe { k_joy_changed() },
+            compat: compat_abi,
+        });
     }
     // Audio: OSS's /dev/dsp and /dev/mixer, a null output, as natively
     // (shims/native). 32-bit Wine's wineoss.drv is a pure Unix library linked into

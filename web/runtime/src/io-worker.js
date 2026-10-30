@@ -1104,6 +1104,10 @@ const ops = {
   hostReply: (m) => hostReply(m),
   // Where `/dev/dsp`'s rings are (shims/kernel/src/audio.rs), made if not yet.
   audioRing: () => (k.k_audio_ring ? k.k_audio_ring() >>> 0 : 0),
+  // The game controllers' table (shims/kernel/src/joy.rs), and a change in
+  // it, which wakes the processes reading /dev/input.
+  joyTable: () => (k.k_joy_table ? k.k_joy_table() >>> 0 : 0),
+  joyNotify: () => { k.k_joy_notify?.(); return 0; },
   mount: ({ path, id }) => mount(path, id),
   persistStart: (m) => persistStart(m),
   persistChanged: () => persistChanged(),

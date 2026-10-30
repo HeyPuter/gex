@@ -251,6 +251,21 @@ browser's text comes in on a paste into the page and, where the browser
 allows reading it, when the page gets the focus. Text only, up to 1 MiB
 (256 KiB to and from X programs).
 
+`new Gamepads(sys, { source })`: the browser's game controllers as the
+guest's `/dev/input/event0` to `event3`, Linux evdev joysticks. SDL reads
+them, and Wine reads them through SDL. A controller the browser maps to the
+standard layout appears as an Xbox 360 pad, with the ids, name, buttons and
+axes Linux's xpad driver gives one, so SDL's mapping database knows it. Any
+other controller appears as a joystick under its own name and USB ids. A
+node exists while its controller is connected. A program without udev finds
+controllers by scanning `/dev/input`; SDL scans again when the directory's
+mtime moves. Add `env` (`SDL_JOYSTICK_DISABLE_UDEV=1`) to `spawn`'s
+environment so SDL scans even where libudev is installed. `pads` lists
+`{ slot, id, mapping }`; the events are `connect` and `disconnect`, with
+`slot`. A browser shows a page a controller only after one of its buttons
+is pressed. `source` replaces `navigator.getGamepads` (a test's made-up
+controllers). Rumble is accepted and dropped.
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the

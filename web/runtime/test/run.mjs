@@ -51,10 +51,11 @@ copyFileSync(BUSYBOX, join(tree, 'bin/busybox'));
 for (const name of readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean)) {
   linkSync(join(tree, 'bin/busybox'), join(tree, 'bin', name));
 }
-// And what busybox has no applet for (probe/rt-probe.c), and a Wayland and
-// an X11 window (probe/rt-wl.c, rt-x11.c).
+// And what busybox has no applet for (probe/rt-probe.c), a Wayland and an
+// X11 window (probe/rt-wl.c, rt-x11.c), and game controllers (rt-joy.c).
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-probe'), join(HERE, 'probe/rt-probe.c'), '-lm'], { stdio: 'inherit' });
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-wl'), join(HERE, 'probe/rt-wl.c'), '-lwayland-client', '-lffi'], { stdio: 'inherit' });
+execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-joy'), join(HERE, 'probe/rt-joy.c')], { stdio: 'inherit' });
 execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bin/rt-x11'), join(HERE, 'probe/rt-x11.c'), '-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'], { stdio: 'inherit' });
 // An extended attribute, which the tar carries (tar --xattrs).
 execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
