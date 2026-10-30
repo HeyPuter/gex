@@ -161,6 +161,9 @@ async function startBrowser() {
   const server = await createServer({
     ...base,
     configFile: false,
+    // A missing file is a 404, not the app's index.html: a page that fetches
+    // an absent module then sees it absent rather than failing to compile HTML.
+    appType: 'mpa',
     root: WEB,
     logLevel: 'warn',
     server: { ...base.server, port: PORT, strictPort: true, host: '127.0.0.1' },
