@@ -1,9 +1,9 @@
 // runProgram (web/src/runtime.js) as a preset over the runtime API
 // (run-program.js): an untarred bundle laid into the root with its hard
 // links, symbolic links, modes, extended attributes, file times and a lazy
-// file; the program pid 1 on a terminal bridged to an xterm-shaped object;
-// keys typed into it; its exit status; and its last output before the
-// system stops.
+// file; the program, a child of the kernel's pid 1, on a terminal bridged to
+// an xterm-shaped object; keys typed into it; its exit status; and its last
+// output before the system stops.
 import { runProgram } from '../../web/src/runtime.js';
 import { setGlobals } from '../../web/src/page-globals.js';
 import { untar } from '../../web/src/tar.js';
@@ -35,6 +35,7 @@ export default async function (t) {
   };
   const script = [
     'rt-probe tty',
+    'echo "ppid $PPID"; cat /proc/1/comm',
     'ls -i /bin/sh /bin/ls | sort -k2 | awk \'{print $1}\' | uniq | wc -l | sed "s/^/inodes /"',
     'ls -l /bin/rt-probe | cut -c1-10 | sed "s/^/mode /"',
     'rt-probe xattr /etc/xattr user.rt',
@@ -63,13 +64,15 @@ export default async function (t) {
   run.catch((e) => { out += `\n[runProgram threw: ${e?.stack ?? e}]`; });
   await timeout(until(() => /\/dev\/pts\//.test(out), 'the terminal', 60000), 70000, 'start')
     .catch((e) => { throw new Error(`${e.message}: ${out.slice(-600)}`); });
-  say(`pid 1 runs in ${(performance.now() - t0).toFixed(0)} ms`);
+  say(`the program runs in ${(performance.now() - t0).toFixed(0)} ms`);
   keys?.('typed\r');
   const r = await timeout(run, 30000, 'the end');
   const lines = out.replace(/\r/g, '');
   say(lines.split('\n').map((l) => `  | ${l}`).join('\n'));
-  eq('pid 1\'s status', r.status, 7);
-  check('pid 1 on a terminal', /^\/dev\/pts\/\d+$/m.test(lines), lines.slice(0, 200));
+  eq('the program\'s status', r.status, 7);
+  check('the program on a terminal', /^\/dev\/pts\/\d+$/m.test(lines), lines.slice(0, 200));
+  // (The terminal echoes the typed keys wherever they fall.)
+  check('a child of the kernel\'s pid 1', /^ppid 1$/m.test(lines) && /^init$/m.test(lines));
   check('hard links are one inode', /^inodes 1$/m.test(lines));
   check('a file\'s mode', /^mode -rwxr-xr-x$/m.test(lines));
   check('an extended attribute', /^kept$/m.test(lines));
