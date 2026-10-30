@@ -73,8 +73,8 @@ export interface GuestConnection extends EventTarget {
 export declare class System extends EventTarget {
   constructor(options?: SystemOptions);
   get state(): SystemState;
-  /** `init`: the path of the program that is pid 1; without one, pid 1 is the kernel's own. */
-  boot(init?: string): Promise<void>;
+  /** With arguments (`spawn`'s), the program that is pid 1; without, pid 1 is the kernel's own. */
+  boot(argv?: string[], options?: SpawnOptions): Promise<void>;
   /** Throws when the system has an init. */
   spawn(argv: string[], options?: SpawnOptions): Process;
   /** The init's Process, or null without one. */

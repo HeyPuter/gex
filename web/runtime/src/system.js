@@ -63,6 +63,19 @@ export function treeArch({ files, symlinks = {}, hard = {} }) {
   return null;
 }
 
+/** `spawn`'s and `boot`'s arguments, checked: `[argv, opts]`. One parser,
+ *  so the two take the same. */
+function programArgs(what, argv, opts = {}) {
+  if (!Array.isArray(argv) || !argv.length || argv.some((a) => typeof a !== 'string')) {
+    throw new TypeError(`${what}: argv is a non-empty array of strings`);
+  }
+  if (typeof opts !== 'object' || opts === null) throw new TypeError(`${what}: options is an object`);
+  for (const k of Object.keys(opts)) {
+    if (!['pty', 'env', 'cwd', 'uid', 'gid', 'detached'].includes(k)) throw new TypeError(`${what}: no option ${k}`);
+  }
+  return [argv, opts];
+}
+
 /** A Worker that answers calls, for the runtime's helpers. */
 export class Rpc {
   #w; #next = 1; #calls = new Map();
@@ -126,7 +139,8 @@ export class System extends EventTarget {
   #net = new NetSwitch();
   #hostCalls = new Map();
   #pageFs = null;
-  /** The init's path (`boot(init)`), and its Process once it runs. */
+  /** The init (`boot(argv, opts)`), `[argv, opts]`, and its Process once
+   *  it runs. */
   #init = null;
   #initProcess = null;
 
@@ -194,16 +208,16 @@ export class System extends EventTarget {
   }
 
   /** Start the kernel. Subsystems that must exist before boot
-   *  (the filesystem, windows, persistence) are made first. `init`: the
-   *  path of the program that is pid 1, which then owns the processes:
-   *  `spawn` throws, the page reaches programs through what the init
-   *  starts (terminals, windows, /dev/gex-host), and when it ends the
-   *  system stops. Without one, pid 1 is the kernel's own and the page
-   *  spawns. */
-  boot(init) {
-    if (init !== undefined && (typeof init !== 'string' || !init)) throw new TypeError('boot: init is a path');
+   *  (the filesystem, windows, persistence) are made first. With
+   *  arguments, as `spawn`'s, the program that is pid 1 (`argv[0]` its
+   *  path), which then owns the processes: `spawn` throws, the page reaches
+   *  programs through what the init starts (terminals, windows,
+   *  /dev/gex-host), and when it ends the system stops. Without, pid 1 is
+   *  the kernel's own and the page spawns. */
+  boot(...args) {
+    const init = args.length ? programArgs('boot', ...args) : null;
     if (this.#booting) return this.#booting;
-    if (init !== undefined) this.#init = init;
+    this.#init = init;
     this.#booting = this.#boot().catch((e) => {
       this.#state.phase = 'failed';
       this.#state.error = String(e?.stack ?? e);
@@ -317,8 +331,9 @@ export class System extends EventTarget {
     if (this.#init) {
       // Pid 1, before anything else runs. When it ends, so does the system,
       // as on Linux.
-      // As Linux starts it: its path as argv[0], HOME and TERM only.
-      const p = this.#initProcess = this.#spawn([this.#init], { env: ['HOME=/', 'TERM=linux'] }, true);
+      // With no environment given, Linux's for an init: HOME and TERM.
+      const [argv, o] = this.#init;
+      const p = this.#initProcess = this.#spawn(argv, { env: ['HOME=/', 'TERM=linux'], ...o }, true);
       p.exited.then((st) => {
         if (this.#state.phase !== 'running') return;
         this.#state.init = st;
@@ -437,23 +452,18 @@ export class System extends EventTarget {
   spawn(argv, opts = {}) {
     this.#running('spawn');
     if (this.#init) {
-      throw new Error(`spawn: this system has an init (${this.#init}), which owns the processes; the page reaches programs through what it starts`);
+      throw new Error(`spawn: this system has an init (${this.#init[0][0]}), which owns the processes; the page reaches programs through what it starts`);
     }
     return this.#spawn(argv, opts, false);
   }
 
-  /** The init (`boot(init)`) as a Process, null without one. */
+  /** The init (`boot(argv, opts)`) as a Process, null without one. */
   get init() {
     return this.#initProcess;
   }
 
   #spawn(argv, opts, init) {
-    if (!Array.isArray(argv) || !argv.length || argv.some((a) => typeof a !== 'string')) {
-      throw new TypeError('spawn: argv is a non-empty array of strings');
-    }
-    for (const k of Object.keys(opts)) {
-      if (!['pty', 'env', 'cwd', 'uid', 'gid', 'detached'].includes(k)) throw new TypeError(`spawn: no option ${k}`);
-    }
+    [argv, opts] = programArgs(init ? 'boot' : 'spawn', argv, opts);
     const h = this.#nextHandle++;
     const stdio = opts.pty ? 'pty' : opts.detached ? 'null' : 'pipe';
     const io = this.#io;
