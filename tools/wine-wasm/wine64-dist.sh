@@ -15,8 +15,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
 #               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
-#   wwl32-P     with WINE64_WOW64=1, the i386 PE winewayland.drv (a tree of
-#               its own: the 32-bit side's display driver)
+#   wwl-P       with WINE64_WOW64=1, the i386 and x86_64 PE winewayland.drv
+#               (a tree of its own: the display driver's PE halves)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
@@ -171,19 +171,21 @@ pe_build() {
 log "$ARCHS PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
 
-# WoW64: the 32-bit side's display driver, which a 32-bit process's user32
-# loads from lib/wine/i386-windows. Its PE half needs no Wayland libraries,
-# but the PE tree's configure (--without-wayland: no host libraries) leaves
-# the whole module out, and enabling the module there has `make` build its
-# Unix half as well, which cannot build without them. A tree of its own,
-# configured with the module enabled, makes the i386 PE file alone; the
-# Unix half is the loader's (link-wine64.sh, with its WoW64 table).
-wwl32_build() {
-	"$W/configure" --enable-archs=i386 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
-	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv
+# WoW64: the display driver's PE halves. A 32-bit process's user32 loads
+# the i386 one from lib/wine/i386-windows; the prefix needs both in its
+# system directories, since a process loads a driver only from there (the
+# 64-bit one is the native core's when there is one). They need no Wayland
+# libraries, but the PE tree's configure (--without-wayland: no host
+# libraries) leaves the whole module out, and enabling the module there has
+# `make` build its Unix half as well, which cannot build without them. A
+# tree of its own, configured with the module enabled, makes the PE files
+# alone; the Unix half is the loader's (link-wine64.sh, with its WoW64 table).
+wwl_build() {
+	"$W/configure" --enable-archs=i386,x86_64 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv dlls/winewayland.drv/x86_64-windows/winewayland.drv
 }
-WD=; if [ "$WOW" != 0 ]; then
-	log "i386 winewayland.drv ($P)"; step wwl32-$P wwl32_build; WD=-wwl
+WD=; WL=; if [ "$WOW" != 0 ]; then
+	log "winewayland.drv's PE halves ($P)"; step wwl-$P wwl_build; WD=-wwl2; WL=$C/wwl-$P/dlls/winewayland.drv
 fi
 
 pfx_make() {
@@ -211,12 +213,13 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
-# WoW64: the i386 display driver in syswow64 too (wwl32's: the prefix's
-# Wine has none), where a 32-bit process's user32 loads it from.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl32) | sha256sum | cut -c1-10)
+# WoW64: the display driver in system32 and syswow64 (wwl's: the prefix's
+# Wine has none), where a process loads it from.
+R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
-	[ -z "$WD" ] || cp -p "$C/wwl32-$P/dlls/winewayland.drv/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
+	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
+	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
@@ -260,7 +263,8 @@ dist_make() {
 	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
-	[ "$WOW" = 0 ] || cp -p "$C/wwl32-$P/dlls/winewayland.drv/i386-windows/winewayland.drv" lib/wine/i386-windows/
+	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
+	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" lib/wine/x86_64-windows/
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
