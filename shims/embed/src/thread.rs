@@ -25,6 +25,9 @@ static NEXT_TID: AtomicU32 = AtomicU32::new(PID + 1);
 /// `__aw_thread_attach` in the guest's libc, once it is mapped (`overlay`).
 pub static ATTACH: AtomicU64 = AtomicU64::new(0);
 
+/// Every thread's id, context and guest stack (lowest address, end): what `gex_embed_dump_threads` reports.
+pub static ALL: std::sync::Mutex<Vec<(u32, u32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
 /// The context's allocation: its size rounded to a cache line.
 const CTX_BYTES: usize = (ctx::SIZE + 63) & !63;
 
@@ -87,6 +90,7 @@ fn new() -> Thread {
     };
     crate::cpu::set_u32(t.ctx, ctx::SAFEPOINT_COUNTER, crate::imports::SAFEPOINT_INTERVAL);
     crate::cpu::set_u64(t.ctx, ctx::TID, tid as u64);
+    ALL.lock().unwrap().push((tid, t.ctx, t.stack_base, t.stack_top));
     t
 }
 
@@ -95,6 +99,9 @@ pub fn become_main() {
     let t = current();
     t.tid = PID;
     t.bionic = true;
+    for e in ALL.lock().unwrap().iter_mut().filter(|e| e.1 == t.ctx) {
+        e.0 = PID;
+    }
     crate::cpu::set_u64(t.ctx, ctx::TID, PID as u64);
 }
 

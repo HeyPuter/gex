@@ -198,6 +198,18 @@ pub extern "C" fn gex_embed_missing(ctx: u32, label: u32) {
     overlay::missing(ctx, label)
 }
 
+/// Say where every guest thread is: its last system call (x8, x0-x2) and its backtrace. For a hang: a thread blocked
+/// in a system call shows what it waits on.
+#[no_mangle]
+pub extern "C" fn gex_embed_dump_threads() {
+    let all = thread::ALL.lock().unwrap().clone();
+    for (tid, c, lo, hi) in all {
+        let (x8, x0, x1, x2) = (cpu::x(c, 8), cpu::x(c, 0), cpu::x(c, 1), cpu::x(c, 2));
+        let bt = diag::backtrace_in(c, lo, hi);
+        host::log(&format!("gex-embed: thread {tid}: x8={x8} x0={x0:#x} x1={x1:#x} x2={x2:#x}\n{bt}"));
+    }
+}
+
 /// Say every guest system call on stderr.
 #[no_mangle]
 pub extern "C" fn gex_embed_set_trace(on: i32) {

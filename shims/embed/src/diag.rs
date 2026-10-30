@@ -52,11 +52,16 @@ pub fn name(a: u64) -> String {
 
 /// The guest's backtrace on this thread: the pc, x30, and the frame records x29 chains through.
 pub fn backtrace(ctx: u32) -> String {
+    let t = crate::thread::current();
+    backtrace_in(ctx, t.stack_base, t.stack_base + crate::thread::STACK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64)
+}
+
+/// The backtrace of the thread whose context is `ctx` and whose guest stack is `[lo, hi)`: as it last left its
+/// registers there (at a system call or a call to the host, for a thread inside one).
+pub fn backtrace_in(ctx: u32, lo: u64, hi: u64) -> String {
     use gex_abi::ctx as c;
     let pc = crate::cpu::get_u64(ctx, c::PC);
     let mut out = format!("  pc  {}\n  x30 {}\n", name(pc), name(crate::cpu::x(ctx, 30)));
-    let t = crate::thread::current();
-    let (lo, hi) = (t.stack_base, t.stack_base + crate::thread::STACK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64);
     let mut fp = crate::cpu::x(ctx, 29);
     for _ in 0..32 {
         if fp < lo || fp + 16 > hi || fp % 8 != 0 {

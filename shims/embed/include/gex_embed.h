@@ -53,6 +53,9 @@ void gex_embed_provide(const char *soname, const gex_provided *fns, uint32_t n, 
 /* A `missing` for gex_embed_provide: says which function, once, and returns 0. */
 void gex_embed_missing(uint32_t ctx, uint32_t label);
 
+/* Say where every guest thread is, on stderr: its last system call and its guest backtrace (a hang's waits). */
+void gex_embed_dump_threads(void);
+
 /* Say every guest system call on stderr. */
 void gex_embed_set_trace(int on);
 
