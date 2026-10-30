@@ -3396,7 +3396,12 @@ export class Gex {
     if (child.cwd) this.#putBytes(new TextEncoder().encode(child.cwd), e.gex_set_cwd);
     if (child.state?.length) this.#putBytes(child.state, e.gex_set_child_state);
     e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
-    this.#dense = !!o.dense && !this.#nativeOnly && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    // Dense unless asked not to (`dense: false`), as for a process booted
+    // fresh: an exec whose options never said is not a classic one. What
+    // its children are given is the ask, not this program's answer.
+    const denseAsked = o.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#dense = denseAsked && !this.#nativeOnly;
+    o.dense = denseAsked ? (o.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(o, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
