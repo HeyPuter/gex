@@ -221,6 +221,12 @@ impl FileSystem for DevFs {
                 times: Default::default(),
             });
         }
+        // A device the host added (`add`): what its handle says, as `fstat`
+        // of an open one does. Without this `open` found it and `stat` did
+        // not, so `ls /dev/gex-gl` and `access` said there was no GPU.
+        if let Some((_, handle)) = self.extra.iter().find(|(n, _)| n == path) {
+            return handle.metadata();
+        }
         if path == "pts" && self.pts.is_some() {
             return Ok(Metadata::dir());
         }
@@ -524,5 +530,8 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert!(names.iter().any(|n| n == "gex-thing"));
+        // And stat finds what open does: the name, as the handle describes it.
+        assert_eq!(fs.metadata("gex-thing").unwrap().file_type, FileType::CharDevice);
+        assert_eq!(fs.metadata("gex-other").err(), Some(Errno::ENOENT));
     }
 }

@@ -32,6 +32,9 @@
 //     --aot                  an ejected project's run with translation (its
 //                            training run): everything else as --no-jit
 //
+// GEX_GL_CHANNEL=1: the guest has /dev/gex-gl, a ring nothing serves (no Mesa
+// under Node): enough to see the device, not to draw.
+//
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
@@ -44,6 +47,7 @@ import { enableSingle, FiberWorker, sched } from './single.mjs';
 import { spareMemories } from './lazy-fetch.mjs';
 import { pageHosts } from './page-host.mjs';
 import { envOptions } from './options.mjs';
+import { makeGlChannel } from './gl-bridge.mjs';
 
 /** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
  *  a directory against this one. */
@@ -558,6 +562,10 @@ const host = new ProcessHost({
     // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
     mem64: MEM64,
+    // GEX_GL_CHANNEL=1: every process gets a GL ring, as a page with
+    // `gl: 'compositor'` gives them before its compositor starts Mesa: the
+    // guest has /dev/gex-gl, and nothing answers a batch sent into it.
+    glChannel: process.env.GEX_GL_CHANNEL === '1' ? makeGlChannel() : undefined,
     // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
     // its start (a test-only switch).
     testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
