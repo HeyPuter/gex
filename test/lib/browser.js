@@ -21,8 +21,9 @@ const emit = (s) => {
 const t = makeT({ host: 'browser', arch: q.get('arch'), gpu: q.has('gpu'), timed: q.has('timed'), phase: kept?.phase ?? 1, state: kept?.state ?? null, res, emit });
 
 Object.assign(t, {
-  /** The runtime's assets, as a System's `baseUrl`. */
-  baseUrl: '/',
+  /** The runtime's assets, as a System's `baseUrl` (`--package`: the
+   *  package's). */
+  baseUrl: q.get('base') ?? '/',
   /** The runtime's debug switches for this run: vite dev's Workers need
    *  workergraph=0; `arch` the runner's. */
   debug: (more = {}) => ({ workergraph: '0', ...(t.arch ? { arch: t.arch } : {}), ...more }),

@@ -10,10 +10,11 @@
 import { spawn, fork } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { Cdp, browserWsUrl } from '../web/test/cdp.mjs';
 import { images, outputs } from './fixtures/images.mjs';
+import { packaged } from './lib/package.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
@@ -37,9 +38,15 @@ const { values: o, positionals } = parseArgs({
     gpu: { type: 'boolean', default: false },
     timed: { type: 'boolean', default: false },
     prebuilt: { type: 'boolean', default: false },
+    package: { type: 'string', default: process.env.GEX_TEST_PACKAGE },
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
+// `--package DIR`: the runtime as web/runtime/build.sh built it into DIR, not
+// from source. The tests' imports of the runtime's entry modules go to the
+// built ones, and its assets come from DIR/gex.
+const PACKAGE = o.package ? resolve(o.package) : null;
+if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (web/runtime/build.sh DIR)`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** The /proc status (VmData, VmRSS, VmHWM; KiB) of the one Chromium
@@ -143,6 +150,9 @@ process.exit(bad ? 1 : 0);
 async function runJob({ test, host, arch }) {
   const t0 = Date.now();
   const out = { test: test.name, host, arch, result: 'FAIL', ms: 0, checks: 0, fail: [], skip: null, times: {} };
+  // The package is built for the browser: its Workers are bundled for a
+  // page, and under Node it would reach for its sources.
+  if (PACKAGE && host === 'node') return { ...out, result: 'skip', skip: '--package runs on the browser host only' };
   const why = test.meta.images.map((n) => missing.get(n)).find(Boolean);
   if (why) return { ...out, result: 'skip', skip: why };
   const say = (line) => {
@@ -220,10 +230,25 @@ async function startBrowser() {
     appType: 'mpa',
     root: WEB,
     logLevel: 'warn',
-    server: { ...base.server, port: PORT, strictPort: true, host: '127.0.0.1' },
-    plugins: [{
+    server: { ...base.server, port: PORT, strictPort: true, host: '127.0.0.1', ...(PACKAGE && { fs: { ...base.server?.fs, allow: [...(base.server?.fs?.allow ?? []), PACKAGE] } }) },
+    plugins: [...(PACKAGE ? [{
+      name: 'gex-test-package',
+      enforce: 'pre',
+      resolveId: (source, importer) => packaged(PACKAGE, join(WEB, 'runtime/src/'), source, importer),
+    }] : []), {
       name: 'gex-test',
       configureServer(s) {
+        // `--package`: the built modules as they are, not through vite's
+        // transforms (which would rewrite their Workers' URLs).
+        if (PACKAGE) s.middlewares.use(`/@fs${PACKAGE}/`, (req, res, next) => {
+          const f = join(PACKAGE, decodeURIComponent(req.url.split('?')[0]));
+          if (!f.startsWith(PACKAGE) || !existsSync(f) || !statSync(f).isFile()) return next();
+          res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          const type = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' }[f.slice(f.lastIndexOf('.'))];
+          if (type) res.setHeader('Content-Type', type);
+          res.end(readFileSync(f));
+        });
         s.middlewares.use('/__t/', (req, res, next) => {
           const [path, query = ''] = req.url.split('?');
           const iso = () => {
@@ -331,7 +356,7 @@ async function runPage(test, arch, say, timeout) {
   await cdp.send('Inspector.enable', {}, sessionId).catch(() => {});
   await cdp.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
-  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}) });
+  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}), ...(PACKAGE ? { base: `/@fs${PACKAGE}/` } : {}) });
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url: `http://127.0.0.1:${o.port}/__t/page?${q}` }, sessionId);
   let shown = 0;
