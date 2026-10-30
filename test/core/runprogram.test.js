@@ -1,7 +1,7 @@
 // runProgram (web/src/runtime.js) as a preset over the runtime API
 // (run-program.js): an untarred bundle laid into the root with its hard
 // links, symbolic links, modes, extended attributes, file times and a lazy
-// file; the program, a child of the kernel's pid 1, on a terminal bridged to
+// file; the program, by a directory link's name, a child of the kernel's pid 1, on a terminal bridged to
 // an xterm-shaped object; keys typed into it; its exit status; and its last
 // output before the system stops.
 import { runProgram } from '../../web/src/runtime.js';
@@ -43,18 +43,20 @@ export default async function (t) {
     'cat /etc/hello',
     'wc -c < /lazy.bin | sed "s/^/lazy /"',
     'readlink /etc/link',
+    'readlink /lbin | sed "s/^/lbin /"',
     'read x; echo "got $x"',
     'echo last line; exit 7',
   ].join('\n');
   const t0 = performance.now();
   const run = runProgram(term, {
     elf: tree.files[tree.hard['/bin/sh'] ?? '/bin/sh'],
-    args: ['/bin/sh', '-c', script],
+    // The program by a directory link's name (/bin/bash, /bin -> usr/bin).
+    args: ['/lbin/sh', '-c', script],
     files: { ...tree.files, '/etc/hello': 'hello\n' },
     dirs: [...(tree.dirs ?? []), '/empty'],
     modes: tree.modes,
     hard: tree.hard,
-    symlinks: { ...(tree.links ?? {}), '/etc/link': '/etc/hello' },
+    symlinks: { ...(tree.links ?? {}), '/etc/link': '/etc/hello', '/lbin': 'bin' },
     xattrs: tree.xattrs,
     mtimes: { '/etc/hello': 1000000000 },
     lazy: [['/lazy.bin', 3 << 20, lazyAt]],
@@ -80,6 +82,7 @@ export default async function (t) {
   check('a file of the caller\'s over the bundle\'s', /^hello$/m.test(lines));
   check('a lazy file', new RegExp(`^lazy ${3 << 20}$`, 'm').test(lines));
   check('a symbolic link', /^\/etc\/hello$/m.test(lines));
+  check('the program by a directory link\'s name, the link kept', /^lbin bin$/m.test(lines));
   check('keys from the terminal', /^got typed$/m.test(lines));
   check('the last line before the system stops', /^last line$/m.test(lines));
   eq('the system stopped', r.system?.state.phase, 'stopped');

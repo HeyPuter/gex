@@ -68,7 +68,18 @@ export async function runPreset(term, {
   if (!Array.isArray(args) || !args.length) throw new TypeError('runProgram: args, the program\'s argv');
   if (gl && gl !== 'compositor') throw new TypeError('runProgram: gl is \'compositor\' (the windows\' Mesa) or nothing');
   const exe = args[0];
-  const named = files[exe] !== undefined || hard[exe] !== undefined || symlinks[exe] !== undefined;
+  // The bundle names the program itself, or a link on its way (/bin/bash
+  // where /bin -> usr/bin): `elf` is then not laid in, or it would make a
+  // directory where the link goes.
+  const viaLink = (p) => {
+    let at = '';
+    for (const part of p.split('/').filter(Boolean)) {
+      at += `/${part}`;
+      if (symlinks[at] !== undefined) return true;
+    }
+    return false;
+  };
+  const named = files[exe] !== undefined || hard[exe] !== undefined || viaLink(exe);
   if (!elf && !named) throw new Error(`runProgram: no ${exe} in the files`);
 
   const q = pageParams();
