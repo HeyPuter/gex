@@ -4,7 +4,8 @@
 # their shared chunks and Workers beside them, and under gex/ the files a
 # system fetches: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
-# shims/browser/build.sh), the aarch64 export providers, the X server
+# shims/browser/build.sh), the aarch64 export providers, the guest GL's WebGPU
+# replay (gex-wgpu-replay.*), the X server
 # (web/build-xwayland-wasm.sh). The modules find gex/ beside themselves;
 # `new System({ baseUrl })` points elsewhere.
 #
@@ -55,6 +56,13 @@ if ls "$PUB/cgen/providers/"*.wasm > /dev/null 2>&1; then
     mkdir -p "$OUT/gex/cgen/providers"
     cp "$PUB/cgen/providers/"*.wasm "$OUT/gex/cgen/providers/"
 fi
+
+# The guest GL's replay of WebGPU (gl.js MesaGl: gex-wgpu-replay.js and its
+# wasm, the deferred part fetched after the start).
+for f in gex-wgpu-replay.js gex-wgpu-replay.wasm gex-wgpu-replay.deferred.wasm; do
+    [ ! -f "$PUB/$f" ] || cp "$PUB/$f" "$OUT/gex/$f"
+done
+[ -f "$PUB/gex-wgpu-replay.js" ] || echo "web/runtime/build.sh: no $PUB/gex-wgpu-replay.js: MesaGl will not start" >&2
 
 # The X server (runtime.js startXServer: gex/xwayland/, and gex/xwayland-st/
 # in the single-thread build), web/build-xwayland-wasm.sh's; its compositor
