@@ -4951,7 +4951,16 @@ export class Gex {
     }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
-    if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
+    if (!this.#spareWait && wasmprog) {
+      // Another Worker applying them is waited for (the shim's side).
+      if (e.gex_wasmprog_relocate(prov)) {
+        try {
+          inst.exports.__wasm_apply_data_relocs?.();
+        } finally {
+          e.gex_wasmprog_relocated?.(prov);
+        }
+      }
+    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
       // (a packed module's element segments filled them)
       if (!packed) for (const [slot, name] of extra) {
