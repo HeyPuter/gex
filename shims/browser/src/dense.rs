@@ -79,45 +79,124 @@ pub extern "C" fn gex_dense_size() -> u32 {
     word(NEXT).load(Ordering::Acquire).max(1)
 }
 
-/// Table `k`'s slot map, made on first need. Call before any directory
-/// entry names a page in table `k` (`dir_note` does), so dispatch never
-/// finds a dense page with a classic (empty) table behind it.
-pub(crate) fn map(k: usize) -> Option<u64> {
-    if !on() || !dense::table(k) {
-        return None;
-    }
-    let w = word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64);
-    let m = w.load(Ordering::Acquire);
-    if m != 0 {
-        return Some(m as u64);
-    }
-    let _l = Lock::take();
-    let m = w.load(Ordering::Acquire);
-    if m != 0 {
-        return Some(m as u64);
-    }
-    // Fresh arena is zero (never written): untouched, it costs address space
-    // only, and only the pages of slots written become resident.
-    // Whole wasm pages: the arena's cursor must stay page-aligned, since the
-    // guest's mappings come from it next (a 40,000,000-byte span left it at
-    // ...a00 and `mmap` handed a thread stack that address).
-    let len = (4 * dense::MAP_SLOTS).next_multiple_of(65536);
-    let Some(at) = crate::arena_take(len) else {
-        crate::warn_line(&format!("[gex] no arena for dispatch table {k}'s slot map ({} MiB)\n", len >> 20));
-        return None;
-    };
-    crate::memmap::claim(crate::memmap::Kind::Heap, 0, at, at + len, "dense slot map");
-    if crate::tracing() {
-        crate::trace_line(&format!("[dense] table {k}'s slot map at {at:#x}..{:#x}\n", at + len));
-    }
-    w.store(at as u32, Ordering::Release);
-    Some(at)
+/// Slot-map pages (`SLOTS_PER_PAGE` slots each) a table's map can cover.
+const MAP_PAGES: u64 = dense::MAP_SLOTS.div_ceil(gex_abi::SLOTS_PER_PAGE);
+const _: () = assert!(MAP_PAGES <= u16::MAX as u64);
+
+/// The pages each table's map covers, `lo | hi << 16` (`lo..hi`; 0: none).
+/// The map word in the low region is the map's address less `4 * lo`'s
+/// slot, so a slot's word is at `map + 4 * slot` (u32 arithmetic, as the
+/// dispatch code computes it) for every slot in the window, and nothing is
+/// there for slots outside it: every page a directory entry names in the
+/// table is in it ([`note_entry`] grows it first). A window grows by a new
+/// map (the old one stays, read by dispatch that loaded it before) with
+/// the old one's words, its word in the low region stored before this.
+static WIN: [AtomicU32; dense::TABLES] = [const { AtomicU32::new(0) }; dense::TABLES];
+
+fn window(k: usize) -> (u64, u64) {
+    let w = WIN[k - dense::FIRST_TABLE].load(Ordering::Acquire);
+    ((w & 0xffff) as u64, (w >> 16) as u64)
 }
 
-/// Make sure the map for the table a directory entry names exists.
+fn map_word(k: usize) -> &'static AtomicU32 {
+    word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64)
+}
+
+/// The address of slot `slot`'s word in a map whose low-region word is `m`.
+fn at(m: u32, slot: u64) -> u64 {
+    m.wrapping_add(4 * slot as u32) as u64
+}
+
+/// Table `k`'s map word when its window holds `slot` (none is made here).
+fn covering(k: usize, slot: u64) -> Option<u32> {
+    let (lo, hi) = window(k);
+    let page = slot / gex_abi::SLOTS_PER_PAGE;
+    if page < lo || page >= hi {
+        return None;
+    }
+    let m = map_word(k).load(Ordering::Acquire);
+    (m != 0).then_some(m)
+}
+
+/// Table `k`'s map grown to hold slots `from..to`, with [`LOCK`] held; its
+/// low-region word, or `None` (not dense, or no arena).
+fn grow_locked(k: usize, from: u64, to: u64) -> Option<u32> {
+    if !on() || !dense::table(k) || from >= dense::MAP_SLOTS {
+        return None;
+    }
+    let spp = gex_abi::SLOTS_PER_PAGE;
+    let (want_lo, want_hi) = (from / spp, to.min(dense::MAP_SLOTS).div_ceil(spp).max(from / spp + 1));
+    let (lo, hi) = window(k);
+    let m = map_word(k).load(Ordering::Acquire);
+    if m != 0 && lo <= want_lo && want_hi <= hi {
+        return Some(m);
+    }
+    // Twice the old span, so a table a process keeps adding to is copied a
+    // few times, not once a page; the old maps together cost what the last one does.
+    let (u_lo, u_hi) = if hi > lo { (lo.min(want_lo), hi.max(want_hi)) } else { (want_lo, want_hi) };
+    let span = (u_hi - u_lo).max(2 * (hi - lo)).min(MAP_PAGES);
+    let n_lo = u_lo.min(MAP_PAGES - span);
+    let n_hi = n_lo + span;
+    // Whole wasm pages: the arena's cursor stays page-aligned.
+    let len = (4 * span * spp).next_multiple_of(65536);
+    let Some(base) = crate::arena_take(len) else {
+        crate::warn_line(&format!("[gex] no arena for dispatch table {k}'s slot map ({} KiB)\n", len >> 10));
+        return None;
+    };
+    crate::memmap::claim(crate::memmap::Kind::Heap, 0, base, base + len, "dense slot map");
+    // Fresh arena is zero; the words the old window held come along.
+    if hi > lo && m != 0 {
+        for slot in lo * spp..hi * spp {
+            let v = word(at(m, slot)).load(Ordering::Acquire);
+            if v != 0 {
+                word(base + 4 * (slot - n_lo * spp)).store(v, Ordering::Relaxed);
+            }
+        }
+    }
+    let nm = (base as u32).wrapping_sub(4 * (n_lo * spp) as u32);
+    if nm == 0 {
+        // 0 reads as a classic table: never the word of a dense one.
+        crate::warn_line(&format!("[gex] dispatch table {k}'s slot map lands on word 0; left classic\n"));
+        return None;
+    }
+    if crate::tracing() {
+        crate::trace_line(&format!("[dense] table {k}'s slot map pages {n_lo}..{n_hi} at {base:#x}..{:#x}\n", base + len));
+    }
+    map_word(k).store(nm, Ordering::Release);
+    WIN[k - dense::FIRST_TABLE].store((n_lo | n_hi << 16) as u32, Ordering::Release);
+    Some(nm)
+}
+
+/// Whether table `k` is numbered densely in this process (its map holds the
+/// pages directory entries name in it, made as they are noted).
+pub(crate) fn dense_table(k: usize) -> bool {
+    on() && dense::table(k)
+}
+
+/// Make sure the map for the table a directory entry names holds that
+/// entry's page. Call before the entry is written.
 pub(crate) fn note_entry(entry: u32) {
-    if on() {
-        let _ = map(gex_abi::dispatch_entry_table(entry));
+    let k = gex_abi::dispatch_entry_table(entry);
+    if !on() || !dense::table(k) {
+        return;
+    }
+    let base = gex_abi::dispatch_entry_base(entry) as u64;
+    if covering(k, base).is_some() && covering(k, base + gex_abi::SLOTS_PER_PAGE - 1).is_some() {
+        return;
+    }
+    let _l = Lock::take();
+    let _ = grow_locked(k, base, base + gex_abi::SLOTS_PER_PAGE);
+}
+
+/// Store `d` at slot `slot` of table `k` (only over 0 with `only_empty`),
+/// the window grown to hold it; [`LOCK`] held.
+fn put_locked(k: usize, slot: u64, d: u32, only_empty: bool) {
+    let Some(m) = grow_locked(k, slot, slot + 1) else { return };
+    let w = word(at(m, slot));
+    if only_empty {
+        let _ = w.compare_exchange(0, d, Ordering::AcqRel, Ordering::Relaxed);
+    } else {
+        w.store(d, Ordering::Release);
     }
 }
 
@@ -151,19 +230,17 @@ pub(crate) fn register(wasm: &mut [u8]) -> Option<Section> {
 }
 
 fn write(s: &Section, only_empty: bool) {
+    let _l = Lock::take();
     for (j, &e) in s.entries.iter().enumerate() {
-        let Some(m) = map(gex_abi::dispatch_entry_table(e)) else { continue };
+        let k = gex_abi::dispatch_entry_table(e);
+        if !dense_table(k) {
+            continue;
+        }
         let slot = gex_abi::dispatch_entry_base(e) as u64;
         if slot >= dense::MAP_SLOTS {
             continue;
         }
-        let w = word(m + 4 * slot);
-        let d = s.word(j);
-        if only_empty {
-            let _ = w.compare_exchange(0, d, Ordering::AcqRel, Ordering::Relaxed);
-        } else {
-            w.store(d, Ordering::Release);
-        }
+        put_locked(k, slot, s.word(j), only_empty);
     }
 }
 
@@ -221,6 +298,8 @@ pub(crate) fn test_hole(pc: u64) {
         return;
     }
     let hole = HOLE.load(Ordering::Relaxed);
+    let _l = Lock::take();
+    let Some(w) = slot_word(pc) else { return };
     if hole != 0 && w.compare_exchange(0, hole, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
         HOLES_MADE.fetch_add(1, Ordering::Relaxed);
         HOLE_AT.with(|h| h.set((pc, hole)));
@@ -244,10 +323,35 @@ pub extern "C" fn gex_dense_adopt(ptr: u32, len: u32) -> i32 {
 /// A forked child, before it runs: the maps its low region names are its
 /// parent's (in an arena it did not inherit); start empty ones.
 pub(crate) fn child() {
-    for k in 0..dense::TABLES {
-        let w = word(dense::MAPS + 4 * k as u64);
-        if w.swap(0, Ordering::AcqRel) != 0 {
-            let _ = map(dense::FIRST_TABLE + k);
+    let mut had = [false; dense::TABLES];
+    for (k, h) in had.iter_mut().enumerate() {
+        *h = word(dense::MAPS + 4 * k as u64).swap(0, Ordering::AcqRel) != 0;
+        WIN[k].store(0, Ordering::Release);
+    }
+    if !had.iter().any(|&h| h) {
+        return;
+    }
+    // The directory is the parent's: a window over every page it names in
+    // each table that had a map.
+    let mut span = [(u64::MAX, 0u64); dense::TABLES];
+    let dir = gex_abi::dispatch_dir();
+    for page in 0..gex_abi::dispatch_max_pages() {
+        let e = word(dir + 4 * page).load(Ordering::Relaxed);
+        if e == 0 {
+            continue;
+        }
+        let k = gex_abi::dispatch_entry_table(e);
+        if !dense::table(k) || !had[k - dense::FIRST_TABLE] {
+            continue;
+        }
+        let b = gex_abi::dispatch_entry_base(e) as u64;
+        let s = &mut span[k - dense::FIRST_TABLE];
+        *s = (s.0.min(b), s.1.max(b + gex_abi::SLOTS_PER_PAGE));
+    }
+    let _l = Lock::take();
+    for (i, &(from, to)) in span.iter().enumerate() {
+        if had[i] && from < to {
+            let _ = grow_locked(dense::FIRST_TABLE + i, from, to);
         }
     }
 }
@@ -277,15 +381,11 @@ fn slot_word(pc: u64) -> Option<&'static AtomicU32> {
     if entry == 0 || !dense::table(k) {
         return None;
     }
-    let m = word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64).load(Ordering::Acquire);
-    if m == 0 {
-        return None;
-    }
     let slot = gex_abi::dispatch_index(pc, entry);
     if slot >= dense::MAP_SLOTS {
         return None;
     }
-    Some(word(m as u64 + 4 * slot))
+    covering(k, slot).map(|m| word(at(m, slot)))
 }
 
 thread_local! {
@@ -310,22 +410,18 @@ pub(crate) fn missing(pc: u64) -> bool {
     TRIED.with(|t| t.replace((pc, d)) != (pc, d))
 }
 
-/// The slot map of the table `entry` names, if there is one (never made here).
-fn existing_map(entry: u32) -> Option<u64> {
-    let k = gex_abi::dispatch_entry_table(entry);
-    if !on() || !dense::table(k) {
-        return None;
-    }
-    let m = word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64).load(Ordering::Acquire);
-    (m != 0).then_some(m as u64)
-}
-
 /// A retired page's slots (its directory entry `entry`) name nothing.
 pub(crate) fn clear_page(entry: u32) {
-    let Some(m) = existing_map(entry) else { return };
+    let k = gex_abi::dispatch_entry_table(entry);
+    if !dense_table(k) {
+        return;
+    }
+    let _l = Lock::take();
     let base = gex_abi::dispatch_entry_base(entry) as u64;
     for slot in base..(base + gex_abi::SLOTS_PER_PAGE).min(dense::MAP_SLOTS) {
-        word(m + 4 * slot).store(0, Ordering::Release);
+        if let Some(m) = covering(k, slot) {
+            word(at(m, slot)).store(0, Ordering::Release);
+        }
     }
 }
 
@@ -345,10 +441,14 @@ pub(crate) fn alloc(n: u32) -> u32 {
 /// Point one slot (`table << 24 | slot`) at slot map word `w` (`index << 8
 /// | arm`): a bridge's arm of an entry bridges share.
 pub(crate) fn set_slot_word(entry: u32, w: u32) {
-    let Some(m) = map(gex_abi::dispatch_entry_table(entry)) else { return };
+    let k = gex_abi::dispatch_entry_table(entry);
+    if !dense_table(k) {
+        return;
+    }
     let slot = gex_abi::dispatch_entry_base(entry) as u64;
     if slot < dense::MAP_SLOTS {
-        word(m + 4 * slot).store(w, Ordering::Release);
+        let _l = Lock::take();
+        put_locked(k, slot, w, false);
     }
 }
 

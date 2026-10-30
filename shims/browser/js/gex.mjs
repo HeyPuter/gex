@@ -1255,10 +1255,6 @@ export class Gex {
    *  Null for one with the window, else its program's image span, which the
    *  arena steps over (`[0, 0]`: a fork child's, inherited). */
   #noPlace = null;
-  /** A native wasm program that runs no guest code (its header asks for no
-   *  Windows space), a fork child of one, or an exec of one: it numbers no
-   *  blocks densely, so it makes no slot map (`gex_set_dense`). */
-  #nativeOnly = false;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -2125,7 +2121,6 @@ export class Gex {
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
-    this.#nativeOnly = this.#noPlace !== null;
     this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
@@ -2509,13 +2504,12 @@ export class Gex {
     this.#guestInstantiateMs = performance.now() - tGuest;
     this.#tnAt('boot');
     // Dense block tables when the image module has `blocks` (the seed does;
-    // a closure image, whose libraries dispatch classically, does not).
-    // What the children are given is the ask, not this program's answer: a
-    // native program that runs no guest code (`#nativeOnly`) numbers none,
-    // its fork children neither (theirs is a copy), but a program it execs
-    // that runs guest code does, and so do that program's children.
+    // a closure image, whose libraries dispatch classically, does not). A
+    // native wasm program numbers pages too, for the units its libraries
+    // call through, and those numbers are shared system-wide: classic, its
+    // table would reach the highest any process numbered.
     const denseAsked = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    this.#dense = denseAsked && !this.#nativeOnly;
+    this.#dense = denseAsked;
     this.#opts.dense = denseAsked ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
@@ -3386,7 +3380,6 @@ export class Gex {
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
     this.#noPlace = child.wasmImage ?? null;
-    this.#nativeOnly = !!child.wasmImage;
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool
@@ -3401,10 +3394,9 @@ export class Gex {
     if (child.state?.length) this.#putBytes(child.state, e.gex_set_child_state);
     e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
     // Dense unless asked not to (`dense: false`), as for a process booted
-    // fresh: an exec whose options never said is not a classic one. What
-    // its children are given is the ask, not this program's answer.
+    // fresh: an exec whose options never said is not a classic one.
     const denseAsked = o.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    this.#dense = denseAsked && !this.#nativeOnly;
+    this.#dense = denseAsked;
     o.dense = denseAsked ? (o.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(o, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
@@ -3552,7 +3544,6 @@ export class Gex {
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
     this.#noPlace = child.placeWindow === 0 ? [0, 0] : null;
-    this.#nativeOnly = !!child.nativeOnly;
     this.#forkChild = true;
     this.#inheritedEnds = child.image.map((r) => [r.at, Math.max(r.end ?? 0, r.at + imageLen(r))]);
     await this.attach(shimWasm, guestWasm);
@@ -3627,7 +3618,7 @@ export class Gex {
     }
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
-    this.#dense = !!(child.opts ?? {}).dense && !this.#nativeOnly && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     e.gex_set_dense?.(denseArg(child.opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
@@ -4234,8 +4225,6 @@ export class Gex {
       // Whether its memory has the placement window: the child's is laid out
       // as its parent's (`#noPlace`).
       placeWindow: e.gex_place_window?.() ?? 1,
-      // And whether it numbers blocks densely (`#nativeOnly`).
-      nativeOnly: this.#nativeOnly,
       image: (() => {
         const t0 = performance.now();
         // The process's other threads out of guest code while the memory is
