@@ -57,11 +57,16 @@ Object.assign(t, {
     const [r] = await t.cdp({ method: '__logs', re: re.source, flags: re.flags.replace('g', '') });
     return r.lines;
   },
-  /** The page's renderer's peak RSS in KiB (its Workers are its threads),
-   *  or null where the runner cannot tell which renderer is the page's. */
+  /** The page's renderer's memory from /proc (its Workers are its
+   *  threads), KiB: `{ data, rss, hwm }` (VmData, VmRSS, VmHWM), or null
+   *  where the runner cannot tell which renderer is the page's. */
+  async procStatus() {
+    const [r] = await t.cdp({ method: '__status' });
+    return r.status;
+  },
+  /** The renderer's peak RSS in KiB, or null (procStatus). */
   async peakRss() {
-    const [r] = await t.cdp({ method: '__rss' });
-    return r.kib;
+    return (await t.procStatus())?.hwm ?? null;
   },
   /** Real input through the browser: `{ method: 'Input.dispatchMouseEvent',
    *  ... }` and the like. Resolves once they are sent. */

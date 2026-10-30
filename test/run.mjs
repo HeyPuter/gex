@@ -42,10 +42,11 @@ const { values: o, positionals } = parseArgs({
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** The peak RSS (VmHWM, KiB) of the one Chromium renderer that holds more
- *  than 256 MiB (a page running a test; spare renderers hold a few dozen):
- *  null when there are several (other jobs' pages) or none. */
-async function rendererPeak() {
+/** The /proc status (VmData, VmRSS, VmHWM; KiB) of the one Chromium
+ *  renderer that holds more than 256 MiB (a page running a test; spare
+ *  renderers hold a few dozen): null when there are several (other jobs'
+ *  pages) or none. */
+async function rendererStatus() {
   const info = await cdp.send('SystemInfo.getProcessInfo', {}).catch(() => null);
   const big = [];
   for (const p of info?.processInfo ?? []) {
@@ -53,7 +54,7 @@ async function rendererPeak() {
     try {
       const st = readFileSync(`/proc/${p.id}/status`, 'utf8');
       const kb = (k) => Number(new RegExp(`${k}:\\s+(\\d+) kB`).exec(st)?.[1] ?? 0);
-      if (kb('VmRSS') > 256 * 1024) big.push(kb('VmHWM'));
+      if (kb('VmRSS') > 256 * 1024) big.push({ data: kb('VmData'), rss: kb('VmRSS'), hwm: kb('VmHWM') });
     } catch {}
   }
   return big.length === 1 ? big[0] : null;
@@ -118,15 +119,20 @@ if (jobs.some((j) => j.host === 'browser')) ({ server, chrome, cdp } = await sta
 
 // -- the run -----------------------------------------------------------------
 let bad = 0;
-const queue = [...jobs];
-await Promise.all(Array.from({ length: Math.max(1, Number(o.jobs)) }, async () => {
-  for (let j; (j = queue.shift());) {
-    const r = await runJob(j);
-    console.log(JSON.stringify(r));
-    if (r.result === 'FAIL' || (r.result === 'skip' && !o['allow-skip'])) bad++;
-    log(`${j.test.name} ${j.host} ${j.arch}: ${r.result}${r.skip ? ` (${r.skip})` : ''} (${(r.ms / 1000).toFixed(1)} s)`);
-  }
-}));
+// `meta.alone`: a test that reads its process's memory from /proc (the
+// renderer's is told from others only when it is the one running) goes after
+// the rest, one at a time.
+const lone = (j) => j.test.meta.alone;
+for (const [queue, width] of [[jobs.filter((j) => !lone(j)), Math.max(1, Number(o.jobs))], [jobs.filter(lone), 1]]) {
+  await Promise.all(Array.from({ length: width }, async () => {
+    for (let j; (j = queue.shift());) {
+      const r = await runJob(j);
+      console.log(JSON.stringify(r));
+      if (r.result === 'FAIL' || (r.result === 'skip' && !o['allow-skip'])) bad++;
+      log(`${j.test.name} ${j.host} ${j.arch}: ${r.result}${r.skip ? ` (${r.skip})` : ''} (${(r.ms / 1000).toFixed(1)} s)`);
+    }
+  }));
+}
 cdp?.close();
 chrome?.kill();
 await server?.close();
@@ -358,7 +364,7 @@ async function runPage(test, arch, say, timeout) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
       const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } }
-        : method === '__rss' ? { result: { kib: await rendererPeak() } } : await Promise.race([cdp.send(method, params, sessionId).then(
+        : method === '__status' ? { result: { status: await rendererStatus() } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
       ), crash.then(() => ({ error: crashed }))]);

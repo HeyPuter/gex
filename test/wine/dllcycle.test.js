@@ -11,7 +11,7 @@
 import { bootWine, exitStats } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
-export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800 };
+export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800, alone: true };
 
 const ROUNDS = [1, 4];
 

@@ -89,6 +89,7 @@ export default async function (t) {
 | `timeout` | Seconds for the whole test, every phase (default 120). |
 | `html` | The page's elements (browser), added to its body before the test runs. |
 | `timed` | A timing test: run by `--timed` only (default false). |
+| `alone` | Run after every other job, one at a time (default false): a test that reads its renderer's memory from /proc (`t.procStatus`), which the runner can only tell from other pages' when it is the only one running. |
 
 A page or process runs one test, so each makes its own System.
 
@@ -117,7 +118,7 @@ A page or process runs one test, so each makes its own System.
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
 | `t.logs(re)` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). |
-| `t.peakRss()` | The peak RSS in KiB of this phase's process (node), or of the page's renderer when it is the only renderer holding over 256 MiB (browser; null otherwise). |
+| `t.procStatus()` | Memory from /proc in KiB, `{ data, rss, hwm }` (VmData, VmRSS, VmHWM): this phase's process (node), or the page's renderer when it is the only renderer holding over 256 MiB (browser; null otherwise). `t.peakRss()` is its `hwm` (node: the process's maxRSS). |
 
 ## Images
 

@@ -6,7 +6,7 @@
 
 import { pathToFileURL } from 'node:url';
 import { join, relative } from 'node:path';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { makeT, runTest } from './t.js';
 
 const file = process.argv[2];
@@ -46,6 +46,12 @@ process.once('message', async ({ arch, phase, state, res, work, gpu, timed }) =>
     }),
     /** This phase's process's peak RSS in KiB (its Workers are its threads). */
     peakRss: async () => process.resourceUsage().maxRSS,
+    /** This process's memory from /proc, KiB: `{ data, rss, hwm }`. */
+    procStatus: async () => {
+      const st = readFileSync('/proc/self/status', 'utf8');
+      const kb = (k) => Number(new RegExp(`${k}:\\s+(\\d+) kB`).exec(st)?.[1] ?? 0);
+      return { data: kb('VmData'), rss: kb('VmRSS'), hwm: kb('VmHWM') };
+    },
     input: browserOnly('t.input'),
     click: browserOnly('t.click'),
   });
