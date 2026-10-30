@@ -6,7 +6,7 @@
 //   node web/runtime/test/run.mjs [PAGE...]      (default: every *.html here)
 //
 // Env: BUSYBOX (a wasm32 busybox; the test tree is it and its applets),
-// GEXCC (gexcc, to build gex-init into web/public/gex when it is missing or
+// GEXCC (gexcc, to build gex-host into web/public/gex when it is missing or
 // older than its source), CHROME, RT_PORT (vite; Chromium's is RT_PORT+1),
 // RT_TIMEOUT (seconds per page, default 120), RT_WORK (scratch directory),
 // RT_VERBOSE=1 (every console line), RT_ARCH (the translated arch, else the
@@ -32,13 +32,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const WORK = process.env.RT_WORK || mkdtempSync(join(tmpdir(), 'gex-rt-'));
 mkdirSync(WORK, { recursive: true });
 
-// -- gex-init --------------------------------------------------------------
-const INIT_SRC = join(WEB, 'runtime/init/gex-init.c');
-const INIT = join(WEB, 'public/gex/gex-init');
-if (!existsSync(INIT) || statSync(INIT).mtimeMs < statSync(INIT_SRC).mtimeMs) {
+// -- gex-host --------------------------------------------------------------
+const HOSTCALL_SRC = join(WEB, 'runtime/host/gex-host.c');
+const HOSTCALL = join(WEB, 'public/gex/gex-host');
+if (!existsSync(HOSTCALL) || statSync(HOSTCALL).mtimeMs < statSync(HOSTCALL_SRC).mtimeMs) {
   const cc = process.env.GEXCC || 'gexcc';
-  log(`building ${INIT}`);
-  execFileSync(cc, ['-O2', '-Wall', '-o', INIT, INIT_SRC], { stdio: 'inherit' });
+  log(`building ${HOSTCALL}`);
+  execFileSync(cc, ['-O2', '-Wall', '-o', HOSTCALL, HOSTCALL_SRC], { stdio: 'inherit' });
 }
 
 // -- the test tree: busybox and its applets --------------------------------

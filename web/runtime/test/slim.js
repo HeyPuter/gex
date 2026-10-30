@@ -34,6 +34,9 @@ main(async () => {
     return r;
   };
 
+  // The image's own start (its D-Bus system bus), run by the page.
+  const boot = await timeout(sys.spawn(['/etc/gex/boot'], { env, detached: true }).exited, 60000, '/etc/gex/boot');
+  eq('/etc/gex/boot', boot, { code: 0, signal: null });
   if (phase === 1) {
     eq('dbus started by /etc/gex/boot', (await run(['sh', '-c', 'test -S /run/dbus/system_bus_socket && echo up'])).stdout, 'up\n');
     // Offline: only the mounted repository.

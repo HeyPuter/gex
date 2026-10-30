@@ -76,7 +76,9 @@ main(async () => {
   eq('the page locked the window\'s canvas', document.pointerLockElement === (scene ? document.getElementById('out') : wins.find((w) => w.title === 'game').canvas), true);
   await move(gx + 30, gy + 20);
   await move(gx + 70, gy + 10);
-  await until(() => out.some((l) => /^rel /.test(l)), 'relative motion', 5000);
+  // The movement so far, said after each event: both moves in, or the
+  // last said at the time out.
+  await until(() => out.includes('rel 70 10'), 'relative motion', 5000).catch(() => {});
   const last = out.filter((l) => /^rel /.test(l)).pop();
   eq('the movement, relative', last, 'rel 70 10');
   await input(key('rawKeyDown', 'Escape', 'Escape', 27), key('keyUp', 'Escape', 'Escape', 27));

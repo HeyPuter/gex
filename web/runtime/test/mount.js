@@ -12,14 +12,12 @@ main(async () => {
   const big = new Uint8Array(1 << 20).map((_, i) => (i * 7) & 0xff);
   const early = new MemFs({ '/hello': 'hello from the page\n', '/sub/deep.txt': 'deep\n', '/big': big });
   fs.mount('/mnt/early', early);
-  // The tree's boot script reads a mount made before boot.
-  fs.addFiles({ '/etc/gex/boot': '#!/bin/sh\ncat /mnt/early/hello > /tmp/boot-saw\n' }, { mode: 0o755 });
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
   const sh = async (cmd) => (await timeout(sys.run(['sh', '-c', cmd], { env }), 30000, cmd));
   const out = async (cmd) => (await sh(cmd)).stdout;
 
-  eq('/etc/gex/boot read a mount made before boot', await fs.readFile('/tmp/boot-saw', { encoding: 'utf-8' }), 'hello from the page\n');
+  eq('the first program reads a mount made before boot', await out('cat /mnt/early/hello'), 'hello from the page\n');
   eq('cat', await out('cat /mnt/early/hello'), 'hello from the page\n');
   eq('ls', (await out('ls /mnt/early')).split('\n').filter(Boolean), ['big', 'hello', 'sub']);
   eq('a listing\'s types', (await out('ls -l /mnt/early | grep -c "^d"')).trim(), '1');

@@ -663,6 +663,41 @@ export class ProcessHost {
   get pids() { return [...this.#workers.keys()]; }
 
   /**
+   * Where the global kernel's per-Worker stacks are (`Gex#kernelStacks`'s
+   * shape), said by whatever instance of it came first when no process of
+   * this host did: a page with no pid 1 of its own. Before this no Worker
+   * is given a stack, so none may start.
+   */
+  useKernelStacks(stacks) {
+    if (this.#stacks) return;
+    this.#stacks = stacks;
+    this.#preattachOne();
+  }
+
+  /**
+   * Start process `pid` (the global kernel's `k_spawn` made it) on a
+   * program, from no parent Worker: the record a posix_spawn child's exec
+   * hands its new Worker (`Gex#vforkExecRecord`, run by `#adoptExec`), with
+   * the page's own parts. `exec` is the command (vfork.rs
+   * `stage_exec_parts`), `fds` its descriptors (`adopt_fds_text` lines, each
+   * end already held for `pid`), `opts` its run options with the identity.
+   * Resolves with its exit status.
+   */
+  spawnExec({ pid, exec, fds, cwd = '/', wasmImage = null, opts = {} }) {
+    this.#flavourOf.delete(pid);
+    const child = {
+      pid,
+      // Its first thread's registers, at the first context
+      // (`gex_abi::ctx_addr(0)`), as a loaded program's are.
+      ctx: 0x1000n,
+      pc: 0n, sp: 0n, tls: 0n, compat: 0, wasm32: 0n, brk: 0n, windowsSpace: 0,
+      image: [], vmaBlob: null, slots: 0, pages: null, shared: null, modules: [],
+      opts, exec, wasmImage, fds, cwd, state: new Uint8Array(0), exe: null,
+    };
+    return this.#spawn(pid, { kind: 'adopt', child });
+  }
+
+  /**
    * Run `elf` as pid 1 and resolve with its exit status. Children are stopped
    * when it exits -- a page done with a program is done with its daemons.
    */

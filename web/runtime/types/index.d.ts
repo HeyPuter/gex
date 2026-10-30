@@ -51,7 +51,7 @@ export type Phase = 'new' | 'booting' | 'running' | 'stopped' | 'failed';
 export interface SystemState {
   phase: Phase;
   error: string | null;
-  /** What pid 1 and the runtime said. */
+  /** What the runtime said. */
   console: string;
 }
 

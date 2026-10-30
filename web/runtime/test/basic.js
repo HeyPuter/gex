@@ -9,7 +9,6 @@ main(async () => {
   const fs = new Filesystem(sys);
   fs.addTar('/__rt/bb.tar.zst');
   fs.addFiles({ '/etc/hello': 'hello from addFiles\n' });
-  fs.addFiles({ '/etc/gex/boot': '#!/bin/sh\necho booted > /tmp/booted\n' }, { mode: 0o755 });
   check('a second System throws', (() => { try { new System(); return false; } catch (e) { return /one system/.test(e.message); } })());
   check('a second Filesystem throws', (() => { try { new Filesystem(sys); return false; } catch { return true; } })());
   const t0 = performance.now();
@@ -18,7 +17,22 @@ main(async () => {
   eq('state', sys.state.phase, 'running');
 
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
-  eq('/etc/gex/boot ran', await fs.readFile('/tmp/booted', { encoding: 'utf-8' }), 'booted\n');
+  // Pid 1 is the kernel's: a program's parent, an orphan's, and named init.
+  eq('a program is pid 1\'s child', (await sys.run(['sh', '-c', 'echo $PPID'], { env })).stdout, '1\n');
+  eq('/proc/1', (await sys.run(['cat', '/proc/1/comm'], { env })).stdout, 'init\n');
+  eq('a signal to pid 1 is ignored', (await sys.run(['sh', '-c', 'rt-probe kill 1 15 && rt-probe kill 1 9 && rt-probe kill 1 0'], { env })).stdout, '0\n0\n0\n');
+  const orphan = await sys.run(['sh', '-c', 'sh -c \'sleep 0.3; exec rt-probe ppid > /tmp/orphan-ppid\' > /dev/null 2>&1 & echo $!'], { env });
+  const opid = orphan.stdout.trim();
+  const ppidSeen = async () => fs.readFile('/tmp/orphan-ppid', { encoding: 'utf-8' }).catch(() => '');
+  for (let i = 0; i < 100 && !(await ppidSeen()); i++) await new Promise((r) => setTimeout(r, 50));
+  eq('an orphan is given to pid 1', await ppidSeen(), '1\n');
+  let reaped = false;
+  for (let i = 0; i < 100 && !reaped; i++) {
+    reaped = !(await fs.stat(`/proc/${opid}`).then(() => true, () => false));
+    if (!reaped) await new Promise((r) => setTimeout(r, 50));
+  }
+  check('an orphan that ends is collected', reaped, `/proc/${opid} still there`);
+  eq('an empty argument is an argument', (await sys.run(['sh', '-c', 'echo $#', 'sh', '', 'b'], { env })).stdout, '2\n');
   let t = performance.now();
   const r = await timeout(sys.run(['sh', '-c', 'echo out; echo err >&2; cat /etc/hello; exit 3'], { env }), 30000, 'run');
   say(`run in ${(performance.now() - t).toFixed(0)} ms`);

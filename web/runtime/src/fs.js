@@ -1,6 +1,7 @@
 // `Filesystem`: the guest's root, one per system. Before boot it is the tars
-// and files a page adds, laid one over another in the order added; pid 1
-// seeds the kernel's root with them (web/src/runtime.js `files`, `lazy`, ...).
+// and files a page adds, laid one over another in the order added; the
+// runtime's Worker seeds the kernel's root with them at boot (io-worker.js
+// `seed`).
 // After boot, a tar or files are written into the live tree, and the guest's
 // files can be read and written from the page.
 
@@ -103,7 +104,7 @@ export class Filesystem extends EventTarget {
     this[INTERNAL] = {
       sources: () => this.#sources,
       /** For the runtime's Worker's start: its control buffer, and the
-       *  mounts made before boot, in place before pid 1's first program. */
+       *  mounts made before boot, in place before the first program. */
       pageFs: () => this.#pagefs?.control,
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
       /** A Persist on this filesystem (persist.js): one, made before boot. */
@@ -196,7 +197,7 @@ export class Filesystem extends EventTarget {
     if (anyX) opts.xattrs = { ...(opts.xattrs ?? {}), ...xattrs };
     // What a Persist kept, over all of it.
     if (this.#persist) applyRecords(opts, await this.#persist.load());
-    // The sources' bytes are pid 1's now.
+    // The sources' bytes are the boot's now.
     this.#sources.length = 0;
   }
 

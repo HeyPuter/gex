@@ -3,10 +3,10 @@
 // It holds an instance of the global kernel of its own (web/src/kernel-helper.js)
 // and does, from outside every guest process, what the API asks for:
 //
-// - starts programs, through pid 1 (web/runtime/init/gex-init.c), which
-//   connects to the unix socket "\0gex-runtime" this Worker binds in the
-//   kernel. A program's terminal is a pty made here (the master stays here);
-//   its pipes are made here too and their far ends sent with the request;
+// - seeds the root with the boot tree, and holds the kernel's pid 1 when
+//   the page names no init (below, "programs");
+// - makes each program's process, its terminal or pipes (the page's ends
+//   stay here), and the exec record its Worker starts from;
 // - moves bytes between those ends and the page, waiting for them on a wait
 //   slot of its own registered on each end's queue (shims/kernel wait.rs),
 //   with `Atomics.waitAsync`, so a message from the page is never held up;
@@ -34,7 +34,6 @@ const EIO = -5;
 const ERANGE = -34;
 // The pid the page's own ends are held under: no process has it.
 const HOST = 0;
-const NAME = '\0gex-runtime';
 // Linux open flags.
 /** `remote::xattr_op::SET`. */
 const XATTR_SET = 1;
@@ -322,15 +321,79 @@ function addTree(t) {
   return { files, bytes };
 }
 
-// -- programs --------------------------------------------------------------
+/** The tree the system boots with (the Filesystem's layers, runtime.js's
+ *  `files`, `dirs`, ... options), into the empty root, in gex.mjs `load`'s
+ *  order: empty directories, files, directories' modes, lazy files, hard
+ *  links, symbolic links, times, extended attributes. Seeding, not a
+ *  program's writes (a persist diff does not take it). */
+function seed({ files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes = {}, xattrs = {} }) {
+  const PART = 16 << 20;
+  for (const d of dirs) {
+    const { at: [[a, an]] } = lay(d);
+    k.k_fs_add_dir(BigInt(a), an, 0o755);
+  }
+  const chmodRaw = (p, m) => {
+    const { at: [[a, an]] } = lay(p);
+    k.k_fs_chmod(BigInt(a), an, m);
+  };
+  for (const [p, data] of Object.entries(files)) {
+    const d = typeof data === 'string' ? enc.encode(data) : data;
+    // A large file in parts, so this Worker's memory never holds a whole one.
+    const first = d.subarray(0, PART);
+    const { at: [[pp, pl], [dp, dl]] } = lay(p, first);
+    k.k_fs_add(BigInt(pp), pl, BigInt(dp), dl);
+    for (let off = PART; off < d.length; off += PART) {
+      const piece = d.subarray(off, off + PART);
+      const { at: [[qp, ql], [ep, el]] } = lay(p, piece);
+      k.k_fs_add_part(BigInt(qp), ql, BigInt(off), BigInt(ep), el);
+    }
+    if (modes[p] !== undefined) chmodRaw(p, modes[p]);
+  }
+  for (const d of dirs) if (modes[d] !== undefined) chmodRaw(d, modes[d]);
+  for (const [p, size, url, head] of lazy) {
+    // The bundle's file wins, unless it is the lazy file's head.
+    if (files[p] !== undefined && !(head && files[p].length === head)) continue;
+    const { at: [[a, an], [b, bn]] } = lay(p, url);
+    k.k_fs_add_lazy(BigInt(a), an, BigInt(b), bn, BigInt(size));
+    if (modes[p] !== undefined) chmodRaw(p, modes[p]);
+  }
+  for (const [p, target] of Object.entries(hard)) {
+    const { at: [[a, an], [b, bn]] } = lay(target, p);
+    k.k_fs_link(BigInt(a), an, BigInt(b), bn);
+    if (modes[target] !== undefined) chmodRaw(p, modes[target]);
+  }
+  for (const [p, target] of Object.entries(symlinks)) {
+    const { at: [[a, an], [b, bn]] } = lay(target, p);
+    k.k_fs_symlink(BigInt(a), an, BigInt(b), bn);
+  }
+  for (const [p, secs] of Object.entries(mtimes ?? {})) {
+    const { at: [[a, an]] } = lay(p);
+    k.k_fs_set_mtime(BigInt(a), an, BigInt(Math.trunc(secs)));
+  }
+  for (const [p, attrs] of Object.entries(xattrs ?? {})) {
+    for (const [name, value] of Object.entries(attrs)) {
+      const v = typeof value === 'string' ? enc.encode(value) : value;
+      const { at: [[a, an], [b, bn], [c, cn]] } = lay(p, name, v);
+      k.k_fs_xattr(-1, BigInt(a), an, XATTR_SET, BigInt(b), bn, BigInt(c), cn, 0);
+    }
+  }
+  k.k_fs_populate_done();
+}
 
-/** pid 1's connection: the listener, the connection, what is to be sent,
- *  the line being read. */
-const init = { listener: -1, conn: -1, out: [], line: '', ready: null, readyResolve: null };
-/** Requests waiting for pid 1's answer, by id. */
-const asked = new Map();
-/** Each program's ends, by handle: { pty, stdin, stdout, stderr, queue } */
+// -- programs --------------------------------------------------------------
+//
+// Pid 1 is the kernel's own when the page names no init: in the process
+// table (proc.rs `INIT_PID`) and nowhere else, no Worker and no program. A
+// program the page starts is its child, in a session of its own; an orphan
+// is given to it, as on Linux. This Worker waits on its queue and collects
+// every child that ends: the page's own programs' statuses go to the page,
+// an orphan is just let go.
+
+const INIT = 1;
+/** Each program's ends, by handle: { pty, stdin, stdout, stderr, pid } */
 const handles = new Map();
+/** The page's programs, pid -> handle. */
+const programs = new Map();
 
 function watch(queue) {
   if (queue) k.k_wq_add(queue, slot);
@@ -339,70 +402,166 @@ function unwatch(queue) {
   if (queue) k.k_wq_del(queue, slot);
 }
 
-/** A frame for pid 1: a u32 length, a letter, NUL-terminated fields. */
-function frame(letter, fields) {
-  const body = enc.encode(letter + fields.map((f) => `${f}\0`).join(''));
-  const out = new Uint8Array(4 + body.length);
-  new DataView(out.buffer).setUint32(0, body.length, true);
-  out.set(body, 4);
-  return out;
+/** The program `file` names: itself with a slash in it (from `cwd` when
+ *  relative), else the first executable of that name on `env`'s PATH (or
+ *  the usual one). A negative errno when there is none. */
+function findProgram(file, env, cwd) {
+  const usable = (p) => {
+    try {
+      const st = stat(p);
+      if (st.type !== 'file') return -13;
+      return st.mode & 0o111 ? 0 : -13;
+    } catch (e) {
+      return -(e.errno ?? 2);
+    }
+  };
+  if (file.includes('/')) {
+    const p = file.startsWith('/') ? file : `${(cwd || '/').replace(/\/+$/, '')}/${file}`;
+    const r = usable(p);
+    return r < 0 ? r : p;
+  }
+  const kv = env.find((e) => e.startsWith('PATH='));
+  const path = kv ? kv.slice(5) : '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  let best = -2;
+  for (const d of path.split(':')) {
+    const p = d ? `${d.replace(/\/+$/, '')}/${file}` : file;
+    const r = usable(p);
+    if (r === 0) return p;
+    if (r === -13) best = -13;
+  }
+  return best;
 }
 
-/** Start a program: its ends made here, the request sent, pid 1's answer
- *  awaited. Requests go one at a time, so the descriptors one carries are
- *  never read with another's. */
-let spawnChain = Promise.resolve();
-function spawn(m) {
-  const run = spawnChain.then(() => spawnNow(m));
-  spawnChain = run.catch(() => {});
-  return run;
+/** `len` bytes of the file `path` at `off`, fewer at its end; null when it
+ *  cannot be read. */
+function readAt(path, off, len) {
+  let h;
+  try {
+    h = open(path, 0);
+  } catch {
+    return null;
+  }
+  try {
+    ensure(len);
+    const n = k.k_fs_read(h, BigInt(off), 0n, len);
+    return n < 0 ? null : view().slice(0, n);
+  } finally {
+    k.k_fs_close(h);
+  }
 }
 
-async function spawnNow({ h, argv, env = [], cwd = '', uid = -1, gid = -1, stdio = 'pipe', cols = 80, rows = 24 }) {
-  await init.ready;
-  const ends = { h, pty: -1, ptyReading: false, stdin: -1, stdout: -1, stderr: -1, writes: [], closeIn: false, pid: 0 };
-  let flags = 0, pts = 0;
-  const descs = [];
+/** A native wasm program's image span `[lowest, highest)`, when the file at
+ *  `path` is one that runs no translated code, for its memory (the shim's
+ *  vfork.rs `exec_wasm_image`, read here from the file): an ELF with
+ *  `GEXWASM` 0x40 bytes below its entry, in a loaded segment, and no
+ *  Windows address space asked for in the header's flags. Else null. */
+function wasmImage(path) {
+  const head = readAt(path, 0, 64);
+  if (!head || head.length < 64 || head[0] !== 0x7f || head[1] !== 0x45 || (head[4] !== 1 && head[4] !== 2)) return null;
+  const e64 = head[4] === 2;
+  const word = (dv, o) => (e64 ? Number(dv.getBigUint64(o, true)) : dv.getUint32(o, true));
+  const hv = new DataView(head.buffer);
+  const at = word(hv, 24) - 0x40;
+  const phoff = word(hv, e64 ? 32 : 28), phent = hv.getUint16(e64 ? 54 : 42, true), phnum = hv.getUint16(e64 ? 56 : 44, true);
+  if (phent < (e64 ? 56 : 32) || !phnum || phnum > 64) return null;
+  const ph = readAt(path, phoff, phent * phnum);
+  if (!ph || ph.length < phent * phnum) return null;
+  const pv = new DataView(ph.buffer);
+  let lo = Infinity, hi = 0, flags = null;
+  for (let i = 0; i < phnum; i++) {
+    const p = i * phent;
+    if (pv.getUint32(p, true) !== 1) continue;
+    const off = word(pv, p + (e64 ? 8 : 4)), vaddr = word(pv, p + (e64 ? 16 : 8));
+    const filesz = word(pv, p + (e64 ? 32 : 16)), memsz = word(pv, p + (e64 ? 40 : 20));
+    lo = Math.min(lo, vaddr);
+    hi = Math.max(hi, vaddr + memsz);
+    if (flags === null && at >= vaddr && at + 8 <= vaddr + filesz) {
+      const h = readAt(path, off + (at - vaddr), 40);
+      if (!h || h.length < 8 || dec.decode(h.subarray(0, 7)) !== 'GEXWASM' || h[7] !== 0) return null;
+      flags = h.length >= 40 ? new DataView(h.buffer).getUint32(36, true) : 0;
+    }
+  }
+  return flags !== null && (flags & 3) === 0 ? [lo, hi] : null;
+}
+
+/** Make a program's process: its pid (a child of pid 1, leading a session
+ *  of its own), its descriptors held for it in the kernel, and the exec
+ *  record the page starts its Worker from (host.mjs `spawnExec`). */
+function spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 24 }) {
+  const prog = findProgram(argv[0], env, cwd);
+  if (typeof prog === 'number') return { h, error: -prog };
+  const pid = k.k_spawn(INIT);
+  k.k_setsid(pid);
+  const ends = { h, pty: -1, ptyReading: false, stdin: -1, stdout: -1, stderr: -1, writes: [], closeIn: false, pid };
+  const fds = [];
   if (stdio === 'pty') {
-    const r = k.k_pty_open_master(HOST);
-    const id = r >> 16;
+    const id = k.k_pty_open_master(HOST) >> 16;
     k.k_pty_set_lock(id, 0);
     k.k_pty_set_winsize(id, (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n));
+    for (const fd of [0, 1, 2]) {
+      k.k_pty_open_end(id, 0, pid);
+      fds.push(`${fd} 0 ${O_RDWR} 0 pty:[${id}:s]`);
+    }
+    // Its controlling terminal, with its group in the foreground, as a
+    // session leader's open of the slave makes it (syscalls.rs `open_pty`).
+    k.k_pty_set_sid(id, pid);
+    k.k_pty_set_fg(id, pid);
     ends.pty = id;
     ends.ptyReading = true;
-    pts = k.k_pty_ptn(id);
-    flags = 1;
     watch(k.k_pty_queue(id));
   } else if (stdio === 'null') {
-    flags = 2;
+    for (const fd of [0, 1, 2]) fds.push(`${fd} 0 ${O_RDWR} 0 /dev/null`);
   } else {
-    // Three pipes; the far end of each goes with the request (one more
-    // holder while it is in flight), and this side lets its own copy of
-    // that end go.
+    // Three pipes. The far end's first reference becomes the program's;
+    // this side keeps the near one.
     for (const [fd, mine] of [[0, 'stdin'], [1, 'stdout'], [2, 'stderr']]) {
       const id = k.k_pipe_new(HOST);
-      const childWrites = fd !== 0;
-      k.k_pipe_open_end(id, childWrites ? 1 : 0, -1);
-      k.k_pipe_close_end(id, childWrites ? 1 : 0, HOST);
-      descs.push(`${childWrites ? O_WRONLY : 0} 0 pipe:[${id}]`);
+      const childWrites = fd !== 0 ? 1 : 0;
+      k.k_pipe_open_end(id, childWrites, pid);
+      k.k_pipe_close_end(id, childWrites, HOST);
+      fds.push(`${fd} 0 ${childWrites ? O_WRONLY : 0} 0 pipe:[${id}]`);
       ends[mine] = id;
       watch(k.k_pipe_queue(id));
     }
   }
   handles.set(h, ends);
-  const fields = [h, flags, uid ?? -1, gid ?? -1, cwd ?? '', pts, argv.length, ...argv, env.length, ...env];
-  const answer = new Promise((resolve) => asked.set(h, resolve));
-  init.out.push({ bytes: frame('S', fields), descs: descs.join('\n') });
+  programs.set(pid, h);
+  // vfork.rs `stage_exec_parts`: the path, how many arguments, the
+  // arguments, an empty field, the environment.
+  const exec = enc.encode([prog, String(argv.length), ...argv, '', ...env].map((x) => `${x}\0`).join(''));
   pump();
-  const a = await answer;
-  if (a.err) {
-    closeEnds(ends);
-    handles.delete(h);
-    return { h, error: a.err };
+  return { h, pid, exec, fds: enc.encode(`${fds.join('\n')}\n`), cwd: cwd || '/', wasmImage: wasmImage(prog) };
+}
+
+/** A program whose Worker never started: what was held for it let go,
+ *  and its exit (127, as an exec that failed) collected as any. */
+function abandon({ pid }) {
+  k.k_pipe_forget(pid);
+  k.k_pty_forget(pid);
+  k.k_exit(pid, 127);
+}
+
+/** Every child of pid 1 that has ended, collected. */
+function reap() {
+  let moved = false;
+  // What was sent to pid 1 (a SIGCHLD per exit, any `kill 1`): ignored, as
+  // init's signals are.
+  k.k_take_signals(INIT);
+  for (;;) {
+    const r = k.k_wait(INIT, -1, 0);
+    if (!r) break;
+    moved = true;
+    const pid = Number(r >> 32n), st = Number(r & 0xffffffffn);
+    const h = programs.get(pid);
+    if (h === undefined) continue;
+    programs.delete(pid);
+    // What it wrote before it ended goes first.
+    const e = handles.get(h);
+    if (e) pump1(e);
+    const sig = st & 0x7f;
+    post({ ev: 'exit', pid, code: sig ? 128 + sig : (st >> 8) & 0xff, signal: sig });
   }
-  ends.pid = a.pid;
-  pump();
-  return { h, pid: a.pid };
+  return moved;
 }
 
 /** A connection of the page's to what a program listens on at
@@ -465,8 +624,8 @@ function resize(h, cols, rows) {
 }
 
 function kill(pid, signal) {
-  init.out.push({ bytes: frame('K', [pid, signal]), descs: '' });
-  pump();
+  const r = k.k_kill(INIT, pid, signal);
+  if (r < 0 && r !== -3) throw errno(r, `kill ${pid}`);
 }
 
 /** Handles done with: ends closed, the page told. */
@@ -550,7 +709,7 @@ function readWatches() {
   return true;
 }
 
-// -- host calls (gex-host NAME JSON: gex-init.c host_call) ---------------------
+// -- host calls (gex-host NAME JSON: host/gex-host.c) ---------------------------
 
 const hostCalls = { listener: -1, conns: new Map(), next: 1 };
 
@@ -662,49 +821,10 @@ function xWanted() {
  *  anything did. */
 function pass() {
   let moved = readWatches() | xWanted() | passHostCalls();
-  if (init.conn < 0 && init.listener >= 0) {
-    const c = k.k_sock_accept(init.listener);
-    if (c >= 0) {
-      init.conn = c;
-      watch(k.k_sock_queue(c));
-      moved = true;
-    }
-  }
-  if (init.conn >= 0) {
-    // pid 1's lines.
-    ensure(READ_MAX);
-    for (;;) {
-      const n = k.k_sock_read(init.conn, 0n, 65536);
-      if (n <= 0) {
-        if (n === 0) post({ ev: 'init-gone' });
-        break;
-      }
-      moved = true;
-      init.line += dec.decode(view().slice(0, n));
-      let nl;
-      while ((nl = init.line.indexOf('\n')) >= 0) {
-        heard(init.line.slice(0, nl));
-        init.line = init.line.slice(nl + 1);
-      }
-    }
-    // What is to go to it.
-    while (init.out.length) {
-      const o = init.out[0];
-      const { at: [[a, an], [d, dn]] } = lay(o.bytes, o.descs);
-      const n = o.descs ? k.k_sock_write_fds(init.conn, BigInt(a), an, BigInt(d), dn) : k.k_sock_write(init.conn, BigInt(a), an);
-      if (n === EAGAIN || n === 0) break;
-      if (n < 0) {
-        post({ ev: 'log', text: `gex: the runtime could not write to pid 1 (${n})` });
-        init.out.shift();
-        continue;
-      }
-      moved = true;
-      if (n < o.bytes.length) init.out[0] = { bytes: o.bytes.subarray(n), descs: '' };
-      else init.out.shift();
-    }
-  }
   for (const e of handles.values()) moved = pump1(e) || moved;
-  return moved;
+  // Exits last: what a program wrote before it ended reaches the page
+  // before its end does.
+  return reap() || moved;
 }
 
 /** A connection's turn (`connectGuest`). */
@@ -817,21 +937,6 @@ function pump1(e) {
   return moved;
 }
 
-function heard(line) {
-  const [what, a, b, c] = line.split(' ');
-  if (what === 'R') {
-    init.readyResolve?.();
-  } else if (what === 'P') {
-    asked.get(Number(a))?.({ pid: Number(b) });
-    asked.delete(Number(a));
-  } else if (what === 'E') {
-    asked.get(Number(a))?.({ err: Number(b) });
-    asked.delete(Number(a));
-  } else if (what === 'X') {
-    post({ ev: 'exit', pid: Number(a), code: Number(b), signal: Number(c) });
-  }
-}
-
 let kick = null;
 let looping = false;
 /** Something to do from the page: the loop goes round now rather than at
@@ -867,7 +972,7 @@ async function loop() {
 
 // -- persistence (persist.js) ----------------------------------------------
 // What the programs changed in the root, as records a store keeps: the tree
-// as seeded (`seed`, taken before pid 1's first program) against the tree
+// as seeded (`seed`, taken before the first program) against the tree
 // now, both from the kernel's node list (`k_fs_tree`, no file's bytes), and
 // against what the store holds (`known`: path -> stamp). A file's bytes are
 // read only when the program wrote it and it changed since it was last
@@ -1058,29 +1163,34 @@ function unmount(path) {
 // -- calls -----------------------------------------------------------------
 
 const ops = {
-  async start({ spec, stackTop, mounts = [], persist: keep = null }) {
-    ({ k, mem } = await helperKernel(spec, stackTop, 32));
+  async start({ spec, tree, mounts = [], persist: keep = null }) {
+    // The first instance of the kernel there is: on its linked stack (the
+    // one no process's Worker is given).
+    ({ k, mem } = await helperKernel(spec, 0, 32));
     kernelWords = new Int32Array(spec.memory.buffer);
-    // The page's mounts made before boot, before pid 1 can connect (it runs
-    // the tree's /etc/gex/boot once it has).
+    seed(tree);
+    // The page's mounts made before boot, in place before the first program.
     for (const [path, id] of mounts) mount(path, id);
     // The tree as seeded, before any program of the tree's runs.
-    if (keep) {
-      while (k.k_fs_populated && !k.k_fs_populated()) await new Promise((r) => setTimeout(r, 5));
-      persistStart(keep);
-    }
+    if (keep) persistStart(keep);
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
     listenHostCalls();
-    const { at: [[a, an]] } = lay(NAME);
-    init.listener = k.k_sock_bind(BigInt(a), an);
-    if (init.listener < 0) throw errno(init.listener, 'binding the runtime socket');
-    watch(k.k_sock_queue(init.listener));
-    init.ready = new Promise((r) => { init.readyResolve = r; });
+    // What /proc/1 says of pid 1.
+    const { at: [[a, an]] } = lay('init\ninit\0');
+    k.k_proc_set_info(INIT, BigInt(a), an);
+    watch(k.k_proc_queue(INIT));
     loop();
-    return true;
+    // Where the kernel's stacks are, for the host to hand out (gex.mjs
+    // `kernelStacks`).
+    return {
+      area: k.k_stack_area() >>> 0, size: k.k_stack_size() >>> 0, count: k.k_stack_count() >>> 0,
+      ...(k.k_snap_word ? { snapWord: k.k_snap_word() >>> 0, wsAddr: k.k_ws_addr(0) >>> 0, wsCount: k.k_ws_count() >>> 0 } : {}),
+      ...(k.k_mono_held_at ? { monoHeld: k.k_mono_held_at() >>> 0 } : {}),
+      ...(k.k_snap_extents_at ? { extents: k.k_snap_extents_at() >>> 0 } : {}),
+    };
   },
-  ready: () => init.ready.then(() => true),
+  abandon,
   spawn,
   write: ({ h, bytes }) => write(h, bytes),
   closeStdin: ({ h }) => closeStdin(h),

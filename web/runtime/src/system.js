@@ -3,21 +3,19 @@
 // persistence, sound, GL -- is a class of its own that takes the system as
 // its first argument (web/runtime/README.md).
 //
-// Built on the page runtime (web/src/runtime.js `runProgram`): pid 1 is
-// gex-init (web/runtime/init), which starts each program `spawn` asks for,
-// and a Worker of the runtime's own (io-worker.js) holds the kernel's side of
-// their terminals and pipes and reads and writes the guest's files.
+// Built on the page runtime (web/src/runtime.js `runProgram`), with no
+// program of its own for pid 1: pid 1 is the kernel's (io-worker.js holds
+// it), each program `spawn` asks for is its child, started in a Worker of
+// its own from an exec record (host.mjs `spawnExec`), and the runtime's
+// Worker holds the kernel's side of their terminals and pipes and reads and
+// writes the guest's files.
 
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
 import { GuestConnection } from './connection.js';
 
-/** Where pid 1's program is in the guest: under /run, which nothing
- *  persists. */
-const INIT_PATH = '/run/gex/init';
-/** `gex-host NAME JSON`: a guest's call to the page (`hostCalls`), gex-init
- *  under another name. */
+/** `gex-host NAME JSON`: a guest's call to the page (`hostCalls`). */
 const HOST_CALL_PATH = '/usr/bin/gex-host';
 /** Where the runtime's files (gex/...) are: beside the package's modules
  *  in a build (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__`), the
@@ -131,7 +129,7 @@ export class System extends EventTarget {
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
-   * gex-init, ...); default beside the package. `debug`: the runtime's
+   * gex-host, ...); default beside the package. `debug`: the runtime's
    * switches, `{name: value}` as gex's test pages take `?name=value`;
    * unstable, for debugging only.
    */
@@ -177,7 +175,7 @@ export class System extends EventTarget {
   }
 
   /** `phase` ('new', 'booting', 'running', 'stopped', 'failed'), `error`,
-   *  and `console`: what pid 1 and the runtime said. */
+   *  and `console`: what the runtime said. */
   get state() {
     return { ...this.#state };
   }
@@ -189,7 +187,7 @@ export class System extends EventTarget {
     if (this.#opts.debug.console) console.log(`[gex] ${text.replace(/\n$/, '')}`);
   }
 
-  /** Start the kernel and pid 1. Subsystems that must exist before boot
+  /** Start the kernel. Subsystems that must exist before boot
    *  (the filesystem, windows, persistence) are made first. */
   boot() {
     this.#booting ??= this.#boot().catch((e) => {
@@ -215,11 +213,10 @@ export class System extends EventTarget {
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     const { assetUrl } = await import('../../src/page-env.js');
 
-    const init = await bytesOf(assetUrl('/gex/gex-init'), 'gex-init');
+    const hostCall = await bytesOf(assetUrl('/gex/gex-host'), 'gex-host');
     const opts = {
-      elf: init,
-      // Its own file too: a fork's child finds its program by this path.
-      args: [INIT_PATH],
+      // No program: pid 1 is the kernel's.
+      elf: null,
       files: {},
       dirs: [],
       modes: {},
@@ -227,9 +224,7 @@ export class System extends EventTarget {
       symlinks: {},
       lazy: [],
       env: [],
-      cwd: '/',
       uid: 0,
-      tty: true,
       // Every Worker reaches the network through the page; which network
       // is the page's to set, any time (net.js).
       network: this.#net,
@@ -237,12 +232,12 @@ export class System extends EventTarget {
       playAudio: false,
     };
     for (const fn of this.#beforeBoot) await fn(opts);
-    opts.files[INIT_PATH] = init;
-    opts.modes[INIT_PATH] = 0o755;
-    if (!opts.files[HOST_CALL_PATH] && !opts.symlinks[HOST_CALL_PATH]) opts.symlinks[HOST_CALL_PATH] = INIT_PATH;
+    if (!opts.files[HOST_CALL_PATH] && !opts.symlinks[HOST_CALL_PATH]) {
+      opts.files[HOST_CALL_PATH] = hostCall;
+      opts.modes[HOST_CALL_PATH] = 0o755;
+    }
 
-    // The translated architecture, beside which wasm32 programs (gex-init
-    // among them) run: the global kernel is built for one (its syscall ABI,
+    // The translated architecture, beside which wasm32 programs run: the global kernel is built for one (its syscall ABI,
     // struct layouts, signal frame), so it is chosen here, from the tree's
     // programs. A tree with none yet (wasm32 only, its native packages to
     // come) gets aarch64, Debian's arm64 being the usual second
@@ -274,27 +269,27 @@ export class System extends EventTarget {
     this.#io = new Rpc(worker, (m) => this.#event(m));
     opts.onSystem = (s) => {
       this.#sys = s;
-      // A kernel stack of its own, which the host can hand out once pid 1's
-      // Worker has said where the stacks are (before that its helper would
-      // run on pid 1's). gex-init waits for the socket.
-      const io = this.#io;
-      const go = () => {
-        if (this.#state.phase !== 'booting') return;
-        const stackTop = s.host.takeKernelStack('runtime');
-        if (stackTop === undefined) return void setTimeout(go, 10);
-        const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-        io.call('start', { spec: { module: s.kernel.module, memory: s.kernel.memory, pageFs: fsi?.pageFs?.() }, stackTop, mounts: fsi?.mounts?.() ?? [], persist: fsi?.persistArgs?.() })
-          .then(() => io.call('ready'))
-          .then(up.resolve, up.reject);
-      };
-      go();
+      // The boot tree goes to the runtime's Worker, which seeds the root
+      // with it before the first program. Copied: the page's own bytes
+      // (`addFiles`) stay the page's.
+      const fsi = this.#parts.get('filesystem')?.[INTERNAL];
+      const { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs } = opts;
+      this.#io.call('start', {
+        spec: { module: s.kernel.module, memory: s.kernel.memory, pageFs: fsi?.pageFs?.() },
+        tree: { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs },
+        mounts: fsi?.mounts?.() ?? [],
+        persist: fsi?.persistArgs?.(),
+      }).then((stacks) => {
+        s.host.useKernelStacks(stacks);
+        up.resolve();
+      }, up.reject);
+      opts.files = null;
     };
     this.#run = runProgram(term, opts);
-    this.#run.then(({ status }) => {
+    this.#run.then(() => {
       if (this.#state.phase === 'running' || this.#state.phase === 'booting') {
         this.#state.phase = 'stopped';
-        this.#say(`gex: pid 1 ended (${status})\n`);
-        up.reject(new Error(`pid 1 ended (${status}) before the system was up: ${this.#state.console.slice(-400)}`));
+        up.reject(new Error(`the system stopped before it was up: ${this.#state.console.slice(-400)}`));
         this.dispatchEvent(new Event('stopped'));
       }
     }, (e) => {
@@ -322,7 +317,6 @@ export class System extends EventTarget {
         if (this.#early.size > 4096) this.#early.delete(this.#early.keys().next().value);
       }
     } else if (m.ev === 'log') this.#say(`${m.text}\n`);
-    else if (m.ev === 'init-gone') this.#say('gex: pid 1 closed the runtime\'s connection\n');
     else if (m.ev === 'host-call') this.#hostCall(m);
     else for (const fn of this.#listeners.get(m.ev) ?? []) fn(m);
   }
@@ -445,8 +439,6 @@ export class System extends EventTarget {
       argv,
       env: envList(opts.env),
       cwd: opts.cwd ?? '',
-      uid: opts.uid ?? -1,
-      gid: opts.gid ?? opts.uid ?? -1,
       stdio,
       cols: opts.pty?.cols ?? 80,
       rows: opts.pty?.rows ?? 24,
@@ -464,6 +456,12 @@ export class System extends EventTarget {
         this.#byPid.delete(r.pid);
         p[INTERNAL].exit(early);
       }
+      const uid = opts.uid ?? 0;
+      this.#sys.spawnExec({ pid: r.pid, exec: r.exec, fds: r.fds, cwd: r.cwd, wasmImage: r.wasmImage, uid, gid: opts.gid ?? opts.uid ?? 0 })
+        .catch((e) => {
+          this.#say(`gex: ${argv[0]} (pid ${r.pid}) did not start: ${e?.message ?? e}\n`);
+          io.send('abandon', { pid: r.pid });
+        });
     }, (e) => {
       this.#procs.delete(h);
       p[INTERNAL].failed(e);
@@ -505,8 +503,8 @@ export class System extends EventTarget {
     this.#procs.clear();
     this.#byPid.clear();
     for (const parts of this.#parts.values()) for (const part of [parts].flat()) await part?.[INTERNAL]?.shutdown?.();
-    try { await this.#sys?.host?.stop(); } catch {}
-    this.#sys?.compositor?.stop?.();
+    this.#sys?.halt?.();
+    try { await this.#run; } catch {}
     this.#io?.terminate();
     this.dispatchEvent(new Event('stopped'));
   }

@@ -779,6 +779,17 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     EXEC_FRESH.with(|c| c.set(true));
     // A fresh Worker's process, its own until the program runs.
     crate::with_own_host(|h| {
+        // A script names its interpreter (`#!`), as `execve` reads it: a
+        // vfork child's exec was resolved by its `execve` already, the
+        // page's own programs (host.mjs `spawnExec`) are not.
+        let (path, argv) = match h.kernel.resolve_interpreter(path.clone(), argv) {
+            Ok(v) => v,
+            Err(e) => {
+                warn_line(&format!("gex: {path}: {e:?}\n"));
+                exit_process(127);
+                return 0;
+            }
+        };
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
             warn_line(&format!("gex: {path}: the program could not be loaded\n"));

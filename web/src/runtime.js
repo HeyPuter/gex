@@ -1329,9 +1329,18 @@ async function runProgramHere(
     ? (listen) => (xStarted ??= startXServer({ kernel, wlChannel, compositor: () => compositor, term, listen }).then((x) => { xServer = x; return x; }))
     : null;
   let xStarted = null;
-  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl, wlChannel, startX });
+  // No program (`elf` null): pid 1 is the kernel's, and the caller starts
+  // each process itself, a child of it (`spawnExec`: host.mjs, from an exec
+  // record), until it halts the run.
+  let halt = null;
+  const halted = elf ? null : new Promise((r) => { halt = r; });
+  const spawnExec = elf ? null : ({ uid: u = uid, gid: g = u, ...r }) => host.spawnExec({
+    ...r,
+    opts: { ...startOptions('opts'), recompileObjects, heartbeat, link, uid: u, gid: g },
+  });
+  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl, wlChannel, startX, spawnExec, halt: (code = 0) => halt?.(code) });
   try {
-    const status = await host.start({
+    const status = halted ? await halted : await host.start({
       elf,
       files,
       transfer,

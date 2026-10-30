@@ -36,19 +36,23 @@ term.onData((d) => sh.pty.write(d));
   programs at boot (`/bin/sh` first); aarch64 when the tree has none. The
   kernel is built for one, so this is fixed for the system's life: a program
   of the other one fails to start (`ENOEXEC`).
-- At boot, before the first program, pid 1 runs the tree's `/etc/gex/boot`
-  when it has one (as root; it must end, and what it starts goes on): where
-  a tree starts its daemons.
+- Pid 1 is the kernel's own: no program runs as it. Each program `spawn`
+  starts is its child, in a session of its own; a program whose parent
+  ends is given to it, and its exit is collected there, as an init's would
+  be. `getppid()` of either is 1, `/proc/1` names `init`, and a signal sent
+  to pid 1 is ignored.
+- Nothing runs at boot. A tree's own start (its daemons) is the page's
+  first `spawn`s, made once `boot()` resolves.
 
 ## System
 
 | Member | Does |
 | --- | --- |
-| `new System({ baseUrl, debug })` | A system, not started; a page makes one. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log pid 1's console); they are not a stable API. |
-| `boot()` | Starts the kernel and pid 1. Parts that work before boot (the filesystem) must be made before it. |
+| `new System({ baseUrl, debug })` | A system, not started; a page makes one. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. |
+| `boot()` | Starts the kernel and lays the filesystem's sources into its root. Parts that work before boot (the filesystem) must be made before it. |
 | `spawn(argv, opts)` | Starts a program and returns its `Process` at once. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). |
-| `state` | `{ phase, error, console }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what pid 1 and the runtime say. |
+| `state` | `{ phase, error, console }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
 | `shutdown()` | Ends every program and the kernel. |
 
@@ -110,7 +114,7 @@ or a hard link between it and the rest of the tree is `EXDEV` (`mv` copies).
 ## Persistence
 
 The root, kept across page loads: a `Persist` on the filesystem, made
-before boot, lays what it kept over the sources before pid 1's first
+before boot, lays what it kept over the sources before the first
 program, and keeps what the programs change from then on: about a second
 after their changes settle, every 30 s, when the page is hidden or left,
 and at `shutdown()`. Files, directories, symlinks, modes and deletions of
@@ -340,8 +344,9 @@ themselves.
 
 `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, and
 under `gex/` the shim, kernel and seed of each guest architecture the tree has
-built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`) and pid
-1, `gex-init` (`web/runtime/init`, built with `gexcc`).
+built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`) and
+`gex-host`, a guest's call to the page (`web/runtime/host`, built with
+`gexcc`).
 
 ## Tests
 

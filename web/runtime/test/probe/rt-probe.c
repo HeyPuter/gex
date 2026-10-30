@@ -10,7 +10,10 @@
  *                    upper-cased, back ("listening" once it listens)
  *   rt-probe tone HZ MS   a sine of HZ for MS ms on /dev/dsp (s16, stereo,
  *                    48 kHz), then the ms it took
+ *   rt-probe ppid    its parent's pid
+ *   rt-probe kill PID SIG   kill(PID, SIG): "0", or the error
  */
+#include <signal.h>
 #include <fcntl.h>
 #include <math.h>
 #include <sys/soundcard.h>
@@ -42,6 +45,14 @@ int main(int argc, char **argv) {
       return 1;
     }
     printf("%s\n", name);
+  } else if (!strcmp(what, "ppid")) {
+    printf("%d\n", (int)getppid());
+  } else if (!strcmp(what, "kill") && argc == 4) {
+    if (kill(atoi(argv[2]), atoi(argv[3])) < 0) {
+      perror("kill");
+      return 1;
+    }
+    printf("0\n");
   } else if (!strcmp(what, "ids")) {
     printf("%u %u\n", (unsigned)getuid(), (unsigned)getgid());
   } else if (!strcmp(what, "xattr") && argc == 4) {

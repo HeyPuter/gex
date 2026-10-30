@@ -8873,7 +8873,7 @@ impl Kernel {
     /// Linux either.
     ///
     /// Nesting is bounded. A script naming itself would otherwise loop.
-    fn resolve_interpreter(
+    pub fn resolve_interpreter(
         &mut self,
         mut path: String,
         mut argv: Vec<String>,
