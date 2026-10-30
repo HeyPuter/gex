@@ -324,12 +324,14 @@ async function runPage(test, arch, say, timeout) {
   const names = new Map([[sessionId, 'page']]);
   const mine = new Set([sessionId]);
   const off = [];
-  // The page's and its Workers' console this phase, for `t.logs`.
+  // The page's and its Workers' console this phase, for `t.logs`, and each
+  // line's level (`log`, `info`, `warning`, `error`, `debug`).
   const logs = [];
+  const levels = [];
   off.push(cdp.on('Runtime.consoleAPICalled', (p, sid) => {
     if (!mine.has(sid)) return;
     const text = (p.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ');
-    if (logs.length < 100000) logs.push(text);
+    if (logs.length < 100000) logs.push(text), levels.push(p.type);
     if (sid === sessionId) return; // the page's own lines come through __t
     if (o.verbose || /\b(FAIL|Error|error|trap|panic)\b/.test(text)) process.stderr.write(`${test.name}: ${names.get(sid)}: ${text}\n`);
   }));
@@ -388,7 +390,7 @@ async function runPage(test, arch, say, timeout) {
     for (; sent < v.asks.length; sent++) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
-      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } }
+      const reply = method === '__logs' ? { result: { lines: logs.map((l, i) => (params.levels ? `${levels[i]} ${l}` : l)).filter((l) => new RegExp(params.re, params.flags).test(l)) } }
         : method === '__status' ? { result: { status: await rendererStatus() } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),

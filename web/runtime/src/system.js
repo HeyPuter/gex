@@ -235,6 +235,11 @@ export class System extends EventTarget {
     const { arch: wantArch, ...switches } = this.#opts.debug;
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(switches)) if (v !== undefined && v !== false && k !== 'console') q.set(k, v === true ? '1' : String(v));
+    // Quiet unless asked: a page embedding the runtime hears errors and rare
+    // events, not gex's routine lines (each process started, each library
+    // loaded). `log` names debug output (shims/browser/js/log.mjs).
+    const asked = q.has('log') || globalThis.GEX_LOG !== undefined || !!globalThis.process?.env?.GEX_LOG;
+    if (!asked) q.set('log', 'quiet');
     // The options the switches stand for.
     if (this.#opts.units) {
       q.set('cgen', this.#opts.units.require ? '2' : '1');

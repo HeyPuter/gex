@@ -53,9 +53,11 @@ Object.assign(t, {
     });
   },
   /** The lines the runtime logged this phase (the page's and every
-   *  Worker's console) that match `re`. */
-  async logs(re = /./) {
-    const [r] = await t.cdp({ method: '__logs', re: re.source, flags: re.flags.replace('g', '') });
+   *  Worker's console) that match `re`; with `{ levels: true }`, each
+   *  begins with its console level and a space (`warning ...`), and `re`
+   *  is matched against that. */
+  async logs(re = /./, { levels = false } = {}) {
+    const [r] = await t.cdp({ method: '__logs', re: re.source, flags: re.flags.replace('g', ''), levels });
     return r.lines;
   },
   /** The page's renderer's memory from /proc (its Workers are its

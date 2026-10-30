@@ -1326,7 +1326,7 @@ pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
 // Pty wrappers: the ones that name a holder inject this Worker's pid, the way
 // the pipe wrappers do, so the global kernel can release a process's ends when
 // it leaves by a trap.
-/// The first few pty end open/close events, with who did them.
+/// The first few pty end open/close events, with who did them (debug output).
 ///
 /// An end is opened and closed a handful of times in a session -- a terminal
 /// takes the master, its child takes the slave, a fork hands both on -- and the
@@ -1341,9 +1341,9 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
         return;
     }
     let counts = unsafe { k_pty_counts(id) };
-    // A note (console.warn), not an error: nothing is wrong when it is said.
-    warn_line(&format!(
-        "[gex-note] [pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
+    // Debug output (GEX_LOG=debug): a terminal session makes dozens.
+    trace_line(&format!(
+        "[pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
         if master != 0 { "master" } else { "slave" },
         counts >> 16,
         counts & 0xffff

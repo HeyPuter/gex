@@ -118,7 +118,7 @@ A page or process runs one test, so each makes its own System.
 | `t.screenshot(name, clip)` | The page, or `clip` of it, saved as `NAME.png` among the artefacts: its path (browser). |
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
-| `t.logs(re)` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). |
+| `t.logs(re, { levels })` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). With `levels` (browser), each line begins with its console level and a space (`warning ...`). |
 | `t.procStatus()` | Memory from /proc in KiB, `{ data, rss, hwm }` (VmData, VmRSS, VmHWM): this phase's process (node), or the page's renderer when it is the only renderer holding over 256 MiB (browser; null otherwise). `t.peakRss()` is its `hwm` (node: the process's maxRSS). |
 
 ## Images

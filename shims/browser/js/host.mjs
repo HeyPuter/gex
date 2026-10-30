@@ -26,7 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
-import { logNamed, logOn, logQuiet } from './log.mjs';
+import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
@@ -62,7 +62,7 @@ function seeLibrary(st) {
   const path = String(st.path).replace(/^wasm(dll|prog):/, '');
   if (libsSeen.has(path)) return;
   libsSeen.add(path);
-  inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
+  if (logRoutine()) inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
 }
 function watchLibraries() {
   if (libChannel || typeof BroadcastChannel !== 'function') return;
@@ -706,7 +706,7 @@ export class ProcessHost {
     // One of the few default lines: what pid 1 runs. Its execs say their own
     // (the shim's `do_exec`).
     const what = [opts.argv0, ...args].filter((a) => typeof a === 'string' && a).join(' ');
-    inform(`[gex] pid 1: start ${what.length > 200 ? `${what.slice(0, 200)}...` : what || '(program)'}`);
+    if (logRoutine()) inform(`[gex] pid 1: start ${what.length > 200 ? `${what.slice(0, 200)}...` : what || '(program)'}`);
     const status = await this.#spawn(1, {
       kind: 'run',
       elf,

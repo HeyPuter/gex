@@ -15,7 +15,7 @@ import { kernelThread, lazyFetch, lazyReady, processMemories } from "./lazy-fetc
 import { pageFs } from './page-fs.mjs';
 import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
-import { logNamed, logOn, logQuiet } from "./log.mjs";
+import { logNamed, logOn, logRoutine } from "./log.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -1890,7 +1890,7 @@ export class Gex {
           // `[gex-info] `: one of the few things said by default (a process
           // starting, log.mjs): information, not a warning.
           if (text.startsWith('[gex-info] ')) {
-            if (!logQuiet()) console.info(`[gex] ${text.slice(11)}`);
+            if (logRoutine()) console.info(`[gex] ${text.slice(11)}`);
             // `?straceexe=NAME`: narrate the process that execs a program
             // of that name, whatever its pid
             const ex = this.#opts?.straceExe && /^pid \d+: exec (\S+)/.exec(text.slice(11));
