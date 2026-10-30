@@ -17,6 +17,7 @@ import { join, dirname, basename, extname, resolve as resolvePath } from 'node:p
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { Cdp, browserWsUrl } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
@@ -125,6 +126,9 @@ function makeServer(root, closureStem, oneShot = false) {
   const pending = new Map();
   let ready = null;
   const readyWaiters = [];
+  // The page's renderer gone (a crash, V8 out of memory): every waiter hears
+  // it now, and so does every later command, not at its deadline.
+  let crashed = null;
   let nextId = 1;
 
   const handOut = () => {
@@ -211,6 +215,10 @@ function makeServer(root, closureStem, oneShot = false) {
 
     if (p === '/control/run') {
       const cmd = url.searchParams.get('cmd') || '';
+      if (crashed) {
+        return res.writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ id: -1, out: '', status: -1, ms: 0, error: `page crashed: ${crashed}`, log: [] }));
+      }
       // The one-shot page reports id 0 and never pulls a job. `nextId` starts
       // at 1, so a one-shot run must wait on id 0, not a fresh id nothing sends.
       const id = oneShot ? 0 : nextId++;
@@ -244,6 +252,7 @@ function makeServer(root, closureStem, oneShot = false) {
     }
 
     if (p === '/control/ready') {
+      if (crashed) ready ??= { fatal: `page crashed: ${crashed}` };
       if (ready) {
         return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(ready));
       }
@@ -269,6 +278,15 @@ function makeServer(root, closureStem, oneShot = false) {
 
     return serveStatic(req, res);
   });
+  server.crashed = (why) => {
+    if (crashed) return;
+    crashed = why;
+    process.stderr.write(`harness: page crashed: ${why}\n`);
+    ready = ready ?? { fatal: `page crashed: ${why}` };
+    for (const w of readyWaiters.splice(0)) w(ready);
+    for (const [id, waiter] of pending) waiter({ id, out: '', status: -1, ms: 0, error: `page crashed: ${why}`, log: [] });
+    pending.clear();
+  };
   return server;
 }
 
@@ -322,6 +340,8 @@ async function start(args) {
       ...(NO_COI ? [] : ['--enable-features=SharedArrayBuffer']),
       '--enable-logging=stderr',
       '--v=0',
+      // For the page's crash (Target.targetCrashed), heard at once.
+      `--remote-debugging-port=${PORT + 1}`,
       url,
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
@@ -332,9 +352,27 @@ async function start(args) {
     // counters come out.
     for (const line of s.split('\n')) {
       if (line.includes('CONSOLE') || line.includes('ERROR:')) process.stderr.write(`${line}\n`);
+      // A renderer out of memory says so here before it goes.
+      if (/V8 javascript OOM|Out of memory/.test(line)) server.crashed(line.replace(/^\[[^\]]*\]\s*/, '').trim());
     }
   });
+  // The browser itself gone is the page gone too.
+  let leaving = false;
+  chrome.on('exit', (code, sig) => { if (!leaving) server.crashed(`the browser exited (${sig ?? code})`); });
+  // The renderer's crash or out-of-memory, from the browser's own word.
+  (async () => {
+    let ws = null;
+    for (let i = 0; i < 300 && !ws; i++) {
+      ws = await browserWsUrl(PORT + 1);
+      if (!ws) await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!ws) return;
+    const cdp = await Cdp.connect(ws);
+    cdp.on('Target.targetCrashed', (e) => server.crashed(`the renderer ${e.status ?? 'crashed'} (error ${e.errorCode ?? '?'})`));
+    await cdp.send('Target.setDiscoverTargets', { discover: true });
+  })().catch(() => {});
   const bye = () => {
+    leaving = true;
     chrome.kill('SIGKILL');
     // Chromium keeps writing its profile as it dies, so the rmdir can race a
     // new file (ENOTEMPTY); a stale profile dir is not worth crashing the run.
@@ -456,6 +494,7 @@ if (verb === 'start') {
     for (const l of r.log || []) process.stderr.write(`${l}\n`);
     if (r.error) process.stderr.write(`harness: ${r.error}\n`);
     process.stderr.write(`harness: ${r.ms}ms\n`);
+    if (r.error?.startsWith('page crashed')) process.exit(1);
   }
   process.exit(0);
 } else {
