@@ -466,8 +466,15 @@ fn install_module(
     // side is left to `Late` slots.
     if core.is_some() {
         let mut deps = std::collections::BTreeSet::new();
+        // (not a DLL it only delay-imports, which it marks `gexw-delay!DLL`:
+        // its calls load the DLL first, and then are bound, through `Late`
+        // slots, when Wine loads it)
+        let delayed = |d: &str| sh.exports.iter().any(|(e, _)| e.strip_prefix("gexw-delay!") == Some(d));
         for (m, n, _, _) in &sh.imports {
             if let (true, Some((d, _))) = (m == "env" || m == "GOT.func", n.split_once('!')) {
+                if delayed(d) {
+                    continue;
+                }
                 if let Some(f) = sh.modules.get(d) {
                     deps.insert(f.clone());
                 }

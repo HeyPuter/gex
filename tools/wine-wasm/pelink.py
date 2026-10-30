@@ -480,6 +480,35 @@ def link(dlls, out, gexrt, others=None):
         f.write(f'{name} gexw-guest {sym}\n')
         return True
 
+    # A native DLL that a module only delay-imports (its Makefile.in's
+    # DELAYIMPORTS, none of its static imports needing it either) is loaded on
+    # the module's first call into it, as Windows' delay-load helper loads it:
+    # the call goes through a thunk that loads the DLL once (`gexw-thunk`,
+    # below). Loaded with the module instead, every delay import's DllMain ran
+    # at its start (explorer's shell32, shdocvw and ieframe: ieframe's window
+    # class needed the display driver before explorer had loaded it) and a
+    # process loaded its delay imports' whole closure.
+    static_below = {}
+    def static_closure(m):
+        if m not in static_below:
+            seen, todo = set(), [d for d in EAGER.get(m, []) if d != m]
+            while todo:
+                d = todo.pop()
+                if d not in seen:
+                    seen.add(d)
+                    todo += EAGER.get(d, [])
+            static_below[m] = seen
+        return static_below[m]
+    native_set = {m for m, _, _, _ in dlls}
+    # (Not one an activation context redirects: a DLL's LoadLibrary of
+    # comctl32 may load comctl32_v6, and the calls bound to comctl32's own
+    # module then reached one never installed.)
+    def lazy_delay(mod, pick):
+        return (pick != mod and pick in DELAY.get(mod, []) and pick in native_set
+                and pick not in ACTCTX_DLLS and pick not in static_closure(mod))
+    delay_eager = {}  # module -> delay imports it still loads first (a data import, an unknown signature)
+    direct_refs = {}  # group -> the DLLs its code is bound to directly
+
     for mod, ro, ex, imports in dlls:
         local = os.path.join(tmp, mod + '.l.o')
         alias_file = os.path.join(tmp, mod + '.aliases')
@@ -534,9 +563,31 @@ def link(dlls, out, gexrt, others=None):
                 # NotifyWinEvent is void, win32u's stub returns a word) goes
                 # through a thunk: wasm calls must match exactly
                 have, want = sigs[mod].get((name, 'undefined')), sigs[pick].get((name, 'defined'))
+                used = have or f'{pick}!{name}' in data  # (not an export the module does not call)
+                # the delay import the name is the module's through: pick, or
+                # one that forwards it to pick (imm32's CoRegisterInitializeSpy
+                # is ole32's, defined in combase: ole32 is still the DLL loaded,
+                # and imm32 then finds it by GetModuleHandle)
+                via = pick if lazy_delay(mod, pick) else None
+                if used and not via and pick not in EAGER.get(mod, []):
+                    via = next((d for d in DELAY.get(mod, []) if lazy_delay(mod, d)
+                                and (d in exporters.get(name, ()) or d in forwards.get(name, {}))), None)
+                if used and via:
+                    if have and want:
+                        thunk = f'{mod}.{name}'
+                        thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want, grp(mod), via))
+                        f.write(f'{name} gexw-thunk {thunk}\n')
+                        if via != pick:
+                            direct_refs.setdefault(grp(mod), set()).add(pick)
+                        continue
+                    if os.environ.get('PELINK_DELAY_DEBUG'):
+                        print(f'pelink: {mod} loads {via} first: {name} ({have} -> {want})', file=sys.stderr)
+                    delay_eager.setdefault(mod, set()).add(via)
+                if used:
+                    direct_refs.setdefault(grp(mod), set()).add(pick)
                 if have and want and have != want:
                     thunk = f'{mod}.{name}'
-                    thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want, grp(mod)))
+                    thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want, grp(mod), None))
                     f.write(f'{name} gexw-thunk {thunk}\n')
                     continue
                 f.write(f'{name} {pick}\n')
@@ -548,9 +599,21 @@ def link(dlls, out, gexrt, others=None):
                     continue
                 target, want = fwd_def.get(f'{pick}!{name}', (None, None))
                 have = sigs[mod].get((name, 'undefined'))
+                used = have or f'{pick}!{name}' in data  # (not an export the module does not call)
+                if used and lazy_delay(mod, pick):
+                    if have and want and target:
+                        thunk = f'{mod}.{name}'
+                        thunks.append((f'gexw-thunk!{thunk}', have, target, want, grp(mod), pick))
+                        f.write(f'{name} gexw-thunk {thunk}\n')
+                        continue
+                    if os.environ.get('PELINK_DELAY_DEBUG'):
+                        print(f'pelink: {mod} loads {pick} first: {name} ({have} -> {target} {want})', file=sys.stderr)
+                    delay_eager.setdefault(mod, set()).add(pick)
+                if used:
+                    direct_refs.setdefault(grp(mod), set()).update({pick} | ({target.split('!', 1)[0]} if target else set()))
                 if have and want and have != want:
                     thunk = f'{mod}.{name}'
-                    thunks.append((f'gexw-thunk!{thunk}', have, target, want, grp(mod)))
+                    thunks.append((f'gexw-thunk!{thunk}', have, target, want, grp(mod), None))
                     f.write(f'{name} gexw-thunk {thunk}\n')
                     continue
                 f.write(f'{name} {pick}\n')
@@ -575,12 +638,33 @@ def link(dlls, out, gexrt, others=None):
         objs[grp(mod)].append(bound)
 
     for g in objs:
-      gthunks = [t[:4] for t in thunks if t[4] == g]
+      gthunks = [t[:4] + (t[5],) for t in thunks if t[4] == g]
       if gthunks:
           ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
           src = os.path.join(tmp, f'forwards{g}.c')
+          delayed = sorted({t[4] for t in gthunks if t[4]})
           with open(src, 'w') as f:
-              for k, (alias, have, target, want) in enumerate(gthunks):
+              if delayed:
+                  # A delay import's first call: the DLL loaded (and attached)
+                  # once, the flag set after it with a release store, read with
+                  # an acquire load (two threads' first calls load it twice:
+                  # a reference more). A DLL that fails to load raises the
+                  # delay-load helper's exception, VcppException(ERROR_SEVERITY_ERROR,
+                  # ERROR_MOD_NOT_FOUND), not a call through nothing. (Its
+                  # functions are bound when linked: no export can be missing.)
+                  own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
+                  f.write(f'void *gexw_dl_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
+                  f.write(f'void gexw_dl_RaiseException(unsigned int, unsigned int, unsigned int, const void *) '
+                          f'__asm__("{own("RaiseException")}!RaiseException");\n')
+                  f.write('static int dl[%d];\n' % len(delayed))
+                  # each DLL only these thunks reach, marked for gex (wasmdll):
+                  # its module is not installed ahead of this one
+                  for k, d in enumerate(x for x in delayed if x not in direct_refs.get(g, ())):
+                      f.write(f'__attribute__((export_name("gexw-delay!{d}"))) void dm{k}(void) {{}}\n')
+                  f.write('static __attribute__((noinline)) void dl_load(int i, const char *name)\n{\n'
+                          '    if (!gexw_dl_LoadLibraryA(name)) gexw_dl_RaiseException(0xc06d007e, 0, 0, 0);\n'
+                          '    __atomic_store_n(&dl[i], 1, __ATOMIC_RELEASE);\n}\n')
+              for k, (alias, have, target, want, delay) in enumerate(gthunks):
                   hr, hp = have.split(':')
                   wr, wp = want.split(':')
                   params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(hp)) or 'void'
@@ -595,6 +679,9 @@ def link(dlls, out, gexrt, others=None):
                       body = f'{call}; return 0;'
                   else:
                       body = f'return ({ctype[hr]}){call};'
+                  if delay:
+                      i = delayed.index(delay)
+                      body = (f'if (!__atomic_load_n(&dl[{i}], __ATOMIC_ACQUIRE)) dl_load({i}, "{delay}"); ' + body)
                   f.write(f'{ctype[hr]} f{k}({params}) {{ {body} }}\n')
           obj = os.path.join(tmp, f'forwards{g}.o')
           subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
@@ -731,7 +818,7 @@ def link(dlls, out, gexrt, others=None):
                 # runtime they call, whose lock table was not made yet, and
                 # its _lock recursed until the stack ran out)
                 deps += [d for d in DELAY.get(mod, []) if d in native_mods and d != mod and d not in deps
-                         and mod not in needs_first(d)]
+                         and mod not in needs_first(d) and d in delay_eager.get(mod, ())]
                 f.write('    "%s", "%s",\n' % (mod, ''.join(d + '\\0' for d in deps)))
             f.write('    0\n};\n')
             f.write('const char *__gexw_module_imports(const unsigned short *name)\n{\n'

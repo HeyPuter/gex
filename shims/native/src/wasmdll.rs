@@ -628,8 +628,16 @@ fn install_module(
             static BUSY: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let mut deps = std::collections::BTreeSet::new();
+        // (not a DLL it only delay-imports, which it marks `gexw-delay!DLL`:
+        // its calls load the DLL first, and then are bound, through `Late`
+        // slots, when Wine loads it)
+        let delayed: std::collections::HashSet<&str> =
+            module.exports().filter_map(|e| e.name().strip_prefix("gexw-delay!")).collect();
         for imp in module.imports() {
             if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func"), imp.name().split_once('!')) {
+                if delayed.contains(dll) {
+                    continue;
+                }
                 if let Some(f) = pm.modules.get(dll) {
                     deps.insert(f.clone());
                 }
