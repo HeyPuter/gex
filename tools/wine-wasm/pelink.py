@@ -438,12 +438,14 @@ def link(dlls, out, gexrt, others=None):
     # and unicows' GetCharWidthW too); forwards to one of the defining DLLs
     # are left to the direct binding.
     shadowed = {}  # export name -> {forwarding dll}
+    elsewhere = {}  # export name -> {forwarding dll} whose forward reaches none of its definitions
     for name, by in forwards.items():
         for via, fwd in by.items():
             hit = resolve_forward(fwd)
             if name in exporters:
                 if hit and hit[0] in exporters[name]:
                     continue
+                elsewhere.setdefault(name, set()).add(via)
                 if hit:
                     shadowed.setdefault(name, set()).add(via)
             if hit:
@@ -608,7 +610,7 @@ def link(dlls, out, gexrt, others=None):
                 # DLL defined the name; combase's PostThreadMessageW is
                 # user32's forward to win32u, not unicows' own)
                 if pick not in EAGER.get(mod, []) + imports and any(
-                        v in EAGER.get(mod, []) + imports for v in forwards.get(name, {})):
+                        v in EAGER.get(mod, []) + imports for v in elsewhere.get(name, ())):
                     continue
                 # An i386 DLL the module imports explicitly, ahead of the
                 # native owner, is the one the name comes from, as an import
