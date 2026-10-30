@@ -387,6 +387,10 @@ const CALLOUT_UNWOUND = 64n << 10n;
 /** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
  *  `NATIVE_UNWOUND`. */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
+/** The door area's user shared data state (+144, the server's door.c):
+ *  "USD0", no process has filled the page; "USD1", one has. */
+const USD_UNPUBLISHED = 0x30445355;
+const USD_PUBLISHED = 0x31445355;
 const NATIVE_UNWOUND = 512n;
 /** Where a native caller's `run_until` goes after a stray return to its
  *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
@@ -6604,16 +6608,28 @@ export class Gex {
     this.#env.publishDoor?.(door);
   }
 
+  /** `gex.usd_copy` / `gex.usd_publish`: the server's user shared data
+   *  page (area +140) to or from this process; the bytes copied, -1 with no
+   *  door, and for a copy -2 while no process has published a fill there
+   *  (area +144 USD_UNPUBLISHED): the bytes are copied, but only the
+   *  server's own fields are good, and the fill is in the caller's mapping.
+   *  A publish marks it USD_PUBLISHED. A server without the field has
+   *  neither value there. */
   #usdMove(at, size, publish) {
     const d = this.#door;
     if (!d || single.on || !this.#doorLive(d)) return -1;
-    const { u8, dv } = this.#doorView();
+    const { u8, dv, i32 } = this.#doorView();
     const usd = dv.getUint32(d.area + 140, true);
     if (!usd) return -1;
+    const state = Atomics.load(i32, (d.area + 144) >>> 2);
     const n = Math.min(size, 4096);
-    if (publish) u8.set(this.#bytes().subarray(at, at + n), usd);
-    else this.#bytes().set(u8.subarray(usd, usd + n), at);
-    return n;
+    if (publish) {
+      u8.set(this.#bytes().subarray(at, at + n), usd);
+      if (state === USD_UNPUBLISHED) Atomics.store(i32, (d.area + 144) >>> 2, USD_PUBLISHED);
+      return n;
+    }
+    this.#bytes().set(u8.subarray(usd, usd + n), at);
+    return state === USD_UNPUBLISHED ? -2 : n;
   }
 
   #sessTr = 0;

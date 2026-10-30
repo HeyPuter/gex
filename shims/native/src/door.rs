@@ -43,7 +43,17 @@ mod area {
     pub const SESSION_SIZE: u32 = 132;
     pub const CTX_SIZE: u32 = 136;
     pub const USD: u32 = 140;
+    /// Whether the user shared data page holds a session's fill
+    /// ([`USD_UNPUBLISHED`], [`USD_PUBLISHED`]); a server without the field
+    /// has neither there.
+    pub const USD_STATE: u32 = 144;
 }
+
+/// [`area::USD_STATE`]: the server's page as it made it, which no process
+/// has filled ("USD0").
+const USD_UNPUBLISHED: u32 = u32::from_le_bytes(*b"USD0");
+/// [`area::USD_STATE`]: a process wrote its fill there (`usd_publish`, "USD1").
+const USD_PUBLISHED: u32 = u32::from_le_bytes(*b"USD1");
 
 /// A native wasm32 program as installed, by pid (`wasmprog::install`): what
 /// a door instance needs to instantiate it again on the same memory.
@@ -440,22 +450,31 @@ fn session_copy_delay() -> Option<u64> {
 
 /// `gex.usd_copy(dst, size)` / `gex.usd_publish(src, size)`: the server's
 /// user shared data page to or from the caller; the bytes copied, -1 with
-/// no door.
+/// no door, and for a copy -2 while no process has published a fill there:
+/// the bytes are copied, but only the server's own fields are good, and the
+/// fill is in the caller's mapping. A publish marks the page published.
 pub(crate) fn usd_move(caller: &mut Caller<'_, HostState>, at: u32, size: u32, publish: bool) -> Result<i32> {
     let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(-1) };
     let usd = s.get(area::USD);
     if usd == 0 {
         return Ok(-1);
     }
+    let state = s.get(area::USD_STATE);
     let n = size.min(4096) as usize;
     let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let (c, u) = (at as usize, usd as usize);
     if publish {
         let v = cm.bytes()[c..c + n].to_vec();
         s.mem.bytes()[u..u + n].copy_from_slice(&v);
+        if state == USD_UNPUBLISHED {
+            s.put(area::USD_STATE, USD_PUBLISHED);
+        }
     } else {
         let v = s.mem.bytes()[u..u + n].to_vec();
         cm.bytes()[c..c + n].copy_from_slice(&v);
+        if state == USD_UNPUBLISHED {
+            return Ok(-2);
+        }
     }
     Ok(n as i32)
 }
