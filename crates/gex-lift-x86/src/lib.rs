@@ -82,6 +82,11 @@ pub mod sysreg {
     /// A far `jmp`/`call`/`ret` or `iret`: written with `offset | selector
     /// << 32`; the host checks the selector and sets `ctx::CS`.
     pub const FAR: i32 = -104;
+    /// A far transfer whose block then reads [`FAR_NEXT`] for the address
+    /// to dispatch: written as [`FAR`] is.
+    pub const FAR_IN_PLACE: i32 = -105;
+    /// Read after [`FAR_IN_PLACE`]: the address the block dispatches.
+    pub const FAR_NEXT: i32 = -106;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
@@ -2689,23 +2694,30 @@ impl<'a> Lifter<'a> {
 
     /// A far transfer to `sel:off` (`sel` an `I32`, `off` an `I64`): the
     /// host checks the selector and sets the thread's mode
-    /// ([`sysreg::FAR`]; any selector but a code segment's is #GP, an
-    /// access violation), then the target is dispatched in that mode.
+    /// ([`sysreg::FAR_IN_PLACE`]; any selector but a code segment's is #GP,
+    /// an access violation), then the block dispatches what the host names
+    /// ([`sysreg::FAR_NEXT`]): the offset, or for a change of mode an
+    /// address this mode's directory never holds, whose miss the host
+    /// answers with the target's translation in the new mode. The thread
+    /// stays in wasm across the change.
     fn far(&mut self, pc: u64, sel: Value, off: Value) -> Flow {
         let sel = self.b.extend(sel, false);
         let sh = self.k64(32);
         let sel = self.b.bin(BinOp::Shl, Ty::I64, sel, sh);
         let v = self.b.bin(BinOp::Or, Ty::I64, off, sel);
         let pcv = self.k64(pc);
-        let id = self.k32(sysreg::FAR as u32);
+        let id = self.k32(sysreg::FAR_IN_PLACE as u32);
         self.b.stmt(Stmt::HostCall {
             func: HostFunc::SysRegWrite,
             args: vec![pcv, id, v],
         });
-        Flow::End(Term::Indirect {
-            target: off,
-            is_ret: false,
-        })
+        let next = self.k32(sysreg::FAR_NEXT as u32);
+        let target = self.b.def(Expr::HostCall {
+            func: HostFunc::SysRegRead,
+            args: vec![pcv, next],
+            ty: Ty::I64,
+        });
+        Flow::End(Term::Indirect { target, is_ret: false })
     }
 
     /// The user-writable flags from a popped `rflags` (an `I32`): what

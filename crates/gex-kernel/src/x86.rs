@@ -36,6 +36,19 @@ pub const SYSREG_TRACE: i32 = -103;
 /// A far transfer (`gex_lift_x86::sysreg::FAR`): the value is `offset |
 /// selector << 32`. See [`serve_far`].
 pub const SYSREG_FAR: i32 = -104;
+/// A far transfer the block goes on from in wasm
+/// (`gex_lift_x86::sysreg::FAR_IN_PLACE`): served as [`SYSREG_FAR`], then
+/// the block reads [`SYSREG_FAR_NEXT`] for the address it dispatches.
+pub const SYSREG_FAR_IN_PLACE: i32 = -105;
+/// What a block dispatches after [`SYSREG_FAR_IN_PLACE`]
+/// (`gex_lift_x86::sysreg::FAR_NEXT`): the target, or [`FAR_PAD`] when the
+/// transfer changed the thread's mode.
+pub const SYSREG_FAR_NEXT: i32 = -106;
+/// The address a block dispatches after a far transfer that changed the
+/// thread's mode: its module's directory is the old mode's, and no
+/// directory has an entry for page 0, so the dispatch misses, and the miss
+/// path goes on at the target through the new mode's directory.
+pub const FAR_PAD: u64 = 0x10;
 
 /// A far `jmp`/`call`/`ret` or `iret` to `selector:offset`: a user code
 /// selector (64-bit 0x33, 32-bit 0x23 or 0x1b) becomes the thread's

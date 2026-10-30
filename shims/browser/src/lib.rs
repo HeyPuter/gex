@@ -15395,6 +15395,7 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
         // MIDR_EL1: a plausible Cortex-A72, the same one the native host
         // claims to be.
         -7 => 0x410f_d083,
+        gex_kernel::x86::SYSREG_FAR_NEXT if gex_abi::X86 => FAR_NEXT.with(|c| c.get().0) as i64,
         _ => 0,
     }
 }
@@ -15428,7 +15429,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     // A change of mode leaves the block's module, whose directory is the old
     // mode's: JavaScript's loop goes on at the target through a module of
     // the new mode's (`gex.mjs` `#enter`).
-    if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_FAR {
+    if gex_abi::X86 && (reg == gex_kernel::x86::SYSREG_FAR || reg == gex_kernel::x86::SYSREG_FAR_IN_PLACE) {
         let mut gm = GuestMem::new(guest_bytes());
         let cs_at = ctx as u32 as u64 + ctx::CS as u64;
         let before = gm.read_u32(cs_at).unwrap_or(0);
@@ -15436,11 +15437,18 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
             far_fault(sel, ctx, pc as u64);
         }
         let after = gm.read_u32(cs_at).unwrap_or(0);
-        if cs_alt(before) != cs_alt(after) {
-            set_resume(val as u64 & 0xffff_ffff);
+        let switch = cs_alt(before) != cs_alt(after);
+        FAR_TRANSFERS[switch as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = val as u64 & 0xffff_ffff;
+        if switch && reg == gex_kernel::x86::SYSREG_FAR {
+            set_resume(target);
             set_resume_ctx(ctx as u32 as u64);
             trap();
         }
+        // A block that reads where it goes on (`SYSREG_FAR_NEXT`): across a
+        // change of mode the pad, whose miss is served in the new mode
+        // (`far_switch`), in wasm.
+        FAR_NEXT.with(|c| c.set(if switch { (gex_kernel::x86::FAR_PAD, target) } else { (target, 0) }));
     }
     // `cmpxchg16b`, under the host's lock.
     if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
@@ -15451,6 +15459,43 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, val as u64);
     }
 }
+
+thread_local! {
+    /// What the block of this thread's last far transfer dispatches
+    /// (`SYSREG_FAR_NEXT`), and across a change of mode the target the pad's
+    /// miss goes on at.
+    static FAR_NEXT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// A dispatch of [`gex_kernel::x86::FAR_PAD`]: the block of a far transfer
+/// that changed the thread's mode, whose module dispatches through the old
+/// mode's directory. The target's translation in the new mode, a table-0
+/// slot the miss stub tail-calls, with the context at the target as
+/// dispatch leaves it; when it has none (not translated yet, or in another
+/// table) the thread leaves wasm and JavaScript's loop goes on at the
+/// target, as for any far transfer before.
+fn far_switch(ctx: i32) -> i32 {
+    let target = FAR_NEXT.with(|c| c.get().1);
+    let c = ctx as u32 as u64;
+    let mut gm = GuestMem::new(guest_bytes());
+    let _ = gm.write_u64(c + ctx::PC as u64, target);
+    let _ = gm.write_u64(c + ctx::LAST_TARGET as u64, target);
+    let key = gex_abi::page_key(target, thread_alt());
+    let alt_dir = ALT_DIR.load(std::sync::atomic::Ordering::Acquire);
+    let entry = gex_abi::dir_entry_addr(key, alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(0);
+    if entry != 0 && gex_abi::dispatch_entry_table(entry) == 0 {
+        let slot = gex_abi::dispatch_entry_base(entry) + ((target & (gex_abi::DISPATCH_PAGE - 1)) >> gex_abi::DISPATCH_SHIFT) as u32;
+        return slot as i32;
+    }
+    set_resume(target);
+    set_resume_ctx(c);
+    trap();
+}
+
+/// Far transfers this process made (`SYSREG_FAR`): within a mode, and
+/// between the two (each of which leaves wasm for JavaScript's loop).
+/// `gex_reuse_stat` 12 and 13.
+static FAR_TRANSFERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The process's other directory (`gex_abi::ALT_PAGE`: a WoW64 thread's
 /// 32-bit code), mapped the first time a thread runs code in that mode; 0
@@ -16438,6 +16483,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if thread_gone() {
         stop_gone();
         trap();
+    }
+    if gex_abi::X86 && pc == gex_kernel::x86::FAR_PAD {
+        return far_switch(_ctx);
     }
     LAST_MISS_PC.with(|c| c.set(pc));
     // Code in the process's other mode (a WoW64 thread's 32-bit code): its
@@ -20423,6 +20471,8 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             9 => NOIDENT_WHY.with(|c| c.borrow().0),
             10 => NOIDENT_WHY.with(|c| c.borrow().1),
             11 => j.reuse_served_alt,
+            12 => FAR_TRANSFERS[0].load(std::sync::atomic::Ordering::Relaxed),
+            13 => FAR_TRANSFERS[1].load(std::sync::atomic::Ordering::Relaxed),
             _ => j.reuse_noident,
         }) as i64
     })

@@ -4850,6 +4850,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 // MIDR_EL1: a plausible Cortex-A72.
                 -7 => 0x410f_d083,
+                gex_kernel::x86::SYSREG_FAR_NEXT if gex_abi::X86 => FAR_NEXT.with(|c| c.get()) as i64,
                 _ => 0,
             }
         },
@@ -4899,7 +4900,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A change of mode leaves the block's module, whose directory is
             // the old mode's: the thread loop goes on at the target through
             // the new mode's (`alt_enter_for`).
-            if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_FAR {
+            if gex_abi::X86 && (reg == gex_kernel::x86::SYSREG_FAR || reg == gex_kernel::x86::SYSREG_FAR_IN_PLACE) {
                 let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
                 let mut gm = GuestMem::new(memory.bytes());
                 let cs_at = ctx as u32 as u64 + ctx::CS as u64;
@@ -4922,6 +4923,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         x(14)
                     );
                 }
+                // The block's dispatch after it (`SYSREG_FAR_NEXT`): within
+                // the mode, the target.
+                FAR_NEXT.with(|c| c.set(v as u64 & 0xffff_ffff));
                 if cs_alt(before) != cs_alt(after) {
                     let target = v as u64 & 0xffff_ffff;
                     let state = caller.data_mut();
@@ -5851,6 +5855,13 @@ static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = M
 /// `function->target count`.
 /// Sampled nest exits that were not a plain return (see NEST_EXIT_SAMPLE).
 static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+thread_local! {
+    /// Where the block that made this thread's last far transfer goes on
+    /// (`SYSREG_FAR_NEXT`). Natively a change of mode leaves the block's
+    /// module instead (`resume_at`), so this is always the target.
+    static FAR_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A function-tier call-out in progress (`call_out`): the return it waits
 /// for, and the dispatch slot it watches for it with the old content.
