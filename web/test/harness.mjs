@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { Cdp, browserWsUrl } from './cdp.mjs';
+import { refuseStale } from '../build-inputs.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
@@ -298,6 +299,9 @@ async function start(args) {
     console.error(`harness: no built site at ${DIST}. Run 'npm run build' in web/.`);
     process.exit(2);
   });
+  // A dist built from other source runs the old code without a word.
+  refuseStale('harness', DIST, ['page'], 'web/build-all.sh --dist-only');
+  refuseStale('harness', join(DIST, 'gex'), ['gex_kernel', 'gex_browser'], 'shims/browser/build.sh, then web/build-all.sh --dist-only');
   await stat(root).catch(() => {
     console.error(`harness: no rootfs at ${root}`);
     process.exit(2);

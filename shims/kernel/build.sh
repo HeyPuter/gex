@@ -30,6 +30,9 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     INFIX=".x86"
     TDIR=target/shared-kernel-x86
 fi
+# What this is built from, taken now, before the build: written beside it as
+# web/public/gex/.inputs once it is installed (web/build-inputs.mjs).
+INPUTS_KEY=$(node web/build-inputs.mjs key gex_kernel$INFIX)
 OUT=$TDIR/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 # A shared memory carries its maximum in its *type*, so the host's memory and
 # this module must agree on it exactly. The linker defaults the maximum to the
@@ -104,6 +107,8 @@ rm -f "$OUT.p32"
 if [ -n "$ARCH_FEATURES" ]; then
     cp web/public/gex/gex_kernel$INFIX.wasm web/public/gex/gex_kernel$INFIX.m64.wasm
 fi
+
+node web/build-inputs.mjs stamp web/public/gex "gex_kernel$INFIX=$INPUTS_KEY"
 
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the module that was here a moment ago.

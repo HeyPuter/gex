@@ -158,6 +158,9 @@ xwl() { # xwl <mt|st>
 [ "$DISTS" = 1 ] || exit 0
 
 # -- 3. one dist per flavour ---------------------------------------------------
+# What the bundle is built from, taken before it is: written as the dist's
+# .inputs (web/build-inputs.mjs). Its gex/.inputs comes from web/public.
+PAGE_KEY=$(node "$HERE/build-inputs.mjs" key page)
 dist() { # dist <mp|sp>
     f=$1
     out=$HERE/dist; [ "$f" = sp ] && out=$HERE/dist-sp
@@ -200,6 +203,7 @@ dist() { # dist <mp|sp>
     done
     (cd "$HERE" && GEX_PUBLIC_DIR="$stage" GEX_OUT_DIR="$out" npm run --silent build > "$CACHE/vite-$f.log" 2>&1) ||
         { tail -20 "$CACHE/vite-$f.log"; exit 1; }
+    node "$HERE/build-inputs.mjs" stamp "$out" "page=$PAGE_KEY"
     rm -rf "$stage"
     echo "  web/${out##*/}: $(du -sh "$out" | cut -f1)"
 }

@@ -71,6 +71,9 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     TSUF="-x86"
     GEXC=target/x86/release/gexc
 fi
+# What this is built from, taken now, before the build: written beside it as
+# web/public/gex/.inputs once it is installed (web/build-inputs.mjs).
+INPUTS_KEY=$(node web/build-inputs.mjs key gex_browser$INFIX)
 FEATURES=""
 [ -n "$ARCH_FEAT" ] && FEATURES="--features $ARCH_FEAT"
 # And the same list for the shared build below, which takes `shared-memory`
@@ -255,6 +258,8 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
     $GEXC seed --mem64 -o web/public/gex/seed$INFIX.m64.shared.wasm >/dev/null
     echo "shims/browser: $(stat -c%s "$M64OUT") bytes (wasm64, memory64), seed$INFIX.m64.shared.wasm"
 fi
+
+node web/build-inputs.mjs stamp web/public/gex "gex_browser$INFIX=$INPUTS_KEY"
 
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the shim that was here a moment ago.

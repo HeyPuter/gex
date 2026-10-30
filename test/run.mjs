@@ -15,6 +15,7 @@ import { parseArgs } from 'node:util';
 import { Cdp, browserWsUrl } from '../web/test/cdp.mjs';
 import { images, outputs } from './fixtures/images.mjs';
 import { packaged } from './lib/package.mjs';
+import { refuseStale } from '../web/build-inputs.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
@@ -121,6 +122,15 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
 // `--prepare`: the images the tests need, made in the work directory and no
 // test run (another host then runs them with --prebuilt).
 if (o.prepare) process.exit(missing.size ? 1 : 0);
+
+// -- the build ---------------------------------------------------------------
+// Both hosts run web/public's kernel and shim (the page's JavaScript comes from
+// source), which run the old code without a word when they are older than it.
+{
+  const infix = (a) => (a === 'x86' ? '.x86' : '');
+  const names = [...new Set(jobs.flatMap((j) => [`gex_kernel${infix(j.arch)}`, `gex_browser${infix(j.arch)}`]))];
+  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public'), 'gex'), names, 'shims/browser/build.sh (GEX_ARCH=x86 for .x86)');
+}
 
 // -- the browser -------------------------------------------------------------
 let server = null;
