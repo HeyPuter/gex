@@ -33,6 +33,8 @@
 # Options:
 #   --null             the null display driver (no compositor; tests)
 #   --prefix DIR       copy this prefix instead of the Makefile's
+#   --native DIR       (64-bit Wine) the native PE core (wine64-dist.sh's
+#                      WINE64_NATIVE) over the dist's x86_64-windows
 #   --keep DIR         run in DIR, a prefix copy kept for the next run (made
 #                      when missing); without it a temporary copy is removed
 #   --dist DIR         this dist instead of the Makefile's
@@ -51,7 +53,7 @@
 # Make settings (WINE32_CACHE, WINE_DIR, ...) pass through the environment.
 set -euo pipefail
 WINE32=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$WINE32/../.." && pwd)
-graphics=wayland prefix="" keep="" dist="" units="" size=1280x720 out=null debug=err+all,fixme-all tmo="" make=1 envs=()
+graphics=wayland prefix="" native="" keep="" dist="" units="" size=1280x720 out=null debug=err+all,fixme-all tmo="" make=1 envs=()
 gexc=${GEXC:-$ROOT/target/x86/release/gexc}
 build_units="" page=""
 # The bench box's half of --page: TREE UNITS SECS EXE [ARGS...], from the
@@ -76,6 +78,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --null) graphics=null ;;
     --prefix) prefix=$2; shift ;;
+    --native) native=$(realpath "$2"); shift ;;
     --keep) keep=$2; shift ;;
     --dist) dist=$2; shift ;;
     --units) units=$2; shift ;;
@@ -105,7 +108,7 @@ if [ -n "$w64" ]; then
   [ -n "$page" ] || { echo "run.sh: a 64-bit Wine dist runs with --page only" >&2; exit 1; }
   [ -n "$prefix" ] || { echo "run.sh: a 64-bit Wine dist needs --prefix (its WINE64_PREFIX)" >&2; exit 1; }
   dist=$(realpath "$dist")
-  WINE32_KEY=w64s-$({ echo "$dist"; find -L "$dist" -type f -printf '%T@ %s %p\n' | sort; } | sha256sum | cut -c1-12)
+  WINE32_KEY=w64s-$({ echo "$dist $native"; find -L "$dist" ${native:+"$native"} -type f -printf '%T@ %s %p\n' | sort; } | sha256sum | cut -c1-12)
   WINE32_DIST=$dist
   units=${units:-$(dirname "$dist")/page-units}
 else
@@ -137,12 +140,17 @@ if [ -n "$page" ]; then
     # global kernel's memory, which ends at 4 GiB: the bundle's PE files
     # without their debug information and without the import libraries
     # (.a), on a linked copy (the dist itself is left as it is).
-    [ -f "$wt" ] || {
-      ds=$(mktemp -d "$pg/dist.XXXXXX"); cp -rlL "$dist" "$ds/$mnt"
+    # The copy is kept beside the tar: units are built from the files the page has.
+    ds=$pg/dist-$WINE32_KEY
+    [ -f "$wt" ] && [ -d "$ds/$mnt" ] || {
+      rm -rf "$ds" "$wt"; mkdir -p "$ds"; cp -rlL "$dist" "$ds/$mnt"
       find "$ds/$mnt/lib/wine" -name '*.a' -delete
+      # the native core's files in place of the PE ones (removed first: links)
+      [ -z "$native" ] || for f in "$native"/*; do rm -f "$ds/$mnt/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$ds/$mnt/lib/wine/x86_64-windows/"; done
       find "$ds/$mnt/lib/wine" -path '*-windows/*' -type f ! -name '*.a' -print0 |
         xargs -0 -r -P"$(nproc)" -n 32 sh -c 'for f; do llvm-strip --strip-debug -o "$f.s" "$f" 2>/dev/null && mv "$f.s" "$f" || rm -f "$f.s"; done' sh
-      tar -C "$ds" -cf "$wt.tmp" "$mnt" && mv "$wt.tmp" "$wt"; rm -rf "$ds"; }
+      tar -C "$ds" -cf "$wt.tmp" "$mnt" && mv "$wt.tmp" "$wt"; }
+    udist=$ds/$mnt
   else
     [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),$mnt," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
   fi
@@ -190,7 +198,7 @@ if [ -n "$page" ]; then
     WINE32_PAGE_ENV="$(IFS=,; echo "${env[*]}")" ${WINE32_PAGE_Q+WINE32_PAGE_Q="$WINE32_PAGE_Q"} \
     bash "$rt/tools/wine-wasm/run.sh" --remote "$rt" "$units" "${tmo:-300}" "$(basename "$exe")" "$@" 2>&1 | tee "$log"
   rc=${PIPESTATUS[0]}
-  [ -n "$build_units" ] && "$WINE32/wine32/units.sh" "$log" "$units" "$gexc" "$dist" "$(dirname "$exe")" ${w64:+"$prefix"}
+  [ -n "$build_units" ] && "$WINE32/wine32/units.sh" "$log" "$units" "$gexc" "${udist:-$dist}" "$(dirname "$exe")" ${w64:+"$prefix"}
   echo "run.sh: log $log"
   exit $rc
 fi
