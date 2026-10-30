@@ -15440,7 +15440,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         let switch = cs_alt(before) != cs_alt(after);
         FAR_TRANSFERS[switch as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let target = val as u64 & 0xffff_ffff;
-        if switch && reg == gex_kernel::x86::SYSREG_FAR {
+        if switch && (reg == gex_kernel::x86::SYSREG_FAR || callout_unwound(ctx)) {
             set_resume(target);
             set_resume_ctx(ctx as u32 as u64);
             trap();
@@ -15461,6 +15461,34 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 }
 
 thread_local! {
+    /// The innermost open call-out of JavaScript's loops, as the stack
+    /// pointer past which its caller's frame is unwound and whether it was
+    /// made from code in the other mode (`gex_callout_guard`); 0 for none,
+    /// or one that wants no stack.
+    static CALLOUT_GUARD: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// JavaScript's innermost call-out (`gex.mjs` `#calloutGuard`): `limit` the
+/// stack pointer past which its caller is unwound, 0 for none.
+#[no_mangle]
+pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
+    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0)));
+}
+
+/// Whether the stack of the thread at `ctx` has unwound past the caller of
+/// JavaScript's innermost call-out (a longjmp out of a callback, as
+/// `NtCallbackReturn`'s): a change of mode then traps, and the call-out's
+/// loop leaves, as it did when every change of mode trapped.
+fn callout_unwound(ctx: i32) -> bool {
+    let (limit, alt) = CALLOUT_GUARD.with(|g| g.get());
+    if limit == 0 {
+        return false;
+    }
+    let sp = gex_callout_live_sp(ctx, alt as i32);
+    sp != -1 && sp as u64 > limit
+}
+
+thread_local! {
     /// What the block of this thread's last far transfer dispatches
     /// (`SYSREG_FAR_NEXT`), and across a change of mode the target the pad's
     /// miss goes on at.
@@ -15469,33 +15497,48 @@ thread_local! {
 
 /// A dispatch of [`gex_kernel::x86::FAR_PAD`]: the block of a far transfer
 /// that changed the thread's mode, whose module dispatches through the old
-/// mode's directory. The target's translation in the new mode, a table-0
-/// slot the miss stub tail-calls, with the context at the target as
-/// dispatch leaves it; when it has none (not translated yet, or in another
-/// table) the thread leaves wasm and JavaScript's loop goes on at the
-/// target, as for any far transfer before.
+/// mode's directory. The target's translation in the new mode, as the
+/// entry the miss stub dispatches to (`DISPATCH_MISS_ENTRY`), with the
+/// context at the target as dispatch leaves it; when it has none (not
+/// translated in that mode yet) the thread leaves wasm and JavaScript's
+/// loop goes on at the target, as for any far transfer before.
 fn far_switch(ctx: i32) -> i32 {
     let target = FAR_NEXT.with(|c| c.get().1);
     let c = ctx as u32 as u64;
-    let mut gm = GuestMem::new(guest_bytes());
-    let _ = gm.write_u64(c + ctx::PC as u64, target);
-    let _ = gm.write_u64(c + ctx::LAST_TARGET as u64, target);
-    let key = gex_abi::page_key(target, thread_alt());
-    let alt_dir = ALT_DIR.load(std::sync::atomic::Ordering::Acquire);
-    let entry = gex_abi::dir_entry_addr(key, alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(0);
-    if entry != 0 && gex_abi::dispatch_entry_table(entry) == 0 {
-        let slot = gex_abi::dispatch_entry_base(entry) + ((target & (gex_abi::DISPATCH_PAGE - 1)) >> gex_abi::DISPATCH_SHIFT) as u32;
-        return slot as i32;
+    if let Some(r) = mode_entry(c, target) {
+        FAR_TRANSFERS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return r;
     }
     set_resume(target);
     set_resume_ctx(c);
     trap();
 }
 
-/// Far transfers this process made (`SYSREG_FAR`): within a mode, and
-/// between the two (each of which leaves wasm for JavaScript's loop).
-/// `gex_reuse_stat` 12 and 13.
-static FAR_TRANSFERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// What the miss stub dispatches to for `pc` in the mode the thread at `c`
+/// runs in (`DISPATCH_MISS_ENTRY`), the context at `pc` as dispatch leaves
+/// it; `None` when that mode's directory has no entry for its page.
+fn mode_entry(c: u64, pc: u64) -> Option<i32> {
+    let alt = thread_alt();
+    let mut gm = GuestMem::new(guest_bytes());
+    let alt_dir = ALT_DIR.load(std::sync::atomic::Ordering::Acquire);
+    let entry = gex_abi::dir_entry_addr(gex_abi::page_key(pc, alt), alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(0);
+    if entry == 0 {
+        return None;
+    }
+    let _ = gm.write_u64(c + ctx::PC as u64, pc);
+    let _ = gm.write_u64(c + ctx::LAST_TARGET as u64, pc);
+    let slot = gex_abi::dispatch_entry_base(entry) + ((pc & (gex_abi::DISPATCH_PAGE - 1)) >> gex_abi::DISPATCH_SHIFT) as u32;
+    if gex_abi::DISPATCH_TABLES <= 1 {
+        return Some(slot as i32);
+    }
+    Some(gex_emit::module::dispatch_miss_entry(gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(entry), slot)))
+}
+
+/// Far transfers this process made (`SYSREG_FAR`): within a mode, between
+/// the two, and of those the ones whose target the miss path served in
+/// wasm (`far_switch`; the others left for JavaScript's loop).
+/// `gex_reuse_stat` 12, 13 and 14.
+static FAR_TRANSFERS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// The process's other directory (`gex_abi::ALT_PAGE`: a WoW64 thread's
 /// 32-bit code), mapped the first time a thread runs code in that mode; 0
@@ -20473,6 +20516,7 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             11 => j.reuse_served_alt,
             12 => FAR_TRANSFERS[0].load(std::sync::atomic::Ordering::Relaxed),
             13 => FAR_TRANSFERS[1].load(std::sync::atomic::Ordering::Relaxed),
+            14 => FAR_TRANSFERS[2].load(std::sync::atomic::Ordering::Relaxed),
             _ => j.reuse_noident,
         }) as i64
     })

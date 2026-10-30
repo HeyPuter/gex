@@ -282,7 +282,7 @@ pub(crate) fn test_hole(pc: u64) {
     if !HOLES.load(Ordering::Relaxed) {
         return;
     }
-    let Some(w) = slot_word(pc) else { return };
+    let Some(w) = slot_word(pc, crate::thread_alt()) else { return };
     let now = w.load(Ordering::Acquire);
     if now != 0 {
         if HOLE_AT.with(|h| h.get()) == (pc, now) {
@@ -299,7 +299,7 @@ pub(crate) fn test_hole(pc: u64) {
     }
     let hole = HOLE.load(Ordering::Relaxed);
     let _l = Lock::take();
-    let Some(w) = slot_word(pc) else { return };
+    let Some(w) = slot_word(pc, crate::thread_alt()) else { return };
     if hole != 0 && w.compare_exchange(0, hole, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
         HOLES_MADE.fetch_add(1, Ordering::Relaxed);
         HOLE_AT.with(|h| h.set((pc, hole)));
@@ -364,11 +364,18 @@ pub(crate) fn index(pc: u64) -> u32 {
 /// The slot map word of `pc` in this process, or 0: its index in `blocks`,
 /// and its arm in that entry (`gex_emit::dense`).
 pub(crate) fn lookup(pc: u64) -> u32 {
-    slot_word(pc).map_or(0, |w| w.load(Ordering::Acquire))
+    lookup_in(pc, crate::thread_alt())
 }
 
-/// The slot map word of `pc`, where its page is in a dense table.
-fn slot_word(pc: u64) -> Option<&'static AtomicU32> {
+/// [`lookup`] in the directory of mode `alt` (`gex_abi::page_key`) rather
+/// than the one this thread runs in.
+pub(crate) fn lookup_in(pc: u64, alt: bool) -> u32 {
+    slot_word(pc, alt).map_or(0, |w| w.load(Ordering::Acquire))
+}
+
+/// The slot map word of `pc` in mode `alt`'s directory, where its page is
+/// in a dense table.
+fn slot_word(pc: u64, alt: bool) -> Option<&'static AtomicU32> {
     if !on() {
         return None;
     }
@@ -376,8 +383,7 @@ fn slot_word(pc: u64) -> Option<&'static AtomicU32> {
     if page >= gex_abi::dispatch_max_pages() {
         return None;
     }
-    // In the directory of the mode this thread runs in.
-    let dir = crate::dir_word(gex_abi::page_key(pc, crate::thread_alt()));
+    let dir = crate::dir_word(gex_abi::page_key(pc, alt));
     if dir == u64::MAX {
         return None;
     }

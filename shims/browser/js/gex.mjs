@@ -8285,7 +8285,10 @@ export class Gex {
     const e = this.#shim.exports;
     const stub = this.#watch();
     for (const c of this.#callouts) {
-      const ref = e.gex_dispatch_ref(c.ret);
+      // In the mode the call-out was made in: the thread may be in the
+      // other, and a change of mode in wasm (no trap) comes back to it with
+      // no arming in between.
+      const ref = e.gex_dispatch_ref_mode ? e.gex_dispatch_ref_mode(c.ret, c.alt ? 1 : 0) : e.gex_dispatch_ref(c.ret);
       const table = ref < 0n ? -1 : Number(ref >> 32n), index = ref < 0n ? -1 : Number(ref & 0xffffffffn);
       if (c.w && (c.w.table !== table || c.w.index !== index)) this.#unwatch(c);
       if (table < 0) continue;
@@ -8419,6 +8422,7 @@ export class Gex {
     c.span = span >= 0n ? span : CALLOUT_UNWOUND;
     c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
+    this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');
     this.#calloutsMade++;
     if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
@@ -8606,6 +8610,7 @@ export class Gex {
       e.gex_callout_leave_ok?.(0);
       this.#unwatch(c);
       this.#callouts.pop();
+      this.#calloutGuard();
       this.#nest.pop();
       // Left by an exception, the shim's half has not popped its entry.
       e.gex_callout_unwind?.(me);
@@ -8617,6 +8622,18 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /** Tell the shim where the innermost call-out's caller is unwound past
+   *  (`gex_callout_guard`): a change of mode served in wasm, which never
+   *  comes back to this loop, leaves it when the stack is past there, as
+   *  this loop's own check would after a trap. */
+  #calloutGuard() {
+    const g = this.#shim.exports.gex_callout_guard;
+    if (!g) return;
+    const c = this.#callouts.at(-1);
+    if (!c || c.spWant === 0n) g(0n, 0);
+    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0);
+  }
 
   /** The guest stack pointer's byte offset in a thread's context, which
    *  differs by guest architecture. */

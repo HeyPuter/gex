@@ -2630,24 +2630,36 @@ pub extern "C" fn gex_callout_hit() -> i32 {
     HIT.with(|h| h.replace(-1))
 }
 
-/// How dispatch reaches `pc` in this Worker: `table << 32 | index`, the
-/// table being a dispatch table or `gex_emit::dense::TABLE_INDEX`
-/// (`blocks`); -1 when nothing is there yet (a miss). What a call-out
-/// watches its return through.
+/// How dispatch reaches `pc` in this Worker, in the mode this thread runs
+/// in: `table << 32 | index`, the table being a dispatch table or
+/// `gex_emit::dense::TABLE_INDEX` (`blocks`); -1 when nothing is there yet
+/// (a miss).
 #[no_mangle]
 pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
-    let pc = pc as u64;
-    let page = gex_abi::dispatch_page(pc);
-    if page >= gex_abi::dispatch_max_pages() {
+    dispatch_ref(pc as u64, crate::thread_alt())
+}
+
+/// [`gex_dispatch_ref`] in mode `alt` (1: a WoW64 process's 32-bit code),
+/// whichever the thread runs in now: what a call-out watches its return
+/// through, in the mode it was made in, as the thread may be in the other
+/// when it arms it.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_ref_mode(pc: i64, alt: i32) -> i64 {
+    dispatch_ref(pc as u64, alt != 0)
+}
+
+fn dispatch_ref(pc: u64, alt: bool) -> i64 {
+    let at = crate::dir_word(gex_abi::page_key(pc, alt));
+    if at == u64::MAX {
         return -1;
     }
-    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
+    let entry = GuestMem::new(crate::guest_bytes()).read_u32(at).unwrap_or(0);
     if entry == 0 {
         return -1;
     }
     let k = gex_abi::dispatch_entry_table(entry);
     if crate::dense::dense_table(k) {
-        let d = crate::dense::lookup(pc);
+        let d = crate::dense::lookup_in(pc, alt);
         return if d == 0 { -1 } else { ((gex_emit::dense::TABLE_INDEX as i64) << 32) | d as i64 };
     }
     ((k as i64) << 32) | gex_abi::dispatch_index(pc, entry) as i64

@@ -600,6 +600,19 @@ pub const DISPATCH_MISS_REDISPATCH: i32 = -1;
 /// most of what a call-out cost in the browser.
 pub const DISPATCH_MISS_LEAVE: i32 = -2;
 
+/// What `gex.dispatch_miss` returns, at or below this, for "dispatch to the
+/// slot of this directory-style entry (`table << 24 | slot`, the slot
+/// within its page already added)": `DISPATCH_MISS_ENTRY - entry`. The
+/// stub selects the table as dispatch does, dense tables included. A far
+/// transfer's change of mode takes it: the target's translation in the new
+/// mode's directory, which this module does not read.
+pub const DISPATCH_MISS_ENTRY: i32 = -16;
+
+/// [`DISPATCH_MISS_ENTRY`]'s answer for `entry`.
+pub const fn dispatch_miss_entry(entry: u32) -> i32 {
+    DISPATCH_MISS_ENTRY - entry as i32
+}
+
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
@@ -1437,10 +1450,56 @@ impl ModuleBuilder {
         f.if_void();
         f.byte(0x0f); // return
         f.end();
+        if gex_abi::DISPATCH_TABLES > 1 {
+            // An entry to dispatch to (DISPATCH_MISS_ENTRY), its table
+            // selected as `build_dispatch` selects it.
+            let index = f.add_local(ValType::I32);
+            let table = f.add_local(ValType::I32);
+            f.local_get(r);
+            f.i32_const(DISPATCH_MISS_ENTRY);
+            f.byte(0x4c); // i32.le_s
+            f.if_void();
+            f.i32_const(DISPATCH_MISS_ENTRY);
+            f.local_get(r);
+            f.byte(0x6b); // i32.sub: the entry
+            f.local_tee(table);
+            f.i32_const(gex_abi::DISPATCH_SLOT_MASK as i32);
+            f.byte(0x71); // i32.and
+            f.local_set(index);
+            f.local_get(table);
+            f.i32_const(gex_abi::DISPATCH_SLOT_BITS as i32);
+            f.byte(0x76); // i32.shr_u
+            f.local_set(table);
+            self.emit_table_call(&mut f, index, table);
+            f.end();
+        }
         f.local_get(0); // ctx argument for the target
         f.local_get(r);
         f.return_call_indirect(self.block_ty, 0);
         f.finish()
+    }
+
+    /// The tail call to slot `index` of the table numbered in local `table`
+    /// (`ctx` in local 0), table 0 for a number past the last: `br_table`
+    /// over the tables, a dense one through its arm.
+    fn emit_table_call(&self, f: &mut FuncBody, index: u32, table: u32) {
+        let n = gex_abi::DISPATCH_TABLES as u32;
+        for _ in 0..n {
+            f.block_void();
+        }
+        f.local_get(table);
+        let targets: Vec<u32> = (0..n).map(|k| n - 1 - k).collect();
+        f.br_table(&targets, n - 1);
+        for k in (0..n).rev() {
+            f.end();
+            if crate::dense::table(k as usize) {
+                crate::dense::emit_arm(f, k as usize, 0, index, table, self.block_ty, self.entry_ty);
+                continue;
+            }
+            f.local_get(0); // ctx argument for the target block
+            f.local_get(index);
+            f.return_call_indirect(self.block_ty, k);
+        }
     }
 
     /// `(ctx, pc) -> ()`: the host's entry point into translated code:
@@ -1535,27 +1594,11 @@ impl ModuleBuilder {
         // And the table the entry names, selected as tier-1 selects it: table
         // k breaks to depth `n-1-k`, the default being table 0 so an entry
         // naming a nonexistent table reaches the miss stub, not the engine.
-        let n = gex_abi::DISPATCH_TABLES as u32;
         f.local_get(entry);
         f.i32_const(gex_abi::DISPATCH_SLOT_BITS as i32);
         f.byte(0x76); // i32.shr_u
         f.local_set(entry);
-        for _ in 0..n {
-            f.block_void();
-        }
-        f.local_get(entry);
-        let targets: Vec<u32> = (0..n).map(|k| n - 1 - k).collect();
-        f.br_table(&targets, n - 1);
-        for k in (0..n).rev() {
-            f.end();
-            if crate::dense::table(k as usize) {
-                crate::dense::emit_arm(&mut f, k as usize, 0, index, entry, self.block_ty, self.entry_ty);
-                continue;
-            }
-            f.local_get(0); // ctx argument for the target block
-            f.local_get(index);
-            f.return_call_indirect(self.block_ty, k);
-        }
+        self.emit_table_call(&mut f, index, entry);
         f.finish()
     }
 }
