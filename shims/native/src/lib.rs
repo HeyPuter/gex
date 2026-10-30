@@ -5158,11 +5158,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // not always RSP: 32-bit code runs on its 32-bit stack, the
                 // 64-bit one's pointer in R14 (`hook_stack`), which is what
                 // has or has not unwound (`wow64_live_sp`).
+                // A call-out made from 32-bit code waits on ESP, and not
+                // while the thread is in 64-bit code (`callout_live_sp`).
                 let sp = if gex_abi::X86 {
                     let wow64 = caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir != 0);
-                    gex_kernel::x86::wow64_live_sp(&GuestMem::new(memory.bytes()), ctx_addr, thread_alt(&caller), wow64)
+                    gex_kernel::x86::callout_live_sp(&GuestMem::new(memory.bytes()), ctx_addr, thread_alt(&caller), wow64, co.alt)
                 } else {
-                    GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0)
+                    GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).ok()
                 };
                 // Not at a function's own address under a native caller (the
                 // bridge's poll there): leaving would hand the function back
@@ -5180,9 +5182,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // it: a whole trap-out and re-entry per safepoint on every
                 // thread but the main one (wined3d's command-stream thread
                 // spun at a crawl, and a game drew no frame).
-                if co.ret != 0 && sp > co.sp_want + co.unwound && !at_function() {
+                if co.ret != 0 && sp.is_some_and(|sp| sp > co.sp_want + co.unwound) && !at_function() {
                     if wasm_trace() {
-                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
+                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {:#x}, want {:#x})", co.ret, sp.unwrap_or(0), co.sp_want);
                     }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
                     caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
@@ -5865,6 +5867,9 @@ struct Callout {
     /// callee's argument bytes exactly those (a return to the pad with the
     /// stack above them is an outer native caller's).
     span: u64,
+    /// Made from code in the mode its process's class is not (`thread_alt`):
+    /// a WoW64 process's 32-bit code, whose frames are on the 32-bit stack.
+    alt: bool,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
@@ -6501,7 +6506,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             }
         }
     }
-    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, slot: None, live: false });
+    let alt = thread_alt(caller);
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;

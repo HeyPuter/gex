@@ -80,6 +80,18 @@ pub fn wow64_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool) ->
     if !on(rsp) && on(r14) { r14 } else { rsp }
 }
 
+/// [`wow64_live_sp`] for a call-out made in `callout_alt` mode, whose
+/// caller's frame is on that mode's stack: one made from 32-bit code (a
+/// native 32-bit module's guest call, `ctx::CS` 0x23 at the call) waits on
+/// ESP, which says nothing while the thread runs 64-bit code (a syscall
+/// under it): `None` then, and the check waits for the thread's return.
+pub fn callout_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool, callout_alt: bool) -> Option<u64> {
+    if !callout_alt {
+        return Some(wow64_live_sp(m, ctx_addr, alt, wow64));
+    }
+    alt.then(|| m.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff)
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -1231,6 +1243,34 @@ mod tests {
         assert_eq!(run(&[-12.0], x87op::FXTRACT).0, vec![-1.5, 3.0]);
         assert_eq!(run(&[0.0], x87op::FXTRACT).0, vec![0.0, f64::NEG_INFINITY]);
         assert_eq!(run(&[f64::MIN_POSITIVE / 4.0], x87op::FXTRACT).0, vec![1.0, -1024.0]);
+    }
+
+    #[test]
+    fn call_outs_wait_on_the_stack_of_the_mode_they_were_made_in() {
+        // A WoW64 thread: TEB at 0x2000, its 64-bit stack 0x10000..0x20000,
+        // the 32-bit stack around 0x8000 (R14 keeps the 64-bit one).
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u64(CTX + ctx::GS_BASE as u64, 0x2000).unwrap();
+        m.write_u64(0x2008, 0x20000).unwrap();
+        m.write_u64(0x2010, 0x10000).unwrap();
+        let regs = |m: &mut GuestMem<'_>, rsp: u64, r14: u64| {
+            m.write_u64(CTX + ctx::x(4) as u64, rsp).unwrap();
+            m.write_u64(CTX + ctx::x(14) as u64, r14).unwrap();
+        };
+        // In 32-bit code: a 64-bit call-out waits on R14, a 32-bit one on ESP.
+        regs(&mut m, 0xffff_ffff_0000_8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, true, true, false), Some(0x18000));
+        assert_eq!(callout_live_sp(&m, CTX, true, true, true), Some(0x8000));
+        // In 64-bit code (a syscall under a 32-bit call-out): RSP for a
+        // 64-bit call-out; a 32-bit one waits.
+        regs(&mut m, 0x17000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x17000));
+        assert_eq!(callout_live_sp(&m, CTX, false, true, true), None);
+        // 64-bit code still on the 32-bit stack (before syscall_32to64's
+        // switch): R14.
+        regs(&mut m, 0x8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x18000));
     }
 
     #[test]

@@ -7035,7 +7035,7 @@ export class Gex {
       // native frame down to the innermost loop, live ones included.
       if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
-        const sp = this.#liveSp(Number(ctx));
+        const sp = this.#liveSp(Number(ctx), c);
         if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
           err.gexNativeLeft = true;
           throw err;
@@ -8406,7 +8406,9 @@ export class Gex {
     // (native Wine's own for a thread's loop, `gex_call_out(ctx, pc, 0, 0)`).
     // This list's index is not it.
     const ri = e.gex_callout_opened?.() ?? me;
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri };
+    // `alt`: made from code in the mode its process's class is not (a WoW64
+    // process's 32-bit code), whose frames are on the 32-bit stack.
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri, alt: (e.gex_ctx_alt?.(ctx) ?? 0) === 1 };
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -8500,7 +8502,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && this.#liveSp(ctx) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && this.#liveSp(ctx, c) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -8568,7 +8570,7 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
-          const sp = this.#liveSp(ctx);
+          const sp = this.#liveSp(ctx, c);
           // Native Wine's return pad, reached with nobody's watch or miss
           // taking it (cgen.rs `native_return_stray`): the guest went on
           // past this call-out to a native caller's return (an exception
@@ -8660,9 +8662,12 @@ export class Gex {
   /** The stack pointer of the stack call-outs are made on, which a call-out's
    *  caller's frame is or is not unwound past: RSP, but in a WoW64 process
    *  the 64-bit stack's wherever the WoW64 CPU keeps it (R14 in 32-bit code
-   *  and around its transitions: the shim's `gex_live_sp`). */
-  #liveSp(ctx) {
+   *  and around its transitions: the shim's `gex_live_sp`). For call-out
+   *  `c` made from 32-bit code, ESP, and -1n while the thread runs 64-bit
+   *  code, which no comparison takes as unwound (`gex_callout_live_sp`). */
+  #liveSp(ctx, c = null) {
     const e = this.#shim.exports;
+    if (c?.alt && e.gex_callout_live_sp) return BigInt(e.gex_callout_live_sp(ctx, 1));
     if (e.gex_live_sp) return BigInt.asUintN(64, BigInt(e.gex_live_sp(ctx)));
     return new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
   }

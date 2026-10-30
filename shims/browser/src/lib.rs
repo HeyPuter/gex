@@ -15487,6 +15487,21 @@ pub extern "C" fn gex_live_sp(ctx: i32) -> i64 {
     gex_kernel::x86::wow64_live_sp(&gm, c, alt, wow64) as i64
 }
 
+/// [`gex_live_sp`] for a call-out made in `callout_alt` mode
+/// (`gex_kernel::x86::callout_live_sp`): -1 while it says nothing (a call-out
+/// made from 32-bit code, the thread now in 64-bit code).
+#[no_mangle]
+pub extern "C" fn gex_callout_live_sp(ctx: i32, callout_alt: i32) -> i64 {
+    if !gex_abi::X86 || callout_alt == 0 {
+        return gex_live_sp(ctx);
+    }
+    let gm = GuestMem::new(guest_bytes());
+    let c = ctx as u32 as u64;
+    let alt = cs_alt(gm.read_u32(c + ctx::CS as u64).unwrap_or(0));
+    let wow64 = ALT_DIR.load(std::sync::atomic::Ordering::Acquire) != 0;
+    gex_kernel::x86::callout_live_sp(&gm, c, alt, wow64, true).map_or(-1, |sp| sp as i64)
+}
+
 /// Whether this thread runs code in the mode its process's own class is
 /// not (`ctx::CS`): a WoW64 process's 32-bit code.
 pub(crate) fn thread_alt() -> bool {
