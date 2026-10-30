@@ -1,7 +1,7 @@
 // A test in a page of its own (run.mjs `--host browser`): the page is
 // /__t/page?test=GROUP/NAME&src=URL&arch=ARCH. `globalThis.__t` is what the
-// runner reads: `lines` as they come, `input` it sends over CDP, and `done`
-// with the result.
+// runner reads: `lines` as they come, `asks` it sends over CDP (answering
+// each in `replies`), and `done` with the result.
 
 import { makeT, runTest } from './t.js';
 
@@ -13,7 +13,7 @@ try {
   sessionStorage.removeItem('__t');
 } catch {}
 const res = kept?.res ?? { checks: 0, fail: [], times: {} };
-const g = (globalThis.__t = { done: false, lines: kept?.lines ?? [], input: [], inputDone: 0, res });
+const g = (globalThis.__t = { done: false, lines: kept?.lines ?? [], asks: [], replies: {}, res });
 const emit = (s) => {
   g.lines.push(s);
   console.log(s);
@@ -37,13 +37,45 @@ Object.assign(t, {
     location.reload();
     return new Promise(() => {});
   },
-  /** Real input through the browser (the runner sends each over CDP):
-   *  `{ method: 'Input.dispatchMouseEvent', ... }` and the like. Resolves once
-   *  they are sent. */
+  /** CDP commands on this page, sent by the runner in order: their results.
+   *  `save: NAME` on one whose result has `data` (a screenshot): the runner
+   *  writes it to its artefacts directory, and the result is `{ path }`. */
+  async cdp(...asks) {
+    const from = g.asks.length;
+    g.asks.push(...asks);
+    await t.until(() => from + asks.length - 1 in g.replies, 'the test runner answering', 30000);
+    return asks.map((a, i) => {
+      const r = g.replies[from + i];
+      delete g.replies[from + i];
+      if (r.error) throw new Error(`${a.method}: ${r.error}`);
+      return r.result;
+    });
+  },
+  /** Real input through the browser: `{ method: 'Input.dispatchMouseEvent',
+   *  ... }` and the like. Resolves once they are sent. */
   async input(...events) {
-    g.input.push(...events);
-    const want = g.input.length;
-    await t.until(() => g.inputDone >= want, 'the test runner sending input', 10000);
+    await t.cdp(...events);
+  },
+  /** The page as the browser shows it, saved as `NAME` (.png) among the
+   *  run's artefacts: its path. `clip`: `{ x, y, width, height }` only. */
+  async screenshot(name, clip) {
+    const [r] = await t.cdp({ method: 'Page.captureScreenshot', format: 'png', save: `${name}.png`, ...(clip ? { clip: { ...clip, scale: 1 } } : {}) });
+    return r.path;
+  },
+  /** The page's pixels in `clip` (`{ x, y, width, height }`, CSS pixels), as
+   *  the browser composited them: what a WebGPU canvas showed, which the page
+   *  itself cannot read back. An ImageData. */
+  async pixels(clip) {
+    const [r] = await t.cdp({ method: 'Page.captureScreenshot', format: 'png', clip: { ...clip, scale: 1 } });
+    const bytes = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
+    const img = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+    const c = new OffscreenCanvas(img.width, img.height).getContext('2d');
+    c.drawImage(img, 0, 0);
+    return c.getImageData(0, 0, img.width, img.height);
+  },
+  /** One pixel at page coordinates `(x, y)`: `[r, g, b, a]`. */
+  async pixel(x, y) {
+    return [...(await t.pixels({ x, y, width: 1, height: 1 })).data];
   },
   /** A real click at page coordinates `(x, y)`. */
   click: (x, y) => t.input(

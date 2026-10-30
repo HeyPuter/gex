@@ -20,12 +20,13 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--verbose` | Every check line, the guest's console and Chromium's. |
 | `--work DIR` | The work directory (default a fresh temporary one, deleted after). Its images are kept and reused while their inputs are unchanged. |
 | `--port N` | vite's port (default 5411); Chromium's debugging port is N+1. |
+| `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
 default on PATH), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
-/usr/bin/chromium), `GEX_TEST_WORK` and `GEX_TEST_PORT` (the defaults of
-`--work` and `--port`).
+/usr/bin/chromium), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
+defaults of `--work`, `--port` and `--artefacts`).
 
 The browser host is vite on web/ (cross-origin isolated, the runtime from
 source) and one headless Chromium on WebGPU. Each test gets a page in a
@@ -92,6 +93,7 @@ A page or process runs one test, so each makes its own System.
 | | |
 |---|---|
 | `t.check(what, cond, detail)`, `t.eq(what, got, want, more)` | A check: a line, `ok` or `FAIL`. A failed check does not stop the test. |
+| `t.near(what, colour, want, tol)` | A check that a colour is within `tol` (default 8) of `want` in every channel it names. |
 | `t.say(text)` | A line of output. |
 | `t.until(fn, what, ms)`, `t.timeout(promise, ms, what)` | Wait for a truthy `fn()`, or for a promise, else throw. |
 | `t.lines(process, stream)` | A stream's text as lines, as they come (a process's stdout by default). |
@@ -103,6 +105,9 @@ A page or process runs one test, so each makes its own System.
 | `t.reload(state)` | Run the test again in a fresh page or process, as phase `t.phase + 1` with `t.state = state`; the checks so far are kept. |
 | `t.phase`, `t.state` | This run's phase (1 first), and what `reload` was given. |
 | `t.input(...events)`, `t.click(x, y)` | Real input over CDP: `{ method: 'Input.dispatchMouseEvent', ... }` and the like (browser). |
+| `t.pixels(clip)`, `t.pixel(x, y)` | The page's pixels as the browser composited them (a WebGPU canvas too): an ImageData of `{ x, y, width, height }`, or one `[r, g, b, a]` (browser). |
+| `t.screenshot(name, clip)` | The page, or `clip` of it, saved as `NAME.png` among the artefacts: its path (browser). |
+| `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
 
 ## Images

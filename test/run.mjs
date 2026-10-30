@@ -1,13 +1,14 @@
 // gex's test runner: test/README.md.
 //
 //   node test/run.mjs [--group G,...] [--host browser|node|both] [--arch a64,x86]
-//                     [--jobs N] [--allow-skip] [--verbose] [--work DIR] [--port N] [TEST...]
+//                     [--jobs N] [--allow-skip] [--verbose] [--work DIR] [--artefacts DIR]
+//                     [--port N] [TEST...]
 //
 // One JSON line per test, host and arch on stdout; what a person reads on
 // stderr. Exit 0 only when every test is ok (and skips, with --allow-skip).
 
 import { spawn, fork } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -31,6 +32,7 @@ const { values: o, positionals } = parseArgs({
     verbose: { type: 'boolean', default: false },
     work: { type: 'string', default: process.env.GEX_TEST_WORK },
     port: { type: 'string', default: process.env.GEX_TEST_PORT || '5411' },
+    artefacts: { type: 'string', default: process.env.GEX_TEST_ARTEFACTS },
     list: { type: 'boolean', default: false },
   },
 });
@@ -71,6 +73,8 @@ if (o.list) {
 // -- the images --------------------------------------------------------------
 const WORK = o.work || mkdtempSync(join(tmpdir(), 'gex-test-'));
 mkdirSync(WORK, { recursive: true });
+// Screenshots (`t.screenshot`, and one of every browser test that fails).
+const ARTEFACTS = o.artefacts || join(WORK, 'artefacts');
 const missing = new Map();
 for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
   if (!images[name]) throw new Error(`no image ${name} (test/fixtures/images.mjs)`);
@@ -262,23 +266,39 @@ async function runPage(test, arch, say, timeout) {
   let shown = 0;
   let sent = 0;
   let v = null;
+  const dir = join(ARTEFACTS, `${test.name.replace('/', '-')}-${arch}`);
+  const save = (name, b64) => {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, name);
+    writeFileSync(path, Buffer.from(b64, 'base64'));
+    say(`saved ${path}`);
+    return path;
+  };
+  const poll = 'JSON.stringify(globalThis.__t ? (({ done, lines, asks, res, result, skip }) => ({ done, lines, asks, res, result, skip }))(globalThis.__t) : null)';
   while (Date.now() - t0 < timeout) {
-    await sleep(250);
-    const r = await cdp.send('Runtime.evaluate', { expression: 'JSON.stringify(globalThis.__t ?? null)', returnByValue: true }, sessionId).catch(() => null);
+    await sleep(sent ? 50 : 250);
+    const r = await cdp.send('Runtime.evaluate', { expression: poll, returnByValue: true }, sessionId).catch(() => null);
     const now = r?.result?.value ? JSON.parse(r.result.value) : null;
     if (!now) continue;
     v = now;
     for (; shown < v.lines.length; shown++) say(v.lines[shown]);
-    // Real input the page asks for (`t.input`): what a user gesture needs.
-    if (v.input.length < sent) sent = v.input.length; // a new phase
-    if (v.input.length > sent) {
-      for (; sent < v.input.length; sent++) {
-        const { method, ...params } = v.input[sent];
-        await cdp.send(method, params, sessionId).catch((e) => say(`${method}: ${e?.message ?? e}`));
-      }
-      await cdp.send('Runtime.evaluate', { expression: `globalThis.__t.inputDone = ${sent}` }, sessionId).catch(() => {});
+    // What the page asks of the browser (`t.cdp`): real input, which a user
+    // gesture needs, and screenshots. Each answer goes back by its index.
+    if (v.asks.length < sent) sent = v.asks.length; // a new phase
+    for (; sent < v.asks.length; sent++) {
+      const { method, save: name, ...params } = v.asks[sent];
+      const reply = await cdp.send(method, params, sessionId).then(
+        (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
+        (e) => ({ error: String(e?.message ?? e) }),
+      );
+      await cdp.send('Runtime.evaluate', { expression: `globalThis.__t.replies[${sent}] = ${JSON.stringify(reply)}` }, sessionId).catch(() => {});
     }
     if (v.done) break;
+  }
+  // What the page showed when it failed.
+  if (!v?.done || v.result === 'FAIL') {
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId).catch(() => null);
+    if (shot?.data) save('fail.png', shot.data);
   }
   for (const f of off) f();
   await cdp.send('Target.closeTarget', { targetId }).catch(() => {});

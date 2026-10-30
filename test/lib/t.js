@@ -28,6 +28,9 @@ export function makeT({ host, arch, phase = 1, state = null, res, emit }) {
     },
     /** `more`: said too when it fails (a log's tail). */
     eq: (what, got, want, more = '') => t.check(what, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}${more ? ` (${more})` : ''}`),
+    /** A colour within `tol` of `want` in every channel (`[r, g, b]` or
+     *  `[r, g, b, a]`). */
+    near: (what, got, want, tol = 8) => t.check(what, want.every((w, i) => Math.abs(got[i] - w) <= tol), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)} within ${tol}`),
     /** End the test as skipped, saying why. */
     skip(why) {
       throw new Skip(why);
