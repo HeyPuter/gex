@@ -1,4 +1,4 @@
-// An init named in the boot options runs as pid 1 and owns the processes:
+// An init given to boot() runs as pid 1 and owns the processes:
 // the page spawns nothing, the init's children run and it collects them and
 // their orphans, and when it ends the system stops.
 import { System } from '../src/index.js';
@@ -6,12 +6,15 @@ import { Filesystem } from '../src/fs.js';
 import { main, check, eq, timeout, testDebug } from './lib.js';
 
 main(async () => {
-  // Its child exits 7 and leaves a grandchild that exits 5 after it.
-  const cmd = 'sh -c "sleep 0.3; exit 5" > /dev/null 2>&1 & echo $! > /tmp/orphan; exit 7';
-  const sys = new System({ baseUrl: '/', init: { argv: ['rt-probe', 'init', cmd], env: { PATH: '/bin:/usr/bin' } }, debug: testDebug() });
+  const sys = new System({ baseUrl: '/', debug: testDebug() });
   const fs = new Filesystem(sys);
   fs.addTar('/__rt/bb.tar.zst');
-  await timeout(sys.boot(), 60000, 'boot');
+  // The init, a script: its child exits 7 and leaves a grandchild that
+  // exits 5 after it.
+  fs.addFiles({ '/sbin/rt-init': `#!/bin/sh
+exec rt-probe init 'sh -c "sleep 0.3; exit 5" > /dev/null 2>&1 & echo $! > /tmp/orphan; exit 7'
+` }, { mode: 0o755 });
+  await timeout(sys.boot('/sbin/rt-init'), 60000, 'boot');
   eq('init is pid 1', await timeout(sys.init.started, 10000, 'init'), 1);
   let threw = null;
   try { sys.spawn(['true']); } catch (e) { threw = e; }
