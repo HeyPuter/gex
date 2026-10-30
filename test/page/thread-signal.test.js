@@ -14,7 +14,7 @@ export default async function (t) {
   const g = guest(t);
   g.pub('gex_browser{infix}.shared.wasm');
   g.pub('gex_kernel{infix}.wasm');
-  const r = await g.run(g.seed(), g.cc('thread-signal.c', { flags: ['-lpthread'] }), [], { env: { GEX_SHARED: '1' } });
+  const r = await g.run(g.seed(), g.cc('thread-signal.c', { libs: ['-lpthread'] }), [], { env: { GEX_SHARED: '1' } });
   t.eq('a pthread_kill reaches a spinning thread, and an alarm a spinning main thread', r.guest,
     'spinning threads took SIGUSR1 promptly: yes\nalarm ended a spin: yes', tail(r.stderr, 3));
 }

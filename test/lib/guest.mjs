@@ -10,7 +10,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 export const ROOT = join(import.meta.dirname, '..', '..');
@@ -31,6 +31,8 @@ const which = (cmd) => {
 export function guestLines(out) {
   return out.split('\n').map((l) => l.replace(/\[gex[^\]]*\] .*/, '').replace(/^\[.*/, '')).filter(Boolean).join('\n');
 }
+
+let runs = 0;
 
 export function guest(t) {
   const arch = t.arch === 'x86' ? 'x86' : 'a64';
@@ -64,20 +66,20 @@ export function guest(t) {
      * arch: by default static musl with zig, at the address the page's
      * programs load (`-Wl,--image-base=0x1000000`). `glibc`: dynamic,
      * against the host's glibc (gcc, x86 only) or zig's glibc 2.36 (a64).
-     * `flags`: more for the compiler; `imageBase: false` leaves a musl
+     * `flags`: more for the compiler, `libs` after the source; `imageBase: false` leaves a musl
      * program where the linker puts it; `opt` the optimisation flag.
      */
-    cc(src, { glibc = false, flags = [], imageBase = true, opt = glibc ? '-O1' : '-O2' } = {}) {
+    cc(src, { glibc = false, flags = [], libs = [], imageBase = true, opt = glibc ? '-O1' : '-O2' } = {}) {
       const { name, code } = typeof src === 'string' ? { name: basename(src, '.c'), code: readFileSync(join(PROGRAMS, src), 'utf8') } : src;
       let cmd;
       if (glibc && x86) cmd = [tool('gcc'), opt];
       else if (glibc) cmd = [tool('zig'), 'cc', '-target', 'aarch64-linux-gnu.2.36', opt];
       else cmd = [tool('zig'), 'cc', '-target', `${x86 ? 'x86_64' : 'aarch64'}-linux-musl`, opt, '-static', ...(imageBase ? ['-Wl,--image-base=0x1000000'] : [])];
       const all = [...cmd, ...flags];
-      return cached(`${all.join(' ')}\n${code}`, name, (out) => {
+      return cached(`${all.join(' ')} ${libs.join(' ')}\n${code}`, name, (out) => {
         const c = `${out}.c`;
         writeFileSync(c, code);
-        execFileSync(all[0], [...all.slice(1), '-o', out, c], { stdio: ['ignore', 'ignore', 'pipe'] });
+        execFileSync(all[0], [...all.slice(1), '-o', out, c, ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
       });
     },
     /**
@@ -113,15 +115,14 @@ export function guest(t) {
      * host path }`), `argv0`, `env` (on top of this one's), `timeout` (ms)
      * and `flags` (run-node.mjs's own, before the seed). `single`: the
      * single-thread build, as the page without SharedArrayBuffer runs it
-     * (GEX_SINGLE=1, JSPI, no SharedArrayBuffer). Resolves `{ code, signal,
-     * stdout, stderr, guest }`, `guest` being `guestLines(stdout)`.
+     * (GEX_SINGLE=1, JSPI, no SharedArrayBuffer); `jspi` JSPI alone, where
+     * this node has it only behind a flag. Resolves `{ code, signal,
+     * stdout, stderr, all, guest }`, `guest` being `guestLines(stdout)`.
      */
-    run(seed, prog, args = [], { files = {}, argv0, env = {}, timeout = 120000, flags = [], single = false } = {}) {
+    run(seed, prog, args = [], { files = {}, argv0, env = {}, timeout = 120000, flags = [], single = false, merge = false, jspi = single } = {}) {
       const argv = [
-        ...(single ? [
-          ...(typeof WebAssembly.Suspending === 'function' ? [] : ['--experimental-wasm-jspi']),
-          '--import', 'data:text/javascript,delete globalThis.SharedArrayBuffer',
-        ] : []),
+        ...(jspi && typeof WebAssembly.Suspending !== 'function' ? ['--experimental-wasm-jspi'] : []),
+        ...(single ? ['--import', 'data:text/javascript,delete globalThis.SharedArrayBuffer'] : []),
         join(ROOT, 'shims/browser/js/run-node.mjs'), ...flags,
       ];
       if (single) env = { ...env, GEX_SINGLE: '1' };
@@ -131,16 +132,23 @@ export function guest(t) {
       return new Promise((resolve) => {
         // Not this process's IPC channel to the runner (fork's NODE_CHANNEL_FD).
         const { NODE_CHANNEL_FD, NODE_CHANNEL_SERIALIZATION_MODE, ...base } = process.env;
-        const p = spawn(process.execPath, argv, { cwd: ROOT, env: { ...base, ...g.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+        // `merge`: stdout and stderr into one file, in the order written, as
+        // `2>&1` keeps them (`all`; stdout and stderr then empty).
+        const file = merge ? join(cache, `run-${process.pid}-${++runs}.out`) : null;
+        const fd = file ? openSync(file, 'w') : null;
+        const p = spawn(process.execPath, argv, { cwd: ROOT, env: { ...base, ...g.env, ...env }, stdio: ['ignore', fd ?? 'pipe', fd ?? 'pipe'] });
+        if (fd !== null) closeSync(fd);
         const out = [];
         const err = [];
-        p.stdout.on('data', (d) => out.push(d));
-        p.stderr.on('data', (d) => err.push(d));
+        p.stdout?.on('data', (d) => out.push(d));
+        p.stderr?.on('data', (d) => err.push(d));
         const timer = setTimeout(() => p.kill('SIGKILL'), timeout);
         p.on('close', (code, signal) => {
           clearTimeout(timer);
           const stdout = Buffer.concat(out).toString();
-          resolve({ code, signal, stdout, stderr: Buffer.concat(err).toString(), guest: guestLines(stdout) });
+          const all = file ? readFileSync(file, 'utf8') : null;
+          if (file) rmSync(file, { force: true });
+          resolve({ code, signal, stdout, stderr: Buffer.concat(err).toString(), all, guest: guestLines(all ?? stdout) });
         });
       });
     },
