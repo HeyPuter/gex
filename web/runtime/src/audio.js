@@ -25,7 +25,7 @@ export class WebAudio extends EventTarget {
     this.#ready = new Promise((resolve, reject) => {
       i.afterBoot(async (s) => {
         try {
-          const at = await i.io().call('audioRing');
+          const at = (await i.kernel().r('k_audio_ring')) >>> 0;
           if (this.#closed) return resolve(this);
           const { playAudio } = await import('../../src/audio.js');
           this.#player = playAudio({ memory: s.kernel.memory, at, latency, context: ctx });

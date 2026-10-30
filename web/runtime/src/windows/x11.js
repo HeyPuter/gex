@@ -1,4 +1,4 @@
-// X11 for every windows part: display :0 held by the runtime's Worker until
+// X11 for every windows part: display :0 held by the page (programs.js) until
 // the first X client connects, then the runtime's X server (web/src/hostx.js,
 // through runProgram's `startX`) started on those sockets, where the client
 // waits.
@@ -7,7 +7,7 @@
 export function xOnDemand(i) {
   i.afterBoot(async (sys) => {
     if (!sys.startX) return;
-    const ids = await i.io().call('holdX');
+    const ids = await i.programs().holdX();
     i.on('x-wanted', () => {
       sys.startX(ids).catch((e) => i.say(`gex: the X server would not start: ${e?.message ?? e}\n`));
     });

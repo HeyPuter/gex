@@ -190,7 +190,7 @@ export class Gamepads extends EventTarget {
   #timer = 0;
   #raf = 0;
   #closed = false;
-  #io = null;
+  #k = null;
 
   /** `source`: what lists the controllers (default `navigator.getGamepads`).
    *  Events: `connect` (with `slot`, N of `eventN`, and the `gamepad`) and
@@ -202,8 +202,8 @@ export class Gamepads extends EventTarget {
     this.#i = i;
     i.attach('gamepads', this);
     i.afterBoot(async (s) => {
-      this.#io = i.io();
-      const at = await this.#io.call('joyTable');
+      this.#k = i.kernel();
+      const at = (await this.#k.r('k_joy_table')) >>> 0;
       if (this.#closed) return;
       if (!at) {
         i.say('gex: Gamepads: this kernel has no game controller table\n');
@@ -255,7 +255,7 @@ export class Gamepads extends EventTarget {
     for (let slot = 0; slot < this.#slots.length; slot++) {
       if (this.#slots[slot] && !seen.has(slot)) changed = this.#drop(slot) || changed;
     }
-    if (changed) this.#io.send('joyNotify');
+    if (changed) this.#notify();
   }
 
   #pad(slot) {
@@ -319,12 +319,17 @@ export class Gamepads extends EventTarget {
     return true;
   }
 
+  /** A change in the table, which wakes the processes reading /dev/input. */
+  #notify() {
+    this.#k?.r('k_joy_notify').catch(() => {});
+  }
+
   /** Stop: every controller goes from the guest. */
   close() {
     if (this.#closed) return;
     let changed = false;
     if (this.#mem) for (let slot = 0; slot < this.#slots.length; slot++) if (this.#slots[slot]) changed = this.#drop(slot) || changed;
-    if (changed) this.#io.send('joyNotify');
+    if (changed) this.#notify();
     this.#closed = true;
     clearTimeout(this.#timer);
     if (this.#raf) cancelAnimationFrame(this.#raf);

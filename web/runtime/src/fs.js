@@ -1,7 +1,6 @@
 // `Filesystem`: the guest's root, one per system. Before boot it is the tars
-// and files a page adds, laid one over another in the order added; the
-// runtime's Worker seeds the kernel's root with them at boot (io-worker.js
-// `seed`).
+// and files a page adds, laid one over another in the order added, seeded
+// into the kernel's root at boot (kfs.js `seed`).
 // After boot, a tar or files are written into the live tree, and the guest's
 // files can be read and written from the page.
 
@@ -96,7 +95,7 @@ export class Filesystem extends EventTarget {
     i.beforeBoot((opts) => this.#seed(opts));
     this[INTERNAL] = {
       sources: () => this.#sources,
-      /** For the runtime's Worker's start: the mounts made before boot,
+      /** For the system's start: the mounts made before boot,
        *  in place before the first program. */
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
       /** A Persist on this filesystem (persist.js): one, made before boot. */
@@ -109,9 +108,10 @@ export class Filesystem extends EventTarget {
     };
   }
 
-  #io(what) {
+  /** The guest's files (kfs.js), once the system runs. */
+  #files(what) {
     if (this.#sys.phase !== 'running') throw new Error(`${what}: the system is ${this.#sys.phase}, not running`);
-    return this.#sys.io();
+    return this.#sys.files();
   }
 
   /**
@@ -151,7 +151,7 @@ export class Filesystem extends EventTarget {
       tree.catch(() => {});
       return tree.then(() => {});
     }
-    return tree.then((t) => this.#io('addTar').call('addTree', { tree: t }));
+    return tree.then((t) => this.#files('addTar').addTree(t));
   }
 
   /** The layers, in order, as runProgram's options: later wins. */
@@ -225,7 +225,7 @@ export class Filesystem extends EventTarget {
     const mount = new Mount(this, at, provider);
     this.#mounts.set(at, { mount, id });
     if (this.#sys.phase === 'running') {
-      mount.ready = this.#sys.io().call('mount', { path: at, id }).then(() => mount);
+      mount.ready = this.#sys.files().mount(at, id).then(() => mount);
     } else {
       mount.ready = Promise.resolve(mount);
     }
@@ -239,7 +239,7 @@ export class Filesystem extends EventTarget {
     const m = this.#mounts.get(at);
     if (!m) throw Object.assign(new Error(`unmount: nothing mounted at ${at}`), { code: 'EINVAL' });
     this.#mounts.delete(at);
-    if (this.#sys.phase === 'running') await this.#sys.io().call('unmount', { path: at });
+    if (this.#sys.phase === 'running') await this.#sys.files().unmount(at);
     this.#host().remove(m.id);
     m.mount.dispatchEvent(new Event('unmounted'));
   }
@@ -253,48 +253,48 @@ export class Filesystem extends EventTarget {
 
   /** A file's bytes (`encoding`: its text). */
   async readFile(path, { encoding } = {}) {
-    const b = await this.#io('readFile').call('readFile', { path: norm(path) });
+    const b = await this.#files('readFile').readFile(norm(path));
     return encoding ? new TextDecoder(encoding).decode(b) : b;
   }
 
   /** Write a file, made if missing (`mode`, default 0644); `append`. */
   async writeFile(path, data, { mode, append, exclusive } = {}) {
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : await bytesOf(data, path);
-    return this.#io('writeFile').call('writeFile', { path: norm(path), data: bytes, opts: { mode, append, exclusive } });
+    return this.#files('writeFile').writeFile(norm(path), bytes, { mode, append, exclusive });
   }
 
   /** `{type, mode, size, ino, mtime (ms), nlink}`; `follow: false` is lstat. */
   stat(path, { follow = true } = {}) {
-    return this.#io('stat').call('stat', { path: norm(path), follow });
+    return this.#files('stat').stat(norm(path), follow);
   }
 
   /** `[{name, type}]`, without `.` and `..`. */
   readdir(path) {
-    return this.#io('readdir').call('readdir', { path: norm(path) });
+    return this.#files('readdir').readdir(norm(path));
   }
 
   mkdir(path, { recursive = false, mode = 0o755 } = {}) {
-    return this.#io('mkdir').call('mkdir', { path: norm(path), opts: { recursive, mode } });
+    return this.#files('mkdir').mkdir(norm(path), { recursive, mode });
   }
 
   rm(path, { recursive = false, force = false } = {}) {
-    return this.#io('rm').call('rm', { path: norm(path), opts: { recursive, force } });
+    return this.#files('rm').rm(norm(path), { recursive, force });
   }
 
   rename(from, to) {
-    return this.#io('rename').call('rename', { from: norm(from), to: norm(to) });
+    return this.#files('rename').rename(norm(from), norm(to));
   }
 
   symlink(target, path) {
-    return this.#io('symlink').call('symlink', { target, path: norm(path) });
+    return this.#files('symlink').symlink(target, norm(path));
   }
 
   readlink(path) {
-    return this.#io('readlink').call('readlink', { path: norm(path) });
+    return this.#files('readlink').readlink(norm(path));
   }
 
   chmod(path, mode) {
-    return this.#io('chmod').call('chmod', { path: norm(path), mode });
+    return this.#files('chmod').chmod(norm(path), mode);
   }
 
   /**
@@ -321,15 +321,16 @@ export class Filesystem extends EventTarget {
     let h = null;
     let stopped = false;
     const each = Object.assign((e) => fn(e), { at });
-    this.#io('watch').call('watch', { path: at }).then((got) => {
+    this.#files('watch');
+    i.programs().addWatch(at).then((got) => {
       h = got;
-      if (stopped) return i.io().call('unwatch', { h }).catch(() => {});
+      if (stopped) return i.programs().rmWatch(h).catch(() => {});
       this.#watching.set(h, each);
     }, (error) => fn({ type: 'error', path: at, error }));
     return () => {
       if (stopped) return;
       stopped = true;
-      if (h !== null && this.#watching.delete(h)) i.io()?.call('unwatch', { h }).catch(() => {});
+      if (h !== null && this.#watching.delete(h)) i.programs()?.rmWatch(h).catch(() => {});
     };
   }
   #watching = null;

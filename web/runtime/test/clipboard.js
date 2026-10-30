@@ -22,7 +22,6 @@ main(async () => {
     Object.assign(w.canvas.style, { position: 'absolute', left: `${x}px`, top: '0px' });
     desk.append(w.canvas);
     w.place(x, 0);
-    w.x = x;
   });
   // Without sync: this page's own clipboard stays out of it.
   const clip = new Clipboard(sys, { sync: false });

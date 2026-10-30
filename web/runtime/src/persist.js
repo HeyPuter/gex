@@ -2,9 +2,8 @@
 // the store's records are laid over the filesystem's sources; while the
 // system runs, what the programs change is handed to the store, about a
 // second after a change settles, every 30 s, and when the page is hidden or
-// left. The diff itself is the runtime's Worker's (io-worker.js
-// `persistDiff`): the tree as seeded against the tree now, without reading
-// a file nobody wrote.
+// left. The diff itself is kpersist.js's: the tree as seeded against the
+// tree now, without reading a file nobody wrote.
 //
 // A store is `{ load(), store({ put, drop }), reset() }`: `load` resolves
 // the records it holds; `store` takes new or changed records (`put`) and the
@@ -53,7 +52,7 @@ export class Persist extends EventTarget {
     this[INTERNAL] = {
       // The system's shutdown: one last save while the tree is there.
       shutdown: async () => {
-        if (this.#io && !this.#stopped) await this.save().catch(() => {});
+        if (this.#changes && !this.#stopped) await this.save().catch(() => {});
         this.#stop();
       },
     };
@@ -87,13 +86,13 @@ export class Persist extends EventTarget {
   }
 
   #run(i) {
-    this.#io = i.io();
-    const io = this.#io;
+    this.#changes = i.changes();
+    const changes = this.#changes;
     let first = 0;
     let last = 0;
     this.#timers.push(setInterval(() => {
       if (this.#stopped) return;
-      io.call('persistChanged').then((moved) => {
+      changes.changed().then((moved) => {
         const now = performance.now();
         if (moved) {
           last = now;
@@ -112,12 +111,12 @@ export class Persist extends EventTarget {
       globalThis.addEventListener?.('pagehide', this.#onHide);
     }
   }
-  #io = null;
+  #changes = null;
 
   /** Store what changed now. Resolves `{ stored, dropped, bytes }` once the
    *  store has it; a save asked while one runs runs after it. */
   save() {
-    if (!this.#io) return Promise.reject(new Error('persist: the system is not running'));
+    if (!this.#changes) return Promise.reject(new Error('persist: the system is not running'));
     if (this.#busy) {
       this.#again = true;
       return this.#busy;
@@ -138,7 +137,7 @@ export class Persist extends EventTarget {
   }
 
   async #once() {
-    const { put, drop } = await this.#io.call('persistDiff', { exclude: this.#exclude() });
+    const { put, drop } = await this.#changes.diff(this.#exclude());
     let bytes = 0;
     for (const r of put) bytes += r.data?.length ?? 0;
     if (put.length || drop.length) {
@@ -149,7 +148,7 @@ export class Persist extends EventTarget {
         this.dispatchEvent(Object.assign(new Event('error'), { error: e }));
         throw e;
       }
-      await this.#io.call('persistStored', { put: put.map((r) => [r.path, r.stamp]), drop });
+      this.#changes.stored({ put: put.map((r) => [r.path, r.stamp]), drop });
     }
     const s = this.#stats;
     s.saves++;
