@@ -28,7 +28,7 @@ node test/run.mjs --list                   # the jobs, without running them
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
 default on PATH), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
-/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
+/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_GEXC` (the `wine64-units` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
 
 The browser host is vite on web/ (cross-origin isolated, the runtime from
@@ -115,6 +115,7 @@ A page or process runs one test, so each makes its own System.
 | `t.screenshot(name, clip)` | The page, or `clip` of it, saved as `NAME.png` among the artefacts: its path (browser). |
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
+| `t.logs(re)` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). |
 
 ## Images
 
@@ -123,6 +124,7 @@ fixtures/images.mjs:
 - `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin`, a lazy file's bytes.
 - `slim`: GEX_TEST_SLIM's image and repository, with `slim-repo.json` listing the repository.
 - `package`: `pkg/`, the runtime package (web/runtime/build.sh).
-- `wine64`: `wine64.tar` and `wine64-lazy.json`. They hold 64-bit Wine's install (GEX_TEST_WINE64_DIST, wine64-dist.sh's WINE64_DIST) at /wine64 and a page prefix made from GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at /pfx. Files over 64 KiB are lazy, served from `wine64/` in the work directory (fixtures/wine/pack.py).
-- `win-progs`: `win-progs.tar`, the Windows test programs in fixtures/wine/src built with MinGW or clang (a source's `gex-nt-cc:` line) into `x64/` and `x86/`, or into one of them (`gex-nt-arch:`), with the libraries a `gex-nt-libs:` line names. `win-progs.json` says which did not build, and why.
+- `wine64`: `wine64.tar` and `wine64-lazy.json`. They hold 64-bit Wine's install (GEX_TEST_WINE64_DIST, wine64-dist.sh's WINE64_DIST) at /wine64 and a page prefix made from GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at /pfx. Files over 64 KiB are lazy, served from `wine64/` in the work directory (fixtures/wine/pack.py). A link in the install that points out of it (a dist made of links into another) is packed as what it points at.
+- `win-progs`: `win-progs.tar`, the Windows test programs in fixtures/wine/src built with MinGW or clang (a source's `gex-nt-cc:` line) into `x64/` and `x86/`, or into one of them (`gex-nt-arch:`), with the libraries a `gex-nt-libs:` line names, as a DLL with `gex-nt-shared`. `win-progs.json` says which did not build, and why.
+- `wine64-units`: `wine64-units/`, function-tier units (a unit cache) for the test programs in fixtures/wine/units.mjs and Wine's core DLLs, at the bases a run of each program names (fixtures/wine/unit-bases.mjs), and the NT trampolines. Built with GEX_TEST_GEXC (default target/x86's gexc) in a few minutes.
 - `gl-probes`: `gl-probes-x86.tar` and `gl-probes-a64.tar`, the guest GL and the self-checking probes in guest/gl/probes built against it (x86-64 glibc with gcc; aarch64 musl with ~/toolchains/aarch64-linux-musl-cross, when it is there). Also `gl-probes.json`: each probe's last line from a run on the host's own Mesa, which the guest's run must print, and the GL version it needs. Needs the host's EGL and GL and third_party/opengl-registry.

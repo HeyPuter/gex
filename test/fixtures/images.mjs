@@ -11,13 +11,19 @@
 //   package  pkg/: the runtime package, web/runtime/build.sh.
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
-//            `gex-nt-arch:` and `gex-nt-libs:` lines); win-progs.json says which
+//            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
+//            compiler, its one arch, its libraries, a DLL); win-progs.json says which
 //            did not build, and why.
 //   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
 //            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
 //            GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at
 //            /pfx; files over 64 KiB are lazy, served from wine64/ in the
 //            work directory (fixtures/wine/pack.py).
+//   wine64-units  wine64-units/: function-tier units (a unit cache, `gexc
+//            cgen-image`'s) for the programs in wine/units.mjs and Wine's core DLLs at the bases a
+//            run of them names (fixtures/wine/unit-bases.mjs), and the NT
+//            trampolines. Built with GEX_TEST_GEXC (default target/x86's
+//            gexc); a few minutes.
 //   gl-probes  gl-probes-ARCH.tar: the guest GL (guest/gl/build.sh) and each
 //            self-checking probe in guest/gl/probes built against it
 //            (/probes/NAME), with a loader and libc: x86-64 glibc with gcc and
@@ -29,11 +35,12 @@
 //            Needs gcc, the host's EGL and GL headers and libraries, and
 //            third_party/opengl-registry.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { UNIT_PROGS } from './wine/units.mjs';
 
 const HERE = import.meta.dirname;
 const ROOT = join(HERE, '..', '..');
@@ -48,7 +55,11 @@ const PROBES = {
 
 /** What each image leaves in the work directory: with `--prebuilt`, an
  *  image whose files are not there is missing. */
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'] };
+// The `wine64-units` image: Wine's DLLs that get a unit (where every
+// program spends its calls), beside the test programs (wine/units.mjs).
+const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
+
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'] };
 
 export const images = {
   async busybox(work) {
@@ -213,7 +224,7 @@ export const images = {
     // Small files in the tar; the rest fetched as read, from the work
     // directory (the dist through its link).
     execFileSync('python3', ['-I', join(import.meta.dirname, 'wine/pack.py'), join(work, 'wine64.tar'), join(work, 'wine64-lazy.json'), './wine64/',
-      `${realpathSync(dist)}=/wine64,dist`, `${join(dir, 'pfx')}=/pfx,pfx`], { stdio: ['ignore', 'ignore', 'pipe'] });
+      `${realpathSync(dist)}=/wine64,dist,follow`, `${join(dir, 'pfx')}=/pfx,pfx`], { stdio: ['ignore', 'ignore', 'pipe'] });
     writeFileSync(keyFile, key);
     return null;
   },
@@ -247,7 +258,9 @@ export const images = {
         // One that does not build is missing, and said so (win-progs.json);
         // the others are still made.
         try {
-          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', '-o', join(dir, arch, f.replace(/\.[a-z]+$/, '.exe')), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
+          // `gex-nt-shared`: a DLL.
+          const dll = /gex-nt-shared/.test(text);
+          execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), '-o', join(dir, arch, f.replace(/\.[a-z]+$/, dll ? '.dll' : '.exe')), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
         } catch (e) {
           failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
         }
@@ -255,6 +268,60 @@ export const images = {
     }
     writeFileSync(join(work, 'win-progs.json'), JSON.stringify({ failed }, null, 1));
     execFileSync('tar', ['-cf', join(work, 'win-progs.tar'), '-C', dir, '.']);
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
+  async 'wine64-units'(work) {
+    for (const dep of ['wine64', 'win-progs']) {
+      const why = await images[dep](work);
+      if (why) return why;
+    }
+    const gexc = process.env.GEX_TEST_GEXC ?? join(ROOT, 'target/x86/release/gexc');
+    if (!existsSync(gexc)) return `no ${gexc} (cargo build --release -p gexc --features x86 --target-dir target/x86, or GEX_TEST_GEXC)`;
+    const h = createHash('sha256').update(String(statSync(gexc).mtimeMs)).update(String(statSync(gexc).size));
+    for (const f of ['wine64.key', 'win-progs.key']) h.update(readFileSync(join(work, f)));
+    h.update(readFileSync(new URL(import.meta.url))).update(readFileSync(join(HERE, 'wine/unit-bases.mjs')));
+    const key = h.digest('hex');
+    const keyFile = join(work, 'wine64-units.key');
+    const dir = join(work, 'wine64-units');
+    if (existsSync(dir) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    // The images and bases a run names as having no unit (with the flavour
+    // it wants: GEX_CGEN_GUARD=1 when it says so), of Wine's core and the
+    // test programs, and the NT trampolines.
+    // A system per program: a wineserver that exited leaves its socket's
+    // name bound (page/unix-rebind).
+    let said = '';
+    for (const exe of UNIT_PROGS) {
+      const r = spawnSync('node', [join(HERE, 'wine/unit-bases.mjs'), work, exe], { encoding: 'utf8', maxBuffer: 1 << 30 });
+      said += `${r.stdout}\n${r.stderr}\n`;
+      if (r.status !== 0) return `the run of ${exe} that names the images failed (exit ${r.status}): ${`${r.stdout}\n${r.stderr}`.trim().split('\n').slice(-3).join(' / ')}`;
+    }
+    const guard = /GEX_CGEN_GUARD=1 gexc cgen-image/.test(said);
+    const progs = join(work, 'wine64-units-progs');
+    rmSync(progs, { recursive: true, force: true });
+    mkdirSync(progs);
+    execFileSync('tar', ['-xf', join(work, 'win-progs.tar'), '-C', progs, ...UNIT_PROGS.map((e) => `./x64/${e}`)]);
+    const builds = new Set();
+    for (const m of said.matchAll(/gex-pe: image (\S+) at base (0x[0-9a-f]+): no function-tier unit/g)) {
+      const [, path, base] = m;
+      const name = path.split('/').pop().toLowerCase();
+      const host = path.startsWith('/wine64/') && UNIT_DLLS.includes(name) ? join(realpathSync(process.env.GEX_TEST_WINE64_DIST), path.slice(8))
+        : UNIT_PROGS.includes(name) ? join(progs, 'x64', name) : null;
+      if (host) builds.add(JSON.stringify([host, '--pe-base', base, '--jobs', '8']));
+    }
+    if (/gex-pe: missing unit: \[the trampolines\]/.test(said)) builds.add(JSON.stringify(['--nt-trampolines64']));
+    if (![...builds].some((b) => b.includes('ntdll.dll'))) return 'the run named no base for ntdll.dll';
+    for (const b of builds) {
+      try {
+        execFileSync('nice', [gexc, 'cgen-image', ...JSON.parse(b)], { env: { ...process.env, GEX_CGEN_CACHE: dir, ...(guard ? { GEX_CGEN_GUARD: '1' } : {}) }, stdio: ['ignore', 'ignore', 'pipe'] });
+      } catch (e) {
+        return `gexc cgen-image ${JSON.parse(b).join(' ')}: ${String(e.stderr ?? e.message).trim().split('\n').slice(-2).join(' / ')}`;
+      }
+    }
+    rmSync(progs, { recursive: true, force: true });
     writeFileSync(keyFile, key);
     return null;
   },

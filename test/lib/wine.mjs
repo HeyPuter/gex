@@ -9,10 +9,11 @@ import { Filesystem } from '../../web/runtime/src/fs.js';
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 
 /** `env`: more of Wine's environment; `parts(sys, fs)`: the page's other
- *  classes, made before boot; `wow64`: 32-bit programs through WoW64 (the
+ *  classes, made before boot; `system`: more of System's options (`units`,
+ *  `xcache`) and `debug` its switches; `wow64`: 32-bit programs through WoW64 (the
  *  install's i386-windows), with no display (the null graphics driver). */
-export async function bootWine(t, { env = {}, parts, wow64 = false } = {}) {
-  const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
+export async function bootWine(t, { env = {}, parts, wow64 = false, system = {}, debug = {} } = {}) {
+  const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
   const fs = new Filesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
   fs.addTar(t.work('win-progs.tar'), { at: '/progs' });
@@ -24,9 +25,9 @@ export async function bootWine(t, { env = {}, parts, wow64 = false } = {}) {
     try { await fs.stat('/wine64/lib/wine/i386-windows'); } catch { t.skip('the Wine install has no lib/wine/i386-windows: not a WoW64 build'); }
     await fs.writeFile('/pfx/user.reg', '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="null"\n', { append: true });
   }
-  /** Copy test program `exe` (in /progs/ARCH) into C:\. */
+  /** Copy test program or DLL `exe` (in /progs/ARCH) into C:\. */
   async function put(exe, arch = 'x64') {
-    const why = failed[`${arch}/${exe.replace(/\.exe$/, '.c')}`] ?? failed[`${arch}/${exe.replace(/\.exe$/, '.cpp')}`];
+    const why = failed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.c')}`] ?? failed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.cpp')}`];
     if (why) throw new Error(`${arch}/${exe} did not build: ${why}`);
     await fs.writeFile(`/pfx/drive_c/${exe}`, await fs.readFile(`/progs/${arch}/${exe}`));
   }
@@ -36,7 +37,26 @@ export async function bootWine(t, { env = {}, parts, wow64 = false } = {}) {
     const r = await t.timeout(sys.run([WINE, `C:\\${exe}`, ...args], { env: { ...wineEnv, ...e }, cwd: '/pfx/drive_c' }), timeout, exe);
     return { ...r, stdout: r.stdout.replace(/\r/g, '') };
   }
-  return { sys, fs, run, put, env: wineEnv, more };
+  /** Start Wine's server (`wineserver -f -p`) from the page, before any
+   *  program: resolves with its Process once it is up, as Wine's loader
+   *  waits for it (ntdll start_server): a byte on the descriptor
+   *  WINEGEX_SERVER_READY names, here its stdout. Its socket alone is not
+   *  enough: a client that comes before the server's door is up cannot
+   *  publish the shared user data, and wineboot copies an empty one. */
+  async function startServer({ timeout = 120000 } = {}) {
+    const p = sys.spawn([WINE.replace(/wine$/, 'wineserver'), '-f', '-p'], { env: { ...wineEnv, WINEGEX_SERVER_READY: '1' } });
+    // Read, not cancelled: a write to a closed pipe would end it (SIGPIPE).
+    p.stderr.pipeTo(new WritableStream()).catch(() => {});
+    const rd = p.stdout.getReader();
+    const ready = rd.read().then(({ value, done }) => {
+      if (done || !value?.length) throw new Error('wineserver ended before it was up');
+      rd.releaseLock();
+      p.stdout.pipeTo(new WritableStream()).catch(() => {});
+    });
+    await t.timeout(Promise.race([ready, p.exited.then((st) => { throw new Error(`wineserver exited (${JSON.stringify(st)}) before it was up`); })]), timeout, 'wineserver up');
+    return p;
+  }
+  return { sys, fs, run, put, startServer, env: wineEnv, more };
 }
 
 function fetchWork(t, name) {
