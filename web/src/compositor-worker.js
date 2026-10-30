@@ -610,7 +610,7 @@ class Compositor {
     const held = this.#memories.get(token);
     if (!held) return null;
     // A shared memory grown by another thread can keep its buffer object and
-    // only grow its length (overlay-worker.js's check): a view from before
+    // only grow its length: a view from before
     // then stops short, and the windows of a process that grew past it (a
     // desktop and taskbar, with explorer /desktop a process of its own)
     // were never painted again.
