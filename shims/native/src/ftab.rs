@@ -631,7 +631,9 @@ fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     if s.ftab.providers.contains(&f.install) {
-        return true;
+        // A binding of 64-bit Wine's PE module where its skeleton no longer
+        // is serves nothing (`wasmdll::WinePe::binding_is_stale`).
+        return !s.wine_pe.as_ref().is_some_and(|wp| wp.install == f.install && wp.binding_is_stale(memory, addr));
     }
     match inst.tier {
         Tier::Unit => {

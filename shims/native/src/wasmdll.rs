@@ -112,6 +112,25 @@ pub(crate) struct WinePe {
     mapped: Mutex<std::collections::HashSet<String>>,
 }
 
+impl WinePe {
+    /// Whether this module's binding at `addr` outlived its skeleton: the
+    /// bytes there are no longer the skeleton's stub (each export and the
+    /// entry point is `ud2; ud2`, tools/wine-wasm/specgen.py), so the code
+    /// there is the guest's and the native export has nothing to do with it.
+    /// A view unmapped and its addresses reused (an image view, freed, then
+    /// `VirtualAlloc`'d for the program's own code) is that: kept, the
+    /// binding sent those calls to Wine's PE module. 64-bit Wine's module
+    /// only (32-bit Wine's skeletons keep their bindings beside a Detours
+    /// hook), and only at guest addresses: the entry thunks are bound at
+    /// table indices below the ICALL floor, where no stub is.
+    pub(crate) fn binding_is_stale(&self, memory: &[u8], addr: u64) -> bool {
+        if !self.ptr64 || addr < 0x3f0000 {
+            return false;
+        }
+        memory.get(addr as usize..addr as usize + 4).is_some_and(|b| b != [0x0f, 0x0b, 0x0f, 0x0b])
+    }
+}
+
 /// After an install's catch-up (the module instantiated, its data
 /// initialised): the writes that had to wait for it.
 pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) {
