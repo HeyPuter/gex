@@ -17,6 +17,8 @@
  *   rt-probe ppid    its parent's pid
  *   rt-probe kill PID SIG   kill(PID, SIG): "0", or the error
  *   rt-probe trap    a trap (wasm's unreachable): the program's crash
+ *   rt-probe sigpipe   a write to a pipe with no reader, SIGPIPE's action the
+ *                    default: the program dies of SIGPIPE
  *   rt-probe init [CMD]   an init: starts `sh -c CMD`, then collects every
  *                    child, "reaped PID CODE" for each, for ever (when it
  *                    has none, it waits for one)
@@ -85,6 +87,13 @@ int main(int argc, char **argv) {
     }
   } else if (!strcmp(what, "trap")) {
     __builtin_trap();
+  } else if (!strcmp(what, "sigpipe")) {
+    int p[2];
+    signal(SIGPIPE, SIG_DFL);
+    if (pipe(p)) return 2;
+    close(p[0]);
+    (void)!write(p[1], "x", 1);
+    return 3;
   } else if ((!strcmp(what, "creat") || !strcmp(what, "chmod")) && argc == 4) {
     mode_t mode = (mode_t)strtoul(argv[3], 0, 8);
     int fd;

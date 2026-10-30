@@ -35,12 +35,14 @@ export default async function (t) {
   const before = await noise();
   eq('nothing said for it', before, []);
 
-  // A pipeline's ordinary end: `yes` dies of SIGPIPE.
+  // A pipeline's ordinary end: `yes` ends on its write with no reader.
   eq('a pipeline ends', (await sys.run(['sh', '-c', 'yes | head -1'], { env })).stdout, 'y\n');
+  // And one that surely dies of it (busybox's `yes` may end on EPIPE).
+  const piped = await sys.run(['rt-probe', 'sigpipe'], { env });
+  eq('a write with no reader ends it by SIGPIPE', piped.signal, 'SIGPIPE');
   await new Promise((r) => setTimeout(r, 500));
   const after = (await noise()).slice(before.length);
-  t.known('nothing said for a SIGPIPE', after.length === 0, JSON.stringify(after.slice(0, 3)),
-    'the crash report for SIGPIPE goes quiet with kc/sigpipe-quiet bd0f8073');
+  t.check('nothing said for a SIGPIPE', after.length === 0, JSON.stringify(after.slice(0, 3)));
   // A real crash is still said: the default keeps errors.
   const seg = await sys.run(['rt-probe', 'trap'], { env });
   // A 127 is a program whose Worker never started: what the system said why.
