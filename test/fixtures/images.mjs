@@ -98,6 +98,7 @@ export const images = {
     for (const n of names) h.update(n).update(readFileSync(join(probes, `${n}.c`)));
     const version = join(ROOT, 'test/fixtures/programs/gl-version.c');
     h.update(readFileSync(version));
+    h.update(readFileSync(new URL(import.meta.url))); // how it is built
     const key = h.digest('hex');
     const keyFile = join(work, 'gl-probes.key');
     if (existsSync(join(work, 'gl-probes.tar')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
