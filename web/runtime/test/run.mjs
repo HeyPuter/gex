@@ -59,7 +59,7 @@ execFileSync('zstd', ['-q', '-f', '-3', join(WORK, 'bb.tar'), '-o', join(WORK, '
 // A Debian image and its apt repository (slim.html): RT_SLIM names the
 // directory (debian-slim.tar.zst, repo/), served at /__rt/slim/, with
 // repo.json listing the repository for the page's provider.
-rmSync(join(WORK, 'slim'), { force: true });
+rmSync(join(WORK, 'slim'), { recursive: true, force: true });
 if (process.env.RT_SLIM) {
   symlinkSync(realpathSync(process.env.RT_SLIM), join(WORK, 'slim'));
   const list = [];
