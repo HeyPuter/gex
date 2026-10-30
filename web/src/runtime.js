@@ -10,7 +10,10 @@ import './zfetch.js';
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
-import { xcHash } from '../../shims/browser/js/xcache.mjs';
+import { xcHash, xcRead } from '../../shims/browser/js/xcache.mjs';
+
+/** A saved translation cache's bytes by name (the runtime API's `xcache`). */
+export { xcRead };
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { logNamed, logOn } from '../../shims/browser/js/log.mjs';
@@ -28,6 +31,10 @@ export const workerGraphBytes = { net: 0, cached: 0 };
 const absUrl = (u) => {
   try { return new URL(u, globalThis.location?.href).href; } catch { return u; }
 };
+
+/** A unit cache at a `file:` URL is read as a directory (Node: a Worker
+ *  there has no synchronous request). */
+const unitsAt = (c) => (c.url.startsWith('file:') ? { ...c, root: decodeURIComponent(new URL(c.url).pathname) } : c);
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -164,7 +171,7 @@ let kernelBytes = null;
  * the dist's own flavour if it says, and the switches that change emission.
  * A different build never reads another's cache.
  */
-function xcacheName() {
+export function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
   const switches = ['tso', 'coherentloads', 'arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
@@ -887,7 +894,7 @@ export async function makeProcessHost({
     // with no units; `?providers=0` runs glibc's
     // own code translated instead.
     // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-    cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined }
+    cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined })
       : flag('providers') === '0' ? undefined
       : { mode: 8, url: assetUrl('/gex/cgen') },
     // `?aot=1`: an ejected project's run, with no run-time translation (a

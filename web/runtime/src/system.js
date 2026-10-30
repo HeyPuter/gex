@@ -119,18 +119,30 @@ export class System extends EventTarget {
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
-   * ...); default beside the package. `debug`: the runtime's switches, `{name: value}`
-   * as gex's test pages take `?name=value`; unstable, for debugging only.
+   * ...); default beside the package. `units`: a directory of compiled
+   * function-tier units (`gexc cgen-image`'s cache), each used for the image
+   * it was built for where one is mapped at its base; `{ url, require }`
+   * with `require` makes a program image without one fail. `xcache`: keep
+   * the translated code across loads (in the origin's private storage, a
+   * directory under Node: GEX_XCACHE_DIR). `debug`: the runtime's switches,
+   * `{name: value}` as gex's test pages take `?name=value`; unstable, for
+   * debugging only.
    */
-  constructor({ baseUrl, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
     made = true;
-    this.#opts = { baseUrl: String(baseUrl ?? DEFAULT_BASE()), debug: { ...debug } };
+    const u = typeof units === 'object' && units && !(units instanceof URL) ? units : units ? { url: units } : null;
+    this.#opts = {
+      baseUrl: String(baseUrl ?? DEFAULT_BASE()),
+      units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
+      xcache: !!xcache,
+      debug: { ...debug },
+    };
     this.#pageFs = new PageFsHost((name, json) => this.#hostCall(name, json));
     const self = this;
     this[INTERNAL] = {
@@ -223,6 +235,12 @@ export class System extends EventTarget {
     const { arch: wantArch, ...switches } = this.#opts.debug;
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(switches)) if (v !== undefined && v !== false && k !== 'console') q.set(k, v === true ? '1' : String(v));
+    // The options the switches stand for.
+    if (this.#opts.units) {
+      q.set('cgen', this.#opts.units.require ? '2' : '1');
+      q.set('cgenurl', this.#opts.units.url);
+    }
+    if (this.#opts.xcache) q.set('xcache', '1');
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     await import('../../src/page-env.js');
@@ -345,6 +363,7 @@ export class System extends EventTarget {
     for (const l of layers) await this.#files.lay(l);
     if (records.length) await this.#files.restore(records);
     await k.r('k_fs_populate_done');
+    if (this.#opts.xcache) await this.#xcacheRestore(s, k);
     for (const [path, id] of fsi?.mounts?.() ?? []) await this.#files.mount(path, id);
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
@@ -364,6 +383,21 @@ export class System extends EventTarget {
       ...(k.has('k_mono_held_at') ? { monoHeld: r.k_mono_held_at } : {}),
       ...(k.has('k_snap_extents_at') ? { extents: r.k_snap_extents_at } : {}),
     });
+  }
+
+  /** The translated code a load saved (`xcache`), into the kernel before
+   *  the first process: each process's Worker names code by its bytes from
+   *  then on, and checks a saved module's file when it first uses it. */
+  async #xcacheRestore(s, k) {
+    const name = s.rt.xcacheName();
+    if (!name || !k.has('k_store_restore')) return;
+    await k.r('k_xcache_enable');
+    const bytes = await s.rt.xcRead(name);
+    if (!bytes) return void this.#say(`xcache ${name}: nothing saved\n`);
+    const at = (await k.r('k_store_restore_buf', bytes.length)) >>> 0;
+    new Uint8Array(s.kernel.memory.buffer).set(bytes, at);
+    const n = await k.r('k_store_restore');
+    this.#say(`xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB, restored ${n} modules\n`);
   }
 
   #exit(m) {
