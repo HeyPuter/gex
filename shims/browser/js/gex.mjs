@@ -4961,7 +4961,16 @@ export class Gex {
     }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
-    if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
+    if (!this.#spareWait && wasmprog) {
+      // Another Worker applying them is waited for (the shim's side).
+      if (e.gex_wasmprog_relocate(prov)) {
+        try {
+          inst.exports.__wasm_apply_data_relocs?.();
+        } finally {
+          e.gex_wasmprog_relocated?.(prov);
+        }
+      }
+    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
       // (a packed module's element segments filled them)
       if (!packed) for (const [slot, name] of extra) {
@@ -6271,7 +6280,11 @@ export class Gex {
         if (!h) return 0;
         this.#cgenCatchUp();
         const st = this.#cgenStore();
-        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
+        // Taken whole before any constructor runs: one that calls dlopen
+        // itself replaces the list.
+        const fresh = [];
+        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) fresh.push(n);
+        for (const n of fresh) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
         return h | 0;
       },
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,

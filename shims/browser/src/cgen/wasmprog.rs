@@ -26,6 +26,9 @@ pub(super) struct Prog {
     pub number: u32,
     pub wasm: Vec<u8>,
     pub relocate: bool,
+    /// One Worker is applying the data relocations (`relocate` claimed and
+    /// not yet [`gex_wasmprog_relocated`]).
+    pub relocating: bool,
     /// The bytes' content key, made on first asking (`gex_cgen_pmod_wasm_key`).
     pub key: Option<(u64, u64)>,
     /// The file the bytes are from, for the system-wide key cache.
@@ -352,7 +355,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // The bytes before the record: a Worker catching up takes the record
     // (`gex_cgen_pmod_ready`) as the sign that both are there.
     let lowered = is_lowered(&wasm);
-    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, key: None, path: path.clone(), lowered, from_file: false, gone: None });
+    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, relocating: false, key: None, path: path.clone(), lowered, from_file: false, gone: None });
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
@@ -611,8 +614,43 @@ pub extern "C" fn gex_cgen_pmod_lowered(number: u32) -> i32 {
 }
 
 /// Whether this instantiation of program `number` applies its data
-/// relocations: once, for a fresh image.
+/// relocations: once, for a fresh image. While another Worker applies them
+/// this waits for it to finish ([`gex_wasmprog_relocated`]): a module is
+/// run as soon as it is instantiated (a `dlopen`'s constructors and the
+/// caller's first calls), and before then its function pointers in data
+/// (vtables) are offsets into its own table range, other modules' slots.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_relocate(number: u32) -> i32 {
-    lock(&PROGS).iter_mut().find(|p| p.number == number).is_some_and(|p| std::mem::replace(&mut p.relocate, false)) as i32
+    let mut waits: u64 = 0;
+    loop {
+        {
+            let mut g = lock(&PROGS);
+            let Some(p) = g.iter_mut().find(|p| p.number == number) else { return 0 };
+            if std::mem::replace(&mut p.relocate, false) {
+                p.relocating = true;
+                return 1;
+            }
+            if !p.relocating {
+                return 0;
+            }
+        }
+        waits += 1;
+        if waits % 10_000 == 0 {
+            crate::warn_line(&format!("gex: wasm32 module {number}: still waiting for another Worker to relocate its data\n"));
+        }
+        #[cfg(feature = "shared-memory")]
+        {
+            let nap = std::sync::atomic::AtomicI32::new(0);
+            unsafe { crate::warch::memory_atomic_wait32(nap.as_ptr(), 0, 100_000) };
+        }
+    }
+}
+
+/// The Worker [`gex_wasmprog_relocate`] picked has applied program
+/// `number`'s data relocations.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_relocated(number: u32) {
+    if let Some(p) = lock(&PROGS).iter_mut().find(|p| p.number == number) {
+        p.relocating = false;
+    }
 }
