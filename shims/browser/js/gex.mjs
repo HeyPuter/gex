@@ -5464,12 +5464,14 @@ export class Gex {
   /** Function JIT module `n` (fjit.rs), compiled once per process from the
    *  shim's bytes and offered to the siblings. Synchronous (a Worker). */
   #fjitModule(n) {
-    const name = `fjit:${n}`;
-    let mod = this.#sharedModules.get(name);
-    if (mod) return mod;
     const e = this.#shim.exports;
     const ptr = e.gex_fjit_ptr(n) >>> 0;
     const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+    // By its bytes, not its number: the map outlives the process in a
+    // pooled Worker, where another process's module `n` is other code.
+    const name = `fjit:${moduleContentKey(bytes)}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
     const dump = globalThis.process?.env?.GEX_FJIT_DUMP;
     if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
     const t0 = performance.now();
