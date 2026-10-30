@@ -14,10 +14,11 @@ export function errno(n, what) {
 }
 
 async function makeWorker() {
-  const url = new URL('./kernel-worker.js', import.meta.url);
-  if (typeof Worker === 'function') return new Worker(url, { type: 'module', name: 'gex-kernel' });
+  // The URL written out in the `new Worker`, which is how a bundler knows the
+  // file is a Worker to build (web/runtime/build.sh), not an asset to copy.
+  if (typeof Worker === 'function') return new Worker(new URL('./kernel-worker.js', import.meta.url), { type: 'module', name: 'gex-kernel' });
   const { Worker: NodeWorker } = await import('node:worker_threads');
-  return new NodeWorker(url);
+  return new NodeWorker(new URL('./kernel-worker.js', import.meta.url));
 }
 
 export class Kernel {
