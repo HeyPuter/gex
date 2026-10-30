@@ -6657,6 +6657,36 @@ fn image_is_ours(p: &Px<'_>, idx: usize) -> bool {
 /// one `gexc` `PageTable` allocated the whole closure. Returns the slot count
 /// the table must reach, or zero if the metadata could not be read (then the
 /// caller must not install it).
+/// A prebuilt module of the process's other mode (an ejected project's
+/// `.other` module: its directory entries are `ALT_PAGE` keys), given whole
+/// as `wasm` with its metadata section `meta`: queued for JavaScript to
+/// install as a translation is, its pages numbered as it was built and the
+/// other directory made first, so its entries are published there. A
+/// closure library is filled on demand by page, and that path knows only the
+/// process's own directory. 1 when queued; 0 for a module of the own mode.
+#[no_mangle]
+pub extern "C" fn gex_queue_other_mode_module(meta: u32, meta_len: u32, wasm: u32, wasm_len: u32) -> u32 {
+    let Some(m) = gex_xlate::Metadata::decode(shim_slice(meta, meta_len)) else {
+        return 0;
+    };
+    if !m.dir_entries.iter().any(|(k, _)| k & gex_abi::ALT_PAGE != 0) {
+        return 0;
+    }
+    let bytes = shim_slice(wasm, wasm_len).to_vec();
+    with_px(|px| {
+        ensure_alt_dir(px);
+        with_jit_only(|j| {
+            for (key, base) in &m.dir_entries {
+                if j.page_table.lookup(*key).is_none() {
+                    j.page_table.assign(*key, *base);
+                }
+            }
+            push_pending(j, m.dir_entries.clone(), m.table_slots, bytes, 0);
+        })
+    });
+    1
+}
+
 #[no_mangle]
 pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {

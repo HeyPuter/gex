@@ -2658,7 +2658,15 @@ export class Gex {
     if (!add) return;
     // The highest slot total any of them needs, so the tables grow once.
     let most = 0;
+    let other = 0;
     for (const [i, entry] of this.#closureModules.entries()) {
+      // A module of the process's other mode (an ejected project's `.other`
+      // module, sent with its bytes): installed now, as a translation is,
+      // into the other directory (`gex_queue_other_mode_module`).
+      if (entry?.otherMode && entry.bytes && this.#queueOtherMode(entry)) {
+        other++;
+        continue;
+      }
       // Either the raw wasm, or the pair a page should send: the metadata
       // section alone plus the already-compiled module. A `Module` crosses
       // `postMessage` by reference, so the pair avoids cloning and recompiling
@@ -2712,6 +2720,29 @@ export class Gex {
     // for one of its pages, instead of growing to the whole closure up front.
     void most;
     this.#closureModules = [];
+    if (other) {
+      const e = this.#shim.exports;
+      const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+      if (need) this.#growTables(need, 'closure');
+      e.gex_jit_pending_refresh?.();
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+    }
+  }
+
+  /** Queue an other-mode closure module ({ meta, bytes }) in the shim: true
+   *  when it was one. */
+  #queueOtherMode(entry) {
+    const e = this.#shim.exports;
+    if (!e.gex_queue_other_mode_module || !entry.meta?.length) return false;
+    const { meta, bytes } = entry;
+    const mp = e.gex_alloc(meta.length) >>> 0;
+    this.#bytes().set(meta, mp);
+    const wp = e.gex_alloc(bytes.length) >>> 0;
+    this.#bytes().set(bytes, wp);
+    const queued = e.gex_queue_other_mode_module(mp, meta.length, wp, bytes.length) >>> 0;
+    e.gex_free?.(wp, bytes.length);
+    e.gex_free?.(mp, meta.length);
+    return queued !== 0;
   }
 
   /** The kernel, shim and guest instances on this Worker's memory: what
