@@ -1434,7 +1434,7 @@ async function handle(msg) {
       // parent's libraries: pages it already had, pages the identity map knew,
       // pages it did not, pages with no identity.
       reuse: gex.shim.exports.gex_reuse_stat
-        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
+        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
         : null,
       // How much of this process's memory the shim used: a memory per process
       // decides how many processes a browser holds at once.
