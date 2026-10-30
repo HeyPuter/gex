@@ -23,6 +23,7 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--gpu` | Chromium on the machine's GPU (Vulkan), not SwiftShader. |
 | `--timed` | Only the tests whose `meta.timed` is true, which no other run includes; refused outside bench.sh (GBENCH_RUN), and implies `--gpu`. |
 | `--prebuilt` | Use the images already in `--work` as they are, building none (a bench host, with a work directory synced from where the images were built). An image whose files are not there is missing, and its tests skip (a FAIL without `--allow-skip`). |
+| `--prepare` | Make the images the chosen tests need in `--work`, run no test: the half of a `--prebuilt` run done where the images can be built. Exit 1 when one could not be made. |
 | `--package DIR` | The runtime as `web/runtime/build.sh DIR` built it, the npm package, not from source: the tests' imports of its entry modules go to DIR's, and `t.baseUrl` is DIR (its `gex/`). Browser host only: the package's Workers are bundled for a page. Also GEX_TEST_PACKAGE. |
 | `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 

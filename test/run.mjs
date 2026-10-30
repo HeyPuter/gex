@@ -2,7 +2,7 @@
 //
 //   node test/run.mjs [--group G,...] [--host browser|node|both] [--arch a64,x86]
 //                     [--jobs N] [--allow-skip] [--verbose] [--work DIR] [--artefacts DIR]
-//                     [--port N] [--gpu] [--timed] [--prebuilt] [TEST...]
+//                     [--port N] [--gpu] [--timed] [--prebuilt] [--prepare] [TEST...]
 //
 // One JSON line per test, host and arch on stdout; what a person reads on
 // stderr. Exit 0 only when every test is ok (and skips, with --allow-skip).
@@ -38,6 +38,7 @@ const { values: o, positionals } = parseArgs({
     gpu: { type: 'boolean', default: false },
     timed: { type: 'boolean', default: false },
     prebuilt: { type: 'boolean', default: false },
+    prepare: { type: 'boolean', default: false },
     package: { type: 'string', default: process.env.GEX_TEST_PACKAGE },
   },
 });
@@ -117,6 +118,9 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
     log(`image ${name}: ${why}`);
   }
 }
+// `--prepare`: the images the tests need, made in the work directory and no
+// test run (another host then runs them with --prebuilt).
+if (o.prepare) process.exit(missing.size ? 1 : 0);
 
 // -- the browser -------------------------------------------------------------
 let server = null;
