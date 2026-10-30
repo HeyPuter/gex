@@ -44,6 +44,12 @@ main(async () => {
     eq('apt-get update', (await run(['apt-get', 'update'])).code, 0);
     eq(`apt-get install ${PKG}`, (await run(['apt-get', 'install', '-y', PKG])).code, 0);
     eq(`${PKG} runs`, (await run([CMD, '1920', '1080'])).stdout.includes('Modeline'), true);
+    // ps and pstree with pid 1 the kernel's.
+    const ps = await run(['ps', '-eo', 'pid,ppid,comm']);
+    check('ps lists pid 1 and the page\'s programs under it', ps.code === 0 && /^\s*1\s+0\s+init$/m.test(ps.stdout) && /^\s*\d+\s+1\s+ps$/m.test(ps.stdout), ps.stdout + ps.stderr);
+    eq('apt-get install psmisc', (await run(['apt-get', 'install', '-y', 'psmisc'])).code, 0);
+    const tree = await run(['pstree', '-p']);
+    check('pstree', tree.code === 0 && /^init\(1\).*pstree\(\d+\)/s.test(tree.stdout), tree.stdout + tree.stderr);
     t = performance.now();
     const s = await persist.save();
     say(`saved ${s.stored} records (${s.bytes} bytes) in ${(performance.now() - t).toFixed(0)} ms; in all ${JSON.stringify(persist.stats)}`);

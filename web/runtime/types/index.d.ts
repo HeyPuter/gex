@@ -16,6 +16,12 @@ export declare const SIGNALS: Readonly<{
 export interface SystemOptions {
   /** The directory that holds `gex/` (default: beside the modules). */
   baseUrl?: string;
+  /**
+   * Pid 1, which then owns the processes: it collects its children and
+   * orphans, `spawn` throws, and when it ends the system stops. Without
+   * one, pid 1 is the kernel's own and the page spawns.
+   */
+  init?: string[] | ({ argv: string[] } & SpawnOptions);
   /** Switches for debugging (`{ strace: 1 }`, `{ console: true }`); not a stable API. */
   debug?: Record<string, unknown>;
 }
@@ -53,6 +59,8 @@ export interface SystemState {
   error: string | null;
   /** What the runtime said. */
   console: string;
+  /** How the `init` ended, which stopped the system. */
+  init?: { code: number; signal: string | null } | { error: string };
 }
 
 export interface HostCalls {
@@ -72,7 +80,10 @@ export declare class System extends EventTarget {
   constructor(options?: SystemOptions);
   get state(): SystemState;
   boot(): Promise<void>;
+  /** Throws when the system has an `init`. */
   spawn(argv: string[], options?: SpawnOptions): Process;
+  /** The `init`'s Process, or null without one. */
+  get init(): Process | null;
   run(argv: string[], options?: RunOptions & { encoding?: string }): Promise<RunResult<string>>;
   run(argv: string[], options: RunOptions & { encoding: null }): Promise<RunResult<Uint8Array>>;
   get hostCalls(): HostCalls;

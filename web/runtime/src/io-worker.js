@@ -382,14 +382,17 @@ function seed({ files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, laz
 
 // -- programs --------------------------------------------------------------
 //
-// Pid 1 is the kernel's own when the page names no init: in the process
-// table (proc.rs `INIT_PID`) and nowhere else, no Worker and no program. A
-// program the page starts is its child, in a session of its own; an orphan
-// is given to it, as on Linux. This Worker waits on its queue and collects
-// every child that ends: the page's own programs' statuses go to the page,
-// an orphan is just let go.
+// Pid 1 is the kernel's own when the page names no init (`k_init_virtual`):
+// in the process table (proc.rs `INIT_PID`) and nowhere else, no Worker and
+// no program. A program the page starts is its child, in a session of its
+// own, and this Worker collects it as pid 1 when it ends, for the page; an
+// orphan is given to pid 1, as on Linux, and the kernel lets it go as it
+// ends. When the page names an init, that program is pid 1, the child of
+// nobody (parent 0), and the page starts nothing else.
 
 const INIT = 1;
+/** The page names an init: pid 1 is a program. */
+let realInit = false;
 /** Each program's ends, by handle: { pty, stdin, stdout, stderr, pid } */
 const handles = new Map();
 /** The page's programs, pid -> handle. */
@@ -484,14 +487,15 @@ function wasmImage(path) {
   return flags !== null && (flags & 3) === 0 ? [lo, hi] : null;
 }
 
-/** Make a program's process: its pid (a child of pid 1, leading a session
- *  of its own), its descriptors held for it in the kernel, and the exec
- *  record the page starts its Worker from (host.mjs `spawnExec`). */
-function spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 24 }) {
+/** Make a program's process: its pid (the page's child, leading a session
+ *  of its own; pid 1 for the page's init), its descriptors held for it in
+ *  the kernel, and the exec record the page starts its Worker from (host.mjs
+ *  `spawnExec`). */
+function spawn({ h, argv, env = [], cwd = '', stdio = 'pipe', cols = 80, rows = 24, init = false }) {
   const prog = findProgram(argv[0], env, cwd);
   if (typeof prog === 'number') return { h, error: -prog };
-  const pid = k.k_spawn(INIT);
-  k.k_setsid(pid);
+  const pid = init ? INIT : k.k_spawn(INIT);
+  if (!init) k.k_setsid(pid);
   const ends = { h, pty: -1, ptyReading: false, stdin: -1, stdout: -1, stderr: -1, writes: [], closeIn: false, pid };
   const fds = [];
   if (stdio === 'pty') {
@@ -541,22 +545,19 @@ function abandon({ pid }) {
   k.k_exit(pid, 127);
 }
 
-/** Every child of pid 1 that has ended, collected. */
+/** Every program of the page's that has ended, collected: pid 1's children
+ *  under the kernel's init, the init itself under a real one. */
 function reap() {
   let moved = false;
-  // What was sent to pid 1 (a SIGCHLD per exit, any `kill 1`): ignored, as
-  // init's signals are.
-  k.k_take_signals(INIT);
   for (;;) {
-    const r = k.k_wait(INIT, -1, 0);
+    const r = realInit ? k.k_wait(0, INIT, 0) : k.k_wait(INIT, -1, 0);
     if (!r) break;
     moved = true;
     const pid = Number(r >> 32n), st = Number(r & 0xffffffffn);
     const h = programs.get(pid);
-    if (h === undefined) continue;
     programs.delete(pid);
     // What it wrote before it ended goes first.
-    const e = handles.get(h);
+    const e = h === undefined ? null : handles.get(h);
     if (e) pump1(e);
     const sig = st & 0x7f;
     post({ ev: 'exit', pid, code: sig ? 128 + sig : (st >> 8) & 0xff, signal: sig });
@@ -1083,7 +1084,7 @@ function unmount(path) {
 // -- calls -----------------------------------------------------------------
 
 const ops = {
-  async start({ spec, tree, mounts = [], persist: keep = null }) {
+  async start({ spec, tree, mounts = [], persist: keep = null, init = false }) {
     // The first instance of the kernel there is: on its linked stack (the
     // one no process's Worker is given).
     ({ k, mem } = await helperKernel(spec, 0, 32));
@@ -1098,9 +1099,15 @@ const ops = {
     if (keep) persistStart(keep);
     slot = k.k_ws_alloc();
     if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
-    // What /proc/1 says of pid 1.
-    const { at: [[a, an]] } = lay('init\ninit\0');
-    k.k_proc_set_info(INIT, BigInt(a), an);
+    // Pid 1: the page's init, started next, or the kernel's own, which
+    // /proc/1 calls init.
+    realInit = init;
+    if (!init) {
+      k.k_init_virtual(1);
+      const { at: [[a, an]] } = lay('init\ninit\0');
+      k.k_proc_set_info(INIT, BigInt(a), an);
+    }
+    // Moved when a child of pid 1 ends, and when pid 1 itself does.
     watch(k.k_proc_queue(INIT));
     loop();
     // Where the kernel's stacks are, for the host to hand out (gex.mjs

@@ -36,23 +36,31 @@ term.onData((d) => sh.pty.write(d));
   programs at boot (`/bin/sh` first); aarch64 when the tree has none. The
   kernel is built for one, so this is fixed for the system's life: a program
   of the other one fails to start (`ENOEXEC`).
-- Pid 1 is the kernel's own: no program runs as it. Each program `spawn`
-  starts is its child, in a session of its own; a program whose parent
-  ends is given to it, and its exit is collected there, as an init's would
-  be. `getppid()` of either is 1, `/proc/1` names `init`, and a signal sent
-  to pid 1 is ignored.
-- Nothing runs at boot. A tree's own start (its daemons) is the page's
-  first `spawn`s, made once `boot()` resolves.
+- Pid 1 is the kernel's own unless the boot options name an `init`: no
+  program runs as it. Each program `spawn` starts is its child, in a
+  session of its own; a program whose parent ends is given to it, and its
+  exit is collected in the kernel, as an init's would be. `getppid()` of
+  either is 1, `/proc/1` names `init`, and a signal sent to pid 1 is
+  ignored.
+- With an `init` named (`new System({ init })`), that program is pid 1 and
+  owns the processes, as on Linux: it collects its children and the
+  orphans given to it, and `spawn` throws. The page reaches programs
+  through what the init starts: terminals, windows, `/dev/gex-host`.
+  `sys.init` is its `Process`. When it ends, the system stops, and
+  `state.init` says how it ended.
+- Nothing runs at boot but the `init`. Without one, a tree's own start (its
+  daemons) is the page's first `spawn`s, made once `boot()` resolves.
 
 ## System
 
 | Member | Does |
 | --- | --- |
-| `new System({ baseUrl, debug })` | A system, not started; a page makes one. `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. |
+| `new System({ baseUrl, init, debug })` | A system, not started; a page makes one. `init`: pid 1, as `[path, ...args]` or `{ argv, ...spawn options }` (see above). `debug` holds the runtime's switches for debugging (`{ strace: 1 }`, `{ console: true }` to log the runtime's console); they are not a stable API. |
 | `boot()` | Starts the kernel and lays the filesystem's sources into its root. Parts that work before boot (the filesystem) must be made before it. |
-| `spawn(argv, opts)` | Starts a program and returns its `Process` at once. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
+| `spawn(argv, opts)` | Starts a program and returns its `Process` at once; throws when the system has an `init`. `opts`: `pty: { cols, rows, encoding }` for a terminal, else three pipes; `env` (`{K: V}` or `['K=V']`; nothing is inherited), `cwd`, `uid`, `gid`, `detached` (no terminal or pipes: output goes nowhere). The program is found on `env.PATH`, or in `/usr/local/bin:/usr/bin:/bin` and the `sbin`s. |
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). |
-| `state` | `{ phase, error, console }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what the runtime says. |
+| `init` | The `init`'s `Process`, or null without one. |
+| `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. A `running` event when it boots, `console` events for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
 | `shutdown()` | Ends every program and the kernel. |
 

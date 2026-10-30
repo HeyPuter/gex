@@ -1861,6 +1861,14 @@ pub extern "C" fn k_proc_queue(pid: i32) -> u32 {
     procs().queue(pid)
 }
 
+/// Pid 1 is the kernel's own, with no program (`ProcTable::set_virtual_init`):
+/// the host collects what it starts as pid 1's child, an orphan that ends is
+/// let go here, and a signal to pid 1 is ignored.
+#[no_mangle]
+pub extern "C" fn k_init_virtual(on: i32) {
+    procs().set_virtual_init(on != 0);
+}
+
 /// Whether `pid` is a live process.
 #[no_mangle]
 pub extern "C" fn k_exists(pid: i32) -> i32 {

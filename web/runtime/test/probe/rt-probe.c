@@ -12,6 +12,9 @@
  *                    48 kHz), then the ms it took
  *   rt-probe ppid    its parent's pid
  *   rt-probe kill PID SIG   kill(PID, SIG): "0", or the error
+ *   rt-probe init [CMD]   an init: starts `sh -c CMD`, then collects every
+ *                    child, "reaped PID CODE" for each, for ever (when it
+ *                    has none, it waits for one)
  */
 #include <signal.h>
 #include <fcntl.h>
@@ -26,6 +29,7 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -53,6 +57,26 @@ int main(int argc, char **argv) {
       return 1;
     }
     printf("0\n");
+  } else if (!strcmp(what, "init")) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("init %d\n", (int)getpid());
+    if (argc > 2) {
+      pid_t c = fork();
+      if (c == 0) {
+        execl("/bin/sh", "sh", "-c", argv[2], (char *)NULL);
+        _exit(127);
+      }
+      printf("started %d\n", (int)c);
+    }
+    for (;;) {
+      int st;
+      pid_t pid = waitpid(-1, &st, 0);
+      if (pid < 0) {
+        usleep(50000);
+        continue;
+      }
+      printf("reaped %d %d\n", (int)pid, WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+    }
   } else if (!strcmp(what, "ids")) {
     printf("%u %u\n", (unsigned)getuid(), (unsigned)getgid());
   } else if (!strcmp(what, "xattr") && argc == 4) {

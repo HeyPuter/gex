@@ -126,17 +126,31 @@ export class System extends EventTarget {
   #net = new NetSwitch();
   #hostCalls = new Map();
   #pageFs = null;
+  /** The boot options' init, and its Process once it runs. */
+  #init = null;
+  #initProcess = null;
 
   /**
    * `baseUrl`: where the runtime's files are (the shim, kernel, seed,
-   * ...); default beside the package. `debug`: the runtime's
-   * switches, `{name: value}` as gex's test pages take `?name=value`;
-   * unstable, for debugging only.
+   * ...); default beside the package. `init`: the program that is pid 1,
+   * as `[path, ...args]` or `{ argv, ...spawn options }`. It owns the
+   * processes: `spawn` throws, and the page reaches programs through what
+   * the init starts (terminals, windows, /dev/gex-host); when it ends, the
+   * system stops. Without one, pid 1 is the kernel's own and the page
+   * spawns. `debug`: the runtime's switches, `{name: value}`
+   * as gex's test pages take `?name=value`; unstable, for debugging only.
    */
-  constructor({ baseUrl, debug = {} } = {}) {
+  constructor({ baseUrl, init, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'init', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+    }
+    if (init !== undefined) {
+      init = Array.isArray(init) ? { argv: init } : { ...init };
+      if (!Array.isArray(init.argv) || !init.argv.length || init.argv.some((a) => typeof a !== 'string')) {
+        throw new TypeError('System: init is [path, ...args] or { argv, ... }');
+      }
+      this.#init = init;
     }
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
@@ -178,7 +192,8 @@ export class System extends EventTarget {
   }
 
   /** `phase` ('new', 'booting', 'running', 'stopped', 'failed'), `error`,
-   *  and `console`: what the runtime said. */
+   *  `console`: what the runtime said, and `init`: how the boot options'
+   *  init ended (`{code, signal}`), which stops the system. */
   get state() {
     return { ...this.#state };
   }
@@ -281,6 +296,7 @@ export class System extends EventTarget {
         tree: { files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs },
         mounts: fsi?.mounts?.() ?? [],
         persist: fsi?.persistArgs?.(),
+        init: !!this.#init,
       }).then((stacks) => {
         s.host.useKernelStacks(stacks);
         up.resolve();
@@ -302,6 +318,21 @@ export class System extends EventTarget {
     });
     await started;
     this.#state.phase = 'running';
+    if (this.#init) {
+      // Pid 1, before anything else runs. When it ends, so does the system,
+      // as on Linux.
+      const { argv, ...o } = this.#init;
+      const p = this.#initProcess = this.#spawn(argv, o, true);
+      p.exited.then((st) => {
+        if (this.#state.phase !== 'running') return;
+        this.#state.init = st;
+        this.shutdown();
+      }, (e) => {
+        if (this.#state.phase !== 'running') return;
+        this.#state.init = { error: String(e?.message ?? e) };
+        this.shutdown();
+      });
+    }
     for (const fn of this.#afterBoot.splice(0)) await fn(this.#sys);
     this.dispatchEvent(new Event('running'));
     return this;
@@ -409,6 +440,18 @@ export class System extends EventTarget {
    */
   spawn(argv, opts = {}) {
     this.#running('spawn');
+    if (this.#init) {
+      throw new Error('spawn: this system has an init (the boot options\' `init`), which owns the processes; the page reaches programs through what it starts');
+    }
+    return this.#spawn(argv, opts, false);
+  }
+
+  /** The boot options' init as a Process, null without one. */
+  get init() {
+    return this.#initProcess;
+  }
+
+  #spawn(argv, opts, init) {
     if (!Array.isArray(argv) || !argv.length || argv.some((a) => typeof a !== 'string')) {
       throw new TypeError('spawn: argv is a non-empty array of strings');
     }
@@ -441,6 +484,7 @@ export class System extends EventTarget {
       stdio,
       cols: opts.pty?.cols ?? 80,
       rows: opts.pty?.rows ?? 24,
+      init,
     }).then((r) => {
       if (r.error) {
         this.#procs.delete(h);
