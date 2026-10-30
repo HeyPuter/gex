@@ -37,6 +37,10 @@ const PROBES = {
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
 };
 
+/** What each image leaves in the work directory: with `--prebuilt`, an
+ *  image whose files are not there is missing. */
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'] };
+
 export const images = {
   async busybox(work) {
     const bb = process.env.BUSYBOX;

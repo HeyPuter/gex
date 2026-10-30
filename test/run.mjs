@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { Cdp, browserWsUrl } from '../web/test/cdp.mjs';
-import { images } from './fixtures/images.mjs';
+import { images, outputs } from './fixtures/images.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
@@ -82,9 +82,11 @@ mkdirSync(WORK, { recursive: true });
 // Screenshots (`t.screenshot`, and one of every browser test that fails).
 const ARTEFACTS = o.artefacts || join(WORK, 'artefacts');
 const missing = new Map();
-for (const name of o.prebuilt ? [] : new Set(jobs.flatMap((j) => j.test.meta.images))) {
+for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
   if (!images[name]) throw new Error(`no image ${name} (test/fixtures/images.mjs)`);
-  const why = await images[name](WORK).catch((e) => String(e?.message ?? e));
+  const why = o.prebuilt
+    ? (outputs[name] ?? []).every((f) => existsSync(join(WORK, f))) ? null : 'not in the work directory (--prebuilt)'
+    : await images[name](WORK).catch((e) => String(e?.message ?? e));
   if (why) {
     missing.set(name, why);
     log(`image ${name}: ${why}`);

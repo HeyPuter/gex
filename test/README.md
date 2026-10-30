@@ -22,7 +22,7 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--port N` | vite's port (default 5411); Chromium's debugging port is N+1. |
 | `--gpu` | Chromium on the machine's GPU (Vulkan), not SwiftShader. |
 | `--timed` | Only the tests whose `meta.timed` is true, which no other run includes; refused outside bench.sh (GBENCH_RUN), and implies `--gpu`. |
-| `--prebuilt` | Use the images already in `--work` as they are, building none (a bench host, with a work directory synced from where the images were built). |
+| `--prebuilt` | Use the images already in `--work` as they are, building none (a bench host, with a work directory synced from where the images were built). An image whose files are not there is missing, and its tests skip (a FAIL without `--allow-skip`). |
 | `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
