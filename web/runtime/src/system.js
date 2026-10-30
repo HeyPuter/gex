@@ -33,53 +33,82 @@ let made = false;
 /** ELF's machine numbers, as the guest's programs are built for them. */
 const EM = { 62: 'x86', 183: 'aarch64' };
 
+/** The machine of the 64-bit ELF whose bytes start at `at` in `b`, or null
+ *  (a gexcc program, wasm32, runs on either and says nothing). */
+function machine(b, at = 0) {
+  return b && b.length >= at + 20 && b[at] === 0x7f && b[at + 1] === 0x45 && b[at + 2] === 0x4c && b[at + 3] === 0x46 && b[at + 4] === 2
+    ? EM[b[at + 18] | (b[at + 19] << 8)] ?? null
+    : null;
+}
+
 /**
- * The guest architecture a tree's programs are built for: the machine of the
- * first native program found among the usual ones (a gexcc program, wasm32,
- * runs on either and says nothing), or null.
+ * The guest architecture a tar's programs are built for: the machine of
+ * what `/bin/sh` is, its links followed, read from the headers up to the
+ * entry that decides it, with no file's bytes but an ELF header read; else
+ * of the first native program in it. Null for none.
  */
-export function treeArch({ files, symlinks = {}, hard = {} }) {
+function tarArch(tarEntries, b) {
+  const links = new Map(); // path -> [target, hard]
+  const files = new Map(); // path -> where its bytes start
   const resolve = (p) => {
-    for (let i = 0; i < 16; i++) {
-      if (hard[p]) p = hard[p];
-      const l = symlinks[p];
-      if (l === undefined) return p;
-      p = l.startsWith('/') ? l : `${p.slice(0, p.lastIndexOf('/'))}/${l}`;
-      const out = [];
-      for (const part of p.split('/')) {
-        if (!part || part === '.') continue;
-        if (part === '..') out.pop();
-        else out.push(part);
+    let todo = p.split('/');
+    let cur = [];
+    for (let hops = 0; todo.length;) {
+      const x = todo.shift();
+      if (!x || x === '.') continue;
+      if (x === '..') {
+        cur.pop();
+        continue;
       }
-      p = `/${out.join('/')}`;
+      cur.push(x);
+      const l = links.get(`/${cur.join('/')}`);
+      if (!l) continue;
+      if (++hops > 40) return null;
+      const [t, hard] = l;
+      cur.pop();
+      todo = [...(t.startsWith('/') || hard ? [] : cur), ...t.split('/'), ...todo];
+      cur = [];
     }
-    return p;
+    return `/${cur.join('/')}`;
   };
-  const machine = (b) => (b && b.length > 20 && b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46 && b[4] === 2 ? EM[b[18] | (b[19] << 8)] ?? null : null);
-  for (const p of ['/bin/sh', '/usr/bin/sh', '/bin/bash', '/usr/bin/env', '/sbin/init', '/bin/busybox', '/usr/bin/busybox']) {
-    const m = machine(files[resolve(p)]);
-    if (m) return m;
-  }
-  for (const b of Object.values(files)) {
-    const m = machine(b);
-    if (m) return m;
-  }
+  let want = '/bin/sh';
+  let found = null;
+  let first = null;
+  tarEntries(b, ({ name, type, body, link }) => {
+    const p = `/${name.split("/").filter((x) => x && x !== ".").join("/")}`;
+    if (type === '2' || type === '1') {
+      links.set(p, [link, type === '1']);
+      want = resolve('/bin/sh');
+    } else if (type === '0' || type === '\0' || type === '7') {
+      files.set(p, body);
+      first ??= machine(b, body);
+    }
+    if (want && files.has(want)) {
+      found = machine(b, files.get(want));
+      return true;
+    }
+    return false;
+  });
+  return found ?? first;
+}
+
+/** [`tarArch`] of single files (`{ path: bytes }`). */
+function filesArch(files = {}) {
+  for (const p of ['/bin/sh', '/usr/bin/sh']) if (machine(files[p])) return machine(files[p]);
+  for (const d of Object.values(files)) if (machine(d)) return machine(d);
   return null;
 }
 
-/** [`treeArch`] of the layers laid at the root (fs.js), later ones over
- *  earlier ones: their tars read for that alone. */
+/** The guest architecture of the layers laid at the root (fs.js), the last
+ *  first, each one's read only as far as it takes. */
 async function layersArch(layers) {
-  const { untar } = await import('../../src/tar.js');
-  const t = { files: {}, symlinks: {}, hard: {} };
-  for (const l of layers) {
+  const { tarEntries } = await import('../../src/tar.js');
+  for (const l of [...layers].reverse()) {
     if (l.at && l.at !== '/') continue;
-    const u = l.tar ? untar(l.tar.byteOffset === 0 && l.tar.byteLength === l.tar.buffer.byteLength ? l.tar.buffer : l.tar.slice().buffer) : { files: l.files };
-    Object.assign(t.files, u.files ?? {});
-    Object.assign(t.symlinks, u.links ?? {});
-    Object.assign(t.hard, u.hard ?? {});
+    const m = l.tar ? tarArch(tarEntries, l.tar) : filesArch(l.files);
+    if (m) return m;
   }
-  return treeArch(t);
+  return null;
 }
 
 /** `spawn`'s and `boot`'s arguments, checked: `[argv, opts]`. One parser,

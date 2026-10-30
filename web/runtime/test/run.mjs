@@ -33,13 +33,17 @@ mkdirSync(WORK, { recursive: true });
 
 // -- the test tree: busybox and its applets --------------------------------
 const BUSYBOX = process.env.BUSYBOX;
-if (!BUSYBOX || !existsSync(BUSYBOX)) throw new Error('BUSYBOX: a wasm32 busybox');
+if (!process.env.RT_REUSE && (!BUSYBOX || !existsSync(BUSYBOX))) throw new Error('BUSYBOX: a wasm32 busybox');
 const tree = join(WORK, 'tree');
-rmSync(tree, { recursive: true, force: true });
-for (const d of ['bin', 'usr/bin', 'etc', 'tmp', 'root', 'home/user', 'dev', 'proc']) mkdirSync(join(tree, d), { recursive: true });
-copyFileSync(BUSYBOX, join(tree, 'bin/busybox'));
-for (const name of readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean)) {
-  linkSync(join(tree, 'bin/busybox'), join(tree, 'bin', name));
+// RT_REUSE=1: the tree a run before built in RT_WORK, as it is (a copy run
+// where there is no gexcc).
+const reuse = !!process.env.RT_REUSE && existsSync(join(WORK, 'bb.tar.zst'));
+if (!reuse) {
+  rmSync(tree, { recursive: true, force: true });
+  for (const d of ['bin', 'usr/bin', 'etc', 'tmp', 'root', 'home/user', 'dev', 'proc']) mkdirSync(join(tree, d), { recursive: true });
+  copyFileSync(BUSYBOX, join(tree, 'bin/busybox'));
+  for (const name of readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean)) {
+    linkSync(join(tree, 'bin/busybox'), join(tree, 'bin', name));
 }
 // And what busybox has no applet for (probe/rt-probe.c), a Wayland and an
 // X11 window (probe/rt-wl.c, rt-x11.c), and game controllers (rt-joy.c).
@@ -51,6 +55,7 @@ execFileSync(process.env.GEXCC || 'gexcc', ['-O2', '-Wall', '-o', join(tree, 'bi
 execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
 execFileSync('tar', ['--xattrs', '-cf', join(WORK, 'bb.tar'), '-C', tree, '.']);
 execFileSync('zstd', ['-q', '-f', '-3', join(WORK, 'bb.tar'), '-o', join(WORK, 'bb.tar.zst')]);
+}
 // A Debian image and its apt repository (slim.html): RT_SLIM names the
 // directory (debian-slim.tar.zst, repo/), served at /__rt/slim/, with
 // repo.json listing the repository for the page's provider.
@@ -178,7 +183,7 @@ async function runPage(page) {
   }));
   await cdp.send('Runtime.enable', {}, sessionId);
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
-  const url = `http://127.0.0.1:${PORT}/runtime/test/${page}${process.env.RT_ARCH ? `?arch=${process.env.RT_ARCH}` : ''}`;
+  const url = `http://127.0.0.1:${PORT}/${basename(join(HERE, '..'))}/test/${page}${process.env.RT_ARCH ? `?arch=${process.env.RT_ARCH}` : ''}`;
   log(`${page}: ${url}`);
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url }, sessionId);
