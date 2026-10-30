@@ -497,15 +497,26 @@ fn identity_line(image: &gex_ld::Image, base: u64, key: &str, identity: &str, pa
 /// own, so the page never takes a key its own hashing would not give. A
 /// 64-bit memory's and a compact process's are marked (`gex_key::IdentityLine`,
 /// the shim's `KNOWN`).
+/// An image the recording used more than one unit for (a WoW64 page's
+/// 64-bit win32u.dll, whose unit's key differs between a 64-bit process
+/// and a 32-bit one) gets no line: the page hashes it per process.
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
     let tar = crate::reach::Tar::parse(&bytes)?;
+    let mut per_path = std::collections::HashMap::<String, usize>::new();
+    for u in units {
+        *per_path.entry(json::str_field(u, "path", what)?).or_default() += 1;
+    }
     let mut lines = Vec::new();
     let mut skipped = 0;
     for u in units {
         let key = json::str_field(u, "key", what)?;
         let path = json::str_field(u, "path", what)?;
+        if per_path[&path] > 1 {
+            skipped += 1;
+            continue;
+        }
         let site = site_key(&key);
         let found = (|| -> Option<String> {
             let data = tar.read(&path)?;
