@@ -95,10 +95,13 @@ export default async function (t) {
   p.pty.write('rt-probe size\n');
   await until(/40 120/, 'pty resize');
   p.pty.write('sleep 100\n');
-  await new Promise((r) => setTimeout(r, 500));
+  // ^C once sleep runs (a busy machine starts it later than any fixed wait),
+  // and its output, not the terminal's echo of the line typed.
+  const sleeping = async () => /^sleep$/m.test((await sys.run(['sh', '-c', 'cat /proc/[0-9]*/comm'], { env })).stdout);
+  for (let i = 0; i < 100 && !(await sleeping()); i++) await new Promise((r) => setTimeout(r, 100));
   p.pty.write('\x03');
   p.pty.write('echo after-ctrl-c\n');
-  await until(/after-ctrl-c\r?\n/, '^C interrupts the foreground job');
+  await until(/(^|\n)after-ctrl-c\r?\n/, '^C interrupts the foreground job');
   p.pty.write('exit 5\n');
   const st = await timeout(p.exited, 30000, 'pty exit');
   eq('pty exit', st, { code: 5, signal: null });
