@@ -350,13 +350,16 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     };
     let path = path.to_string();
     let path = path.as_str();
+    // Each list after its length: an argument or variable may be empty, so
+    // an empty string cannot end one (`gex_adopted_exec`).
     let mut cmd = Vec::new();
-    for s in std::iter::once(path).chain(std::iter::once("")).chain(argv.iter().map(String::as_str)) {
-        cmd.extend_from_slice(s.as_bytes());
-        cmd.push(0);
-    }
-    cmd.push(0);
-    for s in envp {
+    let (argc, envc) = (argv.len().to_string(), envp.len().to_string());
+    let strings = std::iter::once(path)
+        .chain(std::iter::once(argc.as_str()))
+        .chain(argv.iter().map(String::as_str))
+        .chain(std::iter::once(envc.as_str()))
+        .chain(envp.iter().map(String::as_str));
+    for s in strings {
         cmd.extend_from_slice(s.as_bytes());
         cmd.push(0);
     }
@@ -761,17 +764,16 @@ pub extern "C" fn gex_vfork_end() -> i64 {
 #[no_mangle]
 pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     let blob = shim_slice(ptr, len).to_vec();
+    // The path, then the arguments and the environment, each after its
+    // length (`stage_exec_parts`).
     let mut parts = blob.split(|b| *b == 0).map(|s| String::from_utf8_lossy(s).into_owned());
     let path = parts.next().unwrap_or_default();
-    let _ = parts.next();
-    let mut argv = Vec::new();
-    for s in parts.by_ref() {
-        if s.is_empty() {
-            break;
-        }
-        argv.push(s);
-    }
-    let envp: Vec<String> = parts.filter(|s| !s.is_empty()).collect();
+    let list = |parts: &mut dyn Iterator<Item = String>| -> Vec<String> {
+        let n = parts.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        parts.take(n).collect()
+    };
+    let argv = list(&mut parts);
+    let envp = list(&mut parts);
     // This Worker's memory is new (host.mjs gives an exec child no recycled
     // one), so the exec need not clear what no program wrote.
     EXEC_FRESH.with(|c| c.set(true));
