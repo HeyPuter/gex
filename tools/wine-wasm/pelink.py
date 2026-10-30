@@ -32,6 +32,11 @@ import subprocess
 import sys
 import tempfile
 
+# The C functions a module of the process's other mode calls directly
+# (shims' wasmdll.rs CROSS_MODE): WoW64's native wow64cpu, for native i386
+# ntdll's system calls and Unix calls.
+CROSS_MODE = ('wow64cpu.dll!__wine_gex_syscall32', 'wow64cpu.dll!__wine_gex_unix_call32')
+
 here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
 # DLLs a program's activation context may redirect (to comctl32_v6.dll)
@@ -1028,6 +1033,9 @@ static void *gexw_ntdll_proc(const char *name)
                     f.write(f'--export-if-defined={d}\n')
             # what the --split modules import from the core
             for n in sorted(needs):
+                f.write(f'--export-if-defined={n}\n')
+            # what the other mode's modules call (wasmdll's CROSS_MODE)
+            for n in CROSS_MODE:
                 f.write(f'--export-if-defined={n}\n')
             # gexrt's bounds of the entry-thunk pairs (gexw_entries)
             f.write('--export-if-defined=__gexw_entries\n')
