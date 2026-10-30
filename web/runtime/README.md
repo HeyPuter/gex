@@ -199,7 +199,7 @@ processes and memory.
 | --- | --- |
 | `pid` | Its pid once it runs. |
 | `started` | Resolves with the pid; rejects when the program could not start (`no such program`, with `errno`). |
-| `exited` | Resolves with `{ code, signal }`: a program killed by a signal has `signal` set (`'SIGTERM'`) and `code` 128 plus its number. An `exit` event too. |
+| `exited` | Resolves with `{ code, signal }`: a program killed by a signal has `signal` set (`'SIGTERM'`) and `code` 128 plus its number. An `exit` event too. Rejects as `started` does when the program never ran. |
 | `pty` | With a terminal: `write(data)` (a string or bytes, any size), `resize(cols, rows)` (the program hears `SIGWINCH`), and `data` events (bytes, or strings with an `encoding`). |
 | `stdin`, `stdout`, `stderr` | Without a terminal: a `WritableStream` and two `ReadableStream`s of bytes. The outputs are read from the program's pipes as the page reads the streams: a program whose output nobody reads waits when its pipe is full (64 KiB), as on Linux and in Node, and may never end. Read both, cancel one you do not want (the program then gets `EPIPE`, or `SIGPIPE`), or spawn it `detached`. A terminal's output is always read, into `data` events. An init (`boot(argv)`) has pipes too, unless `detached`: read them. |
 | `kill(signal)` | `'SIGTERM'` by default; a name or a number. |

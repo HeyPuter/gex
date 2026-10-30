@@ -81,7 +81,7 @@ export function makeT({ host, arch, gpu = false, timed = false, phase = 1, state
           buf += dec.decode(value, { stream: true });
           for (let i; (i = buf.indexOf('\n')) >= 0;) { got.push(buf.slice(0, i)); buf = buf.slice(i + 1); }
         }
-      })();
+      })().catch(() => {}); // a program that never started errors its streams
       return got;
     },
   };
