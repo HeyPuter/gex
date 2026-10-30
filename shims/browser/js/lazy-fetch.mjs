@@ -4,7 +4,7 @@
 // there anyway); it fills `len` bytes at `dst` in the kernel's memory.
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
-import { cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
+import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
 // one after another in one stream, while the guest runs. `buf` (a
@@ -298,47 +298,58 @@ export function lazyFetch(memory) {
       if (n < 0) sayOnce(href, `[lazy] ${href}: a read failed (rest bundle)`);
       return n;
     }
-    // The page's cache of lazy files, when it keeps one (lazy-cache.mjs).
-    if (cachedRead(absolute(href), from, dst, len) === len) {
-      done(len);
-      return len;
+    // The page's cache of lazy files, when it keeps one (lazy-cache.mjs):
+    // its answer, or its failure (it tried the server already).
+    const c = cachedRead(absolute(href), from, dst, len);
+    if (c === len || c === OWNER_FAILED) {
+      done(c === len ? len : 0);
+      return c === len ? len : -1;
     }
     if (typeof XMLHttpRequest !== 'function') {
       const n = nodeFetch(href, from, memory, dst, len);
       done(n > 0 ? n : 0);
       return n;
     }
+    // As a rest bundle's frame (bundleRead): tried a few times with waits
+    // between, then held as failed by chunk, its reads failing at once.
+    const abs = absolute(href);
+    const key = `${abs}#c${Math.floor(from / CHUNK)}`;
+    if (failed.held(key)) {
+      done(0);
+      return -1;
+    }
     let last = 'no response';
-    try {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const got = retrySync(() => {
+      const x = new XMLHttpRequest();
+      // A path: against the page's origin (a Worker started from a blob
+      // URL has `GEX_BASE`, its module's real URL; worker-graph.js).
+      x.open('GET', abs, false);
+      x.responseType = 'arraybuffer';
+      x.setRequestHeader('Range', `bytes=${from}-${from + len - 1}`);
+      // The HTTP cache can answer a range from a partial entry badly (a
+      // later range of a file whose first chunk it holds); the guest keeps
+      // its own copy of each chunk, so the cache buys nothing here.
+      x.setRequestHeader('Cache-Control', 'no-store');
       try {
-        const x = new XMLHttpRequest();
-        // A path: against the page's origin (a Worker started from a blob
-        // URL has `GEX_BASE`, its module's real URL; worker-graph.js).
-        x.open('GET', absolute(href), false);
-        x.responseType = 'arraybuffer';
-        x.setRequestHeader('Range', `bytes=${from}-${from + len - 1}`);
-        // The HTTP cache can answer a range from a partial entry badly (a
-        // later range of a file whose first chunk it holds); the guest keeps
-        // its own copy of each chunk, so the cache buys nothing here.
-        x.setRequestHeader('Cache-Control', 'no-store');
         x.send();
-        const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
-        last = `status ${x.status}, ${got.length} bytes`;
-        // 206 is the range; a server without ranges sends the whole file (200).
-        const at = x.status === 206 ? 0 : x.status === 200 ? from : -1;
-        if (at < 0 || got.length < at + len) continue;
-        new Uint8Array(memory.buffer, dst, len).set(got.subarray(at, at + len));
-        done(len);
-        return len;
       } catch (e) {
         last = String(e);
+        return null;
       }
-    }
-    } finally {
+      const b = new Uint8Array(x.response ?? new ArrayBuffer(0));
+      last = `status ${x.status}, ${b.length} bytes`;
+      // 206 is the range; a server without ranges sends the whole file (200).
+      const at = x.status === 206 ? 0 : x.status === 200 ? from : -1;
+      return at < 0 || b.length < at + len ? null : b.subarray(at, at + len);
+    });
+    if (!got) {
+      failed.failed(key);
       done(0);
+      sayOnce(key, `[lazy] ${href} @${from}+${len}: failed (${last})`);
+      return -1;
     }
-    console.error(`[lazy] ${href} @${from}+${len}: failed (${last})`);
-    return -1;
+    new Uint8Array(memory.buffer, dst, len).set(got);
+    done(len);
+    return len;
   };
 }

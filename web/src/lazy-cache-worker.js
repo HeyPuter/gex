@@ -55,16 +55,20 @@ async function read(cache, url, from, len) {
     let stop = k;
     while (stop < last && !chunks.has(stop + 1)) stop++;
     const lo = k * CHUNK, hi = (stop + 1) * CHUNK - 1;
-    let got = null;
-    for (let attempt = 0; attempt < 3 && !got; attempt++) {
-      try {
-        const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi}` }, cache: 'no-store' });
-        const body = new Uint8Array(await res.arrayBuffer());
-        if (res.status === 206) got = body;
-        else if (res.status === 200) got = body.subarray(lo, hi + 1);
-      } catch { /* again */ }
+    // Tried a few times with waits between, then held as failed by chunk
+    // (as a rest bundle's frame): reads of it fail at once until the hold ends.
+    for (let c = k; c <= stop; c++) if (failed.held(`${url}#c${c}`)) throw heldError;
+    const got = await retryAsync(async () => {
+      const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi}` }, cache: 'no-store' });
+      const body = new Uint8Array(await res.arrayBuffer());
+      if (res.status === 206) return body;
+      if (res.status === 200) return body.subarray(lo, hi + 1);
+      return null;
+    });
+    if (!got) {
+      for (let c = k; c <= stop; c++) failed.failed(`${url}#c${c}`);
+      throw new Error(`${url} @${lo}: no answer`);
     }
-    if (!got) throw new Error(`${url} @${lo}: no answer`);
     net += got.length;
     for (let c = k; c <= stop; c++) {
       const b = got.slice((c - k) * CHUNK, (c - k + 1) * CHUNK);

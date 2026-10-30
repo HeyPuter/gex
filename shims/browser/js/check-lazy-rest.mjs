@@ -14,10 +14,13 @@
  *     asked by readers in other threads: the same counts, and readers of one
  *     frame at once share one request.
  *
+ * A plain lazy file (a URL of its own, read by ranges) the same: a read of a
+ * failing chunk is 1 + RETRY_MS.length requests, the reads after it none.
+ *
  * Usage: node check-lazy-rest.mjs
  */
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
-import { RETRY_MS, FAILED_HOLD_MS } from './lazy-cache.mjs';
+import { RETRY_MS, FAILED_HOLD_MS, OWNER_FAILED } from './lazy-cache.mjs';
 
 const FRAME = 4096;
 const NFRAMES = 3;
@@ -62,10 +65,16 @@ const BASE = 'http://site.test/';
 const URL_BIN = `${BASE}rest.bin`;
 
 // counts[0]: requests for rest.bin; counts[1]: for rest.bin.json;
-// counts[2]: the server's mode (0 a 503 for rest.bin, 1 answers).
+// counts[2]: the server's mode (0 a 503 for rest.bin and plain.bin, 1
+// answers); counts[3]: requests for plain.bin (the test's tar, unpacked).
 function server(counts, delayMs = 0) {
-  const { bin, json } = bundle();
+  const { bin, json, plain: p } = bundle();
   return (url, range) => {
+    if (url.endsWith('plain.bin')) {
+      Atomics.add(counts, 3, 1);
+      if (Atomics.load(counts, 2) === 0) return { status: 503, body: new Uint8Array(0) };
+      return { status: 206, body: p.slice(range[0], range[1] + 1) };
+    }
     const isJson = url.endsWith('.json');
     Atomics.add(counts, isJson ? 1 : 0, 1);
     if (isJson) return { status: 200, body: new TextEncoder().encode(json) };
@@ -90,7 +99,7 @@ if (isMainThread) {
 
   // -- a Worker's own reads (lazy-fetch.mjs) ---------------------------------
   {
-    const counts = new Int32Array(new SharedArrayBuffer(12));
+    const counts = new Int32Array(new SharedArrayBuffer(16));
     const serve = server(counts);
     globalThis.XMLHttpRequest = class {
       open(_m, url) { this.url = url; this.headers = {}; }
@@ -123,12 +132,24 @@ if (isMainThread) {
     read(FRAME + 10, 10);
     check(`worker: another frame, ${TRIES} more (${counts[0] - TRIES})`, counts[0] === 2 * TRIES);
     check(`worker: the index asked for once (${counts[1]})`, counts[1] === 1);
+    const purl = new TextEncoder().encode('plain.bin');
+    new Uint8Array(memory.buffer).set(purl, 512);
+    const readPlain = (from, len) => fetchLazy(512, purl.length, BigInt(from), 2048, len);
+    const p1 = readPlain(100, 200);
+    check(`worker: a plain file's failing chunk fails (${p1}) after ${TRIES} requests (${counts[3]})`, p1 === -1 && counts[3] === TRIES);
+    for (let i = 0; i < 20; i++) readPlain(100 + i, 50);
+    check(`worker: 20 reads more of it, no request (${counts[3] - TRIES})`, counts[3] === TRIES);
     // The hold over and the server back: the bytes.
     Atomics.store(counts, 2, 1);
     const now = Date.now;
     Date.now = () => now() + FAILED_HOLD_MS + 1000;
     const before = counts[0];
     const r2 = read(100, 200);
+    const pb = counts[3];
+    const p2 = readPlain(300, 100);
+    const pgot = new Uint8Array(memory.buffer, 2048, 100).slice();
+    check(`worker: the plain file after the hold, one request (${p2}, ${counts[3] - pb})`,
+      p2 === 100 && counts[3] - pb === 1 && pgot.every((x, i) => x === want[300 + i]));
     Date.now = now;
     console.error = quiet;
     const got = new Uint8Array(memory.buffer, 1024, 200);
@@ -138,7 +159,7 @@ if (isMainThread) {
 
   // -- the owner's reads (lazy-cache-worker.js) -------------------------------
   {
-    const counts = new Int32Array(new SharedArrayBuffer(12));
+    const counts = new Int32Array(new SharedArrayBuffer(16));
     const ctl = new SharedArrayBuffer((await import('./lazy-cache.mjs')).HEAD + 32 * 1056);
     const memory = new WebAssembly.Memory({ initial: 4, maximum: 4, shared: true });
     const owner = new Worker(new URL(import.meta.url), { workerData: { role: 'owner', counts, delayMs: 300 } });
@@ -148,16 +169,21 @@ if (isMainThread) {
       zstd: new URL('../../../web/eject-site/vendor/zstddec-stream.mjs', import.meta.url).href,
     });
     await new Promise((r) => owner.once('message', r));
-    const readers = (n, from, len) => Promise.all(Array.from({ length: n }, (_, i) => new Promise((resolve, reject) => {
-      const w = new Worker(new URL(import.meta.url), { workerData: { role: 'reader', ctl, from: from + i, len, dst: 4096 + i * 512 } });
+    const readers = (n, from, len, url = URL_BIN + '#0') => Promise.all(Array.from({ length: n }, (_, i) => new Promise((resolve, reject) => {
+      const w = new Worker(new URL(import.meta.url), { workerData: { role: 'reader', ctl, url, from: from + i, len, dst: 4096 + i * 512 } });
       w.once('message', resolve);
       w.once('error', reject);
     })));
-    let got = await readers(1, 100, 200);
-    check(`owner: a read of a failing frame fails (${got[0]})`, got[0] === -1);
+    let got = await readers(1, 100, 200, `${BASE}plain.bin`);
+    // (OWNER_FAILED: the reader does not ask the server itself after that)
+    check(`owner: a plain file's failing chunk fails (${got[0]}) after ${TRIES} requests (${counts[3]})`, got[0] === OWNER_FAILED && counts[3] === TRIES);
+    got = await readers(4, 100, 50, `${BASE}plain.bin`);
+    check(`owner: 4 reads more of it, no request (${counts[3] - TRIES})`, got.every((n) => n === OWNER_FAILED) && counts[3] === TRIES);
+    got = await readers(1, 100, 200);
+    check(`owner: a read of a failing frame fails (${got[0]})`, got[0] === OWNER_FAILED);
     check(`owner: it asked ${TRIES} times (${counts[0]})`, counts[0] === TRIES);
     got = await readers(8, 100, 50);
-    check(`owner: 8 reads more of it, no request (${counts[0] - TRIES})`, got.every((n) => n === -1) && counts[0] === TRIES);
+    check(`owner: 8 reads more of it, no request (${counts[0] - TRIES})`, got.every((n) => n === OWNER_FAILED) && counts[0] === TRIES);
     // Readers of a frame not asked for yet, at once, with the server
     // answering: one request between them.
     Atomics.store(counts, 2, 1);
@@ -187,5 +213,5 @@ if (isMainThread) {
 } else {
   const { setLazyCache, cachedRead } = await import('./lazy-cache.mjs');
   setLazyCache({ ctl: workerData.ctl });
-  parentPort.postMessage(cachedRead(URL_BIN + '#0', workerData.from, workerData.dst, workerData.len));
+  parentPort.postMessage(cachedRead(workerData.url, workerData.from, workerData.dst, workerData.len));
 }

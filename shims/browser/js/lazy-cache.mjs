@@ -72,9 +72,14 @@ export function setLazyCache(c) {
 // when the owner's fetch outlasted the old 60 s bound on the whole wait).
 const WAIT_MS = 60000;
 
+/** What `cachedRead` returns when the owner took the ask and its fetch
+ *  failed: the caller's own request would only ask the server again. */
+export const OWNER_FAILED = -2;
+
 /** Read `len` bytes of `href` at `from` into the kernel memory at `dst`,
- *  through the owner. Returns the bytes written, or -1 when it could not
- *  (no owner, no free slot, a failure): the caller then fetches. */
+ *  through the owner. Returns the bytes written; -1 when it could not ask
+ *  (no owner, no free slot), and the caller then fetches; OWNER_FAILED
+ *  when the owner's fetch failed. */
 export function cachedRead(href, from, dst, len) {
   if (!ctl) return -1;
   const url = new TextEncoder().encode(href);
@@ -107,7 +112,7 @@ export function cachedRead(href, from, dst, len) {
   }
   const n = ctl[base + 1];
   Atomics.store(ctl, base, FREE);
-  return n;
+  return n < 0 ? OWNER_FAILED : n;
 }
 
 // A rest bundle's ranged request that fails (lazy-fetch.mjs, the owner's
