@@ -721,7 +721,8 @@ const host = new ProcessHost({
           // child lifts its parent's libraries again.
           (m.reuse
             ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}` +
-              ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}`
+              ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}` +
+              (m.reuse[11] ? ` servedOtherMode=${m.reuse[11]}` : '')
             : '') +
           (m.byObject ? ` [${m.byObject}]` : '') +
           (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB` +

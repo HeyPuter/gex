@@ -618,11 +618,17 @@ fn refresh_ident_snapshot(p: &Px<'_>) {
 /// for narration.
 fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     use std::hash::{Hash, Hasher};
-    let addr = page * gex_abi::DISPATCH_PAGE;
+    let alt = page & gex_abi::ALT_PAGE != 0;
+    let addr = (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
     let snap = IDENT_SNAPSHOT.0.borrow();
     let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
     let mut hs = hasher.clone();
     (off + (addr - start)).hash(&mut hs);
+    // A page key of the other mode is `key_identity`'s, whole.
+    if alt {
+        flavour_salt(&mut hs);
+        mode_salt(&mut hs, true);
+    }
     Some((hs.finish(), id.clone()))
 }
 
@@ -3835,6 +3841,8 @@ struct Jit {
     reuse_noident: u64,
     /// Modules installed from the shared store instead of being lifted.
     reuse_served: u64,
+    /// Of `reuse_served`, modules of the other mode's code (`key_identity`).
+    reuse_served_alt: u64,
     /// The slot map word (`blocks` index and arm) each dense slot's bridge
     /// was given (`cgen::bridges`, by `table << 24 | slot`): a slot bridged
     /// again gets the same one. A fresh index per bridge numbered a 64-bit
@@ -11062,6 +11070,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         reuse_miss: 0,
         reuse_noident: 0,
         reuse_served: 0,
+        reuse_served_alt: 0,
         bridge_dense: Default::default(),
         bridge_group: (0, 0),
         store_ok: 0,
@@ -12571,6 +12580,12 @@ thread_local! {
 /// grain a process installs at -- having missed once in libc it will miss all
 /// over libc, each a module somebody already built.
 fn object_identity(p: &Px<'_>, addr: u64) -> Option<u64> {
+    object_identity_mode(p, addr, false)
+}
+
+/// [`object_identity`], for translations in the process's other mode when
+/// `alt` ([`page_identity_mode`]).
+fn object_identity_mode(p: &Px<'_>, addr: u64, alt: bool) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mm = p.mm.lock();
     let v = mm.vmas().iter().find(|v| addr >= v.start && addr < v.end)?;
@@ -12581,9 +12596,19 @@ fn object_identity(p: &Px<'_>, addr: u64) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     flavour_salt(&mut hasher);
+    mode_salt(&mut hasher, alt);
     let key = hasher.finish();
     note_key(p, key, id);
     Some(key)
+}
+
+/// The mode in a code identity: translations in the process's other mode
+/// (`alt`) are keyed apart; its own add nothing, so their keys stay as they
+/// were.
+fn mode_salt(h: &mut impl std::hash::Hasher, alt: bool) {
+    if alt {
+        h.write_u8(0x23);
+    }
 }
 
 /// The flavour in a code identity ([`object_identity`], [`page_identity`]):
@@ -12611,14 +12636,14 @@ fn flavour_salt(h: &mut impl std::hash::Hasher) {
 }
 
 /// Whether the object covering this page has been translated whole.
-fn obj_finished(p: &Px<'_>, page: u64) -> bool {
+fn obj_finished(p: &Px<'_>, key: u64) -> bool {
     // SAFETY: a scalar in, a scalar out, and no borrow of anything this
     // module owns.
     unsafe {
         if k_present() == 0 {
             return false;
         }
-        match object_identity(p, page * gex_abi::DISPATCH_PAGE) {
+        match object_identity_mode(p, (key & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE, key & gex_abi::ALT_PAGE != 0) {
             Some(obj) => k_obj_is_translated(obj) != 0,
             None => false,
         }
@@ -12972,6 +12997,19 @@ fn note_content_names() {
 }
 
 fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
+    page_identity_mode(p, page, false)
+}
+
+/// [`page_identity`] for a page key (`gex_abi::page_key`): the page's
+/// identity, that of its translations in the other mode (`ALT_PAGE`) apart.
+fn key_identity(p: &Px<'_>, key: u64) -> Option<u64> {
+    page_identity_mode(p, (key & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE, key & gex_abi::ALT_PAGE != 0)
+}
+
+/// [`page_identity`], for translations in the process's other mode when
+/// `alt` (a WoW64 thread's 32-bit code): the same bytes translated in the
+/// other mode are other code, so its key is apart.
+fn page_identity_mode(p: &Px<'_>, page: u64, alt: bool) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mm = p.mm.lock();
     let v = mm.vmas().iter().find(|v| page >= v.start && page < v.end)?;
@@ -13009,6 +13047,7 @@ fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
     id.hash(&mut hasher);
     (off + (page - v.start)).hash(&mut hasher);
     flavour_salt(&mut hasher);
+    mode_salt(&mut hasher, alt);
     let key = hasher.finish();
     note_key(p, key, id);
     Some(key)
@@ -13017,7 +13056,7 @@ fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
 /// Whether `page`'s code is named by its bytes ([`gex_kernel::mem::CONTENT_ID`])
 /// and the base the system gave that name's page is `base`.
 fn content_base_agrees(p: &Px<'_>, page: u64, base: u32) -> bool {
-    let at = page * gex_abi::DISPATCH_PAGE;
+    let at = (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
     let named = {
         let mm = p.mm.lock();
         mm.vmas()
@@ -13027,7 +13066,7 @@ fn content_base_agrees(p: &Px<'_>, page: u64, base: u32) -> bool {
             .is_some_and(|(id, _)| id.starts_with(gex_kernel::mem::CONTENT_ID))
     };
     // SAFETY: a lookup in the kernel's memory, borrowing nothing here.
-    named && page_identity(p, at).is_some_and(|k| unsafe { k_slot_get(page, k) } == base)
+    named && key_identity(p, page).is_some_and(|k| unsafe { k_slot_get(page, k) } == base)
 }
 
 /// Nanoseconds on the host clock.
@@ -16907,9 +16946,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     ));
                 }
             }
-            // Nothing is shared of the other mode's code: modules are
-            // stored and served by page identity, which has no mode.
-            let ident = if alt { None } else { page_identity(px, page * gex_abi::DISPATCH_PAGE) };
+            // The other mode's translations of a page are keyed apart
+            // (`key_identity`).
+            let ident = key_identity(px, page);
             if ident.is_none() {
                 j.reuse_noident += 1;
             }
@@ -16976,7 +17015,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // size behind it, and the lot is however many megabytes of wasm
                 // somebody stored: a finished object served 317 MiB in one miss.
                 // What this leaves is taken by the next miss.
-                let obj = object_identity(px, page * gex_abi::DISPATCH_PAGE).unwrap_or(0);
+                let obj = object_identity_mode(px, (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE, alt).unwrap_or(0);
                 let (ready, cursor) = shared_modules_of_object(
                     j,
                     obj,
@@ -17096,7 +17135,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                                 // page's code. Unnamed pages are taken as before.
                                 // SAFETY: lookups in the kernel's memory, borrowing nothing here.
                                 let other = unsafe { k_present() } != 0
-                                    && page_identity(px, *p * gex_abi::DISPATCH_PAGE)
+                                    && key_identity(px, *p)
                                         .is_some_and(|k| unsafe { k_slot_get(*p, k) } != *b);
                                 if other {
                                     if tracing() {
@@ -17110,7 +17149,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                                 keep.push((*p, *b));
                                 continue;
                             }
-                            let same = page_identity(px, *p * gex_abi::DISPATCH_PAGE)
+                            let same = key_identity(px, *p)
                                 // SAFETY: a lookup in the kernel's memory, borrowing nothing here.
                                 .map_or(false, |k| unsafe { k_slot_get(*p, k) } == *b);
                             if !same {
@@ -17132,6 +17171,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         dirs.extend_from_slice(&keep);
                         kept.push(keep);
                         j.reuse_served += 1;
+                        j.reuse_served_alt += alt as u64;
                     }
                     // Does any of this answer the block that faulted? A unit
                     // holds only what was reachable in the process that built
@@ -17384,7 +17424,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // Not into the store if code was retired while it lifted: it may hold
         // the old bytes, and another process would be served them.
         let stale = retired_since.as_ref().is_some_and(|r| !r.is_empty());
-        let mod_id = if stale || alt { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
+        let mod_id = if stale { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
         if mod_id == 0 {
             j.store_full += 1;
         } else {
@@ -17398,7 +17438,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let named = unit
                 .covered
                 .iter()
-                .filter(|(pg, _)| page_identity(px, *pg * gex_abi::DISPATCH_PAGE).is_some())
+                .filter(|(pg, _)| key_identity(px, *pg).is_some())
                 .count();
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if tracing() && NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -17407,8 +17447,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 ));
             }
         }
-        for (page, base) in unit.covered.iter().filter(|_| !alt) {
-            if let Some(key) = page_identity(px, *page * gex_abi::DISPATCH_PAGE) {
+        for (page, base) in unit.covered.iter() {
+            if let Some(key) = key_identity(px, *page) {
                 record_shared_slot(j, px.pid, *page, key, *base);
                 if mod_id != 0 {
                     // SAFETY: a call into the kernel taking no borrow here.
@@ -17422,7 +17462,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if mod_id != 0 {
             let mut claimed: Vec<u64> = Vec::new();
             for (addr, _) in &unit.exported_blocks {
-                if let Some(obj) = object_identity(px, *addr) {
+                if let Some(obj) = object_identity_mode(px, *addr, alt) {
                     if !claimed.contains(&obj) {
                         claimed.push(obj);
                         // SAFETY: a call into the kernel taking no borrow.
@@ -20337,6 +20377,7 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             8 => SERVE_NONE.with(|c| c.borrow().1),
             9 => NOIDENT_WHY.with(|c| c.borrow().0),
             10 => NOIDENT_WHY.with(|c| c.borrow().1),
+            11 => j.reuse_served_alt,
             _ => j.reuse_noident,
         }) as i64
     })
