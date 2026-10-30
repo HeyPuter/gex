@@ -132,6 +132,11 @@ const RECYCLE_COUNT = 4;
 /** How many spare thread Workers (`#startSpare`) the page keeps waiting at
  *  once; past it the oldest is let go. */
 const SPARE_MAX = 8;
+/** How long a spare waits for its thread before it is let go. A process
+ *  starts its threads in bursts, which find their spares within seconds;
+ *  one that waits longer holds a whole thread's instantiation for a start
+ *  that may never come. */
+const SPARE_IDLE_MS = 5000;
 /** A test-only switch: whether a running fork child's
  *  record, its parent's modules with it, can be collected once the child's
  *  Worker has it. Node only, with `--expose-gc`. */
@@ -1261,7 +1266,17 @@ export class ProcessHost {
       compat: rec.compat,
       procOpts: rec.procOpts,
     });
-    this.#spares.push({ proc, key, w, ref, gen: rec.execGen });
+    const sp = { proc, key, w, ref, gen: rec.execGen };
+    this.#spares.push(sp);
+    const idle = setTimeout(() => {
+      const i = this.#spares.indexOf(sp);
+      if (i < 0) return;
+      this.#spares.splice(i, 1);
+      if (logNamed('spare')) console.warn(`[spare] ${key}: let go, no thread in ${SPARE_IDLE_MS / 1000} s`);
+      this.#letSpareGo(sp);
+    }, SPARE_IDLE_MS);
+    // Not what keeps a host's event loop alive.
+    idle.unref?.();
     if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
   }
