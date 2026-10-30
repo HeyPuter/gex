@@ -3929,7 +3929,12 @@ export class Gex {
         return { entry: 0n, ctx: 0, gone: true };
       }
       Object.assign(thread, go);
+      // The `clone` that made this thread promised it a slot, and this
+      // Worker has held one since it attached: kept now, or every thread a
+      // spare takes keeps a slot promised for good and the process's
+      // `clone`s fail once they add up to every slot.
       this.#promise = true;
+      this.keepPromise();
       const had = this.#cgen?.dyl.size ?? 0;
       if (said) {
         const ta = performance.now();
