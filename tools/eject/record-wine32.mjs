@@ -26,6 +26,8 @@
 // --boot-units list, whose units ship in the boot's download and the rest in
 // the background fill. Union several runs' lists for a program whose start
 // varies (sort -u).
+// Env RECORD_PAGE_OUT=FILE: when no window comes, the page's whole output
+// (`__nt.out`) to FILE; stderr gets its last 1500 characters.
 
 import { spawn } from 'node:child_process';
 import { appendFileSync, createReadStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -202,7 +204,9 @@ while (Date.now() - t0 < timeout) {
 if (!title) {
   console.error(`record-wine32: no window titled /${titleRe.source}/ in ${timeout / 1000} s`);
   console.error(`  at ${await ev('location.href')}, phase ${await ev('globalThis.__nt?.phase')}`);
-  console.error(`  page says: ${String(await ev("globalThis.__nt?.out ?? document.body?.innerText ?? ''")).slice(-1500)}`);
+  const said = String(await ev("globalThis.__nt?.out ?? document.body?.innerText ?? ''"));
+  if (process.env.RECORD_PAGE_OUT) writeFileSync(process.env.RECORD_PAGE_OUT, said);
+  console.error(`  page says: ${said.slice(-1500)}`);
   for (const e of errors.slice(0, 8)) console.error(`  console error: ${e}`);
   done(1);
 }
