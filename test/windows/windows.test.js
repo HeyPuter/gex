@@ -46,8 +46,8 @@ export default async function (t) {
 
   w.focus();
   await until(() => out.includes('focus'), 'keyboard focus');
-  w.canvas.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyA', key: 'a', bubbles: true }));
-  w.canvas.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyA', key: 'a', bubbles: true }));
+  // Real input, through the browser to the focused window.
+  await t.key('KeyA', 'a');
   await until(() => out.includes('key 30'), 'a key');
   check('a key reaches it', true);
 
@@ -63,10 +63,8 @@ export default async function (t) {
   // A press on it: the client asks to be moved (its own title bar would).
   const moved = new Promise((r) => w.addEventListener('request', (e) => r(e.kind), { once: true }));
   const r = w.canvas.getBoundingClientRect();
-  const at = { clientX: r.left + 20, clientY: r.top + 20, pointerId: 1, button: 0, buttons: 1, bubbles: true };
-  w.canvas.dispatchEvent(new PointerEvent('pointerenter', at));
-  w.canvas.dispatchEvent(new PointerEvent('pointerdown', at));
-  w.canvas.dispatchEvent(new PointerEvent('pointerup', { ...at, buttons: 0 }));
+  await t.move(r.left + 20, r.top + 20);
+  await t.click(r.left + 20, r.top + 20);
   eq('move request', await timeout(moved, 20000, 'move request').catch((e) => `${e.message}: ${JSON.stringify(out.slice(-6))}`), 'move');
 
   const closed = new Promise((r) => w.addEventListener('closed', r, { once: true }));
@@ -80,10 +78,8 @@ export default async function (t) {
   const m = await until(() => wins.find((x) => x.title === 'max'), 'the second window');
   const reqd = new Promise((res) => m.addEventListener('request', (e) => res(e.kind), { once: true }));
   const r2 = m.canvas.getBoundingClientRect();
-  const at2 = { clientX: r2.left + 20, clientY: r2.top + 20, pointerId: 2, button: 0, buttons: 1, bubbles: true };
-  m.canvas.dispatchEvent(new PointerEvent('pointerenter', at2));
-  m.canvas.dispatchEvent(new PointerEvent('pointerdown', at2));
-  m.canvas.dispatchEvent(new PointerEvent('pointerup', { ...at2, buttons: 0 }));
+  await t.move(r2.left + 20, r2.top + 20);
+  await t.click(r2.left + 20, r2.top + 20);
   const req = await timeout(reqd, 20000, 'maximize request');
   eq('maximize request', req, 'maximize');
   q.kill();

@@ -105,6 +105,7 @@ A page or process runs one test, so each makes its own System.
 | `t.reload(state)` | Run the test again in a fresh page or process, as phase `t.phase + 1` with `t.state = state`; the checks so far are kept. |
 | `t.phase`, `t.state` | This run's phase (1 first), and what `reload` was given. |
 | `t.input(...events)`, `t.click(x, y)` | Real input over CDP: `{ method: 'Input.dispatchMouseEvent', ... }` and the like (browser). |
+| `t.key(code, key, modifiers)`, `t.type(text)`, `t.move(x, y, buttons)`, `t.wheel(x, y, dx, dy)` | Real keys, typing, pointer motion and wheel turns, to whatever the page has focused or under the pointer (browser). |
 | `t.pixels(clip)`, `t.pixel(x, y)` | The page's pixels as the browser composited them (a WebGPU canvas too): an ImageData of `{ x, y, width, height }`, or one `[r, g, b, a]` (browser). |
 | `t.screenshot(name, clip)` | The page, or `clip` of it, saved as `NAME.png` among the artefacts: its path (browser). |
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |

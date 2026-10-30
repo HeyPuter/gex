@@ -56,6 +56,20 @@ Object.assign(t, {
   async input(...events) {
     await t.cdp(...events);
   },
+  /** A real key press and release: `code` as KeyboardEvent.code has it
+   *  ('KeyA', 'Enter'), `key` what it types (default: none). */
+  key: (code, key = '', mods = 0) => t.input(
+    { method: 'Input.dispatchKeyEvent', type: key.length === 1 ? 'keyDown' : 'rawKeyDown', code, key, text: key.length === 1 ? key : undefined, modifiers: mods, windowsVirtualKeyCode: vk(code, key) },
+    { method: 'Input.dispatchKeyEvent', type: 'keyUp', code, key, modifiers: mods, windowsVirtualKeyCode: vk(code, key) },
+  ),
+  /** Text typed one key at a time (letters, digits, space). */
+  async type(text) {
+    for (const c of text) await t.key(c === ' ' ? 'Space' : /\d/.test(c) ? `Digit${c}` : `Key${c.toUpperCase()}`, c, /[A-Z]/.test(c) ? 8 : 0);
+  },
+  /** The pointer moved to `(x, y)`, `buttons` held. */
+  move: (x, y, buttons = 0) => t.input({ method: 'Input.dispatchMouseEvent', type: 'mouseMoved', x, y, buttons, button: buttons & 1 ? 'left' : 'none' }),
+  /** A wheel turn at `(x, y)`, in CSS pixels. */
+  wheel: (x, y, deltaX, deltaY) => t.input({ method: 'Input.dispatchMouseEvent', type: 'mouseWheel', x, y, deltaX, deltaY }),
   /** The page as the browser shows it, saved as `NAME` (.png) among the
    *  run's artefacts: its path. `clip`: `{ x, y, width, height }` only. */
   async screenshot(name, clip) {
@@ -83,6 +97,13 @@ Object.assign(t, {
     { method: 'Input.dispatchMouseEvent', type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 },
   ),
 });
+
+/** The Windows virtual key code CDP wants for a key to act on the page. */
+function vk(code, key) {
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+  if (/^Digit\d$/.test(code)) return code.charCodeAt(5);
+  return { Enter: 13, Space: 32, Escape: 27, Backspace: 8, Tab: 9, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, ShiftLeft: 16, ControlLeft: 17, AltLeft: 18 }[code] ?? (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
+}
 
 (async () => {
   let r;
