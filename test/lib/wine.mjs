@@ -65,3 +65,39 @@ function fetchWork(t, name) {
   if (u.startsWith('file:')) return import('node:fs/promises').then((f) => f.readFile(new URL(u))).then((b) => new Response(b));
   return fetch(u);
 }
+
+/** What the runtime said of each process as it exited, under the debug
+ *  switch `log: 'debug'` (host.mjs, "[gex] pid N: lived ..."): its dispatch
+ *  slots left (the page's budget, in thousands), memory and the blocks it
+ *  translated by object. A process may be said twice (its last thread). */
+export async function exitStats(t) {
+  return (await t.logs(/\[gex\] pid [0-9:]+: lived /)).map((l) => ({
+    pid: /pid ([0-9:]+)/.exec(l)[1],
+    cmd: /\{([^}]*)\}/.exec(l)?.[1] ?? '',
+    slotsLeftK: Number(/(\d+)k dispatch slots left/.exec(l)?.[1] ?? NaN),
+    memoryMib: Number(/memory (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    kernelMib: Number(/kernel (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    tables: /tables blocks (\d+) ftab (\d+)/.exec(l)?.slice(1).map(Number) ?? null,
+    // name=blocks@first..last
+    objects: [...l.matchAll(/(\S*)=(\d+)@0x([0-9a-f]+)\.\.0x([0-9a-f]+)/g)].map((m) => ({ name: m[1], blocks: Number(m[2]), first: parseInt(m[3], 16) })),
+  }));
+}
+
+/** The blocks translated in the objects that start in any of `ranges`
+ *  (`[lo, hi)` pairs): each object once, at the most any line says. */
+export function blocksIn(stats, ranges) {
+  const most = new Map();
+  for (const s of stats) {
+    for (const o of s.objects) {
+      if (!ranges.some(([lo, hi]) => o.first >= lo && o.first < hi)) continue;
+      const k = `${o.name}@${o.first}`;
+      most.set(k, Math.max(most.get(k) ?? 0, o.blocks));
+    }
+  }
+  return [...most.values()].reduce((a, b) => a + b, 0);
+}
+
+/** The ranges xcload.exe and xcload2.exe print ("base=B size=S"). */
+export function printedRanges(stdout) {
+  return [...stdout.matchAll(/base=([0-9A-Fa-f]+) size=([0-9a-f]+)/g)].map((m) => [parseInt(m[1], 16), parseInt(m[1], 16) + parseInt(m[2], 16)]);
+}

@@ -57,6 +57,12 @@ Object.assign(t, {
     const [r] = await t.cdp({ method: '__logs', re: re.source, flags: re.flags.replace('g', '') });
     return r.lines;
   },
+  /** The page's renderer's peak RSS in KiB (its Workers are its threads),
+   *  or null where the runner cannot tell which renderer is the page's. */
+  async peakRss() {
+    const [r] = await t.cdp({ method: '__rss' });
+    return r.kib;
+  },
   /** Real input through the browser: `{ method: 'Input.dispatchMouseEvent',
    *  ... }` and the like. Resolves once they are sent. */
   async input(...events) {

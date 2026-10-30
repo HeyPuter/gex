@@ -41,6 +41,23 @@ const { values: o, positionals } = parseArgs({
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The peak RSS (VmHWM, KiB) of the one Chromium renderer that holds more
+ *  than 256 MiB (a page running a test; spare renderers hold a few dozen):
+ *  null when there are several (other jobs' pages) or none. */
+async function rendererPeak() {
+  const info = await cdp.send('SystemInfo.getProcessInfo', {}).catch(() => null);
+  const big = [];
+  for (const p of info?.processInfo ?? []) {
+    if (p.type !== 'renderer') continue;
+    try {
+      const st = readFileSync(`/proc/${p.id}/status`, 'utf8');
+      const kb = (k) => Number(new RegExp(`${k}:\\s+(\\d+) kB`).exec(st)?.[1] ?? 0);
+      if (kb('VmRSS') > 256 * 1024) big.push(kb('VmHWM'));
+    } catch {}
+  }
+  return big.length === 1 ? big[0] : null;
+}
 const hosts = o.host === 'both' ? HOSTS : [o.host];
 if (!hosts.every((h) => HOSTS.includes(h))) throw new Error(`--host: browser, node or both, not ${o.host}`);
 // Timing only on a bench host, through bench.sh (which sets GBENCH_RUN).
@@ -340,7 +357,8 @@ async function runPage(test, arch, say, timeout) {
     for (; sent < v.asks.length; sent++) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
-      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } } : await Promise.race([cdp.send(method, params, sessionId).then(
+      const reply = method === '__logs' ? { result: { lines: logs.filter((l) => new RegExp(params.re, params.flags).test(l)) } }
+        : method === '__rss' ? { result: { kib: await rendererPeak() } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
       ), crash.then(() => ({ error: crashed }))]);

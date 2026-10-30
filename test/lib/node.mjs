@@ -44,6 +44,8 @@ process.once('message', async ({ arch, phase, state, res, work, gpu, timed }) =>
       process.on('message', on);
       process.send({ logs: { re: re.source, flags: re.flags.replace('g', '') } });
     }),
+    /** This phase's process's peak RSS in KiB (its Workers are its threads). */
+    peakRss: async () => process.resourceUsage().maxRSS,
     input: browserOnly('t.input'),
     click: browserOnly('t.click'),
   });
