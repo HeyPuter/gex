@@ -53,8 +53,8 @@ todo=$(mktemp); trap 'rm -f "$todo"' EXIT
 # PATH BASE INPUTS KEY (the page's inputs id of the process it ran in and the key it asked, "-" when
 # the line names none)
 { sed -n 's/^unitless: \(\S*\) \(0x[0-9a-f]*\).*/\1 \2 -/p' "$log"
-  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key \([0-9a-f]*\), inputs \([0-9a-f]*\).*/\1 \2 \4 \3/p' "$log"
-  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*)/\1 \2 -/p' "$log"
+  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key \([0-9a-f]*\(-p[0-9a-f]*\)\?\), inputs \([0-9a-f]*\).*/\1 \2 \5 \3/p' "$log"
+  sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*\(-p[0-9a-f]*\)\?)/\1 \2 -/p' "$log"
   sed -n 's/^gex-\(w3\|wine32\): \(\/\S*\) at \(0x[0-9a-f]*\): no function-tier unit.*/\2 \3 -/p' "$log"; } |
   sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 " -" } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
 # The flavour, per inputs id (a 64-bit Wine's WoW64 processes and its other
@@ -64,9 +64,9 @@ while read -r p b in _; do
   [ -z "${flag[$in]+x}" ] || continue
   # (that id's line: an image both kinds load, at one base, has a key per id)
   if [ "$in" = - ]; then
-    key=$(grep -aom1 "$p at \(base \)\?$b: no function-tier unit (key [0-9a-f]*" "$log" | sed 's/.*(key //')
+    key=$(grep -aom1 "$p at \(base \)\?$b: no function-tier unit (key [0-9a-f]*\(-p[0-9a-f]*\)\?" "$log" | sed 's/.*(key //')
   else
-    key=$(grep -aom1 "$p at base $b: no function-tier unit (key [0-9a-f]*, inputs $in" "$log" | sed 's/.*(key //; s/,.*//')
+    key=$(grep -aom1 "$p at base $b: no function-tier unit (key [0-9a-f]*\(-p[0-9a-f]*\)\?, inputs $in" "$log" | sed 's/.*(key //; s/,.*//')
   fi
   f=$(file "$p")
   [ -n "$key" ] && [ -n "$f" ] && [ -f "$f" ] || continue
