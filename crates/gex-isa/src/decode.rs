@@ -1551,6 +1551,33 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
         }
         return None;
     }
+    // Scalar x indexed element: 01 U 11111 size L M Rm opcode H 0 Rn Rd. The
+    // floating-point multiplies (`fmul s1, s3, v2.s[0]`) and their
+    // accumulating forms, as the vector group decodes them; the saturating
+    // doubling integer ones (`sqdmulh s0, s1, v2.s[1]`) are not decoded.
+    if bits(raw, 28, 24) == 0b11111 && bit(raw, 10) == 0 {
+        return match decode_simd_by_element(raw, true, u)? {
+            Inst::VByElement {
+                op,
+                mut arr,
+                vd,
+                vn,
+                vm,
+                index,
+            } if arr.float => {
+                arr.scalar = true;
+                Some(Inst::VByElement {
+                    op,
+                    arr,
+                    vd,
+                    vn,
+                    vm,
+                    index,
+                })
+            }
+            _ => None,
+        };
+    }
     if bits(raw, 28, 24) != 0b11110 || bit(raw, 21) != 1 {
         return None;
     }
@@ -2942,6 +2969,27 @@ mod tests {
             d(0x0f62a840),
             Inst::VWiden { op: VWidenOp::MulL, signed: true, index: Some(6), .. }
         ));
+    }
+
+    #[test]
+    fn scalar_float_multiply_by_element() {
+        // The scalar forms of the floating-point by-element multiplies, as
+        // libDoodleJump's `fmul s1, s3, v2.s[0]`; the integer ones stay out.
+        for (raw, text) in [
+            (0x5f829061, "fmul s1, s3, v2.s[0]"),
+            (0x5fd11820, "fmla d0, d1, v17.d[1]"),
+            (0x5fbf58a4, "fmls s4, s5, v31.s[3]"),
+            (0x7f8898e6, "fmulx s6, s7, v8.s[2]"),
+        ] {
+            let inst = d(raw);
+            assert!(
+                matches!(inst, Inst::VByElement { arr: VArr { scalar: true, float: true, .. }, .. }),
+                "{raw:#x}: {inst:?}"
+            );
+            assert_eq!(crate::fmt::disasm(&inst, 0), text);
+        }
+        // sqdmulh s0, s1, v2.s[1]
+        assert!(!matches!(d(0x5fa2c020), Inst::VByElement { .. }));
     }
 
     #[test]

@@ -1356,12 +1356,10 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vm,
             index,
         } => format!(
-            "{} v{}.{}, v{}.{}, v{}.{}[{index}]",
+            "{} {}, {}, v{}.{}[{index}]",
             vop3_name(op),
-            vd.0,
-            arr.suffix(),
-            vn.0,
-            arr.suffix(),
+            areg(vd, arr),
+            areg(vn, arr),
             vm.0,
             arr.letter()
         ),

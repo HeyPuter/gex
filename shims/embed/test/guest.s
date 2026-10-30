@@ -47,6 +47,18 @@ fadd2:
     fadd d0, d0, d1
     ret
 
+// s0 * v1.s[2]: a scalar by-element multiply.
+.globl fmul_lane
+fmul_lane:
+    fmul s0, s0, v1.s[2]
+    ret
+
+// d0 + d1 * v2.d[1].
+.globl fmla_lane
+fmla_lane:
+    fmla d0, d1, v2.d[1]
+    ret
+
 // x0 + the ninth and tenth arguments, which are on the stack.
 .globl stack_args
 stack_args:

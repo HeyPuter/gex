@@ -118,6 +118,24 @@ int main(int argc, char** argv) {
     memcpy(&r, &c.rv[0][0], 8);
     CHECK("fadd2", r == 3.75, 1);
 
+    // Scalar by-element multiplies write only their element: the rest of v0 is zeroed.
+    float fs[4] = {1.0f, 2.0f, 3.5f, 4.0f}, f0 = 1.5f, fr;
+    memset(&c, 0, sizeof c);
+    memcpy(&c.v[0][0], &f0, 4);
+    c.v[0][1] = 0x7fc000007fc00000ull;
+    memcpy(&c.v[1][0], fs, 16);
+    gex_embed_call(at(OFF_fmul_lane), &c);
+    memcpy(&fr, &c.rv[0][0], 4);
+    CHECK("fmul s0, s0, v1.s[2]", fr == 5.25f && (c.rv[0][0] >> 32) == 0 && c.rv[0][1] == 0, 1);
+    double acc = 1.0, mul = 3.0, lanes[2] = {-1.0, 4.0};
+    memset(&c, 0, sizeof c);
+    memcpy(&c.v[0][0], &acc, 8);
+    memcpy(&c.v[1][0], &mul, 8);
+    memcpy(&c.v[2][0], lanes, 16);
+    gex_embed_call(at(OFF_fmla_lane), &c);
+    memcpy(&r, &c.rv[0][0], 8);
+    CHECK("fmla d0, d1, v2.d[1]", r == 13.0 && c.rv[0][1] == 0, 1);
+
     uint64_t stack[2] = {1000, 20000};
     memset(&c, 0, sizeof c);
     c.x[0] = 7;
