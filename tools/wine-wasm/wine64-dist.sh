@@ -211,9 +211,12 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0) | sha256sum | cut -c1-10)
+# WoW64: the i386 display driver in syswow64 too (wwl32's: the prefix's
+# Wine has none), where a 32-bit process's user32 loads it from.
+R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl32) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
+	[ -z "$WD" ] || cp -p "$C/wwl32-$P/dlls/winewayland.drv/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
