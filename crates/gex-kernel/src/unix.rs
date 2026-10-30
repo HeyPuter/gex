@@ -756,26 +756,43 @@ impl SocketNames {
     /// its name goes with the file, as on Linux, where the name is the
     /// file. A socket bound there keeps its connections and its own address
     /// (`getsockname`), and the path can be bound again. A name `to` had is
-    /// gone with the file the rename replaced.
+    /// gone with the file the rename replaced. A renamed directory takes
+    /// the names of the sockets under it along.
     pub fn rename_name(&self, from: &str, to: Option<&str>) {
+        // `from`'s path in `to`, if it is `from` or under it.
+        let moved = |p: &str| -> Option<String> {
+            let to = to?;
+            if p == from {
+                return Some(to.to_string());
+            }
+            let rest = p.strip_prefix(from)?;
+            (rest.starts_with('/') && !from.is_empty()).then(|| format!("{to}{rest}"))
+        };
         {
             let mut bound = self.bound.lock().unwrap();
             if let Some(to) = to {
                 bound.retain(|(p, _)| p != to);
             }
             match to {
-                Some(to) => bound.iter_mut().filter(|(p, _)| p == from).for_each(|(p, _)| *p = to.to_string()),
+                Some(_) => bound.iter_mut().for_each(|(p, _)| {
+                    if let Some(n) = moved(p) {
+                        *p = n;
+                    }
+                }),
                 None => bound.retain(|(p, _)| p != from),
             }
         }
         let mut d = self.dgram.lock().unwrap();
         if let Some(to) = to {
             d.remove(to);
-        }
-        if let Some(s) = d.remove(from) {
-            if let Some(to) = to {
-                d.insert(to.to_string(), s);
+            let keys: Vec<String> = d.keys().filter(|k| moved(k).is_some()).cloned().collect();
+            for k in keys {
+                if let Some(s) = d.remove(&k) {
+                    d.insert(moved(&k).unwrap(), s);
+                }
             }
+        } else {
+            d.remove(from);
         }
     }
 

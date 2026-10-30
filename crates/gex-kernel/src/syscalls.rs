@@ -3723,9 +3723,10 @@ impl PathIo<'_> {
             let _ = RENAME_EXCHANGE;
             return Err(Errno::EINVAL);
         }
-        let (from_sock, to_sock) = (self.is_socket_file(&from), self.is_socket_file(&to));
+        let from_moves = self.ns.metadata_nofollow(&from).is_ok_and(|md| matches!(md.file_type, FileType::Socket | FileType::Directory));
+        let to_sock = self.is_socket_file(&to);
         self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0)?;
-        if from_sock && from != to {
+        if from_moves && from != to {
             self.socket_renamed(&from, Some(&to));
         } else if to_sock && from != to {
             self.socket_renamed(&to, None);
@@ -12752,6 +12753,34 @@ mod tests {
         assert_eq!(call(&mut m, nr::LISTEN, &[l4, 4]), 0);
         assert_eq!(call(&mut m, nr::CONNECT, &[c5, 0x22000, ra]), 0, "the renamed-over name is the new file's");
         assert!(call(&mut m, nr::ACCEPT4, &[l4, 0, 0, oflags::O_NONBLOCK]) > 0, "reached the socket renamed over it");
+        // A directory renamed: the socket under it is bound at its new path,
+        // and its old path is free.
+        addr(&mut m, 0x23000, "/sockdir");
+        assert_eq!(call(&mut m, nr::MKDIRAT, &[AT_FDCWD, 0x23080, 0o755]), 0);
+        let ia = addr(&mut m, 0x24000, "/sockdir/s");
+        let l5 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l5, 0x24000, ia]), 0);
+        assert_eq!(call(&mut m, nr::LISTEN, &[l5, 4]), 0);
+        addr(&mut m, 0x25000, "/sockdir2");
+        assert_eq!(call(&mut m, nr::RENAMEAT2, &[AT_FDCWD, 0x23080, AT_FDCWD, 0x25080, 0]), 0);
+        let na = addr(&mut m, 0x26000, "/sockdir2/s");
+        let c6 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c6, 0x26000, na]), 0, "connect under the renamed directory");
+        assert!(call(&mut m, nr::ACCEPT4, &[l5, 0, 0, oflags::O_NONBLOCK]) > 0, "reached the socket under the renamed directory");
+        assert_eq!(call(&mut m, nr::MKDIRAT, &[AT_FDCWD, 0x23080, 0o755]), 0);
+        let l6 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l6, 0x24000, ia]), 0, "bind the old path under the directory's old name");
+        // A name that only shares a prefix stays where it is.
+        addr(&mut m, 0x27000, "/sockdir2x");
+        assert_eq!(call(&mut m, nr::MKDIRAT, &[AT_FDCWD, 0x27080, 0o755]), 0);
+        let xa = addr(&mut m, 0x28000, "/sockdir2x/s");
+        let l7 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l7, 0x28000, xa]), 0);
+        assert_eq!(call(&mut m, nr::LISTEN, &[l7, 4]), 0);
+        addr(&mut m, 0x29000, "/sockdir3");
+        assert_eq!(call(&mut m, nr::RENAMEAT2, &[AT_FDCWD, 0x25080, AT_FDCWD, 0x29080, 0]), 0);
+        let c7 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c7, 0x28000, xa]), 0, "a prefix-sharing sibling keeps its name");
     }
 
     /// `free_call`, the lock-free class, answers as the full call does:
