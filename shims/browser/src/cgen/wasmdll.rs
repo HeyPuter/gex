@@ -924,6 +924,14 @@ pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
     lock(&WINE_PE).mods.iter().find(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
 }
 
+/// Whether provider module `number` is Wine's PE module of the process's
+/// other mode (WoW64's i386 one): built for wasm32 and not lowered, beside a
+/// 64-bit Wine whose own is.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_alt(number: u32) -> i32 {
+    lock(&WINE_PE).mods.iter().any(|w| w.number == number && w.alt) as i32
+}
+
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
     if let Some(n) = super::wasmprog::len(number).or_else(|| super::libprov::wasm(number).map(|(_, n)| n)) {

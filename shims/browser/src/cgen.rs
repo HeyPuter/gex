@@ -1322,6 +1322,10 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     bridges_mode(addrs, false)
 }
 
+/// The tag on a `[table, slot]` pair's table that [`bridges_mode`] gives the
+/// other mode's bridges.
+pub(crate) const ALT_BRIDGE: u32 = 1 << 31;
+
 /// [`bridges`] in the process's other mode (`alt`: a WoW64 process's i386
 /// Wine modules): the pages keyed with `gex_abi::ALT_PAGE`, in the other
 /// directory, which code in that mode dispatches through.
@@ -1357,7 +1361,8 @@ pub(crate) fn bridges_mode(addrs: &[u64], alt: bool) -> (Vec<u32>, Vec<(u64, u32
         // entry every Worker that wrote the bridge there still holds.
         let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::dense_table(t as usize)).collect();
         let entries: Vec<u32> = dense.iter().map(|&(t, slot)| gex_abi::dispatch_entry(t as usize, slot)).collect();
-        let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, &mut j.bridge_group, &entries, crate::dense::alloc);
+        let group = if alt { &mut j.bridge_group_alt } else { &mut j.bridge_group };
+        let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, group, &entries, crate::dense::alloc);
         let mut filled = std::collections::BTreeSet::new();
         for (&entry, &w) in entries.iter().zip(&words) {
             crate::dense::set_slot_word(entry, w);
@@ -1369,6 +1374,13 @@ pub(crate) fn bridges_mode(addrs: &[u64], alt: bool) -> (Vec<u32>, Vec<(u64, u32
         for (t, slot) in seen {
             if !crate::dense::dense_table(t as usize) {
                 regs.extend_from_slice(&[t, slot]);
+            }
+        }
+        // The other mode's bridges are tagged: JS writes that mode's bridge
+        // there (`#writeBridges`).
+        if alt {
+            for t in regs.iter_mut().step_by(2) {
+                *t |= ALT_BRIDGE;
             }
         }
         j.translated.extend(addrs.iter().map(|&a| gex_abi::addr_key(a, alt)));
@@ -2695,33 +2707,39 @@ static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// The function table's runtime module (`gex_cgen::runtime`): where its
 /// bytes are, and how long they are.
 static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
+/// The other mode's (`gex_cgen::runtime::module_alt`): its bridge serves a
+/// function bound in the process's other directory (a WoW64 process's
+/// native i386 Wine), and its `enter` starts a thread there.
+static RUNTIME_ALT: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn runtime() -> &'static Vec<u8> {
-    RUNTIME.get_or_init(|| {
-        let m = gex_cgen::runtime::module();
-        let mut m = if !crate::dense::on() {
-            m
-        } else {
-            dense_runtime(&m).unwrap_or_else(|| {
-                crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
-                m
-            })
-        };
-        // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
-        // gex-ftab-runtime-...`).
-        let name = b"gex-ftab-runtime";
-        let mut sub = vec![name.len() as u8];
-        sub.extend_from_slice(name);
-        let mut sec = vec![4u8];
-        sec.extend_from_slice(b"name");
-        sec.push(0); // the module-name subsection
-        put_leb(&mut sec, sub.len() as u32);
-        sec.extend_from_slice(&sub);
-        m.push(0);
-        put_leb(&mut m, sec.len() as u32);
-        m.extend_from_slice(&sec);
+    RUNTIME.get_or_init(|| runtime_bytes(false))
+}
+
+fn runtime_bytes(alt: bool) -> Vec<u8> {
+    let m = if alt { gex_cgen::runtime::module_alt() } else { gex_cgen::runtime::module() };
+    let mut m = if !crate::dense::on() {
         m
-    })
+    } else {
+        dense_runtime(&m, alt).unwrap_or_else(|| {
+            crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+            m
+        })
+    };
+    // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
+    // gex-ftab-runtime-...`).
+    let name = b"gex-ftab-runtime";
+    let mut sub = vec![name.len() as u8];
+    sub.extend_from_slice(name);
+    let mut sec = vec![4u8];
+    sec.extend_from_slice(b"name");
+    sec.push(0); // the module-name subsection
+    put_leb(&mut sec, sub.len() as u32);
+    sec.extend_from_slice(&sub);
+    m.push(0);
+    put_leb(&mut m, sec.len() as u32);
+    m.extend_from_slice(&sec);
+    m
 }
 
 #[no_mangle]
@@ -2732,6 +2750,16 @@ pub extern "C" fn gex_ftab_runtime_ptr() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_len() -> u32 {
     runtime().len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_ftab_runtime_alt_ptr() -> u32 {
+    RUNTIME_ALT.get_or_init(|| runtime_bytes(true)).as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_ftab_runtime_alt_len() -> u32 {
+    RUNTIME_ALT.get_or_init(|| runtime_bytes(true)).len() as u32
 }
 
 fn leb(b: &[u8], p: &mut usize) -> Option<u32> {
@@ -2764,8 +2792,9 @@ fn put_leb(out: &mut Vec<u8>, mut v: u32) {
 /// import of `gex.blocks` after its tables, and that function replaced by
 /// `gex_emit::dense::dispatch_body`. `None` if the module is not the shape
 /// that was written for (memory, `ftab` and the dispatch tables imported, four
-/// functions defined, `dispatch` last, of type 3).
-fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
+/// functions defined, `dispatch` the fourth, of type 3; the other mode's
+/// also imports its directory, global 0, and defines `enter` fifth).
+fn dense_runtime(m: &[u8], alt: bool) -> Option<Vec<u8>> {
     if m.get(..8)? != b"\0asm\x01\0\0\0" {
         return None;
     }
@@ -2824,6 +2853,7 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                                 leb(body, &mut q)?;
                             }
                         }
+                        3 if alt => q += 3, // the kind, its value type, mutability
                         _ => return None,
                     }
                 }
@@ -2841,7 +2871,7 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
             10 => {
                 let mut q = 0;
                 let n = leb(body, &mut q)?;
-                if n != 4 {
+                if n != if alt { 5 } else { 4 } {
                     return None;
                 }
                 put_leb(&mut sec, n);
@@ -2849,10 +2879,10 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                     let at = q;
                     let l = leb(body, &mut q)? as usize;
                     q += l;
-                    if k + 1 < n {
+                    if k != 3 {
                         sec.extend_from_slice(body.get(at..q)?);
                     } else {
-                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, entry_ty?, 1, tables));
+                        sec.extend_from_slice(&gex_emit::dense::dispatch_body_in(3, entry_ty?, 1, tables, alt.then_some(0)));
                     }
                 }
             }

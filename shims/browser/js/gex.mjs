@@ -1127,6 +1127,9 @@ const TABLE_NAMES = [
   'dispatch7',
 ];
 
+/** The tag on a bridge's table (cgen.rs `ALT_BRIDGE`): the other mode's. */
+const ALT_BRIDGE = 0x80000000;
+
 /** A stateful provider's `provider_throw`, caught by its `provider_try`. */
 class ProviderThrow extends Error {
   constructor(code) {
@@ -4728,11 +4731,36 @@ export class Gex {
     if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
     const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
-    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map() };
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map(), gex, alt: null };
     this.#entryReset();
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
+  }
+
+  /** This Worker's runtime instance of the process's other mode
+   *  (`gex_cgen::runtime::module_alt`, a WoW64 process's 32-bit code): its
+   *  `bridge` serves a function bound in that mode's directory and goes on
+   *  through that directory, and its `enter` starts a thread there. Made at
+   *  the first use, against the directory the process has then. */
+  #cgenAlt() {
+    const st = this.#cgenStore();
+    const e = this.#shim.exports;
+    const dir = BigInt(e.gex_alt_dir?.() ?? 0);
+    if (!dir) throw new Error('gex: a bridge of the other mode before the process has its directory');
+    if (st.alt?.dir === dir) return st.alt;
+    let rm = this.#sharedModules.get('ftab-runtime-alt');
+    if (!rm) {
+      const ptr = e.gex_ftab_runtime_alt_ptr() >>> 0;
+      rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_alt_len() >>> 0)));
+      this.#sharedModules.set('ftab-runtime-alt', rm);
+    }
+    const alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, dir) : new WebAssembly.Global({ value: 'i32' }, Number(dir) | 0);
+    const ri = new WebAssembly.Instance(rm, { gex: { ...st.gex, alt_dir } });
+    const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
+    st.instances.push(ri);
+    st.alt = { dir, bridge, enter: ri.exports.enter };
+    return st.alt;
   }
 
   /** Grow this Worker's function table past every index handed out, with
@@ -4812,7 +4840,8 @@ export class Gex {
     // Wine's PE module in a 64-bit Wine process (the native PE core,
     // winepe.wasm): built LP64 and lowered as its program was, so i64 globals and
     // stack pointer. A Worker installs its program before any PE module.
-    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
+    // Not WoW64's i386 one (the process's other mode): wasm32 as built.
+    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64() && !e.gex_cgen_pmod_alt?.(prov);
     const lowered = (libprov || progLowered || dllLowered) && !m64();
     const w64 = m64() || lowered;
     if (wasmprog) {
@@ -8225,8 +8254,12 @@ export class Gex {
   #enterOf(ctx, pc) {
     const e = this.#shim.exports;
     if (!e.gex_ctx_alt?.(ctx)) return this.#guest.exports.enter;
-    if (this.#altEnter && this.#altEnterDir === BigInt(e.gex_alt_dir())) return this.#altEnter;
+    const dir = BigInt(e.gex_alt_dir());
+    if (this.#altEnter && this.#altEnterDir === dir) return this.#altEnter;
     this.#altEnter = null;
+    // Before any of that mode's code is translated (its first code native
+    // i386 Wine's): the runtime's, which dispatches through its directory.
+    if (dir && this.#cgen) return this.#cgenAlt().enter;
     e.gex_dispatch_miss(ctx, BigInt.asIntN(64, BigInt(pc)));
     return this.#altEnter ?? this.#guest.exports.enter;
   }
@@ -10104,11 +10137,17 @@ export class Gex {
    *  the call-out never saw its return. So an entry holding the bridge is
    *  left as it is, and a watched one keeps its watches around the bridge. */
   /** Write the bridge at each (table, index) pair of `regs`, table
-   *  `TABLE_NAMES.length` being `blocks`. */
+   *  `TABLE_NAMES.length` being `blocks`; a table tagged `ALT_BRIDGE` (the
+   *  other mode's, cgen.rs `bridges_mode`) gets that mode's bridge. */
   #writeBridges(tables, blocks, regs, bridge) {
     for (let j = 0; j + 1 < regs.length; j += 2) {
-      if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], bridge);
-      else tables[regs[j]].set(regs[j + 1], bridge);
+      let t = regs[j], b = bridge;
+      if (t & ALT_BRIDGE) {
+        t &= ~ALT_BRIDGE;
+        b = this.#cgenAlt().bridge;
+      }
+      if (t === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], b);
+      else tables[t].set(regs[j + 1], b);
     }
   }
 

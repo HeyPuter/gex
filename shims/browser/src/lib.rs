@@ -3853,6 +3853,9 @@ struct Jit {
     /// The `blocks` entry new bridges take arms of, and its next arm
     /// (`gex_emit::dense::bridge_words`).
     bridge_group: (u32, u32),
+    /// [`Self::bridge_group`] for the other mode's bridges, which run that
+    /// mode's bridge: an entry's arms all run one function.
+    bridge_group_alt: (u32, u32),
     /// Translation units the system-wide store accepted, and units it turned
     /// away. A unit it refuses can never be shared, however well the identity
     /// of its pages matches.
@@ -7963,7 +7966,12 @@ fn count_syscall(nr: u64, a0: u64, a1: u64) {
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A system call from the other mode's code (int 0x80, syscall or
     // sysenter in a WoW64 thread's 32-bit code): no such gate, #GP.
-    if gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0)) {
+    // Native i386 Wine's own calls (gexrt, through the page's glue) carry
+    // `PROVIDER_SYSCALL` and are no such instruction.
+    if gex_abi::X86
+        && pc as u64 & PROVIDER_SYSCALL == 0
+        && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))
+    {
         gp_fault(ctx, pc as u64 & 0x00ff_ffff_ffff_ffff);
     }
     leave_guest();
@@ -11105,6 +11113,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         reuse_served_alt: 0,
         bridge_dense: Default::default(),
         bridge_group: (0, 0),
+        bridge_group_alt: (0, 0),
         store_ok: 0,
         store_full: 0,
         intrinsics: Default::default(),
