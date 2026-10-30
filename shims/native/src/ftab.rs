@@ -29,6 +29,8 @@ pub(crate) struct Shared {
     pub modules: Vec<Module>,
     /// The runtime module (`gex_cgen::runtime`), compiled once.
     runtime: Option<Module>,
+    /// The runtime module of the process's other mode (`runtime::module_alt`).
+    runtime_alt: Option<Module>,
     /// The page checks of each run-time translation, by install: the
     /// `PAGE_GEN` value of every page it covers, as it was translated.
     checks: HashMap<u32, Vec<(u64, u32)>>,
@@ -87,6 +89,9 @@ pub(crate) struct Store {
     pub table: Table,
     pub resolve: wasmtime::Func,
     pub bridge: wasmtime::Func,
+    /// The other mode's bridge (`runtime::module_alt`), made at its first
+    /// bridge in the other directory.
+    pub bridge_alt: Option<wasmtime::Func>,
     /// The run loop (`gex_cgen::runtime::ROOT`), which an AOT-only process
     /// enters through (`aot_only::bind_root`).
     pub root: wasmtime::Func,
@@ -237,7 +242,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
     Ok(())
 }
 
@@ -584,7 +589,8 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
         if !dirs.iter().any(|&(p, _)| p == page) {
             dirs.push((page, base));
         }
-        slots.push(gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32));
+        let slot = gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32);
+        slots.push(slot | if alt { ALT_BRIDGE } else { 0 });
     }
     s.translated.extend(keys);
     let unit = Arc::new(CompiledUnit {
@@ -1085,17 +1091,86 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
     call_out(caller, ctx, target, ret, sp + delta, need)
 }
 
+/// The bit a bridge's packed slot ([`publish_bridges`]) carries when the
+/// slot is the other directory's: the other mode's bridge goes there, which
+/// dispatches where the function left through that directory. (A packed
+/// slot's table is below `DISPATCH_TABLES`, so the top bit is free.)
+pub(crate) const ALT_BRIDGE: u32 = 1 << 31;
+
 /// Write the bridge into this store's dispatch tables at `slots`, each a
-/// table and slot packed as a directory entry (`gex_abi::dispatch_entry`).
+/// table and slot packed as a directory entry (`gex_abi::dispatch_entry`),
+/// [`ALT_BRIDGE`] marking the other mode's.
 pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots: &[u32]) -> Result<()> {
     ensure(cx.as_context_mut())?;
-    let jit = cx.as_context().data().jit.as_ref().unwrap();
-    let (tables, bridge) = (jit.tables.clone(), jit.ftab.as_ref().unwrap().bridge.clone());
-    for &packed in slots {
-        let s = crate::Slot::of_entry(packed);
-        let table = tables.get(s.table).ok_or_else(|| anyhow!("a bridge in dispatch table {}, past the last", s.table))?;
-        table.set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(bridge.clone())))?;
+    if slots.iter().any(|&p| p & ALT_BRIDGE != 0) {
+        ensure_alt(cx.as_context_mut())?;
     }
+    let jit = cx.as_context().data().jit.as_ref().unwrap();
+    let st = jit.ftab.as_ref().unwrap();
+    let (tables, bridge, bridge_alt) = (jit.tables.clone(), st.bridge.clone(), st.bridge_alt.clone());
+    for &packed in slots {
+        let s = crate::Slot::of_entry(packed & !ALT_BRIDGE);
+        let table = tables.get(s.table).ok_or_else(|| anyhow!("a bridge in dispatch table {}, past the last", s.table))?;
+        let f = if packed & ALT_BRIDGE != 0 { bridge_alt.clone().unwrap() } else { bridge.clone() };
+        table.set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(f)))?;
+    }
+    Ok(())
+}
+
+/// Make this store's other-mode bridge (`runtime::module_alt`), once the
+/// process has its other directory.
+fn ensure_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> {
+    let jit = cx.as_context().data().jit.as_ref().unwrap();
+    if jit.ftab.as_ref().is_some_and(|st| st.bridge_alt.is_some()) {
+        return Ok(());
+    }
+    let (sh, linker, tables) = (Arc::clone(&jit.shared), jit.linker.clone(), jit.tables.clone());
+    let table = jit.ftab.as_ref().unwrap().table;
+    let memory = cx.as_context().data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let (rm, alt_dir) = {
+        let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let m = match &s.ftab.runtime_alt {
+            Some(m) => m.clone(),
+            None => {
+                let m = gex_cache::compile(cx.as_context().engine(), &gex_cgen::runtime::module_alt())
+                    .context("compiling the other mode's runtime module")?;
+                s.ftab.runtime_alt = Some(m.clone());
+                m
+            }
+        };
+        (m, s.alt_dir)
+    };
+    if alt_dir == 0 {
+        bail!("a bridge in the other directory before there is one");
+    }
+    let mut l = linker;
+    l.allow_shadowing(true);
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::ftab::TABLE, table)?;
+    for i in 0..gex_abi::DISPATCH_TABLES {
+        let t = match tables.get(i) {
+            Some(t) => *t,
+            None => Table::new(cx.as_context_mut(), wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None), wasmtime::Ref::Func(None))?,
+        };
+        l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::dispatch_table(i), t)?;
+    }
+    let g = wasmtime::Global::new(
+        cx.as_context_mut(),
+        wasmtime::GlobalType::new(
+            if gex_abi::mem64() { wasmtime::ValType::I64 } else { wasmtime::ValType::I32 },
+            wasmtime::Mutability::Const,
+        ),
+        if gex_abi::mem64() { Val::I64(alt_dir as i64) } else { Val::I32(alt_dir as u32 as i32) },
+    )?;
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::imports::ALT_DIR, g)?;
+    let inst = l.instantiate(cx.as_context_mut(), &rm).context("instantiating the other mode's runtime module")?;
+    let bridge = inst
+        .get_func(cx.as_context_mut(), gex_cgen::runtime::BRIDGE)
+        .ok_or_else(|| anyhow!("the other mode's runtime module exports no bridge"))?;
+    let mut c = cx.as_context_mut();
+    let jit = c.data_mut().jit.as_mut().unwrap();
+    jit.instances.push(inst);
+    jit.ftab.as_mut().unwrap().bridge_alt = Some(bridge);
     Ok(())
 }
 
