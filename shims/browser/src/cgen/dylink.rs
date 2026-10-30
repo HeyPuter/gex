@@ -54,9 +54,14 @@ struct DyProc {
 static DYPROC: Mutex<Option<DyProc>> = Mutex::new(None);
 /// Binding lists, by provider module number.
 static BINDS: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
-/// The modules the last `dlopen` loaded, in initialisation order, for JS
-/// to run their constructors once it has instantiated them.
-static DL_NEW: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+thread_local! {
+    /// The modules this thread's last `dlopen` loaded, in initialisation
+    /// order, for JS to run their constructors once it has instantiated them.
+    /// The calling thread's own: a `dlopen` on another thread between this
+    /// one's and its constructors would otherwise hand it that thread's
+    /// list, and this one's constructors would never run.
+    static DL_NEW: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// Bumped by every `dlopen` once its modules are published: a Worker that
 /// has not seen the latest number catches up after its next system call
 /// (`gex_wasmprog_dl_gen`), so a function pointer another thread got from
@@ -344,7 +349,7 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
 pub(super) fn on_exec() {
     *lock(&DYPROC) = None;
     *lock(&BINDS) = None;
-    lock(&DL_NEW).clear();
+    DL_NEW.with(|d| d.borrow_mut().clear());
     *lock(&ADOPT) = None;
     *lock(&REGISTRY) = None;
 }
@@ -457,7 +462,7 @@ fn dlopen(path: &str) -> Result<u32, String> {
     all.extend(find_needed(&mut q, from)?);
     let (order, _) = publish(&mut q, from, all, true, false, None)?;
     DL_GEN.fetch_add(1, Ordering::Release);
-    *lock(&DL_NEW) = order.iter().map(|&i| q.module_of[i]).collect();
+    DL_NEW.with(|d| *d.borrow_mut() = order.iter().map(|&i| q.module_of[i]).collect());
     *p = q;
     Ok(HANDLE_BASE + from as u32 * 16)
 }
@@ -469,7 +474,7 @@ fn dlopen(path: &str) -> Result<u32, String> {
 /// program's (libgex built with GEX_MEMORY64); JS widens a 32-bit one's.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_dlopen(path: u64, err: u64, errlen: u32) -> u32 {
-    lock(&DL_NEW).clear();
+    DL_NEW.with(|d| d.borrow_mut().clear());
     let r = guest_str(path).ok_or_else(|| "dlopen: bad path".to_string()).and_then(|p| dlopen(&p));
     match r {
         Ok(h) => h,
@@ -487,7 +492,7 @@ pub extern "C" fn gex_wasmprog_dlopen(path: u64, err: u64, errlen: u32) -> u32 {
 /// The `k`th module the last dlopen loaded, in initialisation order, or -1.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_dl_new(k: u32) -> i32 {
-    lock(&DL_NEW).get(k as usize).map_or(-1, |&n| n as i32)
+    DL_NEW.with(|d| d.borrow().get(k as usize).map_or(-1, |&n| n as i32))
 }
 
 /// `gex.dlsym(handle, name)`: a function's table index or a datum's

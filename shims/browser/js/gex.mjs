@@ -6261,7 +6261,11 @@ export class Gex {
         if (!h) return 0;
         this.#cgenCatchUp();
         const st = this.#cgenStore();
-        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
+        // Taken whole before any constructor runs: one that calls dlopen
+        // itself replaces the list.
+        const fresh = [];
+        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) fresh.push(n);
+        for (const n of fresh) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
         return h | 0;
       },
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,
