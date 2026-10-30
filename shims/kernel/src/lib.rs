@@ -3384,6 +3384,16 @@ fn sock_bind(p: String) -> i32 {
     keep(s)
 }
 
+/// The socket file at a name unlinked (`to_len` 0) or renamed: the name
+/// goes with it, and the path can be bound again
+/// (`SocketNames::rename_name`).
+#[no_mangle]
+pub extern "C" fn k_sock_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) {
+    let from = path_of_raw(from, from_len);
+    let to = (to_len > 0).then(|| path_of_raw(to, to_len));
+    names().rename_name(&from, to.as_deref());
+}
+
 /// Connect to a name. Returns this end's id, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
@@ -3663,6 +3673,7 @@ fn kernel_sockets() -> gex_kernel::unix::Remote {
         // Nothing passes descriptors over a moved socket's own streams.
         describe: |_| None,
         rebuild: |_, _| None,
+        rename: k_sock_rename,
     }
 }
 

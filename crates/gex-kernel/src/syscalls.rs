@@ -2908,6 +2908,10 @@ pub struct PathIo<'a> {
     pub fs: std::borrow::Cow<'a, Arc<FsCwd>>,
     /// For `utimensat`'s "now".
     pub clock: ClockFn,
+    /// The bound socket names an unlink or rename of a socket file takes
+    /// with it: this kernel's, and the global kernel's when there is one.
+    pub socket_names: &'a Arc<unix::SocketNames>,
+    pub unix_remote: Option<unix::Remote>,
 }
 
 thread_local! {
@@ -3630,7 +3634,27 @@ impl PathIo<'_> {
             }
             self.ns.rmdir(&p).map(|_| 0)
         } else {
-            self.ns.unlink(&p).map(|_| 0)
+            let sock = self.is_socket_file(&p);
+            self.ns.unlink(&p)?;
+            if sock {
+                self.socket_renamed(&p, None);
+            }
+            Ok(0)
+        }
+    }
+
+    fn is_socket_file(&self, p: &str) -> bool {
+        self.ns.metadata_nofollow(p).is_ok_and(|md| md.file_type == FileType::Socket)
+    }
+
+    /// The socket file at `from` unlinked (`to` none) or renamed: its bound
+    /// name goes with it ([`unix::SocketNames::rename_name`]), here and in
+    /// the global kernel, so the path can be bound again.
+    fn socket_renamed(&self, from: &str, to: Option<&str>) {
+        self.socket_names.rename_name(from, to);
+        if let Some(r) = self.unix_remote {
+            let to = to.unwrap_or("");
+            (r.rename)(from.as_ptr() as crate::PAddr, from.len() as u32, to.as_ptr() as crate::PAddr, to.len() as u32);
         }
     }
 
@@ -3699,7 +3723,14 @@ impl PathIo<'_> {
             let _ = RENAME_EXCHANGE;
             return Err(Errno::EINVAL);
         }
-        self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0).map(|_| 0)
+        let (from_sock, to_sock) = (self.is_socket_file(&from), self.is_socket_file(&to));
+        self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0)?;
+        if from_sock && from != to {
+            self.socket_renamed(&from, Some(&to));
+        } else if to_sock && from != to {
+            self.socket_renamed(&to, None);
+        }
+        Ok(0)
     }
 
     /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
@@ -4885,7 +4916,10 @@ impl NetIo<'_> {
             return Ok(0);
         }
         sock.bind(&path)?;
-        self.socket_names.bind(&path, sock)?;
+        if let Err(e) = self.socket_names.bind(&path, sock.clone()) {
+            sock.unbind_failed(&path);
+            return Err(e);
+        }
         // And a node in the filesystem, so the name can be seen as well as
         // connected to. Xvfb binds /tmp/.X11-unix/X0 and every X client waits
         // for that path to appear before trying it; without the node the
@@ -9658,6 +9692,8 @@ impl Kernel {
             tmpfiles: &self.tmpfiles,
             fs: std::borrow::Cow::Owned(self.fs_of(self.ctx_addr)),
             clock: self.clock,
+            socket_names: &self.socket_names,
+            unix_remote: self.unix_remote,
         }
     }
 
@@ -12640,6 +12676,82 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::LSEEK, &[dup, 0, 1]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), 4);
+    }
+
+    /// A unix socket's name is its file's: unlinked, the path binds again
+    /// (the old socket open or closed, its connections still carrying);
+    /// renamed, the name moves; while the file is there a bind is
+    /// EADDRINUSE and leaves the socket free to bind later.
+    #[test]
+    fn a_socket_files_unlink_or_rename_takes_its_name() {
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        const AF_UNIX: u64 = 1;
+        const SOCK_STREAM: u64 = 1;
+        const AT_FDCWD: u64 = -100i64 as u64;
+        let mut call = |m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        // sockaddr_un for `name` at `addr`, its length; the bare path after it.
+        let addr = |m: &mut GuestMem<'_>, addr: u64, name: &str| {
+            let mut sa = vec![1u8, 0];
+            sa.extend_from_slice(name.as_bytes());
+            sa.push(0);
+            m.write(addr, &sa).unwrap();
+            m.write(addr + 0x80, name.as_bytes()).unwrap();
+            m.write(addr + 0x80 + name.len() as u64, &[0]).unwrap();
+            sa.len() as u64
+        };
+        let la = addr(&mut m, 0x20000, "/srv-sock");
+        let sock = |m: &mut GuestMem<'_>, call: &mut dyn FnMut(&mut GuestMem<'_>, u64, &[u64]) -> i64| call(m, nr::SOCKET, &[AF_UNIX, SOCK_STREAM, 0]) as u64;
+        let l = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l, 0x20000, la]), 0);
+        assert_eq!(call(&mut m, nr::LISTEN, &[l, 4]), 0);
+        // A connection made before the unlink.
+        let c = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c, 0x20000, la]), 0);
+        let s = call(&mut m, nr::ACCEPT4, &[l, 0, 0, 0]);
+        assert!(s > 0, "accept: {s}");
+        // The name is taken while the file is there, the listener open or not.
+        let l2 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l2, 0x20000, la]), -98, "bind over a bound name");
+        // Unlinked: bound again, by a new socket, with the old one still open.
+        assert_eq!(call(&mut m, nr::UNLINKAT, &[AT_FDCWD, 0x20080, 0]), 0);
+        assert_eq!(call(&mut m, nr::BIND, &[l2, 0x20000, la]), 0, "bind after the unlink");
+        assert_eq!(call(&mut m, nr::LISTEN, &[l2, 4]), 0);
+        // The old connection still carries bytes; a new one reaches the new
+        // listener.
+        m.write(0x21000, b"old").unwrap();
+        assert_eq!(call(&mut m, nr::SENDTO, &[c, 0x21000, 3, 0, 0, 0]), 3);
+        assert_eq!(call(&mut m, nr::RECVFROM, &[s as u64, 0x21100, 16, 0, 0, 0]), 3);
+        let c2 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c2, 0x20000, la]), 0);
+        assert!(call(&mut m, nr::ACCEPT4, &[l2, 0, 0, oflags::O_NONBLOCK]) > 0, "the new listener's connection");
+        // Closed, then unlinked: free again.
+        assert_eq!(call(&mut m, nr::CLOSE, &[l2]), 0);
+        let l3 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l3, 0x20000, la]), -98, "bind over a closed socket's file");
+        assert_eq!(call(&mut m, nr::UNLINKAT, &[AT_FDCWD, 0x20080, 0]), 0);
+        assert_eq!(call(&mut m, nr::BIND, &[l3, 0x20000, la]), 0, "bind after closing and unlinking");
+        assert_eq!(call(&mut m, nr::LISTEN, &[l3, 4]), 0);
+        // Renamed: the name moves with the file; the old path is free.
+        let ra = addr(&mut m, 0x22000, "/srv-sock2");
+        assert_eq!(call(&mut m, nr::RENAMEAT2, &[AT_FDCWD, 0x20080, AT_FDCWD, 0x22080, 0]), 0);
+        let c3 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c3, 0x22000, ra]), 0, "connect to the new name");
+        let c4 = sock(&mut m, &mut call);
+        assert_ne!(call(&mut m, nr::CONNECT, &[c4, 0x20000, la]), 0, "connect to the old name");
+        let l4 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::BIND, &[l4, 0x20000, la]), 0, "bind the old name after the rename");
+        // Renamed over: the file replaced takes its name with it.
+        assert_eq!(call(&mut m, nr::RENAMEAT2, &[AT_FDCWD, 0x20080, AT_FDCWD, 0x22080, 0]), 0);
+        let c5 = sock(&mut m, &mut call);
+        assert_eq!(call(&mut m, nr::LISTEN, &[l4, 4]), 0);
+        assert_eq!(call(&mut m, nr::CONNECT, &[c5, 0x22000, ra]), 0, "the renamed-over name is the new file's");
+        assert!(call(&mut m, nr::ACCEPT4, &[l4, 0, 0, oflags::O_NONBLOCK]) > 0, "reached the socket renamed over it");
     }
 
     /// `free_call`, the lock-free class, answers as the full call does:

@@ -529,6 +529,7 @@ extern "C" {
     // to be somewhere neither of them owns.
     fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_sock_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32);
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
     fn k_sock_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
@@ -1457,6 +1458,9 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
 extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_bind(path, path_len) }
 }
+extern "C" fn rs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) {
+    unsafe { k_sock_rename(from, from_len, to, to_len) }
+}
 extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_connect(path, path_len) }
 }
@@ -1621,6 +1625,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         read_fds: rs_read_fds,
         describe: scm_describe,
         rebuild: scm_rebuild,
+        rename: rs_rename,
     })
 }
 

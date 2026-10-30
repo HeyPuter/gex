@@ -362,6 +362,15 @@ impl UnixSocket {
         }
     }
 
+    /// Undo a `bind` whose name was taken: a failed bind leaves the socket
+    /// unbound, free to bind again.
+    pub fn unbind_failed(&self, path: &str) {
+        let mut role = self.role.lock().unwrap();
+        if matches!(&*role, Role::Bound(p) if p == path) {
+            *role = Role::Fresh;
+        }
+    }
+
     /// The path this socket is bound to or listening on.
     pub fn bound_path(&self) -> Option<String> {
         match &*self.role.lock().unwrap() {
@@ -741,6 +750,33 @@ impl SocketNames {
 
     pub fn unbind(&self, path: &str) {
         self.bound.lock().unwrap().retain(|(p, _)| p != path);
+    }
+
+    /// The socket file at `from` unlinked (`to` none) or renamed to `to`:
+    /// its name goes with the file, as on Linux, where the name is the
+    /// file. A socket bound there keeps its connections and its own address
+    /// (`getsockname`), and the path can be bound again. A name `to` had is
+    /// gone with the file the rename replaced.
+    pub fn rename_name(&self, from: &str, to: Option<&str>) {
+        {
+            let mut bound = self.bound.lock().unwrap();
+            if let Some(to) = to {
+                bound.retain(|(p, _)| p != to);
+            }
+            match to {
+                Some(to) => bound.iter_mut().filter(|(p, _)| p == from).for_each(|(p, _)| *p = to.to_string()),
+                None => bound.retain(|(p, _)| p != from),
+            }
+        }
+        let mut d = self.dgram.lock().unwrap();
+        if let Some(to) = to {
+            d.remove(to);
+        }
+        if let Some(s) = d.remove(from) {
+            if let Some(to) = to {
+                d.insert(to.to_string(), s);
+            }
+        }
     }
 
     /// Unbind `path` if it is `sock`'s (a socket closing gives up an abstract
@@ -1896,6 +1932,9 @@ pub struct Remote {
     pub rebuild: fn(&crate::vfs::Namespace, &str) -> Option<Arc<OpenFile>>,
     /// The end's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
+    /// The socket file at a name unlinked (`to_len` 0) or renamed
+    /// ([`SocketNames::rename_name`]).
+    pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32),
 }
 
 /// One end of a socket in the global kernel.
