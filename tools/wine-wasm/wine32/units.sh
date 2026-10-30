@@ -1,7 +1,7 @@
 #!/bin/bash
 # Function-tier units for the images a run named as unitless.
 #
-#   wine32/units.sh LOG UNITS GEXC DIST GAMEDIR
+#   wine32/units.sh LOG UNITS GEXC DIST GAMEDIR [PREFIX]
 #
 # Every image LOG names without a unit ("unitless: PATH BASE" from
 # tools/wine-wasm/wine32/page-run.mjs, "image PATH at base BASE: no
@@ -9,18 +9,20 @@
 # gexc) gets `gexc cgen-image PATH --pe-base BASE` into the unit cache UNITS
 # (GEX_CGEN_CACHE), and so does the NT trampoline page when LOG names it
 # missing. Page paths are mapped: /wine32 is DIST (/w3 in recordings made
-# before the rename), /g GAMEDIR; host paths (a native run's) are used as they
+# before the rename), /wine a 64-bit Wine's DIST, /pfx's C: drive PREFIX's
+# (a 64-bit Wine's page run), /g GAMEDIR; host paths (a native run's) are used as they
 # are. The provider modules are built too (`cgen-image --providers`), once per
 # gexc. Unit keys include gexc's gex-cgen sources: units from another gexc are
 # simply not found, never wrong.
 #
 # A Wine that folds KUSER_SHARED_DATA wants its units built with
-# --wine32-kuser, which changes their keys. The first image whose key LOG
-# names is built plain and, if that is not the key the run asked for, again
-# with --wine32-kuser; the rest are built the way that matched.
+# --wine32-kuser, and a 64-bit Wine's take --wine64-compact or --mem64, which
+# change their keys. The first image whose key LOG names is built plain and,
+# if that is not the key the run asked for, with each of those in turn; the
+# rest are built the way that matched.
 # Env: WINE32_JOBS (default 12; four images at once, each with WINE32_JOBS/4 jobs).
 set -u
-log=${1:?LOG} U=$(realpath -m "${2:?UNITS}") G=$(realpath "${3:?GEXC}") D=$(realpath "${4:?DIST}") A=$(realpath "${5:?GAMEDIR}")
+log=${1:?LOG} U=$(realpath -m "${2:?UNITS}") G=$(realpath "${3:?GEXC}") D=$(realpath "${4:?DIST}") A=$(realpath "${5:?GAMEDIR}") P=${6:+$(realpath "$6")}
 J=$(( ${WINE32_JOBS:-12} / 4 )); [ $J -ge 1 ] || J=1
 mkdir -p "$U"
 export GEX_CGEN_CACHE=$U
@@ -30,7 +32,9 @@ file() { # PATH: the host file of a run's path, or nothing
   case $p in
     /wine32/*) echo "$D/${p#/wine32/}" ;;
     /w3/*) echo "$D/${p#/w3/}" ;;
+    /wine/*) echo "$D/${p#/wine/}" ;;
     /g/*) echo "$A/${p#/g/}" ;;
+    /pfx/dosdevices/c:/*) [ -n "$P" ] && echo "$P/drive_c/${p#/pfx/dosdevices/c:/}" ;;
     /pfx/dosdevices/z:/*) echo "/${p#/pfx/dosdevices/z:/}" ;;
     /*) echo "$p" ;;
   esac
@@ -49,10 +53,10 @@ while read -r p b; do
   key=$(grep -aom1 "$p at \(base \)\?$b: no function-tier unit (key [0-9a-f]*" "$log" | sed 's/.*(key //')
   f=$(file "$p")
   [ -n "$key" ] && [ -n "$f" ] && [ -f "$f" ] || continue
-  build "$f" "$b" > /dev/null
-  [ -d "$U/$key" ] && break
-  build "$f" "$b" --wine32-kuser > /dev/null
-  [ -d "$U/$key" ] && { flag=--wine32-kuser; break; }
+  for fl in "" --wine32-kuser --wine64-compact --mem64; do
+    build "$f" "$b" $fl > /dev/null
+    [ -d "$U/$key" ] && { flag=$fl; break 2; }
+  done
 done < "$todo"
 echo "wine32/units: units built ${flag:-plain}"
 one() {
@@ -68,6 +72,8 @@ one() {
   done < "$todo"; wait; }
 # The NT trampoline page's unit, which the page places with the first image.
 if grep -aq 'missing unit: \[the trampolines\]' "$log"; then
-  echo "wine32/units: the trampolines: $(nice -n 19 "$G" cgen-image $flag --nt-trampolines32 2>&1 | tail -1 | cut -c1-140)"
+  t=--nt-trampolines32; grep -aq 'missing unit: \[the trampolines\].*--nt-trampolines64' "$log" && t=--nt-trampolines64
+  [ "$flag" = --wine32-kuser ] && [ $t = --nt-trampolines64 ] && flag=
+  echo "wine32/units: the trampolines: $(nice -n 19 "$G" cgen-image $flag $t 2>&1 | tail -1 | cut -c1-140)"
 fi
 echo "wine32/units: $U"

@@ -23,6 +23,12 @@
 # afterwards (wine32/units.sh) for the next run: the page builds none itself.
 # WINE32_PAGE_DIR defaults to WINE32_CACHE/page; on a remote box it and the unit
 # cache must be under paths the runner maps.
+# With --dist a 64-bit Wine install (wine64-dist.sh's: lib/wine/x86_64-unix)
+# it runs that in the page instead, at /wine, on --prefix (required: its
+# WINE64_PREFIX, copied) with --null's driver or Wayland, and without doors;
+# a dist with lib/wine/i386-windows (WINE64_WOW64=1) runs 32-bit programs in
+# the 64-bit process (WoW64). No make then; units default to page-units
+# beside the dist. Only with --page.
 #
 # Options:
 #   --null             the null display driver (no compositor; tests)
@@ -54,14 +60,16 @@ if [ "${1:-}" = --remote ]; then
   T=$(cd "$2" && pwd) U=$(cd "$3" && pwd) secs=$4; shift 4
   free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
   CP=$(free_port); VP=$(free_port)
-  mkdir -p "$T/../tmp-$(basename "$T")"
-  export TMPDIR=$(cd "$T/../tmp-$(basename "$T")" && pwd) GEX_WIN_CHROME_PORT=$CP GEX_WIN_VITE_PORT=$VP GEX_WEBGPU_SOFTWARE=0
+  # A short TMPDIR, as Chromium's singleton socket goes under it and a Unix
+  # socket's path ends at 107 bytes (a tree's own deep path can pass that)
+  TD=/tmp/wpg-$(printf %s "$T" | sha256sum | cut -c1-12); rm -rf "$TD"; mkdir -p "$TD"
+  export TMPDIR=$TD GEX_WIN_CHROME_PORT=$CP GEX_WIN_VITE_PORT=$VP GEX_WEBGPU_SOFTWARE=0
   export GEX_WIN_BROWSER_MAX_LINES=200000 GEX_CGEN_CACHE=$U GEX_WIN_BROWSER_KEEP="no function-tier unit|validation"
   kill_ours() { for p in $(pgrep -f -- "--remote-debugging-port=$CP\b"); do kill $p 2>/dev/null; done; }
-  trap 'kill_ours; [ -n "${np:-}" ] && kill $np 2>/dev/null; exit 143' TERM INT
+  trap 'kill_ours; [ -n "${np:-}" ] && kill $np 2>/dev/null; rm -rf "$TD"; exit 143' TERM INT
   node "$T/tools/wine-wasm/wine32/page-run.mjs" "$T" "$secs" "$@" & np=$!
   wait $np; rc=$?
-  kill_ours
+  kill_ours; rm -rf "$TD"
   exit $rc
 fi
 while [ $# -gt 0 ]; do
@@ -90,24 +98,54 @@ done
 exe=$(realpath "${1:?usage: run.sh [options] EXE [ARGS...]}"); shift
 [ -n "$page" ] || [ -x "$gexc" ] || { echo "run.sh: no x86 gexc at $gexc (cargo build --release -p gexc --features x86, or --gexc)" >&2; exit 1; }
 target=prefix; [ $graphics = null ] && target=prefix-null
-[ -n "$make" ] && make -s -C "$WINE32" dist $target >&2
-eval "$(make -s -C "$WINE32" paths)"
-dist=${dist:-$WINE32_DIST}
-[ -n "$prefix" ] || { [ $graphics = null ] && prefix=$WINE32_PREFIX_NULL || prefix=$WINE32_PREFIX; }
-units=${units:-$WINE32_UNITS}
-[ -d "$dist/lib/wine/i386-unix" ] || { echo "run.sh: no dist at $dist" >&2; exit 1; }
+# A 64-bit Wine dist (--dist with lib/wine/x86_64-unix: wine64-dist.sh's)
+# runs as it is, with its own prefix: no make.
+w64=""; [ -n "$dist" ] && [ -f "$dist/lib/wine/x86_64-unix/wine" ] && w64=1
+if [ -n "$w64" ]; then
+  [ -n "$page" ] || { echo "run.sh: a 64-bit Wine dist runs with --page only" >&2; exit 1; }
+  [ -n "$prefix" ] || { echo "run.sh: a 64-bit Wine dist needs --prefix (its WINE64_PREFIX)" >&2; exit 1; }
+  dist=$(realpath "$dist")
+  WINE32_KEY=w64s-$({ echo "$dist"; find -L "$dist" -type f -printf '%T@ %s %p\n' | sort; } | sha256sum | cut -c1-12)
+  WINE32_DIST=$dist
+  units=${units:-$(dirname "$dist")/page-units}
+else
+  [ -n "$make" ] && make -s -C "$WINE32" dist $target >&2
+  eval "$(make -s -C "$WINE32" paths)"
+  dist=${dist:-$WINE32_DIST}
+  [ -n "$prefix" ] || { [ $graphics = null ] && prefix=$WINE32_PREFIX_NULL || prefix=$WINE32_PREFIX; }
+  units=${units:-$WINE32_UNITS}
+  [ -d "$dist/lib/wine/i386-unix" ] || { echo "run.sh: no dist at $dist" >&2; exit 1; }
+fi
 [ -f "$prefix/system.reg" ] || { echo "run.sh: no prefix at $prefix" >&2; exit 1; }
 mkdir -p "$units"
 if [ -n "$page" ]; then
-  for f in gex_browser.x86.shared.wasm seed.x86.shared.wasm gex_kernel.x86.wasm gex-wgpu-replay.wasm; do
+  # (Mesa's gex-wgpu-replay.wasm not for a --null run: no GL there)
+  nogl=""; [ $graphics = null ] && nogl=1
+  for f in gex_browser.x86.shared.wasm seed.x86.shared.wasm gex_kernel.x86.wasm $([ -n "$nogl" ] || echo gex-wgpu-replay.wasm); do
     [ -f "$page/web/public/gex/$f" ] || { echo "run.sh: $page is not page-ready: no web/public/gex/$f" >&2; exit 1; }
   done
   [ -x "$page/web/node_modules/.bin/vite" ] || { echo "run.sh: $page has no web/node_modules" >&2; exit 1; }
   pg=$(realpath -m "${WINE32_PAGE_DIR:-$(dirname "$WINE32_DIST")/page}"); mkdir -p "$pg"
   name=$(basename "$exe"); name=${name%.*}
   # The dist bundle, once per dist (links dereferenced: the page has none).
+  # A 64-bit Wine's at /wine (its loader is lib/wine/x86_64-unix/wine),
+  # 32-bit Wine's at /wine32.
+  mnt=wine32; [ -n "$w64" ] && mnt=wine
   wt=$pg/wine32-$WINE32_KEY.tar
-  [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),wine32," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
+  if [ -n "$w64" ]; then
+    # A WoW64 dist holds both PE sides, and the page keeps every file in the
+    # global kernel's memory, which ends at 4 GiB: the bundle's PE files
+    # without their debug information and without the import libraries
+    # (.a), on a linked copy (the dist itself is left as it is).
+    [ -f "$wt" ] || {
+      ds=$(mktemp -d "$pg/dist.XXXXXX"); cp -rlL "$dist" "$ds/$mnt"
+      find "$ds/$mnt/lib/wine" -name '*.a' -delete
+      find "$ds/$mnt/lib/wine" -path '*-windows/*' -type f ! -name '*.a' -print0 |
+        xargs -0 -r -P"$(nproc)" -n 32 sh -c 'for f; do llvm-strip --strip-debug -o "$f.s" "$f" 2>/dev/null && mv "$f.s" "$f" || rm -f "$f.s"; done' sh
+      tar -C "$ds" -cf "$wt.tmp" "$mnt" && mv "$wt.tmp" "$wt"; rm -rf "$ds"; }
+  else
+    [ -f "$wt" ] || { tar -C "$(dirname "$dist")" -h --transform "s,^$(basename "$dist"),$mnt," -cf "$wt.tmp" "$(basename "$dist")" && mv "$wt.tmp" "$wt"; }
+  fi
   # The run tree, at one path per program, so the box's copy updates by difference.
   rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/web" "$rt/shims/browser" "$rt/tools/wine-wasm/wine32"
   for d in web/nt.html web/vite.config.js web/package.json web/src web/test web/node_modules web/public web/eject-site/vendor shims/browser/js; do
@@ -118,19 +156,41 @@ if [ -n "$page" ]; then
   ln "$wt" "$rt/web/public/gex/nt/wine32.tar" 2>/dev/null || cp "$wt" "$rt/web/public/gex/nt/wine32.tar"
   # The program's bundle: the prefix, xkb data, its directory.
   st=$(mktemp -d "$pg/stage.XXXXXX"); trap 'rm -rf "$st"' EXIT
-  cp -a "$prefix" "$st/pfx"; mkdir -p "$st/usr/share/X11"; cp -rL /usr/share/X11/xkb "$st/usr/share/X11/"
+  cp -a "$prefix" "$st/pfx"
+  # 64-bit Wine: the prefix's driver as --null asks (its prefix keeps one)
+  if [ -n "$w64" ]; then
+    gd=wayland; [ $graphics = null ] && gd=null
+    printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' $gd >> "$st/pfx/user.reg"
+    # wineboot's copies of the builtin PE files in system32 and syswow64,
+    # links to the dist's instead (the loader takes the builtin either way):
+    # the same bytes would be in the page's memory twice
+    for a in system32:x86_64 syswow64:i386; do
+      d=$st/pfx/drive_c/windows/${a%%:*}; b=$dist/lib/wine/${a#*:}-windows
+      [ -d "$d" ] && [ -d "$b" ] || continue
+      find "$d" -type f | while IFS= read -r f; do
+        n=${f##*/}; [ -f "$b/$n" ] && cmp -s "$f" "$b/$n" && ln -sfn "/$mnt/lib/wine/${a#*:}-windows/$n" "$f"
+      done
+    done
+  fi
+  mkdir -p "$st/usr/share/X11"; cp -rL /usr/share/X11/xkb "$st/usr/share/X11/"
   cp -al "$(dirname "$exe")" "$st/g" 2>/dev/null || cp -a "$(dirname "$exe")" "$st/g"
   # With the prefix's extended attributes (Wine's DOS attributes: a
   # desktop.ini hidden and system), which web/src/tar.js reads back.
   tar -C "$st" --xattrs --xattrs-include='user.*' -cf "$rt/web/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"
   env=() ; for ((i = 1; i < ${#envs[@]}; i += 2)); do env+=("${envs[i]}"); done
+  # 64-bit Wine: no doors; its 32-bit programs in the 64-bit process
+  # (WoW64) when the dist has the i386 side
+  if [ -n "$w64" ]; then
+    env+=(WINEGEX_DOOR=0); [ -d "$dist/lib/wine/i386-windows" ] && env+=(WINEGEX_WOW64=1)
+  fi
   log=$pg/$name.log
   BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:?--page needs BENCH_SH, a bench runner}" -s "$rt" -s "$units" -- \
     env WINE32_PAGE_TARS=/gex/nt/wine32.tar,/gex/nt/app.tar WINE32_PAGE_SIZE="$size" WINE32_PAGE_DEBUG="$debug" \
+    WINE32_PAGE_EXE=/$mnt/lib/wine/$([ -n "$w64" ] && echo x86_64 || echo i386)-unix/wine ${nogl:+WINE32_PAGE_GL=0} \
     WINE32_PAGE_ENV="$(IFS=,; echo "${env[*]}")" ${WINE32_PAGE_Q+WINE32_PAGE_Q="$WINE32_PAGE_Q"} \
     bash "$rt/tools/wine-wasm/run.sh" --remote "$rt" "$units" "${tmo:-300}" "$(basename "$exe")" "$@" 2>&1 | tee "$log"
   rc=${PIPESTATUS[0]}
-  [ -n "$build_units" ] && "$WINE32/wine32/units.sh" "$log" "$units" "$gexc" "$dist" "$(dirname "$exe")"
+  [ -n "$build_units" ] && "$WINE32/wine32/units.sh" "$log" "$units" "$gexc" "$dist" "$(dirname "$exe")" ${w64:+"$prefix"}
   echo "run.sh: log $log"
   exit $rc
 fi

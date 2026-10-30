@@ -15,7 +15,9 @@
 //   "== wine32 page: running at SECS s (F frames)"   (a timeout is no failure)
 //   "== wine32 page: FAIL WHY"
 // Env: WINE32_PAGE_SIZE (WxH, default 1280x720), WINE32_PAGE_ENV (more K=V,...),
-// WINE32_PAGE_DEBUG (WINEDEBUG), WINE32_PAGE_Q (the page's query flags, default
+// WINE32_PAGE_DEBUG (WINEDEBUG), WINE32_PAGE_EXE (the loader, default 32-bit Wine's
+// /wine32/lib/wine/i386-unix/wine; 64-bit Wine's is /wine/lib/wine/x86_64-unix/wine),
+// WINE32_PAGE_GL (0: no GL, the page loads no Mesa), WINE32_PAGE_Q (the page's query flags, default
 // &cgen=1), WINE32_PAGE_SHOT (DIR: the compositor's last frame as DIR/end.ppm).
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,7 +36,7 @@ const argv = encodeURIComponent(JSON.stringify([exe, ...args]));
 const env = encodeURIComponent(['WINEPREFIX=/pfx', `WINEDEBUG=${process.env.WINE32_PAGE_DEBUG || 'err+all,fixme-all'}`,
   'XDG_RUNTIME_DIR=/tmp', 'WAYLAND_DISPLAY=wayland-0', ...(process.env.WINE32_PAGE_ENV ? [process.env.WINE32_PAGE_ENV] : [])].join(','));
 const { evaluate, state, consoleLines } = await openPage(
-  `tar=${tars}&exe=/wine32/lib/wine/i386-unix/wine&mtimes=1&cwd=/g&gl=1&glbackend=wgpu&size=${size}`
+  `tar=${tars}&exe=${process.env.WINE32_PAGE_EXE || '/wine32/lib/wine/i386-unix/wine'}&mtimes=1&cwd=/g${process.env.WINE32_PAGE_GL === '0' ? '' : '&gl=1&glbackend=wgpu'}&size=${size}`
     + `&argv=${argv}&env=${env}${process.env.WINE32_PAGE_Q ?? '&cgen=1'}`,
   { width: w + 20, height: h + 100 },
 );
