@@ -7,7 +7,7 @@
 // scrollbar and the dropdown responsive. What stays here is what only the page
 // can do: DOM events, and the canvas's size.
 
-import { assetUrl, pageParams } from './page-env.js';
+import { assetFiles, assetUrl, pageParams } from './page-env.js';
 import { startWakeRelay } from '@gex/wl-bridge.mjs';
 import { EVDEV, BTN, modsOf } from './input-map.js';
 
@@ -72,7 +72,7 @@ export class Compositor {
       // `?gltrace=1`: every one of Mesa's reports, not one a minute of each
       // (mesa-gl.js quietReports); the worker cannot read the page's query.
       const glTrace = q?.get('gltrace') === '1';
-      this.#worker.postMessage({ kind: 'gl', channel, url: assetUrl('/gex/gex-wgpu-replay.js'), ...opts, ...(mesaEnv ? { mesaEnv } : {}),
+      this.#worker.postMessage({ kind: 'gl', channel, url: assetUrl('/gex/gex-wgpu-replay.js'), files: assetFiles('/gex/'), ...opts, ...(mesaEnv ? { mesaEnv } : {}),
         ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}),
         ...(wgpuStats ? { wgpuStats } : {}), ...(glTrace ? { glTrace } : {}) });
     });

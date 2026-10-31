@@ -31,9 +31,9 @@
 
 import { helperKernel } from '../../src/kernel-helper.js';
 
-const port = globalThis.postMessage
-  ? globalThis
-  : (await import('node:worker_threads')).parentPort;
+// Under Node, the parent's port once node:worker_threads is in (below; no
+// top-level await, which a bundler's classic-script Worker cannot hold).
+let port = globalThis.postMessage ? globalThis : null;
 const post = (m, transfer) => port.postMessage(m, transfer ?? []);
 const enc = new TextEncoder();
 
@@ -127,4 +127,10 @@ const onMessage = async (m) => {
   }
 };
 if (port === globalThis) globalThis.onmessage = (e) => onMessage(e.data);
-else port.on('message', onMessage);
+else {
+  // A parent's messages wait on the port until it has a listener.
+  import('node:worker_threads').then(({ parentPort }) => {
+    port = parentPort;
+    port.on('message', onMessage);
+  });
+}

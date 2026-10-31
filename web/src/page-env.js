@@ -16,9 +16,25 @@ export function pageParams() {
   return new URLSearchParams(pageSearch());
 }
 
-/** A site-root path (`/gex/x.wasm`) under the library's base, when it has
- *  one; the path as it is otherwise. */
+/** A site-root path (`/gex/x.wasm`): the file's own URL when the runtime
+ *  package lists its files (`GEX_ASSET_FILES`, path -> URL: each file named
+ *  where the page's bundler put it), else under the library's base, when it
+ *  has one; the path as it is otherwise. */
 export function assetUrl(path) {
+  const rel = path.replace(/^\//, '');
+  const listed = globalThis.GEX_ASSET_FILES?.[rel];
+  if (listed) return listed;
   const base = globalThis.GEX_ASSET_BASE;
-  return base ? new URL(path.replace(/^\//, ''), base).href : path;
+  return base ? new URL(rel, base).href : path;
+}
+
+/** The listed files under `dir` (`gex/cgen/`), by their path below it, or
+ *  null when the package lists none: then they are under `assetUrl(dir)`. */
+export function assetFiles(dir) {
+  const files = globalThis.GEX_ASSET_FILES;
+  if (!files) return null;
+  const at = dir.replace(/^\//, '');
+  const out = {};
+  for (const [k, v] of Object.entries(files)) if (k.startsWith(at)) out[k.slice(at.length)] = v;
+  return out;
 }

@@ -17,8 +17,10 @@ async function makeWorker() {
   // The URL written out in the `new Worker`, which is how a bundler knows the
   // file is a Worker to build (web/runtime/build.sh), not an asset to copy.
   if (typeof Worker === 'function') return new Worker(new URL('./kernel-worker.js', import.meta.url), { type: 'module', name: 'gex-kernel' });
+  // Node runs the source tree. Its URL not written out: a bundler would copy
+  // the unbuilt file into the page's build.
   const { Worker: NodeWorker } = await import('node:worker_threads');
-  return new NodeWorker(new URL('./kernel-worker.js', import.meta.url));
+  return new NodeWorker(new URL(import.meta.url.replace(/[^/]*$/, 'kernel-worker.js')));
 }
 
 export class Kernel {

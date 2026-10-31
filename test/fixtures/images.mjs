@@ -361,7 +361,7 @@ export const images = {
   },
 
   async package(work) {
-    execFileSync(join(ROOT, 'web/runtime/build.sh'), [join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync(join(ROOT, 'web/runtime/build.sh'), [join(work, 'pkg/@gex/runtime')], { stdio: ['ignore', 'ignore', 'inherit'] });
     return null;
   },
 };

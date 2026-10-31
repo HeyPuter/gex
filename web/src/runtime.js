@@ -16,7 +16,7 @@ import { single, singleSupported, FiberWorker } from '../../shims/browser/js/sin
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { logNamed, logOn } from '../../shims/browser/js/log.mjs';
 import { startOptions } from '../../shims/browser/js/options.mjs';
-import { assetUrl, pageParams, pageSearch } from './page-env.js';
+import { assetFiles, assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
 
@@ -602,6 +602,9 @@ function pageGlobals() {
     const v = globalThis[k];
     if (v === null || ['string', 'number', 'boolean', 'undefined'].includes(typeof v)) out[k] = v;
   }
+  // The runtime package's files (page-env.js assetUrl): the Worker's build
+  // names none of its own.
+  if (globalThis.GEX_ASSET_FILES) out.GEX_ASSET_FILES = globalThis.GEX_ASSET_FILES;
   return out;
 }
 
@@ -735,7 +738,10 @@ export async function startXServer({ kernel, wlChannel, compositor, term, rootfu
   // The single-thread build: the server is a fiber of
   // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
   // waits suspend. The same messages, without a Worker between.
-  const xDir = assetUrl(single.on ? '/gex/xwayland-st/' : '/gex/xwayland/');
+  const xRoot = single.on ? '/gex/xwayland-st/' : '/gex/xwayland/';
+  const xDir = assetUrl(xRoot);
+  // Each file by itself: a bundler names them where it puts them.
+  const xFile = (f) => new URL(assetFiles(xRoot)?.[f] ?? `${xDir}${f}`, location.href).href;
   if (single.on) {
     const { HostX } = await import('./hostx.js');
     let deliver = null;
@@ -772,9 +778,11 @@ export async function startXServer({ kernel, wlChannel, compositor, term, rootfu
   };
   xServer.postMessage({
     kind: 'start',
-    xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
-    hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
-    keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
+    xwaylandUrl: xFile('Xwayland.mjs'),
+    hostwlUrl: xFile('gexhostwl.wasm'),
+    keymapUrl: xFile('gex.xkm'),
+    // What Xwayland.mjs asks its own directory for (its wasm), by name.
+    xwaylandFiles: { 'Xwayland.wasm': xFile('Xwayland.wasm') },
     // Its memory is a wasm32 one, also under `?mem64=1`: the kernel module
     // serves both (gex-kmem, lazy-fetch.mjs `processMemories`).
     kernel: { module: kernel.module, memory: kernel.memory, spare: kernel.spare },
@@ -933,7 +941,7 @@ export async function makeProcessHost({
     // Absolute: a Worker started from a blob URL has no base to resolve a path against.
     cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined })
       : flag('providers') === '0' ? undefined
-      : { mode: 8, url: assetUrl('/gex/cgen') },
+      : { mode: 8, url: assetUrl('/gex/cgen'), files: assetFiles('/gex/cgen/') },
     // `?aot=1`: an ejected project's run, with no run-time translation (a
     // miss stops the run, saying where).
     jit: globalThis.GEX_NO_JIT ? false : undefined,

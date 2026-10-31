@@ -2110,6 +2110,7 @@ async function startGl(m, canvas) {
   const { MesaGlDevice } = await import('./mesa-gl.js');
   glDevice = await MesaGlDevice.create(glTarget, {
     url: m.url,
+    files: m.files,
     api: m.api || 'core',
     env: m.mesaEnv,
     capture: m.glCapture,

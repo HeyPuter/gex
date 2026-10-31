@@ -98,8 +98,9 @@ if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
 if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.env?.GEX_SYNC_CONSOLE)) {
   // Synchronous, too: a Worker's console goes through the main thread
   // asynchronously, and the megabytes a crashing process traces just before
-  // it is killed never arrive -- the one stretch the trace is for.
-  const fs = await import('node:fs');
+  // it is killed never arrive -- the one stretch the trace is for. Not an
+  // await: a bundler's classic-script Worker cannot hold one at the top.
+  const fs = process.getBuiltinModule('node:fs');
   const sync = (...a) => {
     try { fs.writeSync(2, a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ') + '\n'); } catch {}
   };
@@ -709,10 +710,13 @@ async function handle(msg) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
           return fs ? new Uint8Array(fs.readFileSync(`${c.root}/${rel}`)) : null;
         }
+        // A file the runtime package lists by its own URL (a bundler names
+        // them where it puts them): not one it lists is not there.
+        if (c.files && !c.files[rel]) return null;
         // A unit's module, served compressed (`c.zst`): decoded here.
         const packed = c.zst && zstd && rel.endsWith('/c.wasm');
         const x = new XMLHttpRequest();
-        x.open('GET', `${c.url}/${rel}${packed ? '.zst' : ''}`, false);
+        x.open('GET', c.files ? c.files[rel] : `${c.url}/${rel}${packed ? '.zst' : ''}`, false);
         x.responseType = 'arraybuffer';
         const done = noteFetch(`unit:${rel}`, 0, this.owner);
         const tx = logNamed('unitstall') ? performance.now() : -1;
@@ -1550,5 +1554,8 @@ if (handed && !carry) handle(handed);
 
 // A real Worker runs itself; the single-thread build registers the function
 // and runs it once per fiber (single.mjs `FiberWorker`).
+// Not a top-level await, which a bundler's classic-script Worker cannot
+// hold; a failure is thrown again outside the promise, so the Worker's
+// `error` event still reports it.
 if (single.on) registerWorkerMain(workerMain);
-else await workerMain(await channel());
+else channel().then(workerMain).catch((e) => setTimeout(() => { throw e; }));

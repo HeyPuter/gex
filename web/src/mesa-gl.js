@@ -12,7 +12,7 @@ import { requestGexDevice } from './gpu-device.js';
 
 import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';
-import { assetUrl, pageParams } from './page-env.js';
+import { assetFiles, assetUrl, pageParams } from './page-env.js';
 import { logOn } from '@gex/log.mjs';
 import { ValidationLog } from './gl-validation.js';
 import { fitReply } from './gl-reply.js';
@@ -364,7 +364,9 @@ export class MesaGlDevice {
         // Where the glue really lives, for the blob fallback above: Emscripten
         // starts its pthread workers from this rather than `import.meta.url`.
         mainScriptUrlOrBlob: new URL(url, location.href).href,
-        locateFile: (file) => new URL(file, new URL(url, location.href)).href,
+        // A listed file by its name (the runtime package's: a bundler names
+        // them where it puts them), else beside the glue.
+        locateFile: (file) => (options.files ?? assetFiles('/gex/'))?.[file] ?? new URL(file, new URL(url, location.href)).href,
         // Mesa's stdout is its chatter; its stderr (below) stays.
         print: (line) => logOn('debug') && console.log('[mesa-gl]', line),
         printErr: quietReports((line) => console.warn('[mesa-gl]', line), options.glTrace ?? pageFlag('gltrace')),

@@ -11,9 +11,10 @@ import { enableSingle } from '../../shims/browser/js/single.mjs';
 import { assetUrl } from './page-env.js';
 
 enableSingle();
-// After `enableSingle`: these compile modules as they load.
-await import('../../shims/browser/js/worker.mjs');
-const { runProgram, primeRuntime } = await import('./runtime.js');
+// After `enableSingle`: these compile modules as they load. Awaited by each
+// message (below), not at the top: a bundler's classic-script Worker cannot
+// hold a top-level await. Messages resume in the order they came.
+const loaded = import('../../shims/browser/js/worker.mjs').then(() => import('./runtime.js'));
 
 /** xterm's surface, as far as `runProgram` uses it, over messages. */
 class TermProxy {
@@ -90,6 +91,7 @@ async function openCompositor(width, height) {
 }
 
 self.onmessage = async (ev) => {
+  const { runProgram, primeRuntime } = await loaded;
   const m = ev.data;
   if (m.kind === 'comp-open') comp = openCompositor(m.width, m.height);
   else if (m.kind === 'comp') {

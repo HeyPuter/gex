@@ -20,6 +20,7 @@ import { Kernel } from './kernel.js';
 import { Files } from './kfs.js';
 import { Programs } from './programs.js';
 import { Changes } from './kpersist.js';
+import files from './runtime-files.js';
 
 /** Where the runtime's files (gex/...) are: beside the package's modules
  *  in a build (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__`), the
@@ -145,6 +146,8 @@ export class System extends EventTarget {
     const u = typeof units === 'object' && units && !(units instanceof URL) ? units : units ? { url: units } : null;
     this.#opts = {
       baseUrl: String(baseUrl ?? DEFAULT_BASE()),
+      // The package's own list of its files, unless the page names a place.
+      files: baseUrl == null ? files : null,
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
       xcache: !!xcache,
       debug: { ...debug },
@@ -255,6 +258,7 @@ export class System extends EventTarget {
     if (this.#opts.xcache) q.set('xcache', '1');
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
+    if (this.#opts.files) globalThis.GEX_ASSET_FILES = this.#opts.files;
     await import('../../src/page-env.js');
 
     // The filesystem's layers and persistence's records (fs.js).

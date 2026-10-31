@@ -29,8 +29,8 @@ the runtime. Its windows go to the desktop's own window manager, and its root
 stays across loads. Each step is one of the parts below; the reference sections
 say the rest.
 
-**Serve it.** Serve the package's directory as it is, `gex/` included, from
-the desktop's own origin. Every page that makes a system must be served with
+**Serve it.** Import the package from the desktop's code, through its bundler
+or served as it is, from the desktop's own origin. Every page that makes a system must be served with
 `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`. Anything the page loads from
 another origin (an iframe, an image) then needs CORP or CORS. Keep one
@@ -151,23 +151,17 @@ processes and memory.
 - Programs run in Workers on a shared memory, so the page must be
   cross-origin isolated: `Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`.
-- The runtime fetches its files from `gex/`, beside its modules when the
-  package is served as it is. `new System({ baseUrl })` names another place,
-  the directory that holds `gex/`.
-- With a bundler, the page's own build takes in the modules and their
-  Workers, but not `gex/`: copy the package's `gex/` into the files the page
-  serves as they are (vite's `public/`), and give `baseUrl` the directory
-  that holds it (`new System({ baseUrl: '/' })` for `public/gex/`). vite also
-  needs the Workers as modules, and the package left out of its dev server's
-  pre-bundling:
-
-  ```javascript
-  // vite.config.js
-  export default {
-    worker: { format: 'es' },
-    optimizeDeps: { exclude: ['@gex/runtime'] },
-  };
-  ```
+- Install the package and import it; nothing else to do. The modules name
+  each file the runtime fetches (`new URL('…', import.meta.url)`) and each
+  Worker (`new Worker(new URL('…', import.meta.url), { type: 'module' })`),
+  so a bundler that follows these (vite does, webpack 5 does) takes them
+  into the page's build as they come, with no settings, and vite's dev server serves them
+  from `node_modules`. Every Worker is one file with no imports, so a
+  bundler's default classic-script Workers build too.
+- Served without a bundler, the package's directory must end in
+  `@gex/runtime` (as `node_modules/@gex/runtime` does): the modules name the
+  files by that path. `new System({ baseUrl })` takes them from a directory
+  of the page's instead, laid out as gex's own site has them (`gex/…`).
 - One system per page: a second `new System()` throws.
 - A system runs wasm32 programs (built with gexcc) and the programs of one
   translated architecture, x86-64 or aarch64, which it takes from the tree's
@@ -377,7 +371,7 @@ const gl = new MesaGl(sys);       // before boot
 
 | Member | Does |
 | --- | --- |
-| `new MesaGl(sys, { eager, d3d, source })` | `eager`: start Mesa at boot. `d3d`: the Direct3D device too (a Mesa built with it). `source(name)`: Mesa's files from the page (`gex-wgpu-replay.js`, `.wasm`, `.deferred.wasm`) as bytes, or null to fetch them from `baseUrl`. |
+| `new MesaGl(sys, { eager, d3d, source })` | `eager`: start Mesa at boot. `d3d`: the Direct3D device too (a Mesa built with it). `source(name)`: Mesa's files from the page (`gex-wgpu-replay.js`, `.wasm`, `.deferred.wasm`) as bytes, or null to fetch the package's own (or `baseUrl`'s). |
 | `start()` | Start Mesa now; resolves its description. A program's first GL call shares the same start. |
 | Events | `started` (`description`), `failed` (`error`), for starts through `start()`. |
 
@@ -498,10 +492,11 @@ themselves.
 
 ## Building
 
-`web/runtime/build.sh DIR` builds the package into `DIR`: its modules, and
-under `gex/` the shim, kernel and seed of each guest architecture the tree has
-built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
-GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`). The
+`web/runtime/build.sh DIR` builds the package into `DIR`: its modules, their
+Workers, and beside them, each named by its content, the shim, kernel and
+seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
+GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`), stripped
+of names and DWARF (`GEX_KEEP_NAMES=1` keeps them). The
 package is for browser pages only. Node runs the runtime from its sources
 as a test host (`test/run.mjs --host node`), not as a host the API
 supports.

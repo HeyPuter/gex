@@ -201,7 +201,7 @@ export class HostX {
       // Where the server's own wasm is, said rather than inferred: the glue
       // works it out from `import.meta.url`, which is a blob when it is loaded
       // the way `loadGlue` has to load it in a page.
-      locateFile: (f) => new URL(f, new URL(msg.xwaylandUrl, base())).href,
+      locateFile: (f) => msg.xwaylandFiles?.[f] ?? new URL(f, new URL(msg.xwaylandUrl, base())).href,
       // The server explains itself on stderr, and in a Worker that is the only
       // diagnostic there is.
       print: (s) => this.log(s),
