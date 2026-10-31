@@ -160,8 +160,26 @@ async function fetchBytes(url, onProgress) {
   return checkWasm(url, res, out);
 }
 
-/** The kernel's bytes, for `?xcache=`'s fingerprint. */
+/** The kernel's bytes until it is compiled. */
 let kernelBytes = null;
+/** What `?xcache=`'s fingerprint keeps of the shim and the kernel once
+ *  their bytes are let go (`letGo`): a hash of each. */
+const prints = { shim: null, kernel: null };
+const xcacheOn = () => !!flag('xcache') && flag('xcache') !== '0';
+/** The bytes of `which` ('shim', 'kernel') are no longer needed once
+ *  compiled: their hash is kept for the fingerprint and the bytes dropped,
+ *  not held for the page's life. A later `loadRuntime` fetches them again. */
+function letGo(which, bytes) {
+  if (xcacheOn() && bytes) prints[which] ??= xcHash(bytes);
+  if (which === 'shim') shimBytes = null;
+  else kernelBytes = null;
+}
+
+/** Whether the page still holds the shim's or the kernel's bytes (a test
+ *  asks, after boot and a program). */
+export function heldBytes() {
+  return { shim: !!shimBytes, kernel: !!kernelBytes };
+}
 
 /**
  * `?xcache=1`: the name the translation cache is saved under, a fingerprint of everything a saved module depends on: the shim and
@@ -170,7 +188,10 @@ let kernelBytes = null;
  * A different build never reads another's cache.
  */
 export function xcacheName() {
-  if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
+  if (!xcacheOn()) return undefined;
+  const shim = prints.shim ?? (shimBytes && xcHash(shimBytes));
+  const kernel = prints.kernel ?? (kernelBytes && xcHash(kernelBytes));
+  if (!shim || !kernel) return undefined;
   const switches = ['tso', 'coherentloads', 'arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&')
@@ -180,7 +201,7 @@ export function xcacheName() {
     + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '')
     + (globalThis.GEX_MXCSR ? '&mxcsr=1' : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
-  return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
+  return `xc-${xcHash(shim, kernel, switches, flavour, globalThis.location?.pathname ?? '')}`;
 }
 
 let fetchOther = null;
@@ -488,13 +509,15 @@ export async function loadKernel() {
   try {
     const bytes = kernelBytes ?? await fetchBytes(KERNEL_URL());
     kernelBytes = bytes;
+    const module = await WebAssembly.compile(bytes);
+    letGo('kernel', bytes);
     kernelSpec = {
       // The maximum must match `--max-memory` in `shims/kernel/build.sh`
       // exactly: a shared memory carries its maximum in its type, so a host
       // offering a different one cannot instantiate the module. It reserves
       // address space, not pages -- the rootfs lives here and grows as files
       // arrive.
-      module: await WebAssembly.compile(bytes),
+      module,
       memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
       // The empty process memories every Worker's instance imports for the
       // flavour it does not use, made once (lazy-fetch.mjs `spareMemories`).
@@ -818,7 +841,7 @@ export async function makeProcessHost({
 }, on) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const makeGuestWorker = await guestWorkerFactory();
-  return new ProcessHost({
+  const host = new ProcessHost({
   makeWorker: makeGuestWorker,
   // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
   // Worker of its own, off this thread.
@@ -1003,6 +1026,9 @@ export async function makeProcessHost({
   },
     ...on,
   });
+  // The host compiles the shim at its first process and keeps the Module.
+  letGo('shim', shimBytes);
+  return host;
 }
 
 /** The page's network served to every Worker (net-bridge.mjs), or null. A
