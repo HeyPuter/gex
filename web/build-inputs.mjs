@@ -22,7 +22,7 @@
 // warning. With no git checkout or no stamp they go on, with a one-line note.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -38,7 +38,18 @@ const INPUTS = {
 // Not build inputs anywhere: documentation and tests.
 const SKIP = [':(exclude,glob)**/*.md', ':(exclude,glob)**/tests/**', ':(exclude,glob)**/test/**'];
 
-const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { maxBuffer: 256 << 20 });
+const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+/** Whether ROOT is a git checkout's top (not a copy without .git, which may
+ *  sit inside some other repository). */
+let checkout;
+function isCheckout() {
+  try {
+    checkout ??= realpathSync(git('rev-parse', '--show-toplevel').toString().trim()) === realpathSync(ROOT);
+  } catch {
+    checkout = false;
+  }
+  return checkout;
+}
 
 /** The key of NAME's inputs as this tree has them now; null without git.
  *  Each input file by path and git blob hash of its content in the working
@@ -46,6 +57,7 @@ const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { maxBuffer:
  *  staged, changed or new. */
 export function inputsKey(name) {
   const spec = ['--', ...INPUTS[name.split('.')[0]], ...SKIP];
+  if (!isCheckout()) return null;
   try {
     const blobs = new Map();
     // Index entries: `MODE BLOB STAGE\tPATH`.
@@ -60,7 +72,7 @@ export function inputsKey(name) {
     const here = changed.filter((f) => existsSync(join(ROOT, f)));
     for (const f of changed) blobs.delete(f);
     if (here.length) {
-      const hashes = execFileSync('git', ['-C', ROOT, 'hash-object', '--stdin-paths'], { input: here.join('\n'), maxBuffer: 64 << 20 }).toString().trim().split('\n');
+      const hashes = execFileSync('git', ['-C', ROOT, 'hash-object', '--stdin-paths'], { input: here.join('\n'), maxBuffer: 64 << 20, stdio: ['pipe', 'pipe', 'pipe'] }).toString().trim().split('\n');
       here.forEach((f, i) => blobs.set(f, hashes[i]));
     }
     const h = createHash('sha256');
