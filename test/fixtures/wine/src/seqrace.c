@@ -243,23 +243,32 @@ static void key_case(void)
     check(!k_stale, "input: stale key states", k_stale);
 }
 
-/* a read that never sees a write can stall a case: fail it instead */
+/* a read that never sees a write can stall a case: fail it instead. Stalled
+ * is the writer's count unmoved in one phase for two minutes; a phase that
+ * runs longer while its writes go on is slow, not stalled. */
 static volatile const char *phase_name;
 static HANDLE quit;
 static int cases = 7;
 static DWORD WINAPI watchdog(void *arg)
 {
     const char *last = NULL;
+    LONG64 last_n = -1;
+    int still = 0;
     for (;;)
     {
-        const char *now = (const char *)phase_name;
+        const char *now;
+        LONG64 n;
         if (!WaitForSingleObject(quit, 60000)) return 0;
-        if (now == phase_name && now == last)
+        now = (const char *)phase_name;
+        n = published;
+        still = now == last && n == last_n ? still + 1 : 0;
+        if (still >= 2)
         {
-            printf("FAIL %s: no progress for two minutes\n%d failures\n", now, failures + 1);
+            printf("FAIL %s: no progress for two minutes (%lld writes)\n%d failures\n", now, n, failures + 1);
             ExitProcess(1);
         }
         last = now;
+        last_n = n;
     }
 }
 
@@ -270,7 +279,8 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1 && atoi(argv[1]) > 0) WRITES = atoi(argv[1]);
     /* argv[2]: the cases to run, a mask (1 window, 2 queue, 4 input; 7 by
-     * default; 8, 16 and 32 are cut-down window cases for the SP exit hang) */
+     * default; 8, 16 and 32 are cut-down window cases for the SP exit hang;
+     * 64 is a phase with no writes, which the watchdog must fail) */
     if (argc > 2) cases = atoi(argv[2]);
     quit = CreateEventW(NULL, TRUE, FALSE, NULL);
     dog = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
@@ -307,6 +317,12 @@ int main(int argc, char **argv)
     {
         phase_name = "input";
         key_case();
+    }
+    if (cases & 64)
+    {
+        phase_name = "stall";
+        published = 0;
+        Sleep(INFINITE);
     }
     /* the watchdog ends before the program does (a page's single thread
      * runs the others only when they wake) */
