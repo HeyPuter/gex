@@ -818,6 +818,7 @@ async function handle(msg) {
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
+  gex.setDoorWord(msg.doorWord);
   if (msg.door) gex.setDoor(msg.door);
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();

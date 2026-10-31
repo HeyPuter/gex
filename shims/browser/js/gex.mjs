@@ -6291,7 +6291,7 @@ export class Gex {
       // messages): Wine runs its program again in its place, in a new Worker
       // that starts with the door (loader.c `wineserver_relaunch`,
       // `exec_fresh`). None in the SP build.
-      door_missing: () => (this.#door || single.on ? 0 : 1),
+      door_missing: () => ((this.#door && this.#doorLive(this.#door)) || single.on ? 0 : 1),
       // The next exec goes on in a new Worker and memory, the process's pid
       // kept (shim `gex_exec_fresh`).
       exec_fresh: () => { e.gex_exec_fresh?.(); },
@@ -6335,6 +6335,11 @@ export class Gex {
   #wasmprogBindText = '';
   /** The session's door server, and this Worker's instance on it. */
   #door = null;
+  /** The session's door word (host.mjs `#doorWord`): the pid of the server
+   *  whose door is current, written by that server as it publishes and
+   *  cleared when it ends. Read where a door is used, so a Worker never has
+   *  to have heard a message to know that its door is another server's. */
+  #doorWord = null;
   #doorInst = null;
   #doorViews = null;
   /** Census: door calls, fallbacks, proxies. */
@@ -6365,12 +6370,17 @@ export class Gex {
       area, kickId, pid: dv.getInt32(area + 112, true), id: `${Date.now()}:${area}`,
     };
     if (globalThis.GEX_DOOR_TRACE) console.error(`[gex-door] wineserver pid ${door.pid} published its door (area ${area})`);
+    // Current from now, for every Worker of the session at once: before the
+    // server says it is ready, so the process that started it finds its own
+    // door (if any) not this one, and runs again with this one
+    // (ntdll wineserver_relaunch, `door_missing`).
+    if (this.#doorWord) Atomics.store(this.#doorWord, 0, door.pid);
     this.#env.publishDoor?.(door);
   }
 
   #usdMove(at, size, publish) {
     const d = this.#door;
-    if (!d || single.on) return -1;
+    if (!d || single.on || !this.#doorLive(d)) return -1;
     const { u8, dv } = this.#doorView();
     const usd = dv.getUint32(d.area + 140, true);
     if (!usd) return -1;
@@ -6391,7 +6401,7 @@ export class Gex {
   #sess = null;
   #session() {
     const d = this.#door;
-    if (!d) return null;
+    if (!d || !this.#doorLive(d)) return null;
     let s = this.#sess;
     if (s && s.door === d && s.u8.length >= s.end) return s;
     const v = this.#doorView();
@@ -6422,6 +6432,19 @@ export class Gex {
     // A seqlock's word: whole, as the server stores it (8-aligned).
     if (!(at & 7)) return Atomics.load(s.i64, at / 8);
     return new DataView(s.u8.buffer).getBigInt64(at, true);
+  }
+
+  /** The session's door word, from the start message. */
+  setDoorWord(word) {
+    this.#doorWord = word ?? null;
+  }
+
+  /** Whether `d` is the current server's door: one whose server ended, or
+   *  that a later server's replaced, is not (a program that started while
+   *  a server was ending, and connected to the next). */
+  #doorLive(d) {
+    const w = this.#doorWord;
+    return !w || Atomics.load(w, 0) === d.pid;
   }
 
   /** The door server, from the host (all Workers of the session). */
@@ -6664,10 +6687,11 @@ export class Gex {
     if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
-    // Poisoned (a door call died midway): no more doors; the pipes say the
-    // rest when the server goes. A plain read, before the lock as the
-    // atomic load was: the flag only ever goes from 0 to set.
-    if (i32[(a + 124) >> 2] !== 0) return 1;
+    // Poisoned (a door call died midway, or the server ended): no more
+    // doors; the pipes say the rest when the server goes. A plain read,
+    // before the lock as the atomic load was: the flag only ever goes from
+    // 0 to set. Nor another server's door than the current one.
+    if (i32[(a + 124) >> 2] !== 0 || !this.#doorLive(d)) return 1;
     if (Atomics.compareExchange(i32, L, 0, 1) !== 0 && !this.#doorLockSlow(i32, a, L, pid, tid)) return 1;
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
@@ -6748,6 +6772,10 @@ export class Gex {
       const v = Atomics.compareExchange(i32, L, 0, 1);
       if (v === 0) return true;
       if (spins < 200) continue;
+      // Poisoned meanwhile (the server ended, or a call died in it), or no
+      // longer the current server's: the lock may never come free; the pipe
+      // says the rest.
+      if (Atomics.load(i32, (a + 124) >> 2) !== 0 || !this.#doorLive(this.#door ?? {})) return false;
       if (this.#snapRec && this.#kernel?.k_snap_pending?.()) return false;
       if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
       Atomics.wait(i32, L, 2, 1);

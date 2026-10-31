@@ -319,6 +319,11 @@ export class ProcessHost {
   #workers = new Map();
   /** The wineserver's door, once published (`doorPublish`). */
   #door = null;
+  /** The pid of the server whose door is current, shared with every Worker
+   *  (gex.mjs `#doorWord`): the server writes it as it publishes, before it
+   *  says it is ready; cleared here when it ends. Without shared memory
+   *  (the single-thread build) there are no doors. */
+  #doorWord = typeof SharedArrayBuffer === 'function' ? new Int32Array(new SharedArrayBuffer(4)) : null;
   #pending = new Map();
   #first = null;
   #forked = 0;
@@ -1477,6 +1482,7 @@ export class ProcessHost {
             unitFiles: this.#unitFilePack(),
             // the wineserver's door, if one is up (`doorPublish`)
             door: this.#door ?? undefined,
+            doorWord: this.#doorWord ?? undefined,
             memories: MEMORIES || undefined,
             // A fork child's memory: an exited process's, zeroed, if one fits.
             recycledMemory: msg.kind === 'adopt' && msg.child && !msg.child.exec && !this.#foreign(pid)
@@ -1821,7 +1827,17 @@ export class ProcessHost {
         // The wineserver ended: its door goes with it. A program started
         // after it starts a server of its own (Wine's loader asks
         // `door_missing`), and one would otherwise wait for a dead server.
+        //
+        // Its clients go with it, as on Linux when their pipes close: the
+        // door is poisoned (area +124), so a call waiting for the lock, which
+        // the server's pump may have held as it ended, or made before the
+        // Worker hears of the end, goes by the pipe and finds the server
+        // gone.
         if (this.#door && pid === this.#door.pid) {
+          const i32 = new Int32Array(this.#door.memory.buffer), a = this.#door.area >> 2;
+          if (!Atomics.load(i32, a + 31)) Atomics.store(i32, a + 31, -1);
+          if (this.#doorWord) Atomics.compareExchange(this.#doorWord, 0, this.#door.pid, 0);
+          Atomics.notify(i32, a);
           this.#door = null;
           for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
         }
