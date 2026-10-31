@@ -3,6 +3,10 @@
  *   rt-probe size    the terminal's "rows cols"
  *   rt-probe tty     the terminal's name
  *   rt-probe ids     "uid gid"
+ *   rt-probe creat PATH MODE   open(PATH, O_CREAT|O_WRONLY, MODE, octal)
+ *                    under umask 022: the file's mode by fstat, then by stat
+ *   rt-probe chmod PATH MODE   PATH opened, chmod to MODE (octal): the mode
+ *                    by fstat of the open descriptor, then by stat
  *   rt-probe xattr PATH NAME   the attribute's value
  *   rt-probe connect HOST PORT TEXT   TEXT to HOST:PORT (a name: getaddrinfo),
  *                    then what comes back until the far end closes
@@ -28,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -80,6 +85,25 @@ int main(int argc, char **argv) {
     }
   } else if (!strcmp(what, "trap")) {
     __builtin_trap();
+  } else if ((!strcmp(what, "creat") || !strcmp(what, "chmod")) && argc == 4) {
+    mode_t mode = (mode_t)strtoul(argv[3], 0, 8);
+    int fd;
+    if (!strcmp(what, "creat")) {
+      umask(022);
+      fd = open(argv[2], O_CREAT | O_WRONLY, mode);
+    } else {
+      fd = open(argv[2], O_RDONLY);
+      if (fd >= 0 && chmod(argv[2], mode) < 0) {
+        perror("chmod");
+        return 1;
+      }
+    }
+    struct stat f, s;
+    if (fd < 0 || fstat(fd, &f) < 0 || stat(argv[2], &s) < 0) {
+      perror(argv[2]);
+      return 1;
+    }
+    printf("%04o %04o\n", (unsigned)(f.st_mode & 07777), (unsigned)(s.st_mode & 07777));
   } else if (!strcmp(what, "ids")) {
     printf("%u %u\n", (unsigned)getuid(), (unsigned)getgid());
   } else if (!strcmp(what, "xattr") && argc == 4) {

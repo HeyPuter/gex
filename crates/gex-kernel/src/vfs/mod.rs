@@ -759,6 +759,13 @@ pub trait FileSystem: Send + Sync {
     }
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
+    /// [`FileSystem::open`] for a program's `open` (or the page's, which has
+    /// no umask): a file O_CREAT makes gets exactly `mode`, the umask
+    /// already applied, 0 making a 0000 file as on Linux. `open` itself is
+    /// the kernel's own, whose created files take the filesystem's default.
+    fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open(path, flags, mode)
+    }
     fn metadata(&self, path: &str) -> Result<Metadata, Errno>;
     /// [`FileSystem::metadata`] of a symlink itself rather than what it
     /// names (`lstat`). The default asks [`FileSystem::read_link`] first; a
@@ -1321,9 +1328,23 @@ impl Namespace {
 
     /// Open a path, following symlinks up to a bounded depth.
     pub fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_with(path, |fs, rel| fs.open(rel, flags, mode))
+    }
+
+    /// [`Namespace::open`] by [`FileSystem::open_mode`]: a program's open,
+    /// whose O_CREAT makes the file with exactly `mode`.
+    pub fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_with(path, |fs, rel| fs.open_mode(rel, flags, mode))
+    }
+
+    fn open_with(
+        &self,
+        path: &str,
+        open: impl Fn(&Arc<dyn FileSystem>, &str) -> Result<Arc<dyn FileHandle>, Errno>,
+    ) -> Result<Arc<dyn FileHandle>, Errno> {
         let mut current = normalize(path, &self.cwd);
         if let Some((fs, rel)) = self.resolve_final(&current)? {
-            return fs.open(&rel, flags, mode);
+            return open(fs, &rel);
         }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
@@ -1338,7 +1359,7 @@ impl Namespace {
                         normalize(&target, &parent)
                     };
                 }
-                Err(_) => return fs.open(&rel, flags, mode),
+                Err(_) => return open(fs, &rel),
             }
         }
         Err(Errno::ELOOP)

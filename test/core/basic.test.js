@@ -136,6 +136,11 @@ export default async function (t) {
   eq('writeFile over a file keeps its mode', (await fs.stat('/root/hi.sh')).mode & 0o777, 0o755);
   await fs.rm('/root/hi.sh');
   // A program's O_CREAT mode, less its umask.
+  // open(O_CREAT, 0) makes a 0000 file, 0666 under umask 022 a 0644 one,
+  // and fstat says the mode stat does, a chmod later too.
+  eq('open(O_CREAT, 0)', (await sys.run(['rt-probe', 'creat', '/tmp/m0', '0'], { env })).stdout, '0000 0000\n');
+  eq('open(O_CREAT, 0666) under umask 022', (await sys.run(['rt-probe', 'creat', '/tmp/m1', '666'], { env })).stdout, '0644 0644\n');
+  eq('fstat after chmod', (await sys.run(['rt-probe', 'chmod', '/tmp/m1', '751'], { env })).stdout, '0751 0751\n');
   eq('open\'s mode less the umask', (await sys.run(['sh', '-c', 'umask 077; echo > /tmp/u; umask 0; echo > /tmp/v; ls -l /tmp/u /tmp/v | cut -c1-10'], { env })).stdout, '-rw-------\n-rw-rw-rw-\n');
   await sys.run(['sh', '-c', 'mkdir -p /root/d/e && echo guest > /root/d/e/f && ln -s e/f /root/d/link'], { env });
   eq('page reads the guest\'s file', await fs.readFile('/root/d/e/f', { encoding: 'utf-8' }), 'guest\n');

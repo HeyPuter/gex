@@ -3172,10 +3172,10 @@ impl PathIo<'_> {
             let (tmp, h) = loop {
                 let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-                match self.ns.open(
+                match self.ns.open_mode(
                     &tmp,
                     oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
-                    if mode == 0 { 0o600 } else { mode },
+                    mode & 0o7777 & !self.fs.umask(),
                 ) {
                     Err(Errno::EEXIST) if tries < 256 => tries += 1,
                     r => break (tmp, r?),
@@ -3210,7 +3210,7 @@ impl PathIo<'_> {
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
             // O_CREAT's mode, less the umask, as Linux makes the file.
-            let h = self.ns.open(&p, flags, mode & 0o7777 & !self.fs.umask())?;
+            let h = self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask())?;
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {

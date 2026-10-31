@@ -2689,8 +2689,8 @@ fn as_unit(r: Result<(), gex_kernel::errno::Errno>) -> i32 {
 pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
     let p = path_of(path, path_len);
     let opened = match pagefs::find(&p) {
-        Some((m, rel)) => m.open(&rel, flags, mode),
-        None => rootfs().open(&p, flags, mode),
+        Some((m, rel)) => m.open_mode(&rel, flags, mode),
+        None => rootfs().open_mode(&p, flags, mode),
     };
     match opened {
         Ok(h) => install_handle(h),
@@ -2706,8 +2706,8 @@ pub extern "C" fn k_fs_open_now(path: gex_kmem::PAddr, path_len: u32, flags: u64
     use gex_kernel::fs::oflags::{O_CREAT, O_TRUNC};
     let p = path_of(path, path_len);
     let opened = match pagefs::find(&p) {
-        Some((m, rel)) => m.open(&rel, flags, mode),
-        None => rootfs().open(&p, flags, mode),
+        Some((m, rel)) => m.open_mode(&rel, flags, mode),
+        None => rootfs().open_mode(&p, flags, mode),
     };
     match opened {
         Ok(h) => {

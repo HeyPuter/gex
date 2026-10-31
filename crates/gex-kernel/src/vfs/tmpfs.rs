@@ -156,6 +156,10 @@ pub struct FileNode {
     /// reader that saw the same count before and after its read read
     /// contents no change was halfway through. From 1, as 0 is no count.
     changes: core::sync::atomic::AtomicU64,
+    /// The mode its last name had when that name went, for `fstat` of a
+    /// descriptor that outlives every name. Modes are kept by name
+    /// (`Inner::modes`) while it has one.
+    gone_mode: core::sync::atomic::AtomicU32,
 }
 
 impl FileNode {
@@ -169,6 +173,7 @@ impl FileNode {
             read: core::sync::atomic::AtomicU64::new(0),
             written: core::sync::atomic::AtomicBool::new(false),
             changes: core::sync::atomic::AtomicU64::new(1),
+            gone_mode: core::sync::atomic::AtomicU32::new(0o644),
         }
     }
     /// One more change of the contents; called with `data` locked (the
@@ -615,9 +620,11 @@ impl Inner {
 
     /// Remove name `path` and what it keeps beside the node.
     fn forget(&mut self, path: &str) {
-        self.nodes.remove(path);
+        let mode = self.modes.remove(path);
+        if let Some(Node::File(f)) = self.nodes.remove(path) {
+            f.gone_mode.store(mode.unwrap_or(0o644), Ordering::Relaxed);
+        }
         self.drop_ino(path);
-        self.modes.remove(path);
         self.mtimes.remove(path);
     }
 
@@ -1318,10 +1325,19 @@ impl FileHandle for TmpHandle {
         // An unlinked file still has a size and an inode number, so a handle
         // onto one answers from the contents rather than the tree.
         if let Some(file) = &self.file {
+            // Its mode by the name it was opened under while that still
+            // names it, else by any name it has now, else the last one's.
+            let mode = {
+                let inner = self.inner.read().unwrap();
+                match self.here(&inner) {
+                    Some(p) => inner.modes.get(&p).copied().unwrap_or(0o644),
+                    None => file.gone_mode.load(Ordering::Relaxed),
+                }
+            };
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: file.size(),
-                mode: 0o644,
+                mode,
                 ino: file.ino,
                 mtime: file.mtime.load(Ordering::Relaxed),
                 nlink: 1,
@@ -1522,9 +1538,12 @@ impl FileHandle for TmpHandle {
     }
 }
 
-impl FileSystem for TmpFs {
-    fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+impl TmpFs {
+    /// [`FileSystem::open`], with the mode a file it creates takes: a
+    /// program's exact `mode` ([`FileSystem::open_mode`]), or the default.
+    fn open_as(&self, path: &str, flags: u64, mode: Option<u32>) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
+
         let mut dir = None;
         let mut wrote = false;
         let mut created = false;
@@ -1585,9 +1604,9 @@ impl FileSystem for TmpFs {
                     wrote = true;
                     created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
-                    // The mode O_CREAT gives (the caller's umask applied).
-                    // 0 is an internal caller's "no mode": the default.
-                    if mode != 0 {
+                    // A program's O_CREAT mode (its umask applied): exactly
+                    // that, 0 too. The kernel's own opens take the default.
+                    if let Some(mode) = mode {
                         let _ = inner.chmod(&path, mode);
                     }
                     Some(f)
@@ -1613,6 +1632,16 @@ impl FileSystem for TmpFs {
             h.note_here(mask::OPEN);
         }
         Ok(Arc::new(h))
+    }
+}
+
+impl FileSystem for TmpFs {
+    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_as(path, flags, None)
+    }
+
+    fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_as(path, flags, Some(mode))
     }
 
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
@@ -1737,9 +1766,8 @@ impl FileSystem for TmpFs {
             Some(Node::Dir) => Err(Errno::EISDIR),
             Some(_) => {
                 let own = node_ino(&inner, path);
-                inner.nodes.remove(path);
-                inner.drop_ino(path);
-                inner.mtimes.remove(path);
+                // Its mode too: a file made at the name later is a new one.
+                inner.forget(path);
                 saved(path);
                 if let Some(own) = own {
                     note_removed(&inner, fs_key(&self.inner), path, own);
@@ -2234,12 +2262,31 @@ mod tests {
     #[test]
     fn a_file_created_takes_the_open_mode_and_an_existing_one_keeps_its_own() {
         let fs = TmpFs::new();
-        fs.open("x", oflags::O_CREAT | oflags::O_RDWR, 0o755).unwrap();
-        assert_eq!(fs.metadata("x").unwrap().mode & 0o7777, 0o755);
-        fs.open("x", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
-        assert_eq!(fs.metadata("x").unwrap().mode & 0o7777, 0o755);
-        fs.open("d", oflags::O_CREAT | oflags::O_RDWR, 0).unwrap();
-        assert_eq!(fs.metadata("d").unwrap().mode & 0o7777, 0o644);
+        let mode = |p: &str| fs.metadata(p).unwrap().mode & 0o7777;
+        fs.open_mode("x", oflags::O_CREAT | oflags::O_RDWR, 0o755).unwrap();
+        assert_eq!(mode("x"), 0o755);
+        fs.open_mode("x", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
+        assert_eq!(mode("x"), 0o755);
+        // A program's 0 is 0000, as on Linux.
+        fs.open_mode("z", oflags::O_CREAT | oflags::O_RDWR, 0).unwrap();
+        assert_eq!(mode("z"), 0);
+        // The kernel's own open: the default.
+        fs.open("d", oflags::O_CREAT | oflags::O_RDWR, 0o700).unwrap();
+        assert_eq!(mode("d"), 0o644);
+    }
+
+    #[test]
+    fn fstat_says_the_mode_after_a_chmod_a_rename_and_an_unlink() {
+        let fs = TmpFs::new();
+        let h = fs.open_mode("f", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
+        let fmode = || h.metadata().unwrap().mode & 0o7777;
+        assert_eq!(fmode(), 0o600);
+        fs.chmod("f", 0o751).unwrap();
+        assert_eq!(fmode(), 0o751);
+        fs.rename("f", "g").unwrap();
+        assert_eq!(fmode(), 0o751);
+        fs.unlink("g").unwrap();
+        assert_eq!(fmode(), 0o751);
     }
 
     #[test]
