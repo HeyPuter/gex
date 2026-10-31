@@ -43,6 +43,7 @@ EAGER = {}  # module -> the DLLs to load before it (pelink's main)
 ACTCTX_DLLS = ('comctl32.dll',)
 DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
+BUILD = None  # the Wine build tree (pelink's main)
 WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
 M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
@@ -220,8 +221,9 @@ def main():
         extra.append((sys.argv[2], sys.argv[3], sys.argv[4], [i for i in sys.argv[5].split(',') if i]))
         del sys.argv[1:6]
     build, src, out = sys.argv[1:4]
-    global SRC
+    global SRC, BUILD
     SRC = src
+    BUILD = build
     WINE64 = WINE64 or makefile_var(os.path.join(build, 'Makefile'), 'HOST_ARCH') == ['wasm64']
     M64 = M64 or (WINE64 and '-mgex-memory64' in (makefile_var(os.path.join(build, 'Makefile'), 'CC') or []))
     only = set(sys.argv[4:]) | (set(SPLIT) if sys.argv[4:] else set())
@@ -415,6 +417,61 @@ def link(dlls, out, gexrt, others=None):
         listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', ro],
                                  capture_output=True, text=True, check=True).stdout
         sigs[mod] = {(l.split()[0], l.split()[1]): l.split()[2] for l in listing.splitlines() if len(l.split()) == 3}
+    # C runtime functions a DLL's code calls by their C names that no .spec
+    # exports (Wine's i386 msvcrt and ucrtbase export sinf, atan2f and the
+    # other float functions on 64-bit only, and the compiler's own calls are
+    # among them): the core DLL that defines one exports it, so a --split
+    # module's call is bound to it rather than left an import nothing provides.
+    rt_exports = {}  # core dll -> [C names it exports beside its .spec's]
+    core_defs = {}
+    for mod, ro, ex, _ in sorted(dlls, key=lambda d: ('ucrtbase.dll', 'msvcrt.dll').index(d[0])
+                                 if d[0] in ('ucrtbase.dll', 'msvcrt.dll') else 2):
+        if not SPLIT.get(mod):
+            for (n, k) in sigs[mod]:
+                if k == 'defined':
+                    core_defs.setdefault(n, mod)
+    # (one the core's DLLs do not define either, ceilf or trunc: the C
+    # runtime's own library, libs/musl, which Wine links into msvcrt and
+    # ucrtbase, has it: its objects, with the members they need in turn, are
+    # linked into the core's C runtime DLL, whose own math_error and _fdclass
+    # they call, and that DLL exports its C name)
+    musl = os.path.join(BUILD or '', 'libs', 'musl', 'libmusl.a')
+    ro_own = {}
+    crt = next((d for d in ('ucrtbase.dll', 'msvcrt.dll') if any(m == d and not SPLIT.get(m) for m, _, _, _ in dlls)), None)
+    if crt and os.path.exists(musl):
+        lib = subprocess.run(['llvm-nm', '--defined-only', '--print-file-name', musl], capture_output=True, text=True).stdout
+        # (`libmusl.a:ceilf.o: 00000001 T ceilf`)
+        in_lib = {l.split()[-1]: l.split()[0].split(':')[-2] for l in lib.splitlines()
+                  if len(l.split()) >= 3 and l.split()[-2] == 'T'}
+        want = sorted({n for mod, _, _, _ in dlls for (n, k) in sigs[mod]
+                       if k == 'undefined' and n in in_lib and n not in core_defs
+                       and (n, 'defined') not in sigs[mod]})
+        if want:
+            crt_tmp = tempfile.mkdtemp(prefix='pelink-crt-')
+            members = sorted({in_lib[n] for n in want})
+            subprocess.check_call(['llvm-ar', 'x', '--output', crt_tmp, musl] + members)
+            ro_crt = next(ro for m, ro, _, _ in dlls if m == crt)
+            merged = os.path.join(crt_tmp, crt + '.r.o')
+            # (the archive after them: the members they need, and only those)
+            subprocess.check_call(['wasm-ld', '-r', '-o', merged, ro_crt]
+                                  + [os.path.join(crt_tmp, m) for m in members] + [musl])
+            dlls = [(m, merged if m == crt else ro, ex, imp) for m, ro, ex, imp in dlls]
+            # (the link drops what only an export names, rewind_preserve_stack:
+            # what nothing defines is found in the DLL's own object)
+            ro_own[crt] = ro_crt
+            listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', merged],
+                                     capture_output=True, text=True, check=True).stdout
+            sigs[crt] = {(l.split()[0], l.split()[1]): l.split()[2] for l in listing.splitlines() if len(l.split()) == 3}
+            for n in want:
+                if (n, 'defined') in sigs[crt]:
+                    core_defs[n] = crt
+    for mod, ro, ex, _ in dlls:
+        for (n, k) in sigs[mod]:
+            owner = core_defs.get(n)
+            if k == 'undefined' and owner and owner != mod and n not in exporters and n not in forwards \
+                    and (n, 'defined') not in sigs[mod]:
+                exporters[n] = [owner]
+                rt_exports.setdefault(owner, []).append(n)
     def resolve_forward(fwd, depth=0):
         """(dll, name) a forward like NTDLL.RtlEnterCriticalSection reaches."""
         dll, _, name = fwd.partition('.')
@@ -565,7 +622,9 @@ def link(dlls, out, gexrt, others=None):
         of every DLL defining it, or through a forward when it imports
         neither."""
         vias = shadowed.get(name)
-        if not vias or mod in vias or mod in exporters[name]:
+        # (an export of the module's that it takes from another DLL is not
+        # its own: unicows' lstrlenW, kernelbase's)
+        if not vias or mod in vias or (mod in exporters[name] and (name, 'defined') in sigs[mod]):
             return False
         first = next((o for o in EAGER.get(mod, []) + imports
                       if o in vias or o in exporters[name]), None)
@@ -580,6 +639,12 @@ def link(dlls, out, gexrt, others=None):
         with open(alias_file, 'w') as f:
             for a, n in aliases.get(mod, []):
                 f.write(f'{a} {n}\n')
+        if rt_exports.get(mod):
+            ex_rt = os.path.join(tmp, mod + '.exports')
+            with open(ex_rt, 'w') as f:
+                f.write(open(ex).read())
+                f.writelines(f'{n} func\n' for n in sorted(set(rt_exports[mod])))
+            ex = ex_rt
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'dll', ro, local, mod, ex, alias_file])
         mapfile = os.path.join(tmp, mod + '.map')
         with open(mapfile, 'w') as f:
@@ -603,6 +668,12 @@ def link(dlls, out, gexrt, others=None):
                     f.write(f'{name} gexw-guest {sym}\n')
                     continue
                 owners = defs or owners
+                if mod in owners and (name, 'defined') not in sigs[mod]:
+                    # an export it takes from another DLL (unicows' lstrlenW):
+                    # bound to that DLL's, or by its forward below
+                    owners = [o for o in owners if o != mod]
+                    if not owners:
+                        continue
                 if mod in owners:
                     continue  # its own: already resolved inside it
                 # (its own C runtime first, which its import list does not
@@ -1075,7 +1146,7 @@ static void *gexw_ntdll_proc(const char *name)
         for mod, ro, ex, imports in dlls:
             if grp(mod) != g:
                 continue
-            nm = subprocess.run(['llvm-nm', '--undefined-only', ro], capture_output=True, text=True).stdout
+            nm = subprocess.run(['llvm-nm', '--undefined-only', ro_own.get(mod, ro)], capture_output=True, text=True).stdout
             strong |= {l.split()[-1] for l in nm.splitlines() if l.split()[:1] == ['U']}
         callers = {n: v for n, v in callers.items() if n in strong}
         gaps = sorted(callers.items())
@@ -1184,6 +1255,83 @@ static void *gexw_ntdll_proc(const char *name)
     for g in objs:
         if g:
             emit(g, os.path.join(os.path.dirname(out), g), None)
+    if SPLIT:
+        check_imports(out, [os.path.join(os.path.dirname(out), g) for g in objs if g])
+
+
+# What a module may import beside the others' exports: the memory, table and
+# stack the loader gives every module, and the weak main names a C runtime
+# asks a program for (left null: pelink's emit).
+LOADER_IMPORTS = {'memory', '__indirect_function_table', '__stack_pointer', '__memory_base', '__table_base'}
+WEAK_IMPORTS = {'main', '__main_argc_argv', '__original_main', 'WinMain'}
+
+
+def check_imports(core, splits):
+    """With modules of their own, each function a module imports is
+    another's export: the core's, another --split module's, or the other
+    mode's (CROSS_MODE). A name none exports would fail at load, in a
+    process that only then maps the DLL: the link fails here instead."""
+    def section(path, sid_want):
+        b = open(path, 'rb').read()
+        i, out = 8, []
+        while i < len(b):
+            sid = b[i]
+            size, j = leb_at(b, i + 1)
+            if sid == sid_want:
+                out.append(b[j:j + size])
+            i = j + size
+        return out
+    def exports(path):
+        names = set()
+        for body in section(path, 7):
+            cnt, k = leb_at(body, 0)
+            for _ in range(cnt):
+                ln, k = leb_at(body, k)
+                names.add(body[k:k + ln].decode())
+                k += ln + 1
+                _, k = leb_at(body, k)
+        return names
+    def func_imports(path):
+        names = []
+        for body in section(path, 2):
+            cnt, k = leb_at(body, 0)
+            for _ in range(cnt):
+                ml, k = leb_at(body, k)
+                mod = body[k:k + ml].decode()
+                k += ml
+                fl, k = leb_at(body, k)
+                field = body[k:k + fl].decode()
+                k += fl
+                kind = body[k]
+                k += 1
+                if kind == 0:
+                    _, k = leb_at(body, k)
+                    if mod == 'env':
+                        names.append(field)
+                elif kind in (1, 2):
+                    if kind == 1:
+                        k += 1
+                    flags, k = leb_at(body, k)
+                    _, k = leb_at(body, k)
+                    if flags & 1:
+                        _, k = leb_at(body, k)
+                elif kind == 3:
+                    k += 2
+                elif kind == 4:
+                    k += 1
+                    _, k = leb_at(body, k)
+        return names
+    mods = [core] + splits
+    have = {m: exports(m) for m in mods}
+    bad = []
+    for m in mods:
+        others = set().union(*(have[o] for o in mods if o != m))
+        gaps = sorted({n for n in func_imports(m) if n not in others and n not in LOADER_IMPORTS
+                       and n not in WEAK_IMPORTS and n not in CROSS_MODE})
+        if gaps:
+            bad.append(f'{os.path.basename(m)}: {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))
+    if bad:
+        sys.exit('pelink: functions modules import that no module exports:\n  ' + '\n  '.join(bad))
 
 
 main()
