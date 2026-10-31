@@ -151,9 +151,23 @@ processes and memory.
 - Programs run in Workers on a shared memory, so the page must be
   cross-origin isolated: `Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`.
-- The runtime fetches its files from `gex/`, beside its modules. A bundler
-  copies the package as it is. `new System({ baseUrl })` names another place,
+- The runtime fetches its files from `gex/`, beside its modules when the
+  package is served as it is. `new System({ baseUrl })` names another place,
   the directory that holds `gex/`.
+- With a bundler, the page's own build takes in the modules and their
+  Workers, but not `gex/`: copy the package's `gex/` into the files the page
+  serves as they are (vite's `public/`), and give `baseUrl` the directory
+  that holds it (`new System({ baseUrl: '/' })` for `public/gex/`). vite also
+  needs the Workers as modules, and the package left out of its dev server's
+  pre-bundling:
+
+  ```javascript
+  // vite.config.js
+  export default {
+    worker: { format: 'es' },
+    optimizeDeps: { exclude: ['@gex/runtime'] },
+  };
+  ```
 - One system per page: a second `new System()` throws.
 - A system runs wasm32 programs (built with gexcc) and the programs of one
   translated architecture, x86-64 or aarch64, which it takes from the tree's

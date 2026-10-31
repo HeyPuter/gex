@@ -20,6 +20,8 @@
 
 const CACHE = 'gex-modules-v1';
 const SPEC = /(["'`])(\.\/[A-Za-z0-9_.-]+\.m?js)\1/g;
+// Every static and dynamic import's specifier.
+const IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*)(["'`])([^"'`\s]+)\1/g;
 // A chunk named by its content (vite's `name-HASH.js`): kept; anything else
 // is fetched each time.
 const hashed = (u) => /-[A-Za-z0-9_-]{8}\.m?js$/.test(new URL(u).pathname);
@@ -66,6 +68,10 @@ export async function workerGraph(entry, onBytes = () => {}) {
     busy.add(u);
     let code = await text(u);
     if (/\bimport\.meta\b/.test(code)) throw new Error(`${u} reads import.meta`);
+    // An import by any other name (a dev server's "/node_modules/..." or
+    // "/@fs/...") would not resolve from a blob URL.
+    const other = [...code.matchAll(IMPORT)].map((m) => m[2]).find((s) => !s.startsWith('./'));
+    if (other) throw new Error(`${u} imports ${other}`);
     const deps = [...new Set([...code.matchAll(SPEC)].map((m) => new URL(m[2], u).href))];
     // One at a time: a shared dependency is fetched once.
     for (const d of deps) await visit(d);
