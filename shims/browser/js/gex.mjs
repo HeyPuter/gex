@@ -1247,6 +1247,8 @@ export class Gex {
   /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
+  /** A 64-bit Wine program being loaded into a 64-bit memory: the split. */
+  #wine64Split = false;
   /** A process that runs no translated code (a native wasm program, a fork
    *  child of one, an exec of one): no placement window, its arena from
    *  `MMAP_BOTTOM` (`gex_set_no_place_window`, before the first claim).
@@ -1444,7 +1446,7 @@ export class Gex {
       // the first claim: the 2 GiB split at its parent's line, or 32-bit Wine's
       // compact space (nothing grown; inherited regions become islands).
       // `?winesplit=1` before the space is taken: the split, not the compact one.
-      if (globalThis.GEX_WINE32_SPLIT) this.#shim.exports.gex_set_wine_split?.(1);
+      if (globalThis.GEX_WINE32_SPLIT || this.#wine64Split) this.#shim.exports.gex_set_wine_split?.(1);
       // `?nullguard=1` before anything is translated (gex_abi::null_guard).
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
       // `?mxcsr=1` before anything is translated: SSE under MXCSR (gex_ir::mxcsr_exact).
@@ -2111,9 +2113,13 @@ export class Gex {
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
     // A 32-bit Wine program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
-    // Windows DLLs load (0x10000000).
+    // Windows DLLs load (0x10000000). A 64-bit one in a 32-bit memory takes no space here unless
+    // the site asks for the split: its load picks the compact space or the
+    // split (wasmprog.rs `publish`), and a space taken here first would be
+    // 32-bit Wine's.
     const wine = wine32ProgramFlags(elf);
-    if (wine) this.#windowsSpace = -1;
+    if (wine && ((wine & 2) === 0 || m64() || globalThis.GEX_WINE32_SPLIT)) this.#windowsSpace = -1;
+    this.#wine64Split = (wine & 2) !== 0 && m64();
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
