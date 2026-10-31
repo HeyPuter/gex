@@ -128,7 +128,10 @@ enum Ev {
 ///
 /// `window W H` in place of `frames N` starts the clock once a placed window
 /// of W x H is on the screen: what a test waits for when a loaded machine
-/// makes any fixed delay after the first frame too short.
+/// makes any fixed delay after the first frame too short. `clients N` starts
+/// it once the Nth client has connected: for a client that shows no window
+/// (one that only listens to its outputs), where `frames 0` would count the
+/// time its program takes to load.
 ///
 /// Coordinates are the focused surface's pixels.
 struct Input {
@@ -142,6 +145,10 @@ struct Input {
     seen: u64,
     /// `window W H`: the clock starts once a placed window this size is up.
     window: Option<(u32, u32)>,
+    /// `clients N`: the clock starts once N clients have connected, and how
+    /// many have.
+    clients: Option<u32>,
+    connected: u32,
     /// `output W H` lines: the output's new size, and when. Apart from the
     /// events, which wait for a client that takes input; a resize does not.
     outputs: Vec<(f64, i32, i32)>,
@@ -191,6 +198,7 @@ impl Input {
         let mut drags = Vec::new();
         let mut after = 1;
         let mut window = None;
+        let mut clients = None;
         let mut outputs = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -201,6 +209,10 @@ impl Input {
             let bad = || format!("{path}:{}: cannot read `{line}`", n + 1);
             if w[0] == "frames" {
                 after = w.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                continue;
+            }
+            if w[0] == "clients" {
+                clients = Some(w.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?);
                 continue;
             }
             if w[0] == "window" {
@@ -255,8 +267,8 @@ impl Input {
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
         outputs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
-        let start = if after == 0 && window.is_none() { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, drags, next: 0, start, after, seen: 0, window, outputs })
+        let start = if after == 0 && window.is_none() && clients.is_none() { Some(std::time::Instant::now()) } else { None };
+        Ok(Input { events, drags, next: 0, start, after, seen: 0, window, clients, connected: 0, outputs })
     }
 }
 
@@ -293,7 +305,7 @@ impl Wayland {
         crate::stall::frame();
         if let Some(inp) = self.inner.input.lock().unwrap().as_mut() {
             inp.seen += 1;
-            if inp.window.is_none() && inp.seen >= inp.after && inp.start.is_none() {
+            if inp.window.is_none() && inp.clients.is_none() && inp.seen >= inp.after && inp.start.is_none() {
                 eprintln!("[gex] input: the script's clock starts at frame {}", inp.seen);
                 inp.start = Some(std::time::Instant::now());
             }
@@ -313,6 +325,17 @@ impl Wayland {
             .any(|k| screen.frames.get(k).is_some_and(|f| f.width as u32 == w && f.height as u32 == h));
         if up {
             eprintln!("[gex] input: the script's clock starts with a {w}x{h} window up");
+            inp.start = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A client connected: the input script's clock starts at its `clients N`th.
+    fn note_client(&self) {
+        let mut g = self.inner.input.lock().unwrap();
+        let Some(inp) = g.as_mut() else { return };
+        inp.connected += 1;
+        if inp.start.is_none() && inp.clients.is_some_and(|n| inp.connected >= n) {
+            eprintln!("[gex] input: the script's clock starts with client {}", inp.connected);
             inp.start = Some(std::time::Instant::now());
         }
     }
@@ -955,6 +978,7 @@ impl HostListener for Wayland {
             drag: None,
             drag_said: None,
         });
+        self.note_client();
     }
 }
 
