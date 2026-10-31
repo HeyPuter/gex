@@ -129,6 +129,14 @@ export default async function (t) {
   // The filesystem from the page.
   await fs.writeFile('/root/note.txt', 'from the page\n');
   eq('guest reads the page\'s file', (await sys.run(['cat', '/root/note.txt'], { env })).stdout, 'from the page\n');
+  // A file the page makes takes writeFile's mode (one already there keeps its own).
+  await fs.writeFile('/root/hi.sh', '#!/bin/sh\necho made by the page\n', { mode: 0o755 });
+  eq('writeFile\'s mode', [(await fs.stat('/root/hi.sh')).mode & 0o777, (await sys.run(['/root/hi.sh'], { env })).stdout], [0o755, 'made by the page\n']);
+  await fs.writeFile('/root/hi.sh', '#!/bin/sh\necho again\n', { mode: 0o600 });
+  eq('writeFile over a file keeps its mode', (await fs.stat('/root/hi.sh')).mode & 0o777, 0o755);
+  await fs.rm('/root/hi.sh');
+  // A program's O_CREAT mode, less its umask.
+  eq('open\'s mode less the umask', (await sys.run(['sh', '-c', 'umask 077; echo > /tmp/u; umask 0; echo > /tmp/v; ls -l /tmp/u /tmp/v | cut -c1-10'], { env })).stdout, '-rw-------\n-rw-rw-rw-\n');
   await sys.run(['sh', '-c', 'mkdir -p /root/d/e && echo guest > /root/d/e/f && ln -s e/f /root/d/link'], { env });
   eq('page reads the guest\'s file', await fs.readFile('/root/d/e/f', { encoding: 'utf-8' }), 'guest\n');
   const stt = await fs.stat('/root/d/e/f');

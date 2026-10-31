@@ -1523,7 +1523,7 @@ impl FileHandle for TmpHandle {
 }
 
 impl FileSystem for TmpFs {
-    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+    fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
         let mut dir = None;
         let mut wrote = false;
@@ -1585,6 +1585,11 @@ impl FileSystem for TmpFs {
                     wrote = true;
                     created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
+                    // The mode O_CREAT gives (the caller's umask applied).
+                    // 0 is an internal caller's "no mode": the default.
+                    if mode != 0 {
+                        let _ = inner.chmod(&path, mode);
+                    }
                     Some(f)
                 }
             }
@@ -2224,6 +2229,17 @@ mod tests {
         assert_eq!(f.read_at(0, &mut buf).unwrap(), 3);
         assert_eq!(&buf[..3], b"gex");
         assert_eq!(f.metadata().unwrap().size, 3);
+    }
+
+    #[test]
+    fn a_file_created_takes_the_open_mode_and_an_existing_one_keeps_its_own() {
+        let fs = TmpFs::new();
+        fs.open("x", oflags::O_CREAT | oflags::O_RDWR, 0o755).unwrap();
+        assert_eq!(fs.metadata("x").unwrap().mode & 0o7777, 0o755);
+        fs.open("x", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
+        assert_eq!(fs.metadata("x").unwrap().mode & 0o7777, 0o755);
+        fs.open("d", oflags::O_CREAT | oflags::O_RDWR, 0).unwrap();
+        assert_eq!(fs.metadata("d").unwrap().mode & 0o7777, 0o644);
     }
 
     #[test]

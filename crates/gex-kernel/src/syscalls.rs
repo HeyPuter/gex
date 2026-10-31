@@ -3209,7 +3209,8 @@ impl PathIo<'_> {
             }
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
-            let h = self.ns.open(&p, flags, mode)?;
+            // O_CREAT's mode, less the umask, as Linux makes the file.
+            let h = self.ns.open(&p, flags, mode & 0o7777 & !self.fs.umask())?;
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
