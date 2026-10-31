@@ -4,9 +4,10 @@
 // old build does not fail: it runs the old code, and a test reports what the
 // old code does. So each build writes a stamp, `.inputs`, beside what it
 // built: one line per artefact, `NAME KEY`, where KEY hashes the content of the
-// artefact's inputs (git's index entries for them, plus `git diff` and any new
-// files of a dirty tree). Content, not times: a tree copied after its build
-// (cp -al, cp --parents) has new mtimes and the same key.
+// artefact's inputs (each file's git blob hash as the working tree has it, so
+// a commit of what was built keeps the key). Content, not times: a tree
+// copied after its build (cp -al, cp --parents) has new mtimes and the same
+// key.
 //
 //   node web/build-inputs.mjs key NAME            the key of NAME's inputs now
 //   node web/build-inputs.mjs stamp DIR NAME[=KEY]...
@@ -21,7 +22,7 @@
 // warning. With no git checkout or no stamp they go on, with a one-line note.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -39,15 +40,31 @@ const SKIP = [':(exclude,glob)**/*.md', ':(exclude,glob)**/tests/**', ':(exclude
 
 const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { maxBuffer: 256 << 20 });
 
-/** The key of NAME's inputs as this tree has them now; null without git. */
+/** The key of NAME's inputs as this tree has them now; null without git.
+ *  Each input file by path and git blob hash of its content in the working
+ *  tree: the same files give the same key whether they are committed,
+ *  staged, changed or new. */
 export function inputsKey(name) {
   const spec = ['--', ...INPUTS[name.split('.')[0]], ...SKIP];
   try {
+    const blobs = new Map();
+    // Index entries: `MODE BLOB STAGE\tPATH`.
+    for (const e of git('ls-files', '-s', '-z', ...spec).toString().split('\0').filter(Boolean)) {
+      const tab = e.indexOf('\t');
+      blobs.set(e.slice(tab + 1), e.slice(0, tab).split(' ')[1]);
+    }
+    // Those the working tree changed, and new ones: hashed as they are now
+    // (a deleted one is gone from the key).
+    const list = (...a) => git(...a, ...spec).toString().split('\0').filter(Boolean);
+    const changed = [...new Set([...list('diff', '--name-only', '-z'), ...list('ls-files', '-z', '--others', '--exclude-standard')])];
+    const here = changed.filter((f) => existsSync(join(ROOT, f)));
+    for (const f of changed) blobs.delete(f);
+    if (here.length) {
+      const hashes = execFileSync('git', ['-C', ROOT, 'hash-object', '--stdin-paths'], { input: here.join('\n'), maxBuffer: 64 << 20 }).toString().trim().split('\n');
+      here.forEach((f, i) => blobs.set(f, hashes[i]));
+    }
     const h = createHash('sha256');
-    h.update(git('ls-files', '-s', ...spec));
-    h.update(git('diff', '--no-ext-diff', '--binary', ...spec));
-    const added = git('ls-files', '-z', '--others', '--exclude-standard', ...spec).toString().split('\0').filter(Boolean);
-    for (const f of added) h.update(`${f}\0`).update(readFileSync(join(ROOT, f)));
+    for (const f of [...blobs.keys()].sort()) h.update(`${f}\0${blobs.get(f)}\n`);
     return h.digest('hex').slice(0, 32);
   } catch {
     return null;
