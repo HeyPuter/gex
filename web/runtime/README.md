@@ -287,7 +287,8 @@ name.
 ```js
 import { Wisp } from '@gex/runtime/net/wisp';
 new Wisp(sys);                                   // wss://anura.pro/
-new Wisp(sys, { url: 'wss://wisp.example/' });
+// or, through another proxy (one network per system):
+// new Wisp(sys, { url: 'wss://wisp.example/' });
 ```
 
 | Member | Does |
@@ -355,7 +356,9 @@ at `start()`, not at boot.
 
 ```js
 import { MesaGl } from '@gex/runtime/gl';
-const gl = new MesaGl(sys);      // before boot
+import { HostWindows } from '@gex/runtime/windows/host';
+const hw = new HostWindows(sys);  // the windows GL draws into
+const gl = new MesaGl(sys);       // before boot
 ```
 
 | Member | Does |
@@ -424,6 +427,7 @@ Each guest window is handed to the page to frame and place, as a desktop's
 window manager does.
 
 ```js
+import { HostWindows } from '@gex/runtime/windows/host';
 const hw = new HostWindows(sys, { width: 1280, height: 720 });
 hw.addEventListener('window', ({ window: w }) => {
   if (w.kind === 'toplevel' && w.decorations === 'host') frame(w);   // a title bar, w.canvas inside
