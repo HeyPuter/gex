@@ -40,6 +40,15 @@ export default async function (t) {
   eq('run stdout', r.stdout, 'out\nhello from addFiles\n');
   eq('run stderr', r.stderr, 'err\n');
   eq('run code', r.code, 3);
+  // A daemon it leaves holding its pipes: run ends with the program, with
+  // what it wrote, and the daemon's later writes neither block nor kill it.
+  start = performance.now();
+  const dm = await timeout(sys.run(['sh', '-c', '(sleep 2; echo late; echo late >&2; sleep 1; echo alive > /tmp/daemon) & echo early; echo early >&2'], { env }), 30000, 'run with a daemon');
+  eq('run with a daemon: its own output', [dm.code, dm.stdout, dm.stderr], [0, 'early\n', 'early\n']);
+  check('run with a daemon: ends with the program', performance.now() - start < 1800, `${(performance.now() - start).toFixed(0)} ms`);
+  const daemonSaw = async () => fs.readFile('/tmp/daemon', { encoding: 'utf-8' }).catch(() => '');
+  for (let i = 0; i < 200 && !(await daemonSaw()); i++) await new Promise((res) => setTimeout(res, 50));
+  eq('run with a daemon: the daemon writes on', await daemonSaw(), 'alive\n');
 
   const c = await timeout(sys.run(['cat'], { env, input: 'piped through\n' }), 30000, 'cat');
   eq('stdin piped', c.stdout, 'piped through\n');

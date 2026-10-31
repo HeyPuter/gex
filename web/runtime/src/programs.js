@@ -150,8 +150,9 @@ export class Programs {
   }
 
   /** The next bytes the program wrote to `fd` (1 or 2; a connection has one
-   *  way in), when it writes them; null at their end. */
-  async read(h, fd = 1) {
+   *  way in), when it writes them; null at their end; undefined when it
+   *  holds nothing and `done()` says to stop waiting. */
+  async read(h, fd = 1, done = null) {
     const e = await this.#ends.get(h);
     const id = e ? (e.sock >= 0 ? e.sock : fd === 2 ? e.stderr : e.stdout) : -1;
     if (id < 0) return null;
@@ -161,6 +162,7 @@ export class Programs {
       const { r, out } = await k.call(f, id, { out: READ_MAX }).catch(() => ({ r: -9 }));
       if (r > 0) return out[0];
       if (r === EAGAIN) {
+        if (done?.()) return undefined;
         await k.changed(seq);
         continue;
       }
@@ -168,6 +170,11 @@ export class Programs {
       if (e.sock < 0) await this.#close(e, fd === 2 ? 'stderr' : 'stdout');
       return null;
     }
+  }
+
+  /** Every read waiting on a pipe looks again. */
+  kick() {
+    this.#k.kick();
   }
 
   /** Output `fd` no longer read: the program's writes to it fail (EPIPE). */

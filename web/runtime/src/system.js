@@ -523,7 +523,7 @@ export class System extends EventTarget {
     if (this.#init) {
       throw new Error(`spawn: this system has an init (${this.#init[0][0]}), which owns the processes; the page reaches programs through what it starts`);
     }
-    return this.#spawn(argv, opts, false);
+    return this.#spawn(argv, opts, false, false);
   }
 
   /** The init (`boot(argv, opts)`) as a Process, null without one. */
@@ -531,7 +531,10 @@ export class System extends EventTarget {
     return this.#initProcess;
   }
 
-  #spawn(argv, opts, init) {
+  /** `untilExit`: its pipes end for the page once the program has exited
+   *  and they hold nothing more (`run`); what a daemon it left writes to
+   *  them later is read and dropped. */
+  #spawn(argv, opts, init, untilExit) {
     [argv, opts] = programArgs(init ? 'boot' : 'spawn', argv, opts);
     const h = this.#nextHandle++;
     const stdio = opts.pty ? 'pty' : opts.detached ? 'null' : 'pipe';
@@ -541,8 +544,10 @@ export class System extends EventTarget {
       argv,
       stdio,
       encoding: opts.pty?.encoding,
-      read: (fd) => pr.read(h, fd),
+      untilExit,
+      read: (fd, done) => pr.read(h, fd, done),
       unread: (fd) => quiet(pr.unread(h, fd)),
+      kick: () => pr.kick(),
       write: (bytes) => pr.write(h, bytes),
       closeStdin: () => pr.closeStdin(h),
       resize: (cols, rows) => quiet(pr.resize(h, cols, rows)),
@@ -593,7 +598,13 @@ export class System extends EventTarget {
   /** Spawn with pipes, write `input` (if any), wait, collect:
    *  `{code, signal, stdout, stderr}`, text unless `encoding: null`. */
   async run(argv, { input, encoding = 'utf-8', ...opts } = {}) {
-    const p = this.spawn(argv, { ...opts, detached: false, pty: undefined });
+    this.#running('spawn');
+    if (this.#init) {
+      throw new Error(`run: this system has an init (${this.#init[0][0]}), which owns the processes; the page reaches programs through what it starts`);
+    }
+    // Its output is what it wrote before it ended: a daemon it started (a
+    // server it leaves running) may hold its pipes for good.
+    const p = this.#spawn(argv, { ...opts, detached: false, pty: undefined }, false, true);
     const take = async (s) => {
       const parts = [];
       for (const r = s.getReader(); ;) {

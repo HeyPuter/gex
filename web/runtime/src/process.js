@@ -52,10 +52,10 @@ export class Process extends EventTarget {
   #pendingKills = [];
   #drained = null;
 
-  constructor({ argv, stdio, encoding, read, unread, write, closeStdin, resize, kill, release, windows }) {
+  constructor({ argv, stdio, encoding, untilExit = false, read, unread, write, closeStdin, resize, kill, kick, release, windows }) {
     super();
     this.argv = [...argv];
-    this.#io = { write, closeStdin, resize, kill, release, windows };
+    this.#io = { write, closeStdin, resize, kill, kick, release, windows };
     this.started = new Promise((res, rej) => { this.#startedResolve = res; this.#startedReject = rej; });
     this.exited = new Promise((res, rej) => { this.#exitedResolve = res; this.#exitedReject = rej; });
     // Nobody need wait on both.
@@ -75,12 +75,23 @@ export class Process extends EventTarget {
       });
       // Read as the page reads them: a program whose output nobody reads
       // stops when its pipe is full.
+      // `untilExit`: the stream ends once the program has ended and its pipe
+      // is empty; what is written after (by a daemon it left) is read and
+      // dropped to the pipe's real end, so that writer neither blocks nor
+      // gets EPIPE.
+      const ended = untilExit ? () => this.#status !== null : null;
+      const drop = async (fd) => {
+        while (await read(fd));
+        this.#ends--;
+        this.#settle();
+      };
       const output = (fd) => new ReadableStream({
         pull: async (c) => {
-          const b = this.#failed ? null : await read(fd);
+          const b = this.#failed ? null : await read(fd, ended);
           if (b) return c.enqueue(b);
           if (this.#failed) return c.error(this.#failed);
           c.close();
+          if (b === undefined) return void drop(fd);
           this.#ends--;
           this.#settle();
         },
@@ -127,6 +138,7 @@ export class Process extends EventTarget {
         if (this.#status) return;
         this.#status = { code, signal: signal ? signalName(signal) : null };
         if (shutdown) this.#ends = 0;
+        else if (untilExit) io.kick?.();
         this.#settle();
       },
     };
