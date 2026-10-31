@@ -40,9 +40,12 @@ file() { # PATH: the host file of a run's path, or nothing
     /wine/*) echo "$D/${p#/wine/}" ;;
     /g/*) echo "$A/${p#/g/}" ;;
     /pfx/dosdevices/c:/windows/system32/*|/pfx/dosdevices/c:/windows/syswow64/*)
-      # a builtin's copy is a link to the dist's file in the page
-      local a=x86_64 n=${p##*/}; case $p in */syswow64/*) a=i386 ;; esac
-      if [ -f "$D/lib/wine/$a-windows/$n" ]; then echo "$D/lib/wine/$a-windows/$n"
+      # a builtin's copy is a link to the dist's file in the page; a file of
+      # its own there (a program's native DLL of a builtin's name) is the image
+      local a=x86_64 n=${p##*/} q=; case $p in */syswow64/*) a=i386 ;; esac
+      [ -n "$P" ] && q=$P/drive_c/${p#/pfx/dosdevices/c:/}
+      if [ -n "$q" ] && [ -f "$q" ] && [ ! -L "$q" ]; then echo "$q"
+      elif [ -f "$D/lib/wine/$a-windows/$n" ]; then echo "$D/lib/wine/$a-windows/$n"
       elif [ -n "$P" ]; then echo "$P/drive_c/${p#/pfx/dosdevices/c:/}"; fi ;;
     /pfx/dosdevices/c:/*) [ -n "$P" ] && echo "$P/drive_c/${p#/pfx/dosdevices/c:/}" ;;
     /pfx/dosdevices/z:/*) echo "/${p#/pfx/dosdevices/z:/}" ;;
@@ -53,7 +56,7 @@ build() { # FILE BASE FLAG...: the last line of cgen-image's report
   local f=$1 b=$2; shift 2
   nice -n 19 "$G" cgen-image "$f" --pe-base "$b" "$@" --jobs $J 2>&1 | tail -1 | cut -c1-140
 }
-todo=$(mktemp); trap 'rm -f "$todo"' EXIT
+todo=$(mktemp); locks=$(mktemp -d); trap 'rm -f "$todo"; rm -rf "$locks"' EXIT
 # PATH BASE INPUTS KEY (the page's inputs id of the process it ran in and the key it asked, "-" when
 # the line names none)
 { sed -n 's/^unitless: \(\S*\) \(0x[0-9a-f]*\).*/\1 \2 -/p' "$log"
@@ -74,9 +77,11 @@ while read -r p b in _; do
   fi
   f=$(file "$p")
   [ -n "$key" ] && [ -n "$f" ] && [ -f "$f" ] || continue
+  # (a unit an earlier run made tells nothing: the first flavour tried would match)
+  [ -f "$U/$key/c.wasm" ] && continue
   for fl in plain --wine32-kuser --wine64-compact --mem64; do
     build "$f" "$b" ${fl#plain} > /dev/null
-    [ -d "$U/$key" ] && { flag[$in]=$fl; break; }
+    [ -f "$U/$key/c.wasm" ] && { flag[$in]=$fl; break; }
   done
 done < "$todo"
 for in in "${!flag[@]}"; do echo "wine32/units: inputs $in: ${flag[$in]}"; done
@@ -87,31 +92,33 @@ any=plain; [ ${#flag[@]} = 1 ] && any=${flag[*]}
 # programs in the compact space and its other 64-bit processes), so an image
 # both load at one base has a key per kind under one id.
 one() {
-  local p=$1 b=$2 in=$3 key=$4 f fl r
+  local p=$1 b=$2 in=$3 key=$4 f fl r l
+  # one build of an image at a base at a time: its lines per inputs id run
+  # in parallel and would write the same unit together
+  exec {l}> "$locks/${p//\//_}-$b"; flock "$l"
   fl=${flag[$in]:-$any}
   f=$(file "$p")
   [ -n "$f" ] || { echo "wine32/units: unmapped $p"; return; }
   [ -f "$f" ] || { echo "wine32/units: missing $f ($p)"; return; }
   r=$(build "$f" "$b" ${fl#plain})
-  if [ "$key" != - ] && [ ! -d "$U/$key" ]; then
+  if [ "$key" != - ] && [ ! -f "$U/$key/c.wasm" ]; then
     for o in plain --wine32-kuser --wine64-compact --mem64; do
       [ $o = "$fl" ] && continue
-      r=$(build "$f" "$b" ${o#plain}); [ -d "$U/$key" ] && break
+      r=$(build "$f" "$b" ${o#plain}); [ -f "$U/$key/c.wasm" ] && break
     done
   fi
   echo "$p $b: $r"
+  exec {l}>&-
 }
 { while read -r p b in key; do
     one "$p" "$b" "$in" "$key" &
     while [ "$(jobs -r | wc -l)" -ge 4 ]; do wait -n; done
   done < "$todo"; wait; }
 # The NT trampoline page's unit, which the page places with the first image:
-# in each flavour found (a 32-bit Wine's take no --wine32-kuser)
-if grep -aq 'missing unit: \[the trampolines\]' "$log"; then
-  t=--nt-trampolines32; grep -aq 'missing unit: \[the trampolines\].*--nt-trampolines64' "$log" && t=--nt-trampolines64
-  for fl in $(printf '%s\n' "${flag[@]:-plain}" | sort -u); do
-    [ $fl = --wine32-kuser ] && fl=plain
-    echo "wine32/units: the trampolines ($fl): $(nice -n 19 "$G" cgen-image ${fl#plain} $t 2>&1 | tail -1 | cut -c1-140)"
-  done
-fi
+# each set of options a miss line asks for (a flavour found from an image
+# misses when the images' units were all there before this run)
+grep -ao 'missing unit: \[the trampolines\].*gexc cgen-image --nt-trampolines[0-9a-z -]*' "$log" |
+  sed 's/.*gexc cgen-image //; s/ *$//' | sort -u | while read -r o; do
+  echo "wine32/units: the trampolines ($o): $(nice -n 19 "$G" cgen-image $o 2>&1 | tail -1 | cut -c1-140)"
+done
 echo "wine32/units: $U"
