@@ -84,7 +84,8 @@ WINE_ID := $(call short,$(WINE_COMMIT))
 WINE_BID := $(WINE_ID)
 endif
 TOOLS := $(C)/tools-$(WINE_BID)
-BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
+# (the tree's configure options are in wine32/wine-build.sh: a tree per set of them)
+BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)-$(call h,$(WINE32)/wine32/wine-build.sh,6)
 
 # The dist: everything above plus these scripts (stage, link, rebase).
 TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/Makefile $(WINE32)/wine32/*.sh $(WINE32)/wine32/*.c)),8)

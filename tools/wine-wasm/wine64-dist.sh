@@ -28,12 +28,13 @@
 #               EGL, guest/gl/gexgl.c), secur32 (+ GnuTLS) and
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
 #               in the loader; WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
-#   srv-K       the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD)
+#   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
+#               that script and the 32-bit configure options it compiles with
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
-#   dist64-K-S-fF-twin  with WINE64_TWIN=1, that install plus the memory64
+#   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S-fF  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
 #               the name gets -wwl)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
@@ -68,12 +69,13 @@ W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
 J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
+V=$(cat "$here/link-wineserver.sh" "$here/wine32/wine-build.sh" | sha256sum | cut -c1-6)
 pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine64.pins")
 [ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine64.pins' $(printf %.12s "$pin")" >&2
 log() { echo "wine64-dist: $*" >&2; }
 # The server's prerequisite first, so a missing one fails now, not after
 # the Wine builds: a configured 32-bit Wine build tree and its sysroot.
-if [ ! -e "$C/srv-$K/.done" ]; then
+if [ ! -e "$C/srv-$K-$V/.done" ]; then
 	own=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
 	ownb=$(sed -n 's/^WINE32_BUILD=//p' <<< "$own")
 	if [ -z "${WINE32_BUILD:-}" ]; then
@@ -252,15 +254,18 @@ b64_build() {
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
 srv_link() {
+	# (a tree configured before wine32/wine-build.sh kept inotify has none)
+	grep -q '^#define HAVE_SYS_INOTIFY_H 1' "$WINE32_BUILD/include/config.h" ||
+		{ echo "wine64-dist: $WINE32_BUILD was configured without inotify (make -C tools/wine-wasm build)"; return 1; }
 	"$here/link-wineserver.sh" "$WINE32_BUILD" "$W" "$PWD/obj" "$PWD"
 }
-log "wineserver ($K)"; step srv-$K srv_link
+log "wineserver ($K, $V)"; step srv-$K-$V srv_link
 
 dist_make() {
 	local d=$PWD
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
-	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
+	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
@@ -274,7 +279,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F$WS$WD)"; step dist64-$K-$S-f$F$WS$WD dist_make
+log "install ($K, $S, $F, $V$WS$WD)"; step dist64-$K-$S-f$F-s$V$WS$WD dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -306,7 +311,7 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F$WS$WD
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD
 NATIVE=$C/pen64-$K-$NK/native
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
@@ -338,8 +343,8 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 		rm -f .done
 		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
 	}
-	log "twin install ($K, $S, $F)"; step dist64-$K-$S-f$F-twin twin_make
-	DIST=$C/dist64-$K-$S-f$F-twin
+	log "twin install ($K, $S, $F, $V)"; step dist64-$K-$S-f$F-s$V-twin twin_make
+	DIST=$C/dist64-$K-$S-f$F-s$V-twin
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done

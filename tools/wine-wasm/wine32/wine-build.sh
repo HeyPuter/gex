@@ -19,10 +19,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 J=${WINE32_JOBS:-12}
 # The options both trees share: what 32-bit Wine does without (no X11, no PE
 # cross-compiler: the PE side is wasm32 skeletons and the host's i386 DLLs).
+# inotify stays: the server watches directories with it for
+# FindFirstChangeNotification and ReadDirectoryChangesW (the gex kernel has it).
 OPTS="--disable-tests --without-mingw --enable-archs= --without-x --without-gstreamer --without-pulse --without-alsa
  --without-cups --without-sane --without-gphoto --without-v4l2 --without-vulkan --without-dbus --without-krb5
  --without-gssapi --without-netapi --without-pcap --without-usb --without-unwind --without-sdl --without-oss --without-udev
- --without-capi --without-inotify"
+ --without-capi"
 configure() { # DIR STAMP CMD...
   local dir=$1 stamp=$2; shift 2
   mkdir -p "$dir"
