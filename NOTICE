@@ -24,7 +24,7 @@ tools/wine-wasm/wine32/oss/sys/soundcard.h
     FreeBSD's sys/soundcard.h (OSSv4 API), Copyright Hannu Savolainen,
     4Front Technologies, Luigi Rizzo and others. BSD-2-Clause (in the file).
 
-web/eject-site/vendor/zstddec-stream.mjs
+web/eject-site/vendor/zstddec-stream.mjs, web/eject-site/vendor/zstddec.wasm
     zstddec, Copyright (c) 2020 Don McCurdy. MIT licence
     (web/eject-site/vendor/zstddec-LICENSE).
 

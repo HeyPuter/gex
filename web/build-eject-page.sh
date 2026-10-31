@@ -34,7 +34,7 @@ export default {
 CFG
 (cd "$WEB" && node_modules/.bin/vite build --config "$CONFIG")
 mkdir -p "$OUT/gex" "$OUT/vendor"
-cp "$WEB/eject-site/vendor/zstddec-stream.mjs" "$WEB/eject-site/vendor/zstddec-LICENSE" "$OUT/vendor/"
+cp "$WEB/eject-site/vendor/zstddec-stream.mjs" "$WEB/eject-site/vendor/zstddec.wasm" "$WEB/eject-site/vendor/zstddec-LICENSE" "$OUT/vendor/"
 for f in gex_browser.x86.shared.wasm gex_kernel.x86.wasm seed.x86.shared.wasm; do
     cp "$WEB/public/gex/$f" "$OUT/gex/$f"
 done

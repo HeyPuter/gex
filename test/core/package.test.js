@@ -1,13 +1,13 @@
 // The package web/runtime/build.sh makes (run.mjs builds it into the work
-// directory, as installed: pkg/@gex/runtime), imported as a page would, with
-// no baseUrl: it finds its files itself.
+// directory), imported as a page would, with no baseUrl: it finds its files
+// itself.
 
 export const meta = { hosts: ['browser'], images: ['busybox', 'package'], timeout: 120 };
 
 export default async function (t) {
   const { say, eq, timeout } = t;
   // Not literals, which vite would try to resolve as its own.
-  const pkg = t.work('pkg/@gex/runtime/');
+  const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
   const { Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
   const sys = new System();

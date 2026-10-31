@@ -46,11 +46,9 @@ const { values: o, positionals } = parseArgs({
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
 // `--package DIR`: the runtime as web/runtime/build.sh built it into DIR, not
 // from source. The tests' imports of the runtime's entry modules go to the
-// built ones, which find their files themselves. DIR is .../@gex/runtime, as
-// installed: the package names its files by that path (web/runtime/build.sh).
+// built ones, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
 if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (web/runtime/build.sh DIR)`);
-if (PACKAGE && !PACKAGE.endsWith('/@gex/runtime')) throw new Error(`--package: ${PACKAGE} is not a .../@gex/runtime directory`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** The /proc status (VmData, VmRSS, VmHWM; KiB) of the one Chromium

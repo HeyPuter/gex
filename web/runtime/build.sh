@@ -10,16 +10,13 @@
 # or through its own bundler, with nothing else to do; `new System({ baseUrl
 # })` takes the files from a directory of the page's instead.
 #
-#   web/runtime/build.sh DIR      (DIR/.../@gex/runtime to serve it unbundled)
+#   web/runtime/build.sh DIR
 set -e
 OUT=$(realpath -m "${1:?usage: web/runtime/build.sh DIR}")
 RT=$(cd "$(dirname "$0")" && pwd)
 WEB=$(dirname "$RT")
 PUB=$WEB/public/gex
 mkdir -p "$OUT"
-# Unbundled, the package must be served from an @gex/runtime directory (as
-# node_modules holds it): it names its files by that path (below).
-case $OUT in */@gex/runtime) ;; *) echo "web/runtime/build.sh: note: $OUT is not an @gex/runtime directory: served as it is, the package will not find its files (a bundler's copy will)" >&2 ;; esac
 
 STAGE=$(mktemp -d -p "$WEB" .runtime-pkg.XXXXXX)
 CONFIG=$STAGE/vite.config.mjs
@@ -92,7 +89,7 @@ export default {
   base: './',
   publicDir: false,
   logLevel: 'warn',
-  define: { ...base.define, __GEX_RUNTIME_ASSETS__: JSON.stringify('./') },
+  define: { ...base.define, __GEX_RUNTIME_ASSETS__: 'null' },
   resolve: { ...base.resolve, alias: { ...base.resolve?.alias, './runtime-files.js': '$STAGE/runtime-files.js' } },
   // No preload lists: they name the package's chunks, which an app's bundler
   // renames; the app's own build preloads what it keeps. Every file a file,
@@ -110,36 +107,47 @@ export default {
             // Each Worker one file, with no imports: a page's bundler builds a
             // Worker as a classic script by default (vite's iife), which
             // cannot import a chunk.
-            rollupOptions: { output: { entryFileNames: '[name]-[hash].mjs', chunkFileNames: '[name]-[hash].mjs', codeSplitting: false } } },
+            rollupOptions: { output: { entryFileNames: '[name]-[hash].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]', codeSplitting: false } } },
 };
 CFG
 (cd "$WEB" && node_modules/.bin/vite build --config "$CONFIG")
 
 # A Worker or file as vite writes it, new URL(``+new URL(`x`,
 # import.meta.url).href,``+import.meta.url), is not one a bundler knows: an
-# app's build would leave it out. Written new URL("../../@gex/runtime/x",
-# import.meta.url), the app's bundler takes the file in and builds the Worker;
-# a Worker's options' type a plain literal, which vite asks for. The path
-# through node_modules, not "./x": it is right both from the package itself
-# (node_modules/@gex/runtime/) and from where a dev server moves the package's
-# code (vite's node_modules/.vite/deps/), whose "./x" names nothing.
+# app's build would leave it out. Written new URL("./x", import.meta.url), the
+# app's bundler takes the file in and builds the Worker (and vite's dev
+# server, which moves the package's code to node_modules/.vite/deps, points
+# it back at the package); a Worker's options' type a plain literal, which
+# vite asks for. A file's URL with ?no-inline, vite's word for a file kept a
+# file: an app's build would make each one under 4 KB (a seed, a provider) a
+# data: URL in its code; any other bundler or server reads it as a query.
 node - "$OUT" <<'JS'
 const fs = require('fs'), path = require('path');
 const out = process.argv[2];
-const here = '../../@gex/runtime/';
+const here = './';
 const url = /new URL\(``\+new URL\(`([^`$]+)`,import\.meta\.url\)\.href,``\+import\.meta\.url\)(,\{type:`module`(,name:`([^`$]*)`)?)?/g;
 let workers = 0, files = 0;
 for (const f of fs.readdirSync(out).filter((f) => f.endsWith('.mjs'))) {
   const p = path.join(out, f), s = fs.readFileSync(p, 'utf8');
   const t = s.replace(url, (m, name, opts, named, wname) => {
     if (!fs.existsSync(path.join(out, name))) throw new Error(`${f}: ${name}, not in the package`);
-    const u = `new URL(${JSON.stringify(here + name)},import.meta.url)`;
-    if (!opts) { files++; return u; }
+    if (!opts) { files++; return `new URL(${JSON.stringify(here + name + '?no-inline')},import.meta.url)`; }
     workers++;
-    return `${u},{type:"module"${named ? `,name:${JSON.stringify(wname)}` : ''}`;
+    return `new URL(${JSON.stringify(here + name)},import.meta.url),{type:"module"${named ? `,name:${JSON.stringify(wname)}` : ''}`;
   });
   if (t !== s) fs.writeFileSync(p, t);
 }
+// An import() or new URL() of a URL known only at run time (a unit, the
+// page's zstd module) marked as one, as the minifier left it uncommented: a
+// bundler (webpack) would otherwise take in every file of the package as what
+// it might name. Every one the package itself names is a literal.
+let marked = 0;
+for (const f of fs.readdirSync(out).filter((f) => f.endsWith('.mjs'))) {
+  const p = path.join(out, f), s = fs.readFileSync(p, 'utf8');
+  const t = s.replace(/\b(import|new URL)\((?![`'"]|\/\*)/g, (m) => { marked++; return `${m}/* @vite-ignore */ /* webpackIgnore: true */ `; });
+  if (t !== s) fs.writeFileSync(p, t);
+}
+console.log(`web/runtime/build.sh: ${marked} run-time URLs marked`);
 if (!workers) throw new Error('web/runtime/build.sh: no Worker found to write for a bundler');
 if (!files) throw new Error('web/runtime/build.sh: none of the runtime files found to write for a bundler');
 console.log(`web/runtime/build.sh: ${workers} Workers, ${files} files written for a bundler`);

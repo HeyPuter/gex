@@ -22,12 +22,13 @@ import { Programs } from './programs.js';
 import { Changes } from './kpersist.js';
 import files from './runtime-files.js';
 
-/** Where the runtime's files (gex/...) are: beside the package's modules
- *  in a build (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__`), the
- *  tree's web/public in place. Not a literal, so a bundler does not take
- *  the directory for an asset of its own. */
-const ASSETS = typeof __GEX_RUNTIME_ASSETS__ === 'string' ? __GEX_RUNTIME_ASSETS__ : '../../public/';
-const DEFAULT_BASE = () => new URL(ASSETS, import.meta.url).href;
+/** Where the runtime's files (gex/...) are: the tree's web/public in place.
+ *  The package (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__` null)
+ *  lists its own files (`files`), and anything else is the page's site
+ *  root's: no directory of the package's, which a bundler would take for a
+ *  module to resolve. */
+const ASSETS = typeof __GEX_RUNTIME_ASSETS__ === 'undefined' ? '../../public/' : __GEX_RUNTIME_ASSETS__;
+const DEFAULT_BASE = () => (ASSETS === null ? new URL('/', globalThis.location?.href).href : new URL(ASSETS, import.meta.url).href);
 
 /** Whether this page has made its system. */
 let made = false;

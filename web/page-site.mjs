@@ -99,7 +99,7 @@ try {
 walk(join(work, 'page'), (p, rel) => { mkdirSync(dirname(join(out, rel)), { recursive: true }); copyFileSync(p, join(out, rel)); });
 for (const f of ['gex_browser.x86.shared.wasm', 'gex_kernel.x86.wasm', 'seed.x86.shared.wasm']) place(strip(join(web, 'public/gex', f)), `gex/${f}`);
 mkdirSync(join(out, 'vendor'), { recursive: true });
-for (const f of ['zstddec-stream.mjs', 'zstddec-LICENSE']) copyFileSync(join(web, 'eject-site/vendor', f), join(out, 'vendor', f));
+for (const f of ['zstddec-stream.mjs', 'zstddec.wasm', 'zstddec-LICENSE']) copyFileSync(join(web, 'eject-site/vendor', f), join(out, 'vendor', f));
 
 // The bundle: stripped, pruned, deduplicated, and split as an ejected site's
 // (web/site-bundle.mjs): with --split, the files the recorded run opened stay

@@ -12,9 +12,10 @@
 // So the page fetches each module once (from the cache when a visit before
 // kept it: a bundler's chunk is named by its content), rewrites its imports
 // of the others (`"./name-HASH.js"`, static and dynamic) to their blob URLs,
-// and starts each Worker from the entry's blob URL. A module that reads its
-// own URL (`import.meta`) or an import cycle leaves the graph as it was:
-// Workers then load by URL, as before. A relative URL a Worker resolves at
+// and starts each Worker from the entry's blob URL. A module's
+// `import.meta.url` (a file beside it: `new URL('./x.wasm', import.meta.url)`)
+// is written as the module's real URL. Any other `import.meta`, or an import
+// cycle, leaves the graph as it was: Workers then load by URL, as before. A relative URL a Worker resolves at
 // run time (a lazy file's path) is resolved against `GEX_BASE`, the
 // entry's real URL, which a prelude sets first (a blob URL is no base).
 
@@ -67,6 +68,9 @@ export async function workerGraph(entry, onBytes = () => {}) {
     if (busy.has(u)) throw new Error(`an import cycle at ${u}`);
     busy.add(u);
     let code = await text(u);
+    // A name, not the URL in place: in a string literal the text changes,
+    // never the syntax.
+    if (/\bimport\.meta\.url\b/.test(code)) code = `const __gexModuleUrl = ${JSON.stringify(u)};\n${code.replace(/\bimport\.meta\.url\b/g, '__gexModuleUrl')}`;
     if (/\bimport\.meta\b/.test(code)) throw new Error(`${u} reads import.meta`);
     // An import by any other name (a dev server's "/node_modules/..." or
     // "/@fs/...") would not resolve from a blob URL.

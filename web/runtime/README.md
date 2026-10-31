@@ -152,16 +152,20 @@ processes and memory.
   cross-origin isolated: `Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`.
 - Install the package and import it; nothing else to do. The modules name
-  each file the runtime fetches (`new URL('…', import.meta.url)`) and each
-  Worker (`new Worker(new URL('…', import.meta.url), { type: 'module' })`),
-  so a bundler that follows these (vite does, webpack 5 does) takes them
-  into the page's build as they come, with no settings, and vite's dev server serves them
-  from `node_modules`. Every Worker is one file with no imports, so a
-  bundler's default classic-script Workers build too.
-- Served without a bundler, the package's directory must end in
-  `@gex/runtime` (as `node_modules/@gex/runtime` does): the modules name the
-  files by that path. `new System({ baseUrl })` takes them from a directory
-  of the page's instead, laid out as gex's own site has them (`gex/…`).
+  each file the runtime fetches (`new URL('./…', import.meta.url)`) and each
+  Worker (`new Worker(new URL('./…', import.meta.url), { type: 'module' })`),
+  so the page's bundler takes them into its build as files, with no
+  settings (vite and webpack 5 are tested), and vite 8's dev server serves
+  them from `node_modules`. vite 7's dev server does not point a
+  pre-bundled package's URLs back at it: there, the package fails to start
+  unless it is left out of pre-bundling
+  (`optimizeDeps: { exclude: ['@gex/runtime'] }`); vite 7's build works as
+  it is. Every Worker is one file with no imports, so a bundler's default
+  classic-script Workers build too. No file becomes a `data:` URL.
+- Served without a bundler, from any directory, the modules find their
+  files beside themselves. `new System({ baseUrl })` takes them from a
+  directory of the page's instead, laid out as gex's own site has them
+  (`gex/…`).
 - One system per page: a second `new System()` throws.
 - A system runs wasm32 programs (built with gexcc) and the programs of one
   translated architecture, x86-64 or aarch64, which it takes from the tree's
