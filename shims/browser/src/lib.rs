@@ -15298,16 +15298,24 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 /// A guest access into the runtime's own low memory (below
 /// `gex_abi::GUEST_FLOOR`): where hardware would fault, gex would write into
 /// its contexts or dispatch directory. Said, then raised: an access
-/// violation through SEH for a Windows program, SIGSEGV otherwise.
+/// violation (a write, at `addr`, from the block's start `pc`) for the
+/// process's fault hook (Wine), SIGSEGV without one. Does not return.
 fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
-    let gm = GuestMem::new(guest_bytes());
+    let mut gm = GuestMem::new(guest_bytes());
     let c = ctx as u32 as u64;
     let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
     warn_line(&format!(
         "gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation. regs [{}]\n",
         r.join(" ")
     ));
-    set_exit(128 + 11);
+    if cgen::fault_hook() != 0 {
+        let _ = gm.write_u64(c + ctx::PC as u64, pc);
+        cgen::fault_stage(0xc000_0005, addr, 1);
+        set_resume(pc);
+        set_resume_ctx(c);
+    } else {
+        set_exit(128 + 11);
+    }
     trap();
 }
 

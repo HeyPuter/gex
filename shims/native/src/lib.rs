@@ -4024,12 +4024,15 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
 }
 
-/// Wire the `gex.*` import surface to the kernel.
 /// A guest write into the runtime's own low memory (below
 /// `gex_abi::GUEST_FLOOR`), where hardware would have faulted: said, then
-/// raised as an access violation for a Windows program, SIGSEGV otherwise.
+/// an access violation (a write, at `addr`) for the process's fault hook
+/// (Wine), SIGSEGV without one. `pc` is the block's start.
 fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64) -> Result<()> {
     eprintln!("gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation");
+    if deliver_guest_fault_kind(caller, fault_code::ACCESS_VIOLATION, pc, addr, 1)? {
+        return Err(StopExecution.into());
+    }
     caller.data_mut().exit = Some(Exit::Signal {
         signal: 11,
         pc,
@@ -4039,6 +4042,7 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
     Err(StopExecution.into())
 }
 
+/// Wire the `gex.*` import surface to the kernel.
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
     libprov::register(linker)?;
