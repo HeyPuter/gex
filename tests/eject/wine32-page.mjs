@@ -543,4 +543,9 @@ if (placedChecks) {
     await until(wins, (l) => l.length === 1);
   }
 }
+// A check that failed after the window: the programs' own output too.
+if (failed && process.env.WINE32_PAGE_CONSOLE) {
+  const { appendFileSync } = await import('node:fs');
+  appendFileSync(process.env.WINE32_PAGE_CONSOLE, `== the programs' output\n${(await ev('String(globalThis.__nt?.out ?? "").slice(-200000)')) ?? ''}\n`);
+}
 done();
