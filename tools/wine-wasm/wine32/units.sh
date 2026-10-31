@@ -12,7 +12,7 @@
 # before the rename), /wine a 64-bit Wine's DIST, /pfx's C: drive PREFIX's
 # (a 64-bit Wine's page run), /g GAMEDIR; host paths (a native run's) are used as they
 # are. The provider modules are built too (`cgen-image --providers`), once per
-# gexc. Unit keys include gexc's gex-cgen sources: units from another gexc are
+# gexc and flavour. Unit keys include gexc's gex-cgen sources: units from another gexc are
 # simply not found, never wrong.
 #
 # A Wine that folds KUSER_SHARED_DATA wants its units built with
@@ -27,7 +27,11 @@ log=${1:?LOG} U=$(realpath -m "${2:?UNITS}") G=$(realpath "${3:?GEXC}") D=$(real
 J=$(( ${WINE32_JOBS:-12} / 4 )); [ $J -ge 1 ] || J=1
 mkdir -p "$U"
 export GEX_CGEN_CACHE=$U
-nice -n 19 "$G" cgen-image --providers --jobs ${WINE32_JOBS:-12} 2>&1 | tail -1
+# In each flavour: a process's providers follow its images' (the 32-bit images of a WoW64
+# process fold KUSER_SHARED_DATA, so their providers are --wine32-kuser's).
+for f in "" --wine32-kuser --mem64; do
+	nice -n 19 "$G" cgen-image $f --providers --jobs ${WINE32_JOBS:-12} 2>&1 | tail -1
+done
 file() { # PATH: the host file of a run's path, or nothing
   local p=$1
   case $p in
