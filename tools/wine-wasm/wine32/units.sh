@@ -47,7 +47,11 @@ file() { # PATH: the host file of a run's path, or nothing
       if [ -n "$q" ] && [ -f "$q" ] && [ ! -L "$q" ]; then echo "$q"
       elif [ -f "$D/lib/wine/$a-windows/$n" ]; then echo "$D/lib/wine/$a-windows/$n"
       elif [ -n "$P" ]; then echo "$P/drive_c/${p#/pfx/dosdevices/c:/}"; fi ;;
-    /pfx/dosdevices/c:/*) [ -n "$P" ] && echo "$P/drive_c/${p#/pfx/dosdevices/c:/}" ;;
+    /pfx/dosdevices/c:/*)
+      # a link to a page path (a program linked to a builtin's file, as
+      # C:\winlogon.exe to the dist's) is that path's file
+      local q t; [ -n "$P" ] && q=$P/drive_c/${p#/pfx/dosdevices/c:/} || return 0
+      if [ -L "$q" ] && t=$(readlink "$q") && [ "${t#/}" != "$t" ]; then file "$t"; else echo "$q"; fi ;;
     /pfx/dosdevices/z:/*) echo "/${p#/pfx/dosdevices/z:/}" ;;
     /*) echo "$p" ;;
   esac
