@@ -29,10 +29,13 @@
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
 import { isZstd, unzstd } from './zfetch.js';
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { pageFs } from '../../shims/browser/js/page-fs.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;
+/** The most clipboard text that crosses to and from X programs. */
+const X_CLIP = 256 << 10;
 /** errno values the transport answers with. */
 const EAGAIN = 11;
 const EBADF = 9;
@@ -254,7 +257,7 @@ export class HostX {
         ? msg.kernel.module
         : await WebAssembly.compile(msg.kernel.module);
       const inst = await WebAssembly.instantiate(mod, {
-        env: { memory: msg.kernel.memory, ...processMemories(this.#x.wasmMemory, false, msg.kernel.spare), lazy_fetch: lazyFetch(msg.kernel.memory) },
+        env: { memory: msg.kernel.memory, ...processMemories(this.#x.wasmMemory, false, msg.kernel.spare), lazy_fetch: lazyFetch(msg.kernel.memory), page_fs: pageFs(msg.kernel.memory) },
       });
       // Every Worker in the kernel needs its own stack slice: wasm-ld gives
       // each instance the same `__stack_pointer`, so two Workers sharing one
@@ -323,9 +326,12 @@ export class HostX {
   /** The server's arguments, with the descriptors this Worker made. */
   #argv(msg) {
     // Where guest X clients connect. Both spellings, because libxcb tries the
-    // abstract name first and falls back to the path.
-    const listen = ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0']
-      .map((name) => this.#listenOn(name))
+    // abstract name first and falls back to the path. Or the sockets the
+    // starter bound already (`listen`, global kernel socket ids), where a
+    // client may be waiting.
+    const listen = (msg.listen
+      ? msg.listen.map((id) => { this.#watch(id); return this.#reserve({ kind: 'listen', id }); })
+      : ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0'].map((name) => this.#listenOn(name)))
       .filter((fd) => fd >= 0);
     if (!listen.length) throw new Error('the X display name is already taken');
 
@@ -852,6 +858,30 @@ export class HostX {
     m.set(key, (m.get(key) ?? 0) + n);
   }
 
+  /** The clipboard's number this server last saw or set. */
+  #clipSeen = 0;
+
+  /**
+   * The clipboard between the page and X programs, through the window
+   * manager: an X program's copy onto the page's clipboard, and the page's
+   * new text to the manager, which owns the X clipboard with it.
+   */
+  #clip() {
+    const hw = this.#hw;
+    const px = this.#proxy;
+    if (!hw.hw_clip_take || !px) return;
+    let p = hw.hw_scratch(X_CLIP);
+    const n = hw.hw_clip_take(p, X_CLIP);
+    if (n >= 0) this.#clipSeen = px.clipSet(this.#hwMem, p, n);
+    const serial = px.clipSerial();
+    if (serial && serial !== this.#clipSeen) {
+      this.#clipSeen = serial;
+      p = hw.hw_scratch(X_CLIP);
+      const len = px.clipGet(this.#hwMem, p, X_CLIP);
+      hw.hw_clip_set(p, Math.min(len, X_CLIP));
+    }
+  }
+
   /**
    * Between two turns of the server's loop: run the window manager, take the
    * page's input, publish the scene.
@@ -882,6 +912,8 @@ export class HostX {
       this.#out = { w: size.w, h: size.h };
       hw.hw_set_output(size.w, size.h);
     }
+
+    this.#clip();
 
     if (hw.hw_wants_input()) {
       const p = hw.hw_scratch(MAX_INPUT * EV * 4);

@@ -62,6 +62,7 @@ mod op {
     pub const CHANGE_PROPERTY: u8 = 18;
     pub const GET_PROPERTY: u8 = 20;
     pub const SET_SELECTION_OWNER: u8 = 22;
+    pub const CONVERT_SELECTION: u8 = 24;
     pub const SEND_EVENT: u8 = 25;
     pub const SET_INPUT_FOCUS: u8 = 42;
     pub const QUERY_EXTENSION: u8 = 98;
@@ -85,8 +86,23 @@ mod ev {
     pub const CONFIGURE_NOTIFY: u8 = 22;
     pub const CONFIGURE_REQUEST: u8 = 23;
     pub const PROPERTY_NOTIFY: u8 = 28;
+    pub const SELECTION_CLEAR: u8 = 29;
+    pub const SELECTION_REQUEST: u8 = 30;
+    pub const SELECTION_NOTIFY: u8 = 31;
     pub const CLIENT_MESSAGE: u8 = 33;
 }
+
+/// XFixes, for hearing who owns the clipboard: its requests by minor
+/// opcode, and the event mask that asks for an owner change.
+mod xfixes {
+    pub const QUERY_VERSION: u8 = 0;
+    pub const SELECT_SELECTION_INPUT: u8 = 2;
+    pub const SET_SELECTION_OWNER_MASK: u32 = 1;
+}
+
+/// The most clipboard text carried to or from an X client: what one
+/// `ChangeProperty` takes without BIG-REQUESTS or INCR (256 KiB requests).
+const X_CLIP_MAX: usize = 250 * 1024;
 
 /// `SubstructureRedirect | SubstructureNotify | PropertyChange`: be the window
 /// manager, hear about every child of the root, and hear title changes.
@@ -118,6 +134,12 @@ const ATOM_NAMES: &[&str] = &[
     // server. Without it the display exists and accepts nothing, which looks
     // exactly like a display nobody connected to.
     "WM_S0",
+    // The clipboard, between X clients and the compositor's (see
+    // `set_clipboard` and `take_copied`).
+    "CLIPBOARD",
+    "TARGETS",
+    "TEXT",
+    "GEX_SELECTION",
 ];
 
 #[derive(Default, Clone, Copy)]
@@ -134,6 +156,10 @@ struct Atoms {
     net_wm_window_type: u32,
     net_wm_window_type_normal: u32,
     wm_s0: u32,
+    clipboard: u32,
+    targets: u32,
+    text: u32,
+    gex_selection: u32,
 }
 
 impl Atoms {
@@ -151,6 +177,10 @@ impl Atoms {
             9 => self.net_wm_window_type = atom,
             10 => self.net_wm_window_type_normal = atom,
             11 => self.wm_s0 = atom,
+            12 => self.clipboard = atom,
+            13 => self.targets = atom,
+            14 => self.text = atom,
+            15 => self.gex_selection = atom,
             _ => {}
         }
     }
@@ -170,6 +200,10 @@ enum Awaiting {
     /// A `WM_NAME` read, tried when `_NET_WM_NAME` was not set. xterm and the
     /// Athena programs set only this one.
     LegacyTitle(u32),
+    /// XFixes' major opcode and first event.
+    XFixes,
+    /// The clipboard's text, converted onto our window.
+    Copied,
 }
 
 /// One X window the manager knows about.
@@ -240,6 +274,14 @@ pub struct Xwm {
     /// Pumps spent waiting for the setup reply.
     waited: u32,
     failed: bool,
+    /// XFixes' major opcode and its first event, once known.
+    xfixes: u8,
+    xfixes_event: u8,
+    clip_started: bool,
+    /// The clipboard text this manager owns the X selection for (the
+    /// compositor's), and a client's copy read out, not yet taken.
+    clip_text: Option<Vec<u8>>,
+    copied: Option<Vec<u8>>,
 }
 
 impl Xwm {
@@ -271,6 +313,11 @@ impl Xwm {
             composite: 0,
             waited: 0,
             failed: false,
+            xfixes: 0,
+            xfixes_event: 0,
+            clip_started: false,
+            clip_text: None,
+            copied: None,
         };
         // The connection setup: little-endian, X11 revision 0, no
         // authorisation -- Xwayland is started `-ac`, which is what a
@@ -329,13 +376,110 @@ impl Xwm {
     }
 
     fn query_extension(&mut self, name: &str) {
+        self.query_extension_for(name, Awaiting::Composite);
+    }
+
+    fn query_extension_for(&mut self, name: &str, what: Awaiting) {
         let mut body = Vec::new();
         body.extend_from_slice(&(name.len() as u16).to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(name.as_bytes());
         self.request(op::QUERY_EXTENSION, 0, &body);
         let seq = self.seq;
-        self.awaiting.push_back((seq, Awaiting::Composite));
+        self.awaiting.push_back((seq, what));
+    }
+
+    // -- the clipboard -------------------------------------------------------
+
+    /// Listen for the clipboard's owner, once the atoms, the manager's own
+    /// window and XFixes are all there.
+    fn start_clipboard(&mut self) {
+        if self.clip_started || self.xfixes == 0 || self.check_window == 0 || self.atoms.clipboard == 0 {
+            return;
+        }
+        self.clip_started = true;
+        let mut body = Vec::new();
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        self.request(self.xfixes, xfixes::QUERY_VERSION, &body);
+        let mut body = Vec::new();
+        body.extend_from_slice(&self.check_window.to_le_bytes());
+        body.extend_from_slice(&self.atoms.clipboard.to_le_bytes());
+        body.extend_from_slice(&xfixes::SET_SELECTION_OWNER_MASK.to_le_bytes());
+        self.request(self.xfixes, xfixes::SELECT_SELECTION_INPUT, &body);
+        if self.clip_text.is_some() {
+            self.own_clipboard();
+        }
+    }
+
+    fn own_clipboard(&mut self) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&self.check_window.to_le_bytes());
+        body.extend_from_slice(&self.atoms.clipboard.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
+        self.request(op::SET_SELECTION_OWNER, 0, &body);
+    }
+
+    /// The compositor's clipboard text: this manager takes the X clipboard
+    /// and gives X clients that paste this.
+    pub fn set_clipboard(&mut self, text: Vec<u8>) {
+        let mut text = text;
+        text.truncate(X_CLIP_MAX);
+        self.clip_text = Some(text);
+        if self.clip_started {
+            self.own_clipboard();
+        }
+    }
+
+    /// An X client's copy, read out since the last call.
+    pub fn take_copied(&mut self) -> Option<Vec<u8>> {
+        self.copied.take()
+    }
+
+    /// Answer a client's `SelectionRequest` for the clipboard we own: its
+    /// targets, or the text, onto its property; then `SelectionNotify`.
+    fn answer_selection(&mut self, time: u32, requestor: u32, selection: u32, target: u32, property: u32) {
+        let a = self.atoms;
+        // An obsolete client names no property: the target is it.
+        let property = if property == 0 { target } else { property };
+        let mut answered = 0;
+        if let Some(text) = self.clip_text.clone().filter(|_| selection == a.clipboard) {
+            if target == a.targets {
+                let mut data = Vec::new();
+                for t in [a.targets, a.utf8_string, 31 /* STRING */, a.text] {
+                    data.extend_from_slice(&t.to_le_bytes());
+                }
+                self.change_property(requestor, property, 4 /* ATOM */, 32, &data);
+                answered = property;
+            } else if target == a.utf8_string || target == 31 || target == a.text {
+                let ptype = if target == a.text { a.utf8_string } else { target };
+                self.change_property(requestor, property, ptype, 8, &text);
+                answered = property;
+            }
+        }
+        let mut event = [0u8; 32];
+        event[0] = ev::SELECTION_NOTIFY;
+        event[4..8].copy_from_slice(&time.to_le_bytes());
+        event[8..12].copy_from_slice(&requestor.to_le_bytes());
+        event[12..16].copy_from_slice(&selection.to_le_bytes());
+        event[16..20].copy_from_slice(&target.to_le_bytes());
+        event[20..24].copy_from_slice(&answered.to_le_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(&requestor.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&event);
+        self.request(op::SEND_EVENT, 0, &body);
+    }
+
+    /// A client took the clipboard: ask it for the text, onto our window.
+    fn convert_clipboard(&mut self, time: u32) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&self.check_window.to_le_bytes());
+        body.extend_from_slice(&self.atoms.clipboard.to_le_bytes());
+        body.extend_from_slice(&self.atoms.utf8_string.to_le_bytes());
+        body.extend_from_slice(&self.atoms.gex_selection.to_le_bytes());
+        body.extend_from_slice(&time.to_le_bytes());
+        self.request(op::CONVERT_SELECTION, 0, &body);
     }
 
     /// Redirect a window's drawing to an offscreen pixmap.
@@ -412,13 +556,19 @@ impl Xwm {
     }
 
     fn get_property(&mut self, window: u32, property: u32, what: Awaiting) {
+        self.get_property_as(window, property, 256, false, what);
+    }
+
+    /// `GetProperty` of up to `words` 32-bit units, deleting it after with
+    /// `delete`.
+    fn get_property_as(&mut self, window: u32, property: u32, words: u32, delete: bool, what: Awaiting) {
         let mut body = Vec::new();
         body.extend_from_slice(&window.to_le_bytes());
         body.extend_from_slice(&property.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
         body.extend_from_slice(&0u32.to_le_bytes()); // long_offset
-        body.extend_from_slice(&256u32.to_le_bytes()); // long_length
-        self.request(op::GET_PROPERTY, 0, &body);
+        body.extend_from_slice(&words.to_le_bytes()); // long_length
+        self.request(op::GET_PROPERTY, u8::from(delete), &body);
         let seq = self.seq;
         self.awaiting.push_back((seq, what));
     }
@@ -562,6 +712,7 @@ impl Xwm {
             self.intern_atom(name, i);
         }
         self.query_extension("Composite");
+        self.query_extension_for("XFIXES", Awaiting::XFixes);
         unsafe {
             crate::write_stderr(&format!(
                 "[xwm] managing the X server: root 0x{root:x}\n"
@@ -658,6 +809,7 @@ impl Xwm {
                 self.atoms_done += 1;
                 if self.atoms_done == ATOM_NAMES.len() {
                     self.announce_wm();
+                    self.start_clipboard();
                 }
             }
             Awaiting::Composite => {
@@ -682,6 +834,22 @@ impl Xwm {
                     for window in known {
                         self.redirect(window);
                     }
+                }
+            }
+            Awaiting::XFixes => {
+                if msg[8] != 0 {
+                    self.xfixes = msg[9];
+                    self.xfixes_event = msg[10];
+                }
+                self.start_clipboard();
+            }
+            Awaiting::Copied => {
+                // format, type, bytes after, length in format units, data.
+                let format = msg[1];
+                let len = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
+                if format == 8 {
+                    let end = (32 + len).min(msg.len());
+                    self.copied = Some(msg[32..end].to_vec());
                 }
             }
             Awaiting::Title(window) | Awaiting::LegacyTitle(window) => {
@@ -885,6 +1053,31 @@ impl Xwm {
                     w.surface = Some(surface);
                     w.announced = false;
                     self.pending_pairs.push((window, surface));
+                }
+            }
+            ev::SELECTION_REQUEST => {
+                self.answer_selection(word(4), word(12), word(16), word(20), word(24));
+            }
+            ev::SELECTION_CLEAR => {
+                // Another client owns it now; its text comes by XFixes.
+                if word(12) == self.atoms.clipboard {
+                    self.clip_text = None;
+                }
+            }
+            ev::SELECTION_NOTIFY => {
+                // Our conversion of a client's clipboard: the text is on our
+                // window (none when the client refused).
+                if word(8) == self.check_window && word(12) == self.atoms.clipboard && word(20) != 0 {
+                    let (w, p) = (self.check_window, self.atoms.gex_selection);
+                    self.get_property_as(w, p, (X_CLIP_MAX / 4) as u32, true, Awaiting::Copied);
+                }
+            }
+            k if self.xfixes_event != 0 && k == self.xfixes_event => {
+                // XFixesSelectionNotify: the clipboard's new owner.
+                let (owner, selection, time) = (word(8), word(12), word(16));
+                if selection == self.atoms.clipboard && owner != 0 && owner != self.check_window {
+                    self.clip_text = None;
+                    self.convert_clipboard(time);
                 }
             }
             _ => {}

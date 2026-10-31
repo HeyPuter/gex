@@ -203,6 +203,9 @@ struct Proc {
     /// Its address space, for another process's `process_vm_readv` and
     /// `process_vm_writev`: see [`ProcTable::set_vm`]. `None` once it exits.
     vm: Option<Arc<PeerVm>>,
+    /// Started by the host as a child of the virtual init, which the host
+    /// collects (with `wait` as pid 1) rather than the table at its exit.
+    host_child: bool,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -255,6 +258,8 @@ pub struct ProcTable {
     halt_code: AtomicI32,
     /// Where the table really is, when it is not here. See [`Remote`].
     remote: Option<Remote>,
+    /// Pid 1 is the kernel's own, with no program ([`ProcTable::set_virtual_init`]).
+    virtual_init: AtomicBool,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -281,6 +286,7 @@ impl ProcTable {
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
             remote: None,
+            virtual_init: AtomicBool::new(false),
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
@@ -297,6 +303,7 @@ impl ProcTable {
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
                     vm: None,
+                    host_child: false,
                 }],
             }),
         }
@@ -320,6 +327,8 @@ impl ProcTable {
             Some(p) => (p.pgid, p.sid),
             None => (pid, pid),
         };
+        // The virtual init runs nothing, so a child of it is the host's.
+        let host_child = ppid == INIT_PID && self.virtual_init.load(Ordering::Acquire);
         t.procs.push(Proc {
             pid,
             ppid,
@@ -333,6 +342,7 @@ impl ProcTable {
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
             vm: None,
+            host_child,
         });
         pid
     }
@@ -490,12 +500,17 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
-        let (cell, done, was_ppid, own_q) = {
+        let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            let mut orphans = Vec::new();
             for p in t.procs.iter_mut() {
                 if p.ppid == pid {
                     p.ppid = INIT_PID;
+                    if virtual_init {
+                        orphans.push((p.pid, Arc::clone(&p.child.status)));
+                    }
                 }
             }
             // Its threads went with it.
@@ -503,11 +518,22 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
-                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id())
+                    (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
                 }
                 None => return,
             }
         };
+        // Its children that had ended already and are given to a virtual
+        // init: nobody will collect them, so they go now. (Each status is
+        // read with the table let go, as in `entries`.)
+        let ended: Vec<i32> = orphans
+            .into_iter()
+            .filter(|(_, st)| st.lock().map(|s| s.is_some()).unwrap_or(false))
+            .map(|(pid, _)| pid)
+            .collect();
+        if !ended.is_empty() {
+            self.lock().procs.retain(|p| !(ended.contains(&p.pid) && p.ppid == INIT_PID));
+        }
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
@@ -520,17 +546,31 @@ impl ProcTable {
         // still running and wait for a SIGCHLD that has already come (as
         // dbus-daemon's activation helper does).
         let parent_q = {
-            let t = self.lock();
+            let mut t = self.lock();
             // its parent now (it may have been given to init since), or, if
             // a parked `wait4` has collected it already, the one it had
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid).or(was_ppid);
-            match ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
+            match ppid {
+                // Under a virtual init, which wants no SIGCHLD: the host
+                // collects what it started, from pid 1's queue; an orphan
+                // is let go now.
+                Some(INIT_PID) if virtual_init => match t.procs.iter().position(|p| p.pid == pid) {
+                    Some(i) if t.procs[i].host_child => t.procs.iter().find(|p| p.pid == INIT_PID).map_or(0, |p| p.queue.id()),
+                    Some(i) => {
+                        t.procs[i].child.reaped.store(true, Ordering::Release);
+                        t.procs.remove(i);
+                        0
+                    }
+                    None => 0,
+                },
+                _ => match ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
                 Some(parent) => {
                     parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
                     SIGNAL_SEQ.fetch_add(1, Ordering::Release);
                     parent.queue.id()
                 }
                 None => 0,
+                },
             }
         };
         // The parent's `wait4`, and its SIGCHLD.
@@ -697,8 +737,12 @@ impl ProcTable {
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
+            let virtual_init = self.virtual_init.load(Ordering::Acquire);
             for &i in &hits {
                 let p = &mut t.procs[i];
+                if virtual_init && p.pid == INIT_PID {
+                    continue;
+                }
                 p.killed |= bit;
                 p.senders[signo as usize - 1] = caller;
                 p.pending.fetch_or(bit, Ordering::AcqRel);
@@ -898,6 +942,15 @@ impl ProcTable {
         self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.queue.id())
     }
 
+    /// Pid 1 is the kernel's own (`on`): no program runs as it. What the
+    /// host starts as its child the host collects; an orphan that ends is
+    /// let go at once; a signal to it is ignored, as a real init ignores
+    /// what it has no handler for. Otherwise a program is pid 1 and
+    /// collects its orphans itself, as on Linux.
+    pub fn set_virtual_init(&self, on: bool) {
+        self.virtual_init.store(on, Ordering::Release);
+    }
+
     /// The exit code the machine is halting with, if it is.
     pub fn halt_code(&self) -> Option<i32> {
         if let Some(r) = self.remote {
@@ -991,6 +1044,44 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_collects_what_it_started_and_a_virtual_init_its_orphans() {
+        let t = ProcTable::new();
+        t.set_virtual_init(true);
+        let a = t.spawn(INIT_PID);
+        let b = t.spawn(a);
+        let c = t.spawn(a);
+        // c ends first and is a zombie of a's; then a ends: c is given to
+        // pid 1 and, ended already, let go; b is given to pid 1, alive.
+        t.exit(c, 0);
+        t.exit(a, 3);
+        assert!(!t.exists(c));
+        assert_eq!(t.ppid(b), INIT_PID);
+        // a, the host's, waits for the host.
+        assert!(t.exists(a));
+        assert_eq!(t.children(INIT_PID).iter().map(|c| c.pid).collect::<Vec<_>>(), vec![a, b]);
+        // b ends under the virtual init: gone, and pid 1 has no SIGCHLD.
+        t.exit(b, 0);
+        assert!(!t.exists(b));
+        assert!(!t.has_signals(INIT_PID));
+        // A signal to pid 1 reaches it and does nothing.
+        assert_eq!(t.kill(a, INIT_PID, 15), Ok(1));
+        assert!(!t.has_signals(INIT_PID));
+    }
+
+    #[test]
+    fn a_real_init_collects_its_orphans() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let b = t.spawn(a);
+        t.exit(a, 0);
+        t.exit(b, 0);
+        // A zombie of pid 1's, and pid 1 has its SIGCHLD.
+        assert!(t.exists(b));
+        assert_eq!(t.ppid(b), INIT_PID);
+        assert!(t.has_signals(INIT_PID));
+    }
 
     /// Threads and processes are numbered from one count, so no id names
     /// two tasks; a thread's id finds its process for `kill` and `/proc`

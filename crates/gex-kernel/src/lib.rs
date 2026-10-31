@@ -52,6 +52,7 @@ pub mod pty;
 pub mod signal;
 pub mod stdio;
 pub mod sync;
+pub mod tar;
 pub mod syscalls;
 pub mod timerfd;
 pub mod tty;

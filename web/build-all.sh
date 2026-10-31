@@ -66,9 +66,9 @@ for a in "$@"; do
     --no-gl) GL=0 ;;
     --no-x) X=0 ;;
     --dist-only) ASSETS=0 GL=0 X=0 ;;
-    # Only Xwayland into web/public (web/build-demo.sh's step).
+    # Only Xwayland into web/public.
     --x-only) ASSETS=0 GL=0 X=1 DISTS=0 ;;
-    # Only Mesa into web/public (web/build-demo.sh --gl).
+    # Only Mesa into web/public.
     --gl-only) ASSETS=0 GL=1 X=0 DISTS=0 ;;
     *) echo "usage: web/build-all.sh [--mp | --sp | --both] [--debug] [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]" >&2; exit 2 ;;
     esac

@@ -30,6 +30,9 @@
 //                        straight on (`gex_after_trap`) or through each step
 //                        (only when named)
 //   GEX_LOG=a,b          several of those
+//   GEX_LOG=quiet        the default lines but the routine ones: no line per
+//                        process started or library loaded; errors and rare
+//                        events still said (the runtime API's default)
 //   GEX_LOG=off          not even the default lines (tests that compare a
 //                        program's output with its native run)
 
@@ -57,10 +60,17 @@ export function logQuiet() {
   return v === 'off' || v === 'none';
 }
 
+/** Whether the routine default lines are said: a process starting, a
+ *  library loaded. Off under `quiet` and `off`. */
+export function logRoutine() {
+  const v = value();
+  return v !== 'quiet' && v !== 'off' && v !== 'none';
+}
+
 /** Whether debug output of kind `what` (or any, without one) is on. */
 export function logOn(what) {
   const v = value();
-  if (v === null || v === 'off' || v === 'none') return false;
+  if (v === null || v === 'off' || v === 'none' || v === 'quiet') return false;
   if (v === '1' || v === 'all') return true;
   const kinds = v.split(',');
   return what === undefined ? kinds.length > 0 : kinds.includes(what);

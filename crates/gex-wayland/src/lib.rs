@@ -16,6 +16,7 @@
 //! or `wl_drm`, so a client insisting on a GPU buffer finds none.
 
 pub mod data;
+mod pointer;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -303,6 +304,9 @@ pub struct SurfaceInfo {
     /// whole surface, as it is until a client sets one, and an empty region
     /// takes no pointer input at all.
     pub input: Option<Region>,
+    /// A client's `zwp_locked_pointer_v1` asks for the pointer on this
+    /// surface (`flags` bit 31): the host locks it when it can (pointer.rs).
+    pub pointer_lock: bool,
 }
 
 /// A placed surface's position and stacking, as its client asked for them
@@ -353,8 +357,8 @@ impl Placement {
 impl SurfaceInfo {
     /// `R_FLAGS`, as `wl-bridge.mjs` reads it: fullscreen (bit 0), external (bit 1), a configure
     /// not yet acked (bit 2), the request's number (bits 3..6), the buffer
-    /// and client scales (bits 8 and 16), and the request itself
-    /// ([`Request::code`], bits 24..30).
+    /// and client scales (bits 8 and 16), the request itself
+    /// ([`Request::code`], bits 24..30), and a pointer lock asked for (bit 31).
     pub fn flags(&self) -> i32 {
         i32::from(self.fullscreen)
             | (i32::from(self.external) << 1)
@@ -364,6 +368,7 @@ impl SurfaceInfo {
             | ((self.client_scale & 0xff) << 16)
             | (((self.request.code() & 0x7f) as i32) << 24)
             | (i32::from(self.input.is_some()) << 7)
+            | (i32::from(self.pointer_lock) << 31)
     }
 
     /// The input region as a host's record carries it, with `flags` bit 7
@@ -494,6 +499,11 @@ const GLOBALS: &[(&str, u32)] = &[
     // adds the `origin` event: where the compositor has the surface, for
     // turning its surface-local pointer positions into Win32's.
     ("gex_window_placement_manager_v1", 2),
+    // Mouse look: a lock the host grants (the page's pointer lock) and the
+    // movement under it (pointer.rs). Xwayland locks for an X client that
+    // grabs the pointer and hides it.
+    ("zwp_relative_pointer_manager_v1", 1),
+    ("zwp_pointer_constraints_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -531,6 +541,11 @@ enum Object {
     Decoration { surface: u32 },
     PlacementManager,
     Placement { surface: u32 },
+    RelativePointerManager,
+    RelativePointer,
+    PointerConstraints,
+    LockedPointer,
+    ConfinedPointer,
 }
 
 /// An `xdg_positioner`: where a popup wants to be, expressed the way the
@@ -792,6 +807,10 @@ pub struct Client {
     pending_keymap: Option<Vec<u8>>,
     /// Data devices, sources and offers (data.rs).
     data: data::DataState,
+    /// `zwp_relative_pointer_v1` objects, and pointer locks and
+    /// confinements by object id (pointer.rs).
+    relative_pointers: Vec<u32>,
+    constraints: HashMap<u32, pointer::Constraint>,
 }
 
 /// Wayland's error codes on `wl_display`.
@@ -843,6 +862,8 @@ impl Client {
             keyboard_on: None,
             pending_keymap: None,
             data: data::DataState::default(),
+            relative_pointers: Vec::new(),
+            constraints: HashMap::new(),
         }
     }
 
@@ -1022,6 +1043,10 @@ impl Client {
                 Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
                 Object::PlacementManager => self.placement_manager(opcode, &mut r),
                 Object::Placement { surface } => self.placement(object, surface, opcode, &mut r),
+                Object::RelativePointerManager => self.relative_pointer_manager(object, opcode, &mut r),
+                Object::RelativePointer => self.relative_pointer(object, opcode),
+                Object::PointerConstraints => self.pointer_constraints(object, opcode, &mut r),
+                Object::LockedPointer | Object::ConfinedPointer => self.constrained_pointer(object, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager { version } => self.data_device_manager(version, opcode, &mut r),
                 Object::DataDevice => self.data_device(object, opcode, &mut r),
@@ -1257,6 +1282,12 @@ impl Client {
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
                 self.placement_version = version.min(2);
+            }
+            "zwp_relative_pointer_manager_v1" => {
+                self.objects.insert(id, Object::RelativePointerManager);
+            }
+            "zwp_pointer_constraints_v1" => {
+                self.objects.insert(id, Object::PointerConstraints);
             }
             _ => return false,
         }
@@ -2657,6 +2688,7 @@ impl Client {
                 client_scale: self.scale,
                 placement: s.placement,
                 input: s.input.clone(),
+                pointer_lock: self.wants_lock(*id),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -4314,6 +4346,39 @@ mod tests {
         // of it lands where the pointer is.
         let x = i32::from_le_bytes([enter[8], enter[9], enter[10], enter[11]]);
         assert_eq!(x, 3 * 256, "the enter's x, in 24.8 fixed point");
+    }
+
+    #[test]
+    fn a_locked_pointer_waits_for_the_host_and_takes_relative_motion() {
+        let pool = Placed(0xa000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let bind = |c: &mut Client, name: u32, iface: &str, id: u32| {
+            c.receive(&Writer::new(2, 0).uint(name).string(iface).uint(1).new_id(id).finish(), &[], &pool);
+        };
+        let idx = |iface: &str| GLOBALS.iter().position(|g| g.0 == iface).unwrap() as u32 + 1;
+        c.receive(&Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(60).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 0).new_id(61).finish(), &[], &pool);
+        bind(&mut c, idx("zwp_relative_pointer_manager_v1"), "zwp_relative_pointer_manager_v1", 80);
+        bind(&mut c, idx("zwp_pointer_constraints_v1"), "zwp_pointer_constraints_v1", 81);
+        c.receive(&Writer::new(80, 1).new_id(82).object(61).finish(), &[], &pool);
+        assert!(!c.scene().iter().any(|s| s.pointer_lock), "no lock asked yet");
+        // lock_pointer(id, surface, pointer, region, lifetime oneshot)
+        c.receive(&Writer::new(81, 1).new_id(83).object(surface).object(61).object(0).uint(1).finish(), &[], &pool);
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+        c.take_outgoing();
+        let s = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        assert!(s.pointer_lock && s.flags() < 0, "the lock is in the scene, flags bit 31");
+        c.pointer_locked(surface, true);
+        c.pointer_relative(3 * 256, -2 * 256, 1000);
+        let out = messages(&c.take_outgoing());
+        assert!(out.iter().any(|(id, op, _)| *id == 83 && *op == 0), "locked");
+        let (_, _, m) = out.iter().find(|(id, op, _)| *id == 82 && *op == 0).expect("relative_motion");
+        let w = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+        assert_eq!((w(4) as u32, w(8), w(12)), (1_000_000, 3 * 256, -2 * 256));
+        // A oneshot lock released is done with.
+        c.pointer_locked(surface, false);
+        assert!(messages(&c.take_outgoing()).iter().any(|(id, op, _)| *id == 83 && *op == 1), "unlocked");
+        assert!(!c.scene().iter().any(|s| s.pointer_lock), "a oneshot lock asks no more");
     }
 
     #[test]

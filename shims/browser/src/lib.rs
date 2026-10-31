@@ -273,6 +273,10 @@ impl net::NetStack for WispNet {
 extern "C" {
     /// Is there a global kernel behind these calls at all?
     fn k_present() -> i32;
+    /// Host calls (/dev/gex-host, shims/kernel `k_host_open`): whether the
+    /// page answers them, and a new open, a global kernel handle.
+    fn k_host_calls_served() -> i32;
+    fn k_host_open() -> i32;
     /// The machine's synthetic DNS answers (`gex_kernel::net::share_names`):
     /// the address for a name, allocated on first asking; and the name an
     /// address was given for, into `out` (its length, or -1 for none).
@@ -478,6 +482,9 @@ extern "C" {
     fn k_audio_close(stream: u32);
     fn k_audio_info(stream: u32, now_ms: u32, out: gex_kernel::PAddr) -> i32;
     fn k_audio_capture_pos() -> u32;
+    fn k_joy_read(pad: u32, out: gex_kernel::PAddr) -> i32;
+    fn k_joy_queue() -> u32;
+    fn k_joy_changed() -> u32;
     fn k_audio_capture(pos: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32) -> i64;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
@@ -1074,7 +1081,7 @@ extern "C" fn rp_new(pid: i32) -> i32 {
 /// closed under another, double-closing ends.
 static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-fn my_pid() -> i32 {
+pub(crate) fn my_pid() -> i32 {
     vfork::pid_here().unwrap_or_else(|| MY_PID.load(std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -1291,7 +1298,7 @@ pub extern "C" fn gex_audio_ring_addr() -> u32 {
 }
 
 /// Where a pipe's buffer goes, when there is a global kernel to put it in.
-fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
+pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }
@@ -1320,7 +1327,7 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
 // Pty wrappers: the ones that name a holder inject this Worker's pid, the way
 // the pipe wrappers do, so the global kernel can release a process's ends when
 // it leaves by a trap.
-/// The first few pty end open/close events, with who did them.
+/// The first few pty end open/close events, with who did them (debug output).
 ///
 /// An end is opened and closed a handful of times in a session -- a terminal
 /// takes the master, its child takes the slave, a fork hands both on -- and the
@@ -1335,9 +1342,9 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
         return;
     }
     let counts = unsafe { k_pty_counts(id) };
-    // A note (console.warn), not an error: nothing is wrong when it is said.
-    warn_line(&format!(
-        "[gex-note] [pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
+    // Debug output (GEX_LOG=debug): a terminal session makes dozens.
+    trace_line(&format!(
+        "[pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
         if master != 0 { "master" } else { "slave" },
         counts >> 16,
         counts & 0xffff
@@ -1914,6 +1921,37 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         if crate::gl::have_d3d() {
             devfs.add("gex-d3d", crate::gl::GlDevice::new());
         }
+    }
+    // `/dev/gex-host`: calls to the page, where it answers them. Each open is
+    // a handle in the global kernel, so the call crosses fork and exec.
+    if unsafe { k_present() } != 0 && unsafe { k_host_calls_served() } != 0 {
+        if let Some(root) = global_root() {
+            let remote = root.remote();
+            devfs.add_per_open(
+                gex_kernel::vfs::hostcall::NAME,
+                Arc::new(move || match unsafe { k_host_open() } {
+                    id if id >= 0 => gex_kernel::vfs::remote::adopt(remote, id),
+                    _ => gex_kernel::vfs::hostcall::open(gex_kernel::vfs::hostcall::HostCalls {
+                        call: |_, _| Err(gex_kernel::errno::Errno::ENODEV),
+                        read: |_, _, _| Ok(0),
+                        done: |_| {},
+                    }),
+                }),
+            );
+        }
+    }
+    // Game controllers: the page's, in the global kernel's table
+    // (shims/kernel `joy.rs`), as /dev/input/eventN.
+    if unsafe { k_present() } != 0 {
+        fn joy_read(pad: u32, out: &mut [u32; gex_kernel::vfs::evdev::PAD_WORDS]) -> bool {
+            unsafe { k_joy_read(pad, out.as_mut_ptr() as usize as gex_kernel::PAddr) == 0 }
+        }
+        gex_kernel::vfs::evdev::set_joy_host(gex_kernel::vfs::evdev::JoyHost {
+            read: joy_read,
+            queue: || unsafe { k_joy_queue() },
+            changed: || unsafe { k_joy_changed() },
+            compat: compat_abi,
+        });
     }
     // Audio: OSS's /dev/dsp and /dev/mixer, a null output, as natively
     // (shims/native). 32-bit Wine's wineoss.drv is a pure Unix library linked into
@@ -3730,6 +3768,11 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// The pages each of `installed_mods` covers, by page: a page retired
+    /// takes its modules out of `installed_mods`, so the same code mapped
+    /// there again is served from the store rather than lifted and stored
+    /// once more.
+    mods_on_page: std::collections::HashMap<u64, Vec<u32>>,
     /// Per object, how many of the kernel's modules for it (in its order) are
     /// all in `installed_mods`: a miss reads the list from there on, not from
     /// the start. See `shared_modules_of_object`.
@@ -9587,13 +9630,14 @@ pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
     *CHILD_STATE.0.borrow_mut() = shim_slice(ptr, len).to_vec();
 }
 
-/// The signal state, umask and resource limits a process passes on: to a
-/// fork's child (`pending` false), or with its pending signals across an
-/// exec that starts in another Worker.
+/// The signal state, umask, resource limits and identity a process passes
+/// on: to a fork's child (`pending` false), or with its pending signals
+/// across an exec that starts in another Worker. The identity is the
+/// process's own, so a `setuid` before an exec holds after it.
 fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let sig = k.signals.to_bytes(pending);
     let limits = k.rlimits.get();
-    let mut v = Vec::with_capacity(8 + sig.len() + limits.len() * 16);
+    let mut v = Vec::with_capacity(16 + sig.len() + limits.len() * 16);
     v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     v.extend_from_slice(&sig);
     v.extend_from_slice(&k.proc_fs.umask().to_le_bytes());
@@ -9601,6 +9645,8 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
+    v.extend_from_slice(&k.creds.uid().to_le_bytes());
+    v.extend_from_slice(&k.creds.gid().to_le_bytes());
     v
 }
 
@@ -9611,7 +9657,7 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
     let mut limits = k.rlimits.get();
-    if rest.len() != 4 + limits.len() * 16 {
+    if rest.len() != 4 + limits.len() * 16 + 8 {
         return;
     }
     k.signals = sig;
@@ -9624,6 +9670,9 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
     k.rlimits.set(limits);
+    let at = 4 + limits.len() * 16;
+    k.creds.set_uid(u32::from_le_bytes(rest[at..at + 4].try_into().unwrap()));
+    k.creds.set_gid(u32::from_le_bytes(rest[at + 4..at + 8].try_into().unwrap()));
 }
 
 #[no_mangle]
@@ -10976,6 +11025,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         ever_threaded: false,
         shared: Default::default(),
         installed_mods: Default::default(),
+        mods_on_page: Default::default(),
         obj_cursor: Default::default(),
         dense_base: Default::default(),
         module_dense: Default::default(),
@@ -11618,9 +11668,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         direct_argv.as_deref().unwrap_or(argv),
         envp,
         *b"gexdeterministic",
+        // The process's, which a `setuid` before the exec changed.
         gex_ld::Identity {
-            uid: unsafe { IDENTITY.0 },
-            gid: unsafe { IDENTITY.1 },
+            uid: h.kernel.creds.uid(),
+            gid: h.kernel.creds.gid(),
             interp_base,
             entry_hook: hook,
         },
@@ -11752,6 +11803,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // writes the same blocks into the same slots, and its compile is shared
     // by content key.
     h.jit.installed_mods.clear();
+    h.jit.mods_on_page.clear();
     // The new program and its interpreter, placed by gex's loader rather than
     // mapped by the guest, announced as their `mmap`s would have been: the
     // syscall's return serves their units before the interpreter's first
@@ -15251,16 +15303,24 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 /// A guest access into the runtime's own low memory (below
 /// `gex_abi::GUEST_FLOOR`): where hardware would fault, gex would write into
 /// its contexts or dispatch directory. Said, then raised: an access
-/// violation through SEH for a Windows program, SIGSEGV otherwise.
+/// violation (a write, at `addr`, from the block's start `pc`) for the
+/// process's fault hook (Wine), SIGSEGV without one. Does not return.
 fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
-    let gm = GuestMem::new(guest_bytes());
+    let mut gm = GuestMem::new(guest_bytes());
     let c = ctx as u32 as u64;
     let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
     warn_line(&format!(
         "gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation. regs [{}]\n",
         r.join(" ")
     ));
-    set_exit(128 + 11);
+    if cgen::fault_hook() != 0 {
+        let _ = gm.write_u64(c + ctx::PC as u64, pc);
+        cgen::fault_stage(0xc000_0005, addr, 1);
+        set_resume(pc);
+        set_resume_ctx(c);
+    } else {
+        set_exit(128 + 11);
+    }
     trap();
 }
 
@@ -15582,6 +15642,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 return;
             }
             j.retired_pages.insert(page);
+            forget_installed_on(j, page);
             let home = if jit_diag() { sigs::home() } else { None };
             note_page_retired(
                 home.as_ref().map(|h| h.mm()),
@@ -16780,7 +16841,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let mut dirs: Vec<(u64, u32)> = Vec::new();
                     let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
-                        j.installed_mods.insert(*id);
+                        note_installed(j, *id, d.iter().map(|(p, _)| *p));
                         slots = slots.max(*s);
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
@@ -17156,7 +17217,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         if mod_id != 0 {
-            j.installed_mods.insert(mod_id);
+            note_installed(j, mod_id, unit.covered.iter().map(|(p, _)| *p));
         }
         for (addr, _) in &unit.exported_blocks {
             j.translated.insert(*addr);
@@ -17727,6 +17788,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
+            forget_installed_on(j, page);
             let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
@@ -17763,6 +17825,29 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             }
         }
     }
+}
+
+/// Stored module `id`, covering `pages`, is in this Worker's tables.
+fn note_installed(j: &mut Jit, id: u32, pages: impl Iterator<Item = u64>) {
+    if !j.installed_mods.insert(id) {
+        return;
+    }
+    for p in pages {
+        let on = j.mods_on_page.entry(p).or_default();
+        if !on.contains(&id) {
+            on.push(id);
+        }
+    }
+}
+
+/// `page` retired: the stored modules covering it no longer run here, and
+/// are served again when its code is (the object's cursor starts over).
+fn forget_installed_on(j: &mut Jit, page: u64) {
+    let Some(ids) = j.mods_on_page.remove(&page) else { return };
+    for id in ids {
+        j.installed_mods.remove(&id);
+    }
+    j.obj_cursor.clear();
 }
 
 /// Note the pages an installed runtime module has blocks on (`dense_on_page`).

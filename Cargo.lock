@@ -732,6 +732,7 @@ dependencies = [
  "gex-abi",
  "gex-kernel",
  "gex-kmem",
+ "gex-ld",
 ]
 
 [[package]]

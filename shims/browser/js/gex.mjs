@@ -12,9 +12,10 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { kernelThread, lazyFetch, lazyReady, processMemories } from "./lazy-fetch.mjs";
+import { pageFs } from './page-fs.mjs';
 import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
-import { logNamed, logOn, logQuiet } from "./log.mjs";
+import { logNamed, logOn, logRoutine } from "./log.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -1254,10 +1255,6 @@ export class Gex {
    *  Null for one with the window, else its program's image span, which the
    *  arena steps over (`[0, 0]`: a fork child's, inherited). */
   #noPlace = null;
-  /** A native wasm program that runs no guest code (its header asks for no
-   *  Windows space), a fork child of one, or an exec of one: it numbers no
-   *  blocks densely, so it makes no slot map (`gex_set_dense`). */
-  #nativeOnly = false;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -1889,7 +1886,7 @@ export class Gex {
           // `[gex-info] `: one of the few things said by default (a process
           // starting, log.mjs): information, not a warning.
           if (text.startsWith('[gex-info] ')) {
-            if (!logQuiet()) console.info(`[gex] ${text.slice(11)}`);
+            if (logRoutine()) console.info(`[gex] ${text.slice(11)}`);
             // `?straceexe=NAME`: narrate the process that execs a program
             // of that name, whatever its pid
             const ex = this.#opts?.straceExe && /^pid \d+: exec (\S+)/.exec(text.slice(11));
@@ -2100,6 +2097,9 @@ export class Gex {
         // client says of it, for the page (wl-bridge.mjs `waitDrag`).
         wl_drag_data: (ptr, max) => this.#wl?.dragData(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         wl_drag_status: (serial, flags) => this.#wl?.dragStatus(serial >>> 0, flags >>> 0),
+        wl_clip_serial: () => this.#wl?.clipSerial?.() ?? 0,
+        wl_clip_get: (ptr, max) => this.#wl?.clipGet?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        wl_clip_set: (ptr, len) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0) ?? 0,
     };
   }
 
@@ -2121,7 +2121,6 @@ export class Gex {
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
-    this.#nativeOnly = this.#noPlace !== null;
     this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
@@ -2505,13 +2504,12 @@ export class Gex {
     this.#guestInstantiateMs = performance.now() - tGuest;
     this.#tnAt('boot');
     // Dense block tables when the image module has `blocks` (the seed does;
-    // a closure image, whose libraries dispatch classically, does not).
-    // What the children are given is the ask, not this program's answer: a
-    // native program that runs no guest code (`#nativeOnly`) numbers none,
-    // its fork children neither (theirs is a copy), but a program it execs
-    // that runs guest code does, and so do that program's children.
+    // a closure image, whose libraries dispatch classically, does not). A
+    // native wasm program numbers pages too, for the units its libraries
+    // call through, and those numbers are shared system-wide: classic, its
+    // table would reach the highest any process numbered.
     const denseAsked = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
-    this.#dense = denseAsked && !this.#nativeOnly;
+    this.#dense = denseAsked;
     this.#opts.dense = denseAsked ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(this.#opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
@@ -3058,7 +3056,7 @@ export class Gex {
     _k('instantiate');
     await lazyReady();
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory) },
+      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory), page_fs: pageFs(memory) },
     });
     _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
@@ -3382,7 +3380,6 @@ export class Gex {
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
     this.#noPlace = child.wasmImage ?? null;
-    this.#nativeOnly = !!child.wasmImage;
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool
@@ -3396,7 +3393,11 @@ export class Gex {
     if (child.cwd) this.#putBytes(new TextEncoder().encode(child.cwd), e.gex_set_cwd);
     if (child.state?.length) this.#putBytes(child.state, e.gex_set_child_state);
     e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
-    this.#dense = !!o.dense && !this.#nativeOnly && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    // Dense unless asked not to (`dense: false`), as for a process booted
+    // fresh: an exec whose options never said is not a classic one.
+    const denseAsked = o.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#dense = denseAsked;
+    o.dense = denseAsked ? (o.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(denseArg(o, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
@@ -3543,7 +3544,6 @@ export class Gex {
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
     this.#noPlace = child.placeWindow === 0 ? [0, 0] : null;
-    this.#nativeOnly = !!child.nativeOnly;
     this.#forkChild = true;
     this.#inheritedEnds = child.image.map((r) => [r.at, Math.max(r.end ?? 0, r.at + imageLen(r))]);
     await this.attach(shimWasm, guestWasm);
@@ -3618,7 +3618,7 @@ export class Gex {
     }
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
-    this.#dense = !!(child.opts ?? {}).dense && !this.#nativeOnly && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     e.gex_set_dense?.(denseArg(child.opts, this.#dense));
     if (TEST_KEEP_PROBE) e.gex_test_keep_probe?.(1);
     this.#entriesInit();
@@ -3924,7 +3924,12 @@ export class Gex {
         return { entry: 0n, ctx: 0, gone: true };
       }
       Object.assign(thread, go);
+      // The `clone` that made this thread promised it a slot, and this
+      // Worker has held one since it attached: kept now, or every thread a
+      // spare takes keeps a slot promised for good and the process's
+      // `clone`s fail once they add up to every slot.
       this.#promise = true;
+      this.keepPromise();
       const had = this.#cgen?.dyl.size ?? 0;
       if (said) {
         const ta = performance.now();
@@ -4220,8 +4225,6 @@ export class Gex {
       // Whether its memory has the placement window: the child's is laid out
       // as its parent's (`#noPlace`).
       placeWindow: e.gex_place_window?.() ?? 1,
-      // And whether it numbers blocks densely (`#nativeOnly`).
-      nativeOnly: this.#nativeOnly,
       image: (() => {
         const t0 = performance.now();
         // The process's other threads out of guest code while the memory is
@@ -4951,7 +4954,16 @@ export class Gex {
     }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
-    if (!this.#spareWait && (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase))) inst.exports.__wasm_apply_data_relocs?.();
+    if (!this.#spareWait && wasmprog) {
+      // Another Worker applying them is waited for (the shim's side).
+      if (e.gex_wasmprog_relocate(prov)) {
+        try {
+          inst.exports.__wasm_apply_data_relocs?.();
+        } finally {
+          e.gex_wasmprog_relocated?.(prov);
+        }
+      }
+    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
       // (a packed module's element segments filled them)
       if (!packed) for (const [slot, name] of extra) {
@@ -6261,7 +6273,11 @@ export class Gex {
         if (!h) return 0;
         this.#cgenCatchUp();
         const st = this.#cgenStore();
-        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
+        // Taken whole before any constructor runs: one that calls dlopen
+        // itself replaces the list.
+        const fresh = [];
+        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) fresh.push(n);
+        for (const n of fresh) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
         return h | 0;
       },
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,

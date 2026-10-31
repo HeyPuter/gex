@@ -1,0 +1,311 @@
+// `Filesystem`: the guest's root, one per system. Before boot it is the tars
+// and files a page adds, laid one over another in the order added into the
+// kernel's root at boot (kfs.js `lay`).
+// After boot, a tar or files are written into the live tree, and the guest's
+// files can be read and written from the page.
+
+import { INTERNAL, internals, bytesOf } from './internal.js';
+
+const norm = (p) => {
+  if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);
+  const out = [];
+  for (const part of p.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') out.pop();
+    else out.push(part);
+  }
+  return `/${out.join('/')}`;
+};
+const under = (at, p) => norm(`${at}/${p}`);
+
+/** zstd's frame magic. */
+const isZstd = (b) => b.length > 4 && b[0] === 0x28 && b[1] === 0xb5 && b[2] === 0x2f && b[3] === 0xfd;
+
+async function tarBytes(src) {
+  const bytes = await bytesOf(src, 'tar');
+  if (!isZstd(bytes)) return bytes;
+  const { unzstd } = await import('../../src/zfetch.js');
+  return unzstd(bytes);
+}
+
+/** A lazy list: `[[path, size, url], ...]`, or the URL of one as JSON (an
+ *  ejected build's lazy.json: `{ base, files: [[path, size, rel], ...] }`
+ *  too). A file's URL is a path on the page's origin. */
+async function lazyList(lazy) {
+  let list = lazy;
+  let base = globalThis.location?.href;
+  if (typeof lazy === 'string' || lazy instanceof URL) {
+    base = new URL(lazy, globalThis.location?.href).href;
+    list = JSON.parse(new TextDecoder().decode(await bytesOf(base, 'lazy list')));
+  }
+  if (!Array.isArray(list)) {
+    if (list?.files) {
+      const b = new URL(list.base ?? './', base);
+      return list.files.map(([p, size, rel, mode]) => [p, size, new URL(rel, b).href, mode]);
+    }
+    throw new TypeError('lazy: a list of [path, size, url] or its URL');
+  }
+  return list.map(([p, size, url, mode]) => [p, size, new URL(url, base).href, mode]);
+}
+
+/** A same-origin URL as the path the kernel keeps for a lazy file. */
+function lazyPath(href) {
+  const u = new URL(href, globalThis.location?.href);
+  // Under Node (the runtime's own tests), a file URL is a host path.
+  if (u.protocol === 'file:') return decodeURIComponent(u.pathname);
+  if (globalThis.location && u.origin !== globalThis.location.origin) {
+    throw new Error(`lazy file ${href}: only the page's own origin can be read lazily`);
+  }
+  return u.pathname + u.search + u.hash;
+}
+
+/** A directory the page serves (`Filesystem.mount`). Events: `unmounted`. */
+export class Mount extends EventTarget {
+  #fs;
+
+  constructor(fs, path, provider) {
+    super();
+    this.#fs = fs;
+    /** Where it is in the guest's tree. */
+    this.path = path;
+    this.provider = provider;
+  }
+
+  /** Take it out of the tree ([`Filesystem.unmount`]). */
+  unmount() {
+    return this.#fs.unmount(this.path);
+  }
+}
+
+export class Filesystem extends EventTarget {
+  #sys;
+  #sources = [];
+  #mounts = new Map(); // path -> { mount, id }
+  #persist = null; // a Persist's hooks
+
+  constructor(sys) {
+    super();
+    const i = internals(sys, 'Filesystem');
+    i.attach('filesystem', this, { beforeBoot: true });
+    this.#sys = i;
+    i.beforeBoot((opts) => this.#seed(opts));
+    this[INTERNAL] = {
+      sources: () => this.#sources,
+      /** For the system's start: the mounts made before boot,
+       *  in place before the first program. */
+      mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
+      /** A Persist on this filesystem (persist.js): one, made before boot. */
+      persist: (part, hooks) => {
+        i.attach('persistence', part, { beforeBoot: true });
+        this.#persist = hooks;
+        i.afterBoot(() => hooks.running(i));
+      },
+      persistArgs: () => this.#persist?.startArgs() ?? null,
+      /** A program's image as an untarred bundle has it (kfs.js
+       *  `layImage`): a preset's (web/src/run-program.js), not the API's. */
+      addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
+    };
+  }
+
+  /** The guest's files (kfs.js), once the system runs. */
+  #files(what) {
+    if (this.#sys.phase !== 'running') throw new Error(`${what}: the system is ${this.#sys.phase}, not running`);
+    return this.#sys.files();
+  }
+
+  /**
+   * A tar (bytes, a Blob, a stream, or a URL; zstd or not) laid over the
+   * root at `at` (default '/'). Before boot it is one more layer; after, it
+   * is written into the running tree. `lazy`: files fetched as they are
+   * first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without
+   * one) or the URL of such a list, laid with the tar (`src` may then be
+   * null). A list at a URL may be `{ base, files }`, each url relative to
+   * `base`, itself relative to the list.
+   */
+  addTar(src, { at = '/', lazy } = {}) {
+    const p = (async () => {
+      const lz = lazy ? await lazyList(lazy) : [];
+      return {
+        tar: src == null ? null : await tarBytes(src),
+        at: norm(at),
+        lazy: lz.map(([p, size, url, mode]) => [under(at, p), size, lazyPath(url), mode]),
+      };
+    })();
+    return this.#add(p);
+  }
+
+  /** Single files: `{ '/path': bytes | Blob | URL | string }` (a string is
+   *  the file's text), each of `mode` (default 0644). */
+  addFiles(map, { mode } = {}) {
+    const p = (async () => {
+      const files = {};
+      const modes = {};
+      for (const [path, v] of Object.entries(map)) {
+        files[norm(path)] = typeof v === 'string' ? new TextEncoder().encode(v) : await bytesOf(v, path);
+        if (mode !== undefined) modes[norm(path)] = mode;
+      }
+      return { files, modes };
+    })();
+    return this.#add(p);
+  }
+
+  #add(layer) {
+    if (this.#sys.phase === 'new' || this.#sys.phase === 'booting') {
+      this.#sources.push(layer);
+      layer.catch(() => {});
+      return layer.then(() => {});
+    }
+    return layer.then((l) => (l.image ? this.#files('addTar').layImage(l) : this.#files('addTar').lay(l))).then(() => {});
+  }
+
+  /** For boot: the layers, in order (later wins), and what a Persist kept,
+   *  laid over them. */
+  async #seed(opts) {
+    opts.layers = await Promise.all(this.#sources);
+    opts.records = this.#persist ? await this.#persist.load() : [];
+    this.#sources.length = 0;
+  }
+
+  #host() {
+    return this.#sys.pageFs();
+  }
+
+  /**
+   * Serve `path` from `provider`, the page's own filesystem, for every
+   * program, before boot or while the system runs. Over whatever the tree
+   * has there, which comes back at `unmount`. A guest call on it waits, in
+   * its own thread only, for the provider's promise. The provider's methods
+   * take paths inside it (`/`, `/a/b`) and throw errors with a `code`
+   * ('ENOENT', ...): `stat(path)` -> `{ type: 'file' | 'directory' |
+   * 'symlink', size, mode, mtime (ms or a Date), ino }`; `readdir(path)` ->
+   * `[{ name, type }]` or names; `open(path, { read, write, create,
+   * truncate, exclusive, append, mode })` -> a handle (anything);
+   * `read(handle, offset, length)` -> bytes; `write(handle, offset, bytes)`
+   * -> count; `close(handle)`; `mkdir(path, mode)`, `unlink(path)`,
+   * `rename(from, to)`; and when it has them `lstat`, `rmdir`,
+   * `truncate(path, length, handle)`, `chmod(path, mode)`, `utimes(path,
+   * mtime)`, `readlink(path)`, `symlink(target, path)`. Returns a `Mount`.
+   */
+  mount(path, provider) {
+    const at = norm(path);
+    if (at === '/') throw new Error('mount: the root is the system\'s own');
+    for (const m of ['stat', 'readdir', 'open', 'read', 'close']) {
+      if (typeof provider?.[m] !== 'function') throw new TypeError(`mount: the provider has no ${m}()`);
+    }
+    if (this.#mounts.has(at)) throw new Error(`mount: ${at} is mounted already`);
+    if (!['new', 'booting', 'running'].includes(this.#sys.phase)) throw new Error(`mount: the system is ${this.#sys.phase}`);
+    const id = this.#host().add(provider);
+    const mount = new Mount(this, at, provider);
+    this.#mounts.set(at, { mount, id });
+    if (this.#sys.phase === 'running') {
+      mount.ready = this.#sys.files().mount(at, id).then(() => mount);
+    } else {
+      mount.ready = Promise.resolve(mount);
+    }
+    return mount;
+  }
+
+  /** Take the mount at `path` out of the tree: what was there before shows
+   *  again, and its files still open fail. */
+  async unmount(path) {
+    const at = norm(path);
+    const m = this.#mounts.get(at);
+    if (!m) throw Object.assign(new Error(`unmount: nothing mounted at ${at}`), { code: 'EINVAL' });
+    this.#mounts.delete(at);
+    if (this.#sys.phase === 'running') await this.#sys.files().unmount(at);
+    this.#host().remove(m.id);
+    m.mount.dispatchEvent(new Event('unmounted'));
+  }
+
+  /** Every mount, as `[Mount]`. */
+  mounts() {
+    return [...this.#mounts.values()].map((m) => m.mount);
+  }
+
+  // -- the running tree ----------------------------------------------------
+
+  /** A file's bytes (`encoding`: its text). */
+  async readFile(path, { encoding } = {}) {
+    const b = await this.#files('readFile').readFile(norm(path));
+    return encoding ? new TextDecoder(encoding).decode(b) : b;
+  }
+
+  /** Write a file, made if missing (`mode`, default 0644); `append`. */
+  async writeFile(path, data, { mode, append, exclusive } = {}) {
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : await bytesOf(data, path);
+    return this.#files('writeFile').writeFile(norm(path), bytes, { mode, append, exclusive });
+  }
+
+  /** `{type, mode, size, ino, mtime (ms), nlink}`; `follow: false` is lstat. */
+  stat(path, { follow = true } = {}) {
+    return this.#files('stat').stat(norm(path), follow);
+  }
+
+  /** `[{name, type}]`, without `.` and `..`. */
+  readdir(path) {
+    return this.#files('readdir').readdir(norm(path));
+  }
+
+  mkdir(path, { recursive = false, mode = 0o755 } = {}) {
+    return this.#files('mkdir').mkdir(norm(path), { recursive, mode });
+  }
+
+  rm(path, { recursive = false, force = false } = {}) {
+    return this.#files('rm').rm(norm(path), { recursive, force });
+  }
+
+  rename(from, to) {
+    return this.#files('rename').rename(norm(from), norm(to));
+  }
+
+  symlink(target, path) {
+    return this.#files('symlink').symlink(target, norm(path));
+  }
+
+  readlink(path) {
+    return this.#files('readlink').readlink(norm(path));
+  }
+
+  chmod(path, mode) {
+    return this.#files('chmod').chmod(norm(path), mode);
+  }
+
+  /**
+   * Changes to `path` while the system runs, made by anyone (a program or
+   * the page), through the guest's inotify: for a directory, its entries
+   * (not their subdirectories' entries); for a file, the file.
+   * `fn({type, path})` for each, `type` one of 'create', 'change' (a write
+   * finished), 'attrib', 'delete', 'move-out', 'move-in' (a rename's two
+   * halves share a `cookie`), and 'gone' when `path` itself was deleted or
+   * moved, after which nothing more comes. Returns a function that stops it.
+   */
+  watch(path, fn) {
+    const at = norm(path);
+    const i = this.#sys;
+    if (!this.#watching) {
+      this.#watching = new Map();
+      i.on('watch', (m) => {
+        const f = this.#watching.get(m.h);
+        if (!f) return;
+        if (m.type === 'gone') this.#watching.delete(m.h);
+        f({ type: m.type, path: m.name ? norm(`${f.at}/${m.name}`) : f.at, ...(m.cookie ? { cookie: m.cookie } : {}) });
+      });
+    }
+    let h = null;
+    let stopped = false;
+    const each = Object.assign((e) => fn(e), { at });
+    this.#files('watch');
+    i.programs().addWatch(at).then((got) => {
+      h = got;
+      if (stopped) return i.programs().rmWatch(h).catch(() => {});
+      this.#watching.set(h, each);
+    }, (error) => fn({ type: 'error', path: at, error }));
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      if (h !== null && this.#watching.delete(h)) i.programs()?.rmWatch(h).catch(() => {});
+    };
+  }
+  #watching = null;
+}
+

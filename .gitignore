@@ -3,10 +3,8 @@ target/
 web/node_modules/
 web/dist/
 web/dist-sp/
-web/dist-demo/
 web/public/gex/
 web/public/rootfs/
-web/public/closure/
 /web/public/fs/
 guest/gl/out*/
 guest/glx-init/out/

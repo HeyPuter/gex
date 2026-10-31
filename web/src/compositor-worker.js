@@ -1,5 +1,3 @@
-// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
-import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
@@ -35,6 +33,7 @@ import {
   ROLE_CURSOR,
   F_CONFIGURE_PENDING,
   F_FULLSCREEN,
+  F_POINTER_LOCK,
   EV_MOTION,
   EV_BUTTON,
   EV_AXIS,
@@ -46,6 +45,8 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  EV_POINTER_LOCK,
+  EV_RELATIVE,
   waitPublish,
   releaseToken,
 } from '@gex/wl-bridge.mjs';
@@ -481,6 +482,29 @@ class Compositor {
   /** The placed window a held button belongs to (see `pointerMove`). */
   #grab = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
+  /** Pointer lock (pointer.rs): the window a press asked the page to lock
+   *  for, and the one the page's lock is now given to. */
+  #lockWant = null;
+  /** The window whose content the last press was on. */
+  #pressKey = null;
+  #lockKey = null;
+
+  /** The page's pointer lock began or ended. */
+  pointerLock(on, time) {
+    const prev = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (prev) sendEvent(this.#channel, prev.block, EV_POINTER_LOCK, 0, 0, time, 0, prev.client, prev.surface);
+    this.#lockKey = on ? this.#lockWant : null;
+    const win = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (win) sendEvent(this.#channel, win.block, EV_POINTER_LOCK, 1, 0, time, 0, win.client, win.surface);
+  }
+
+  /** Movement under the lock, in device pixels (1/256). */
+  pointerRelative(dx, dy, time) {
+    const win = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (!win) return;
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_RELATIVE, Math.round(dx / k), Math.round(dy / k), time, 0, win.client, win.surface);
+  }
   #drag = null;
   /** An interactive resize: the window, the edges being dragged
    *  (`EDGE_*`), and where the pointer and the window started. */
@@ -586,7 +610,7 @@ class Compositor {
     const held = this.#memories.get(token);
     if (!held) return null;
     // A shared memory grown by another thread can keep its buffer object and
-    // only grow its length (overlay-worker.js's check): a view from before
+    // only grow its length: a view from before
     // then stops short, and the windows of a process that grew past it (a
     // desktop and taskbar, with explorer /desktop a process of its own)
     // were never painted again.
@@ -820,6 +844,17 @@ class Compositor {
       }
       const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;
       if (fs !== !!win.fullscreen) this.#fullscreen(k, win, fs);
+      // A client's pointer lock asked for, or given up (pointer.rs).
+      const wanted = !!win.wantsLock;
+      win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
+      if (!win.wantsLock && this.#lockKey === k) post({ kind: 'lock-release' });
+      // Asked for by the window last pressed, after the press (an X
+      // program's grab on a click): the page takes it if that click's
+      // activation still lasts.
+      if (win.wantsLock && !wanted && this.#pressKey === k && !this.#lockKey) {
+        this.#lockWant = k;
+        post({ kind: 'lock-wanted', late: true });
+      }
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
       win.layer = s.layer;
@@ -879,6 +914,7 @@ class Compositor {
       }
       this.#windows.delete(k);
       this.#order = this.#order.filter((o) => o !== k);
+      if (this.#lockKey === k) post({ kind: 'lock-release' });
       // The keyboard goes to whatever is now on top, and that window is told
       // so -- a focus that is only a variable here leaves every client
       // believing it is inactive.
@@ -1673,6 +1709,20 @@ class Compositor {
   }
 
   pointerButton(button, pressed, time) {
+    // Under the lock every button is the locked window's.
+    const locked = this.#lockKey ? this.#windows.get(this.#lockKey) : null;
+    if (locked) {
+      sendEvent(this.#channel, locked.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, locked.client, locked.surface);
+      return;
+    }
+    if (pressed) {
+      const hit = this.#hit(this.#pointer.x, this.#pointer.y);
+      this.#pressKey = hit?.part === 'content' ? hit.key : null;
+      if (hit?.part === 'content' && hit.win.wantsLock) {
+        this.#lockWant = hit.key;
+        post({ kind: 'lock-wanted' });
+      }
+    }
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
@@ -2054,7 +2104,9 @@ async function startGl(m, canvas) {
   glFrames = textureCanvas();
   glTarget = glFrames.canvas;
   // Emscripten looks a canvas up by selector, and a worker has no document.
-  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
+  // Nothing else is in it (a dev server's client, seeing a document, lists
+  // its styles).
+  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget, querySelectorAll: () => [] };
   const { MesaGlDevice } = await import('./mesa-gl.js');
   glDevice = await MesaGlDevice.create(glTarget, {
     url: m.url,
@@ -2168,6 +2220,10 @@ const onMessage = ({ data: m }) => {
       comp?.resize(m.width, m.height);
     } else if (m.kind === 'pointer-move') {
       comp?.pointerMove(m.x, m.y, m.time);
+    } else if (m.kind === 'pointer-lock') {
+      comp?.pointerLock(m.on, m.time);
+    } else if (m.kind === 'pointer-relative') {
+      comp?.pointerRelative(m.dx, m.dy, m.time);
     } else if (m.kind === 'pointer-button') {
       comp?.pointerButton(m.button, m.pressed, m.time);
     } else if (m.kind === 'pointer-axis') {

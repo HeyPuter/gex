@@ -426,7 +426,6 @@ async function begin(opts, base, at, state, meter) {
   let [w, h] = sizeOf(opts.size ?? b.size);
   let canvas = opts.canvas ?? null;
   let desk = null;
-  let bareDesktop = null;
   if (compositor) {
     if (!canvas) {
       canvas = document.createElement('canvas');
@@ -445,7 +444,6 @@ async function begin(opts, base, at, state, meter) {
     if (canvas) canvas.replaceWith(desk);
     else container.append(desk);
     canvas = null;
-    ({ bareDesktop } = await import('./bare-desktop.js'));
   }
 
   state.phase = 'fetching';
@@ -514,7 +512,7 @@ async function begin(opts, base, at, state, meter) {
   const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
   // The runtime's wasm, compressed in the pack when the site packed it
   // (plain, the shim alone was 6.6 MB of Paint's download), and fetched now,
-  // first, when it did not: a module left for pid 1 to fetch (the 2 KB seed,
+  // first, when it did not: a module left for the program to fetch (the 2 KB seed,
   // which packing does not shrink) waited 90 ms behind the bundle and the fill.
   const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
     [k, await fetchShared(url, fetcher, { priority: 'high' })]))
@@ -684,8 +682,8 @@ async function begin(opts, base, at, state, meter) {
       preModules.splice(c < 0 ? preModules.length : c, 0, entry);
     };
     // Downloaded, decoded into `buf` and its late units compiled in a Worker
-    // (fill-worker.js): on this thread the decode held pid 1's start-up,
-    // whose every await waited behind a chunk (running to pid 1 ready took
+    // (fill-worker.js): on this thread the decode held the program's start-up,
+    // whose every await waited behind a chunk (running to its ready took
     // 110-160 ms beside it, 53-69 ms before the fill).
     const z = await packedEntry(at(fl.url), fetcher);
     const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module', name: 'fill' });
@@ -844,7 +842,8 @@ async function begin(opts, base, at, state, meter) {
     d3d: !!b.d3d,
     wl: desk ?? canvas,
     wlInput: desk ?? canvas,
-    onDesktop: desk ? (d) => { desktop = d; globalThis.__gexCompositor = bareDesktop(d, desk); } : null,
+    // The windows laid out in `desk` (bare-desktop.js, at `__gexCompositor`).
+    onDesktop: desk ? (d) => { desktop = d; } : null,
     onSystem: (s) => { sys = s; },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,
     // under the X session's own window manager (see hostx.js).
@@ -858,7 +857,6 @@ async function begin(opts, base, at, state, meter) {
     identities: b.identities ?? null,
     stateful: b.stateful ?? null,
     providerSources: b.providerSources ?? null,
-    transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
     onFilesLoaded: () => {
@@ -920,8 +918,7 @@ async function begin(opts, base, at, state, meter) {
     state,
     kill() {
       if (state.phase === 'done' || state.phase === 'failed') return;
-      sys?.host?.stop();
-      sys?.compositor?.stop?.();
+      sys?.system.shutdown().catch(() => {});
       globalThis.__gexSystemWorker?.terminate?.();
       settle(137);
     },
@@ -1256,9 +1253,9 @@ function mesaSource(f, at) {
 }
 
 /**
- * A file in one ArrayBuffer, which is moved (not cloned) to pid 1's Worker:
- * a clone would copy it, and a SharedArrayBuffer stays resident for the
- * session. The Worker frees it once loaded.
+ * A file in one ArrayBuffer, not a SharedArrayBuffer: one stays resident
+ * for the session, and the page lets go of this once the kernel has the
+ * files (`onFilesLoaded`).
  */
 async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   const z = await packedEntry(url, f);

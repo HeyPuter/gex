@@ -64,6 +64,10 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  EV_POINTER_LOCK,
+  EV_RELATIVE,
+  F_FULLSCREEN,
+  F_POINTER_LOCK,
   ROLE_TOPLEVEL,
   ROLE_POPUP,
   ROLE_SUBSURFACE,
@@ -144,6 +148,19 @@ class DomWindow {
     this.onresized = null;
     this.onplace = null;
     this.onclosed = null;
+    /** The client's window-management requests from its own frame:
+     *  `onrequest(kind, edges)`, kind 'move', 'resize' (`edges`: 1 top,
+     *  2 bottom, 4 left, 8 right), 'maximize' or 'unmaximize'; each once. */
+    this.onrequest = null;
+    this.requestSeq = undefined;
+    /** `onfullscreen(on)`: the client asked to be fullscreen, or not. */
+    this.onfullscreen = null;
+    this.fullscreen = false;
+    /** The states the page has given it (`setStates`): STATE_MAXIMIZED,
+     *  STATE_FULLSCREEN, STATE_RESIZING; activation is the keyboard's. */
+    this.states = 0;
+    /** Buffer pixels per surface unit (`wl_surface.set_buffer_scale`). */
+    this.bufferScale = 1;
     this.#desktop = desktop;
   }
 
@@ -167,6 +184,12 @@ class DomWindow {
 
   /** Ask the client to be this size. It answers by drawing at it. */
   resize(w, h) {
+    this.#desktop.configure(this, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
+  }
+
+  /** Tell the client its states (`DomDesktop.STATE_*`), with its size. */
+  setStates(states, w = this.width, h = this.height) {
+    this.states = states & ~1;
     this.#desktop.configure(this, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
   }
 
@@ -315,6 +338,10 @@ function clampDamage(s, cw, ch, full = false) {
  * `mount` is only what keyboard and wheel events are listened on.
  */
 export class DomDesktop {
+  /** A configure's states (`gex_wayland::STATE_*`). */
+  static STATE_MAXIMIZED = 2;
+  static STATE_RESIZING = 4;
+  static STATE_FULLSCREEN = 8;
   #channel;
   #mount;
   #windows = new Map();
@@ -342,6 +369,24 @@ export class DomDesktop {
   #glGone = false;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
+  /** Pointer lock (web/runtime PointerLock): whether a click on a window
+   *  whose client asks for a locked pointer takes the browser's lock, and
+   *  `onpointerlock(win | null)` as it is taken and let go. */
+  pointerLock = false;
+  onpointerlock = null;
+  #locked = null;
+  /** The window the last press was on. */
+  #pressed = null;
+  #onLockChange = () => {
+    const el = document.pointerLockElement;
+    const win = el ? [...this.#windows.values()].find((w) => w.canvas === el) ?? null : null;
+    if (win === this.#locked) return;
+    const t = Math.round(performance.now());
+    if (this.#locked) sendEvent(this.#channel, this.#locked.block, EV_POINTER_LOCK, 0, 0, t, 0, this.#locked.client, this.#locked.surface);
+    this.#locked = win;
+    if (win) sendEvent(this.#channel, win.block, EV_POINTER_LOCK, 1, 0, t, 0, win.client, win.surface);
+    this.onpointerlock?.(win);
+  };
 
   static create(mount, channel, { width, height } = {}) {
     const d = new DomDesktop();
@@ -351,16 +396,19 @@ export class DomDesktop {
     const h = height || mount.clientHeight || 760;
     setOutputSize(channel, w, h);
     d.#listen();
+    document.addEventListener('pointerlockchange', d.#onLockChange);
     d.#running = true;
     d.#raf = requestAnimationFrame(() => d.#frame());
     return d;
   }
 
   /** The output's size from now on (app.js `resize()`): what a client asks
-   *  for the screen's size sees this. Windows already up keep their places. */
-  resizeOutput(w, h) {
+   *  for the screen's size sees this. Windows already up keep their places.
+   *  `scale`, when given: device pixels per surface unit (wl_output.scale),
+   *  which clients that connect after it are told. */
+  resizeOutput(w, h, scale) {
     this.#touched++;
-    setOutputSize(this.#channel, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
+    setOutputSize(this.#channel, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)), scale);
   }
 
   /** Run the guest's OpenGL for this desktop.
@@ -471,7 +519,7 @@ export class DomDesktop {
     const held = this.#memories.get(token);
     if (!held) return null;
     // A shared memory grown by another thread can keep its buffer object and
-    // only grow its length (overlay-worker.js's check): a view from before
+    // only grow its length: a view from before
     // then stops short, and the windows of a process that grew past it (a
     // desktop and taskbar, with explorer /desktop a process of its own)
     // were never painted again.
@@ -500,6 +548,8 @@ export class DomDesktop {
 
   stop() {
     this.#running = false;
+    document.removeEventListener('pointerlockchange', this.#onLockChange);
+    if (this.#locked) document.exitPointerLock?.();
     if (this.#raf) cancelAnimationFrame(this.#raf);
     this.#raf = 0;
     for (const win of this.#windows.values()) win.onclosed?.();
@@ -641,6 +691,7 @@ export class DomDesktop {
       if (live.has(k)) continue;
       this.#windows.delete(k);
       this.#focusPrev = this.#focusPrev.filter((w) => w !== win);
+      if (this.#pressed === win) this.#pressed = null;
       if (this.#focus === win) {
         // Back to the window that had it before, or the client's next key goes
         // nowhere: Win32 does not activate anything when a menu, a tooltip or
@@ -655,7 +706,7 @@ export class DomDesktop {
         // which is what the scene compositor's fallback arrow amounts to.
         this.#cursor = null;
         this.#cursorShown = -1;
-        this.#mount.style.cursor = 'default';
+        this.#setCursor('default');
       }
       if (win.glFrame) this.#gl?.surfaceCanvas?.(win.glFrame, false);
       win.dropGl();
@@ -685,6 +736,33 @@ export class DomDesktop {
     // client's subsurface for a window's GL picture is one, laid over its
     // parent, and its parent must get the pointer. A region that is not
     // empty is taken as the whole surface here.
+    win.bufferScale = (s.flags >> 8) & 0xff || 1;
+    // A client's request from its own frame (a GTK title bar, a client-side
+    // border), acted on once per number; the first sight of a window only
+    // learns the number. As the scene compositor reads it.
+    const seq = (s.flags >> 3) & 0xf;
+    if (win.requestSeq === undefined) win.requestSeq = seq;
+    else if (seq !== win.requestSeq && s.role === ROLE_TOPLEVEL && !s.placed) {
+      win.requestSeq = seq;
+      const code = (s.flags >>> 24) & 0x7f;
+      const kind = ['none', 'move', 'resize', 'maximize', 'unmaximize'][code & 7];
+      if (kind && kind !== 'none') win.onrequest?.(kind, (code >> 3) & 0xf);
+    }
+    const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;
+    if (fs !== win.fullscreen) {
+      win.fullscreen = fs;
+      win.onfullscreen?.(fs);
+    }
+    // The client's lock asked for (taken at a click) or given up.
+    const wanted = !!win.wantsLock;
+    win.wantsLock = (s.flags & F_POINTER_LOCK) !== 0;
+    if (!win.wantsLock && this.#locked === win) document.exitPointerLock?.();
+    // Asked for by the window last pressed, after the press (an X program's
+    // grab on a click): taken while that click's activation lasts.
+    if (win.wantsLock && !wanted && this.pointerLock && this.#pressed === win && !this.#locked
+        && navigator.userActivation?.isActive && document.pointerLockElement !== win.canvas) {
+      win.canvas.requestPointerLock?.()?.catch?.(() => {});
+    }
     const noInput = !takesPointer(s);
     if (noInput !== win.noInput) {
       win.noInput = noInput;
@@ -763,11 +841,21 @@ export class DomDesktop {
       const hy = Math.max(0, Math.round(win.relY));
       // `default` after it, because a cursor image the browser rejects -- too
       // large, or a hotspot outside it -- must not leave the pointer invisible.
-      this.#mount.style.cursor = `url(${url}) ${hx} ${hy}, default`;
+      this.#setCursor(`url(${url}) ${hx} ${hy}, default`);
     } catch (e) {
-      this.#mount.style.cursor = 'default';
+      this.#setCursor('default');
     }
   }
+
+  /** The client's cursor as a CSS `cursor` value: on the mount, which every
+   *  window in it inherits, or to `oncursor(css)` when the page puts the
+   *  windows elsewhere. */
+  #setCursor(css) {
+    if (this.oncursor) this.oncursor(css);
+    else this.#mount.style.cursor = css;
+  }
+
+  oncursor = null;
 
   // -- what the page asks for ---------------------------------------------
 
@@ -777,7 +865,7 @@ export class DomDesktop {
   }
 
   configure(win, w, h) {
-    sendEvent(this.#channel, win.block, EV_CONFIGURE, w, h, 0,
+    sendEvent(this.#channel, win.block, EV_CONFIGURE, w, h, win.states | 0,
               this.#focus === win ? 1 : 0, win.client, win.surface);
   }
 
@@ -911,12 +999,29 @@ export class DomDesktop {
                 p.t, 0, win.client, win.surface);
     };
     c.addEventListener('pointermove', (e) => {
+      // Locked: movement only, which the client's relative pointer takes.
+      if (this.#locked === win) {
+        if (e.movementX || e.movementY) {
+          sendEvent(this.#channel, win.block, EV_RELATIVE, Math.round(e.movementX * 256), Math.round(e.movementY * 256),
+            Math.round(e.timeStamp), 0, win.client, win.surface);
+        }
+        if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, { t: Math.round(e.timeStamp) });
+        return;
+      }
       const p = at(e);
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
       if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
+      this.#pressed = win;
+      if (this.#locked === win) {
+        button(e, true, { t: Math.round(e.timeStamp) });
+        return;
+      }
+      if (this.pointerLock && win.wantsLock && document.pointerLockElement !== c) {
+        c.requestPointerLock?.()?.catch?.(() => {});
+      }
       const p = at(e);
       this.focus(win);
       // A pointer that is no longer active makes this throw, and a window
@@ -960,18 +1065,8 @@ export class DomDesktop {
    *  focus anywhere -- a titlebar's close button, say -- and the client with
    *  the keyboard should keep receiving keys. */
   #listen() {
-    const onKey = (e, pressed) => {
-      const win = this.#focus;
-      if (!win) return;
-      const code = EVDEV[e.code];
-      if (code === undefined) return;
-      e.preventDefault();
-      sendEvent(this.#channel, win.block, EV_MODS, modsOf(e), 0, 0, 0, win.client, 0);
-      sendEvent(this.#channel, win.block, EV_KEY, code, pressed ? 1 : 0,
-                Math.round(e.timeStamp), 0, win.client, win.surface);
-    };
-    const down = (e) => onKey(e, true);
-    const up = (e) => onKey(e, false);
+    const down = (e) => this.keyEvent(e, true);
+    const up = (e) => this.keyEvent(e, false);
     // The mouse's buttons are the guest's, not the browser's: no context
     // menu over the desktop (it opens on the right button's press on Linux
     // and macOS, and takes the release with it: the client never sees the
@@ -998,6 +1093,20 @@ export class DomDesktop {
   }
 
   #detach = null;
+
+  /** A `keydown` (`pressed`) or `keyup` the page heard, to the window with
+   *  the keyboard: for a page that listens for keys somewhere other than
+   *  the mount. */
+  keyEvent(e, pressed) {
+    const win = this.#focus;
+    if (!win) return;
+    const code = EVDEV[e.code];
+    if (code === undefined) return;
+    e.preventDefault();
+    sendEvent(this.#channel, win.block, EV_MODS, modsOf(e), 0, 0, 0, win.client, 0);
+    sendEvent(this.#channel, win.block, EV_KEY, code, pressed ? 1 : 0,
+              Math.round(e.timeStamp), 0, win.client, win.surface);
+  }
 
   /** The cursor surface a client asked for, if it has one: a page that wants
    *  to draw it puts this canvas at the pointer, offset by its hotspot. */

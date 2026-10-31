@@ -1347,7 +1347,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // One word per slot for good: bridged again (`elfprov::rebridge`, a
         // second publish over the same pages), it gets the one it had, whose
         // entry every Worker that wrote the bridge there still holds.
-        let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::map(t as usize).is_some()).collect();
+        let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::dense_table(t as usize)).collect();
         let entries: Vec<u32> = dense.iter().map(|&(t, slot)| gex_abi::dispatch_entry(t as usize, slot)).collect();
         let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, &mut j.bridge_group, &entries, crate::dense::alloc);
         let mut filled = std::collections::BTreeSet::new();
@@ -1359,7 +1359,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
             }
         }
         for (t, slot) in seen {
-            if crate::dense::map(t as usize).is_none() {
+            if !crate::dense::dense_table(t as usize) {
                 regs.extend_from_slice(&[t, slot]);
             }
         }
@@ -2641,7 +2641,7 @@ pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
         return -1;
     }
     let k = gex_abi::dispatch_entry_table(entry);
-    if crate::dense::map(k).is_some() {
+    if crate::dense::dense_table(k) {
         let d = crate::dense::lookup(pc);
         return if d == 0 { -1 } else { ((gex_emit::dense::TABLE_INDEX as i64) << 32) | d as i64 };
     }

@@ -13,6 +13,7 @@
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { pageFs } from './page-fs.mjs';
 import { single, sched } from './single.mjs';
 
 /** The single-thread build's fibers park on the scheduler, not on their
@@ -75,12 +76,12 @@ export class PageTty {
       try {
         scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared: true });
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory), page_fs: pageFs(spec.memory) },
         });
       } catch {
         scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory), page_fs: pageFs(spec.memory) },
         });
       }
     } catch (e) {

@@ -80,6 +80,9 @@ export class WispNetwork {
   #waiting = [];
   /** The page-served hosts (page-host.mjs `pageHosts`): name -> base URL. */
   #pageHosts = null;
+  /** `connect(host, port)`: every stream from the page's own network
+   *  rather than Wisp (web/runtime `Network`). */
+  #dial = null;
 
   /** Receive rings in shared memory (net-bridge.mjs `Rings`), set by
    *  `serveNet`: each stream's bytes go into its ring as they arrive, and its
@@ -92,11 +95,15 @@ export class WispNetwork {
   onActivity = () => {};
 
   /** `pageHosts`: a Map of host name to the base URL its files are
-   *  fetched under (page-host.mjs), answered here rather than over Wisp. */
-  constructor(wispUrl, onEvent = () => {}, { pageHosts = null } = {}) {
+   *  fetched under (page-host.mjs), answered here rather than over Wisp.
+   *  `dial(host, port)`: a stream as a Wisp stream is (`send`, `close`,
+   *  `onopen`, `onmessage`, `onclose`, `onerror`) for every connection, in
+   *  place of the proxy. */
+  constructor(wispUrl, onEvent = () => {}, { pageHosts = null, dial = null } = {}) {
     this.#url = wispUrl == null ? null : wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
     this.#onEvent = onEvent;
     this.#pageHosts = pageHosts?.size ? pageHosts : null;
+    this.#dial = dial;
   }
 
   /** The page-served hosts, as `[name, base]` pairs: what a Worker that
@@ -164,7 +171,7 @@ export class WispNetwork {
   // -- the seven calls the shim makes --------------------------------------
 
   open() {
-    if (!this.#conn && !this.#redialing && !this.#pageHosts) return 0;
+    if (!this.#conn && !this.#redialing && !this.#pageHosts && !this.#dial) return 0;
     const id = this.#next++;
     const s = new Stream(id);
     if (this.rings) s.slot = this.rings.claim(id);
@@ -185,6 +192,17 @@ export class WispNetwork {
     const base = this.#pageHosts?.get(String(host).toLowerCase());
     if (base) {
       this.#wire(s, id, new PageHostStream(base), host, port);
+      return;
+    }
+    if (this.#dial) {
+      let w;
+      try {
+        w = this.#dial(host, port);
+      } catch {
+        this.#state(s, REFUSED);
+        return;
+      }
+      this.#wire(s, id, w, host, port);
       return;
     }
     if (!this.#conn) {

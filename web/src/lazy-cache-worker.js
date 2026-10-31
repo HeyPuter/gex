@@ -17,7 +17,7 @@
 // Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
 //      now and then (bytes from the network, from the cache, since the last).
 
-import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP, chunkKey } from '../../shims/browser/js/lazy-cache.mjs';
+import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP, chunkKey, FailedFrames, retryAsync } from '../../shims/browser/js/lazy-cache.mjs';
 
 let net = 0, kept = 0, posted = 0;
 const report = () => {
@@ -98,29 +98,37 @@ async function decoder() {
   zstd ??= import(zstdUrl).then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); return d; });
   return zstd;
 }
+// The bundles' index and frames given up (lazy-cache.mjs FailedFrames):
+// a read of one fails at once until its hold ends, and quietly (the give-up
+// said so once).
+const failed = new FailedFrames();
+const heldError = new Error('given up a moment ago');
 async function getRange(url, lo, hi) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
-      const body = new Uint8Array(await res.arrayBuffer());
-      if (res.status === 206 && body.length === hi - lo) return body;
-      if (res.status === 200 && body.length >= hi) return body.subarray(lo, hi);
-    } catch { /* again */ }
-  }
-  throw new Error(`${url} @${lo}: no answer`);
+  const body = await retryAsync(async () => {
+    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
+    const b = new Uint8Array(await res.arrayBuffer());
+    if (res.status === 206 && b.length === hi - lo) return b;
+    if (res.status === 200 && b.length >= hi) return b.subarray(lo, hi);
+    return null;
+  });
+  if (!body) throw new Error(`${url} @${lo}: no answer`);
+  return body;
 }
+// One fetch a frame however many readers want it: they share its promise
+// (`decoded`) while it is in flight.
 function frameOf(url, b, k) {
   const key = `${url}#${k}`;
   let f = decoded.get(key);
   if (f) {
     decoded.delete(key);
   } else {
+    if (failed.held(key)) return Promise.reject(heldError);
     const [o, n] = b.frames[k];
     f = Promise.all([getRange(url, o, o + n), decoder()]).then(([z, d]) => {
       net += z.length;
       return d.decode(z, k === b.frames.length - 1 ? 0 : b.frame);
     });
-    f.catch(() => decoded.delete(key));
+    f.catch(() => { decoded.delete(key); failed.failed(key); });
   }
   decoded.set(key, f);
   while (decoded.size > FRAMES_KEPT) decoded.delete(decoded.keys().next().value);
@@ -132,9 +140,14 @@ async function bundleRead(href, from, len) {
   const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
   let b = bundles.get(url);
   if (!b) {
-    b = fetch(`${url}.json`).then((r) => r.json());
+    const key = `${url}.json`;
+    if (failed.held(key)) throw heldError;
+    b = retryAsync(async () => {
+      const r = await fetch(key);
+      return r.ok ? r.json() : null;
+    }).then((j) => j ?? Promise.reject(new Error(`${key}: no answer`)));
     bundles.set(url, b);
-    b.catch(() => bundles.delete(url));
+    b.catch(() => { bundles.delete(url); failed.failed(key); });
   }
   b = await b;
   const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
@@ -186,7 +199,7 @@ self.onmessage = async ({ data: m }) => {
     try {
       bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len) : await read(cache, url, from, len);
     } catch (e) {
-      console.warn(`[lazy-cache] ${e?.message ?? e}`);
+      if (e !== heldError) console.warn(`[lazy-cache] ${e?.message ?? e}`);
     }
     // (A reader no longer gives up once its ask is taken; should one ever,
     // nothing is written into its buffer, which may be gone.)

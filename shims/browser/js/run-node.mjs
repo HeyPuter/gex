@@ -607,6 +607,8 @@ const host = new ProcessHost({
     // libraries, their modules under the unit cache (cgen.rs `set_stateful`).
     stateful: process.env.GEX_STATEFUL || undefined,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
+    // Its own line per process exit (`onExit` below), not the host's.
+    ownExitLines: true,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,

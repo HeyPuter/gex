@@ -109,3 +109,52 @@ export function cachedRead(href, from, dst, len) {
   Atomics.store(ctl, base, FREE);
   return n;
 }
+
+// A rest bundle's ranged request that fails (lazy-fetch.mjs, the owner's
+// lazy-cache-worker.js): tried again after each of RETRY_MS, then given up;
+// the reader gets -1 (the kernel's EIO). A frame given up is not asked for
+// again for FAILED_HOLD_MS: every read of it before then fails at once, with
+// no request. Without this every read of a frame the server would not give
+// asked again at once, and the guest read again, a few hundred requests a
+// second while the program waited on the file.
+export const RETRY_MS = Object.freeze([250, 1000, 4000]);
+export const FAILED_HOLD_MS = 30000;
+
+/** Frames (by key) given up, until when. */
+export class FailedFrames {
+  #until = new Map();
+  /** Whether `key` was given up and is still held. */
+  held(key, now = Date.now()) {
+    const t = this.#until.get(key);
+    if (t === undefined) return false;
+    if (now < t) return true;
+    this.#until.delete(key);
+    return false;
+  }
+  failed(key, now = Date.now()) { this.#until.set(key, now + FAILED_HOLD_MS); }
+  ok(key) { this.#until.delete(key); }
+}
+
+let napCell = null;
+/** `get()` until it gives bytes, waiting RETRY_MS between tries (a Worker
+ *  blocked in the kernel: `Atomics.wait`); null once given up. */
+export function retrySync(get, delays = RETRY_MS) {
+  for (let i = 0; ; i++) {
+    let got = null;
+    try { got = get(); } catch { got = null; }
+    if (got) return got;
+    if (i >= delays.length) return null;
+    Atomics.wait(napCell ??= new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[i]);
+  }
+}
+
+/** The same for an asynchronous `get()` (the owner's fetch). */
+export async function retryAsync(get, delays = RETRY_MS) {
+  for (let i = 0; ; i++) {
+    let got = null;
+    try { got = await get(); } catch { got = null; }
+    if (got) return got;
+    if (i >= delays.length) return null;
+    await new Promise((r) => setTimeout(r, delays[i]));
+  }
+}

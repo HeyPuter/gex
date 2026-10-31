@@ -29,6 +29,55 @@ function octal(bytes, off, len) {
 }
 
 /**
+ * Each entry of a tar, in order: `visit({ name, type, size, body, off,
+ * link, ext })`, its name and link target with the long-name and pax
+ * headers before it applied (`ext`: that pax header's records), `body`
+ * where its bytes start, `off` its header. A true answer stops the walk.
+ * Nothing is copied but the names.
+ */
+export function tarEntries(buf, visit) {
+  const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let off = 0;
+  let longName = null;
+  let longLink = null;
+  // The pax extended header for the next entry: { path, linkpath, xattrs }.
+  let pax = null;
+  while (off + BLOCK <= b.length) {
+    // Two zero blocks end the archive; one is enough to know we are done.
+    if (b[off] === 0) {
+      off += BLOCK;
+      continue;
+    }
+    const size = octal(b, off + 124, 12);
+    const type = String.fromCharCode(b[off + 156] || 0x30);
+    const body = off + BLOCK;
+    const next = body + Math.ceil(size / BLOCK) * BLOCK;
+    if (type === 'x') {
+      pax = paxRecords(b.subarray(body, body + size));
+    } else if (type === 'K') {
+      // GNU long link target, for the next entry.
+      longLink = str(b, body, size);
+    } else if (type === 'L') {
+      // GNU long name: this entry's body is the name of the next entry.
+      longName = str(b, body, size);
+    } else if (type !== 'g') {
+      let name = str(b, off, 100);
+      const prefix = str(b, off + 345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+      if (longName !== null) name = longName;
+      let link = longLink ?? str(b, off + 157, 100);
+      longName = longLink = null;
+      const ext = pax;
+      pax = null;
+      if (ext?.path !== undefined) name = ext.path;
+      if (ext?.linkpath !== undefined) link = ext.linkpath;
+      if (visit({ name, type, size, body, off, link, ext })) return;
+    }
+    off = next;
+  }
+}
+
+/**
  * Unpack a tar into `{ files, dirs, links, hard, modes }`.
  *
  * `files` maps an absolute guest path to its bytes, `dirs` lists directories
@@ -53,11 +102,6 @@ export function untar(buf, root = '') {
   // Extended attributes (`user.*`), path to { name: bytes }: what the pax
   // headers carry, for `gex_set_xattr`.
   const xattrs = Object.create(null);
-  let off = 0;
-  let longName = null;
-  let longLink = null;
-  // The pax extended header for the next entry: { path, linkpath, xattrs }.
-  let pax = null;
 
   const path = (name) => {
     let p = name.replace(/^\.\//, '').replace(/\/+$/, '');
@@ -65,52 +109,11 @@ export function untar(buf, root = '') {
     return `${root}/${p}`.replace(/\/{2,}/g, '/');
   };
 
-  while (off + BLOCK <= b.length) {
-    // Two zero blocks end the archive; one is enough to know we are done.
-    if (b[off] === 0) {
-      off += BLOCK;
-      continue;
-    }
-    let name = str(b, off, 100);
-    const size = octal(b, off + 124, 12);
-    const type = String.fromCharCode(b[off + 156] || 0x30);
-    const prefix = str(b, off + 345, 155);
-    if (prefix) name = `${prefix}/${name}`;
-    if (longName !== null) {
-      name = longName;
-      longName = null;
-    }
-    let linkTarget = null;
-    if (longLink !== null) {
-      linkTarget = longLink;
-      longLink = null;
-    }
-    const body = off + BLOCK;
-    const next = body + Math.ceil(size / BLOCK) * BLOCK;
-    // This entry's pax header, used up by it (a header's own type is next).
-    let ext = null;
-    if (pax && type !== 'x' && type !== 'g' && type !== 'L' && type !== 'K') {
-      ext = pax;
-      pax = null;
-      if (ext.path !== undefined) name = ext.path;
-      if (ext.linkpath !== undefined) linkTarget = ext.linkpath;
-    }
-    const linkOf = () => linkTarget ?? str(b, off + 157, 100);
+  tarEntries(b, ({ name, type, size, body, off, link, ext }) => {
     const keepXattrs = (p) => {
       if (p && ext && ext.xattrs) xattrs[p] = ext.xattrs;
     };
-
-    if (type === 'x') {
-      pax = paxRecords(b.subarray(body, body + size));
-    } else if (type === 'g') {
-      // A global header: nothing here needs one.
-    } else if (type === 'K') {
-      // GNU long link target, for the next entry.
-      longLink = str(b, body, size);
-    } else if (type === 'L') {
-      // GNU long name: this entry's body is the name of the next entry.
-      longName = str(b, body, size);
-    } else if (type === '5') {
+    if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
       // The archive's own top (`./`) names the directory it unpacks into,
@@ -127,15 +130,13 @@ export function untar(buf, root = '') {
       if (p && mode && mode !== 0o755) modes[p] = mode;
     } else if (type === '2') {
       const p = path(name);
-      const target = linkOf();
-      if (p) links[p] = target;
+      if (p) links[p] = link;
     } else if (type === '1') {
       // A hard link's target is relative to the root of the archive, not the
       // link's directory (a symlink's is). Resolving it like a symlink would
       // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
       const p = path(name);
-      const target = linkOf();
-      if (p && target) hard[p] = `/${target.replace(/^\.\//, '')}`;
+      if (p && link) hard[p] = `/${link.replace(/^\.\//, '')}`;
     } else if (type === '0' || type === '\0' || type === '7') {
       const p = path(name);
       if (p) {
@@ -151,8 +152,7 @@ export function untar(buf, root = '') {
         keepXattrs(p);
       }
     }
-    off = next;
-  }
+  });
   return { files, dirs, links, hard, modes, mtimes, xattrs };
 }
 

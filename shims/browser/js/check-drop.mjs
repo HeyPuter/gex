@@ -38,7 +38,7 @@ const proc = new WebAssembly.Memory({ initial: 16, maximum: 65535, shared: true 
 const env = {
   memory,
   process: proc,
-  lazy_fetch: () => 0,
+  lazy_fetch: () => 0, page_fs: () => -5,
   process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }),
 };
 // The page's own instance, which reads back what the Worker wrote.

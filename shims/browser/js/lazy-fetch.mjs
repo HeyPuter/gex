@@ -4,7 +4,7 @@
 // there anyway); it fills `len` bytes at `dst` in the kernel's memory.
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
-import { cachedRead, lazyCacheOn } from './lazy-cache.mjs';
+import { cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
 // one after another in one stream, while the guest runs. `buf` (a
@@ -95,7 +95,17 @@ export function lazyReady() {
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
   return zstdLoad;
 }
-const bundles = new Map(); // bundle URL -> { frame, frames, kept: Map(k -> bytes) } or null
+const bundles = new Map(); // bundle URL -> { frame, frames, kept: Map(k -> bytes) }
+// Its index and frames this Worker gave up on (lazy-cache.mjs FailedFrames).
+const failed = new FailedFrames();
+// A failure said once a hold, not at every read of it (a guest that reads
+// again and again).
+const said = new FailedFrames();
+function sayOnce(key, line) {
+  if (said.held(key)) return;
+  said.failed(key);
+  console.error(line);
+}
 function syncGet(url, range) {
   const x = new XMLHttpRequest();
   x.open('GET', url, false);
@@ -110,16 +120,22 @@ function syncGet(url, range) {
   return null;
 }
 function bundleIndex(url) {
-  if (bundles.has(url)) return bundles.get(url);
-  let b = null;
-  try {
-    const j = JSON.parse(new TextDecoder().decode(syncGet(`${url}.json`)));
-    b = { frame: j.frame, frames: j.frames, kept: new Map() };
-  } catch (e) {
-    console.error(`[lazy] ${url}.json: ${e?.message ?? e}`);
+  const b = bundles.get(url);
+  if (b) return b;
+  const key = `${url}.json`;
+  if (failed.held(key)) return null;
+  const got = retrySync(() => {
+    const j = JSON.parse(new TextDecoder().decode(syncGet(key)));
+    return Array.isArray(j.frames) ? j : null;
+  });
+  if (!got) {
+    failed.failed(key);
+    console.error(`[lazy] ${key}: no answer`);
+    return null;
   }
-  bundles.set(url, b);
-  return b;
+  const n = { frame: got.frame, frames: got.frames, kept: new Map() };
+  bundles.set(url, n);
+  return n;
 }
 function bundleRead(href, from, memory, dst, len) {
   const h = absolute(href);
@@ -127,19 +143,26 @@ function bundleRead(href, from, memory, dst, len) {
   if (cut < 0 || typeof XMLHttpRequest !== 'function') return -1;
   const url = h.slice(0, cut);
   const start = Number(h.slice(cut + 1)) + from;
-  const b = bundleIndex(url);
-  if (!b || !zstd) {
-    if (!zstd) console.error(`[lazy] ${url}: the zstd decoder is not loaded (lazyReady)`);
+  if (!zstd) {
+    // (none by design where the page's owner reads for every Worker)
+    if (!lazyCacheOn()) sayOnce(url, `[lazy] ${url}: the zstd decoder is not loaded (lazyReady)`);
     return -1;
   }
+  const b = bundleIndex(url);
+  if (!b) return -1;
   const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
   const want = [];
   for (let k = first; k <= last; k++) if (!b.kept.has(k)) want.push(k);
   if (want.length) {
+    // A frame given up a moment ago: no request until its hold ends.
+    if (want.some((k) => failed.held(`${url}#${k}`))) return -1;
     // The missing frames, one request (they are adjacent in BUNDLE).
     const lo = b.frames[want[0]][0], hi = b.frames[want.at(-1)][0] + b.frames[want.at(-1)][1];
-    const z = syncGet(url, [lo, hi]);
-    if (!z) return -1;
+    const z = retrySync(() => syncGet(url, [lo, hi]));
+    if (!z) {
+      for (const k of want) failed.failed(`${url}#${k}`);
+      return -1;
+    }
     for (const k of want) {
       const [o, n] = b.frames[k];
       const unpacked = k === b.frames.length - 1 ? 0 : b.frame;
@@ -272,7 +295,7 @@ export function lazyFetch(memory) {
       }
       const n = bundleRead(href, from, memory, dst, len);
       done(n > 0 ? n : 0);
-      if (n < 0) console.error(`[lazy] ${href} @${from}+${len}: failed (rest bundle)`);
+      if (n < 0) sayOnce(href, `[lazy] ${href}: a read failed (rest bundle)`);
       return n;
     }
     // The page's cache of lazy files, when it keeps one (lazy-cache.mjs).

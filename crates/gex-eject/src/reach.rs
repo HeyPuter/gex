@@ -333,8 +333,8 @@ pub fn reach(u: &gex_split::Unit, bytes: &[u8]) -> Result<Reach> {
     Ok(Reach { keep, whole: None, base, functions: prog.functions.len(), roots, unknown })
 }
 
-/// A tar's files, by path: enough of ustar (and GNU long names, pax paths)
-/// to read a bundle's images, following its symbolic and hard links.
+/// A tar's files, by path (`gex_kernel::tar`), following its symbolic and
+/// hard links: enough to read a bundle's images.
 pub struct Tar<'a> {
     data: &'a [u8],
     entries: BTreeMap<String, TarEntry>,
@@ -347,153 +347,46 @@ enum TarEntry {
     Hard(String),
 }
 
+use gex_kernel::tar::clean;
+
+// For rewriting a tar in place (`tar_put`, `tar_drop`).
 fn field(b: &[u8]) -> String {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
 fn octal(b: &[u8]) -> usize {
-    let s = field(b);
-    usize::from_str_radix(s.trim(), 8).unwrap_or(0)
-}
-
-fn clean(p: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for c in p.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    out.join("/")
+    usize::from_str_radix(field(b).trim(), 8).unwrap_or(0)
 }
 
 /// A tar's user extended attributes (pax `SCHILY.xattr.user.*`, as `tar
 /// --xattrs` writes them): each entry's, by its path with a leading `/`,
 /// as (name, value) with the name from `user.`. The page sets them on its
-/// files (`web/src/tar.js` reads the same records): the memory64 mark on a
-/// program, Wine's DOS attributes on a prefix.
+/// files: the memory64 mark on a program, Wine's DOS attributes on a prefix.
 pub fn xattrs(data: &[u8]) -> Result<BTreeMap<String, Vec<(String, String)>>> {
     let mut out = BTreeMap::new();
-    let mut off = 0usize;
-    let mut long: Option<String> = None;
-    let mut pending: Vec<(String, String)> = Vec::new();
-    while off + 512 <= data.len() {
-        let h = &data[off..off + 512];
-        if h.iter().all(|&c| c == 0) {
-            off += 512;
-            continue;
+    for (h, _) in gex_kernel::tar::entries(data).map_err(|e| anyhow::anyhow!(e))? {
+        if !h.xattrs.is_empty() {
+            let kv = h.xattrs.into_iter().map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned())).collect();
+            out.insert(format!("/{}", h.path), kv);
         }
-        let size = octal(&h[124..136]);
-        let kind = h[156];
-        let body = off + 512;
-        let next = body + size.div_ceil(512) * 512;
-        if next > data.len() {
-            bail!("a tar entry runs past the end ({off:#x})");
-        }
-        match kind {
-            b'L' => long = Some(field(&data[body..body + size])),
-            b'x' => {
-                // Records are "LEN key=value\n", LEN counting the whole record.
-                let rec = &data[body..body + size];
-                let mut i = 0;
-                while i < rec.len() {
-                    let Some(sp) = rec[i..].iter().position(|&c| c == b' ') else { break };
-                    let Ok(n) = std::str::from_utf8(&rec[i..i + sp]).unwrap_or("").parse::<usize>() else { break };
-                    if n == 0 || i + n > rec.len() {
-                        break;
-                    }
-                    let kv = &rec[i + sp + 1..i + n - 1];
-                    if let Some(eq) = kv.iter().position(|&c| c == b'=') {
-                        let k = String::from_utf8_lossy(&kv[..eq]).into_owned();
-                        let v = String::from_utf8_lossy(&kv[eq + 1..]).into_owned();
-                        if k == "path" {
-                            long = Some(v);
-                        } else if let Some(name) = k.strip_prefix("SCHILY.xattr.").filter(|n| n.starts_with("user.")) {
-                            pending.push((name.to_string(), v));
-                        }
-                    }
-                    i += n;
-                }
-            }
-            b'g' | b'K' => {}
-            _ => {
-                let mut name = field(&h[0..100]);
-                let prefix = field(&h[345..500]);
-                if !prefix.is_empty() {
-                    name = format!("{prefix}/{name}");
-                }
-                if let Some(l) = long.take() {
-                    name = l;
-                }
-                if !pending.is_empty() {
-                    out.insert(format!("/{}", clean(&name)), std::mem::take(&mut pending));
-                }
-            }
-        }
-        off = next;
     }
     Ok(out)
 }
 
 impl<'a> Tar<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Tar<'a>> {
+        use gex_kernel::tar::Kind;
         let mut entries = BTreeMap::new();
-        let mut off = 0usize;
-        let mut long: Option<String> = None;
-        while off + 512 <= data.len() {
-            let h = &data[off..off + 512];
-            if h.iter().all(|&c| c == 0) {
-                off += 512;
-                continue;
-            }
-            let size = octal(&h[124..136]);
-            let kind = h[156];
-            let body = off + 512;
-            let next = body + size.div_ceil(512) * 512;
-            if next > data.len() {
-                bail!("a tar entry runs past the end ({off:#x})");
-            }
-            let mut name = field(&h[0..100]);
-            let prefix = field(&h[345..500]);
-            if !prefix.is_empty() {
-                name = format!("{prefix}/{name}");
-            }
-            if let Some(l) = long.take() {
-                name = l;
-            }
-            let link = field(&h[157..257]);
-            match kind {
-                b'L' => long = Some(field(&data[body..body + size])),
-                b'x' => {
-                    // pax: a "path=" record replaces the next entry's name.
-                    let text = String::from_utf8_lossy(&data[body..body + size]);
-                    for rec in text.lines() {
-                        if let Some((_, kv)) = rec.split_once(' ') {
-                            if let Some(p) = kv.strip_prefix("path=") {
-                                long = Some(p.to_string());
-                            }
-                        }
-                    }
-                }
-                b'5' => {
-                    entries.insert(clean(&name), TarEntry::Dir);
-                }
-                b'2' => {
-                    entries.insert(clean(&name), TarEntry::Sym(link));
-                }
-                b'1' => {
-                    entries.insert(clean(&name), TarEntry::Hard(clean(&link)));
-                }
-                b'0' | 0 | b'7' => {
-                    entries.insert(clean(&name), TarEntry::File(body, size));
-                }
-                _ => {}
-            }
-            off = next;
+        for (h, at) in gex_kernel::tar::entries(data).map_err(|e| anyhow::anyhow!(e))? {
+            let e = match h.kind {
+                Kind::Dir => TarEntry::Dir,
+                Kind::Symlink => TarEntry::Sym(h.link),
+                Kind::Hard => TarEntry::Hard(h.link),
+                Kind::File => TarEntry::File(at, h.size as usize),
+                Kind::Other => continue,
+            };
+            entries.insert(h.path, e);
         }
         Ok(Tar { data, entries })
     }

@@ -26,7 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
-import { logNamed, logOn, logQuiet } from './log.mjs';
+import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
@@ -62,7 +62,7 @@ function seeLibrary(st) {
   const path = String(st.path).replace(/^wasm(dll|prog):/, '');
   if (libsSeen.has(path)) return;
   libsSeen.add(path);
-  inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
+  if (logRoutine()) inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
 }
 function watchLibraries() {
   if (libChannel || typeof BroadcastChannel !== 'function') return;
@@ -132,6 +132,11 @@ const RECYCLE_COUNT = 4;
 /** How many spare thread Workers (`#startSpare`) the page keeps waiting at
  *  once; past it the oldest is let go. */
 const SPARE_MAX = 8;
+/** How long a spare waits for its thread before it is let go. A process
+ *  starts its threads in bursts, which find their spares within seconds;
+ *  one that waits longer holds a whole thread's instantiation for a start
+ *  that may never come. */
+const SPARE_IDLE_MS = 5000;
 /** A test-only switch: whether a running fork child's
  *  record, its parent's modules with it, can be collected once the child's
  *  Worker has it. Node only, with `--expose-gc`. */
@@ -658,6 +663,41 @@ export class ProcessHost {
   get pids() { return [...this.#workers.keys()]; }
 
   /**
+   * Where the global kernel's per-Worker stacks are (`Gex#kernelStacks`'s
+   * shape), said by whatever instance of it came first when no process of
+   * this host did: a page with no pid 1 of its own. Before this no Worker
+   * is given a stack, so none may start.
+   */
+  useKernelStacks(stacks) {
+    if (this.#stacks) return;
+    this.#stacks = stacks;
+    this.#preattachOne();
+  }
+
+  /**
+   * Start process `pid` (the global kernel's `k_spawn` made it) on a
+   * program, from no parent Worker: the record a posix_spawn child's exec
+   * hands its new Worker (`Gex#vforkExecRecord`, run by `#adoptExec`), with
+   * the page's own parts. `exec` is the command (vfork.rs
+   * `stage_exec_parts`), `fds` its descriptors (`adopt_fds_text` lines, each
+   * end already held for `pid`), `opts` its run options with the identity.
+   * Resolves with its exit status.
+   */
+  spawnExec({ pid, exec, fds, cwd = '/', wasmImage = null, opts = {} }) {
+    this.#flavourOf.delete(pid);
+    const child = {
+      pid,
+      // Its first thread's registers, at the first context
+      // (`gex_abi::ctx_addr(0)`), as a loaded program's are.
+      ctx: 0x1000n,
+      pc: 0n, sp: 0n, tls: 0n, compat: 0, wasm32: 0n, brk: 0n, windowsSpace: 0,
+      image: [], vmaBlob: null, slots: 0, pages: null, shared: null, modules: [],
+      opts, exec, wasmImage, fds, cwd, state: new Uint8Array(0), exe: null,
+    };
+    return this.#spawn(pid, { kind: 'adopt', child });
+  }
+
+  /**
    * Run `elf` as pid 1 and resolve with its exit status. Children are stopped
    * when it exits -- a page done with a program is done with its daemons.
    */
@@ -666,7 +706,7 @@ export class ProcessHost {
     // One of the few default lines: what pid 1 runs. Its execs say their own
     // (the shim's `do_exec`).
     const what = [opts.argv0, ...args].filter((a) => typeof a === 'string' && a).join(' ');
-    inform(`[gex] pid 1: start ${what.length > 200 ? `${what.slice(0, 200)}...` : what || '(program)'}`);
+    if (logRoutine()) inform(`[gex] pid 1: start ${what.length > 200 ? `${what.slice(0, 200)}...` : what || '(program)'}`);
     const status = await this.#spawn(1, {
       kind: 'run',
       elf,
@@ -1148,8 +1188,8 @@ export class ProcessHost {
 
   /**
    * A kernel stack slice for something that is not a guest Worker but calls
-   * into the global kernel from a realm of its own (the demo's overlay
-   * Worker, `web/src/overlay-worker.js`). Undefined until the first Worker has said
+   * into the global kernel from a realm of its own (a page's drop Worker,
+   * `web/src/drop.js`). Undefined until the first Worker has said
    * where the stacks are. Give it back with `releaseKernelStack(key)`.
    */
   takeKernelStack(key) {
@@ -1261,7 +1301,17 @@ export class ProcessHost {
       compat: rec.compat,
       procOpts: rec.procOpts,
     });
-    this.#spares.push({ proc, key, w, ref, gen: rec.execGen });
+    const sp = { proc, key, w, ref, gen: rec.execGen };
+    this.#spares.push(sp);
+    const idle = setTimeout(() => {
+      const i = this.#spares.indexOf(sp);
+      if (i < 0) return;
+      this.#spares.splice(i, 1);
+      if (logNamed('spare')) console.warn(`[spare] ${key}: let go, no thread in ${SPARE_IDLE_MS / 1000} s`);
+      this.#letSpareGo(sp);
+    }, SPARE_IDLE_MS);
+    // Not what keeps a host's event loop alive.
+    idle.unref?.();
     if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
   }
@@ -1768,6 +1818,13 @@ export class ProcessHost {
           }
           break;
         }
+        // The wineserver ended: its door goes with it. A program started
+        // after it starts a server of its own (Wine's loader asks
+        // `door_missing`), and one would otherwise wait for a dead server.
+        if (this.#door && pid === this.#door.pid) {
+          this.#door = null;
+          for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
+        }
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
@@ -1786,9 +1843,9 @@ export class ProcessHost {
           console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
         }
         // The page passes no `onExit`, so these per-process numbers were
-        // computed and thrown away. Printed here, guarded so the Node harness
-        // (which prints its own) does not double up.
-        if (typeof window !== 'undefined' && m.millis !== undefined && logOn('debug')) {
+        // computed and thrown away. Printed here, except under run-node
+        // (`ownExitLines`), which prints its own.
+        if (!this.#extra?.ownExitLines && m.millis !== undefined && logOn('debug')) {
           // How long the process existed, against what it can account for.
           const lived = this.#asked.has(pid)
             ? Math.round(performance.now() - this.#asked.get(pid))

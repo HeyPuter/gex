@@ -112,6 +112,9 @@ fn note_capacity(before: usize, after: usize) {
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
+/// The fixed part of one [`TmpFs::tree`] entry.
+pub const TREE_ENTRY: usize = 40;
+
 /// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
 pub const LAZY_MTIME: i64 = 0;
 
@@ -913,6 +916,40 @@ impl TmpFs {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every node, for a persist store's diff of the tree (web/runtime
+    /// persist.js): no file's bytes, so nothing lazy is fetched. Each is
+    /// [`TREE_ENTRY`] bytes, little-endian -- kind (0 file, 1 directory, 2
+    /// symlink, 3 socket), written ([`FileNode::written`]), two spare, mode,
+    /// size, changes ([`FileNode::changes`], 0 for not a file), mtime, the
+    /// path's length and the target's -- then the path (no leading `/`) and
+    /// a symlink's target.
+    pub fn tree(&self) -> Vec<u8> {
+        let inner = self.inner.read().unwrap();
+        let mut out = Vec::with_capacity(inner.nodes.len() * (TREE_ENTRY + 32));
+        for (p, n) in inner.nodes.iter() {
+            let (kind, written, size, changes, mtime, target): (u8, bool, u64, u64, i64, &str) = match n {
+                Node::File(f) => (0, f.written.load(Ordering::Relaxed), f.size(), f.changes.load(Ordering::Acquire), f.mtime.load(Ordering::Relaxed), ""),
+                Node::Dir => (1, false, 0, 0, inner.mtimes.get(p).copied().unwrap_or(0), ""),
+                Node::Symlink(t) => (2, false, t.len() as u64, 0, inner.mtimes.get(p).copied().unwrap_or(0), t.as_str()),
+                Node::Socket => (3, false, 0, 0, 0, ""),
+            };
+            let default = if kind == 1 { Metadata::dir().mode } else if kind == 2 { 0o777 } else { 0o644 };
+            let mode = inner.modes.get(p).copied().unwrap_or(default);
+            out.push(kind);
+            out.push(written as u8);
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&mode.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&changes.to_le_bytes());
+            out.extend_from_slice(&mtime.to_le_bytes());
+            out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(target.len() as u32).to_le_bytes());
+            out.extend_from_slice(p.as_bytes());
+            out.extend_from_slice(target.as_bytes());
+        }
+        out
     }
 
     /// Where file contents lie in this address space, for a session

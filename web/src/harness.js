@@ -120,16 +120,40 @@ export async function start() {
 
   const tar = await fetchBytes('/harness/rootfs.tar');
   const tree = untar(tar);
-  const files = { ...tree.files };
-  // Symlinks, resolved the way the demos do it: the guest filesystem holds
-  // bytes, so a link becomes another name for the same bytes.
-  for (const [path, target] of Object.entries(tree.links || {})) {
-    const abs = target.startsWith('/')
-      ? target
-      : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-    if (files[abs]) files[path] = files[abs];
-  }
-  const elf = files[shell];
+  const files = tree.files;
+  // Symbolic links stay links (a directory's too: /bin -> usr/bin in a
+  // merged-/usr Debian), and hard links names of one file, as the tar keeps
+  // them. The program's own bytes are found through both.
+  const links = tree.links ?? {};
+  const hard = tree.hard ?? {};
+  const resolve = (p) => {
+    for (let n = 0; n < 40; n++) {
+      const parts = p.split('/').filter(Boolean);
+      let at = '';
+      let moved = false;
+      for (let i = 0; i < parts.length; i++) {
+        at += `/${parts[i]}`;
+        const to = links[at];
+        if (to === undefined) continue;
+        const base = to.startsWith('/') ? to : `${at.slice(0, at.lastIndexOf('/'))}/${to}`;
+        const out = [];
+        for (const seg of [...base.split('/'), ...parts.slice(i + 1)]) {
+          if (seg === '..') out.pop();
+          else if (seg && seg !== '.') out.push(seg);
+        }
+        p = `/${out.join('/')}`;
+        moved = true;
+        break;
+      }
+      if (!moved) return p;
+    }
+    return p;
+  };
+  const fileOf = (p) => {
+    const r = resolve(p);
+    return files[r] ?? files[hard[r]];
+  };
+  const elf = fileOf(shell);
   if (!elf) throw new Error(`the rootfs has no ${shell}`);
 
   // The closure, when the driver was given one: the image module, every
@@ -185,7 +209,7 @@ export async function start() {
   if (params.get('program')) {
     const path = params.get('program');
     const argv = [path, ...(params.getAll('arg') || [])];
-    const exe = files[path];
+    const exe = fileOf(path);
     if (!exe) throw new Error(`the rootfs has no ${path}`);
     const began = performance.now();
     let status = -1;
@@ -196,6 +220,10 @@ export async function start() {
       const running = runProgram(io.term, {
         elf: exe,
         files,
+        hard,
+        symlinks: links,
+        dirs: tree.dirs,
+        modes: tree.modes,
         args: argv,
         cwd: '/',
         tty: false,
@@ -238,6 +266,10 @@ export async function start() {
   const done = runProgram(io.term, {
     elf,
     files,
+    hard,
+    symlinks: links,
+    dirs: tree.dirs,
+    modes: tree.modes,
     args: [shell, '-i'],
     cwd: '/',
     tty: true,

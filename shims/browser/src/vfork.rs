@@ -393,63 +393,10 @@ pub(crate) fn exec_wasm_image(h: &Host, path: &str) -> Option<(u64, u64, u32)> {
     image.filter(|&(_, _, flags)| flags & 3 == 0)
 }
 
-/// The span `[lowest, highest)` the loaded segments of the file at `path`
-/// cover, when it is a native wasm program's container: an ELF of either
-/// class with `GEXWASM\0` 0x40 bytes below its entry, in a loaded segment's
-/// file bytes (`gex_ld::Image::is_wasm_program`, from the file rather than a
-/// loaded image), with the header's flags. `None` for anything else, or
-/// unreadable.
+/// [`gex_ld::elf::wasm_program_span`] of the file at `path`.
 fn wasm_program_image(path: &str) -> Option<(u64, u64, u32)> {
     let home = crate::sigs::proc_home();
-    let mut head = [0u8; 64];
-    if home.read_file_at(path, 0, &mut head) != Some(64) || &head[..4] != b"\x7fELF" {
-        return None;
-    }
-    let e64 = match head[4] {
-        1 => false,
-        2 => true,
-        _ => return None,
-    };
-    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u64;
-    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64;
-    let word = |b: &[u8], o: usize| if e64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) } else { u32_at(b, o) };
-    let at = word(&head, 24).wrapping_sub(0x40);
-    let (phoff, phent, phnum) = if e64 {
-        (word(&head, 32), u16_at(&head, 54), u16_at(&head, 56))
-    } else {
-        (word(&head, 28), u16_at(&head, 42), u16_at(&head, 44))
-    };
-    let need = if e64 { 56 } else { 32 };
-    if phent < need || phnum == 0 || phnum > 64 {
-        return None;
-    }
-    let mut ph = vec![0u8; (phent * phnum) as usize];
-    if home.read_file_at(path, phoff, &mut ph) != Some(ph.len()) {
-        return None;
-    }
-    let (mut lo, mut hi, mut header) = (u64::MAX, 0u64, None);
-    for p in ph.chunks_exact(phent as usize) {
-        if u32_at(p, 0) != 1 {
-            continue;
-        }
-        let (off, vaddr, filesz, memsz) = if e64 {
-            (word(p, 8), word(p, 16), word(p, 32), word(p, 40))
-        } else {
-            (word(p, 4), word(p, 8), word(p, 16), word(p, 20))
-        };
-        lo = lo.min(vaddr);
-        hi = hi.max(vaddr.saturating_add(memsz));
-        if header.is_none() && at >= vaddr && at.saturating_add(8) <= vaddr.saturating_add(filesz) {
-            let mut h = [0u8; 40];
-            let n = home.read_file_at(path, off + (at - vaddr), &mut h)?;
-            if n < 8 || &h[..8] != crate::cgen::wasmprog::MAGIC {
-                return None;
-            }
-            // The flags (offset 36) of a header that has them, else none.
-            header = Some(if n >= 40 { u32::from_le_bytes(h[36..40].try_into().unwrap()) } else { 0 });
-        }
-    }
-    header.map(|flags| (lo, hi, flags))
+    gex_ld::elf::wasm_program_span(&mut |off, buf| home.read_file_at(path, off, buf))
 }
 
 /// [`exec_memory`] for an exec's path, relative to the caller's cwd.
@@ -779,6 +726,17 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     EXEC_FRESH.with(|c| c.set(true));
     // A fresh Worker's process, its own until the program runs.
     crate::with_own_host(|h| {
+        // A script names its interpreter (`#!`), as `execve` reads it: a
+        // vfork child's exec was resolved by its `execve` already, the
+        // page's own programs (host.mjs `spawnExec`) are not.
+        let (path, argv) = match h.kernel.resolve_interpreter(path.clone(), argv) {
+            Ok(v) => v,
+            Err(e) => {
+                warn_line(&format!("gex: {path}: {e:?}\n"));
+                exit_process(127);
+                return 0;
+            }
+        };
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
             warn_line(&format!("gex: {path}: the program could not be loaded\n"));
