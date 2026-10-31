@@ -1,9 +1,10 @@
 // 64-bit Wine's console cases (the test programs in fixtures/wine/src): each
 // must exit with its code and print exactly what it should. Most check
-// themselves and print a line per check, then "0 failures". Each in a System
-// of its own, a phase each (t.reload): a wineserver that exited leaves its
-// socket's name bound (page/unix-rebind), so the next program's server could
-// not start in the same system.
+// themselves and print a line per check, then "0 failures". One System for
+// the cases with Wine's usual driver and one (a second phase, t.reload) for
+// those with the null driver, which is the prefix's setting: each case's
+// wineserver may exit before the next starts one, which binds the socket's
+// name again (page/unix-rebind).
 import { bootWine } from '../lib/wine.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800 };
@@ -37,10 +38,13 @@ const CASES = [
 ];
 
 export default async function (t) {
-  const [name, code, out, exe, args = [], nullDriver = false] = CASES[t.phase - 1];
+  const nullDriver = t.phase === 2;
   const w = await bootWine(t, { nullDriver });
-  const r = await t.time(name, () => w.run(exe, args)).catch((e) => ({ code: -1, stdout: '', stderr: String(e.message) }));
-  t.check(`${name}: exit ${code}, its output`, r.code === code && out.test(r.stdout), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  for (const [name, code, out, exe, args = [], wantNull = false] of CASES) {
+    if (wantNull !== nullDriver) continue;
+    const r = await t.time(name, () => w.run(exe, args)).catch((e) => ({ code: -1, stdout: '', stderr: String(e.message) }));
+    t.check(`${name}: exit ${code}, its output`, r.code === code && out.test(r.stdout), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  }
   await w.sys.shutdown();
-  if (t.phase < CASES.length) return t.reload();
+  if (!nullDriver) return t.reload();
 }
