@@ -22,10 +22,22 @@ const under = (at, p) => norm(`${at}/${p}`);
 const isZstd = (b) => b.length > 4 && b[0] === 0x28 && b[1] === 0xb5 && b[2] === 0x2f && b[3] === 0xfd;
 
 async function tarBytes(src) {
-  const bytes = await bytesOf(src, 'tar');
-  if (!isZstd(bytes)) return bytes;
-  const { unzstd } = await import('../../src/zfetch.js');
-  return unzstd(bytes);
+  let bytes = await bytesOf(src, 'tar');
+  if (isZstd(bytes)) {
+    const { unzstd } = await import('../../src/zfetch.js');
+    bytes = await unzstd(bytes);
+  }
+  // A tar's first header says "ustar" (POSIX and GNU), or the tar is empty
+  // (zero blocks). Anything else is not one: a server's page for a path it
+  // has no file at (a dev server answers 200 with its index.html), laid as
+  // a tar, would be an empty root that fails nothing until a program is
+  // missing.
+  const magic = new TextDecoder().decode(bytes.subarray(257, 262));
+  if (bytes.length < 512 || (magic !== 'ustar' && bytes.subarray(0, 512).some((b) => b !== 0))) {
+    const head = new TextDecoder().decode(bytes.subarray(0, 40)).replace(/\s+/g, ' ').trim();
+    throw new Error(`tar ${typeof src === 'string' || src instanceof URL ? src : '(bytes)'}: not a tar or a zstd tar (it starts ${JSON.stringify(head)})`);
+  }
+  return bytes;
 }
 
 /** A lazy list: `[[path, size, url], ...]`, or the URL of one as JSON (an
