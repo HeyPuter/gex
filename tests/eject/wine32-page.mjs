@@ -469,7 +469,8 @@ if (placedChecks) {
     const before = m;
     await drag(before.x + Math.round(before.w / 2), before.y + 10, before.x + Math.round(before.w / 2) + 40, before.y + 40);
     m = await until(main, (w) => w.x === before.x + 40 && w.y === before.y + 30);
-    check(m.x === before.x + 40 && m.y === before.y + 30 && m.w === before.w, `a caption drag moves it by the drag (${fmt(before)} -> ${fmt(m)})`);
+    check(!!m && m.x === before.x + 40 && m.y === before.y + 30 && m.w === before.w, `a caption drag moves it by the drag (${fmt(before)} -> ${fmt(m)})`);
+    m = m ?? before;
     // Smooth caption drags, out and back, a move every 4 ms (a fast hand,
     // which is when it shook: Wine moved the window between two moves): every
     // animation frame, where the window is against where the pointer is.
@@ -477,19 +478,22 @@ if (placedChecks) {
       const from = m;
       const r = await smoothDrag(from.x + Math.round(from.w / 2), from.y + 10, ddx, ddy);
       m = await until(main, (w) => w.x === from.x + ddx && w.y === from.y + ddy);
+      const end = m; m = m ?? from;
       check(r.frames >= 10 && r.back === 0 && r.ahead <= 2 && r.maxErr <= 16,
         `a smooth caption drag by ${ddx},${ddy}: the window follows the pointer (${r.frames} frames: moved against the drag in ${r.back}, ahead of the pointer in ${r.ahead} by up to ${r.maxAhead} px; behind it by ${r.meanErr} px on average, ${r.maxErr} px at most)`);
-      check(m.x === from.x + ddx && m.y === from.y + ddy, `... and ends where the drag did (${fmt(from)} -> ${fmt(m)})`);
+      check(!!end && end.x === from.x + ddx && end.y === from.y + ddy, `... and ends where the drag did (${fmt(from)} -> ${fmt(end)})`);
     }
     // Right border: out by 30 (past the canvas: the pointer stays captured), then in by 60.
     const at = m;
     await drag(at.x + at.w - 3, at.y + Math.round(at.h / 2), at.x + at.w - 3 + 30, at.y + Math.round(at.h / 2));
     m = await until(main, (w) => w.w > at.w);
-    check(m.w >= at.w + 25 && m.w <= at.w + 35 && m.x === at.x, `a border drag past its edge grows it (${fmt(at)} -> ${fmt(m)})`);
-    const grown = m;
+    check(!!m && m.w >= at.w + 25 && m.w <= at.w + 35 && m.x === at.x, `a border drag past its edge grows it (${fmt(at)} -> ${fmt(m)})`);
+    const grown = m ?? at;
     await drag(grown.x + grown.w - 3, grown.y + Math.round(grown.h / 2), grown.x + grown.w - 3 - 60, grown.y + Math.round(grown.h / 2));
     m = await until(main, (w) => w.w < grown.w);
-    check(m.w >= grown.w - 65 && m.w <= grown.w - 55 && m.x === grown.x, `a border drag inside it shrinks it (${fmt(grown)} -> ${fmt(m)})`);
+    check(!!m && m.w >= grown.w - 65 && m.w <= grown.w - 55 && m.x === grown.x, `a border drag inside it shrinks it (${fmt(grown)} -> ${fmt(m)})`);
+    // (a check that failed leaves the rest to run: on from the last place known)
+    m = m ?? grown;
     // An owned dialog stays above its owner when the owner is clicked.
     await key('w', 'KeyW', 87, 2);
     let ws = await until(wins, (l) => l.length >= 2);
@@ -524,7 +528,7 @@ if (placedChecks) {
     // BTN_RIGHT go down and up), and the browser's own context menu is
     // cancelled (it opens on the press on Linux and took the release).
     await ev(`(() => { globalThis.__ctxMenus = []; addEventListener('contextmenu', (e) => globalThis.__ctxMenus.push(e.defaultPrevented)); return 1; })()`);
-    m = await main();
+    m = (await main()) ?? m;
     const rx = m.x + Math.round(m.w / 2), ry = m.y + 10;
     const right = (type, held) => browser.send('Input.dispatchMouseEvent',
       { type, x: rx, y: ry, button: 'right', buttons: held ? 2 : 0, clickCount: 1 }, page);
