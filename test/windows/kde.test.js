@@ -6,7 +6,7 @@
 
 // Alone: a desktop's dozens of processes, each a Worker with its own memory,
 // beside other tests' pages in the same renderer ran out of address space.
-export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 900, alone: true, html: `<style>html, body { margin: 0; }</style>
+export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 1200, alone: true, html: `<style>html, body { margin: 0; }</style>
 <canvas id="out" width="1280" height="800" style="width: 100vw; display: block;"></canvas>` };
 
 export default async function (t) {
@@ -30,12 +30,29 @@ export default async function (t) {
     ...out.env, XDG_RUNTIME_DIR: '/run/user/0', DISPLAY: ':0',
   };
   const p = sys.spawn(['/usr/bin/bash', '/usr/local/bin/gex-kde-session'], { env, cwd: '/root' });
-  let log = '';
-  const keep = (s) => new WritableStream({ write(b) { log = (log + new TextDecoder().decode(b)).slice(-200000); } });
+  // The session's output, each chunk stamped with the seconds since the spawn.
+  let log = '', stamped = '';
+  const t1 = performance.now();
+  const keep = (s) => new WritableStream({ write(b) {
+    const text = new TextDecoder().decode(b);
+    log = (log + text).slice(-200000);
+    stamped += text.replace(/^(?=.)/gm, `[${((performance.now() - t1) / 1000).toFixed(1)}] `);
+  } });
   p.stdout.pipeTo(keep()).catch(() => {});
   p.stderr.pipeTo(keep()).catch(() => {});
-  const up = await t.time('plasmashell up', () => until(() => /Plasma Shell startup completed/.test(log), 'plasmashell up', 600000))
+  // Up in about 70-100 s alone on an idle host; 440 s beside 48 busy loops
+  // on 24 threads.
+  const up = await t.time('plasmashell up', () => until(() => /Plasma Shell startup completed/.test(log), 'plasmashell up', 900000))
     .then(() => true, () => false);
+  if (!up) {
+    // Where it stopped: the session's whole output, the system's console,
+    // and what was running then.
+    const ps = await timeout(sys.run(['ps', '-eo', 'pid,ppid,stat,time,etime,args'], { env }), 30000, 'ps')
+      .then((r) => r.stdout + r.stderr, (e) => `ps: ${e?.message ?? e}`);
+    await t.saveFile('session.log', stamped);
+    await t.saveFile('console.log', sys.state.console);
+    await t.saveFile('ps.txt', ps);
+  }
   check('plasmashell says its startup completed', up, `log ${JSON.stringify(log.slice(-1500))}; console ${JSON.stringify(sys.state.console.slice(-800))}`);
   const d = await out.describe();
   say(`scene: ${JSON.stringify(d).slice(0, 400)}`);

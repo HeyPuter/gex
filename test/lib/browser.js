@@ -96,6 +96,14 @@ Object.assign(t, {
     const [r] = await t.cdp({ method: 'Page.captureScreenshot', format: 'png', save: `${name}.png`, ...(clip ? { clip: { ...clip, scale: 1 } } : {}) });
     return r.path;
   },
+  /** `text` saved as `NAME` among the run's artefacts: its path. */
+  async saveFile(name, text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    const [r] = await t.cdp({ method: '__save', save: name, data: btoa(bin) });
+    return r.path;
+  },
   /** The page's pixels in `clip` (`{ x, y, width, height }`, CSS pixels), as
    *  the browser composited them: what a WebGPU canvas showed, which the page
    *  itself cannot read back. An ImageData. */
