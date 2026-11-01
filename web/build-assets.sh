@@ -62,10 +62,15 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 # Export providers' modules (glibc's mem*/str*, libm: gex-cgen providers/),
 # in a unit cache's layout under gex/cgen/: the page binds them when a
 # translated program maps the library they name, with no units
-# (`?providers=0` turns them off).
+# (`?providers=0` turns them off). Each guest's come from its own gexc (their
+# ABI header is the build's): aarch64's, and x86-64's from the x86 gexc
+# shims/browser/build.sh builds for that shim.
 echo "building the export providers..."
+cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc --features x86 --target-dir "$ROOT/target/x86" >/dev/null 2>&1
 rm -rf "$WORK/provcache"
-GEX_CGEN_CACHE="$WORK/provcache" "$ROOT/target/release/gexc" cgen-image --providers 2>/dev/null
+for g in "$ROOT/target/release/gexc" "$ROOT/target/x86/release/gexc"; do
+    GEX_CGEN_CACHE="$WORK/provcache" "$g" cgen-image --providers --elf 2>/dev/null
+done
 mkdir -p "$PUB/gex/cgen/providers"
 rm -f "$PUB/gex/cgen/providers/"*.wasm
 cp "$WORK/provcache/providers/"*.wasm "$PUB/gex/cgen/providers/"

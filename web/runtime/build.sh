@@ -4,7 +4,7 @@
 # their shared chunks and Workers beside them, and the files a system
 # fetches, each by its own URL: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
-# shims/browser/build.sh), the aarch64 export providers, the guest GL's WebGPU
+# shims/browser/build.sh), each of those guests' export providers, the guest GL's WebGPU
 # replay (gex-wgpu-replay.*), the X server
 # (web/build-xwayland-wasm.sh). A page imports the package, served as it is
 # or through its own bundler, with nothing else to do; `new System({ baseUrl
@@ -44,14 +44,18 @@ for infix in "" .x86; do
             strip_wasm "$G/$f"
         done
         n=$((n + 1))
+        # Its guest's glibc providers (web/build-assets.sh): without them
+        # every program of that guest runs glibc's own code, translated.
+        prov=glibc_mem_a64
+        [ "$infix" = .x86 ] && prov=glibc_mem
+        ls "$PUB/cgen/providers/$prov"-*.wasm > /dev/null 2>&1 || {
+            echo "web/runtime/build.sh: $PUB/gex_browser$infix.shared.wasm has no providers in $PUB/cgen/providers (web/build-assets.sh)" >&2; exit 1; }
     fi
 done
 [ "$n" -gt 0 ] || { echo "web/runtime/build.sh: no shim in $PUB (shims/browser/build.sh)" >&2; exit 1; }
-if ls "$PUB/cgen/providers/"*.wasm > /dev/null 2>&1; then
-    mkdir -p "$G/cgen/providers"
-    cp "$PUB/cgen/providers/"*.wasm "$G/cgen/providers/"
-    strip_wasm "$G/cgen/providers/"*.wasm
-fi
+mkdir -p "$G/cgen/providers"
+cp "$PUB/cgen/providers/"*.wasm "$G/cgen/providers/"
+strip_wasm "$G/cgen/providers/"*.wasm
 # The guest GL's replay of WebGPU (gl.js MesaGl: gex-wgpu-replay.js and its
 # wasm, the deferred part fetched after the start).
 for f in gex-wgpu-replay.js gex-wgpu-replay.wasm gex-wgpu-replay.deferred.wasm; do

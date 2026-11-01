@@ -192,8 +192,11 @@ usage:
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
                                    needs it built ahead (GEX_CGEN_GUARD=1)
-  gexc cgen-image --providers      every export provider's module, into
-                                   GEX_CGEN_CACHE (the browser cannot build them)
+  gexc cgen-image --providers [--elf]
+                                   every export provider's module for this
+                                   gexc's guest (an x86 gexc's for x86-64),
+                                   into GEX_CGEN_CACHE (the browser cannot
+                                   build them); --elf: only ELF libraries'
   gexc cgen-image --inputs         a hash of everything a unit key takes besides
                                    its image: a cache of units built by a gexc
                                    that printed another one has no hits here
@@ -2440,7 +2443,11 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let path = path.context("expected a PE image")?;
     if path == "--providers" {
         let root = std::path::PathBuf::from(std::env::var("GEX_CGEN_CACHE").context("--providers needs GEX_CGEN_CACHE")?);
-        for p in gex_cgen::provider::all() {
+        // One gexc builds its own guest's providers: their ABI header
+        // (`gex_abi.h`, in every fingerprint) is this build's. An x86-64
+        // dist's come from a gexc built with `--features x86`.
+        // `--elf`: only those for ELF libraries (glibc's), none of Windows'.
+        for p in gex_cgen::provider::all().into_iter().filter(|p| !elf || p.dlls.iter().all(|d| d.contains(".so"))) {
             let (out, _) = gex_cgen::provider::build(&p, &root)?;
             eprintln!("provider {}: {}", p.name, out.display());
         }
