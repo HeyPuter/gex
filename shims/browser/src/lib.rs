@@ -368,7 +368,7 @@ extern "C" {
     fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_mkdir_now(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32;
     fn k_fs_add_dir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
@@ -972,9 +972,9 @@ extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(8);
     r
 }
-extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
+extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_mkdir(path, path_len, mode) };
+    let r = unsafe { k_fs_mkdir_now(path, path_len, mode, now) };
     gex_kernel::phase::mark(8);
     r
 }

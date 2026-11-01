@@ -3250,6 +3250,17 @@ pub extern "C" fn k_fs_mkdir(path: gex_kmem::PAddr, path_len: u32, mode: u32) ->
     as_unit(rootfs().mkdir(&p, mode))
 }
 
+/// [`k_fs_mkdir`], the directory dated `now`, the caller's clock (this
+/// module has none), as [`k_fs_open_now`] dates a file it makes.
+#[no_mangle]
+pub extern "C" fn k_fs_mkdir_now(path: gex_kmem::PAddr, path_len: u32, mode: u32, now: i64) -> i32 {
+    let p = path_of(path, path_len);
+    if let Some((m, rel)) = pagefs::find(&p) {
+        return as_unit(m.mkdir(&rel, mode));
+    }
+    as_unit(rootfs().mkdir_now(&p, mode, now))
+}
+
 /// A directory put into the shared root with every missing one above it
 /// (`TmpFs::add_dir`): seeding, where [`k_fs_mkdir`] is a program's
 /// `mkdir` and wants the parent there.

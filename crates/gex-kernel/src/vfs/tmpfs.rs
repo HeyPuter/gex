@@ -7,7 +7,7 @@
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
 use crate::fs::oflags;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -504,9 +504,14 @@ struct Inner {
     /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
     /// Modification times of the nodes that are not files (a file keeps its
-    /// own, see `FileNode`), set by `utimensat`; sparse like `modes`, and a
-    /// path without one reports 0.
+    /// own, see `FileNode`), set by `utimensat`, a program's `mkdir` and
+    /// seeding; sparse like `modes`, and a path without one reports 0.
     mtimes: BTreeMap<String, i64>,
+    /// The directories whose time in `mtimes` is their newest entry's, not
+    /// their own: seeded without one (a tar that names no entry for a
+    /// directory, a lazy list's parents), dated by what seeding dates in
+    /// them ([`Inner::date_parents`]) until something dates them.
+    inferred: BTreeSet<String>,
     /// How many names each inode in `inos` has: a file's link count, kept
     /// as names come and go (counting `inos` at every `stat` scanned the
     /// whole tree, 16 us a call once a Python was installed).
@@ -626,6 +631,27 @@ impl Inner {
         }
         self.drop_ino(path);
         self.mtimes.remove(path);
+        self.inferred.remove(path);
+    }
+
+    /// Seeding dated `path` at `secs`: each directory above it with no time
+    /// of its own takes its newest entry's, the same on every load (never
+    /// the load's clock). Without this they read 0, January 1970.
+    fn date_parents(&mut self, path: &str, secs: i64) {
+        if secs <= 0 {
+            return;
+        }
+        let mut p = path;
+        while let Some((d, _)) = p.rsplit_once('/') {
+            p = d;
+            match self.mtimes.get(d) {
+                Some(&t) if !self.inferred.contains(d) || t >= secs => {}
+                _ => {
+                    self.mtimes.insert(d.to_string(), secs);
+                    self.inferred.insert(d.to_string());
+                }
+            }
+        }
     }
 
     /// Move everything named under directory `from` to the same names under
@@ -677,6 +703,28 @@ pub struct TmpFs {
 }
 
 impl TmpFs {
+    /// `mkdir`, the directory dated `now`, the caller's clock (a kernel
+    /// module with none takes its process's).
+    pub fn mkdir_now(&self, path: &str, mode: u32, now: i64) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(path) {
+            return Err(Errno::EEXIST);
+        }
+        inner.parent_ok(path)?;
+        let mode = mode & 0o7777;
+        if mode != Metadata::dir().mode {
+            inner.modes.insert(path.to_string(), mode);
+        }
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.set_ino(path.to_string(), ino);
+        inner.nodes.insert(path.to_string(), Node::Dir);
+        // A program's directory is made now, as a file is.
+        inner.mtimes.insert(path.to_string(), now);
+        note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
+        Ok(())
+    }
+
     /// `utimensat` with the change time given (see
     /// [`FileHandle::set_times_now`]). A file keeps both times to the
     /// nanosecond; anything else keeps whole-second modification times.
@@ -688,6 +736,7 @@ impl TmpFs {
             Some(_) => {
                 if let Some((s, _)) = mtime {
                     inner.mtimes.insert(path.to_string(), s);
+                    inner.inferred.remove(path);
                 }
             }
         }
@@ -1690,8 +1739,10 @@ impl FileSystem for TmpFs {
             Some(Node::File(f)) => f.stamp(secs),
             Some(_) => {
                 inner.mtimes.insert(path.to_string(), secs);
+                inner.inferred.remove(path);
             }
         }
+        inner.date_parents(path, secs);
         note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
         Ok(())
     }
@@ -1779,21 +1830,7 @@ impl FileSystem for TmpFs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.nodes.contains_key(path) {
-            return Err(Errno::EEXIST);
-        }
-        inner.parent_ok(path)?;
-        let mode = mode & 0o7777;
-        if mode != Metadata::dir().mode {
-            inner.modes.insert(path.to_string(), mode);
-        }
-        let ino = inner.next_ino;
-        inner.next_ino += 1;
-        inner.set_ino(path.to_string(), ino);
-        inner.nodes.insert(path.to_string(), Node::Dir);
-        note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
-        Ok(())
+        self.mkdir_now(path, mode, now())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
@@ -2342,6 +2379,33 @@ mod tests {
         assert_eq!(fs.read_link("nothing-here"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("no-dir/x"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("f/x"), Err(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn a_seeded_directory_has_its_newest_entrys_time_and_its_own_wins() {
+        // A tar with no entry for `a` or `a/b` (or a lazy list's parents):
+        // they read 0, January 1970, in every file manager.
+        let fs = TmpFs::new();
+        fs.add_file("a/b/one", b"1".to_vec());
+        fs.set_mtime("a/b/one", 1_600_000_000).unwrap();
+        fs.add_file("a/b/two", b"2".to_vec());
+        fs.set_mtime("a/b/two", 1_700_000_000).unwrap();
+        fs.add_file("a/b/old", b"3".to_vec());
+        fs.set_mtime("a/b/old", 1_500_000_000).unwrap();
+        assert_eq!(fs.metadata("a/b").unwrap().mtime, 1_700_000_000, "its newest entry's");
+        assert_eq!(fs.metadata("a").unwrap().mtime, 1_700_000_000);
+        // A directory's own time (a tar's entry for it) wins over its
+        // entries', before or after them.
+        fs.set_mtime("a", 1_234_567_890).unwrap();
+        fs.add_file("a/c", b"4".to_vec());
+        fs.set_mtime("a/c", 1_800_000_000).unwrap();
+        assert_eq!(fs.metadata("a").unwrap().mtime, 1_234_567_890, "its own");
+        // A lazy file not dated yet dates nothing.
+        fs.add_lazy("z/lazy", 10, "/z");
+        assert_eq!(fs.metadata("z").unwrap().mtime, 0);
+        // A program's directory is made now.
+        fs.mkdir("made", 0o755).unwrap();
+        assert!(fs.metadata("made").unwrap().mtime > 0);
     }
 
     #[test]

@@ -130,8 +130,10 @@ export class Files {
   }
 
   async mkdir(path, { recursive = false, mode = 0o755 } = {}) {
+    // Dated now, as a program's mkdir is (the kernel has no clock).
+    const now = BigInt(Math.trunc(Date.now() / 1000));
     if (!recursive) {
-      const r = await this.#k.r('k_fs_mkdir', { in: path }, mode);
+      const r = await this.#k.r('k_fs_mkdir_now', { in: path }, mode, now);
       if (r < 0) throw errno(r, path);
       return;
     }
@@ -139,7 +141,7 @@ export class Files {
     let p = '';
     for (const part of path.split('/').filter(Boolean)) {
       p += `/${part}`;
-      list.push({ f: 'k_fs_mkdir', a: [{ in: p }, mode] });
+      list.push({ f: 'k_fs_mkdir_now', a: [{ in: p }, mode, now] });
     }
     const res = await this.#k.calls(list);
     res.forEach(({ r }, i) => {
@@ -203,12 +205,16 @@ export class Files {
       n += await k.r('k_fs_tar_close', id);
     }
     const list = [];
+    // Single files are the page's, made now: dated so, and their folders
+    // with them (a folder seeded without a time takes its newest entry's).
+    const now = BigInt(Math.trunc(Date.now() / 1000));
     for (const [p, data] of Object.entries(files)) {
       const d = typeof data === 'string' ? enc.encode(data) : data;
       // A large file in parts, so the Worker's memory never holds a whole one.
       list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
       for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
       if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, now] });
       n++;
     }
     for (const [p, size, url, mode, mtime] of lazy) {
