@@ -424,11 +424,13 @@ def link(dlls, out, gexrt, others=None):
     # module's call is bound to it rather than left an import nothing provides.
     rt_exports = {}  # core dll -> [C names it exports beside its .spec's]
     core_defs = {}
+    # (a program in the core provides none: services.exe's __main_argc_argv
+    # bound a split notepad.exe's weak main to it, and notepad ran services)
     for mod, ro, ex, _ in sorted(dlls, key=lambda d: ('ucrtbase.dll', 'msvcrt.dll').index(d[0])
                                  if d[0] in ('ucrtbase.dll', 'msvcrt.dll') else 2):
-        if not SPLIT.get(mod):
+        if not SPLIT.get(mod) and not mod.endswith('.exe'):
             for (n, k) in sigs[mod]:
-                if k == 'defined':
+                if k == 'defined' and n not in WEAK_IMPORTS:
                     core_defs.setdefault(n, mod)
     # (one the core's DLLs do not define either, ceilf or trunc: the C
     # runtime's own library, libs/musl, which Wine links into msvcrt and
