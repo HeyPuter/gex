@@ -5,7 +5,11 @@
 //   node shims/browser/js/run-node.mjs [opts] <guest.wasm> <program.elf> [args...]
 //
 //     --file <guest>=<host>     bundle a host file into the guest's filesystem
-//     --dir <guest>=<host>      bundle a whole directory tree
+//     --dir <guest>=<host>      a whole directory tree: files under 64 KiB
+//                               bundled, larger ones lazy (as --lazy: read
+//                               as the guest reads them, as a page fetches
+//                               its rest bundle); GEX_DIR_EAGER=1 bundles
+//                               every file
 //     --extract <guest>=<host>  write a file back out when the program ends
 //     --lazy <guest>=<host>     a lazy file (the page's lazy.json files),
 //                               fetched as it is read: here read from the
@@ -38,7 +42,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { accessSync, appendFileSync, closeSync, constants as fsc, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
@@ -138,6 +142,9 @@ let providersRoot = false;
 let noJit = false;
 let aotRun = false;
 const dirs = [];
+// `--dir`'s files from this size up are lazy, unless GEX_DIR_EAGER=1.
+const DIR_LAZY_MIN = 64 << 10;
+const dirEager = process.env.GEX_DIR_EAGER === '1';
 // Symbolic links, path -> target text (`--tar`).
 const symlinks = {};
 const rest = [];
@@ -209,7 +216,16 @@ const rest = [];
             else symlinks[g] = readlinkSync(h);
           } else {
             try {
-              files[g] = readFileSync(h);
+              // A large file is read only as far as the guest reads it: a
+              // test's Wine dist is a gigabyte, mostly DLLs no run loads,
+              // and reading it all up front was every page case's start.
+              if (st.size >= DIR_LAZY_MIN && !dirEager) {
+                accessSync(h, fsc.R_OK);
+                lazy.push([g, st.size, resolve(h).replace(/^\/+/, '')]);
+                process.env.GEX_NODE_LAZY = '1';
+              } else {
+                files[g] = readFileSync(h);
+              }
               mtimes[g] = Math.trunc(st.mtimeMs / 1000);
             } catch {
               // Unreadable, or a name the host rejects. One file is not the
@@ -219,6 +235,11 @@ const rest = [];
         }
       };
       walk(guestRoot.replace(/\/$/, ''), hostRoot.replace(/\/$/, ''));
+      // Its lazy files skip GEX_LAZY_DELAY_MS (lazy-fetch.mjs `nodeFetch`).
+      if (!dirEager) {
+        const roots = (process.env.GEX_DIR_LAZY_ROOTS ?? '').split('\n').filter(Boolean);
+        process.env.GEX_DIR_LAZY_ROOTS = [...roots, resolve(hostRoot)].join('\n');
+      }
     } else if (av[i] === '--lazy') {
       const spec = av[++i] ?? '';
       const eq = spec.indexOf('=');
