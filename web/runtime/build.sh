@@ -160,6 +160,11 @@ cat > "$OUT/package.json" <<PKG
   "version": "$VERSION",
   "description": "Linux programs in the browser: a kernel, the programs it runs, and their files",
   "license": "AGPL-3.0-only",
+  "repository": { "type": "git", "url": "git+https://github.com/HeyPuter/gex.git", "directory": "web/runtime" },
+  "homepage": "https://github.com/HeyPuter/gex/tree/master/web/runtime#readme",
+  "bugs": "https://github.com/HeyPuter/gex/issues",
+  "keywords": ["linux", "wasm", "webassembly", "browser", "kernel", "x86-64", "aarch64", "wine", "wayland", "x11"],
+  "files": ["*.mjs", "*.js", "*.wasm", "*.xkm", "*.d.ts", "README.md", "LICENSE", "NOTICE"],
   "type": "module",
   "exports": {
     ".": { "types": "./index.d.ts", "default": "./index.mjs" },
@@ -181,6 +186,8 @@ cat > "$OUT/package.json" <<PKG
 }
 PKG
 [ ! -f "$RT/README.md" ] || cp "$RT/README.md" "$OUT/README.md"
+# gex's licence and notices, which name the third-party code it carries.
+cp "$WEB/../LICENSE" "$WEB/../NOTICE" "$OUT/"
 # The declarations (types/), one beside each module.
 cp "$RT"/types/*.d.ts "$OUT/"
 echo "web/runtime/build.sh: $OUT"
