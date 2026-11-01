@@ -582,6 +582,7 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     }
     run_one(&mut e, block, region);
     strip_tees(&mut e);
+    e.close_kuser_fault();
     e.f.finish_with_relocs()
 }
 
@@ -640,6 +641,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     }
     run_one(&mut e, block, region);
     strip_tees(&mut e);
+    e.close_kuser_fault();
     e.f.finish()
 }
 
@@ -756,6 +758,9 @@ struct Emitter<'a> {
     value_fp: Vec<Option<bool>>,
     free_f32: Vec<u32>,
     free_f64: Vec<u32>,
+    /// A bounds guard branched to the shared KUSER fault: the body still
+    /// needs [`Self::close_kuser_fault`].
+    kuser_fault: bool,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -819,6 +824,7 @@ impl<'a> Emitter<'a> {
             value_fp: Vec::new(),
             free_f32: Vec::new(),
             free_f64: Vec::new(),
+            kuser_fault: false,
         }
     }
 
@@ -1745,10 +1751,10 @@ impl<'a> Emitter<'a> {
         let t = self.scratch_i64;
         // 32-bit Wine with KUSER_SHARED_DATA folded: an address at or above the old
         // page is a pointer the translator could not fold. A branch to the
-        // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation),
-        // where the select would steer to a bare trap. The context holds
-        // what the block last wrote back, at its start's pc, as natively for
-        // an out-of-bounds access.
+        // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation at
+        // that address), where the select would steer to a bare trap. The
+        // context holds what the block last wrote back, at its start's pc, as
+        // natively for an out-of-bounds access.
         if gex_abi::kuser_fold() {
             if floor == 0 {
                 self.f.local_tee(t);
@@ -1758,18 +1764,18 @@ impl<'a> Emitter<'a> {
                 self.guard_range(floor);
             }
             self.f.byte(code::I64_GE_U);
-            self.f.if_void();
-            self.store_pc(self.block_start);
-            self.f.local_get(self.ctx_local);
-            self.f.i64_const(self.block_start as i64);
-            self.f.local_get(t);
-            self.f.i64_const(32);
-            self.f.byte(code::I64_SHL);
-            self.f.byte(code::I64_OR);
-            self.f.i32_const(gex_abi::imports::BRK_KUSER_UNFOLDED);
-            self.f.call(self.cx.breakpoint);
-            self.f.unreachable();
-            self.f.end();
+            if self.func_regs.is_some() {
+                // The function JIT's bodies have results and their own exits:
+                // the fault stays in place.
+                self.f.if_void();
+                self.kuser_fault_call();
+                self.f.end();
+            } else {
+                // One fault per body (`close_kuser_fault`), `t` still the
+                // address there.
+                self.f.br_if(self.f.open());
+                self.kuser_fault = true;
+            }
             self.f.local_get(t);
             self.f.byte(code::I32_WRAP_I64);
             return;
@@ -1781,6 +1787,40 @@ impl<'a> Emitter<'a> {
         self.guard_range(floor);
         self.f.byte(code::I64_LT_U);
         self.f.select();
+    }
+
+    /// `BRK_KUSER_UNFOLDED` for the address in the scratch local, at the
+    /// block's start (the host writes that pc back); it does not return.
+    fn kuser_fault_call(&mut self) {
+        let t = self.scratch_i64;
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(self.block_start as i64);
+        self.f.local_get(t);
+        self.f.i64_const(32);
+        self.f.byte(code::I64_SHL);
+        self.f.byte(code::I64_OR);
+        self.f.i32_const(gex_abi::imports::BRK_KUSER_UNFOLDED);
+        self.f.call(self.cx.breakpoint);
+        self.f.unreachable();
+    }
+
+    /// The fault the body's KUSER guards branch to: the body becomes
+    /// `block block <body> br 1 end <fault> end`, so it runs as before and
+    /// a guard at any depth reaches the fault with one `br_if`. The body is
+    /// a block function's (no results), complete.
+    fn close_kuser_fault(&mut self) {
+        if !std::mem::take(&mut self.kuser_fault) {
+            return;
+        }
+        let before = self.f.code.len();
+        debug_assert_eq!(self.f.open(), 0);
+        self.f.prepend_block();
+        self.f.prepend_block();
+        self.f.br(1);
+        self.f.end();
+        self.kuser_fault_call();
+        self.f.end();
+        GUARD_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
     // -- statements --------------------------------------------------------
