@@ -80,6 +80,9 @@ for dll in "$@" "${splits[@]}"; do
     if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
     # a GUI program's skeleton says so (stage-native.sh)
     if [ ! -f "$spec" ] && grep -q -- '-mwindows' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem windows); fi
+    # a driver's skeleton is a native image, as its build makes it (-Wl,--subsystem,native):
+    # Wine's loader then calls no DllMain at its entry, which is DriverEntry
+    if grep -q -- '--subsystem,native' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem native); fi
     # shellcheck disable=SC2046
     "$winebuild" -w -b "$target" --cc-cmd="$cc" "${kind[@]}" --fake-module \
         --wasm-shared "$module" -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
