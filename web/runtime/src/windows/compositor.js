@@ -13,11 +13,15 @@ export class CompositorWindows extends EventTarget {
    * `canvas`: the output, its backing store the output's size in device
    * pixels; `scale`: device pixels per CSS pixel (default devicePixelRatio,
    * rounded), which clients are told. The canvas's control goes to the
-   * compositor's Worker.
+   * compositor's Worker. `x11`: 'rootless' (the default), each X window a
+   * window of the desktop, placed by the runtime's window manager; or
+   * 'rootful', one X screen filling the output, run by the session's own
+   * window manager (kwin_x11 and the like).
    */
-  constructor(sys, { canvas, scale } = {}) {
+  constructor(sys, { canvas, scale, x11 = 'rootless' } = {}) {
     super();
     if (typeof canvas?.getContext !== 'function') throw new TypeError('CompositorWindows: a canvas');
+    if (x11 !== 'rootless' && x11 !== 'rootful') throw new TypeError("CompositorWindows: x11 is 'rootless' or 'rootful'");
     const i = internals(sys, 'CompositorWindows');
     i.attach('windows', this, { beforeBoot: true });
     i.devices(async (dev) => {
@@ -25,7 +29,7 @@ export class CompositorWindows extends EventTarget {
       Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, say: (t) => dev.say(`${t}\n`) }));
       this.#c = dev.compositor;
     });
-    const x = {};
+    const x = { rootful: x11 === 'rootful' };
     xOnDemand(i, x);
     this[INTERNAL] = {
       x,

@@ -8,7 +8,8 @@ of it is packed as what it points at (a dist made of links into another; not
 a prefix, whose z: is /). A lazy file's URL is BASE_REL/LINK/RELPATH,
 relative to the list (LINK is a name in the work directory standing for ROOT,
 default AT's last part). Files of LIMIT bytes or less (default 64 KiB) go in
-the tar.
+the tar. The list is an ejected site's lazy.json: `{ base, files: [[path,
+size, rel, mtime, mode], ...] }`.
 """
 import json, os, sys, tarfile
 
@@ -54,7 +55,7 @@ with tarfile.open(out, 'w', format=tarfile.PAX_FORMAT) as tar:
                 elif (os.path.islink(p) and not follow) or os.path.isdir(p) or st.st_size <= LIMIT:
                     tar.add(os.path.realpath(p) if follow else p, arcname=g, recursive=False, filter=whole_seconds)
                 else:
-                    files.append([f'/{g}', st.st_size, f'{link}/{r}', st.st_mode & 0o7777])
+                    files.append([f'/{g}', st.st_size, f'{link}/{r}', int(st.st_mtime), st.st_mode & 0o7777])
             # A link to a directory in the tree is a link; one out of it is
             # walked as the directory it points at.
             dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x)) or outside(os.path.join(d, x))]

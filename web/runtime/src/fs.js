@@ -40,9 +40,12 @@ async function tarBytes(src) {
   return bytes;
 }
 
-/** A lazy list: `[[path, size, url], ...]`, or the URL of one as JSON (an
- *  ejected build's lazy.json: `{ base, files: [[path, size, rel], ...] }`
- *  too). A file's URL is a path on the page's origin. */
+/** A lazy list, as `[[path, size, url, mode, mtime], ...]`: the page's own
+ *  (`[[path, size, url, mode], ...]`), or the URL of one as JSON, which may
+ *  also be an ejected build's lazy.json (web/eject-site.mjs: `{ base, files:
+ *  [[path, size, rel, mtime, mode], ...] }`, mtime in seconds, mode and
+ *  mtime optional; `rel` may be a rest bundle's `BUNDLE#OFFSET`). A file's
+ *  URL is a path on the page's origin. */
 async function lazyList(lazy) {
   let list = lazy;
   let base = globalThis.location?.href;
@@ -53,7 +56,7 @@ async function lazyList(lazy) {
   if (!Array.isArray(list)) {
     if (list?.files) {
       const b = new URL(list.base ?? './', base);
-      return list.files.map(([p, size, rel, mode]) => [p, size, new URL(rel, b).href, mode]);
+      return list.files.map(([p, size, rel, mtime, mode]) => [p, size, new URL(rel, b).href, mode ?? undefined, mtime ?? undefined]);
     }
     throw new TypeError('lazy: a list of [path, size, url] or its URL');
   }
@@ -140,7 +143,7 @@ export class Filesystem extends EventTarget {
       return {
         tar: src == null ? null : await tarBytes(src),
         at: norm(at),
-        lazy: lz.map(([p, size, url, mode]) => [under(at, p), size, lazyPath(url), mode]),
+        lazy: lz.map(([p, size, url, mode, mtime]) => [under(at, p), size, lazyPath(url), mode, mtime]),
       };
     })();
     return this.#add(p);
@@ -167,7 +170,14 @@ export class Filesystem extends EventTarget {
       layer.catch(() => {});
       return layer.then(() => {});
     }
-    return layer.then((l) => (l.image ? this.#files('addTar').layImage(l) : this.#files('addTar').lay(l))).then(() => {});
+    return layer.then((l) => {
+      // Its Workers started without the rest bundle's decoder (boot's
+      // layers had no such file).
+      if (l.lazy?.some(([, , url]) => url.includes('#')) && !this.#sys.restBundle()) {
+        throw new Error('addTar: a rest bundle\'s lazy files (BUNDLE#OFFSET) after boot, in a system that booted with none: add the bundle\'s list before boot');
+      }
+      return l.image ? this.#files('addTar').layImage(l) : this.#files('addTar').lay(l);
+    }).then(() => {});
   }
 
   /** For boot: the layers, in order (later wins), and what a Persist kept,
