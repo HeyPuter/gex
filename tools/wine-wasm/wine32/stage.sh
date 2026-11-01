@@ -49,6 +49,10 @@ rm -rf "$P/drive_c/users"
 # that has no wasm build yet), with icuin and icuuc, which only forward to
 # it. WINE_ICU=1 keeps them (the dist name then has no -noicu).
 [ "${WINE_ICU:-0}" != 0 ] || rm -f "$P/drive_c/windows/system32/"{icu,icuin,icuuc}.dll
+# winegstreamer left out (its media framework, GStreamer, is not in the
+# build: the DLL would only fail to start). WINE_GSTREAMER=1 keeps it (the
+# dist name then has no -nogst).
+[ "${WINE_GSTREAMER:-0}" != 0 ] || rm -f "$P/drive_c/windows/system32/winegstreamer.dll"
 dd=$D/lib/wine/i386-windows; mkdir -p "$dd" "$D/share/wine"
 for f in "$P"/drive_c/windows/system32/*; do [ -f "$f" ] && cp -p "$f" "$dd/"; done
 # The in-process parts find nls/ beside the executable's directory
