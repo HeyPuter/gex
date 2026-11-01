@@ -4,7 +4,9 @@
 // session (gex-kde-session) spawned as the site's page starts it. Up when
 // plasmashell says its startup completed.
 
-export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 900, html: `<style>html, body { margin: 0; }</style>
+// Alone: a desktop's dozens of processes, each a Worker with its own memory,
+// beside other tests' pages in the same renderer ran out of address space.
+export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 900, alone: true, html: `<style>html, body { margin: 0; }</style>
 <canvas id="out" width="1280" height="800" style="width: 100vw; display: block;"></canvas>` };
 
 export default async function (t) {
@@ -39,5 +41,8 @@ export default async function (t) {
   say(`scene: ${JSON.stringify(d).slice(0, 400)}`);
   await new Promise((r) => setTimeout(r, 5000));
   await t.screenshot('kde');
+  // The renderer's memory with the desktop up (KiB), for a run's budget.
+  const mem = await t.procStatus();
+  if (mem) say(`renderer: VmData ${(mem.data / 1024).toFixed(0)} MiB, VmRSS ${(mem.rss / 1024).toFixed(0)} MiB, VmHWM ${(mem.hwm / 1024).toFixed(0)} MiB`);
   await sys.shutdown();
 }

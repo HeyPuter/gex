@@ -91,7 +91,7 @@ export default async function (t) {
 | `timeout` | Seconds for the whole test, every phase (default 120). |
 | `html` | The page's elements (browser), added to its body before the test runs. |
 | `timed` | A timing test: run by `--timed` only (default false). |
-| `alone` | Run after every other job, one at a time (default false): a test that reads its renderer's memory from /proc (`t.procStatus`), which the runner can only tell from other pages' when it is the only one running. |
+| `alone` | Run after every other job, one at a time (default false): a test that reads its renderer's memory from /proc (`t.procStatus`), which the runner can only tell from other pages' when it is the only one running, or one too big to share a renderer (windows/kde: a whole desktop's Workers). |
 
 A page or process runs one test, so each makes its own System.
 

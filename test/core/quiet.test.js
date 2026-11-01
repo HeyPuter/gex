@@ -43,7 +43,9 @@ export default async function (t) {
     'the crash report for SIGPIPE goes quiet with kc/sigpipe-quiet bd0f8073');
   // A real crash is still said: the default keeps errors.
   const seg = await sys.run(['rt-probe', 'trap'], { env });
-  t.check('a program that traps dies of a signal', !!seg.signal, JSON.stringify(seg));
+  // A 127 is a program whose Worker never started: what the system said why.
+  t.check('a program that traps dies of a signal', !!seg.signal,
+    `${JSON.stringify(seg)}${seg.signal ? '' : `; said ${JSON.stringify((await noise()).slice(-4))}`}`);
   await new Promise((r) => setTimeout(r, 500));
   const crash = (await noise()).slice(before.length + after.length);
   t.check('and its crash is said', crash.some((l) => /signal|trap/.test(l)), JSON.stringify(crash.slice(0, 3)));
