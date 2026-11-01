@@ -262,8 +262,6 @@ function isShared(buf) {
  *  the registry kept its bytes in the shim's heap again and that ran out.
  *  A growable SharedArrayBuffer only commits what it has grown to. */
 const MODULE_STORE_MAX = [32, 16, 8, 4].map((g) => g * 1024 * 1024 * 1024);
-/** A new module store: a growable SharedArrayBuffer whose first eight bytes
- *  are the bump cursor. Null where SharedArrayBuffer cannot grow. */
 /** How many wasm32 modules a program installs before its first thread is
  *  given a Worker ahead (`#offerSpare`): below it, instantiating them again
  *  in the thread's Worker is short. */
@@ -275,12 +273,19 @@ const SPARE_POLL_MAX_MS = 1000;
 /** A test-only switch: the threshold itself, so a small program gets one. */
 const spareModules = () => Number(globalThis.GEX_TEST_SPARE_MODULES ?? globalThis.process?.env?.GEX_TEST_SPARE_MODULES ?? 0) || SPARE_MODULES;
 
-function makeModuleStore() {
+/** Where a module store's first module goes: after the bump cursor (eight
+ *  bytes) and the registry epoch it was made at (four, then padding). */
+const STORE_HEAD = 16;
+/** A new module store for the registry of `epoch` (`gex_registry_epoch`):
+ *  a growable SharedArrayBuffer whose first eight bytes are the bump cursor
+ *  and the next four the epoch. Null where SharedArrayBuffer cannot grow. */
+function makeModuleStore(epoch = 0) {
   if (typeof SharedArrayBuffer === 'undefined' || typeof SharedArrayBuffer.prototype.grow !== 'function') return null;
   for (const max of MODULE_STORE_MAX) {
     try {
       const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: max });
-      Atomics.store(new BigInt64Array(sab, 0, 1), 0, 8n);
+      new Int32Array(sab, 8, 1)[0] = epoch;
+      Atomics.store(new BigInt64Array(sab, 0, 1), 0, BigInt(STORE_HEAD));
       if (globalThis.GEX_REGISTRY_TRACE || globalThis.process?.env?.GEX_REGISTRY_TRACE) {
         globalThis.process?.getBuiltinModule?.('fs')?.writeSync(2, `[gex] module store max ${max / 2 ** 30} GiB\n`);
       }
@@ -3837,7 +3842,7 @@ export class Gex {
     if (!tid) return null;
     // Made before the first thread exists, so every Worker of the process
     // holds the same one.
-    this.#moduleStore ??= makeModuleStore();
+    this.#programStore(true);
     const thread = {
       tid,
       ctx: e.gex_thread_ctx(),
@@ -6870,7 +6875,7 @@ export class Gex {
     if (logNamed('spare')) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${why ? `no spare (${why})` : 'offered'}`);
     this.#spareGen = gen;
     if (why) return;
-    this.#moduleStore ??= makeModuleStore();
+    this.#programStore(true);
     this.#env.offerSpare({
       memory: this.#memory,
       moduleStore: this.#moduleStore,
@@ -8627,6 +8632,28 @@ export class Gex {
    */
   #moduleStore = null;
 
+  /** The module store of the program running now, made if `make` and there
+   *  is none; null otherwise. A store outlives an exec in its Worker, and the
+   *  registry does not (`reset_registry`): the old program's modules in it
+   *  are no one's, and appending the new program's after them kept both, so
+   *  every program of a threaded exec chain paid for all before it. A store
+   *  of an earlier registry epoch is let go of here, and a new one made for
+   *  the threads the new program starts. No row names the old one: the
+   *  registry started over without any, and only threads add them. */
+  #programStore(make) {
+    const e = this.#shim.exports;
+    const epoch = e.gex_registry_epoch?.() ?? 0;
+    if (this.#moduleStore && new Int32Array(this.#moduleStore, 8, 1)[0] !== epoch) {
+      this.#moduleStore = null;
+      // This Worker's place in the registry is the old one's: what is there
+      // now this Worker installed itself.
+      this.#installed = e.gex_module_count?.() >>> 0;
+      this.#rowMemo = null;
+    }
+    if (make) this.#moduleStore ??= makeModuleStore(epoch);
+    return this.#moduleStore;
+  }
+
   /** Registry module `i`'s bytes (a copy), wherever they are kept; null if none. */
   /** Registry module `i`'s content key: as the store's writer recorded it
    *  when the module is in the store, so a catching-up Worker does not hash
@@ -8701,7 +8728,7 @@ export class Gex {
    *  place instead of the bytes. */
   #noteExternal(bytes, key) {
     const e = this.#shim.exports;
-    if (!this.#moduleStore || !key || !e.gex_jit_note_external || !e.gex_jit_keeps?.()) return;
+    if (!key || !e.gex_jit_note_external || !e.gex_jit_keeps?.() || !this.#programStore(false)) return;
     const off = storeAppend(this.#moduleStore, bytes);
     if (off < 0) return;
     // Its size now and then (every 64 MiB; every MiB under
