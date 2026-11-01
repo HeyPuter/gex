@@ -480,8 +480,9 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 		rm -f .done
 		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
 	}
-	log "twin install ($K, $S, $F, $V)"; step dist64-$K-$S-f$F-s$V-twin twin_make
-	DIST=$C/dist64-$K-$S-f$F-s$V-twin
+	# (named after the install it copies: a twin of another install is another twin)
+	log "twin install ($K, $S, $F, $V)"; step "${DIST##*/}-twin" twin_make
+	DIST=$DIST-twin
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done
