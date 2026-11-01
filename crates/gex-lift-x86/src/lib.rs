@@ -371,14 +371,16 @@ impl<'a> Lifter<'a> {
                 Some(s) => self.b.bin(BinOp::Add, Ty::I64, s, p),
             });
         }
-        // 32-bit Wine (`gex_abi::fold_kuser`): a displacement into Windows'
-        // KUSER_SHARED_DATA page names Wine's page instead, in every form that
-        // has one (absolute, with a base, an index or both); not through a
-        // segment, and not for `lea`. An address the emitter sees as a
-        // constant (a pointer loaded in the same block) is folded there;
-        // one computed at run time faults by name (`BRK_KUSER_UNFOLDED`).
-        let disp = match gex_abi::fold_kuser(m.disp as u64 & 0xffff_ffff) {
-            Some(f) if fold && m.addr32 && m.seg.is_none() => {
+        // KUSER_SHARED_DATA folded (`gex_abi::fold_kuser`): a displacement into
+        // Windows' page names the folded page instead, in every form that has
+        // one (absolute, with a base, an index or both), 32- and 64-bit
+        // addressing alike; not through a segment, and not for `lea`. An
+        // address the emitter sees as a constant (a pointer loaded in the same
+        // block) is folded there; one computed at run time faults by name
+        // (`BRK_KUSER_UNFOLDED`).
+        let named = if m.addr32 { m.disp as u64 & 0xffff_ffff } else { m.disp as u64 };
+        let disp = match gex_abi::fold_kuser(named) {
+            Some(f) if fold && m.seg.is_none() => {
                 gex_ir::note_kuser_fold();
                 f as i64
             }
@@ -388,7 +390,7 @@ impl<'a> Lifter<'a> {
             // A bare absolute address: in 32-bit code the sign-extended
             // disp32 names a 32-bit address.
             None if m.addr32 => (self.k64(disp as u64 & 0xffff_ffff), 0),
-            None => (self.k64(m.disp as u64), 0),
+            None => (self.k64(disp as u64), 0),
             Some(s) if m.addr32 => {
                 // 32-bit address arithmetic wraps before the access.
                 let d = self.k64(disp as u64);
@@ -396,7 +398,7 @@ impl<'a> Lifter<'a> {
                 let s = self.b.wrap(s);
                 (self.b.extend(s, false), 0)
             }
-            Some(s) => (s, m.disp),
+            Some(s) => (s, disp),
         }
     }
 
