@@ -453,7 +453,7 @@ def link(dlls, out, gexrt, others=None):
             ro_crt = next(ro for m, ro, _, _ in dlls if m == crt)
             merged = os.path.join(crt_tmp, crt + '.r.o')
             # (the archive after them: the members they need, and only those)
-            subprocess.check_call(['wasm-ld', '-r', '-o', merged, ro_crt]
+            subprocess.check_call(['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['-r', '-o', merged, ro_crt]
                                   + [os.path.join(crt_tmp, m) for m in members] + [musl])
             dlls = [(m, merged if m == crt else ro, ex, imp) for m, ro, ex, imp in dlls]
             # (the link drops what only an export names, rewind_preserve_stack:
