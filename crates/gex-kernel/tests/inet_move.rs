@@ -307,3 +307,46 @@ fn udp_off_the_machine_is_a_flow_of_the_network() {
     let n = none.read_at(0, &mut a).unwrap() as usize;
     assert!(n > q.len() && a[..2] == q[..2], "the kernel answers it");
 }
+
+#[test]
+fn a_moved_udp_socket_reads_every_holders_flows() {
+    let _one = global::install();
+    let (res, ports) = (Arc::new(Resolver::new()), Arc::new(Ports::new()));
+    let net = || Arc::new(named::Net) as Arc<dyn gex_kernel::net::NetStack>;
+    let before = global::live();
+    // A flow before the move stays the first holder's, and the others read
+    // it too.
+    let server = Arc::new(Socket::new(Kind::Udp, net(), Arc::clone(&res), Arc::clone(&ports), None));
+    server.set_self();
+    server.set_peer(0x0a00_0001, 7);
+    server.write_at(0, b"early").unwrap();
+    let early = named::conn(named::made() - 1);
+    let name = server.move_out().unwrap();
+    let client = Socket::moved_proxy(&name, net(), Arc::clone(&res), Arc::clone(&ports), None).unwrap();
+    // As the wineserver polls and the client reads.
+    assert!(client.poll_readable());
+    let mut b = [0u8; 16];
+    assert_eq!(client.read_at(0, &mut b).unwrap(), 5);
+    assert_eq!(client.last_from(), Some((0x0a00_0001, 7)));
+    // The client sends elsewhere: the global kernel has no network, so the
+    // flow is the client's, and the server sees the reply.
+    client.set_peer(0x0a00_0002, 9);
+    assert_eq!(client.write_at(0, b"hi").unwrap(), 2);
+    let flow = named::conn(named::made() - 1);
+    assert!(server.poll_readable(), "every holder sees the flows ready");
+    assert!(client.poll_readable(), "and a poll reads nothing");
+    assert_eq!(server.read_at(0, &mut b).unwrap(), 2);
+    assert_eq!((&b[..2], server.last_from()), (&b"hi"[..], Some((0x0a00_0002, 9))));
+    assert!(!client.poll_readable(), "a datagram is read once");
+    // The server's next datagram there goes down the same flow.
+    let n = named::made();
+    server.set_peer(0x0a00_0002, 9);
+    server.write_at(0, b"again").unwrap();
+    assert_eq!(named::made(), n);
+    assert_eq!(&*flow.sent.lock().unwrap(), b"hiagain");
+    assert_eq!(*flow.holders.lock().unwrap(), 2);
+    drop(server);
+    drop(client);
+    assert_eq!((*flow.holders.lock().unwrap(), *early.holders.lock().unwrap()), (0, 0));
+    assert_eq!(global::live(), before, "every hold is given back");
+}

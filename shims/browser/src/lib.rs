@@ -254,7 +254,9 @@ const NET_DGRAM: i32 = 0x1_0000;
 /// One of the page's UDP flows, as the kernel's [`net::Transport`]: a
 /// stream of datagrams, each framed as its length (two bytes, big-endian)
 /// and its bytes, both ways (web/src/net.js's `Sockets`). Nothing is kept
-/// here: a datagram is read only once all of it has arrived.
+/// here: a datagram is read only once all of it has arrived, so the holders
+/// of a moved socket (each its own process) read whole ones off the one
+/// stream.
 #[derive(Debug)]
 struct PageDgram {
     id: std::sync::atomic::AtomicI32,
@@ -363,6 +365,13 @@ impl net::Transport for PageDgram {
             unsafe { net_close(id) };
         }
     }
+
+    /// A moved UDP socket's other holders read this flow too
+    /// (`net::Socket::sync_flows`).
+    fn name(&self) -> Option<String> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        (id != 0).then(|| format!("pagedg:{id}"))
+    }
 }
 
 /// Where the browser's connections come from.
@@ -383,6 +392,10 @@ impl net::NetStack for PageNet {
 
     /// Another holder of a stream another process opened (`net_dup`).
     fn adopt(&self, name: &str) -> Option<Arc<dyn net::Transport>> {
+        if let Some(id) = name.strip_prefix("pagedg:") {
+            let id = id.parse::<i32>().ok()?;
+            return (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(PageDgram::new(id)) as Arc<dyn net::Transport>);
+        }
         let id = name.strip_prefix("page:")?.parse::<i32>().ok()?;
         (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(PageStream { id: std::sync::atomic::AtomicI32::new(id) }) as Arc<dyn net::Transport>)
     }
