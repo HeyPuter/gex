@@ -810,6 +810,9 @@ function writeSparse(dst, src, at) {
 }
 
 const DISPATCH_DIR = 0x00100000;
+/** gex_abi::ftab::NATIVE_FN_TOP: native PE code's function pointers (table
+ *  indices) stay below it. */
+const NATIVE_FN_TOP = 0x00300000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 // An M64 memory's dense directory, one word per page of all 16 GiB, and its
 // patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END).
@@ -5027,6 +5030,8 @@ export class Gex {
         : new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
+        // native PE code's ICALL bound: this Worker's (`#raiseIcallLimit`)
+        icall_limit64: this.#icallLimit[0], icall_limit: this.#icallLimit[1],
         // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
         // clock, crt_heap's pages.
         ...(prov >= 0 ? {
@@ -5757,6 +5762,9 @@ export class Gex {
           }
           else this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
         }
+        // installs come in index order: every slot below this one's end is
+        // in the table (or a deferred unit's, which native code never calls)
+        if (e.gex_ftab_install_len) this.#raiseIcallLimit((e.gex_ftab_install_base(v) >>> 0) + (e.gex_ftab_install_len(v) >>> 0));
       }
       else if (kind === 2) {
         st.ftab.set(tIdx(v), st.resolve);
@@ -5766,6 +5774,7 @@ export class Gex {
       e.gex_cgen_have(st.have);
     }
     this.#dlSize.value = size;
+    if (st.have >= len) this.#raiseIcallLimit(size);
     if (timed && st.have - from > 16) console.warn(`[unitcatch] ${this.#whoFills()}${this.#forkChild ? ' (fork child)' : ''}: ${st.have - from} events in ${(performance.now() - t0).toFixed(1)} ms`);
     this.#wasmdllCatchUp();
   }
@@ -6087,6 +6096,17 @@ export class Gex {
   /** `gex.dl_size`: the function-table slots this Worker has caught up
    *  with (`#cgenCatchUp`), for modules built with GEX_DL_CHECKED_CALLS. */
   #dlSize = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+  /** `gex.icall_limit64` and `gex.icall_limit` (gex_abi::ftab::ICALL_LIMIT64):
+   *  native PE code's indirect calls take an index below it straight to this
+   *  Worker's table, so it is the slots that table holds, capped at
+   *  NATIVE_FN_TOP (`#raiseIcallLimit`). */
+  #icallLimit = [new WebAssembly.Global({ value: 'i64', mutable: true }, 0n), new WebAssembly.Global({ value: 'i32', mutable: true }, 0)];
+  #raiseIcallLimit(held) {
+    const v = Math.min(held, NATIVE_FN_TOP);
+    if (v <= Number(this.#icallLimit[1].value >>> 0)) return;
+    this.#icallLimit[0].value = BigInt(v);
+    this.#icallLimit[1].value = v;
+  }
   #dlTlsNext = 0;
 
   /** Module `prov`'s (just instantiated as `inst`) thread-local block in
@@ -8669,6 +8689,10 @@ export class Gex {
 
   *#callOutSteps(ctx, target, ret, spWant, suspendable, resume = null) {
     const e = this.#shim.exports;
+    // A table index native code took for a guest address: at or past this
+    // Worker's ICALL bound, a module another Worker installed since. In this
+    // Worker's table before the entry thunk bound at that index runs.
+    if (!resume && Number(target) < NATIVE_FN_TOP) this.#cgenCatchUp();
     const sp0 = e.__stack_pointer.value;
     const psp0 = this.#progSpAt();
     const me = this.#callouts.length;

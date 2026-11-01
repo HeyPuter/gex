@@ -8,7 +8,11 @@
 //   call callee(args...)
 //
 // A function pointer below 0x3f0000 (gex-kernel's NT trampolines) is a function-table index (native
-// code), called directly; anything else is a guest address. The exit stub,
+// code), called directly; anything else is a guest address. On wasm64 the
+// bound is not that constant but the thread's `gex.icall_limit64` (see
+// limit() below): the slots its table holds, so an index into a
+// module another thread has just installed takes the exit stub too, and the
+// host catches this thread up before it runs the function. The exit stub,
 // one per wasm signature (linkonce_odr), lays the arguments out as i386
 // stack words and calls __gexw_guest_call / __gexw_guest_call_fp
 // (gexw_rt.c), which run the guest function through gex's function table
@@ -110,6 +114,31 @@ static bool smallStruct(uint64_t n) { return n == 1 || n == 2 || n == 4 || n == 
 
 struct GexIcall : PassInfoMixin<GexIcall> {
   bool Wasm64 = false;
+
+  // The thread's bound for the select form on wasm64: gex's
+  // `gex.icall_limit64` (the host has an i32 `gex.icall_limit` beside it for
+  // wasm32 code, which still compares with 0x3f0000), a mutable global each thread's instances
+  // import (one per wasmtime store, one per Worker), which the host sets at
+  // instantiation to the slots that thread's table holds and raises as it
+  // catches up (never past gex_abi::ftab::NATIVE_FN_TOP). An index at or
+  // above it is a module installed since this thread last caught up: the
+  // exit stub takes it as a guest address, gex's call-out catches the thread
+  // up, and the entry thunk bound at that index runs the function. The bound
+  // only grows, so a stale read costs a slow call, never a wrong one. A wasm
+  // global (address space 1) read at the site: one global.get. (Pointer
+  // wide: LLVM folds a zero-extended i32 global read into a memory load.)
+  Value *limit(Module &M, IRBuilder<> &B, Type *IP) {
+    const char *name = "__gexw_icall_limit_g";
+    GlobalVariable *G = M.getGlobalVariable(name);
+    if (!G) {
+      G = new GlobalVariable(M, IP, false, GlobalValue::ExternalLinkage, nullptr, name, nullptr,
+                             GlobalValue::NotThreadLocal, 1);
+      M.appendModuleInlineAsm(std::string(".import_module __gexw_icall_limit_g, gex\n"
+                                          ".import_name __gexw_icall_limit_g, ") +
+                              (IP->isIntegerTy(64) ? "icall_limit64" : "icall_limit") + "\n");
+    }
+    return B.CreateLoad(IP, G);
+  }
 
   Function *getTarget(Module &M, const char *name, FunctionType *FT) {
     return cast<Function>(M.getOrInsertFunction(name, FT).getCallee());
@@ -623,7 +652,8 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       SmallVector<OperandBundleDef, 1> Funclet;
       if (auto OB = CB->getOperandBundle(LLVMContext::OB_funclet)) Funclet.emplace_back(*OB);
       B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P}, Funclet);
-      Value *Native = B.CreateICmpULT(P, ConstantInt::get(IP, ICALL_LIMIT));
+      Value *Limit = Wasm64 ? limit(M, B, IP) : (Value *)ConstantInt::get(IP, ICALL_LIMIT);
+      Value *Native = B.CreateICmpULT(P, Limit);
       CB->setCalledOperand(B.CreateSelect(Native, Callee, Stub));
       done++;
     }

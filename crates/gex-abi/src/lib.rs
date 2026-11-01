@@ -850,6 +850,16 @@ pub mod ftab {
     /// static data `addr` is, or 0. Indices are one space for both modes of a
     /// WoW64 process, and each module's data is its own allocation.
     pub const IMAGE_OF: &str = "image_of";
+    /// `gex.icall_limit64` (i64) and `gex.icall_limit` (i32): mutable globals,
+    /// one pair per thread, that native PE code's indirect calls compare a
+    /// function pointer with (the GexIcall pass): below it, a table index
+    /// the thread's table holds, called directly; at or above it, the exit
+    /// stub's guest call. The host keeps them at the slots the thread's
+    /// table holds (capped at [`NATIVE_FN_TOP`]), raised as it catches up,
+    /// so an index into a module another thread installed since reaches the
+    /// call-out, which catches the thread up first.
+    pub const ICALL_LIMIT64: &str = "icall_limit64";
+    pub const ICALL_LIMIT: &str = "icall_limit";
 
     /// `F_body`'s results.
     pub const RET_PREDICTED: i32 = 1;
