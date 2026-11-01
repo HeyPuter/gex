@@ -202,6 +202,10 @@ pub struct Context<'a> {
     pub page_bases: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
+    /// The global holding it instead, set by the host at instantiation
+    /// (`crate::module::with_module_id_global`): the bytes then do not
+    /// depend on which id the module was given.
+    pub module_id_global: Option<u32>,
     /// The module's imported dense base (`crate::dense::GLOBAL`), when it
     /// has one: `PAGE_STALE` passes its value, where this module's dense
     /// blocks really are in the process running it.
@@ -5421,11 +5425,18 @@ impl<'a> Emitter<'a> {
             // The argument: this module's dense base (high half, read at run
             // time: where its blocks are in the process running it, unique
             // there by construction) and its id (low half). The id is
-            // compiled in and code outlives its process (units adopted from
+            // compiled in (natively, a global set at instantiation) and code
+            // outlives its process (units adopted from
             // another, modules restored from the translation cache), so ids
             // repeat; it only decides whether to translate again, never
             // whether to resume from JavaScript (`gex_cache_op`).
-            self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64);
+            match self.cx.module_id_global {
+                Some(g) => {
+                    self.f.global_get(g);
+                    self.f.byte(0xad); // i64.extend_i32_u
+                }
+                None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
+            }
             if let Some(g) = self.cx.dense_global {
                 self.f.global_get(g);
                 self.f.byte(0xad); // i64.extend_i32_u

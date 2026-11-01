@@ -450,6 +450,9 @@ static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 struct CompiledUnit {
     /// None for a unit that only writes dispatch slots (`bridges`).
     module: Option<Module>,
+    /// Its `TranslatedModule::module_id`, for its `gex_module_id` global
+    /// (`gex_emit::with_module_id_global`); 0 for one without.
+    module_id: u64,
     exported_blocks: Vec<(u64, String)>,
     dir_entries: Vec<(u64, u32)>,
     table_slots: u64,
@@ -5202,7 +5205,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     });
     gex_xlate::set_volatile_ranges(volatile);
     }
-    let (translated_module, stats) = {
+    let (translated_module, stats) = gex_emit::with_module_id_global(|| {
         let data = memory.bytes();
         gex_xlate::translate_runtime(
             data,
@@ -5217,7 +5220,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             true,
             &Default::default(),
         )
-    };
+    });
     jit_stats::note(pc);
     // 32-bit Wine's KUSER_SHARED_DATA folds (`gex_abi::fold_kuser`), by object: the
     // translator's line for them, as the browser's.
@@ -5437,6 +5440,7 @@ fn publish_unit(
     }
     let unit = Arc::new(CompiledUnit {
         module: Some(module),
+        module_id: translated.module_id,
         exported_blocks: translated.exported_blocks.clone(),
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
@@ -5587,6 +5591,11 @@ fn install_unit(
         .instantiate(cx.as_context_mut(), unit.module.as_ref().unwrap())
         .context("instantiating a runtime-translated module")?;
     profile::attach(cx.as_context_mut(), &instance)?;
+    // Its id, which its page checks pass `PAGE_STALE` (gex_emit::
+    // with_module_id_global): set before anything here can run it.
+    if let Some(g) = instance.get_global(cx.as_context_mut(), gex_emit::MODULE_ID_GLOBAL) {
+        g.set(cx.as_context_mut(), wasmtime::Val::I32(unit.module_id as u32 as i32))?;
+    }
 
     // The module carries element segments for the table it imports, so
     // instantiating it already filled its slots. Writing the directory is
@@ -6672,7 +6681,7 @@ fn recompile_object(
     // discovery does the rest. Scanning every decodable address is complete
     // but finds ~200,000 interior blocks in libc that entry blocks cover.
     let started = std::time::Instant::now();
-    let (modules, stats) = {
+    let (modules, stats) = gex_emit::with_module_id_global(|| {
         let data = memory.bytes();
         gex_xlate::translate_object(
             data,
@@ -6687,7 +6696,7 @@ fn recompile_object(
             true,
             &Default::default(),
         )
-    };
+    });
     if modules.iter().all(|m| m.exported_blocks.is_empty()) {
         return Ok(());
     }

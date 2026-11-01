@@ -566,9 +566,31 @@ impl Reader<'_> {
     }
 }
 
-/// Builds a wasm module from GIR blocks.
 /// The next `TranslatedModule::module_id`.
 static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The global a module built under [`with_module_id_global`] exports: its
+/// `TranslatedModule::module_id`, which the host sets once it has
+/// instantiated it.
+pub const MODULE_ID_GLOBAL: &str = "gex_module_id";
+
+thread_local! {
+    static MODULE_ID_IN_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the shared-linkage modules this thread starts keeping their
+/// id in a global ([`MODULE_ID_GLOBAL`]) that the host sets at
+/// instantiation, rather than compiled into every block's page check. Ids
+/// come from one counter for every process a host runs and every thread of
+/// each, so compiled in they gave the same translation different bytes from
+/// run to run, and a cache keyed by the bytes did not hit. Only for a host
+/// that sets the global on every instance; another leaves it 0.
+pub fn with_module_id_global<R>(f: impl FnOnce() -> R) -> R {
+    let was = MODULE_ID_IN_GLOBAL.with(|g| g.replace(true));
+    let r = f();
+    MODULE_ID_IN_GLOBAL.with(|g| g.set(was));
+    r
+}
 
 /// What `gex.dispatch_miss` returns for "translated `pc` and installed it in
 /// this store: dispatch to it again". The miss stub then re-enters dispatch
@@ -625,6 +647,9 @@ pub struct ModuleBuilder {
     profile: Option<ProfileFns>,
     /// The imported global holding this module's dense base, if any.
     dense_global: Option<u32>,
+    /// The defined global holding this module's id, if any
+    /// ([`with_module_id_global`]).
+    id_global: Option<u32>,
 }
 
 /// The helpers a profiled module defines. See `crate::profile`.
@@ -834,7 +859,15 @@ impl ModuleBuilder {
             demand_fill: false,
             profile: None,
             dense_global,
+            id_global: None,
         };
+        // Defined before profiling's global, and only with no global
+        // imported (`Module::add_global` numbers from 0).
+        if linkage == Linkage::Shared && dense_global.is_none() && MODULE_ID_IN_GLOBAL.with(|g| g.get()) {
+            let g = b.m.add_global(ValType::I32, true, 0);
+            b.m.export(MODULE_ID_GLOBAL, ExportKind::Global, g);
+            b.id_global = Some(g);
+        }
 
         if profiling {
             let i32_ = ValType::I32;
@@ -998,6 +1031,7 @@ impl ModuleBuilder {
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
                 module_id,
+                module_id_global: self.id_global,
                 dense_global: self.dense_global,
                 loop_heads: Some(&heads),
                 enter: Some(self.dispatch),

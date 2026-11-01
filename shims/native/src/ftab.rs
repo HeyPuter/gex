@@ -580,6 +580,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
     s.translated.extend(entries.iter().copied());
     let unit = Arc::new(CompiledUnit {
         module: None,
+        module_id: 0,
         exported_blocks: Vec::new(),
         dir_entries: dirs,
         table_slots: s.page_table.slots(),
