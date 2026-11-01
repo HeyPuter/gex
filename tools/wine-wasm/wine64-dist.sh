@@ -7,6 +7,8 @@
 #
 # prints WINE64_DIST=..., WINE64_PREFIX=..., and WINE64_TOOLS=... and WINE64_SRC=...
 # (the native tools build and the Wine tree: the native PE side's case),
+# WINE64_BUILD=... (the wasm64 build tree: its import libraries, headers and
+# libgexrt, which gexcc-win links against),
 # for a test, WINE64_NTDLL=... (the native PE ntdll) and
 # WINE64_NATIVE=... (the native PE core).
 # Each step is cached in CACHE by what it depends on, and skipped when done:
@@ -430,6 +432,7 @@ if [ "$M64" != 0 ]; then
 		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 	fi
 	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
+	echo "WINE64_BUILD=$C/b64-$K-$S"
 	[ "${WINE64_M64_NATIVE:-0}" = 0 ] || echo "WINE64_NATIVE=$NATIVE"
 	exit 0
 fi
@@ -501,6 +504,7 @@ echo "WINE64_DIST=$DIST"
 echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"
 echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
+echo "WINE64_BUILD=$C/b64-$K-$S"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
 echo "WINE64_NATIVE=$NATIVE"
 [ -z "$NATIVE32" ] || echo "WINE64_NATIVE32=$NATIVE32"
