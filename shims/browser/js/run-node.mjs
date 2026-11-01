@@ -778,7 +778,7 @@ const host = new ProcessHost({
 // layout 2), as the page plays them (web/src/audio.js). GEX_AUDIO_TAP=1
 // reports, at exit, what the newest quarter second of the slot written last
 // sounds like: its rate, generation, RMS and frequency (left channel, by
-// zero crossings), and how many slots were ever used.
+// the spacing of its zero crossings), and how many slots were ever used.
 let audioRing = null;
 const AU_HDR = 32, AU_SW = 16, AU_OFF = (AU_HDR + 8 * AU_SW) * 4;
 function audioWords() {
@@ -801,14 +801,25 @@ function audioTap() {
   const w = W[b + 3], rate = W[b + 1], owner = W[b], gen = W[b + 2];
   const n = Math.min(w, cap, Math.floor(rate / 4));
   const f = new Float32Array(memory.buffer, at + AU_OFF + best * cap * 8, cap * 2);
-  let sq = 0, cross = 0, last = 0;
+  let sq = 0, last = 0, prev = -1;
+  const gaps = [];
   for (let i = w - n; i < w; i++) {
     const l = f[((i >>> 0) % cap) * 2];
     sq += l * l;
-    if (i > w - n && (l >= 0) !== (last >= 0)) cross++;
+    if (i > w - n && (l >= 0) !== (last >= 0)) {
+      if (prev >= 0) gaps.push(i - prev);
+      prev = i;
+    }
     last = l;
   }
-  const rms = n ? Math.sqrt(sq / n) : 0, hz = n ? cross / 2 / (n / rate) : 0;
+  // The frequency from the spacing of the crossings, those within a quarter
+  // of the median averaged: a writer that fell behind under load leaves a
+  // gap or a splice, a few odd spacings that would add crossings to a plain
+  // count.
+  const med = gaps.slice().sort((a, b) => a - b)[gaps.length >> 1];
+  const mid = gaps.filter((g) => Math.abs(g - med) <= med / 4);
+  const half = mid.length ? mid.reduce((a, b) => a + b, 0) / mid.length : 0;
+  const rms = n ? Math.sqrt(sq / n) : 0, hz = half ? rate / (2 * half) : 0;
   process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)} slots ${used}\n`);
 }
 
