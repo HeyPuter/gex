@@ -3,20 +3,30 @@
 # wasm64 Wine build linked as one module (pelink.py, lowered to wasm32),
 # with a PE32+ skeleton per DLL that names it (winebuild --wasm-shared).
 #
-#   tools/wine-wasm/stage-native64.sh WINE_BUILD WINE_SRC OUTDIR DLL...
+#   tools/wine-wasm/stage-native64.sh [--i386] WINE_BUILD WINE_SRC OUTDIR DLL...
 #
 # WINE_BUILD is a wasm64 build tree of the Wine fork (wine64-dist.sh's b64:
 # winegcc there leaves each DLL's relocatable object and export list),
 # WINE_SRC its source. OUTDIR gets winepe.wasm and the skeletons, to go in
 # place of a 64-bit Wine install's lib/wine/x86_64-windows DLLs; every DLL not named stays x86-64 code.
 # GEX_WASM64_SYSROOT must be set (build-sysroot64.sh).
+# --i386: WoW64's 32-bit side instead: WINE_BUILD a wasm32 build tree of the
+# same fork (wine32/wine-build.sh wasm), PE32 skeletons over wasm32 modules,
+# for lib/wine/i386-windows; GEX_WASM_SYSROOT must be set (build-sysroot.sh).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-[ $# -ge 4 ] || { sed -n 2,13p "$0" >&2; exit 2; }
+i386=0; [ "${1:-}" != --i386 ] || { i386=1; shift; }
+[ $# -ge 4 ] || { sed -n 2,16p "$0" >&2; exit 2; }
 build=$(cd "$1" && pwd) src=$(cd "$2" && pwd) out=$3
 shift 3
-: "${GEX_WASM64_SYSROOT:?set GEX_WASM64_SYSROOT}"
-grep -q '^HOST_ARCH = wasm64' "$build/Makefile" || { echo "$build is not a wasm64 build tree" >&2; exit 2; }
+if [ $i386 = 1 ]; then
+    : "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT}"
+    host=wasm32; target=wasm32-unknown-linux-musl; cc="$here/wcc"; link=(); bin=
+else
+    : "${GEX_WASM64_SYSROOT:?set GEX_WASM64_SYSROOT}"
+    host=wasm64; target=wasm64-unknown-linux-musl; cc="$here/wcc64 -D_WIN32"; link=(--wasm64); bin=$GEX_WASM64_SYSROOT/binaryen/bin:
+fi
+grep -q "^HOST_ARCH = $host" "$build/Makefile" || { echo "$build is not a $host build tree" >&2; exit 2; }
 winebuild=${WINEBUILD:-$(grep -m1 -o '[^ ]*/tools/winebuild/winebuild' "$build/Makefile")}
 [ -x "$winebuild" ] || { echo "no winebuild (WINEBUILD=...)" >&2; exit 2; }
 
@@ -46,13 +56,13 @@ fi
 # skeleton is; their imports of the core's DLLs bind to its exports.
 split=() splits=()
 for dll in ${WINE64_SPLIT_DLLS:-}; do split+=(--split "$dll.wasm" "$dll"); splits+=("$dll"); done
-PATH=$GEX_WASM64_SYSROOT/binaryen/bin:$PATH TMPDIR=$tmp python3 "$here/pelink.py" --wasm64 "${split[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
+PATH=$bin$PATH TMPDIR=$tmp python3 "$here/pelink.py" "${link[@]}" "${split[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
 cp "$tmp/winepe.wasm" "$out/winepe.wasm"
 for dll in "${splits[@]}"; do cp "$tmp/$dll.wasm" "$out/$dll.wasm"; done
 if [ ${#extras[@]} -gt 0 ]; then
     mkdir -p "$out/extra"
     for dll in "${extras[@]}"; do
-        "$winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$here/wcc64 -D_WIN32" --dll -E "$WINE64_EXTRA_DLLS/${dll%.*}.spec" \
+        "$winebuild" -w -b "$target" --cc-cmd="$cc" --dll -E "$WINE64_EXTRA_DLLS/${dll%.*}.spec" \
             --fake-module --wasm-shared winepe.wasm -F "$dll" -o "$out/extra/$dll"
     done
 fi
@@ -60,8 +70,10 @@ for dll in "$@" "${splits[@]}"; do
     name=${dll%.*}
     module=winepe.wasm
     for x in "${splits[@]}"; do [ "$x" != "$dll" ] || module=$dll.wasm; done
-    dir=$build/dlls/$name
-    [ -d "$dir" ] || dir=$build/dlls/$dll
+    # a module named with its extension (msacm32.drv) has its own directory
+    dir=$build/dlls/$dll
+    [ -d "$dir" ] || dir=$build/dlls/$name
+    [ -d "$dir" ] || dir=$build/programs/$dll
     [ -d "$dir" ] || dir=$build/programs/$name
     spec=$src/${dir#$build/}/$name.spec
     if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
@@ -69,7 +81,7 @@ for dll in "$@" "${splits[@]}"; do
     # a GUI program's skeleton says so (stage-native.sh)
     if [ ! -f "$spec" ] && grep -q -- '-mwindows' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem windows); fi
     # shellcheck disable=SC2046
-    "$winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$here/wcc64 -D_WIN32" "${kind[@]}" --fake-module \
+    "$winebuild" -w -b "$target" --cc-cmd="$cc" "${kind[@]}" --fake-module \
         --wasm-shared "$module" -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
 echo "$out: ${*} native ($(du -h "$out/winepe.wasm" | cut -f1) module)${splits:+, ${splits[*]} as modules of their own}"

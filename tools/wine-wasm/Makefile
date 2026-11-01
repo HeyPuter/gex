@@ -133,6 +133,7 @@ paths:
 	@echo WINE32_WINE_SRC=$(WINE_SRC)
 	@echo WINE32_BUILD=$(BUILD)
 	@echo GEX_WASM_SYSROOT=$(GEX_WASM_SYSROOT)
+	@echo WINE32_DEPS=$(DEPS)
 	@echo WINE32_UNITS=$(C)/units
 	@echo WINE32_KEY=$(DIST_KEY)
 

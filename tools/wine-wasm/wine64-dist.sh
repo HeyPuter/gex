@@ -40,13 +40,22 @@
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
-#   pen64-K-N   the native PE core : WINE64_NATIVE_DLLS (default ntdll,
-#               kernelbase, kernel32, msvcrt, ucrtbase, and winewayland.drv,
-#               the display driver's PE side) made in b64-K-S and
-#               linked as one module behind their skeletons
-#               (stage-native64.sh)
+#   pen64-K-N   the native PE side: WINE64_NATIVE_DLLS (default ntdll,
+#               kernelbase, kernel32, msvcrt, ucrtbase, winewayland.drv (the
+#               display driver's PE side), WoW64's DLLs, wineboot, services
+#               and explorer) made in b64-K-S and linked as one module behind
+#               their skeletons, and every other module that tree builds as
+#               one of its own (stage-native64.sh)
 #   pen64-K-N-twin  with WINE64_TWIN=1, that core plus the memory64 build's
 #               module as winepe.wasm.m64 (WINE64_NATIVE then names it)
+#   b32-K-B     with WINE64_WOW64=1, the wasm32 build tree of the i386 PE side
+#               (wine32/wine-build.sh wasm; B: that script, 32-bit Wine's
+#               sysroot and libraries)
+#   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
+#               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
+#   dist64-...-nN[-N32]  the install with the native PE side in place of
+#               the PE builtins, both arches: WINE64_DIST (WINE64_NATIVE_PE=0:
+#               the install above, translated)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
 # S those, gex's link tools, gex-gl's guest library and the OSSv4 header
@@ -313,29 +322,79 @@ ntdll_native() {
 # (the lone PE ntdll: the lowered flavour's only)
 [ "$M64" != 0 ] || { log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native; }
 
+# The native PE side, the install's default: the PE builtins as native wasm
+# modules (pelink.py, stage-native64.sh) in place of their x86-64 code. The
+# core, WINE64_NATIVE_DLLS, is one module (winepe.wasm); every other module the
+# wasm64 tree builds that the install has is a module of its own beside it
+# (WINE64_SPLIT_DLLS names them instead). A module the tree cannot build stays
+# x86-64 code. The install's name then gets -nNK. WINE64_NATIVE_PE=0: the PE
+# builtins as they are, translated (for comparison; the core is still made).
+NPE=${WINE64_NATIVE_PE:-1}
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
-# WINE64_SPLIT_DLLS="DLL ...": those linked as modules of their own beside
-# the core (stage-native64.sh); part of N
+# WoW64's own DLLs, and the programs every process start runs, in the core too
+if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
+	[ "$WOW" = 0 ] || D="$D wow64.dll wow64win.dll wow64cpu.dll"
+	D="$D wineboot.exe services.exe explorer.exe"
+fi
 SP=${WINE64_SPLIT_DLLS:-}
-NK=$( { echo "$S $D${SP:+ split $SP}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+# (the memory64 flavour: the core alone, as before; its twin pairs only winepe.wasm)
+SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || [ "$M64" != 0 ] || SPA=all
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
-	local b=$C/b64-$K-$S t
+	local b=$C/b64-$K-$S t sp=$SP
 	t="libs/gexrt/libgexrt.a"
-	for dll in $D; do t="$t dlls/${dll%.dll}/wasm64-windows/$dll"; done
-	for dll in $SP; do
-		if [ -d "$b/dlls/${dll%.*}" ]; then t="$t dlls/${dll%.*}/wasm64-windows/$dll"
-		elif [ -d "$b/dlls/$dll" ]; then t="$t dlls/$dll/wasm64-windows/$dll"
-		else t="$t programs/${dll%.*}/wasm64-windows/$dll"; fi
-	done
+	for dll in $D; do t="$t $(pe_target "$b" "$dll")"; done
+	if [ -n "$SPA" ]; then
+		# every PE module, as far as each builds (one that fails stays x86-64 code)
+		( cd "$b" && nice -n 10 make -k -j"$J" ) || true
+		sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
+			while read -r m; do case " $D " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
+		echo "$sp" > split.txt
+	fi
+	for dll in $sp; do t="$t $(pe_target "$b" "$dll")"; done
 	# shellcheck disable=SC2086
 	( cd "$b" && nice -n 10 make -j"$J" $t ) || return 1
 	# shellcheck disable=SC2086
-	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
+	WINE64_SPLIT_DLLS="$(echo $sp)" nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
+pe_target() { # BUILD DLL: the tree's make target for DLL's wasm64 build
+	# a module named with its extension (msacm32.drv) has its own directory
+	if [ -d "$1/dlls/$2" ]; then echo "dlls/$2/wasm64-windows/$2"
+	elif [ -d "$1/dlls/${2%.*}" ]; then echo "dlls/${2%.*}/wasm64-windows/$2"
+	elif [ -d "$1/programs/$2" ]; then echo "programs/$2/wasm64-windows/$2"
+	else echo "programs/${2%.*}/wasm64-windows/$2"; fi
+}
 NATIVE=$C/pen64-$K-$NK/native
+# WoW64's i386 PE side native as well: a wasm32 build tree of this Wine tree
+# (wine32/wine-build.sh wasm, with 32-bit Wine's sysroot and libraries and
+# this tree's tools), its modules staged as the x86_64 ones are
+# (stage-native64.sh --i386): the core, WINE64_NATIVE_DLLS32, one module, and
+# every other module the tree builds that the install's i386-windows has, one
+# of its own. The install's name gets -N32 too.
+N32=; NATIVE32=
+if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
+	p32=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
+	SR32=$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32"); DEPS32=$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")
+	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
+	B32K=$( { echo "$SR32 $DEPS32"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
+	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
+	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+	NATIVE32=$C/pen32-$K-$N32/native
+fi
+b32_build() {
+	GEX_WASM_SYSROOT=$SR32 WINE32_JOBS=$J nice -n 10 "$here/wine32/wine-build.sh" wasm "$W" "$T" "$PWD" "$DEPS32"
+}
+pe_native32() {
+	local b=$C/b32-$K-$B32K sp
+	sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
+		while read -r m; do case " $D32 " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/i386-windows/$m" ] && echo "$m"; done)
+	echo "$sp" > split.txt
+	# shellcheck disable=SC2086
+	GEX_WASM_SYSROOT=$SR32 WINE64_SPLIT_DLLS="$(echo $sp)" nice -n 10 "$here/stage-native64.sh" --i386 "$b" "$W" "$PWD/native" $D32
+}
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
 	# half) its PE core too, a module for a 64-bit memory (pelink.py sees
@@ -348,6 +407,25 @@ if [ "$M64" != 0 ]; then
 	exit 0
 fi
 log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
+if [ -n "$N32" ]; then
+	log "i386 wasm32 tree ($K, $B32K)"; step b32-$K-$B32K b32_build
+	log "i386 native PE side ($K, $N32)"; step pen32-$K-$N32 pe_native32
+fi
+# The install with the native PE side in place of the PE builtins (rm first:
+# the copy's files are hard links)
+native_make() {
+	cp -al "$DIST/." .
+	rm -f .done
+	local a n
+	for a in x86_64:$NATIVE i386:$NATIVE32; do
+		n=${a#*:}; [ -n "$n" ] || continue
+		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
+	done
+}
+if [ "$NPE" != 0 ]; then
+	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST-n$NK${N32:+-$N32} native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST-n$NK${N32:+-$N32}
+fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as
 # x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's wine; one PE side, one
@@ -382,3 +460,4 @@ echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
 echo "WINE64_NATIVE=$NATIVE"
+[ -z "$NATIVE32" ] || echo "WINE64_NATIVE32=$NATIVE32"
