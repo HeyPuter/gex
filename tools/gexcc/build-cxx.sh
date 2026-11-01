@@ -6,7 +6,7 @@
 #
 # LLVM_SRC needs runtimes/, cmake/, llvm/cmake, llvm/utils, libcxx/,
 # libcxxabi/, libunwind/, libc/ (libc++ uses libc's shared headers) and
-# third-party/. Installs into PREFIX/sysroot: include/c++/v1, lib/libc++.a,
+# third-party/: a checkout of llvm.pin's commit. Installs into PREFIX/sysroot: include/c++/v1, lib/libc++.a,
 # libc++abi.a, libunwind.a (gexc++ links them).
 set -eu
 PREFIX=$(realpath "$1")
@@ -22,14 +22,10 @@ done
 JOBS=${JOBS:-6}
 export PATH=$PREFIX/bin:$PATH
 rm -rf "$B"
-# Our changes to the LLVM runtimes (patches/libcxx-*.patch, each saying why),
-# applied to LLVM_SRC once
-for p in "$(dirname "$0")"/patches/libcxx-*.patch; do
-  [ -e "$p" ] || continue
-  if ! patch -d "$SRC" -p1 -R -s -f --dry-run < "$p" > /dev/null 2>&1; then
-    patch -d "$SRC" -p1 -s -N < "$p" || { echo "build-cxx.sh: $p does not apply" >&2; exit 1; }
-  fi
-done
+# LLVM_SRC at llvm.pin's commit (our changes to the runtimes are commits
+# there): any other tree builds a libc++ the gate never tested
+. "$(dirname "$0")/llvm-pin.sh"
+llvm_pin_check "$SRC"
 # wasm is not ELF, so libunwind would mark its exports __declspec(dllexport)
 # unless told the symbols are hidden (one static module: they need not be
 # exported at all).
