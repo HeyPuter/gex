@@ -1749,8 +1749,13 @@ export class Gex {
       // bytes re-read from files, bytes copied out of the image, ms in each.
       cost: e.gex_link_cost ? (() => {
         const p = e.gex_alloc(40) >>> 0;
+        // Read at a Worker's end, the process possibly torn down under it:
+        // an allocation this Worker's view of the memory does not hold is
+        // no cost to report, not a reason for the report to throw.
+        const b = this.#bytes();
+        if (!p || p % 8 || p + 40 > b.byteLength) return null;
         e.gex_link_cost(p);
-        const v = new BigUint64Array(this.#bytes().buffer, p, 5);
+        const v = new BigUint64Array(b.buffer, p, 5);
         return [Number(v[0]), Number(v[1]), Number(v[2]), Number(v[3]), Number(v[4])];
       })() : null,
     };
