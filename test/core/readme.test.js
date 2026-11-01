@@ -14,8 +14,7 @@ import * as single from '../../web/runtime/src/windows/single.js';
 import * as compositor from '../../web/runtime/src/windows/compositor.js';
 import * as persist from '../../web/runtime/src/persist.js';
 import * as idb from '../../web/runtime/src/persist/idb.js';
-import * as net from '../../web/runtime/src/net.js';
-import * as wisp from '../../web/runtime/src/net/wisp.js';
+import * as wisp from '../../web/runtime/src/net/wisp.mjs';
 import * as audio from '../../web/runtime/src/audio.js';
 import * as gl from '../../web/runtime/src/gl.js';
 import * as input from '../../web/runtime/src/input.js';
@@ -25,7 +24,7 @@ export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
 const M = {
   '@gex/runtime': index, '@gex/runtime/fs': fsMod, '@gex/runtime/windows/host': host,
   '@gex/runtime/windows/single': single, '@gex/runtime/windows/compositor': compositor,
-  '@gex/runtime/persist': persist, '@gex/runtime/persist/idb': idb, '@gex/runtime/net': net,
+  '@gex/runtime/persist': persist, '@gex/runtime/persist/idb': idb,
   '@gex/runtime/net/wisp': wisp, '@gex/runtime/audio': audio, '@gex/runtime/gl': gl, '@gex/runtime/input': input,
 };
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
@@ -62,22 +61,22 @@ const PHASES = [
     const s = await v.persist.save();
     t.check('persistence: save()', typeof s?.stored === 'number' && typeof s?.bytes === 'number', JSON.stringify(s));
   } },
-  { blocks: [5], pre: 'booted', check: async (t, v) => {
-    t.check('network: a Wisp', v.sys.net !== undefined, '');
+  { blocks: [5, 6], pre: 'booted', check: async (t, v) => {
+    t.check('network: the last one set, a Wisp', v.sys.network instanceof wisp.Wisp && v.sys.network.url === 'wss://wisp.example/', String(v.sys.network?.url));
   } },
-  { blocks: [6], pre: 'booted', check: async (t, v) => {
-    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[6], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
+  { blocks: [7], pre: 'booted', check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[7], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
     t.eq('host calls: the guest reads "\\0true"', [r.code, r.stdout], [0, '\0true']);
     t.eq('host calls: notify ran', v.calls.showToast, 'built');
     v.off();
     t.eq('host calls: unregistered', v.sys.hostCalls.names().includes('notify'), false);
   } },
-  { blocks: [8], pre: 'new', after: [7], boot: true, check: async (t, v) => {
+  { blocks: [9], pre: 'new', after: [8], boot: true, check: async (t, v) => {
     t.check('GL: a MesaGl before boot, beside its windows', !!v.gl && !!v.hw, '');
     v.button.onclick();
     t.check('audio: the click made a WebAudio', true, '');
   } },
-  { blocks: [9], pre: 'new', check: async (t, v) => {
+  { blocks: [10], pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
     t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
   } },
@@ -120,7 +119,7 @@ const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'persist', 'gl'
 export default async function (t) {
   const { eq, check, say } = t;
   if (t.phase === 1) {
-    eq('the README\'s examples', BLOCKS.length, 10);
+    eq('the README\'s examples', BLOCKS.length, 11);
     members(t);
   }
   const phase = PHASES[t.phase - 1];
@@ -156,14 +155,13 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
 /** Every class the README's tables name, with their members. */
 function members(t) {
   const want = {
-    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'shutdown', 'hostCalls', 'net', 'addEventListener']],
+    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
     'Process': [index.Process.prototype, ['pid', 'kill', 'windows', 'addEventListener']],
     'Filesystem': [fsMod.Filesystem.prototype, ['addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
     'Mount': [fsMod.Mount.prototype, ['unmount']],
     'Persist': [persist.Persist.prototype, ['save', 'reset', 'stats']],
     'IdbPersist': [idb.IdbPersist.prototype, ['save', 'reset', 'stats']],
-    'Network': [net.Network.prototype, ['ready']],
-    'Wisp': [wisp.Wisp.prototype, ['ready']],
+    'Wisp': [wisp.Wisp.prototype, ['url', 'connect', 'datagram', 'close', 'addEventListener']],
     'WebAudio': [audio.WebAudio.prototype, ['ready', 'context', 'stats', 'close']],
     'MesaGl': [gl.MesaGl.prototype, ['start']],
     'PointerLock': [input.PointerLock.prototype, ['locked', 'release']],

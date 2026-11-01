@@ -1,7 +1,7 @@
 // A network for the Node fast lane, backed by real TCP sockets: the same seven
-// calls the page carries over Wisp, so everything above Wisp -- apt's helper,
+// calls the page carries over its network, so everything above it -- apt's helper,
 // the fetch, the decompression, the parse -- runs here in two minutes instead
-// of twenty. Wisp itself is not exercised.
+// of twenty. The page's network itself is not exercised.
 //
 // Every call returns without waiting: the guest's thread is parked by the
 // kernel, so blocking here would take the wasm stack and nothing would ever
@@ -64,7 +64,7 @@ export class NodeNetwork {
     this.#tcp = tcp;
   }
   /** Called on every socket event: the single-thread build wakes its parked
-   *  fibers with it (as web/src/net.js's WispNetwork does). */
+   *  fibers with it (as web/src/net.js's Sockets does). */
   onActivity = () => {};
 
   /** A fresh identifier; the guest connects it next. */

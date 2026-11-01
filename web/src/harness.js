@@ -112,9 +112,8 @@ export async function start() {
   // A page cannot open a TCP socket, so the network is carried over Wisp.
   let network = null;
   if (params.get('wisp')) {
-    const { WispNetwork } = await import('./net.js');
-    network = new WispNetwork(params.get('wisp'));
-    await network.start();
+    const [{ Sockets }, { Wisp }] = await Promise.all([import('./net.js'), import('../runtime/src/net/wisp.mjs')]);
+    network = new Sockets(new Wisp(params.get('wisp')));
   }
   const t0 = performance.now();
 

@@ -6,9 +6,9 @@
 // guest any files this way (a package repository beside the page, which the
 // network proxy could not reach).
 //
-// A stream here has the shape of a Wisp client's (`send`, `close`, and the
-// `onopen`/`onmessage`/`onclose` its owner sets), so a network that holds
-// Wisp streams holds these the same way.
+// A stream here has the shape web/src/net.js wires a connection as (`send`,
+// `close`, and the `onopen`/`onmessage`/`onclose` its owner sets), so the
+// socket table holds these as it holds the network's.
 
 /** `{host: base}` with each base a URL ending in a slash (relative ones
  *  against `relativeTo`), or null for none. */

@@ -1,6 +1,9 @@
 // @gex/runtime: the System and the programs it runs. README.md says what
 // each does; these are its shapes.
 
+import type { Network } from './net';
+export type { Duplex, Network } from './net';
+
 export type Env = Record<string, string> | string[];
 export type Bytes = Uint8Array;
 /** What the runtime takes as a file's or a tar's contents. */
@@ -89,6 +92,9 @@ export declare class System extends EventTarget {
   run(argv: string[], options?: RunOptions & { encoding?: string }): Promise<RunResult<string>>;
   run(argv: string[], options: RunOptions & { encoding: null }): Promise<RunResult<Uint8Array>>;
   get hostCalls(): HostCalls;
+  /** Where programs' connections out go (a Network the page implements), or null: then they fail as unreachable. Set before or after boot; one at a time. */
+  get network(): Network | null;
+  set network(network: Network | null);
   get net(): { connectGuest(port: number, options?: { host?: string }): Promise<GuestConnection> };
   describe(): { phase: Phase; arch: string | null; processes: { pid: number | null; argv: string[] }[]; pids: number[]; threads: number; memory: { kernel: number } };
   shutdown(): Promise<void>;

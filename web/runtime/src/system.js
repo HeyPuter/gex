@@ -14,6 +14,7 @@
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
+import { Sockets } from '../../src/net.js';
 import { GuestConnection } from './connection.js';
 import { PageFsHost } from './mount.js';
 import { Kernel } from './kernel.js';
@@ -118,6 +119,9 @@ export class System extends EventTarget {
   #booting = null;
   #arch = null;
   #net = new NetSwitch();
+  #network = null;
+  /** The guest's sockets (web/src/net.js), made with the first network. */
+  #sockets = null;
   #hostCalls = new Map();
   #pageFs = null;
   /** The init (`boot(argv, opts)`), `[argv, opts]`, and its Process once
@@ -196,8 +200,12 @@ export class System extends EventTarget {
       files: () => this.#files,
       programs: () => this.#programs,
       changes: () => this.#changes,
-      /** The guest's network from now on (net.js). */
-      network: (backend) => this.#net.set(backend),
+      /** The guest's sockets from now on (web/src/net.js `Sockets`): a
+       *  preset's, with its page-served hosts. `sys.network` sets theirs. */
+      sockets: (sockets) => {
+        sockets.network ??= this.#network;
+        this.#net.set(this.#sockets = sockets);
+      },
       sys: () => this.#sys,
       get phase() { return self.#state.phase; },
       opts: this.#opts,
@@ -505,6 +513,19 @@ export class System extends EventTarget {
     return {
       connectGuest: (port, { host = '127.0.0.1' } = {}) => this.#connectGuest(port, host),
     };
+  }
+
+  /** The guest's connections out (README "Network"): any object with
+   *  `connect(host, port)`, or null for none. Set any time; open
+   *  connections stay where they are. */
+  get network() {
+    return this.#network;
+  }
+  set network(network) {
+    if (network != null && typeof network.connect !== 'function') throw new TypeError('network: an object with connect(host, port), or null');
+    this.#network = network ?? null;
+    if (!this.#sockets) this.#net.set(this.#sockets = new Sockets(null));
+    this.#sockets.network = this.#network;
   }
 
   async #connectGuest(port, host) {

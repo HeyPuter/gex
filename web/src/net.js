@@ -1,13 +1,13 @@
-// The guest's network, carried over Wisp: a page cannot open a TCP connection,
-// so `@mercuryworkshop/wisp-js` multiplexes streams down one WebSocket to a
-// proxy that can. This adds the shape the shim asks for: integer stream ids, a
-// receive buffer per stream, and calls that never wait -- they must not,
-// because the page's event loop is what delivers the bytes the parked guest is
-// waiting on.
+// The guest's sockets, over the page's network: a page cannot open a TCP
+// connection, so each connection a program makes goes to the network the
+// page gave the system (web/runtime README "Network": any object with
+// `connect(host, port)` resolving `{ readable, writable }`). This adds the
+// shape the shim asks for: integer stream ids, a receive buffer per stream,
+// and calls that never wait -- they must not, because the page's event loop
+// is what delivers the bytes the parked guest is waiting on.
 
-import { client } from '@mercuryworkshop/wisp-js/client';
-import { logOn } from '@gex/log.mjs';
-import { PageHostStream } from '@gex/page-host.mjs';
+import { logOn } from '../../shims/browser/js/log.mjs';
+import { PageHostStream } from '../../shims/browser/js/page-host.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -15,7 +15,7 @@ const CLOSED = 2;
 const REFUSED = 3;
 
 /** How much may pile up unread on one stream before the page says so. The
- *  Wisp client cannot be told to stop reading, so past this the bytes are
+ *  network's stream is read as fast as it comes, so past this the bytes are
  *  kept anyway: dropping them is what turned a 9.6 MB download into a Hash
  *  Sum mismatch. */
 const HIGH_WATER = 16 << 20;
@@ -26,11 +26,11 @@ class Stream {
     this.state = CONNECTING;
     this.chunks = [];
     this.buffered = 0;
-    this.wisp = null;
+    this.conn = null;
     // Descriptors holding the stream, across processes (`dup`): closed when
     // the last lets go, as a socket outlives one of its descriptors.
     this.refs = 1;
-    // Its receive ring's slot (`WispNetwork#rings`), or -1: `chunks` then
+    // Its receive ring's slot (`Sockets#rings`), or -1: `chunks` then
     // holds only what arrived past what the ring had room for.
     this.slot = -1;
   }
@@ -62,27 +62,73 @@ class Stream {
   }
 }
 
-// A network for `Gex.useNetwork`. `wispUrl` must end in a slash (the Wisp
-// client insists), or be null for none: only the page-served hosts then.
-// `meter` counts what the proxy delivers; see `onmessage`.
+/** A connection's two streams (a Duplex) as a stream the socket table
+ *  wires (`#wire`): `send`, `close`, and `onopen`, `onmessage`, `onclose`,
+ *  `onerror`. */
+class DuplexWire {
+  open = false;
+  onopen = null;
+  onmessage = null;
+  onclose = null;
+  onerror = null;
+  #writer = null;
+  #reader = null;
+  #pending = [];
+  #closed = false;
+
+  constructor(made) {
+    Promise.resolve(made).then(async ({ readable, writable }) => {
+      if (this.#closed) {
+        readable?.cancel?.().catch(() => {});
+        writable?.abort?.().catch(() => {});
+        return;
+      }
+      this.#writer = writable.getWriter();
+      for (const b of this.#pending.splice(0)) this.#writer.write(b).catch(() => {});
+      this.open = true;
+      this.onopen?.();
+      this.#reader = readable.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await this.#reader.read();
+          if (done) break;
+          if (value?.length) this.onmessage?.(value instanceof Uint8Array ? value : new Uint8Array(value));
+        }
+      } catch {}
+      this.#closed = true;
+      this.onclose?.();
+    }, (e) => {
+      this.#closed = true;
+      this.onerror?.(e);
+    });
+  }
+
+  send(bytes) {
+    if (this.#closed) return;
+    if (this.#writer) this.#writer.write(bytes).catch(() => {});
+    else this.#pending.push(bytes);
+  }
+
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#writer?.close().catch(() => {});
+    this.#reader?.cancel().catch(() => {});
+  }
+}
+
+// `meter` counts what the network delivers; see `onmessage`.
 const meter = { n: 0, bytes: 0, last: 0 };
 
-export class WispNetwork {
-  #conn = null;
+/** The guest's sockets (`Gex.useNetwork`, net-bridge.mjs `serveNet`). */
+export class Sockets {
   #streams = new Map();
   #next = 1;
-  #url;
   #onEvent;
-  /** Set once a connection has been made: from then on a drop is redialled. */
-  #redialing = false;
-  #drops = 0;
-  /** `[id, host, port]` of connects made while redialling. */
-  #waiting = [];
   /** The page-served hosts (page-host.mjs `pageHosts`): name -> base URL. */
   #pageHosts = null;
-  /** `connect(host, port)`: every stream from the page's own network
-   *  rather than Wisp (web/runtime `Network`). */
-  #dial = null;
+  /** The page's network (`connect(host, port)`), or null. */
+  #network = null;
 
   /** Receive rings in shared memory (net-bridge.mjs `Rings`), set by
    *  `serveNet`: each stream's bytes go into its ring as they arrive, and its
@@ -94,84 +140,34 @@ export class WispNetwork {
    *  on the scheduler, not on this thread's event loop). */
   onActivity = () => {};
 
-  /** `pageHosts`: a Map of host name to the base URL its files are
-   *  fetched under (page-host.mjs), answered here rather than over Wisp.
-   *  `dial(host, port)`: a stream as a Wisp stream is (`send`, `close`,
-   *  `onopen`, `onmessage`, `onclose`, `onerror`) for every connection, in
-   *  place of the proxy. */
-  constructor(wispUrl, onEvent = () => {}, { pageHosts = null, dial = null } = {}) {
-    this.#url = wispUrl == null ? null : wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
+  /** `network`: the page's (`connect(host, port)`), or null. `pageHosts`: a
+   *  Map of host name to the base URL its files are fetched under
+   *  (page-host.mjs), answered here rather than by the network. `onEvent`:
+   *  told 'connect HOST:PORT' for each connection. */
+  constructor(network, { pageHosts = null, onEvent = () => {} } = {}) {
+    this.#network = network ?? null;
     this.#onEvent = onEvent;
     this.#pageHosts = pageHosts?.size ? pageHosts : null;
-    this.#dial = dial;
   }
 
-  /** The page-served hosts, as `[name, base]` pairs: what a Worker that
-   *  makes a network of its own is given with the proxy's address. */
+  /** The page's network: connections opened from now on go to it, and
+   *  open ones stay on the one they were opened on. */
+  get network() {
+    return this.#network;
+  }
+  set network(network) {
+    this.#network = network ?? null;
+  }
+
+  /** The page-served hosts, as `[name, base]` pairs. */
   get pageHosts() {
     return this.#pageHosts ?? undefined;
-  }
-
-  /** The proxy this was pointed at, normalised. Each guest process (a Worker)
-   * opens its own connection to it, so the address is what travels between
-   * them. */
-  get url() {
-    return this.#url;
-  }
-
-  /** Open the WebSocket. Resolves once the proxy has said hello. */
-  async start() {
-    if (this.#conn || this.#url == null) return;
-    await new Promise((resolve, reject) => {
-      const c = new client.ClientConnection(this.#url);
-      const fail = (e) => reject(new Error(`wisp: ${e?.message || 'could not connect'}`));
-      c.onopen = () => {
-        this.#conn = c;
-        this.#drops = 0;
-        resolve();
-        // Streams opened while the connection was down go out now.
-        const waiting = this.#waiting;
-        this.#waiting = [];
-        for (const [id, host, port] of waiting) this.connect(id, host, port);
-      };
-      c.onerror = fail;
-      c.onclose = () => {
-        // Every stream on a dropped connection is gone with it.
-        for (const s of this.#streams.values()) if (!s.waiting) this.#state(s, CLOSED);
-        if (this.#conn !== c) return;
-        this.#conn = null;
-        this.#onEvent('closed');
-        this.#reconnect();
-      };
-      setTimeout(() => reject(new Error('wisp: the proxy did not answer')), 10000);
-    });
-    this.#onEvent('open');
-  }
-
-  /** A proxy that drops the WebSocket (one closed every connection after a
-   * few seconds) is dialled again, so the guest's *next* connection works:
-   * apt fetches each index on a new stream, and without this every one after
-   * the drop was ENETUNREACH. Streams that were open are lost either way. */
-  #reconnect() {
-    if (this.#redialing) return;
-    this.#redialing = true;
-    const wait = Math.min(250 * 2 ** this.#drops, 8000);
-    this.#drops += 1;
-    console.info(`[wisp] connection dropped; dialling again in ${wait} ms`);
-    setTimeout(() => {
-      this.start()
-        .catch((e) => console.warn(`[wisp] ${e.message}`))
-        .finally(() => {
-          this.#redialing = false;
-          if (!this.#conn) this.#reconnect();
-        });
-    }, wait);
   }
 
   // -- the seven calls the shim makes --------------------------------------
 
   open() {
-    if (!this.#conn && !this.#redialing && !this.#pageHosts && !this.#dial) return 0;
+    if (!this.#pageHosts && !this.#network) return 0;
     const id = this.#next++;
     const s = new Stream(id);
     if (this.rings) s.slot = this.rings.claim(id);
@@ -194,28 +190,13 @@ export class WispNetwork {
       this.#wire(s, id, new PageHostStream(base), host, port);
       return;
     }
-    if (this.#dial) {
-      let w;
-      try {
-        w = this.#dial(host, port);
-      } catch {
-        this.#state(s, REFUSED);
-        return;
-      }
-      this.#wire(s, id, w, host, port);
+    if (!this.#network) {
+      this.#state(s, REFUSED);
       return;
     }
-    if (!this.#conn) {
-      // Redialling: the stream stays CONNECTING until the proxy is back.
-      if (!this.#redialing) return;
-      s.waiting = true;
-      this.#waiting.push([id, host, port]);
-      return;
-    }
-    s.waiting = false;
     let w;
     try {
-      w = this.#conn.create_stream(host, port, 'tcp');
+      w = new DuplexWire(this.#network.connect(String(host), Number(port)));
     } catch {
       this.#state(s, REFUSED);
       return;
@@ -223,10 +204,10 @@ export class WispNetwork {
     this.#wire(s, id, w, host, port);
   }
 
-  /** Stream `s` carried by `w`: a Wisp stream, or a page-served host's. */
+  /** Stream `s` carried by `w`: the network's connection, or a page-served host's. */
   #wire(s, id, w, host, port) {
-    s.wisp = w;
-    // The Wisp client reports the connection as open once the proxy has it.
+    s.conn = w;
+    // Open once the network has given its streams.
     w.onopen = () => {
       this.#state(s, OPEN);
       this.onActivity();
@@ -241,13 +222,13 @@ export class WispNetwork {
         const waited = s.firstSend ? (now - s.firstSend) / 1000 : -1;
         // Per-stream timing: debug output (GEX_LOG, `?log=1`).
         if (logOn('debug')) console.info(
-          `[wisp] stream ${id}: first reply at ${(now / 1000).toFixed(1)}s, `
+          `[net] stream ${id}: first reply at ${(now / 1000).toFixed(1)}s, `
           + `${waited.toFixed(1)}s after the request`,
         );
       }
       if (meter.last && now - meter.last > 1000) {
         if (logOn('debug')) console.info(
-          `[wisp] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
+          `[net] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
           + `after ${meter.n} messages and `
           + `${(meter.bytes / 1048576).toFixed(1)} MiB`,
         );
@@ -257,7 +238,7 @@ export class WispNetwork {
       meter.bytes += bytes.length;
       if (s.buffered > HIGH_WATER && !s.warned) {
         s.warned = true;
-        console.warn(`[wisp] stream ${id}: ${s.buffered >> 20} MiB unread`);
+        console.warn(`[net] stream ${id}: ${s.buffered >> 20} MiB unread`);
       }
       this.#take(s, bytes);
       this.onActivity();
@@ -270,8 +251,7 @@ export class WispNetwork {
       this.#state(s, s.state === CONNECTING ? REFUSED : CLOSED);
       this.onActivity();
     };
-    // Some builds of the client open synchronously and never fire `onopen`.
-    if (w.open === true || s.wisp?.open === true) this.#state(s, OPEN);
+    if (w.open === true) this.#state(s, OPEN);
     this.#onEvent(`connect ${host}:${port}`);
   }
 
@@ -317,7 +297,7 @@ export class WispNetwork {
 
   send(id, bytes) {
     const s = this.#streams.get(id);
-    if (!s || !s.wisp || s.state === CLOSED || s.state === REFUSED) return -1;
+    if (!s || !s.conn || s.state === CLOSED || s.state === REFUSED) return -1;
     // Log every send with its timestamp: paired against the first-reply time in
     // `onmessage`, it says whether the ~318s stall is a late request (ours) or
     // a late answer (the proxy's or mirror's). The copy below is because the
@@ -326,10 +306,10 @@ export class WispNetwork {
     s.sends = (s.sends ?? 0) + 1;
     if (!s.firstSend) s.firstSend = performance.now();
     if (logOn('debug')) console.info(
-      `[wisp] stream ${id}: send ${s.sends}, ${bytes.length} bytes at `
+      `[net] stream ${id}: send ${s.sends}, ${bytes.length} bytes at `
       + `${(performance.now() / 1000).toFixed(1)}s`,
     );
-    s.wisp.send(bytes.slice());
+    s.conn.send(bytes.slice());
     return bytes.length;
   }
 
@@ -377,7 +357,7 @@ export class WispNetwork {
     if (!s) return;
     if (--s.refs > 0) return;
     try {
-      s.wisp?.close();
+      s.conn?.close();
     } catch {
       /* already gone */
     }

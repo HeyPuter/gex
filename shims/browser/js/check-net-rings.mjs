@@ -3,10 +3,10 @@
  * no call to the page?
  *
  * net-bridge.mjs gives each open stream a receive ring in shared memory:
- * net.js's WispNetwork writes what arrives into it (keeping what does not
+ * net.js's Sockets writes what arrives into it (keeping what does not
  * fit, and moving that in as the ring empties), and a Worker's NetProxy
- * answers status, poll, recv and peek from it. This runs a WispNetwork on a
- * stand-in Wisp client in this thread (the page) and a NetProxy in a worker
+ * answers status, poll, recv and peek from it. This runs a Sockets over a
+ * stand-in network in this thread (the page) and a NetProxy in a worker
  * thread:
  *
  *   - 3 MiB arrive in uneven chunks, faster than the Worker reads: it gets
@@ -30,26 +30,26 @@ const byte = (i) => (i * 131 + (i >>> 11)) & 255;
 
 if (isMainThread) {
   const here = new URL('.', import.meta.url).href;
-  // net.js's imports: gex's own modules, and a stand-in Wisp client.
-  const stub = `data:text/javascript,${encodeURIComponent(`
-    export const client = { ClientConnection: class {
-      constructor() { setTimeout(() => this.onopen?.(), 0); }
-      create_stream(host, port) {
-        const s = { host, port, sent: [], send(b) { this.sent.push(b); }, close() { this.closed = true; } };
-        (globalThis.fakeStreams ??= []).push(s);
-        return s;
-      }
-    } };`)}`;
+  // net.js's imports: gex's own modules.
   register(`data:text/javascript,${encodeURIComponent(`
     export async function resolve(spec, ctx, next) {
-      if (spec === '@mercuryworkshop/wisp-js/client') return { url: ${JSON.stringify(stub)}, shortCircuit: true };
       if (spec.startsWith('@gex/')) return { url: ${JSON.stringify(here)} + spec.slice(5), shortCircuit: true };
       return next(spec, ctx);
     }`)}`);
-  const { WispNetwork } = await import('../../../web/src/net.js');
+  const { Sockets } = await import('../../../web/src/net.js');
   const { makeNetChannel, serveNet } = await import('./net-bridge.mjs');
-  const net = new WispNetwork('ws://stand-in/');
-  await net.start();
+  // A stand-in network: each connection's far end, driven from here.
+  const net = new Sockets({
+    connect(host, port) {
+      let c;
+      const s = { host, port, sent: [], onopen() {}, onmessage(b) { c.enqueue(b); }, onclose() { c.close(); } };
+      (globalThis.fakeStreams ??= []).push(s);
+      return {
+        readable: new ReadableStream({ start: (ctl) => { c = ctl; }, cancel: () => { s.closed = true; } }),
+        writable: new WritableStream({ write: (b) => { s.sent.push(b); }, close: () => { s.closed = true; } }),
+      };
+    },
+  });
   const asked = { status: 0, recv: 0, peek: 0, available: 0, refill: 0 };
   for (const k of Object.keys(asked)) {
     const f = net[k].bind(net);

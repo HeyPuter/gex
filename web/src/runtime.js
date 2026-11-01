@@ -613,6 +613,21 @@ function pageGlobals() {
  * runs in one Worker (web/src/system-worker.js); this side holds the terminal
  * and forwards keys, sizes and output.
  */
+/** The system Worker's `net-dial` (system-worker.js `pageRelay`): a
+ *  connection of the page's network `net`, its streams handed to the Worker
+ *  (transferred), or why not. */
+function dialFor(net, m) {
+  const reply = m.reply;
+  Promise.resolve()
+    .then(() => {
+      if (!net) throw new Error('no network');
+      if (m.datagram && typeof net.datagram !== 'function') throw new Error('no datagrams');
+      return m.datagram ? net.datagram(m.host, m.port) : net.connect(m.host, m.port);
+    })
+    .then(({ readable, writable }) => reply.postMessage({ readable, writable }, [readable, writable]),
+      (e) => reply.postMessage({ error: String(e?.message ?? e) }));
+}
+
 async function runInSystemWorker(term, opts) {
   // `onFilesLoaded` and `onSystem` are functions, which cannot cross to the
   // Worker (nt.html passes `onSystem`: its every run failed to start here).
@@ -675,6 +690,7 @@ async function runInSystemWorker(term, opts) {
         const m = e.data;
         if (m.kind === 'write') term.write(m.data);
         else if (m.kind === 'net') onNetEvent?.(m.event);
+        else if (m.kind === 'net-dial') dialFor(network?.network, m);
         else if (m.kind === 'done') resolve({ status: m.status, host: null, tenv: null });
         else if (m.kind === 'failed') reject(Object.assign(new Error(m.message), { workerStack: m.stack }));
       });
@@ -688,7 +704,9 @@ async function runInSystemWorker(term, opts) {
         cols: term.cols,
         opts: {
           ...rest,
-          networkUrl: network?.url ?? null,
+          // The page's network stays here; the Worker dials through it
+          // (`net-dial`, system-worker.js `pageRelay`).
+          netRelay: network?.network ? { datagram: typeof network.network.datagram === 'function' } : null,
           pageHosts: network?.pageHosts,
           wl: canvas ? { inRealm: true } : undefined,
           gl: glHere ? 'compositor' : undefined,
@@ -916,12 +934,11 @@ export async function makeProcessHost({
     // compositor can carry its frames to the page's canvas. Like glChannel.
     wlChannel: wlChannel ?? undefined,
     // The page's network, served to every Worker over shared memory
-    // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
+    // (net-bridge.mjs).
     netChannel: netChannel ?? undefined,
-    // The single-thread build's fibers share this realm, and so the one
-    // Wisp connection itself.
-    wispNet: single.on ? network ?? undefined : undefined,
-    wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
+    // The single-thread build's fibers share this realm, and so the
+    // page's sockets themselves.
+    pageNet: single.on ? network ?? undefined : undefined,
     pageHosts: netChannel || single.on ? undefined : network?.pageHosts,
     winsize,
     // Every guest write mirrored to the console and a crash narrated where it
@@ -1341,7 +1358,7 @@ async function runSingle(
     }
   }
 
-  // The network: the page's Wisp connection, which every Worker calls across
+  // The network: the page's sockets, which every Worker calls across
   // shared memory. A WebSocket in the guest's own Worker delivers on that
   // Worker's event loop, which a wasm32 program waiting in a syscall never
   // gives back.

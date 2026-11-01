@@ -1,5 +1,5 @@
-// The guest's network, reached from a Worker. The page holds the one Wisp
-// connection; every guest Worker calls it across a `SharedArrayBuffer` with
+// The guest's network, reached from a Worker. The page holds the sockets
+// (web/src/net.js) over its network; every guest Worker calls it across a `SharedArrayBuffer` with
 // `Atomics.wait`, the way gl-bridge.mjs reaches the page's GL device.
 //
 // Why not a WebSocket in each Worker, as before: its bytes arrive as messages
@@ -85,7 +85,7 @@ export function makeNetChannel() {
 }
 
 /** The receive rings, as the page (`page`: it writes them, for
- *  `WispNetwork`'s `rings`, net.js) or a Worker (it reads them) sees them. */
+ *  `Sockets`'s `rings`, net.js) or a Worker (it reads them) sees them. */
 export class Rings {
   #w;
   #d;
@@ -254,7 +254,7 @@ export class Rings {
   }
 }
 
-/** The page's half: run `net` (a `WispNetwork`) when a Worker asks. Returns a
+/** The page's half: run `net` (net.js `Sockets`) when a Worker asks. Returns a
  *  function that stops it. */
 export function serveNet(net, channel) {
   const ctl = new Int32Array(channel.control);

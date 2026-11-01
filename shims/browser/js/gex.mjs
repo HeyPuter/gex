@@ -4488,10 +4488,10 @@ export class Gex {
   useNetwork(net, { shared = false } = {}) {
     this.#net = net;
     // One network object every process of the machine reaches (the page's
-    // Wisp connection over net-bridge, or the single-thread build's one
+    // sockets over net-bridge, or the single-thread build's one
     // object): its stream ids mean the same in every process, so a socket can
     // be handed to another process on the same stream (`net_dup`). A network
-    // of this Worker's own (run-node's sockets, a Worker's own Wisp client)
+    // of this Worker's own (run-node's sockets, a Worker's own page-served hosts)
     // has ids no other process knows.
     this.#netShared = !!(net && shared);
     // Its events end a network wait (`#netWait`). Chained: the single-thread

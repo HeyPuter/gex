@@ -54,7 +54,7 @@ const sys = new System({ xcache: true });              // translated code kept a
 const fs = new Filesystem(sys);
 fs.addTar('/gex-trees/debian.tar.zst', { lazy: '/gex-trees/debian-lazy.json' });
 new IdbPersist(fs, { db: 'debian' });                  // the root, kept
-new Wisp(sys);                                         // connections out (wss://anura.pro/)
+sys.network = new Wisp('wss://wisp.example/');        // connections out (see Network)
 const hw = new HostWindows(sys, { width: innerWidth, height: innerHeight });
 await sys.boot();
 ```
@@ -304,24 +304,67 @@ them, path by path.
 
 ## Network
 
-Where the guest's connections out go: one `Network` per system, made before
-or after boot. Until there is one a program's connection fails as
-unreachable. TCP only; a program's name lookups reach the network as the
-name.
+The guest's connections out go to the page, which carries them over whatever
+transport it has. A network is any object with a `connect(host, port)`
+method; the page gives it to the system as `sys.network`, before or after
+boot. There is one at a time: setting another sends the next connections
+there (open ones stay where they are), and `null` takes it away. With none,
+a program's connection fails as unreachable. TCP only.
 
 ```js
-import { Wisp } from '@gex/runtime/net/wisp';
-new Wisp(sys);                                   // wss://anura.pro/
-// or, through another proxy (one network per system):
-// new Wisp(sys, { url: 'wss://wisp.example/' });
+// One WebSocket per connection, through the page's own relay.
+class RelayNetwork {
+  connect(host, port) {
+    const ws = new WebSocket(`wss://relay.example/tcp?host=${encodeURIComponent(host)}&port=${port}`);
+    ws.binaryType = 'arraybuffer';
+    return new Promise((resolve, reject) => {
+      ws.onerror = () => reject(new Error(`${host}:${port} refused`));
+      ws.onopen = () => resolve({
+        readable: new ReadableStream({
+          start(c) {
+            ws.onmessage = (e) => c.enqueue(new Uint8Array(e.data));
+            ws.onclose = () => c.close();
+          },
+          cancel: () => ws.close(),
+        }),
+        writable: new WritableStream({
+          write: (bytes) => ws.send(bytes),
+          close: () => ws.close(),
+        }),
+      });
+    });
+  }
+}
+sys.network = new RelayNetwork();
 ```
 
 | Member | Does |
 | --- | --- |
-| `new Wisp(sys, { url })` (`@gex/runtime/net/wisp`) | Over a Wisp proxy, default `wss://anura.pro/`: one WebSocket, dialled again when it drops. Events `open`, `closed`. |
-| `new Network(sys, { connect(host, port) })` (`@gex/runtime/net`) | The page's own: `connect` returns (or resolves) `{ readable, writable }`, a ReadableStream and a WritableStream of bytes; a throw or rejection refuses the connection. The page closing its readable ends the program's reads; the program closing its socket closes the writable. A program's `shutdown(SHUT_WR)` does not reach the page (Wisp has no half close). |
-| `ready` | Resolves once connections go through it. |
-| Events | `connect` (`host`, `port`). |
+| `connect(host, port)` | A program's TCP connection out. `host` is what the program connects to: an address, or a name, which is not looked up first (a program's lookup of a name succeeds, and its connection brings the name here). Returns or resolves a `Duplex`; a throw or a rejection refuses the connection. |
+| `Duplex` | `{ readable, writable }`: a ReadableStream of the far end's bytes and a WritableStream of the program's. The page ending `readable` is the far end closing, which the program reads as the end. The program closing its socket closes `writable` and cancels `readable`. |
+| `sys.network` | The network, or `null`. |
+
+Not in it: UDP; a program that listens is reached from the page with
+`connectGuest` (below), not through the network; a program's
+`shutdown(SHUT_WR)` does not reach the page.
+
+**Wisp.** `@gex/runtime/net/wisp` is a network over a
+[Wisp](https://github.com/MercuryWorkshop/wisp-protocol) proxy, with
+MercuryWorkshop's wisp-js client: every connection on one WebSocket, dialled
+again when it drops. It is an implementation of the interface above, and
+only a page that imports it carries wisp-js.
+
+```js
+import { Wisp } from '@gex/runtime/net/wisp';
+sys.network = new Wisp('wss://wisp.example/');
+```
+
+| Member | Does |
+| --- | --- |
+| `new Wisp(url)` | The proxy at `url` (`ws:` or `wss:`), dialled at the first connection. |
+| `connect(host, port)` | As above. |
+| `close()` | Closes the WebSocket; the next connection dials again. |
+| Events | `open` and `closed` as the WebSocket comes and goes. |
 
 Into the guest, `sys.net.connectGuest(port)` connects to what a program
 listens on at `127.0.0.1:port`. It resolves `{ readable, writable, close() }`

@@ -1,10 +1,13 @@
-import type { System } from './index';
-import { Network } from './net';
+import type { Duplex, Network } from './net';
 
-export declare const DEFAULT_WISP: string;
-
-/** Over a Wisp proxy. Events: `open`, `closed`, `connect`. */
-export declare class Wisp extends Network {
-  constructor(sys: System, options?: { url?: string });
+/** A network over a Wisp proxy (MercuryWorkshop's wisp-js client): every
+ *  connection on one WebSocket, dialled again when it drops. Events: `open`
+ *  and `closed` as the WebSocket comes and goes. */
+export declare class Wisp extends EventTarget implements Network {
+  /** The proxy at `url` (`ws:` or `wss:`), dialled at the first connection. */
+  constructor(url: string | URL);
   get url(): string;
+  connect(host: string, port: number): Promise<Duplex>;
+  /** Closes the WebSocket; the next connection dials again. */
+  close(): void;
 }
