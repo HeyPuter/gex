@@ -6,7 +6,7 @@
 // every base the cache holds translations of the other image's bytes, which
 // must not run. The restored run translates under 5% of the first run's
 // blocks in the two images (the runtime's exit lines, `log: 'debug'`).
-import { bootWine, exitStats, blocksIn, printedRanges } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf, blocksIn, printedRanges } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1200 };
@@ -26,6 +26,8 @@ export default async function (t) {
   // The program's own lines: a process's cache save may be said among them.
   const own = r.stdout.split('\n').filter((l) => /^(xc[ab]\.dll |unloaded$)/.test(l)).join('\n');
   t.check(`${phase}: every call's result`, r.code === 0 && want.test(own), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  // Its exit line, which says what it translated: after its save.
+  t.check(`${phase}: xcload2's exit line`, await exitLineOf(t, /xcload2\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   const blocks = blocksIn(await exitStats(t), printedRanges(own));
   t.record(`${phase} DLL blocks`, blocks);

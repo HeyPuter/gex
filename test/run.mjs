@@ -187,27 +187,40 @@ async function runNode(test, arch, say, timeout) {
     // What the runtime says, for `t.logs`: its Workers write to the process's
     // own descriptors, not through anything the test could catch.
     const logs = [];
-    const keep = (d, part) => {
+    // `t.logs`' marks (node.mjs), by stream, once read.
+    const marks = new Set();
+    const keep = (d, part, stream) => {
       const lines = (part + d).split('\n');
       const rest = lines.pop();
-      if (logs.length < 100000) logs.push(...lines);
+      for (const l of lines) {
+        if (l.startsWith('\u0001gex-logs ')) marks.add(`${stream} ${l}`);
+        else if (logs.length < 100000) logs.push(l);
+      }
       return rest;
     };
     let outPart = '';
     let errPart = '';
     child.stdout.on('data', (d) => {
-      outPart = keep(d, outPart);
+      outPart = keep(d, outPart, 'out');
       if (o.verbose) process.stdout.write(d);
     });
     child.stderr.on('data', (d) => {
       err = (err + d).slice(-4000);
-      errPart = keep(d, errPart);
+      errPart = keep(d, errPart, 'err');
     });
     const m = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve({ timeout: true }), Math.max(0, until - Date.now()));
       child.on('message', (msg) => {
         if (msg.line !== undefined) return say(msg.line);
-        if (msg.logs) return child.send({ logs: logs.filter((l) => new RegExp(msg.logs.re, msg.logs.flags).test(l)) });
+        if (msg.logs) {
+          // Once both pipes have brought the mark: all written before it.
+          const { re, flags, mark } = msg.logs;
+          const answer = () => child.send({ logs: logs.filter((l) => new RegExp(re, flags).test(l)) });
+          if (!mark) return answer();
+          const t1 = Date.now() + 10000;
+          const look = () => (marks.has(`out ${mark}`) && marks.has(`err ${mark}`)) || Date.now() > t1 ? answer() : setTimeout(look, 10);
+          return look();
+        }
         clearTimeout(timer);
         resolve(msg);
       });

@@ -7,7 +7,7 @@
 // blocks each run translated in the DLL (the runtime's exit lines, under
 // `log: 'debug'`): the restored run under 5% of the first's, the moved one
 // at least half of it (none of the first base's translations fit).
-import { bootWine, exitStats, blocksIn, printedRanges } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf, blocksIn, printedRanges } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1200 };
@@ -23,8 +23,11 @@ export default async function (t) {
   const m = new RegExp(`^x=${expect(1000)} base=([0-9A-Fa-f]+) size=[0-9a-f]+$`, 'm').exec(r.stdout);
   t.check(`${phase}: the DLL ran`, r.code === 0 && m, `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
   const base = m?.[1];
+  // Its exit line, which says what it translated: after its save.
+  t.check(`${phase}: xcload's exit line`, await exitLineOf(t, /xcload\.exe/), 'none in 60 s');
   await w.sys.shutdown();
-  const blocks = blocksIn(await exitStats(t), printedRanges(r.stdout));
+  const stats = await exitStats(t);
+  const blocks = blocksIn(stats, printedRanges(r.stdout));
   t.record(`${phase} DLL blocks`, blocks);
   const first = t.state?.blocks ?? blocks;
   if (phase === 'save') t.check(`save: the DLL's blocks translated (${blocks})`, blocks > 1000, `${blocks}`);

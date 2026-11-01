@@ -496,7 +496,7 @@ themselves.
 
 ## Building
 
-`web/runtime/build.sh DIR` builds the package into `DIR`: its modules, their
+In gex's tree, `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, their
 Workers, and beside them, each named by its content, the shim, kernel and
 seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
 GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`), stripped
@@ -507,6 +507,6 @@ supports.
 
 ## Tests
 
-The runtime's tests are gex's test runner's `core`, `windows`, `gl`,
+The runtime's tests, in gex's tree, are its test runner's `core`, `windows`, `gl`,
 `image` and `wine` groups (test/README.md): `node test/run.mjs --group core,windows,gl,image,wine`.
 `--package DIR` runs the browser's against a built package.

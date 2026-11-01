@@ -160,6 +160,11 @@ cat > "$OUT/package.json" <<PKG
   "version": "$VERSION",
   "description": "Linux programs in the browser: a kernel, the programs it runs, and their files",
   "license": "AGPL-3.0-only",
+  "repository": { "type": "git", "url": "git+https://github.com/HeyPuter/gex.git", "directory": "web/runtime" },
+  "homepage": "https://github.com/HeyPuter/gex/tree/master/web/runtime#readme",
+  "bugs": "https://github.com/HeyPuter/gex/issues",
+  "keywords": ["linux", "wasm", "webassembly", "browser", "kernel", "x86-64", "aarch64", "wine", "wayland", "x11"],
+  "files": ["*.mjs", "*.js", "*.wasm", "*.xkm", "*.d.ts", "README.md", "LICENSE", "NOTICE", "THIRD-PARTY"],
   "type": "module",
   "exports": {
     ".": { "types": "./index.d.ts", "default": "./index.mjs" },
@@ -181,6 +186,122 @@ cat > "$OUT/package.json" <<PKG
 }
 PKG
 [ ! -f "$RT/README.md" ] || cp "$RT/README.md" "$OUT/README.md"
+# gex's licence and notices, which name the third-party code it carries.
+cp "$WEB/../LICENSE" "$WEB/../NOTICE" "$OUT/"
+
+# THIRD-PARTY: the third-party code the package's files carry, each
+# component's licence as its source tree has it, under a header naming the
+# component and the files that hold it. A component whose files are in the
+# package and whose licence file is not found fails the build. The replay's
+# and the X server's licences are staged beside them by their builds
+# (web/build-mesa-wasm.sh, web/build-xwayland-wasm.sh); Emscripten's from the
+# emsdk that builds this, Rust's from the tree's toolchain, the crates' from
+# cargo's sources.
+TP=$OUT/THIRD-PARTY
+in_pkg() { (cd "$OUT" && for g; do for f in $g; do if [ -f "$f" ]; then printf '%s ' "$f"; fi; done; done); }
+lic() { [ -f "$1" ] || { echo "web/runtime/build.sh: no $1 ($2's licence)" >&2; exit 1; }; }
+# section NAME FILES SOURCE LICENCE-FILE...
+section() {
+    s_name=$1 s_files=$2 s_src=$3; shift 3
+    for f; do lic "$f" "$s_name"; done
+    {
+        printf '%s\n%s\nIn: %s\nLicence: %s\n%s\n' '================================================================================' "$s_name" "$s_files" "$s_src" '================================================================================'
+        for f; do printf '\n--- %s ---\n\n' "$(basename "$f")"; cat "$f"; done
+        printf '\n'
+    } >> "$TP"
+}
+: > "$TP"
+REPLAY=$(in_pkg 'gex-wgpu-replay*')
+XWL=$(in_pkg 'Xwayland*')
+XKM=$(in_pkg 'gex-*.xkm')
+ZSTD=$(in_pkg 'zstddec*')
+ZSTDW=$(in_pkg 'zstddec*.wasm')
+PROV=$(in_pkg 'glibc_printf*.wasm' 'glibc_malloc*.wasm' 'crt_heap*.wasm')
+if [ -n "$REPLAY" ]; then
+    L=$PUB/licenses
+    section "Mesa" "$REPLAY" "Mesa's docs/license.rst and licenses/" "$L/mesa/license.rst" "$L/mesa/MIT" "$L/mesa/Apache-2.0" "$L/mesa/BSL-1.0" "$L/mesa/SGI-B-2.0"
+    section "Dawn and Tint" "$REPLAY" "Dawn's LICENSE" "$L/dawn/LICENSE"
+    section "emdawnwebgpu" "$REPLAY" "emdawnwebgpu's webgpu_cpp/LICENSE" "$L/emdawnwebgpu/LICENSE"
+fi
+if [ -n "$XWL" ]; then
+    L=$PUB/xwayland/licenses
+    section "Xwayland (the X.Org X server)" "$XWL" "xserver's COPYING" "$L/xserver"
+    section "libwayland" "$XWL" "wayland's COPYING" "$L/wayland"
+    for n in pixman libxcvt libxtrans libXau libfontenc libXfont2 libxkbfile zlib; do
+        section "$n" "$XWL" "$n's licence file" "$L/$n"
+    done
+fi
+[ -z "$XKM" ] || section "xkeyboard-config" "$XKM" "the build host's xkeyboard-config copyright" "$PUB/xwayland/licenses/xkeyboard-config"
+EMLIB=
+if [ -n "$REPLAY$XWL$ZSTDW$PROV" ]; then
+    command -v emcc > /dev/null || { echo "web/runtime/build.sh: no emcc: Emscripten's licences" >&2; exit 1; }
+    EM=$(dirname "$(readlink -f "$(command -v emcc)")")
+    EMLIB=$EM/system/lib
+    section "Emscripten's runtime and system libraries (libc++, libc++abi, libunwind, compiler-rt)" "$REPLAY$XWL$ZSTDW" "emscripten's LICENSE and system/lib's" \
+        "$EM/LICENSE" "$EMLIB/libcxx/LICENSE.TXT" "$EMLIB/libcxxabi/LICENSE.TXT" "$EMLIB/libunwind/LICENSE.TXT" "$EMLIB/compiler-rt/LICENSE.TXT"
+    section "musl libc (Emscripten's libc$( [ -z "$PROV" ] || echo "; the printf providers' formatting core"))" "$REPLAY$XWL$ZSTDW$PROV" "emscripten's system/lib/libc/musl/COPYRIGHT" "$EMLIB/libc/musl/COPYRIGHT"
+    lic "$EMLIB/dlmalloc.c" dlmalloc
+    DL=$STAGE/dlmalloc-notice
+    grep -m1 -B1 -A3 'released to the public domain' "$EMLIB/dlmalloc.c" > "$DL" || { echo "web/runtime/build.sh: no public-domain notice in $EMLIB/dlmalloc.c" >&2; exit 1; }
+    section "dlmalloc (Emscripten's malloc$( [ -z "$PROV" ] || echo "; the heap providers'"))" "$REPLAY$XWL$ZSTDW$PROV" "the notice in emscripten's system/lib/dlmalloc.c" "$DL"
+fi
+[ -z "$ZSTD" ] || section "zstddec" "$ZSTD" "zstddec's LICENSE" "$WEB/eject-site/vendor/zstddec-LICENSE"
+RUSTW=$(in_pkg 'gex_browser*.wasm' 'gex_kernel*.wasm' 'gexhostwl*.wasm')
+if [ -n "$RUSTW" ]; then
+    SYSROOT=$(cd "$WEB/.." && rustc --print sysroot)
+    lic "$SYSROOT/share/doc/rust/COPYRIGHT-library.html" "Rust's standard library"
+    RS=$STAGE/rust-COPYRIGHT-library.txt
+    sed -e 's/<[^>]*>//g' -e 's/&#34;/"/g' -e "s/&#39;/'/g" -e 's/&#60;/</g' -e 's/&#62;/>/g' -e 's/&amp;/\&/g' "$SYSROOT/share/doc/rust/COPYRIGHT-library.html" | cat -s > "$RS"
+    section "The Rust standard library (core, alloc, std)" "$RUSTW" "the toolchain's share/doc/rust/COPYRIGHT-library.html, as text" "$RS"
+    # The crates linked into each Rust module, not the build's (proc macros
+    # and what only they use).
+    (cd "$WEB/.." && cargo metadata --format-version 1 --filter-platform wasm32-unknown-unknown --locked) > "$STAGE/meta.json"
+    node - "$STAGE/meta.json" "$OUT" "$WEB/../third_party/wasmtime-49.0.2/LICENSE" >> "$TP" <<'JS' || exit 1
+const fs = require('fs'), path = require('path');
+const [meta, out, bca] = process.argv.slice(2);
+const m = JSON.parse(fs.readFileSync(meta, 'utf8'));
+const pkgs = new Map(m.packages.map((p) => [p.id, p]));
+const nodes = new Map(m.resolve.nodes.map((n) => [n.id, n]));
+const shipped = (re) => fs.readdirSync(out).filter((f) => re.test(f)).join(' ');
+const roots = [['gex-browser', /^gex_browser.*\.wasm$/], ['gex-kernel-wasm', /^gex_kernel.*\.wasm$/], ['gex-hostwl', /^gexhostwl.*\.wasm$/]];
+const isMacro = (p) => p.targets.some((t) => t.kind.includes('proc-macro'));
+const inFiles = new Map();
+for (const [name, re] of roots) {
+  const files = shipped(re), root = m.packages.find((p) => p.name === name && p.source == null);
+  if (!files || !root) continue;
+  const seen = new Set(), todo = [root.id];
+  while (todo.length) {
+    const id = todo.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (isMacro(pkgs.get(id))) continue;
+    for (const d of nodes.get(id).deps) if (d.dep_kinds.some((k) => k.kind === null)) todo.push(d.pkg);
+  }
+  for (const id of seen) {
+    const p = pkgs.get(id);
+    if (p.source == null || isMacro(p)) continue;
+    inFiles.set(id, [...(inFiles.get(id) ?? []), files]);
+  }
+}
+const bar = '='.repeat(80);
+for (const [id, files] of [...inFiles].sort((a, b) => pkgs.get(a[0]).name.localeCompare(pkgs.get(b[0]).name))) {
+  const p = pkgs.get(id), dir = path.dirname(p.manifest_path);
+  let lics = fs.readdirSync(dir).filter((f) => /^(licen[cs]e|copying|copyright|notice)/i.test(f)).sort().map((f) => path.join(dir, f));
+  let src = `the crate's ${lics.map((f) => path.basename(f)).join(', ')} (${p.license})`;
+  if (!lics.length) {
+    // wasm-encoder and wasmparser (the Bytecode Alliance's wasm-tools) ship
+    // none: their Apache-2.0 WITH LLVM-exception, as wasmtime's tree has it.
+    if (!/Apache-2\.0 WITH LLVM-exception/.test(p.license ?? '')) throw new Error(`web/runtime/build.sh: ${p.name} ${p.version}: no licence file`);
+    lics = [bca];
+    src = `the crate ships no licence file (${p.license}): the Bytecode Alliance's Apache-2.0 WITH LLVM-exception, as third_party/wasmtime-49.0.2/LICENSE has it`;
+  }
+  process.stdout.write(`${bar}\nRust crate ${p.name} ${p.version}\nIn: ${files.join(' ')}\nLicence: ${src}\n${bar}\n`);
+  for (const f of lics) process.stdout.write(`\n--- ${path.basename(f)} ---\n\n${fs.readFileSync(f, 'utf8')}\n`);
+  process.stdout.write('\n');
+}
+JS
+fi
+[ -s "$TP" ] || rm -f "$TP"
 # The declarations (types/), one beside each module.
 cp "$RT"/types/*.d.ts "$OUT/"
 echo "web/runtime/build.sh: $OUT"

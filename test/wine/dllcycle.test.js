@@ -8,7 +8,7 @@
 // (each load currently keeps about 8 MiB), and under 0.5 MiB of the
 // kernel's memory: an unloaded image's translations must go with it, and
 // one loaded again is served from the store, not lifted and stored again.
-import { bootWine, exitStats } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800, alone: true };
@@ -27,6 +27,7 @@ export default async function (t) {
   // This phase's process (Node) or the page's renderer: its Workers are its
   // threads. The browser's is unknown when other jobs' renderers run too.
   const rss = await t.peakRss();
+  t.check(`${name}: dllcycle's exit line`, await exitLineOf(t, /dllcycle\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   const stats = await exitStats(t);
   const left = Math.min(...stats.map((s) => s.slotsLeftK).filter((n) => n >= 0));

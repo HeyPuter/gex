@@ -764,6 +764,20 @@ cp "$HOSTWL" "$PUB/gexhostwl.wasm"
 # rather than embedded at link time: it changes independently of the server, and
 # a module that has to be relinked to change a keymap is a worse thing to own.
 cp "$OUT/xkb/gex.xkm" "$PUB/"
+# The licences of what the server is built from, beside it, for the npm
+# package's THIRD-PARTY (web/runtime/build.sh): each source tree's own, and
+# the keymap's, compiled from the host's xkeyboard-config.
+rm -rf "$PUB/licenses"
+mkdir -p "$PUB/licenses"
+for n in xserver wayland pixman libxcvt libxtrans libXau libfontenc libXfont2 libxkbfile zlib; do
+    f=
+    for c in COPYING LICENSE COPYRIGHT; do [ -f "$SRC/$n/$c" ] && { f=$SRC/$n/$c; break; }; done
+    [ -n "$f" ] || { echo "no licence file in $SRC/$n" >&2; exit 1; }
+    cp "$f" "$PUB/licenses/$n"
+done
+XKB_COPYRIGHT=${GEX_XKB_COPYRIGHT:-/usr/share/doc/xkb-data/copyright}
+[ -f "$XKB_COPYRIGHT" ] || { echo "no $XKB_COPYRIGHT (xkeyboard-config's licence; GEX_XKB_COPYRIGHT names one)" >&2; exit 1; }
+cp "$XKB_COPYRIGHT" "$PUB/licenses/xkeyboard-config"
 
 echo
 printf '  %-28s %9d bytes\n' "Xwayland.wasm" "$(stat -c%s "$PUB/Xwayland.wasm")"

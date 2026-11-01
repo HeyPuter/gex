@@ -38,6 +38,10 @@ mod stub {
 
     pub(crate) fn set_wine_split(_on: bool) {}
 
+    pub(crate) fn split_asked() -> bool {
+        false
+    }
+
     pub(crate) fn wine32_split() -> bool {
         false
     }
@@ -177,6 +181,11 @@ mod imp {
 
     pub(crate) fn set_wine_split(on: bool) {
         WINE32_SPLIT.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the site asked for the split (`?winesplit=1`).
+    pub(crate) fn split_asked() -> bool {
+        WINE32_SPLIT.load(Ordering::Relaxed)
     }
 
     /// Whether this is a 32-bit Wine process that took the split (`?winesplit=1`):

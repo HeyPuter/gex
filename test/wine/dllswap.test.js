@@ -5,7 +5,7 @@
 // own image's result. Phase 1 takes one round, phase 2 eight; the further
 // loads spend under 4096 dispatch slots each (the runtime's exit lines,
 // under `log: 'debug'`).
-import { bootWine, exitStats } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800 };
@@ -29,6 +29,7 @@ export default async function (t) {
   const r = await t.time(name, () => w.run('xcload2.exe', ops, { timeout: 600000 }))
     .catch((e) => ({ code: -1, stdout: '', stderr: String(e.message) }));
   t.check(`${name}: every call's result`, r.code === 0 && new RegExp(`^${want.join('\\n')}\\n?$`).test(r.stdout), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  t.check(`${name}: xcload2's exit line`, await exitLineOf(t, /xcload2\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   const left = Math.min(...(await exitStats(t)).map((s) => s.slotsLeftK).filter((n) => n >= 0));
   t.record(`${name} slots left k`, left);

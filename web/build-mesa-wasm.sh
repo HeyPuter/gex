@@ -96,6 +96,11 @@ fi
     OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP-$VARIANT" KEEP_TMP=true WASM_THREADS=$WT \
         "$ROOT/web/tint/build-tint.sh"
 }
+# Mesa's own files by fixed names too: the replay includes Tint's headers,
+# whose assertion strings would otherwise carry the build machine's paths. A
+# build directory compiled before this keeps its objects' old strings
+# (emcc's flags from the environment are not ninja's to track).
+export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
 if [ ! -f "$BUILD/build.ninja" ]; then
     mkdir -p "$OUT"
@@ -253,6 +258,24 @@ if [ -d "$PUB" ] && [ -f "$FROM/gex-wgpu-replay.wasm" ]; then
         cp "$FROM/$f" "$PUB/$f"
         echo "  published $PUB/$f"
     done
+    # The licences of what the replay is built from, beside it, for the npm
+    # package's THIRD-PARTY (web/runtime/build.sh): Mesa's, Dawn's (Tint is
+    # Dawn's) and emdawnwebgpu's.
+    L=$PUB/licenses
+    rm -rf "$L/mesa" "$L/dawn" "$L/emdawnwebgpu"
+    mkdir -p "$L/mesa" "$L/dawn" "$L/emdawnwebgpu"
+    for f in docs/license.rst licenses/MIT licenses/Apache-2.0 licenses/BSL-1.0 licenses/SGI-B-2.0; do
+        [ -f "$MESA/$f" ] || { echo "no $MESA/$f: Mesa's licence for the replay" >&2; exit 1; }
+        cp "$MESA/$f" "$L/mesa/$(basename "$f")"
+    done
+    DAWN_LICENSE=${GEX_DAWN_LICENSE:-}
+    [ -n "$DAWN_LICENSE" ] || [ -z "${WINK_CACHE:-}" ] ||
+        DAWN_LICENSE=$(ls -t "$WINK_CACHE"/dawn/src-*/LICENSE 2>/dev/null | head -1)
+    [ -n "$DAWN_LICENSE" ] || DAWN_LICENSE=$TINT_TMP-$VARIANT/dawn/LICENSE
+    [ -f "$DAWN_LICENSE" ] || { echo "no Dawn LICENSE ($DAWN_LICENSE; GEX_DAWN_LICENSE names one)" >&2; exit 1; }
+    cp "$DAWN_LICENSE" "$L/dawn/LICENSE"
+    [ -f "$EMDAWN/webgpu_cpp/LICENSE" ] || { echo "no $EMDAWN/webgpu_cpp/LICENSE" >&2; exit 1; }
+    cp "$EMDAWN/webgpu_cpp/LICENSE" "$L/emdawnwebgpu/LICENSE"
 fi
 
 printf '%s\n' \

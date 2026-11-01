@@ -38,6 +38,9 @@ const LIMIT64_BYTES = 16 * 2 ** 30;
 /** The smallest module a Worker hands its siblings compiled (`Gex#offerModule`).
  *  Below it a sibling compiles the bytes itself: at most a few milliseconds. */
 const RELAY_MIN_BYTES = 256 * 1024;
+// Run switches a Worker takes at the top of its message as well as in its
+// run options (worker.mjs's `run`), which an exec it adopts takes too.
+const EXEC_SWITCHES = ['link', 'dense', 'fjit', 'fjitMax', 'fjitOnly', 'liftMax', 'inlineDispatch', 'xlateReport', 'discoverSkip', 't1Fold', 'providers', 'xcache'];
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
@@ -1247,7 +1250,7 @@ export class Gex {
   /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
-  /** A 64-bit Wine program being loaded: its space is the 2 GiB split. */
+  /** A 64-bit Wine program being loaded into a 64-bit memory: the split. */
   #wine64Split = false;
   /** A process that runs no translated code (a native wasm program, a fork
    *  child of one, an exec of one): no placement window, its arena from
@@ -2113,15 +2116,16 @@ export class Gex {
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
     // A 32-bit Wine program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
-    // Windows DLLs load (0x10000000).
-    // A 64-bit one (64-bit Wine) the 2 GiB split: 32-bit Wine's compact space ends at
-    // 2 GiB, and a 64-bit Wine maps past it.
+    // Windows DLLs load (0x10000000). A 64-bit one in a 32-bit memory takes no space here unless
+    // the site asks for the split: its load picks the compact space or the
+    // split (wasmprog.rs `publish`), and a space taken here first would be
+    // 32-bit Wine's.
     const wine = wine32ProgramFlags(elf);
-    if (wine) this.#windowsSpace = -1;
+    if (wine && ((wine & 2) === 0 || m64() || globalThis.GEX_WINE32_SPLIT)) this.#windowsSpace = -1;
+    this.#wine64Split = (wine & 2) !== 0 && m64();
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
-    this.#wine64Split = (wine & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
@@ -3388,6 +3392,11 @@ export class Gex {
     const e = this.#shim.exports;
     this.#setMetadata(guestWasm);
     const o = child.opts ?? {};
+    // The switches the host hands every Worker (its `extra`, at the top of
+    // `opts` here) that the record's options leave unsaid: a page's spawn
+    // (ProcessHost.spawnExec) carries the run options alone, where a
+    // posix_spawn child's carry its parent's.
+    for (const k of EXEC_SWITCHES) if (o[k] === undefined && opts?.[k] !== undefined) o[k] = opts[k];
     const uid = o.uid ?? child.uid;
     if (uid !== undefined) e.gex_set_identity(uid, o.gid ?? child.gid ?? uid);
     if (child.cwd) this.#putBytes(new TextEncoder().encode(child.cwd), e.gex_set_cwd);
