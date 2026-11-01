@@ -515,7 +515,9 @@ themselves.
 
 In gex's tree, `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, their
 Workers, and beside them, each named by its content, the shim, kernel and
-seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
+seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`),
+with x86's the memory64 shim and seed its processes with `GEX_MEM64` run on
+(`GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh`, needed when x86 is built), the
 GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`), stripped
 of names and DWARF (`GEX_KEEP_NAMES=1` keeps them). The
 package is for browser pages only. Node runs the runtime from its sources
