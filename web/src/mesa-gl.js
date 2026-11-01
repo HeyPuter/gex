@@ -86,9 +86,12 @@ async function loadGlue(url) {
  *
  * Null when the source has no glue: Mesa is then loaded as files.
  */
-async function loadFromSource(url, source) {
+async function loadFromSource(url, source, files = null) {
   const href = new URL(url, location.href).href;
-  const base = href.split('/').pop().replace(/\.js$/, '');
+  // A listed glue (the runtime package's) by its listed name: its URL is
+  // the name a bundler gave it.
+  const listed = files && Object.keys(files).find((k) => new URL(files[k], location.href).href === href);
+  const base = (listed ?? href.split('/').pop()).replace(/\.js$/, '');
   const got = (name) => Promise.resolve().then(() => source(name)).catch((e) => {
     console.warn(`[mesa-gl] ${name}: ${e?.message ?? e}; fetched as a file`);
     return null;
@@ -357,7 +360,17 @@ export class MesaGlDevice {
       });
 
       const t0 = performance.now();
-      const fromSource = options.source ? await loadFromSource(url, options.source) : null;
+      const files = options.files ?? assetFiles('/gex/');
+      // The runtime package's files are named by their content, so the glue
+      // would not find its cold part beside its module by name: given the
+      // listed files as its source, Mesa is instantiated here, cold part and
+      // all, each by its own URL.
+      const listedSource = files?.['gex-wgpu-replay.js'] && ((name) => (files[name] ? fetch(files[name]).then((r) => {
+        if (!r.ok) throw new Error(`${files[name]}: ${r.status}`);
+        return r.arrayBuffer();
+      }) : null));
+      const source = options.source ?? listedSource ?? null;
+      const fromSource = source ? await loadFromSource(url, source, files) : null;
       const Module = fromSource?.factory ?? await loadGlue(url);
       const made = Module({
         preinitializedWebGPUDevice: device,
@@ -366,7 +379,7 @@ export class MesaGlDevice {
         mainScriptUrlOrBlob: new URL(url, location.href).href,
         // A listed file by its name (the runtime package's: a bundler names
         // them where it puts them), else beside the glue.
-        locateFile: (file) => (options.files ?? assetFiles('/gex/'))?.[file] ?? new URL(file, new URL(url, location.href)).href,
+        locateFile: (file) => files?.[file] ?? new URL(file, new URL(url, location.href)).href,
         // Mesa's stdout is its chatter; its stderr (below) stays.
         print: (line) => logOn('debug') && console.log('[mesa-gl]', line),
         printErr: quietReports((line) => console.warn('[mesa-gl]', line), options.glTrace ?? pageFlag('gltrace')),
