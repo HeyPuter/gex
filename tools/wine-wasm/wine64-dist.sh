@@ -352,13 +352,28 @@ pe_native() {
 		( cd "$b" && nice -n 10 make -k -j"$J" ) || true
 		sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
 			while read -r m; do case " $D " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
-		echo "$sp" > split.txt
 	fi
 	for dll in $sp; do t="$t $(pe_target "$b" "$dll")"; done
 	# shellcheck disable=SC2086
 	( cd "$b" && nice -n 10 make -j"$J" $t ) || return 1
-	# shellcheck disable=SC2086
-	WINE64_SPLIT_DLLS="$(echo $sp)" nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
+	echo "$sp" > split.txt
+	stage_split "$b" "$W" "$PWD/native" $D
+}
+# stage-native64.sh ARGS over the split modules in split.txt. A split module
+# importing what no module exports (one with a source the wasm tree does not
+# build: dmsynth's C++ fluidsynth) is left out of split.txt and stays x86 code.
+stage_split() {
+	local i bad
+	for i in 1 2 3; do
+		# shellcheck disable=SC2046
+		WINE64_SPLIT_DLLS="$(echo $(cat split.txt))" nice -n 10 "$here/stage-native64.sh" "$@" 2> stage.err && { cat stage.err >&2; return 0; }
+		cat stage.err >&2
+		bad=$(sed -n 's/^  \([^ :]*\)\.wasm: .*/\1/p' stage.err | grep -vx winepe) || return 1
+		log "x86 code (imports no module exports): $(echo $bad)"
+		grep -vxF -f <(echo "$bad") split.txt > split.tmp || true
+		mv split.tmp split.txt
+	done
+	return 1
 }
 pe_target() { # BUILD DLL: the tree's make target for DLL's wasm64 build
 	# a module named with its extension (msacm32.drv) has its own directory
@@ -393,7 +408,7 @@ pe_native32() {
 		while read -r m; do case " $D32 " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/i386-windows/$m" ] && echo "$m"; done)
 	echo "$sp" > split.txt
 	# shellcheck disable=SC2086
-	GEX_WASM_SYSROOT=$SR32 WINE64_SPLIT_DLLS="$(echo $sp)" nice -n 10 "$here/stage-native64.sh" --i386 "$b" "$W" "$PWD/native" $D32
+	GEX_WASM_SYSROOT=$SR32 stage_split --i386 "$b" "$W" "$PWD/native" $D32
 }
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
