@@ -16700,6 +16700,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume_ctx(my_ctx());
         trap();
     }
+    // The other mode's: an i386 Wine module's export or entry thunk bound
+    // there (WoW64's 32-bit builtins as native modules) is bridged in that
+    // mode's directory, never translated (its bytes are the skeleton's
+    // stubs), as gexc's `ftab::serve_alt`.
+    if alt && cgen::elfprov::rebridge_alt(pc) {
+        miss_way(pc, 7);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     if cgen::libprov::replaced(pc) {
         cgen::libprov::note_stray(pc);
     }
@@ -17471,7 +17481,8 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         MissPre::Done(t) => t,
         MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
     // A provider's address counts as known: a miss there is bridged again
-    // (`cgen::provider_serves`), its bytes may be a `ud2` stub.
+    // (`cgen::provider_serves`), its bytes may be a `ud2` stub; in the other
+    // mode, a function of that mode bound there (`cgen::alt_serves`).
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
     let cs = if gex_abi::X86 { GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
@@ -17479,7 +17490,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&gex_abi::addr_key(a, alt)) || (!alt && crate::cgen::provider_serves(a)),
+            &|a| known.contains(&gex_abi::addr_key(a, alt)) || if alt { crate::cgen::alt_serves(a) } else { crate::cgen::provider_serves(a) },
             table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;

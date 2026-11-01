@@ -347,6 +347,21 @@ pub(crate) fn rebridge(pc: u64) -> bool {
     true
 }
 
+/// [`rebridge`] for a miss in the process's other mode (a WoW64 thread's
+/// 32-bit code): only a function of that mode bound there (an i386 Wine
+/// module's export or entry thunk) serves it, through a bridge in that
+/// mode's directory, whose page entry is written with it.
+pub(crate) fn rebridge_alt(pc: u64) -> bool {
+    if !super::alt_serves(pc) {
+        return false;
+    }
+    let (regs, dirs, slots) = super::bridges_mode(&[pc], true);
+    super::write_dirs(dirs);
+    REBRIDGE.with(|v| v.borrow_mut().extend(regs));
+    NEED.fetch_max(slots.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    true
+}
+
 /// What the dispatch tables must hold for the re-bridged slots.
 static NEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

@@ -1890,6 +1890,12 @@ pub(crate) fn provider_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).module >= PROVIDER))
 }
 
+/// [`provider_serves`] in the process's other mode: an i386 Wine module's
+/// export or entry thunk bound at `addr` in an x86-64 process.
+pub(crate) fn alt_serves(addr: u64) -> bool {
+    wasmdll::alt_serves(addr)
+}
+
 /// Whether a current JIT function serves `addr` (its pages unchanged since).
 /// After the JIT forgets (`fjit::on_retire`) this is what still knows
 /// which functions it has made.

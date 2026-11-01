@@ -168,6 +168,13 @@ const CORE_MODULE: &str = "winepe.wasm";
 /// go into the other directory (`bind`).
 static ALT_INSTALLS: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 
+/// Whether a function of the process's other mode serves `addr`: an i386
+/// Wine module's export or entry thunk bound there in an x86-64 process.
+pub(crate) fn alt_serves(addr: u64) -> bool {
+    let Some(install) = ftab(|m| m.get(addr).map(|f| f.install)) else { return false };
+    lock(&ALT_INSTALLS).contains(&install)
+}
+
 /// Whether a Wine module of this pointer size is of the process's other
 /// mode: an ILP32 one (32-bit Wine's, PE32 skeletons) in an x86-64 process.
 fn module_alt(is64: bool) -> bool {
