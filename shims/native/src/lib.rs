@@ -1791,11 +1791,11 @@ fn perform_block(
     /// descriptor ready (`ready`); `$seen` is the sequence taken before this
     /// turn's check.
     macro_rules! turn {
-        ($seen:expr) => {
+        ($what:ident, $seen:expr) => {
             if interrupted() {
                 return Err(Errno::EINTR);
             }
-            ready::wait($seen, std::time::Duration::from_millis(1));
+            blocked::$what($seen, std::time::Duration::from_millis(1));
         };
     }
     match op {
@@ -1895,7 +1895,7 @@ fn perform_block(
                 // Saturating: the deadline can pass between the test above
                 // and here, and `Duration` subtraction panics on underflow.
                 let left = d.saturating_sub(start.elapsed());
-                std::thread::sleep(left.min(std::time::Duration::from_millis(1)));
+                blocked::sleep(left.min(std::time::Duration::from_millis(1)));
             }
             Ok(0)
         }
@@ -1904,7 +1904,7 @@ fn perform_block(
             let seen = ready::seq();
             match socket.status() {
                 gex_kernel::net::Status::Connecting => {
-                    turn!(seen);
+                    turn!(connect, seen);
                 }
                 gex_kernel::net::Status::Open => return Ok(0),
                 gex_kernel::net::Status::Refused => return Err(Errno::ECONNREFUSED),
@@ -1928,7 +1928,7 @@ fn perform_block(
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
-                turn!(seen);
+                turn!(poll, seen);
             }
         }
         BlockOp::WriteStream { handle, buf, len, gathered } => {
@@ -1945,7 +1945,7 @@ fn perform_block(
                     if interrupted() {
                         return if done > 0 { Ok(done as u64) } else { Err(Errno::EINTR) };
                     }
-                    ready::wait(seen, std::time::Duration::from_millis(1));
+                    blocked::write_stream(seen, std::time::Duration::from_millis(1));
                     continue;
                 }
                 match handle.write_at(0, &data[done..]) {
@@ -1956,7 +1956,7 @@ fn perform_block(
                     // descriptor that is not non-blocking. (Or a small write
                     // waiting for room for all of it.)
                     Err(Errno::EAGAIN) => {
-                        ready::wait(seen, std::time::Duration::from_millis(1));
+                        blocked::write_stream(seen, std::time::Duration::from_millis(1));
                         continue;
                     }
                     // A partial write already delivered is what the caller
@@ -1987,7 +1987,7 @@ fn perform_block(
                     }
                     return Ok(n);
                 }
-                turn!(seen);
+                turn!(read_stream, seen);
             }
         }
         BlockOp::SigSuspend { .. } => loop {
@@ -1997,7 +1997,7 @@ fn perform_block(
             if interrupted() {
                 return Err(Errno::EINTR);
             }
-            ready::wait(seen, std::time::Duration::from_millis(1));
+            blocked::sigsuspend(seen, std::time::Duration::from_millis(1));
         },
         // `rt_sigtimedwait`: until one of `set` is pending (then the kernel
         // takes it, `finish_blocking`), the time is up (`EAGAIN`), or a
@@ -2022,7 +2022,7 @@ fn perform_block(
                     },
                     None => std::time::Duration::from_millis(1),
                 };
-                ready::wait(seen, left.min(std::time::Duration::from_millis(1)));
+                blocked::sigwait(seen, left.min(std::time::Duration::from_millis(1)));
             }
         }
         BlockOp::AcceptWait { socket } => {
@@ -2034,7 +2034,7 @@ fn perform_block(
                 if socket.poll_readable() {
                     return Ok(0);
                 }
-                turn!(seen);
+                turn!(accept, seen);
             }
         }
         BlockOp::WaitChild {
@@ -2108,6 +2108,32 @@ fn perform_block(
                     .wait_timeout(guard, std::time::Duration::from_millis(20));
             }
         }
+    }
+}
+
+/// A blocked syscall's wait (`perform_block`), one function for each thing
+/// it waits on, never inlined: a host stack of a hung guest's threads (gdb's)
+/// then says what each waits in, where the arms' shared wait would name only
+/// itself. A call each, nothing more.
+mod blocked {
+    macro_rules! waits {
+        ($($what:ident),*) => {$(
+            #[inline(never)]
+            pub fn $what(seen: u64, max: std::time::Duration) {
+                super::ready::wait(seen, max);
+                // Not a tail call, which would leave no frame of its own,
+                // and not the same code as its siblings, to be folded.
+                std::hint::black_box(stringify!($what));
+            }
+        )*};
+    }
+    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept);
+
+    /// A sleep's (nanosleep, a Windows program's `Sleep`).
+    #[inline(never)]
+    pub fn sleep(d: std::time::Duration) {
+        std::thread::sleep(d);
+        std::hint::black_box("sleep");
     }
 }
 
