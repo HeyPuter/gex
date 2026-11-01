@@ -163,6 +163,9 @@ static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Ve
 /// The core module's file name: the module a skeleton of a DLL linked as
 /// a module of its own finds beside itself.
 const CORE_MODULE: &str = "winepe.wasm";
+/// clang's names for a C main, and WinMain: Wine's crt_main references them
+/// weakly (gex.mjs MAIN_NAMES gives the undefined ones a trapping stub).
+const MAIN_NAMES: [&str; 4] = ["main", "__main_argc_argv", "__original_main", "WinMain"];
 
 /// The installs of the process's other mode (`WinePe::alt`), whose bridges
 /// go into the other directory (`bind`).
@@ -707,10 +710,13 @@ fn install_module(
                 }
             } else if m == "env" && core.is_some_and(|c| g.mods[c].exports.contains(n)) {
                 B::Export(g.mods[core.unwrap()].number)
-            } else if m == "env" && *func && n.contains('!') {
+            } else if m == "env" && *func && (n.contains('!') || !MAIN_NAMES.contains(&n.as_str())) {
                 // another module's: bound to it if it is installed, else a
                 // call through a slot filled when it is (the core's calls
-                // into user32, say)
+                // into user32, say; a program with no core beside it, whose
+                // image maps before ntdll's, calls the core's runtime,
+                // __gexw_entry, as natively). Not the C mains Wine's crt_main
+                // names weakly, which JS's stubs answer.
                 let cross = CROSS_MODE.contains(&n.as_str());
                 match others(n).or_else(|| if cross { g.mods.iter().find(|w| w.ptr64 != is64 && w.funcs.contains(n)) } else { None }) {
                     Some(w) => {
