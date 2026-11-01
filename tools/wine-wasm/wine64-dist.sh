@@ -100,10 +100,10 @@ TP=$(git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|config
 # those, the link and gex-gl's guest library (linked into the loader).
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$here"/wine64-deps.sh "$here"/wine32.pins \
 	"$here"/ffi64/*; } | sha256sum | cut -c1-10)
-# dpnsvr (configure enables it for x86_64, not wasm64, which serves
-# x86-64 programs), and dmsynth with its FluidSynth (C, enabled only with
-# a C++ compiler): x86-64 builtins as wasm64 modules too (part of S)
-B64_MODS="--enable-dpnsvr --enable-dmsynth --enable-fluidsynth"
+# dpnsvr and vcruntime140_1 (configure enables them for x86_64, not wasm64,
+# which serves x86-64 programs), and dmsynth with its FluidSynth (C, enabled
+# only with a C++ compiler): x86-64 builtins as wasm64 modules too (part of S)
+B64_MODS="--enable-dpnsvr --enable-vcruntime140_1 --enable-dmsynth --enable-fluidsynth"
 S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
