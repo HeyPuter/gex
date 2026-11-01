@@ -17,6 +17,9 @@ import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logRoutine } from "./log.mjs";
 
+/** The longest an exec waits for the other memory flavour's runtime. */
+const OTHER_WAIT_MS = 300_000;
+
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
 /** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
@@ -1860,6 +1863,22 @@ export class Gex {
    */
   #hostImports() {
     return {
+        // Whether the other memory flavour's runtime is here (worker.mjs
+        // `otherGate`), for an exec of a program of that flavour while it can
+        // still fail (vfork.rs `exec_unrunnable`): asked for on first use and
+        // waited for, then 1, or a negated errno. 1 where nothing says.
+        other_runtime: () => {
+          const g = globalThis.GEX_OTHER_GATE;
+          if (!g || !globalThis.GEX_ASK_OTHER) return 1;
+          if (Atomics.load(g, 0) === 0) globalThis.GEX_ASK_OTHER();
+          // A slow link's few MB, but never for ever.
+          for (const until = performance.now() + OTHER_WAIT_MS; performance.now() < until;) {
+            const s = Atomics.load(g, 0);
+            if (s === 1 || s < 0) return s;
+            Atomics.wait(g, 0, s, 1000);
+          }
+          return -110; // ETIMEDOUT
+        },
         // `ptr` is an i64 (a BigInt) from the wasm64 shim, whose thread
         // stacks sit above 4 GiB: cut to 32 bits, a thread's stderr printed
         // as NUL bytes from the wrong place.

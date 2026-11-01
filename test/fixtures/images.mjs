@@ -60,7 +60,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'no-m64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -76,15 +76,25 @@ export const images = {
   },
   // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
   // zig), for core/mem64: a system's memory64 process through the API.
+  // And no-m64/: the runtime's files as gex's site lays them out (gex/...,
+  // links to web/public/gex), less the memory64 shim, for core/mem64-missing.
   async mem64(work) {
     const zig = process.env.ZIG || 'zig';
-    const src = join(HERE, 'programs/mem64-pick.c'), out = join(work, 'mem64-pick.x86');
-    const key = createHash('sha256').update(readFileSync(src)).digest('hex'), keyFile = `${out}.key`;
-    if (existsSync(out) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
-    const r = spawnSync(zig, ['cc', '-target', 'x86_64-linux-musl', '-O2', '-static', '-o', out, src], { stdio: ['ignore', 'ignore', 'pipe'] });
-    if (r.error) return `no ${zig} (ZIG)`;
-    if (r.status !== 0) throw new Error(`mem64-pick.c: ${r.stderr}`);
-    writeFileSync(keyFile, key);
+    for (const name of ['mem64-pick', 'mem64-miss']) {
+      const src = join(HERE, `programs/${name}.c`), out = join(work, `${name}.x86`);
+      const key = createHash('sha256').update(readFileSync(src)).digest('hex'), keyFile = `${out}.key`;
+      if (existsSync(out) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) continue;
+      const r = spawnSync(zig, ['cc', '-target', 'x86_64-linux-musl', '-O2', '-static', '-o', out, src], { stdio: ['ignore', 'ignore', 'pipe'] });
+      if (r.error) return `no ${zig} (ZIG)`;
+      if (r.status !== 0) throw new Error(`${name}.c: ${r.stderr}`);
+      writeFileSync(keyFile, key);
+    }
+    const pub = join(ROOT, 'web/public/gex'), site = join(work, 'no-m64');
+    rmSync(site, { recursive: true, force: true });
+    mkdirSync(join(site, 'gex'), { recursive: true });
+    for (const f of readdirSync(pub)) {
+      if (f !== 'gex_browser.x86.m64.shared.wasm') symlinkSync(join(pub, f), join(site, 'gex', f));
+    }
     return null;
   },
 
@@ -387,6 +397,13 @@ export const images = {
 
   async package(work) {
     execFileSync(join(ROOT, 'web/runtime/build.sh'), [join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    // A copy without the memory64 shim, for core/mem64-missing.
+    const less = join(work, 'pkg-no-m64');
+    rmSync(less, { recursive: true, force: true });
+    execFileSync('cp', ['-al', join(work, 'pkg'), less]);
+    const m64 = readdirSync(less).filter((f) => f.startsWith('gex_browser.x86.m64.shared'));
+    if (m64.length !== 1) throw new Error(`pkg: ${m64.length} memory64 shims`);
+    rmSync(join(less, m64[0]));
     return null;
   },
 };

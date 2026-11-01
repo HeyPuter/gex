@@ -497,6 +497,14 @@ pub(crate) fn exec_route(h: &Host, path: &str) -> Option<String> {
     (exec_memory_of(h, &other) == Need::Is(need)).then_some(other)
 }
 
+/// Whether this process's exec of `path` needs the other memory flavour
+/// ([`exec_target`]) and the page could not get its runtime (`other_runtime`,
+/// which fetches it on the first such exec and waits). The host says why
+/// on the console, once for the page.
+pub(crate) fn exec_unrunnable(h: &Host, path: &str) -> bool {
+    page_flavours() & 2 != 0 && exec_target(h, path) != gex_abi::mem64() && unsafe { crate::other_runtime() } < 0
+}
+
 /// Whether this process's exec of `path` goes on in another Worker: its
 /// program's memory flavour ([`exec_target`]) is not this Worker's (lib.rs
 /// `exec_away`).

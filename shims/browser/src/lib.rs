@@ -64,6 +64,10 @@ extern "C" {
     /// dispatches again in place; 0 (a page's main thread cannot compile
     /// synchronously) and the miss traps out as before.
     fn jit_install(ctx: i32) -> i32;
+    /// Whether the other memory flavour's runtime is here, fetched and
+    /// waited for when first asked: 1, or a negated errno (vfork.rs
+    /// `exec_unrunnable`).
+    pub(crate) fn other_runtime() -> i32;
     /// Write `len` bytes at `ptr` -- an address in the shared memory -- to the
     /// host's console for `fd`. A pointer-sized address: the wasm64 shim's
     /// buffers (a thread's stack among them) can be above 4 GiB.
@@ -8776,6 +8780,16 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].ctx_addr());
                 1
+            }
+            // A program of the other memory flavour whose runtime the page
+            // could not get: the exec fails while it still can, as one whose
+            // interpreter is missing does (`ENOENT`), not in a Worker that
+            // never starts.
+            SyscallOutcome::Exec { ref path, .. } if vfork::exec_unrunnable(h, path) => {
+                let mut gm = GuestMem::new(guest_bytes());
+                let ctx_addr = h.threads[cur()].ctx_addr();
+                let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, Errno::ENOENT.as_return());
+                0
             }
             SyscallOutcome::Exec { path, argv, envp } if vfork::active() => {
                 // posix_spawn's child, in its parent's memory: the new

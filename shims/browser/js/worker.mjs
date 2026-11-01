@@ -158,6 +158,14 @@ function resetRealm() {
 // while it waited in the pool. Messages the old call still posts are dropped.
 async function workerMain(rawPort, carry = null) {
 const life = { on: true };
+// The host's word on the other memory flavour's runtime (host.mjs
+// `#otherGate`), which an exec of a program of that flavour waits on
+// (gex.mjs `other_runtime`), and how to ask for it.
+function otherGate(msg) {
+  globalThis.GEX_OTHER_GATE = msg.otherGate ? new Int32Array(msg.otherGate) : undefined;
+  globalThis.GEX_ASK_OTHER = msg.otherGate ? () => port.post({ kind: 'loadOther' }) : undefined;
+}
+
 const port = {
   post: (m, transfer) => {
     if (life.on) rawPort.post(m, transfer);
@@ -398,6 +406,7 @@ async function handle(msg) {
     if (mem64) globalThis.GEX_MEM64 = 1;
     else delete globalThis.GEX_MEM64;
     if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
+    otherGate(msg);
     preattached = (async () => {
       const gex = new Gex(new Env(), {
         kernel: { ...msg.kernel, stackTop: stack },
@@ -763,6 +772,7 @@ async function handle(msg) {
   else delete globalThis.GEX_MEM64;
   // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
   if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
+  otherGate(msg);
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
