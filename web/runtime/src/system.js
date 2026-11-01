@@ -90,6 +90,10 @@ function programArgs(what, argv, opts = {}) {
   return [argv, opts];
 }
 
+/** The Cache Storage that keeps the lazy files a system read (boot's owner
+ *  of them, web/src/lazy-cache-worker.js), by URL and version. */
+const LAZY_CACHE = 'gex-runtime-lazy-v1';
+
 export class System extends EventTarget {
   #opts;
   #state = { phase: 'new', error: null, progress: null, console: '' };
@@ -302,18 +306,24 @@ export class System extends EventTarget {
     const { compositor } = dev;
     const netChannel = await rt.openNet(this.#net);
     // A lazy file in a rest bundle (`BUNDLE#OFFSET`: an ejected site's
-    // lazy.json, web/eject-site.mjs) is read through zstd frames: each Worker
-    // then loads the decoder before its guest runs. Only then, as a decoder
-    // costs every Worker a memory reservation.
+    // lazy.json, web/eject-site.mjs) is read through zstd frames.
     this.#restBundle = opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
     const stops = [];
+    // One Worker owns the lazy files (web/src/lazy-cache-worker.js), as an
+    // ejected page's does: every Worker's read asks it, and it keeps what it
+    // fetched in Cache Storage for the next visit and decodes a rest
+    // bundle's frames with the one decoder. Without it each Worker loaded a
+    // decoder of its own, an engine memory reservation in each, and a
+    // desktop's Workers ran the page out of them. Where it cannot run (no
+    // shared memory, no Cache Storage), each Worker reads for itself.
+    const lazyCache = await this.#lazyOwner(rt, kernel, opts.layers, stops);
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
       // after boot reaches the programs already running, and each reaches
       // /dev/gex-host. Every Worker reaches the network through the page;
       // which network is the page's to set, any time (net.js).
       uid: 0, ...this.#preset.host,
-      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
+      kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
     }, {
       onOutput: (fd, text) => this.#say(text),
       // The compositor lets go of an exited process's memory.
@@ -607,6 +617,33 @@ export class System extends EventTarget {
       p[INTERNAL].failed(e);
     });
     return p;
+  }
+
+  /** The lazy files' owner for boot's `layers` (see boot): its control
+   *  buffer for every Worker (`{ ctl }`), or null where there is none. */
+  async #lazyOwner(rt, kernel, layers, stops) {
+    const lazy = layers.flatMap((l) => l.lazy ?? []);
+    if (!lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
+      || rt.singleMode() || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) return null;
+    const { makeControl, lazyVersion } = await import('../../../shims/browser/js/lazy-cache.mjs');
+    const ctl = makeControl();
+    const w = new Worker(new URL('../../src/lazy-cache-worker.js', import.meta.url), { type: 'module', name: 'lazy-cache' });
+    const ready = await new Promise((r) => {
+      w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
+      w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
+      setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
+      w.postMessage({
+        ctl, memory: kernel.memory, cache: LAZY_CACHE, zstd: this.#restBundle || null,
+        versions: Object.fromEntries(lazy.map(([, size, url, , mtime]) => [url, lazyVersion(size, mtime)])),
+      });
+    });
+    if (!ready.ok) {
+      w.terminate();
+      if (this.#restBundle) this.#say(`gex: lazy files read by each process: ${ready.why}\n`);
+      return null;
+    }
+    stops.push(() => w.terminate());
+    return { ctl };
   }
 
   /** Spawn with pipes, write `input` (if any), wait, collect:
