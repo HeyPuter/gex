@@ -494,6 +494,9 @@ const ENTRY_TRAMP = new Uint8Array([
  *  RangeError when it is not there, which is caught here: nothing the guest
  *  or the shim was doing is unwound. */
 const STACK_ROOM = new Array(32768).fill(0);
+/** Call-outs open past which a new one asks `stackRoom` first (each asks
+ *  at the cost of a call that large). */
+const CALLOUT_ROOM_DEPTH = 32;
 const stackSink = function () { return 1; };
 function stackRoom() {
   try {
@@ -8615,6 +8618,11 @@ export class Gex {
       c.span = c.unwound = (1n << 64n) - 1n;
       e.gex_wow64_waits?.(1);
     }
+    // Deep inside others, one more needs the host's stack to have room for
+    // it: native Wine's guest calls hold their native frames, which no trap
+    // drops, so the shim's count cannot bound them (the shim ends the
+    // process, as a spent stack does).
+    if (me >= CALLOUT_ROOM_DEPTH && stackRoom() === 0) e.gex_callout_stack_spent?.();
     this.#callouts.push(c);
     this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');

@@ -2417,6 +2417,18 @@ static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// cannot leave.
 const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
 
+/// A call-out the glue opens inside others when the host's stack has no room
+/// for one more (`#callOutSteps`): a native Wine module's guest call (64-bit
+/// native Wine's `__gexw_guest_call64`), whose native frames no trap drops, as
+/// a handler that faults in every dispatch makes them without end. The
+/// process ends as one whose stack is spent, never with the host's stack
+/// overflowing in the runtime.
+#[no_mangle]
+pub extern "C" fn gex_callout_stack_spent() {
+    crate::warn_line("gex: guest calls nest deeper than the host's stack has room for: the process ends (stack overflow)\n");
+    crate::end_process(0xc000_00fd);
+}
+
 /// How far above a call-out's `sp_want` its return may come back (what a
 /// stdcall callee pops, or a function frame resumed inside), and past which
 /// the stack has unwound beyond its caller: as natively.
