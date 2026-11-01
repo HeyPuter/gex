@@ -1281,6 +1281,22 @@ async function handle(msg) {
     const asThread = msg.kind === 'thread' && !msg.snapMain;
     globalThis.GEX_REPORT_ABANDONED = !asThread;
     const runStarted = performance.now();
+    // A thread's Worker joins a shared memory that another Worker may have
+    // grown since this one instantiated, and the engine updates a Worker's
+    // bound on that memory only at its own next interrupt: a thread that
+    // starts first reads past the bound it still holds and dies of an
+    // out-of-bounds trap (32-bit Wine's second thread, started as its loader
+    // reserves its address space, did -- about one process in a hundred
+    // under load, which the parent's CreateProcess saw as a child that died
+    // at once). Growing by nothing takes the memory's present length.
+    if (asThread && !gone && gex.memory) {
+      try {
+        gex.memory.grow(0);
+      } catch {
+        // A 64-bit memory counts its pages in BigInt.
+        gex.memory.grow(0n);
+      }
+    }
     const status = gone ? 0 : await gex.run(entry, ctx);
     // The process's exec went to another Worker (a program of the other
     // memory flavour, lib.rs `exec_away`): this one ends, the process does
