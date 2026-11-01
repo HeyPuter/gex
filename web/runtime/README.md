@@ -96,7 +96,12 @@ Then wire it to the desktop's window manager:
 - **Close:** the frame's close button calls `close()`. Drop the frame on
   `closed`.
 - **Client-side frames:** `request` events (`move`, `resize`, `maximize`,
-  ...) are the window asking the desktop's manager to act.
+  `minimize`, ...) are the window asking the desktop's manager to act.
+- **Minimize:** hiding a frame is the desktop's own; the program is not
+  told, and its window keeps its size and contents for when it comes back.
+- **Taskbar:** `appId` names the application (`appid` when it changes) and
+  `pid` its program (`process.windows()` goes the other way), so a taskbar
+  groups windows and matches them to the launcher's entries.
 
 An X11 program needs nothing more: `DISPLAY` is in `hw.env`, and the
 runtime starts its X server for the first client. When the desktop's work
@@ -106,6 +111,14 @@ area changes, call `hw.setOutputSize(width, height)`.
 directory of the desktop's own filesystem to every program, while it runs
 (Mounts says what a provider implements). A mount is the desktop's to keep:
 persistence leaves it out.
+
+**A launcher.** The tree's applications are its desktop entries:
+`fs.readdir('/usr/share/applications')`, each `.desktop` file read with
+`fs.readFile(path, { encoding: 'utf-8' })` for its `Name`, `Exec` and `Icon`
+(an icon theme's file under `/usr/share/icons`). An entry's `Exec` runs as a
+`spawn` of its words, its field codes (`%f`, `%U`) left out or filled, and its
+windows' `appId` is the entry's name without `.desktop` (a Wayland program)
+or its `StartupWMClass` (an X one).
 
 **Calls out of the guest.** To let a program open a URL in the desktop's
 browser, or show a notification, register a host call. A guest script then
@@ -224,7 +237,7 @@ files are written into the running tree.
 
 | Member | Does |
 | --- | --- |
-| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode, mtime], ...]` (mode optional, 0644 without; mtime in seconds, optional) or the URL of such a list as JSON. A list at a URL may be an ejected site's `lazy.json` instead: `{ base, files: [[path, size, url, mtime, mode], ...] }`, each url relative to `base`, and a url `BUNDLE#OFFSET` a file in the site's rest bundle (zstd frames, indexed by `BUNDLE.json`), which must be added before boot. Their URLs must be on the page's own origin and answer range requests. |
+| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode, mtime], ...]` (mode optional, 0644 without; mtime in seconds, optional) or the URL of such a list as JSON. A list at a URL may be an ejected site's `lazy.json` instead: `{ base, files: [[path, size, url, mtime, mode], ...] }`, each url relative to `base`, and a url `BUNDLE#OFFSET` a file in the site's rest bundle (zstd frames, indexed by `BUNDLE.json`), which must be added before boot. Their URLs must be on the page's own origin and answer range requests. What a system reads of them is kept in the page's Cache Storage (`gex-runtime-lazy-v1`), by URL and version (size and mtime), for the next visit, where the page has shared memory and Cache Storage. |
 | `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |
@@ -466,14 +479,15 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | --- | --- |
 | `canvas` | Its pixels, CSS-sized to the window. Focusable: keys go to the window whose canvas has the page's focus; pointer and wheel input are its own. |
 | `kind` | `'toplevel'`, `'popup'` (a menu, a tooltip: never framed, drawn above its parent and outside its frame) or `'subsurface'`. |
-| `parent`, `pid`, `title`, `width`, `height` | |
+| `parent`, `title`, `width`, `height` | `title` whole (up to 256 bytes of UTF-8). |
+| `pid` | The program's pid: an X window's as the program says (`_NET_WM_PID`, which Qt, GTK and most toolkits set), else its X server's. `process.windows()` uses it. |
 | `decorations` | `'host'` (frame it), `'client'` (it draws its own: a Win32 window under Wine) or `'none'`. |
 | `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
 | `place(x, y)` | Where the page put it on the output; call after each move (X windows' menus read it). |
 | `resize(w, h)`, `setStates({ maximized, fullscreen, resizing }, w, h)` | Ask for a size, with states. |
 | `focus()`, `close()` | The keyboard; a polite close. |
-| `appId` | `null` for now. |
-| Events | `title`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
+| `appId` | What application it is, or `null` when the program does not say: a Wayland window's app id (by convention its desktop entry's name, `org.kde.kate`), an X window's `WM_CLASS` class (what a desktop entry's `StartupWMClass` names, `XTerm`). |
+| Events | `title`, `appid`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'minimize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
 
 ### SingleCanvas (`@gex/runtime/windows/single`)
 
@@ -501,7 +515,9 @@ themselves.
 
 In gex's tree, `web/runtime/build.sh DIR` builds the package into `DIR`: its modules, their
 Workers, and beside them, each named by its content, the shim, kernel and
-seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`), the
+seed of each guest architecture the tree has built (`shims/browser/build.sh`, `GEX_ARCH=x86 shims/browser/build.sh`),
+with x86's the memory64 shim and seed its processes with `GEX_MEM64` run on
+(`GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh`, needed when x86 is built), the
 GL's WebGPU replay and the X server (`web/build-xwayland-wasm.sh`), stripped
 of names and DWARF (`GEX_KEEP_NAMES=1` keeps them). The
 package is for browser pages only. Node runs the runtime from its sources

@@ -172,7 +172,15 @@ const rest = [];
         // prefix's `Temp` and profile folders arrive empty, and an empty
         // one's parents need not hold a file either (an ejected project's
         // sparse prefix: `users/gex/AppData/Local/Temp` alone).
-        if (guest) dirs.push(guest);
+        if (guest) {
+          dirs.push(guest);
+          // And its time, as a file's: a file manager lists folders by it.
+          try {
+            mtimes[guest] = Math.trunc(statSync(host).mtimeMs / 1000);
+          } catch {
+            // Its entries date it (the kernel's `date_parents`).
+          }
+        }
         for (const name of names) {
           const h = `${host}/${name}`, g = `${guest}/${name}`;
           // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and

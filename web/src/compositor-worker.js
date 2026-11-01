@@ -649,7 +649,7 @@ class Compositor {
   #clientRequest(k, win, code) {
     const kind = code & 7;
     const held = (this.#pointer.buttons & 1) !== 0;
-    this.#note(`request ${k} ${['none', 'move', 'resize', 'maximize', 'unmaximize'][kind] ?? kind}`);
+    this.#note(`request ${k} ${['none', 'move', 'resize', 'maximize', 'unmaximize', 'minimize'][kind] ?? kind}`);
     if (win.fullscreen) return;
     if (kind === 1 && held && !win.maximized) {
       this.#drag = { key: k, dx: this.#pointer.x - win.x, dy: this.#pointer.y - win.y };

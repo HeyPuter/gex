@@ -26,11 +26,11 @@ use gex_wayland::{Buffers, Client, SurfaceInfo};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-/// Words in one published surface record, and words in one input event. The
-/// same layout the guest shim publishes, because the page reads one arena.
-const REC: usize = 38;
+/// Words in one input event, and the published surface record
+/// (`gex_wayland::push_record`): the same layout the guest shim publishes,
+/// because the page reads one arena.
+use gex_wayland::{push_record, REC};
 const EV: usize = 8;
-const TITLE_BYTES: usize = 32;
 
 #[link(wasm_import_module = "gex_host")]
 extern "C" {
@@ -555,44 +555,3 @@ pub extern "C" fn hw_failed(ptr: u32, max: u32) -> u32 {
     .unwrap_or(0)
 }
 
-/// One surface's record, in the layout `wl-bridge.mjs` reads.
-fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
-    let base = out.len();
-    out.resize(base + REC, 0);
-    let r = &mut out[base..base + REC];
-    r[0] = client as i32;
-    r[1] = info.surface as i32;
-    r[2] = info.role.code() as i32;
-    r[3] = info.parent as i32;
-    r[4] = info.rel_x;
-    r[5] = info.rel_y;
-    r[6] = info.width;
-    r[7] = info.height;
-    r[8] = info.addr as u32 as i32;
-    r[9] = info.stride;
-    r[10] = info.format as i32;
-    r[11] = info.serial as i32;
-    r[12] = info.damage.x;
-    r[13] = info.damage.y;
-    r[14] = info.damage.w;
-    r[15] = info.damage.h;
-    r[16] = info.flags();
-    // The X window this surface is, for a GL client that names a drawable.
-    r[17] = info.xid as i32;
-    let mut n = info.title.len().min(TITLE_BYTES);
-    while n > 0 && !info.title.is_char_boundary(n) {
-        n -= 1;
-    }
-    let bytes = &info.title.as_bytes()[..n];
-    for (i, chunk) in bytes.chunks(4).enumerate() {
-        let mut word = [0u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
-        r[18 + i] = i32::from_le_bytes(word);
-    }
-    // Where its client placed it, if it did (`gex_window_placement_v1`).
-    r[28..33].copy_from_slice(&info.placement.record_words());
-    // Where it takes the pointer, when its client said (`flags` bit 7).
-    r[33..37].copy_from_slice(&info.input_words());
-    // The address's high half: a memory64 process's pool may sit above 4 GiB.
-    r[37] = (info.addr >> 32) as u32 as i32;
-}

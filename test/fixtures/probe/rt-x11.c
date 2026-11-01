@@ -3,7 +3,8 @@
  * it hears: "mapped", "key KEYCODE" for each key pressed, "button N" for
  * each button pressed, and "close" when
  * the window manager asks it to close (WM_DELETE_WINDOW), which ends it
- * with 0.
+ * with 0. Its WM_CLASS is "rt-x11", "RtX11" and its _NET_WM_PID its pid,
+ * as a toolkit's window's are.
  *
  *   rt-x11 TITLE [copy TEXT] [paste] [look] [where]
  *
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -44,6 +46,10 @@ int main(int argc, char **argv) {
   int scr = DefaultScreen(dpy);
   Window w = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, 160, 80, 0, 0, 0x3060c0);
   XStoreName(dpy, w, title);
+  XClassHint class = {"rt-x11", "RtX11"};
+  XSetClassHint(dpy, w, &class);
+  long pid = getpid();
+  XChangeProperty(dpy, w, XInternAtom(dpy, "_NET_WM_PID", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&pid, 1);
   Atom del = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
   Atom clipboard = XInternAtom(dpy, "CLIPBOARD", False);
   Atom utf8 = XInternAtom(dpy, "UTF8_STRING", False);

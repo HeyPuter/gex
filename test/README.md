@@ -117,6 +117,7 @@ A page or process runs one test, so each makes its own System.
 | `t.key(code, key, modifiers)`, `t.type(text)`, `t.move(x, y, buttons)`, `t.wheel(x, y, dx, dy)` | Real keys, typing, pointer motion and wheel turns, to whatever the page has focused or under the pointer (browser). |
 | `t.pixels(clip)`, `t.pixel(x, y)` | The page's pixels as the browser composited them (a WebGPU canvas too): an ImageData of `{ x, y, width, height }`, or one `[r, g, b, a]` (browser). |
 | `t.screenshot(name, clip)` | The page, or `clip` of it, saved as `NAME.png` among the artefacts: its path (browser). |
+| `t.saveFile(name, text)` | `text` saved as `NAME` among the artefacts, beside the screenshots: its path (browser). |
 | `t.cdp(...commands)` | Any CDP commands on the page, `{ method, ...params }`, sent in order: their results (browser). |
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
 | `t.logs(re, { levels })` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). With `levels` (browser), each line begins with its console level and a space (`warning ...`). |

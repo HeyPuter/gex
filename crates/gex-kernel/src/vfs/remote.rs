@@ -55,7 +55,8 @@ pub struct Remote {
     /// [`WALK_META_AT_MOUNT`] with nothing written.
     pub walk_meta: extern "C" fn(path: crate::PAddr, path_len: u32, mounts: crate::PAddr, mounts_len: u32, at: crate::PAddr) -> i32,
     pub unlink: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
+    /// Make a directory, dated `now` (the caller's clock).
+    pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32, now: i64) -> i32,
     pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     /// `rename`; `noreplace` bit 0 is `RENAME_NOREPLACE`, checked with the
     /// move under the filesystem's lock, and the bits above it the
@@ -378,7 +379,7 @@ impl FileSystem for RemoteFs {
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (a, n) = at(path.as_bytes());
-        ok((self.remote.mkdir)(a, n, mode)).map(|_| ())
+        ok((self.remote.mkdir)(a, n, mode, super::tmpfs::now())).map(|_| ())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {

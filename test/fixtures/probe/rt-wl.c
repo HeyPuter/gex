@@ -1,13 +1,14 @@
 /* A Wayland window for the runtime's window tests: one xdg_toplevel of a
  * solid colour, titled from argv, that says on stdout what it hears.
  *
- *   rt-wl TITLE [maximize] [move] [lock] [copy TEXT] [paste]
+ *   rt-wl TITLE [maximize] [minimize] [move] [lock] [copy TEXT] [paste] [app ID]
  *
  * "drawn W H" for each frame, "configure W H STATES" for each configure
  * (STATES: m maximized, f fullscreen, r resizing, a activated), "focus" when
  * it gets the keyboard, "key CODE" for each key pressed and "button" for
  * each press. With "move", a press asks to be moved (xdg_toplevel.move), as
- * its own title bar would; with "maximize", to be maximized. With "lock",
+ * its own title bar would; with "maximize", to be maximized, and with
+ * "minimize", minimized. "app ID" sets its app id. With "lock",
  * it asks for a locked pointer (pointer constraints, persistent) and says
  * "locked", "unlocked" and "rel DX DY" (the movement so far, in whole
  * pixels) as they come. With "copy TEXT", it sets TEXT as the selection
@@ -111,7 +112,8 @@ static struct wl_seat *seat;
 static struct wl_proxy *wm_base;
 static struct wl_surface *surface;
 static struct wl_proxy *xdg_surface, *toplevel;
-static int width = 200, height = 100, want_w, want_h, running = 1, move_on_press, maximize;
+static int width = 200, height = 100, want_w, want_h, running = 1, move_on_press, maximize, minimize;
+static const char *app_id;
 static uint32_t colour = 0xff3060c0;
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -333,6 +335,7 @@ static void p_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t t,
   say("button\n");
   if (move_on_press) wl_proxy_marshal(toplevel, 5, seat, serial);
   if (maximize) wl_proxy_marshal(toplevel, 9);
+  if (minimize) wl_proxy_marshal(toplevel, 13);
 }
 static void p_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) {
   (void)d; (void)p; (void)t; (void)a; (void)v;
@@ -394,6 +397,8 @@ int main(int argc, char **argv) {
   const char *title = argc > 1 ? argv[1] : "rt-wl";
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "maximize")) maximize = 1;
+    else if (!strcmp(argv[i], "minimize")) minimize = 1;
+    else if (!strcmp(argv[i], "app") && i + 1 < argc) app_id = argv[++i];
     else if (!strcmp(argv[i], "move")) move_on_press = 1;
     else if (!strcmp(argv[i], "lock")) want_lock = 1;
     else if (!strcmp(argv[i], "paste")) want_paste = 1;
@@ -416,6 +421,7 @@ int main(int argc, char **argv) {
   toplevel = wl_proxy_marshal_constructor(xdg_surface, 1, &xdg_toplevel_interface, NULL);
   wl_proxy_add_listener(toplevel, (void (**)(void))toplevel_listener, NULL);
   wl_proxy_marshal(toplevel, 2, title);
+  if (app_id) wl_proxy_marshal(toplevel, 3, app_id);
   wl_surface_commit(surface);
   if (want_lock) {
     wl_display_roundtrip(dpy);

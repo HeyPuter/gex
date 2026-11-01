@@ -140,6 +140,9 @@ const ATOM_NAMES: &[&str] = &[
     "TARGETS",
     "TEXT",
     "GEX_SELECTION",
+    // The program a window is (EWMH): told to the compositor beside the
+    // window, which knows only the X server's connection.
+    "_NET_WM_PID",
 ];
 
 #[derive(Default, Clone, Copy)]
@@ -160,6 +163,7 @@ struct Atoms {
     targets: u32,
     text: u32,
     gex_selection: u32,
+    net_wm_pid: u32,
 }
 
 impl Atoms {
@@ -181,6 +185,7 @@ impl Atoms {
             13 => self.targets = atom,
             14 => self.text = atom,
             15 => self.gex_selection = atom,
+            16 => self.net_wm_pid = atom,
             _ => {}
         }
     }
@@ -204,7 +209,14 @@ enum Awaiting {
     XFixes,
     /// The clipboard's text, converted onto our window.
     Copied,
+    /// A window's `WM_CLASS`: its application.
+    Class(u32),
+    /// A window's `_NET_WM_PID`: its program.
+    Pid(u32),
 }
+
+/// `WM_CLASS`, one of X11's predefined atoms.
+const WM_CLASS: u32 = 67;
 
 /// One X window the manager knows about.
 #[derive(Default, Clone)]
@@ -225,6 +237,9 @@ struct XWindow {
     /// The `wl_surface` Xwayland told us this window draws into.
     surface: Option<u32>,
     title: String,
+    /// `WM_CLASS`'s class (its second string), and `_NET_WM_PID`, 0 unset.
+    app_id: String,
+    pid: u32,
     /// Told to the compositor already, so a pump that changes nothing is quiet.
     announced: bool,
 }
@@ -869,6 +884,49 @@ impl Xwm {
                 }
                 self.announce(window, client);
             }
+            Awaiting::Class(window) => {
+                // "instance\0class\0": the class is what a desktop entry's
+                // StartupWMClass names.
+                let len = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
+                let bytes = &msg[32..(32 + len).min(msg.len())];
+                let class = bytes.split(|&b| b == 0).nth(1).unwrap_or(&[]);
+                let class = String::from_utf8_lossy(class).to_string();
+                if let Some(w) = self.windows.get_mut(&window) {
+                    w.app_id = class;
+                }
+                self.identify(window, client);
+            }
+            Awaiting::Pid(window) => {
+                let format = msg[1];
+                let len = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
+                let pid = if format == 32 && len >= 1 && msg.len() >= 36 {
+                    u32::from_le_bytes([msg[32], msg[33], msg[34], msg[35]])
+                } else {
+                    0
+                };
+                if let Some(w) = self.windows.get_mut(&window) {
+                    w.pid = pid;
+                }
+                self.identify(window, client);
+            }
+        }
+    }
+
+    /// Which application and program a window is, to the compositor, once
+    /// it is paired with its surface.
+    fn identify(&mut self, window: u32, client: &mut Client) {
+        let Some(w) = self.windows.get(&window) else { return };
+        if let (Some(surface), true) = (w.surface, w.mapped) {
+            client.set_x11_identity(surface, &w.app_id, w.pid);
+        }
+    }
+
+    /// Ask for a window's application and program.
+    fn ask_identity(&mut self, window: u32) {
+        self.get_property(window, WM_CLASS, Awaiting::Class(window));
+        let pid = self.atoms.net_wm_pid;
+        if pid != 0 {
+            self.get_property(window, pid, Awaiting::Pid(window));
         }
     }
 
@@ -979,6 +1037,7 @@ impl Xwm {
                 } else {
                     self.announce(window, client);
                 }
+                self.ask_identity(window);
             }
             ev::UNMAP_NOTIFY => {
                 let window = word(8);
@@ -1039,6 +1098,9 @@ impl Xwm {
                 if (atom == self.atoms.net_wm_name && atom != 0) || atom == 39 {
                     let name = self.atoms.net_wm_name;
                     self.get_property(window, name, Awaiting::Title(window));
+                }
+                if atom == WM_CLASS || (atom == self.atoms.net_wm_pid && atom != 0) {
+                    self.ask_identity(window);
                 }
             }
             ev::CLIENT_MESSAGE => {
@@ -1104,6 +1166,7 @@ impl Xwm {
             ));
         }
         client.adopt_x11(surface, &w.title, w.override_redirect, w.x, w.y);
+        client.set_x11_identity(surface, &w.app_id, w.pid);
         // And which window it is: a GL client names its drawable, and the
         // compositor has no other way to know which surface that became.
         client.set_xid(surface, window);

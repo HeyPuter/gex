@@ -40,15 +40,18 @@ import { single, sched } from './single.mjs';
 const BLOCKS = 32;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
-/** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 38;
+/** Words in one surface record. Must match `REC` in `crates/gex-wayland`
+ *  (`push_record`), which both the guest shim and the X server's bridge
+ *  write. */
+export const REC = 119;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
 const RING = 64;
 
 // Field offsets inside a surface record, named so neither side indexes by
-// accident. The tail is the title as UTF-8 bytes.
+// accident. The tail is the title, then the app id, as UTF-8 bytes, then the
+// program's pid where its connection does not say it (an X window's).
 export const R_CLIENT = 0;
 export const R_SURFACE = 1;
 export const R_ROLE = 2;
@@ -68,8 +71,12 @@ export const R_DAMAGE_H = 15;
 export const R_FLAGS = 16;
 /** The X window this surface is, or zero. See `F_EXTERNAL`. */
 export const R_XID = 17;
-export const R_TITLE = 18;
-export const R_TITLE_WORDS = 8;
+// Words 18..25 are free (the title's, before it had room).
+export const R_TITLE = 38;
+export const R_TITLE_WORDS = 64;
+export const R_APP_ID = 102;
+export const R_APP_ID_WORDS = 16;
+export const R_PID = 118;
 /** With `F_EXTERNAL`: where in the surface the host's GL frame goes, as
  * `x | y << 16` and `w | h << 16`. Zero for the whole surface (a Wayland GL
  * client's window is all frame; a Windows one has its frame and title bar
@@ -342,9 +349,25 @@ export function outputSize(channel) {
 }
 
 const decoder = new TextDecoder();
-/// One scratch buffer for titles rather than one per surface per frame: this
-/// runs for every surface at frame rate.
-const titleBytes = new Uint8Array(R_TITLE_WORDS * 4);
+/// One scratch buffer for a record's text rather than one per surface per
+/// frame: this runs for every surface at frame rate.
+const textBytes = new Uint8Array(R_TITLE_WORDS * 4);
+/** The UTF-8 text in `words` words at `at`: up to its first NUL. */
+function recordText(a, at, words) {
+  const bytes = textBytes;
+  let end = words * 4;
+  for (let w = 0; w < words; w++) {
+    const v = a[at + w];
+    if (v === 0) { end = w * 4; break; }
+    bytes[w * 4] = v & 0xff;
+    bytes[w * 4 + 1] = (v >>> 8) & 0xff;
+    bytes[w * 4 + 2] = (v >>> 16) & 0xff;
+    bytes[w * 4 + 3] = (v >>> 24) & 0xff;
+  }
+  const nul = bytes.subarray(0, end).indexOf(0);
+  if (nul >= 0) end = nul;
+  return end ? decoder.decode(bytes.subarray(0, end)) : '';
+}
 
 /**
  * Every surface every process has published, newest state, as plain objects.
@@ -374,17 +397,6 @@ export function readScene(channel, { onlyChanged = false } = {}) {
     const count = Math.min(Atomics.load(a, base + B_COUNT), SLOTS);
     for (let i = 0; i < count; i++) {
       const r = base + B_WORDS + i * REC;
-      // The title's bytes stop at the first NUL, or fill the field.
-      const bytes = titleBytes;
-      for (let w = 0; w < R_TITLE_WORDS; w++) {
-        const v = a[r + R_TITLE + w];
-        bytes[w * 4] = v & 0xff;
-        bytes[w * 4 + 1] = (v >>> 8) & 0xff;
-        bytes[w * 4 + 2] = (v >>> 16) & 0xff;
-        bytes[w * 4 + 3] = (v >>> 24) & 0xff;
-      }
-      let end = bytes.indexOf(0);
-      if (end < 0) end = bytes.length;
       out.push({
         token,
         block: b,
@@ -418,7 +430,10 @@ export function readScene(channel, { onlyChanged = false } = {}) {
             h: a[r + R_GL_SIZE] >>> 16,
           }
           : null,
-        title: end ? decoder.decode(bytes.subarray(0, end)) : '',
+        // Each stops at its first NUL, or fills its field.
+        title: recordText(a, r + R_TITLE, R_TITLE_WORDS),
+        appId: recordText(a, r + R_APP_ID, R_APP_ID_WORDS),
+        pid: a[r + R_PID] >>> 0,
         placed: (a[r + R_PLACE] & P_PLACED) !== 0,
         unmanaged: (a[r + R_PLACE] & P_UNMANAGED) !== 0,
         layer: (a[r + R_PLACE] >> 8) & 0xff,

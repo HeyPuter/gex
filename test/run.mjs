@@ -418,7 +418,9 @@ async function runPage(test, arch, say, timeout) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
       const reply = method === '__logs' ? { result: { lines: logs.map((l, i) => (params.levels ? `${levels[i]} ${l}` : l)).filter((l) => new RegExp(params.re, params.flags).test(l)) } }
-        : method === '__status' ? { result: { status: await rendererStatus() } } : await Promise.race([cdp.send(method, params, sessionId).then(
+        : method === '__status' ? { result: { status: await rendererStatus() } }
+        // Not CDP: a file of the page's among the artefacts (`t.saveFile`).
+        : method === '__save' ? { result: { path: save(name, params.data) } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
       ), crash.then(() => ({ error: crashed }))]);

@@ -11,11 +11,11 @@ const KINDS = { 1: 'toplevel', 2: 'popup', 3: 'subsurface' };
 /** `DomDesktop.STATE_*`. */
 const STATE = { maximized: 2, resizing: 4, fullscreen: 8 };
 
-/** One guest window, as the page sees it. Events: `title`, `resized`,
- *  `position` (a popup's or a placed window's place changed), `request`
- *  (`kind`: 'move', 'resize' with `edges`, 'maximize', 'unmaximize',
- *  'fullscreen', 'unfullscreen'), `restack` (a placed window's `below`) and
- *  `closed`. */
+/** One guest window, as the page sees it. Events: `title`, `appid`,
+ *  `resized`, `position` (a popup's or a placed window's place changed),
+ *  `request` (`kind`: 'move', 'resize' with `edges`, 'maximize',
+ *  'unmaximize', 'minimize', 'fullscreen', 'unfullscreen'), `restack` (a
+ *  placed window's `below`) and `closed`. */
 export class GuestWindow extends EventTarget {
   #w;
   #d;
@@ -42,6 +42,7 @@ export class GuestWindow extends EventTarget {
     c.addEventListener('keyup', (e) => this.#host.keyEvent(e, false));
     c.addEventListener('focus', () => desktop.focus(w));
     w.onretitle = () => this.dispatchEvent(new Event('title'));
+    w.onappid = () => this.dispatchEvent(new Event('appid'));
     w.onresized = () => {
       this.#size();
       this.dispatchEvent(new Event('resized'));
@@ -57,9 +58,10 @@ export class GuestWindow extends EventTarget {
     this.canvas.style.height = `${this.height}px`;
   }
 
-  /** The pid of the process that made it (an X window's is the X server's). */
+  /** The pid of the process that made it: an X window's as its program
+   *  says (`_NET_WM_PID`), else its X server's. */
   get pid() {
-    return this.#w.token;
+    return this.#w.guestPid || this.#w.token;
   }
 
   /** The window it belongs to (a popup's or a subsurface's), or null. */
@@ -73,9 +75,13 @@ export class GuestWindow extends EventTarget {
     return this.#w.title ?? '';
   }
 
-  /** Not known yet: the guest's compositor does not pass it on. */
+  /** What application it is, or null when its program does not say: a
+   *  Wayland window's `xdg_toplevel` app id (by convention its desktop
+   *  entry's name, `org.kde.kate`), an X window's `WM_CLASS` class (a
+   *  desktop entry's `StartupWMClass`, `XTerm`). The `appid` event when it
+   *  changes. */
   get appId() {
-    return null;
+    return this.#w.appId || null;
   }
 
   /** Who draws its frame: 'host' (the page), 'client' (the program: a

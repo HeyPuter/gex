@@ -13,7 +13,7 @@
 // In: { ctl: SharedArrayBuffer, memory: the kernel's WebAssembly.Memory,
 //       cache: the Cache Storage name, versions: { URL path: version } of
 //       the lazy files (lazy-cache.mjs lazyVersion), zstd: the decoder's
-//       module URL, for a rest bundle }
+//       module URL, or true for the one bundled here, for a rest bundle }
 // Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
 //      now and then (bytes from the network, from the cache, since the last).
 
@@ -95,7 +95,9 @@ const decoded = new Map();
 const FRAMES_KEPT = 4;
 let zstdUrl = null, zstd = null;
 async function decoder() {
-  zstd ??= import(zstdUrl).then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); return d; });
+  // `true`: the one bundled with this Worker (the runtime package's).
+  zstd ??= (zstdUrl === true ? import('../eject-site/vendor/zstddec-stream.mjs') : import(zstdUrl))
+    .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); return d; });
   return zstd;
 }
 // The bundles' index and frames given up (lazy-cache.mjs FailedFrames):

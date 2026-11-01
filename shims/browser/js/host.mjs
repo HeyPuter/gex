@@ -299,6 +299,11 @@ export class ProcessHost {
   /// `exec_memory`), a fork child has its parent's, and anything else the
   /// page's. As the X server's (runtime.js), which takes the wasm32 kernel.
   #other; #otherShim = null; #otherLoading = null;
+  /// Whether the other flavour's runtime is here, for an exec that asks for
+  /// it to wait on before it is past failing (vfork.rs `exec_unrunnable`):
+  /// 0 not asked, 2 loading, 1 loaded, -2 (`-ENOENT`) it could not be had.
+  /// Only for one fetched on first use, and only with SharedArrayBuffer.
+  #otherGate = null; #otherGated = false;
   /// Each process's memory flavour, by pid, where it is not the page's.
   #flavourOf = new Map();
   /// Per Worker, a shared counter of the output messages this host has
@@ -461,6 +466,7 @@ export class ProcessHost {
       // GEX_MEM64), which every pooled Worker has (`#other`).
       mem64: !!this.#extra?.mem64,
       pageFlavours: this.#pageFlavours(),
+      otherGate: this.#otherGate?.buffer,
     }));
   }
   #poolSeq = 0;
@@ -593,6 +599,7 @@ export class ProcessHost {
     unitModule = null,
   }) {
     this.#other = other;
+    if (typeof other === 'function' && typeof SharedArrayBuffer === 'function') this.#otherGate = new Int32Array(new SharedArrayBuffer(4));
     this.#unitModule = unitModule;
     this.#makeWorker = makeWorker;
     this.#shim = shim;
@@ -646,16 +653,35 @@ export class ProcessHost {
     if (!this.#foreign(pid)) {
       return { shim: await this.#shimModule(), guest: this.#guest, kernel: this.#kernel ?? undefined, mem64 };
     }
-    // Fetched on first use when given as a function: few pages run one.
-    const o = typeof this.#other === 'function' ? await (this.#otherLoading ??= this.#other()) : this.#other;
+    const o = await this.#loadOther();
     if (!o) throw new Error(`process ${pid} needs a ${mem64 ? '64' : '32'}-bit memory, which this page does not run`);
-    this.#otherShim ??= o.shim instanceof WebAssembly.Module ? Promise.resolve(o.shim) : WebAssembly.compile(o.shim);
     return {
       shim: await this.#otherShim,
       guest: o.guest,
       kernel: this.#kernel ? { ...this.#kernel, module: o.kernel } : undefined,
       mem64,
     };
+  }
+
+  /** The other flavour's runtime, its shim compiled: fetched on first use
+   *  when given as a function (few pages run one), once. The gate says how
+   *  that went, and a failure is said once on the console. */
+  #loadOther() {
+    this.#otherLoading ??= (async () => {
+      const o = typeof this.#other === 'function' ? await this.#other() : this.#other;
+      if (o) this.#otherShim ??= o.shim instanceof WebAssembly.Module ? Promise.resolve(o.shim) : WebAssembly.compile(o.shim);
+      if (o) await this.#otherShim;
+      return o;
+    })();
+    if (this.#otherGate && !this.#otherGated) {
+      this.#otherGated = true;
+      Atomics.store(this.#otherGate, 0, 2);
+      this.#otherLoading.then((o) => o ? 1 : -2, (e) => {
+        console.error(`gex: the other memory flavour's runtime could not be loaded, so no program that needs it runs: ${e?.message ?? e}`);
+        return -2;
+      }).then((s) => { Atomics.store(this.#otherGate, 0, s); Atomics.notify(this.#otherGate, 0); });
+    }
+    return this.#otherLoading;
   }
 
   /** How many children the guest has forked. */
@@ -1471,6 +1497,7 @@ export class ProcessHost {
             kernel: rt.kernel,
             mem64: rt.mem64,
             pageFlavours: this.#pageFlavours(),
+            otherGate: this.#otherGate?.buffer,
             saveGate: this.#saveGate,
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all
@@ -1506,12 +1533,20 @@ export class ProcessHost {
             );
           }
           },
-          );
+          ).catch((e) => {
+            // Its runtime could not be had: the process ends, not waits.
+            this.#onOutput(2, `gex: process ${pid} could not start: ${e?.message ?? e}\n`, pid);
+            reject(e);
+          });
         }
         break;
       }
       case 'note':
         relayNote(m.note);
+        break;
+      case 'loadOther':
+        // An exec waits on the gate (`#otherGate`) for the answer.
+        this.#loadOther().catch(() => {});
         break;
       case 'doorPublish': {
         // The wineserver's door: every Worker of
