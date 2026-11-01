@@ -43,7 +43,10 @@ tools)
 wasm)
   src=$(realpath "$2") tools=$(realpath "$3") build=$(realpath -m "$4") deps=$(realpath "$5")
   : "${GEX_WASM_SYSROOT:?}"
-  o="$OPTS --with-gnutls --without-ffmpeg --without-fontconfig"
+  # dpnsvr and twain_32: i386 builtins configure enables for i386 alone
+  # (wasm32 serves i386 programs); dmsynth and its FluidSynth (C), which it
+  # enables only with a C++ compiler: native wasm32 modules too.
+  o="$OPTS --with-gnutls --without-ffmpeg --without-fontconfig --enable-dpnsvr --enable-twain_32 --enable-dmsynth --enable-fluidsynth"
   export PKG_CONFIG_LIBDIR=$deps/install/lib/pkgconfig
   # wcc: the Wine trees' paths as /wine, not this host's.
   export GEX_WCC_MAP="$src=/wine:$build=/wine-build:$tools=/wine-tools:$deps=/wine-deps"

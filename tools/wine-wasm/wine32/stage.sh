@@ -38,6 +38,13 @@ mkdir -p "$P/dosdevices" && ln -sfn ../drive_c "$P/dosdevices/c:" && ln -sfn / "
 # No user folders: the host's staged prefix's are its own runs' (a game's
 # saves, the host user's profile). The install makes the page user's afresh.
 rm -rf "$P/drive_c/users"
+# Win16 and VxD left out (no 16-bit program runs on gex): the 16-bit modules
+# (.dll16 .drv16 .exe16 .mod16), the VxDs, winevdm (the 16-bit program host),
+# and wow32 and w32skrnl, which import krnl386.exe16 and so load only beside
+# it. WINE_WIN16=1 keeps them, as before (the Makefile's dist name then has
+# no -no16).
+[ "${WINE_WIN16:-0}" != 0 ] || (cd "$P/drive_c/windows/system32" &&
+  rm -f ./*.dll16 ./*.drv16 ./*.exe16 ./*.mod16 ./*.vxd winevdm.exe wow32.dll w32skrnl.dll)
 dd=$D/lib/wine/i386-windows; mkdir -p "$dd" "$D/share/wine"
 for f in "$P"/drive_c/windows/system32/*; do [ -f "$f" ] && cp -p "$f" "$dd/"; done
 # The in-process parts find nls/ beside the executable's directory
