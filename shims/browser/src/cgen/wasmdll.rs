@@ -276,6 +276,9 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
     };
     let fresh = g.mods.len() > before;
+    if fresh {
+        super::dylink::published();
+    }
     // the core first, then the other modules of their own
     let others: Vec<usize> = core.into_iter().chain(0..g.mods.len()).filter(|&c| c != idx && g.mods[c].ptr64 == pe.is64).collect();
 

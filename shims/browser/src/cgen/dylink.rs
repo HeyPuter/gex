@@ -62,11 +62,21 @@ thread_local! {
     /// list, and this one's constructors would never run.
     static DL_NEW: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// Bumped by every `dlopen` once its modules are published: a Worker that
+/// Bumped by every `dlopen` once its modules are published, and by every
+/// Wine PE module's install ([`published`]): a Worker that
 /// has not seen the latest number catches up after its next system call
 /// (`gex_wasmprog_dl_gen`), so a function pointer another thread got from
 /// `dlsym` and handed over is in its table by the time it can call it.
 static DL_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Modules another thread may call into were published outside a `dlopen`
+/// (a Wine PE module, which Wine's loader installs on the loading thread):
+/// every other Worker catches up after its next system call, before a
+/// pointer into them handed over (an IRP's dispatch routine, a callback) can
+/// reach a slot its table does not hold yet.
+pub(crate) fn published() {
+    DL_GEN.fetch_add(1, Ordering::Release);
+}
 /// A fork child's link map (`gex_wasmprog_adopt_link`).
 static ADOPT: Mutex<Option<String>> = Mutex::new(None);
 /// libc's registry to fill once the modules are instantiated (their data
