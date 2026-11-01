@@ -77,7 +77,7 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill, fillFile } from './lazy-fetch.mjs';
+import { setFill, fillFile, lazyReady } from './lazy-fetch.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
 import { setPageFs } from './page-fs.mjs';
@@ -782,7 +782,12 @@ async function handle(msg) {
   // The directories the page serves (web/runtime fs.mount, page-fs.mjs).
   if (msg.pageFs) setPageFs(msg.pageFs);
   // A rest bundle's files among the lazy ones (lazy-fetch.mjs `lazyReady`).
-  if (msg.restBundle) globalThis.GEX_REST_BUNDLE = 1;
+  // Its decoder now: a runtime the pool made ahead for an exec'd child
+  // started its kernel before this message said so, and found none needed.
+  if (msg.restBundle) {
+    globalThis.GEX_REST_BUNDLE = 1;
+    await lazyReady();
+  }
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   // The runtime made in the pool, when this process runs on a fresh memory

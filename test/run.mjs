@@ -141,8 +141,8 @@ if (jobs.some((j) => j.host === 'browser')) ({ server, chrome, cdp } = await sta
 // -- the run -----------------------------------------------------------------
 let bad = 0;
 // `meta.alone`: a test that reads its process's memory from /proc (the
-// renderer's is told from others only when it is the one running) goes after
-// the rest, one at a time.
+// renderer's is told from others only when it is the one running), or one
+// too big to share a renderer, goes after the rest, one at a time.
 const lone = (j) => j.test.meta.alone;
 for (const [queue, width] of [[jobs.filter((j) => !lone(j)), Math.max(1, Number(o.jobs))], [jobs.filter(lone), 1]]) {
   await Promise.all(Array.from({ length: width }, async () => {

@@ -224,7 +224,7 @@ files are written into the running tree.
 
 | Member | Does |
 | --- | --- |
-| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without) or the URL of such a list (JSON; or `{ base, files }`, each url relative to `base`); their URLs must be on the page's own origin and answer range requests. |
+| `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode, mtime], ...]` (mode optional, 0644 without; mtime in seconds, optional) or the URL of such a list as JSON. A list at a URL may be an ejected site's `lazy.json` instead: `{ base, files: [[path, size, url, mtime, mode], ...] }`, each url relative to `base`, and a url `BUNDLE#OFFSET` a file in the site's rest bundle (zstd frames, indexed by `BUNDLE.json`), which must be added before boot. Their URLs must be on the page's own origin and answer range requests. |
 | `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |
@@ -486,10 +486,13 @@ program (a game, a Win32 program that draws its own frames). `env`,
 
 ### CompositorWindows (`@gex/runtime/windows/compositor`)
 
-`new CompositorWindows(sys, { canvas, scale })`: the whole desktop in one
+`new CompositorWindows(sys, { canvas, scale, x11 })`: the whole desktop in one
 canvas, drawn by gex's scene compositor on WebGPU in a Worker: frames, title
-bars, stacking, the cursor. `env`, `resize(width, height)` (device pixels),
-`describe()`.
+bars, stacking, the cursor. `x11` is `'rootless'` (the default: each X window
+is a desktop window, placed by the runtime's window manager) or `'rootful'`
+(one X screen fills the canvas and the session runs its own window manager,
+as a KDE or Xfce session does). `env`, `resize(width, height)` (device
+pixels), `describe()`.
 
 `process.windows()` is for HostWindows; the other two keep their windows to
 themselves.
