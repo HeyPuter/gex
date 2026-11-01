@@ -159,11 +159,16 @@ export class Programs {
     const f = e.sock >= 0 ? 'k_sock_read' : 'k_pipe_read';
     for (const k = this.#k; ;) {
       const seq = k.seq();
+      // Whether it had ended before this read: only then is an empty pipe
+      // all it wrote. One that ends while the read is under way may have
+      // written after the kernel found the pipe empty, and before its
+      // exit came; that is read again.
+      const ended = done?.();
       const { r, out } = await k.call(f, id, { out: READ_MAX }).catch(() => ({ r: -9 }));
       if (r > 0) return out[0];
       if (r === EAGAIN) {
-        if (done?.()) return undefined;
-        await k.changed(seq);
+        if (ended) return undefined;
+        if (!done?.()) await k.changed(seq);
         continue;
       }
       // The program closed it (0), or it failed.
