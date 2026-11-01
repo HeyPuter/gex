@@ -84,6 +84,7 @@ pub(crate) fn install(
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
     let _ = state;
     crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
+    crate::dylink::published();
     Ok(Some(n))
 }
 
@@ -832,6 +833,7 @@ fn install_module(
     if alt {
         shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.alt_installs.insert(install);
     }
+    crate::dylink::published();
     let wp = Arc::new(WinePe {
         install,
         file: file.to_path_buf(),
