@@ -509,6 +509,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
     })?;
+    // The native DLL a function pointer (a table index) or a static
+    // variable's address is in, as its skeleton's base (ntdll's
+    // LdrFindEntryForAddress, when no image holds the address).
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::IMAGE_OF, |caller: Caller<'_, HostState>, addr: i64| -> i64 {
+        caller.data().jit.as_ref().map_or(0, |j| crate::wasmdll::image_of(&j.shared, addr as u64) as i64)
+    })?;
     // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
     // address against it at start; the browser's `gex_kuser_address`).
     linker.func_wrap(IMPORT_MODULE, "kuser_address", || -> i32 {
@@ -644,6 +650,12 @@ fn asyncify(caller: &mut Caller<'_, HostState>, op: i32, arg: i32) -> Result<i32
 /// [`register`] for a 64-bit guest memory: the same functions with i64
 /// addresses, sizes and function-table indices.
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
+    // The native DLL a function pointer (a table index) or a static
+    // variable's address is in, as its skeleton's base (ntdll's
+    // LdrFindEntryForAddress, when no image holds the address).
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::IMAGE_OF, |caller: Caller<'_, HostState>, addr: i64| -> i64 {
+        caller.data().jit.as_ref().map_or(0, |j| crate::wasmdll::image_of(&j.shared, addr as u64) as i64)
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter).

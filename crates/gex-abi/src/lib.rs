@@ -839,6 +839,18 @@ pub mod ftab {
     /// Indices below this are the runtime's; modules' functions start here.
     pub const RESERVED: u32 = 16;
 
+    /// Native PE code's function pointers are table indices, and they stay
+    /// below this: the end of the dispatch directory ([`super::DISPATCH_DIR_END`]),
+    /// below which no Windows view lies (Wine's virtual memory floor on gex), so
+    /// a value below it is a function, never data. A Wine PE module whose slots
+    /// would reach it is refused. `gex.image_of` finds the DLL of either.
+    pub const NATIVE_FN_TOP: u64 = super::DISPATCH_DIR_END;
+    /// `gex.image_of(addr: i64) -> i64`: the base of the skeleton of the
+    /// native DLL whose function (a table index below [`NATIVE_FN_TOP`]) or
+    /// static data `addr` is, or 0. Indices are one space for both modes of a
+    /// WoW64 process, and each module's data is its own allocation.
+    pub const IMAGE_OF: &str = "image_of";
+
     /// `F_body`'s results.
     pub const RET_PREDICTED: i32 = 1;
     pub const RET_LEFT: i32 = 0;

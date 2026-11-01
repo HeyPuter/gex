@@ -121,7 +121,69 @@ pub(crate) struct WinePe {
     /// The DLLs whose skeleton has been mapped: a later mapping of one (an
     /// image view, LoadLibraryEx as an image resource) binds its exports
     /// but writes none of the variables, which belong to the loaded DLL.
-    mapped: Mutex<std::collections::HashSet<String>>,
+    /// Each with the base of that first mapping, the loaded DLL's
+    /// ([`image_of`]).
+    mapped: Mutex<std::collections::HashMap<String, u64>>,
+    /// The module's data bytes from `data`.
+    data_size: u64,
+    /// Each DLL's table slots and data (pelink's `gexw.dllslots`).
+    dll_slots: Arc<Vec<DllRange>>,
+}
+
+/// A range of one DLL's table slots (past the install's base) or data
+/// bytes (past the module's data), end exclusive.
+pub(crate) struct DllRange {
+    dll: String,
+    func: bool,
+    lo: u64,
+    hi: u64,
+}
+
+/// pelink's `gexw.dllslots` custom section: lines `dll f|d LO HI` (hex).
+fn dll_slots(wasm: &[u8]) -> Vec<DllRange> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(c)) = payload {
+            if c.name() == "gexw.dllslots" {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    let t: Vec<&str> = line.split(' ').collect();
+                    if let [dll, kind, lo, hi] = t[..] {
+                        if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) {
+                            out.push(DllRange { dll: dll.to_string(), func: kind == "f", lo, hi });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `gex.image_of`: the base of the loaded skeleton of the native DLL whose
+/// function `addr` is (a table index below `NATIVE_FN_TOP`, in a Wine PE
+/// module's slots) or whose static data it is (in a module's data, which no
+/// image holds), else 0. ntdll asks when no image contains `addr`
+/// (GetModuleHandleExW's FROM_ADDRESS, RtlPcToFileHeader).
+pub(crate) fn image_of(shared: &Arc<Mutex<JitShared>>, addr: u64) -> u64 {
+    let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let func = addr < gex_abi::ftab::NATIVE_FN_TOP;
+    for wp in s.wine_pe.iter().chain(s.wine_pe_split.iter()) {
+        let off = if func {
+            let inst = s.ftab.map.install(wp.install);
+            match addr.checked_sub(inst.base as u64) {
+                Some(off) if off < inst.len as u64 => off,
+                _ => continue,
+            }
+        } else {
+            match addr.checked_sub(wp.data) {
+                Some(off) if off < wp.data_size => off,
+                _ => continue,
+            }
+        };
+        let dll = wp.dll_slots.iter().find(|r| r.func == func && off >= r.lo && off < r.hi).map(|r| r.dll.as_str());
+        return dll.and_then(|d| wp.mapped.lock().unwrap_or_else(|e| e.into_inner()).get(d).copied()).unwrap_or(0);
+    }
+    0
 }
 
 impl WinePe {
@@ -275,6 +337,7 @@ struct ParsedModule {
     data_exports: std::collections::HashMap<String, u32>,
     /// With modules of their own (pelink's `gexw.modules`): each DLL's module file.
     modules: std::collections::HashMap<String, String>,
+    dll_slots: Arc<Vec<DllRange>>,
     module: wasmtime::Module,
 }
 
@@ -349,6 +412,7 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
         any_dll,
         data_exports: exported_offsets(&wasm)?,
         modules,
+        dll_slots: Arc::new(dll_slots(&wasm)),
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -523,7 +587,14 @@ fn install_shared(
     // native Wine's own Unix side (32-bit Wine) reset ntdll's __wine_unixlib_handle,
     // which load_ntdll_functions had set, to gex-kernel's handle: every
     // later Unix call of ntdll's went through a table at address 1.
-    let first_mapping = wp.mapped.lock().unwrap_or_else(|e| e.into_inner()).insert(dll.clone());
+    let first_mapping = {
+        let mut m = wp.mapped.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !m.contains_key(&dll);
+        if first {
+            m.insert(dll.clone(), base);
+        }
+        first
+    };
     // winecrt0's base of this DLL (its unix calls, delay loads and version
     // resources find the DLL by it): the skeleton's.
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
@@ -830,6 +901,22 @@ fn install_module(
         m
     };
     let install = crate::ftab::publish_stateful(shared, memory, module, len, &[], crate::libprov::Extras { memory_base: data })?;
+    {
+        // its function pointers are its slots: below NATIVE_FN_TOP, or they
+        // would read as data addresses
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let inst = s.ftab.map.install(install);
+        let end = inst.base as u64 + inst.len as u64;
+        if end > gex_abi::ftab::NATIVE_FN_TOP {
+            let msg = format!(
+                "{}: its {} table slots, from index {:#x} ({} indices taken before it), end at {end:#x}, past {:#x}: \
+                 its function pointers would read as data addresses",
+                file.display(), inst.len, inst.base, inst.base, gex_abi::ftab::NATIVE_FN_TOP
+            );
+            eprintln!("gex-pe: {msg}");
+            bail!("{msg}");
+        }
+    }
     if alt {
         shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.alt_installs.insert(install);
     }
@@ -847,6 +934,8 @@ fn install_module(
         ptr64: is64,
         alt,
         mapped: Default::default(),
+        data_size: size as u64,
+        dll_slots: Arc::clone(&pm.dll_slots),
     });
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
     // (`wine_pe` is the core of the process's own mode; the other mode's

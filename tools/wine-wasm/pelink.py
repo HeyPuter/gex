@@ -319,6 +319,93 @@ def leb_at(b, i):
             return r, i
 
 
+def dll_slots(path, mapfile, obj_dll):
+    """Which DLL each of a linked module's table slots and data bytes is,
+    for gex to find the module of an address (GetModuleHandleExW's
+    FROM_ADDRESS): a function pointer is its table slot, a static
+    variable's address is in the module's data, neither in its skeleton.
+    From wasm-ld's map of the link (each function and data chunk's input
+    object; OBJ_DLL names the DLL of an object) and the module's element
+    segment (slot -> function). Lines `dll f LO HI` (slots past
+    __table_base) and `dll d LO HI` (bytes past __memory_base), HI
+    exclusive, ranges merged."""
+    b = open(path, 'rb').read()
+    i, nimp, elems = 8, 0, []
+    while i < len(b):
+        sid, i = b[i], i + 1
+        size, i = leb_at(b, i)
+        end = i + size
+        if sid == 2:
+            n, j = leb_at(b, i)
+            for _ in range(n):
+                for _ in range(2):
+                    ln, j = leb_at(b, j)
+                    j += ln
+                kind, j = b[j], j + 1
+                if kind == 0:
+                    nimp += 1
+                    _, j = leb_at(b, j)
+                elif kind == 1:
+                    j += 1
+                    fl, j = leb_at(b, j)
+                    _, j = leb_at(b, j)
+                    if fl & 1:
+                        _, j = leb_at(b, j)
+                elif kind == 2:
+                    fl, j = leb_at(b, j)
+                    _, j = leb_at(b, j)
+                    if fl & 1:
+                        _, j = leb_at(b, j)
+                elif kind == 3:
+                    j += 2
+                else:
+                    # a tag (C++ exceptions): its attribute, its type
+                    _, j = leb_at(b, j + 1)
+        elif sid == 9:
+            n, j = leb_at(b, i)
+            for _ in range(n):
+                fl, j = leb_at(b, j)
+                if fl != 0:
+                    sys.exit(f'pelink: {path}: element segment flags {fl}: only the active function list is read')
+                while b[j] != 0x0b:
+                    j += 1
+                c, j = leb_at(b, j + 1)
+                for _ in range(c):
+                    f, j = leb_at(b, j)
+                    elems.append(f)
+        i = end
+    funcs, data, out_sec = [], [], ''
+    for line in open(mapfile):
+        # the Out, In and Symbol columns: one name, indented by the column
+        m = re.match(r'\s*(\S+)\s+(\S+)\s+(\S+) (\s*)(\S+)$', line)
+        if not m:
+            continue
+        t, col = m.groups(), len(m.group(4))
+        if col < 4:
+            out_sec = t[4]
+        elif col < 12 and ':(' in t[4]:
+            obj = t[4].rsplit(':(', 1)[0]
+            if out_sec == 'CODE':
+                funcs.append(obj_dll.get(obj))
+            elif out_sec.startswith('.') and not out_sec.startswith(('.tdata', '.tbss')) and t[0] != '-':
+                data.append((int(t[0], 16), int(t[2], 16), obj_dll.get(obj)))
+    ranges = {}
+
+    def add(dll, kind, lo, hi):
+        if not dll or hi <= lo:
+            return
+        rs = ranges.setdefault((dll, kind), [])
+        if rs and rs[-1][1] == lo:
+            rs[-1][1] = hi
+        else:
+            rs.append([lo, hi])
+    for k, f in enumerate(elems):
+        add(funcs[f - nimp] if 0 <= f - nimp < len(funcs) else None, 'f', k, k + 1)
+    for a, n, dll in sorted(data):
+        add(dll, 'd', a, a + n)
+    return ''.join(f'{dll} {kind} {lo:x} {hi:x}\n' for (dll, kind), rs in sorted(ranges.items()) for lo, hi in rs)
+
+
 def name_imports(path):
     """A --split module's function imports named by their symbols: wasm-ld
     keeps an undefined symbol's original import name (env.strlen) though
@@ -522,6 +609,7 @@ def link(dlls, out, gexrt, others=None):
     tmp = tempfile.mkdtemp(prefix='pelink-')
     # Each module's objects: the core's (''), and a --split module's by its file name.
     objs = {'': []}
+    obj_dll = {}  # a DLL's object -> the DLL (dll_slots)
     grp = lambda m: SPLIT.get(m, '')
     for g in set(SPLIT.values()):
         objs[g] = []
@@ -785,6 +873,7 @@ def link(dlls, out, gexrt, others=None):
         subprocess.check_call(['llvm-objcopy', '--remove-section=llvm.func_attr.annotate.gex.stdcall',
                                '--remove-section=reloc.llvm.func_attr.annotate.gex.stdcall', bound])
         objs[grp(mod)].append(bound)
+        obj_dll[bound] = mod
 
     for g in objs:
       gthunks = [t[:4] + (t[5],) for t in thunks if t[4] == g]
@@ -1115,7 +1204,7 @@ static void *gexw_ntdll_proc(const char *name)
             f.write('--export-if-defined=__gexw_entries_decl\n')
         cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
                '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
-               '--unresolved-symbols=import-dynamic', '-o', out,
+               '--unresolved-symbols=import-dynamic', '-o', out, '-Map=' + out + '.map',
                f'@{rsp}'] + objs[g] + ([gexrt] if gexrt else [])
         # compiler-rt's builtins (__multi3 and the like), from the toolchain's
         # sysroot (tools/wine-wasm/build-sysroot.sh, build-sysroot64.sh)
@@ -1166,6 +1255,11 @@ static void *gexw_ntdll_proc(const char *name)
             cmd.insert(cmd.index(f'@{rsp}') + 1, obj)
             subprocess.check_call(cmd)
             print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
+        # Each DLL's table slots and data (`gexw.dllslots`), read from the
+        # link as it is: wasm-opt keeps slots and data offsets, not function
+        # numbers.
+        slots = dll_slots(out, out + '.map', obj_dll)
+        os.unlink(out + '.map')
         # wcc compiles code without -D_WIN32 as Unix-side code, whose setjmp
         # lowers onto the legacy exception instructions (for asyncify); that
         # includes winebuild's glue, where an adapter of msvcrt's _setjmp calls
@@ -1227,6 +1321,10 @@ static void *gexw_ntdll_proc(const char *name)
                 lines.append(f'{name} {hit[0]}!{hit[1]}')
         if lines:
             payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
+            with open(out, 'ab') as f:
+                f.write(bytes([0]) + enc_leb(len(payload)) + payload)
+        if slots:
+            payload = enc_name('gexw.dllslots') + slots.encode()
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
         # With modules of their own: which module each DLL is in

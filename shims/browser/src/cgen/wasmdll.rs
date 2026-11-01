@@ -59,7 +59,12 @@ struct WinePe {
     /// writes none of the variables, which are the loaded DLL's -- under 32-bit Wine
     /// rewriting them reset ntdll's `__wine_unixlib_handle`, which Wine's
     /// own loader had set (as the native host found).
-    mapped: std::collections::HashSet<String>,
+    /// Each with the base of that first mapping, the loaded DLL's (`image_of`).
+    mapped: HashMap<String, u64>,
+    /// Its data bytes from `data`, and each DLL's table slots and data
+    /// (pelink's `gexw.dllslots`).
+    data_size: u64,
+    dll_slots: Vec<DllRange>,
     /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16 (as natively).
     ptr64: bool,
@@ -92,6 +97,53 @@ struct Late {
     provider: Option<u32>,
     /// The importer's mode (`WinePe::ptr64`): only a module of that mode provides it.
     ptr64: bool,
+}
+
+/// A range of one DLL's table slots (past the install's base) or data
+/// bytes (past the module's data), end exclusive.
+struct DllRange {
+    dll: String,
+    func: bool,
+    lo: u64,
+    hi: u64,
+}
+
+/// pelink's `gexw.dllslots` custom section: lines `dll f|d LO HI` (hex).
+fn dll_slots(wasm: &[u8]) -> Vec<DllRange> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(c)) = payload {
+            if c.name() == "gexw.dllslots" {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    let t: Vec<&str> = line.split(' ').collect();
+                    if let [dll, kind, lo, hi] = t[..] {
+                        if let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) {
+                            out.push(DllRange { dll: dll.to_string(), func: kind == "f", lo, hi });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `gex.image_of(addr)`: the base of the loaded skeleton of the native DLL
+/// whose function `addr` is (a table index below `NATIVE_FN_TOP`, in a Wine
+/// PE module's slots) or whose static data it is (in a module's data, which
+/// no image holds), else 0, as natively. ntdll asks when no image contains
+/// `addr` (GetModuleHandleExW's FROM_ADDRESS, RtlPcToFileHeader).
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_image_of(addr: u64) -> u64 {
+    let g = lock(&WINE_PE);
+    let func = addr < gex_abi::ftab::NATIVE_FN_TOP;
+    for wp in &g.mods {
+        let (lo, n) = if func { (wp.base as u64, ftab(|m| m.install(wp.install).len) as u64) } else { (wp.data, wp.data_size) };
+        let Some(off) = addr.checked_sub(lo).filter(|&o| o < n) else { continue };
+        let dll = wp.dll_slots.iter().find(|r| r.func == func && off >= r.lo && off < r.hi);
+        return dll.and_then(|r| wp.mapped.get(&r.dll).copied()).unwrap_or(0);
+    }
+    0
 }
 
 struct WinePes {
@@ -331,7 +383,10 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // winecrt0's base of this DLL: the skeleton's (after the module's data
     // initialisation: at its first instantiation, or now once it had one)
     let wp = &mut g.mods[idx];
-    let first_mapping = wp.mapped.insert(dll.clone());
+    let first_mapping = !wp.mapped.contains_key(&dll);
+    if first_mapping {
+        wp.mapped.insert(dll.clone(), base);
+    }
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         let at = wp.data + *off as u64;
         let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
@@ -670,6 +725,7 @@ fn install_module(
         }
     }
 
+    let dll_slots = dll_slots(&wasm);
     g.mods.push(WinePe {
         number,
         install: 0,
@@ -684,6 +740,8 @@ fn install_module(
         key: None,
         installed: false,
         mapped: Default::default(),
+        data_size: size as u64,
+        dll_slots,
         ptr64: is64,
         alt,
         name: name.to_string(),
@@ -698,6 +756,16 @@ fn install_module(
         lock(&ALT_INSTALLS).insert(install);
     }
     let base = ftab(|m| m.install(install).base);
+    // its function pointers are its slots: below NATIVE_FN_TOP, or they
+    // would read as data addresses
+    let end = base as u64 + len as u64;
+    if end > gex_abi::ftab::NATIVE_FN_TOP {
+        return Err(format!(
+            "{}: its {len} table slots, from index {base:#x} ({base} indices taken before it), end at {end:#x}, past {:#x}: \
+             its function pointers would read as data addresses",
+            g.mods[idx].file, gex_abi::ftab::NATIVE_FN_TOP
+        ));
+    }
     let (regs, dirs, nslots) = bridges(&[]);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{}", g.mods[idx].file), regs, dirs, slots: nslots, memory_base: data });
 

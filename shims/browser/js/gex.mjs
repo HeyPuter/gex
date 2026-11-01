@@ -5040,6 +5040,9 @@ export class Gex {
           syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall),
           // Where this process has KUSER_SHARED_DATA (64-bit Wine's PE side reads it there).
           kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
+          // The native DLL a function pointer or static variable is in (ntdll's
+          // LdrFindEntryForAddress, when no image holds the address).
+          image_of: (addr) => e.gex_wasmdll_image_of ? e.gex_wasmdll_image_of(BigInt.asUintN(64, BigInt(addr))) : 0n,
         } : {}),
       },
     };
@@ -6549,6 +6552,9 @@ export class Gex {
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
+      // The native DLL a function pointer or static variable is in (32-bit
+      // Wine's ntdll, when no image holds the address).
+      image_of: (addr) => e.gex_wasmdll_image_of ? e.gex_wasmdll_image_of(BigInt.asUintN(64, BigInt(addr))) : 0n,
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place. Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
