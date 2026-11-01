@@ -16018,28 +16018,35 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
         with_jit_only(|j| {
-            if j.page_table.forget(page).is_none() {
+            // The page in either mode: a WoW64 process's 32-bit blocks are
+            // under the other mode's key alone (`gex_abi::ALT_PAGE`), so a
+            // guard of theirs found no page of the process's own mode, and
+            // the block it guards ran into its guard again for ever.
+            let key = page | gex_abi::ALT_PAGE;
+            let own = j.page_table.forget(page).is_some();
+            let alt = j.page_table.forget(key).is_some();
+            if !own && !alt {
                 return;
             }
-            j.retired_pages.insert(page);
-            forget_installed_on(j, page);
             let home = if jit_diag() { sigs::home() } else { None };
-            note_page_retired(
-                home.as_ref().map(|h| h.mm()),
-                page,
-                &gex_kernel::RetireWhy { start: addr as u64, end: addr as u64 + 1, why: "guard", prot: 0, pc: _pc as u64 },
-            );
             let mut gm = GuestMem::new(guest_bytes());
-            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, 0);
+            for (k, gone) in [(page, own), (key, alt)] {
+                if !gone {
+                    continue;
+                }
+                j.retired_pages.insert(k);
+                forget_installed_on(j, k);
+                note_page_retired(
+                    home.as_ref().map(|h| h.mm()),
+                    k,
+                    &gex_kernel::RetireWhy { start: addr as u64, end: addr as u64 + 1, why: "guard", prot: 0, pc: _pc as u64 },
+                );
+                let _ = gm.write_u32(dir_word(k), 0);
+            }
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
             // Either mode's blocks of it.
             j.translated.retain(|&a| !(lo..hi).contains(&(a & !gex_abi::ALT_ADDR)));
-            let key = page | gex_abi::ALT_PAGE;
-            if j.page_table.forget(key).is_some() {
-                j.retired_pages.insert(key);
-                let _ = gm.write_u32(dir_word(key), 0);
-            }
             xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
