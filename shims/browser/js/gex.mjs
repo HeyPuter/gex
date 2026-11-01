@@ -38,6 +38,9 @@ const LIMIT64_BYTES = 16 * 2 ** 30;
 /** The smallest module a Worker hands its siblings compiled (`Gex#offerModule`).
  *  Below it a sibling compiles the bytes itself: at most a few milliseconds. */
 const RELAY_MIN_BYTES = 256 * 1024;
+// Run switches a Worker takes at the top of its message as well as in its
+// run options (worker.mjs's `run`), which an exec it adopts takes too.
+const EXEC_SWITCHES = ['link', 'dense', 'fjit', 'fjitMax', 'fjitOnly', 'liftMax', 'inlineDispatch', 'xlateReport', 'discoverSkip', 't1Fold', 'providers', 'xcache'];
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
@@ -3388,6 +3391,11 @@ export class Gex {
     const e = this.#shim.exports;
     this.#setMetadata(guestWasm);
     const o = child.opts ?? {};
+    // The switches the host hands every Worker (its `extra`, at the top of
+    // `opts` here) that the record's options leave unsaid: a page's spawn
+    // (ProcessHost.spawnExec) carries the run options alone, where a
+    // posix_spawn child's carry its parent's.
+    for (const k of EXEC_SWITCHES) if (o[k] === undefined && opts?.[k] !== undefined) o[k] = opts[k];
     const uid = o.uid ?? child.uid;
     if (uid !== undefined) e.gex_set_identity(uid, o.gid ?? child.gid ?? uid);
     if (child.cwd) this.#putBytes(new TextEncoder().encode(child.cwd), e.gex_set_cwd);
