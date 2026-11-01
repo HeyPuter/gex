@@ -618,7 +618,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       IRBuilder<> B(CB);
       Value *Callee = CB->getCalledOperand();
       Value *P = B.CreatePtrToInt(Callee, IP);
-      B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P});
+      // (in a C++ catch funclet, with the call's funclet bundle: a call
+      // there without one is dropped as unreachable by WinEHPrepare)
+      SmallVector<OperandBundleDef, 1> Funclet;
+      if (auto OB = CB->getOperandBundle(LLVMContext::OB_funclet)) Funclet.emplace_back(*OB);
+      B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P}, Funclet);
       Value *Native = B.CreateICmpULT(P, ConstantInt::get(IP, ICALL_LIMIT));
       CB->setCalledOperand(B.CreateSelect(Native, Callee, Stub));
       done++;
