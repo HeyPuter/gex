@@ -495,12 +495,15 @@ const ENTRY_TRAMP = new Uint8Array([
  *  or the shim was doing is unwound. */
 const STACK_ROOM = new Array(32768).fill(0);
 /** Call-outs open past which a new one asks `stackRoom` first (each asks
- *  at the cost of a call that large). */
+ *  at the cost of a call that large), and the room it asks for: a level's
+ *  frames and what the next check's way there may take, less than a fault's
+ *  dispatch (a delivery in place asks for STACK_ROOM's itself). */
 const CALLOUT_ROOM_DEPTH = 32;
+const CALLOUT_ROOM = new Array(12288).fill(0);
 const stackSink = function () { return 1; };
-function stackRoom() {
+function stackRoom(room = STACK_ROOM) {
   try {
-    return Reflect.apply(stackSink, null, STACK_ROOM);
+    return Reflect.apply(stackSink, null, room);
   } catch (err) {
     if (err instanceof RangeError) return 0;
     throw err;
@@ -8622,7 +8625,7 @@ export class Gex {
     // it: native Wine's guest calls hold their native frames, which no trap
     // drops, so the shim's count cannot bound them (the shim ends the
     // process, as a spent stack does).
-    if (me >= CALLOUT_ROOM_DEPTH && stackRoom() === 0) e.gex_callout_stack_spent?.();
+    if (me >= CALLOUT_ROOM_DEPTH && stackRoom(CALLOUT_ROOM) === 0) e.gex_callout_stack_spent?.();
     this.#callouts.push(c);
     this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');
