@@ -45,6 +45,10 @@ rm -rf "$P/drive_c/users"
 # no -no16).
 [ "${WINE_WIN16:-0}" != 0 ] || (cd "$P/drive_c/windows/system32" &&
   rm -f ./*.dll16 ./*.drv16 ./*.exe16 ./*.mod16 ./*.vxd winevdm.exe wow32.dll w32skrnl.dll)
+# icu left out too (Windows' ICU API, which few programs use: its ICU is C++
+# that has no wasm build yet), with icuin and icuuc, which only forward to
+# it. WINE_ICU=1 keeps them (the dist name then has no -noicu).
+[ "${WINE_ICU:-0}" != 0 ] || rm -f "$P/drive_c/windows/system32/"{icu,icuin,icuuc}.dll
 dd=$D/lib/wine/i386-windows; mkdir -p "$dd" "$D/share/wine"
 for f in "$P"/drive_c/windows/system32/*; do [ -f "$f" ] && cp -p "$f" "$dd/"; done
 # The in-process parts find nls/ beside the executable's directory

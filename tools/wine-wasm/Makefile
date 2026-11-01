@@ -102,7 +102,10 @@ export WINE32_MONO
 # wow32, w32skrnl), which it otherwise leaves out (wine32/stage.sh).
 WINE_WIN16 ?= 0
 export WINE_WIN16
-DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))$(if $(filter 1,$(WINE_WIN16)),,-no16)
+# WINE_ICU=1: the dist keeps icu (and icuin, icuuc), which it otherwise leaves out.
+WINE_ICU ?= 0
+export WINE_ICU
+DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))$(if $(filter 1,$(WINE_WIN16)),,-no16)$(if $(filter 1,$(WINE_ICU)),,-noicu)
 DIST := $(C)/dist-$(DIST_KEY)
 BARE := $(C)/pfx-bare-$(DIST_KEY)
 INSTALLED := $(C)/pfx-installed-$(DIST_KEY)

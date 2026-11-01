@@ -36,7 +36,7 @@
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
 #   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
-#               the name gets -wwl; less Win16 and VxD: -no16)
+#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -130,6 +130,11 @@ fi
 # install's name then has no -no16).
 WIN16_GLOB='*.dll16 *.drv16 *.exe16 *.mod16 *.vxd winevdm.exe wow32.dll w32skrnl.dll'
 W16=; [ "$WOW" = 0 ] || [ "${WINE_WIN16:-0}" != 0 ] || W16=-no16-$(echo "$WIN16_GLOB" | sha256sum | cut -c1-4)
+# And icu (Windows' ICU API, which few programs use: its ICU is C++ that has no
+# wasm build yet), with icuin and icuuc, which only forward to it: out of
+# both arches. WINE_ICU=1 keeps them, as before (no -noicu in the name).
+ICU_GLOB='icu.dll icuin.dll icuuc.dll'
+WICU=; [ "${WINE_ICU:-0}" != 0 ] || WICU=-noicu
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -282,6 +287,7 @@ dist_make() {
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" lib/wine/x86_64-windows/
 	[ -z "$W16" ] || (cd lib/wine/i386-windows && rm -f $WIN16_GLOB)
+	[ -z "$WICU" ] || for a in x86_64-windows i386-windows; do [ ! -d lib/wine/$a ] || (cd lib/wine/$a && rm -f $ICU_GLOB); done
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
@@ -291,7 +297,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F, $V$WS$WD$W16)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16 dist_make
+log "install ($K, $S, $F, $V$WS$WD$W16$WICU)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -323,7 +329,7 @@ pe_native() {
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU
 NATIVE=$C/pen64-$K-$NK/native
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
