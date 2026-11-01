@@ -1,13 +1,19 @@
-/* Two programs' worth of /dev/dsp at once: two opens play sines (441 Hz and
- * 1000 Hz, amplitude 0.25, S16 stereo at the player's rate) side by side,
- * and the player's loopback (GEX_AUDIO_LOOP=1) is read back. Mixed, the
- * capture's RMS is 0.25; one stream alone (the old "last writer takes the
- * device") would be 0.177. Prints "dsp-mix rms R". */
+/* Two programs' worth of /dev/dsp at once: two opens play sines side by
+ * side (S16 stereo at the player's rate, amplitude 0.25): stream a 441 Hz on
+ * both channels, stream b 1000 Hz on the right only. The player's loopback
+ * (GEX_AUDIO_LOOP=1) is read back, and each captured frame says what reached
+ * it: its left is a's sample, its right less its left b's. Only frames where
+ * both streams had data count (a player that ran a stream dry, or had none,
+ * leaves that stream's part zero there): the RMS of their right channel, a
+ * and b summed, is 0.25 when the device mixes. A device that plays one
+ * stream (the old "last writer takes the device") has no such frame, and its
+ * one stream's RMS is 0.177. Prints "dsp-mix rms R (N frames)". */
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -55,16 +61,25 @@ int main(void) {
     for (int k = 0; k < rate / CHUNK; k++) {
         for (int i = 0; i < CHUNK; i++, t++) {
             x[2 * i] = x[2 * i + 1] = (int16_t)(8192 * sin(2 * M_PI * 441 * t / rate));
-            y[2 * i] = y[2 * i + 1] = (int16_t)(8192 * sin(2 * M_PI * 1000 * t / rate));
+            y[2 * i] = 0;
+            y[2 * i + 1] = (int16_t)(8192 * sin(2 * M_PI * 1000 * t / rate));
         }
         put(a, x);
         put(b, y);
         for (;;) {
             ssize_t got = read(r, in, sizeof in);
             if (got <= 0) break;
-            // The second half of the second only: both streams going.
+            // The second half of the second only: both streams going. A
+            // part under 2 (a rounding apart from zero) is a stream that was
+            // not there; a sine's few samples that near zero go too.
             if (k > rate / CHUNK / 2)
-                for (ssize_t i = 0; i < got / 2; i += 2) { double v = in[i] / 32768.0; sq += v * v; n++; }
+                for (ssize_t i = 0; i < got / 2; i += 2) {
+                    int l = in[i], d = in[i + 1] - in[i];
+                    if (abs(l) < 2 || abs(d) < 2) continue;
+                    double v = in[i + 1] / 32768.0;
+                    sq += v * v;
+                    n++;
+                }
         }
     }
     printf("dsp-mix rms %.3f (%ld frames)\n", n ? sqrt(sq / n) : 0, n);

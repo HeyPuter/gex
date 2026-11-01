@@ -11,7 +11,9 @@
 //               wall clock (about 0.2 s and 1.6 s; the wall clock's 0.8 s);
 //   dsp-impulse an impulse's round trip with the 256-frame buffer it asks for:
 //               under 20 ms (the old fixed 32 KiB buffer: about 170 ms);
-//   dsp-mix     two streams at once: mixed, loopback RMS 0.25 (one: 0.177);
+//   dsp-mix     two streams at once: mixed, loopback RMS 0.25 over the frames
+//               both streams reached (one stream: 0.177, and no such frame),
+//               so a player running a stream dry under load does not count;
 //   dsp-mmap    a mapped DMA buffer, as Quake-engine games use one: 441 Hz at
 //               half amplitude reaches the ring (RMS 0.354, 22050 Hz).
 // The single-thread flavour has no ring yet.
@@ -51,8 +53,10 @@ export default async function (t) {
   t.check(`dsp-impulse, 256-frame buffer: median ${med} ms round trip (want under 20)`, r.code === 0 && med > 0 && med < 20, `exit ${r.code}`);
 
   r = await run(cc('dsp-mix', ['-lm']), [], { GEX_AUDIO_PLAYER: '1', GEX_AUDIO_LOOP: '1' });
-  const rms = Number(/^dsp-mix rms (\S+)/m.exec(r.guest)?.[1] ?? NaN);
-  t.check(`dsp-mix: two streams mixed, loopback RMS ${rms} (want 0.25)`, r.code === 0 && rms > 0.23 && rms < 0.27, `exit ${r.code}`);
+  const [, rms, frames] = (/^dsp-mix rms (\S+) \((\d+) frames\)/m.exec(r.guest) ?? [0, NaN, 0]).map(Number);
+  // A twentieth of a second at least: both streams mixed for a while, not a
+  // frame or two.
+  t.check(`dsp-mix: two streams mixed, loopback RMS ${rms} over ${frames} frames with both (want 0.25)`, r.code === 0 && rms > 0.23 && rms < 0.27 && frames >= 2400, `exit ${r.code}`);
 
   r = await run(cc('dsp-mmap', ['-lm']), [], { GEX_AUDIO_PLAYER: '1', GEX_AUDIO_TAP: '1' });
   ({ line, v } = tap(r.stderr));
