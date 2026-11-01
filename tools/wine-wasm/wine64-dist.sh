@@ -53,9 +53,10 @@
 #               sysroot and libraries)
 #   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
 #               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
-#   dist64-...-nN[-N32]  the install with the native PE side in place of
-#               the PE builtins, both arches: WINE64_DIST (WINE64_NATIVE_PE=0:
-#               the install above, translated)
+#   dist64-...-nN[-N32|-i386t]  the install with the native PE side in place
+#               of the PE builtins, both arches (-i386t: WoW64's i386 side
+#               translated, WINE64_WOW64_I386_TRANSLATED=1): WINE64_DIST
+#               (WINE64_NATIVE_PE=0: the install above, translated)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
 # S those, gex's link tools, gex-gl's guest library and the OSSv4 header
@@ -393,8 +394,12 @@ NATIVE=$C/pen64-$K-$NK/native
 # (stage-native64.sh --i386): the core, WINE64_NATIVE_DLLS32, one module, and
 # every other module the tree builds that the install's i386-windows has, one
 # of its own. The install's name gets -N32 too.
+# WINE64_WOW64_I386_TRANSLATED=1: the i386 side stays the PE builtins as they
+# are, translated (until its native modules run WoW64's programs), and the
+# install's name gets -i386t; its x86_64 side is native as ever.
+I386T=${WINE64_WOW64_I386_TRANSLATED:-0}
 N32=; NATIVE32=
-if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
+if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ] && [ "$I386T" = 0 ]; then
 	p32=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
 	SR32=$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32"); DEPS32=$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")
 	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
@@ -441,15 +446,21 @@ native_make() {
 		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
 	done
 	# no builtin runs translated: a PE image left with machine code fails the
-	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported)
+	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported).
+	# The i386 side under WINE64_WOW64_I386_TRANSLATED=1 is listed, not refused.
 	if [ -n "$SPA" ]; then
 		python3 "$here/pescan.py" lib/wine/x86_64-windows ${NATIVE32:+lib/wine/i386-windows} >&2 ||
 			[ "${WINE64_NATIVE_PARTIAL:-0}" = 1 ] || { log "PE images with machine code (above): the dist is not native"; return 1; }
+		if [ "$WOW" != 0 ] && [ -z "$NATIVE32" ]; then
+			python3 "$here/pescan.py" lib/wine/i386-windows >&2 || true
+			log "i386-windows translated: WINE64_WOW64_I386_TRANSLATED=1 is on"
+		fi
 	fi
 }
 if [ "$NPE" != 0 ]; then
-	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST-n$NK${N32:+-$N32} native_make
-	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST-n$NK${N32:+-$N32}
+	NI=-n$NK${N32:+-$N32}; [ "$WOW" = 0 ] || [ "$I386T" = 0 ] || NI=$NI-i386t
+	log "native install ($K, $NK${N32:+, $N32}$([ "${NI%-i386t}" = "$NI" ] || echo ", i386 translated"))"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI
 fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as
