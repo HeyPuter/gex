@@ -60,7 +60,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -74,6 +74,20 @@ export const images = {
     symlinkSync(realpathSync(site), to);
     return null;
   },
+  // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
+  // zig), for core/mem64: a system's memory64 process through the API.
+  async mem64(work) {
+    const zig = process.env.ZIG || 'zig';
+    const src = join(HERE, 'programs/mem64-pick.c'), out = join(work, 'mem64-pick.x86');
+    const key = createHash('sha256').update(readFileSync(src)).digest('hex'), keyFile = `${out}.key`;
+    if (existsSync(out) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    const r = spawnSync(zig, ['cc', '-target', 'x86_64-linux-musl', '-O2', '-static', '-o', out, src], { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (r.error) return `no ${zig} (ZIG)`;
+    if (r.status !== 0) throw new Error(`mem64-pick.c: ${r.stderr}`);
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
   async busybox(work) {
     const bb = process.env.BUSYBOX;
     const applets = readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean);
