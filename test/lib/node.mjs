@@ -7,6 +7,8 @@
 import { pathToFileURL } from 'node:url';
 import { join, relative } from 'node:path';
 import { readFileSync, rmSync } from 'node:fs';
+
+let logsAsked = 0;
 import { makeT, runTest } from './t.js';
 
 const file = process.argv[2];
@@ -34,15 +36,20 @@ process.once('message', async ({ arch, phase, state, res, work, gpu, timed }) =>
       return new Promise(() => {});
     },
     /** The lines the runtime logged this phase that match `re` (the runner
-     *  keeps this process's output). */
+     *  keeps this process's output). Everything written before the call:
+     *  a mark goes down stdout and stderr first, and the runner answers once
+     *  it has read both (its pipes are not ordered with this message). */
     logs: (re = /./) => new Promise((resolve) => {
+      const mark = `\u0001gex-logs ${++logsAsked}`;
       const on = (m) => {
         if (!m?.logs) return;
         process.off('message', on);
         resolve(m.logs);
       };
       process.on('message', on);
-      process.send({ logs: { re: re.source, flags: re.flags.replace('g', '') } });
+      process.stdout.write(`${mark}\n`);
+      process.stderr.write(`${mark}\n`);
+      process.send({ logs: { re: re.source, flags: re.flags.replace('g', ''), mark } });
     }),
     /** This phase's process's peak RSS in KiB (its Workers are its threads). */
     peakRss: async () => process.resourceUsage().maxRSS,

@@ -72,7 +72,8 @@ function fetchWork(t, name) {
  *  translated by object. A process may be said twice (its last thread). */
 export async function exitStats(t) {
   return (await t.logs(/\[gex\] pid [0-9:]+: lived /)).map((l) => ({
-    pid: /pid ([0-9:]+)/.exec(l)[1],
+    // `P`, or `P:T` for a thread T's line (no trailing colon).
+    pid: /pid (\d+(?::\d+)*): lived/.exec(l)[1],
     cmd: /\{([^}]*)\}/.exec(l)?.[1] ?? '',
     slotsLeftK: Number(/(\d+)k dispatch slots left/.exec(l)?.[1] ?? NaN),
     memoryMib: Number(/memory (\d+) MiB/.exec(l)?.[1] ?? NaN),
@@ -81,6 +82,19 @@ export async function exitStats(t) {
     // name=blocks@first..last
     objects: [...l.matchAll(/(\S*)=(\d+)@0x([0-9a-f]+)\.\.0x([0-9a-f]+)/g)].map((m) => ({ name: m[1], blocks: Number(m[2]), first: parseInt(m[3], 16) })),
   }));
+}
+
+/** Wait (up to `ms`) for the runtime's exit line of the process whose
+ *  command line matches `cmd`: the process's own (`pid P`), which comes
+ *  after its threads' (`pid P:T`). A program's exit reaches the page (its `run` ends)
+ *  before its Worker has saved the translation cache and sent the numbers
+ *  its exit line says; a shutdown before then ends the Worker without that
+ *  line. True once it is there. */
+export async function exitLineOf(t, cmd, ms = 60000) {
+  for (const t1 = Date.now() + ms; Date.now() < t1; await new Promise((r) => setTimeout(r, 200))) {
+    if ((await exitStats(t)).some((s) => !s.pid.includes(':') && cmd.test(s.cmd))) return true;
+  }
+  return false;
 }
 
 /** The blocks translated in the objects that start in any of `ranges`

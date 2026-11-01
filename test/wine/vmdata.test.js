@@ -8,7 +8,7 @@
 // said with it. Browser only: Node's own reservations for wasm memories put
 // its VmData far past what Chrome's renderer counts (42 GiB for this run),
 // and no limit applies there.
-import { bootWine, exitStats } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf } from '../lib/wine.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 900, alone: true };
 
@@ -32,6 +32,7 @@ export default async function (t) {
   done = true;
   await sampler;
   t.check('rpccom: exit 0', r.code === 0, `exit ${r.code}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  t.check('rpccom: its exit line', await exitLineOf(t, /rpccom\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   // What each process's memory grew to (the runtime's exit lines), each once.
   const mem = new Map();
