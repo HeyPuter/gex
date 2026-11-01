@@ -374,14 +374,17 @@ export const images = {
     mkdirSync(progs);
     execFileSync('tar', ['-xf', join(work, 'win-progs.tar'), '-C', progs, ...UNIT_PROGS.map((e) => `./x64/${e}`)]);
     const builds = new Set();
-    for (const m of said.matchAll(/gex-pe: image (\S+) at base (0x[0-9a-f]+): no function-tier unit/g)) {
-      const [, path, base] = m;
+    // Each with the switches its line names (the process's flavour: a
+    // compact-space process's units are --wine64-compact ones).
+    for (const m of said.matchAll(/gex-pe: image (\S+) at base (0x[0-9a-f]+): no function-tier unit.*--pe-base 0x[0-9a-f]+((?: --[a-z0-9-]+(?: \d+)?)*)$/gm)) {
+      const [, path, base, flags] = m;
       const name = path.split('/').pop().toLowerCase();
       const host = path.startsWith('/wine64/') && UNIT_DLLS.includes(name) ? join(realpathSync(process.env.GEX_TEST_WINE64_DIST), path.slice(8))
         : UNIT_PROGS.includes(name) ? join(progs, 'x64', name) : null;
-      if (host) builds.add(JSON.stringify([host, '--pe-base', base, '--jobs', '8']));
+      if (host) builds.add(JSON.stringify([host, '--pe-base', base, ...flags.split(' ').filter(Boolean), '--jobs', '8']));
     }
-    if (/gex-pe: missing unit: \[the trampolines\]/.test(said)) builds.add(JSON.stringify(['--nt-trampolines64']));
+    const tramp = /gex-pe: missing unit: \[the trampolines\].* gexc cgen-image (--nt-trampolines64(?: --[a-z0-9-]+(?: \d+)?)*)$/m.exec(said);
+    if (tramp) builds.add(JSON.stringify(tramp[1].split(' ')));
     if (![...builds].some((b) => b.includes('ntdll.dll'))) return 'the run named no base for ntdll.dll';
     for (const b of builds) {
       try {

@@ -1156,16 +1156,9 @@ pub extern "C" fn gex_cgen_base(u: u32) -> u64 {
 /// The `gexc cgen-image` flags that build the trampoline page's unit this
 /// process asks for: 32-bit Wine's (KUSER fold), a 64-bit Wine process's in
 /// the compact space (fold and entry page) or in memory64, or another's.
-fn trampolines_build() -> &'static str {
-    if TRAMPOLINES32.load(Ordering::Relaxed) {
-        if gex_abi::kuser_fold() { "--wine32-kuser --nt-trampolines32" } else { "--nt-trampolines32" }
-    } else if gex_abi::kuser_fold() && gex_abi::kuser_fold_entry() {
-        "--nt-trampolines64 --wine64-compact"
-    } else if gex_abi::mem64() {
-        "--nt-trampolines64 --mem64"
-    } else {
-        "--nt-trampolines64"
-    }
+fn trampolines_build() -> String {
+    let page = if TRAMPOLINES32.load(Ordering::Relaxed) { "--nt-trampolines32" } else { "--nt-trampolines64" };
+    std::iter::once(page.to_string()).chain(gex_cgen::image::flavour_switches()).collect::<Vec<_>>().join(" ")
 }
 
 /// The path of the image unit `u` is for, for messages.
@@ -1206,13 +1199,14 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
         "gex-pe: image {} at base {:#x}: no function-tier unit (key {}, inputs {}), tier-1; build it with \
-         {}gexc cgen-image <image> --pe-base {:#x}\n",
+         {}gexc cgen-image <image> --pe-base {:#x}{}\n",
         x.path,
         x.base,
         x.key,
         gex_cgen::image::inputs_id(),
         if gex_cgen::image::unguarded() { "" } else { "GEX_CGEN_GUARD=1 " },
-        x.base
+        x.base,
+        gex_cgen::image::flavour_switches().iter().map(|s| format!(" {s}")).collect::<String>()
     ));
     0
 }

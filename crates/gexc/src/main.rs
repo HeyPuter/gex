@@ -2411,17 +2411,15 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             }
             // A unit for a 64-bit guest memory: another
             // key, other code.
-            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             // A 32-bit Wine unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
             // gex_abi::WINE32_KUSER): constant accesses to Windows' page folded
-            // there, every other address checked. Another key.
-            "--wine32-kuser" => gex_abi::set_kuser_fold(true),
-            // A 64-bit Wine unit for a process in the compact space (Wine's
-            // session programs in a wasm32 memory): KUSER_SHARED_DATA and the
-            // entry page after it folded as --wine32-kuser folds the first.
-            "--wine64-compact" => {
-                gex_abi::set_kuser_fold(true);
-                gex_abi::set_kuser_fold_entry(true);
+            // there, every other address checked. Or a 64-bit Wine unit for a
+            // process in the compact space (Wine's session programs in a
+            // wasm32 memory): KUSER_SHARED_DATA and the entry page after it
+            // folded the same way. Each another key, as a process's "build it
+            // with" line names it (`image::flavour_switches`).
+            s @ ("--mem64" | "--wine32-kuser" | "--wine64-compact") => {
+                gex_cgen::image::set_flavour_switch(s);
             }
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
