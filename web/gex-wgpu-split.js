@@ -12,19 +12,18 @@
 // suspend across. (Emscripten's own placeholders are JS functions that make
 // the call themselves; web/mesa-split.py replaces them.)
 //
-// Two ways in, both here because this file runs in every realm the module
-// does:
+// Where it is loaded:
 //
-// - Prefetch. Once the module has presented a frame, the realm fetches the
-//   cold part and compiles it asynchronously, in the background. A miss
-//   after that only instantiates it.
-// - A miss before then loads it synchronously: a synchronous XHR as text in
-//   the x-user-defined charset, compiled synchronously, which a Worker may
-//   do at any size.
-//
-// A page's main thread may not (Chromium refuses a synchronous compile or
-// instantiation over 8 MB there), so on one the cold part is instantiated
-// with the module, asynchronously, and never missed.
+// - With the module. The glue's instantiation fetches and compiles the cold
+//   part beside the module, both streaming, and instantiates it before the
+//   module starts, in the page's main thread and a Worker alike: a page's
+//   main thread may not compile a module over 8 MB synchronously (Chromium
+//   refuses), and a Worker's first frames miss into it.
+// - On a miss, where it was not (`gexColdLazy`, a pthread, a caller's own
+//   instantiation): a synchronous XHR as text in the x-user-defined charset,
+//   compiled synchronously, which a Worker may do at any size. Once the
+//   module has presented a frame, a realm without it prefetches it in the
+//   background, so a later miss only instantiates it.
 //
 // The build sets the marker below when it split the module
 // (web/build-mesa-wasm.sh); an unsplit build fetches nothing and changes
@@ -33,10 +32,20 @@ var gexMesaColdSplit = 'GEX_MESA_COLD_NO';
 var gexMesaCold = function () {
   return globalThis.__gexMesaCold || (globalThis.__gexMesaCold = {});
 };
+// By its own name, as the glue finds its module (`locateFile`): a page or
+// package that names its files where it puts them (a bundler's content
+// hashes) answers for this one too, where the module's URL with its suffix
+// swapped would name a file nobody wrote.
 var gexMesaColdFile = function () {
-  return wasmBinaryFile.slice(0, -5) + '.deferred.wasm';
+  return locateFile('gex-wgpu-replay.deferred.wasm');
 };
 var gexMesaColdInstance = null;
+// How the cold part came in, for a caller to read (`Module.gexColdLoaded`):
+// 'with the module' or 'on a miss'; unset while it has not. A property, not
+// a log line: loading it with the module is every start's.
+var gexMesaColdLoaded = function (how) {
+  Module['gexColdLoaded'] = how;
+};
 
 // `gexcold.load`: the cold part, instantiated over this instance's table.
 var gexMesaColdLoad = function () {
@@ -61,6 +70,7 @@ var gexMesaColdLoad = function () {
     how = 'fetched and compiled now, ' + buf.length + ' bytes';
   }
   gexMesaColdInstance = new WebAssembly.Instance(module, { primary: wasmRawExports });
+  gexMesaColdLoaded('on a miss');
   // Who missed: the frames under the trampoline, for web/mesa-hot.txt.
   var where = String(new Error().stack).split('\n').filter(function (l) {
     return l.indexOf('.wasm') >= 0 && l.indexOf('gexcoldtramp') < 0;
@@ -90,31 +100,35 @@ if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['instantiateWasm']) {
         .then(function (r) { return r.arrayBuffer(); })
         .then(function (bytes) { return WebAssembly.instantiate(bytes, all); });
     };
-    // A page's main thread may not compile or instantiate a module over
-    // 8 MB synchronously, so there the cold part is not left for a miss: it
-    // is instantiated now, asynchronously, before the module starts. (The
-    // pages that run Mesa there are demos and test harnesses; the desktop's
-    // compositor and SP's system Worker are Workers, and load it lazily.)
+    // The cold part is not left for a miss: it is fetched and compiled
+    // beside the module, streaming, and instantiated before the module
+    // starts. A page's main thread may not compile a module over 8 MB
+    // synchronously, so a miss there could not load it at all; and in a
+    // Worker (the compositor's, SP's system Worker) the first frames miss
+    // into it, so a miss's synchronous fetch and compile, 120 ms of a
+    // 10 MB part on gl/gears, came in the middle of the start.
     // `gexColdLazy` keeps it lazy anyway, for measuring a miss.
-    var eager = typeof ENVIRONMENT_IS_WEB !== 'undefined' && ENVIRONMENT_IS_WEB &&
-      !Module['gexColdLazy'];
+    var eager = !Module['gexColdLazy'];
+    // The cold part's fetch and compile start with the module's, both
+    // streaming, not after it: it is instantiated once the module is.
+    var coldFile = eager ? gexMesaColdFile() : null;
+    var coldModule = eager ? WebAssembly.compileStreaming(fetch(coldFile, { credentials: 'same-origin' }))
+      .catch(function () {
+        return fetch(coldFile, { credentials: 'same-origin' })
+          .then(function (x) { return x.arrayBuffer(); })
+          .then(function (bytes) { return WebAssembly.compile(bytes); });
+      }) : null;
+    // Awaited below; a module that fails first leaves it unawaited.
+    if (coldModule) coldModule.catch(function () {});
     WebAssembly.instantiateStreaming(fetch(file, { credentials: 'same-origin' }), all)
       .catch(slow)
       .then(function (r) {
         if (!eager) return r;
-        var t0 = performance.now();
-        var cold = gexMesaColdFile();
-        var imp = { primary: r.instance.exports };
-        return WebAssembly.instantiateStreaming(fetch(cold, { credentials: 'same-origin' }), imp)
-          .catch(function () {
-            return fetch(cold, { credentials: 'same-origin' })
-              .then(function (x) { return x.arrayBuffer(); })
-              .then(function (bytes) { return WebAssembly.instantiate(bytes, imp); });
-          })
-          .then(function (c) {
-            gexMesaColdInstance = c.instance;
-            console.warn('[gex-wgpu] cold part loaded with the module (a page\'s main thread) in ' +
-                         (performance.now() - t0).toFixed(1) + ' ms');
+        return coldModule
+          .then(function (m) { return WebAssembly.instantiate(m, { primary: r.instance.exports }); })
+          .then(function (instance) {
+            gexMesaColdInstance = instance;
+            gexMesaColdLoaded('with the module');
             return r;
           });
       })

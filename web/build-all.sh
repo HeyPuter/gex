@@ -87,7 +87,7 @@ fi
 # -- 2. Mesa and Xwayland, per flavour ----------------------------------------
 # What a Mesa build reads, as xwl_key does for Xwayland: the Mesa checkout (its commit and any
 # uncommitted change), the build script, the toolchain, and gex's own sources that the build
-# compiles or includes (web/mesa, guest/gl: every file outside third_party/mesa in
+# compiles or includes (web/mesa, guest/gl, the glue's pre-js hooks: every file outside third_party/mesa in
 # its ninja deps). ninja alone rebuilt and relinked gex-wgpu-replay on every build (2-4 min a
 # flavour, 15-40 min under load) because a merge touched those files' mtimes, not their content.
 mesa_key() { # mesa_key <mt|st>
@@ -97,7 +97,7 @@ mesa_key() { # mesa_key <mt|st>
         emcc --version 2>/dev/null | head -1
         git -C "$ROOT/third_party/mesa" rev-parse HEAD
         git -C "$ROOT/third_party/mesa" diff HEAD
-        git -C "$ROOT" ls-files -z web/mesa guest/gl | (cd "$ROOT" && xargs -0 cat)
+        git -C "$ROOT" ls-files -z web/mesa guest/gl web/gex-wgpu-split.js web/gex-wgpu-jspi.js | (cd "$ROOT" && xargs -0 cat)
     } | sha256sum | cut -c1-32
 }
 mesa() { # mesa <mt|st>

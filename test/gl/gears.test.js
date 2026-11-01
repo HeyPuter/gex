@@ -19,8 +19,8 @@ export default async function (t) {
   new CompositorWindows(sys, { canvas: document.getElementById('out') });
   const gl = new MesaGl(sys);
   await t.timeout(sys.boot(), 60000, 'boot');
-  await t.timeout(gl.start(), 120000, 'Mesa');
-  const r = await t.timeout(sys.run(['/probes/gles-gears', '30'], { env: { HOME: '/' } }), 120000, 'gles-gears');
+  await t.time('Mesa started', () => t.timeout(gl.start(), 120000, 'Mesa'));
+  const r = await t.time('gles-gears 30 frames', () => t.timeout(sys.run(['/probes/gles-gears', '30'], { env: { HOME: '/' } }), 120000, 'gles-gears'));
   const got = (k) => new RegExp(`^${k} (.*)$`, 'm').exec(r.stdout)?.[1];
   t.say(`renderer ${got('renderer')}`);
   t.eq('exit', r.code, 0, r.stderr.trim().split('\n').slice(-2).join(' / '));

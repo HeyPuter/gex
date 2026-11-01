@@ -97,9 +97,9 @@ fi
         "$ROOT/web/tint/build-tint.sh"
 }
 # Mesa's own files by fixed names too: the replay includes Tint's headers,
-# whose assertion strings would otherwise carry the build machine's paths. A
-# build directory compiled before this keeps its objects' old strings
-# (emcc's flags from the environment are not ninja's to track).
+# whose assertion strings would otherwise carry the build machine's paths.
+# emcc's flags from the environment are not ninja's to track, so a build
+# directory compiled with other ones is cleaned below.
 export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
 if [ ! -f "$BUILD/build.ninja" ]; then
@@ -140,6 +140,13 @@ else
     fi
     meson configure "$BUILD" -Dgex-emdawn-dir="$EMDAWN" \
         -Dgex-tint-dir="$TINT_OUT" -Dgex-sanitize="$GEX_SANITIZE"
+fi
+# Objects compiled with other emcc flags (the prefix maps above) are compiled
+# again: ninja would keep them, and their strings with them.
+FLAGS_STAMP=$BUILD/.gex-emcc-cflags
+if [ "$(cat "$FLAGS_STAMP" 2>/dev/null)" != "$EMCC_CFLAGS" ]; then
+    ninja -C "$BUILD" -t clean > /dev/null
+    printf '%s' "$EMCC_CFLAGS" > "$FLAGS_STAMP"
 fi
 DIRK_PKG=
 if [ "$DIRK" = 1 ]; then

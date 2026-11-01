@@ -88,13 +88,15 @@ async function loadGlue(url) {
  */
 async function loadFromSource(url, source, files = null) {
   const href = new URL(url, location.href).href;
-  // A listed glue (the runtime package's) by its listed name: its URL is
-  // the name a bundler gave it.
+  // A listed glue (the runtime package's) by its listed name, which is what
+  // the source is asked for: its URL is the name a bundler gave it.
   const listed = files && Object.keys(files).find((k) => new URL(files[k], location.href).href === href);
   const base = (listed ?? href.split('/').pop()).replace(/\.js$/, '');
+  // Null is the source's "fetch it as a file"; a source that fails says
+  // which file, rather than leaving Mesa to a fetch the source was meant to
+  // spare it.
   const got = (name) => Promise.resolve().then(() => source(name)).catch((e) => {
-    console.warn(`[mesa-gl] ${name}: ${e?.message ?? e}; fetched as a file`);
-    return null;
+    throw new Error(`Mesa's ${name} from its source: ${e?.message ?? e}`);
   });
   const [js, main, cold] = await Promise.all([`${base}.js`, `${base}.wasm`, `${base}.deferred.wasm`].map(got));
   if (!js) return null;
@@ -361,16 +363,7 @@ export class MesaGlDevice {
 
       const t0 = performance.now();
       const files = options.files ?? assetFiles('/gex/');
-      // The runtime package's files are named by their content, so the glue
-      // would not find its cold part beside its module by name: given the
-      // listed files as its source, Mesa is instantiated here, cold part and
-      // all, each by its own URL.
-      const listedSource = files?.['gex-wgpu-replay.js'] && ((name) => (files[name] ? fetch(files[name]).then((r) => {
-        if (!r.ok) throw new Error(`${files[name]}: ${r.status}`);
-        return r.arrayBuffer();
-      }) : null));
-      const source = options.source ?? listedSource ?? null;
-      const fromSource = source ? await loadFromSource(url, source, files) : null;
+      const fromSource = options.source ? await loadFromSource(url, options.source, files) : null;
       const Module = fromSource?.factory ?? await loadGlue(url);
       const made = Module({
         preinitializedWebGPUDevice: device,
