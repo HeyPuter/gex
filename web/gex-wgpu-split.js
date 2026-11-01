@@ -40,6 +40,12 @@ var gexMesaColdFile = function () {
   return locateFile('gex-wgpu-replay.deferred.wasm');
 };
 var gexMesaColdInstance = null;
+// How the cold part came in, for a caller to read (`Module.gexColdLoaded`):
+// 'with the module' or 'on a miss'; unset while it has not. A property, not
+// a log line: loading it with the module is every start's.
+var gexMesaColdLoaded = function (how) {
+  Module['gexColdLoaded'] = how;
+};
 
 // `gexcold.load`: the cold part, instantiated over this instance's table.
 var gexMesaColdLoad = function () {
@@ -64,6 +70,7 @@ var gexMesaColdLoad = function () {
     how = 'fetched and compiled now, ' + buf.length + ' bytes';
   }
   gexMesaColdInstance = new WebAssembly.Instance(module, { primary: wasmRawExports });
+  gexMesaColdLoaded('on a miss');
   // Who missed: the frames under the trampoline, for web/mesa-hot.txt.
   var where = String(new Error().stack).split('\n').filter(function (l) {
     return l.indexOf('.wasm') >= 0 && l.indexOf('gexcoldtramp') < 0;
@@ -121,6 +128,7 @@ if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['instantiateWasm']) {
           .then(function (m) { return WebAssembly.instantiate(m, { primary: r.instance.exports }); })
           .then(function (instance) {
             gexMesaColdInstance = instance;
+            gexMesaColdLoaded('with the module');
             return r;
           });
       })
