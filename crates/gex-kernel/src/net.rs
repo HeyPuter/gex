@@ -11,6 +11,11 @@
 //! itself, handing back an address from a private range and remembering the
 //! name against it; when the guest connects to that address the name comes
 //! back and the host is asked for a stream to it.
+//!
+//! UDP off this machine goes the same way: each (socket, far address) is a
+//! flow the host carries (`NetStack::udp`), one datagram per `send` and per
+//! `recv`. DNS stays the kernel's even so: the names it answers are what
+//! page-served hosts and the proxy are reached by.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -97,6 +102,12 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 /// Where a host's connections come from.
 pub trait NetStack: Send + Sync + std::fmt::Debug {
     fn tcp(&self) -> Result<Arc<dyn Transport>, Errno>;
+    /// A UDP flow: `connect` names the far end, each `send` is one datagram
+    /// to it and each `recv` one datagram from it (`Err(EAGAIN)`: none yet).
+    /// `ENETUNREACH` from a network that carries no datagrams.
+    fn udp(&self) -> Result<Arc<dyn Transport>, Errno> {
+        Err(Errno::ENETUNREACH)
+    }
     /// A connection by `Transport::name`, held once more here; `None` when
     /// it has ended or this network has no such names.
     fn adopt(&self, name: &str) -> Option<Arc<dyn Transport>> {
@@ -475,6 +486,13 @@ struct UdpRemote {
     outbound: HashMap<u16, i32>,
 }
 
+/// A UDP socket's flow off this machine: where to, and the host's transport.
+#[derive(Debug)]
+struct Flow {
+    to: (u32, u16),
+    t: Arc<dyn Transport>,
+}
+
 /// The TCP ports guests on this machine listen on. Shared across `fork`, as
 /// the resolver is: a child connects to its parent's listener.
 #[derive(Debug, Default)]
@@ -535,7 +553,8 @@ pub fn is_local(addr: u32) -> bool {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     Tcp,
-    /// Only ever used to talk to the resolver, which is this kernel.
+    /// To the resolver (this kernel), guests on this machine, and the host's
+    /// flows (`NetStack::udp`).
     Udp,
 }
 
@@ -586,6 +605,9 @@ pub struct Socket {
     /// In the global kernel: the connection a holder made out of it, by
     /// name (`op::GO_OUT`). Every holder then holds that connection itself.
     went_out: Mutex<Option<String>>,
+    /// A UDP socket's flows off this machine (`send_out`), each opened at
+    /// its first datagram.
+    flows: Mutex<Vec<Flow>>,
 }
 
 impl Socket {
@@ -609,6 +631,7 @@ impl Socket {
             udp_remote: Mutex::new(UdpRemote::default()),
             moved: std::sync::atomic::AtomicI32::new(-1),
             went_out: Mutex::new(None),
+            flows: Mutex::new(Vec::new()),
         }
     }
 
@@ -946,13 +969,7 @@ impl Socket {
             // the only destination that means anything here is the resolver.
             return Ok(());
         }
-        // A name if this address came from an answer we gave, otherwise the
-        // dotted quad -- a guest connecting to a literal address is asking
-        // the proxy for exactly that.
-        let host = self.resolver.name_for(addr).unwrap_or_else(|| {
-            let b = addr.to_be_bytes();
-            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-        });
+        let host = self.host_for(addr);
         let t = self.net.tcp()?;
         t.connect(&host, port)?;
         *self.transport.lock().unwrap() = Some(t);
@@ -1034,6 +1051,13 @@ impl Socket {
                 return Ok(data.len() as u64);
             }
         }
+        // Off this machine, but for DNS: the network's flow there.
+        if let Some(to) = to.filter(|&(a, p)| !is_local(a) && p != 53) {
+            if self.local.lock().unwrap().is_none() {
+                self.udp_take(0, 0)?;
+            }
+            return self.send_out(to, data).map(|_| data.len() as u64);
+        }
         match answer_dns(data, &self.resolver) {
             Some(reply) => {
                 self.dgrams.lock().unwrap().push_back((reply, to.unwrap_or((0, 0))));
@@ -1060,9 +1084,82 @@ impl Socket {
         })
     }
 
+    /// The name the host is asked for `addr` by: the name, if the address
+    /// came from an answer the kernel gave, otherwise the dotted quad -- a
+    /// guest using a literal address is asking for exactly that.
+    fn host_for(&self, addr: u32) -> String {
+        self.resolver.name_for(addr).unwrap_or_else(|| {
+            let b = addr.to_be_bytes();
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        })
+    }
+
+    /// A datagram to `to`, off this machine: on the host's flow there,
+    /// opened at the first. `ENETUNREACH` when the network carries no
+    /// datagrams.
+    fn send_out(&self, to: (u32, u16), data: &[u8]) -> Result<(), Errno> {
+        let t = {
+            let mut flows = self.flows.lock().unwrap();
+            // One the network refused or ended is asked for again.
+            flows.retain(|f| {
+                let gone = f.to == to && matches!(f.t.status(), Status::Closed | Status::Refused);
+                if gone {
+                    f.t.close();
+                }
+                !gone
+            });
+            match flows.iter().find(|f| f.to == to) {
+                Some(f) => f.t.clone(),
+                None => {
+                    let t = self.net.udp()?;
+                    t.connect(&self.host_for(to.0), to.1)?;
+                    // Refused at once: a network that carries no datagrams.
+                    if t.status() == Status::Refused {
+                        t.close();
+                        return Err(Errno::ENETUNREACH);
+                    }
+                    flows.push(Flow { to, t: t.clone() });
+                    t
+                }
+            }
+        };
+        // A flow that cannot take it drops it, as UDP may.
+        let _ = t.send(data);
+        Ok(())
+    }
+
+    /// What arrived on this socket's flows, queued with where it came from;
+    /// a flow that has ended goes (the next datagram there opens another).
+    fn flows_pump(&self) {
+        let mut flows = self.flows.lock().unwrap();
+        if flows.is_empty() {
+            return;
+        }
+        let mut q = self.dgrams.lock().unwrap();
+        let mut buf = Vec::new();
+        flows.retain(|f| {
+            while f.t.has_data() {
+                buf.resize(65536, 0);
+                match f.t.recv(&mut buf) {
+                    Ok(n) => q.push_back((buf[..n].to_vec(), f.to)),
+                    Err(_) => break,
+                }
+            }
+            match f.t.status() {
+                Status::Closed | Status::Refused => {
+                    f.t.close();
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
+
     /// Take what senders in other processes wrote: accept new streams, read
-    /// each, and queue every whole datagram.
+    /// each, and queue every whole datagram. And what the flows off this
+    /// machine brought.
     fn udp_pump(&self) {
+        self.flows_pump();
         let Some(r) = self.remote else { return };
         let mut u = self.udp_remote.lock().unwrap();
         let Some(l) = u.listener else { return };
@@ -1350,10 +1447,7 @@ impl Socket {
     /// one stops forwarding.
     fn go_out(&self, addr: u32, port: u16) -> Result<(), Errno> {
         let Some(m) = self.moved() else { return self.connect(addr, port) };
-        let host = self.resolver.name_for(addr).unwrap_or_else(|| {
-            let b = addr.to_be_bytes();
-            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-        });
+        let host = self.host_for(addr);
         let t = self.net.tcp()?;
         t.connect(&host, port)?;
         let Some(tname) = t.name() else {
@@ -1763,6 +1857,10 @@ impl FileHandle for Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
+        // Its flows off the machine: this holder's hold on each.
+        for f in std::mem::take(&mut *self.flows.lock().unwrap()) {
+            f.t.close();
+        }
         // A moved socket's state is the global kernel's: this was one hold.
         if let Some(m) = self.moved() {
             (m.r.close)(m.id);

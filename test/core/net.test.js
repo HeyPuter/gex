@@ -23,6 +23,15 @@ function reverser(host, port) {
   return { readable, writable };
 }
 
+/** A UDP flow in the page: each datagram comes back prefixed with where
+ *  it was going. */
+function echoer(host, port) {
+  let push;
+  const readable = new ReadableStream({ start: (c) => { push = c; } });
+  const writable = new WritableStream({ write: (b) => push.enqueue(enc.encode(`${host}:${port} ${dec.decode(b)}`)) });
+  return { readable, writable };
+}
+
 async function text(readable) {
   let s = '';
   for (const r = readable.getReader(); ;) {
@@ -61,6 +70,29 @@ export default async function (t) {
   say(`  connect saw ${asked.join(', ')}`);
   const refused = await run(['rt-probe', 'connect', '10.1.2.3', '81', 'x']);
   check('a throw in connect refuses it', refused.code !== 0, JSON.stringify(refused));
+  const noUdp = await run(['rt-probe', 'sendto', '10.1.2.3', '7', 'x']);
+  check('a network without datagram: UDP out is unreachable', noUdp.code !== 0 && /unreachable/i.test(noUdp.stderr), JSON.stringify(noUdp));
+
+  // Datagrams: the network's `datagram`, one flow per far address.
+  const flows = [];
+  sys.network = {
+    connect: (host, port) => reverser(host, port),
+    datagram: (host, port) => {
+      flows.push(`${host}:${port}`);
+      return echoer(host, port);
+    },
+  };
+  const to = await run(['rt-probe', 'sendto', '10.1.2.3', '7', 'one', 'two']);
+  eq('sendto and recvfrom, the reply from where it went', [to.code, to.stdout], [0, '10.1.2.3:7 10.1.2.3:7 one\n10.1.2.3:7 10.1.2.3:7 two\n']);
+  eq('two datagrams there are one flow', flows, ['10.1.2.3:7']);
+  const conn = await run(['rt-probe', 'udp', '10.1.2.3', '9', 'hello']);
+  eq('a connected UDP socket', [conn.code, conn.stdout], [0, '10.1.2.3:9 hello\n']);
+  const byName = await run(['rt-probe', 'udp', 'example.test', '9', 'hi']);
+  eq('a name reaches datagram as the name', [byName.code, byName.stdout], [0, 'example.test:9 hi\n']);
+  const dns = await run(['rt-probe', 'connect', 'example.test', '8080', 'abc']);
+  check('DNS is still the kernel\'s', dns.code === 0 && !flows.some((f) => f.endsWith(':53')), JSON.stringify([dns, flows]));
+  say(`  datagram saw ${flows.join(', ')}`);
+
   const later = await run(['rt-probe', 'connect', '10.1.2.3', '80', 'x']);
   sys.network = null;
   const gone = await run(['rt-probe', 'connect', '10.1.2.3', '80', 'x']);

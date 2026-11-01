@@ -306,10 +306,12 @@ them, path by path.
 
 The guest's connections out go to the page, which carries them over whatever
 transport it has. A network is any object with a `connect(host, port)`
-method; the page gives it to the system as `sys.network`, before or after
-boot. There is one at a time: setting another sends the next connections
-there (open ones stay where they are), and `null` takes it away. With none,
-a program's connection fails as unreachable. TCP only.
+method, for TCP, and optionally `datagram(host, port)`, for UDP; the page
+gives it to the system as `sys.network`, before or after boot. There is one
+at a time: setting another sends the next connections there (open ones stay
+where they are), and `null` takes it away. With none, a program's
+connection fails as unreachable, and so does UDP with a network that has no
+`datagram`.
 
 ```js
 // One WebSocket per connection, through the page's own relay.
@@ -341,12 +343,16 @@ sys.network = new RelayNetwork();
 | Member | Does |
 | --- | --- |
 | `connect(host, port)` | A program's TCP connection out. `host` is what the program connects to: an address, or a name, which is not looked up first (a program's lookup of a name succeeds, and its connection brings the name here). Returns or resolves a `Duplex`; a throw or a rejection refuses the connection. |
+| `datagram(host, port)` | Optional. A program's UDP to `host:port`, a flow: the first datagram a socket sends there asks for it, and the socket's later ones there go down it. Returns or resolves a `Duplex` whose chunks are datagrams, each written one the program sent and each read one back, which the program receives as from `host:port`. A throw or a rejection drops what was sent. Sending with `sendto` and with `connect` and `send` both work. |
 | `Duplex` | `{ readable, writable }`: a ReadableStream of the far end's bytes and a WritableStream of the program's. The page ending `readable` is the far end closing, which the program reads as the end. The program closing its socket closes `writable` and cancels `readable`. |
 | `sys.network` | The network, or `null`. |
 
-Not in it: UDP; a program that listens is reached from the page with
-`connectGuest` (below), not through the network; a program's
-`shutdown(SHUT_WR)` does not reach the page.
+DNS is not the network's: the guest's lookups are answered by the system
+itself, and a name the program connects to (or sends a datagram to) reaches
+`connect` or `datagram` as that name. Not in it: a program that listens is
+reached from the page with `connectGuest` (below), not through the network;
+a program's `shutdown(SHUT_WR)` does not reach the page; UDP from a far
+address the program did not send to first.
 
 **Wisp.** `@gex/runtime/net/wisp` is a network over a
 [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) proxy, with
@@ -363,6 +369,7 @@ sys.network = new Wisp('wss://wisp.example/');
 | --- | --- |
 | `new Wisp(url)` | The proxy at `url` (`ws:` or `wss:`), dialled at the first connection. |
 | `connect(host, port)` | As above. |
+| `datagram(host, port)` | As above, a Wisp UDP stream (a proxy without Wisp's UDP extension refuses it). |
 | `close()` | Closes the WebSocket; the next connection dials again. |
 | Events | `open` and `closed` as the WebSocket comes and goes. |
 

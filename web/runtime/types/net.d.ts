@@ -7,9 +7,14 @@ export interface Duplex {
 }
 
 /** Where a system's programs' connections out go (`System.network`): the
- *  page's to implement, over whatever transport it has. TCP only. */
+ *  page's to implement, over whatever transport it has. */
 export interface Network {
   /** A program's connection to `host` (an address, or a name the program
    *  did not look up first) at `port`. A throw or a rejection refuses it. */
   connect(host: string, port: number): Duplex | Promise<Duplex>;
+  /** A program's UDP to `host` at `port`: a flow whose chunks are
+   *  datagrams, each written one the program sent and each read one back
+   *  from there. Without it, UDP out is unreachable. A throw or a rejection
+   *  drops what was sent. */
+  datagram?(host: string, port: number): Duplex | Promise<Duplex>;
 }

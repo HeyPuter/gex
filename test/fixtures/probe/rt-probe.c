@@ -10,6 +10,11 @@
  *   rt-probe xattr PATH NAME   the attribute's value
  *   rt-probe connect HOST PORT TEXT   TEXT to HOST:PORT (a name: getaddrinfo),
  *                    then what comes back until the far end closes
+ *   rt-probe sendto HOST PORT TEXT...   each TEXT a datagram to HOST:PORT
+ *                    from one unconnected UDP socket, then each reply by
+ *                    recvfrom: "ADDR:PORT REPLY" (5 s each, else "timeout")
+ *   rt-probe udp HOST PORT TEXT   TEXT on a connected UDP socket (send,
+ *                    recv): the reply
  *   rt-probe serve PORT   on 127.0.0.1:PORT, one connection: what it sends,
  *                    upper-cased, back ("listening" once it listens)
  *   rt-probe tone HZ MS   a sine of HZ for MS ms on /dev/dsp (s16, stereo,
@@ -29,6 +34,8 @@
 #include <ctype.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -133,6 +140,47 @@ int main(int argc, char **argv) {
     ssize_t n;
     while ((n = read(s, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, stdout);
     printf("\n");
+  } else if ((!strcmp(what, "sendto") && argc >= 5) || (!strcmp(what, "udp") && argc == 5)) {
+    int connected = !strcmp(what, "udp");
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    int e = getaddrinfo(argv[2], argv[3], &hints, &ai);
+    if (e) {
+      fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e));
+      return 1;
+    }
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || (connected && connect(s, ai->ai_addr, ai->ai_addrlen) < 0)) {
+      perror("connect");
+      return 1;
+    }
+    for (int i = 4; i < argc; i++) {
+      ssize_t w = connected ? send(s, argv[i], strlen(argv[i]), 0)
+                            : sendto(s, argv[i], strlen(argv[i]), 0, ai->ai_addr, ai->ai_addrlen);
+      if (w < 0) {
+        perror(connected ? "send" : "sendto");
+        return 1;
+      }
+    }
+    for (int i = 4; i < argc; i++) {
+      struct pollfd p = {s, POLLIN, 0};
+      if (poll(&p, 1, 5000) != 1) {
+        printf("timeout\n");
+        return 1;
+      }
+      char buf[2048];
+      struct sockaddr_in from = {0};
+      socklen_t fl = sizeof from;
+      ssize_t n = connected ? recv(s, buf, sizeof buf, 0)
+                            : recvfrom(s, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+      if (n < 0) {
+        perror("recv");
+        return 1;
+      }
+      if (connected) printf("%.*s\n", (int)n, buf);
+      else printf("%s:%d %.*s\n", inet_ntoa(from.sin_addr), ntohs(from.sin_port), (int)n, buf);
+    }
   } else if (!strcmp(what, "serve") && argc == 3) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = {0};
@@ -183,7 +231,7 @@ int main(int argc, char **argv) {
     close(fd);
     printf("%ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
   } else {
-    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|serve PORT|tone HZ MS\n");
+    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|serve PORT|tone HZ MS\n");
     return 2;
   }
   return 0;

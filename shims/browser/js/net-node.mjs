@@ -12,6 +12,8 @@ import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { PageHostStream } from './page-host.mjs';
+import { createSocket } from 'node:dgram';
+import { NET_DGRAM, frame, Unframer } from './dgram-frames.mjs';
 
 /** `fetch`, and for a `file:` URL the file itself (a page-served host's
  *  files in a directory), streamed, one `bytes=a-b` range of it if asked:
@@ -77,6 +79,11 @@ export class NodeNetwork {
   connect(id, host, port) {
     const s = this.#sockets.get(id);
     if (!s) return;
+    if (port & NET_DGRAM) {
+      s.dgram = true;
+      this.#datagram(s, host, port & 0xffff);
+      return;
+    }
     const base = this.#pageHosts?.get(String(host).toLowerCase());
     if (base) {
       const p = new PageHostStream(base, fetchOrFile);
@@ -124,13 +131,49 @@ export class NodeNetwork {
     s.sock = sock;
   }
 
+  /** A UDP flow to `host:port` over a real UDP socket, its datagrams
+   *  framed on the stream (dgram-frames.mjs). */
+  #datagram(s, host, port) {
+    if (!this.#tcp) {
+      s.status = REFUSED;
+      s.eof = true;
+      return;
+    }
+    const sock = createSocket('udp4');
+    const out = new Unframer();
+    sock.on('message', (m) => {
+      s.rx.push(Buffer.from(frame(m)));
+      this.onActivity();
+    });
+    sock.on('error', () => {
+      s.status = s.status === CONNECTING ? REFUSED : CLOSED;
+      s.eof = true;
+      this.onActivity();
+    });
+    sock.connect(port, host, () => {
+      s.status = OPEN;
+      this.onActivity();
+    });
+    const early = [];
+    s.sock = {
+      write: (b) => {
+        for (const d of out.push(new Uint8Array(b))) {
+          if (s.status === OPEN) sock.send(d);
+          else early.push(d);
+        }
+      },
+      destroy: () => { try { sock.close(); } catch {} },
+    };
+    sock.once('connect', () => { for (const d of early.splice(0)) sock.send(d); });
+  }
+
   status(id) {
     return this.#sockets.get(id)?.status ?? CLOSED;
   }
 
   send(id, bytes) {
     const s = this.#sockets.get(id);
-    if (!s?.sock || s.status !== OPEN) return -1;
+    if (!s?.sock || (s.status !== OPEN && !(s.status === CONNECTING && s.dgram))) return -1;
     // Copied, because the view is onto the guest's memory and Node keeps the
     // buffer until the write drains -- by which time the guest has moved on
     // and written something else there.

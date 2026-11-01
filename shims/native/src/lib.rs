@@ -3704,6 +3704,74 @@ impl gex_kernel::net::NetStack for HostNet {
     fn tcp(&self) -> Result<Arc<dyn gex_kernel::net::Transport>, gex_kernel::Errno> {
         Ok(Arc::new(HostStream::default()))
     }
+    fn udp(&self) -> Result<Arc<dyn gex_kernel::net::Transport>, gex_kernel::Errno> {
+        Ok(Arc::new(HostDgram::default()))
+    }
+}
+
+/// A guest's UDP flow (`NetStack::udp`), as a connected host UDP socket:
+/// one datagram per `send` and per `recv`.
+#[derive(Debug, Default)]
+struct HostDgram {
+    sock: Mutex<Option<std::net::UdpSocket>>,
+}
+
+impl HostDgram {
+    fn with<T>(&self, f: impl FnOnce(&std::net::UdpSocket) -> std::io::Result<T>) -> Result<T, gex_kernel::Errno> {
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let sock = guard.as_ref().ok_or(gex_kernel::Errno::ENOTCONN)?;
+        f(sock).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => gex_kernel::Errno::EAGAIN,
+            _ => gex_kernel::Errno::from_io(&e),
+        })
+    }
+}
+
+impl gex_kernel::net::Transport for HostDgram {
+    fn connect(&self, host: &str, port: u16) -> Result<(), gex_kernel::Errno> {
+        use std::net::ToSocketAddrs;
+        let addr = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| gex_kernel::Errno::ENETUNREACH)?
+            .find(|a| a.is_ipv4())
+            .ok_or(gex_kernel::Errno::ENETUNREACH)?;
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| gex_kernel::Errno::from_io(&e))?;
+        sock.connect(addr).map_err(|e| gex_kernel::Errno::from_io(&e))?;
+        sock.set_nonblocking(true).map_err(|e| gex_kernel::Errno::from_io(&e))?;
+        *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock);
+        Ok(())
+    }
+
+    fn status(&self) -> gex_kernel::net::Status {
+        match &*self.sock.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(_) => gex_kernel::net::Status::Open,
+            None => gex_kernel::net::Status::Closed,
+        }
+    }
+
+    fn send(&self, data: &[u8]) -> Result<usize, gex_kernel::Errno> {
+        self.with(|s| s.send(data))
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        self.with(|s| s.recv(buf))
+    }
+
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        self.with(|s| s.peek(buf))
+    }
+
+    fn has_data(&self) -> bool {
+        self.with(|s| s.peek(&mut [0u8; 1])).is_ok()
+    }
+
+    fn available(&self) -> usize {
+        self.with(|s| s.peek(&mut vec![0u8; 65536])).unwrap_or(0)
+    }
+
+    fn close(&self) {
+        let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
 #[derive(Debug, Default)]

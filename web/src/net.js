@@ -1,13 +1,16 @@
 // The guest's sockets, over the page's network: a page cannot open a TCP
 // connection, so each connection a program makes goes to the network the
 // page gave the system (web/runtime README "Network": any object with
-// `connect(host, port)` resolving `{ readable, writable }`). This adds the
-// shape the shim asks for: integer stream ids, a receive buffer per stream,
-// and calls that never wait -- they must not, because the page's event loop
+// `connect(host, port)` resolving `{ readable, writable }`, and
+// `datagram(host, port)` for UDP, a datagram a chunk). A UDP flow is a
+// stream here as a connection is, its datagrams framed (dgram-frames.mjs).
+// This adds the shape the shim asks for: integer stream ids, a receive
+// buffer per stream, and calls that never wait -- they must not, because the page's event loop
 // is what delivers the bytes the parked guest is waiting on.
 
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { PageHostStream } from '../../shims/browser/js/page-host.mjs';
+import { NET_DGRAM, frame, Unframer } from '../../shims/browser/js/dgram-frames.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -185,6 +188,10 @@ export class Sockets {
   connect(id, host, port) {
     const s = this.#streams.get(id);
     if (!s) return;
+    if (port & NET_DGRAM) {
+      this.#datagram(s, id, host, port & 0xffff);
+      return;
+    }
     const base = this.#pageHosts?.get(String(host).toLowerCase());
     if (base) {
       this.#wire(s, id, new PageHostStream(base), host, port);
@@ -202,6 +209,28 @@ export class Sockets {
       return;
     }
     this.#wire(s, id, w, host, port);
+  }
+
+  /** Stream `s` as a UDP flow to `host:port`: the network's `datagram`,
+   *  each datagram framed on the stream (refused by a network without it). */
+  #datagram(s, id, host, port) {
+    let w;
+    try {
+      if (typeof this.#network?.datagram !== 'function') throw new Error('no datagrams');
+      w = new DuplexWire(this.#network.datagram(String(host), Number(port)));
+    } catch {
+      this.#state(s, REFUSED);
+      return;
+    }
+    const out = new Unframer();
+    const wire = {
+      get open() { return w.open; },
+      send: (bytes) => { for (const d of out.push(bytes)) w.send(d); },
+      close: () => w.close(),
+    };
+    this.#wire(s, id, wire, host, port);
+    for (const k of ['onopen', 'onclose', 'onerror']) w[k] = (...a) => wire[k]?.(...a);
+    w.onmessage = (d) => wire.onmessage?.(frame(d));
   }
 
   /** Stream `s` carried by `w`: the network's connection, or a page-served host's. */

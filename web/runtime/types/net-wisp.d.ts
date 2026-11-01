@@ -8,6 +8,8 @@ export declare class Wisp extends EventTarget implements Network {
   constructor(url: string | URL);
   get url(): string;
   connect(host: string, port: number): Promise<Duplex>;
+  /** A Wisp UDP stream (refused by a proxy without Wisp's UDP extension). */
+  datagram(host: string, port: number): Promise<Duplex>;
   /** Closes the WebSocket; the next connection dials again. */
   close(): void;
 }
