@@ -145,12 +145,20 @@ class DomWindow {
     /** How many times this window has been painted from guest memory. */
     this.paints = 0;
     this.onretitle = null;
+    /** What application it is (`xdg_toplevel.set_app_id`, an X window's
+     *  WM_CLASS class), '' unsaid; `onappid` when it changes. */
+    this.appId = s.appId ?? '';
+    this.onappid = null;
+    /** The guest pid of an X window's program (`_NET_WM_PID`), 0 when its
+     *  connection (`token`) is its program. */
+    this.guestPid = s.pid || 0;
     this.onresized = null;
     this.onplace = null;
     this.onclosed = null;
     /** The client's window-management requests from its own frame:
      *  `onrequest(kind, edges)`, kind 'move', 'resize' (`edges`: 1 top,
-     *  2 bottom, 4 left, 8 right), 'maximize' or 'unmaximize'; each once. */
+     *  2 bottom, 4 left, 8 right), 'maximize', 'unmaximize' or 'minimize';
+     *  each once. */
     this.onrequest = null;
     this.requestSeq = undefined;
     /** `onfullscreen(on)`: the client asked to be fullscreen, or not. */
@@ -724,6 +732,11 @@ export class DomDesktop {
       win.onretitle?.(s.title);
       winNote(win, 'title');
     }
+    win.guestPid = s.pid || 0;
+    if (s.appId !== win.appId) {
+      win.appId = s.appId;
+      win.onappid?.(s.appId);
+    }
     if (s.width !== win.width || s.height !== win.height) {
       win.width = s.width;
       win.height = s.height;
@@ -745,7 +758,7 @@ export class DomDesktop {
     else if (seq !== win.requestSeq && s.role === ROLE_TOPLEVEL && !s.placed) {
       win.requestSeq = seq;
       const code = (s.flags >>> 24) & 0x7f;
-      const kind = ['none', 'move', 'resize', 'maximize', 'unmaximize'][code & 7];
+      const kind = ['none', 'move', 'resize', 'maximize', 'unmaximize', 'minimize'][code & 7];
       if (kind && kind !== 'none') win.onrequest?.(kind, (code >> 3) & 0xf);
     }
     const fs = (s.flags & F_FULLSCREEN) !== 0 && s.role === ROLE_TOPLEVEL && !s.placed;

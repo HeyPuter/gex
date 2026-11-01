@@ -96,7 +96,12 @@ Then wire it to the desktop's window manager:
 - **Close:** the frame's close button calls `close()`. Drop the frame on
   `closed`.
 - **Client-side frames:** `request` events (`move`, `resize`, `maximize`,
-  ...) are the window asking the desktop's manager to act.
+  `minimize`, ...) are the window asking the desktop's manager to act.
+- **Minimize:** hiding a frame is the desktop's own; the program is not
+  told, and its window keeps its size and contents for when it comes back.
+- **Taskbar:** `appId` names the application (`appid` when it changes) and
+  `pid` its program (`process.windows()` goes the other way), so a taskbar
+  groups windows and matches them to the launcher's entries.
 
 An X11 program needs nothing more: `DISPLAY` is in `hw.env`, and the
 runtime starts its X server for the first client. When the desktop's work
@@ -106,6 +111,14 @@ area changes, call `hw.setOutputSize(width, height)`.
 directory of the desktop's own filesystem to every program, while it runs
 (Mounts says what a provider implements). A mount is the desktop's to keep:
 persistence leaves it out.
+
+**A launcher.** The tree's applications are its desktop entries:
+`fs.readdir('/usr/share/applications')`, each `.desktop` file read with
+`fs.readFile(path, { encoding: 'utf-8' })` for its `Name`, `Exec` and `Icon`
+(an icon theme's file under `/usr/share/icons`). An entry's `Exec` runs as a
+`spawn` of its words, its field codes (`%f`, `%U`) left out or filled, and its
+windows' `appId` is the entry's name without `.desktop` (a Wayland program)
+or its `StartupWMClass` (an X one).
 
 **Calls out of the guest.** To let a program open a URL in the desktop's
 browser, or show a notification, register a host call. A guest script then
@@ -466,14 +479,15 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | --- | --- |
 | `canvas` | Its pixels, CSS-sized to the window. Focusable: keys go to the window whose canvas has the page's focus; pointer and wheel input are its own. |
 | `kind` | `'toplevel'`, `'popup'` (a menu, a tooltip: never framed, drawn above its parent and outside its frame) or `'subsurface'`. |
-| `parent`, `pid`, `title`, `width`, `height` | |
+| `parent`, `title`, `width`, `height` | `title` whole (up to 256 bytes of UTF-8). |
+| `pid` | The program's pid: an X window's as the program says (`_NET_WM_PID`, which Qt, GTK and most toolkits set), else its X server's. `process.windows()` uses it. |
 | `decorations` | `'host'` (frame it), `'client'` (it draws its own: a Win32 window under Wine) or `'none'`. |
 | `placed`, `x`, `y` | A popup's or subsurface's place relative to its parent's canvas; a placed window's (`placed`, Wine's) on the output, where its client moves and stacks it (`restack`). |
 | `place(x, y)` | Where the page put it on the output; call after each move (X windows' menus read it). |
 | `resize(w, h)`, `setStates({ maximized, fullscreen, resizing }, w, h)` | Ask for a size, with states. |
 | `focus()`, `close()` | The keyboard; a polite close. |
-| `appId` | `null` for now. |
-| Events | `title`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
+| `appId` | What application it is, or `null` when the program does not say: a Wayland window's app id (by convention its desktop entry's name, `org.kde.kate`), an X window's `WM_CLASS` class (what a desktop entry's `StartupWMClass` names, `XTerm`). |
+| Events | `title`, `appid`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'minimize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
 
 ### SingleCanvas (`@gex/runtime/windows/single`)
 

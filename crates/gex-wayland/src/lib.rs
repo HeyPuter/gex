@@ -266,6 +266,14 @@ pub struct SurfaceInfo {
     pub damage: Damage,
     /// The `xdg_toplevel` title, for the decoration the host draws.
     pub title: String,
+    /// What application it is: `xdg_toplevel.set_app_id` (by convention its
+    /// desktop entry's name), or an X window's `WM_CLASS` class, as a desktop
+    /// entry's `StartupWMClass` names it. Empty when the client said nothing.
+    pub app_id: String,
+    /// The guest pid of the program that made it, when known otherwise than
+    /// by its connection: an X window's `_NET_WM_PID` (its connection is the
+    /// X server's). 0 when not.
+    pub pid: u32,
     /// The client's last window-management request (`xdg_toplevel.move`,
     /// `resize`, `set_maximized`, `unset_maximized`), numbered so the host
     /// acts on each once: a client-decorated window is dragged, resized and
@@ -388,6 +396,71 @@ pub fn configure_states(states: i32, activated: i32) -> u32 {
     (states as u32 & !STATE_ACTIVATED) | if activated != 0 { STATE_ACTIVATED } else { 0 }
 }
 
+/// Words in one published surface record: the layout a host page reads
+/// (`shims/browser/js/wl-bridge.mjs`, the same numbers by name), written by
+/// [`push_record`] for a guest's surfaces and the browser X server's alike.
+pub const REC: usize = 119;
+/// Where the title's UTF-8 bytes start, and how many there are room for.
+pub const REC_TITLE: usize = 38;
+pub const REC_TITLE_BYTES: usize = 256;
+/// The app id's, likewise.
+pub const REC_APP_ID: usize = 102;
+pub const REC_APP_ID_BYTES: usize = 64;
+/// [`SurfaceInfo::pid`].
+pub const REC_PID: usize = 118;
+
+/// `text` into `words` as UTF-8, little-endian, cut on a character boundary
+/// to fit; the rest zero.
+fn put_text(words: &mut [i32], text: &str) {
+    let mut n = text.len().min(words.len() * 4);
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    for (i, chunk) in text.as_bytes()[..n].chunks(4).enumerate() {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        words[i] = i32::from_le_bytes(word);
+    }
+}
+
+/// One surface's record, appended to `out`, for the host's client `client`.
+/// Words 18..25 are free (the title's before it had room); 26, 27 and 29..32
+/// beyond the placement's are the host side's own.
+pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
+    let base = out.len();
+    out.resize(base + REC, 0);
+    let r = &mut out[base..base + REC];
+    r[0] = client as i32;
+    r[1] = info.surface as i32;
+    r[2] = info.role.code() as i32;
+    r[3] = info.parent as i32;
+    r[4] = info.rel_x;
+    r[5] = info.rel_y;
+    r[6] = info.width;
+    r[7] = info.height;
+    r[8] = info.addr as u32 as i32;
+    r[9] = info.stride;
+    r[10] = info.format as i32;
+    r[11] = info.serial as i32;
+    r[12] = info.damage.x;
+    r[13] = info.damage.y;
+    r[14] = info.damage.w;
+    r[15] = info.damage.h;
+    r[16] = info.flags();
+    // Which X window this is, for a host that knows a drawable and not a
+    // surface -- an OpenGL client naming what it draws into.
+    r[17] = info.xid as i32;
+    // Where its client placed it, if it did (`gex_window_placement_v1`).
+    r[28..33].copy_from_slice(&info.placement.record_words());
+    // Where it takes the pointer, when its client said (`flags` bit 7).
+    r[33..37].copy_from_slice(&info.input_words());
+    // The address's high half: a memory64 process's pool may sit above 4 GiB.
+    r[37] = (info.addr >> 32) as u32 as i32;
+    put_text(&mut r[REC_TITLE..REC_TITLE + REC_TITLE_BYTES / 4], &info.title);
+    put_text(&mut r[REC_APP_ID..REC_APP_ID + REC_APP_ID_BYTES / 4], &info.app_id);
+    r[REC_PID] = info.pid as i32;
+}
+
 /// A window-management request a client made of the compositor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Request {
@@ -400,6 +473,8 @@ pub enum Request {
     Resize(u8),
     Maximize,
     Unmaximize,
+    /// `xdg_toplevel.set_minimized`: a client's own minimize button.
+    Minimize,
 }
 
 impl Request {
@@ -411,6 +486,7 @@ impl Request {
             Request::Resize(edges) => 2 | (u32::from(edges & 0xf) << 3),
             Request::Maximize => 3,
             Request::Unmaximize => 4,
+            Request::Minimize => 5,
         }
     }
 }
@@ -626,6 +702,8 @@ struct SurfaceState {
     pending_callbacks: Vec<u32>,
     title: String,
     app_id: String,
+    /// See [`SurfaceInfo::pid`].
+    pid: u32,
     /// The `xdg_surface` that gave this surface a role, if any.
     xdg: Option<u32>,
     /// Set once the client has acknowledged a configure, which is when a
@@ -1992,6 +2070,7 @@ impl Client {
                 if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
                     s.app_id = app_id;
                 }
+                self.dirty = true;
                 true
             }
             // show_window_menu(seat, serial, x, y)
@@ -2035,9 +2114,13 @@ impl Client {
                 self.dirty = true;
                 true
             }
-            // set_max_size, set_min_size, set_minimized -- acknowledged and
-            // not acted on.
-            7 | 8 | 13 => true,
+            // set_minimized: a client's own minimize button, for the host.
+            13 => {
+                self.request(xdg_surface, Request::Minimize);
+                true
+            }
+            // set_max_size, set_min_size -- acknowledged and not acted on.
+            7 | 8 => true,
             _ => false,
         }
     }
@@ -2677,6 +2760,8 @@ impl Client {
                 // host only reads damage when the serial has moved on.
                 damage: s.damage.unwrap_or_else(Damage::all),
                 title: s.title.clone(),
+                app_id: s.app_id.clone(),
+                pid: s.pid,
                 request: s.request,
                 request_seq: s.request_seq,
                 fullscreen: s.fullscreen,
@@ -2835,6 +2920,19 @@ impl Client {
             s.title = "X11".to_string();
         }
         self.dirty = true;
+    }
+
+    /// An X window's application and program, as its client named them:
+    /// `WM_CLASS`'s class (`app_id`) and `_NET_WM_PID` (`pid`, 0 unknown).
+    pub fn set_x11_identity(&mut self, surface: u32, app_id: &str, pid: u32) {
+        let Some(s) = self.surfaces.get_mut(&surface) else {
+            return;
+        };
+        if s.app_id != app_id || s.pid != pid {
+            s.app_id = app_id.to_string();
+            s.pid = pid;
+            self.dirty = true;
+        }
     }
 
     /// The X window is gone or unmapped.
@@ -4415,6 +4513,43 @@ mod tests {
         assert_eq!((word(b, 0), word(b, 1)), (1280 - 2, 627 - 27), "the output less the frame, in surface units");
         let cfg = &out[configure].2;
         assert_eq!((word(cfg, 0), word(cfg, 1)), (0, 0), "a new window was given a size instead of choosing one");
+    }
+
+    #[test]
+    fn a_windows_whole_title_app_id_and_minimize_reach_its_record() {
+        // placed_window: toplevel 8 on xdg_surface 7, surface 6.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let title = "Document 1 \u{2014} a title past the record's old 32 bytes";
+        c.receive(&Writer::new(8, 2).string(title).finish(), &[], &pool);
+        c.receive(&Writer::new(8, 3).string("org.kde.kate").finish(), &[], &pool);
+        // set_minimized
+        c.receive(&Writer::new(8, 13).finish(), &[], &pool);
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        assert_eq!(info.request, Request::Minimize);
+        let mut rec = Vec::new();
+        push_record(&mut rec, 3, &info);
+        assert_eq!(rec.len(), REC);
+        let text = |at: usize, n: usize| {
+            let b: Vec<u8> = rec[at..at + n / 4].iter().flat_map(|w| w.to_le_bytes()).collect();
+            String::from_utf8(b.into_iter().take_while(|&x| x != 0).collect()).unwrap()
+        };
+        assert_eq!(text(REC_TITLE, REC_TITLE_BYTES), title);
+        assert_eq!(text(REC_APP_ID, REC_APP_ID_BYTES), "org.kde.kate");
+        assert_eq!(rec[REC_PID], 0, "a Wayland window's program is its connection's");
+        assert_eq!(((rec[16] >> 24) & 0x7f) as u32, Request::Minimize.code());
+        // An X window's identity, from its window manager.
+        c.set_x11_identity(surface, "XTerm", 42);
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        assert_eq!((info.app_id.as_str(), info.pid), ("XTerm", 42));
+    }
+
+    #[test]
+    fn a_title_cut_to_fit_stays_whole_characters() {
+        let mut w = [0i32; 2];
+        put_text(&mut w, "abcdefg\u{e9}");
+        let b: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(&b, b"abcdefg\0", "the two-byte character is left out, not cut");
     }
 
     #[test]
