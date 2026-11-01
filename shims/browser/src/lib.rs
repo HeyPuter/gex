@@ -11818,6 +11818,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // by content key.
     h.jit.installed_mods.clear();
     h.jit.mods_on_page.clear();
+    // And the registry, as a new process's starts (`set_host`): its modules
+    // are the old program's, and a thread the new program starts would
+    // instantiate every one of them in its Worker. Its bytes in the JS-side
+    // store go too: that store is made again for the new program
+    // (`Gex#programStore`).
+    reset_registry(&mut h.jit);
     // The new program and its interpreter, placed by gex's loader rather than
     // mapped by the guest, announced as their `mmap`s would have been: the
     // syscall's return serves their units before the interpreter's first
@@ -12775,6 +12781,39 @@ fn backfill_registry(j: &mut Jit) {
         j.registry.push(wasm);
         j.registry_ext.push(None);
     }
+}
+
+/// An empty registry, kept off until the program threads again
+/// (`ever_threaded`): at an exec, where the registry's modules all belong to
+/// the program that is gone. A Worker of that program still catching up
+/// reads the count first (`regview::row`), so the count goes before the bytes.
+fn reset_registry(j: &mut Jit) {
+    regview::reset();
+    REGISTRY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    #[cfg(feature = "shared-memory")]
+    REGISTRY_BYTES.fetch_sub(j.registry.iter().map(|w| w.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
+    EXTERNAL_BYTES.fetch_sub(
+        j.registry_ext.iter().flatten().map(|&(_, len, _)| len as u64).sum(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    j.registry = Vec::new();
+    j.registry_ext = Vec::new();
+    j.registry_sums = Vec::new();
+    j.registry_dense = Vec::new();
+    j.store_grace.clear();
+    j.ever_threaded = false;
+}
+
+/// How many times this process's registry has started over
+/// (`reset_registry`). A failed exec bumps `EXEC_GEN` and keeps the registry,
+/// so the JS-side store is tied to this instead.
+static REGISTRY_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `REGISTRY_EPOCH`: the JS-side module store is made for one epoch
+/// (`Gex#programStore`), since every row naming it goes when it changes.
+#[no_mangle]
+pub extern "C" fn gex_registry_epoch() -> u32 {
+    REGISTRY_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A hash of each 256-byte chunk of `b`.
