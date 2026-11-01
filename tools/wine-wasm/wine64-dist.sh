@@ -326,9 +326,11 @@ ntdll_native() {
 # modules (pelink.py, stage-native64.sh) in place of their x86-64 code. The
 # core, WINE64_NATIVE_DLLS, is one module (winepe.wasm); every other module the
 # wasm64 tree builds that the install has is a module of its own beside it
-# (WINE64_SPLIT_DLLS names them instead). A module the tree cannot build stays
-# x86-64 code. The install's name then gets -nNK. WINE64_NATIVE_PE=0: the PE
-# builtins as they are, translated (for comparison; the core is still made).
+# (WINE64_SPLIT_DLLS names them instead). No builtin is left x86 code: the
+# install fails when any PE image still holds machine code (pescan.py), unless
+# WINE64_NATIVE_PARTIAL=1. The install's name then gets -nNK.
+# WINE64_NATIVE_PE=0: the PE builtins as they are, translated (for comparison;
+# the core is still made).
 NPE=${WINE64_NATIVE_PE:-1}
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
 # WoW64's own DLLs, and the programs every process start runs, in the core too
@@ -348,7 +350,8 @@ pe_native() {
 	t="libs/gexrt/libgexrt.a"
 	for dll in $D; do t="$t $(pe_target "$b" "$dll")"; done
 	if [ -n "$SPA" ]; then
-		# every PE module, as far as each builds (one that fails stays x86-64 code)
+		# every PE module, as far as each builds; one that fails is still
+		# machine code, which native_make's scan refuses
 		( cd "$b" && nice -n 10 make -k -j"$J" ) || true
 		sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
 			while read -r m; do case " $D " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
@@ -360,8 +363,9 @@ pe_native() {
 	stage_split "$b" "$W" "$PWD/native" $D
 }
 # stage-native64.sh ARGS over the split modules in split.txt. A split module
-# importing what no module exports (one with a source the wasm tree does not
-# build: dmsynth's C++ fluidsynth) is left out of split.txt and stays x86 code.
+# importing what no module exports (a source the wasm tree does not build) is
+# named and left out, so that the rest link and native_make's scan lists every
+# module still machine code in one build.
 stage_split() {
 	local i bad
 	for i in 1 2 3; do
@@ -369,7 +373,7 @@ stage_split() {
 		WINE64_SPLIT_DLLS="$(echo $(cat split.txt))" nice -n 10 "$here/stage-native64.sh" "$@" 2> stage.err && { cat stage.err >&2; return 0; }
 		cat stage.err >&2
 		bad=$(sed -n 's/^  \([^ :]*\)\.wasm: .*/\1/p' stage.err | grep -vx winepe) || return 1
-		log "x86 code (imports no module exports): $(echo $bad)"
+		log "NOT NATIVE: imports no module exports: $(echo $bad)"
 		grep -vxF -f <(echo "$bad") split.txt > split.tmp || true
 		mv split.tmp split.txt
 	done
@@ -436,6 +440,12 @@ native_make() {
 		n=${a#*:}; [ -n "$n" ] || continue
 		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
 	done
+	# no builtin runs translated: a PE image left with machine code fails the
+	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported)
+	if [ -n "$SPA" ]; then
+		python3 "$here/pescan.py" lib/wine/x86_64-windows ${NATIVE32:+lib/wine/i386-windows} >&2 ||
+			[ "${WINE64_NATIVE_PARTIAL:-0}" = 1 ] || { log "PE images with machine code (above): the dist is not native"; return 1; }
+	fi
 }
 if [ "$NPE" != 0 ]; then
 	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST-n$NK${N32:+-$N32} native_make
