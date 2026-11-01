@@ -96,6 +96,11 @@ fi
     OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP-$VARIANT" KEEP_TMP=true WASM_THREADS=$WT \
         "$ROOT/web/tint/build-tint.sh"
 }
+# Mesa's own files by fixed names too: the replay includes Tint's headers,
+# whose assertion strings would otherwise carry the build machine's paths. A
+# build directory compiled before this keeps its objects' old strings
+# (emcc's flags from the environment are not ninja's to track).
+export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
 if [ ! -f "$BUILD/build.ninja" ]; then
     mkdir -p "$OUT"
