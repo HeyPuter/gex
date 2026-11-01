@@ -123,6 +123,9 @@ const REUSES = Symbol('gex.reuses');
  *  given-back Workers the pool keeps beyond the new ones it is topped up to. */
 const REUSE_MAX = 256;
 const GIVEN_BACK_MAX = 2;
+/** The other flavour's runtime after a failed fetch: when it is tried again
+ *  (`#loadOther`), the wait doubling from the first to the last. */
+const OTHER_RETRY_MS = 1000, OTHER_RETRY_MAX_MS = 60_000;
 /** How long `stop` waits for store saves under way. */
 const SAVE_WAIT_MS = 60_000;
 /** How many exited processes' memories are kept for fork children, and how
@@ -301,9 +304,11 @@ export class ProcessHost {
   #other; #otherShim = null; #otherLoading = null;
   /// Whether the other flavour's runtime is here, for an exec that asks for
   /// it to wait on before it is past failing (vfork.rs `exec_unrunnable`):
-  /// 0 not asked, 2 loading, 1 loaded, -2 (`-ENOENT`) it could not be had.
-  /// Only for one fetched on first use, and only with SharedArrayBuffer.
-  #otherGate = null; #otherGated = false;
+  /// 0 not asked (or asked again), 2 loading, 1 loaded, -2 (`-ENOENT`) the last try failed, which
+  /// an exec sets back to 0 to ask again (`#loadOther` retries after a
+  /// backoff). Only for one fetched on first use, and only with
+  /// SharedArrayBuffer.
+  #otherGate = null; #otherError = null; #otherRetryAt = 0; #otherBackoff = 0; #otherSaid = false;
   /// Each process's memory flavour, by pid, where it is not the page's.
   #flavourOf = new Map();
   /// Per Worker, a shared counter of the output messages this host has
@@ -664,24 +669,57 @@ export class ProcessHost {
   }
 
   /** The other flavour's runtime, its shim compiled: fetched on first use
-   *  when given as a function (few pages run one), once. The gate says how
-   *  that went, and a failure is said once on the console. */
+   *  when given as a function (few pages run one). A fetch that fails is
+   *  tried again on the next request once a backoff has passed (1 s,
+   *  doubling to a minute), and until then a request fails at once: a
+   *  dropped connection does not cost the page the flavour for good. The
+   *  gate says how the last try went, and the first failure is said on the
+   *  console. */
   #loadOther() {
-    this.#otherLoading ??= (async () => {
+    if (!this.#otherLoading && this.#otherError) {
+      if (performance.now() < this.#otherRetryAt) {
+        this.#answerOther(-2);
+        return Promise.reject(this.#otherError);
+      }
+      this.#otherError = null;
+    }
+    if (this.#otherLoading) {
+      // Asked again after it settled (a page with no other runtime answers
+      // -2 for good): the asker waits on the gate.
+      this.#otherLoading.then((o) => this.#answerOther(o ? 1 : -2), () => {});
+      return this.#otherLoading;
+    }
+    const p = (async () => {
       const o = typeof this.#other === 'function' ? await this.#other() : this.#other;
       if (o) this.#otherShim ??= o.shim instanceof WebAssembly.Module ? Promise.resolve(o.shim) : WebAssembly.compile(o.shim);
       if (o) await this.#otherShim;
       return o;
     })();
-    if (this.#otherGate && !this.#otherGated) {
-      this.#otherGated = true;
-      Atomics.store(this.#otherGate, 0, 2);
-      this.#otherLoading.then((o) => o ? 1 : -2, (e) => {
-        console.error(`gex: the other memory flavour's runtime could not be loaded, so no program that needs it runs: ${e?.message ?? e}`);
-        return -2;
-      }).then((s) => { Atomics.store(this.#otherGate, 0, s); Atomics.notify(this.#otherGate, 0); });
-    }
-    return this.#otherLoading;
+    this.#otherLoading = p;
+    if (this.#otherGate) Atomics.store(this.#otherGate, 0, 2);
+    p.then((o) => {
+      this.#otherBackoff = 0;
+      this.#answerOther(o ? 1 : -2);
+    }, (e) => {
+      this.#otherLoading = null;
+      this.#otherShim = null;
+      this.#otherError = e;
+      this.#otherBackoff = Math.min(Math.max(this.#otherBackoff * 2, OTHER_RETRY_MS), OTHER_RETRY_MAX_MS);
+      this.#otherRetryAt = performance.now() + this.#otherBackoff;
+      if (!this.#otherSaid) {
+        this.#otherSaid = true;
+        console.error(`gex: the other memory flavour's runtime could not be loaded, so no program that needs it runs until a later try gets it: ${e?.message ?? e}`);
+      }
+      this.#answerOther(-2);
+    });
+    return p;
+  }
+
+  /** The gate's answer for the execs waiting on it (gex.mjs `other_runtime`). */
+  #answerOther(s) {
+    if (!this.#otherGate) return;
+    Atomics.store(this.#otherGate, 0, s);
+    Atomics.notify(this.#otherGate, 0);
   }
 
   /** How many children the guest has forked. */

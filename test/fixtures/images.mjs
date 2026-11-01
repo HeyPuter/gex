@@ -60,7 +60,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'no-m64'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -77,10 +77,11 @@ export const images = {
   // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
   // zig), for core/mem64: a system's memory64 process through the API.
   // And no-m64/: the runtime's files as gex's site lays them out (gex/...,
-  // links to web/public/gex), less the memory64 shim, for core/mem64-missing.
+  // links to web/public/gex), less the memory64 shim, for core/mem64-missing
+  // (and core/mem64-retry, which links it in later).
   async mem64(work) {
     const zig = process.env.ZIG || 'zig';
-    for (const name of ['mem64-pick', 'mem64-miss']) {
+    for (const name of ['mem64-pick', 'mem64-miss', 'mem64-retry']) {
       const src = join(HERE, `programs/${name}.c`), out = join(work, `${name}.x86`);
       const key = createHash('sha256').update(readFileSync(src)).digest('hex'), keyFile = `${out}.key`;
       if (existsSync(out) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) continue;
