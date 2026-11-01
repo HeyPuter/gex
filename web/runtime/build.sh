@@ -304,4 +304,31 @@ fi
 [ -s "$TP" ] || rm -f "$TP"
 # The declarations (types/), one beside each module.
 cp "$RT"/types/*.d.ts "$OUT/"
+
+# No file of the package names the machine it was built on: a path under
+# /home, /root or /tmp (an assertion's __FILE__, a build directory baked into
+# a string), or the sandbox's name, in any file, wasm included, fails the
+# build, naming the file and the string. The guest's own paths, which the
+# runtime and its programs use at run time, are allowed by name.
+node - "$OUT" <<'JS'
+const fs = require('fs'), path = require('path');
+const out = process.argv[2];
+const guest = [
+  /^\/tmp\/\.X11-unix(\/X0?)?$/, /^\/tmp\/wayland-0$/, /^\/tmp\/$/,
+  /^\/tmp\/mesa_%s_%d_XXXXXX\.log$/,       // Mesa's own debug log, in the guest's /tmp
+  /^\/tmp\/proc\/dev\/run\/var\/var\/tmp$/, // the kernel's mount points, one string after another
+  /^\/home\/web_user$/,                     // Emscripten's filesystem's home
+];
+const re = /(?:\/home\/|\/root\/|\/tmp\/)[^\0-\x20"'`(),;\\\x7f-\xff]*|[^\0-\x20"'`]*gex-sandbox[^\0-\x20"'`]*/g;
+let bad = 0;
+for (const f of fs.readdirSync(out).sort()) {
+  const s = fs.readFileSync(path.join(out, f)).toString('latin1');
+  for (const m of new Set(Array.from(s.matchAll(re), (x) => x[0]))) {
+    if (!m.includes('gex-sandbox') && guest.some((g) => g.test(m))) continue;
+    console.error(`web/runtime/build.sh: ${f} names a build machine's path: ${m.slice(0, 160)}`);
+    bad++;
+  }
+}
+if (bad) { console.error(`web/runtime/build.sh: ${bad} host paths in the package`); process.exit(1); }
+JS
 echo "web/runtime/build.sh: $OUT"
