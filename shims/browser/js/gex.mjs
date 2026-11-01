@@ -1865,12 +1865,16 @@ export class Gex {
     return {
         // Whether the other memory flavour's runtime is here (worker.mjs
         // `otherGate`), for an exec of a program of that flavour while it can
-        // still fail (vfork.rs `exec_unrunnable`): asked for on first use and
-        // waited for, then 1, or a negated errno. 1 where nothing says.
+        // still fail (vfork.rs `exec_unrunnable`): asked for on first use, and
+        // after a failed try, and waited for, then 1, or a negated errno. 1
+        // where nothing says.
         other_runtime: () => {
           const g = globalThis.GEX_OTHER_GATE;
           if (!g || !globalThis.GEX_ASK_OTHER) return 1;
-          if (Atomics.load(g, 0) === 0) globalThis.GEX_ASK_OTHER();
+          // A last try that failed is asked again (the host says at once if
+          // its backoff has not passed).
+          const was = Atomics.load(g, 0);
+          if (was === 0 || (was < 0 && Atomics.compareExchange(g, 0, was, 0) === was)) globalThis.GEX_ASK_OTHER();
           // A slow link's few MB, but never for ever.
           for (const until = performance.now() + OTHER_WAIT_MS; performance.now() < until;) {
             const s = Atomics.load(g, 0);
