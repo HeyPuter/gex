@@ -46,7 +46,8 @@ fn budget() -> u64 {
 /// Delete least-recently-used entries until the cache is under budget.
 ///
 /// "Least recently used" is the metadata file's mtime, which
-/// [`load_or_compile`] refreshes on a hit. Evicts down to 80% of budget, not
+/// [`load_or_compile`] refreshes on a hit (to the hour, [`REFRESH_AFTER`]).
+/// Evicts down to 80% of budget, not
 /// exactly to it, so a full cache does not sweep on every store. Returns the
 /// size left.
 fn evict(dir: &Path, budget: u64) -> u64 {
@@ -256,11 +257,7 @@ pub fn load_or_compile(
         // failure path below simply rebuilds.
         match unsafe { Module::deserialize(engine, &bytes) } {
             Ok(module) => {
-                // Rewriting the metadata refreshes its mtime, which eviction
-                // sorts by. Via `store`, not `fs::write`: this runs on every
-                // hit, and `fs::write` truncates before it fills, so a
-                // concurrent reader could see an empty file.
-                store(dir, &meta_path, &metadata);
+                refresh(&meta_path);
                 return Ok(Loaded {
                     module,
                     metadata,
@@ -301,6 +298,28 @@ pub fn load_or_compile(
         metadata,
         hit: false,
     })
+}
+
+/// How stale a hit's metadata mtime may be before the hit refreshes it.
+/// Eviction needs no finer order than this, and a refresh is a write to the
+/// cache's filesystem: a Wine child starts with some seventy hits, and when
+/// each one rewrote its metadata file (a new file renamed over the old), a
+/// busy disk's journal held every start for seconds.
+const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Mark a hit's entry as recently read for [`evict`]: its metadata file's
+/// mtime set to now, in place (its bytes untouched, so a concurrent reader
+/// never sees it partial), and only when older than [`REFRESH_AFTER`].
+fn refresh(meta_path: &Path) {
+    let Ok(f) = std::fs::File::open(meta_path) else { return };
+    let now = std::time::SystemTime::now();
+    let fresh = f
+        .metadata()
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age < REFRESH_AFTER));
+    if !fresh {
+        let _ = f.set_modified(now);
+    }
 }
 
 /// A compiled module kept at `path` (no eviction: for large, long-lived
@@ -615,6 +634,66 @@ mod tests {
     }
 
     use super::*;
+
+    /// A hit writes nothing to the cache unless its entry's mtime is stale,
+    /// and then only the mtime: the same file (no new one renamed over it),
+    /// its bytes untouched.
+    #[test]
+    fn a_hit_refreshes_a_stale_mtime_in_place_and_leaves_a_fresh_one() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("gex-meta-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.meta");
+        std::fs::write(&path, b"meta").unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let set = |ago: u64| {
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
+            std::fs::File::open(&path).unwrap().set_modified(t).unwrap();
+            t
+        };
+        let mtime = || std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let recent = set(600);
+        refresh(&path);
+        assert_eq!(mtime(), recent, "a mtime newer than REFRESH_AFTER is left");
+
+        let stale = set(2 * 3600);
+        refresh(&path);
+        let after = mtime();
+        assert!(after > stale + std::time::Duration::from_secs(3600), "a stale mtime is refreshed");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "in place, not a new file");
+        assert_eq!(std::fs::read(&path).unwrap(), b"meta");
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "no temporary file left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the mtime refreshed at most once an hour, an entry read all the
+    /// time still sorts as recent: its mtime is within the hour, and entries
+    /// not read for longer go before it.
+    #[test]
+    fn eviction_keeps_an_entry_read_all_the_time() {
+        let dir = std::env::temp_dir().join(format!("gex-evict-hour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        // Read 59 minutes ago and refreshed then, read since (no refresh);
+        // last read 2 h and 3 h ago.
+        for (k, ago) in [("busy", 59 * 60), ("old", 2 * 3600), ("older", 3 * 3600)] {
+            std::fs::write(dir.join(format!("{k}.cwasm")), [0u8; 1000]).unwrap();
+            let meta = dir.join(format!("{k}.meta"));
+            std::fs::write(&meta, b"m").unwrap();
+            std::fs::File::open(&meta).unwrap().set_modified(now - std::time::Duration::from_secs(ago)).unwrap();
+        }
+        refresh(&dir.join("busy.meta"));
+        // Over budget; eviction goes down to 80% of it, room for one entry
+        // (1001 bytes): two must go.
+        let left = evict(&dir, 1300);
+        let kept: Vec<bool> = ["busy", "old", "older"].iter().map(|k| dir.join(format!("{k}.cwasm")).exists()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, [true, false, false], "the busy entry is kept, the two idle ones evicted");
+        assert_eq!(left, 1001);
+    }
 
     #[test]
     fn the_key_covers_every_field() {
