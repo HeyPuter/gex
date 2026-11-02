@@ -103,7 +103,9 @@ function importedArities(bytes) {
  * from source, not by loading it -- building an instance is what this checks.
  * Entries are matched as `name: (args) => ...`, or as `name: single.on ?
  * (args) => ... : wasm` (or `(SP_CODE && single.on) ? ...`; a wasm function in the threaded build: its arity is
- * the arrow's).
+ * the arrow's). An entry built by a glue method (`name: this.#make()`) is a
+ * wasm function made at run time: supplied, with an arity the source cannot
+ * show, so only its presence is checked.
  */
 function suppliedArities(source) {
   // Either spelling: the inline `gex_env: { ... }` or the `#hostImports()`
@@ -132,6 +134,9 @@ function suppliedArities(source) {
   for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:(?:\(SP_CODE\s*&&\s*single\.on\)|single\.on)\s*\?\s*(?:new WebAssembly\.Suspending\(\s*)?)?\(([^)]*)\)\s*=>/g)) {
     const params = m[2].trim();
     out.set(m[1], params ? params.split(',').length : 0);
+  }
+  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*this\.#[A-Za-z_][A-Za-z0-9_]*\(\)\s*,/g)) {
+    if (!out.has(m[1])) out.set(m[1], null);
   }
   return out;
 }
@@ -165,7 +170,7 @@ const problems = [];
 for (const [name, arity] of needs) {
   if (!has.has(name)) {
     problems.push(`the glue does not supply ${NS}.${name} -- the shim will not instantiate`);
-  } else if (has.get(name) !== arity) {
+  } else if (has.get(name) !== null && has.get(name) !== arity) {
     // The quiet one. Nothing throws; the call just gets the wrong arguments.
     problems.push(
       `${NS}.${name} takes ${arity} argument${arity === 1 ? '' : 's'} in the shim `
