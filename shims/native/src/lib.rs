@@ -6655,6 +6655,13 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
         return Ok(0);
     }
+    // A table index native code took for a guest address: one at or past
+    // its thread's ICALL bound, a module another thread installed since
+    // (`gex_abi::ftab::ICALL_LIMIT64`). In this thread's table before the
+    // entry thunk bound at that index runs.
+    if target < gex_abi::ftab::NATIVE_FN_TOP {
+        ftab::catch_up(&mut *caller)?;
+    }
     let Some(enter) = any_enter(caller) else { return Ok(0) };
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;

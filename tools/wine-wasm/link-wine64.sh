@@ -37,14 +37,21 @@ reg="ntdll.so:func:__wine_main"
 # __wine_unix_call_funcs renamed apart, and dlreg's registry naming them.
 WF=$(sed -n 's/^srcdir *= *//p' Makefile); WF=$(cd "$WF" && pwd)
 fail=gexwine64/.fail; rm -f "$fail"
+# fresh OUT SRC: OUT is newer than SRC, this script, the headers beside SRC
+# and the newest header in include/ (a header change rebuilds the objects
+# that include it when the tree is linked again in place).
+inc=$(find "$WF/include" -name '*.h' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+fresh() {
+	[ "$1" -nt "$2" ] && [ "$1" -nt "$HERE/link-wine64.sh" ] && [ "$1" -nt "$inc" ] &&
+		[ -z "$(find "$(dirname "$2")" -maxdepth 1 -name '*.h' -newer "$1" | head -1)" ]
+}
 # compile SRC_REL OBJ_REL OUT DEFS: OUT from the build's command for OBJ_REL,
-# with DEFS, unless OUT is newer than its source and this script; at most J
-# at once.
+# with DEFS, unless OUT is fresh; at most J at once.
 compile() {
 	local src=$WF/$1 rel=$2 out=$3 defs=$4 cmd
 	[ -f "$src" ] || src=${src%.c}.cpp  # (win32u's syscall_wasm64.cpp)
 	objs="$objs $out"
-	[ "$out" -nt "$src" ] && [ "$out" -nt "$HERE/link-wine64.sh" ] && return 0
+	fresh "$out" "$src" && return 0
 	cmd=$(make -n -W "$src" "$rel" 2>/dev/null | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' | grep -- "-c -o $rel")
 	[ -n "$cmd" ] || { echo "link-wine64: no compile command for $rel" >&2; touch "$fail"; return 0; }
 	( eval "${cmd//-c -o $rel/-c -o $out} $defs" >&2 ) || { echo "link-wine64: $rel failed" >&2; touch "$fail"; } &
@@ -181,7 +188,7 @@ for spec in $uxl; do
 	mkdir -p "gexwine64/$lib"
 	for b in ${srcs//,/ }; do
 		out=gexwine64/$lib/$b.o; objs="$objs $out"
-		[ "$out" -nt "$WF/dlls/$dir/$b.c" ] && [ "$out" -nt "$HERE/link-wine64.sh" ] && continue
+		fresh "$out" "$WF/dlls/$dir/$b.c" && continue
 		cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/$dir\/$b.c}
 		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/$dir -I$HERE\/wine32\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
 		( eval "$cmd -D__wine_unix_call_funcs=${lib}__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=${lib}__wine_unix_call_wow64_funcs" >&2 ) ||

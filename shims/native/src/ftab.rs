@@ -124,8 +124,26 @@ pub(crate) struct Store {
     /// asyncify's state and data pointer, shared by this store's modules
     /// (binaryen's `asyncify-relocatable`: a fork unwinds through all).
     pub asyncify: Option<(wasmtime::Global, wasmtime::Global)>,
+    /// `gex.icall_limit64` and `gex.icall_limit` of this thread's native PE
+    /// modules: the slots this table holds, capped at `NATIVE_FN_TOP`
+    /// ([`raise_icall_limit`]).
+    pub icall_limit: (wasmtime::Global, wasmtime::Global),
     /// How far through the map's log this table is.
     replayed: usize,
+}
+
+/// This store's table holds every slot below `held`: raise its ICALL bound
+/// to that (never lower it, never past `NATIVE_FN_TOP`).
+fn raise_icall_limit(mut cx: impl AsContextMut<Data = HostState>, held: u64) -> Result<()> {
+    let mut c = cx.as_context_mut();
+    let Some((g64, g32)) = c.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|st| st.icall_limit) else { return Ok(()) };
+    let v = held.min(gex_abi::ftab::NATIVE_FN_TOP);
+    if g64.get(&mut c).i64().is_some_and(|now| now as u64 >= v) {
+        return Ok(());
+    }
+    g64.set(&mut c, Val::I64(v as i64))?;
+    g32.set(&mut c, Val::I32(v as i32))?;
+    Ok(())
 }
 
 /// `GEX_WIN_STATS` counters: host lookups, run-time translations, lookups
@@ -243,9 +261,14 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     let want = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size() + HEADROOM;
     table.grow(&mut c, want as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
+    // 0: nothing is in this table until its first catch-up, which follows
+    let icall_limit = (
+        wasmtime::Global::new(&mut c, wasmtime::GlobalType::new(wasmtime::ValType::I64, wasmtime::Mutability::Var), Val::I64(0))?,
+        wasmtime::Global::new(&mut c, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var), Val::I32(0))?,
+    );
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, icall_limit, replayed: 0 });
     Ok(())
 }
 
@@ -267,7 +290,12 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
         let ev = s.ftab.map.log_from(from).to_vec();
         if ev.is_empty() {
-            return Ok(());
+            // every slot below the map's size is in this table (a module
+            // this store installed itself, `publish_stateful`, has no event
+            // left for it here)
+            let size = s.ftab.map.size() as u64;
+            drop(s);
+            return raise_icall_limit(cx.as_context_mut(), size);
         }
         (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone(), s.ftab.stateful.clone(), s.ftab.dylink.clone())
     };
@@ -286,6 +314,9 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
                 if let Some(dy) = dy {
                     crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.base, inst.module, &inst_i, &dy)?;
                 }
+                // installs come in index order (`FuncMap::publish`): every
+                // slot below this one's end is in the table now
+                raise_icall_limit(cx.as_context_mut(), inst.base as u64 + inst.len as u64)?;
                 if crate::wasm_trace() && t0.elapsed().as_millis() >= 10 {
                     eprintln!("gex: instantiated install {i} (base {}) in {:.3}s", inst.base, t0.elapsed().as_secs_f64());
                 }
@@ -301,7 +332,7 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
     if let Some(g) = st.dl_size {
         g.set(&mut c, Val::I32(size as i32))?;
     }
-    Ok(())
+    raise_icall_limit(c, size as u64)
 }
 
 /// Instantiate a module whose element segment fills `table` from `base`.
@@ -353,6 +384,11 @@ fn instantiate(
     l.define(&mut c, f::PIC_MODULE, "memory", memory.shared().clone())?;
     l.define(&mut c, gex_abi::IMPORT_MODULE, f::TABLE, table)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE, table)?;
+    // native PE code's ICALL bound: this thread's, as its table is now
+    if let Some((g64, g32)) = c.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|st| st.icall_limit) {
+        l.define(&mut c, gex_abi::IMPORT_MODULE, f::ICALL_LIMIT64, g64)?;
+        l.define(&mut c, gex_abi::IMPORT_MODULE, f::ICALL_LIMIT, g32)?;
+    }
     let g = i32c(&mut c, base as u64, wasmtime::Mutability::Const)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE_BASE, g)?;
     match stateful {

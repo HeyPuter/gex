@@ -33,6 +33,10 @@ pub(crate) struct Binds {
     /// None for the modules a program starts with: libc's registry lays
     /// theirs out in every thread's TLS area.
     pub tls: Option<(u32, u32)>,
+    /// A Wine PE module (wasmdll): when it exports `__wasm_init_tls`, each
+    /// store gives its instance a thread-local block of its own
+    /// ([`own_tls`]); its start function sets one up only in the first.
+    pub own_tls: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -183,7 +187,7 @@ fn publish(
         let pairs = pairs_of(i, m, &at);
         let module = p.module_of[i];
         s.ftab.stateful.insert(module, crate::libprov::Extras { memory_base: m.memory_base as u64 });
-        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra, tls }));
+        s.ftab.dylink.insert(module, Arc::new(Binds { path: m.path.clone(), imports, extra, tls, own_tls: false }));
         s.ftab.modules.push(modules[i - from].clone());
         let (n, ok) = s.ftab.map.publish_at(m.table_base, len, module, gex_kernel::ftab::Tier::Unit, &pairs);
         if !ok {
@@ -639,6 +643,33 @@ pub(crate) fn after_instantiate(
     if let Some((size, align)) = dy.tls {
         thread_tls(&mut c, module, inst, size, align).with_context(|| format!("{}: its thread-local block", dy.path))?;
     }
+    if dy.own_tls {
+        own_tls(&mut c, inst).with_context(|| format!("{}: its thread-local block", dy.path))?;
+    }
+    Ok(())
+}
+
+/// A Wine PE module's thread-local block in this store, when it has
+/// thread-local data (`__wasm_init_tls`, `__tls_size` and `__tls_align`
+/// exported, as pelink links them): a fresh one with the module's initial
+/// image, for every instance (wasm64 modules take an i64 address).
+fn own_tls(c: &mut wasmtime::StoreContextMut<'_, HostState>, inst: &wasmtime::Instance) -> Result<()> {
+    let Some(init) = inst.get_func(&mut *c, "__wasm_init_tls") else { return Ok(()) };
+    let num = |c: &mut wasmtime::StoreContextMut<'_, HostState>, name: &str| -> Option<u64> {
+        match inst.get_global(&mut *c, name)?.get(&mut *c) {
+            Val::I32(v) => Some(v as u32 as u64),
+            Val::I64(v) => Some(v as u64),
+            _ => None,
+        }
+    };
+    let Some(size) = num(c, "__tls_size") else { return Ok(()) };
+    let align = num(c, "__tls_align").unwrap_or(1);
+    let block = tls_block(c.data_mut(), size as u32, align as u32)?;
+    let arg = match init.ty(&*c).params().next() {
+        Some(wasmtime::ValType::I64) => Val::I64(block as i64),
+        _ => Val::I32(block as i32),
+    };
+    init.call(&mut *c, &[arg], &mut [])?;
     Ok(())
 }
 

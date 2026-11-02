@@ -1257,6 +1257,12 @@ static void *gexw_ntdll_proc(const char *name)
             # gexrt's bounds of the entry-thunk pairs (gexw_entries)
             f.write('--export-if-defined=__gexw_entries\n')
             f.write('--export-if-defined=__gexw_entries_decl\n')
+            # a module with thread-local data (a gexcc-win program's C++
+            # runtime): the host gives each thread's instance a block of
+            # its own (wasmdll), as wasm-ld's start function does only for
+            # the first
+            for n in ('__wasm_init_tls', '__tls_size', '__tls_align'):
+                f.write(f'--export-if-defined={n}\n')
         cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
                '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
                '--unresolved-symbols=import-dynamic', '-o', out, '-Map=' + out + '.map',

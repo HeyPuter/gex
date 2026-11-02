@@ -91,12 +91,25 @@ const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'),
   '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
   `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });
-const done = (code) => {
+// Chromium is its own process group: killed with it on every way out. A
+// signal or an uncaught error goes through `done`; a SIGKILL of this process
+// (timeout -k) can't, so a watchdog outside it kills the group once this
+// process is gone.
+const killChrome = () => {
   try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
+  try { rmSync(profile, { recursive: true, force: true }); } catch {}
+};
+spawn('bash', ['-c', 'while kill -0 "$1" 2>/dev/null; do sleep 2; done; kill -KILL -- "-$2" 2>/dev/null; rm -rf -- "$3"',
+  'record-wine32-watchdog', String(process.pid), String(chrome.pid), profile], { detached: true, stdio: 'ignore' }).unref();
+process.on('exit', killChrome);
+const done = (code) => {
+  killChrome();
   server?.close();
-  rmSync(profile, { recursive: true, force: true });
   process.exit(code);
 };
+for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]]) process.on(sig, () => done(128 + n));
+process.on('uncaughtException', (e) => { console.error('record-wine32:', e); done(1); });
+process.on('unhandledRejection', (e) => { console.error('record-wine32:', e); done(1); });
 
 let ws = null;
 for (let i = 0; i < 80 && !ws; i++) { ws = await browserWsUrl(port); if (!ws) await sleep(250); }

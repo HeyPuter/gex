@@ -15,7 +15,7 @@
 # PATH at run time). GEXC_X86: an x86 gexc for -fgex-guest-i386's runtime
 # (default GEXC). GEX_BINARYEN: an existing binaryen install.
 # BUSYBOX_TAR: busybox 1.37.0's tarball, built as the guest's native
-# /bin/sh and coreutils. LLVM_SRC: an LLVM tree for libc++ (build-cxx.sh).
+# /bin/sh and coreutils. LLVM_SRC: a checkout of llvm.pin's commit, for libc++ (build-cxx.sh).
 set -eu
 PREFIX=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
@@ -317,7 +317,7 @@ fi
   echo "musl $(git -C "$MUSL" rev-parse HEAD 2>/dev/null || echo unknown)"
 } > "$PREFIX/lib/gexcc/installed-from"
 echo "gexcc: $B/gexcc (sysroot $PREFIX/sysroot, runner $R)"
-# C++ (LLVM_SRC: an LLVM source tree of clang's version)
+# C++ (LLVM_SRC: a checkout of llvm.pin's commit)
 if [ -n "${LLVM_SRC:-}" ]; then
   "$HERE/build-cxx.sh" "$PREFIX" "$LLVM_SRC"
 fi
