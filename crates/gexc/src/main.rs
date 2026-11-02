@@ -117,6 +117,7 @@ fn real_main() -> Result<ExitCode> {
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-split" => cmd_cgen_split(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-flavour" => cmd_cgen_flavour(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-c" => cmd_cgen_c(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
@@ -124,6 +125,45 @@ fn real_main() -> Result<ExitCode> {
         }
         other => bail!("unknown subcommand `{other}` (try `gexc help`)"),
     }
+}
+
+/// `gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] LOADER`:
+/// the `gexc cgen-image` switches of the unit flavour a new process of
+/// LOADER (an install's wine, the program a run execs) looks up, with
+/// those run flags and this environment, as its "build it with" line names
+/// them (`gex_cgen::image::flavour_switches`). Nothing runs: the flavour is
+/// the process's own state, decided before any image is placed
+/// (`ProcessFlavour`, which the shims use). An empty line for none.
+fn cmd_cgen_flavour(args: &[String]) -> Result<()> {
+    let mut pf = gex_cgen::image::ProcessFlavour::default();
+    let mut loader = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            // in the page (the browser shim), natively otherwise
+            "--page" => pf.page = true,
+            "--mem64" => pf.mem64 = true,
+            // the page's ?winesplit=1
+            "--winesplit" => pf.split = true,
+            "--max-insns" => {
+                i += 1;
+                gex_cgen::image::set_max_insns(args.get(i).context("--max-insns needs a number")?.parse()?);
+            }
+            a if a.starts_with('-') => bail!("cgen-flavour: unknown switch {a}"),
+            a if loader.is_none() => loader = Some(a.to_string()),
+            a => bail!("cgen-flavour: one loader, not {a} as well"),
+        }
+        i += 1;
+    }
+    let loader = loader.context("usage: gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] LOADER")?;
+    let bytes = std::fs::read(&loader).with_context(|| format!("reading {loader}"))?;
+    let exe = gex_ld::elf::load(&bytes, 0).map_err(|e| anyhow::anyhow!("{loader}: {e:?}"))?;
+    pf.flags = gex_cgen::image::program_flags::of(&exe);
+    let full = std::fs::canonicalize(&loader).map(|p| p.display().to_string()).unwrap_or(loader);
+    pf.native_ntdll = gex_cgen::image::loader_has_native_ntdll(&full);
+    pf.apply();
+    println!("{}", gex_cgen::image::flavour_switches().join(" "));
+    Ok(())
 }
 
 fn usage() {
@@ -192,6 +232,11 @@ usage:
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
                                    needs it built ahead (GEX_CGEN_GUARD=1)
+  gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] <loader>
+                                   the cgen-image switches of the units a new
+                                   process of <loader> looks up with those run
+                                   flags (--page: in the browser), as its
+                                   'build it with' lines name them; runs nothing
   gexc cgen-image --providers [--elf]
                                    every export provider's module for this
                                    gexc's guest (an x86 gexc's for x86-64),

@@ -1385,8 +1385,9 @@ fn run_program_with(
         // An i386 Wine with KUSER_SHARED_DATA at 32-bit Wine's address: Windows'
         // constant addresses folded there, the old page and above a
         // named fault (`gex_abi::KUSER_GUARD`).
-        let f = wasmprog::flags(program);
-        if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_WINE32 != 0 {
+        // (`gex_cgen::image::ProcessFlavour`: what `gexc cgen-flavour` names)
+        let pf = gex_cgen::image::ProcessFlavour { flags: wasmprog::flags(program), ..Default::default() };
+        if pf.kuser_fold() {
             gex_abi::set_kuser_fold(true);
             gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
         }

@@ -269,7 +269,7 @@ fn binds_get(i: usize) -> Option<&'static Bind> {
 }
 
 pub(super) fn is_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
-    pe.sections.iter().any(|s| s.name == ".wasmref")
+    gex_cgen::image::is_skeleton(pe)
 }
 
 /// Whether provider `i` of unit `u` is a native Wine DLL's skeleton.

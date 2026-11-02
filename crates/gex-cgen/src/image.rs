@@ -156,6 +156,101 @@ pub fn set_flavour_switch(switch: &str) -> bool {
     true
 }
 
+/// The GEXWASM header's flags (offset 36 of the header 0x40 bytes before a
+/// native wasm32 program's entry): what the program's process is, before it
+/// runs. Natively and in the page alike (the page reads them from the
+/// placed image). 0 for a program without the header.
+pub mod program_flags {
+    pub const MAGIC: &[u8; 8] = b"GEXWASM\0";
+    /// The program runs i386 code (32-bit Wine).
+    pub const GUEST_I386: u32 = 1;
+    /// The program runs x86-64 code (64-bit native Wine).
+    pub const GUEST_X86_64: u32 = 2;
+    /// This i386 Wine maps KUSER_SHARED_DATA at `gex_abi::WINE32_KUSER`.
+    pub const KUSER_WINE32: u32 = 4;
+
+    /// The flags of `exe` (an ELF container's loaded image).
+    pub fn of(exe: &gex_ld::elf::Image) -> u32 {
+        let at = exe.entry.wrapping_sub(0x40);
+        exe.segments
+            .iter()
+            .find(|s| at >= s.vaddr && at + 40 <= s.vaddr + s.bytes.len() as u64)
+            .map(|s| {
+                let o = (at - s.vaddr) as usize;
+                if &s.bytes[o..o + 8] != MAGIC {
+                    return 0;
+                }
+                u32::from_le_bytes(s.bytes[o + 36..o + 40].try_into().unwrap())
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// What decides a new process's unit flavour, all known before any image is
+/// placed: so a test (or a site's build) can ask for the switches a process
+/// will name (`gexc cgen-flavour`) without running it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessFlavour {
+    /// In the page (the browser shim); natively otherwise.
+    pub page: bool,
+    /// The program's [`program_flags`].
+    pub flags: u32,
+    /// The process has a 64-bit memory.
+    pub mem64: bool,
+    /// The page was asked for 32-bit Wine's 2 GiB split (`?winesplit=1`).
+    pub split: bool,
+    /// The install's x86_64-windows/ntdll.dll is the native PE core's
+    /// skeleton (which asks gex where KUSER_SHARED_DATA is).
+    pub native_ntdll: bool,
+}
+
+/// Whether `pe` is a native Wine DLL's skeleton (its code a wasm module,
+/// named by a `.wasmref` section).
+pub fn is_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
+    pe.sections.iter().any(|s| s.name == ".wasmref")
+}
+
+/// [`ProcessFlavour::native_ntdll`] for an install's loader file: the
+/// x86_64-windows/ntdll.dll beside its x86_64-unix directory a skeleton.
+pub fn loader_has_native_ntdll(loader: &str) -> bool {
+    let Some((dir, _)) = loader.rsplit_once("/x86_64-unix/") else { return false };
+    std::fs::read(format!("{dir}/x86_64-windows/ntdll.dll"))
+        .ok()
+        .and_then(|b| gex_ld::pe::parse(&b).ok().map(|pe| is_skeleton(&pe)))
+        .unwrap_or(false)
+}
+
+impl ProcessFlavour {
+    /// 64-bit Wine in the compact space: a page process of x86-64 Wine in a
+    /// wasm32 memory with the native ntdll, unless the split was asked for.
+    /// Natively there is no compact space. (A process that inherits a space,
+    /// a fork or an exec in the same memory, keeps its parent's.)
+    pub fn compact64(&self) -> bool {
+        self.page && self.flags & program_flags::GUEST_X86_64 != 0 && !self.mem64 && !self.split && self.native_ntdll
+    }
+
+    /// 32-bit Wine's KUSER_SHARED_DATA fold: an i386 Wine that maps the page
+    /// at `gex_abi::WINE32_KUSER`; the compact space folds it too.
+    pub fn kuser_fold(&self) -> bool {
+        self.compact64()
+            || self.flags & program_flags::GUEST_I386 != 0 && self.flags & program_flags::KUSER_WINE32 != 0
+    }
+
+    /// Set this process's flavour (before its first unit key), as the shims
+    /// do when the process starts; [`flavour_switches`] then names it.
+    pub fn apply(&self) {
+        if self.mem64 {
+            gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64);
+        }
+        if self.kuser_fold() {
+            gex_abi::set_kuser_fold(true);
+        }
+        if self.compact64() {
+            gex_abi::set_kuser_fold_entry(true);
+        }
+    }
+}
+
 /// Store an i386 program's general-purpose registers to the low 32 bits of
 /// their 64-bit context slots (3-4% of the wasm of one game's large hot
 /// functions). Exact because every other writer of those slots

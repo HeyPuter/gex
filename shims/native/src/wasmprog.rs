@@ -43,18 +43,18 @@ pub(crate) fn is_wasm32(program: &Program) -> bool {
 
 /// Header flag (offset 36): the program runs i386 code (32-bit Wine), so the
 /// process translates i386 and leaves Windows' fixed addresses free.
-pub const FLAG_GUEST_I386: u32 = 1;
+pub const FLAG_GUEST_I386: u32 = gex_cgen::image::program_flags::GUEST_I386;
 /// Header flag: the program runs x86-64 code (64-bit native Wine). It
 /// shares 32-bit Wine's address space and trampoline
 /// page ([`FLAG_WINDOWS_SPACE`]), never its i386 decoding.
-pub const FLAG_GUEST_X86_64: u32 = 2;
+pub const FLAG_GUEST_X86_64: u32 = gex_cgen::image::program_flags::GUEST_X86_64;
 /// The flags whose process leaves Windows' fixed addresses free and gets
 /// the trampoline page.
 pub const FLAG_WINDOWS_SPACE: u32 = FLAG_GUEST_I386 | FLAG_GUEST_X86_64;
 /// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
 /// `gex_abi::WINE32_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
 /// the process folds Windows' constant addresses there.
-pub const FLAG_KUSER_WINE32: u32 = 4;
+pub const FLAG_KUSER_WINE32: u32 = gex_cgen::image::program_flags::KUSER_WINE32;
 
 /// Header flag, with [`FLAG_GUEST_I386`]: the program's i386 code is its
 /// own (a JIT's, gexcc -fgex-guest-i386), not Windows': the process keeps
@@ -62,22 +62,10 @@ pub const FLAG_KUSER_WINE32: u32 = 4;
 /// of its calls into the guest).
 pub const FLAG_LINUX_SPACE: u32 = 8;
 
-/// The header's flags, 0 for a program without them (or not wasm32).
+/// The header's flags, 0 for a program without them (or not wasm32)
+/// (`gex_cgen::image::program_flags`, read the same way for `gexc cgen-flavour`).
 pub(crate) fn flags(program: &Program) -> u32 {
-    let at = program.exe.entry.wrapping_sub(0x40);
-    program
-        .exe
-        .segments
-        .iter()
-        .find(|s| at >= s.vaddr && at + 40 <= s.vaddr + s.bytes.len() as u64)
-        .map(|s| {
-            let o = (at - s.vaddr) as usize;
-            if &s.bytes[o..o + 8] != MAGIC {
-                return 0;
-            }
-            u32::from_le_bytes(s.bytes[o + 36..o + 40].try_into().unwrap())
-        })
-        .unwrap_or(0)
+    gex_cgen::image::program_flags::of(&program.exe)
 }
 
 /// Whether `wasm` imports a memory that is not a 64-bit one.

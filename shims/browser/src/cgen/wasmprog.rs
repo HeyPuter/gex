@@ -118,14 +118,10 @@ pub(super) static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic
 pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
 /// Header flag (offset 36): the program runs i386 code (Wine, 32-bit Wine).
-const FLAG_GUEST_I386: u32 = 1;
+const FLAG_GUEST_I386: u32 = gex_cgen::image::program_flags::GUEST_I386;
 /// Header flag: the program runs x86-64 code (64-bit native Wine, 64-bit Wine). It
 /// shares 32-bit Wine's address-space split and trampoline page.
-const FLAG_GUEST_X86_64: u32 = 2;
-/// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
-/// `gex_abi::WINE32_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
-/// the process folds Windows' constant addresses there (`winspace::wine32_kuser`).
-const FLAG_KUSER_WINE32: u32 = 4;
+const FLAG_GUEST_X86_64: u32 = gex_cgen::image::program_flags::GUEST_X86_64;
 /// Header flag, with [`FLAG_GUEST_I386`]: the program's i386 code is its own
 /// (a JIT's, gexcc -fgex-guest-i386), not Windows': Linux's address space,
 /// only the trampoline page added (the return pad of its calls into the
@@ -275,11 +271,16 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // core's, which asks gex where KUSER_SHARED_DATA is; with another
         // ntdll, the split. Not in a process that has its space already (an
         // exec in the same memory keeps it).
-        let compact64 = flags & FLAG_GUEST_X86_64 != 0
-            && !gex_abi::mem64()
-            && !crate::winspace::split_asked()
-            && crate::winspace::windows_space() == 0
-            && wine64_native_ntdll(&crate::sigs::proc_home().exe());
+        // (`gex_cgen::image::ProcessFlavour`: what `gexc cgen-flavour --page` names)
+        let fresh = crate::winspace::windows_space() == 0;
+        let pf = gex_cgen::image::ProcessFlavour {
+            page: true,
+            flags,
+            mem64: gex_abi::mem64(),
+            split: crate::winspace::split_asked(),
+            native_ntdll: fresh && flags & FLAG_GUEST_X86_64 != 0 && wine64_native_ntdll(&crate::sigs::proc_home().exe()),
+        };
+        let compact64 = fresh && pf.compact64();
         if flags & FLAG_GUEST_X86_64 != 0 && !compact64 {
             crate::winspace::set_wine_split(true);
         }
@@ -288,7 +289,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         } else {
             crate::winspace::wine32_space().map_err(|e| format!("wine32: {e}"))?
         };
-        if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_WINE32 != 0 {
+        if flags & FLAG_GUEST_I386 != 0 && pf.kuser_fold() {
             crate::winspace::wine32_kuser();
         }
         {
