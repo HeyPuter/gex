@@ -389,7 +389,7 @@ export class System extends EventTarget {
       },
     });
     this.#sys = {
-      host, kernel, term, rt, compositor, wlChannel: dev.wlChannel,
+      host, kernel, term, rt, compositor, wlChannel: dev.wlChannel, lazyCache,
       // Pid 1 is the kernel's: each process starts here, a child of it, from
       // its exec record (host.mjs `spawnExec`).
       spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
@@ -527,7 +527,11 @@ export class System extends EventTarget {
    *  pid 1; then the kernel's stacks handed to the processes' host (gex.mjs
    *  `kernelStacks`). */
   async #start(s, layers, records, fsi, started = null) {
-    const k = started ?? await Kernel.start({ module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control });
+    // Its reads of lazy files as a process's: by the page's owner of them,
+    // or a rest bundle's with a decoder of its own (kernel-worker.js).
+    const k = started ?? await Kernel.start({
+      module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache: s.lazyCache ?? null,
+    });
     this.#kernel = k;
     this.#files = new Files(k);
     this.#changes = new Changes(k, this.#files);

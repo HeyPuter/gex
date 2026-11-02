@@ -94,6 +94,15 @@ export default async function (t) {
     return;
   }
 
+  // A file of the rest bundle read by the page itself (the kernel-call
+  // Worker's lazy reads): the smallest, whole.
+  const lazyList = params.lazy ? await (await fetch(at(params.lazy))).json() : null;
+  const rest = (lazyList?.files ?? []).filter(([, size, rel]) => String(rel).includes('#') && size > 0).sort((a, b) => a[1] - b[1])[0];
+  if (rest) {
+    const got = await fs.readFile(rest[0]).then((b) => b.length, (e) => e.message);
+    eq(`the page reads ${rest[0]} from the rest bundle`, got, rest[1]);
+  }
+
   const env = Object.fromEntries((nt.env ?? []).map((e) => [e.slice(0, e.indexOf('=')), e.slice(e.indexOf('=') + 1)]));
   Object.assign(env, hw.env);
   const p = sys.spawn([nt.exe, ...(nt.argv ?? [])], { env, cwd: nt.cwd ?? '/' });

@@ -72,6 +72,14 @@ function batch(k, mem) {
 /** Run `list` on the kernel's exports `k`, with `mem` its scratch process
  *  memory; every argument is laid out after the last, so what a call wrote
  *  is still there when the batch is done. */
+/** Whether the batches read a file's bytes (`k_fs_read`): a lazy file's may
+ *  come from a rest bundle, whose frames need the zstd decoder
+ *  (lazy-fetch.mjs `lazyReady`), loaded before the read, as it cannot be
+ *  waited for in the middle of one. */
+export function readsFiles(groups) {
+  return groups.some((list) => list.some((c) => c.f === 'k_fs_read'));
+}
+
 export function runCalls(k, mem, list) {
   const b = batch(k, mem);
   for (const c of list) {

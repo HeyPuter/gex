@@ -46,7 +46,8 @@
 // `[result, bytes]` on the port `reply`.
 
 import { enableSingle, sched } from '../../../shims/browser/js/single.mjs';
-import { runCallsAsync } from './kernel-calls.js';
+import { runCallsAsync, readsFiles } from './kernel-calls.js';
+import { lazyReady } from '../../../shims/browser/js/lazy-fetch.mjs';
 import { Sockets, pageRelay } from '../../src/net.js';
 import { setPageFsAsk } from '../../../shims/browser/js/page-fs.mjs';
 
@@ -81,6 +82,8 @@ setPageFsAsk((req, cap) => new Promise((resolve) => {
 
 const words = () => new Int32Array(kernel.memory.buffer);
 let callsDone = Promise.resolve();
+// The lazy files are in a rest bundle, its decoder not yet loaded (`calls`).
+let restBundle = false;
 let audioTimer = 0;
 
 /** The audio rings at `at` (shims/kernel/src/audio.rs), kept in the page's
@@ -178,6 +181,7 @@ async function load(globals, arch) {
 
 const ops = {
   async start({ spec: { globals, arch, host: hostOpts, wl, gl } }) {
+    restBundle = !!hostOpts?.restBundle;
     // Begun by `prepare` when the page knew the architecture early, else now.
     if (loading && loadedArch !== arch) throw new Error(`the runtime was loaded for ${loadedArch}, and the system starts on ${arch}`);
     const rt = await (loading ??= load(globals, arch));
@@ -267,6 +271,13 @@ const ops = {
   // the page's instance has one stack, so one batch at a time.
   calls({ groups }) {
     const run = async () => {
+      // A rest bundle's decoder before the page's first read of a file's
+      // bytes, which may come before any process loaded it (gex.mjs).
+      if (restBundle && readsFiles(groups)) {
+        restBundle = false;
+        globalThis.GEX_REST_BUNDLE = 1;
+        await lazyReady();
+      }
       const value = [];
       const transfer = [];
       for (const list of groups) {

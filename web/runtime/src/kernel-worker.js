@@ -30,7 +30,9 @@
 // with one per call made, or `{ call, error }`.
 
 import { helperKernel } from '../../src/kernel-helper.js';
-import { runCalls } from './kernel-calls.js';
+import { runCalls, readsFiles } from './kernel-calls.js';
+import { lazyReady } from '../../../shims/browser/js/lazy-fetch.mjs';
+import { setLazyCache } from '../../../shims/browser/js/lazy-cache.mjs';
 
 // Under Node, the parent's port once node:worker_threads is in (below; no
 // top-level await, which a bundler's classic-script Worker cannot hold).
@@ -39,14 +41,26 @@ const post = (m, transfer) => port.postMessage(m, transfer ?? []);
 
 let k = null;
 let mem = null;
+// The lazy files are in a rest bundle (`spec.restBundle`): its decoder,
+// loaded at the first batch that reads a file, as a process's Worker loads
+// its own at its start. None where the page's lazy-file owner reads them
+// (`spec.lazyCache`), as for a process's.
+let rest = false;
 
 const ops = {
   async start({ spec }) {
+    if (spec.lazyCache) setLazyCache(spec.lazyCache);
+    rest = !!spec.restBundle;
     ({ k, mem } = await helperKernel(spec, 0, 32));
     // Its exports' names: what this kernel build has.
     return { value: Object.keys(k).filter((n) => typeof k[n] === 'function') };
   },
-  calls({ groups }) {
+  async calls({ groups }) {
+    if (rest && readsFiles(groups)) {
+      rest = false;
+      globalThis.GEX_REST_BUNDLE = 1;
+      await lazyReady();
+    }
     const value = [];
     const transfer = [];
     for (const list of groups) {

@@ -46,7 +46,7 @@ export class Kernel {
   #single = false;
   #seen = 0;
 
-  /** A Worker with the kernel `spec` ({ module, memory, pageFs }). */
+  /** A Worker with the kernel `spec` ({ module, memory, pageFs, restBundle, lazyCache }). */
   static async start(spec) {
     const k = new Kernel(await makeWorker(), spec.memory);
     k.#names = new Set(await k.#rpc('start', { spec }));
