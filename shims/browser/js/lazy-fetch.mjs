@@ -55,8 +55,11 @@ let sleeper = null;
 function nodeFetch(href, from, memory, dst, len) {
   const fs = globalThis.process?.env?.GEX_NODE_LAZY && globalThis.process.getBuiltinModule?.('node:fs');
   if (!fs) return -1;
+  // A slow link is a `--lazy` file's: a `--dir`'s large files are lazy only
+  // to spare the disk (run-node.mjs GEX_DIR_LAZY_ROOTS), and come at once.
   const ms = Number(globalThis.process.env.GEX_LAZY_DELAY_MS || 0);
-  if (ms > 0) Atomics.wait(sleeper ??= new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const roots = globalThis.process.env.GEX_DIR_LAZY_ROOTS;
+  if (ms > 0 && !(roots && roots.split('\n').some((r) => href.startsWith(`${r}/`)))) Atomics.wait(sleeper ??= new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   try {
     const fd = fs.openSync(href, 'r');
     try {
