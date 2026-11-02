@@ -11,6 +11,8 @@ import { xOnDemand } from './x11.js';
  *  Worker goes as `{ comp }`, what comes back arrives as `comp-out` events
  *  (`listeners`), and its counters, which it cannot share, as copies. */
 async function relayed(canvas, scale, k, listeners) {
+  // gex-eject's `"compositor": false` builds drop it (runtime.js `openWayland`).
+  if (!(typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__)) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
   const { Compositor } = await import('../../../src/compositor.js');
   const mine = new Set();
   let stats = null;

@@ -54,6 +54,10 @@ import { setPageFsAsk } from '../../../shims/browser/js/page-fs.mjs';
 enableSingle();
 
 const post = (m, transfer) => globalThis.postMessage(m, transfer ?? []);
+// gex-eject's `"compositor": false` builds drop the scene compositor and the
+// GL device beside a DOM desktop (gpu-device.js), as runtime.js does: the
+// page's windows part asks for neither there.
+const COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__;
 
 let k = null;
 let mem = null;
@@ -223,8 +227,8 @@ const ops = {
         },
         send: () => {},
       };
-      if (gl) glr = (await import('../../src/gl-in-realm.js')).openGlInRealm(post);
-    } else if (wl) {
+      if (gl && COMPOSITOR) glr = (await import('../../src/gl-in-realm.js')).openGlInRealm(post);
+    } else if (wl && COMPOSITOR) {
       const { openCompositor } = await import('../../src/compositor-in-realm.js');
       comp = await openCompositor(wl.width, wl.height, wl.scale, (m, transfer) => post({ ev: 'comp-out', m }, transfer));
       compTimer = setInterval(() => post({ ev: 'comp-stats', stats: comp.stats() }), 500);
