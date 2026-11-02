@@ -88,9 +88,12 @@ export async function runPreset(term, {
     // `?xcache=1`: the translated code a load saved, restored before the
     // program runs.
     xcache: !!q.get('xcache') && q.get('xcache') !== '0',
+    // The architecture the page chose: the runtime loads while the files
+    // are laid out.
+    arch: guestArch(),
     // The page's own switches, as its URL or the library set them
-    // (page-env.js), and the architecture it chose.
-    debug: { ...Object.fromEntries(q), arch: guestArch() },
+    // (page-env.js).
+    debug: Object.fromEntries(q),
   });
   const i = sys[INTERNAL];
   // The runtime's routine lines stay as the page had them.

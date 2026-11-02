@@ -16,6 +16,9 @@
 //   start { spec: { globals, arch, host, wl, gl } }  the page's switches (its GEX_*
 //       globals, as `GEX_PAGE_SEARCH`), the guest's architecture, the
 //       processes' host's options; answered with the kernel's export names
+//   (and unanswered, before it: `{ prepare: { globals, arch } }`, the same
+//   switches and architecture, so the runtime loads while the page lays out
+//   its files)
 //   calls { groups }       kernel.js `calls`; answered with the wait slot's
 //       word too (`seq`), once the page has one
 //   slot { word }          the page's wait slot, by word index
@@ -145,26 +148,41 @@ function census() {
   post({ ev: 'census', pids: host?.pids ?? [], threads: host?.threads ?? 0, memory: kernel?.memory?.buffer?.byteLength ?? 0 });
 }
 
+/** The page's switches and the guest's architecture in, then the kernel,
+ *  shim and seed fetched and the kernel's first instance made: what `start`
+ *  needs before the page's devices and the processes' host. */
+let loading = null;
+let loadedArch = null;
+async function load(globals, arch) {
+  loadedArch = arch;
+  // The page's switches, as the default build's Workers get them.
+  Object.assign(globalThis, globals);
+  await import('../../src/page-env.js');
+  const q = new URLSearchParams(globalThis.GEX_PAGE_SEARCH ?? '');
+  const { setGlobals } = await import('../../src/page-globals.js');
+  setGlobals((name) => q.get(name), { arch });
+  // A fiber runs worker.mjs's code: it registers itself (single.mjs
+  // `registerWorkerMain`) as it loads.
+  const [, rt] = await Promise.all([import('../../../shims/browser/js/worker.mjs'), import('../../src/runtime.js')]);
+  // The shim and seed (the processes' host's) are fetched while the
+  // kernel is: one wait for the network, not two in turn.
+  const runtime = rt.loadRuntime();
+  runtime.catch(() => {});
+  [globalThis.__gexTso, kernel] = await Promise.all([rt.detectTso(), rt.loadKernel()]);
+  if (!kernel) throw new Error('the kernel would not load');
+  await runtime;
+  const { helperKernel } = await import('../../src/kernel-helper.js');
+  ({ k, mem } = await helperKernel(kernel, 0, 32, { suspending: true }));
+  return rt;
+}
+
 const ops = {
   async start({ spec: { globals, arch, host: hostOpts, wl, gl } }) {
-    // The page's switches, as the default build's Workers get them.
+    // Begun by `prepare` when the page knew the architecture early, else now.
+    if (loading && loadedArch !== arch) throw new Error(`the runtime was loaded for ${loadedArch}, and the system starts on ${arch}`);
+    const rt = await (loading ??= load(globals, arch));
+    // The page's switches as they are now: what the page set since.
     Object.assign(globalThis, globals);
-    await import('../../src/page-env.js');
-    const q = new URLSearchParams(globalThis.GEX_PAGE_SEARCH ?? '');
-    const { setGlobals } = await import('../../src/page-globals.js');
-    setGlobals((name) => q.get(name), { arch });
-    // A fiber runs worker.mjs's code: it registers itself (single.mjs
-    // `registerWorkerMain`) as it loads.
-    const [, rt] = await Promise.all([import('../../../shims/browser/js/worker.mjs'), import('../../src/runtime.js')]);
-    // The shim and seed (the processes' host's) are fetched while the
-    // kernel is: one wait for the network, not two in turn.
-    const runtime = rt.loadRuntime();
-    runtime.catch(() => {});
-    [globalThis.__gexTso, kernel] = await Promise.all([rt.detectTso(), rt.loadKernel()]);
-    if (!kernel) throw new Error('the kernel would not load');
-    await runtime;
-    const { helperKernel } = await import('../../src/kernel-helper.js');
-    ({ k, mem } = await helperKernel(kernel, 0, 32, { suspending: true }));
     // The scene compositor (the page's windows part asked for one): here,
     // beside the memories it reads; the page's half relays (`comp`).
     if (wl?.dom) {
@@ -343,6 +361,13 @@ globalThis.onmessage = async ({ data: m }) => {
   }
   // Its GL windows' canvases (gl-relay.js).
   if (m?.glc) return void (m.glc.stop ? glr?.stop() : glr?.canvas(m.glc));
+  // The page knows the guest's architecture before its files are ready:
+  // the runtime loads meanwhile (`start` then takes it).
+  if (m?.prepare) {
+    loading ??= load(m.prepare.globals, m.prepare.arch);
+    loading.catch(() => {});
+    return;
+  }
   if (m?.call === undefined) return;
   try {
     const { value, transfer, seq: s } = await ops[m.op](m);

@@ -11,11 +11,14 @@ export default async function (t) {
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/etc/hello': 'hello from addFiles\n' });
   check('a second System throws', (() => { try { new System(); return false; } catch (e) { return /one system/.test(e.message); } })());
+  check('an arch the runtime has none of throws', (() => { try { new System({ arch: 'mips' }); return false; } catch (e) { return e instanceof TypeError && /arch is one of x86, aarch64/.test(e.message); } })());
   check('a second Filesystem throws', (() => { try { new Filesystem(sys); return false; } catch { return true; } })());
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');
   say(`booted in ${(performance.now() - t0).toFixed(0)} ms`);
   eq('state', sys.state.phase, 'running');
+  // The architecture the run names (t.debug's), or the tree's.
+  if (t.arch) eq('describe() says the architecture', sys.describe().arch, t.arch);
 
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
   // Pid 1 is the kernel's: a program's parent, an orphan's, and named init.

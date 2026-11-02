@@ -25,6 +25,10 @@ export interface SystemOptions {
   units?: string | URL | { url: string | URL; require?: boolean };
   /** Keep translated code across loads (the origin's private file system). */
   xcache?: boolean;
+  /** The translated architecture the tree's programs are built for. Default:
+   *  read from the tree at boot. Given, the kernel and runtime load while the
+   *  page lays out its files. */
+  arch?: 'x86' | 'aarch64';
   /** Switches for debugging (`{ strace: 1 }`, `{ console: true }`, `{ log: '1' }`
    *  for the runtime's default lines); not a stable API. */
   debug?: Record<string, unknown>;

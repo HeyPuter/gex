@@ -41,6 +41,9 @@ const DEFAULT_BASE = () => (ASSETS === null ? new URL('/', globalThis.location?.
 /** Whether this page has made its system. */
 let made = false;
 
+/** The guest architectures a page may name (`arch`), as `describe()` says them. */
+const ARCHES = { x86: 'x86', aarch64: 'aarch64' };
+
 /** ELF's machine numbers, as the guest's programs are built for them. */
 const EM = { 62: 'x86', 183: 'aarch64' };
 
@@ -157,11 +160,12 @@ export class System extends EventTarget {
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
-  constructor({ baseUrl, units, xcache = false, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
+    if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
     made = true;
@@ -172,6 +176,7 @@ export class System extends EventTarget {
       files: baseUrl == null ? files : null,
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
       xcache: !!xcache,
+      arch: arch === undefined ? undefined : ARCHES[arch],
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the
@@ -297,6 +302,22 @@ export class System extends EventTarget {
     if (this.#opts.files) globalThis.GEX_ASSET_FILES = this.#opts.files;
     await import('../../src/page-env.js');
 
+    // An architecture the page names (`arch`): the kernel, shim and seed load
+    // while the files are got ready, not after the tree is read for one.
+    const given = this.#opts.arch ?? wantArch;
+    let kernelEarly = null;
+    if (given) {
+      const { setGlobals } = await import('../../src/page-globals.js');
+      setGlobals((name) => q.get(name), { arch: given });
+      const rt = await import('../../src/runtime.js');
+      if (SP_CODE && SINGLE) this.#earlyWorker?.postMessage({ prepare: { globals: rt.pageGlobals(), arch: given } });
+      // Not under Node, whose runtime is primed from files first (below).
+      else if (!(globalThis.process?.versions?.node && !globalThis.document)) {
+        kernelEarly = rt.loadKernel();
+        kernelEarly.catch(() => {});
+      }
+    }
+
     // The filesystem's layers and persistence's records (fs.js).
     const opts = { layers: [], records: [] };
     for (const fn of this.#beforeBoot) await fn(opts);
@@ -308,7 +329,7 @@ export class System extends EventTarget {
     // native packages to come) gets aarch64, Debian's arm64 being the usual
     // second architecture of a wasm32 tree, so apt can install them later.
     // A program of the other one does not run.
-    const arch = wantArch ?? (await layersArch(opts.layers)) ?? 'aarch64';
+    const arch = given ?? (await layersArch(opts.layers)) ?? 'aarch64';
     const { setGlobals } = await import('../../src/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
     const rt = await import('../../src/runtime.js');
@@ -321,7 +342,7 @@ export class System extends EventTarget {
     }
     this.#arch = arch;
     globalThis.__gexTso = await rt.detectTso();
-    const kernel = await rt.loadKernel();
+    const kernel = await (kernelEarly ?? rt.loadKernel());
     if (!kernel) throw new Error('the kernel would not load');
 
     // What the runtime says (the X server, Mesa), on the console.
