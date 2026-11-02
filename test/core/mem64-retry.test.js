@@ -7,7 +7,8 @@
 // (web/runtime/build.sh), its first fetch of the memory64 shim failing as a
 // dropped connection would; on the Node host a site laid out as gex's whose
 // memory64 shim is linked in only after the first failure.
-export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180 };
+export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180,
+  single: 'no memory64 in the single-thread package yet' };
 
 const WANT = `first: No such file or directory
 again at once: No such file or directory

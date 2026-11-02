@@ -41,6 +41,7 @@ const { values: o, positionals } = parseArgs({
     prebuilt: { type: 'boolean', default: false },
     prepare: { type: 'boolean', default: false },
     package: { type: 'string', default: process.env.GEX_TEST_PACKAGE },
+    single: { type: 'boolean', default: false },
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
@@ -49,6 +50,14 @@ const log = (s) => process.stderr.write(`[test] ${s}\n`);
 // built ones, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
 if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (web/runtime/build.sh DIR)`);
+// `--single`: the single-thread build. Its pages are served without
+// cross-origin isolation, so they have no SharedArrayBuffer: the runtime from
+// source runs that build, and so must a package (--package, as
+// `web/runtime/build.sh --single` builds @gex/runtime-single). Browser only.
+// A test the single-thread build cannot run yet says why in its meta
+// (`single: 'why'`) and is skipped.
+if (o.single && o.host === 'node') throw new Error('--single: the browser host only');
+if (o.single && o.host === 'both') o.host = 'browser';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** The /proc status (VmData, VmRSS, VmHWM; KiB) of the one Chromium
@@ -113,7 +122,7 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
   if (!images[name]) throw new Error(`no image ${name} (test/fixtures/images.mjs)`);
   const why = o.prebuilt
     ? (outputs[name] ?? []).every((f) => existsSync(join(WORK, f))) ? null : 'not in the work directory (--prebuilt)'
-    : await images[name](WORK).catch((e) => String(e?.message ?? e));
+    : await images[name](WORK, { single: o.single }).catch((e) => String(e?.message ?? e));
   if (why) {
     missing.set(name, why);
     log(`image ${name}: ${why}`);
@@ -167,6 +176,7 @@ async function runJob({ test, host, arch }) {
   // The package is built for the browser: its Workers are bundled for a
   // page, and under Node it would reach for its sources.
   if (PACKAGE && host === 'node') return { ...out, result: 'skip', skip: '--package runs on the browser host only' };
+  if (o.single && test.meta.single) return { ...out, result: 'skip', skip: `single-thread build: ${test.meta.single}` };
   const why = test.meta.images.map((n) => missing.get(n)).find(Boolean);
   if (why) return { ...out, result: 'skip', skip: why };
   const say = (line) => {
@@ -257,7 +267,7 @@ async function startBrowser() {
     appType: 'mpa',
     root: WEB,
     logLevel: 'warn',
-    server: { ...base.server, port: PORT, strictPort: true, host: '127.0.0.1', ...(PACKAGE && { fs: { ...base.server?.fs, allow: [...(base.server?.fs?.allow ?? []), PACKAGE] } }) },
+    server: { ...base.server, ...(o.single && { headers: {} }), port: PORT, strictPort: true, host: '127.0.0.1', ...(PACKAGE && { fs: { ...base.server?.fs, allow: [...(base.server?.fs?.allow ?? []), PACKAGE] } }) },
     plugins: [...(PACKAGE ? [{
       name: 'gex-test-package',
       enforce: 'pre',
@@ -270,8 +280,10 @@ async function startBrowser() {
         if (PACKAGE) s.middlewares.use(`/@fs${PACKAGE}/`, (req, res, next) => {
           const f = join(PACKAGE, decodeURIComponent(req.url.split('?')[0]));
           if (!f.startsWith(PACKAGE) || !existsSync(f) || !statSync(f).isFile()) return next();
-          res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          if (!o.single) {
+            res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+            res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          }
           const type = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' }[f.slice(f.lastIndexOf('.'))];
           if (type) res.setHeader('Content-Type', type);
           res.end(readFileSync(f));
@@ -279,6 +291,7 @@ async function startBrowser() {
         s.middlewares.use('/__t/', (req, res, next) => {
           const [path, query = ''] = req.url.split('?');
           const iso = () => {
+            if (o.single) return;
             res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
             res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
             res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');

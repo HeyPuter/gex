@@ -3,7 +3,7 @@
 // `__gexCompositor`) and an X client's window there, the X server started at
 // its first connection.
 import { setGlobals } from '../../web/src/page-globals.js';
-import { runProgram } from '../../web/src/runtime.js';
+import { runProgram } from '../../web/src/run.js';
 import { untar } from '../../web/src/tar.js';
 import { unzstd } from '../../web/src/zfetch.js';
 

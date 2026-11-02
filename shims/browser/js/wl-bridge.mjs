@@ -34,6 +34,7 @@
 // No locks -- one writer per word, and the compositor polls at frame rate.
 
 import { single, sched } from './single.mjs';
+import { SP_CODE } from './mode.mjs';
 
 /** Processes that can publish surfaces at once (a desktop shell has more
  *  than eight: winlogon, the desktop, explorer, its COM servers). */
@@ -606,7 +607,7 @@ function wakeBlock(channel, a, block) {
   if (q && slots && k) {
     notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
     // The single-thread build: the fibers parked on those words look.
-    if (single.on) sched.checkSlots();
+    if ((SP_CODE && single.on)) sched.checkSlots();
   } else if (q && slots && channel.arena instanceof SharedArrayBuffer) {
     // No kernel memory here: the relay's thread has it (`startWakeRelay`).
     Atomics.or(a, M_RELAY_BLOCKS, 1 << block);

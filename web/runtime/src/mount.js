@@ -53,7 +53,9 @@ function putStat(dv, at, st) {
 }
 
 /** The page's filesystems, its host calls, and the requests for them. One
- *  per system. */
+ *  per system. The default build's Workers ask over a shared control buffer
+ *  (page-fs.mjs); the single-thread build's system Worker, which has none,
+ *  hands each request over by message (`request`). */
 export class PageFsHost {
   #ctl;
   #i32;
@@ -71,17 +73,29 @@ export class PageFsHost {
   #answers = new Map();
   #nextAnswer = 1;
 
-  constructor(hostCall) {
+  constructor(hostCall, { shared = true } = {}) {
+    this.#hostCall = hostCall;
+    if (!shared) return;
     this.#ctl = makePageFsControl();
     this.#i32 = new Int32Array(this.#ctl);
     this.#u8 = new Uint8Array(this.#ctl);
-    this.#hostCall = hostCall;
     this.#serve();
   }
 
   /** What every Worker is handed (runtime.js `pageFs`). */
   get control() {
     return { ctl: this.#ctl };
+  }
+
+  /** One request's answer, `[result, bytes]`: a count, a handle or a
+   *  negated errno, and at most `cap` bytes. */
+  async request(req, cap) {
+    try {
+      const [result, out] = await this.#call(req);
+      return [result, out ? out.subarray(0, Math.min(out.length, cap)) : null];
+    } catch (e) {
+      return [errnoOf(e), null];
+    }
   }
 
   add(provider) {
@@ -97,7 +111,7 @@ export class PageFsHost {
   }
 
   #serve() {
-    if (this.#serving) return;
+    if (this.#serving || !this.#ctl) return;
     this.#serving = true;
     const loop = () => {
       this.#scan();

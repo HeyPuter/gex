@@ -8,7 +8,7 @@ import { HostWindows } from '../../web/runtime/src/windows/host.js';
 import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
 import { PointerLock } from '../../web/runtime/src/input.js';
 
-export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
+export const meta = { single: 'no windows yet', hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };
 
 

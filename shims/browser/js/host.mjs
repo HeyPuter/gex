@@ -24,6 +24,7 @@ function narrate(text) {
  * scraping, which fails open. See task 146.
  */
 import { single } from './single.mjs';
+import { SP_CODE } from './mode.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
@@ -320,7 +321,7 @@ export class ProcessHost {
   #outputAck(w) {
     // Fibers (the single-thread build) deliver in order through one queue,
     // and could not wait for an ack on the thread that delivers it anyway.
-    if (single.on || typeof SharedArrayBuffer === 'undefined') return undefined;
+    if ((SP_CODE && single.on) || typeof SharedArrayBuffer === 'undefined') return undefined;
     const a = new Int32Array(new SharedArrayBuffer(4));
     this.#outputAcks.set(w, a);
     return a.buffer;
@@ -1847,7 +1848,7 @@ export class ProcessHost {
         // Worker for its first thread, caught up with them meanwhile.
         const proc = String(pid).split(':')[0];
         this.#dropSpares(proc);
-        if (this.#foreign(proc) || !this.#extra?.shared || single.on) break;
+        if (this.#foreign(proc) || !this.#extra?.shared || (SP_CODE && single.on)) break;
         this.#spareRec.set(proc, m.spare);
         this.#threadsOf.set(proc, 0);
         this.#startSpare(proc);

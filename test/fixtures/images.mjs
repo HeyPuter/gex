@@ -9,7 +9,8 @@
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
-//   package  pkg/: the runtime package, web/runtime/build.sh.
+//   package  pkg/: the runtime package, web/runtime/build.sh (--single:
+//            @gex/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
 //            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
@@ -399,8 +400,11 @@ export const images = {
     return null;
   },
 
-  async package(work) {
-    execFileSync(join(ROOT, 'web/runtime/build.sh'), [join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+  // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
+  // @gex/runtime-single, which has no memory64 shim to leave out.
+  async package(work, { single = false } = {}) {
+    execFileSync(join(ROOT, 'web/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    if (single) return null;
     // A copy without the memory64 shim, for core/mem64-missing.
     const less = join(work, 'pkg-no-m64');
     rmSync(less, { recursive: true, force: true });

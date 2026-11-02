@@ -120,6 +120,40 @@ class DuplexWire {
   }
 }
 
+/** The page's network as a system Worker reaches it, the network staying
+ *  on the page: each connection asked for there (`post(m, transfer)`, the
+ *  page answering with `dialFor`), its streams transferred here.
+ *  `datagram`: whether the page's network has `datagram`. */
+export function pageRelay(post, { datagram }) {
+  const dial = (host, port, dgram) => new Promise((resolve, reject) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = ({ data }) => {
+      port1.close();
+      if (data.error) reject(new Error(data.error));
+      else resolve({ readable: data.readable, writable: data.writable });
+    };
+    post({ host, port, datagram: dgram, reply: port2 }, [port2]);
+  });
+  const relay = { connect: (host, port) => dial(host, port, false) };
+  if (datagram) relay.datagram = (host, port) => dial(host, port, true);
+  return relay;
+}
+
+/** The page's side of `pageRelay`: a connection of the page's network
+ *  `net` for request `m`, its streams handed to the Worker (transferred),
+ *  or why not. */
+export function dialFor(net, m) {
+  const reply = m.reply;
+  Promise.resolve()
+    .then(() => {
+      if (!net) throw new Error('no network');
+      if (m.datagram && typeof net.datagram !== 'function') throw new Error('no datagrams');
+      return m.datagram ? net.datagram(m.host, m.port) : net.connect(m.host, m.port);
+    })
+    .then(({ readable, writable }) => reply.postMessage({ readable, writable }, [readable, writable]),
+      (e) => reply.postMessage({ error: String(e?.message ?? e) }));
+}
+
 // `meter` counts what the network delivers; see `onmessage`.
 const meter = { n: 0, bytes: 0, last: 0 };
 

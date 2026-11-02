@@ -13,6 +13,7 @@ import { xcHash, xcRead } from '../../shims/browser/js/xcache.mjs';
 /** A saved translation cache's bytes by name (the runtime API's `xcache`). */
 export { xcRead };
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
+import { SP_CODE, MP_CODE } from '../../shims/browser/js/mode.mjs';
 import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { logNamed, logOn } from '../../shims/browser/js/log.mjs';
 import { startOptions } from '../../shims/browser/js/options.mjs';
@@ -225,6 +226,12 @@ export async function loadRuntime(onProgress) {
   if (!shimBytes) shimBytes = await fetchBytes(SHIM_URL(), onProgress);
   if (!seedBytes) seedBytes = await fetchBytes(SEED_URL());
   return { shimBytes, seedBytes };
+}
+
+/** The page's copies of the shim and seed, if it fetched them already
+ *  (`primeRuntime` for the system Worker). */
+export function loadedRuntime() {
+  return shimBytes ? { shimBytes, seedBytes } : undefined;
 }
 
 export { fetchBytes };
@@ -502,7 +509,7 @@ export async function loadKernel() {
   // too (which lets the terminal test drive this same file). The
   // single-thread build needs none: its kernel memory is plain, held by
   // every fiber.
-  if (typeof SharedArrayBuffer !== 'function' && !single.on) {
+  if (typeof SharedArrayBuffer !== 'function' && !(SP_CODE && single.on)) {
     kernelSpec = false;
     return null;
   }
@@ -521,7 +528,7 @@ export async function loadKernel() {
       memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
       // The empty process memories every Worker's instance imports for the
       // flavour it does not use, made once (lazy-fetch.mjs `spareMemories`).
-      spare: spareMemories(!single.on),
+      spare: spareMemories(!(SP_CODE && single.on)),
     };
   } catch {
     kernelSpec = false;
@@ -538,7 +545,8 @@ export async function loadKernel() {
  */
 async function guestWorkerFactory() {
   // The single-thread build: a process is a fiber of this realm.
-  if (single.on) return () => new FiberWorker();
+  if ((SP_CODE && single.on)) return () => new FiberWorker();
+  if (!MP_CODE) throw new Error('the single-thread build runs its processes as fibers (single.mjs)');
   if (typeof Worker === 'function') {
     // A guest Worker is made for the pool before it has a process, so its
     // name (what a profiler or trace lists its thread by) is a serial; the
@@ -586,7 +594,7 @@ async function guestWorkerFactory() {
  * has JSPI. A cross-origin isolated page keeps the Worker build.
  */
 export function singleMode() {
-  if (single.on) return true;
+  if ((SP_CODE && single.on)) return true;
   const want = flag('single');
   if (want === '0') return false;
   if (!singleSupported()) return false;
@@ -595,7 +603,7 @@ export function singleMode() {
 
 /** What of the page's state the system Worker needs: its query and every
  *  `GEX_*` switch the page set. */
-function pageGlobals() {
+export function pageGlobals() {
   const out = { GEX_PAGE_SEARCH: pageSearch() };
   for (const k of Object.keys(globalThis)) {
     if (!k.startsWith('GEX_')) continue;
@@ -606,135 +614,6 @@ function pageGlobals() {
   // names none of its own.
   if (globalThis.GEX_ASSET_FILES) out.GEX_ASSET_FILES = globalThis.GEX_ASSET_FILES;
   return out;
-}
-
-/**
- * `runProgram` for the single-thread build, from the page: the whole system
- * runs in one Worker (web/src/system-worker.js); this side holds the terminal
- * and forwards keys, sizes and output.
- */
-/** The system Worker's `net-dial` (system-worker.js `pageRelay`): a
- *  connection of the page's network `net`, its streams handed to the Worker
- *  (transferred), or why not. */
-function dialFor(net, m) {
-  const reply = m.reply;
-  Promise.resolve()
-    .then(() => {
-      if (!net) throw new Error('no network');
-      if (m.datagram && typeof net.datagram !== 'function') throw new Error('no datagrams');
-      return m.datagram ? net.datagram(m.host, m.port) : net.connect(m.host, m.port);
-    })
-    .then(({ readable, writable }) => reply.postMessage({ readable, writable }, [readable, writable]),
-      (e) => reply.postMessage({ error: String(e?.message ?? e) }));
-}
-
-async function runInSystemWorker(term, opts) {
-  // `onFilesLoaded` and `onSystem` are functions, which cannot cross to the
-  // Worker (nt.html passes `onSystem`: its every run failed to start here).
-  // So is `glSource` (app.js `mesaSource`), and it names the threaded Mesa's
-  // files besides: the system Worker fetches the single-thread one (st/).
-  const { network, onNetEvent, onFilesLoaded, onDesktop, onSystem, transfer, wl, wlInput, gl, hostX, preModules, closure, glSource, ...rest } = opts;
-  // Said once, so a person (and a test) can tell which build ran.
-  term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
-  // The compositor: a canvas only (not the DOM desktop), drawn by the system
-  // Worker, which holds every guest memory it reads pixels out of.
-  const canvas = typeof wl?.getContext === 'function' && typeof wl.transferControlToOffscreen === 'function' ? wl : null;
-  // GL: the compositor's own (`gl: 'compositor'`) runs in the system Worker
-  // beside it, the non-pthread Mesa (web/public/gex/st/); a page-side device
-  // does not exist there.
-  const glHere = gl === 'compositor' && !!canvas;
-  // The X server too: in the system Worker, beside the compositor.
-  const xHere = !!hostX && !!canvas;
-  if ((wl && !canvas) || (gl && !glHere) || (hostX && !xHere)) {
-    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && !xHere && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
-  }
-  const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module', name: 'system' });
-  globalThis.__gexSystemWorker = w;
-  const ready = new Promise((resolve, reject) => {
-    w.addEventListener('message', (e) => { if (e.data?.kind === 'ready') resolve(); });
-    w.addEventListener('error', (e) => reject(new Error(e.message || 'the system Worker failed to start')));
-  });
-  await ready;
-  // The compositor's page side (listeners, canvas size) talks to its worker
-  // half through the system Worker: `comp` messages in, `comp-out` back.
-  const compListeners = new Set();
-  let compStats = null;
-  const compPort = {
-    postMessage(m, transfer = []) {
-      if (m?.kind === 'init' && m.stats) compStats = new Int32Array(m.stats);
-      w.postMessage({ kind: 'comp', m }, transfer);
-    },
-    addEventListener(type, f) { if (type === 'message') compListeners.add(f); },
-    removeEventListener(type, f) { compListeners.delete(f); },
-    terminate() {},
-  };
-  w.addEventListener('message', (e) => {
-    const m = e.data;
-    if (m?.kind === 'comp-out') for (const f of [...compListeners]) f({ data: m.m });
-    else if (m?.kind === 'comp-stats' && compStats) compStats.set(m.stats.subarray(0, compStats.length));
-  });
-  let compositor = null;
-  if (canvas && GEX_COMPOSITOR) {
-    const { Compositor } = await import('./compositor.js');
-    // Before `run`: the Worker takes the canvas first, then starts the guest.
-    w.postMessage({ kind: 'comp-open', width: canvas.width, height: canvas.height });
-    compositor = await Compositor.create(canvas, null, wlInput || canvas, { makeWorker: () => compPort });
-    globalThis.__gexCompositor = compositor;
-  }
-  const keys = term.onData((data) => w.postMessage({ kind: 'key', data }));
-  const resize = term.onResize(({ rows, cols }) => w.postMessage({ kind: 'resize', rows, cols }));
-  term.focus?.();
-  try {
-    return await new Promise((resolve, reject) => {
-      w.addEventListener('message', (e) => {
-        const m = e.data;
-        if (m.kind === 'write') term.write(m.data);
-        else if (m.kind === 'net') onNetEvent?.(m.event);
-        else if (m.kind === 'net-dial') dialFor(network?.network, m);
-        else if (m.kind === 'done') resolve({ status: m.status, host: null, tenv: null });
-        else if (m.kind === 'failed') reject(Object.assign(new Error(m.message), { workerStack: m.stack }));
-      });
-      w.postMessage({
-        kind: 'run',
-        globals: pageGlobals(),
-        // Already fetched by the page (loadRuntime): copied, not
-        // fetched again by the Worker.
-        runtime: shimBytes ? { shimBytes, seedBytes } : undefined,
-        rows: term.rows,
-        cols: term.cols,
-        opts: {
-          ...rest,
-          // The page's network stays here; the Worker dials through it
-          // (`net-dial`, system-worker.js `pageRelay`).
-          netRelay: network?.network ? { datagram: typeof network.network.datagram === 'function' } : null,
-          pageHosts: network?.pageHosts,
-          wl: canvas ? { inRealm: true } : undefined,
-          gl: glHere ? 'compositor' : undefined,
-          hostX: xHere ? hostX : undefined,
-        },
-      });
-    });
-  } finally {
-    keys.dispose();
-    resize.dispose();
-    compositor?.stop();
-    w.terminate();
-  }
-}
-
-/**
- * Run one program, `opts.args[0]`, as pid 1 of a system of its own, its
- * terminal `term` (an xterm, or anything with its `write`, `onData`,
- * `onResize`, `rows` and `cols`): a preset over the runtime API
- * (run-program.js). The single-thread build runs the whole system in one
- * Worker (system-worker.js, `runSingle` there). Resolves `{ status }` when
- * the program ends.
- */
-export async function runProgram(term, opts) {
-  if (single.on) return runSingle(term, opts);
-  if (singleMode()) return runInSystemWorker(term, opts);
-  const { runPreset } = await import('./run-program.js');
-  return runPreset(term, opts);
 }
 
 /** `/dev/dsp`'s output, played from the first gesture on: a Worker's
@@ -756,11 +635,11 @@ export async function startXServer({ kernel, wlChannel, compositor, term, rootfu
   // The single-thread build: the server is a fiber of
   // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
   // waits suspend. The same messages, without a Worker between.
-  const xRoot = single.on ? '/gex/xwayland-st/' : '/gex/xwayland/';
+  const xRoot = (SP_CODE && single.on) ? '/gex/xwayland-st/' : '/gex/xwayland/';
   const xDir = assetUrl(xRoot);
   // Each file by itself: a bundler names them where it puts them.
   const xFile = (f) => new URL(assetFiles(xRoot)?.[f] ?? `${xDir}${f}`, location.href).href;
-  if (single.on) {
+  if ((SP_CODE && single.on)) {
     const { HostX } = await import('./hostx.js');
     let deliver = null;
     const hx = new HostX((m) => deliver?.({ data: m }));
@@ -772,6 +651,8 @@ export async function startXServer({ kernel, wlChannel, compositor, term, rootfu
       }),
       terminate() {},
     };
+  } else if (!MP_CODE) {
+    throw new Error('the single-thread build runs its X server in its system Worker');
   } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module', name: 'xwayland' });
   // Waited for below: a guest that starts before the display is listening
   // gets "Can't open display" and dies, and the display here is a name in the
@@ -938,8 +819,8 @@ export async function makeProcessHost({
     netChannel: netChannel ?? undefined,
     // The single-thread build's fibers share this realm, and so the
     // page's sockets themselves.
-    pageNet: single.on ? network ?? undefined : undefined,
-    pageHosts: netChannel || single.on ? undefined : network?.pageHosts,
+    pageNet: (SP_CODE && single.on) ? network ?? undefined : undefined,
+    pageHosts: netChannel || (SP_CODE && single.on) ? undefined : network?.pageHosts,
     winsize,
     // Every guest write mirrored to the console and a crash narrated where it
     // happens, since a Worker that falls over takes its last messages with it.
@@ -1144,12 +1025,12 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
 }
 
 /**
- * The single-thread build's run, in its system Worker (single.on): pid 1
+ * The single-thread build's run, in its system Worker ((SP_CODE && single.on)): pid 1
  * loads the program and its files itself, the terminal is the page's line
  * discipline. Only the single-thread build has it; every other page runs
  * through the runtime API (run-program.js).
  */
-async function runSingle(
+export async function runSingle(
   term,
   {
     elf,
@@ -1338,7 +1219,7 @@ async function runSingle(
   let glChannel = null;
   let glServe = null;
   let startGl = null;
-  if (gl && single.on) {
+  if (gl && (SP_CODE && single.on)) {
     // The single-thread build: no ring. Each process's `gl_submit` calls the
     // compositor's Mesa in this realm on its own memory (compositor-worker.js
     // `glInRealm`), started by the system Worker.

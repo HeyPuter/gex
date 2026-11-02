@@ -90,26 +90,8 @@ async function openCompositor(width, height) {
   };
 }
 
-/** The page's network (README "Network"), which stays on the page: each
- *  connection asked for there (runtime.js `dialFor`), its streams
- *  transferred here. */
-function pageRelay({ datagram }) {
-  const dial = (host, port, dgram) => new Promise((resolve, reject) => {
-    const { port1, port2 } = new MessageChannel();
-    port1.onmessage = ({ data }) => {
-      port1.close();
-      if (data.error) reject(new Error(data.error));
-      else resolve({ readable: data.readable, writable: data.writable });
-    };
-    self.postMessage({ kind: 'net-dial', host, port, datagram: dgram, reply: port2 }, [port2]);
-  });
-  const relay = { connect: (host, port) => dial(host, port, false) };
-  if (datagram) relay.datagram = (host, port) => dial(host, port, true);
-  return relay;
-}
-
 self.onmessage = async (ev) => {
-  const { runProgram, primeRuntime } = await loaded;
+  const { runSingle, primeRuntime } = await loaded;
   const m = ev.data;
   if (m.kind === 'comp-open') comp = openCompositor(m.width, m.height);
   else if (m.kind === 'comp') {
@@ -148,15 +130,16 @@ self.onmessage = async (ev) => {
         }
       } else delete opts.gl;
       if (opts.netRelay || opts.pageHosts) {
-        const { Sockets } = await import('./net.js');
-        const net = new Sockets(opts.netRelay ? pageRelay(opts.netRelay) : null,
+        const { Sockets, pageRelay } = await import('./net.js');
+        const dial = (m, t) => self.postMessage({ kind: 'net-dial', ...m }, t);
+        const net = new Sockets(opts.netRelay ? pageRelay(dial, opts.netRelay) : null,
           { pageHosts: opts.pageHosts ?? null, onEvent: (e) => self.postMessage({ kind: 'net', event: e }) });
         opts.network = net;
       }
       delete opts.netRelay;
       delete opts.pageHosts;
       opts.onNetEvent = (e) => self.postMessage({ kind: 'net', event: e });
-      const { status } = await runProgram(term, opts);
+      const { status } = await runSingle(term, opts);
       self.postMessage({ kind: 'done', status });
     } catch (e) {
       self.postMessage({ kind: 'failed', message: e?.message ?? String(e), stack: e?.stack ?? '' });

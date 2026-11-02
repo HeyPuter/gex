@@ -10,9 +10,20 @@
 # or through its own bundler, with nothing else to do; `new System({ baseUrl
 # })` takes the files from a directory of the page's instead.
 #
-#   web/runtime/build.sh DIR
+#   web/runtime/build.sh [--single] DIR
+#
+# Two packages, one build each. @gex/runtime (the default) is for a
+# cross-origin isolated page: SharedArrayBuffer, a Worker per guest thread.
+# @gex/runtime-single (--single) is for a page without SharedArrayBuffer:
+# the system in one Worker, every guest thread a fiber of it (JSPI), its GL
+# the single-thread Mesa (gex/st/). Each carries only its own code: the
+# build's shims/browser/js/mode.mjs says which (SP_CODE, MP_CODE), the
+# bundler drops the other's branches, and a chunk nothing names any more is
+# deleted.
 set -e
-OUT=$(realpath -m "${1:?usage: web/runtime/build.sh DIR}")
+MODE=mp
+[ "${1:-}" != --single ] || { MODE=sp; shift; }
+OUT=$(realpath -m "${1:?usage: web/runtime/build.sh [--single] DIR}")
 RT=$(cd "$(dirname "$0")" && pwd)
 WEB=$(dirname "$RT")
 PUB=$WEB/public/gex
@@ -55,7 +66,9 @@ done
 # An x86 guest's memory64 shim and seed (runtime.js: a process with
 # GEX_MEM64 or user.gex.mem64, as 64-bit Wine's programs over 4 GiB run),
 # beside its wasm32 one; the kernel serves both.
-if [ -f "$G/gex_browser.x86.shared.wasm" ]; then
+# The single-thread build runs one memory flavour: a program that asks for
+# the other fails to exec (ENOENT), so it has no memory64 runtime.
+if [ $MODE = mp ] && [ -f "$G/gex_browser.x86.shared.wasm" ]; then
     for f in gex_browser.x86.m64.shared.wasm seed.x86.m64.shared.wasm; do
         [ -f "$PUB/$f" ] || { echo "web/runtime/build.sh: no $PUB/$f: an x86 process with GEX_MEM64 would not start (GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh)" >&2; exit 1; }
         cp "$PUB/$f" "$G/$f"
@@ -68,20 +81,26 @@ cp "$PUB/cgen/providers/"*.wasm "$G/cgen/providers/"
 strip_wasm "$G/cgen/providers/"*.wasm
 # The guest GL's replay of WebGPU (gl.js MesaGl: gex-wgpu-replay.js and its
 # wasm, the deferred part fetched after the start).
+# The guest GL's Mesa: the pthread build, or the single-thread one (st/).
+MESA=$PUB MESAG=$G
+[ $MODE = mp ] || { MESA=$PUB/st MESAG=$G/st; mkdir -p "$MESAG"; }
 for f in gex-wgpu-replay.js gex-wgpu-replay.wasm gex-wgpu-replay.deferred.wasm; do
-    [ ! -f "$PUB/$f" ] || cp "$PUB/$f" "$G/$f"
-    case $f in *.wasm) [ ! -f "$G/$f" ] || strip_wasm "$G/$f" ;; esac
+    [ ! -f "$MESA/$f" ] || cp "$MESA/$f" "$MESAG/$f"
+    case $f in *.wasm) [ ! -f "$MESAG/$f" ] || strip_wasm "$MESAG/$f" ;; esac
 done
-[ -f "$PUB/gex-wgpu-replay.js" ] || echo "web/runtime/build.sh: no $PUB/gex-wgpu-replay.js: MesaGl will not start" >&2
+[ -f "$MESA/gex-wgpu-replay.js" ] || echo "web/runtime/build.sh: no $MESA/gex-wgpu-replay.js: MesaGl will not start" >&2
 # The X server (runtime.js startXServer: gex/xwayland/),
 # web/build-xwayland-wasm.sh's. The single-thread build's (xwayland-st) is
 # not the package's: a system needs SharedArrayBuffer.
-if [ -f "$PUB/xwayland/Xwayland.mjs" ]; then
-    mkdir -p "$G/xwayland"
-    for f in Xwayland.mjs Xwayland.wasm gexhostwl.wasm gex.xkm; do cp "$PUB/xwayland/$f" "$G/xwayland/$f"; done
-    strip_wasm "$G/xwayland/"*.wasm
+# The X server: the pthread build, or the single-thread one (xwayland-st/).
+XW=xwayland
+[ $MODE = mp ] || XW=xwayland-st
+if [ -f "$PUB/$XW/Xwayland.mjs" ]; then
+    mkdir -p "$G/$XW"
+    for f in Xwayland.mjs Xwayland.wasm gexhostwl.wasm gex.xkm; do cp "$PUB/$XW/$f" "$G/$XW/$f"; done
+    strip_wasm "$G/$XW/"*.wasm
 else
-    echo "web/runtime/build.sh: no $PUB/xwayland (web/build-xwayland-wasm.sh): X11 programs will not start" >&2
+    echo "web/runtime/build.sh: no $PUB/$XW (web/build-xwayland-wasm.sh): X11 programs will not start" >&2
 fi
 
 # Their list (src/runtime-files.js), each by its own new URL(...,
@@ -94,10 +113,16 @@ fi
   process.stdout.write("export default {\n" + lines.map((p) => `  ${q(p)}: new URL(${q("./" + p)}, import.meta.url).href,\n`).join("") + "};\n");
 ' > "$STAGE/runtime-files.js"
 
+# This package's mode (shims/browser/js/mode.mjs), in that module's place.
+if [ $MODE = mp ]; then SP_CODE=false MP_CODE=true; else SP_CODE=true MP_CODE=false; fi
+printf 'export const SP_CODE = %s;\nexport const MP_CODE = %s;\n' $SP_CODE $MP_CODE > "$STAGE/mode.mjs"
+
 cat > "$CONFIG" <<CFG
 import base from '$WEB/vite.config.js';
+const mode = { name: 'gex-mode', enforce: 'pre', resolveId: (source) => /(^|\/)mode\.mjs\$/.test(source) ? '$STAGE/mode.mjs' : null };
 export default {
   ...base,
+  plugins: [...(base.plugins ?? []), mode],
   root: '$WEB',
   // Relative, so the package works wherever it is served from.
   base: './',
@@ -117,7 +142,11 @@ export default {
   // A Worker's build lists none of them (src/runtime-files.js as it is): the
   // system Worker takes the page's list (runtime.js pageGlobals), and a
   // second list would be a second copy of every file.
-  worker: { ...base.worker, plugins: () => [{ name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;' : null }],
+  // Nor any Worker runProgram's preset (run-program.js), which is the page's:
+  // through it a Worker's build would take in System and its Workers again,
+  // a cycle vite refuses (the single-thread system Worker takes in runtime.js).
+  worker: { ...base.worker, plugins: () => [mode, { name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;'
+              : id === '$WEB/src/run-program.js' ? 'export function runPreset() { throw new Error("runProgram runs on the page"); }' : null }],
             // Each Worker one file, with no imports: a page's bundler builds a
             // Worker as a classic script by default (vite's iife), which
             // cannot import a chunk.
@@ -167,6 +196,24 @@ if (!files) throw new Error('web/runtime/build.sh: none of the runtime files fou
 console.log(`web/runtime/build.sh: ${workers} Workers, ${files} files written for a bundler`);
 JS
 
+# A chunk or Worker of the other mode's code: built, since the bundler takes
+# every Worker and import() it meets, but named by nothing once the other
+# mode's branches are gone. Deleted, so the package carries none of it.
+node - "$OUT" <<'JS'
+const fs = require('fs'), path = require('path');
+const out = process.argv[2];
+const code = fs.readdirSync(out).filter((f) => /\.(mjs|js)$/.test(f));
+const entries = code.filter((f) => !/-[A-Za-z0-9_-]{8}\.(mjs|js)$/.test(f));
+const seen = new Set(entries), todo = [...entries];
+while (todo.length) {
+  const s = fs.readFileSync(path.join(out, todo.pop()), 'utf8');
+  for (const f of code) if (!seen.has(f) && s.includes(f)) { seen.add(f); todo.push(f); }
+}
+const gone = code.filter((f) => !seen.has(f));
+for (const f of gone) fs.rmSync(path.join(out, f));
+console.log(`web/runtime/build.sh: ${gone.length} chunks of the other mode deleted${gone.length ? `: ${gone.join(' ')}` : ''}`);
+JS
+
 # wisp-js is in net-wisp.mjs alone: a page that imports only the runtime
 # (index.mjs and every file it reaches, by import or by URL) carries none of
 # it. Its marker is a string the client's own code has and gex's does not.
@@ -192,11 +239,13 @@ console.log(`web/runtime/build.sh: wisp-js only in net-wisp.mjs; none in the ${r
 JS
 
 VERSION=$(cd "$WEB" && node -p "require('./package.json').version ?? '0.0.0'" 2>/dev/null || echo 0.0.0)
+NAME=@gex/runtime DESC="Linux programs in the browser: a kernel, the programs it runs, and their files"
+[ $MODE = mp ] || NAME=@gex/runtime-single DESC="Linux programs in the browser, on a page without SharedArrayBuffer: a kernel, the programs it runs, and their files"
 cat > "$OUT/package.json" <<PKG
 {
-  "name": "@gex/runtime",
+  "name": "$NAME",
   "version": "$VERSION",
-  "description": "Linux programs in the browser: a kernel, the programs it runs, and their files",
+  "description": "$DESC",
   "license": "AGPL-3.0-only",
   "repository": { "type": "git", "url": "git+https://github.com/HeyPuter/gex.git", "directory": "web/runtime" },
   "homepage": "https://github.com/HeyPuter/gex/tree/master/web/runtime#readme",
@@ -255,20 +304,20 @@ ZSTD=$(in_pkg 'zstddec*')
 ZSTDW=$(in_pkg 'zstddec*.wasm')
 PROV=$(in_pkg 'glibc_printf*.wasm' 'glibc_malloc*.wasm' 'crt_heap*.wasm')
 if [ -n "$REPLAY" ]; then
-    L=$PUB/licenses
+    L=$MESA/licenses
     section "Mesa" "$REPLAY" "Mesa's docs/license.rst and licenses/" "$L/mesa/license.rst" "$L/mesa/MIT" "$L/mesa/Apache-2.0" "$L/mesa/BSL-1.0" "$L/mesa/SGI-B-2.0"
     section "Dawn and Tint" "$REPLAY" "Dawn's LICENSE" "$L/dawn/LICENSE"
     section "emdawnwebgpu" "$REPLAY" "emdawnwebgpu's webgpu_cpp/LICENSE" "$L/emdawnwebgpu/LICENSE"
 fi
 if [ -n "$XWL" ]; then
-    L=$PUB/xwayland/licenses
+    L=$PUB/$XW/licenses
     section "Xwayland (the X.Org X server)" "$XWL" "xserver's COPYING" "$L/xserver"
     section "libwayland" "$XWL" "wayland's COPYING" "$L/wayland"
     for n in pixman libxcvt libxtrans libXau libfontenc libXfont2 libxkbfile zlib; do
         section "$n" "$XWL" "$n's licence file" "$L/$n"
     done
 fi
-[ -z "$XKM" ] || section "xkeyboard-config" "$XKM" "the build host's xkeyboard-config copyright" "$PUB/xwayland/licenses/xkeyboard-config"
+[ -z "$XKM" ] || section "xkeyboard-config" "$XKM" "the build host's xkeyboard-config copyright" "$PUB/$XW/licenses/xkeyboard-config"
 EMLIB=
 if [ -n "$REPLAY$XWL$ZSTDW$PROV" ]; then
     command -v emcc > /dev/null || { echo "web/runtime/build.sh: no emcc: Emscripten's licences" >&2; exit 1; }

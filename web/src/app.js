@@ -19,9 +19,11 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
+import { SP_CODE } from '../../shims/browser/js/mode.mjs';
 import { zstdLoader } from './zstd-loader.js';
 import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browser/js/lazy-cache.mjs';
-import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
+import { globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
+import { runProgram } from './run.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 import { noRegSave } from './wine-env.js';
@@ -407,7 +409,7 @@ async function begin(opts, base, at, state, meter) {
     } catch { /* the URL, then */ }
   }
 
-  if (!globalThis.crossOriginIsolated && !singleMode()) {
+  if (!globalThis.crossOriginIsolated && !(SP_CODE && singleMode())) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
   }
   // A lazy GL needs WebGPU only once a program asks for it, and fails then
@@ -728,7 +730,7 @@ async function begin(opts, base, at, state, meter) {
   // the owner would write each read's bytes into this page's kernel memory.
   let lazyCache = null;
   const lazyVersions = Object.fromEntries(lazy.map(([path, size, url]) => [url, lazyVersion(size, lazyMtimes[path])]));
-  if (lazy.length && typeof SharedArrayBuffer === 'function' && !singleMode() && sw.lazycache !== '0') {
+  if (lazy.length && typeof SharedArrayBuffer === 'function' && !(SP_CODE && singleMode()) && sw.lazycache !== '0') {
     const k = await globalKernel();
     if (k?.memory) {
       const ctl = lazyCacheControl();

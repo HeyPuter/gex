@@ -189,7 +189,9 @@ export class Filesystem extends EventTarget {
   }
 
   #host() {
-    return this.#sys.pageFs();
+    const h = this.#sys.pageFs();
+    if (!h) throw new Error('mount: this system serves no page directories');
+    return h;
   }
 
   /**

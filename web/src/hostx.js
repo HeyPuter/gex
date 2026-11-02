@@ -31,6 +31,7 @@ import { isZstd, unzstd } from './zfetch.js';
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { pageFs } from '../../shims/browser/js/page-fs.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
+import { SP_CODE } from '../../shims/browser/js/mode.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;
@@ -791,7 +792,7 @@ export class HostX {
         // The single-thread build: the server is a
         // fiber of the system Worker, so it parks on the scheduler, and the
         // wait is a promise its stack suspends on (gexos.c GEX_XWL_JSPI).
-        if (single.on) {
+        if ((SP_CODE && single.on)) {
           const words = () => new Int32Array(self.#kmem.buffer);
           const r = sched.parkSlot(words, (k.k_ws_addr(slot) >>> 0) >>> 2, seq, ns);
           return r === 1 ? done() : r.then(done);
@@ -803,7 +804,7 @@ export class HostX {
     // And what it does to a guest's socket notifies that socket's waiters,
     // whose words the guests' fibers do not `Atomics.wait` on in the
     // single-thread build: they look.
-    if (single.on) {
+    if ((SP_CODE && single.on)) {
       for (const name of ['connect', 'accept', 'close', 'send', 'recv']) {
         const fn = raw[name];
         raw[name] = (...a) => {

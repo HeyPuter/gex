@@ -5,7 +5,8 @@
 // makes on demand (`/harness/rootfs.tar`) -- the same tree the Node harness
 // passes to `--dir`, so the two hosts are measured against identical bytes.
 import { untar } from './tar.js';
-import { fetchBytes, runProgram } from './runtime.js';
+import { fetchBytes } from './runtime.js';
+import { runProgram } from './run.js';
 import { metadataSection } from '../../shims/browser/js/gex.mjs';
 import { pageOptions } from '../../shims/browser/js/options.mjs';
 

@@ -78,3 +78,24 @@ export function pageFs(memory) {
     return r;
   };
 }
+
+// The single-thread build: no control buffer and no thread to wait in. The
+// system Worker hands a request to the page and the calling fiber's stack
+// suspends until the page answers (`WebAssembly.Suspending`).
+let ask = null;
+/** `fn(req, cap)` -> Promise<[result, bytes]>: the page's answer. */
+export function setPageFsAsk(fn) {
+  ask = fn;
+}
+
+/** `page_fs` for the single-thread build, against the kernel memory `memory`. */
+export function pageFsSuspending(memory) {
+  return new WebAssembly.Suspending(async (req, reqLen, out, cap) => {
+    req >>>= 0; reqLen >>>= 0; out >>>= 0; cap >>>= 0;
+    if (!ask) return -EIO;
+    const [r, bytes] = await ask(new Uint8Array(memory.buffer, req, reqLen).slice(), cap);
+    // The memory may have grown while this stack was suspended.
+    if (bytes?.length) new Uint8Array(memory.buffer, out, Math.min(bytes.length, cap)).set(bytes.subarray(0, cap));
+    return r;
+  });
+}

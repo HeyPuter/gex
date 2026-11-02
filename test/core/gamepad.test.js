@@ -6,7 +6,7 @@ import { System } from '../../web/runtime/src/index.js';
 import { Filesystem } from '../../web/runtime/src/fs.js';
 import { Gamepads } from '../../web/runtime/src/input.js';
 
-export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
+export const meta = { single: "Gamepads writes the kernel's memory from the page; the single-thread build keeps it in its Worker", hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 
 const button = (pressed = false, value = pressed ? 1 : 0) => ({ pressed, value });
 function pad(index, id, mapping, nb, na) {

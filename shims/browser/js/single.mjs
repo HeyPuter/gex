@@ -423,7 +423,7 @@ export class Sched {
 }
 
 /** The one scheduler of this realm. */
-export const sched = new Sched();
+export const sched = /* @__PURE__ */ new Sched();
 
 // ---------------------------------------------------------------------------
 // Fibers: a Worker's code, run in this realm.

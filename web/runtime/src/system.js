@@ -14,7 +14,7 @@
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
-import { Sockets } from '../../src/net.js';
+import { Sockets, dialFor } from '../../src/net.js';
 import { GuestConnection } from './connection.js';
 import { PageFsHost } from './mount.js';
 import { Kernel } from './kernel.js';
@@ -22,6 +22,13 @@ import { Files } from './kfs.js';
 import { Programs } from './programs.js';
 import { Changes } from './kpersist.js';
 import files from './runtime-files.js';
+import { SP_CODE, MP_CODE } from '../../../shims/browser/js/mode.mjs';
+
+/** Whether this system is the single-thread build's (@gex/runtime-single:
+ *  the kernel and every process in one Worker, kernel-single-worker.js): a
+ *  package is one build or the other, and the source tree runs it where the
+ *  page has no SharedArrayBuffer. */
+const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
 
 /** Where the runtime's files (gex/...) are: the tree's web/public in place.
  *  The package (web/runtime/build.sh defines `__GEX_RUNTIME_ASSETS__` null)
@@ -122,6 +129,10 @@ export class System extends EventTarget {
   #network = null;
   /** The guest's sockets (web/src/net.js), made with the first network. */
   #sockets = null;
+  /** The single-thread build's system Worker (kernel.js `startSingle`). */
+  #earlyWorker = null;
+  /** And its kernel. */
+  #singleKernel = null;
   #hostCalls = new Map();
   #pageFs = null;
   /** The init (`boot(argv, opts)`), `[argv, opts]`, and its Process once
@@ -163,7 +174,9 @@ export class System extends EventTarget {
       xcache: !!xcache,
       debug: { ...debug },
     };
-    this.#pageFs = new PageFsHost((name, json) => this.#hostCall(name, json));
+    // The page's mounts and host calls: over shared memory, or in the
+    // single-thread build, which has none, by message (`page-fs`).
+    this.#pageFs = new PageFsHost((name, json) => this.#hostCall(name, json), { shared: !SINGLE });
     const self = this;
     this[INTERNAL] = {
       system: this,
@@ -244,6 +257,7 @@ export class System extends EventTarget {
     if (this.#booting) return this.#booting;
     this.#init = init;
     this.#booting = this.#boot().catch((e) => {
+      this.#earlyWorker?.terminate();
       this.#state.phase = 'failed';
       this.#state.error = String(e?.stack ?? e);
       throw e;
@@ -254,9 +268,14 @@ export class System extends EventTarget {
   async #boot() {
     if (this.#state.phase !== 'new') throw new Error('this system has already booted');
     this.#state.phase = 'booting';
-    if (typeof SharedArrayBuffer !== 'function') {
-      throw new Error('the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp)');
+    if (!SINGLE && typeof SharedArrayBuffer !== 'function') {
+      throw new Error(SP_CODE
+        ? 'the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp), or JSPI for the single-thread build'
+        : 'the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp); @gex/runtime-single runs without');
     }
+    // The single-thread build's system Worker, now: its modules load while
+    // the files below are got ready.
+    if (SP_CODE && SINGLE && typeof Worker === 'function') this.#earlyWorker = Kernel.singleWorker();
     // The page runtime takes its switches and asset base from these
     // (web/src/page-env.js, page-globals.js); never the page's URL.
     const { arch: wantArch, ...switches } = this.#opts.debug;
@@ -293,6 +312,7 @@ export class System extends EventTarget {
     const { setGlobals } = await import('../../src/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
     const rt = await import('../../src/runtime.js');
+    if (SP_CODE && SINGLE) return this.#bootSingle(rt, arch, opts);
     // Under Node (the runtime's tests) there is no fetch of a file URL.
     if (globalThis.process?.versions?.node && !globalThis.document) {
       const u = rt.runtimeUrls();
@@ -367,6 +387,12 @@ export class System extends EventTarget {
       this.#sys.stop();
       throw e;
     }
+    return this.#begin();
+  }
+
+  /** Boot's end, in either build: the init, if any, and what waited for
+   *  the system to run. */
+  async #begin() {
     this.#state.phase = 'running';
     if (this.#init) {
       // Pid 1, before anything else runs. When it ends, so does the system,
@@ -392,13 +418,68 @@ export class System extends EventTarget {
     return this;
   }
 
+  /** Boot's single-thread build (`SINGLE`): the kernel and the processes'
+   *  host in the system Worker (kernel-single-worker.js), which the page
+   *  reaches by message; the rest of boot as the default build's. Windows
+   *  and GL are not in it yet. */
+  async #bootSingle(rt, arch, opts) {
+    if (this.#devices.length) throw new Error('the single-thread build has no windows or GL yet');
+    this.#arch = arch;
+    const term = { write: (d) => this.#say(String(d)), writeln: (t) => this.#say(`${t}\n`) };
+    let census = { pids: [], threads: 0, memory: 0 };
+    const early = this.#earlyWorker;
+    this.#earlyWorker = null;
+    const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host } }, (m) => {
+      if (m.ev === 'output') this.#say(m.text);
+      else if (m.ev === 'census') census = m;
+      else if (m.ev === 'message') for (const fn of this.#preset.onMessage) fn(m.m);
+      else if (m.ev === 'net-dial') dialFor(this.#network, m);
+      else if (m.ev === 'page-fs') {
+        this.#pageFs.request(m.req, m.cap).then((a) => {
+          m.reply.postMessage(a);
+          m.reply.close();
+        });
+      }
+    }, early ?? undefined);
+    this.#singleKernel = k;
+    this.#networkToSingle();
+    const stops = [];
+    const host = {
+      spawnExec: (r) => k.ask('spawnExec', { r }),
+      useKernelStacks: (stacks) => void k.ask('useKernelStacks', { stacks }),
+      stop: () => k.ask('stop').catch(() => {}),
+      get pids() { return census.pids; },
+      get threads() { return census.threads; },
+    };
+    this.#sys = {
+      host, kernel: { memory: { buffer: { get byteLength() { return census.memory; } } } }, term, rt, compositor: null, wlChannel: null,
+      spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
+      onStop: (fn) => stops.push(fn),
+      stop: () => {
+        for (const fn of stops.splice(0)) try { fn(); } catch {}
+        host.stop();
+      },
+    };
+    const fsi = this.#parts.get('filesystem')?.[INTERNAL];
+    const { layers, records } = opts;
+    opts.layers = opts.records = null;
+    try {
+      await this.#start(this.#sys, layers, records, fsi, k);
+    } catch (e) {
+      this.#sys.stop();
+      k.terminate();
+      throw e;
+    }
+    return this.#begin();
+  }
+
   /** The kernel's first instance (kernel.js), from the page: the
    *  filesystem's layers and what persistence kept laid into the root before
    *  the first program, the page's mounts, host calls, persistence's seed,
    *  pid 1; then the kernel's stacks handed to the processes' host (gex.mjs
    *  `kernelStacks`). */
-  async #start(s, layers, records, fsi) {
-    const k = await Kernel.start({ module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control });
+  async #start(s, layers, records, fsi, started = null) {
+    const k = started ?? await Kernel.start({ module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control });
     this.#kernel = k;
     this.#files = new Files(k);
     this.#changes = new Changes(k, this.#files);
@@ -412,7 +493,7 @@ export class System extends EventTarget {
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
     if (records.length) await this.#files.restore(records);
     await k.r('k_fs_populate_done');
-    if (this.#opts.xcache) await this.#xcacheRestore(s, k);
+    if (this.#opts.xcache && !(SP_CODE && SINGLE)) await this.#xcacheRestore(s, k);
     for (const [path, id] of fsi?.mounts?.() ?? []) await this.#files.mount(path, id);
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
@@ -526,6 +607,14 @@ export class System extends EventTarget {
     this.#network = network ?? null;
     if (!this.#sockets) this.#net.set(this.#sockets = new Sockets(null));
     this.#sockets.network = this.#network;
+    if (SP_CODE) this.#networkToSingle();
+  }
+
+  /** The single-thread build's system Worker told which network the page
+   *  has (kernel-single-worker.js `network`): its sockets dial through it. */
+  #networkToSingle() {
+    const n = this.#network;
+    this.#singleKernel?.ask('network', { net: n && { datagram: typeof n.datagram === 'function' } }).catch(() => {});
   }
 
   async #connectGuest(port, host) {
@@ -644,8 +733,8 @@ export class System extends EventTarget {
    *  buffer for every Worker (`{ ctl }`), or null where there is none. */
   async #lazyOwner(rt, kernel, layers, stops) {
     const lazy = layers.flatMap((l) => l.lazy ?? []);
-    if (!lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
-      || rt.singleMode() || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) return null;
+    if (!MP_CODE || !lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
+      || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) return null;
     const { makeControl, lazyVersion } = await import('../../../shims/browser/js/lazy-cache.mjs');
     const ctl = makeControl();
     const w = new Worker(new URL('../../src/lazy-cache-worker.js', import.meta.url), { type: 'module', name: 'lazy-cache' });

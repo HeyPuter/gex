@@ -5,6 +5,8 @@
 // takes `seq()` before a call that may find nothing to do and, when it
 // does, waits for `changed(seq)` and calls again.
 
+import { SP_CODE, MP_CODE } from '../../../shims/browser/js/mode.mjs';
+
 const ERRNO = { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 11: 'EAGAIN', 13: 'EACCES', 17: 'EEXIST', 18: 'EXDEV', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 28: 'ENOSPC', 36: 'ENAMETOOLONG', 39: 'ENOTEMPTY', 40: 'ELOOP', 111: 'ECONNREFUSED' };
 
 /** A negated errno `n` as an Error that says `what`. */
@@ -14,6 +16,8 @@ export function errno(n, what) {
 }
 
 async function makeWorker() {
+  // The single-thread build has no kernel-call Worker (kernel-single-worker.js).
+  if (!MP_CODE) throw new Error('the single-thread build has no kernel-call Worker');
   // The URL written out in the `new Worker`, which is how a bundler knows the
   // file is a Worker to build (web/runtime/build.sh), not an asset to copy.
   if (typeof Worker === 'function') return new Worker(new URL('./kernel-worker.js', import.meta.url), { type: 'module', name: 'gex-kernel' });
@@ -37,6 +41,10 @@ export class Kernel {
   /** Waiting for the slot to move: `[seq, resolve]`. */
   #waiters = [];
   #ticking = false;
+  /** The single-thread build: no kernel memory here, and the wait slot's
+   *  word as the Worker last said it (every answer carries it). */
+  #single = false;
+  #seen = 0;
 
   /** A Worker with the kernel `spec` ({ module, memory, pageFs }). */
   static async start(spec) {
@@ -45,15 +53,42 @@ export class Kernel {
     return k;
   }
 
+  /** The single-thread build's system Worker, made before its `start`:
+   *  its modules load while the page gets the system's files ready. */
+  static singleWorker() {
+    if (!SP_CODE) throw new Error('this build has no single-thread mode');
+    return new Worker(new URL('./kernel-single-worker.js', import.meta.url), { type: 'module', name: 'gex-system' });
+  }
+
+  /** The single-thread build's system Worker (kernel-single-worker.js),
+   *  which holds the kernel and the processes: `spec` its `start`'s, `onEvent`
+   *  for what it says unasked (`{ ev, ... }`). The page holds no kernel
+   *  memory; the wait slot's word is the Worker's to watch (`seq`). */
+  static async startSingle(spec, onEvent, w = Kernel.singleWorker()) {
+    const k = new Kernel(w, null, onEvent);
+    k.#names = new Set(await k.#rpc('start', { spec }));
+    return k;
+  }
+
+  /** One of the single-thread system Worker's own ops (kernel-single-worker.js). */
+  ask(op, args = {}) {
+    return this.#rpc(op, args);
+  }
+
   /** Whether this kernel build has export `f`. */
   has(f) {
     return this.#names.has(f);
   }
 
-  constructor(worker, memory) {
+  constructor(worker, memory, onEvent = null) {
     this.#w = worker;
     this.#memory = memory;
+    this.#single = SP_CODE && !memory;
     const on = (m) => {
+      if (SP_CODE && this.#single) {
+        if (m?.ev) return void onEvent?.(m);
+        if (m?.seq !== undefined) this.#seen = m.seq;
+      }
       const c = this.#calls.get(m?.call);
       if (!c) return;
       this.#calls.delete(m.call);
@@ -89,11 +124,12 @@ export class Kernel {
    *  message. */
   calls(list) {
     // A view of part of a larger buffer (a file in a tar) is sent as a copy
-    // of that part: posted as it is, the whole buffer would be copied.
+    // of that part: posted as it is, the whole buffer would be copied. (The
+    // single-thread build's page has no SharedArrayBuffer to ask about.)
     for (const c of list) {
       for (const x of c.a ?? []) {
         const v = x?.in ?? x?.ptr;
-        if (v instanceof Uint8Array && v.byteLength !== v.buffer.byteLength && !(v.buffer instanceof SharedArrayBuffer)) {
+        if (v instanceof Uint8Array && v.byteLength !== v.buffer.byteLength && !(!(SP_CODE && this.#single) && v.buffer instanceof SharedArrayBuffer)) {
           if (x.in !== undefined) x.in = v.slice();
           else x.ptr = v.slice();
         }
@@ -138,6 +174,7 @@ export class Kernel {
       if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
       this.#slot = slot;
       this.#slotWord = (addr >>> 0) >>> 2;
+      if (SP_CODE && this.#single) this.#seen = await this.#rpc('slot', { word: this.#slotWord });
     }
     await this.r('k_wq_add', queue, this.#slot);
   }
@@ -150,6 +187,7 @@ export class Kernel {
   /** Where the wait slot is now. Taken before a call that may find nothing
    *  to do, then given to `changed`, so a move in between is not missed. */
   seq() {
+    if (SP_CODE && this.#single) return this.#slot < 0 ? 0 : this.#seen;
     return this.#slot < 0 ? 0 : Atomics.load(this.words(), this.#slotWord);
   }
 
@@ -171,6 +209,13 @@ export class Kernel {
       const still = this.#waiters.filter(([s, res]) => s === now || void res());
       this.#waiters = still;
       if (!still.length) break;
+      if (SP_CODE && this.#single) {
+        // The Worker answers when the word has moved, or after 30 s.
+        const v = await this.#rpc('slotWait', { seq: now }).catch(() => now);
+        this.#seen = v ?? now;
+        if (this.#seen === now) this.#waiters.splice(0).forEach(([, res]) => res());
+        continue;
+      }
       const w = Atomics.waitAsync(this.words(), this.#slotWord, now, 30000);
       if (w.async && (await w.value) === 'timed-out') this.#waiters.splice(0).forEach(([, res]) => res());
     }

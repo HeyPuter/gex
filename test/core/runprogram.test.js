@@ -1,10 +1,10 @@
-// runProgram (web/src/runtime.js) as a preset over the runtime API
+// runProgram (web/src/run.js) as a preset over the runtime API
 // (run-program.js): an untarred bundle laid into the root with its hard
 // links, symbolic links, modes, extended attributes, file times and a lazy
 // file; the program, by a directory link's name, a child of the kernel's pid 1, on a terminal bridged to
 // an xterm-shaped object; keys typed into it; its exit status; and its last
 // output before the system stops.
-import { runProgram } from '../../web/src/runtime.js';
+import { runProgram } from '../../web/src/run.js';
 import { setGlobals } from '../../web/src/page-globals.js';
 import { untar } from '../../web/src/tar.js';
 import { unzstd } from '../../web/src/zfetch.js';

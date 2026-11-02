@@ -14,7 +14,8 @@ import { persist } from '../../web/src/persist.js';
 import { openedFiles } from '../../web/src/fs-opened.js';
 import { HELPER_STACKS, helperStackTop } from '../../shims/browser/js/lazy-fetch.mjs';
 
-export const meta = { hosts: ['browser'], arches: ['x86'], timeout: 240 };
+export const meta = { hosts: ['browser'], arches: ['x86'], timeout: 240,
+  single: "the page's helpers share the kernel's memory, which is the default build's" };
 
 const SECONDS = 30;
 const KERNEL = '/gex/gex_kernel.x86.wasm';

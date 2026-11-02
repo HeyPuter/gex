@@ -32,8 +32,9 @@ const DB = 'debian';
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes
  *  first when its blocks start from a system they do not make (`pre`:
- *  'new' a System and Filesystem with the tree; 'booted' those, booted), and
- *  what is checked after. */
+ *  'new' a System and Filesystem with the tree; 'booted' those, booted),
+ *  whether they make windows (`windows`, which the single-thread build has
+ *  none of yet), and what is checked after. */
 const PHASES = [
   { blocks: [0], check: async (t, v) => {
     t.check('intro: uname -a', v.code === 0 && /Linux/.test(v.stdout), `exit ${v.code}: ${v.stdout}${JSON.stringify(v.sys.state.console.slice(-600))}`);
@@ -41,7 +42,7 @@ const PHASES = [
     v.sh.pty.write('exit\n');
     t.eq('intro: bash -l exits', (await t.timeout(v.sh.exited, 30000, 'bash exit')).code, 0);
   } },
-  { blocks: [1, 2, 3], before: () => dropDb(DB), check: async (t, v) => {
+  { blocks: [1, 2, 3], windows: true, before: () => dropDb(DB), check: async (t, v) => {
     t.eq('desktop: running', v.sys.state.phase, 'running');
     t.check('desktop: hw.env names the display', !!(v.hw.env.WAYLAND_DISPLAY && v.hw.env.DISPLAY), JSON.stringify(v.hw.env));
     await t.until(() => /\S/.test(v.term.text), 'terminals: bash -l says something on its terminal', 60000);
@@ -71,12 +72,12 @@ const PHASES = [
     v.off();
     t.eq('host calls: unregistered', v.sys.hostCalls.names().includes('notify'), false);
   } },
-  { blocks: [9], pre: 'new', after: [8], boot: true, check: async (t, v) => {
+  { blocks: [9], windows: true, pre: 'new', after: [8], boot: true, check: async (t, v) => {
     t.check('GL: a MesaGl before boot, beside its windows', !!v.gl && !!v.hw, '');
     v.button.onclick();
     t.check('audio: the click made a WebAudio', true, '');
   } },
-  { blocks: [10], pre: 'new', check: async (t, v) => {
+  { blocks: [10], windows: true, pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
     t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
   } },
@@ -123,6 +124,11 @@ export default async function (t) {
     members(t);
   }
   const phase = PHASES[t.phase - 1];
+  // A page with no SharedArrayBuffer runs the single-thread build.
+  if (phase.windows && typeof SharedArrayBuffer !== 'function') {
+    say(`phase ${t.phase}: blocks ${phase.blocks.join(', ')} not run: the single-thread build has no windows yet`);
+    return t.phase < PHASES.length ? t.reload() : undefined;
+  }
   const tree = t.work('slim/debian-slim.tar.zst');
   await phase.before?.();
   const pre = phase.pre === undefined ? '' : `const { System } = M['@gex/runtime']; const { Filesystem } = M['@gex/runtime/fs'];

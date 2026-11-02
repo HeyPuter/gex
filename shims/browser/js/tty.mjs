@@ -15,10 +15,11 @@
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { pageFs } from './page-fs.mjs';
 import { single, sched } from './single.mjs';
+import { SP_CODE, MP_CODE } from './mode.mjs';
 
 /** The single-thread build's fibers park on the scheduler, not on their
  *  wait slots' words: whatever this file changes in the kernel, they look. */
-const poke = () => { if (single.on) sched.checkSlots(); };
+const poke = () => { if ((SP_CODE && single.on)) sched.checkSlots(); };
 
 /// Where the page writes bytes for the kernel to copy out of. The kernel
 /// imports the calling process's memory and addresses it with `memory.copy`;
@@ -45,7 +46,7 @@ export class PageTty {
     // typed while a Worker held one -- a persist snapshot, a guest's syscall --
     // threw "Atomics.wait cannot be called in this context" here. The
     // single-thread build has nothing else in the kernel, and stays here.
-    if (!single.on && typeof Worker === 'function' && typeof SharedArrayBuffer !== 'undefined'
+    if (MP_CODE && !(SP_CODE && single.on) && typeof Worker === 'function' && typeof SharedArrayBuffer !== 'undefined'
         && spec.memory.buffer instanceof SharedArrayBuffer) {
       return RemoteTty.open(spec);
     }

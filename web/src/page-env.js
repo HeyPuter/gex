@@ -25,7 +25,9 @@ export function assetUrl(path) {
   const listed = globalThis.GEX_ASSET_FILES?.[rel];
   if (listed) return listed;
   const base = globalThis.GEX_ASSET_BASE;
-  return base ? new URL(rel, base).href : path;
+  // A base may be a path (`/`), which a Worker resolves against its own
+  // script's URL: the same site.
+  return base ? new URL(rel, new URL(base, globalThis.location?.href)).href : path;
 }
 
 /** The listed files under `dir` (`gex/cgen/`), by their path below it, or

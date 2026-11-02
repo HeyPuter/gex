@@ -53,7 +53,7 @@ async function channel() {
 /// modules that ran one full collection after another on the thread every
 /// process waits on. The single-thread build and Node keep the one message.
 const FORK_BULK = ['modules', 'image', 'vmaBlob', 'pages', 'shared'];
-const forkDirect = () => !single.on && typeof MessageChannel === 'function' && typeof WorkerGlobalScope !== 'undefined';
+const forkDirect = () => !(SP_CODE && single.on) && typeof MessageChannel === 'function' && typeof WorkerGlobalScope !== 'undefined';
 /** How far a record's image reaches (host.mjs `imageExtent`), said in the
  *  record that travels without it. */
 function forkExtent(child) {
@@ -85,6 +85,7 @@ import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
+import { SP_CODE } from './mode.mjs';
 import { logNamed, setLog } from './log.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
@@ -114,7 +115,7 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
 // Workers are fibers of one realm and are never given back.
 const timers = new Set();
 const realmGlobals = new Set(Object.getOwnPropertyNames(globalThis));
-if (!single.on) {
+if (!(SP_CODE && single.on)) {
   for (const [make, clear, once] of [['setTimeout', 'clearTimeout', true], ['setInterval', 'clearInterval', false]]) {
     const mk = globalThis[make];
     const cl = globalThis[clear];
@@ -175,7 +176,7 @@ const port = {
 // What this Worker fetches and installs, to its host (fetch-note.mjs). Not
 // in the single-thread build, whose fibers share the page's realm (and the
 // last fiber's port would outlive none of them).
-if (!single.on) setNoteSink((note) => port.post({ kind: 'note', note }));
+if (!(SP_CODE && single.on)) setNoteSink((note) => port.post({ kind: 'note', note }));
 
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
@@ -1040,7 +1041,7 @@ async function handle(msg) {
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
     const net = new NodeNetwork({ pageHosts: msg.pageHosts ?? null, tcp: !!msg.tcp });
-    if (single.on) net.onActivity = () => sched.wake();
+    if ((SP_CODE && single.on)) net.onActivity = () => sched.wake();
     gex.useNetwork(net);
   }
   if (msg.pageNet) {
@@ -1464,7 +1465,7 @@ async function handle(msg) {
     // realm's own (Node's sockets, a Wisp WebSocket). The single-thread
     // build's fibers are never given back.
     exitMsg.workerRuns = runs;
-    exitMsg.giveBack = !single.on && !thread && !carries && !gone && recyclable
+    exitMsg.giveBack = !(SP_CODE && single.on) && !thread && !carries && !gone && recyclable
       && (msg.kind === 'adopt' || msg.kind === 'run')
       && status >= 0 && status < 128 && !msg.network && !msg.pageHosts;
     port.post(exitMsg);
@@ -1527,13 +1528,16 @@ async function handle(msg) {
       // process runs on in its other Workers.
       if (!inert) {
         gex?.shim?.exports?.gex_dump_state?.();
-        gex?.shim?.exports?.gex_abandon?.(-9);
+        const abandon = gex?.shim?.exports?.gex_abandon;
+        // In the single-thread build the kernel's calls may suspend, which
+        // needs a stack of its own (`WebAssembly.promising`).
+        if (abandon) await ((SP_CODE && single.on) ? WebAssembly.promising(abandon)(-9) : abandon(-9));
       }
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
     // A fiber's timers outlive it unless stopped (single.mjs).
-    if (single.on) gex?.close?.();
+    if ((SP_CODE && single.on)) gex?.close?.();
     port.post({
       kind: 'threw',
       message: (e?.message ?? String(e)) + where,
@@ -1578,5 +1582,5 @@ if (handed && !carry) handle(handed);
 // Not a top-level await, which a bundler's classic-script Worker cannot
 // hold; a failure is thrown again outside the promise, so the Worker's
 // `error` event still reports it.
-if (single.on) registerWorkerMain(workerMain);
+if ((SP_CODE && single.on)) registerWorkerMain(workerMain);
 else channel().then(workerMain).catch((e) => setTimeout(() => { throw e; }));
