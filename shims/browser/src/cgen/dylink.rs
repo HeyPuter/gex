@@ -21,8 +21,9 @@
 //!                           `export`; `at` is its table slot (a function),
 //!                           `g` and its value (a constant global) or `-`,
 //!                           for a module whose exports the page packed;
-//!   `L mod name slot`       a function through table slot `slot` (a module
-//!                           instantiated after this one);
+//!   `L mod name slot [sig]` a function through table slot `slot` (a module
+//!                           instantiated after this one), of type `sig`
+//!                           (`Info::sigs`) when it has one the page can write;
 //!   `M mod name message`    a function that throws `message`;
 //! then `X slot export` per table slot past the element segment to fill
 //! with an export after instantiation (or, packed, by an element segment
@@ -208,7 +209,11 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
                     };
                     format!("E\t{mo}\t{na}\t{}\t{name}\t{}", p.module_of[module], at.as_deref().unwrap_or("-"))
                 }
-                Bind::Late { slot } => format!("L\t{mo}\t{na}\t{slot}"),
+                // and the import's type, which the page calls the slot with
+                Bind::Late { slot } => match m.info.sigs.get(imp.ty as usize).cloned().flatten() {
+                    Some(sig) => format!("L\t{mo}\t{na}\t{slot}\t{sig}"),
+                    None => format!("L\t{mo}\t{na}\t{slot}"),
+                },
                 Bind::Missing(_) if imp.kind == Kind::Global => format!("G\t{mo}\t{na}\t0\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
                 Bind::Missing(msg) => {
                     let msg = if msg.is_empty() { format!("{}: undefined weak symbol {na} called", m.path) } else { msg };
