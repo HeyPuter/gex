@@ -5730,6 +5730,9 @@ export class Gex {
       // fresh TLS (an execve from another thread): this Worker's table still
       // holds what it replayed.
       if (e.gex_ftab_behind()) e.gex_cgen_have(st.have);
+      // (and every slot below the map's size is in it: a module this Worker
+      // installed itself has no event left for it here)
+      this.#raiseIcallLimit(size);
       this.#wasmdllCatchUp();
       return;
     }

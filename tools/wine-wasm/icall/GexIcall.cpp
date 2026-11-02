@@ -7,12 +7,17 @@
 //   callee = p < 0x3f0000 ? p : __gexw_exit.<sig>
 //   call callee(args...)
 //
+// or on wasm64 the branch form (see run()):
+//
+//   if (p < limit) call p(args...)
+//   else { gexw_set_icall_target(p); call __gexw_exit.<sig>(args...) }
+//
 // A function pointer below 0x3f0000 (gex-kernel's NT trampolines) is a function-table index (native
 // code), called directly; anything else is a guest address. On wasm64 the
 // bound is not that constant but the thread's `gex.icall_limit64` (see
-// limit() below): the slots its table holds, so an index into a
-// module another thread has just installed takes the exit stub too, and the
-// host catches this thread up before it runs the function. The exit stub,
+// limit() below): the slots its table holds, so an index into a module
+// another thread has just installed takes the exit stub until this thread
+// has caught up, and the host catches it up before it runs the function. The exit stub,
 // one per wasm signature (linkonce_odr), lays the arguments out as i386
 // stack words and calls __gexw_guest_call / __gexw_guest_call_fp
 // (gexw_rt.c), which run the guest function through gex's function table
@@ -51,6 +56,11 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/IR/MDBuilder.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/LICM.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include <map>
 #include <set>
 #include <cstdlib>
@@ -115,29 +125,35 @@ static bool smallStruct(uint64_t n) { return n == 1 || n == 2 || n == 4 || n == 
 struct GexIcall : PassInfoMixin<GexIcall> {
   bool Wasm64 = false;
 
-  // The thread's bound for the select form on wasm64: gex's
-  // `gex.icall_limit64` (the host has an i32 `gex.icall_limit` beside it for
-  // wasm32 code, which still compares with 0x3f0000), a mutable global each thread's instances
-  // import (one per wasmtime store, one per Worker), which the host sets at
-  // instantiation to the slots that thread's table holds and raises as it
-  // catches up (never past gex_abi::ftab::NATIVE_FN_TOP). An index at or
-  // above it is a module installed since this thread last caught up: the
-  // exit stub takes it as a guest address, gex's call-out catches the thread
-  // up, and the entry thunk bound at that index runs the function. The bound
-  // only grows, so a stale read costs a slow call, never a wrong one. A wasm
-  // global (address space 1) read at the site: one global.get. (Pointer
-  // wide: LLVM folds a zero-extended i32 global read into a memory load.)
+  // The bound on wasm64: `gex.icall_limit64` (gex_abi::ftab::ICALL_LIMIT64;
+  // the host has an i32 `gex.icall_limit` beside it for wasm32 code, which
+  // still compares with 0x3f0000), a mutable global each thread's instances
+  // import (one per wasmtime store, one per Worker), which the host keeps
+  // at the slots that thread's table holds, raised as it catches up, never
+  // past gex_abi::ftab::NATIVE_FN_TOP. An index at or above it is a module
+  // installed since this thread last caught up: the exit stub takes it as
+  // a guest address, gex's call-out catches the thread up, and the entry
+  // thunk bound at that index runs the function. This thread's table only
+  // grows, so any value it has read stays a safe bound for it: the load is
+  // marked invariant, and LLVM may hoist it (and the compare, for a
+  // loop-invariant pointer) as it would the constant. A stale value is at
+  // worst low, and costs the exit stub's second look.
   Value *limit(Module &M, IRBuilder<> &B, Type *IP) {
+    LoadInst *L = B.CreateLoad(IP, limitGlobal(M));
+    L->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(M.getContext(), {}));
+    return L;
+  }
+
+  GlobalVariable *limitGlobal(Module &M) {
     const char *name = "__gexw_icall_limit_g";
     GlobalVariable *G = M.getGlobalVariable(name);
     if (!G) {
-      G = new GlobalVariable(M, IP, false, GlobalValue::ExternalLinkage, nullptr, name, nullptr,
-                             GlobalValue::NotThreadLocal, 1);
-      M.appendModuleInlineAsm(std::string(".import_module __gexw_icall_limit_g, gex\n"
-                                          ".import_name __gexw_icall_limit_g, ") +
-                              (IP->isIntegerTy(64) ? "icall_limit64" : "icall_limit") + "\n");
+      G = new GlobalVariable(M, Type::getInt64Ty(M.getContext()), false, GlobalValue::ExternalLinkage, nullptr, name,
+                             nullptr, GlobalValue::NotThreadLocal, 1);
+      M.appendModuleInlineAsm(".import_module __gexw_icall_limit_g, gex\n"
+                              ".import_name __gexw_icall_limit_g, icall_limit64\n");
     }
-    return B.CreateLoad(IP, G);
+    return G;
   }
 
   Function *getTarget(Module &M, const char *name, FunctionType *FT) {
@@ -237,6 +253,26 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       sretSize = DL.getTypeAllocSize(CB.getParamStructRetType(0));
       first = 1;
     }
+    // An index this thread's table holds by now (`gex.icall_limit64` read
+    // again: the caller's value may be one it read before a catch-up): call
+    // it here. Anything else goes out as a guest call.
+    Function *Get = getTarget(M, "gexw_get_icall_target", FunctionType::get(I64, false));
+    Value *T = B.CreateCall(Get);
+    {
+      GlobalVariable *Held = limitGlobal(M);
+      BasicBlock *OwnBB = BasicBlock::Create(C, "own", F), *ExitBB = BasicBlock::Create(C, "exit", F);
+      B.CreateCondBr(B.CreateICmpULT(T, B.CreateLoad(I64, Held)), OwnBB, ExitBB);
+      IRBuilder<> OB(OwnBB);
+      SmallVector<Value *, 8> Args;
+      for (Argument &A : F->args()) Args.push_back(&A);
+      CallInst *CI = OB.CreateCall(FT, OB.CreateIntToPtr(T, Ptr), Args);
+      // the call site's parameter attributes (byval, sret), as the select's
+      for (unsigned i = 0; i < FT->getNumParams(); i++)
+        CI->setAttributes(CI->getAttributes().addParamAttributes(C, i, AttrBuilder(C, CB.getAttributes().getParamAttrs(i))));
+      if (FT->getReturnType()->isVoidTy()) OB.CreateRetVoid();
+      else OB.CreateRet(CI);
+      B.SetInsertPoint(ExitBB);
+    }
     unsigned n = FT->getNumParams() - first + (SRet && !smallStruct(sretSize) ? 1 : 0);
     Value *Buf = B.CreateAlloca(I64, B.getInt32(n ? n : 1));
     unsigned w = 0;
@@ -272,8 +308,6 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       }
       w++;
     }
-    Function *Get = getTarget(M, "gexw_get_icall_target", FunctionType::get(I64, false));
-    Value *T = B.CreateCall(Get);
     Type *R = FT->getReturnType();
     Function *Call = getTarget(M, "__gexw_guest_call64", FunctionType::get(I64, {I64, Ptr, I32, I32}, false));
     Value *V = B.CreateCall(Call, {T, Buf, B.getInt32(w), B.getInt32(R->isFloatingPointTy() ? 1 : 0)});
@@ -627,6 +661,12 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (Wasm64) emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
+    // gexrt's setter of one variable: it returns and does not unwind (so a
+    // limit load after it in a loop may still be hoisted)
+    if (Function *Set = cast<Function>(M.getOrInsertFunction("gexw_set_icall_target", SetT).getCallee())) {
+      Set->addFnAttr(Attribute::NoUnwind);
+      Set->addFnAttr(Attribute::WillReturn);
+    }
     unsigned done = 0, varargs = 0;
     std::vector<CallBase *> sites;
     for (Function &F : M) {
@@ -651,10 +691,40 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       // there without one is dropped as unreachable by WinEHPrepare)
       SmallVector<OperandBundleDef, 1> Funclet;
       if (auto OB = CB->getOperandBundle(LLVMContext::OB_funclet)) Funclet.emplace_back(*OB);
-      B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P}, Funclet);
       Value *Limit = Wasm64 ? limit(M, B, IP) : (Value *)ConstantInt::get(IP, ICALL_LIMIT);
       Value *Native = B.CreateICmpULT(P, Limit);
-      CB->setCalledOperand(B.CreateSelect(Native, Callee, Stub));
+      // wasm64: the branch form, the stub called directly on its own path,
+      // so the call_indirect only ever sees native targets: an engine that
+      // speculates on a call_indirect's targets (V8 inlines the ones it has
+      // seen) then does not keep speculating on the stub at a site that ran
+      // while the limit was below its target. An invoke or a musttail call
+      // keeps the select form.
+      auto *Call = dyn_cast<CallInst>(CB);
+      if (!Wasm64 || !Call || Call->isMustTailCall()) {
+        B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P}, Funclet);
+        CB->setCalledOperand(B.CreateSelect(Native, Callee, Stub));
+        done++;
+        continue;
+      }
+      MDNode *Likely = MDBuilder(C).createLikelyBranchWeights();
+      Instruction *ThenT, *ElseT;
+      SplitBlockAndInsertIfThenElse(Native, Call, &ThenT, &ElseT, Likely);
+      auto *Fast = cast<CallInst>(Call->clone());
+      Fast->insertBefore(ThenT->getIterator());
+      // (the target for the stub only: a native callee does not read it)
+      IRBuilder<> EB(ElseT);
+      EB.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P}, Funclet);
+      auto *Slow = cast<CallInst>(Call->clone());
+      Slow->setCalledOperand(Stub);
+      Slow->insertBefore(ElseT->getIterator());
+      if (!Call->getType()->isVoidTy()) {
+        PHINode *Phi = PHINode::Create(Call->getType(), 2, "", Call->getIterator());
+        Phi->addIncoming(Fast, Fast->getParent());
+        Phi->addIncoming(Slow, Slow->getParent());
+        Phi->takeName(Call);
+        Call->replaceAllUsesWith(Phi);
+      }
+      Call->eraseFromParent();
       done++;
     }
     if (getenv("GEXW_ICALL_STATS"))
@@ -669,6 +739,15 @@ struct GexIcall : PassInfoMixin<GexIcall> {
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "GexIcall", "0.1", [](PassBuilder &PB) {
             PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) { MPM.addPass(GexIcall()); });
+                [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
+                  MPM.addPass(GexIcall());
+                  // the limit's loads (invariant): one per function where
+                  // they agree, and out of loops with the compare, as the
+                  // optimizer did for the constant before this pass ran
+                  FunctionPassManager FPM;
+                  FPM.addPass(EarlyCSEPass(true));
+                  FPM.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
+                  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                });
           }};
 }

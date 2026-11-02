@@ -290,7 +290,12 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
         let ev = s.ftab.map.log_from(from).to_vec();
         if ev.is_empty() {
-            return Ok(());
+            // every slot below the map's size is in this table (a module
+            // this store installed itself, `publish_stateful`, has no event
+            // left for it here)
+            let size = s.ftab.map.size() as u64;
+            drop(s);
+            return raise_icall_limit(cx.as_context_mut(), size);
         }
         (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone(), s.ftab.stateful.clone(), s.ftab.dylink.clone())
     };
