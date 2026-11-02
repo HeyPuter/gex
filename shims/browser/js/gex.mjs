@@ -8655,7 +8655,10 @@ export class Gex {
           // returns instead of trapping (`#watchHit`).
           const ret = this.#calloutSignal;
           if (ret?.kind === 'return') {
-            this.#calloutSignal = null;
+            // An outer call-out's: it stays for that one's loop, which the
+            // frames between (function-tier bodies, which trap on a call-out
+            // that did not come back) reach through the loops between.
+            this.#calloutSignal = ret.i < me ? ret : null;
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
             return ret.i === me ? 1 : 0;
           }
@@ -8686,7 +8689,15 @@ export class Gex {
             }
             return v;
           };
-          if (sig?.kind === 'return') return ended(sig.i === me ? 1 : 0);
+          // An outer call-out's return (the stack unwound to a native caller's
+          // frame, a 64-bit handler's target under a WoW64 thread's nested
+          // 32-bit calls): it stays for that one's loop, as above. Taken here,
+          // the loops between saw a plain trap at the return pad and left at
+          // STRAY_PC, which the outer loop then ran (its int3).
+          if (sig?.kind === 'return') {
+            if (sig.i < me) this.#calloutSignal = sig;
+            return ended(sig.i === me ? 1 : 0);
+          }
           if (sig?.kind === 'bypass') {
             if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
             next = sig.f;
@@ -8812,6 +8823,8 @@ export class Gex {
         }
       }
     } finally {
+      // A return signal for this call-out or a deeper one is spent with it.
+      if (this.#calloutSignal?.kind === 'return' && this.#calloutSignal.i >= me) this.#calloutSignal = null;
       if (anyStack) e.gex_wow64_waits?.(-1);
       e.gex_callout_leave_ok?.(0);
       this.#unwatch(c);
