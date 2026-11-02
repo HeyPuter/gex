@@ -19,6 +19,11 @@
  *                    numbered) on a connected UDP socket, none read until a
  *                    second after the last, then every reply read: "N ok",
  *                    or the first one wrong
+ *   rt-probe hold HOST PORT N [fork|trap] [udp]   N connections to
+ *                    HOST:PORT (`udp`: connected UDP sockets), a byte sent on
+ *                    each, then "held N" and a read of the first for ever
+ *                    (with `fork`: a child holds them too, and says "child
+ *                    PID"; with `trap`: a trap instead of the read)
  *   rt-probe serve PORT   on 127.0.0.1:PORT, one connection: what it sends,
  *                    upper-cased, back ("listening" once it listens)
  *   rt-probe tone HZ MS   a sine of HZ for MS ms on /dev/dsp (s16, stereo,
@@ -226,6 +231,42 @@ int main(int argc, char **argv) {
       }
     }
     printf("%d ok\n", n);
+  } else if (!strcmp(what, "hold") && argc >= 5 && argc <= 7) {
+    int fork_ = 0, trap_ = 0, udp = 0;
+    for (int i = 5; i < argc; i++) {
+      if (!strcmp(argv[i], "fork")) fork_ = 1;
+      else if (!strcmp(argv[i], "trap")) trap_ = 1;
+      else if (!strcmp(argv[i], "udp")) udp = 1;
+      else return 2;
+    }
+    int type = udp ? SOCK_DGRAM : SOCK_STREAM;
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = type;
+    if (getaddrinfo(argv[2], argv[3], &hints, &ai)) return 1;
+    int n = atoi(argv[4]), first = -1;
+    for (int i = 0; i < n; i++) {
+      int s = socket(ai->ai_family, type, 0);
+      if (s < 0 || connect(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+        perror("connect");
+        return 1;
+      }
+      if (write(s, "x", 1) < 0) perror("write");
+      if (first < 0) first = s;
+    }
+    setvbuf(stdout, 0, _IONBF, 0);
+    if (fork_) {
+      pid_t c = fork();
+      if (c == 0) {
+        char b;
+        for (;;) if (read(first, &b, 1) <= 0) pause();
+      }
+      printf("child %d\n", (int)c);
+    }
+    printf("held %d\n", n);
+    if (trap_) __builtin_trap();
+    char b;
+    for (;;) if (read(first, &b, 1) <= 0) pause();
   } else if (!strcmp(what, "serve") && argc == 3) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = {0};
@@ -276,7 +317,7 @@ int main(int argc, char **argv) {
     close(fd);
     printf("%ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
   } else {
-    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|serve PORT|tone HZ MS\n");
+    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|flood HOST PORT N SIZE|hold HOST PORT N [fork|trap] [udp]|serve PORT|tone HZ MS\n");
     return 2;
   }
   return 0;
