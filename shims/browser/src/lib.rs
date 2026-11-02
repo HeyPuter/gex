@@ -15976,6 +15976,19 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 let d = dense::index(start);
                 d != 0 && ours.is_some_and(|n| d < stale_base || d >= stale_base + n)
             };
+            // Classic numbering has no ranges to ask, but this Worker knows
+            // the same thing another way: it translated `start` again for this
+            // very stale module, so its own slot at `start` holds that newer
+            // block (or a newer one still) and no longer the stale one, which
+            // only a sibling's direct jump reaches now. Without this the
+            // sibling's every jump came back as `repeat` and translated
+            // `start` again: one new module per trip, without end.
+            let elsewhere = elsewhere
+                || (!dense::on()
+                    && STALE_AGAIN_HERE.with(|m| {
+                        m.borrow().get(&start) == Some(&(stale_id as u32, EXEC_GEN.load(std::sync::atomic::Ordering::Relaxed)))
+                    })
+                    && j.provider.get(&start).is_some_and(|&m| m & 0xffff_ffff != stale_id));
             // A module served or restored here is numbered as it is queued, so
             // its own range answers; one this process did not number has none.
             // Either way the id never picks the range.
@@ -16046,6 +16059,10 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             (again, elsewhere)
         });
         if again {
+            if !dense::on() {
+                let gen = EXEC_GEN.load(std::sync::atomic::Ordering::Relaxed);
+                STALE_AGAIN_HERE.with(|m| m.borrow_mut().insert(start, ((addr as u64 & 0xffff_ffff) as u32, gen)));
+            }
             if jit_diag() {
                 thread_local!(static STALE_AGAIN: std::cell::RefCell<std::collections::HashMap<u64, u64>> = Default::default());
                 let n = STALE_AGAIN.with(|m| {
@@ -16444,6 +16461,11 @@ thread_local! {
     /// The last `PAGE_STALE` (block, module), to tell a stale block that
     /// keeps coming back from one met once. See `gex_cache_op`.
     static STALE_LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Classic numbering: each block start this Worker translated again for
+    /// a stale page check, with the id of the stale module it was for and
+    /// the program it was in (`EXEC_GEN`: an exec in this Worker starts its
+    /// tables again). See `gex_cache_op`'s `PAGE_STALE`.
+    static STALE_AGAIN_HERE: std::cell::RefCell<std::collections::HashMap<u64, (u32, u32)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT
