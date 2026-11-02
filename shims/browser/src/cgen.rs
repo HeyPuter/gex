@@ -1728,17 +1728,52 @@ pub extern "C" fn gex_provider_missing(addr: u32) {
     crate::end_process(0xc000_0139);
 }
 
-/// Whether the provider data at `base` still needs its relocations applied
-/// (once per process): 1 the first time, then 0.
+/// Provider data by base whose relocations a Worker took: whether it has
+/// applied them yet ([`gex_provider_relocated`]).
+static RELOCATED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+
+/// Whether this instantiation applies the relocations of the provider data
+/// at `base`: 1 the first time (once per process), then 0. While another
+/// Worker applies them this waits for it to finish, as
+/// `wasmprog::gex_wasmprog_relocate` does: a Wine PE module runs as soon as
+/// it is instantiated (its DLL's entry), and before then its function
+/// pointers in data (winecrt0's `__wine_unix_call_dispatcher`) are not yet
+/// slots of its table range. Another Worker instantiates it first once the
+/// install wakes it (`dylink::published`).
 #[no_mangle]
 pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
-    static DONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-    let mut d = lock(&DONE);
-    if d.contains(&base) {
-        return 0;
+    let mut waits: u64 = 0;
+    loop {
+        {
+            let mut d = lock(&RELOCATED);
+            match d.iter().find(|&&(b, _)| b == base) {
+                None => {
+                    d.push((base, false));
+                    return 1;
+                }
+                Some(&(_, true)) => return 0,
+                Some(_) => {}
+            }
+        }
+        waits += 1;
+        if waits % 10_000 == 0 {
+            crate::warn_line(&format!("gex: provider data at {base:#x}: still waiting for another Worker to relocate it\n"));
+        }
+        #[cfg(feature = "shared-memory")]
+        {
+            let nap = std::sync::atomic::AtomicI32::new(0);
+            unsafe { crate::warch::memory_atomic_wait32(nap.as_ptr(), 0, 100_000) };
+        }
     }
-    d.push(base);
-    1
+}
+
+/// The Worker [`gex_provider_relocate`] picked has applied the relocations
+/// of the provider data at `base` (or given up: it threw).
+#[no_mangle]
+pub extern "C" fn gex_provider_relocated(base: u32) {
+    if let Some(e) = lock(&RELOCATED).iter_mut().find(|e| e.0 == base) {
+        e.1 = true;
+    }
 }
 
 /// GEX_WIN_ENTRY_LOG: print each pc entered inside a unit's pages without an

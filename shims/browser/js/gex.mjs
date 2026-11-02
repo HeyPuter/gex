@@ -5102,7 +5102,14 @@ export class Gex {
           e.gex_wasmprog_relocated?.(prov);
         }
       }
-    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) {
+      // Another Worker applying them is waited for (the shim's side).
+      try {
+        inst.exports.__wasm_apply_data_relocs?.();
+      } finally {
+        e.gex_provider_relocated?.(memBase);
+      }
+    }
     if (wasmprog) {
       // (a packed module's element segments filled them)
       if (!packed) for (const [slot, name] of extra) {
