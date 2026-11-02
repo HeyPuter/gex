@@ -5149,6 +5149,16 @@ export class Gex {
           // call takes the ud2 route)
           unix_dispatcher: (op, idx) => (globalThis.GEX_TEST_UD2_ENTRY && (op === 0 || op === 4)) ? 0 :
             e.gex_unix_dispatcher?.(op, addrNum(idx)) ?? 0,
+          // 64-bit Wine's guarded call (the debugging switch GEX_NATIVE_TRY):
+          // fn(arg), and a memory access out of bounds inside it (a bad pointer
+          // Wine's code wrote or read through) caught here, every wasm frame
+          // since gone: 0xc0000005 (STATUS_ACCESS_VIOLATION), else what fn
+          // returned. Index 0 asks whether it is on: 2, else -1 (always in the
+          // single-thread build, where a blocking call under it would need a
+          // promise each). The high bit of `idx`: fn takes an i64. Its function
+          // is cached by index: the callers' (Wine's system call entry, wow64's
+          // thunks) stay put.
+          native_try: single.on || !globalThis.GEX_NATIVE_TRY ? () => -1 : (idx, arg) => this.#nativeTry(idx, arg),
           fault_hook: (idx) => e.gex_fault_hook_set?.(addrNum(idx)),
           signal_hook: (idx) => e.gex_signal_hook_set?.(addrNum(idx)),
           code_changed: (addr, len) => e.gex_code_changed?.(addrBig(addr), len),
@@ -7421,6 +7431,46 @@ export class Gex {
       this.#startThread();
     }
     if (flags & 4) this.#cgenCatchUp();
+  }
+
+  // gex.native_try's functions, by table index: the last one called (the
+  // system call entry, every 64-bit call), then the rest (wow64's thunks).
+  // Not an array: the indices are in the thousands, and a sparse array's
+  // lookups hashed (a third of the import's cost).
+  #tryTab = null;
+  #tryIdx = -1;
+  #tryFn = null;
+  #tryFns = new Map();
+
+  #nativeTry(idx, arg) {
+    let f;
+    if (idx === this.#tryIdx && this.#cgen.ftab === this.#tryTab) f = this.#tryFn;
+    else {
+      if (idx === 0) return 2;
+      const tab = this.#cgen.ftab;
+      if (tab !== this.#tryTab) {
+        this.#tryTab = tab;
+        this.#tryFns = new Map();
+      }
+      const i = idx & 0x7fffffff;
+      f = this.#tryFns.get(i);
+      if (!f) this.#tryFns.set(i, (f = tab.get(tIdx(i))));
+      this.#tryIdx = idx;
+      this.#tryFn = f;
+    }
+    try {
+      return f(idx < 0 ? BigInt(arg >>> 0) : arg) ?? 0;
+    } catch (err) {
+      if (err?.gexHandoff || !(err instanceof WebAssembly.RuntimeError) || !/memory access out of bounds/.test(err.message)) throw err;
+      const e = this.#shim.exports;
+      if (e.gex_handoff()) {
+        err.gexHandoff = true;
+        throw err;
+      }
+      // the shim's own (in a syscall, translating): a crash
+      if (e.gex_native_oob?.() !== 1) throw err;
+      return -1073741819;
+    }
   }
 
   #nativeSyscall = (ctx, pc) => {

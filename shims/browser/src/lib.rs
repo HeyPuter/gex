@@ -18143,6 +18143,16 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     1
 }
 
+/// A "memory access out of bounds" trap native code made under gex.native_try
+/// (gex.mjs `#nativeTry`): 1 when it is that code's, a bad pointer it went
+/// through, which the call then ends with; 0 when this thread was in a
+/// syscall or translating, where it is the runtime's own crash.
+#[no_mangle]
+pub extern "C" fn gex_native_oob() -> u32 {
+    let own = IN_SYSCALL.with(|c| c.get()) || jit_holds() || jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me();
+    (!own) as u32
+}
+
 /// The PE images Wine mapped in this process (`gex_image_mapped`): base,
 /// end and file name. Wine maps an image into anonymous memory, so the
 /// memory map has no name for its code; the KUSER lines name it from here.
