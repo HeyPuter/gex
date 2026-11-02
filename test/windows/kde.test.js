@@ -6,7 +6,8 @@
 
 // Alone: a desktop's dozens of processes, each a Worker with its own memory,
 // beside other tests' pages in the same renderer ran out of address space.
-export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 1200, alone: true, html: `<style>html, body { margin: 0; }</style>
+export const meta = { hosts: ['browser'], arches: ['a64'], images: ['package', 'kde'], timeout: 1200, alone: true,
+  single: 'its wasm32 programs trap at a new thread or child start (function signature mismatch)', html: `<style>html, body { margin: 0; }</style>
 <canvas id="out" width="1280" height="800" style="width: 100vw; display: block;"></canvas>` };
 
 export default async function (t) {
