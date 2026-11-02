@@ -436,7 +436,10 @@ export class System extends EventTarget {
     this.#earlyWorker = null;
     const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale, dom: !!single.wl.dom };
     const gl = single.gl && { d3d: !!single.gl.d3d };
-    const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host }, wl, gl }, (m) => {
+    // A rest bundle's lazy files (`BUNDLE#OFFSET`) are read through zstd
+    // frames: the system Worker loads the decoder before its kernel starts.
+    this.#restBundle = opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
+    const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host, restBundle: this.#restBundle }, wl, gl }, (m) => {
       if (m.ev === 'output') this.#say(m.text);
       else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted' || m.ev === 'wl-mirror' || m.ev === 'wl-drop' || m.ev === 'gl-surfaces') for (const fn of single.listeners) fn(m);
       else if (m.ev === 'census') census = m;
