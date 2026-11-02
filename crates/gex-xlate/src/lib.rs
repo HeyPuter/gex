@@ -1626,6 +1626,40 @@ fn lift_one(
 
 #[cfg(all(test, not(feature = "x86")))]
 mod tests {
+    /// The same code translated twice, as two runs would: under
+    /// `with_module_id_global` the module id is not in the bytes, so the two
+    /// are the same bytes (what a cache keyed by them needs); compiled in,
+    /// the second module's id makes them differ.
+    #[test]
+    fn a_module_id_in_a_global_leaves_the_bytes_alike() {
+        // add x0, x0, #1; ret -- at 0x10000, its page numbered afresh each time.
+        let mut mem = vec![0u8; 0x20000];
+        mem[0x10000..0x10004].copy_from_slice(&0x9100_0400u32.to_le_bytes());
+        mem[0x10004..0x10008].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
+        let once = || {
+            translate_runtime(
+                &mem,
+                0x10000,
+                &|a| (0x10000..0x11000).contains(&a),
+                &|_| false,
+                PageTable::new(),
+                BlockLimits::default(),
+                16,
+                true,
+                &Default::default(),
+            )
+            .0
+        };
+        let (a, b) = (gex_emit::with_module_id_global(once), gex_emit::with_module_id_global(once));
+        assert_ne!(a.module_id, b.module_id);
+        assert_eq!(a.wasm, b.wasm);
+        let has = |w: &[u8]| w.windows(gex_emit::MODULE_ID_GLOBAL.len()).any(|x| x == gex_emit::MODULE_ID_GLOBAL.as_bytes());
+        assert!(has(&a.wasm));
+        let (c, d) = (once(), once());
+        assert!(!c.covered.is_empty() && !has(&c.wasm));
+        assert_ne!(c.wasm, d.wasm);
+    }
+
     #[test]
     fn cgen_refuses_profiling() {
         assert!(super::cgen_conflict(true, true).is_some());

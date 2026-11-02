@@ -38,6 +38,7 @@ fn main() {
         page_bases: None,
         dense_global: None,
         module_id: 0,
+        module_id_global: None,
         loop_heads: None,
         enter: None,
     };

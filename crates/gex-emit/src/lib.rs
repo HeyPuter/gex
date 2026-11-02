@@ -16,5 +16,5 @@ pub mod region;
 pub mod tier1;
 pub mod wasm;
 
-pub use module::{ModuleBuilder, PageTable, TranslatedModule};
+pub use module::{with_module_id_global, ModuleBuilder, PageTable, TranslatedModule, MODULE_ID_GLOBAL};
 pub use tier1::set_trace_blocks;

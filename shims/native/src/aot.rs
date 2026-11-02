@@ -295,6 +295,7 @@ pub(crate) fn install_shared(
     for (module, meta) in units {
         let unit = Arc::new(super::CompiledUnit {
             module: Some(module),
+            module_id: 0,
             exported_blocks: Vec::new(),
             dir_entries: meta.dir_entries.clone(),
             table_slots: meta.table_slots,
