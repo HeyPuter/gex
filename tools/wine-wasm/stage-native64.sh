@@ -80,7 +80,9 @@ for dll in "$@" "${splits[@]}"; do
     [ -d "$dir" ] || dir=$build/dlls/$name
     [ -d "$dir" ] || dir=$build/programs/$dll
     [ -d "$dir" ] || dir=$build/programs/$name
-    spec=$src/${dir#$build/}/$name.spec
+    # (a module named with its extension has its spec named so too: wshom.ocx.spec)
+    spec=$src/${dir#$build/}/$dll.spec
+    [ -f "$spec" ] || spec=$src/${dir#$build/}/$name.spec
     if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
     if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
     # a GUI program's skeleton says so (stage-native.sh)

@@ -51,7 +51,9 @@ for dll in "$@"; do
     dir=$build/dlls/$name
     [ -d "$dir" ] || dir=$build/dlls/$dll  # (winewayland.drv's directory keeps the extension)
     [ -d "$dir" ] || dir=$build/programs/$name
-    spec=$src/${dir#$build/}/$name.spec
+    # (a module named with its extension has its spec named so too: wshom.ocx.spec)
+    spec=$src/${dir#$build/}/$dll.spec
+    [ -f "$spec" ] || spec=$src/${dir#$build/}/$name.spec
     rm -f "$sys/$dll"
     # a program has no .spec: an exe skeleton, its entry point the module's
     # (a DLL with no .spec, a driver like winewayland.drv, exports nothing:
