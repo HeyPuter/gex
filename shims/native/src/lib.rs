@@ -5547,12 +5547,7 @@ fn install_unit(
     if unit.module.is_none() {
         // Bridges only: tier-1's slots for addresses a function serves.
         ftab::install_bridges(cx.as_context_mut(), &unit.bridges)?;
-        let current: Vec<(u64, u32)> = {
-            let jit = cx.as_context().data().jit.as_ref().unwrap();
-            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-            unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect()
-        };
-        return write_dispatch_dir(memory, &current);
+        return write_current_dir(&cx, memory, unit);
     }
     let mut linker = linker;
     linker.allow_shadowing(true);
@@ -5593,12 +5588,7 @@ fn install_unit(
     // idempotent: it lives in shared guest memory.
     // Only entries still current: replaying an old unit into a new store
     // must not point a page retired since back at its abandoned slots.
-    let current: Vec<(u64, u32)> = {
-        let jit = cx.as_context().data().jit.as_ref().unwrap();
-        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-        unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect()
-    };
-    write_dispatch_dir(memory, &current)?;
+    write_current_dir(&cx, memory, unit)?;
     cx.as_context_mut()
         .data_mut()
         .jit
@@ -5607,6 +5597,21 @@ fn install_unit(
         .instances
         .push(instance);
     Ok(())
+}
+
+/// Write `unit`'s directory entries that are still the page table's, checked
+/// and written under the lock `retire_translations` zeroes them under, so a
+/// retired page's old base is never written back.
+fn write_current_dir(
+    cx: &impl wasmtime::AsContext<Data = HostState>,
+    memory: gex_mem::GuestMemory,
+    unit: &CompiledUnit,
+) -> Result<()> {
+    let jit = cx.as_context().data().jit.as_ref().unwrap();
+    let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+    let current: Vec<(u64, u32)> =
+        unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect();
+    write_dispatch_dir(memory, &current)
 }
 
 /// Blocks tier-1 has translated, by guest page, for GEX_WIN_STATS's split
