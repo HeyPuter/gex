@@ -14163,6 +14163,11 @@ fn killed(signal: i32, at: u64) -> i32 {
             && caller != pid && (target == pid || target == -pid || target == 0))
     {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
+    } else if signal == 13 {
+        // SIGPIPE: a write with no reader left, a pipeline's ordinary end
+        // (`yes | head`). One quiet line too; the last kill (`from`) is not
+        // what raised it.
+        trace_line(&format!("[gex] pid {pid} ended by signal {signal} (a write with no reader)\n"));
     } else {
     warn_line(&format!(
         "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  stderr: {}\n  threads:{}\n  \
