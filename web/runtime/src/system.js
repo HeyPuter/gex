@@ -423,14 +423,22 @@ export class System extends EventTarget {
    *  reaches by message; the rest of boot as the default build's. Windows
    *  and GL are not in it yet. */
   async #bootSingle(rt, arch, opts) {
-    if (this.#devices.length) throw new Error('the single-thread build has no windows or GL yet');
+    // The page's parts: here, before the system Worker starts, they say
+    // what it must make for them (`single.wl`: a canvas's compositor), and
+    // once it runs they attach their page halves (`attach`).
+    const single = { wl: null, listeners: new Set() };
+    const dev = { rt, single, say: (t) => this.#say(t) };
+    for (const { fn } of this.#devices.sort((a, b) => a.stage - b.stage)) await fn(dev);
     this.#arch = arch;
     const term = { write: (d) => this.#say(String(d)), writeln: (t) => this.#say(`${t}\n`) };
     let census = { pids: [], threads: 0, memory: 0 };
     const early = this.#earlyWorker;
     this.#earlyWorker = null;
-    const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host } }, (m) => {
+    const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale };
+    const gl = single.gl && { d3d: !!single.gl.d3d };
+    const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host }, wl, gl }, (m) => {
       if (m.ev === 'output') this.#say(m.text);
+      else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted') for (const fn of single.listeners) fn(m);
       else if (m.ev === 'census') census = m;
       else if (m.ev === 'message') for (const fn of this.#preset.onMessage) fn(m.m);
       else if (m.ev === 'net-dial') dialFor(this.#network, m);
@@ -464,6 +472,8 @@ export class System extends EventTarget {
     const { layers, records } = opts;
     opts.layers = opts.records = null;
     try {
+      if (single.wl) this.#sys.compositor = await single.wl.attach(k, single.listeners);
+      single.gl?.attach(this.#sys.compositor, single.listeners);
       await this.#start(this.#sys, layers, records, fsi, k);
     } catch (e) {
       this.#sys.stop();

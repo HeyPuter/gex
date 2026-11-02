@@ -70,6 +70,12 @@ export class Kernel {
     return k;
   }
 
+  /** A message to the single-thread system Worker that wants no answer
+   *  (kernel-single-worker.js: the compositor's `{ comp }`). */
+  post(m, transfer = []) {
+    this.#w.postMessage(m, transfer);
+  }
+
   /** One of the single-thread system Worker's own ops (kernel-single-worker.js). */
   ask(op, args = {}) {
     return this.#rpc(op, args);

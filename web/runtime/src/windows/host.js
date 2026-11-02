@@ -184,6 +184,7 @@ export class HostWindows extends EventTarget {
     const x = {};
     xOnDemand(i, x);
     i.devices(async (dev) => {
+      if (dev.single) throw new Error('the single-thread build has no HostWindows yet: CompositorWindows draws its windows');
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts
       // them, and keys come from their canvases.

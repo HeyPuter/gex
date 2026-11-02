@@ -26,6 +26,7 @@ export class SingleCanvas extends EventTarget {
     // `onDesktop(desktop, bare)` when the desktop is made.
     const x = {};
     i.devices(async (dev) => {
+      if (dev.single) throw new Error('the single-thread build has no SingleCanvas yet: CompositorWindows draws its windows');
       const { bareDesktop } = await import('../../../src/bare-desktop.js');
       const onDesktop = (d) => {
         this.#d = bareDesktop(d, container);

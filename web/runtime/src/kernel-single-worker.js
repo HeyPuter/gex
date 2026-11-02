@@ -13,7 +13,7 @@
 //
 // Messages in, `{ call, op, ... }`, answered `{ call, value }` or
 // `{ call, error }`:
-//   start { spec: { globals, arch, host } }  the page's switches (its GEX_*
+//   start { spec: { globals, arch, host, wl, gl } }  the page's switches (its GEX_*
 //       globals, as `GEX_PAGE_SEARCH`), the guest's architecture, the
 //       processes' host's options; answered with the kernel's export names
 //   calls { groups }       kernel.js `calls`; answered with the wait slot's
@@ -27,6 +27,10 @@
 // And out, unasked: `{ ev: 'output', fd, text }`, `{ ev: 'message', m }`
 // (a process's message the page's parts take: audio, net events),
 // `{ ev: 'census', pids, threads, memory }` as processes come and go, and
+// `{ ev: 'comp-out', m }` and `{ ev: 'comp-stats', stats }` from the scene
+// compositor (when `start`'s spec has `wl: { width, height, scale }`), whose
+// page half posts `{ comp: m }` in; `{ ev: 'gl-wanted' }` at a program's
+// first GL call (with `gl: { d3d }`);
 // `{ ev: 'net-dial', host, port, datagram, reply }` for each connection out
 // (net.js `pageRelay`): the page's network stays on the page, and the
 // guest's sockets are here, beside the fibers that wait on them. And
@@ -48,6 +52,10 @@ let mem = null;
 let kernel = null;
 let host = null;
 let slotWord = -1;
+/** The scene compositor, when the page has a canvas for one
+ *  (compositor-in-realm.js). */
+let comp = null;
+let compTimer;
 /** The guest's sockets, on the page's network as it last said. */
 const sockets = new Sockets(null);
 const dial = (m, transfer) => post({ ev: 'net-dial', ...m }, transfer);
@@ -76,7 +84,7 @@ function census() {
 }
 
 const ops = {
-  async start({ spec: { globals, arch, host: hostOpts } }) {
+  async start({ spec: { globals, arch, host: hostOpts, wl, gl } }) {
     // The page's switches, as the default build's Workers get them.
     Object.assign(globalThis, globals);
     await import('../../src/page-env.js');
@@ -95,14 +103,40 @@ const ops = {
     await runtime;
     const { helperKernel } = await import('../../src/kernel-helper.js');
     ({ k, mem } = await helperKernel(kernel, 0, 32, { suspending: true }));
-    host = await rt.makeProcessHost({ kernel, uid: 0, ...hostOpts, network: sockets }, {
+    // The scene compositor (the page's windows part asked for one): here,
+    // beside the memories it reads; the page's half relays (`comp`).
+    if (wl) {
+      const { openCompositor } = await import('../../src/compositor-in-realm.js');
+      comp = await openCompositor(wl.width, wl.height, wl.scale, (m, transfer) => post({ ev: 'comp-out', m }, transfer));
+      compTimer = setInterval(() => post({ ev: 'comp-stats', stats: comp.stats() }), 500);
+      // The guests' GL (MesaGl): no ring, each process's submit runs the
+      // compositor's Mesa on its own memory (compositor-worker.js
+      // `glInRealm`). The first says so, for the page to start Mesa.
+      const inner = gl && globalThis.__gexGlInRealm;
+      if (inner) {
+        let said = false;
+        globalThis.__gexGlInRealm = {
+          submit(...a) {
+            if (!said) post({ ev: 'gl-wanted' });
+            said = true;
+            return inner.submit(...a);
+          },
+        };
+      }
+    }
+    const glChannel = gl && comp ? { inRealm: true, d3d: !!gl.d3d } : null;
+    host = await rt.makeProcessHost({ kernel, uid: 0, ...hostOpts, network: sockets, wlChannel: comp?.channel ?? null, glChannel }, {
       onOutput: (fd, text) => post({ ev: 'output', fd, text: String(text) }),
-      onExit: () => census(),
+      onExit: (m, pid) => {
+        if (typeof pid === 'number') comp?.compositor.dropMemory(pid);
+        census();
+      },
       // No program reads the page's console: each has its own pipes or pty.
       readStdin: () => new Promise(() => {}),
       onMessage: (m) => {
         // A process's memory or pixels stay here (the compositor is this
         // realm's); what the page's parts take goes over.
+        if (m?.kind === 'wl-memory') return void comp?.compositor.addMemory(m.token, m.memory, m.kernel);
         if (m?.kind !== 'audio' && m?.kind !== 'net') return;
         try {
           post({ ev: 'message', m });
@@ -152,12 +186,16 @@ const ops = {
     return { value: null };
   },
   async stop() {
+    clearInterval(compTimer);
+    comp?.compositor.stop();
     await host?.stop();
     return { value: null };
   },
 };
 
 globalThis.onmessage = async ({ data: m }) => {
+  // The page's compositor half, as it would post to a compositor Worker.
+  if (m?.comp) return void comp?.send(m.comp);
   if (m?.call === undefined) return;
   try {
     const { value, transfer, seq: s } = await ops[m.op](m);

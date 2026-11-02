@@ -302,6 +302,10 @@ const PIXELS_MAX = 64 << 20;
 /** Pixel buffers are made in steps of this. */
 const PIXELS_STEP = 1 << 20;
 
+/** Whether `b` is shared memory: never, on a page that has none (the
+ *  single-thread build's, where the name itself is not defined). */
+const isShared = (b) => typeof SharedArrayBuffer === 'function' && b instanceof SharedArrayBuffer;
+
 /** The shared arena a compositor and its guests share (see the top of this
  *  file); `pixels` says the guests copy their surfaces' pixels into buffers
  *  of their own. */
@@ -335,7 +339,7 @@ export function setOutputSize(channel, w, h, scale) {
  * no `Atomics.waitAsync` (the caller keeps its frame clock alone).
  */
 export async function waitPublish(channel, seen) {
-  if (typeof Atomics.waitAsync !== 'function' || !(channel.arena instanceof SharedArrayBuffer)) return null;
+  if (typeof Atomics.waitAsync !== 'function' || !isShared(channel.arena)) return null;
   const a = new Int32Array(channel.arena);
   const v = seen ?? Atomics.load(a, M_PUB);
   const r = Atomics.waitAsync(a, M_PUB, v);
@@ -564,7 +568,7 @@ export async function waitDrag(channel, block, serial, want, ms) {
     if (v >>> 4 === serial >>> 0 && want(v & 15)) return v & 15;
     const left = end - performance.now();
     if (left <= 0) return null;
-    if (typeof Atomics.waitAsync === 'function' && channel.arena instanceof SharedArrayBuffer) {
+    if (typeof Atomics.waitAsync === 'function' && isShared(channel.arena)) {
       const r = Atomics.waitAsync(a, at, v, Math.min(left, 100));
       if (r.async) await r.value;
     } else {
@@ -608,7 +612,7 @@ function wakeBlock(channel, a, block) {
     notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
     // The single-thread build: the fibers parked on those words look.
     if ((SP_CODE && single.on)) sched.checkSlots();
-  } else if (q && slots && channel.arena instanceof SharedArrayBuffer) {
+  } else if (q && slots && isShared(channel.arena)) {
     // No kernel memory here: the relay's thread has it (`startWakeRelay`).
     Atomics.or(a, M_RELAY_BLOCKS, 1 << block);
     Atomics.add(a, M_RELAY, 1);
@@ -625,7 +629,7 @@ function wakeBlock(channel, a, block) {
  * memory is the one used, as `setKernelMemory`'s is.
  */
 export function startWakeRelay(channel, kernel) {
-  if (!kernel || channel.relay || typeof Atomics.waitAsync !== 'function' || !(channel.arena instanceof SharedArrayBuffer)) return;
+  if (!kernel || channel.relay || typeof Atomics.waitAsync !== 'function' || !isShared(channel.arena)) return;
   channel.relay = kernel;
   const a = new Int32Array(channel.arena);
   (async () => {
@@ -667,7 +671,7 @@ export function notifyQueue(w, q, slots) {
       bits &= bits - 1;
       const at = (slots >>> 2) + i * 32 + b;
       Atomics.add(w, at, 1);
-      if (w.buffer instanceof SharedArrayBuffer) Atomics.notify(w, at);
+      if (isShared(w.buffer)) Atomics.notify(w, at);
     }
   }
 }

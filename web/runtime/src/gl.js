@@ -25,6 +25,23 @@ export class MesaGl extends EventTarget {
     // compositor: started here at boot (`eager`), or by `start`, or by a
     // program's first GL call.
     i.devices(async (dev) => {
+      // The single-thread build: Mesa (its non-pthread build, gex/st/) runs
+      // in the system Worker's compositor, beside the guests' memories; a
+      // program's first GL call is said by a `gl-wanted` event.
+      if (dev.single) {
+        if (!dev.single.wl) throw new Error('MesaGl draws into the windows: make CompositorWindows too (the single-thread build has no other yet)');
+        dev.single.gl = {
+          d3d,
+          attach: (compositor, listeners) => {
+            this.#start = async () => {
+              const { assetUrl, assetFiles } = await import('../../src/page-env.js');
+              return compositor.hostGl(null, { api: 'core', url: assetUrl('/gex/st/gex-wgpu-replay.js'), files: assetFiles('/gex/st/') });
+            };
+            if (!eager) listeners.add((m) => { if (m.ev === 'gl-wanted') this.start().catch(() => {}); });
+          },
+        };
+        return;
+      }
       if (!dev.compositor) throw new Error('MesaGl draws into the windows: make HostWindows, CompositorWindows or SingleCanvas too');
       dev.glChannel = await dev.rt.openGlChannel(d3d);
       this.#start = dev.rt.glStarter(dev.compositor, dev.glChannel, { dom: dev.dom, source, ...(i.preset.glBackend ? { backend: i.preset.glBackend } : {}) }, dev.term);
