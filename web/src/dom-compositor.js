@@ -431,6 +431,19 @@ export class DomDesktop {
    * gets a canvas of its own, presented into directly (see `#drawGl`).
    */
   async hostGl(channel, opts = {}) {
+    // A device that is somewhere else (the single-thread build's, in its
+    // system Worker: gl-relay.js): nothing to serve here.
+    if (opts.device) {
+      const device = await opts.device.start();
+      if (!device.ok) {
+        this.onglfailed?.(device.error);
+        throw new Error(device.error || 'the GL device would not start');
+      }
+      this.#gl = device;
+      this.#glServed = true;
+      this.ongl?.(device.describe());
+      return device.describe();
+    }
     const canvas = document.createElement('canvas');
     // In the document, because both backends look this canvas up with
     // `document.querySelector` and one that is not in it is simply not found

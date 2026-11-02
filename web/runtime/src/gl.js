@@ -26,16 +26,21 @@ export class MesaGl extends EventTarget {
     // program's first GL call.
     i.devices(async (dev) => {
       // The single-thread build: Mesa (its non-pthread build, gex/st/) runs
-      // in the system Worker's compositor, beside the guests' memories; a
+      // in the system Worker, beside the guests' memories: in its scene
+      // compositor, or beside a DOM desktop's arena (gl-in-realm.js). A
       // program's first GL call is said by a `gl-wanted` event.
       if (dev.single) {
-        if (!dev.single.wl || dev.single.wl.dom) throw new Error('MesaGl in the single-thread build draws into CompositorWindows (no other yet)');
+        if (!dev.single.wl) throw new Error('MesaGl draws into the windows: make HostWindows, CompositorWindows or SingleCanvas too');
+        const dom = dev.single.wl.dom;
         dev.single.gl = {
           d3d,
-          attach: (compositor, listeners) => {
+          attach: (compositor, listeners, k) => {
             this.#start = async () => {
               const { assetUrl, assetFiles } = await import('../../src/page-env.js');
-              return compositor.hostGl(null, { api: 'core', url: assetUrl('/gex/st/gex-wgpu-replay.js'), files: assetFiles('/gex/st/') });
+              const opts = { api: 'core', url: assetUrl('/gex/st/gex-wgpu-replay.js'), files: assetFiles('/gex/st/') };
+              // Beside a DOM desktop the device is the Worker's, relayed.
+              if (dom) return compositor.hostGl(null, { device: (await import('../../src/gl-relay.js')).relayedGl(k, listeners, opts) });
+              return compositor.hostGl(null, opts);
             };
             if (!eager) listeners.add((m) => { if (m.ev === 'gl-wanted') this.start().catch(() => {}); });
           },

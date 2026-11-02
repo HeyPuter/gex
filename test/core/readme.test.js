@@ -33,8 +33,7 @@ const DB = 'debian';
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes
  *  first when its blocks start from a system they do not make (`pre`:
  *  'new' a System and Filesystem with the tree; 'booted' those, booted),
- *  whether they make windows (`windows`, which the single-thread build has
- *  none of yet), and what is checked after. */
+ *  whether they make windows (`windows`), and what is checked after. */
 const PHASES = [
   { blocks: [0], check: async (t, v) => {
     t.check('intro: uname -a', v.code === 0 && /Linux/.test(v.stdout), `exit ${v.code}: ${v.stdout}${JSON.stringify(v.sys.state.console.slice(-600))}`);
@@ -124,11 +123,6 @@ export default async function (t) {
     members(t);
   }
   const phase = PHASES[t.phase - 1];
-  // A page with no SharedArrayBuffer runs the single-thread build.
-  if (phase.windows && typeof SharedArrayBuffer !== 'function') {
-    say(`phase ${t.phase}: blocks ${phase.blocks.join(', ')} not run: the single-thread build has no windows yet`);
-    return t.phase < PHASES.length ? t.reload() : undefined;
-  }
   const tree = t.work('slim/debian-slim.tar.zst');
   await phase.before?.();
   const pre = phase.pre === undefined ? '' : `const { System } = M['@gex/runtime']; const { Filesystem } = M['@gex/runtime/fs'];

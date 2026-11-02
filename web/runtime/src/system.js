@@ -438,7 +438,7 @@ export class System extends EventTarget {
     const gl = single.gl && { d3d: !!single.gl.d3d };
     const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host }, wl, gl }, (m) => {
       if (m.ev === 'output') this.#say(m.text);
-      else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted' || m.ev === 'wl-mirror' || m.ev === 'wl-drop') for (const fn of single.listeners) fn(m);
+      else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted' || m.ev === 'wl-mirror' || m.ev === 'wl-drop' || m.ev === 'gl-surfaces') for (const fn of single.listeners) fn(m);
       else if (m.ev === 'census') census = m;
       else if (m.ev === 'message') for (const fn of this.#preset.onMessage) fn(m.m);
       else if (m.ev === 'net-dial') dialFor(this.#network, m);
@@ -481,7 +481,7 @@ export class System extends EventTarget {
         this.#sys.compositor = r.compositor;
         this.#sys.wlChannel = r.wlChannel ?? null;
       }
-      single.gl?.attach(this.#sys.compositor, single.listeners);
+      single.gl?.attach(this.#sys.compositor, single.listeners, k);
       await this.#start(this.#sys, layers, records, fsi, k);
     } catch (e) {
       this.#sys.stop();

@@ -31,7 +31,10 @@
 // `{ ev: 'comp-out', m }` and `{ ev: 'comp-stats', stats }` from the scene
 // compositor (when `start`'s spec has `wl: { width, height, scale }`), whose
 // page half posts `{ comp: m }` in; `{ ev: 'gl-wanted' }` at a program's
-// first GL call (with `gl: { d3d }`);
+// first GL call (with `gl: { d3d }`), and beside a DOM desktop
+// (`wl.dom`) `glStart { url, files, api }` starts Mesa here, `{ ev:
+// 'gl-surfaces', list }` says its windows, and the page posts `{ glc }`
+// with their canvases (gl-relay.js);
 // `{ ev: 'net-dial', host, port, datagram, reply }` for each connection out
 // (net.js `pageRelay`): the page's network stays on the page, and the
 // guest's sockets are here, beside the fibers that wait on them. And
@@ -59,6 +62,8 @@ let comp = null;
 let compTimer;
 /** Or the arena a page's DOM desktop mirrors. */
 let mirror = null;
+/** Beside that, the guests' GL (gl-in-realm.js). */
+let glr = null;
 /** The guest's sockets, on the page's network as it last said. */
 const sockets = new Sockets(null);
 const dial = (m, transfer) => post({ ev: 'net-dial', ...m }, transfer);
@@ -135,12 +140,14 @@ const ops = {
           dropMemory: (token) => {
             memories.delete(token);
             bridge.releaseToken(channel, token);
+            glr?.forget(token);
             post({ ev: 'wl-drop', token });
           },
           stop: () => {},
         },
         send: () => {},
       };
+      if (gl) glr = (await import('../../src/gl-in-realm.js')).openGlInRealm(post);
     } else if (wl) {
       const { openCompositor } = await import('../../src/compositor-in-realm.js');
       comp = await openCompositor(wl.width, wl.height, wl.scale, (m, transfer) => post({ ev: 'comp-out', m }, transfer));
@@ -160,7 +167,7 @@ const ops = {
         };
       }
     }
-    const glChannel = gl && comp && !wl.dom ? { inRealm: true, d3d: !!gl.d3d } : null;
+    const glChannel = gl && comp ? { inRealm: true, d3d: !!gl.d3d } : null;
     host = await rt.makeProcessHost({ kernel, uid: 0, ...hostOpts, network: sockets, wlChannel: comp?.channel ?? null, glChannel }, {
       onOutput: (fd, text) => post({ ev: 'output', fd, text: String(text) }),
       onExit: (m, pid) => {
@@ -226,6 +233,11 @@ const ops = {
     await rt.startXServer({ kernel, wlChannel: comp.channel, compositor: () => comp.compositor, term, listen, rootful });
     return { value: null };
   },
+  // Mesa beside a DOM desktop, when the page's MesaGl starts it.
+  glStart(opts) {
+    if (!glr) throw new Error('no GL beside these windows');
+    return glr.start(opts).then((value) => ({ value }));
+  },
   useKernelStacks({ stacks }) {
     host.useKernelStacks(stacks);
     return { value: null };
@@ -233,6 +245,7 @@ const ops = {
   async stop() {
     clearInterval(compTimer);
     comp?.compositor.stop();
+    glr?.stop();
     await host?.stop();
     return { value: null };
   },
@@ -243,6 +256,8 @@ globalThis.onmessage = async ({ data: m }) => {
   // or its DOM desktop's writes on the arena.
   if (m?.comp) return void comp?.send(m.comp);
   if (m?.wl) return void mirror?.call(m.wl.fn, m.wl.args);
+  // Its GL windows' canvases (gl-relay.js).
+  if (m?.glc) return void (m.glc.stop ? glr?.stop() : glr?.canvas(m.glc));
   if (m?.call === undefined) return;
   try {
     const { value, transfer, seq: s } = await ops[m.op](m);
