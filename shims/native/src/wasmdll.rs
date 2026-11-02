@@ -876,7 +876,7 @@ fn install_module(
             }
             imports[i].2 = b;
         }
-        let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), tls: None };
+        let binds = crate::dylink::Binds { path: file.display().to_string(), imports, extra: Vec::new(), tls: None, own_tls: true };
         s.ftab.dylink.insert(m, Arc::new(binds));
         // its calls and addresses into modules not yet installed; earlier
         // modules' into it

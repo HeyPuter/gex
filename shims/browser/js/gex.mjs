@@ -5173,6 +5173,15 @@ export class Gex {
       e.gex_wasmprog_release?.(prov);
       if (this.#wasmprogTls) this.#dlTlsInit(prov, inst, st, this.#wasmprogTls);
     }
+    // A Wine PE module with thread-local data (a gexcc-win program's C++
+    // runtime): its start function gives a block only to the first
+    // instance to run it, so each of this Worker's gets one of its own.
+    else if (wasmdll && inst.exports.__wasm_init_tls && inst.exports.__tls_size) {
+      const size = Number(inst.exports.__tls_size.value);
+      const align = Number(inst.exports.__tls_align?.value ?? 1);
+      const at = this.#dlTlsAlloc(prov, size, align);
+      inst.exports.__wasm_init_tls(typeof inst.exports.__tls_size.value === 'bigint' ? BigInt(at) : at);
+    }
     // A deferred unit's bridges were written when it was deferred.
     const bridges = deferred ? 0 : this.#cgenBridges(regsOf, tables);
     st.instances.push(inst);
@@ -6093,19 +6102,27 @@ export class Gex {
       st.dlTls.set(prov, kept);
       return;
     }
+    const at = this.#dlTlsAlloc(prov, size, align);
+    inst.exports.__wasm_init_tls(at);
+    st.dlTls.set(prov, at);
+  }
+
+  /** `size` bytes at `align` for a module's thread-local block in this
+   *  Worker's chunks. */
+  #dlTlsAlloc(prov, size, align) {
+    const e = this.#shim.exports;
     align = Math.max(align, 8);
     const last = this.#dlTlsChunks.at(-1);
     let at = (this.#dlTlsNext + align - 1) & -align;
     if (!last || at + size > last[0] + last[1]) {
       const len = Math.max(0x4000, size + align);
       const chunk = e.gex_wasmprog_tls_chunk(len) >>> 0;
-      if (!chunk) throw new Error(`wasm32 module ${prov}: no memory for its thread-local block`);
+      if (!chunk) throw new Error(`wasm module ${prov}: no memory for its thread-local block`);
       this.#dlTlsChunks.push([chunk, len]);
       at = (chunk + align - 1) & -align;
     }
     this.#dlTlsNext = at + size;
-    inst.exports.__wasm_init_tls(at);
-    st.dlTls.set(prov, at);
+    return at;
   }
 
   /** This thread's blocks for a fork's child: [link-map index, address]. */
