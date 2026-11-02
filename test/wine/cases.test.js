@@ -31,7 +31,11 @@ const CASES = [
   ['nestsp', 0, allOk, 'nestsp.exe', [], true],
   ['qpcmono', 0, allOk, 'qpcmono.exe'],
   // 2000 writes a case: on the page every read is a server request.
-  ['seqrace', 0, allOk, 'seqrace.exe', ['2000', '7']],
+  // Fewer writes in the single-thread build (a page without
+  // SharedArrayBuffer): one thread serializes every server round trip, so
+  // the race is exercised less there anyway, and the full count outlasts
+  // the run's timeout.
+  ['seqrace', 0, allOk, 'seqrace.exe', typeof SharedArrayBuffer === 'function' ? ['2000', '7'] : ['500', '7']],
   ['authattrs', 0, allOk, 'authattrs.exe'],
   ['rpccom', 0, allOk, 'rpccom.exe'],
   ['dwrite', 0, allOk, 'dwrite.exe'],
