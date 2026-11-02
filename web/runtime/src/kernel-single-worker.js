@@ -244,7 +244,10 @@ const ops = {
       onOutput: (fd, text) => post({ ev: 'output', fd, text: String(text) }),
       onExit: (m, pid) => {
         if (typeof pid === 'number') comp?.compositor.dropMemory(pid);
-        census();
+        // Once the host has let it go (it calls this just before): taken
+        // now, the census still had it, and the last process to end stayed
+        // in the page's list for good.
+        queueMicrotask(census);
       },
       // No program reads the page's console: each has its own pipes or pty.
       readStdin: () => new Promise(() => {}),
