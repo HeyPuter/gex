@@ -129,9 +129,12 @@ export class Programs {
   }
 
   /** A program whose Worker never started: what was held for it let go,
-   *  and its exit (127, as an exec that failed) collected as any. */
+   *  and its exit (127, as an exec that failed) collected as any. One that
+   *  started and fell over has said its own end (a signal) already, which a
+   *  127 would overwrite before the reaper saw it: it keeps its own. */
   async abandon(pid) {
-    await this.#k.calls([{ f: 'k_pipe_forget', a: [pid] }, { f: 'k_pty_forget', a: [pid] }, { f: 'k_exit', a: [pid, 127] }]);
+    const [, , { r: ended }] = await this.#k.calls([{ f: 'k_pipe_forget', a: [pid] }, { f: 'k_pty_forget', a: [pid] }, { f: 'k_wait', a: [INIT, pid, 1] }]);
+    if (!ended) await this.#k.calls([{ f: 'k_exit', a: [pid, 127] }]);
   }
 
   /** A connection of the page's to what a program listens on at
