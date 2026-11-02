@@ -156,7 +156,8 @@ export class System extends EventTarget {
    * it was built for where one is mapped at its base; `{ url, require }`
    * with `require` makes a program image without one fail. `xcache`: keep
    * the translated code across loads (in the origin's private storage, a
-   * directory under Node: GEX_XCACHE_DIR). `debug`: the runtime's switches,
+   * directory under Node: GEX_XCACHE_DIR); a string names the cache, kept
+   * apart from other names' on the same page. `debug`: the runtime's switches,
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
@@ -175,7 +176,7 @@ export class System extends EventTarget {
       // The package's own list of its files, unless the page names a place.
       files: baseUrl == null ? files : null,
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
-      xcache: !!xcache,
+      xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
       debug: { ...debug },
     };
@@ -296,7 +297,7 @@ export class System extends EventTarget {
       q.set('cgen', this.#opts.units.require ? '2' : '1');
       q.set('cgenurl', this.#opts.units.url);
     }
-    if (this.#opts.xcache) q.set('xcache', '1');
+    if (this.#opts.xcache) q.set('xcache', this.#opts.xcache === true ? '1' : this.#opts.xcache);
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     if (this.#opts.files) globalThis.GEX_ASSET_FILES = this.#opts.files;

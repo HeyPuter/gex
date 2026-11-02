@@ -24,7 +24,8 @@ export interface SystemOptions {
    *  that has none. */
   units?: string | URL | { url: string | URL; require?: boolean };
   /** Keep translated code across loads (the origin's private file system). */
-  xcache?: boolean;
+  /** Keep translated code across loads; a string names the cache, apart from other names'. */
+  xcache?: boolean | string;
   /** The translated architecture the tree's programs are built for. Default:
    *  read from the tree at boot. Given, the kernel and runtime load while the
    *  page lays out its files. */

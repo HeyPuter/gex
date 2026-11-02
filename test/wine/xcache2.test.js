@@ -15,7 +15,9 @@ const PHASES = ['save', 'restore', 'swapped'];
 
 export default async function (t) {
   const phase = PHASES[t.phase - 1];
-  const w = await bootWine(t, { system: { xcache: true }, debug: { log: 'debug' } });
+  // A cache of its own name: another test's on the same page path would
+  // be restored and saved over this one's when the two run at once.
+  const w = await bootWine(t, { system: { xcache: 'xcache2' }, debug: { log: 'debug' } });
   await w.put('xca.dll');
   await w.put('xcb.dll');
   const [p, q] = phase === 'swapped' ? ['xcb', 'xca'] : ['xca', 'xcb'];

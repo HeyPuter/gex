@@ -195,7 +195,12 @@ export function xcacheName() {
     + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '')
     + (globalThis.GEX_MXCSR ? '&mxcsr=1' : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
-  return `xc-${xcHash(shim, kernel, switches, flavour, globalThis.location?.pathname ?? '')}`;
+  // The page's path, which a system Worker is told (`pageGlobals`): its own
+  // is the Worker's script, the same for every page. And the cache's own
+  // name, when the page gave one (`?xcache=NAME`).
+  const path = globalThis.GEX_PAGE_PATH ?? globalThis.location?.pathname ?? '';
+  const named = flag('xcache') === '1' ? '' : `&xcache=${flag('xcache')}`;
+  return `xc-${xcHash(shim, kernel, switches + named, flavour, path)}`;
 }
 
 let fetchOther = null;
@@ -440,7 +445,7 @@ export function singleMode() {
 /** What of the page's state the system Worker needs: its query and every
  *  `GEX_*` switch the page set. */
 export function pageGlobals() {
-  const out = { GEX_PAGE_SEARCH: pageSearch() };
+  const out = { GEX_PAGE_SEARCH: pageSearch(), GEX_PAGE_PATH: globalThis.GEX_PAGE_PATH ?? globalThis.location?.pathname };
   for (const k of Object.keys(globalThis)) {
     if (!k.startsWith('GEX_')) continue;
     const v = globalThis[k];
