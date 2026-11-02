@@ -415,6 +415,27 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             },
         }
     })()) })?;
+    // gexrt64's guarded call (wasm64.c `__gexw_native_try`): fn(arg), and a
+    // memory access out of bounds inside it (a bad pointer Wine's code went
+    // through) caught here, every wasm frame since gone: 0xc0000005
+    // (STATUS_ACCESS_VIOLATION), else what fn returned (0 for none). Index 0
+    // asks whether it is on (2; -1 without the debugging switch
+    // GEX_NATIVE_TRY=1). The high bit of `f`: fn takes an i64.
+    linker.func_wrap(IMPORT_MODULE, "native_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
+        if f == 0 {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            return Ok(if *ON.get_or_init(|| std::env::var("GEX_NATIVE_TRY").as_deref() == Ok("1")) { 2 } else { -1 });
+        }
+        let func = ftab::table_func(&mut caller, (f & 0x7fff_ffff) as u32)?;
+        let a = if f < 0 { wasmtime::Val::I64(arg as u32 as i64) } else { wasmtime::Val::I32(arg) };
+        let mut out = [wasmtime::Val::I32(0)];
+        let n = func.ty(&caller).results().len().min(1);
+        match func.call(&mut caller, &[a], &mut out[..n]) {
+            Ok(()) => Ok(if n == 1 { out[0].i32().unwrap_or(0) } else { 0 }),
+            Err(e) if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) => Ok(0xc000_0005u32 as i32),
+            Err(e) => Err(anyhow::Error::from(e)),
+        }
+    })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
     // The `nt_qpc` provider's counter, for an i386 PE ntdll (a WoW64
     // process's): what 64-bit Wine's NtQueryPerformanceCounter reads

@@ -41,6 +41,11 @@ export const OPTIONS = [
   // (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the units are
   // as without it; on, 2-8% slower in tier 1.
   ['nullGuard',      'GEX_NULL_GUARD',       'nullguard',     'GEX_NULL_GUARD',        'one',    'extra', true],
+  // 64-bit Wine: a system call or WoW64 thunk that goes through a bad
+  // pointer ends with STATUS_ACCESS_VIOLATION, as on Windows, not the
+  // process (gex.native_try). A debugging opt-in: off, Wine's system calls
+  // are as without it.
+  ['nativeTry',      'GEX_NATIVE_TRY',       'nativetry',     'GEX_NATIVE_TRY',        'one',    'extra', true],
   // SSE honours MXCSR's rounding control in every tier (gex_ir::mxcsr_exact),
   // for a program that needs it. Off, SSE rounds to nearest, and tier 1 and
   // the units are as without it.
