@@ -2104,7 +2104,7 @@ export class Gex {
         // pointer `sp` as `fault_call`'s are. 0: not here (the single-thread
         // build: the shim stages the frame then, `#signalTake`).
         signal_call: (idx, ctx, pc, sp) => {
-          if (single.on) return 0;
+          if ((SP_CODE && single.on)) return 0;
           const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
