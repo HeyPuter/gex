@@ -30,7 +30,7 @@ import { noRegSave } from './wine-env.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../shims/browser/js/page-host.mjs';
-import { checkOptions, sizeValue, showValue } from './start-options.js';
+import { checkOptions, filesystemValue, sizeValue, showValue } from './start-options.js';
 import { posixTz } from './posix-tz.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 import { pageUser } from './wine-user.js';
@@ -76,10 +76,11 @@ const PIECES = {
  *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
- *   filesystem where the guest's files are kept: 'memory' (the default:
- *              MemoryFilesystem, { kind: 'memory', max } with a limit) or
- *              { kind: 'opfs', name, cache } (OPFSFilesystem, web/runtime
- *              README "Filesystem")
+ *   filesystem where the guest's files are kept, required here or in the
+ *              build (user/eject.json "start"): 'memory' (MemoryFilesystem,
+ *              { kind: 'memory', max } with a limit) or { kind: 'opfs',
+ *              name, cache } (OPFSFilesystem, web/runtime README
+ *              "Filesystem")
  *   network    the guest's network: an object with connect(host, port) (web/runtime
  *              README "Network"); none by default
  *   wisp       a Wisp proxy's URL (ws:// or wss://), for a network over it
@@ -359,6 +360,11 @@ async function begin(opts, base, at, state, meter) {
     opts.onLog?.(s);
   };
   const b = opts.build ?? fromLaunch(await fetchJson(at(opts.launch ?? 'project/build/web/nt.json'), 'the build\'s launch file'), at);
+  // Where the guest's files are kept: the page's choice, or the build's
+  // (user/eject.json "start"). There is no default.
+  const filesystem = opts.filesystem ?? b.filesystem;
+  if (!filesystem) throw new Error("start(): choose where the guest's files are kept: filesystem: 'memory' or { kind: 'opfs', name } (here, or the build's user/eject.json \"start\")");
+  if (!filesystemValue(filesystem)) throw new Error(`start(): the build's filesystem ${JSON.stringify(filesystem)} is not 'memory', { kind: 'memory', max } or { kind: 'opfs', name, cache }`);
 
   // What the build left out cannot be asked for.
   const has = {
@@ -822,7 +828,7 @@ async function begin(opts, base, at, state, meter) {
   }
   const run = runProgram(term, {
     network,
-    filesystem: opts.filesystem ?? b.filesystem ?? 'memory',
+    filesystem,
     elf: exeBytes,
     files,
     dirs: tree.dirs,

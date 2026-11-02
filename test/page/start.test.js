@@ -32,6 +32,7 @@ export default async function (t) {
   const t0 = performance.now();
   const app = await timeout(start({
     container: document.getElementById('app'),
+    filesystem: 'memory',
     size: { w: 640, h: 480 },
     baseUrl: t.baseUrl,
     build: build(['-c', 'echo "ppid $PPID"; cat /proc/1/comm; rt-x11 demo & sleep 600']),

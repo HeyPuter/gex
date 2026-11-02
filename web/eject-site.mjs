@@ -65,6 +65,12 @@ if (!existsSync(join(project, 'build/web/wine32.json'))) {
   process.exit(2);
 }
 const wine32 = JSON.parse(readFileSync(join(project, 'build/web/wine32.json'), 'utf8'));
+// Where the guest's files are kept (user/eject.json "start"), which the
+// project's build requires: a build made before it says nothing.
+if (!wine32.start?.filesystem) {
+  console.error(`eject-site: ${project}'s build names no filesystem: add "filesystem": "memory" (or {"kind": "opfs", "name": ...}) to user/eject.json "start" and build again`);
+  process.exit(2);
+}
 const title = opt('--title', (wine32.title ?? 'gex').replace(/^Untitled - /, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
 rmSync(out, { recursive: true, force: true });
@@ -697,7 +703,7 @@ function wine32Site() {
     else if (rel === 'project/build/web/rest.bin') restBytes = statSync(p).size;
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', filesystem: wine32.start?.filesystem ?? 'memory', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes, ...(restBytes ? { rest: restBytes } : {}) } : null, cold: cold || null }, null, 1));
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', filesystem: wine32.start.filesystem, features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes, ...(restBytes ? { rest: restBytes } : {}) } : null, cold: cold || null }, null, 1));
   console.log(`${out}: wine32 build ${build}; features off: ${wine32.features_off.join(', ') || 'none'}; ${wine32.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand${restBytes ? `; the rest bundle ${mb(restBytes)} MB` : ''})` : ''));
 }

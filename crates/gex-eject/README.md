@@ -402,6 +402,10 @@ whose default the build records: user/eject.json `"start"` (`args`, `env`,
 `cwd`, `size`, `mtimes`, `strace`, `trapstack`, `persist`, `filesystem`, `ready`) over the
 recording's, and the page's options over both. A `"start"` key for a build
 setting (`"compositor"`, say) fails the build and says where it goes.
+`"filesystem"` is required: where the guest's files are kept, `"memory"`
+(gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
+origin private file system; web/runtime README, "Filesystem"). A new
+project's file says `"memory"`; a build whose file says neither fails.
 
 ### A Linux program's web build
 

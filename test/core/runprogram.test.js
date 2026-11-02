@@ -49,6 +49,7 @@ export default async function (t) {
   ].join('\n');
   const t0 = performance.now();
   const run = runProgram(term, {
+    filesystem: 'memory',
     elf: tree.files[tree.hard['/bin/sh'] ?? '/bin/sh'],
     // The program by a directory link's name (/bin/bash, /bin -> usr/bin).
     args: ['/lbin/sh', '-c', script],
