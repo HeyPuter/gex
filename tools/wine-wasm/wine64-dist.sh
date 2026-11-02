@@ -347,7 +347,8 @@ if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && { [ "$M64" = 0 ] || [ 
 fi
 SP=${WINE64_SPLIT_DLLS:-}
 SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || { [ "$M64" != 0 ] && [ "$M64N" = 0 ]; } || SPA=all
-NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+# PELINK_EXPORT_ALL changes the core (every DLL export), so it is part of the key
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}${PELINK_EXPORT_ALL:+ export-all}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
