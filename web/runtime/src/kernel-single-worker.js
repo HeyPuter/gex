@@ -327,6 +327,28 @@ const ops = {
     const all = words();
     return { value: { at, slots: all[(at >>> 2) + 2], cap: all[(at >>> 2) + 3], ccap: all[(at >>> 2) + 8] } };
   },
+  // The translation cache a load saved (system.js `#xcacheRestore`): named
+  // and read here, where the runtime that saves it was loaded, and laid into
+  // the kernel's memory, which only this realm holds; in turn with the
+  // page's calls. `{ name, size, n }`: no name without a cache to keep, no
+  // size with nothing saved, `n` the modules restored or the kernel's
+  // refusal (< 0).
+  xcacheRestore() {
+    const run = async () => {
+      const rt = await loading;
+      const name = rt.xcacheName();
+      if (!name || typeof k.k_store_restore !== 'function') return { value: {} };
+      await invoke('k_xcache_enable', []);
+      const bytes = await rt.xcRead(name);
+      if (!bytes) return { value: { name } };
+      const at = (await invoke('k_store_restore_buf', [bytes.length])) >>> 0;
+      new Uint8Array(kernel.memory.buffer).set(bytes, at);
+      return { value: { name, size: bytes.length, n: await invoke('k_store_restore', []) } };
+    };
+    const done = callsDone.then(run);
+    callsDone = done.catch(() => {});
+    return done;
+  },
   useKernelStacks({ stacks }) {
     host.useKernelStacks(stacks);
     return { value: null };

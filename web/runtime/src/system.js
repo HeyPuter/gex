@@ -547,7 +547,7 @@ export class System extends EventTarget {
     // Each one's failure is had at the end, not said as unhandled meanwhile.
     const step = (p) => { p.catch(() => {}); steps.push(p); };
     step(k.r('k_fs_populate_done'));
-    if (this.#opts.xcache && !(SP_CODE && SINGLE)) {
+    if (this.#opts.xcache) {
       await Promise.all(steps);
       await this.#xcacheRestore(s, k);
     }
@@ -577,6 +577,13 @@ export class System extends EventTarget {
    *  the first process: each process's Worker names code by its bytes from
    *  then on, and checks a saved module's file when it first uses it. */
   async #xcacheRestore(s, k) {
+    // The single-thread build's runtime and kernel memory are its system
+    // Worker's (kernel-single-worker.js `xcacheRestore`).
+    if (SP_CODE && SINGLE) {
+      const { name, size, n } = await k.ask('xcacheRestore');
+      if (name) this.#say(size === undefined ? `xcache ${name}: nothing saved\n` : `xcache ${name}: ${(size / 1048576).toFixed(1)} MiB, restored ${n} modules\n`);
+      return;
+    }
     const name = s.rt.xcacheName();
     if (!name || !k.has('k_store_restore')) return;
     await k.r('k_xcache_enable');
