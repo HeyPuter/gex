@@ -524,6 +524,11 @@ impl FlowNames {
     }
 }
 
+/// A moved UDP socket's AVAILABLE answer: the next datagram's length in
+/// the low bits (at most 65535), the flow table's generation above them.
+const DGRAM_LEN_BITS: u32 = 17;
+const DGRAM_LEN_MASK: u64 = (1 << DGRAM_LEN_BITS) - 1;
+
 /// A flow table line, `ADDR:PORT:TRANSPORT`.
 fn parse_flow(line: &str) -> Option<((u32, u16), &str)> {
     let mut p = line.splitn(3, ':');
@@ -1287,7 +1292,17 @@ impl Socket {
         if self.kind != Kind::Udp {
             return None;
         }
+        // The flows this holder knows first: a poll has just taken the
+        // table up. Only with nothing on them is the table asked after.
+        if let Some(n) = self.flow_take(buf, peek) {
+            return Some(n);
+        }
         self.sync_flows(m, None);
+        self.flow_take(buf, peek)
+    }
+
+    /// The next datagram on one of this holder's flows, in turn.
+    fn flow_take(&self, buf: &mut [u8], peek: bool) -> Option<usize> {
         let flows = self.flows.lock().unwrap();
         let k = flows.len();
         let at = self.flow_turn.fetch_add(1, Ordering::Relaxed);
@@ -1310,6 +1325,12 @@ impl Socket {
             return None;
         }
         self.sync_flows(m, gen);
+        self.flow_ready_here()
+    }
+
+    /// The next datagram's length on one of this holder's flows as it
+    /// knows them, or `None`.
+    fn flow_ready_here(&self) -> Option<usize> {
         self.flows.lock().unwrap().iter().find(|f| f.t.has_data()).map(|f| f.t.available())
     }
 
@@ -1872,6 +1893,11 @@ impl Socket {
             op::WRITE => count(self.write_at(0, buf)),
             op::READ => count(self.read_at(0, buf)),
             op::PEEK => count(self.peek(buf)),
+            // A UDP socket's next datagram's length, its flow table's
+            // generation above it (`available`).
+            op::AVAILABLE if self.kind == Kind::Udp => {
+                (self.available().unwrap_or(0) & DGRAM_LEN_MASK | self.flow_names.lock().unwrap().gen << DGRAM_LEN_BITS) as i64
+            }
             op::AVAILABLE => self.available().unwrap_or(0) as i64,
             // A UDP socket's with its flow table's generation above the
             // first bit, so a holder takes the table up only when it changed
@@ -1987,8 +2013,23 @@ impl FileHandle for Socket {
     /// must be exact -- the length of the next datagram, which a caller uses
     /// to size its buffer.
     fn available(&self) -> Option<u64> {
-        if let Some(n) = self.moved().and_then(|m| self.flow_ready(m, None)) {
-            return Some(n as u64);
+        if let (Kind::Udp, Some(m)) = (self.kind, self.moved()) {
+            // This holder's flows, then the global kernel's queue, whose
+            // answer carries the flow table's generation (as READABLE's):
+            // the table is asked after only when that moved.
+            if let Some(n) = self.flow_ready_here() {
+                return Some(n as u64);
+            }
+            if let Some(v) = self.fwd(op::AVAILABLE, 0, 0, &mut []) {
+                if v <= 0 {
+                    return Some(0);
+                }
+                let len = v as u64 & DGRAM_LEN_MASK;
+                if len > 0 {
+                    return Some(len);
+                }
+                return Some(self.flow_ready(m, Some(v as u64 >> DGRAM_LEN_BITS)).unwrap_or(0) as u64);
+            }
         }
         if let Some(v) = self.fwd(op::AVAILABLE, 0, 0, &mut []) {
             return Some(v.max(0) as u64);

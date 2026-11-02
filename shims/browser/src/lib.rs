@@ -288,7 +288,8 @@ impl PageDgram {
 
     /// One datagram into `buf`, cut to it.
     fn read(&self, buf: &mut [u8], take: bool) -> Result<usize, Errno> {
-        let mut f = vec![0u8; 2 + buf.len()];
+        // No more than a datagram's largest, however large `buf` is.
+        let mut f = vec![0u8; 2 + buf.len().min(u16::MAX as usize)];
         let whole = self.frame(&mut f, take).ok_or(Errno::EAGAIN)?;
         let n = (whole - 2).min(buf.len());
         buf[..n].copy_from_slice(&f[2..2 + n]);
@@ -329,14 +330,15 @@ impl net::Transport for PageDgram {
         let mut frame = Vec::with_capacity(2 + data.len());
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(data);
-        let mut at = 0;
-        while at < frame.len() {
-            match unsafe { net_send(id, frame[at..].as_ptr() as gex_kernel::PAddr, (frame.len() - at) as u32) } {
-                n if n > 0 => at += n as usize,
-                // nothing taken: the datagram dropped, as UDP may
-                0 if at == 0 => return Ok(data.len()),
-                _ => return Err(Errno::EPIPE),
+        // In one call: the page takes a frame whole (the bridge cuts only
+        // past 1 MiB), or nothing, and then it is dropped, as UDP may.
+        match unsafe { net_send(id, frame.as_ptr() as gex_kernel::PAddr, frame.len() as u32) } {
+            n if n == frame.len() as i32 || n == 0 => {}
+            n if n > 0 => {
+                debug_assert!(false, "a datagram's frame cut at {n} of {}", frame.len());
+                return Err(Errno::EPIPE);
             }
+            _ => return Err(Errno::EPIPE),
         }
         Ok(data.len())
     }
