@@ -551,9 +551,15 @@ const CALLOUT_FRONT = new Uint8Array([
  *  `warmFronts` warms those not yet warmed. */
 const FRONT_WARM_DEPTH = 4;
 const FRONT_WARM_CALLS = 1100;
+// Held weakly: a front holds its process's instance (and so its memory),
+// and in the single-thread build every process's is in this one realm. A
+// front whose process is gone has nothing left to warm.
 const coldFronts = [];
 function warmFronts() {
-  for (const warm of coldFronts.splice(0)) for (let i = 0; i < FRONT_WARM_CALLS; i++) warm();
+  for (const [ref, args] of coldFronts.splice(0)) {
+    const f = ref.deref();
+    if (f) for (let i = 0; i < FRONT_WARM_CALLS; i++) f(...args);
+  }
 }
 let enterFrontMod = null;
 const enterFronts = new WeakMap();
@@ -563,7 +569,7 @@ function enterFront(fn) {
   try {
     enterFrontMod ??= new WebAssembly.Module(ENTER_FRONT);
     const f = new WebAssembly.Instance(enterFrontMod, { e: { f: fn } }).exports.enter;
-    coldFronts.push(() => f(0, 0n));
+    coldFronts.push([new WeakRef(f), [0, 0n]]);
     w = f;
   } catch (err) {
     // An `enter` of another signature: called as it is.
@@ -577,7 +583,7 @@ let callOutFrontMod = null;
 function callOutFront(fn) {
   callOutFrontMod ??= new WebAssembly.Module(CALLOUT_FRONT);
   const f = new WebAssembly.Instance(callOutFrontMod, { e: { f: fn } }).exports.call_out;
-  coldFronts.push(() => f(0, 0n, 0n, 0n));
+  coldFronts.push([new WeakRef(f), [0, 0n, 0n, 0n]]);
   return f;
 }
 /** The entry function's module, for a 64-bit function table (`t64`) and an
