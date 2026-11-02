@@ -5093,6 +5093,7 @@ export class Gex {
     }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
+    let relocate = 0;
     if (!this.#spareWait && wasmprog) {
       // Another Worker applying them is waited for (the shim's side).
       if (e.gex_wasmprog_relocate(prov)) {
@@ -5102,8 +5103,10 @@ export class Gex {
           e.gex_wasmprog_relocated?.(prov);
         }
       }
-    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) {
-      // Another Worker applying them is waited for (the shim's side).
+    } else if (!this.#spareWait && memBase && (relocate = e.gex_provider_relocate(memBase))) {
+      // Another Worker applying them is waited for (the shim's side), and
+      // one that never finished ends this one.
+      if (relocate < 0) throw new Error(`provider module ${prov} (${this.#cgenStr(e.gex_cgen_pmod_file, prov)}): another Worker took its data relocations and never applied them`);
       try {
         inst.exports.__wasm_apply_data_relocs?.();
       } finally {
