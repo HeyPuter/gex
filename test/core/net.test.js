@@ -1,9 +1,8 @@
-// The guest's network (a page's own Network), the page's connections into
+// The guest's network (sys.network, a page's own), the page's connections into
 // the guest (sys.net.connectGuest) and the guest's calls to the page
 // (hostCalls, /dev/gex-host).
 import { System } from '../../web/runtime/src/index.js';
 import { Filesystem } from '../../web/runtime/src/fs.js';
-import { Network } from '../../web/runtime/src/net.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120 };
 
@@ -21,6 +20,23 @@ function reverser(host, port) {
       push.close();
     },
   });
+  return { readable, writable };
+}
+
+/** A UDP flow in the page: each datagram comes back prefixed with where
+ *  it was going. */
+function echoer(host, port) {
+  let push;
+  const readable = new ReadableStream({ start: (c) => { push = c; } });
+  const writable = new WritableStream({ write: (b) => push.enqueue(enc.encode(`${host}:${port} ${dec.decode(b)}`)) });
+  return { readable, writable };
+}
+
+/** A UDP flow in the page that sends each datagram back as it is. */
+function mirror() {
+  let push;
+  const readable = new ReadableStream({ start: (c) => { push = c; } });
+  const writable = new WritableStream({ write: (b) => push.enqueue(b.slice()) });
   return { readable, writable };
 }
 
@@ -48,14 +64,13 @@ export default async function (t) {
 
   // A page's own network.
   const asked = [];
-  const net = new Network(sys, {
+  sys.network = {
     connect: (host, port) => {
+      asked.push(`${host}:${port}`);
       if (port === 81) throw new Error('refused');
       return reverser(host, port);
     },
-  });
-  net.addEventListener('connect', (e) => asked.push(`${e.host}:${e.port}`));
-  await timeout(net.ready, 10000, 'network ready');
+  };
   const out = await run(['rt-probe', 'connect', '10.1.2.3', '80', 'hello']);
   eq('a connection out reaches the page\'s connect', [out.code, out.stdout], [0, '10.1.2.3:80 olleh\n']);
   const named = await run(['rt-probe', 'connect', 'example.test', '8080', 'abc']);
@@ -63,6 +78,43 @@ export default async function (t) {
   say(`  connect saw ${asked.join(', ')}`);
   const refused = await run(['rt-probe', 'connect', '10.1.2.3', '81', 'x']);
   check('a throw in connect refuses it', refused.code !== 0, JSON.stringify(refused));
+  const noUdp = await run(['rt-probe', 'sendto', '10.1.2.3', '7', 'x']);
+  check('a network without datagram: UDP out is unreachable', noUdp.code !== 0 && /unreachable/i.test(noUdp.stderr), JSON.stringify(noUdp));
+
+  // Datagrams: the network's `datagram`, one flow per far address.
+  const flows = [];
+  sys.network = {
+    connect: (host, port) => reverser(host, port),
+    datagram: (host, port) => {
+      flows.push(`${host}:${port}`);
+      return echoer(host, port);
+    },
+  };
+  const to = await run(['rt-probe', 'sendto', '10.1.2.3', '7', 'one', 'two']);
+  eq('sendto and recvfrom, the reply from where it went', [to.code, to.stdout], [0, '10.1.2.3:7 10.1.2.3:7 one\n10.1.2.3:7 10.1.2.3:7 two\n']);
+  eq('two datagrams there are one flow', flows, ['10.1.2.3:7']);
+  const conn = await run(['rt-probe', 'udp', '10.1.2.3', '9', 'hello']);
+  eq('a connected UDP socket', [conn.code, conn.stdout], [0, '10.1.2.3:9 hello\n']);
+  const byName = await run(['rt-probe', 'udp', 'example.test', '9', 'hi']);
+  eq('a name reaches datagram as the name', [byName.code, byName.stdout], [0, 'example.test:9 hi\n']);
+  // More unread than a receive ring holds (256 KiB), then read: every
+  // datagram whole and in order, small ones and ones near the largest.
+  sys.network = { connect: (host, port) => reverser(host, port), datagram: () => { flows.push('flood'); return mirror(); } };
+  const flood = await run(['rt-probe', 'flood', '10.1.2.4', '9', '400', '1400']);
+  eq('400 datagrams of 1400 bytes unread, then all read', [flood.code, flood.stdout], [0, '400 ok\n']);
+  const flood2 = await run(['rt-probe', 'flood', '10.1.2.5', '9', '12', '60000']);
+  eq('12 of 60000 bytes unread, then all read', [flood2.code, flood2.stdout], [0, '12 ok\n']);
+  const dns = await run(['rt-probe', 'connect', 'example.test', '8080', 'abc']);
+  check('DNS is still the kernel\'s', dns.code === 0 && !flows.some((f) => f.endsWith(':53')), JSON.stringify([dns, flows]));
+  say(`  datagram saw ${flows.join(', ')}`);
+
+  const later = await run(['rt-probe', 'connect', '10.1.2.3', '80', 'x']);
+  sys.network = null;
+  const gone = await run(['rt-probe', 'connect', '10.1.2.3', '80', 'x']);
+  eq('network = null takes it away', [later.code, gone.code !== 0, sys.network], [0, true, null]);
+  let threw = null;
+  try { sys.network = { open() {} }; } catch (e) { threw = e; }
+  check('a network without connect is a TypeError', threw instanceof TypeError, String(threw));
 
   // Into the guest.
   const srv = sys.spawn(['rt-probe', 'serve', '8080'], { env });

@@ -1043,31 +1043,21 @@ async function handle(msg) {
     if (single.on) net.onActivity = () => sched.wake();
     gex.useNetwork(net);
   }
-  if (msg.wispNet) {
-    // The single-thread build: the system's one Wisp connection, the object
-    // itself (every fiber is in its realm). Its traffic wakes parked fibers.
-    msg.wispNet.onActivity = () => sched.wake();
-    gex.useNetwork(msg.wispNet, { shared: true });
+  if (msg.pageNet) {
+    // The single-thread build: the page's sockets, the object itself (every
+    // fiber is in its realm). Their traffic wakes parked fibers.
+    msg.pageNet.onActivity = () => sched.wake();
+    gex.useNetwork(msg.pageNet, { shared: true });
   } else if (msg.netChannel) {
-    // The page's Wisp connection, called across shared memory (net-bridge.mjs):
-    // a wasm32 program never hands this Worker's event loop back, so a
-    // WebSocket of its own here would never deliver.
+    // The page's sockets, called across shared memory (net-bridge.mjs): a
+    // wasm32 program never hands this Worker's event loop back, so a
+    // connection of its own here would never deliver.
     const { NetProxy } = await bridge('net');
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
-  } else if (msg.wispUrl || (msg.pageHosts && !msg.network)) {
-    // The site's Wisp client, imported only when a proxy was named.
-    const { WispNetwork } = await import('../../../web/src/net.js');
-    const net = new WispNetwork(msg.wispUrl ?? null, (e) => port.post({ kind: 'net', event: e }),
-      { pageHosts: msg.pageHosts ?? null });
-    // Opened and waited for: constructing one only remembers the address, and
-    // until the WebSocket has said hello `open` answers zero -- which the shim
-    // turns into `ENETUNREACH`. A proxy that cannot be reached is not a reason
-    // to refuse to run; the guest gets a network that fails and the page says so.
-    try {
-      await net.start();
-    } catch (e) {
-      port.post({ kind: 'net', event: `error ${e?.message ?? e}` });
-    }
+  } else if (msg.pageHosts && !msg.network) {
+    // Only the page-served hosts, where the page cannot serve its sockets.
+    const { Sockets } = await import('../../../web/src/net.js');
+    const net = new Sockets(null, { pageHosts: msg.pageHosts, onEvent: (e) => port.post({ kind: 'net', event: e }) });
     gex.useNetwork(net);
   }
   // A Worker given back after an earlier process (a test
@@ -1476,7 +1466,7 @@ async function handle(msg) {
     exitMsg.workerRuns = runs;
     exitMsg.giveBack = !single.on && !thread && !carries && !gone && recyclable
       && (msg.kind === 'adopt' || msg.kind === 'run')
-      && status >= 0 && status < 128 && !msg.network && !msg.wispUrl && !msg.pageHosts;
+      && status >= 0 && status < 128 && !msg.network && !msg.pageHosts;
     port.post(exitMsg);
   } catch (e) {
     // A thread that failed before its claim gives its promised slot back.

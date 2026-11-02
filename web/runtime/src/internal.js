@@ -4,11 +4,6 @@
 
 export const INTERNAL = Symbol.for('gex.runtime.internal');
 
-/** A Network subclass's hooks (net.js, net/wisp.js): the shim's network it
- *  stands on, and that network's events as the class's. */
-export const NET_BACKEND = Symbol('gex.runtime.net.backend');
-export const NET_EVENT = Symbol('gex.runtime.net.event');
-
 /** The internals of `sys`, checked to be a System's. */
 export function internals(sys, who) {
   const i = sys?.[INTERNAL];

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The runtime API as an npm package (web/runtime/README.md): its modules built
-# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs, persist*.mjs, net*.mjs, audio.mjs, gl.mjs, input.mjs) and
+# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs, persist*.mjs, net-wisp.mjs, audio.mjs, gl.mjs, input.mjs) and
 # their shared chunks and Workers beside them, and the files a system
 # fetches, each by its own URL: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
@@ -110,7 +110,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', persist: '$RT/src/persist.js', 'persist-idb': '$RT/src/persist/idb.js', net: '$RT/src/net.js', 'net-wisp': '$RT/src/net/wisp.js', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', persist: '$RT/src/persist.js', 'persist-idb': '$RT/src/persist/idb.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -167,6 +167,30 @@ if (!files) throw new Error('web/runtime/build.sh: none of the runtime files fou
 console.log(`web/runtime/build.sh: ${workers} Workers, ${files} files written for a bundler`);
 JS
 
+# wisp-js is in net-wisp.mjs alone: a page that imports only the runtime
+# (index.mjs and every file it reaches, by import or by URL) carries none of
+# it. Its marker is a string the client's own code has and gex's does not.
+node - "$OUT" <<'JS'
+const fs = require('fs'), path = require('path');
+const out = process.argv[2];
+const marker = 'wisp client warning';
+const refs = (s) => [...s.matchAll(/(?:from|import\(?|new URL\()\s*(?:\/\*[^*]*\*\/\s*)*["'`]\.\/([^"'`?]+)/g)].map((m) => m[1]);
+const reach = new Set(), todo = ['index.mjs'];
+while (todo.length) {
+  const f = todo.pop();
+  if (reach.has(f) || !fs.existsSync(path.join(out, f))) continue;
+  reach.add(f);
+  if (/\.m?js$/.test(f)) todo.push(...refs(fs.readFileSync(path.join(out, f), 'utf8')));
+}
+const has = (f) => fs.readFileSync(path.join(out, f)).includes(marker);
+if (!has('net-wisp.mjs')) throw new Error('web/runtime/build.sh: net-wisp.mjs has no wisp-js (the check\'s marker is stale)');
+const bad = [...reach].filter(has);
+if (bad.length) throw new Error(`web/runtime/build.sh: wisp-js reached from index.mjs, in ${bad.join(', ')}`);
+const js = fs.readdirSync(out).filter((f) => /\.m?js$/.test(f) && f !== 'net-wisp.mjs' && has(f));
+if (js.length) throw new Error(`web/runtime/build.sh: wisp-js outside net-wisp.mjs, in ${js.join(', ')}`);
+console.log(`web/runtime/build.sh: wisp-js only in net-wisp.mjs; none in the ${reach.size} files index.mjs reaches`);
+JS
+
 VERSION=$(cd "$WEB" && node -p "require('./package.json').version ?? '0.0.0'" 2>/dev/null || echo 0.0.0)
 cat > "$OUT/package.json" <<PKG
 {
@@ -188,7 +212,6 @@ cat > "$OUT/package.json" <<PKG
     "./windows/compositor": { "types": "./windows-compositor.d.ts", "default": "./windows-compositor.mjs" },
     "./persist": { "types": "./persist.d.ts", "default": "./persist.mjs" },
     "./persist/idb": { "types": "./persist-idb.d.ts", "default": "./persist-idb.mjs" },
-    "./net": { "types": "./net.d.ts", "default": "./net.mjs" },
     "./net/wisp": { "types": "./net-wisp.d.ts", "default": "./net-wisp.mjs" },
     "./audio": { "types": "./audio.d.ts", "default": "./audio.mjs" },
     "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },
@@ -260,6 +283,8 @@ if [ -n "$REPLAY$XWL$ZSTDW$PROV" ]; then
     section "dlmalloc (Emscripten's malloc$( [ -z "$PROV" ] || echo "; the heap providers'"))" "$REPLAY$XWL$ZSTDW$PROV" "the notice in emscripten's system/lib/dlmalloc.c" "$DL"
 fi
 [ -z "$ZSTD" ] || section "zstddec" "$ZSTD" "zstddec's LICENSE" "$WEB/eject-site/vendor/zstddec-LICENSE"
+WISP=$(in_pkg 'net-wisp.mjs')
+[ -z "$WISP" ] || section "wisp-js 0.4.1 (MercuryWorkshop)" "$WISP" "the package's LICENSE (src/net/vendor/wisp-js/SOURCE)" "$RT/src/net/vendor/wisp-js/LICENSE"
 RUSTW=$(in_pkg 'gex_browser*.wasm' 'gex_kernel*.wasm' 'gexhostwl*.wasm')
 if [ -n "$RUSTW" ]; then
     SYSROOT=$(cd "$WEB/.." && rustc --print sysroot)

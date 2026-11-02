@@ -1,5 +1,5 @@
-// The guest's network, reached from a Worker. The page holds the one Wisp
-// connection; every guest Worker calls it across a `SharedArrayBuffer` with
+// The guest's network, reached from a Worker. The page holds the sockets
+// (web/src/net.js) over its network; every guest Worker calls it across a `SharedArrayBuffer` with
 // `Atomics.wait`, the way gl-bridge.mjs reaches the page's GL device.
 //
 // Why not a WebSocket in each Worker, as before: its bytes arrive as messages
@@ -36,6 +36,7 @@ const CLOSE = 7;
 const DUP = 8;
 const PEEK = 9;
 const REFILL = 10;
+const FRAME = 11;
 
 /** Bytes one send or recv carries. A larger send is cut (it returns the count,
  *  as a socket does); a recv takes at most this much. */
@@ -85,7 +86,7 @@ export function makeNetChannel() {
 }
 
 /** The receive rings, as the page (`page`: it writes them, for
- *  `WispNetwork`'s `rings`, net.js) or a Worker (it reads them) sees them. */
+ *  `Sockets`'s `rings`, net.js) or a Worker (it reads them) sees them. */
 export class Rings {
   #w;
   #d;
@@ -222,6 +223,52 @@ export class Rings {
     return this.ended(b) && !this.spill(b) ? 0 : -1;
   }
 
+  /** The shim's `net_frame` (dgram-frames.mjs `frameOf`) of stream `id`:
+   *  its next datagram's frame, whole or nothing, under the slot's lock, so
+   *  two processes reading one flow each take whole frames. A frame partly
+   *  in the ring, the rest held past it, is moved in first (`refill()`):
+   *  a frame is far smaller than a ring. Undefined for a stream without a
+   *  ring. */
+  frame(id, out, take, refill) {
+    const b = this.find(id);
+    if (b < 0) return undefined;
+    for (let moved = false; ; moved = true) {
+      const n = this.#frameCopy(b, id, out, take);
+      if (n === -2) return 0;
+      if (n > 0) {
+        if (take && this.spill(b)) refill();
+        return n;
+      }
+      if (!moved && this.spill(b)) {
+        refill();
+        continue;
+      }
+      return this.ended(b) && !this.spill(b) ? 0 : -1;
+    }
+  }
+
+  /** One whole frame from the ring at `b`, as much of it as `out` holds,
+   *  taken unless `!take`: its whole length; 0 when not all of it is there;
+   *  -2 when the slot is no longer stream `id`'s. */
+  #frameCopy(b, id, out, take) {
+    const w = this.#w;
+    return this.#locked(b, () => {
+      if (Atomics.load(w, b + R_ID) !== id) return -2;
+      const tail = Atomics.load(w, b + R_TAIL) >>> 0;
+      const q = ((Atomics.load(w, b + R_HEAD) >>> 0) - tail) >>> 0;
+      if (q < 2) return 0;
+      const base = (b / SLOT_WORDS) * RING, d = this.#d;
+      const need = 2 + ((d[base + (tail & (RING - 1))] << 8) | d[base + ((tail + 1) & (RING - 1))]);
+      if (q < need) return 0;
+      const n = Math.min(need, out.length);
+      const at = tail & (RING - 1), first = Math.min(n, RING - at);
+      out.set(d.subarray(base + at, base + at + first), 0);
+      if (n > first) out.set(d.subarray(base, base + n - first), first);
+      if (take) Atomics.store(w, b + R_TAIL, (tail + need) | 0);
+      return need;
+    });
+  }
+
   /** Whether a read of stream `id` would not wait; undefined without a ring. */
   available(id) {
     const b = this.find(id);
@@ -254,7 +301,7 @@ export class Rings {
   }
 }
 
-/** The page's half: run `net` (a `WispNetwork`) when a Worker asks. Returns a
+/** The page's half: run `net` (net.js `Sockets`) when a Worker asks. Returns a
  *  function that stops it. */
 export function serveNet(net, channel) {
   const ctl = new Int32Array(channel.control);
@@ -287,6 +334,7 @@ export function serveNet(net, channel) {
         case DUP: r = net.dup ? net.dup(id) : 0; break;
         case PEEK: r = net.peek ? net.peek(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))) : -2; break;
         case REFILL: r = net.refill?.(id) ?? 0; break;
+        case FRAME: r = net.frame ? net.frame(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES)), ctl[A2] !== 0) : -2; break;
         default: r = -1;
       }
     } catch (e) {
@@ -420,6 +468,16 @@ export class NetProxy {
     if (r !== undefined) return r;
     return this.#run(this.#call(PEEK, id, Math.min(out.length, DATA_BYTES)), (r) => {
       if (r > 0) out.set(this.#data.subarray(0, r), 0);
+    });
+  }
+
+  /** The next datagram's frame of a UDP flow, whole or nothing (net.js
+   *  `frame`). */
+  frame(id, out, take) {
+    const r = this.#rings?.frame(id, out, take, () => this.#refill(id));
+    if (r !== undefined) return r;
+    return this.#run(this.#call(FRAME, id, Math.min(out.length, DATA_BYTES), take ? 1 : 0), (r) => {
+      if (r > 0) out.set(this.#data.subarray(0, Math.min(r, out.length)), 0);
     });
   }
 

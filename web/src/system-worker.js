@@ -1,5 +1,5 @@
 // The single-thread build's one Worker: the whole guest system -- the global
-// kernel, every process and thread as a fiber, the Wisp connection -- on this
+// kernel, every process and thread as a fiber, the guest's sockets -- on this
 // thread, with no SharedArrayBuffer. The page keeps
 // the terminal and talks to this by messages.
 //
@@ -90,6 +90,24 @@ async function openCompositor(width, height) {
   };
 }
 
+/** The page's network (README "Network"), which stays on the page: each
+ *  connection asked for there (runtime.js `dialFor`), its streams
+ *  transferred here. */
+function pageRelay({ datagram }) {
+  const dial = (host, port, dgram) => new Promise((resolve, reject) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = ({ data }) => {
+      port1.close();
+      if (data.error) reject(new Error(data.error));
+      else resolve({ readable: data.readable, writable: data.writable });
+    };
+    self.postMessage({ kind: 'net-dial', host, port, datagram: dgram, reply: port2 }, [port2]);
+  });
+  const relay = { connect: (host, port) => dial(host, port, false) };
+  if (datagram) relay.datagram = (host, port) => dial(host, port, true);
+  return relay;
+}
+
 self.onmessage = async (ev) => {
   const { runProgram, primeRuntime } = await loaded;
   const m = ev.data;
@@ -129,18 +147,13 @@ self.onmessage = async (ev) => {
           });
         }
       } else delete opts.gl;
-      if (opts.networkUrl || opts.pageHosts) {
-        const { WispNetwork } = await import('./net.js');
-        const net = new WispNetwork(opts.networkUrl ?? null, (e) => self.postMessage({ kind: 'net', event: e }),
-          { pageHosts: opts.pageHosts ?? null });
-        try {
-          await net.start();
-        } catch (e) {
-          self.postMessage({ kind: 'net', event: `error ${e?.message ?? e}` });
-        }
+      if (opts.netRelay || opts.pageHosts) {
+        const { Sockets } = await import('./net.js');
+        const net = new Sockets(opts.netRelay ? pageRelay(opts.netRelay) : null,
+          { pageHosts: opts.pageHosts ?? null, onEvent: (e) => self.postMessage({ kind: 'net', event: e }) });
         opts.network = net;
       }
-      delete opts.networkUrl;
+      delete opts.netRelay;
       delete opts.pageHosts;
       opts.onNetEvent = (e) => self.postMessage({ kind: 'net', event: e });
       const { status } = await runProgram(term, opts);

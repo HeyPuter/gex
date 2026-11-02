@@ -13,10 +13,8 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "devDependencies": {
+    "@mercuryworkshop/wisp-js": "^0.4.1",
     "vite": "^8.2.0"
-  },
-  "dependencies": {
-    "@mercuryworkshop/wisp-js": "^0.4.1"
   },
   "private": true
 }

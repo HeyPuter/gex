@@ -10,6 +10,20 @@
  *   rt-probe xattr PATH NAME   the attribute's value
  *   rt-probe connect HOST PORT TEXT   TEXT to HOST:PORT (a name: getaddrinfo),
  *                    then what comes back until the far end closes
+ *   rt-probe sendto HOST PORT TEXT...   each TEXT a datagram to HOST:PORT
+ *                    from one unconnected UDP socket, then each reply by
+ *                    recvfrom: "ADDR:PORT REPLY" (5 s each, else "timeout")
+ *   rt-probe udp HOST PORT TEXT   TEXT on a connected UDP socket (send,
+ *                    recv): the reply
+ *   rt-probe flood HOST PORT N SIZE   N datagrams of SIZE bytes (each
+ *                    numbered) on a connected UDP socket, none read until a
+ *                    second after the last, then every reply read: "N ok",
+ *                    or the first one wrong
+ *   rt-probe hold HOST PORT N [fork|trap] [udp]   N connections to
+ *                    HOST:PORT (`udp`: connected UDP sockets), a byte sent on
+ *                    each, then "held N" and a read of the first for ever
+ *                    (with `fork`: a child holds them too, and says "child
+ *                    PID"; with `trap`: a trap instead of the read)
  *   rt-probe serve PORT   on 127.0.0.1:PORT, one connection: what it sends,
  *                    upper-cased, back ("listening" once it listens)
  *   rt-probe tone HZ MS   a sine of HZ for MS ms on /dev/dsp (s16, stereo,
@@ -31,6 +45,8 @@
 #include <ctype.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -142,6 +158,124 @@ int main(int argc, char **argv) {
     ssize_t n;
     while ((n = read(s, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, stdout);
     printf("\n");
+  } else if ((!strcmp(what, "sendto") && argc >= 5) || (!strcmp(what, "udp") && argc == 5)) {
+    int connected = !strcmp(what, "udp");
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    int e = getaddrinfo(argv[2], argv[3], &hints, &ai);
+    if (e) {
+      fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e));
+      return 1;
+    }
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || (connected && connect(s, ai->ai_addr, ai->ai_addrlen) < 0)) {
+      perror("connect");
+      return 1;
+    }
+    for (int i = 4; i < argc; i++) {
+      ssize_t w = connected ? send(s, argv[i], strlen(argv[i]), 0)
+                            : sendto(s, argv[i], strlen(argv[i]), 0, ai->ai_addr, ai->ai_addrlen);
+      if (w < 0) {
+        perror(connected ? "send" : "sendto");
+        return 1;
+      }
+    }
+    for (int i = 4; i < argc; i++) {
+      struct pollfd p = {s, POLLIN, 0};
+      if (poll(&p, 1, 5000) != 1) {
+        printf("timeout\n");
+        return 1;
+      }
+      char buf[2048];
+      struct sockaddr_in from = {0};
+      socklen_t fl = sizeof from;
+      ssize_t n = connected ? recv(s, buf, sizeof buf, 0)
+                            : recvfrom(s, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+      if (n < 0) {
+        perror("recv");
+        return 1;
+      }
+      if (connected) printf("%.*s\n", (int)n, buf);
+      else printf("%s:%d %.*s\n", inet_ntoa(from.sin_addr), ntohs(from.sin_port), (int)n, buf);
+    }
+  } else if (!strcmp(what, "flood") && argc == 6) {
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    int e = getaddrinfo(argv[2], argv[3], &hints, &ai);
+    if (e) {
+      fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e));
+      return 1;
+    }
+    int n = atoi(argv[4]), size = atoi(argv[5]);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || connect(s, ai->ai_addr, ai->ai_addrlen) < 0 || size < 4 || size > 65000) {
+      perror("connect");
+      return 1;
+    }
+    static unsigned char d[65536];
+    for (int i = 0; i < n; i++) {
+      for (int k = 0; k < size; k++) d[k] = (unsigned char)(i * 7 + k);
+      d[0] = (unsigned char)(i >> 24), d[1] = (unsigned char)(i >> 16), d[2] = (unsigned char)(i >> 8), d[3] = (unsigned char)i;
+      if (send(s, d, (size_t)size, 0) != size) {
+        perror("send");
+        return 1;
+      }
+    }
+    sleep(1);
+    for (int i = 0; i < n; i++) {
+      struct pollfd p = {s, POLLIN, 0};
+      if (poll(&p, 1, 5000) != 1) {
+        printf("%d: timeout\n", i);
+        return 1;
+      }
+      ssize_t r = recv(s, d, sizeof d, 0);
+      int at = r >= 4 ? (d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3] : -1;
+      int same = r == size && at == i;
+      for (int k = 4; same && k < size; k++) same = d[k] == (unsigned char)(i * 7 + k);
+      if (!same) {
+        printf("%d: got %zd bytes, number %d\n", i, r, at);
+        return 1;
+      }
+    }
+    printf("%d ok\n", n);
+  } else if (!strcmp(what, "hold") && argc >= 5 && argc <= 7) {
+    int fork_ = 0, trap_ = 0, udp = 0;
+    for (int i = 5; i < argc; i++) {
+      if (!strcmp(argv[i], "fork")) fork_ = 1;
+      else if (!strcmp(argv[i], "trap")) trap_ = 1;
+      else if (!strcmp(argv[i], "udp")) udp = 1;
+      else return 2;
+    }
+    int type = udp ? SOCK_DGRAM : SOCK_STREAM;
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = type;
+    if (getaddrinfo(argv[2], argv[3], &hints, &ai)) return 1;
+    int n = atoi(argv[4]), first = -1;
+    for (int i = 0; i < n; i++) {
+      int s = socket(ai->ai_family, type, 0);
+      if (s < 0 || connect(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+        perror("connect");
+        return 1;
+      }
+      if (write(s, "x", 1) < 0) perror("write");
+      if (first < 0) first = s;
+    }
+    setvbuf(stdout, 0, _IONBF, 0);
+    if (fork_) {
+      pid_t c = fork();
+      if (c == 0) {
+        char b;
+        for (;;) if (read(first, &b, 1) <= 0) pause();
+      }
+      printf("child %d\n", (int)c);
+    }
+    printf("held %d\n", n);
+    if (trap_) __builtin_trap();
+    char b;
+    for (;;) if (read(first, &b, 1) <= 0) pause();
   } else if (!strcmp(what, "serve") && argc == 3) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = {0};
@@ -192,7 +326,7 @@ int main(int argc, char **argv) {
     close(fd);
     printf("%ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
   } else {
-    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|serve PORT|tone HZ MS\n");
+    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|flood HOST PORT N SIZE|hold HOST PORT N [fork|trap] [udp]|serve PORT|tone HZ MS\n");
     return 2;
   }
   return 0;

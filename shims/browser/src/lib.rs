@@ -96,11 +96,13 @@ extern "C" {
     fn drain_output();
 
     // The network. A page cannot open a socket, so each of these asks JS, which
-    // has a Wisp connection to a proxy. All non-blocking: only the kernel can
+    // carries them over the page's network. All non-blocking: only the kernel can
     // park a guest thread, and JS blocking here would take the Worker's wasm
     // stack with it. A stream is a small integer JS hands out; zero is never a
     // stream, so it can mean failure.
     fn net_open() -> i32;
+    /// `port` with `NET_DGRAM` set: a UDP flow, its datagrams framed
+    /// (`PageDgram`).
     fn net_connect(id: i32, host: u32, host_len: u32, port: i32);
     /// 0 connecting, 1 open, 2 closed, 3 refused.
     fn net_status(id: i32) -> i32;
@@ -114,6 +116,13 @@ extern "C" {
     fn net_recv(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
     /// `net_recv`, leaving the bytes queued (`recv(MSG_PEEK)`).
     fn net_peek(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
+    /// A UDP flow's next datagram, framed (`PageDgram`), into `ptr` as far
+    /// as `len` holds it: the frame's whole length if all of it has
+    /// arrived, -1 until then, 0 at the end. Taken off the stream unless
+    /// `take` is 0. Whole or nothing in one call, as
+    /// the page reads it under the stream's lock: two processes holding the
+    /// flow never split a frame between them.
+    fn net_frame(id: i32, ptr: gex_kernel::PAddr, len: u32, take: i32) -> i32;
     /// Whether `net_recv` would answer without waiting.
     fn net_avail(id: i32) -> i32;
     fn net_close(id: i32);
@@ -130,16 +139,16 @@ fn have_net() -> bool {
 }
 
 /// The page's network, when it has one: one stack for every process in this
-/// memory (`WispNet` holds nothing of its own). Read by each socket call
+/// memory (`PageNet` holds nothing of its own). Read by each socket call
 /// (`sigs`'s `NetIo`) and by a kernel as it is built, so a network the page
 /// turns on later reaches every process at its next call, with no kernel to
 /// tell.
 pub(crate) fn page_net() -> Option<&'static Arc<dyn net::NetStack>> {
-    static WISP: std::sync::LazyLock<Arc<dyn net::NetStack>> = std::sync::LazyLock::new(|| Arc::new(WispNet));
+    static WISP: std::sync::LazyLock<Arc<dyn net::NetStack>> = std::sync::LazyLock::new(|| Arc::new(PageNet));
     have_net().then(|| &*WISP)
 }
 
-/// Say that the page has a Wisp connection behind the `net_*` imports.
+/// Say that the page has a network behind the `net_*` imports.
 ///
 /// Off by default: a page with no proxy configured should have its guest see
 /// a machine with no network, which fails cleanly, rather than one whose
@@ -149,16 +158,16 @@ pub extern "C" fn gex_set_network(on: i32) {
     HAVE_NET.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
-/// One Wisp stream, as the kernel's [`net::Transport`].
+/// One of the page's streams, as the kernel's [`net::Transport`].
 #[derive(Debug)]
 ///
 /// Its id is atomic: a parked thread's idle turn asks `has_data` without the
 /// kernel lock (`waitq`).
-struct WispStream {
+struct PageStream {
     id: std::sync::atomic::AtomicI32,
 }
 
-impl net::Transport for WispStream {
+impl net::Transport for PageStream {
     fn connect(&self, host: &str, port: u16) -> Result<(), Errno> {
         let id = unsafe { net_open() };
         if id <= 0 {
@@ -237,31 +246,158 @@ impl net::Transport for WispStream {
     /// when its last holder closes.
     fn carry(&self) -> Option<String> {
         let id = self.id.load(std::sync::atomic::Ordering::Acquire);
-        (id != 0 && unsafe { net_dup(id) } == 1).then(|| format!("wisp:{id}"))
+        (id != 0 && unsafe { net_dup(id) } == 1).then(|| format!("page:{id}"))
     }
 
     fn name(&self) -> Option<String> {
         let id = self.id.load(std::sync::atomic::Ordering::Acquire);
-        (id != 0).then(|| format!("wisp:{id}"))
+        (id != 0).then(|| format!("page:{id}"))
+    }
+}
+
+/// `net_connect`'s port flag for a UDP flow.
+const NET_DGRAM: i32 = 0x1_0000;
+
+/// One of the page's UDP flows, as the kernel's [`net::Transport`]: a
+/// stream of datagrams, each framed as its length (two bytes, big-endian)
+/// and its bytes, both ways (web/src/net.js's `Sockets`). Nothing is kept
+/// here: a datagram is read only once all of it has arrived, so the holders
+/// of a moved socket (each its own process) read whole ones off the one
+/// stream.
+#[derive(Debug)]
+struct PageDgram {
+    id: std::sync::atomic::AtomicI32,
+}
+
+impl PageDgram {
+    fn new(id: i32) -> PageDgram {
+        PageDgram { id: std::sync::atomic::AtomicI32::new(id) }
+    }
+
+    /// The next datagram's frame, if all of it has arrived, into `out` as
+    /// far as it holds it (its head first), read off the stream (`take`) or
+    /// left there: the frame's whole length.
+    fn frame(&self, out: &mut [u8], take: bool) -> Option<usize> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return None;
+        }
+        let n = unsafe { net_frame(id, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, take as i32) };
+        (n >= 2).then_some(n as usize)
+    }
+
+    /// One datagram into `buf`, cut to it.
+    fn read(&self, buf: &mut [u8], take: bool) -> Result<usize, Errno> {
+        let mut f = vec![0u8; 2 + buf.len()];
+        let whole = self.frame(&mut f, take).ok_or(Errno::EAGAIN)?;
+        let n = (whole - 2).min(buf.len());
+        buf[..n].copy_from_slice(&f[2..2 + n]);
+        Ok(n)
+    }
+}
+
+impl net::Transport for PageDgram {
+    fn connect(&self, host: &str, port: u16) -> Result<(), Errno> {
+        let id = unsafe { net_open() };
+        if id <= 0 {
+            return Err(Errno::ENETUNREACH);
+        }
+        self.id.store(id, std::sync::atomic::Ordering::Release);
+        unsafe { net_connect(id, host.as_ptr() as u32, host.len() as u32, port as i32 | NET_DGRAM) };
+        Ok(())
+    }
+
+    fn status(&self) -> net::Status {
+        match self.id.load(std::sync::atomic::Ordering::Acquire) {
+            0 => net::Status::Closed,
+            id => match unsafe { net_status(id) } {
+                0 => net::Status::Connecting,
+                1 => net::Status::Open,
+                3 => net::Status::Refused,
+                _ => net::Status::Closed,
+            },
+        }
+    }
+
+    /// One datagram, whole or not at all.
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return Err(Errno::ENOTCONN);
+        }
+        let len = u16::try_from(data.len()).map_err(|_| Errno::EMSGSIZE)?;
+        let mut frame = Vec::with_capacity(2 + data.len());
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(data);
+        let mut at = 0;
+        while at < frame.len() {
+            match unsafe { net_send(id, frame[at..].as_ptr() as gex_kernel::PAddr, (frame.len() - at) as u32) } {
+                n if n > 0 => at += n as usize,
+                // nothing taken: the datagram dropped, as UDP may
+                0 if at == 0 => return Ok(data.len()),
+                _ => return Err(Errno::EPIPE),
+            }
+        }
+        Ok(data.len())
+    }
+
+    /// One datagram, cut to `buf`.
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.read(buf, true)
+    }
+
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.read(buf, false)
+    }
+
+    fn has_data(&self) -> bool {
+        self.frame(&mut [0u8; 2], false).is_some()
+    }
+
+    /// The next datagram's length.
+    fn available(&self) -> usize {
+        self.frame(&mut [0u8; 2], false).map_or(0, |n| n - 2)
+    }
+
+    fn close(&self) {
+        let id = self.id.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if id != 0 {
+            unsafe { net_close(id) };
+        }
+    }
+
+    /// A moved UDP socket's other holders read this flow too
+    /// (`net::Socket::sync_flows`).
+    fn name(&self) -> Option<String> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        (id != 0).then(|| format!("pagedg:{id}"))
     }
 }
 
 /// Where the browser's connections come from.
 #[derive(Debug)]
-struct WispNet;
+struct PageNet;
 
-unsafe impl Send for WispNet {}
-unsafe impl Sync for WispNet {}
+unsafe impl Send for PageNet {}
+unsafe impl Sync for PageNet {}
 
-impl net::NetStack for WispNet {
+impl net::NetStack for PageNet {
     fn tcp(&self) -> Result<Arc<dyn net::Transport>, Errno> {
-        Ok(Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(0) }))
+        Ok(Arc::new(PageStream { id: std::sync::atomic::AtomicI32::new(0) }))
+    }
+
+    fn udp(&self) -> Result<Arc<dyn net::Transport>, Errno> {
+        Ok(Arc::new(PageDgram::new(0)))
     }
 
     /// Another holder of a stream another process opened (`net_dup`).
     fn adopt(&self, name: &str) -> Option<Arc<dyn net::Transport>> {
-        let id = name.strip_prefix("wisp:")?.parse::<i32>().ok()?;
-        (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(id) }) as Arc<dyn net::Transport>)
+        if let Some(id) = name.strip_prefix("pagedg:") {
+            let id = id.parse::<i32>().ok()?;
+            return (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(PageDgram::new(id)) as Arc<dyn net::Transport>);
+        }
+        let id = name.strip_prefix("page:")?.parse::<i32>().ok()?;
+        (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(PageStream { id: std::sync::atomic::AtomicI32::new(id) }) as Arc<dyn net::Transport>)
     }
 }
 
@@ -10034,7 +10170,7 @@ fn rebuild_carried(
         // this holder's now.
         let sock = net::Socket::moved_proxy(
             path,
-            Arc::new(WispNet),
+            Arc::new(PageNet),
             Arc::new(net::Resolver::new()),
             Arc::new(net::Ports::new()),
             global_sockets(),
@@ -10047,9 +10183,9 @@ fn rebuild_carried(
         // `Socket::carry`'s name: the connection the sender holds, already
         // counted as this holder's.
         let t = net::Socket::carried_transport(path).ok_or("bad inet name")?;
-        let transport: Arc<dyn net::Transport> = if let Some(id) = t.strip_prefix("wisp:") {
+        let transport: Arc<dyn net::Transport> = if let Some(id) = t.strip_prefix("page:") {
             let id = id.parse::<i32>().map_err(|_| "bad stream id")?;
-            Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(id) })
+            Arc::new(PageStream { id: std::sync::atomic::AtomicI32::new(id) })
         } else if let Some(id) = t.strip_prefix("loop:") {
             let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
             Arc::new(net::RemoteEnd::adopt(id, global_sockets().ok_or("no global kernel")?))
@@ -10059,7 +10195,7 @@ fn rebuild_carried(
         let sock = net::Socket::adopt(
             path,
             transport,
-            Arc::new(WispNet),
+            Arc::new(PageNet),
             Arc::new(net::Resolver::new()),
             Arc::new(net::Ports::new()),
             global_sockets(),

@@ -37,7 +37,7 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  *   hostX               'rootful': the X server one fullscreen screen
  *   gl                  'compositor': the guest's GL on the windows' Mesa
  *   glLazy, glSource, glBackend, d3d    MesaGl's start, files, driver, D3D
- *   network, onNetEvent the page's network (net.js) and its events
+ *   network, onNetEvent the guest's sockets (web/src/net.js `Sockets`) and their events
  *   playAudio           /dev/dsp to the speakers (default true)
  *   onFilesLoaded()     the bundle is in the kernel: its bytes can go
  *   onSystem(s)         the running system's parts: { system, host,
@@ -128,7 +128,7 @@ export async function runPreset(term, {
   }
   if (windows) windows[INTERNAL].x.rootful = hostX === 'rootful';
   const mesa = gl && windows ? new MesaGl(sys, { eager: !glLazy, d3d, source: glSource }) : null;
-  if (network) i.network(network);
+  if (network) i.sockets(network);
 
   await sys.boot();
   // The kernel has the files: nothing here views the bundle's bytes now.

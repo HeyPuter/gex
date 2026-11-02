@@ -5,7 +5,7 @@
 
 /** Every option `start` reads (app.js lists what each is). */
 export const OPTIONS = [
-  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'persist', 'wisp',
+  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'persist', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
   'glLazy', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'ready',
 ];
@@ -47,6 +47,7 @@ export function checkOptions(opts) {
   if (given('uid') && !(Number.isInteger(opts.uid) && opts.uid >= 0)) bad('uid', 'a user id (a whole number)');
   if (given('strace') && typeof opts.strace !== 'boolean' && !Number.isInteger(opts.strace)) bad('strace', 'true (every process) or a pid');
   if (given('wisp') && !/^wss?:\/\//.test(String(opts.wisp))) bad('wisp', 'a Wisp proxy\'s URL, ws://... or wss://...');
+  if (given('network') && typeof opts.network?.connect !== 'function') bad('network', 'an object with connect(host, port)');
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
   if (given('persist') && opts.persist !== false && !(typeof opts.persist === 'object' && typeof opts.persist.dir === 'string')) bad('persist', 'false, or {dir, db}');
   for (const k of ['onLog', 'onExit', 'onProgress']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');

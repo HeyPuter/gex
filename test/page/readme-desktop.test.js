@@ -17,11 +17,11 @@ const MODULES = {
   '@gex/runtime': 'index.js',
   '@gex/runtime/fs': 'fs.js',
   '@gex/runtime/persist/idb': 'persist/idb.js',
-  '@gex/runtime/net/wisp': 'net/wisp.js',
+  '@gex/runtime/net/wisp': 'net/wisp.mjs',
   '@gex/runtime/windows/host': 'windows/host.js',
 };
 // `--package`: the built entries instead (lib/package.mjs's names).
-const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'persist/idb.js': 'persist-idb.mjs', 'net/wisp.js': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
+const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'persist/idb.js': 'persist-idb.mjs', 'net/wisp.mjs': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
 
 // Not `new URL(..., import.meta.url)` written out: vite would rewrite that
 // as an asset's URL.

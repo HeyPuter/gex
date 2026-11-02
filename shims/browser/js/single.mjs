@@ -366,7 +366,7 @@ export class Sched {
 
 
   /** Something of the page's own happened that this realm has no queue for
-   *  -- the network's bytes, which the one Wisp connection has no way to say
+   *  -- the network's bytes, which the page's network has no way to say
    *  are whose: every parked fiber re-checks. The single-thread build only;
    *  the default build's network waits turn their own Worker's loop. */
   wake() {

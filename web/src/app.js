@@ -74,8 +74,9 @@ const PIECES = {
  *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
- *   wisp       a Wisp proxy's URL (ws:// or wss://; a final slash is added): the
- *              guest's network (its TCP and DNS go over it); none by default
+ *   network    the guest's network: an object with connect(host, port) (web/runtime
+ *              README "Network"); none by default
+ *   wisp       a Wisp proxy's URL (ws:// or wss://), for a network over it
  *   pageHosts  {host: path or URL}: hosts the page answers itself, over plain
  *              HTTP (GET and HEAD), from the files under that path (relative
  *              to baseUrl): files the guest fetches that no proxy reaches
@@ -796,25 +797,22 @@ async function begin(opts, base, at, state, meter) {
   meter.phase('boot');
   meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
-  // The guest's network: a Wisp proxy the page names (runtime.js serves it
-  // to every Worker). With none, the guest's sockets reach nothing.
+  // The guest's network: the page's (`network`, README "Network"), or a
+  // Wisp proxy it names (`wisp`). With none, the guest's sockets reach
+  // nothing but the page-served hosts.
   let network = null;
+  let net = opts.network ?? null;
+  if (!net && opts.wisp) {
+    const { Wisp } = await import('../runtime/src/net/wisp.mjs');
+    net = new Wisp(String(opts.wisp));
+    for (const e of ['open', 'closed']) net.addEventListener(e, () => say(`[net] ${e}\n`));
+  }
   // `pageHosts`: hosts the page answers itself from files under its origin
-  // (page-host.mjs), with or without a proxy.
+  // (page-host.mjs), with or without a network.
   const hosts = pageHosts(opts.pageHosts, base);
-  if (opts.wisp || hosts) {
-    const { WispNetwork } = await import('./net.js');
-    network = new WispNetwork(opts.wisp ? String(opts.wisp) : null, (e) => say(`[net] ${e}\n`), { pageHosts: hosts });
-    // Opened and waited for, as worker.mjs does: constructing one only
-    // remembers the address, and until the proxy has said hello `open`
-    // answers zero, which the shim turns into ENETUNREACH (every guest
-    // connect failed). A proxy that cannot be reached does not stop the run:
-    // the guest gets a network that fails, and the page says so.
-    try {
-      await network.start();
-    } catch (e) {
-      say(`[net] ${e?.message ?? e}\n`);
-    }
+  if (net || hosts) {
+    const { Sockets } = await import('./net.js');
+    network = new Sockets(net, { pageHosts: hosts, onEvent: (e) => say(`[net] ${e}\n`) });
   }
   const run = runProgram(term, {
     network,
