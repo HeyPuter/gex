@@ -6598,18 +6598,7 @@ export class Gex {
       // (cgen/dylink.rs): the shim loads and publishes, this Worker
       // instantiates the new modules and runs their constructors; other
       // Workers instantiate them as they next catch up
-      dlopen: (path, err, errlen) => {
-        const h = e.gex_wasmprog_dlopen(addrBig(path), addrBig(err), errlen) >>> 0;
-        if (!h) return 0;
-        this.#cgenCatchUp();
-        const st = this.#cgenStore();
-        // Taken whole before any constructor runs: one that calls dlopen
-        // itself replaces the list.
-        const fresh = [];
-        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) fresh.push(n);
-        for (const n of fresh) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
-        return h | 0;
-      },
+      dlopen: (SP_CODE && single.on) ? new WebAssembly.Suspending((path, err, errlen) => this.#dlopen(path, err, errlen, true)) : (path, err, errlen) => this.#dlopen(path, err, errlen, false),
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,
       // Door calls into the wineserver.
       door_publish: (area) => this.#doorPublish(area >>> 0),
@@ -6650,6 +6639,33 @@ export class Gex {
       wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, addrBig(buf), len >>> 0) ?? -38,
       wake_close: () => {},
     };
+  }
+
+  /** libgex's dlopen past its static registry (cgen/dylink.rs): the shim
+   *  loads and publishes, this Worker instantiates the new modules and runs
+   *  their constructors; other Workers instantiate them as they next catch
+   *  up. In the single-thread build a constructor may block (a system call
+   *  that waits), so each runs on a stack of its own and the program's
+   *  waits for it (`suspend`), unless a JS frame below cannot suspend. */
+  #dlopen(path, err, errlen, suspend) {
+    const e = this.#shim.exports;
+    const h = e.gex_wasmprog_dlopen(addrBig(path), addrBig(err), errlen) >>> 0;
+    if (!h) return 0;
+    this.#cgenCatchUp();
+    const st = this.#cgenStore();
+    // Taken whole before any constructor runs: one that calls dlopen
+    // itself replaces the list.
+    const fresh = [];
+    for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) fresh.push(n);
+    const ctors = fresh.map((n) => st.dyl.get(n)?.exports.__wasm_call_ctors).filter(Boolean);
+    if (!suspend || this.#hardNested()) {
+      for (const f of ctors) f();
+      return h | 0;
+    }
+    return (async () => {
+      for (const f of ctors) await this.#promisingOf(f)();
+      return h | 0;
+    })();
   }
 
   // -- door calls ------------------------------
