@@ -511,6 +511,76 @@ function stackRoom(room = STACK_ROOM) {
   }
 }
 let entryTrampMod = null;
+/** A JS call into wasm takes the engine's generic wrapper until that export
+ *  has been called often enough to get one made for its signature (V8: a
+ *  thousand calls), and the generic one holds about 700 bytes of the host's
+ *  stack under every call: each call-out level keeps one open, under the
+ *  guest code it runs. The run loops' `enter` goes through a front of its own
+ *  (`enterFront`), which a call with a null context leaves at once:
+ *  (module (type $e (func (param i32 i64))) (import "e" "f" (func $f (type $e)))
+ *    (func (export "enter") (type $e)
+ *      local.get 0 i32.eqz if return end
+ *      local.get 0 local.get 1 return_call $f)) */
+const ENTER_FRONT = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 6, 1, 0x60, 2, 0x7f, 0x7e, 0,
+  2, 7, 1, 1, 101, 1, 102, 0, 0,
+  3, 2, 1, 0,
+  7, 9, 1, 5, 101, 110, 116, 101, 114, 0, 1,
+  10, 17, 1, 15, 0, 0x20, 0, 0x45, 0x04, 0x40, 0x0f, 0x0b, 0x20, 0, 0x20, 1, 0x12, 0, 0x0b,
+]);
+/** The other way, a wasm call into JS takes a generic wrapper of the same
+ *  kind until that import has been called as often, about 250 bytes under
+ *  every call-out level: the shim's and every module's `call_out` goes
+ *  through a front too (`callOutFront`), whose import a call with a null
+ *  context reaches, which `fn` answers with 0 at once:
+ *  (module (type $c (func (param i32 i64 i64 i64) (result i32)))
+ *    (import "e" "f" (func $f (type $c)))
+ *    (func (export "call_out") (type $c)
+ *      local.get 0 local.get 1 local.get 2 local.get 3 return_call $f)) */
+const CALLOUT_FRONT = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0,
+  1, 9, 1, 0x60, 4, 0x7f, 0x7e, 0x7e, 0x7e, 1, 0x7f,
+  2, 7, 1, 1, 101, 1, 102, 0, 0,
+  3, 2, 1, 0,
+  7, 12, 1, 8, 99, 97, 108, 108, 95, 111, 117, 116, 0, 1,
+  10, 14, 1, 12, 0, 0x20, 0, 0x20, 1, 0x20, 2, 0x20, 3, 0x12, 0, 0x0b,
+]);
+/** The fronts are warmed (called that often with a null context, about a
+ *  millisecond for the pair) only once call-outs nest this deep, which few
+ *  processes do: the levels below keep the generic wrappers.
+ *  `warmFronts` warms those not yet warmed. */
+const FRONT_WARM_DEPTH = 4;
+const FRONT_WARM_CALLS = 1100;
+const coldFronts = [];
+function warmFronts() {
+  for (const warm of coldFronts.splice(0)) for (let i = 0; i < FRONT_WARM_CALLS; i++) warm();
+}
+let enterFrontMod = null;
+const enterFronts = new WeakMap();
+function enterFront(fn) {
+  let w = enterFronts.get(fn);
+  if (w) return w;
+  try {
+    enterFrontMod ??= new WebAssembly.Module(ENTER_FRONT);
+    const f = new WebAssembly.Instance(enterFrontMod, { e: { f: fn } }).exports.enter;
+    coldFronts.push(() => f(0, 0n));
+    w = f;
+  } catch (err) {
+    // An `enter` of another signature: called as it is.
+    if (!(err instanceof WebAssembly.LinkError)) throw err;
+    w = fn;
+  }
+  enterFronts.set(fn, w);
+  return w;
+}
+let callOutFrontMod = null;
+function callOutFront(fn) {
+  callOutFrontMod ??= new WebAssembly.Module(CALLOUT_FRONT);
+  const f = new WebAssembly.Instance(callOutFrontMod, { e: { f: fn } }).exports.call_out;
+  coldFronts.push(() => f(0, 0n, 0n, 0n));
+  return f;
+}
 /** The entry function's module, for a 64-bit function table (`t64`) and an
  *  i64 stack pointer (`s64`), compiled once each.
  *  (module (type $vi (func (param i32))) (type $e (func (param i32 i32 i64) (result i32)))
@@ -2021,7 +2091,7 @@ export class Gex {
           ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
             ? this.#callOut(ctx >>> 0, target, ret, spWant)
             : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
-          : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          : this.#callOutFront(),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
         // In the single build, on a stack of its own, so the body (and guest
@@ -5063,7 +5133,7 @@ export class Gex {
             ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
               ? this.#callOut(ctx >>> 0, target, ret, spWant)
               : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
-            : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+            : this.#callOutFront(),
           image_mapped: (base, fd) => {
             const number = e.gex_image_mapped?.(addrBig(base), fd) ?? -1;
             if (number === -1) return;
@@ -8318,6 +8388,12 @@ export class Gex {
    *  waits for, the stack it comes back at, and the table entry watching
    *  for a translated return (`{ table, index, old }`). */
   #callouts = [];
+  #callOutFn = null;
+  /** The shim's and every module's `call_out` outside the single-thread
+   *  build: one front per process (`callOutFront`). */
+  #callOutFront() {
+    return this.#callOutFn ??= callOutFront((ctx, target, ret, spWant) => (ctx === 0 ? 0 : this.#drive(this.#callOutSteps(ctx >>> 0, target, ret, spWant, false))));
+  }
   /** What the watch stub found (`{ kind: 'return', i }` or `{ kind:
    *  'bypass', f }`), for the nested loop to act on. */
   #calloutSignal = null;
@@ -8356,15 +8432,15 @@ export class Gex {
    *  come back (the caller's loop resumes at `pc`). */
   #enterOf(ctx, pc) {
     const e = this.#shim.exports;
-    if (!e.gex_ctx_alt?.(ctx)) return this.#guest.exports.enter;
+    if (!e.gex_ctx_alt?.(ctx)) return enterFront(this.#guest.exports.enter);
     const dir = BigInt(e.gex_alt_dir());
-    if (this.#altEnter && this.#altEnterDir === dir) return this.#altEnter;
+    if (this.#altEnter && this.#altEnterDir === dir) return enterFront(this.#altEnter);
     this.#altEnter = null;
     // Before any of that mode's code is translated (its first code native
     // i386 Wine's): the runtime's, which dispatches through its directory.
-    if (dir && this.#cgen) return this.#cgenAlt().enter;
+    if (dir && this.#cgen) return enterFront(this.#cgenAlt().enter);
     e.gex_dispatch_miss(ctx, BigInt.asIntN(64, BigInt(pc)));
-    return this.#altEnter ?? this.#guest.exports.enter;
+    return enterFront(this.#altEnter ?? this.#guest.exports.enter);
   }
   #parkPf = null;
   /** `gex_park`, on a stack of its own (it suspends in `k_ws_park`). */
@@ -8691,6 +8767,7 @@ export class Gex {
     // drops, so the shim's count cannot bound them (the shim ends the
     // process, as a spent stack does).
     if (me >= CALLOUT_ROOM_DEPTH && stackRoom(CALLOUT_ROOM) === 0) e.gex_callout_stack_spent?.();
+    if (me >= FRONT_WARM_DEPTH && coldFronts.length) warmFronts();
     this.#callouts.push(c);
     this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');
