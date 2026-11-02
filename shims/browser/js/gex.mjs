@@ -7454,7 +7454,7 @@ export class Gex {
       }
       const i = idx & 0x7fffffff;
       f = this.#tryFns.get(i);
-      if (!f) this.#tryFns.set(i, (f = tab.get(tIdx(i))));
+      if (!f) this.#tryFns.set(i, (f = tab.get(tIdx(this.#wide, i))));
       this.#tryIdx = idx;
       this.#tryFn = f;
     }
