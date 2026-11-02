@@ -6376,7 +6376,10 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
     let f = crate::ftab::table_func(caller, hook)?;
-    let typed = f.typed::<(i32, i32), ()>(&*caller).context("gex.signal_hook: the hook is not void(int, unsigned)")?;
+    // 64-bit Wine's hook takes the pc as 64 bits (a guest above 4 GiB in a
+    // 64-bit memory: cut to its low half, it never matched the pc the frames
+    // return to, and the hook ran that pc as a handler); 32-bit Wine's as 32.
+    let wide = matches!(f.ty(&*caller).params().nth(1), Some(wasmtime::ValType::I64));
     let sp = native_sp(caller.data());
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
@@ -6387,7 +6390,15 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
         }
         _ => None,
     };
-    let r = typed.call(&mut *caller, (ctx_addr as i32, interrupted as u32 as i32));
+    let r = if wide {
+        f.typed::<(i32, i64), ()>(&*caller)
+            .context("gex.signal_hook: the hook is not void(int, unsigned long long)")?
+            .call(&mut *caller, (ctx_addr as i32, interrupted as i64))
+    } else {
+        f.typed::<(i32, i32), ()>(&*caller)
+            .context("gex.signal_hook: the hook is not void(int, unsigned)")?
+            .call(&mut *caller, (ctx_addr as i32, interrupted as u32 as i32))
+    };
     if let (Some(g), Some(cur)) = (&sp, saved) {
         sp_set(&mut *caller, g, cur)?;
     }

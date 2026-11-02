@@ -2182,7 +2182,7 @@ export class Gex {
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
           try {
-            f(ctx, pc);
+            f(ctx, this.#signalPc(pc));
           } finally {
             spG.value = cur;
           }
@@ -9198,7 +9198,15 @@ export class Gex {
     if (!f) throw new Error(`gex: the guest signal hook (function ${hook}) is not in this Worker's table`);
     const spG = this.#wasmprogSp ?? this.#wasmprogStack();
     const cur = this.#belowGuest(spG, sp);
-    return { f, idx: hook, sig: true, args: [Number(BigInt.asUintN(32, pc)) | 0], spG, cur };
+    return { f, idx: hook, sig: true, args: [this.#signalPc(pc)], spG, cur };
+  }
+
+  /** The interrupted pc as the signal hook takes it: 64-bit Wine's whole
+   *  (a guest above 4 GiB in a 64-bit memory: cut to its low half, it never
+   *  matched the pc the frames return to, and the hook ran that pc as a
+   *  handler), 32-bit Wine's low half. */
+  #signalPc(pc) {
+    return this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, BigInt(pc)) : Number(BigInt.asUintN(32, BigInt(pc))) | 0;
   }
 
   /** The stack pointer of the stack call-outs are made on, which a call-out's
