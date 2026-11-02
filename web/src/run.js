@@ -16,7 +16,11 @@ import { singleMode } from './runtime.js';
 export async function runProgram(term, opts) {
   // Said once, so a person (and the smoke test) can tell which build ran; by
   // the page's preset, not the runtime API, which says nothing by default.
-  if ((SP_CODE && singleMode())) console.info(`[gex] single-thread build: the system runs in a Worker, no SharedArrayBuffer (crossOriginIsolated=${globalThis.crossOriginIsolated})`);
+  // On its terminal too, as the page's old single-thread run said it.
+  if ((SP_CODE && singleMode())) {
+    console.info(`[gex] single-thread build: the system runs in a Worker, no SharedArrayBuffer (crossOriginIsolated=${globalThis.crossOriginIsolated})`);
+    term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
+  }
   const { runPreset } = await import('./run-program.js');
   return runPreset(term, opts);
 }
