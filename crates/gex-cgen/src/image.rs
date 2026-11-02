@@ -117,6 +117,45 @@ fn unit_inputs() -> String {
     }
 }
 
+/// The `gexc cgen-image` switches that build a unit of this process's key
+/// flavour (the parts of [`unit_inputs`] a switch sets): what a "build it
+/// with" line must name, or the unit it builds has another key and is never
+/// used. GEX_CGEN_GUARD=1 (the guarded flavour) is an environment setting,
+/// not a switch: see [`unguarded`].
+pub fn flavour_switches() -> Vec<String> {
+    let mut f = Vec::new();
+    if gex_abi::kuser_fold() && gex_abi::kuser_fold_entry() {
+        f.push("--wine64-compact".to_string());
+    } else if gex_abi::kuser_fold() {
+        f.push("--wine32-kuser".to_string());
+    }
+    if gex_abi::mem64() {
+        f.push("--mem64".to_string());
+    }
+    if max_insns() != DEFAULT_MAX_INSNS {
+        f.push("--max-insns".to_string());
+        f.push(max_insns().to_string());
+    }
+    f
+}
+
+/// Apply one of [`flavour_switches`]' switches that takes no value, as gexc
+/// does: false for any other.
+pub fn set_flavour_switch(switch: &str) -> bool {
+    match switch {
+        "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
+        // 32-bit Wine's KUSER_SHARED_DATA fold.
+        "--wine32-kuser" => gex_abi::set_kuser_fold(true),
+        // 64-bit Wine's compact space: the fold and the entry page after it.
+        "--wine64-compact" => {
+            gex_abi::set_kuser_fold(true);
+            gex_abi::set_kuser_fold_entry(true);
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Store an i386 program's general-purpose registers to the low 32 bits of
 /// their 64-bit context slots (3-4% of the wasm of one game's large hot
 /// functions). Exact because every other writer of those slots

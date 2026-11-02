@@ -8,7 +8,7 @@
 
 # The Wine fork: branch w64/gex-surface.
 WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE64_COMMIT := cb901f507170a9984efb37f2a1e17d93a15d6199
+WINE64_COMMIT := 4e37aeafe100ab585bbf8c3e2c3db4ee81f82cea
 
 # The musl fork with gex's wasm64 arch: branch w64/wasm64.
 MUSL64_REPO   := https://github.com/MercuryWorkshop/musl-wasm64.git
