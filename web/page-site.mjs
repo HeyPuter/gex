@@ -158,7 +158,9 @@ walk(unitsIn, (p, rel) => {
     // A preload item is [NAME, URL]: `cgen:KEY` or `file:KEY/FILE`, URL /units/KEY/...
     const list = JSON.parse(readFileSync(p, 'utf8')).filter(([, url]) => !fillKey(String(url).replace(/^\/units\//, '')));
     writeFileSync(join(out, 'units/preload.json'), JSON.stringify(list));
-  } else if (!fillKey(rel)) place(p, `units/${rel}`);
+  } else if (!fillKey(rel) && !rel.startsWith('recovery/')) place(p, `units/${rel}`);
+  // (recovery/: the cgen build's own cache, the functions it recovered per
+  // image, which the page never reads: gigabytes once units.sh built there)
 });
 
 // The launch.

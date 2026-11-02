@@ -384,6 +384,9 @@ pub struct ObjectProfile {
     /// Paths this object was seen under (informational).
     pub paths: Vec<String>,
     pub blocks: BTreeMap<u64, BlockCounts>,
+    /// Blocks that ran in the process's other mode (a WoW64 process's
+    /// 32-bit code): the same address in the other mode is other code.
+    pub other_mode_blocks: BTreeMap<u64, BlockCounts>,
     pub indirect: BTreeMap<u64, IndirectSite>,
     pub returns: BTreeMap<u64, ReturnSite>,
     /// `(syscall instruction offset, enclosing function, canonical number)`.
@@ -427,7 +430,8 @@ impl Profile {
             let at = loc_or_anon(r, b.start);
             let end = b.end.wrapping_sub(b.start).wrapping_add(at.off);
             let o = self.obj(&at.obj);
-            let c = o.blocks.entry(at.off).or_default();
+            let blocks = if b.flags & layout::flags::OTHER_MODE != 0 { &mut o.other_mode_blocks } else { &mut o.blocks };
+            let c = blocks.entry(at.off).or_default();
             if c.end == 0 || end < c.end {
                 c.end = end;
             }
@@ -485,16 +489,18 @@ impl Profile {
                     me.paths.push(p.clone());
                 }
             }
-            for (off, c) in &o.blocks {
-                let m = me.blocks.entry(*off).or_default();
-                if m.end == 0 || (c.end != 0 && c.end < m.end) {
-                    m.end = c.end;
+            for (theirs, mine) in [(&o.blocks, &mut me.blocks), (&o.other_mode_blocks, &mut me.other_mode_blocks)] {
+                for (off, c) in theirs {
+                    let m = mine.entry(*off).or_default();
+                    if m.end == 0 || (c.end != 0 && c.end < m.end) {
+                        m.end = c.end;
+                    }
+                    m.n += c.n;
+                    m.call += c.call;
+                    m.jump += c.jump;
+                    m.ret += c.ret;
+                    m.taken += c.taken;
                 }
-                m.n += c.n;
-                m.call += c.call;
-                m.jump += c.jump;
-                m.ret += c.ret;
-                m.taken += c.taken;
             }
             for (off, s) in &o.indirect {
                 let m = me.indirect.entry(*off).or_default();
@@ -588,6 +594,8 @@ impl Profile {
     ///   "objects": [ {
     ///     "id": "sha256:…" | "anon", "paths": ["/lib/libc.so"],
     ///     "blocks":   [[off, end, n, call, jump, ret, taken], …],
+    ///     "other_mode_blocks": [the same rows], (only when there are any:
+    ///                   blocks run in the process's other mode)
     ///     "indirect": [{"off": o, "call": bool, "total": n, "replaced": n,
     ///                   "targets": [[obj, off, n], …] (top 4, hottest first),
     ///                   "other": n}, …],
@@ -626,6 +634,15 @@ impl Profile {
                     "[{off},{},{},{},{},{},{}]",
                     c.end, c.n, c.call, c.jump, c.ret, c.taken
                 );
+            }
+            if !o.other_mode_blocks.is_empty() {
+                s.push_str("],\n\"other_mode_blocks\":[");
+                for (k, (off, c)) in o.other_mode_blocks.iter().enumerate() {
+                    if k > 0 {
+                        s.push(',');
+                    }
+                    let _ = write!(s, "[{off},{},{},{},{},{},{}]", c.end, c.n, c.call, c.jump, c.ret, c.taken);
+                }
             }
             s.push_str("],\n\"indirect\":[");
             for (k, (off, site)) in o.indirect.iter().enumerate() {
@@ -705,19 +722,21 @@ impl Profile {
             for path in o.get("paths").and_then(Json::as_arr).unwrap_or(&[]) {
                 op.paths.push(path.as_str().ok_or("path")?.to_string());
             }
-            for b in o.get("blocks").and_then(Json::as_arr).unwrap_or(&[]) {
-                let f = nums(b, 7).ok_or("block row")?;
-                op.blocks.insert(
-                    f[0],
-                    BlockCounts {
-                        end: f[1],
-                        n: f[2],
-                        call: f[3],
-                        jump: f[4],
-                        ret: f[5],
-                        taken: f[6],
-                    },
-                );
+            for (key, blocks) in [("blocks", &mut op.blocks), ("other_mode_blocks", &mut op.other_mode_blocks)] {
+                for b in o.get(key).and_then(Json::as_arr).unwrap_or(&[]) {
+                    let f = nums(b, 7).ok_or("block row")?;
+                    blocks.insert(
+                        f[0],
+                        BlockCounts {
+                            end: f[1],
+                            n: f[2],
+                            call: f[3],
+                            jump: f[4],
+                            ret: f[5],
+                            taken: f[6],
+                        },
+                    );
+                }
             }
             for site in o.get("indirect").and_then(Json::as_arr).unwrap_or(&[]) {
                 let off = site.get("off").and_then(Json::as_u64).ok_or("indirect off")?;
@@ -1560,7 +1579,7 @@ mod tests {
             call_return: None,
             guard: None,
         };
-        let region = layout::layout([&b1].into_iter());
+        let region = layout::layout([&b1].into_iter(), false);
         let mut mem = vec![0u8; layout::REGIONS_START as usize + region.size as usize + 64];
         init_thread_memory(&mut mem);
         let (base, need) = next_region(&mem, region.size);

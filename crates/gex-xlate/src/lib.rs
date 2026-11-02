@@ -592,8 +592,12 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
     seen.extend(frontier.iter().copied());
     let show_illegal = std::env::var_os("GEX_SHOW_ILLEGAL").is_some();
 
+    let compat = arch::compat();
     while !frontier.is_empty() {
         let lifted = gex_emit::par::map(&frontier, &|&addr| {
+            // The lifting threads decode in this thread's mode (an image's
+            // own, `set_thread_compat`), not only the process default.
+            let _mode = compat_scope(compat);
             // A recognised library function is emitted as the shim's intrinsic
             // (a `memory.copy`/`memory.fill`) instead of lifting its own code --
             // the same substitution `discover` (the runtime path) does. Without
@@ -703,6 +707,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
         }
         fill.sort_unstable();
         let lifted = gex_emit::par::map(&fill, &|&addr| {
+            let _mode = compat_scope(compat);
             if let Some(&k) = opts.intrinsics.get(&addr) {
                 return intrinsic::block(addr, k);
             }
@@ -735,16 +740,15 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
 /// [`ModuleBuilder`] the whole-image emitters share.
 fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
     let (text_lo, text_hi) = image.text_range;
-    let mut builder = if opts.first_slot == 0 {
+    // An image's code in the process's other mode (gex-eject's seeds of a
+    // WoW64 program's 32-bit code): that mode's pages and directory.
+    let alt = other_mode();
+    let mut builder = if opts.first_slot == 0 && !alt {
         ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory)
     } else {
-        ModuleBuilder::with_pages(
-            text_lo,
-            text_hi - text_lo,
-            opts.linkage,
-            gex_emit::module::PageTable::from_entries(&[], opts.first_slot),
-            opts.shared_memory,
-        )
+        let mut pages = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+        pages.set_alt(alt);
+        ModuleBuilder::with_pages(text_lo, text_hi - text_lo, opts.linkage, pages, opts.shared_memory)
     };
     builder.set_demand_fill(opts.demand_fill);
     builder
@@ -821,6 +825,8 @@ fn cgen_splice(
             limits: opts.limits,
             ..Default::default()
         };
+        // The image's mode for everything below, recovery to emission.
+        let _mode = compat_scope(image.class32);
         let prog = match pe {
             Some(seeds) => func::recover_pe(image, seeds, &ropts),
             None => func::recover(image, None, &ropts),
@@ -865,6 +871,7 @@ fn fjit_splice(
         ..Default::default()
     };
     let started = std::time::Instant::now();
+    let _mode = compat_scope(image.class32);
     let prog = match pe {
         Some(seeds) => func::recover_pe(image, seeds, &ropts),
         None => func::recover(image, None, &ropts),
@@ -927,7 +934,8 @@ pub fn translate_image_split(
     }
     // Split through the proven runtime splitter, threaded from this object's
     // starting slot and emitting the closure's passive segments (`demand_fill`).
-    let page_table = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+    let mut page_table = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+    page_table.set_alt(other_mode());
     let modules = emit_modules(
         collected,
         image.text_range.0,
@@ -1189,6 +1197,8 @@ fn function_stubs(
         return Err(format!("none of the {} function entries is translatable", entries.len()));
     }
     blocks.sort_by_key(|b| b.start);
+    let mut page_table = page_table;
+    page_table.set_alt(other_mode());
     let mut builder = ModuleBuilder::with_pages(blocks[0].start, 0, Linkage::Shared, page_table, shared_memory);
     let mut out: Vec<(Block, u32)> = Vec::new();
     for block in blocks {
@@ -1272,6 +1282,9 @@ fn translate_seeded(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
+    // Code in the process's other mode: its own pages and directory.
+    let mut page_table = page_table;
+    page_table.set_alt(other_mode());
     let (mut blocks, mut stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
     );
@@ -1367,11 +1380,13 @@ fn discover(
     // past the seeds (0: no limit). An experiment: 63% of the blocks node's
     // start-up lifts never run, and the deeper the level the fewer run.
     let max_depth = (DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed) >> 16) & 0xff;
+    let compat = arch::compat();
     while !frontier.is_empty() && stats.blocks < max_blocks && (max_depth == 0 || u32::from(depth) <= max_depth) {
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
         let lifted = gex_emit::par::map(&frontier, &|&a| {
+            let _mode = compat_scope(compat);
             match intrinsics.get(&a) {
                 // Not lifted at all, so discovery never walks into the
                 // function's body and the module never carries it.
@@ -1501,8 +1516,10 @@ fn fetch_code_bytes(
 static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether the code this translator sees is 32-bit (i386 compatibility
-/// mode). One setting per process: a 32-bit program is 32-bit throughout.
-/// On the AArch64 guest there is no such mode and this is a no-op.
+/// mode), as the process default: a 32-bit program is 32-bit throughout.
+/// Code of the other class in the same process is translated under
+/// [`set_thread_compat`] or [`compat_scope`]. Clears this thread's own
+/// setting. On the AArch64 guest there is no such mode and this is a no-op.
 pub fn set_compat(compat: bool) {
     #[cfg(feature = "x86")]
     gex_isa_x86::set_mode(if compat {
@@ -1512,6 +1529,63 @@ pub fn set_compat(compat: bool) {
     });
     #[cfg(not(feature = "x86"))]
     let _ = compat;
+}
+
+/// Whether the code this thread translates next is 32-bit, until the next
+/// call on this thread or [`set_compat`] there: what translating one image
+/// sets (`image.class32`). Other threads keep their own, so two threads
+/// translating images of different classes (a WoW64 process) do not race.
+pub fn set_thread_compat(compat: bool) {
+    #[cfg(feature = "x86")]
+    gex_isa_x86::set_thread_mode(if compat {
+        gex_isa_x86::Mode::Compat
+    } else {
+        gex_isa_x86::Mode::Long
+    });
+    #[cfg(not(feature = "x86"))]
+    let _ = compat;
+}
+
+/// [`set_thread_compat`] for as long as the scope lives; dropping it restores
+/// what this thread had before.
+#[must_use = "the mode holds only while the scope is alive"]
+pub struct CompatScope {
+    #[cfg(feature = "x86")]
+    _scope: gex_isa_x86::ModeScope,
+}
+
+pub fn compat_scope(compat: bool) -> CompatScope {
+    CompatScope {
+        #[cfg(feature = "x86")]
+        _scope: gex_isa_x86::ModeScope::enter(if compat {
+            gex_isa_x86::Mode::Compat
+        } else {
+            gex_isa_x86::Mode::Long
+        }),
+    }
+}
+
+/// Whether the code this thread translates is in the mode the process's own
+/// class is not (a WoW64 process's 32-bit code): its pages are keyed
+/// `gex_abi::ALT_PAGE` and its modules read the other directory.
+pub fn other_mode() -> bool {
+    arch::compat() != default_compat()
+}
+
+/// The process default [`set_compat`] set, whatever this thread has open.
+pub fn default_compat() -> bool {
+    #[cfg(feature = "x86")]
+    {
+        gex_isa_x86::default_mode() == gex_isa_x86::Mode::Compat
+    }
+    #[cfg(not(feature = "x86"))]
+    false
+}
+
+/// The mode code under the thread's selector (`ctx::CS`) is translated in:
+/// a scope for one translation the thread's own code asked for.
+pub fn cs_scope(cs: u32) -> CompatScope {
+    compat_scope(gex_abi::ctx::cs_compat(cs, default_compat()))
 }
 
 pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {

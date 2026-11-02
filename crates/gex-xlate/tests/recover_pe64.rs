@@ -1,7 +1,7 @@
 //! Function recovery on a PE32+ image: S5's `uses.exe` fixture (MinGW
 //! x86-64, imports from two DLLs and a resource), seeded from its entry,
-//! relocations, import thunks and `.pdata`. A test binary of its own: the
-//! decoder's mode is per process, and this one wants long mode.
+//! relocations, import thunks and `.pdata`. Recovery decodes in the image's
+//! own mode on its thread (`recover_mixed.rs` runs both classes at once).
 
 #![cfg(feature = "x86")]
 

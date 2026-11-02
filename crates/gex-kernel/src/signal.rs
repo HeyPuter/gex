@@ -1179,8 +1179,10 @@ fn setup_frame_x86(
     let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
     m.write_u64(mc + xframe::MC_RIP as u64, pc)?;
     m.write_u64(mc + xframe::MC_EFLAGS as u64, read_rflags(m, ctx_addr)?)?;
-    // cs = __USER_CS (0x33), the other selectors zero.
-    m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
+    // cs: the interrupted code's (__USER_CS, 0x33, or __USER32_CS, 0x23,
+    // for a WoW64 thread's 32-bit code), the other selectors zero.
+    let cs = m.read_u32(ctx_addr + ctx::CS as u64)?;
+    m.write_u64(mc + xframe::MC_CS as u64, if cs == 0 { ctx::CS_LONG as u64 } else { cs as u64 })?;
     m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
     m.write_u64(mc + xframe::MC_OLDMASK as u64, saved_mask)?;
     m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
@@ -1216,6 +1218,8 @@ fn setup_frame_x86(
     m.write_u64(ctx_addr + ctx::x(2) as u64, uc)?;
     m.write_u64(ctx_addr + ctx::x(0) as u64, 0)?;
     m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
+    // The handler is 64-bit code, whatever was interrupted.
+    m.write_u32(ctx_addr + ctx::CS as u64, 0)?;
     Ok(action.handler)
 }
 
@@ -1229,6 +1233,14 @@ fn sigreturn_x86(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Resu
         let v = m.read_u64(mc + i as u64 * 8)?;
         m.write_u64(ctx_addr + ctx::x(*reg) as u64, v)?;
     }
+    // Back to 64-bit or 32-bit code (a WoW64 thread's); any other selector
+    // is no code segment, and the return fails (SIGSEGV).
+    let cs = match m.read_u64(mc + xframe::MC_CS as u64)? as u16 as u32 {
+        ctx::CS_LONG => 0,
+        ctx::CS_COMPAT => ctx::CS_COMPAT,
+        _ => return Err(Errno::EFAULT),
+    };
+    m.write_u32(ctx_addr + ctx::CS as u64, cs)?;
     let pc = m.read_u64(mc + xframe::MC_RIP as u64)?;
     m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
     write_rflags(m, ctx_addr, m.read_u64(mc + xframe::MC_EFLAGS as u64)?)?;

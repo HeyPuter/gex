@@ -35,6 +35,7 @@ use wasm_encoder::{
 pub const RESOLVE: &str = "resolve";
 pub const ROOT: &str = "root";
 pub const BRIDGE: &str = "bridge";
+pub const ENTER: &str = "enter";
 
 /// The `F_body` type, as every emitter declares it.
 pub fn body_params() -> [ValType; 4] {
@@ -122,6 +123,19 @@ pub fn emit_probe(f: &mut Function, t: u32, e: u32) {
 /// (table 0), the dispatch tables (tables 1..), `gex.lookup`,
 /// `gex.safepoint`, `gex.cache_op`, `gex.dispatch_miss`.
 pub fn module() -> Vec<u8> {
+    module_in(false)
+}
+
+/// [`module`] for the process's other mode (a WoW64 process's 32-bit code):
+/// its `bridge` serves a function bound in the other directory, and
+/// dispatches where the function left through that directory, which it
+/// imports as `gex.alt_dir` ([`gex_abi::imports::ALT_DIR`]) after the
+/// others.
+pub fn module_alt() -> Vec<u8> {
+    module_in(true)
+}
+
+fn module_in(alt: bool) -> Vec<u8> {
     let mut m = Module::new();
     let mut types = TypeSection::new();
     types.ty().function(body_params(), [ValType::I32]); // 0: F_body
@@ -129,6 +143,7 @@ pub fn module() -> Vec<u8> {
     types.ty().function([ValType::I32, ValType::I64], []); // 2: safepoint
     types.ty().function([ValType::I32], []); // 3: root, bridge, a block
     types.ty().function([ValType::I32, ValType::I64, ValType::I32, ValType::I64], []); // 4: cache_op
+    types.ty().function([ValType::I32, ValType::I64], []); // 5: enter
     m.section(&types);
     let mut imports = ImportSection::new();
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::exports::MEMORY, EntityType::Memory(memory_type()));
@@ -140,6 +155,14 @@ pub fn module() -> Vec<u8> {
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::imports::SAFEPOINT, EntityType::Function(2));
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::imports::CACHE_OP, EntityType::Function(4));
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::imports::DISPATCH_MISS, EntityType::Function(1));
+    if alt {
+        let val_type = if gex_abi::mem64() { ValType::I64 } else { ValType::I32 };
+        imports.import(
+            gex_abi::IMPORT_MODULE,
+            gex_abi::imports::ALT_DIR,
+            EntityType::Global(wasm_encoder::GlobalType { val_type, mutable: false, shared: false }),
+        );
+    }
     m.section(&imports);
     const LOOKUP: u32 = 0;
     const SAFEPOINT: u32 = 1;
@@ -151,11 +174,17 @@ pub fn module() -> Vec<u8> {
     funcs.function(3); // 5 root
     funcs.function(3); // 6 bridge
     funcs.function(3); // 7 dispatch
+    if alt {
+        funcs.function(5); // 8 enter
+    }
     m.section(&funcs);
     let mut exports = ExportSection::new();
     exports.export(RESOLVE, ExportKind::Func, 4);
     exports.export(ROOT, ExportKind::Func, 5);
     exports.export(BRIDGE, ExportKind::Func, 6);
+    if alt {
+        exports.export(ENTER, ExportKind::Func, 8);
+    }
     m.section(&exports);
     let ctxm = |off: usize, align: u32| MemArg { offset: off as u64, align, memory_index: 0 };
     // ctx = local 0; the safepoint countdown, as tier-1's, polling at PC.
@@ -336,7 +365,26 @@ pub fn module() -> Vec<u8> {
     code.function(&f);
 
     // dispatch(ctx): tier-1's indirect dispatch on LAST_TARGET.
-    code.function(&crate::splice::dispatch_function_at(3, 1));
+    code.function(&crate::splice::dispatch_function_in(3, 1, alt.then_some(0)));
+
+    // enter(ctx, pc), the other mode's only: the host's way in at `pc`, as
+    // a translated module's `enter` (its PC and target recorded, then
+    // dispatch), for a thread that enters that mode at a function bound
+    // there before any of its code is translated. (The page's dense
+    // rewrite of the own mode's module expects dispatch last.)
+    if alt {
+        let mut f = Function::new([]);
+        for off in [ctx::PC, ctx::LAST_TARGET] {
+            f.instruction(&I::LocalGet(0));
+            crate::splice::widen_addr(&mut f);
+            f.instruction(&I::LocalGet(1));
+            f.instruction(&I::I64Store(ctxm(off, 3)));
+    }
+        f.instruction(&I::LocalGet(0));
+        f.instruction(&I::ReturnCall(DISPATCH));
+        f.instruction(&I::End);
+        code.function(&f);
+    }
     m.section(&code);
     m.finish()
 }
@@ -404,6 +452,9 @@ mod tests {
         let w = super::module();
         let mut v = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
         v.validate_all(&w).expect("the runtime module validates");
+        let w = super::module_alt();
+        v.reset();
+        v.validate_all(&w).expect("the other mode's runtime module validates");
         let w = super::forwarder_module(&[0x1000, 0x2000]);
         v.reset();
         v.validate_all(&w).expect("the forwarder module validates");

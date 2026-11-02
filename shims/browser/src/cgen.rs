@@ -149,6 +149,10 @@ struct Unit {
     identity: String,
     /// The key before the profile's part (`key` adds it).
     key_base: String,
+    /// An image of the process's other mode (a WoW64 process's i386 one):
+    /// its entries and its providers' are bridged in the other directory,
+    /// which that mode's code dispatches through.
+    alt: bool,
 }
 
 /// One export provider for a placed image.
@@ -645,7 +649,7 @@ pub(crate) fn wine32_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> 
     if !on() {
         return false;
     }
-    wine32_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64 && !other_mode_pe(pe));
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
     if !wine32_matches(&image, base, pe, true) {
         wine32_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
@@ -717,6 +721,19 @@ fn wine32_forget(base: u64, size: u64) {
     }
 }
 
+/// Whether `image` is of the process's other mode: i386 code in an x86-64
+/// process (WoW64), translated in compat mode and dispatched through the
+/// other directory.
+fn other_mode_image(image: &gex_ld::Image) -> bool {
+    gex_abi::X86 && image.class32 != gex_xlate::default_compat()
+}
+
+/// [`other_mode_image`] for a PE image: a PE32 one in an x86-64 process. Its
+/// process's trampolines are still the 64-bit ones.
+fn other_mode_pe(pe: &gex_ld::pe::PeImage) -> bool {
+    gex_abi::X86 && !pe.is64 && !gex_xlate::default_compat()
+}
+
 /// Whether the trampoline page this address space asked for is 32-bit Wine's.
 static TRAMPOLINES32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -780,7 +797,7 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
             }
         },
     };
-    wine32_trampolines(!pe.is64);
+    wine32_trampolines(!pe.is64 && !other_mode_pe(&pe));
     let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
     if !wine32_matches(&image, d.base, &pe, false) {
         crate::warn_line(&format!("gex-wine32: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
@@ -871,6 +888,12 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             groups: Vec::new(),
         }];
     }
+    // Its bridges go in the other directory, which the process may not have
+    // yet (no thread has run that mode's code).
+    let alt = other_mode_image(image);
+    if alt {
+        crate::with_px(|px| crate::ensure_alt_dir(px));
+    }
     let identity = match known {
         Some((_, id)) => id,
         None => gex_key::image_identity(image).trim_start_matches("image:").to_string(),
@@ -888,6 +911,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         dirs: Vec::new(),
         slots: 0,
         providers,
+        alt,
     });
     let at = PLACING_AT.with(|c| c.replace(0));
     if at != 0 {
@@ -1181,11 +1205,12 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // Loudly, as natively: a unit built at another base (or under another
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
-        "gex-pe: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
+        "gex-pe: image {} at base {:#x}: no function-tier unit (key {}, inputs {}), tier-1; build it with \
          {}gexc cgen-image <image> --pe-base {:#x}\n",
         x.path,
         x.base,
         x.key,
+        gex_cgen::image::inputs_id(),
         if gex_cgen::image::unguarded() { "" } else { "GEX_CGEN_GUARD=1 " },
         x.base
     ));
@@ -1216,7 +1241,8 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, nslots) = bridges(&addrs);
+    let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
+    let (regs, dirs, nslots) = bridges_mode(&addrs, alt);
     {
         let mut units = lock(&UNITS);
         let Some(x) = units.get_mut(u as usize) else {
@@ -1253,6 +1279,10 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
 pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
     let mut units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return -1 };
+    // Region entries are tier-1 modules of the process's own mode.
+    if x.alt {
+        return -1;
+    }
     let r = Unit {
         identity: x.identity.clone(),
         key_base: format!("regions/{}", x.key),
@@ -1265,6 +1295,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
         dirs: Vec::new(),
         slots: 0,
         providers: Vec::new(),
+        alt: false,
     };
     units.push(r);
     (units.len() - 1) as i32
@@ -1290,8 +1321,13 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
     let mut units = lock(&UNITS);
     let mut pages = Vec::new();
     let mut paths = Vec::new();
+    let alt = us.first().and_then(|&u| units.get(u)).is_some_and(|x| x.alt);
     for &u in &us {
         let Some(x) = units.get(u) else { return -1 };
+        // One module's entries are bridged in one directory.
+        if x.alt != alt {
+            return -1;
+        }
         pages.extend(x.pages.iter().copied());
         paths.push(x.path.rsplit(['/', '\\']).next().unwrap_or("").to_string());
     }
@@ -1308,6 +1344,7 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
         dirs: Vec::new(),
         slots: 0,
         providers: Vec::new(),
+        alt,
     });
     (units.len() - 1) as i32
 }
@@ -1318,6 +1355,17 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
 pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    bridges_mode(addrs, false)
+}
+
+/// The tag on a `[table, slot]` pair's table that [`bridges_mode`] gives the
+/// other mode's bridges.
+pub(crate) const ALT_BRIDGE: u32 = 1 << 31;
+
+/// [`bridges`] in the process's other mode (`alt`: a WoW64 process's i386
+/// Wine modules): the pages keyed with `gex_abi::ALT_PAGE`, in the other
+/// directory, which code in that mode dispatches through.
+pub(crate) fn bridges_mode(addrs: &[u64], alt: bool) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     crate::with_jit_only(|j| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         // Every page the entries are on, numbered here or before: the
@@ -1328,10 +1376,10 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // on a block whose next page had no entry).
         let mut pages: std::collections::BTreeMap<u64, u32> = Default::default();
         for &a in addrs {
-            let page = a / gex_abi::DISPATCH_PAGE;
-            if page >= gex_abi::dispatch_max_pages() {
+            if a / gex_abi::DISPATCH_PAGE >= gex_abi::dispatch_max_pages() {
                 continue;
             }
+            let page = gex_abi::page_key(a, alt);
             let base = match j.page_table.lookup(page) {
                 Some(b) => b,
                 None => crate::number_by_identity(j, page),
@@ -1349,7 +1397,8 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         // entry every Worker that wrote the bridge there still holds.
         let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::dense_table(t as usize)).collect();
         let entries: Vec<u32> = dense.iter().map(|&(t, slot)| gex_abi::dispatch_entry(t as usize, slot)).collect();
-        let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, &mut j.bridge_group, &entries, crate::dense::alloc);
+        let group = if alt { &mut j.bridge_group_alt } else { &mut j.bridge_group };
+        let words = gex_emit::dense::bridge_words(&mut j.bridge_dense, group, &entries, crate::dense::alloc);
         let mut filled = std::collections::BTreeSet::new();
         for (&entry, &w) in entries.iter().zip(&words) {
             crate::dense::set_slot_word(entry, w);
@@ -1363,7 +1412,14 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
                 regs.extend_from_slice(&[t, slot]);
             }
         }
-        j.translated.extend(addrs.iter().copied());
+        // The other mode's bridges are tagged: JS writes that mode's bridge
+        // there (`#writeBridges`).
+        if alt {
+            for t in regs.iter_mut().step_by(2) {
+                *t |= ALT_BRIDGE;
+            }
+        }
+        j.translated.extend(addrs.iter().map(|&a| gex_abi::addr_key(a, alt)));
         (regs, pages.into_iter().collect(), j.page_table.slots())
     })
 }
@@ -1462,7 +1518,8 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, slots) = bridges(&addrs);
+    let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
+    let (regs, dirs, slots) = bridges_mode(&addrs, alt);
     crate::trace_line(&format!("gex-pe: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
@@ -1619,11 +1676,12 @@ pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
     gex_kernel::clock_ns(crate::browser_clock, clk as u64) as i64
 }
 
-/// `gex.nt_qpc()`: the nt_qpc provider's clock. That provider binds only
-/// to a PE ntdll, which no process here has: always 0.
+/// `gex.nt_qpc()`: the nt_qpc provider's clock, for an i386 PE ntdll (a
+/// WoW64 process's): what 64-bit Wine's NtQueryPerformanceCounter reads
+/// (`monotonic_counter`: CLOCK_BOOTTIME in 100 ns units), so the two agree.
 #[no_mangle]
 pub extern "C" fn gex_nt_qpc() -> i64 {
-    0
+    (gex_kernel::clock_ns(crate::browser_clock, 7) / 100) as i64
 }
 
 /// Provider module `number`'s data (`__memory_base`), 0 when stateless.
@@ -1670,17 +1728,64 @@ pub extern "C" fn gex_provider_missing(addr: u32) {
     crate::end_process(0xc000_0139);
 }
 
-/// Whether the provider data at `base` still needs its relocations applied
-/// (once per process): 1 the first time, then 0.
+/// Provider data by base whose relocations a Worker took: whether it has
+/// applied them yet ([`gex_provider_relocated`]), and the thread that took
+/// them.
+static RELOCATED: Mutex<Vec<(u32, bool, i32)>> = Mutex::new(Vec::new());
+
+/// How long [`gex_provider_relocate`] waits for another Worker's
+/// relocation, in naps of about a millisecond: one takes milliseconds, so
+/// past this the Worker that took them is gone (terminated between its claim
+/// and [`gex_provider_relocated`], where no `finally` runs).
+const RELOCATE_WAIT_NAPS: u64 = 120_000;
+
+/// Whether this instantiation applies the relocations of the provider data
+/// at `base`: 1 the first time (once per process), then 0. While another
+/// Worker applies them this waits for it to finish, as
+/// `wasmprog::gex_wasmprog_relocate` does: a Wine PE module runs as soon as
+/// it is instantiated (its DLL's entry), and before then its function
+/// pointers in data (winecrt0's `__wine_unix_call_dispatcher`) are not yet
+/// slots of its table range. Another Worker instantiates it first once the
+/// install wakes it (`dylink::published`). -1 when that Worker never
+/// finished: the caller fails, naming the module. Only Workers call this
+/// (the shim runs in none but them), so the wait is allowed.
 #[no_mangle]
 pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
-    static DONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-    let mut d = lock(&DONE);
-    if d.contains(&base) {
-        return 0;
+    let mut waits: u64 = 0;
+    loop {
+        let by = {
+            let mut d = lock(&RELOCATED);
+            match d.iter().find(|e| e.0 == base) {
+                None => {
+                    d.push((base, false, crate::my_tid()));
+                    return 1;
+                }
+                Some(&(_, true, _)) => return 0,
+                Some(&(_, false, by)) => by,
+            }
+        };
+        waits += 1;
+        if waits > RELOCATE_WAIT_NAPS {
+            crate::warn_line(&format!(
+                "gex: provider data at {base:#x}: thread {by} took its relocations and has not applied them after {RELOCATE_WAIT_NAPS} waits\n"
+            ));
+            return -1;
+        }
+        #[cfg(feature = "shared-memory")]
+        {
+            let nap = std::sync::atomic::AtomicI32::new(0);
+            unsafe { crate::warch::memory_atomic_wait32(nap.as_ptr(), 0, 1_000_000) };
+        }
     }
-    d.push(base);
-    1
+}
+
+/// The Worker [`gex_provider_relocate`] picked has applied the relocations
+/// of the provider data at `base` (or given up: it threw).
+#[no_mangle]
+pub extern "C" fn gex_provider_relocated(base: u32) {
+    if let Some(e) = lock(&RELOCATED).iter_mut().find(|e| e.0 == base) {
+        e.1 = true;
+    }
 }
 
 /// GEX_WIN_ENTRY_LOG: print each pc entered inside a unit's pages without an
@@ -1773,7 +1878,8 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
                 // it for every other directory write.
                 crate::note_dir_high(base);
                 crate::dense::note_entry(base);
-                let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
+                // (a page key of the other mode's: its directory's word)
+                let _ = gm.write_u32(crate::dir_word(page), base);
             }
         }
     });
@@ -1829,6 +1935,12 @@ pub(crate) fn unit_serves(addr: u64) -> bool {
 /// beside a bound export would otherwise run its stub (c000001d).
 pub(crate) fn provider_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).module >= PROVIDER))
+}
+
+/// [`provider_serves`] in the process's other mode: an i386 Wine module's
+/// export or entry thunk bound at `addr` in an x86-64 process.
+pub(crate) fn alt_serves(addr: u64) -> bool {
+    wasmdll::alt_serves(addr)
 }
 
 /// Whether a current JIT function serves `addr` (its pages unchanged since).
@@ -2208,7 +2320,9 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // The stack once the guest has returned: the caller's, past the return
     // address (and whatever a stdcall callee pops, allowed for below).
     let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
-    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::arch::compat() { 4 } else { 8 };
+    // (in the mode the thread runs in: a WoW64 thread's 32-bit code, an i386
+    // Wine module's guest call into it)
+    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::default_compat() != crate::thread_alt() { 4 } else { 8 };
     let want = sp + delta;
     let span = callout_span(ret as u64, _need as u32);
     let cb = CB_DEPTH.with(|d| d.get());
@@ -2280,6 +2394,10 @@ extern "C" {
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
     fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
+    /// Call the signal hook `idx` (`void(int ctx, unsigned pc)`) here, its
+    /// C frames below the guest's stack pointer `sp`: 1; 0 when this build
+    /// cannot.
+    fn signal_call(idx: i32, ctx: i32, pc: i32, sp: i64) -> i32;
     /// Whether the host's stack has room for one more fault's dispatch: 1
     /// or 0.
     fn stack_room() -> i32;
@@ -2351,6 +2469,18 @@ static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// The same for a stateful provider's or native Wine's guest calls, which
 /// cannot leave.
 const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
+
+/// A call-out the glue opens inside others when the host's stack has no room
+/// for one more (`#callOutSteps`): a native Wine module's guest call (64-bit
+/// native Wine's `__gexw_guest_call64`), whose native frames no trap drops, as
+/// a handler that faults in every dispatch makes them without end. The
+/// process ends as one whose stack is spent, never with the host's stack
+/// overflowing in the runtime.
+#[no_mangle]
+pub extern "C" fn gex_callout_stack_spent() {
+    crate::warn_line("gex: guest calls nest deeper than the host's stack has room for: the process ends (stack overflow)\n");
+    crate::end_process(0xc000_00fd);
+}
 
 /// How far above a call-out's `sp_want` its return may come back (what a
 /// stdcall callee pops, or a function frame resumed inside), and past which
@@ -2469,7 +2599,7 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
     let cb = CB_DEPTH.with(|d| d.get());
     let hit = CALLOUTS.with(|c| {
         let v = c.borrow();
-        v.iter().rposition(|&(r, w, d, span)| d == cb && r == pc && sp >= w && sp <= w + span)
+        v.iter().rposition(|&(r, w, d, span)| d == cb && gex_kernel::win::tramp::returns_at(r, pc) && sp >= w && sp <= w.saturating_add(span))
     });
     match hit {
         Some(i) => {
@@ -2625,24 +2755,36 @@ pub extern "C" fn gex_callout_hit() -> i32 {
     HIT.with(|h| h.replace(-1))
 }
 
-/// How dispatch reaches `pc` in this Worker: `table << 32 | index`, the
-/// table being a dispatch table or `gex_emit::dense::TABLE_INDEX`
-/// (`blocks`); -1 when nothing is there yet (a miss). What a call-out
-/// watches its return through.
+/// How dispatch reaches `pc` in this Worker, in the mode this thread runs
+/// in: `table << 32 | index`, the table being a dispatch table or
+/// `gex_emit::dense::TABLE_INDEX` (`blocks`); -1 when nothing is there yet
+/// (a miss).
 #[no_mangle]
 pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
-    let pc = pc as u64;
-    let page = gex_abi::dispatch_page(pc);
-    if page >= gex_abi::dispatch_max_pages() {
+    dispatch_ref(pc as u64, crate::thread_alt())
+}
+
+/// [`gex_dispatch_ref`] in mode `alt` (1: a WoW64 process's 32-bit code),
+/// whichever the thread runs in now: what a call-out watches its return
+/// through, in the mode it was made in, as the thread may be in the other
+/// when it arms it.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_ref_mode(pc: i64, alt: i32) -> i64 {
+    dispatch_ref(pc as u64, alt != 0)
+}
+
+fn dispatch_ref(pc: u64, alt: bool) -> i64 {
+    let at = crate::dir_word(gex_abi::page_key(pc, alt));
+    if at == u64::MAX {
         return -1;
     }
-    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
+    let entry = GuestMem::new(crate::guest_bytes()).read_u32(at).unwrap_or(0);
     if entry == 0 {
         return -1;
     }
     let k = gex_abi::dispatch_entry_table(entry);
     if crate::dense::dense_table(k) {
-        let d = crate::dense::lookup(pc);
+        let d = crate::dense::lookup_in(pc, alt);
         return if d == 0 { -1 } else { ((gex_emit::dense::TABLE_INDEX as i64) << 32) | d as i64 };
     }
     ((k as i64) << 32) | gex_abi::dispatch_index(pc, entry) as i64
@@ -2668,33 +2810,39 @@ static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// The function table's runtime module (`gex_cgen::runtime`): where its
 /// bytes are, and how long they are.
 static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
+/// The other mode's (`gex_cgen::runtime::module_alt`): its bridge serves a
+/// function bound in the process's other directory (a WoW64 process's
+/// native i386 Wine), and its `enter` starts a thread there.
+static RUNTIME_ALT: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn runtime() -> &'static Vec<u8> {
-    RUNTIME.get_or_init(|| {
-        let m = gex_cgen::runtime::module();
-        let mut m = if !crate::dense::on() {
-            m
-        } else {
-            dense_runtime(&m).unwrap_or_else(|| {
-                crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
-                m
-            })
-        };
-        // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
-        // gex-ftab-runtime-...`).
-        let name = b"gex-ftab-runtime";
-        let mut sub = vec![name.len() as u8];
-        sub.extend_from_slice(name);
-        let mut sec = vec![4u8];
-        sec.extend_from_slice(b"name");
-        sec.push(0); // the module-name subsection
-        put_leb(&mut sec, sub.len() as u32);
-        sec.extend_from_slice(&sub);
-        m.push(0);
-        put_leb(&mut m, sec.len() as u32);
-        m.extend_from_slice(&sec);
+    RUNTIME.get_or_init(|| runtime_bytes(false))
+}
+
+fn runtime_bytes(alt: bool) -> Vec<u8> {
+    let m = if alt { gex_cgen::runtime::module_alt() } else { gex_cgen::runtime::module() };
+    let mut m = if !crate::dense::on() {
         m
-    })
+    } else {
+        dense_runtime(&m, alt).unwrap_or_else(|| {
+            crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+            m
+        })
+    };
+    // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
+    // gex-ftab-runtime-...`).
+    let name = b"gex-ftab-runtime";
+    let mut sub = vec![name.len() as u8];
+    sub.extend_from_slice(name);
+    let mut sec = vec![4u8];
+    sec.extend_from_slice(b"name");
+    sec.push(0); // the module-name subsection
+    put_leb(&mut sec, sub.len() as u32);
+    sec.extend_from_slice(&sub);
+    m.push(0);
+    put_leb(&mut m, sec.len() as u32);
+    m.extend_from_slice(&sec);
+    m
 }
 
 #[no_mangle]
@@ -2705,6 +2853,16 @@ pub extern "C" fn gex_ftab_runtime_ptr() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_len() -> u32 {
     runtime().len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_ftab_runtime_alt_ptr() -> u32 {
+    RUNTIME_ALT.get_or_init(|| runtime_bytes(true)).as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_ftab_runtime_alt_len() -> u32 {
+    RUNTIME_ALT.get_or_init(|| runtime_bytes(true)).len() as u32
 }
 
 fn leb(b: &[u8], p: &mut usize) -> Option<u32> {
@@ -2737,8 +2895,9 @@ fn put_leb(out: &mut Vec<u8>, mut v: u32) {
 /// import of `gex.blocks` after its tables, and that function replaced by
 /// `gex_emit::dense::dispatch_body`. `None` if the module is not the shape
 /// that was written for (memory, `ftab` and the dispatch tables imported, four
-/// functions defined, `dispatch` last, of type 3).
-fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
+/// functions defined, `dispatch` the fourth, of type 3; the other mode's
+/// also imports its directory, global 0, and defines `enter` fifth).
+fn dense_runtime(m: &[u8], alt: bool) -> Option<Vec<u8>> {
     if m.get(..8)? != b"\0asm\x01\0\0\0" {
         return None;
     }
@@ -2797,6 +2956,7 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                                 leb(body, &mut q)?;
                             }
                         }
+                        3 if alt => q += 3, // the kind, its value type, mutability
                         _ => return None,
                     }
                 }
@@ -2814,7 +2974,7 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
             10 => {
                 let mut q = 0;
                 let n = leb(body, &mut q)?;
-                if n != 4 {
+                if n != if alt { 5 } else { 4 } {
                     return None;
                 }
                 put_leb(&mut sec, n);
@@ -2822,10 +2982,10 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                     let at = q;
                     let l = leb(body, &mut q)? as usize;
                     q += l;
-                    if k + 1 < n {
+                    if k != 3 {
                         sec.extend_from_slice(body.get(at..q)?);
                     } else {
-                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, entry_ty?, 1, tables));
+                        sec.extend_from_slice(&gex_emit::dense::dispatch_body_in(3, entry_ty?, 1, tables, alt.then_some(0)));
                     }
                 }
             }
@@ -3094,6 +3254,9 @@ thread_local! {
     /// A guest fault staged for the hook: (NTSTATUS code, address, kind:
     /// Windows' ExceptionInformation[0], 0 read, 1 write, 8 execute).
     static FAULT_PENDING: std::cell::Cell<Option<(u32, u64, u32)>> = const { std::cell::Cell::new(None) };
+    /// A signal frame staged for the signal hook: (the pc the signal
+    /// interrupted, the stack pointer the hook's C frames go below).
+    static SIGNAL_PENDING: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// How many faults may be delivered in place one inside another's
@@ -3121,8 +3284,7 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
     if idx == 0 {
         return false;
     }
-    let gm = GuestMem::new(crate::guest_bytes());
-    let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
+    let Some(sp) = hook_sp(c) else { return false };
     let open = FAULT_NEST.with(|n| {
         let mut n = n.borrow_mut();
         while n.last().is_some_and(|&s| s < sp) {
@@ -3156,6 +3318,72 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
         FAULT_NEST.with(|n| n.borrow_mut().pop());
     }
     ran
+}
+
+/// The guest stack pointer a hook's C frames go below, for the thread at
+/// `c`. In code of the process's other mode (a WoW64 process's 32-bit code)
+/// that is the 64-bit stack, which R14 holds while the 32-bit one is in RSP
+/// (the WoW64 CPU's convention): the 32-bit stack may be nearly full, and
+/// the hook's work is done on the 64-bit one, a little below R14
+/// ([`WOW64_DISPATCH_ROOM`]), as `gex.mjs` `#hookStack` puts it.
+fn hook_sp(c: u64) -> Option<u64> {
+    let gm = GuestMem::new(crate::guest_bytes());
+    if crate::thread_alt() {
+        return gm.read_u64(c + gex_abi::ctx::x(14) as u64).ok().map(|r14| (r14 & 0xffff_ffff).saturating_sub(WOW64_DISPATCH_ROOM));
+    }
+    gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).ok()
+}
+
+/// The room left below a WoW64 thread's 64-bit stack pointer for the
+/// exception frame the hook builds there for a fault in 32-bit code, and
+/// wow64's copy of it (Wine's dispatch fits in the 8 KiB below R14).
+const WOW64_DISPATCH_ROOM: u64 = 0x4000;
+
+/// What became of a signal frame given to the signal hook ([`signal_hook`]).
+pub(crate) enum SignalHooked {
+    /// The process has no hook: the frame's handler is guest code.
+    No,
+    /// The hook ran here, and the context is where its sigreturn left it.
+    Ran,
+    /// Staged for the host ([`gex_signal_take`]), which runs the hook
+    /// before the thread goes on: the caller traps out.
+    Staged,
+}
+
+/// Run the signal frame the kernel just built at a safepoint for the thread
+/// at `c` through the process's signal hook (native Wine's handlers are wasm
+/// functions, not guest code), its C frames below the guest's stack
+/// (`hook_sp`). Where this build cannot call it here (the single-thread
+/// one: a handler that blocks needs a frame that may suspend), the frame is
+/// staged for the host instead, as a fault is. `interrupted` is the pc the
+/// signal interrupted.
+pub(crate) fn signal_hook(c: u64, interrupted: u64) -> SignalHooked {
+    let idx = SIGNAL_HOOK.load(Ordering::Relaxed);
+    if idx == 0 {
+        return SignalHooked::No;
+    }
+    let Some(sp) = hook_sp(c) else { return SignalHooked::No };
+    // SAFETY: a host import taking scalars; nothing here holds a lock or a
+    // borrow.
+    if unsafe { signal_call(idx as i32, c as i32, interrupted as u32 as i32, sp as i64) } != 0 {
+        return SignalHooked::Ran;
+    }
+    SIGNAL_PENDING.with(|s| s.set(Some((interrupted, sp))));
+    SignalHooked::Staged
+}
+
+/// The staged signal frame, taken: the hook's table index (0: none
+/// staged), with the interrupted pc and the stack pointer its C frames go
+/// below at `out` (two u64s, little-endian).
+#[no_mangle]
+pub extern "C" fn gex_signal_take(out: u32) -> u32 {
+    let Some((pc, sp)) = SIGNAL_PENDING.with(|s| s.take()) else { return 0 };
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&pc.to_le_bytes());
+    b[8..].copy_from_slice(&sp.to_le_bytes());
+    // SAFETY: `out` is 16 bytes the host allocated in this module's memory.
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), std::ptr::with_exposed_provenance_mut::<u8>(out as usize), 16) };
+    SIGNAL_HOOK.load(Ordering::Relaxed)
 }
 
 /// How many in-place deliveries may still be in their dispatch on this
@@ -3241,13 +3469,16 @@ pub extern "C" fn gex_fault_take(out: u32) -> u32 {
     fault_hook()
 }
 
-/// Whether a fault is staged for the hook (`gex_after_trap`).
+/// Whether a fault, or a signal frame, is staged for its hook
+/// (`gex_after_trap`).
 pub(crate) fn fault_staged() -> bool {
-    FAULT_PENDING.with(|f| f.get()).is_some()
+    FAULT_PENDING.with(|f| f.get()).is_some() || SIGNAL_PENDING.with(|s| s.get()).is_some()
 }
 
-/// A native wasm32 program's signal hook . Recorded, as the fault
-/// hook is; the page does not run signal frames through it yet .
+/// A native wasm32 program's signal hook: the function that runs the
+/// signal frames the kernel leaves on the guest's stack (libgex's
+/// `__gex_signal_frames(ctx, pc)`), for a signal that arrives while the
+/// thread runs guest code (`signal_hook`).
 static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[no_mangle]

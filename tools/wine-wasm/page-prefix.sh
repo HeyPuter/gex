@@ -60,7 +60,9 @@ mkdir -p "$out/dosdevices"
 ln -s ../drive_c "$out/dosdevices/c:" && ln -s / "$out/dosdevices/z:"
 regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/wine32-session.reg")
 python3 "$here/reg-apply.py" "$out/system.reg" "${regs[@]}"
-stat -c %Y "$dist/share/wine/wine.inf" > "$out/.update-timestamp"
+# the file's own time, a dist of links included: wineboot compares the
+# stamp with the wine.inf it reads, and reruns Wine's whole setup when they differ
+stat -L -c %Y "$dist/share/wine/wine.inf" > "$out/.update-timestamp"
 if [ -n "${GRAPHICS:-}" ]; then
     # "Graphics" in [Software\\Wine\\Drivers] and in no other key: a user.reg
     # whose value sits under another key (DllOverrides) keeps Wine's default

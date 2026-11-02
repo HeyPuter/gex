@@ -388,10 +388,23 @@ const CALLOUT_UNWOUND = 64n << 10n;
 /** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
  *  `NATIVE_UNWOUND`. */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
+/** The door area's user shared data state (+144, the server's door.c):
+ *  "USD0", no process has filled the page; "USD1", one has. */
+const USD_UNPUBLISHED = 0x30445355;
+const USD_PUBLISHED = 0x31445355;
 const NATIVE_UNWOUND = 512n;
 /** Where a native caller's `run_until` goes after a stray return to its
  *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
 const STRAY_PC = NATIVE_RETURN_PAD + 1n;
+/** gex-kernel `tramp::WOW64_STOP_SYSCALL`, `WOW64_STOP_UNIX` and
+ *  `WOW64_RETURN_MARK`: where WoW64's 32-bit code reaches 64-bit code. A
+ *  call-out waiting for the first returns at either of the first two
+ *  (`tramp::returns_at`); one waiting for a stop or the mark takes it with
+ *  the stack anywhere (`tramp::any_stack`). */
+const WOW64_STOP_SYSCALL = 0x3ffff4n;
+const WOW64_STOP_UNIX = 0x3ffff7n;
+const WOW64_RETURN_MARK = 0x3ffffan;
+const returnsAt = (ret, pc) => pc === ret || (ret === WOW64_STOP_SYSCALL && pc === WOW64_STOP_UNIX);
 /** A thread `clone` made that could not be handed to the host. */
 function threadNotStarted(who, err) {
   console.error(`[${who}] starting a thread: ${err?.message ?? err}`);
@@ -482,10 +495,16 @@ const ENTRY_TRAMP = new Uint8Array([
  *  RangeError when it is not there, which is caught here: nothing the guest
  *  or the shim was doing is unwound. */
 const STACK_ROOM = new Array(32768).fill(0);
+/** Call-outs open past which a new one asks `stackRoom` first (each asks
+ *  at the cost of a call that large), and the room it asks for: a level's
+ *  frames and what the next check's way there may take, less than a fault's
+ *  dispatch (a delivery in place asks for STACK_ROOM's itself). */
+const CALLOUT_ROOM_DEPTH = 32;
+const CALLOUT_ROOM = new Array(12288).fill(0);
 const stackSink = function () { return 1; };
-function stackRoom() {
+function stackRoom(room = STACK_ROOM) {
   try {
-    return Reflect.apply(stackSink, null, STACK_ROOM);
+    return Reflect.apply(stackSink, null, room);
   } catch (err) {
     if (err instanceof RangeError) return 0;
     throw err;
@@ -865,8 +884,9 @@ function slotsNeeded(meta) {
  * Wine's loader, 32-bit Wine): its GEXWASM header sits 0x40 bytes before the entry
  * point (cgen/wasmprog.rs), with the flags at offset 36.
  */
-/** clang's names for a C main (see the PE module's instantiation). */
-const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
+/** clang's names for a C main, and WinMain, which Wine's crt_main also
+ * references weakly (see the PE module's instantiation). */
+const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main', 'WinMain'];
 
 function wine32ProgramFlags(elf) {
   return (wasmProgramFlags(elf) ?? 0) & 3;
@@ -1159,6 +1179,9 @@ const TABLE_NAMES = [
   'dispatch6',
   'dispatch7',
 ];
+
+/** The tag on a bridge's table (cgen.rs `ALT_BRIDGE`): the other mode's. */
+const ALT_BRIDGE = 0x80000000;
 
 /** A stateful provider's `provider_throw`, caught by its `provider_try`. */
 class ProviderThrow extends Error {
@@ -2052,20 +2075,28 @@ export class Gex {
           if (single.on) return 0;
           const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
-          const cur = spG.value;
-          const wide = typeof cur === 'bigint';
-          if (wide) {
-            const rsp = BigInt.asUintN(64, sp);
-            spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
-          } else {
-            const esp = Number(sp & 0xffffffffn);
-            const c32 = Number(cur) >>> 0;
-            spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
-          }
+          const cur = this.#belowGuest(spG, sp);
           try {
             const a = this.#shim.exports.gex_guest_x86_64?.() === 1 ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0;
             if (this.#snapHooks) this.#snapHookCall(f, idx >>> 0, ctx, code, a, kind, BigInt.asUintN(64, sp));
             else f(ctx, code, a, kind);
+          } finally {
+            spG.value = cur;
+          }
+          return 1;
+        },
+        // A signal frame the kernel built at a safepoint, run through the
+        // process's signal hook (cgen.rs `signal_hook`: native Wine's
+        // handlers are wasm functions), its C frames below the guest's stack
+        // pointer `sp` as `fault_call`'s are. 0: not here (the single-thread
+        // build: the shim stages the frame then, `#signalTake`).
+        signal_call: (idx, ctx, pc, sp) => {
+          if (single.on) return 0;
+          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+          const cur = this.#belowGuest(spG, sp);
+          try {
+            f(ctx, pc);
           } finally {
             spG.value = cur;
           }
@@ -2697,7 +2728,15 @@ export class Gex {
     if (!add) return;
     // The highest slot total any of them needs, so the tables grow once.
     let most = 0;
+    let other = 0;
     for (const [i, entry] of this.#closureModules.entries()) {
+      // A module of the process's other mode (an ejected project's `.other`
+      // module, sent with its bytes): installed now, as a translation is,
+      // into the other directory (`gex_queue_other_mode_module`).
+      if (entry?.otherMode && entry.bytes && this.#queueOtherMode(entry)) {
+        other++;
+        continue;
+      }
       // Either the raw wasm, or the pair a page should send: the metadata
       // section alone plus the already-compiled module. A `Module` crosses
       // `postMessage` by reference, so the pair avoids cloning and recompiling
@@ -2751,6 +2790,29 @@ export class Gex {
     // for one of its pages, instead of growing to the whole closure up front.
     void most;
     this.#closureModules = [];
+    if (other) {
+      const e = this.#shim.exports;
+      const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+      if (need) this.#growTables(need, 'closure');
+      e.gex_jit_pending_refresh?.();
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+    }
+  }
+
+  /** Queue an other-mode closure module ({ meta, bytes }) in the shim: true
+   *  when it was one. */
+  #queueOtherMode(entry) {
+    const e = this.#shim.exports;
+    if (!e.gex_queue_other_mode_module || !entry.meta?.length) return false;
+    const { meta, bytes } = entry;
+    const mp = e.gex_alloc(meta.length) >>> 0;
+    this.#bytes().set(meta, mp);
+    const wp = e.gex_alloc(bytes.length) >>> 0;
+    this.#bytes().set(bytes, wp);
+    const queued = e.gex_queue_other_mode_module(mp, meta.length, wp, bytes.length) >>> 0;
+    e.gex_free?.(wp, bytes.length);
+    e.gex_free?.(mp, meta.length);
+    return queued !== 0;
   }
 
   /** The kernel, shim and guest instances on this Worker's memory: what
@@ -4113,7 +4175,7 @@ export class Gex {
     this.#vforkDepth++;
     e.gex_snap_enable?.(0);
     try {
-      this.#guest.exports.enter(ctx, entry);
+      this.#enterOf(ctx, entry)(ctx, entry);
     } catch (err) {
       if (!e.gex_handoff?.()) {
         why = 'crash';
@@ -4736,11 +4798,36 @@ export class Gex {
     if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
     const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
-    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map() };
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map(), gex, alt: null };
     this.#entryReset();
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
+  }
+
+  /** This Worker's runtime instance of the process's other mode
+   *  (`gex_cgen::runtime::module_alt`, a WoW64 process's 32-bit code): its
+   *  `bridge` serves a function bound in that mode's directory and goes on
+   *  through that directory, and its `enter` starts a thread there. Made at
+   *  the first use, against the directory the process has then. */
+  #cgenAlt() {
+    const st = this.#cgenStore();
+    const e = this.#shim.exports;
+    const dir = BigInt(e.gex_alt_dir?.() ?? 0);
+    if (!dir) throw new Error('gex: a bridge of the other mode before the process has its directory');
+    if (st.alt?.dir === dir) return st.alt;
+    let rm = this.#sharedModules.get('ftab-runtime-alt');
+    if (!rm) {
+      const ptr = e.gex_ftab_runtime_alt_ptr() >>> 0;
+      rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_alt_len() >>> 0)));
+      this.#sharedModules.set('ftab-runtime-alt', rm);
+    }
+    const alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, dir) : new WebAssembly.Global({ value: 'i32' }, Number(dir) | 0);
+    const ri = new WebAssembly.Instance(rm, { gex: { ...st.gex, alt_dir } });
+    const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
+    st.instances.push(ri);
+    st.alt = { dir, bridge, enter: ri.exports.enter };
+    return st.alt;
   }
 
   /** Grow this Worker's function table past every index handed out, with
@@ -4820,7 +4907,8 @@ export class Gex {
     // Wine's PE module in a 64-bit Wine process (the native PE core,
     // winepe.wasm): built LP64 and lowered as its program was, so i64 globals and
     // stack pointer. A Worker installs its program before any PE module.
-    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
+    // Not WoW64's i386 one (the process's other mode): wasm32 as built.
+    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64() && !e.gex_cgen_pmod_alt?.(prov);
     const lowered = (libprov || progLowered || dllLowered) && !m64();
     const w64 = m64() || lowered;
     if (wasmprog) {
@@ -4926,13 +5014,15 @@ export class Gex {
         __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered || (wasmdll && m64()) ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
-        // clang's three names for a C main: Wine's crt_main references all
-        // of them weakly and a position-independent module (32-bit Wine's PE module)
+        // clang's three names for a C main, and WinMain: Wine's crt_main
+        // references all of them weakly and a position-independent module (32-bit Wine's PE module)
         // keeps the undefined ones as imports. Null through `GOT.func`, as a
         // static link leaves them, and a trap behind the null check.
         ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
-      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, m64()
+      // (i64 for a module built for wasm64, lowered or not: 64-bit Wine's
+      // wineboot.exe, a module of its own, names __original_main)
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, w64
         ? new WebAssembly.Global({ value: 'i64', mutable: true }, 0n)
         : new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
@@ -5003,6 +5093,9 @@ export class Gex {
           syscall: single.on ? this.#nativeSyscall : (e.gex_native_syscall ?? this.#nativeSyscall),
           // Where this process has KUSER_SHARED_DATA (64-bit Wine's PE side reads it there).
           kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
+          // The native DLL a function pointer or static variable is in (ntdll's
+          // LdrFindEntryForAddress, when no image holds the address).
+          image_of: (addr) => e.gex_wasmdll_image_of ? e.gex_wasmdll_image_of(BigInt.asUintN(64, BigInt(addr))) : 0n,
         } : {}),
       },
     };
@@ -5029,16 +5122,25 @@ export class Gex {
     }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText) : [];
+    // One of Wine's PE modules with imports of the others (a DLL linked as
+    // a module of its own, or the core calling into one): its binding list.
+    const peMod = wasmdll && !wasmprog && !libprov;
+    if (peMod) this.#wasmdllBind(prov, imports, st);
     // What a door instance needs to run this program again on its memory
     // (a wineserver: `#doorPublish`).
     if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText, packed };
     inst = new WebAssembly.Instance(mod, imports);
+    if (peMod) {
+      st.dyl.set(prov, inst);
+      this.#wasmdllLate(st);
+    }
     if (peSnap) {
       this.#snapPe = { inst, state: imports.env.__asyncify_state };
       this.#snapSplit();
     }
     // Not a spare's to apply: it may install a module before the Worker that
     // published it, which then runs it at once (`#spareWait`).
+    let relocate = 0;
     if (!this.#spareWait && wasmprog) {
       // Another Worker applying them is waited for (the shim's side).
       if (e.gex_wasmprog_relocate(prov)) {
@@ -5048,7 +5150,16 @@ export class Gex {
           e.gex_wasmprog_relocated?.(prov);
         }
       }
-    } else if (!this.#spareWait && memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    } else if (!this.#spareWait && memBase && (relocate = e.gex_provider_relocate(memBase))) {
+      // Another Worker applying them is waited for (the shim's side), and
+      // one that never finished ends this one.
+      if (relocate < 0) throw new Error(`provider module ${prov} (${this.#cgenStr(e.gex_cgen_pmod_file, prov)}): another Worker took its data relocations and never applied them`);
+      try {
+        inst.exports.__wasm_apply_data_relocs?.();
+      } finally {
+        e.gex_provider_relocated?.(memBase);
+      }
+    }
     if (wasmprog) {
       // (a packed module's element segments filled them)
       if (!packed) for (const [slot, name] of extra) {
@@ -5831,6 +5942,114 @@ export class Gex {
     return extra;
   }
 
+  /** Wine's PE module `prov`'s binding list (cgen/wasmdll.rs, the format of
+   *  cgen/dylink.rs: `G`, `E`, `L`) applied to `imports`. A call through a
+   *  slot (`L`) whose module this Worker has not instantiated yet catches
+   *  up first. */
+  #wasmdllBind(prov, imports, st) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmdll_binds ? e.gex_wasmdll_binds(prov, 0, 0) >>> 0 : 0;
+    if (!n) return;
+    const buf = e.gex_alloc(n) >>> 0;
+    let text;
+    try {
+      e.gex_wasmdll_binds(prov, buf, n);
+      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+    const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
+    const late = {}, lines = [];
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const f = line.split('\t');
+      switch (f[0]) {
+        case 'G':
+          set(f[1], f[2], f[5] === '64'
+            ? new WebAssembly.Global({ value: 'i64', mutable: f[4] === '1' }, BigInt(f[3]))
+            : new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0));
+          break;
+        case 'E': {
+          const x = st.dyl.get(Number(f[3]))?.exports[f[4]];
+          if (x === undefined) throw new Error(`Wine's PE module ${prov}: ${f[2]}: module ${f[3]} is not instantiated in this Worker`);
+          set(f[1], f[2], x);
+          break;
+        }
+        case 'L': {
+          // a call through a slot filled once the module it calls into is
+          // instantiated here (#wasmdllLate): a wasm thunk (cgen/wasmdll.rs
+          // `late_thunks`) calls the slot once filled, and before that this,
+          // which catches up first
+          const slot = tIdx(Number(f[3])), t = st.ftab, k = f[4];
+          const ready = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+          const filled = () => { const fn = t.get(slot); return fn && fn !== t.get(tIdx(0)) ? fn : null; };
+          (st.lateReady ??= new Map()).set(Number(f[3]), [...(st.lateReady.get(Number(f[3])) ?? []), ready]);
+          if (filled()) ready.value = 1;
+          (late.s ??= {})[k] = (...a) => {
+            let fn = filled();
+            if (!fn) {
+              this.#cgenCatchUp();
+              this.#wasmdllLate(st);
+              fn = filled();
+              if (!fn) throw new Error(`${f[2]}: its module is not installed`);
+            }
+            ready.value = 1;
+            return fn(...a);
+          };
+          (late.r ??= {})[k] = ready;
+          lines.push([f[1], f[2], k]);
+          break;
+        }
+      }
+    }
+    if (lines.length) {
+      let mod = this.#wasmdllThunkMods.get(prov);
+      if (!mod) {
+        const n = e.gex_wasmdll_thunks(prov, 0, 0) >>> 0;
+        const tb = e.gex_alloc(n) >>> 0;
+        try {
+          e.gex_wasmdll_thunks(prov, tb, n);
+          mod = new WebAssembly.Module(this.#bytes().slice(tb, tb + n));
+        } finally {
+          e.gex_free?.(tb, n);
+        }
+        this.#wasmdllThunkMods.set(prov, mod);
+      }
+      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s: late.s, r: late.r }).exports;
+      for (const [m, name, k] of lines) set(m, name, x[k]);
+    }
+  }
+
+  /** Fill the slots between Wine's PE modules (cgen/wasmdll.rs `Late`)
+   *  whose two sides this Worker has instantiated. */
+  #wasmdllLate(st) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmdll_lates ? e.gex_wasmdll_lates(0, 0) >>> 0 : 0;
+    if (!n) return;
+    const buf = e.gex_alloc(n) >>> 0;
+    let text;
+    try {
+      e.gex_wasmdll_lates(buf, n);
+      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const [slot, importer, provider, name] = line.split('\t');
+      const p = st.dyl.get(Number(provider));
+      if (!p || !st.dyl.has(Number(importer))) continue;
+      const i = tIdx(Number(slot));
+      const had = st.ftab.get(i);
+      if (had && had !== st.ftab.get(tIdx(0))) continue;
+      const f = p.exports[name];
+      if (typeof f === 'function') {
+        st.ftab.set(i, f);
+        for (const r of st.lateReady?.get(Number(slot)) ?? []) r.value = 1;
+      }
+    }
+  }
+
   /** Provider module `prov`'s binding list, '' for none. */
   #wasmprogBindRead(prov) {
     const e = this.#shim.exports;
@@ -6404,6 +6623,9 @@ export class Gex {
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
+      // The native DLL a function pointer or static variable is in (32-bit
+      // Wine's ntdll, when no image holds the address).
+      image_of: (addr) => e.gex_wasmdll_image_of ? e.gex_wasmdll_image_of(BigInt.asUintN(64, BigInt(addr))) : 0n,
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place. Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
@@ -6424,6 +6646,8 @@ export class Gex {
 
   /** This process's wasm32 program as installed (`#cgenInstall`). */
   #wasmprogInfo = null;
+  /** Wine's PE modules' `L` thunk modules, by provider number (#wasmdllBind). */
+  #wasmdllThunkMods = new Map();
   /** The binding list `#wasmprogBind` read last (for `#wasmprogInfo`). */
   #wasmprogBindText = '';
   /** The session's door server, and this Worker's instance on it. */
@@ -6471,16 +6695,28 @@ export class Gex {
     this.#env.publishDoor?.(door);
   }
 
+  /** `gex.usd_copy` / `gex.usd_publish`: the server's user shared data
+   *  page (area +140) to or from this process; the bytes copied, -1 with no
+   *  door, and for a copy -2 while no process has published a fill there
+   *  (area +144 USD_UNPUBLISHED): the bytes are copied, but only the
+   *  server's own fields are good, and the fill is in the caller's mapping.
+   *  A publish marks it USD_PUBLISHED. A server without the field has
+   *  neither value there. */
   #usdMove(at, size, publish) {
     const d = this.#door;
     if (!d || single.on || !this.#doorLive(d)) return -1;
-    const { u8, dv } = this.#doorView();
+    const { u8, dv, i32 } = this.#doorView();
     const usd = dv.getUint32(d.area + 140, true);
     if (!usd) return -1;
+    const state = Atomics.load(i32, (d.area + 144) >>> 2);
     const n = Math.min(size, 4096);
-    if (publish) u8.set(this.#bytes().subarray(at, at + n), usd);
-    else this.#bytes().set(u8.subarray(usd, usd + n), at);
-    return n;
+    if (publish) {
+      u8.set(this.#bytes().subarray(at, at + n), usd);
+      if (state === USD_UNPUBLISHED) Atomics.store(i32, (d.area + 144) >>> 2, USD_PUBLISHED);
+      return n;
+    }
+    this.#bytes().set(u8.subarray(usd, usd + n), at);
+    return state === USD_UNPUBLISHED ? -2 : n;
   }
 
   #sessTr = 0;
@@ -7051,7 +7287,7 @@ export class Gex {
       // native frame down to the innermost loop, live ones included.
       if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
-        const sp = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + this.#ctxSp(), true);
+        const sp = this.#liveSp(Number(ctx), c);
         if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
           err.gexNativeLeft = true;
           throw err;
@@ -7390,8 +7626,8 @@ export class Gex {
           const h = hook;
           hook = null;
           try {
-            if (single.on) await this.#promisingOf(h.f)(ctx, h.code, h.addr, h.kind);
-            else h.f(ctx, h.code, h.addr, h.kind);
+            if (single.on) await this.#promisingOf(h.f)(ctx, ...h.args);
+            else h.f(ctx, ...h.args);
           } finally {
             h.spG.value = h.cur;
           }
@@ -7405,7 +7641,7 @@ export class Gex {
           await this.#enterP(ctx, pc);
           this.#where = 'trap';
         }
-        else this.#guest.exports.enter(ctx, pc);
+        else this.#enterOf(ctx, pc)(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
         if (globalThis.GEX_DEBUG_EXIT) {
@@ -8101,11 +8337,34 @@ export class Gex {
   #enterPOf = null;
   /** `enter`, on a stack of its own. */
   #enterP(ctx, pc) {
-    if (this.#enterPOf !== this.#guest) {
-      this.#enterPf = WebAssembly.promising(this.#guest.exports.enter);
-      this.#enterPOf = this.#guest;
+    const f = this.#enterOf(ctx, pc);
+    if (this.#enterPOf !== f) {
+      this.#enterPf = WebAssembly.promising(f);
+      this.#enterPOf = f;
     }
     return this.#enterPf(ctx, pc);
+  }
+
+  // The `enter` of a module of the process's other mode (gex_abi::ALT_PAGE: a
+  // WoW64 thread's 32-bit code), which dispatches through that mode's
+  // directory, and the directory it was installed against.
+  #altEnter = null;
+  #altEnterDir = 0n;
+  /** The `enter` to run `ctx`'s thread at `pc` by: the program's, or, while
+   *  its CS names the process's other mode, a module of that mode's. With
+   *  none yet, the miss there translates and installs one, and traps to
+   *  come back (the caller's loop resumes at `pc`). */
+  #enterOf(ctx, pc) {
+    const e = this.#shim.exports;
+    if (!e.gex_ctx_alt?.(ctx)) return this.#guest.exports.enter;
+    const dir = BigInt(e.gex_alt_dir());
+    if (this.#altEnter && this.#altEnterDir === dir) return this.#altEnter;
+    this.#altEnter = null;
+    // Before any of that mode's code is translated (its first code native
+    // i386 Wine's): the runtime's, which dispatches through its directory.
+    if (dir && this.#cgen) return this.#cgenAlt().enter;
+    e.gex_dispatch_miss(ctx, BigInt.asIntN(64, BigInt(pc)));
+    return this.#altEnter ?? this.#guest.exports.enter;
   }
   #parkPf = null;
   /** `gex_park`, on a stack of its own (it suspends in `k_ws_park`). */
@@ -8186,7 +8445,7 @@ export class Gex {
     let i = -1;
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
       const c = this.#callouts[k];
-      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
+      if (returnsAt(c.ret, target) && sp >= c.spWant && sp <= c.spWant + c.span) { i = k; break; }
     }
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
@@ -8282,7 +8541,10 @@ export class Gex {
     const e = this.#shim.exports;
     const stub = this.#watch();
     for (const c of this.#callouts) {
-      const ref = e.gex_dispatch_ref(c.ret);
+      // In the mode the call-out was made in: the thread may be in the
+      // other, and a change of mode in wasm (no trap) comes back to it with
+      // no arming in between.
+      const ref = e.gex_dispatch_ref_mode ? e.gex_dispatch_ref_mode(c.ret, c.alt ? 1 : 0) : e.gex_dispatch_ref(c.ret);
       const table = ref < 0n ? -1 : Number(ref >> 32n), index = ref < 0n ? -1 : Number(ref & 0xffffffffn);
       if (c.w && (c.w.table !== table || c.w.index !== index)) this.#unwatch(c);
       if (table < 0) continue;
@@ -8339,7 +8601,7 @@ export class Gex {
       let v;
       try {
         const [op, a, b, c, d, x] = r.value;
-        v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
+        v = op === 'enter' ? this.#enterOf(a, b)(a, b) : a(b, c, d, x);
       } catch (err) {
         // A nested loop never yields to the event loop (a Wine thread's
         // whole life can be one call-out): an instrumented unit's hits go
@@ -8403,7 +8665,9 @@ export class Gex {
     // (native Wine's own for a thread's loop, `gex_call_out(ctx, pc, 0, 0)`).
     // This list's index is not it.
     const ri = e.gex_callout_opened?.() ?? me;
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri };
+    // `alt`: made from code in the mode its process's class is not (a WoW64
+    // process's 32-bit code), whose frames are on the 32-bit stack.
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri, alt: (e.gex_ctx_alt?.(ctx) ?? 0) === 1 };
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -8413,7 +8677,22 @@ export class Gex {
     const span = e.gex_callout_span?.() ?? -1n;
     c.span = span >= 0n ? span : CALLOUT_UNWOUND;
     c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
+    // WoW64's stops: reached with the stack anywhere, never unwound past
+    // (a spWant of 0 is never read as unwound). The shim counts them for
+    // its stray-arrival rule (`gex_wow64_waits`).
+    const anyStack = c.ret === WOW64_STOP_SYSCALL || c.ret === WOW64_RETURN_MARK;
+    if (anyStack) {
+      c.spWant = 0n;
+      c.span = c.unwound = (1n << 64n) - 1n;
+      e.gex_wow64_waits?.(1);
+    }
+    // Deep inside others, one more needs the host's stack to have room for
+    // it: native Wine's guest calls hold their native frames, which no trap
+    // drops, so the shim's count cannot bound them (the shim ends the
+    // process, as a spent stack does).
+    if (me >= CALLOUT_ROOM_DEPTH && stackRoom(CALLOUT_ROOM) === 0) e.gex_callout_stack_spent?.();
     this.#callouts.push(c);
+    this.#calloutGuard();
     this.#nest.push(suspendable ? 'callout~' : 'callout');
     this.#calloutsMade++;
     if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
@@ -8441,7 +8720,10 @@ export class Gex {
           // returns instead of trapping (`#watchHit`).
           const ret = this.#calloutSignal;
           if (ret?.kind === 'return') {
-            this.#calloutSignal = null;
+            // An outer call-out's: it stays for that one's loop, which the
+            // frames between (function-tier bodies, which trap on a call-out
+            // that did not come back) reach through the loops between.
+            this.#calloutSignal = ret.i < me ? ret : null;
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
             return ret.i === me ? 1 : 0;
           }
@@ -8472,7 +8754,15 @@ export class Gex {
             }
             return v;
           };
-          if (sig?.kind === 'return') return ended(sig.i === me ? 1 : 0);
+          // An outer call-out's return (the stack unwound to a native caller's
+          // frame, a 64-bit handler's target under a WoW64 thread's nested
+          // 32-bit calls): it stays for that one's loop, as above. Taken here,
+          // the loops between saw a plain trap at the return pad and left at
+          // STRAY_PC, which the outer loop then ran (its int3).
+          if (sig?.kind === 'return') {
+            if (sig.i < me) this.#calloutSignal = sig;
+            return ended(sig.i === me ? 1 : 0);
+          }
           if (sig?.kind === 'bypass') {
             if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
             next = sig.f;
@@ -8497,7 +8787,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && this.#liveSp(ctx, c) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -8534,7 +8824,7 @@ export class Gex {
             // Inside a fault's dispatch, which this call-out may lie within:
             // with no room on the stack for another, the process ends, as
             // its frames below cannot be left (`gex_fault_overflow`).
-            if (ft && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
+            if (ft && !ft.sig && e.gex_fault_nesting?.() > 0 && !stackRoom()) {
               ft.spG.value = ft.cur;
               e.gex_fault_overflow(ft.code);
               err.gexHandoff = true;
@@ -8542,8 +8832,8 @@ export class Gex {
             }
             if (ft) {
               try {
-                if (this.#snapHooks) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
-                else yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+                if (this.#snapHooks && !ft.sig) yield ['call', (c, co, ad, ki) => this.#snapHookCall(ft.f, ft.idx, c, co, ad, ki, ft.rsp), ctx, ft.code, ft.addr, ft.kind];
+                else yield ['call', ft.f, ctx, ...ft.args];
               } finally {
                 ft.spG.value = ft.cur;
               }
@@ -8565,7 +8855,7 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
-          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
+          const sp = this.#liveSp(ctx, c);
           // Native Wine's return pad, reached with nobody's watch or miss
           // taking it (cgen.rs `native_return_stray`): the guest went on
           // past this call-out to a native caller's return (an exception
@@ -8598,9 +8888,13 @@ export class Gex {
         }
       }
     } finally {
+      // A return signal for this call-out or a deeper one is spent with it.
+      if (this.#calloutSignal?.kind === 'return' && this.#calloutSignal.i >= me) this.#calloutSignal = null;
+      if (anyStack) e.gex_wow64_waits?.(-1);
       e.gex_callout_leave_ok?.(0);
       this.#unwatch(c);
       this.#callouts.pop();
+      this.#calloutGuard();
       this.#nest.pop();
       // Left by an exception, the shim's half has not popped its entry.
       e.gex_callout_unwind?.(me);
@@ -8612,6 +8906,18 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /** Tell the shim where the innermost call-out's caller is unwound past
+   *  (`gex_callout_guard`): a change of mode served in wasm, which never
+   *  comes back to this loop, leaves it when the stack is past there, as
+   *  this loop's own check would after a trap. */
+  #calloutGuard() {
+    const g = this.#shim.exports.gex_callout_guard;
+    if (!g) return;
+    const c = this.#callouts.at(-1);
+    if (!c || c.spWant === 0n) g(0n, 0);
+    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0);
+  }
 
   /** The guest stack pointer's byte offset in a thread's context, which
    *  differs by guest architecture. */
@@ -8627,8 +8933,9 @@ export class Gex {
   }
 
   /** The staged fault, taken, and the stack made ready for the hook: { f,
-   *  code, addr, kind, spG, cur } (the caller calls `f(ctx, code, addr,
-   *  kind)` and puts `spG` back to `cur`), or null with none staged. */
+   *  code, addr, kind, args, spG, cur } (the caller calls `f(ctx, ...args)`,
+   *  args being `code, addr, kind`, and puts `spG` back to `cur`), or a
+   *  staged signal frame (`#signalTake`), or null with neither staged. */
   #faultTake(ctx) {
     const e = this.#shim.exports;
     if (!e.gex_fault_take) return null;
@@ -8636,7 +8943,7 @@ export class Gex {
     let hook, code, addr, kind;
     try {
       hook = e.gex_fault_take(buf) >>> 0;
-      if (!hook) return null;
+      if (!hook) return this.#signalTake(buf);
       const dv = new DataView(this.#memory.buffer);
       code = dv.getUint32(buf, true);
       addr = dv.getBigUint64(buf + 4, true);
@@ -8651,7 +8958,56 @@ export class Gex {
     // 64-bit Wine's hook (signal_wasm64.c) takes the address as a 64-bit integer
     // (above 4 GiB in a 64-bit memory), 32-bit Wine's (signal_wasm32.c) as 32 bits.
     const wide = e.gex_guest_x86_64?.() === 1;
-    return { f, idx: hook, rsp, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+    const a = wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0;
+    return { f, idx: hook, rsp, code: code | 0, addr: a, kind: kind | 0, args: [code | 0, a, kind | 0], spG, cur };
+  }
+
+  /** A signal frame the shim staged for the process's signal hook (cgen.rs
+   *  `signal_hook`, in the single-thread build), taken into `buf` (16
+   *  bytes, `#faultTake`'s): { f, sig, args, spG, cur } as `#faultTake`'s,
+   *  the hook's C frames below the stack pointer the shim named (as
+   *  `signal_call` puts them), or null with none staged. */
+  #signalTake(buf) {
+    const e = this.#shim.exports;
+    const hook = (e.gex_signal_take?.(buf) ?? 0) >>> 0;
+    if (!hook) return null;
+    const dv = new DataView(this.#memory.buffer);
+    const pc = dv.getBigUint64(buf, true);
+    const sp = dv.getBigUint64(buf + 8, true);
+    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    if (!f) throw new Error(`gex: the guest signal hook (function ${hook}) is not in this Worker's table`);
+    const spG = this.#wasmprogSp ?? this.#wasmprogStack();
+    const cur = this.#belowGuest(spG, sp);
+    return { f, idx: hook, sig: true, args: [Number(BigInt.asUintN(32, pc)) | 0], spG, cur };
+  }
+
+  /** The stack pointer of the stack call-outs are made on, which a call-out's
+   *  caller's frame is or is not unwound past: RSP, but in a WoW64 process
+   *  the 64-bit stack's wherever the WoW64 CPU keeps it (R14 in 32-bit code
+   *  and around its transitions: the shim's `gex_live_sp`). For call-out
+   *  `c` made from 32-bit code, ESP, and -1n while the thread runs 64-bit
+   *  code, which no comparison takes as unwound (`gex_callout_live_sp`). */
+  #liveSp(ctx, c = null) {
+    const e = this.#shim.exports;
+    if (c?.alt && e.gex_callout_live_sp) return BigInt(e.gex_callout_live_sp(ctx, 1));
+    if (e.gex_live_sp) return BigInt.asUintN(64, BigInt(e.gex_live_sp(ctx)));
+    return new DataView(this.#memory.buffer).getBigUint64(ctx + this.#ctxSp(), true);
+  }
+
+  /** Move native Wine's C stack pointer `spG` 4 KiB below the guest's
+   *  stack pointer `sp` (an i64), unless it is already lower, for a hook
+   *  called in place (`fault_call`, `signal_call`): the value it had. */
+  #belowGuest(spG, sp) {
+    const cur = spG.value;
+    if (typeof cur === 'bigint') {
+      const rsp = BigInt.asUintN(64, sp);
+      spG.value = ((cur !== 0n && cur < rsp ? cur : rsp) - 4096n) & ~15n;
+    } else {
+      const esp = Number(sp & 0xffffffffn);
+      const c32 = Number(cur) >>> 0;
+      spG.value = (((c32 !== 0 && c32 < esp ? c32 : esp) - 4096) & ~15) | 0;
+    }
+    return cur;
   }
 
   /** The program's stack pointer moved below the guest's for a hook's C
@@ -8661,16 +9017,24 @@ export class Gex {
     // frame does, with room for the exception frame it builds there.
     const spG = this.#wasmprogStack();
     const cur = spG.value;
+    // In code of the process's other mode (a WoW64 process's 32-bit code)
+    // the 64-bit stack, which R14 holds while the 32-bit one is in RSP (the
+    // WoW64 CPU's convention): the 32-bit stack may be nearly full, and a
+    // fault there is dispatched on the 64-bit one, a little below R14 (the
+    // native shim's WOW64_DISPATCH_ROOM, 16 KiB, keeps these frames under it).
+    const alt = !!this.#shim.exports.gex_ctx_alt?.(ctx);
+    const at = ctx + this.#ctxSp() + (alt ? 10 * 8 : 0);
+    const room = alt ? 0x4000 : 0;
     // An i64 stack pointer (a 64-bit memory, or a lowered LP64 program)
     // takes the guest's whole 64-bit one: a thread stack above 4 GiB cut to
     // its low 32 bits put the hook's frames, and the exception record it
     // writes, over whatever lives there, the runtime's own heap included.
     if (typeof cur === 'bigint') {
-      const rsp = this.#dv().getBigUint64(ctx + this.#ctxSp(), true);
+      const rsp = this.#dv().getBigUint64(at, true) - BigInt(room);
       const low = cur !== 0n && cur < rsp ? cur : rsp;
       spG.value = (low - 4096n) & ~15n;
     } else {
-      const esp = this.#dv().getUint32(ctx + this.#ctxSp(), true);
+      const esp = (this.#dv().getUint32(at, true) - room) >>> 0;
       const c32 = Number(cur) >>> 0;
       // 0: the program has not set it yet, as for an i64 one.
       const low = c32 !== 0 && c32 < esp ? c32 : esp;
@@ -9126,6 +9490,12 @@ export class Gex {
     // A runtime module imports its dense base (gex_emit::dense::GLOBAL)
     // whether or not it has dense blocks; set below when it has.
     imports.dense_base = 0;
+    // The other mode's directory (gex_abi::ALT_PAGE: a WoW64 thread's 32-bit
+    // code), which only a module of that mode imports; 0 until the process
+    // has one, and then no module needs it.
+    // Above 4 GiB in a wasm64 process: the global is address-typed.
+    const altDir = BigInt(e.gex_alt_dir?.() ?? 0);
+    if (altDir) imports.alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, altDir) : new WebAssembly.Global({ value: 'i32' }, Number(altDir) | 0);
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {
@@ -9198,6 +9568,12 @@ export class Gex {
             `${grew} slots grown on retry after: ${first.message}`,
         );
       }
+    }
+    // A module of the other mode: its `enter` is where this thread's loops go
+    // in while its CS names that mode (`#enterOf`).
+    if (altDir && this.#altEnterDir !== altDir && WebAssembly.Module.imports(mod).some((i) => i.name === 'alt_dir')) {
+      this.#altEnter = inst.exports.enter;
+      this.#altEnterDir = altDir;
     }
     // Write the module's blocks into the tables. Its element segments are
     // passive, so instantiating wrote nothing -- deliberate, because a module
@@ -9913,11 +10289,17 @@ export class Gex {
    *  the call-out never saw its return. So an entry holding the bridge is
    *  left as it is, and a watched one keeps its watches around the bridge. */
   /** Write the bridge at each (table, index) pair of `regs`, table
-   *  `TABLE_NAMES.length` being `blocks`. */
+   *  `TABLE_NAMES.length` being `blocks`; a table tagged `ALT_BRIDGE` (the
+   *  other mode's, cgen.rs `bridges_mode`) gets that mode's bridge. */
   #writeBridges(tables, blocks, regs, bridge) {
     for (let j = 0; j + 1 < regs.length; j += 2) {
-      if (regs[j] === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], bridge);
-      else tables[regs[j]].set(regs[j + 1], bridge);
+      let t = regs[j], b = bridge;
+      if (t & ALT_BRIDGE) {
+        t &= ~ALT_BRIDGE;
+        b = this.#cgenAlt().bridge;
+      }
+      if (t === TABLE_NAMES.length) this.#setBridgeEntry(blocks, regs[j + 1], b);
+      else tables[t].set(regs[j + 1], b);
     }
   }
 

@@ -681,6 +681,12 @@ fn dispatch_function(block_ty: u32) -> Function {
 /// index `first` (the function table's runtime module imports `gex.ftab`
 /// first).
 pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
+    dispatch_function_in(block_ty, first, None)
+}
+
+/// [`dispatch_function_at`] reading the directory at global `alt_dir` (the
+/// process's other one) when given, the process's own otherwise.
+pub(crate) fn dispatch_function_in(block_ty: u32, first: u32, alt_dir: Option<u32>) -> Function {
     use Instruction as I;
     // Locals: 1 = target (i64), 2 = page (i64), 3 = entry (i32), 4 = index (i32).
     let mut f = Function::new([(2, ValType::I64), (2, ValType::I32)]);
@@ -702,7 +708,16 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
     widen_addr(&mut f);
-    f.instruction(&I::I32Load(m(gex_abi::dispatch_dir(), 2)));
+    match alt_dir {
+        Some(g) => {
+            f.instruction(&I::GlobalGet(g));
+            f.instruction(&if gex_abi::mem64() { I::I64Add } else { I::I32Add });
+            f.instruction(&I::I32Load(m(0, 2)));
+        }
+        None => {
+            f.instruction(&I::I32Load(m(gex_abi::dispatch_dir(), 2)));
+        }
+    }
     f.instruction(&I::I32Const(0));
     f.instruction(&I::LocalGet(2));
     f.instruction(&I::I64Const(gex_abi::dispatch_max_pages() as i64));

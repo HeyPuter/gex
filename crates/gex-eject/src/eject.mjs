@@ -27,10 +27,15 @@ export async function launch(m, read, { args = null, write, jitFallback = false,
   const closure = [];
   for (const rel of m.closure) {
     const bytes = await read(rel);
+    const mod = await WebAssembly.compile(bytes);
+    // A module of the process's other mode (it reads the other directory)
+    // is installed whole, so it goes with its bytes.
+    const otherMode = WebAssembly.Module.imports(mod).some((i) => i.name === 'alt_dir');
     closure.push({
       meta: metadataSection(bytes),
-      mod: await WebAssembly.compile(bytes),
+      mod,
       program: rel === m.image_module ? m.exe : undefined,
+      ...(otherMode ? { otherMode, bytes } : {}),
     });
   }
   const pins = {};

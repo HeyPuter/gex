@@ -12,9 +12,10 @@
 //! * **Never panics** on any input, including truncated ones: a sequence cut
 //!   short by the end of executable memory is `Unknown`.
 //!
-//! Only 64-bit mode is decoded. VEX/EVEX-encoded instructions are recognised
-//! far enough to measure their length and are otherwise `Unknown`: the CPUID
-//! gex reports advertises no AVX, so a correct guest never runs them.
+//! 64-bit mode and 32-bit compatibility mode ([`Mode`]) are decoded.
+//! VEX/EVEX-encoded instructions are recognised far enough to measure their
+//! length and are otherwise `Unknown`: the CPUID gex reports advertises no
+//! AVX, so a correct guest never runs them.
 
 #![forbid(unsafe_code)]
 
@@ -42,19 +43,69 @@ pub enum Mode {
 
 static MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Set the mode every following `decode` uses. One per process: a whole
-/// i386 program is Compat; a mixed WoW64 process will need the mode carried
-/// per code segment, which is why `decode_in` exists beside `decode`.
-pub fn set_mode(m: Mode) {
-    MODE.store(m as u8, core::sync::atomic::Ordering::Relaxed);
+std::thread_local! {
+    /// This thread's mode while a [`ModeScope`] is open: 0 none (the
+    /// process default holds), else `1 + Mode as u8`.
+    static SCOPED: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
-/// The process-wide mode `decode` assumes.
+/// Set the process default every following `decode` uses: a whole i386
+/// program is Compat. Code whose mode is its own -- an image of the other
+/// class in a WoW64 process -- is decoded under [`set_thread_mode`] or a
+/// [`ModeScope`] instead. Clears this thread's own mode.
+pub fn set_mode(m: Mode) {
+    MODE.store(m as u8, core::sync::atomic::Ordering::Relaxed);
+    SCOPED.with(|s| s.set(0));
+}
+
+/// Set this thread's mode until the next call (or `set_mode` on this thread),
+/// whatever the process default is: what translating one image does, so two
+/// threads translating images of different classes each decode their own.
+pub fn set_thread_mode(m: Mode) {
+    SCOPED.with(|s| s.set(1 + m as u8));
+}
+
+/// The mode `decode` assumes on this thread: an open [`ModeScope`]'s, or the
+/// process default.
 pub fn mode() -> Mode {
+    let v = match SCOPED.with(|s| s.get()) {
+        0 => MODE.load(core::sync::atomic::Ordering::Relaxed),
+        v => v - 1,
+    };
+    if v == 0 {
+        Mode::Long
+    } else {
+        Mode::Compat
+    }
+}
+
+/// The process default, whatever scope this thread has open.
+pub fn default_mode() -> Mode {
     if MODE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         Mode::Long
     } else {
         Mode::Compat
+    }
+}
+
+/// Decode in `mode` on this thread until the scope is dropped, whatever the
+/// process default is. Scopes nest; dropping one restores the mode the
+/// thread had before it. Two threads translating code of different classes
+/// each see their own.
+#[must_use = "the mode holds only while the scope is alive"]
+pub struct ModeScope {
+    prev: u8,
+}
+
+impl ModeScope {
+    pub fn enter(mode: Mode) -> ModeScope {
+        ModeScope { prev: SCOPED.with(|s| s.replace(1 + mode as u8)) }
+    }
+}
+
+impl Drop for ModeScope {
+    fn drop(&mut self) {
+        SCOPED.with(|s| s.set(self.prev));
     }
 }
 
@@ -354,6 +405,18 @@ pub enum Op {
     Loopne,
     Call,
     Ret,
+    /// Far `jmp`/`call` (`ea`, `9a`, `ff /5`, `ff /3`): a selector and an
+    /// offset, the width the offset's. Either two immediates (offset, then
+    /// selector; 32-bit code only) or one memory operand holding the offset
+    /// and then the selector. A WoW64 process changes mode through them.
+    JmpFar,
+    CallFar,
+    /// `retf` (`cb`, `ca imm16`): pops the offset and the selector at the
+    /// width, then the immediate's bytes.
+    RetFar,
+    /// `iret`/`iretd`/`iretq`: pops the offset, the selector and the flags at
+    /// the width; in 64-bit mode the stack pointer and the stack segment too.
+    Iret,
     Leave,
     Enter,
     /// `pusha`/`pushad` and `popa`/`popad`: 32-bit code only.

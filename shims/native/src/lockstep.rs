@@ -37,7 +37,7 @@ fn rd(gm: &GuestMem<'_>, a: u64) -> u64 {
     gm.read_u64(a).unwrap_or(0xdead_dead_dead_dead)
 }
 
-/// The entry line: `E tid pc nr a0..a5 | x0..x30 sp nzcv pa vhash`.
+/// The entry line: `E tid pc nr a0..a5 | x0..x30 sp nzcv pa [cs] vhash` (cs: x86 only).
 pub fn log_entry(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32, pc: u64) {
     let Some(f) = log() else { return };
     let mut s = format!("E {tid} {pc:x} {:x}", rd(gm, ctx_addr + ctx::SYSCALL_NR as u64));
@@ -53,6 +53,10 @@ pub fn log_entry(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32, pc: u64) {
     // AArch64 has four flag bytes; x86-64 six (and DF) in the doubleword.
     let flags = if gex_abi::X86 { flags & 0x00ff_ffff_ffff_ffff } else { flags & 0xffff_ffff };
     s += &format!(" f={flags:x}");
+    // The code selector: a WoW64 thread's mode (0 is the process's own).
+    if gex_abi::X86 {
+        s += &format!(" cs={:x}", gm.read_u32(ctx_addr + ctx::CS as u64).unwrap_or(0));
+    }
     // The vector file as one FNV-1a hash: 512 bytes per line is too much.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     if let Ok(v) = gm.read(ctx_addr + ctx::V as u64, 32 * 16) {
@@ -66,8 +70,8 @@ pub fn log_entry(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32, pc: u64) {
 
 /// `GEX_TRACE_INSNS`: one line per traced instruction, to GEX_TRACE_FILE
 /// (default stderr): `pc eax ecx edx ebx esp ebp esi edi flags`, the flags
-/// as x86 EFLAGS bits (CF PF AF ZF SF DF OF). i386 width when the process is
-/// one.
+/// as x86 EFLAGS bits (CF PF AF ZF SF DF OF). i386 width when the code is
+/// 32-bit (the process's class, or a WoW64 thread's `ctx::CS`).
 pub fn log_trace(gm: &GuestMem<'_>, ctx_addr: u64, pc: u64) {
     static OUT: std::sync::OnceLock<Mutex<Box<dyn Write + Send>>> = std::sync::OnceLock::new();
     let out = OUT.get_or_init(|| {
@@ -80,7 +84,8 @@ pub fn log_trace(gm: &GuestMem<'_>, ctx_addr: u64, pc: u64) {
     let f = |o: usize| gm.read(ctx_addr + ctx::NZCV as u64 + o as u64, 1).map(|b| b[0] as u64 & 1).unwrap_or(0);
     // N Z C V P A D bytes -> SF ZF CF OF PF AF DF bits.
     let eflags = f(2) | f(4) << 2 | f(5) << 4 | f(1) << 6 | f(0) << 7 | f(6) << 10 | f(3) << 11;
-    let compat = COMPAT.load(Ordering::Relaxed);
+    let cs = gm.read_u32(ctx_addr + ctx::CS as u64).unwrap_or(0);
+    let compat = ctx::cs_compat(cs, COMPAT.load(Ordering::Relaxed));
     let mut s = format!("{pc:x}");
     for n in 0..8u8 {
         let v = rd(gm, ctx_addr + ctx::x(n) as u64);

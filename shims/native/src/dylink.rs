@@ -39,6 +39,12 @@ pub(crate) struct Binds {
 pub(crate) enum NBind {
     Shim,
     Global(u32),
+    /// The module's own table base plus this (a slot after its own).
+    OwnSlot(u32),
+    /// A call through the module's own table base plus this, a slot filled
+    /// once the module defining the function is instantiated in the store
+    /// (`wasmdll::fill_late`); until then a catch-up first.
+    LateOwn(u32),
     /// An export of the module with this ftab module number.
     Export {
         module: u32,
@@ -288,7 +294,8 @@ fn trace(p: &DyProcess, order: &[usize], what: &str, t0: std::time::Instant) {
 
 use gex_dylink::HANDLE_BASE;
 
-/// Bumped by every `dlopen` once its modules are published: a thread that
+/// Bumped by every `dlopen` once its modules are published, and by every
+/// Wine PE module's install ([`published`]): a thread that
 /// has not seen the latest number catches up at its next system call's
 /// return ([`sync`]), so a function pointer another thread got from
 /// `dlsym` and handed over (a futex, a pipe, a socket) is in its table by
@@ -302,6 +309,15 @@ use gex_dylink::HANDLE_BASE;
 /// `GEX_DL_CHECKED_CALLS=1` ([`checked_calls`]) closes it at the cost of a
 /// compare per indirect call.
 static DL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Modules another thread may call into were published outside a `dlopen`
+/// (a Wine PE module, which Wine's loader installs on the loading thread):
+/// every other thread catches up at its next system call's return, before a
+/// pointer into them handed over (an IRP's dispatch routine, a callback) can
+/// reach a slot its table still holds the resolver in.
+pub(crate) fn published() {
+    DL_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// After a system call: catch up with the function table when a `dlopen`
 /// has published modules since this store last did.
@@ -502,9 +518,15 @@ pub(crate) fn define_imports(
     c: &mut wasmtime::StoreContextMut<'_, HostState>,
     l: &mut Linker<HostState>,
     table: Table,
+    base: u32,
     module: &Module,
     dy: &Binds,
 ) -> Result<()> {
+    // a global of the import's own width (a lowered module's are i64)
+    let val = |g: &wasmtime::GlobalType, v: u32| match g.content() {
+        wasmtime::ValType::I64 => Val::I64(v as i64),
+        _ => Val::I32(v as i32),
+    };
     let types: HashMap<(String, String), wasmtime::ExternType> = module
         .imports()
         .map(|i| ((i.module().to_string(), i.name().to_string()), i.ty()))
@@ -524,11 +546,15 @@ pub(crate) fn define_imports(
             }
             (NBind::Shim, _) => {}
             (NBind::Global(v), wasmtime::ExternType::Global(g)) => {
-                let g = wasmtime::Global::new(&mut *c, g.clone(), Val::I32(*v as i32))?;
+                let g = wasmtime::Global::new(&mut *c, g.clone(), val(g, *v))?;
+                l.define(&mut *c, m, name, g)?;
+            }
+            (NBind::OwnSlot(o), wasmtime::ExternType::Global(g)) => {
+                let g = wasmtime::Global::new(&mut *c, g.clone(), val(g, base + *o))?;
                 l.define(&mut *c, m, name, g)?;
             }
             (NBind::Missing(_), wasmtime::ExternType::Global(g)) => {
-                let g = wasmtime::Global::new(&mut *c, g.clone(), Val::I32(0))?;
+                let g = wasmtime::Global::new(&mut *c, g.clone(), val(g, 0))?;
                 l.define(&mut *c, m, name, g)?;
             }
             (NBind::Export { module: d, name: en }, _) => {
@@ -555,6 +581,23 @@ pub(crate) fn define_imports(
                 });
                 l.define(&mut *c, m, name, f)?;
             }
+            (NBind::LateOwn(o), wasmtime::ExternType::Func(ft)) => {
+                let (slot, label) = ((base + *o) as u64, format!("{}: {name}", dy.path));
+                // empty until filled
+                table.set(&mut *c, slot, wasmtime::Ref::Func(None))?;
+                let f = wasmtime::Func::new(&mut *c, ft.clone(), move |mut caller, args, rets| {
+                    let mut f = table.get(&mut caller, slot);
+                    if !matches!(f, Some(wasmtime::Ref::Func(Some(_)))) {
+                        crate::ftab::catch_up(&mut caller).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?;
+                        f = table.get(&mut caller, slot);
+                    }
+                    match f {
+                        Some(wasmtime::Ref::Func(Some(f))) => f.call(&mut caller, args, rets),
+                        _ => Err(wasmtime::Error::msg(format!("{label}: called before the module defining it was loaded"))),
+                    }
+                });
+                l.define(&mut *c, m, name, f)?;
+            }
             (NBind::Missing(msg), wasmtime::ExternType::Func(ft)) => {
                 let msg = if msg.is_empty() {
                     format!("{}: undefined weak symbol {name} called", dy.path)
@@ -577,6 +620,7 @@ pub(crate) fn define_imports(
 pub(crate) fn after_instantiate(
     mut cx: impl AsContextMut<Data = HostState>,
     table: Table,
+    base: u32,
     module: u32,
     inst: &wasmtime::Instance,
     dy: &Binds,
@@ -591,6 +635,7 @@ pub(crate) fn after_instantiate(
     if let Some(s) = c.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.dyl.insert(module, *inst);
     }
+    crate::wasmdll::fill_late(&mut c, table, base, module)?;
     if let Some((size, align)) = dy.tls {
         thread_tls(&mut c, module, inst, size, align).with_context(|| format!("{}: its thread-local block", dy.path))?;
     }

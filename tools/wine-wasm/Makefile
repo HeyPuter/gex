@@ -84,7 +84,8 @@ WINE_ID := $(call short,$(WINE_COMMIT))
 WINE_BID := $(WINE_ID)
 endif
 TOOLS := $(C)/tools-$(WINE_BID)
-BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
+# (the tree's configure options are in wine32/wine-build.sh: a tree per set of them)
+BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)-$(call h,$(WINE32)/wine32/wine-build.sh,6)
 
 # The dist: everything above plus these scripts (stage, link, rebase).
 TOOLS_KEY := $(call h,$(filter-out %/local.mk %/wine32.pins %/run.sh %/wine32/units.sh,$(wildcard $(WINE32)/*.py $(WINE32)/*.sh $(WINE32)/*.txt $(WINE32)/*.reg $(WINE32)/wcc $(WINE32)/Makefile $(WINE32)/wine32/*.sh $(WINE32)/wine32/*.c)),8)
@@ -97,7 +98,17 @@ export WINE32_TLS
 # as on a host without it), 210 MB less.
 WINE32_MONO ?= 1
 export WINE32_MONO
-DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))
+# WINE_WIN16=1: the dist keeps Win16 and VxD (the 16-bit modules, winevdm,
+# wow32, w32skrnl), which it otherwise leaves out (wine32/stage.sh).
+WINE_WIN16 ?= 0
+export WINE_WIN16
+# WINE_ICU=1: the dist keeps icu (and icuin, icuuc), which it otherwise leaves out.
+WINE_ICU ?= 0
+export WINE_ICU
+# WINE_GSTREAMER=1: the dist keeps winegstreamer, which it otherwise leaves out.
+WINE_GSTREAMER ?= 0
+export WINE_GSTREAMER
+DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))$(if $(filter 1,$(WINE_WIN16)),,-no16)$(if $(filter 1,$(WINE_ICU)),,-noicu)$(if $(filter 1,$(WINE_GSTREAMER)),,-nogst)
 DIST := $(C)/dist-$(DIST_KEY)
 BARE := $(C)/pfx-bare-$(DIST_KEY)
 INSTALLED := $(C)/pfx-installed-$(DIST_KEY)
@@ -122,6 +133,7 @@ paths:
 	@echo WINE32_WINE_SRC=$(WINE_SRC)
 	@echo WINE32_BUILD=$(BUILD)
 	@echo GEX_WASM_SYSROOT=$(GEX_WASM_SYSROOT)
+	@echo WINE32_DEPS=$(DEPS)
 	@echo WINE32_UNITS=$(C)/units
 	@echo WINE32_KEY=$(DIST_KEY)
 

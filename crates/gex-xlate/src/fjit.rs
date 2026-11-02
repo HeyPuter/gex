@@ -245,9 +245,7 @@ impl Jit {
         if class32 && !gex_abi::X86 {
             return None;
         }
-        if class32 != crate::arch::compat() {
-            crate::set_compat(class32);
-        }
+        let _mode = crate::compat_scope(class32);
         let started = now_us();
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);

@@ -416,9 +416,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
     })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
-    // The `nt_qpc` provider's counter: it binds only to an ntdll that is a
-    // PE image, which a 32-bit Wine prefix's (a wasm32 skeleton) is not.
-    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { 0 })?;
+    // The `nt_qpc` provider's counter, for an i386 PE ntdll (a WoW64
+    // process's): what 64-bit Wine's NtQueryPerformanceCounter reads
+    // (`monotonic_counter`: CLOCK_BOOTTIME in 100 ns units).
+    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |_caller: Caller<'_, HostState>| -> i64 { (gex_kernel::clock_ns(gex_kernel::system_clock, 7) / 100) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter).
@@ -508,6 +509,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
     })?;
+    // The native DLL a function pointer (a table index) or a static
+    // variable's address is in, as its skeleton's base (ntdll's
+    // LdrFindEntryForAddress, when no image holds the address).
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::IMAGE_OF, |caller: Caller<'_, HostState>, addr: i64| -> i64 {
+        caller.data().jit.as_ref().map_or(0, |j| crate::wasmdll::image_of(&j.shared, addr as u64) as i64)
+    })?;
     // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
     // address against it at start; the browser's `gex_kuser_address`).
     linker.func_wrap(IMPORT_MODULE, "kuser_address", || -> i32 {
@@ -562,11 +569,14 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         let name = String::from_utf8_lossy(b).into_owned();
         let Some(jit) = caller.data().jit.as_ref() else { return 0 };
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(wp) = sh.wine_pe.as_ref() else { return 0 };
-        match wp.slots.get(&name) {
-            Some(&k) => (sh.ftab.map.install(wp.install).base + k) as i32,
-            None => 0,
-        }
+        // the core's, or a module of its own's (`pelink.py --split`), of
+        // the process's own mode (the caller is a Unix side's)
+        sh.wine_pe
+            .iter()
+            .chain(sh.wine_pe_split.iter())
+            .filter(|wp| !wp.alt)
+            .find_map(|wp| wp.slots.get(&name).map(|&k| (sh.ftab.map.install(wp.install).base + k) as i32))
+            .unwrap_or(0)
     })?;
     // A native wasm32 program's signal hook (`crate::SIGNAL_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
@@ -640,6 +650,12 @@ fn asyncify(caller: &mut Caller<'_, HostState>, op: i32, arg: i32) -> Result<i32
 /// [`register`] for a 64-bit guest memory: the same functions with i64
 /// addresses, sizes and function-table indices.
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
+    // The native DLL a function pointer (a table index) or a static
+    // variable's address is in, as its skeleton's base (ntdll's
+    // LdrFindEntryForAddress, when no image holds the address).
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::IMAGE_OF, |caller: Caller<'_, HostState>, addr: i64| -> i64 {
+        caller.data().jit.as_ref().map_or(0, |j| crate::wasmdll::image_of(&j.shared, addr as u64) as i64)
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     // `clock_gettime(clk)` in nanoseconds, no kernel lock (32-bit Wine's PE ntdll's
     // performance counter).

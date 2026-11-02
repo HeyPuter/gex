@@ -945,11 +945,9 @@ pub(crate) fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bo
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
-    // i386 code decodes in compatibility mode; the setting is per process
-    // (one program), and summaries read it back ([`arch::compat`]).
-    if image.class32 != arch::compat() {
-        crate::set_compat(image.class32);
-    }
+    // i386 code decodes in compatibility mode: this thread's setting until
+    // its next image, which summaries read back ([`arch::compat`]).
+    crate::set_thread_compat(image.class32);
     if image.class32 && !gex_abi::X86 {
         eprintln!("gex-xlate: an i386 image needs the x86 build; recovering nothing");
         return Program {
@@ -1271,9 +1269,7 @@ fn pe_section_name(pe: &gex_ld::pe::PeImage, raw: &str) -> String {
 
 /// [`recover`] for a PE module from [`pe_input`].
 pub fn recover_pe(image: &Image, extra: &PeSeeds, opts: &RecoverOptions) -> Program {
-    if image.class32 != arch::compat() {
-        crate::set_compat(image.class32);
-    }
+    crate::set_thread_compat(image.class32);
     let code = Code::with_elf(image, None);
     let (mut starts, mut fdes) = seeds(&code, None, opts.scan_data);
     for &(a, src) in &extra.starts {

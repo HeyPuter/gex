@@ -402,6 +402,11 @@ impl FuncBody {
         }
     }
 
+    /// The two addresses on the stack added.
+    pub fn addr_add(&mut self) {
+        self.byte(if gex_abi::mem64() { 0x7c } else { 0x6a }); // i64.add / i32.add
+    }
+
     /// `& k`.
     pub fn addr_and_const(&mut self, k: i64) {
         if gex_abi::mem64() {
@@ -1256,9 +1261,11 @@ impl Module {
     }
 
     /// Define a global (none are imported), returning its index.
+    /// A defined global: its index follows the imported ones'.
     pub fn add_global(&mut self, ty: ValType, mutable: bool, init: i64) -> u32 {
+        let imported = self.imports.iter().filter(|i| matches!(i.kind, ImportKind::Global { .. })).count() as u32;
         self.globals.push((ty, mutable, init));
-        self.globals.len() as u32 - 1
+        imported + self.globals.len() as u32 - 1
     }
 
     pub fn set_start(&mut self, func: u32) {

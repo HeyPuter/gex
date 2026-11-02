@@ -360,6 +360,12 @@ pub fn entry_body(entry_ty: u32, blocks: u32, funcs: &[u32]) -> Vec<u8> {
 /// `blocks` is table `blocks` (the function table's runtime module, whose
 /// bridge carries on in tier-1 through such a function).
 pub fn dispatch_body(block_ty: u32, entry_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
+    dispatch_body_in(block_ty, entry_ty, first, blocks, None)
+}
+
+/// [`dispatch_body`] reading the directory at global `alt_dir` (the
+/// process's other one, `gex_abi::imports::ALT_DIR`) when given.
+pub fn dispatch_body_in(block_ty: u32, entry_ty: u32, first: u32, blocks: u32, alt_dir: Option<u32>) -> Vec<u8> {
     use crate::wasm::{FuncBody, ValType};
     use gex_abi::{ctx, DISPATCH_PAGE};
     let mut f = FuncBody::new(1);
@@ -380,7 +386,14 @@ pub fn dispatch_body(block_ty: u32, entry_ty: u32, first: u32, blocks: u32) -> V
     f.i32_const(4);
     f.byte(0x6c); // i32.mul
     f.addr_i32();
-    f.load64(0x28, 2, gex_abi::dispatch_dir());
+    match alt_dir {
+        Some(g) => {
+            f.global_get(g);
+            f.addr_add();
+            f.load64(0x28, 2, 0);
+        }
+        None => f.load64(0x28, 2, gex_abi::dispatch_dir()),
+    }
     f.i32_const(0);
     f.local_get(page);
     f.i64_const(gex_abi::dispatch_max_pages() as i64);

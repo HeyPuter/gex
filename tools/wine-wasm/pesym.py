@@ -97,6 +97,15 @@ def import_func_names(b):
     return names
 
 
+def lazy_weak_import(kind, flags, idx, func_imports):
+    """`wasm-ld -r` writes a function that is only weakly referenced, with
+    a definition left in an archive member it did not pull (msvcrt's
+    mainCRTStartup and `__main_argc_argv`), as an import with the weak
+    flag but not the undefined one, and without a name. Such a symbol is
+    an undefined weak import."""
+    return kind == 0 and not flags & WASM_SYM_UNDEFINED and idx < len(func_imports)
+
+
 def rewrite(b, fix, aliases=()):
     """Rewrite the symbol table: fix(kind, flags, name, defined) returns
     (flags, name) for each symbol. `aliases` are (new name, name) pairs:
@@ -151,6 +160,8 @@ def rewrite(b, fix, aliases=()):
                 undefined = bool(flags & WASM_SYM_UNDEFINED)
                 if kind in (0, 2, 4, 5):  # function, global, tag, table
                     idx, s = leb(b, s)
+                    if lazy_weak_import(kind, flags, idx, func_imports):
+                        flags |= WASM_SYM_UNDEFINED; undefined = True
                     has_name = not undefined or (flags & WASM_SYM_EXPLICIT_NAME)
                     if has_name:
                         nm, s = name(b, s)
@@ -265,6 +276,8 @@ def print_sigs(b):
                             undefined = bool(flags & WASM_SYM_UNDEFINED)
                             if kind in (0, 2, 4, 5):
                                 idx, t = leb(b, t)
+                                if lazy_weak_import(kind, flags, idx, func_imports):
+                                    flags |= WASM_SYM_UNDEFINED; undefined = True
                                 if not undefined or (flags & WASM_SYM_EXPLICIT_NAME):
                                     nm, t = name(b, t)
                                 else:

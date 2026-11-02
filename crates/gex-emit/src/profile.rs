@@ -156,6 +156,9 @@ pub mod flags {
     pub const RET: u32 = 1 << 3;
     /// The block ends in a call (`call_return` is set).
     pub const CALL: u32 = 1 << 4;
+    /// The block is code in the process's other mode (a WoW64 process's
+    /// 32-bit code), translated into that mode's module.
+    pub const OTHER_MODE: u32 = 1 << 5;
 }
 
 /// Size of a block's record, by its flags.
@@ -215,9 +218,10 @@ pub struct Region {
     pub size: u32,
 }
 
-/// Lay out the region for these blocks, in the order given. A start that
-/// appears twice keeps its first record.
-pub fn layout<'a>(blocks: impl Iterator<Item = &'a gex_ir::Block>) -> Region {
+/// Lay out the region for these blocks, in the order given (`other_mode`:
+/// a module of the process's other mode's code). A start that appears twice
+/// keeps its first record.
+pub fn layout<'a>(blocks: impl Iterator<Item = &'a gex_ir::Block>, other_mode: bool) -> Region {
     let mut seen: HashMap<u64, u32> = HashMap::new();
     let mut descs: Vec<(u64, u64, u64, u64, u32)> = Vec::new();
     for b in blocks {
@@ -225,6 +229,7 @@ pub fn layout<'a>(blocks: impl Iterator<Item = &'a gex_ir::Block>) -> Region {
             continue;
         }
         let (fl, target, aux) = describe(b);
+        let fl = if other_mode { fl | flags::OTHER_MODE } else { fl };
         seen.insert(b.start, descs.len() as u32);
         descs.push((b.start, b.end, target, aux, fl));
     }
