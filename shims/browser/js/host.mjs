@@ -974,7 +974,7 @@ export class ProcessHost {
         const done = this.#spawn(t.main ? pid : t.key, {
           kind: 'thread', tid: t.tid, memory, moduleStore,
           ctx: 0n, pc: BigInt(t.pc),
-          snap: { pc: t.pc, sp: t.sp, door }, snapMain: t.main || undefined, snapReset: reset || undefined,
+          snap: { pc: t.pc, sp: t.sp, door }, snapMain: t.main || undefined, snapThreads: ts.length, snapReset: reset || undefined,
         });
         return { attached, done };
       };
