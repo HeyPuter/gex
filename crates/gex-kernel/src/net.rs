@@ -493,6 +493,44 @@ struct Flow {
     t: Arc<dyn Transport>,
 }
 
+impl Flow {
+    fn ended(&self) -> bool {
+        matches!(self.t.status(), Status::Closed | Status::Refused)
+    }
+}
+
+/// In the global kernel, a moved UDP socket's flows off the machine: one per
+/// far address, the last one a holder opened there (`op::FLOW`), each line
+/// `ADDR:PORT:TRANSPORT`. `gen` counts the changes, so a holder takes the
+/// table up only when it has changed (`Socket::sync_flows`).
+#[derive(Debug, Default)]
+struct FlowNames {
+    gen: u64,
+    list: Vec<((u32, u16), String)>,
+}
+
+impl FlowNames {
+    fn set(&mut self, line: &str) {
+        let Some((to, _)) = parse_flow(line) else { return };
+        match self.list.iter_mut().find(|e| e.0 == to) {
+            Some(e) => e.1 = line.to_string(),
+            None => self.list.push((to, line.to_string())),
+        }
+        self.gen += 1;
+    }
+
+    fn text(&self) -> String {
+        self.list.iter().map(|e| e.1.as_str()).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// A flow table line, `ADDR:PORT:TRANSPORT`.
+fn parse_flow(line: &str) -> Option<((u32, u16), &str)> {
+    let mut p = line.splitn(3, ':');
+    let (a, port, name) = (p.next()?, p.next()?, p.next()?);
+    Some(((a.parse().ok()?, port.parse().ok()?), name))
+}
+
 /// The TCP ports guests on this machine listen on. Shared across `fork`, as
 /// the resolver is: a child connects to its parent's listener.
 #[derive(Debug, Default)]
@@ -609,15 +647,17 @@ pub struct Socket {
     /// its first datagram. A moved socket's holders each hold the ones any
     /// of them opened (`sync_flows`); what arrives on them is read here.
     flows: Mutex<Vec<Flow>>,
-    /// A moved socket's flows, as many as its holders had opened when this
-    /// one last looked (`sync_flows`).
-    flows_seen: std::sync::atomic::AtomicUsize,
+    /// A moved socket's flow table's generation when this holder last took
+    /// it up (`sync_flows`).
+    flows_seen: std::sync::atomic::AtomicU64,
+    /// Where a moved socket's holder starts its next look over its flows
+    /// (`flow_read`), so a busy one does not keep the rest waiting.
+    flow_turn: std::sync::atomic::AtomicUsize,
     /// A moved socket's last datagram read came from one of this holder's
     /// flows, not the global kernel's queue: `last_from` is this one's.
     from_here: AtomicBool,
-    /// In the global kernel: a moved socket's flows, by name
-    /// (`ADDR:PORT:TRANSPORT`, `op::FLOW`).
-    flow_names: Mutex<Vec<String>>,
+    /// In the global kernel: a moved socket's flows (`op::FLOW`).
+    flow_names: Mutex<FlowNames>,
 }
 
 impl Socket {
@@ -642,9 +682,10 @@ impl Socket {
             moved: std::sync::atomic::AtomicI32::new(-1),
             went_out: Mutex::new(None),
             flows: Mutex::new(Vec::new()),
-            flows_seen: std::sync::atomic::AtomicUsize::new(0),
+            flows_seen: std::sync::atomic::AtomicU64::new(0),
+            flow_turn: std::sync::atomic::AtomicUsize::new(0),
             from_here: AtomicBool::new(false),
-            flow_names: Mutex::new(Vec::new()),
+            flow_names: Mutex::new(FlowNames::default()),
         }
     }
 
@@ -1029,7 +1070,7 @@ impl Socket {
             // goes out here, on a flow every holder reads (`sync_flows`).
             if v == -(Errno::ENETUNREACH.0 as i64) {
                 if let (Some(m), Some(to)) = (self.moved(), self.peer().filter(|&(a, _)| !is_local(a))) {
-                    self.sync_flows(m);
+                    self.sync_flows(m, None);
                     return self.send_out(to, data).map(|_| data.len() as u64);
                 }
             }
@@ -1127,13 +1168,15 @@ impl Socket {
             let mut flows = self.flows.lock().unwrap();
             // One the network refused or ended is asked for again.
             flows.retain(|f| {
-                let gone = f.to == to && matches!(f.t.status(), Status::Closed | Status::Refused);
+                let gone = f.to == to && f.ended();
                 if gone {
                     f.t.close();
                 }
                 !gone
             });
-            match flows.iter().find(|f| f.to == to) {
+            // The last one there: a holder's own and one another opened
+            // there after it (`sync_flows`), both read, the newer sent on.
+            match flows.iter().rev().find(|f| f.to == to) {
                 Some(f) => f.t.clone(),
                 None => {
                     let t = self.net.udp()?;
@@ -1146,7 +1189,6 @@ impl Socket {
                     if let (Some(m), Some(n)) = (self.moved(), t.name()) {
                         let mut name = format!("{}:{}:{n}", to.0, to.1).into_bytes();
                         (m.r.op)(m.id, op::FLOW, 0, 0, &mut name);
-                        self.flows_seen.fetch_add(1, Ordering::AcqRel);
                     }
                     flows.push(Flow { to, t: t.clone() });
                     t
@@ -1158,31 +1200,52 @@ impl Socket {
         Ok(())
     }
 
-    /// The flows a moved socket's other holders opened, held here too.
-    fn sync_flows(&self, m: Moved) {
-        let n = (m.r.op)(m.id, op::FLOWS, 0, 0, &mut []);
-        if n <= 0 || self.flows_seen.load(Ordering::Acquire) >= n as usize {
+    /// The flows a moved socket's other holders opened, held here too, if
+    /// the global kernel's table has changed since this holder last looked
+    /// (`gen`: its generation, when the caller has it already; else asked).
+    /// A flow there that this holder holds already is skipped; one that
+    /// replaced this holder's there (it ended and was opened again, or two
+    /// opened at once) is taken up beside it, and this holder's ended ones
+    /// go.
+    fn sync_flows(&self, m: Moved, gen: Option<u64>) {
+        let gen = match gen {
+            Some(g) => g,
+            None => match (m.r.op)(m.id, op::FLOWS, 0, 0, &mut []) {
+                g if g >= 0 => g as u64,
+                _ => return,
+            },
+        };
+        if self.flows_seen.load(Ordering::Acquire) == gen {
             return;
         }
-        let mut buf = vec![0u8; 16384];
+        let len = (m.r.op)(m.id, op::FLOWS, 2, 0, &mut []);
+        if len < 0 {
+            return;
+        }
+        let mut buf = vec![0u8; len as usize];
         let len = (m.r.op)(m.id, op::FLOWS, 1, 0, &mut buf);
         if len < 0 {
             return;
         }
         let mut flows = self.flows.lock().unwrap();
+        flows.retain(|f| {
+            let gone = f.ended() && !f.t.has_data();
+            if gone {
+                f.t.close();
+            }
+            !gone
+        });
         let list = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
         for line in list.lines() {
-            let mut p = line.splitn(3, ':');
-            let (Some(a), Some(port), Some(name)) = (p.next(), p.next(), p.next()) else { continue };
-            let (Ok(a), Ok(port)) = (a.parse::<u32>(), port.parse::<u16>()) else { continue };
-            if flows.iter().any(|f| f.to == (a, port)) {
+            let Some((to, name)) = parse_flow(line) else { continue };
+            if flows.iter().any(|f| f.to == to && f.t.name().as_deref() == Some(name)) {
                 continue;
             }
             if let Some(t) = self.net.adopt(name) {
-                flows.push(Flow { to: (a, port), t });
+                flows.push(Flow { to, t });
             }
         }
-        self.flows_seen.store(n as usize, Ordering::Release);
+        self.flows_seen.store(gen, Ordering::Release);
     }
 
     /// What arrived on this socket's flows, queued with where it came from;
@@ -1224,9 +1287,11 @@ impl Socket {
         if self.kind != Kind::Udp {
             return None;
         }
-        self.sync_flows(m);
+        self.sync_flows(m, None);
         let flows = self.flows.lock().unwrap();
-        for f in flows.iter() {
+        let k = flows.len();
+        let at = self.flow_turn.fetch_add(1, Ordering::Relaxed);
+        for f in (0..k).map(|i| &flows[(at + i) % k]) {
             let r = if peek { f.t.peek(buf) } else { f.t.recv(buf) };
             if let Ok(n) = r {
                 *self.last_from.lock().unwrap() = Some(f.to);
@@ -1238,12 +1303,13 @@ impl Socket {
     }
 
     /// Whether one of a moved socket's flows has a datagram: the next one's
-    /// length, or `None`.
-    fn flow_ready(&self, m: Moved) -> Option<usize> {
+    /// length, or `None`. `gen`: the flow table's generation, if the caller
+    /// has it.
+    fn flow_ready(&self, m: Moved, gen: Option<u64>) -> Option<usize> {
         if self.kind != Kind::Udp {
             return None;
         }
-        self.sync_flows(m);
+        self.sync_flows(m, gen);
         self.flows.lock().unwrap().iter().find(|f| f.t.has_data()).map(|f| f.t.available())
     }
 
@@ -1424,10 +1490,10 @@ pub mod op {
     /// is `EREMCHG`, which tells its holder to take the connection up.
     pub const WENT_OUT: u32 = 20;
     /// A holder opened a flow off the machine (`Socket::send_out`): `buf`
-    /// is its name, `ADDR:PORT:TRANSPORT`.
+    /// is its name, `ADDR:PORT:TRANSPORT`, which replaces the one there.
     pub const FLOW: u32 = 21;
-    /// How many flows its holders have opened (`a` 0), or their names, one
-    /// a line, into `buf` (`a` 1): their length.
+    /// The flow table's generation (`a` 0), its names, one a line, into
+    /// `buf` (`a` 1: their length), or that length (`a` 2).
     pub const FLOWS: u32 = 22;
 
     /// Whether the call reads `buf` (copied from the caller first).
@@ -1719,7 +1785,8 @@ impl Socket {
                     (r.op)(id, op::FLOW, 0, 0, &mut name);
                 }
             }
-            self.flows_seen.store(flows.len(), Ordering::Release);
+            // Its own: named just now.
+            self.flows_seen.store((r.op)(id, op::FLOWS, 0, 0, &mut []).max(0) as u64, Ordering::Release);
         }
         drop(u);
         let m = self.moved()?;
@@ -1806,20 +1873,27 @@ impl Socket {
             op::READ => count(self.read_at(0, buf)),
             op::PEEK => count(self.peek(buf)),
             op::AVAILABLE => self.available().unwrap_or(0) as i64,
+            // A UDP socket's with its flow table's generation above the
+            // first bit, so a holder takes the table up only when it changed
+            // (`poll_readable`).
+            op::READABLE if self.kind == Kind::Udp => self.poll_readable() as i64 | (self.flow_names.lock().unwrap().gen << 1) as i64,
             op::READABLE => self.poll_readable() as i64,
             op::WRITABLE => self.poll_writable() as i64,
             op::LISTENING => self.is_listening() as i64,
             op::QUEUE => self.wait_queue() as i64,
             op::FLOW => {
-                self.flow_names.lock().unwrap().push(String::from_utf8_lossy(buf).into_owned());
+                self.flow_names.lock().unwrap().set(&String::from_utf8_lossy(buf));
                 0
             }
             op::FLOWS => {
                 let names = self.flow_names.lock().unwrap();
                 if a == 0 {
-                    return names.len() as i64;
+                    return names.gen as i64;
                 }
-                let list = names.join("\n");
+                let list = names.text();
+                if a == 2 {
+                    return list.len() as i64;
+                }
                 if list.len() > buf.len() {
                     return -(Errno::ENOMEM.0 as i64);
                 }
@@ -1913,7 +1987,7 @@ impl FileHandle for Socket {
     /// must be exact -- the length of the next datagram, which a caller uses
     /// to size its buffer.
     fn available(&self) -> Option<u64> {
-        if let Some(n) = self.moved().and_then(|m| self.flow_ready(m)) {
+        if let Some(n) = self.moved().and_then(|m| self.flow_ready(m, None)) {
             return Some(n as u64);
         }
         if let Some(v) = self.fwd(op::AVAILABLE, 0, 0, &mut []) {
@@ -1939,11 +2013,14 @@ impl FileHandle for Socket {
     }
 
     fn poll_readable(&self) -> bool {
-        if self.moved().and_then(|m| self.flow_ready(m)).is_some() {
-            return true;
-        }
         if let Some(v) = self.fwd(op::READABLE, 0, 0, &mut []) {
-            return v != 0;
+            if v & 1 != 0 || v < 0 || self.kind != Kind::Udp {
+                return v != 0;
+            }
+            // Its flows off the machine, this holder's own, the table's
+            // generation in the answer: no more calls to the global kernel
+            // unless it changed.
+            return self.moved().and_then(|m| self.flow_ready(m, Some((v as u64) >> 1))).is_some();
         }
         if self.kind == Kind::Udp {
             self.udp_pump();

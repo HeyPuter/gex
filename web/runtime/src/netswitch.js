@@ -36,6 +36,7 @@ export class NetSwitch {
   send(id, bytes) { return this.#b ? this.#b.send(id, bytes) : -1; }
   recv(id, out) { return this.#b ? this.#b.recv(id, out) : 0; }
   peek(id, out) { return this.#b ? this.#b.peek(id, out) : 0; }
+  frame(id, out, take) { return this.#b ? this.#b.frame(id, out, take) : 0; }
   available(id) { return this.#b ? this.#b.available(id) : true; }
   dup(id) { return this.#b ? this.#b.dup(id) : 0; }
   close(id) { this.#b?.close(id); }

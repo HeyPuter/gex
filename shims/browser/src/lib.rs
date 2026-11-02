@@ -116,6 +116,13 @@ extern "C" {
     fn net_recv(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
     /// `net_recv`, leaving the bytes queued (`recv(MSG_PEEK)`).
     fn net_peek(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
+    /// A UDP flow's next datagram, framed (`PageDgram`), into `ptr` as far
+    /// as `len` holds it: the frame's whole length if all of it has
+    /// arrived, -1 until then, 0 at the end. Taken off the stream unless
+    /// `take` is 0. Whole or nothing in one call, as
+    /// the page reads it under the stream's lock: two processes holding the
+    /// flow never split a frame between them.
+    fn net_frame(id: i32, ptr: gex_kernel::PAddr, len: u32, take: i32) -> i32;
     /// Whether `net_recv` would answer without waiting.
     fn net_avail(id: i32) -> i32;
     fn net_close(id: i32);
@@ -267,27 +274,25 @@ impl PageDgram {
         PageDgram { id: std::sync::atomic::AtomicI32::new(id) }
     }
 
-    /// The next datagram, framed, if all of it has arrived; read off the
-    /// stream (`take`) or left there.
-    fn next(&self, take: bool) -> Option<Vec<u8>> {
+    /// The next datagram's frame, if all of it has arrived, into `out` as
+    /// far as it holds it (its head first), read off the stream (`take`) or
+    /// left there: the frame's whole length.
+    fn frame(&self, out: &mut [u8], take: bool) -> Option<usize> {
         let id = self.id.load(std::sync::atomic::Ordering::Acquire);
         if id == 0 {
             return None;
         }
-        let mut head = [0u8; 2];
-        if unsafe { net_peek(id, head.as_mut_ptr() as gex_kernel::PAddr, 2) } != 2 {
-            return None;
-        }
-        let mut frame = vec![0u8; 2 + u16::from_be_bytes(head) as usize];
-        let n = frame.len() as u32;
-        let p = frame.as_mut_ptr() as gex_kernel::PAddr;
-        if unsafe { net_peek(id, p, n) } != n as i32 {
-            return None;
-        }
-        if take && unsafe { net_recv(id, p, n) } != n as i32 {
-            return None;
-        }
-        Some(frame)
+        let n = unsafe { net_frame(id, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, take as i32) };
+        (n >= 2).then_some(n as usize)
+    }
+
+    /// One datagram into `buf`, cut to it.
+    fn read(&self, buf: &mut [u8], take: bool) -> Result<usize, Errno> {
+        let mut f = vec![0u8; 2 + buf.len()];
+        let whole = self.frame(&mut f, take).ok_or(Errno::EAGAIN)?;
+        let n = (whole - 2).min(buf.len());
+        buf[..n].copy_from_slice(&f[2..2 + n]);
+        Ok(n)
     }
 }
 
@@ -328,7 +333,8 @@ impl net::Transport for PageDgram {
         while at < frame.len() {
             match unsafe { net_send(id, frame[at..].as_ptr() as gex_kernel::PAddr, (frame.len() - at) as u32) } {
                 n if n > 0 => at += n as usize,
-                0 => {}
+                // nothing taken: the datagram dropped, as UDP may
+                0 if at == 0 => return Ok(data.len()),
                 _ => return Err(Errno::EPIPE),
             }
         }
@@ -337,26 +343,20 @@ impl net::Transport for PageDgram {
 
     /// One datagram, cut to `buf`.
     fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let f = self.next(true).ok_or(Errno::EAGAIN)?;
-        let n = (f.len() - 2).min(buf.len());
-        buf[..n].copy_from_slice(&f[2..2 + n]);
-        Ok(n)
+        self.read(buf, true)
     }
 
     fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let f = self.next(false).ok_or(Errno::EAGAIN)?;
-        let n = (f.len() - 2).min(buf.len());
-        buf[..n].copy_from_slice(&f[2..2 + n]);
-        Ok(n)
+        self.read(buf, false)
     }
 
     fn has_data(&self) -> bool {
-        self.next(false).is_some()
+        self.frame(&mut [0u8; 2], false).is_some()
     }
 
     /// The next datagram's length.
     fn available(&self) -> usize {
-        self.next(false).map_or(0, |f| f.len() - 2)
+        self.frame(&mut [0u8; 2], false).map_or(0, |n| n - 2)
     }
 
     fn close(&self) {

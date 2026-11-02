@@ -10,7 +10,7 @@
 
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { PageHostStream } from '../../shims/browser/js/page-host.mjs';
-import { NET_DGRAM, frame, Unframer } from '../../shims/browser/js/dgram-frames.mjs';
+import { NET_DGRAM, frame, frameOf, Unframer } from '../../shims/browser/js/dgram-frames.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -361,6 +361,15 @@ export class Sockets {
     if (!s) return 0;
     if (!s.chunks.length) return s.state === CLOSED || s.state === REFUSED ? 0 : -1;
     return s.peek(out);
+  }
+
+  /** A UDP flow's next datagram, framed, whole or nothing (the shim's
+   *  `net_frame`, dgram-frames.mjs `frameOf`): its length, -1 until all of
+   *  it has arrived, 0 at the end. Taken unless `!take`. */
+  frame(id, out, take) {
+    const ring = this.rings?.frame(id, out, take, () => this.refill(id));
+    if (ring !== undefined) return ring;
+    return frameOf((o) => this.peek(id, o), (o) => this.recv(id, o), out, take);
   }
 
   available(id) {

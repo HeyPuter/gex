@@ -32,6 +32,14 @@ function echoer(host, port) {
   return { readable, writable };
 }
 
+/** A UDP flow in the page that sends each datagram back as it is. */
+function mirror() {
+  let push;
+  const readable = new ReadableStream({ start: (c) => { push = c; } });
+  const writable = new WritableStream({ write: (b) => push.enqueue(b.slice()) });
+  return { readable, writable };
+}
+
 async function text(readable) {
   let s = '';
   for (const r = readable.getReader(); ;) {
@@ -89,6 +97,13 @@ export default async function (t) {
   eq('a connected UDP socket', [conn.code, conn.stdout], [0, '10.1.2.3:9 hello\n']);
   const byName = await run(['rt-probe', 'udp', 'example.test', '9', 'hi']);
   eq('a name reaches datagram as the name', [byName.code, byName.stdout], [0, 'example.test:9 hi\n']);
+  // More unread than a receive ring holds (256 KiB), then read: every
+  // datagram whole and in order, small ones and ones near the largest.
+  sys.network = { connect: (host, port) => reverser(host, port), datagram: () => { flows.push('flood'); return mirror(); } };
+  const flood = await run(['rt-probe', 'flood', '10.1.2.4', '9', '400', '1400']);
+  eq('400 datagrams of 1400 bytes unread, then all read', [flood.code, flood.stdout], [0, '400 ok\n']);
+  const flood2 = await run(['rt-probe', 'flood', '10.1.2.5', '9', '12', '60000']);
+  eq('12 of 60000 bytes unread, then all read', [flood2.code, flood2.stdout], [0, '12 ok\n']);
   const dns = await run(['rt-probe', 'connect', 'example.test', '8080', 'abc']);
   check('DNS is still the kernel\'s', dns.code === 0 && !flows.some((f) => f.endsWith(':53')), JSON.stringify([dns, flows]));
   say(`  datagram saw ${flows.join(', ')}`);

@@ -3765,8 +3765,12 @@ impl gex_kernel::net::Transport for HostDgram {
         self.with(|s| s.peek(&mut [0u8; 1])).is_ok()
     }
 
+    /// The next datagram's length: peeked whole, into one buffer per thread.
     fn available(&self) -> usize {
-        self.with(|s| s.peek(&mut vec![0u8; 65536])).unwrap_or(0)
+        thread_local! {
+            static PEEK: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 65536]);
+        }
+        PEEK.with(|b| self.with(|s| s.peek(&mut b.borrow_mut())).unwrap_or(0))
     }
 
     fn close(&self) {

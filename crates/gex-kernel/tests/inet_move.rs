@@ -154,6 +154,8 @@ mod named {
         /// A UDP flow's: each datagram sent comes back, as from an echo
         /// server.
         pub echo: Option<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+        /// The far end ended it.
+        pub ended: Mutex<bool>,
     }
 
     fn conns() -> &'static Mutex<Vec<Arc<Conn>>> {
@@ -178,7 +180,7 @@ mod named {
             Ok(())
         }
         fn status(&self) -> Status {
-            Status::Open
+            if *self.1.ended.lock().unwrap() { Status::Closed } else { Status::Open }
         }
         fn send(&self, data: &[u8]) -> Result<usize, Errno> {
             self.1.sent.lock().unwrap().extend_from_slice(data);
@@ -348,5 +350,60 @@ fn a_moved_udp_socket_reads_every_holders_flows() {
     drop(server);
     drop(client);
     assert_eq!((*flow.holders.lock().unwrap(), *early.holders.lock().unwrap()), (0, 0));
+    assert_eq!(global::live(), before, "every hold is given back");
+}
+
+#[test]
+fn a_moved_udp_sockets_flow_opened_again_reaches_every_holder() {
+    let _one = global::install();
+    let (res, ports) = (Arc::new(Resolver::new()), Arc::new(Ports::new()));
+    let net = || Arc::new(named::Net) as Arc<dyn gex_kernel::net::NetStack>;
+    let before = global::live();
+    let server = Arc::new(Socket::new(Kind::Udp, net(), Arc::clone(&res), Arc::clone(&ports), None));
+    server.set_self();
+    let name = server.move_out().unwrap();
+    let client = Socket::moved_proxy(&name, net(), Arc::clone(&res), Arc::clone(&ports), None).unwrap();
+    let mut b = [0u8; 16];
+    // The far end ends the flow, again and again: each time the client's
+    // next datagram there opens another, and the server reads its reply off
+    // it, the table one entry for the one far address.
+    let mut flows = Vec::new();
+    for round in 0..40u8 {
+        client.set_peer(0x0a00_0003, 5300);
+        let n = named::made();
+        assert_eq!(client.write_at(0, &[round]).unwrap(), 1);
+        assert_eq!(named::made(), n + 1, "round {round}: a flow opened");
+        let flow = named::conn(n);
+        assert!(server.poll_readable(), "round {round}: the server sees the new flow");
+        assert_eq!(server.read_at(0, &mut b).unwrap(), 1);
+        assert_eq!((b[0], server.last_from()), (round, Some((0x0a00_0003, 5300))));
+        assert!(!client.poll_readable(), "round {round}: read once");
+        *flow.ended.lock().unwrap() = true;
+        flows.push(flow);
+    }
+    // Two holders at once: each opens its own flow there, and whatever
+    // comes back on either is read, once.
+    let n = named::made();
+    server.set_peer(0x0a00_0004, 7);
+    client.set_peer(0x0a00_0004, 7);
+    server.write_at(0, b"s").unwrap();
+    client.write_at(0, b"c").unwrap();
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        for h in [&server, &client] {
+            if h.poll_readable() {
+                let k = h.read_at(0, &mut b).unwrap() as usize;
+                got.push(b[..k].to_vec());
+            }
+        }
+    }
+    got.sort();
+    assert_eq!(got, vec![b"c".to_vec(), b"s".to_vec()]);
+    assert!(named::made() <= n + 2);
+    drop(server);
+    drop(client);
+    for f in &flows {
+        assert_eq!(*f.holders.lock().unwrap(), 0);
+    }
     assert_eq!(global::live(), before, "every hold is given back");
 }

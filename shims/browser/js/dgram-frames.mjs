@@ -14,6 +14,23 @@ export function frame(bytes) {
   return out;
 }
 
+/** The shim's `net_frame` over a stream's `peek(out)` and `recv(out)`
+ *  (each as net.js's: bytes, 0 at its end, -1 while it may receive): if all
+ *  of the next frame has arrived, as much of it as `out` holds, taken unless
+ *  `!take`, and its whole length; else -1, or 0 at the end. Whole only where
+ *  nothing else reads the stream between the calls (one thread). */
+export function frameOf(peek, recv, out, take) {
+  const head = new Uint8Array(2);
+  const h = peek(head);
+  if (h < 2) return h === 0 ? 0 : -1;
+  const need = 2 + ((head[0] << 8) | head[1]);
+  const f = out.length >= need ? out.subarray(0, need) : new Uint8Array(need);
+  if (peek(f) !== need) return -1;
+  if (take) recv(f);
+  if (f.buffer !== out.buffer || f.byteOffset !== out.byteOffset) out.set(f.subarray(0, out.length));
+  return need;
+}
+
 /** The datagrams in a byte stream, as its pieces come. */
 export class Unframer {
   #buf = new Uint8Array(0);

@@ -16,6 +16,7 @@ import { pageFs } from './page-fs.mjs';
 import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logRoutine } from "./log.mjs";
+import { frameOf } from './dgram-frames.mjs';
 
 /** The longest an exec waits for the other memory flavour's runtime. */
 const OTHER_WAIT_MS = 300_000;
@@ -2072,6 +2073,16 @@ export class Gex {
           this.#net?.peek
             ? this.#net.peek(id, this.#bytes().subarray(addrNum(ptr), addrNum(ptr) + (len >>> 0)))
             : this.#net ? -2 : 0,
+        // A UDP flow's next datagram, framed, whole or nothing; taken unless
+        // `take` is 0. A network without `frame` (one Worker's own, as the
+        // Node lane's) is read by peeks, nothing else reading it.
+        net_frame: (id, ptr, len, take) => {
+          if (!this.#net) return 0;
+          const out = this.#bytes().subarray(addrNum(ptr), addrNum(ptr) + (len >>> 0));
+          if (this.#net.frame) return this.#net.frame(id, out, take !== 0);
+          if (!this.#net.peek) return -2;
+          return frameOf((o) => this.#net.peek(id, o), (o) => this.#net.recv(id, o), out, take !== 0);
+        },
         net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
         net_close: (id) => this.#net?.close(id),
         // Another holder of a stream (a socket passed to another process).
