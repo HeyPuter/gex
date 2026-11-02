@@ -46,8 +46,9 @@
 #               and explorer) made in b64-K-S and linked as one module behind
 #               their skeletons, and every other module that tree builds as
 #               one of its own (stage-native64.sh)
-#   pen64-K-N-twin  with WINE64_TWIN=1, that core plus the memory64 build's
-#               module as winepe.wasm.m64 (WINE64_NATIVE then names it)
+#   pen64-K-N-twinM  with WINE64_TWIN=1, that core plus the memory64 build's
+#               modules (M: its core's key), each as NAME.wasm.m64
+#               (WINE64_NATIVE then names it)
 #   b32-K-B     with WINE64_WOW64=1, the wasm32 build tree of the i386 PE side
 #               (wine32/wine-build.sh wasm; B: that script, 32-bit Wine's
 #               sysroot and libraries)
@@ -335,13 +336,15 @@ ntdll_native() {
 NPE=${WINE64_NATIVE_PE:-1}
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
 # WoW64's own DLLs, and the programs every process start runs, in the core too
-if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
+# (the twin's memory64 half: the same core and the same split modules, so
+# that each skeleton names a module both halves have)
+M64N=0; [ "$M64" = 0 ] || [ "${WINE64_M64_NATIVE:-0}" = 0 ] || M64N=1
+if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && { [ "$M64" = 0 ] || [ "$M64N" = 1 ]; }; then
 	[ "$WOW" = 0 ] || D="$D wow64.dll wow64win.dll wow64cpu.dll"
 	D="$D wineboot.exe services.exe explorer.exe"
 fi
 SP=${WINE64_SPLIT_DLLS:-}
-# (the memory64 flavour: the core alone, as before; its twin pairs only winepe.wasm)
-SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || [ "$M64" != 0 ] || SPA=all
+SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || { [ "$M64" != 0 ] && [ "$M64N" = 0 ]; } || SPA=all
 NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
 pe_native() {
@@ -486,10 +489,13 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done
-		cp -p "$MN/winepe.wasm" winepe.wasm.m64
+		# every module of the memory64 build's, the core and the split ones
+		local m
+		for m in "$MN"/*.wasm; do cp -p "$m" "${m##*/}.m64"; done
 	}
-	log "twin native PE core ($K, $NK)"; step pen64-$K-$NK-twin twin_native
-	NATIVE=$C/pen64-$K-$NK-twin
+	MK=${MN%/native}; MK=${MK##*-}
+	log "twin native PE core ($K, $NK, $MK)"; step pen64-$K-$NK-twin$MK twin_native
+	NATIVE=$C/pen64-$K-$NK-twin$MK
 fi
 echo "WINE64_DIST=$DIST"
 echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"
