@@ -47,9 +47,10 @@ fn budget() -> u64 {
 ///
 /// "Least recently used" is the metadata file's mtime, which
 /// [`load_or_compile`] refreshes on a hit (to the hour, [`REFRESH_AFTER`]).
-/// Evicts down to 80% of budget, not
-/// exactly to it, so a full cache does not sweep on every store. Returns the
-/// size left.
+/// Evicts down to 80% of budget whenever the cache is above that, not only
+/// once it is over budget: a sweep that left it just under budget let the
+/// next store's estimate cross it again, so every store swept the whole
+/// directory. Returns the size left.
 fn evict(dir: &Path, budget: u64) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -75,11 +76,11 @@ fn evict(dir: &Path, budget: u64) -> u64 {
         total += wasm_len + meta_len;
         items.push((when, key, wasm_len + meta_len));
     }
-    if total <= budget {
+    let target = budget / 5 * 4;
+    if total <= target {
         return total;
     }
     items.sort_by_key(|(when, _, _)| *when);
-    let target = budget / 5 * 4;
     for (_, key, size) in items {
         if total <= target {
             break;
@@ -851,6 +852,24 @@ mod budget_tests {
         assert!(left.contains(&"k0".to_string()), "dropped a recent read: {left:?}");
         assert!(left.contains(&"k9".to_string()), "dropped the newest: {left:?}");
         assert!(!left.contains(&"k1".to_string()), "kept the oldest unread: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sweep that finds the cache under budget but above 80% of it still
+    /// takes it down to 80%, so the stores after it do not sweep again.
+    #[test]
+    fn a_sweep_near_the_budget_leaves_room() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("k{i}.cwasm")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("k{i}.meta")), b"m").unwrap();
+        }
+        // 10 entries of 1025 bytes against a budget of 10.5 of them: under it.
+        let budget = 10 * 1025 + 512;
+        let left = evict(&dir, budget);
+        assert!(left <= budget / 5 * 4, "left {left} bytes, more than 80% of {budget}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
