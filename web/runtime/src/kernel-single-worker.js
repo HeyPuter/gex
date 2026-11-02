@@ -238,6 +238,15 @@ const ops = {
     if (!glr) throw new Error('no GL beside these windows');
     return glr.start(opts).then((value) => ({ value }));
   },
+  // The game controller table (input.js `Gamepads`): its address and a copy,
+  // which the page keeps and sends back changed (`{ joy }`).
+  joyTable() {
+    const at = k.k_joy_table() >>> 0;
+    if (!at) return { value: { at: 0, words: null } };
+    const all = words();
+    const n = 16 + all[(at >>> 2) + 2] * all[(at >>> 2) + 3];
+    return { value: { at, words: all.slice(at >>> 2, (at >>> 2) + n) } };
+  },
   useKernelStacks({ stacks }) {
     host.useKernelStacks(stacks);
     return { value: null };
@@ -257,6 +266,13 @@ globalThis.onmessage = async ({ data: m }) => {
   if (m?.comp) return void comp?.send(m.comp);
   if (m?.wl) return void mirror?.call(m.wl.fn, m.wl.args);
   // Its GL windows' canvases (gl-relay.js).
+  // The page's game controllers, written into the kernel's table, then
+  // their readers woken (a kernel call, in turn with the page's).
+  if (m?.joy) {
+    words().set(m.joy.words, m.joy.at >>> 2);
+    callsDone = callsDone.then(() => runCallsAsync(k, mem, [{ f: 'k_joy_notify' }], invoke)).catch(() => {});
+    return;
+  }
   if (m?.glc) return void (m.glc.stop ? glr?.stop() : glr?.canvas(m.glc));
   if (m?.call === undefined) return;
   try {

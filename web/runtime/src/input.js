@@ -191,6 +191,9 @@ export class Gamepads extends EventTarget {
   #raf = 0;
   #closed = false;
   #k = null;
+  /** The single-thread build's table is its Worker's: `#mem` is then a copy
+   *  (at 0), sent back to `{ at, write }` with each change. */
+  #remote = null;
 
   /** `source`: what lists the controllers (default `navigator.getGamepads`).
    *  Events: `connect` (with `slot`, N of `eventN`, and the `gamepad`) and
@@ -203,15 +206,26 @@ export class Gamepads extends EventTarget {
     i.attach('gamepads', this);
     i.afterBoot(async (s) => {
       this.#k = i.kernel();
-      const at = (await this.#k.r('k_joy_table')) >>> 0;
+      let at;
+      let mem = s.kernel.memory;
+      if (s.joy) {
+        const t = await s.joy.table();
+        at = t.at;
+        if (at) {
+          this.#remote = { at, write: s.joy.write };
+          mem = { buffer: t.words.buffer };
+        }
+      } else {
+        at = (await this.#k.r('k_joy_table')) >>> 0;
+      }
       if (this.#closed) return;
       if (!at) {
         i.say('gex: Gamepads: this kernel has no game controller table\n');
         return;
       }
-      this.#mem = s.kernel.memory;
-      this.#at = at;
-      const pads = this.#words()[(at >>> 2) + 2];
+      this.#mem = mem;
+      this.#at = this.#remote ? 0 : at;
+      const pads = this.#words()[(this.#at >>> 2) + 2];
       this.#slots = Array.from({ length: pads }, () => null);
       this.#loop();
     });
@@ -321,6 +335,7 @@ export class Gamepads extends EventTarget {
 
   /** A change in the table, which wakes the processes reading /dev/input. */
   #notify() {
+    if (this.#remote) return void this.#remote.write(this.#remote.at, this.#words().slice());
     this.#k?.r('k_joy_notify').catch(() => {});
   }
 
