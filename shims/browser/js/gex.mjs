@@ -6558,21 +6558,25 @@ export class Gex {
         this.#startThread();
       }
     };
-    const sync = (ctx, pc) => {
-      e.gex_syscall(ctx, pc);
+    // What a system call left: a child or thread to start, and a library
+    // another thread has `dlopen`ed since, in this Worker's table before the
+    // program goes on (cgen/dylink.rs `DL_GEN`).
+    const after = () => {
       staged();
-      // a library another thread has `dlopen`ed since: in this Worker's
-      // table before the program goes on (cgen/dylink.rs `DL_GEN`)
       const g = e.gex_wasmprog_dl_gen?.();
       if (g !== undefined && g !== this.#dlGen) {
         this.#dlGen = g;
         this.#cgenCatchUp();
       }
     };
+    const sync = (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      after();
+    };
     return {
       // The default build: the shim's export, with no JS frame
       // (`#syscallAfter` gets what the call left).
-      syscall: (SP_CODE && single.on) ? this.#suspendingSyscall(sync, staged) : (e.gex_wasmprog_syscall ?? sync),
+      syscall: (SP_CODE && single.on) ? this.#suspendingSyscall(sync, after) : (e.gex_wasmprog_syscall ?? sync),
       // a module built with GEX_DL_CHECKED_CALLS (cgen/dylink.rs `checked`):
       // the slots this Worker's table has caught up with, and the catch-up
       // its guard calls at an index past them
@@ -6584,7 +6588,7 @@ export class Gex {
       },
       asyncify,
       // The snapshot flavour's (libgex-snap/snapshot.c).
-      ...this.#snapImports(asyncify, (SP_CODE && single.on) ? this.#suspendingSyscall(sync, staged) : sync, inst, mod),
+      ...this.#snapImports(asyncify, (SP_CODE && single.on) ? this.#suspendingSyscall(sync, after) : sync, inst, mod),
       // -fgex-guest-i386 (gexcc's rt/i386.c): i386 code calling `addr` runs
       // the program's function at table index `idx` (cgen/libprov.rs)
       i386_bind: (addr, idx) => e.gex_libprov_i386_bind(addrBig(addr), idx >>> 0),
