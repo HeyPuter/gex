@@ -1082,6 +1082,10 @@ async function handle(msg) {
       }
       ({ entry, ctx, gone } = await (msg.snap ? gex.snapThread(msg.shim, msg.guest, msg) : gex.adoptThread(msg.shim, msg.guest, msg)));
       if (msg.snap) {
+        // The process's other threads came back in Workers of their own
+        // (`ProcessHost.restore`), not through this one's `spawnThread`:
+        // its memory is theirs too, so its exit does not zero it under them.
+        if (msg.snapThreads > 1) recyclable = false;
         port.post({ kind: 'snap-attached' });
         gex.snapRelease();
       }
