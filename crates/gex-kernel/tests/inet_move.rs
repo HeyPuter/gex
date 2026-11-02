@@ -374,7 +374,11 @@ fn a_moved_udp_sockets_flow_opened_again_reaches_every_holder() {
         assert_eq!(client.write_at(0, &[round]).unwrap(), 1);
         assert_eq!(named::made(), n + 1, "round {round}: a flow opened");
         let flow = named::conn(n);
-        assert!(server.poll_readable(), "round {round}: the server sees the new flow");
+        if round % 2 == 0 {
+            assert!(server.poll_readable(), "round {round}: the server sees the new flow");
+        } else {
+            assert_eq!(server.available(), Some(1), "round {round}: FIONREAD sees the new flow");
+        }
         assert_eq!(server.read_at(0, &mut b).unwrap(), 1);
         assert_eq!((b[0], server.last_from()), (round, Some((0x0a00_0003, 5300))));
         assert!(!client.poll_readable(), "round {round}: read once");
