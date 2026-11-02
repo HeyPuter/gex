@@ -2764,10 +2764,16 @@ pub extern "C" fn k_fs_dup(handle: i32) -> i32 {
 /// without closing still frees what it held.
 #[no_mangle]
 pub extern "C" fn k_fs_close(handle: i32) {
-    let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(slot) = t.get_mut(handle as usize) {
-        *slot = None;
-    }
+    // Dropped after the table is let go: the last reference's `Drop` may
+    // call the host (a page file's close, `pagefs::PageFile`), which in the
+    // single-thread build suspends this fiber, and another one opening or
+    // closing a file would then wait on the table, which a plain memory
+    // cannot.
+    let gone = {
+        let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
+        t.get_mut(handle as usize).and_then(Option::take)
+    };
+    drop(gone);
 }
 
 /// Read into the caller's memory. Returns bytes read, or a negated errno.
