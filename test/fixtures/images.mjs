@@ -63,7 +63,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -73,6 +73,18 @@ export const images = {
     if (!site) return 'set GEX_TEST_KDE_SITE to a KDE site (debdemo mksite)';
     if (!existsSync(join(site, 'kde.tar.zst')) || !existsSync(join(site, 'lazy.json'))) return `no kde.tar.zst and lazy.json in ${site}`;
     const to = join(work, 'kde');
+    rmSync(to, { recursive: true, force: true });
+    symlinkSync(realpathSync(site), to);
+    return null;
+  },
+  // A Wine site as gex-eject makes it (GEX_TEST_WINE_SITE: its index.html,
+  // project/build/web/nt.json and the files it names), linked into the work
+  // directory as `wine-site`.
+  async 'wine-site'(work) {
+    const site = process.env.GEX_TEST_WINE_SITE;
+    if (!site) return 'set GEX_TEST_WINE_SITE to an ejected Wine site (gex-eject)';
+    if (!existsSync(join(site, 'project/build/web/nt.json'))) return `no project/build/web/nt.json in ${site}`;
+    const to = join(work, 'wine-site');
     rmSync(to, { recursive: true, force: true });
     symlinkSync(realpathSync(site), to);
     return null;
