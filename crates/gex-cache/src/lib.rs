@@ -25,16 +25,135 @@ use wasmtime::{Engine, Module};
 /// batch keys on which blocks it held and almost never recurs.
 const DEFAULT_BUDGET: u64 = 4 << 30;
 
-/// Sweeping means listing the directory and statting every entry (a
-/// shared cache holds hundreds of thousands), so it is not done on every
-/// store: the first store of a process sweeps, and later ones only when the
-/// size the last sweep found plus what this process stored since reaches the
-/// budget, or every this many stores (other processes store too).
-const STORES_BETWEEN_SWEEPS: u64 = 4096;
-static STORES: AtomicU64 = AtomicU64::new(0);
-/// The cache's size as of the last sweep plus this process's stores since,
-/// or `u64::MAX` before the first sweep.
-static ESTIMATE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The cache's running size lives in this file in the cache directory, so a
+/// store need not list the directory (a shared cache holds hundreds of
+/// thousands of entries, seconds to list and stat): each store adds its bytes,
+/// each eviction subtracts what it removed, and only a sweep walks. Its text is
+/// "<bytes> <unix seconds of the last walk>", rewritten in place under a lock.
+const LEDGER: &str = "size";
+
+/// Held (non-blocking) by the one sweep running against a cache directory.
+const SWEEP_LOCK: &str = "sweep.lock";
+
+/// How long a ledger is trusted before a sweep re-walks the directory to
+/// correct it: other gex builds share the directory and may store without
+/// adding, and two processes storing one key both add it.
+const RESYNC_AFTER: u64 = 3600;
+
+/// Entries an eviction removes between ledger updates, so a process that
+/// exits mid-eviction leaves a ledger that matches what it removed.
+const EVICT_BATCH: usize = 256;
+
+/// The directories this process has a sweep running against.
+static SWEEPING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ledger {
+    bytes: u64,
+    /// When a walk last set `bytes`; 0 for never (a ledger stores started).
+    walked: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Update the ledger under its lock with `f` (given `None` when it is absent
+/// or unreadable) and return what was written. `None` when the ledger cannot
+/// be opened or locked.
+fn ledger_update(dir: &Path, f: impl FnOnce(Option<Ledger>) -> Ledger) -> Option<Ledger> {
+    use std::io::{Read, Seek, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LEDGER))
+        .ok()?;
+    file.lock().ok()?;
+    let mut text = String::new();
+    let old = file.read_to_string(&mut text).ok().and_then(|_| {
+        let mut it = text.split_ascii_whitespace().map(str::parse::<u64>);
+        match (it.next(), it.next(), it.next()) {
+            (Some(Ok(bytes)), Some(Ok(walked)), None) => Some(Ledger { bytes, walked }),
+            _ => None,
+        }
+    });
+    let new = f(old);
+    let line = format!("{} {}\n", new.bytes, new.walked);
+    // Shorter or longer than before; a reader holds the lock, so it never
+    // sees the file between the truncate and the write.
+    let _ = file.set_len(0);
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = file.write_all(line.as_bytes());
+    Some(new)
+}
+
+/// Record `delta` bytes stored (positive) or removed (negative). An absent or
+/// unreadable ledger starts from the delta, marked never walked.
+fn ledger_add(dir: &Path, delta: i64) -> Option<Ledger> {
+    ledger_update(dir, |old| {
+        let old = old.unwrap_or(Ledger { bytes: 0, walked: 0 });
+        Ledger { bytes: old.bytes.saturating_add_signed(delta), walked: old.walked }
+    })
+}
+
+/// Whether a ledger calls for a sweep: over budget, never walked, or walked
+/// too long ago to trust.
+fn needs_sweep(ledger: Option<Ledger>, budget: u64) -> bool {
+    match ledger {
+        None => true,
+        Some(l) => l.bytes > budget || l.walked == 0 || now_secs().saturating_sub(l.walked) > RESYNC_AFTER,
+    }
+}
+
+/// After a store of `added` bytes: account for it, and when the ledger says
+/// so, start a sweep on a thread of its own (the store's caller is a guest
+/// waiting on its code). At most one sweep runs per process, and one per
+/// directory across processes. Returns the sweep's thread, for tests.
+fn account_store(dir: &Path, added: u64, budget: u64) -> Option<std::thread::JoinHandle<()>> {
+    let ledger = ledger_add(dir, added as i64);
+    if !needs_sweep(ledger, budget) {
+        return None;
+    }
+    let done = |dir: &Path| {
+        if let Ok(mut s) = SWEEPING.lock() {
+            s.retain(|d| d != dir);
+        }
+    };
+    {
+        let mut s = SWEEPING.lock().ok()?;
+        if s.iter().any(|d| d == dir) {
+            return None;
+        }
+        s.push(dir.to_path_buf());
+    }
+    let owned = dir.to_path_buf();
+    let spawned = std::thread::Builder::new().name("gex-cache-sweep".into()).spawn(move || {
+        sweep(&owned, budget);
+        done(&owned);
+    });
+    spawned.inspect_err(|_| done(dir)).ok()
+}
+
+/// Walk and evict, unless another process is sweeping this directory or one
+/// has just made the ledger good. Returns the size left, or `None` when
+/// nothing was done.
+fn sweep(dir: &Path, budget: u64) -> Option<u64> {
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(SWEEP_LOCK))
+        .ok()?;
+    lock.try_lock().ok()?;
+    if !needs_sweep(ledger_update(dir, |old| old.unwrap_or(Ledger { bytes: 0, walked: 0 })), budget) {
+        return None;
+    }
+    Some(evict(dir, budget))
+}
 
 fn budget() -> u64 {
     std::env::var("GEX_CACHE_MAX_BYTES")
@@ -50,14 +169,19 @@ fn budget() -> u64 {
 /// Evicts down to 80% of budget whenever the cache is above that, not only
 /// once it is over budget: a sweep that left it just under budget let the
 /// next store's estimate cross it again, so every store swept the whole
-/// directory. Returns the size left.
+/// directory. Sets the ledger to what the walk found (plus what other
+/// processes stored meanwhile) and subtracts each batch it removes. Returns
+/// the size left.
 fn evict(dir: &Path, budget: u64) -> u64 {
+    // What the ledger said before the walk: stores made during it (by any
+    // process) are what it says after, less this.
+    let before = ledger_update(dir, |old| old.unwrap_or(Ledger { bytes: 0, walked: 0 })).map_or(0, |l| l.bytes);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     // (mtime, key, bytes) for each entry, sized as module plus metadata.
     let mut items: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
-    let mut total = 0u64;
+    let mut walked = 0u64;
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("cwasm") {
@@ -73,21 +197,34 @@ fn evict(dir: &Path, budget: u64) -> u64 {
         let when = meta
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        total += wasm_len + meta_len;
+        walked += wasm_len + meta_len;
         items.push((when, key, wasm_len + meta_len));
     }
+    let mut total = ledger_update(dir, |old| Ledger {
+        bytes: walked.saturating_add(old.map_or(0, |l| l.bytes).saturating_sub(before)),
+        walked: now_secs(),
+    })
+    .map_or(walked, |l| l.bytes);
     let target = budget / 5 * 4;
     if total <= target {
         return total;
     }
     items.sort_by_key(|(when, _, _)| *when);
-    for (_, key, size) in items {
-        if total <= target {
+    let mut items = items.into_iter();
+    while total > target {
+        let mut removed = 0u64;
+        for (_, key, size) in items.by_ref().take(EVICT_BATCH) {
+            let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
+            let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+            removed += size;
+            if total.saturating_sub(removed) <= target {
+                break;
+            }
+        }
+        if removed == 0 {
             break;
         }
-        let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
-        let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
-        total = total.saturating_sub(size);
+        total = ledger_add(dir, -(removed as i64)).map_or(total.saturating_sub(removed), |l| l.bytes);
     }
     total
 }
@@ -270,6 +407,7 @@ pub fn load_or_compile(
                 // again. Failing to remove it is not worth reporting.
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(&meta_path);
+                ledger_add(dir, -((bytes.len() + metadata.len()) as i64));
             }
         }
     }
@@ -281,18 +419,7 @@ pub fn load_or_compile(
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
-        // Not on every store: the sweep lists the whole directory, and with a
-        // quarter of a million entries that is not free (a quarter of a
-        // translation-bound program's start, sweeping every 64th store).
-        let added = (metadata.len() + serialized.len()) as u64;
-        let n = STORES.fetch_add(1, Ordering::Relaxed);
-        let est = ESTIMATE.load(Ordering::Relaxed);
-        let budget = budget();
-        if est == u64::MAX || est.saturating_add(added) > budget || n % STORES_BETWEEN_SWEEPS == 0 {
-            ESTIMATE.store(evict(dir, budget), Ordering::Relaxed);
-        } else {
-            ESTIMATE.fetch_add(added, Ordering::Relaxed);
-        }
+        account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
     }
     Ok(Loaded {
         module,
@@ -870,6 +997,68 @@ mod budget_tests {
         let budget = 10 * 1025 + 512;
         let left = evict(&dir, budget);
         assert!(left <= budget / 5 * 4, "left {left} bytes, more than 80% of {budget}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stores keep the ledger without listing the directory; a sweep
+    /// corrects it to what is there and evicts in the background, leaving
+    /// the ledger equal to what it left.
+    #[test]
+    fn the_ledger_follows_stores_and_eviction() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let budget = 8 * 1025;
+        let read = |dir: &Path| ledger_update(dir, |old| old.unwrap()).unwrap();
+
+        // No ledger yet: the first store starts one, never walked, and so
+        // starts a sweep, which finds what is really there.
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("k{i}.cwasm")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("k{i}.meta")), b"m").unwrap();
+        }
+        account_store(&dir, 1025, budget).expect("a sweep").join().unwrap();
+        let l = read(&dir);
+        assert_eq!(l.bytes, 4 * 1025);
+        assert_ne!(l.walked, 0);
+
+        // Stores under budget only add.
+        for i in 4..8 {
+            std::fs::write(dir.join(format!("k{i}.cwasm")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("k{i}.meta")), b"m").unwrap();
+            assert!(account_store(&dir, 1025, budget).is_none(), "swept under budget");
+        }
+        assert_eq!(read(&dir).bytes, 8 * 1025);
+
+        // One more crosses the budget: a sweep takes it to 80%.
+        std::fs::write(dir.join("k8.cwasm"), vec![0u8; 1024]).unwrap();
+        std::fs::write(dir.join("k8.meta"), b"m").unwrap();
+        account_store(&dir, 1025, budget).expect("a sweep").join().unwrap();
+        let left = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("cwasm"))
+            .count() as u64;
+        assert_eq!(read(&dir).bytes, left * 1025);
+        assert!(left * 1025 <= budget / 5 * 4, "{left} entries left");
+
+        // A ledger a sweep cannot trust is corrected by the walk.
+        ledger_update(&dir, |_| Ledger { bytes: 1, walked: 1 });
+        assert_eq!(sweep(&dir, budget), Some(left * 1025));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sweep running in one process keeps another from starting one.
+    #[test]
+    fn one_sweep_at_a_time_per_directory() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-onesweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join(SWEEP_LOCK)).unwrap();
+        held.lock().unwrap();
+        assert_eq!(sweep(&dir, 1 << 20), None);
+        held.unlock().unwrap();
+        assert_eq!(sweep(&dir, 1 << 20), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
