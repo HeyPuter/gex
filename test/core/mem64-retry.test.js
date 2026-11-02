@@ -8,7 +8,7 @@
 // dropped connection would; on the Node host a site laid out as gex's whose
 // memory64 shim is linked in only after the first failure.
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180,
-  single: 'no memory64 in the single-thread package yet' };
+  single: "it drops the page's fetch of the memory64 shim, and the single-thread build fetches it in its system Worker" };
 
 const WANT = `first: No such file or directory
 again at once: No such file or directory

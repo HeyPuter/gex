@@ -6,8 +6,7 @@
 // memory64 shim deleted (the package image's pkg-no-m64), imported as a page
 // would; on the Node host, which runs the sources, a site laid out as gex's
 // without it.
-export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180,
-  single: 'no memory64 in the single-thread package yet' };
+export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180 };
 
 const WANT = `forked execve: No such file or directory
 its exit: 3

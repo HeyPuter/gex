@@ -22,8 +22,6 @@ import { frameOf } from './dgram-frames.mjs';
 /** The longest an exec waits for the other memory flavour's runtime. */
 const OTHER_WAIT_MS = 300_000;
 
-// Read when used, not at import: a Worker learns it from its first message.
-const m64 = () => !!globalThis.GEX_MEM64;
 /** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
  *  process with one Worker, and for one with threads. Room is only how soon
  *  a Worker must grow again: an index past a running Worker's table never
@@ -47,7 +45,7 @@ const RELAY_MIN_BYTES = 256 * 1024;
 // run options (worker.mjs's `run`), which an exec it adopts takes too.
 const EXEC_SWITCHES = ['link', 'dense', 'fjit', 'fjitMax', 'fjitOnly', 'liftMax', 'inlineDispatch', 'xlateReport', 'discoverSkip', 't1Fold', 'providers', 'xcache'];
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
-const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
+const addrVal = (w, v) => (w ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
  *  memory64 program's (64-bit Wine's memory64 flavour, GEX_MEMORY64, i64 at its
  *  imports), a Number from a 32-bit or lowered one's. As a Number, and for
@@ -227,7 +225,7 @@ export function packExports(bytes, extra, base) {
 const lebLen = (v) => { let n = 1; while (v >= 128) { v = Math.floor(v / 128); n++; } return n; };
 
 /** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
-const tIdx = (v) => (m64() ? BigInt(v) : v);
+const tIdx = (w, v) => (w ? BigInt(v) : v);
 
 /**
  * Decode UTF-8 out of guest memory.
@@ -816,8 +814,8 @@ const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 // patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END).
 const DISPATCH_DIR64 = 2 ** 32;
 const HIGH_TABLES_END = DISPATCH_DIR64 + 17 * 2 ** 20;
-const dispatchDir = () => (m64() ? DISPATCH_DIR64 : DISPATCH_DIR);
-const dispatchPages = () => (m64() ? LIMIT64_BYTES / 4096 : 0x80000);
+const dispatchDir = (w) => (w ? DISPATCH_DIR64 : DISPATCH_DIR);
+const dispatchPages = (w) => (w ? LIMIT64_BYTES / 4096 : 0x80000);
 const PAGES = GUEST_BYTES / 65536;
 /** GEX_MEM_MAX_MIB (a test switch): a new wasm32 process memory's maximum, in
  *  MiB, so a grow past it fails the way an engine out of memory fails one
@@ -1207,6 +1205,11 @@ export function vforkTrace(line) {
 }
 
 export class Gex {
+  /** Whether this process's memory is a 64-bit one (its addresses, table
+   *  indices and stack pointer i64): the start message says, and the
+   *  constructor is told. Per runtime, not a global: the single-thread
+   *  build's processes of both flavours share one realm. */
+  #wide = false;
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #d3d = false; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
@@ -1468,7 +1471,8 @@ export class Gex {
     });
   }
 
-  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null, modules = null, fiber = null } = {}) {
+  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null, modules = null, fiber = null, mem64 = !!globalThis.GEX_MEM64 } = {}) {
+    this.#wide = mem64;
     this.#fiber = fiber;
     this.#env = env;
     // Compiled modules this Worker was given before it had a process, kept
@@ -1481,7 +1485,7 @@ export class Gex {
     // memory, seeing the same guest and kernel. A new memory is a new process.
     this.#memory =
       memory ??
-      (m64()
+      (this.#wide
         ? new WebAssembly.Memory({ address: 'i64', initial: BigInt(INITIAL_PAGES), maximum: BigInt(LIMIT64_BYTES / 65536), shared })
         : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: memCapPages() ?? PAGES, shared }));
     this.#kernelSpec = kernel;
@@ -1508,7 +1512,7 @@ export class Gex {
       // memory: one memory, several instances (threads), so the same claim.
       if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && (isShared(this.#memory.buffer) || (SP_CODE && single.on))) {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
-        this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
+        this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, SHIM_STACK_TOP - k * 0x40000);
       }
       // A 32-bit Wine process says so before anything claims arena -- this stack is
       // the first claim: the 2 GiB split at its parent's line, or 32-bit Wine's
@@ -1576,7 +1580,7 @@ export class Gex {
     // A 64-bit memory counts its pages in BigInt, here as everywhere else.
     const pages = Math.ceil((end - have) / 65536);
     try {
-      this.#memory.grow(m64() ? BigInt(pages) : pages);
+      this.#memory.grow(this.#wide ? BigInt(pages) : pages);
     } catch (e) {
       // Said for what it is: the engine's RangeError names no process and no size.
       throw new Error(`gex: out of memory: this process's memory would not grow from ${(have / 1048576) | 0} to ${Math.ceil(end / 1048576)} MiB (${e?.message ?? e})`);
@@ -1744,7 +1748,7 @@ export class Gex {
   recycleMemory() {
     const e = this.#shim?.exports;
     const k = this.#kernel;
-    if (!e?.gex_image_runs || !k?.k_proc_zero || m64() || (SP_CODE && single.on)) return null;
+    if (!e?.gex_image_runs || !k?.k_proc_zero || this.#wide || (SP_CODE && single.on)) return null;
     if (!isShared(this.#memory.buffer)) return null;
     const size = this.#memory.buffer.byteLength;
     let cap = 4096;
@@ -1935,7 +1939,13 @@ export class Gex {
         // still fail (vfork.rs `exec_unrunnable`): asked for on first use, and
         // after a failed try, and waited for, then 1, or a negated errno. 1
         // where nothing says.
-        other_runtime: () => {
+        // The single-thread build has no gate: the exec waits for the host's
+        // promise on its own stack (`GEX_LOAD_OTHER`, host.mjs `#otherLoadFn`).
+        other_runtime: (SP_CODE && single.on) ? new WebAssembly.Suspending(() => {
+          const load = globalThis.GEX_LOAD_OTHER;
+          if (!load || this.#hardNested()) return 1;
+          return Promise.race([load(), new Promise((r) => setTimeout(() => r(-110), OTHER_WAIT_MS))]);
+        }) : () => {
           const g = globalThis.GEX_OTHER_GATE;
           if (!g || !globalThis.GEX_ASK_OTHER) return 1;
           // A last try that failed is asked again (the host says at once if
@@ -2030,17 +2040,17 @@ export class Gex {
         ftab_call: (SP_CODE && single.on)
           ? new WebAssembly.Suspending((idx, ctx, depth, need, ret) => {
             if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
-            const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+            const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
             return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
           })
           : (idx, ctx, depth, need, ret) => {
             if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
-            return this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret);
+            return this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0))(ctx, depth, need, ret);
           },
         // 32-bit Wine: ntdll.so's handler for a guest's Unix call (cgen.rs).
         ftab_call_vi: (idx, arg) => {
           if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
-          this.#cgen.ftab.get(tIdx(idx >>> 0))(arg);
+          this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0))(arg);
         },
         // 64-bit Wine: a unit's call to Wine's system or Unix call entry, run by
         // Wine's direct entry as the fault hook runs the `ud2` (cgen.rs
@@ -2074,7 +2084,7 @@ export class Gex {
         // (the single-thread build: the staged fault then).
         fault_call: (idx, ctx, code, addr, kind, sp) => {
           if ((SP_CODE && single.on)) return 0;
-          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
           try {
@@ -2093,7 +2103,7 @@ export class Gex {
         // build: the shim stages the frame then, `#signalTake`).
         signal_call: (idx, ctx, pc, sp) => {
           if (single.on) return 0;
-          const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+          const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
           try {
@@ -2229,8 +2239,8 @@ export class Gex {
     // split (wasmprog.rs `publish`), and a space taken here first would be
     // 32-bit Wine's.
     const wine = wine32ProgramFlags(elf);
-    if (wine && ((wine & 2) === 0 || m64() || globalThis.GEX_WINE32_SPLIT)) this.#windowsSpace = -1;
-    this.#wine64Split = (wine & 2) !== 0 && m64();
+    if (wine && ((wine & 2) === 0 || this.#wide || globalThis.GEX_WINE32_SPLIT)) this.#windowsSpace = -1;
+    this.#wine64Split = (wine & 2) !== 0 && this.#wide;
     // Not one whose header asks for Windows space: it runs translated code,
     // which the placement window serves.
     this.#noPlace = (wasmProgramFlags(elf) & 3) === 0 ? wasmProgramImage(elf) : null;
@@ -2249,7 +2259,7 @@ export class Gex {
     // First, before any call into the shim: `gex_worker_init` gives this Worker
     // its thread-local block, and until it runs `__tls_base` is zero, so a shim
     // function touching a thread-local writes through a null base.
-    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+    this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
     // An older shim loads but fails on the first call to something it lacks,
     // far from the mistake. Named here so the skew is a sentence, not a mystery.
     const required = [
@@ -2295,7 +2305,7 @@ export class Gex {
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
     // it into the shim's own region, above everything the guest maps.
-    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+    this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
     // Carried into every fork child's Worker (see the fork record's `opts`), so
     // a debugging switch set for the run holds for the processes it spawns --
     // the block trace of a child that crashes is otherwise silent.
@@ -2841,7 +2851,7 @@ export class Gex {
     // its process (`preattach`): the stack is the arena's first claim, and
     // how the arena is laid out is the process's (its start message's
     // `?winesplit=1`, which arrives after, and `#noPlace`).
-    if (stack) this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+    if (stack) this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -2909,7 +2919,7 @@ export class Gex {
     _at('start');
     if (this.#preattached) {
       this.#preattached = false;
-      this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+      this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
     } else await this.#instantiate(shimWasm, guestWasm, _at);
     // The devices this process has -- process-wide flags in shared memory, so
     // only a *process* sets them. A thread answering for itself would turn a
@@ -3019,7 +3029,7 @@ export class Gex {
     // `GEX_DEBUG_EXIT`, whose checksums read the bytes; not in a build whose
     // memories are not shared (the single-thread page), which transfers them.
     const k = this.#kernel;
-    const staging = !globalThis.GEX_DEBUG_EXIT && !m64() && !!k?.k_stage_take
+    const staging = !globalThis.GEX_DEBUG_EXIT && !this.#wide && !!k?.k_stage_take
       && isShared(this.#memory.buffer)
       && isShared(this.#kernelSpec?.memory?.buffer);
     this.#imageStage = 0;
@@ -3031,7 +3041,7 @@ export class Gex {
     // its own (module registry rows naming a module store it does not have).
     let runsCap = 0;
     let runsAt = 0;
-    const runsWasm = e.gex_image_runs && !m64()
+    const runsWasm = e.gex_image_runs && !this.#wide
       ? (start, end) => {
         for (;;) {
           if (!runsCap) {
@@ -3081,7 +3091,7 @@ export class Gex {
       return zeros;
     });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
-    if (m64()) out.push({ at: DISPATCH_DIR64, bytes: new Uint8Array(0), zeros: runs(DISPATCH_DIR64, HIGH_TABLES_END) });
+    if (this.#wide) out.push({ at: DISPATCH_DIR64, bytes: new Uint8Array(0), zeros: runs(DISPATCH_DIR64, HIGH_TABLES_END) });
     // The map read once, as the blob the child rebuilds its map from
     // (`#vmaBlob`), and the regions copied are that blob's: read a region at
     // a time (`gex_vma_count`, then `gex_vma_at`), other threads mapping and
@@ -3199,7 +3209,7 @@ export class Gex {
     _k('instantiate');
     await lazyReady();
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory), page_fs: (SP_CODE && single.on) ? pageFsSuspending(memory) : pageFs(memory) },
+      env: { memory, ...processMemories(this.#memory, this.#wide, spare), lazy_fetch: lazyFetch(memory), page_fs: (SP_CODE && single.on) ? pageFsSuspending(memory) : pageFs(memory) },
     });
     _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
@@ -4789,7 +4799,7 @@ export class Gex {
     }
     // A table64 beside a 64-bit memory: every module of such a process (units, translations,
     // providers) addresses its function table with i64.
-    const ftab = new WebAssembly.Table(m64() ? { element: 'anyfunc', address: 'i64', initial: 0n } : { element: 'anyfunc', initial: 0 });
+    const ftab = new WebAssembly.Table(this.#wide ? { element: 'anyfunc', address: 'i64', initial: 0n } : { element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
       const idx = e.gex_ftab_lookup(ctx, addr);
@@ -4819,7 +4829,7 @@ export class Gex {
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge, lookup, have: 0, instances: [ri], dyl: new Map(), dlTls: new Map(), gex, alt: null };
     this.#entryReset();
     this.#cgenGrow();
-    ftab.set(tIdx(1), e.gex_ftab_fallback);
+    ftab.set(tIdx(this.#wide, 1), e.gex_ftab_fallback);
     return this.#cgen;
   }
 
@@ -4840,7 +4850,7 @@ export class Gex {
       rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_alt_len() >>> 0)));
       this.#sharedModules.set('ftab-runtime-alt', rm);
     }
-    const alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, dir) : new WebAssembly.Global({ value: 'i32' }, Number(dir) | 0);
+    const alt_dir = this.#wide ? new WebAssembly.Global({ value: 'i64' }, dir) : new WebAssembly.Global({ value: 'i32' }, Number(dir) | 0);
     const ri = new WebAssembly.Instance(rm, { gex: { ...st.gex, alt_dir } });
     const bridge = logNamed('bridges') ? this.#countBridges(ri.exports.bridge) : ri.exports.bridge;
     st.instances.push(ri);
@@ -4860,7 +4870,7 @@ export class Gex {
       const want = size + this.#ftabSpare;
       const have = Number(st.ftab.length);
       if (have < want) {
-        st.ftab.grow(tIdx(want - have), st.resolve);
+        st.ftab.grow(tIdx(this.#wide, want - have), st.resolve);
         this.#tallyTables('ftab grew');
       }
       // Counted for the probe cache's indices at this length (cgen.rs
@@ -4926,11 +4936,11 @@ export class Gex {
     // winepe.wasm): built LP64 and lowered as its program was, so i64 globals and
     // stack pointer. A Worker installs its program before any PE module.
     // Not WoW64's i386 one (the process's other mode): wasm32 as built.
-    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64() && !e.gex_cgen_pmod_alt?.(prov);
-    const lowered = (libprov || progLowered || dllLowered) && !m64();
-    const w64 = m64() || lowered;
+    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !this.#wide && !e.gex_cgen_pmod_alt?.(prov);
+    const lowered = (libprov || progLowered || dllLowered) && !this.#wide;
+    const w64 = this.#wide || lowered;
     if (wasmprog) {
-      this.#wasmprogWide = m64() || progLowered;
+      this.#wasmprogWide = this.#wide || progLowered;
       // `entry_call` takes the cached global as it is: one of the other
       // width is made again here, as `#wasmprogStack` would.
       if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== this.#wasmprogWide) {
@@ -5029,9 +5039,9 @@ export class Gex {
         // and its shared libraries share it (one per thread, as natively).
         // (Wine's PE module of a twin install in a 64-bit memory's process,
         // winepe.wasm.m64: built for wasm64 and not lowered, so i64 too.)
-        __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered || (wasmdll && m64()) ? this.#providerStack64() : this.#providerStack())
+        __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered || (wasmdll && this.#wide) ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
-          : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+          : new WebAssembly.Global(this.#wide ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, this.#wide ? 0n : 0),
         // clang's three names for a C main, and WinMain: Wine's crt_main
         // references all of them weakly and a position-independent module (32-bit Wine's PE module)
         // keeps the undefined ones as imports. Null through `GOT.func`, as a
@@ -5068,7 +5078,7 @@ export class Gex {
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(addrNum(ptr), len) ?? 0,
           // A memory64 program's context address is an i64 (Wine's
           // gex_addr_t); the shim's export takes the i32 every context is.
-          ...(wasmprog && m64() ? { sysreg_write: (ctx, pc, reg, v) => this.#imports.sysreg_write(addrNum(ctx), pc, reg, v) } : {}),
+          ...(wasmprog && this.#wide ? { sysreg_write: (ctx, pc, reg, v) => this.#imports.sysreg_write(addrNum(ctx), pc, reg, v) } : {}),
           // Wine's Unix side runs the program's code nested
           // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
           // that never returns for a thread's loop), and reports each image
@@ -5183,7 +5193,7 @@ export class Gex {
       if (!packed) for (const [slot, name] of extra) {
         const f = inst.exports[name];
         if (!f) throw new Error(`wasm32 module ${prov}: ${name} is not exported`);
-        st.ftab.set(tIdx(slot), f);
+        st.ftab.set(tIdx(this.#wide, slot), f);
       }
       st.dyl.set(prov, inst);
       // Instantiated: the shim's copy of a library's bytes can go
@@ -5280,7 +5290,7 @@ export class Gex {
     this.#cgenInstall(x.u, x.base, true);
     if (timed) console.warn(`[unitstall] ${this.#whoFills()}: ${(performance.now() - t0).toFixed(1)} ms ${had ? 'had' : 'compiled'}`);
     // Its element segment filled every slot; those retired since go back.
-    if (x.retired) for (const r of x.retired) this.#cgen.ftab.set(tIdx(r), this.#cgen.resolve);
+    if (x.retired) for (const r of x.retired) this.#cgen.ftab.set(tIdx(this.#wide, r), this.#cgen.resolve);
   }
 
   /** A retired function-table slot of a deferred unit: kept so, when the
@@ -5570,7 +5580,7 @@ export class Gex {
       // a C longjmp).
       provider_try: (f, arg) => {
         try {
-          ftab.get(m64() ? BigInt(f) : f >>> 0)(arg);
+          ftab.get(this.#wide ? BigInt(f) : f >>> 0)(arg);
           e.gex_provider_note(0);
           return 0;
         } catch (err) {
@@ -5768,7 +5778,7 @@ export class Gex {
         }
       }
       else if (kind === 2) {
-        st.ftab.set(tIdx(v), st.resolve);
+        st.ftab.set(tIdx(this.#wide, v), st.resolve);
         if (this.#unitsDeferred.length) this.#unitRetired(v);
       }
       st.have++;
@@ -5845,11 +5855,11 @@ export class Gex {
     const spG = this.#wasmprogSp ?? this.#wasmprogStack();
     const prog = this.#snapProg?.()?.exports;
     const f = prog?.__gex_snap_resume64
-      ? new WebAssembly.Instance(entryFnSnapModule(m64(), typeof spG.value === 'bigint'), { e: {
+      ? new WebAssembly.Instance(entryFnSnapModule(this.#wide, typeof spG.value === 'bigint'), { e: {
         t: this.#cgen.ftab, sp: spG, d: (this.#snapDepth ??= new WebAssembly.Global({ value: 'i32', mutable: true }, 0)), st: prog.asyncify_get_state,
         af: (idx, ctx, rsp) => this.#snapStop(0, idx, ctx, rsp),
       } }).exports.entry
-      : new WebAssembly.Instance(entryFnModule(m64(), typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
+      : new WebAssembly.Instance(entryFnModule(this.#wide, typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
     this.#entryHook.set(0, f);
     return f(idx, ctx, sp);
   }
@@ -5876,7 +5886,7 @@ export class Gex {
 
   #wasmprogStack() {
     // i64 in a 64-bit memory's process and for a lowered (LP64) program
-    const wide = m64() || this.#wasmprogWide;
+    const wide = this.#wide || this.#wasmprogWide;
     if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== wide) this.#wasmprogSp = null;
     if (!this.#wasmprogSp) this.#entryReset();
     return (this.#wasmprogSp ??= new WebAssembly.Global(wide ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, wide ? 0n : 0));
@@ -5925,7 +5935,7 @@ export class Gex {
           if (x === undefined && from && f[5] && f[5] !== '-') {
             x = f[5][0] === 'g'
               ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(f[5].slice(1)) | 0)
-              : st.ftab.get(tIdx(Number(f[5])));
+              : st.ftab.get(tIdx(this.#wide, Number(f[5])));
           }
           if (x === undefined) throw new Error(`wasm32 module ${prov}: ${f[1]}.${f[2]}: ${f[4]} of module ${f[3]} is not instantiated in this Worker`);
           set(f[1], f[2], x);
@@ -5936,7 +5946,7 @@ export class Gex {
           // frame, which the single-thread build's fiber can suspend
           // through, as it cannot through a JS one.
           if (f[4]) { late.push([f[1], f[2], Number(f[3]), f[4]]); break; }
-          const slot = tIdx(Number(f[3])), t = st.ftab;
+          const slot = tIdx(this.#wide, Number(f[3])), t = st.ftab;
           set(f[1], f[2], (...a) => t.get(slot)(...a));
           break;
         }
@@ -5954,7 +5964,7 @@ export class Gex {
       }
     }
     if (late.length) {
-      const x = new WebAssembly.Instance(lateCalls(late, m64()), { e: { t: st.ftab } }).exports;
+      const x = new WebAssembly.Instance(lateCalls(late, this.#wide), { e: { t: st.ftab } }).exports;
       late.forEach(([m, name], i) => set(m, name, x[i]));
     }
     return extra;
@@ -5998,9 +6008,9 @@ export class Gex {
           // instantiated here (#wasmdllLate): a wasm thunk (cgen/wasmdll.rs
           // `late_thunks`) calls the slot once filled, and before that this,
           // which catches up first
-          const slot = tIdx(Number(f[3])), t = st.ftab, k = f[4];
+          const slot = tIdx(this.#wide, Number(f[3])), t = st.ftab, k = f[4];
           const ready = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
-          const filled = () => { const fn = t.get(slot); return fn && fn !== t.get(tIdx(0)) ? fn : null; };
+          const filled = () => { const fn = t.get(slot); return fn && fn !== t.get(tIdx(this.#wide, 0)) ? fn : null; };
           (st.lateReady ??= new Map()).set(Number(f[3]), [...(st.lateReady.get(Number(f[3])) ?? []), ready]);
           if (filled()) ready.value = 1;
           (late.s ??= {})[k] = (...a) => {
@@ -6057,9 +6067,9 @@ export class Gex {
       const [slot, importer, provider, name] = line.split('\t');
       const p = st.dyl.get(Number(provider));
       if (!p || !st.dyl.has(Number(importer))) continue;
-      const i = tIdx(Number(slot));
+      const i = tIdx(this.#wide, Number(slot));
       const had = st.ftab.get(i);
-      if (had && had !== st.ftab.get(tIdx(0))) continue;
+      if (had && had !== st.ftab.get(tIdx(this.#wide, 0))) continue;
       const f = p.exports[name];
       if (typeof f === 'function') {
         st.ftab.set(i, f);
@@ -6346,7 +6356,7 @@ export class Gex {
       P.asyncify_start_rewind(rec);
       this.#entryCallFn(idx, ctx, rsp);
     } else {
-      const f = this.#cgenStore().ftab.get(tIdx(idx));
+      const f = this.#cgenStore().ftab.get(tIdx(this.#wide, idx));
       const wide = e.gex_guest_x86_64?.() === 1;
       const addr = v.getBigUint64(b + 24, true);
       const spG = this.#wasmprogStack();
@@ -7025,7 +7035,7 @@ export class Gex {
    *  (`wide`) are read whole, and its addresses, which pass 4 GiB, are
    *  never put through 32-bit operators. */
   #doorRun(d, req, pid, tid, st, lp64) {
-    const wide = m64();
+    const wide = this.#wide;
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
@@ -7707,7 +7717,7 @@ export class Gex {
         if (crashed && !guestFault && this.#vfork.length && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
-          this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+          this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
           this.#progSpBack(psp);
           ({ pc, ctx } = this.#vforkLeave(err));
           continue;
@@ -7794,7 +7804,7 @@ export class Gex {
             const raw = BigInt(entered);
             const guest = raw < 0n ? raw + (1n << 64n) : raw;
             const page = Number(guest >> 12n);
-            const dir = new DataView(this.#memory.buffer).getUint32(dispatchDir() + page * 4, true);
+            const dir = new DataView(this.#memory.buffer).getUint32(dispatchDir(this.#wide) + page * 4, true);
             const tables = this.#dispatchTables();
             const packed = dir >>> 0;
             const idx = packed >>> 24;
@@ -7822,8 +7832,8 @@ export class Gex {
             let highTable = 0;
             const sample = [];
             const dv = new DataView(this.#memory.buffer);
-            for (let p = 0, n = dispatchPages(); p < n; p++) {
-              const v = dv.getUint32(dispatchDir() + p * 4, true) >>> 0;
+            for (let p = 0, n = dispatchPages(this.#wide); p < n; p++) {
+              const v = dv.getUint32(dispatchDir(this.#wide) + p * 4, true) >>> 0;
               if (v === 0) continue;
               const t = v >>> 24;
               const b = v & 0xffffff;
@@ -7865,7 +7875,7 @@ export class Gex {
         // that restore the shim's shadow-stack global, leaking a few dozen
         // bytes each. Nothing is live below here, so reset it exactly -- left
         // alone it slid into the guest's stack and overwrote saved registers.
-        this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+        this.#shim.exports.__stack_pointer.value = addrVal(this.#wide, this.#workerStack());
         this.#progSpBack(psp);
         const e = this.#shim.exports;
         // A trap that reached the run loop with a provider's guest call
@@ -8989,7 +8999,7 @@ export class Gex {
     } finally {
       e.gex_free?.(buf, 16);
     }
-    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    const f = this.#cgenStore().ftab.get(tIdx(this.#wide, hook));
     if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
     const rsp = this.#snapHooks ? this.#dv().getBigUint64(ctx + this.#ctxSp(), true) : 0n;
     const { spG, cur } = this.#hookStack(ctx);
@@ -9012,7 +9022,7 @@ export class Gex {
     const dv = new DataView(this.#memory.buffer);
     const pc = dv.getBigUint64(buf, true);
     const sp = dv.getBigUint64(buf + 8, true);
-    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    const f = this.#cgenStore().ftab.get(tIdx(this.#wide, hook));
     if (!f) throw new Error(`gex: the guest signal hook (function ${hook}) is not in this Worker's table`);
     const spG = this.#wasmprogSp ?? this.#wasmprogStack();
     const cur = this.#belowGuest(spG, sp);
@@ -9387,7 +9397,7 @@ export class Gex {
           what = f === stub ? `STUB at table ${t} slot ${sl} (len ${tabs[t]?.length})` : f === 'past-end' ? `PAST END table ${t} slot ${sl} len ${tabs[t]?.length}` : null;
         }
         const dv = new DataView(this.#memory.buffer);
-        const dir = dv.getUint32(dispatchDir() + Number(mpc >> 12n) * 4, true) >>> 0;
+        const dir = dv.getUint32(dispatchDir(this.#wide) + Number(mpc >> 12n) * 4, true) >>> 0;
         if (what) console.error(`[install-check] pid ${e.gex_my_pid?.() ?? '?'} miss pc 0x${mpc.toString(16)}: ${what}; dir entry t${dir >>> 24} s${dir & 0xffffff}, pt ${packed >= 0 ? `t${packed >>> 24} s${(packed & 0xffffff) - Number(mpc & 0xfffn)}` : '-'}`);
       } catch (err) { console.error(`[install-check] failed: ${err}`); }
     }
@@ -9533,7 +9543,7 @@ export class Gex {
     // has one, and then no module needs it.
     // Above 4 GiB in a wasm64 process: the global is address-typed.
     const altDir = BigInt(e.gex_alt_dir?.() ?? 0);
-    if (altDir) imports.alt_dir = m64() ? new WebAssembly.Global({ value: 'i64' }, altDir) : new WebAssembly.Global({ value: 'i32' }, Number(altDir) | 0);
+    if (altDir) imports.alt_dir = this.#wide ? new WebAssembly.Global({ value: 'i64' }, altDir) : new WebAssembly.Global({ value: 'i32' }, Number(altDir) | 0);
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {

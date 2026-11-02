@@ -473,6 +473,7 @@ export class ProcessHost {
       mem64: !!this.#extra?.mem64,
       pageFlavours: this.#pageFlavours(),
       otherGate: this.#otherGate?.buffer,
+      otherLoad: this.#otherLoadFn(),
     }));
   }
   #poolSeq = 0;
@@ -715,6 +716,16 @@ export class ProcessHost {
     });
     return p;
   }
+
+  /** The single-thread build's word on the other flavour's runtime, where
+   *  no shared gate can be: its fibers share this realm, so an exec that
+   *  needs the runtime calls this and waits for its promise (gex.mjs
+   *  `other_runtime`): 1 once it is here, -2 when it cannot be had now. */
+  #otherLoadFn() {
+    if (!(SP_CODE && single.on) || !this.#other || !this.#kernel) return undefined;
+    return (this.#otherLoadF ??= () => this.#loadOther().then((o) => (o ? 1 : -2), () => -2));
+  }
+  #otherLoadF = null;
 
   /** The gate's answer for the execs waiting on it (gex.mjs `other_runtime`). */
   #answerOther(s) {
@@ -1537,6 +1548,7 @@ export class ProcessHost {
             mem64: rt.mem64,
             pageFlavours: this.#pageFlavours(),
             otherGate: this.#otherGate?.buffer,
+            otherLoad: this.#otherLoadFn(),
             saveGate: this.#saveGate,
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all

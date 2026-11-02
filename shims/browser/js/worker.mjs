@@ -165,6 +165,8 @@ const life = { on: true };
 function otherGate(msg) {
   globalThis.GEX_OTHER_GATE = msg.otherGate ? new Int32Array(msg.otherGate) : undefined;
   globalThis.GEX_ASK_OTHER = msg.otherGate ? () => port.post({ kind: 'loadOther' }) : undefined;
+  // The single-thread build's, which has no shared gate (host.mjs `#otherLoadFn`).
+  globalThis.GEX_LOAD_OTHER = msg.otherLoad;
 }
 
 const port = {
@@ -404,12 +406,17 @@ async function handle(msg) {
     const mem64 = !!msg.mem64;
     // Either way: a Worker the pool took back may have run the other
     // flavour's process last (a 64-bit program's).
-    if (mem64) globalThis.GEX_MEM64 = 1;
-    else delete globalThis.GEX_MEM64;
+    // Not in the single-thread build, whose realm holds processes of both
+    // flavours and the page's own runtime: each Gex is told its own.
+    if (!(SP_CODE && single.on)) {
+      if (mem64) globalThis.GEX_MEM64 = 1;
+      else delete globalThis.GEX_MEM64;
+    }
     if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
     otherGate(msg);
     preattached = (async () => {
       const gex = new Gex(new Env(), {
+        mem64,
         kernel: { ...msg.kernel, stackTop: stack },
         shared,
         modules: pooled,
@@ -769,8 +776,10 @@ async function handle(msg) {
     globalThis.GEX_TRAP_STACK = 1;
   }
   // A 64-bit guest memory: the wasm64 shim's process.
-  if (msg.mem64) globalThis.GEX_MEM64 = 1;
-  else delete globalThis.GEX_MEM64;
+  if (!(SP_CODE && single.on)) {
+    if (msg.mem64) globalThis.GEX_MEM64 = 1;
+    else delete globalThis.GEX_MEM64;
+  }
   // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
   if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
   otherGate(msg);
@@ -819,7 +828,7 @@ async function handle(msg) {
       + `(shared ${pre.shared}/${!!msg.shared}, stack ${pre.stack}/${msg.kernelStack}, mem64 ${pre.mem64}/${!!msg.mem64}); a new one is made`);
   }
   // Back to the process's own type, should the pool's have been the other.
-  if (pre && pre.mem64 && !msg.mem64) delete globalThis.GEX_MEM64;
+  if (pre && pre.mem64 && !msg.mem64 && !(SP_CODE && single.on)) delete globalThis.GEX_MEM64;
   const gex = fits
     ? pre.gex
     : new Gex(new WorkerEnv(), {
@@ -833,6 +842,7 @@ async function handle(msg) {
       shared: !!msg.shared,
       modules: pooled,
       fiber: rawPort.fiber ?? null,
+      mem64: !!msg.mem64,
     });
   if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
   // Module-scope, so a `sharedModule` message (which arrives outside this

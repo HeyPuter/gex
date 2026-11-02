@@ -5,8 +5,7 @@
 import { System } from '../../web/runtime/src/index.js';
 import { Filesystem } from '../../web/runtime/src/fs.js';
 
-export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64'], timeout: 120,
-  single: "a memory64 program's children and recorded flavours are not followed yet" };
+export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64'], timeout: 120 };
 
 const WANT = `parent: 32
 asked: 64
