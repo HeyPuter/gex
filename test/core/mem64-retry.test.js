@@ -5,10 +5,10 @@
 // inside the backoff, with no second fetch), and, after the test makes the
 // runtime available, again after the backoff. In the browser the package
 // (web/runtime/build.sh), its first fetch of the memory64 shim failing as a
-// dropped connection would; on the Node host a site laid out as gex's whose
-// memory64 shim is linked in only after the first failure.
-export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180,
-  single: "it drops the page's fetch of the memory64 shim, and the single-thread build fetches it in its system Worker" };
+// dropped connection would (the test server's `/__t/drop`, which reaches the
+// single-thread build's system Worker too); on the Node host a site laid out
+// as gex's whose memory64 shim is linked in only after the first failure.
+export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64', 'package'], timeout: 180 };
 
 const WANT = `first: No such file or directory
 again at once: No such file or directory
@@ -22,15 +22,15 @@ export default async function (t) {
   const browser = typeof document !== 'undefined';
   let Filesystem;
   let sys;
-  let fetches = 0;
   let allow;
-  const realFetch = globalThis.fetch;
+  // The package's memory64 shim as the test server was asked for it, from
+  // here on: the first ask fails.
+  const asked = async () => Number(await (await fetch(`/__t/asked?${encodeURIComponent(`pkg/${M64}`)}`)).text());
+  let before = 0;
+  const fetches = async () => (await asked()) - before;
   if (browser) {
-    // The page's fetches of the memory64 shim: the first one fails.
-    globalThis.fetch = (url, ...rest) => {
-      if (String(url?.url ?? url).includes(M64) && fetches++ === 0) return Promise.reject(new TypeError('Failed to fetch (the test drops it)'));
-      return realFetch(url, ...rest);
-    };
+    before = await asked();
+    await fetch(`/__t/drop?${encodeURIComponent(`pkg/${M64}`)}`);
     allow = () => {};
     const pkg = t.work('pkg/');
     const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
@@ -67,7 +67,7 @@ export default async function (t) {
       }
     };
     await timeout(until('waiting\n'), 60000, 'the failed spawns');
-    if (browser) eq('one fetch while the backoff lasts', fetches, 1);
+    if (browser) eq('one fetch while the backoff lasts', await fetches(), 1);
     allow();
     const w = p.stdin.getWriter();
     await w.write(new TextEncoder().encode('go\n'));
@@ -75,9 +75,8 @@ export default async function (t) {
     const r = await timeout(p.exited, 30000, 'exit');
     eq('fails while the fetch fails, runs once it is had', out.trim(), WANT);
     eq('and exits 0', r.code, 0);
-    if (browser) eq('fetched again after the backoff', fetches, 2);
+    if (browser) eq('fetched again after the backoff', await fetches(), 2);
   } finally {
-    if (browser) globalThis.fetch = realFetch;
     await sys.shutdown();
   }
 }

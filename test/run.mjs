@@ -259,6 +259,8 @@ async function startBrowser() {
   const { createServer } = await import(join(WEB, 'node_modules/vite/dist/node/index.js'));
   const base = (await import(join(WEB, 'vite.config.js'))).default;
   const hits = new Map();
+  /** Name parts whose next request fails (`/__t/drop`). */
+  const drops = [];
   const server = await createServer({
     ...base,
     configFile: false,
@@ -307,9 +309,30 @@ async function startBrowser() {
             res.setHeader('Content-Type', 'application/json');
             return res.end(JSON.stringify(hits.get(decodeURIComponent(query)) ?? 0));
           }
+          // The work files asked for whose names hold a string, summed.
+          if (path === '/asked') {
+            const part = decodeURIComponent(query);
+            let n = 0;
+            for (const [k, v] of hits) if (k.includes(part)) n += v;
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify(n));
+          }
+          // The next request for a work file whose name holds a string fails,
+          // as a dropped connection would (503), wherever in the page's
+          // realms it is made.
+          if (path === '/drop') {
+            drops.push(decodeURIComponent(query));
+            return res.end('ok');
+          }
           if (!path.startsWith('/work/')) return next();
           const name = decodeURIComponent(path.slice(6));
           hits.set(name, (hits.get(name) ?? 0) + 1);
+          const drop = drops.findIndex((part) => name.includes(part));
+          if (drop >= 0) {
+            drops.splice(drop, 1);
+            res.statusCode = 503;
+            return res.end('dropped by the test');
+          }
           const f = join(WORK, name);
           if (!f.startsWith(WORK) || !existsSync(f) || !statSync(f).isFile()) return next();
           const all = readFileSync(f);
