@@ -6,7 +6,8 @@
 import { System } from '../../web/runtime/src/index.js';
 import { Filesystem } from '../../web/runtime/src/fs.js';
 
-export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
+// Longer in the single-thread build: one thread runs every process.
+export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300, singleTimeout: 600 };
 
 export default async function (t) {
   const { check, timeout } = t;

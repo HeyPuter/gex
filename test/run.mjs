@@ -55,7 +55,8 @@ if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--packa
 // source runs that build, and so must a package (--package, as
 // `web/runtime/build.sh --single` builds @gex/runtime-single). Browser only.
 // A test the single-thread build cannot run yet says why in its meta
-// (`single: 'why'`) and is skipped.
+// (`single: 'why'`) and is skipped; one that needs longer there says so
+// (`singleTimeout`, seconds, in place of `timeout`).
 if (o.single && o.host === 'node') throw new Error('--single: the browser host only');
 if (o.single && o.host === 'both') o.host = 'browser';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -182,7 +183,7 @@ async function runJob({ test, host, arch }) {
   const say = (line) => {
     if (o.verbose || /^FAIL/.test(line)) process.stderr.write(`${test.name} ${host} ${arch}: ${line}\n`);
   };
-  const r = await (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, test.meta.timeout * 1000);
+  const r = await (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, (o.single && test.meta.singleTimeout || test.meta.timeout) * 1000);
   return { ...out, ...r, ms: Date.now() - t0 };
 }
 
