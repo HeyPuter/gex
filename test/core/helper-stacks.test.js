@@ -36,7 +36,7 @@ self.onmessage = async (e) => {
       for (const shared of [true, false]) {
         pm = new WebAssembly.Memory({ initial: 256, maximum: 65535, shared });
         try {
-          k = (await WebAssembly.instantiate(m.module, { env: { memory: m.memory, ...processMemories(pm), lazy_fetch: lazyFetch(m.memory), page_fs: pageFs(m.memory) } })).exports;
+          k = (await WebAssembly.instantiate(m.module, { env: { memory: m.memory, ...processMemories(pm), lazy_fetch: lazyFetch(m.memory), block_io: () => -1, page_fs: pageFs(m.memory) } })).exports;
           break;
         } catch (err) { if (!shared) throw err; }
       }

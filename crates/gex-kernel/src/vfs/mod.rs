@@ -20,6 +20,7 @@ pub mod peimage;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
+pub mod blocks;
 pub mod tmpfs;
 
 pub use devfs::DevFs;

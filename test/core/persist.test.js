@@ -1,6 +1,6 @@
 // IdbPersist: the root's changes kept across a reload, and nothing else.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { IdbPersist } from '../../web/runtime/src/persist/idb.js';
 import { MemFs } from '../fixtures/memfs.js';
 
@@ -15,7 +15,7 @@ export default async function (t) {
     await new Promise((r, j) => { const q = indexedDB.deleteDatabase(DB); q.onsuccess = r; q.onerror = j; });
   }
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/etc/seeded': 'from the sources\n', '/etc/gone/a': 'a\n', '/etc/gone/b/c': 'c\n' });
   // A lazy file nobody writes: a snapshot must not fetch it.

@@ -23,6 +23,7 @@ import { Programs } from './programs.js';
 import { Changes } from './kpersist.js';
 import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../shims/browser/js/mode.mjs';
+import { serveSlots } from '../../../shims/browser/js/blocks.mjs';
 
 /** Whether this system is the single-thread build's (@gex/runtime-single:
  *  the kernel and every process in one Worker, kernel-single-worker.js): a
@@ -542,6 +543,8 @@ export class System extends EventTarget {
       watch: (m) => this.#event('watch', m),
       xWanted: () => this.#event('x-wanted', {}),
     });
+    // Where the files' contents go (fs.js), before any file is laid.
+    await this.#store(s, k, fsi?.store?.());
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
     if (records.length) await this.#files.restore(records);
     // The steps below are not waited for one by one: the kernel's Worker
@@ -797,6 +800,52 @@ export class System extends EventTarget {
       p[INTERNAL].failed(e);
     });
     return p;
+  }
+
+  /** The filesystem's store (fs.js `storeOf`) set up in the kernel: a
+   *  memory root's limit, or an OPFS store's block store, answered by the
+   *  page's store Worker (the default build) or the system Worker itself
+   *  (the single-thread build). The debug switch `blockscheck` sums every
+   *  block written and checks it read back (and reads every write back). */
+  async #store(s, k, st) {
+    if (!st) return;
+    if (st.kind === 'memory') {
+      if (st.max) await k.r('k_fs_limit', st.max % 0x100000000, Math.floor(st.max / 0x100000000));
+      return;
+    }
+    const check = !!this.#opts.debug.blockscheck;
+    const ctl = await k.r('k_blocks_config', 0, 0, 0, 0);
+    if (st.kind === 'page') {
+      // A page's own store (a Filesystem subclass), asked from here through
+      // the slots. Not in the single-thread build: a request there must
+      // suspend the calling stack, and the kernel reads files where it
+      // cannot (a program's pages faulted in).
+      if (SP_CODE && SINGLE) {
+        throw new Error(`${st.fs.constructor.name}: a store of the page's own needs the default build; the single-thread build keeps files in a MemoryFilesystem or an OPFSFilesystem`);
+      }
+      try {
+        await st.fs.open();
+        await st.fs.truncate(0);
+      } catch (e) {
+        throw new Error(`${st.fs.constructor.name}: the store would not open: ${e?.message ?? e}`);
+      }
+      this.#sys.onStop(serveSlots(s.kernel.memory, ctl >>> 0, st.fs));
+    } else if (SP_CODE && SINGLE) {
+      await k.ask('blocksOpen', { name: st.name, verify: check });
+    } else {
+      const w = new Worker(new URL('../../src/blocks-worker.js', import.meta.url), { type: 'module', name: 'gex-blocks' });
+      const ready = await new Promise((r) => {
+        w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
+        w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
+        w.postMessage({ memory: s.kernel.memory, ctl: ctl >>> 0, name: st.name, verify: check });
+      });
+      if (!ready.ok) {
+        w.terminate();
+        throw new Error(`OPFSFilesystem: the store ${st.name} would not open: ${ready.why}`);
+      }
+      this.#sys.onStop(() => w.terminate());
+    }
+    await k.r('k_blocks_config', st.block, st.cache, st.inline, check ? 1 : 0);
   }
 
   /** The lazy files' owner for boot's `layers` (see boot): its control

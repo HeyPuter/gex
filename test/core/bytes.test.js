@@ -3,7 +3,7 @@
 // (runtime.js `heldBytes`), and a second program still starts from the
 // host's compiled shim.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { heldBytes } from '../../web/src/runtime.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
@@ -11,7 +11,7 @@ export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 
 export default async function (t) {
   const { eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin' };

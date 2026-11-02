@@ -24,6 +24,13 @@ ok({ container: {}, onProgress: () => {}, wisp: 'ws://localhost:6001' });
 ok({ size: '800x600', env: ['A=1', 'B='], strace: 42, hostx: 'rootful', persist: { dir: '/home', db: 'x' }, debug: { cgen: 1 } });
 ok({ strace: true, persist: false, uid: 0, ready: 'manual', compositor: false, args: undefined, env: null });
 ok(Object.fromEntries(OPTIONS.map((k) => [k, undefined])));
+ok({ filesystem: 'memory' });
+ok({ filesystem: { kind: 'memory', max: 1 << 30 } });
+ok({ filesystem: { kind: 'opfs', name: 'debian-1', cache: 512 } });
+no({ filesystem: 'opfs' }, "start({ filesystem: \"opfs\" }): 'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
+no({ filesystem: { kind: 'opfs' } }, "{ kind: 'opfs', name, cache }");
+no({ filesystem: { kind: 'opfs', name: 'a/b' } }, "{ kind: 'opfs', name, cache }");
+no({ filesystem: { kind: 'opfs', name: 'a', cache: 8 } }, "{ kind: 'opfs', name, cache }");
 
 no({ contaner: {} }, 'did you mean container?');
 no({ onlog: () => {} }, 'did you mean onLog?');

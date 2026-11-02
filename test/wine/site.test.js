@@ -7,7 +7,7 @@
 // root kept by IdbPersist across a reload.
 
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { HostWindows } from '../../web/runtime/src/windows/host.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
 import { IdbPersist } from '../../web/runtime/src/persist/idb.js';
@@ -51,7 +51,7 @@ export default async function (t) {
     arch: 'x86',
     debug: t.debug(),
   });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   const tar = 'project/build/web/rootfs.tar';
   fs.addTar(at(packed(tar) ? `${tar}.zst` : tar));
   // The bundle's larger files, kept out of its tar (eject-site.mjs --pieces):

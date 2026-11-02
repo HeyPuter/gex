@@ -16,20 +16,20 @@ execve: No such file or directory`;
 export default async function (t) {
   const { eq, timeout } = t;
   const browser = typeof document !== 'undefined';
-  let Filesystem;
+  let MemoryFilesystem;
   let sys;
   if (browser) {
     // Not literals, which vite would try to resolve as its own.
     const pkg = t.work('pkg-no-m64/');
     const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
-    ({ Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`));
+    ({ MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`));
     sys = new System({ debug: t.debug() });
   } else {
     const { System } = await import('../../web/runtime/src/index.js');
-    ({ Filesystem } = await import('../../web/runtime/src/fs.js'));
+    ({ MemoryFilesystem } = await import('../../web/runtime/src/fs.js'));
     sys = new System({ baseUrl: `${t.work('no-m64')}/`, debug: t.debug() });
   }
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/g/miss': new URL(t.work('mem64-miss.x86')) }, { mode: 0o755 });
   await timeout(sys.boot(), 60000, 'boot');

@@ -8,10 +8,10 @@ argument.
 
 ```js
 import { System } from '@gex/runtime';
-import { Filesystem } from '@gex/runtime/fs';
+import { MemoryFilesystem } from '@gex/runtime/fs';
 
 const sys = new System();
-const fs = new Filesystem(sys);
+const fs = new MemoryFilesystem(sys);
 fs.addTar('/trees/base.tar.zst');
 await sys.boot();
 
@@ -45,13 +45,13 @@ debdemo builds one) runs apt as it comes, over the network below.
 
 ```js
 import { System } from '@gex/runtime';
-import { Filesystem } from '@gex/runtime/fs';
+import { OPFSFilesystem } from '@gex/runtime/fs';
 import { IdbPersist } from '@gex/runtime/persist/idb';
 import { Wisp } from '@gex/runtime/net/wisp';
 import { HostWindows } from '@gex/runtime/windows/host';
 
 const sys = new System({ xcache: true });              // translated code kept across loads
-const fs = new Filesystem(sys);
+const fs = new OPFSFilesystem(sys, { name: 'debian' }); // file data in the page's OPFS
 fs.addTar('/gex-trees/debian.tar.zst', { lazy: '/gex-trees/debian-lazy.json' });
 new IdbPersist(fs, { db: 'debian' });                  // the root, kept
 sys.network = new Wisp('wss://wisp.example/');        // connections out (see Network)
@@ -233,7 +233,84 @@ processes and memory.
 
 ## Filesystem
 
-One per system. Before boot, it is the tars and files a page adds, laid one
+One per system. `Filesystem` is abstract: it holds the tree, a cache of
+its files' contents in the system's memory, and the kernel's side of both.
+Where the contents are kept is the subclass the page makes:
+
+| Class | Keeps file contents |
+| --- | --- |
+| `new MemoryFilesystem(sys, { max })` | In the system's memory. `max` (bytes, optional): writes past it fail with `ENOSPC`; without it, as much as the memory holds. |
+| `new OPFSFilesystem(sys, { name, cache })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. Small files (16 KiB or less) stay in memory. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
+| A subclass of the page's own | Wherever its methods keep them (below). |
+
+`new Filesystem(sys)` throws. A store's contents are not kept across loads
+yet: the system empties the store when it boots.
+
+A store of the page's own is a subclass that implements the store's
+methods: one array of bytes, which the kernel reads and writes by offset in
+blocks of 64 KiB as its cache fills and empties, one call at a time. Its
+constructor takes `cache` as `OPFSFilesystem`'s does. It needs the default
+build: in the single-thread one (`@gex/runtime-single`) the boot rejects it,
+and the built-ins are the choice.
+
+| Method | Does |
+| --- | --- |
+| `open()` | Optional: make the store ready, before boot. |
+| `read(offset, length)` | A `Uint8Array` of `length` bytes at `offset`; shorter past the end, which reads as zeros. |
+| `write(offset, bytes)` | Writes them, growing the store. |
+| `size()`, `truncate(length)` | The store's length; set it (growing with zeros). |
+| `flush()` | Makes what was written durable. |
+
+Each is async. An error with `code: 'ENOSPC'` is a full store to the
+program that wrote; any other error is `EIO`.
+
+```js
+import { System } from '@gex/runtime';
+import { Filesystem } from '@gex/runtime/fs';
+
+const PIECE = 1 << 20;
+// The files' contents in 1 MiB pieces the page keeps (in a Map here).
+class PieceFilesystem extends Filesystem {
+  #pieces = new Map();
+  #size = 0;
+  #each(offset, length, fn) {
+    for (let at = 0; at < length;) {
+      const p = offset + at, n = Math.min(length - at, PIECE - (p % PIECE));
+      fn(Math.floor(p / PIECE), p % PIECE, at, n);
+      at += n;
+    }
+  }
+  async read(offset, length) {
+    const out = new Uint8Array(Math.max(0, Math.min(length, this.#size - offset)));
+    this.#each(offset, out.length, (i, o, at, n) => {
+      const piece = this.#pieces.get(i);
+      if (piece) out.set(piece.subarray(o, o + n), at);
+    });
+    return out;
+  }
+  async write(offset, bytes) {
+    this.#each(offset, bytes.length, (i, o, at, n) => {
+      if (!this.#pieces.has(i)) this.#pieces.set(i, new Uint8Array(PIECE));
+      this.#pieces.get(i).set(bytes.subarray(at, at + n), o);
+    });
+    this.#size = Math.max(this.#size, offset + bytes.length);
+  }
+  async size() { return this.#size; }
+  async truncate(length) {
+    for (const i of this.#pieces.keys()) if (i * PIECE >= length) this.#pieces.delete(i);
+    this.#pieces.get(Math.floor(length / PIECE))?.fill(0, length % PIECE);
+    this.#size = length;
+  }
+  async flush() {}
+}
+
+const sys = new System();
+const fs = new PieceFilesystem(sys, { cache: 16 });
+fs.addTar('/trees/base.tar.zst');
+await sys.boot();
+```
+
+Before boot, it is the tars and files a page adds, laid one
 over another in the order added (a later one wins). After boot, a tar or
 files are written into the running tree.
 

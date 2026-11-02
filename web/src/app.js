@@ -76,6 +76,10 @@ const PIECES = {
  *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
+ *   filesystem where the guest's files are kept: 'memory' (the default:
+ *              MemoryFilesystem, { kind: 'memory', max } with a limit) or
+ *              { kind: 'opfs', name, cache } (OPFSFilesystem, web/runtime
+ *              README "Filesystem")
  *   network    the guest's network: an object with connect(host, port) (web/runtime
  *              README "Network"); none by default
  *   wisp       a Wisp proxy's URL (ws:// or wss://), for a network over it
@@ -818,6 +822,7 @@ async function begin(opts, base, at, state, meter) {
   }
   const run = runProgram(term, {
     network,
+    filesystem: opts.filesystem ?? b.filesystem ?? 'memory',
     elf: exeBytes,
     files,
     dirs: tree.dirs,
@@ -1036,6 +1041,7 @@ function withStart(b, st) {
   }
   if (st.trapstack) out.switches.trapstack = '1';
   if (st.persist !== undefined) out.persist = st.persist || null;
+  if (st.filesystem) out.filesystem = st.filesystem;
   if (st.ready) out.ready = st.ready;
   // "rootful": the X server is one fullscreen window the X session's own
   // window manager runs in, rather than a window per X window.

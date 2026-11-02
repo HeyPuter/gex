@@ -3,7 +3,7 @@
 // the process's output (node). Programs run with pipes and on a terminal, a
 // pipeline ends, a program is killed. A program that crashes is still said.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
@@ -20,7 +20,7 @@ export default async function (t) {
   };
   // t.debug(): only what the run needs (vite's Workers, the arch); no `log`.
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };

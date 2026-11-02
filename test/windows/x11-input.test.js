@@ -2,7 +2,7 @@
 // manager's selection bridge) and a game's pointer grab (hidden cursor and
 // warps), which Xwayland turns into a locked pointer and relative motion.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { HostWindows } from '../../web/runtime/src/windows/host.js';
 import { Clipboard, PointerLock } from '../../web/runtime/src/input.js';
 
@@ -14,7 +14,7 @@ export default async function (t) {
   const { check, eq, timeout, until, lines, input, click } = t;
   const move = (x, y) => input({ method: 'Input.dispatchMouseEvent', type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
   const desk = document.getElementById('desk');

@@ -444,7 +444,7 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                without wineboot, from a recording made with WINEGEX_RECORD_HARDWARE=1 (\"run\": \
                Wine's); see crates/gex-eject/README.md, \"Wineboot\". \
                \"start\": defaults for the app library's start() \
-               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
+               (args, env, cwd, size, mtimes, strace, trapstack, persist, filesystem, ready), over the \
                recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
         ),
         (

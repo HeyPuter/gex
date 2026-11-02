@@ -423,6 +423,8 @@ async function runPage(test, arch, say, timeout) {
   await cdp.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
   const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}), ...(PACKAGE ? { pkg: 1 } : {}) });
+  // GEX_TEST_QUERY: more of the page's query (a measurement's switches).
+  for (const [k, v] of new URLSearchParams(process.env.GEX_TEST_QUERY ?? '')) q.set(k, v);
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url: `http://127.0.0.1:${o.port}/__t/page?${q}` }, sessionId);
   let shown = 0;

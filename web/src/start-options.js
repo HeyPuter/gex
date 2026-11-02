@@ -5,7 +5,7 @@
 
 /** Every option `start` reads (app.js lists what each is). */
 export const OPTIONS = [
-  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'persist', 'network', 'wisp',
+  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'persist', 'filesystem', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
   'glLazy', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'ready',
 ];
@@ -50,8 +50,23 @@ export function checkOptions(opts) {
   if (given('network') && typeof opts.network?.connect !== 'function') bad('network', 'an object with connect(host, port)');
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
   if (given('persist') && opts.persist !== false && !(typeof opts.persist === 'object' && typeof opts.persist.dir === 'string')) bad('persist', 'false, or {dir, db}');
+  if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
   for (const k of ['onLog', 'onExit', 'onProgress']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');
   for (const k of ['debug', 'pageHosts']) if (given(k) && typeof opts[k] !== 'object') bad(k, 'an object, {name: value}');
+}
+
+/** Where the guest's files are kept: `'memory'` (`MemoryFilesystem`),
+ *  `{ kind: 'memory', max }`, or `{ kind: 'opfs', name, cache }`
+ *  (`OPFSFilesystem`), as `{ kind, ... }`; null if it is not one. */
+export function filesystemValue(f) {
+  if (f === 'memory') return { kind: 'memory' };
+  if (typeof f !== 'object' || f === null) return null;
+  if (f.kind === 'memory') return (f.max === undefined || (Number.isSafeInteger(f.max) && f.max > 0)) ? f : null;
+  if (f.kind === 'opfs') {
+    return typeof f.name === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(f.name)
+      && (f.cache === undefined || (Number.isInteger(f.cache) && f.cache >= 16 && f.cache <= 4096)) ? f : null;
+  }
+  return null;
 }
 
 /** A value for an error message, short. */

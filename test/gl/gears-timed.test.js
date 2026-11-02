@@ -2,7 +2,7 @@
 // Mesa on WebGPU, after 30 to warm up, as `times` (ms for the 600, and frames
 // per second). A timed test: bench.sh only (`--timed`), on the GPU.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
 
@@ -13,7 +13,7 @@ export default async function (t) {
   const tar = `gl-probes-${t.arch === 'x86' ? 'x86' : 'a64'}.tar`;
   if (!(await fetch(t.work(tar), { method: 'HEAD' })).ok) return t.skip(`no ${tar} (fixtures/images.mjs)`);
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  new Filesystem(sys).addTar(t.work(tar));
+  new MemoryFilesystem(sys).addTar(t.work(tar));
   new CompositorWindows(sys, { canvas: document.getElementById('out') });
   const gl = new MesaGl(sys);
   await t.timeout(sys.boot(), 60000, 'boot');

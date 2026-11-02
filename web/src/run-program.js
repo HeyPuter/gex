@@ -9,7 +9,8 @@
 // system's preset hooks (system.js `#preset`).
 
 import { System } from '../runtime/src/system.js';
-import { Filesystem } from '../runtime/src/fs.js';
+import { MemoryFilesystem, OPFSFilesystem } from '../runtime/src/fs.js';
+import { filesystemValue } from './start-options.js';
 import { CompositorWindows } from '../runtime/src/windows/compositor.js';
 import { SingleCanvas } from '../runtime/src/windows/single.js';
 import { MesaGl } from '../runtime/src/gl.js';
@@ -30,6 +31,9 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  *                       the bundle (tar.js `untar`'s parts, lazy files
  *                       `[path, size, url, head]`)
  *   env, cwd, uid       the program's; env empty is Debian's for root
+ *   filesystem          'memory' (the default) or start-options.js
+ *                       `filesystemValue`'s { kind, ... }: the runtime's
+ *                       MemoryFilesystem or OPFSFilesystem
  *   tty                 a terminal (default) or pipes
  *   wl, wlScale         a canvas (the scene compositor) or an element (the
  *                       windows laid out in it, bare-desktop.js)
@@ -52,7 +56,7 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  */
 export async function runPreset(term, {
   elf, args, files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes, xattrs,
-  env = [], cwd = '/', uid, tty = true,
+  env = [], cwd = '/', uid, tty = true, filesystem = 'memory',
   wl = null, wlScale = 1, onDesktop = null, hostX = false,
   gl = null, glLazy = false, glSource = null, glBackend, d3d = false,
   network = null, onNetEvent = null, playAudio = true, onFilesLoaded = null, onSystem = null,
@@ -109,7 +113,9 @@ export async function runPreset(term, {
   if (playAudio) i.preset.onMessage.push((m) => { if (m.kind === 'audio') audioFrom(m); });
   if (onNetEvent) i.preset.onMessage.push((m) => { if (m.kind === 'net') onNetEvent(m.event); });
 
-  const fs = new Filesystem(sys);
+  const where = filesystemValue(filesystem);
+  if (!where) throw new TypeError(`runProgram: filesystem is 'memory', { kind: 'memory', max } or { kind: 'opfs', name, cache }`);
+  const fs = where.kind === 'opfs' ? new OPFSFilesystem(sys, where) : new MemoryFilesystem(sys, where);
   const image = { ...files };
   const imageModes = { ...modes };
   if (!named) {

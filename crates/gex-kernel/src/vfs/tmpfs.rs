@@ -15,6 +15,10 @@ use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuar
 /// buffer that grew geometrically keeps the larger allocation whatever its
 /// length says. For the memory census.
 pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The most file contents may take in this memory ([`TMPFS_BYTES`]), 0 for
+/// no limit: past it a write that needs more room is ENOSPC (the page's
+/// `MemoryFilesystem({ max })`).
+pub static TMPFS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The directory a page keeps (its persist store's root, `watch`), without
 /// its leading `/`, and how many times the program has finished a change
@@ -125,6 +129,10 @@ static READ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
+    /// The contents as blocks in the host's store (`super::blocks`), once
+    /// the file is past what stays inline while the store is on; `data` is
+    /// then empty.
+    pg: Mutex<Option<super::blocks::PFile>>,
     /// Contents fetched on demand (`TmpFs::add_lazy`); `None` once the file
     /// is an ordinary one (never, or since a write made it one).
     lazy: Mutex<Option<Lazy>>,
@@ -162,9 +170,32 @@ pub struct FileNode {
     gone_mode: core::sync::atomic::AtomicU32,
 }
 
+/// A file's contents go with its last name and descriptor: their room is
+/// free again ([`TMPFS_BYTES`], which a max is measured against).
+impl Drop for FileNode {
+    fn drop(&mut self) {
+        if let Ok(d) = self.data.get_mut() {
+            note_capacity(d.capacity(), 0);
+        }
+        if let Ok(Some(l)) = self.lazy.get_mut() {
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl FileNode {
-    fn new(data: Vec<u8>, ino: u64) -> FileNode {
+    fn new(mut data: Vec<u8>, ino: u64) -> FileNode {
+        let pg = super::blocks::wants(data.len() as u64).then(|| {
+            let mut p = super::blocks::PFile::new();
+            if !data.is_empty() {
+                let _ = p.write(0, &data);
+                data = Vec::new();
+            }
+            p
+        });
+        note_capacity(0, data.capacity());
         FileNode {
+            pg: Mutex::new(pg),
             data: Mutex::new(data),
             lazy: Mutex::new(None),
             ino,
@@ -175,6 +206,23 @@ impl FileNode {
             changes: core::sync::atomic::AtomicU64::new(1),
             gone_mode: core::sync::atomic::AtomicU32::new(0o644),
         }
+    }
+    /// The store's contents, made from `data` first when the file is to be
+    /// `end` bytes long and that is past what stays inline (blocks.rs).
+    fn paged_for(&self, end: u64) -> std::sync::MutexGuard<'_, Option<super::blocks::PFile>> {
+        let mut pg = self.pg.lock().unwrap();
+        if pg.is_none() && super::blocks::wants(end) {
+            let mut data = self.data.lock().unwrap();
+            let mut p = super::blocks::PFile::new();
+            if !data.is_empty() && p.write(0, &data).is_err() {
+                return pg;
+            }
+            let was = data.capacity();
+            *data = Vec::new();
+            note_capacity(was, 0);
+            *pg = Some(p);
+        }
+        pg
     }
     /// One more change of the contents; called with `data` locked (the
     /// count's reader pairs with this through that lock: [`FileNode::changes`]).
@@ -237,6 +285,9 @@ impl FileNode {
         if let Some(l) = self.lazy.lock().unwrap().as_ref() {
             return l.size;
         }
+        if let Some(p) = self.pg.lock().unwrap().as_ref() {
+            return p.size;
+        }
         self.data.lock().unwrap().len() as u64
     }
 
@@ -253,7 +304,21 @@ impl FileNode {
         if lazy.is_some() {
             return;
         }
+        let mut pg = self.pg.lock().unwrap();
         let mut data = self.data.lock().unwrap();
+        if let Some(p) = pg.as_mut() {
+            if p.size == 0 || p.size >= size {
+                return;
+            }
+            let mut all = vec![0u8; p.size as usize];
+            if p.read(0, &mut all).is_err() {
+                return;
+            }
+            let was = data.capacity();
+            *data = all;
+            note_capacity(was, data.capacity());
+            *pg = None;
+        }
         let have = data.len() as u64;
         let last = size % LAZY_CHUNK;
         let head = if have % LAZY_CHUNK == 0 {
@@ -292,6 +357,13 @@ impl FileNode {
         let Some(l) = lazy.as_mut() else { return Ok(()) };
         let mut all = vec![0u8; l.size as usize];
         l.read(0, &mut all)?;
+        if let Some(p) = self.paged_for(l.size).as_mut() {
+            p.truncate(0)?;
+            p.write(0, &all)?;
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+            *lazy = None;
+            return Ok(());
+        }
         let mut data = self.data.lock().unwrap();
         let was = data.capacity();
         *data = all;
@@ -920,6 +992,9 @@ impl TmpFs {
             Some(Node::File(f)) => Arc::clone(f),
             _ => return Err(Errno::ENOENT),
         };
+        if let Some(p) = f.paged_for(offset + bytes.len() as u64).as_mut() {
+            return p.write(offset, bytes).map(|_| ());
+        }
         let mut data = f.data.lock().unwrap();
         let start = offset as usize;
         let end = start + bytes.len();
@@ -1312,6 +1387,9 @@ impl FileHandle for TmpHandle {
         if let Some(l) = file.lazy.lock().unwrap().as_mut() {
             return l.read(offset, buf);
         }
+        if let Some(p) = file.pg.lock().unwrap().as_mut() {
+            return p.read(offset, buf);
+        }
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
@@ -1325,7 +1403,7 @@ impl FileHandle for TmpHandle {
 
     fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
         let file = self.file.as_ref()?;
-        if file.lazy.lock().unwrap().is_some() {
+        if file.lazy.lock().unwrap().is_some() || file.pg.lock().unwrap().is_some() {
             return None;
         }
         file.mark_read();
@@ -1353,6 +1431,18 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EISDIR);
         };
         file.materialize()?;
+        // Held through the inline write too: a file that crosses the
+        // threshold meanwhile moves only after this write.
+        let mut pg = file.paged_for(offset + buf.len() as u64);
+        if let Some(p) = pg.as_mut() {
+            p.write(offset, buf)?;
+            file.changed();
+            drop(pg);
+            file.touch();
+            self.note_write();
+            self.note_here(crate::inotify::mask::MODIFY);
+            return Ok(buf.len() as u64);
+        }
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
         if start + buf.len() > data.len() {
@@ -1364,6 +1454,7 @@ impl FileHandle for TmpHandle {
         data[start..start + buf.len()].copy_from_slice(buf);
         file.changed();
         drop(data);
+        drop(pg);
         file.touch();
         self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
@@ -1514,7 +1605,11 @@ impl FileHandle for TmpHandle {
         };
         file.materialize()?;
         self.note_write();
-        {
+        let mut pg = file.paged_for(len);
+        if let Some(p) = pg.as_mut() {
+            p.truncate(len)?;
+            file.changed();
+        } else {
             let mut data = file.data.lock().unwrap();
             let was = data.capacity();
             reserve(&mut data, len as usize)?;
@@ -1616,7 +1711,10 @@ impl TmpFs {
                             if let Some(l) = f.lazy.lock().unwrap().take() {
                                 TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
                             }
-                            {
+                            if let Some(p) = f.pg.lock().unwrap().as_mut() {
+                                let _ = p.truncate(0);
+                                f.changed();
+                            } else {
                                 let mut data = f.data.lock().unwrap();
                                 let was = data.capacity();
                                 data.clear();
@@ -1954,6 +2052,19 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
     let more = len.saturating_sub(data.len());
     if more == 0 || data.capacity() >= len {
         return Ok(());
+    }
+    let max = TMPFS_MAX.load(core::sync::atomic::Ordering::Relaxed);
+    if max != 0 {
+        // Under a max, the doubling only while it fits; then exactly `len`.
+        let held = TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed);
+        let doubled = len.max(data.capacity().saturating_mul(2));
+        if held + (doubled - data.capacity()) as u64 <= max {
+            return data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC);
+        }
+        if held + (len - data.capacity()) as u64 > max {
+            return Err(Errno::ENOSPC);
+        }
+        return data.try_reserve_exact(more).map_err(|_| Errno::ENOSPC);
     }
     data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC)
 }

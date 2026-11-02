@@ -697,7 +697,7 @@ function wine32Site() {
     else if (rel === 'project/build/web/rest.bin') restBytes = statSync(p).size;
     else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
   });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes, ...(restBytes ? { rest: restBytes } : {}) } : null, cold: cold || null }, null, 1));
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'wine32', filesystem: wine32.start?.filesystem ?? 'memory', features_off: wine32.features_off, units: wine32.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes, ...(restBytes ? { rest: restBytes } : {}) } : null, cold: cold || null }, null, 1));
   console.log(`${out}: wine32 build ${build}; features off: ${wine32.features_off.join(', ') || 'none'}; ${wine32.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand${restBytes ? `; the rest bundle ${mb(restBytes)} MB` : ''})` : ''));
 }

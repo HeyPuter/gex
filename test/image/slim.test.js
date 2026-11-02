@@ -2,7 +2,7 @@
 // repository): boot it, apt install from the repository mounted from the
 // page, reload, and the package is still installed (IdbPersist).
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { IdbPersist } from '../../web/runtime/src/persist/idb.js';
 import { HttpFs } from '../fixtures/httpfs.js';
 
@@ -19,7 +19,7 @@ export default async function (t) {
   if (!list) return say('skipped: no image (RT_SLIM)');
   if (phase === 1) await new Promise((r, j) => { const q = indexedDB.deleteDatabase(DB); q.onsuccess = r; q.onerror = j; });
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   let start = performance.now();
   fs.addTar(t.work('slim/debian-slim.tar.zst'));
   fs.mount('/mnt/repo', new HttpFs(t.work('slim/repo'), list));

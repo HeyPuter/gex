@@ -399,7 +399,7 @@ path.
 What changes the build's output (its wasm, its bundle, what ships) is
 `user/eject.json`, at build time. Everything else is a `start()` option,
 whose default the build records: user/eject.json `"start"` (`args`, `env`,
-`cwd`, `size`, `mtimes`, `strace`, `trapstack`, `persist`, `ready`) over the
+`cwd`, `size`, `mtimes`, `strace`, `trapstack`, `persist`, `filesystem`, `ready`) over the
 recording's, and the page's options over both. A `"start"` key for a build
 setting (`"compositor"`, say) fails the build and says where it goes.
 

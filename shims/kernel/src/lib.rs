@@ -2599,6 +2599,65 @@ fn fetch_lazy(url: &str, offset: u64, into: &mut [u8]) -> bool {
     n >= 0 && n as usize == into.len()
 }
 
+// -- file contents in the page's block store (gex_kernel::vfs::blocks) ------
+//
+// The host's reads and writes of the one store file go through `block_io`
+// (shims/browser/js/blocks.mjs): a realm holding the store's handle (the
+// single-thread build's system Worker) does them itself; any other asks the
+// page's store Worker through the slots in `BLOCKS_CTL` and waits.
+
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// `op` (gex_kernel::vfs::blocks OP_*) at `offset` of the store file,
+    /// on the `len` bytes at `dst`; `ctl` is `BLOCKS_CTL`'s address.
+    /// Returns `len` when done, negative when not.
+    fn block_io(op: u32, ctl: u32, offset: u64, dst: u32, len: u32) -> i32;
+}
+
+static BLOCKS_CTL: [core::sync::atomic::AtomicI32; 1024] = [const { core::sync::atomic::AtomicI32::new(0) }; 1024];
+
+fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> bool {
+    // SAFETY: the buffer is in this module's memory and stays borrowed for
+    // the call only.
+    let n = unsafe { block_io(op, BLOCKS_CTL.as_ptr() as u32, offset, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    n >= 0 && n as usize == buf.len()
+}
+
+/// Turn the block store on for files made from now on (`block` 0: only
+/// the slots' address): blocks of `block` bytes, `cache_mib` MiB of them
+/// held here, files up to `inline` bytes kept in this memory; `flags` bit 0
+/// checks every block read back against what was written (debugging).
+/// Returns the store's slots' address (`BLOCKS_CTL`).
+#[no_mangle]
+pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags: u32) -> u32 {
+    gex_kernel::vfs::blocks::set_io(blocks_io);
+    if block != 0 {
+        gex_kernel::vfs::blocks::set_check(flags & 1 != 0);
+        gex_kernel::vfs::blocks::configure(block, (cache_mib as u64) << 20, inline as u64);
+    }
+    BLOCKS_CTL.as_ptr() as u32
+}
+
+/// The store's counters (`gex_kernel::vfs::blocks::stats`), u64s.
+#[no_mangle]
+pub extern "C" fn k_blocks_stats(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let s = gex_kernel::vfs::blocks::stats();
+    let b: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if (b.len() as u32) > cap {
+        return -34;
+    }
+    unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    b.len() as i32
+}
+
+/// The most the root's file contents may take in this memory, in bytes (0:
+/// no limit): a write past it is ENOSPC (`MemoryFilesystem({ max })`).
+#[no_mangle]
+pub extern "C" fn k_fs_limit(lo: u32, hi: u32) -> i32 {
+    gex_kernel::vfs::tmpfs::TMPFS_MAX.store(((hi as u64) << 32) | lo as u64, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 /// The root every process sees.
 fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     note_panics();

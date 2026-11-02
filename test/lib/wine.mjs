@@ -4,7 +4,7 @@
 // program into C:\ and runs it with Wine: `{ code, stdout, stderr }`, the
 // output's line ends Unix ones.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 
@@ -15,7 +15,7 @@ export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
  *  graphics driver; WoW64's default). */
 export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {} } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
   fs.addTar(t.work('win-progs.tar'), { at: '/progs' });
   const more = parts?.(sys, fs);

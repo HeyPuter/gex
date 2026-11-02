@@ -2,7 +2,7 @@
 // a probe: bash's /dev/udp (a connected socket, a write, a read), and its
 // /dev/tcp beside it, against a network in the page that echoes.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 180 };
 
@@ -20,7 +20,7 @@ function echo(host, port) {
 export default async function (t) {
   const { eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('slim/debian-slim.tar.zst'));
   const asked = [];
   sys.network = {

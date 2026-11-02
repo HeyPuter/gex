@@ -20,7 +20,7 @@ const M64 = 'gex_browser.x86.m64.shared';
 export default async function (t) {
   const { eq, timeout } = t;
   const browser = typeof document !== 'undefined';
-  let Filesystem;
+  let MemoryFilesystem;
   let sys;
   let allow;
   // The package's memory64 shim as the test server was asked for it, from
@@ -34,7 +34,7 @@ export default async function (t) {
     allow = () => {};
     const pkg = t.work('pkg/');
     const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
-    ({ Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`));
+    ({ MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`));
     sys = new System({ debug: t.debug() });
   } else {
     const { join } = await import('node:path');
@@ -47,11 +47,11 @@ export default async function (t) {
     for (const f of readdirSync(pub)) if (!m64.includes(f)) symlinkSync(join(pub, f), join(site, 'gex', f));
     allow = () => { for (const f of m64) symlinkSync(join(pub, f), join(site, 'gex', f)); };
     const { System } = await import('../../web/runtime/src/index.js');
-    ({ Filesystem } = await import('../../web/runtime/src/fs.js'));
+    ({ MemoryFilesystem } = await import('../../web/runtime/src/fs.js'));
     sys = new System({ baseUrl: `${pathToFileURL(site).href}/`, debug: t.debug() });
   }
   try {
-    const fs = new Filesystem(sys);
+    const fs = new MemoryFilesystem(sys);
     fs.addTar(t.work('bb.tar.zst'));
     fs.addFiles({ '/g/retry': new URL(t.work('mem64-retry.x86')) }, { mode: 0o755 });
     await timeout(sys.boot(), 60000, 'boot');

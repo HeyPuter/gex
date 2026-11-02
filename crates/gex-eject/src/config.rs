@@ -177,7 +177,7 @@ pub struct Config {
 }
 
 /// `"start"`'s settings: app.js `start()` options a build may default.
-pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "persist", "ready"];
+pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "persist", "filesystem", "ready"];
 
 impl Default for Config {
     fn default() -> Self {

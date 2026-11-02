@@ -2,14 +2,14 @@
 // the page spawns nothing, the init's children run and it collects them and
 // their orphans, and when it ends the system stops.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 
 export default async function (t) {
   const { check, eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   // The init, with arguments and an environment as `spawn` takes them: its
   // child says what it was given, exits 7 and leaves a grandchild that

@@ -1,7 +1,7 @@
 // SingleCanvas: the windows laid out in one element of the page, unframed;
 // and an X client's beside a Wayland one's.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { SingleCanvas } from '../../web/runtime/src/windows/single.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #app { position: relative; width: 640px; height: 480px; }</style>
@@ -10,7 +10,7 @@ export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, htm
 export default async function (t) {
   const { check, eq, timeout, until } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const app = document.getElementById('app');
   const out = new SingleCanvas(sys, { container: app });

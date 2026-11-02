@@ -1,6 +1,6 @@
 // WebAudio: a program's /dev/dsp played by the page, at the player's pace.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { WebAudio } from '../../web/runtime/src/audio.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
@@ -8,7 +8,7 @@ export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
 export default async function (t) {
   const { say, check, eq, timeout, until } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };

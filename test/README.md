@@ -68,13 +68,13 @@ unless `--allow-skip` is given.
 
 ```js
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 
 export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  new Filesystem(sys).addTar(t.work('bb.tar.zst'));
+  new MemoryFilesystem(sys).addTar(t.work('bb.tar.zst'));
   await sys.boot();
   t.eq('echo', (await sys.run(['sh', '-c', 'echo hi'], { env: { PATH: '/bin' } })).stdout, 'hi\n');
   await sys.shutdown();

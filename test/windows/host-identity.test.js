@@ -2,7 +2,7 @@
 // whole title, its application (`appId`, `appid`), its program (`pid`, an X
 // window's from _NET_WM_PID) and a client's own minimize (`request`).
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { HostWindows } from '../../web/runtime/src/windows/host.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
@@ -16,7 +16,7 @@ const XLONG = 'xterm-like title, longer than thirty-two bytes';
 export default async function (t) {
   const { eq, check, timeout, until, lines } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
   const desk = document.getElementById('desk');
