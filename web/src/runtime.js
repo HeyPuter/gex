@@ -1025,6 +1025,27 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
 }
 
 /**
+ * The DOM desktop for a page whose guests are in the single-thread build's
+ * system Worker: its channel a mirror of the Worker's arena (wl-bridge.mjs
+ * `mirrorChannel`), its writes sent there by `post(fn, args)`; `apply` takes
+ * the Worker's updates (`mirrorTake`).
+ */
+export async function openWaylandMirror({ wl, post, onDesktop = null, say = () => {} }) {
+  const { mirrorChannel, mirrorApply } = await import('@gex/wl-bridge.mjs');
+  const wlChannel = mirrorChannel(post);
+  const { DomDesktop } = await import('./dom-compositor.js');
+  const compositor = DomDesktop.create(wl, wlChannel, { width: wl.clientWidth, height: wl.clientHeight });
+  globalThis.__gexDesktop = compositor;
+  onDesktop?.(compositor);
+  compositor.onglfailed = (why) => {
+    say(`gex: the guest's OpenGL is gone: ${why}`);
+    say('gex: GL windows will be blank; everything else still runs');
+  };
+  const pixelsTo = (token, id, buffer, replaces) => compositor.addPixels(token, id, buffer, replaces);
+  return { wlChannel, compositor, dom: true, apply: (u) => mirrorApply(wlChannel, u, pixelsTo) };
+}
+
+/**
  * The single-thread build's run, in its system Worker ((SP_CODE && single.on)): pid 1
  * loads the program and its files itself, the terminal is the page's line
  * discipline. Only the single-thread build has it; every other page runs

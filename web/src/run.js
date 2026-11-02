@@ -118,9 +118,9 @@ async function runInSystemWorker(term, opts) {
  * runtime.js `runSingle` there). Resolves `{ status }` when the program ends.
  */
 export async function runProgram(term, opts) {
-  // The single-thread System has no windows, GL or X server yet: a page that
-  // asks for one runs the whole system in a Worker of its own as before.
-  if ((SP_CODE && singleMode()) && (opts.wl || opts.gl || opts.hostX)) return runInSystemWorker(term, opts);
+  // The single-thread System has no GL beside a DOM desktop yet: a page that
+  // asks for it runs the whole system in a Worker of its own as before.
+  if ((SP_CODE && singleMode()) && opts.gl && typeof opts.wl?.getContext !== 'function') return runInSystemWorker(term, opts);
   // Said once, so a person (and the smoke test) can tell which build ran; by
   // the page's preset, not the runtime API, which says nothing by default.
   if ((SP_CODE && singleMode())) console.info(`[gex] single-thread build: the system runs in a Worker, no SharedArrayBuffer (crossOriginIsolated=${globalThis.crossOriginIsolated})`);

@@ -6,6 +6,7 @@
 
 import { INTERNAL, internals } from '../internal.js';
 import { xOnDemand } from './x11.js';
+import { mirrored } from './mirrored.js';
 
 const KINDS = { 1: 'toplevel', 2: 'popup', 3: 'subsurface' };
 /** `DomDesktop.STATE_*`. */
@@ -184,7 +185,6 @@ export class HostWindows extends EventTarget {
     const x = {};
     xOnDemand(i, x);
     i.devices(async (dev) => {
-      if (dev.single) throw new Error('the single-thread build has no HostWindows yet: CompositorWindows draws its windows');
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts
       // them, and keys come from their canvases.
@@ -193,6 +193,13 @@ export class HostWindows extends EventTarget {
       m.dataset.gexDesktop = '';
       document.body.append(m);
       this.#mount = m;
+      // The single-thread build: the scene is the system Worker's, mirrored
+      // here (runtime.js `openWaylandMirror`).
+      if (dev.single) {
+        const { w, h, scale } = this.#size;
+        mirrored(dev, m, { width: w * scale, height: h * scale, scale }, (d) => this.#start(d));
+        return;
+      }
       Object.assign(dev, await dev.rt.openWayland({ wl: m, onDesktop: (d) => this.#start(d), say: (t) => dev.say(`${t}\n`) }));
     });
     const self = this;

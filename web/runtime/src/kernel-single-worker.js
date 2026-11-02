@@ -23,6 +23,7 @@
 //   spawnExec { r }        host.mjs `spawnExec`; answered when the process ends
 //   network { net }        the page's network: null for none, else
 //       `{ datagram }`, whether it has `datagram`
+//   startX { listen, rootful }  the X server, on the sockets the page held
 //   useKernelStacks { stacks }, stop
 // And out, unasked: `{ ev: 'output', fd, text }`, `{ ev: 'message', m }`
 // (a process's message the page's parts take: audio, net events),
@@ -56,6 +57,8 @@ let slotWord = -1;
  *  (compositor-in-realm.js). */
 let comp = null;
 let compTimer;
+/** Or the arena a page's DOM desktop mirrors. */
+let mirror = null;
 /** The guest's sockets, on the page's network as it last said. */
 const sockets = new Sockets(null);
 const dial = (m, transfer) => post({ ev: 'net-dial', ...m }, transfer);
@@ -105,7 +108,40 @@ const ops = {
     ({ k, mem } = await helperKernel(kernel, 0, 32, { suspending: true }));
     // The scene compositor (the page's windows part asked for one): here,
     // beside the memories it reads; the page's half relays (`comp`).
-    if (wl) {
+    if (wl?.dom) {
+      // A DOM desktop on the page: the arena here, mirrored there (wl-bridge.mjs
+      // `mirrorTake`), each frame that something changed.
+      const bridge = await import('../../../shims/browser/js/wl-bridge.mjs');
+      const channel = bridge.makeWlChannel();
+      bridge.setOutputSize(channel, wl.width, wl.height, wl.scale);
+      const memories = new Map();
+      const st = bridge.mirrorState();
+      const memoryOf = (token) => {
+        const m = memories.get(token);
+        return m ? new Uint8Array(m.buffer) : null;
+      };
+      compTimer = setInterval(() => {
+        const t = bridge.mirrorTake(channel, st, memoryOf);
+        if (t) post({ ev: 'wl-mirror', update: t.update }, t.transfer);
+      }, 16);
+      mirror = { channel, call: (fn, args) => bridge.mirrorCall(channel, fn, args) };
+      comp = {
+        channel,
+        compositor: {
+          addMemory: (token, memory, k) => {
+            if (memory) memories.set(token, memory);
+            bridge.setKernelMemory(channel, k);
+          },
+          dropMemory: (token) => {
+            memories.delete(token);
+            bridge.releaseToken(channel, token);
+            post({ ev: 'wl-drop', token });
+          },
+          stop: () => {},
+        },
+        send: () => {},
+      };
+    } else if (wl) {
       const { openCompositor } = await import('../../src/compositor-in-realm.js');
       comp = await openCompositor(wl.width, wl.height, wl.scale, (m, transfer) => post({ ev: 'comp-out', m }, transfer));
       compTimer = setInterval(() => post({ ev: 'comp-stats', stats: comp.stats() }), 500);
@@ -124,7 +160,7 @@ const ops = {
         };
       }
     }
-    const glChannel = gl && comp ? { inRealm: true, d3d: !!gl.d3d } : null;
+    const glChannel = gl && comp && !wl.dom ? { inRealm: true, d3d: !!gl.d3d } : null;
     host = await rt.makeProcessHost({ kernel, uid: 0, ...hostOpts, network: sockets, wlChannel: comp?.channel ?? null, glChannel }, {
       onOutput: (fd, text) => post({ ev: 'output', fd, text: String(text) }),
       onExit: (m, pid) => {
@@ -181,6 +217,15 @@ const ops = {
     sockets.network = net ? pageRelay(dial, net) : null;
     return { value: null };
   },
+  // The X server (the page's windows part, at the first X client): a fiber
+  // here, beside the scene it draws into (runtime.js `startXServer`).
+  async startX({ listen, rootful }) {
+    if (!comp) throw new Error('no windows to put an X server in');
+    const rt = await import('../../src/runtime.js');
+    const term = { writeln: (t) => post({ ev: 'output', fd: 2, text: `${t}\n` }), write: (t) => post({ ev: 'output', fd: 2, text: String(t) }) };
+    await rt.startXServer({ kernel, wlChannel: comp.channel, compositor: () => comp.compositor, term, listen, rootful });
+    return { value: null };
+  },
   useKernelStacks({ stacks }) {
     host.useKernelStacks(stacks);
     return { value: null };
@@ -194,8 +239,10 @@ const ops = {
 };
 
 globalThis.onmessage = async ({ data: m }) => {
-  // The page's compositor half, as it would post to a compositor Worker.
+  // The page's compositor half, as it would post to a compositor Worker,
+  // or its DOM desktop's writes on the arena.
   if (m?.comp) return void comp?.send(m.comp);
+  if (m?.wl) return void mirror?.call(m.wl.fn, m.wl.args);
   if (m?.call === undefined) return;
   try {
     const { value, transfer, seq: s } = await ops[m.op](m);

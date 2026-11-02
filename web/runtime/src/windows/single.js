@@ -5,6 +5,7 @@
 
 import { INTERNAL, internals } from '../internal.js';
 import { xOnDemand } from './x11.js';
+import { mirrored } from './mirrored.js';
 
 export class SingleCanvas extends EventTarget {
   #d = null;
@@ -26,7 +27,6 @@ export class SingleCanvas extends EventTarget {
     // `onDesktop(desktop, bare)` when the desktop is made.
     const x = {};
     i.devices(async (dev) => {
-      if (dev.single) throw new Error('the single-thread build has no SingleCanvas yet: CompositorWindows draws its windows');
       const { bareDesktop } = await import('../../../src/bare-desktop.js');
       const onDesktop = (d) => {
         this.#d = bareDesktop(d, container);
@@ -38,6 +38,10 @@ export class SingleCanvas extends EventTarget {
           this.dispatchEvent(new Event('change'));
         };
       };
+      if (dev.single) {
+        mirrored(dev, container, { width: container.clientWidth, height: container.clientHeight, scale: 1 }, onDesktop);
+        return;
+      }
       Object.assign(dev, await dev.rt.openWayland({ wl: container, onDesktop, say: (t) => dev.say(`${t}\n`) }));
     });
     xOnDemand(i, x);

@@ -279,6 +279,8 @@ export function clipboardSerial(channel) {
 /** The page's text on the clipboard: every client with a data device is
  *  offered it. Its number. */
 export function setClipboard(channel, text) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('setClipboard', [text]);
   const a = new Int32Array(channel.arena);
   const serial = clipPut(a, new TextEncoder().encode(String(text)), 0);
   // Every process's pump offers it, idle ones too.
@@ -319,6 +321,8 @@ export function makeWlChannel() {
 
 /** Tell the guests how large the output is, so a toplevel is configured to it. */
 export function setOutputSize(channel, w, h, scale) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('setOutputSize', [w, h, scale]);
   const a = new Int32Array(channel.arena);
   const was = [Atomics.load(a, M_OUT_W), Atomics.load(a, M_OUT_H)];
   Atomics.store(a, M_OUT_W, w | 0);
@@ -477,6 +481,8 @@ export function takesPointer(record) {
  * has already claimed is left alone.
  */
 export function releaseToken(channel, token) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('releaseToken', [token]);
   const a = new Int32Array(channel.arena);
   let n = 0;
   for (let b = 0; b < BLOCKS; b++) {
@@ -530,6 +536,8 @@ export function sceneStill(channel, marks) {
 
 /** Say that everything published up to `gen` has been drawn. */
 export function ackBlock(channel, block, gen) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('ackBlock', [block, gen]);
   const a = new Int32Array(channel.arena);
   Atomics.store(a, blockBase(block) + B_ACK, gen);
 }
@@ -542,6 +550,8 @@ export function setKernelMemory(channel, memory) {
 /** The page's drag data: `text` (a text/uri-list) for the drag whose
  *  enter follows. False when it does not fit. */
 export function setDragData(channel, text) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('setDragData', [text]);
   const b = new TextEncoder().encode(text);
   if (b.length > D_BYTES) return false;
   const a = new Int32Array(channel.arena);
@@ -579,6 +589,8 @@ export async function waitDrag(channel, block, serial, want, ms) {
 
 /** Write one event into a process's ring, for its guest to pick up. */
 export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, client = 0, surface = 0) {
+  // On a mirror, the real channel's too (`mirrorChannel`).
+  channel.mirror?.('sendEvent', [block, kind, a1, b1, c1, d1, client, surface]);
   const a = new Int32Array(channel.arena);
   const base = ringBase(block);
   const head = Atomics.load(a, base + K_HEAD);
@@ -1209,4 +1221,166 @@ export function mergeDamage(a, b) {
   const r = Math.max(a.x + a.w, b.x + b.w);
   const bt = Math.max(a.y + a.h, b.y + b.h);
   return { x, y, w: r - x, h: bt - y };
+}
+
+// -- the single-thread build's page: a mirror of the arena ------------------
+//
+// The arena and the guests' memories are in the system Worker, which the
+// page's DOM desktop (web/src/dom-compositor.js) cannot read. The Worker
+// sends the page what changed (`mirrorTake`): each block's header, a changed
+// block's records, and the damaged rows of each surface's pixels, copied out
+// of its process's memory into a buffer per surface, which the records then
+// name as a channel with pixel buffers would (`R_ADDR_HI`). The page applies
+// it to an arena of its own (`mirrorApply`), which the desktop reads; what
+// the desktop writes (an event, an ack, the output's size) it writes there
+// and sends to the Worker to write on the real one (`mirrorCall`).
+
+/** Where a surface's pixels start in its buffer on the page. */
+const MIRROR_AT = 64;
+
+/** The page's channel: `post(fn, args)` sends a write to the Worker. */
+export function mirrorChannel(post) {
+  return { arena: new ArrayBuffer(TOTAL_WORDS * 4), pixels: true, mirror: post, buffers: new Map() };
+}
+
+/** A write the page made on its mirror, made on the real `channel`. */
+export function mirrorCall(channel, fn, args) {
+  const f = { setClipboard, setOutputSize, releaseToken, ackBlock, setDragData, sendEvent }[fn];
+  if (f) f(channel, ...args);
+}
+
+/** What the Worker keeps between `mirrorTake`s. */
+export function mirrorState() {
+  return { gens: new Int32Array(BLOCKS * 3), surfaces: new Map(), nextId: 1, clip: -1, sent: 0 };
+}
+
+/**
+ * What changed on `channel` since `st` last saw it, for the page: null when
+ * nothing has. `memoryOf(token)` is a process's memory, as bytes.
+ * `{ heads, blocks: [[b, words]], pixels: [[id, token, size, offset, bytes]],
+ * clip }` and the buffers to transfer.
+ */
+export function mirrorTake(channel, st, memoryOf, force = false) {
+  const a = new Int32Array(channel.arena);
+  let changed = force;
+  const heads = new Int32Array(M_WORDS + BLOCKS * B_WORDS);
+  heads.set(a.subarray(0, M_WORDS));
+  const blocks = [];
+  const pixels = [];
+  const transfer = [];
+  const live = new Set();
+  for (let b = 0; b < BLOCKS; b++) {
+    const base = blockBase(b);
+    heads.set(a.subarray(base, base + B_WORDS), M_WORDS + b * B_WORDS);
+    const token = a[base + B_TOKEN];
+    const gen = a[base + B_GEN];
+    const count = token ? Math.min(a[base + B_COUNT], SLOTS) : 0;
+    const was = b * 3;
+    if (st.gens[was] === token && st.gens[was + 1] === gen && st.gens[was + 2] === count) {
+      if (token) for (const [k] of st.surfaces) if (k.startsWith(`${b}:${token}:`)) live.add(k);
+      continue;
+    }
+    st.gens[was] = token;
+    st.gens[was + 1] = gen;
+    st.gens[was + 2] = count;
+    changed = true;
+    if (!token) continue;
+    const words = a.slice(base + B_WORDS, base + B_WORDS + count * REC);
+    const mem = memoryOf(token);
+    // A surface whose pixels could not be read yet (its process's memory
+    // has not come): the block is looked at again next time.
+    let unread = false;
+    for (let i = 0; i < count; i++) {
+      const r = i * REC;
+      const key = `${b}:${token}:${words[r + R_CLIENT]}:${words[r + R_SURFACE]}`;
+      live.add(key);
+      const stride = words[r + R_STRIDE];
+      const height = words[r + R_HEIGHT];
+      const size = Math.max(0, stride * height);
+      let s = st.surfaces.get(key);
+      if (!s || s.size !== size) {
+        s = { id: st.nextId++, size, serial: -1 };
+        st.surfaces.set(key, s);
+      }
+      // The pixels the record names: its buffer on the page, past a header.
+      // An address of 0 is a surface with no buffer (one the host's GL
+      // draws, say); one that has a buffer is copied even when external,
+      // since the page paints it under the GL frame.
+      const addr = recordAddr(words, r);
+      if (!addr || !size) {
+        words[r + R_ADDR] = 0;
+        words[r + R_ADDR_HI] = 0;
+        continue;
+      }
+      words[r + R_ADDR] = MIRROR_AT;
+      words[r + R_ADDR_HI] = s.id;
+      if (!mem || addr + size > mem.length) {
+        unread = true;
+        continue;
+      }
+      const serial = words[r + R_SERIAL] >>> 0;
+      if (serial === s.serial) continue;
+      // The damaged rows: all of them the first time, after a commit missed,
+      // or for one that named no damage (Xwayland's).
+      const whole = s.serial === -1 || serial !== s.serial + 1 || words[r + R_DAMAGE_W] <= 0 || words[r + R_DAMAGE_H] <= 0;
+      s.serial = serial;
+      const y0 = whole ? 0 : Math.max(0, Math.min(height, words[r + R_DAMAGE_Y]));
+      const y1 = whole ? height : Math.max(y0, Math.min(height, words[r + R_DAMAGE_Y] + words[r + R_DAMAGE_H]));
+      if (y1 <= y0) continue;
+      const bytes = mem.slice(addr + y0 * stride, addr + y1 * stride);
+      pixels.push([s.id, token, MIRROR_AT + size, MIRROR_AT + y0 * stride, bytes]);
+      transfer.push(bytes.buffer);
+    }
+    if (unread) st.gens[was + 1] = gen - 1;
+    blocks.push([b, words]);
+    transfer.push(words.buffer);
+  }
+  // A surface gone: its buffer on the page goes with it.
+  const gone = [];
+  for (const [k, s] of st.surfaces) {
+    if (!live.has(k)) {
+      st.surfaces.delete(k);
+      gone.push(s.id);
+    }
+  }
+  if (gone.length) changed = true;
+  // The clipboard, when a guest has set it.
+  let clip = null;
+  const serial = a[clipBase + C_SERIAL];
+  if (serial !== st.clip) {
+    st.clip = serial;
+    clip = a.slice(clipBase, clipBase + C_HEAD + Math.ceil(Math.min(a[clipBase + C_LEN] >>> 0, C_BYTES) / 4));
+    transfer.push(clip.buffer);
+    changed = true;
+  }
+  // The heads alone (heartbeats, acks, a drag's answer) once a second.
+  const now = Date.now();
+  if (!changed && now - st.sent < 1000) return null;
+  st.sent = now;
+  transfer.push(heads.buffer);
+  return { update: { heads, blocks, pixels, gone, clip }, transfer };
+}
+
+/** The Worker's `mirrorTake`, on the page's `channel`; `pixelsTo(token, id,
+ *  buffer, replaces)` hands a surface's new buffer to the desktop. */
+export function mirrorApply(channel, { heads, blocks, pixels, gone, clip }, pixelsTo) {
+  const a = new Int32Array(channel.arena);
+  a.set(heads.subarray(0, M_WORDS), 0);
+  for (let b = 0; b < BLOCKS; b++) a.set(heads.subarray(M_WORDS + b * B_WORDS, M_WORDS + (b + 1) * B_WORDS), blockBase(b));
+  for (const [b, words] of blocks) a.set(words, blockBase(b) + B_WORDS);
+  for (const id of gone) {
+    const was = channel.buffers.get(id);
+    channel.buffers.delete(id);
+    if (was) pixelsTo(was.token, 0, null, id);
+  }
+  for (const [id, token, size, offset, bytes] of pixels) {
+    let buf = channel.buffers.get(id);
+    if (!buf) {
+      buf = { token, view: new Uint8Array(size) };
+      channel.buffers.set(id, buf);
+      pixelsTo(token, id, buf.view.buffer, 0);
+    }
+    buf.view.set(bytes.subarray(0, Math.max(0, size - offset)), offset);
+  }
+  if (clip) a.set(clip, clipBase);
 }

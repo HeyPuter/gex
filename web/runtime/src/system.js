@@ -434,11 +434,11 @@ export class System extends EventTarget {
     let census = { pids: [], threads: 0, memory: 0 };
     const early = this.#earlyWorker;
     this.#earlyWorker = null;
-    const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale };
+    const wl = single.wl && { width: single.wl.width, height: single.wl.height, scale: single.wl.scale, dom: !!single.wl.dom };
     const gl = single.gl && { d3d: !!single.gl.d3d };
     const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host }, wl, gl }, (m) => {
       if (m.ev === 'output') this.#say(m.text);
-      else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted') for (const fn of single.listeners) fn(m);
+      else if (m.ev === 'comp-out' || m.ev === 'comp-stats' || m.ev === 'gl-wanted' || m.ev === 'wl-mirror' || m.ev === 'wl-drop') for (const fn of single.listeners) fn(m);
       else if (m.ev === 'census') census = m;
       else if (m.ev === 'message') for (const fn of this.#preset.onMessage) fn(m.m);
       else if (m.ev === 'net-dial') dialFor(this.#network, m);
@@ -461,6 +461,8 @@ export class System extends EventTarget {
     };
     this.#sys = {
       host, kernel: { memory: { buffer: { get byteLength() { return census.memory; } } } }, term, rt, compositor: null, wlChannel: null,
+      // The X server, in the system Worker beside the scene (windows/x11.js).
+      startX: single.wl ? (o) => k.ask('startX', o) : null,
       spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
       onStop: (fn) => stops.push(fn),
       stop: () => {
@@ -472,7 +474,13 @@ export class System extends EventTarget {
     const { layers, records } = opts;
     opts.layers = opts.records = null;
     try {
-      if (single.wl) this.#sys.compositor = await single.wl.attach(k, single.listeners);
+      // The page's side of the scene: its compositor, and for a desktop of
+      // windows its mirror of the arena (the clipboard's channel).
+      if (single.wl) {
+        const r = await single.wl.attach(k, single.listeners);
+        this.#sys.compositor = r.compositor;
+        this.#sys.wlChannel = r.wlChannel ?? null;
+      }
       single.gl?.attach(this.#sys.compositor, single.listeners);
       await this.#start(this.#sys, layers, records, fsi, k);
     } catch (e) {

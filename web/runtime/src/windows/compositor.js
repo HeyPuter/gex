@@ -57,7 +57,7 @@ export class CompositorWindows extends EventTarget {
           width: canvas.width,
           height: canvas.height,
           scale: wlScale,
-          attach: async (k, listeners) => (this.#c = await relayed(canvas, wlScale, k, listeners)),
+          attach: async (k, listeners) => ({ compositor: (this.#c = await relayed(canvas, wlScale, k, listeners)) }),
         };
         return;
       }

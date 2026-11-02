@@ -29,7 +29,7 @@ export class MesaGl extends EventTarget {
       // in the system Worker's compositor, beside the guests' memories; a
       // program's first GL call is said by a `gl-wanted` event.
       if (dev.single) {
-        if (!dev.single.wl) throw new Error('MesaGl draws into the windows: make CompositorWindows too (the single-thread build has no other yet)');
+        if (!dev.single.wl || dev.single.wl.dom) throw new Error('MesaGl in the single-thread build draws into CompositorWindows (no other yet)');
         dev.single.gl = {
           d3d,
           attach: (compositor, listeners) => {
