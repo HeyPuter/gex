@@ -64,7 +64,8 @@ export default async function (t) {
     fs.addFiles(files);
     say(`${list.files.length} files from ${list.pieces.length} pieces`);
   }
-  // The lazy files (with the rest bundle's, `rest.bin#OFFSET`).
+  // The lazy files (with the rest bundle's, `rest.bin#OFFSET`), by the
+  // list's URL: its base is the site's, which is not at the origin's root.
   if (params.lazy) fs.addTar(null, { lazy: at(params.lazy) });
   const persist = new IdbPersist(fs, { db: DB, quiet: 300 });
 
@@ -100,8 +101,11 @@ export default async function (t) {
   const keep = () => new WritableStream({ write(b) { log = (log + new TextDecoder().decode(b)).slice(-100000); } });
   p.stdout.pipeTo(keep()).catch(() => {});
   p.stderr.pipeTo(keep()).catch(() => {});
-  const title = nt.title ?? null;
-  const shown = await t.time('window shown', () => until(() => wins.find((x) => x.kind === 'toplevel' && (!title || x.title === title)),
+  // The recorded title may be cut short, and a non-Latin one (Shift-JIS
+  // read as code page 1252) keeps C1 controls the window's own drops.
+  const bare = (s) => String(s).replace(/[\u0080-\u009f]/g, '');
+  const title = nt.title ? bare(nt.title) : null;
+  const shown = await t.time('window shown', () => until(() => wins.find((x) => x.kind === 'toplevel' && (!title || bare(x.title).startsWith(title))),
     `a window${title ? ` titled ${JSON.stringify(title)}` : ''}`, 900000)).then(() => true, () => false);
   if (!shown) {
     await t.saveFile('wine.log', log);

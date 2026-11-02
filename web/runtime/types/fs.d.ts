@@ -49,8 +49,14 @@ export declare class Mount extends EventTarget {
   unmount(): Promise<void>;
 }
 
-/** Files fetched when first read: `[[path, size, url], ...]`, or the URL of such a list. */
-export type LazyList = [string, number, string][] | string | URL;
+/** Files fetched when first read: `[[path, size, url, mode?, mtime?], ...]`, an ejected site's
+ *  lazy.json (`{ base, files: [[path, size, url, mtime?, mode?], ...] }`, each url relative to
+ *  `base`), or the URL of either as JSON. */
+export type LazyList =
+  | [string, number, string, number?, number?][]
+  | { base?: string; files: [string, number, string, (number | null)?, (number | null)?, ...unknown[]][] }
+  | string
+  | URL;
 
 export declare class Filesystem extends EventTarget {
   constructor(sys: System);

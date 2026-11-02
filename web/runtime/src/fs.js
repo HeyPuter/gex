@@ -44,8 +44,29 @@ async function tarBytes(src) {
  *  (`[[path, size, url, mode], ...]`), or the URL of one as JSON, which may
  *  also be an ejected build's lazy.json (web/eject-site.mjs: `{ base, files:
  *  [[path, size, rel, mtime, mode], ...] }`, mtime in seconds, mode and
- *  mtime optional; `rel` may be a rest bundle's `BUNDLE#OFFSET`). A file's
+ *  mtime optional; `rel` may be a rest bundle's `BUNDLE#OFFSET`), or such
+ *  an object itself (its `base` then resolved against the page). A file's
  *  URL is a path on the page's origin. */
+/** A lazy list's `base`, resolved as a link in the list (`at`, its own
+ *  URL) is. An ejected site writes a path from the site's root
+ *  (`/project/build/web/`, or `.../lazy/` below it) and keeps the list in
+ *  that directory or the one above: when the list's directory ends with
+ *  the base, or with a leading part of it, the site's root is what comes
+ *  before that, wherever the site is served. */
+function listBase(rel, at) {
+  const r = String(rel);
+  // (a full URL, or no list's URL to go by: the page's own object)
+  if (!r.startsWith('/') || r.startsWith('//') || !at) return new URL(r, at);
+  const u = new URL(at);
+  const dir = u.pathname.replace(/[^/]*$/, '');
+  const parts = r.replace(/\/*$/, '').split('/').slice(1);
+  for (let n = parts.length; n > 0; n--) {
+    const head = `/${parts.slice(0, n).join('/')}/`;
+    if (dir.endsWith(head)) return new URL(`${dir.slice(0, dir.length - head.length)}${r.replace(/\/*$/, '/')}`, u);
+  }
+  return new URL(r, u);
+}
+
 async function lazyList(lazy) {
   let list = lazy;
   let base = globalThis.location?.href;
@@ -54,13 +75,13 @@ async function lazyList(lazy) {
     list = JSON.parse(new TextDecoder().decode(await bytesOf(base, 'lazy list')));
   }
   if (!Array.isArray(list)) {
-    if (list?.files) {
-      const b = new URL(list.base ?? './', base);
+    if (Array.isArray(list?.files)) {
+      const b = listBase(list.base ?? './', base);
       return list.files.map(([p, size, rel, mtime, mode]) => [p, size, new URL(rel, b).href, mode ?? undefined, mtime ?? undefined]);
     }
     throw new TypeError('lazy: a list of [path, size, url] or its URL');
   }
-  return list.map(([p, size, url, mode]) => [p, size, new URL(url, base).href, mode]);
+  return list.map(([p, size, url, mode, mtime]) => [p, size, new URL(url, base).href, mode, mtime]);
 }
 
 /** A same-origin URL as the path the kernel keeps for a lazy file. */
