@@ -518,21 +518,32 @@ export class System extends EventTarget {
     });
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
     if (records.length) await this.#files.restore(records);
-    await k.r('k_fs_populate_done');
-    if (this.#opts.xcache && !(SP_CODE && SINGLE)) await this.#xcacheRestore(s, k);
+    // The steps below are not waited for one by one: the kernel's Worker
+    // takes its batches in order, so what is asked in one turn goes in one
+    // message, and each round trip to it at boot is one the first program
+    // waits for. Only a step that needs an answer first waits.
+    const steps = [];
+    // Each one's failure is had at the end, not said as unhandled meanwhile.
+    const step = (p) => { p.catch(() => {}); steps.push(p); };
+    step(k.r('k_fs_populate_done'));
+    if (this.#opts.xcache && !(SP_CODE && SINGLE)) {
+      await Promise.all(steps);
+      await this.#xcacheRestore(s, k);
+    }
     for (const [path, id] of fsi?.mounts?.() ?? []) await this.#files.mount(path, id);
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
-    await k.r('k_host_calls_serve');
+    step(k.r('k_host_calls_serve'));
     const keep = fsi?.persistArgs?.();
     if (keep) await this.#changes.start(keep);
-    await this.#programs.start({ init: !!this.#init });
+    step(this.#programs.start({ init: !!this.#init }));
     const opt = (f, ...a) => (k.has(f) ? [{ f, a }] : []);
     const list = [
       { f: 'k_stack_area' }, { f: 'k_stack_size' }, { f: 'k_stack_count' },
       ...opt('k_snap_word'), ...opt('k_ws_addr', 0), ...opt('k_ws_count'), ...opt('k_mono_held_at'), ...opt('k_snap_extents_at'),
     ];
     const r = Object.fromEntries((await k.calls(list)).map((x, i) => [list[i].f, x.r >>> 0]));
+    await Promise.all(steps);
     s.host.useKernelStacks({
       area: r.k_stack_area, size: r.k_stack_size, count: r.k_stack_count,
       ...(k.has('k_snap_word') ? { snapWord: r.k_snap_word, wsAddr: r.k_ws_addr, wsCount: r.k_ws_count } : {}),

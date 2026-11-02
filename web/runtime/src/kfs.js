@@ -257,9 +257,14 @@ export class Files {
       if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
       n++;
     }
-    await batched(k, list.splice(0), (r, c) => {
-      if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
-    });
+    // With no hard links, what follows goes in the same batch: a round trip
+    // to the kernel's Worker fewer at every boot.
+    const hasHard = Object.keys(hard).length > 0;
+    if (hasHard) {
+      await batched(k, list.splice(0), (r, c) => {
+        if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+      });
+    }
     // Hard links after their targets: one inode with two names, as the host
     // had it; a copy where the kernel would not link.
     const copies = [];
@@ -281,7 +286,7 @@ export class Files {
       }
     }
     await batched(k, list, (r, c) => {
-      if (c.f === 'k_fs_add' && r < 0) throw errno(r, c.a[0].in);
+      if ((c.f === 'k_fs_add' || (!hasHard && c.f === 'k_fs_add_lazy')) && r < 0) throw errno(r, c.a[0].in);
     });
     return n;
   }

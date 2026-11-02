@@ -57,7 +57,8 @@ export class Programs {
     const list = [];
     if (!init) list.push({ f: 'k_init_virtual', a: [1] }, { f: 'k_proc_set_info', a: [INIT, { in: 'init\ninit\0' }] });
     list.push({ f: 'k_proc_queue', a: [INIT] });
-    const res = await this.#k.calls(list);
+    // The wait slot in the same batch.
+    const [res] = await Promise.all([this.#k.calls(list), this.#k.prepareWatch()]);
     // Moved when a child of pid 1 ends, and when pid 1 itself does.
     const queue = res[res.length - 1].r;
     await this.#k.watch(queue);
@@ -119,7 +120,7 @@ export class Programs {
     const w = (i) => v.getInt32(i * 4, true);
     const e = { h, pid: w(0), pty: w(1), stdin: w(2), stdout: w(3), stderr: w(4), sock: -1 };
     e.queues = e.pty >= 0 ? [w(5)] : e.stdin >= 0 ? [w(5), w(6), w(7)] : [];
-    for (const q of e.queues) await k.watch(q);
+    await Promise.all(e.queues.map((q) => k.watch(q)));
     this.#programs.set(e.pid, h);
     if (e.pty >= 0) this.#readPty(e);
     const wasmImage = w(8) ? [Number(v.getBigUint64(48, true)), Number(v.getBigUint64(56, true))] : null;

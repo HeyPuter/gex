@@ -175,14 +175,27 @@ export class Kernel {
   async watch(queue) {
     if (!queue || this.#queues.has(queue)) return;
     this.#queues.add(queue);
-    if (this.#slot < 0) {
-      const [{ r: slot }, { r: addr }] = await this.calls([{ f: 'k_ws_alloc' }, { f: 'k_ws_addr', a: [{ ref: 0 }] }]);
-      if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
-      this.#slot = slot;
-      this.#slotWord = (addr >>> 0) >>> 2;
-      if (SP_CODE && this.#single) this.#seen = await this.#rpc('slot', { word: this.#slotWord });
-    }
+    await (this.#slotReady ??= this.#allocSlot());
     await this.r('k_wq_add', queue, this.#slot);
+  }
+
+  /** Allocate this side's wait slot now, in the batch being made, ahead of
+   *  the first `watch`. */
+  prepareWatch() {
+    return (this.#slotReady ??= this.#allocSlot());
+  }
+
+  /** This side's wait slot, once: watches made together wait for the one
+   *  allocation, and their queues go to the kernel in one batch. */
+  #slotReady = null;
+  async #allocSlot() {
+    const [{ r: slot }, { r: addr }] = await this.calls([{ f: 'k_ws_alloc' }, { f: 'k_ws_addr', a: [{ ref: 0 }] }]);
+    if (slot < 0) throw new Error('the runtime found no free wait slot in the kernel');
+    this.#slot = slot;
+    this.#slotWord = (addr >>> 0) >>> 2;
+    // Not waited for: the Worker takes its messages in order, so the slot is
+    // set before any batch sent after it, and its answer sets what was seen.
+    if (SP_CODE && this.#single) this.#rpc('slot', { word: this.#slotWord }).then((v) => { this.#seen = v; }, () => {});
   }
 
   async unwatch(queue) {
