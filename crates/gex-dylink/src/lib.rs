@@ -96,11 +96,37 @@ pub struct Info {
     /// imported globals), if it has one: a data export's address relative
     /// to `__memory_base`.
     pub global_init: Vec<Option<u32>>,
+    /// Each type's signature as `params_results`, one letter a value
+    /// (`i` i32, `j` i64, `f` f32, `d` f64), as the page writes a function
+    /// that calls through the table (`L` in a binding list); `None` for a
+    /// type with any other value or a non-function type.
+    pub sigs: Vec<Option<String>>,
     /// The fork summary (`gex.forkreach`), if the module has one.
     pub forkreach: Option<ForkReach>,
     /// [`Info::slots`], made once: the loader asks for it at every symbol it
     /// binds (a large C++ library binds tens of thousands).
     slots: std::sync::OnceLock<(u32, HashMap<u32, u32>)>,
+}
+
+/// A function type as [`Info::sigs`] writes it.
+fn sig_text(params: &[wasmparser::ValType], results: &[wasmparser::ValType]) -> Option<String> {
+    use wasmparser::ValType;
+    let l = |v: &ValType| match v {
+        ValType::I32 => Some('i'),
+        ValType::I64 => Some('j'),
+        ValType::F32 => Some('f'),
+        ValType::F64 => Some('d'),
+        _ => None,
+    };
+    let mut out = String::new();
+    for v in params {
+        out.push(l(v)?);
+    }
+    out.push('_');
+    for v in results {
+        out.push(l(v)?);
+    }
+    Some(out)
 }
 
 /// A library's fork summary (`gex.forkreach`).
@@ -209,6 +235,16 @@ impl Info {
                 }
                 Payload::CustomSection(c) if c.name() == FORKREACH_SECTION => {
                     info.forkreach = Some(ForkReach::decode(c.data())?);
+                }
+                Payload::TypeSection(r) => {
+                    for g in r {
+                        for t in g?.into_types() {
+                            info.sigs.push(match &t.composite_type.inner {
+                                wasmparser::CompositeInnerType::Func(f) => sig_text(f.params(), f.results()),
+                                _ => None,
+                            });
+                        }
+                    }
                 }
                 Payload::ImportSection(s) => {
                     for imp in s {

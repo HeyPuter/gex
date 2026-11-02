@@ -506,6 +506,38 @@ let entryTrampMod = null;
  *  restores its own. A trap (`unreachable`: the shim's trap out) is not
  *  caught here: the JS loop that catches it puts the pointer back
  *  (`#progSpAt`). */
+/** A wasm32 module's late-bound functions (`L` in a binding list, each
+ *  [mod, name, slot, sig]): a module of one function per binding, exported
+ *  by its index, that calls table `e.t`'s slot with its own arguments.
+ *  (func (export "N") (type sig) local.get 0 .. local.get n-1
+ *    (i32|i64).const slot call_indirect (type sig) 0)
+ *  `t64`: a 64-bit table. */
+function lateCalls(late, t64) {
+  const uleb = (v, o) => { do { let b = v % 128; v = Math.floor(v / 128); if (v) b |= 128; o.push(b); } while (v); return o; };
+  const sleb = (v, o) => { for (;;) { const b = v & 127; v = Math.floor(v / 128); if ((v === 0 && !(b & 64)) || (v === -1 && (b & 64))) { o.push(b); return o; } o.push(b | 128); } };
+  const vt = { i: 0x7f, j: 0x7e, f: 0x7d, d: 0x7c };
+  const sec = (id, b) => [id, ...uleb(b.length, []), ...b];
+  const vec = (items) => [...uleb(items.length, []), ...items.flat()];
+  const sigs = [...new Set(late.map((l) => l[3]))], at = new Map(sigs.map((g, i) => [g, i]));
+  const types = sigs.map((g) => { const [p, r] = g.split('_'); return [0x60, ...vec([...p].map((c) => [vt[c]])), ...vec([...r].map((c) => [vt[c]]))]; });
+  const enc = new TextEncoder();
+  const exps = late.map((_, i) => { const n = enc.encode(String(i)); return [...uleb(n.length, []), ...n, 0, ...uleb(i, [])]; });
+  const bodies = late.map(([, , slot, g]) => {
+    const n = g.split('_')[0].length, b = [0];
+    for (let k = 0; k < n; k++) b.push(0x20, ...uleb(k, []));
+    b.push(t64 ? 0x42 : 0x41, ...sleb(t64 ? slot : slot | 0, []), 0x11, ...uleb(at.get(g), []), 0, 0x0b);
+    return [...uleb(b.length, []), ...b];
+  });
+  return new WebAssembly.Module(new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    ...sec(1, vec(types)),
+    ...sec(2, [1, 1, 101, 1, 116, 1, 0x70, t64 ? 4 : 0, 0]),
+    ...sec(3, vec(late.map((l) => uleb(at.get(l[3]), [])))),
+    ...sec(7, vec(exps)),
+    ...sec(10, vec(bodies)),
+  ]));
+}
+
 const entryFnMods = new Map();
 function entryFnModule(t64, s64) {
   const k = (t64 ? 2 : 0) | (s64 ? 1 : 0);
@@ -5725,7 +5757,7 @@ export class Gex {
   #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov)) {
     this.#wasmprogBindText = text;
     if (!text) return [];
-    const extra = [];
+    const extra = [], late = [];
     this.#wasmprogTls = null;
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
     for (const line of text.split('\n')) {
@@ -5760,6 +5792,10 @@ export class Gex {
           break;
         }
         case 'L': {
+          // In wasm, for a type the list gives: the call stays a wasm
+          // frame, which the single-thread build's fiber can suspend
+          // through, as it cannot through a JS one.
+          if (f[4]) { late.push([f[1], f[2], Number(f[3]), f[4]]); break; }
           const slot = tIdx(Number(f[3])), t = st.ftab;
           set(f[1], f[2], (...a) => t.get(slot)(...a));
           break;
@@ -5776,6 +5812,10 @@ export class Gex {
           this.#wasmprogTls = [Number(f[1]), Number(f[2])];
           break;
       }
+    }
+    if (late.length) {
+      const x = new WebAssembly.Instance(lateCalls(late, m64()), { e: { t: st.ftab } }).exports;
+      late.forEach(([m, name], i) => set(m, name, x[i]));
     }
     return extra;
   }
