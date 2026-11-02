@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link Wine's PE side as one wasm module.
 
-    pelink.py [--split FILE DLL,...] [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
+    pelink.py [--split FILE DLL,...] [--exports-of CORE.wasm] [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
 
 For each DLL (all of them, or those named), the build left the DLL as one
@@ -47,6 +47,7 @@ BUILD = None  # the Wine build tree (pelink's main)
 WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
 M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
+KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 
 
 def cc(*args):
@@ -213,6 +214,13 @@ def main():
         for d in sys.argv[3].split(','):
             SPLIT[d] = sys.argv[2]
         del sys.argv[1:4]
+    # --exports-of CORE.wasm: OUT.wasm exports, where it defines them, the
+    # names that core of an earlier link exports, so that the --split modules
+    # of that link load beside it (their imports bind to the core's exports
+    # by name) without linking them again
+    while sys.argv[1] == '--exports-of':
+        KEEP_EXPORTS.update(wasm_exports(sys.argv[2]))
+        del sys.argv[1:3]
     # --extra NAME R.O EXPORTS IMPORTS (a comma list): a DLL built outside
     # the tree (dirk's d3d11.dll and dxgi.dll), linked in, in place of the
     # tree's own of that name.
@@ -252,11 +260,14 @@ def main():
             ex = os.path.join(build, top, d, mod + '.so.exports')
             if not os.path.exists(ro) or not os.path.exists(ex):
                 continue
-            if only and mod not in only:
+            # (--exports-of: every DLL's load-time imports, the earlier
+            # core's split modules' among them, as that core had them)
+            if only and mod not in only and not KEEP_EXPORTS:
                 continue
             imports = [i.lstrip('-') for i in makefile_var(mk, 'IMPORTS') + makefile_var(mk, 'DELAYIMPORTS')]
             imports = [modname(i) for i in imports]
-            dlls.append((mod, ro, ex, imports))
+            if not only or mod in only:
+                dlls.append((mod, ro, ex, imports))
             # what the loader is to load before the module (makedep's
             # direct imports and default ones: the C runtime, kernel32,
             # ntdll), which a skeleton's empty import table cannot say
@@ -317,6 +328,24 @@ def leb_at(b, i):
         sh += 7
         if not x & 0x80:
             return r, i
+
+
+def wasm_exports(path):
+    """The names a wasm module exports."""
+    b = open(path, 'rb').read()
+    out, i = [], 8
+    while i < len(b):
+        sid = b[i]
+        size, j = leb_at(b, i + 1)
+        if sid == 7:
+            cnt, k = leb_at(b, j)
+            for _ in range(cnt):
+                n, k = leb_at(b, k)
+                out.append(b[k:k + n].decode())
+                k += n + 1
+                _, k = leb_at(b, k)
+        i = j + size
+    return out
 
 
 def dll_slots(path, mapfile, obj_dll):
@@ -499,6 +528,18 @@ def link(dlls, out, gexrt, others=None):
             if len(parts) > 1 and parts[1] == 'data':
                 data.append(f'{mod}!{parts[0]}')
 
+    # (--exports-of: the earlier core's exports that are forwards of DLLs
+    # not linked here, user32's DefWindowProcW to ntdll's
+    # NtdllDefWindowProc_W, are aliases this core defines too)
+    linked = {m for m, _, _, _ in dlls}
+    for via, ex in sorted((others or {}).items()) if KEEP_EXPORTS else ():
+        if via in linked:
+            continue
+        for line in open(ex):
+            parts = line.split()
+            if len(parts) > 2 and parts[1] == 'forward' and f'{via}!{parts[0]}' in KEEP_EXPORTS:
+                forwards.setdefault(parts[0], {})[via] = parts[2]
+
     sigs = {}  # dll -> {(name, 'defined'|'undefined'): sig}
     for mod, ro, ex, imports in dlls:
         listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', ro],
@@ -524,6 +565,11 @@ def link(dlls, out, gexrt, others=None):
     # ucrtbase, has it: its objects, with the members they need in turn, are
     # linked into the core's C runtime DLL, whose own math_error and _fdclass
     # they call, and that DLL exports its C name)
+    # (and with --exports-of, the C names the earlier core's DLLs exported:
+    # its split modules call them, though no DLL linked here does)
+    core_mods = {m for m, _, _, _ in dlls if not SPLIT.get(m)}
+    kept = {tuple(reversed(n.split('!', 1))) for n in KEEP_EXPORTS
+            if '!' in n and n.split('!', 1)[0] in core_mods}
     musl = os.path.join(BUILD or '', 'libs', 'musl', 'libmusl.a')
     ro_own = {}
     crt = next((d for d in ('ucrtbase.dll', 'msvcrt.dll') if any(m == d and not SPLIT.get(m) for m, _, _, _ in dlls)), None)
@@ -534,7 +580,8 @@ def link(dlls, out, gexrt, others=None):
                   if len(l.split()) >= 3 and l.split()[-2] == 'T'}
         want = sorted({n for mod, _, _, _ in dlls for (n, k) in sigs[mod]
                        if k == 'undefined' and n in in_lib and n not in core_defs
-                       and (n, 'defined') not in sigs[mod]})
+                       and (n, 'defined') not in sigs[mod]}
+                      | {n for n, mod in kept if mod == crt and n in in_lib and n not in core_defs})
         if want:
             crt_tmp = tempfile.mkdtemp(prefix='pelink-crt-')
             members = sorted({in_lib[n] for n in want})
@@ -561,6 +608,10 @@ def link(dlls, out, gexrt, others=None):
                     and (n, 'defined') not in sigs[mod]:
                 exporters[n] = [owner]
                 rt_exports.setdefault(owner, []).append(n)
+    for n, mod in sorted(kept):
+        if core_defs.get(n) == mod and n not in exporters and n not in forwards:
+            exporters[n] = [mod]
+            rt_exports.setdefault(mod, []).append(n)
     def resolve_forward(fwd, depth=0):
         """(dll, name) a forward like NTDLL.RtlEnterCriticalSection reaches."""
         dll, _, name = fwd.partition('.')
@@ -1196,6 +1247,10 @@ static void *gexw_ntdll_proc(const char *name)
             # what the --split modules import from the core
             for n in sorted(needs):
                 f.write(f'--export-if-defined={n}\n')
+            # an earlier core's (--exports-of)
+            if not g:
+                for n in sorted(KEEP_EXPORTS):
+                    f.write(f'--export-if-defined={n}\n')
             # what the other mode's modules call (wasmdll's CROSS_MODE)
             for n in CROSS_MODE:
                 f.write(f'--export-if-defined={n}\n')

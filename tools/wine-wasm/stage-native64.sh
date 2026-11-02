@@ -56,7 +56,12 @@ fi
 # skeleton is; their imports of the core's DLLs bind to its exports.
 split=() splits=()
 for dll in ${WINE64_SPLIT_DLLS:-}; do split+=(--split "$dll.wasm" "$dll"); splits+=("$dll"); done
-PATH=$bin$PATH TMPDIR=$tmp python3 "$here/pelink.py" "${link[@]}" "${split[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
+# WINE64_EXPORTS_OF=CORE.wasm: winepe.wasm exports what that core of an
+# earlier staging exports, so that the split modules staged with it still
+# load beside this one (dirk's core in place of a dist's, its split modules
+# kept); name the same DLLs as that staging did.
+keep=(); [ -z "${WINE64_EXPORTS_OF:-}" ] || keep=(--exports-of "$WINE64_EXPORTS_OF")
+PATH=$bin$PATH TMPDIR=$tmp python3 "$here/pelink.py" "${link[@]}" "${split[@]}" "${keep[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
 cp "$tmp/winepe.wasm" "$out/winepe.wasm"
 for dll in "${splits[@]}"; do cp "$tmp/$dll.wasm" "$out/$dll.wasm"; done
 if [ ${#extras[@]} -gt 0 ]; then
