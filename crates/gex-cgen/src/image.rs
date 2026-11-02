@@ -1105,8 +1105,9 @@ mod fingerprint_tests {
         // Not values: modules, types, functions of the host side.
         // NULL_GUARD: embedded only with the null guard on, whose units'
         // key names it (`unit_inputs`), so the fingerprint of every other
-        // build stays as it was.
-        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index", "NULL_GUARD"];
+        // build stays as it was. MemFlavor: the host's memory flavour type
+        // (a flavour's switches), not a value a unit embeds.
+        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index", "NULL_GUARD", "MemFlavor"];
         let mut missing = Vec::new();
         for (file, text) in sources {
             for prefix in ["ctx::", "gex_abi::"] {
