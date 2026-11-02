@@ -2064,9 +2064,11 @@ export class Gex {
         // were most of this glue's cost).
         // In wasm (`entryFnModule`): the shim calls the trampoline's export,
         // which goes on to this Worker's entry function, made on the first
-        // call. 0 in the single-thread build (a blocking call needs a
-        // promising frame).
-        entry_call: (SP_CODE && single.on) ? (idx, ctx, sp) => 0 : this.#entryTramp(),
+        // call. In the single-thread build too: the trampoline and the
+        // entry function are wasm, so a call that blocks suspends the
+        // fiber's stack through them; only the first call, made from JS
+        // (`#entrySlow`), goes by the fault hook instead.
+        entry_call: this.#entryTramp(),
         // A session snapshot's question (`snap_stop`), asked only while one
         // is pending: whether this thread's frames below its wait can be
         // unwound to its program's snapshot root (`#snapOk`).
@@ -5861,6 +5863,8 @@ export class Gex {
       } }).exports.entry
       : new WebAssembly.Instance(entryFnModule(this.#wide, typeof spG.value === 'bigint'), { e: { t: this.#cgen.ftab, sp: spG } }).exports.entry;
     this.#entryHook.set(0, f);
+    // (a JS frame here, which a blocking call could not suspend through)
+    if (SP_CODE && single.on) return 0;
     return f(idx, ctx, sp);
   }
   /** The entry function is made again at its next call. */
@@ -5870,9 +5874,6 @@ export class Gex {
   /** Wine's stack pointer as a loop that catches traps found it, and put back
    *  there: the entry function's own restore does not run for a trap. */
   #progSpAt() {
-    // The single-thread build calls no entry function (`entry_call` is 0):
-    // nothing to put back, and its fibers share the global.
-    if ((SP_CODE && single.on)) return undefined;
     // 0: the program had not set it yet (its start sets it, inside the
     // loop's entry). Put back, that would undo the program's own setting,
     // and a fault hook's frames would then go below address 0.
