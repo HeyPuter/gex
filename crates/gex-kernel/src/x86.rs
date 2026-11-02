@@ -33,6 +33,78 @@ pub const SYSREG_CMPXCHG16B: i32 = -102;
 /// `GEX_TRACE_INSNS` (`gex_lift_x86::sysreg::TRACE`): the value is the pc.
 pub const SYSREG_TRACE: i32 = -103;
 
+/// A far transfer (`gex_lift_x86::sysreg::FAR`): the value is `offset |
+/// selector << 32`. See [`serve_far`].
+pub const SYSREG_FAR: i32 = -104;
+/// A far transfer the block goes on from in wasm
+/// (`gex_lift_x86::sysreg::FAR_IN_PLACE`): served as [`SYSREG_FAR`], then
+/// the block reads [`SYSREG_FAR_NEXT`] for the address it dispatches.
+pub const SYSREG_FAR_IN_PLACE: i32 = -105;
+/// What a block dispatches after [`SYSREG_FAR_IN_PLACE`]
+/// (`gex_lift_x86::sysreg::FAR_NEXT`): the target, or [`FAR_PAD`] when the
+/// transfer changed the thread's mode.
+pub const SYSREG_FAR_NEXT: i32 = -106;
+/// The address a block dispatches after a far transfer that changed the
+/// thread's mode: its module's directory is the old mode's, and no
+/// directory has an entry for page 0, so the dispatch misses, and the miss
+/// path goes on at the target through the new mode's directory.
+pub const FAR_PAD: u64 = 0x10;
+
+/// A far `jmp`/`call`/`ret` or `iret` to `selector:offset`: a user code
+/// selector (64-bit 0x33, 32-bit 0x23 or 0x1b) becomes the thread's
+/// `ctx::CS`, and the translated code goes on at the offset in that mode.
+/// Any other selector is the #GP Windows reports as an access violation:
+/// `Err` with the selector, and the context is left as it was.
+pub fn serve_far(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), u16> {
+    let sel = (v >> 32) as u16;
+    match sel as u32 {
+        ctx::CS_LONG | ctx::CS_COMPAT | 0x1b => {
+            let _ = m.write_u32(ctx_addr + ctx::CS as u64, sel as u32);
+            Ok(())
+        }
+        _ => Err(sel),
+    }
+}
+
+/// The pointer of the stack a WoW64 thread's 64-bit code runs on (where
+/// Wine's call-outs are made, and which a longjmp or an exception unwinds),
+/// for the thread at `ctx_addr`; `alt` says it runs code of the process's
+/// other mode, `wow64` that the process runs any.
+///
+/// Outside a WoW64 process that is RSP. In 32-bit code it is R14, where the
+/// WoW64 CPU keeps it while the 32-bit stack is in RSP. Its transitions
+/// switch the two a few instructions away from the far transfer, so for
+/// those instructions 64-bit code runs on the 32-bit stack (`syscall_32to64`
+/// before its `movq %r14,%rsp`): an RSP off the 64-bit stack the TEB (GS)
+/// names, with R14 on it, is that, and R14 is the answer there too.
+pub fn wow64_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool) -> u64 {
+    let reg = |r: u8| m.read_u64(ctx_addr + ctx::x(r) as u64).unwrap_or(0);
+    let (rsp, r14) = (reg(4), reg(14));
+    if alt {
+        return r14;
+    }
+    if !wow64 {
+        return rsp;
+    }
+    // NT_TIB: StackBase at 8, StackLimit at 16.
+    let teb = m.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+    let (Ok(base), Ok(limit)) = (m.read_u64(teb + 8), m.read_u64(teb + 16)) else { return rsp };
+    let on = |sp: u64| limit < base && sp >= limit && sp <= base;
+    if !on(rsp) && on(r14) { r14 } else { rsp }
+}
+
+/// [`wow64_live_sp`] for a call-out made in `callout_alt` mode, whose
+/// caller's frame is on that mode's stack: one made from 32-bit code (a
+/// native 32-bit module's guest call, `ctx::CS` 0x23 at the call) waits on
+/// ESP, which says nothing while the thread runs 64-bit code (a syscall
+/// under it): `None` then, and the check waits for the thread's return.
+pub fn callout_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool, callout_alt: bool) -> Option<u64> {
+    if !callout_alt {
+        return Some(wow64_live_sp(m, ctx_addr, alt, wow64));
+    }
+    alt.then(|| m.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff)
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -1184,6 +1256,34 @@ mod tests {
         assert_eq!(run(&[-12.0], x87op::FXTRACT).0, vec![-1.5, 3.0]);
         assert_eq!(run(&[0.0], x87op::FXTRACT).0, vec![0.0, f64::NEG_INFINITY]);
         assert_eq!(run(&[f64::MIN_POSITIVE / 4.0], x87op::FXTRACT).0, vec![1.0, -1024.0]);
+    }
+
+    #[test]
+    fn call_outs_wait_on_the_stack_of_the_mode_they_were_made_in() {
+        // A WoW64 thread: TEB at 0x2000, its 64-bit stack 0x10000..0x20000,
+        // the 32-bit stack around 0x8000 (R14 keeps the 64-bit one).
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u64(CTX + ctx::GS_BASE as u64, 0x2000).unwrap();
+        m.write_u64(0x2008, 0x20000).unwrap();
+        m.write_u64(0x2010, 0x10000).unwrap();
+        let regs = |m: &mut GuestMem<'_>, rsp: u64, r14: u64| {
+            m.write_u64(CTX + ctx::x(4) as u64, rsp).unwrap();
+            m.write_u64(CTX + ctx::x(14) as u64, r14).unwrap();
+        };
+        // In 32-bit code: a 64-bit call-out waits on R14, a 32-bit one on ESP.
+        regs(&mut m, 0xffff_ffff_0000_8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, true, true, false), Some(0x18000));
+        assert_eq!(callout_live_sp(&m, CTX, true, true, true), Some(0x8000));
+        // In 64-bit code (a syscall under a 32-bit call-out): RSP for a
+        // 64-bit call-out; a 32-bit one waits.
+        regs(&mut m, 0x17000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x17000));
+        assert_eq!(callout_live_sp(&m, CTX, false, true, true), None);
+        // 64-bit code still on the 32-bit stack (before syscall_32to64's
+        // switch): R14.
+        regs(&mut m, 0x8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x18000));
     }
 
     #[test]

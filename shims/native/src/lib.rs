@@ -279,6 +279,10 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
+    /// The `enter` of a module of code in the process's other mode (a
+    /// WoW64 thread's 32-bit code), which dispatches through the other
+    /// directory: where this thread's loops enter while its CS says so.
+    alt_enter: Option<wasmtime::Func>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// The host function watched slots hold (`watch_stub`).
@@ -467,8 +471,13 @@ struct JitShared {
     /// Which guest pages own which table slots. Process-wide, because a
     /// page's directory entry is a single value in shared guest memory.
     page_table: gex_xlate::PageTable,
-    /// Addresses whose dispatch slot now holds real code, in *some* store.
+    /// Addresses whose dispatch slot now holds real code, in *some* store
+    /// (`gex_abi::addr_key`: code in the process's other mode with its bit).
     translated: std::collections::HashSet<u64>,
+    /// The other directory (`gex_abi::ALT_PAGE`), allocated when a thread
+    /// first runs code in the mode the process's own class is not; 0 until
+    /// then.
+    alt_dir: u64,
     /// Every unit compiled so far, in installation order. Append-only, so a
     /// store catches up by replaying from its own watermark.
     registry: Vec<Arc<CompiledUnit>>,
@@ -495,6 +504,16 @@ struct JitShared {
     /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
     /// at the first skeleton that names it, bound DLL by DLL.
     wine_pe: Option<Arc<wasmdll::WinePe>>,
+    /// Wine's DLLs linked as modules of their own (pelink.py --split),
+    /// each installed at the first skeleton that names it, its imports of
+    /// the core bound to `wine_pe`'s exports.
+    wine_pe_split: Vec<Arc<wasmdll::WinePe>>,
+    /// Calls from one of Wine's modules of their own into another (`wasmdll::Late`).
+    wine_pe_late: Vec<wasmdll::Late>,
+    /// Each function address a module of Wine's takes (`GOT.func`): its
+    /// slot, (ftab module number, offset from that module's table base), by
+    /// the taking module's mode (`WinePe::ptr64`) and the function's name.
+    wine_pe_canon: std::collections::HashMap<(bool, String), (u32, u32)>,
     /// The stateful modules' data addresses whose relocations this address
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
@@ -1197,6 +1216,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            alt_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: sampler.clone(),
@@ -1285,6 +1305,7 @@ fn run_program_with(
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),
                 translated: Default::default(),
+                alt_dir: 0,
                 registry: Vec::new(),
                 blocks: 0,
                 calls: 0,
@@ -1296,6 +1317,9 @@ fn run_program_with(
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
+                wine_pe_split: Vec::new(),
+                wine_pe_late: Vec::new(),
+                wine_pe_canon: std::collections::HashMap::new(),
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),
@@ -2183,9 +2207,12 @@ fn run_thread_loop(
         if let Some(g) = &gate {
             g.enter();
         }
-        let result = enter
-            .call(&mut *store, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut [])
-            .map_err(anyhow::Error::from);
+        let result = match alt_enter_in_store(store, ctx_addr, pc) {
+            Ok(Some(alt)) => alt.call(&mut *store, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []),
+            Ok(None) => enter.call(&mut *store, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []),
+            Err(e) => Err(wasmtime::Error::from_anyhow(e)),
+        }
+        .map_err(anyhow::Error::from);
         if let Some(g) = &gate {
             g.leave();
         }
@@ -2791,6 +2818,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            alt_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: cx.sampler.clone(),
@@ -3169,6 +3197,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            alt_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: cx.sampler.clone(),
@@ -4143,6 +4172,90 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
     Err(StopExecution.into())
 }
 
+/// A far transfer to a selector that names no user code segment: the #GP
+/// Windows delivers as an access violation, SIGSEGV here.
+/// A far transfer to a selector that is no code segment: #GP, which the
+/// guest sees as an access violation (Wine's hook) or SIGSEGV.
+fn far_fault(caller: &mut Caller<'_, HostState>, sel: u16, pc: u64) -> Result<()> {
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        eprintln!("gex: far transfer to selector {sel:#x} in block {pc:#x}: #GP");
+    }
+    gp_fault(caller, pc, format!("a far transfer to selector {sel:#x}, which is no code segment"))
+}
+
+/// #GP at `pc`: an access violation to Wine's hook, else SIGSEGV.
+fn gp_fault(caller: &mut Caller<'_, HostState>, pc: u64, detail: String) -> Result<()> {
+    if deliver_guest_fault(caller, fault_code::ACCESS_VIOLATION, pc, 0)? {
+        return Err(StopExecution.into());
+    }
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let mut gm = GuestMem::new(memory.bytes());
+    let state = caller.data_mut();
+    match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, 0)) {
+        gex_kernel::signal::Delivery::Resume(target) => {
+            state.resume_cause = Some("SIGSEGV".into());
+            state.resume_at = Some(target);
+        }
+        _ => {
+            state.exit = Some(Exit::Signal {
+                signal: signal::SIGSEGV,
+                pc,
+                detail,
+                internal: false,
+            });
+        }
+    }
+    Err(StopExecution.into())
+}
+
+/// Whether `cs` (a `ctx::CS` value) is the process's other mode.
+fn cs_alt(cs: u32) -> bool {
+    let own = gex_xlate::default_compat();
+    gex_abi::ctx::cs_compat(cs, own) != own
+}
+
+/// The `enter` to run this thread at `pc` with: None while its CS is the
+/// process's own mode (the caller's usual one), else a module of the other
+/// mode's -- translating `pc` first when no such module is in this store.
+fn alt_enter_for(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<wasmtime::Func>> {
+    if !thread_alt(caller) {
+        return Ok(None);
+    }
+    if caller.data().alt_enter.is_none() {
+        catch_up_in_caller(caller)?;
+    }
+    if caller.data().alt_enter.is_none() {
+        translate_and_install(caller, pc)?;
+    }
+    if let Some(e) = caller.data().alt_enter.clone() {
+        return Ok(Some(e));
+    }
+    // Nothing of that mode translated in this store, the thread entering
+    // it at a function bound there (a WoW64 thread's first 32-bit code,
+    // LdrInitializeThunk in a native i386 ntdll): the other mode's runtime
+    // dispatches through its directory as well.
+    ftab::enter_alt(&mut *caller).map(Some)
+}
+
+/// [`alt_enter_for`] from a loop that holds the store, not a caller.
+fn alt_enter_in_store(store: &mut Store<HostState>, ctx_addr: u64, pc: u64) -> Result<Option<wasmtime::Func>> {
+    if !gex_abi::X86 {
+        return Ok(None);
+    }
+    let Some(memory) = store.data().memory.clone() else { return Ok(None) };
+    let cs = read_u64(memory.bytes(), (ctx_addr + ctx::CS as u64) as usize) as u32;
+    if !cs_alt(cs) {
+        return Ok(None);
+    }
+    if store.data().alt_enter.is_none() {
+        let find = wasmtime::Func::wrap(&mut *store, move |mut caller: Caller<'_, HostState>| -> wasmtime::Result<()> {
+            crate::host(alt_enter_for(&mut caller, pc).map(|_| ()))
+        });
+        find.call(&mut *store, &[], &mut [])?;
+    }
+    Ok(store.data().alt_enter.clone())
+}
+
 /// Wire the `gex.*` import surface to the kernel.
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
@@ -4152,6 +4265,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { let r = (|| -> anyhow::Result<()> {
+            // A system call from the other mode's code (int 0x80, syscall or
+            // sysenter in a WoW64 thread's 32-bit code): no such gate, #GP.
+            // (Not gexrt's own call from a native i386 Wine module, marked
+            // native: NATIVE_LEFT, below.)
+            if gex_abi::X86 && thread_alt(&caller) && pc as u64 & NATIVE_SYSCALL == 0 {
+                return gp_fault(&mut caller, pc as u64 & !NATIVE_SYSCALL, "a system call from code in the process's other mode".into());
+            }
             // A Unix call from guest code under Wine's own Unix side (32-bit Wine).
             if pc as u64 & NATIVE_SYSCALL == 0 {
                 if let Some(memory) = caller.data().memory.clone() {
@@ -4573,10 +4693,27 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
             }
+            // WoW64's stops with no call-out waiting there (their watch takes
+            // any arrival one waits for): 32-bit code reached 64-bit code's
+            // entry with no wow64cpu run to take it. Named, not the filler's
+            // breakpoint.
+            if wow64_stray(&caller, pc) {
+                eprintln!("gex: 32-bit code reached WoW64's stop {pc:#x} with no wow64cpu run waiting for it");
+                caller.data_mut().exit = Some(Exit::Signal { signal: signal::SIGSEGV, pc, detail: format!("WoW64 stop {pc:#x} reached with no run waiting"), internal: true });
+                return Err(StopExecution.into());
+            }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
                 // Installed in this store: the miss stub dispatches again
-                // in place, keeping every wasm frame below it.
+                // in place, keeping every wasm frame below it. Not for the
+                // other mode's code: the shared miss stub's `enter` reads the
+                // process's own directory, so the loop enters again there.
+                Ok(true) if thread_alt(&caller) => {
+                    let state = caller.data_mut();
+                    state.resume_cause = Some("other-mode miss".into());
+                    state.resume_at = Some(pc);
+                    Err(StopExecution.into())
+                }
                 Ok(true) => Ok(gex_emit::module::DISPATCH_MISS_REDISPATCH),
                 Ok(false) => {
                     branch_not_executable(&mut caller, pc)
@@ -4840,6 +4977,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 // MIDR_EL1: a plausible Cortex-A72.
                 -7 => 0x410f_d083,
+                gex_kernel::x86::SYSREG_FAR_NEXT if gex_abi::X86 => FAR_NEXT.with(|c| c.get()) as i64,
                 _ => 0,
             }
         },
@@ -4884,6 +5022,44 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
                 let gm = GuestMem::new(memory.bytes());
                 lockstep::log_trace(&gm, ctx as u32 as u64, v as u64);
+            }
+            // A far transfer: the selector checked, the thread's mode set.
+            // A change of mode leaves the block's module, whose directory is
+            // the old mode's: the thread loop goes on at the target through
+            // the new mode's (`alt_enter_for`).
+            if gex_abi::X86 && (reg == gex_kernel::x86::SYSREG_FAR || reg == gex_kernel::x86::SYSREG_FAR_IN_PLACE) {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                let cs_at = ctx as u32 as u64 + ctx::CS as u64;
+                let before = gm.read_u32(cs_at).unwrap_or(0);
+                if let Err(sel) = gex_kernel::x86::serve_far(&mut gm, ctx as u32 as u64, v as u64) {
+                    return far_fault(&mut caller, sel, pc as u64);
+                }
+                let after = gm.read_u32(cs_at).unwrap_or(0);
+                // GEX_TRACE_FAR: each far transfer, with the stacks around it
+                // (RSP, and R14, a WoW64 thread's other one).
+                static TRACE_FAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE_FAR.get_or_init(|| std::env::var_os("GEX_TRACE_FAR").is_some()) {
+                    let x = |r: u64| gm.read_u64(ctx as u32 as u64 + ctx::X as u64 + 8 * r).unwrap_or(0);
+                    eprintln!(
+                        "gex: far tid {} at {pc:#x} to {:#x}:{:#x}, cs {before:#x} -> {after:#x}, rsp {:#x}, r14 {:#x}",
+                        caller.data().thread.tid,
+                        (v as u64 >> 32) & 0xffff,
+                        v as u64 & 0xffff_ffff,
+                        x(4),
+                        x(14)
+                    );
+                }
+                // The block's dispatch after it (`SYSREG_FAR_NEXT`): within
+                // the mode, the target.
+                FAR_NEXT.with(|c| c.set(v as u64 & 0xffff_ffff));
+                if cs_alt(before) != cs_alt(after) {
+                    let target = v as u64 & 0xffff_ffff;
+                    let state = caller.data_mut();
+                    state.resume_cause = Some("far transfer".into());
+                    state.resume_at = Some(target);
+                    return Err(StopExecution.into());
+                }
             }
             if reg == gex_kernel::x86::SYSREG_X87 {
                 let memory = caller
@@ -4934,7 +5110,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let gm = GuestMem::new(memory.bytes());
                     let c = caller.data().thread.ctx_addr;
                     let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
-                    let popped = if gex_xlate::arch::compat() {
+                    // Units are of the process's own mode.
+                    let popped = if gex_xlate::default_compat() {
                         gm.read_u32(sp.wrapping_sub(4)).map(|v| v as u64).unwrap_or(1)
                     } else {
                         gm.read_u64(sp.wrapping_sub(8)).unwrap_or(1)
@@ -4957,15 +5134,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // only if its module still provides it; a newer translation
                 // otherwise already sits in the slot dispatch reaches.
                 let start = pc as u64;
+                // In the mode the block ran in: the thread's.
+                let key = gex_abi::addr_key(start, thread_alt(&caller));
                 let again = match caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     Some(shared) => {
                         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
                         // `addr`'s low half is the module id; the high half its
                         // dense base, when it has one (tier1 `emit_page_check`).
-                        let again = sh.provider.get(&start).map_or(true, |&m| m & 0xffff_ffff == addr as u64 & 0xffff_ffff);
+                        let again = sh.provider.get(&key).map_or(true, |&m| m & 0xffff_ffff == addr as u64 & 0xffff_ffff);
                         if again {
-                            sh.translated.remove(&start);
-                            sh.provider.remove(&start);
+                            sh.translated.remove(&key);
+                            sh.provider.remove(&key);
                         }
                         again
                     }
@@ -5000,9 +5179,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if op == gex_abi::cache_op::SLOT_CONFLICT {
+                let key = gex_abi::addr_key(addr as u64, thread_alt(&caller));
                 if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    sh.translated.remove(&(addr as u64));
+                    sh.translated.remove(&key);
                 }
                 return Ok(());
             }
@@ -5105,7 +5285,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // (longjmp, an exception) is abandoned: its caller leaves.
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
-                let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
+                // In a WoW64 process the stack the call-outs were made on is
+                // not always RSP: 32-bit code runs on its 32-bit stack, the
+                // 64-bit one's pointer in R14 (`hook_stack`), which is what
+                // has or has not unwound (`wow64_live_sp`).
+                // A call-out made from 32-bit code waits on ESP, and not
+                // while the thread is in 64-bit code (`callout_live_sp`).
+                let sp = if gex_abi::X86 {
+                    let wow64 = caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir != 0);
+                    gex_kernel::x86::callout_live_sp(&GuestMem::new(memory.bytes()), ctx_addr, thread_alt(&caller), wow64, co.alt)
+                } else {
+                    GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).ok()
+                };
                 // Not at a function's own address under a native caller (the
                 // bridge's poll there): leaving would hand the function back
                 // with the PC its body left for, which the bridge takes as
@@ -5122,9 +5313,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // it: a whole trap-out and re-entry per safepoint on every
                 // thread but the main one (wined3d's command-stream thread
                 // spun at a crawl, and a game drew no frame).
-                if co.ret != 0 && sp > co.sp_want + co.unwound && !at_function() {
+                if co.ret != 0 && sp.is_some_and(|sp| sp > co.sp_want + co.unwound) && !at_function() {
                     if wasm_trace() {
-                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
+                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {:#x}, want {:#x})", co.ret, sp.unwrap_or(0), co.sp_want);
                     }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
                     caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
@@ -5188,6 +5379,48 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the calling thread runs code in the mode its process's own class
+/// is not (`ctx::CS`): a WoW64 process's 32-bit code.
+pub(crate) fn thread_alt(caller: &Caller<'_, HostState>) -> bool {
+    if !gex_abi::X86 {
+        return false;
+    }
+    let Some(memory) = caller.data().memory.as_ref() else { return false };
+    let cs = read_u64(memory.bytes(), (caller.data().thread.ctx_addr + ctx::CS as u64) as usize) as u32;
+    let own = gex_xlate::default_compat();
+    gex_abi::ctx::cs_compat(cs, own) != own
+}
+
+/// Whether `pc` is one of WoW64's stops (`win::tramp::wow64_stop`) that no
+/// call-out of this thread waits for.
+fn wow64_stray(caller: &Caller<'_, HostState>, pc: u64) -> bool {
+    use gex_kernel::win::tramp;
+    tramp::wow64_stop(pc)
+        && !caller.data().callouts.iter().any(|co| tramp::returns_at(co.ret, pc))
+}
+
+/// The process's other directory (`gex_abi::ALT_PAGE`), made the first time
+/// a thread runs code in that mode: top-down below 4 GiB, out of a 32-bit
+/// program's way, zero (every page a miss) until code there is translated.
+pub(crate) fn ensure_alt_dir(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
+    ensure_alt_dir_in(caller.data_mut(), shared)
+}
+
+/// [`ensure_alt_dir`] for a store's state (an ejected project's prebuilt
+/// modules of that mode, installed before the program runs).
+pub(crate) fn ensure_alt_dir_in(state: &mut HostState, shared: &Arc<Mutex<JitShared>>) -> Result<u64> {
+    let have = shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir;
+    if have != 0 {
+        return Ok(have);
+    }
+    let at = libprov::alloc_above_code(state, gex_abi::alt_dir_bytes(), "[gex other-mode dispatch]")?;
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if sh.alt_dir == 0 {
+        sh.alt_dir = at;
+    }
+    Ok(sh.alt_dir)
+}
+
 /// Translate the block at `pc`, install it and everything reachable from it,
 /// and report whether there was anything there to translate.
 ///
@@ -5204,12 +5437,17 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // address -- but nothing new is translated for it. A miss that survives
     // that is a hole in the static recompilation and should be reported as
     // one rather than quietly filled in.
+    // Code in the process's other mode (a WoW64 thread's 32-bit code) is
+    // its own set of translations: keyed apart, in the other directory, and
+    // never served by a unit or function of the process's own class.
+    let alt = thread_alt(caller);
+    let key = gex_abi::addr_key(pc, alt);
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let replayed = replay_registry(caller)?;
         let covered = replayed && {
             let jit = caller.data().jit.as_ref().unwrap();
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-            sh.translated.contains(&pc)
+            sh.translated.contains(&key)
         };
         return Ok(covered);
     }
@@ -5221,18 +5459,21 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     if replayed_any && {
         let jit = caller.data().jit.as_ref().unwrap();
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.contains(&pc)
+        sh.translated.contains(&key)
     } {
         return Ok(true);
     }
 
     // 32-bit Wine: an image Wine relocated gets its function-tier unit at its first
-    // miss (`pe_units::wine32_image`).
+    // miss (`pe_units::wine32_image`); in either mode, a WoW64 process's i386
+    // images being the other mode's (`ftab::serve_alt` below serves them).
     pe_units::wine32_miss(caller, pc)?;
-    // A function the table holds, or the run-time translator can make,
-    // serves this address: tier-1 reaches it through the bridge.
-    if ftab::serve(caller, pc)? {
-        return Ok(true);
+    if !alt {
+        // A function the table holds, or the run-time translator can make,
+        // serves this address: tier-1 reaches it through the bridge.
+        if ftab::serve(caller, pc)? {
+            return Ok(true);
+        }
     }
     let (limits, shared) = {
         let jit = caller
@@ -5242,7 +5483,15 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
         (jit.limits, Arc::clone(&jit.shared))
     };
-    remiss(caller, &shared, pc)?;
+    if alt {
+        ensure_alt_dir(caller, &shared)?;
+        // An i386 Wine module's function bound there (WoW64's 32-bit
+        // builtins as native modules): its bridge, in the other directory.
+        if ftab::serve_alt(caller, pc)? {
+            return Ok(true);
+        }
+    }
+    remiss(caller, &shared, key)?;
     // Not serialised: misses on several threads translate concurrently, each
     // from this snapshot, and two that both lack a page each allocate it a
     // base (the shared mark keeps the two distinct). The first to publish
@@ -5277,7 +5526,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // `ud2` stub).
     let known = |a: u64| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        s.translated.contains(&a) || ftab::serves(&s, memory.bytes(), a)
+        s.translated.contains(&gex_abi::addr_key(a, alt)) || ftab::serves(&s, memory.bytes(), a, alt)
     };
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
@@ -5305,6 +5554,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     }
     let (translated_module, stats) = gex_emit::with_module_id_global(|| {
         let data = memory.bytes();
+        // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
+        let cs = read_u64(data, (caller.data().thread.ctx_addr + ctx::CS as u64) as usize) as u32;
+        let _mode = gex_xlate::cs_scope(if gex_abi::X86 { cs } else { 0 });
         gex_xlate::translate_runtime(
             data,
             pc,
@@ -5406,8 +5658,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // keeps changing under its translator still reports.
     let (covered, retired) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let page = pc / gex_abi::DISPATCH_PAGE;
-        (sh.translated.contains(&pc), sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
+        let page = gex_abi::page_key(pc, alt);
+        (sh.translated.contains(&key), sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
     };
     if !covered {
         thread_local! {
@@ -5452,23 +5704,25 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
     if n <= REMISS_LIMIT {
         return Ok(());
     }
-    let page = pc / gex_abi::DISPATCH_PAGE;
-    let dir = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
+    // (`pc` is a key: the other mode's carries `gex_abi::ALT_ADDR`)
+    let (addr, alt) = (pc & !gex_abi::ALT_ADDR, pc & gex_abi::ALT_ADDR != 0);
+    let page = gex_abi::page_key(addr, alt);
+    let dir = gex_abi::dir_entry_addr(page, sh.alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(u32::MAX);
     let base = sh.page_table.lookup(page);
-    let slot = base.map(|b| b as u64 + ((pc % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
+    let slot = base.map(|b| b as u64 + ((addr % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
     let owner = base.and_then(|b| sh.slot_owner.get(&b).copied());
     let units: Vec<usize> = sh
         .registry
         .iter()
         .enumerate()
-        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == pc))
+        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == addr))
         .map(|(i, _)| i)
         .collect();
     let retired = sh.retired_pages.get(&page).copied().unwrap_or(0);
     let sources = sh.remiss[&pc].1;
     let (n_units, stale) = (sh.registry.len(), sh.stale_blocks);
     drop(sh);
-    let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(pc, 1, prot::WRITE));
+    let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::WRITE));
     eprintln!(
         "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}",
         (units.first(), units.last())
@@ -5576,11 +5830,12 @@ fn publish_unit(
     // was placed at; otherwise its slots are abandoned and the next miss
     // translates it again into the page's new slots.
     let mut stale = 0usize;
+    let alt = translated.page_table.alt();
     for (a, _) in &translated.exported_blocks {
-        let page = *a / gex_abi::DISPATCH_PAGE;
+        let page = gex_abi::page_key(*a, alt);
         if sh.page_table.lookup(page).is_some() && sh.page_table.lookup(page) == translated.page_table.lookup(page) {
-            sh.translated.insert(*a);
-            sh.provider.insert(*a, translated.module_id);
+            sh.translated.insert(gex_abi::addr_key(*a, alt));
+            sh.provider.insert(gex_abi::addr_key(*a, alt), translated.module_id);
         } else {
             stale += 1;
         }
@@ -5667,6 +5922,24 @@ fn install_unit(
             *t,
         )?;
     }
+    // A module of code in the process's other mode reads its directory
+    // through this (`gex_abi::imports::ALT_DIR`); the others ignore it.
+    if gex_abi::X86 {
+        let alt_dir = {
+            let jit = cx.as_context().data().jit.as_ref().unwrap();
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.alt_dir
+        };
+        let g = wasmtime::Global::new(
+            cx.as_context_mut(),
+            wasmtime::GlobalType::new(
+                if gex_abi::mem64() { wasmtime::ValType::I64 } else { wasmtime::ValType::I32 },
+                wasmtime::Mutability::Const,
+            ),
+            if gex_abi::mem64() { Val::I64(alt_dir as i64) } else { Val::I32(alt_dir as u32 as i32) },
+        )?;
+        linker.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::imports::ALT_DIR, g)?;
+    }
     let proc = cx
         .as_context()
         .data()
@@ -5676,14 +5949,19 @@ fn install_unit(
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cx.as_context().data().callouts.is_empty() {
+        let alt_dir = unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0).then(|| other_dir(&cx));
         let slots: std::collections::HashSet<Slot> =
-            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a)).collect();
+            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a, alt_dir)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
     let instance = linker
         .instantiate(cx.as_context_mut(), unit.module.as_ref().unwrap())
         .context("instantiating a runtime-translated module")?;
     profile::attach(cx.as_context_mut(), &instance)?;
+    if gex_abi::X86 && cx.as_context().data().alt_enter.is_none() && unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0) {
+        let enter = instance.get_func(cx.as_context_mut(), exports::ENTER);
+        cx.as_context_mut().data_mut().alt_enter = enter;
+    }
     // Its id, which its page checks pass `PAGE_STALE` (gex_emit::
     // with_module_id_global): set before anything here can run it.
     if let Some(g) = instance.get_global(cx.as_context_mut(), gex_emit::MODULE_ID_GLOBAL) {
@@ -5718,7 +5996,7 @@ fn write_current_dir(
     let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
     let current: Vec<(u64, u32)> =
         unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect();
-    write_dispatch_dir(memory, &current)
+    write_dispatch_dir(memory, &current, sh.alt_dir)
 }
 
 /// Blocks tier-1 has translated, by guest page, for GEX_WIN_STATS's split
@@ -5732,6 +6010,13 @@ static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = M
 /// `function->target count`.
 /// Sampled nest exits that were not a plain return (see NEST_EXIT_SAMPLE).
 static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+thread_local! {
+    /// Where the block that made this thread's last far transfer goes on
+    /// (`SYSREG_FAR_NEXT`). Natively a change of mode leaves the block's
+    /// module instead (`resume_at`), so this is always the target.
+    static FAR_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A function-tier call-out in progress (`call_out`): the return it waits
 /// for, and the dispatch slot it watches for it with the old content.
@@ -5748,6 +6033,9 @@ struct Callout {
     /// callee's argument bytes exactly those (a return to the pad with the
     /// stack above them is an outer native caller's).
     span: u64,
+    /// Made from code in the mode its process's class is not (`thread_alt`):
+    /// a WoW64 process's 32-bit code, whose frames are on the 32-bit stack.
+    alt: bool,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
@@ -5825,13 +6113,17 @@ impl Slot {
 
 /// The slot dispatch reaches `pc` through, as the directory says now: in
 /// the miss span when its page has no entry.
-fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<Slot> {
-    let page = pc / gex_abi::DISPATCH_PAGE;
-    if page >= gex_abi::dispatch_max_pages() {
-        return None;
-    }
-    let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).ok()?;
+/// `alt_dir`: in the process's other directory (code of the other mode: a
+/// WoW64 thread's 32-bit code), `None` for its own.
+fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64, alt_dir: Option<u64>) -> Option<Slot> {
+    let at = gex_abi::dir_entry_addr(gex_abi::page_key(pc, alt_dir.is_some()), alt_dir.unwrap_or(0))?;
+    let entry = GuestMem::new(memory.bytes()).read_u32(at).ok()?;
     Some(Slot { table: gex_abi::dispatch_entry_table(entry), index: gex_abi::dispatch_index(pc, entry) })
+}
+
+/// The process's other directory (`gex_abi::ALT_PAGE`; 0 while there is none).
+fn other_dir(cx: &impl wasmtime::AsContext<Data = HostState>) -> u64 {
+    cx.as_context().data().jit.as_ref().map_or(0, |j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).alt_dir)
 }
 
 /// The per-store stub a watched slot holds (`call_out`), made once.
@@ -5851,14 +6143,15 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let at = if gex_abi::X86 || !gex_emit::tier1::inline_dispatch() { ctx::LAST_TARGET } else { ctx::PC };
         let target = gm.read_u64(c + at as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
+        let mode_dir = thread_alt(&caller).then(|| other_dir(&caller));
         let state = caller.data_mut();
-        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + co.span);
+        let hit = state.callouts.iter().rposition(|co| gex_kernel::win::tramp::returns_at(co.ret, target) && sp >= co.sp_want && sp <= co.sp_want.saturating_add(co.span));
         let signal = match hit {
             Some(i) => CalloutSignal::Return(i),
             None => {
                 // Another address in the slot, or the same return for a
                 // deeper frame (recursion): what the slot held runs it.
-                let slot = dispatch_slot_of(&memory, target);
+                let slot = dispatch_slot_of(&memory, target, mode_dir);
                 let old = state.callouts.iter().rev().find_map(|co| match &co.slot {
                     Some((s, r)) if Some(*s) == slot => r.as_func().flatten().cloned(),
                     _ => None,
@@ -5915,9 +6208,10 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
     let sizes: Vec<u64> = tables.iter().map(|t| t.size(cx.as_context_mut())).collect();
     let n = cx.as_context().data().callouts.len();
     for i in 0..n {
-        let ret = cx.as_context().data().callouts[i].ret;
-        // (only a page with an entry of its own: the miss slots are shared)
-        let want = dispatch_slot_of(&memory, ret).filter(|s| !s.is_miss() && sizes.get(s.table).is_some_and(|&n| s.index < n));
+        let (ret, alt) = (cx.as_context().data().callouts[i].ret, cx.as_context().data().callouts[i].alt);
+        // (only a page with an entry of its own: the miss slots are shared;
+        // in the directory of the mode the call-out was made in)
+        let want = dispatch_slot_of(&memory, ret, alt.then(|| other_dir(cx))).filter(|s| !s.is_miss() && sizes.get(s.table).is_some_and(|&n| s.index < n));
         let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
         if have.is_some() && have != want {
             // The return moved: put the old slot back, unless another
@@ -6037,6 +6331,26 @@ fn native_sp(d: &HostState) -> Option<wasmtime::Global> {
     s.provider_sp64.clone().or_else(|| s.provider_sp.clone())
 }
 
+/// The guest stack pointer a hook's native frames go below. In code of the
+/// process's other mode (a WoW64 process's 32-bit code) that is the 64-bit
+/// stack, which R14 holds while the 32-bit one is in RSP (the WoW64 CPU's
+/// convention, Windows' and Wine's): the 32-bit stack may be nearly full,
+/// and the fault is dispatched on the 64-bit one, a little below R14
+/// ([`WOW64_DISPATCH_ROOM`] keeps the hook's frames under that).
+fn hook_stack(caller: &Caller<'_, HostState>, mem: &[u8], ctx_addr: u64) -> u64 {
+    let x = |r: u64| read_u64(mem, (ctx_addr + ctx::X as u64 + 8 * r) as usize) & 0xffff_ffff;
+    if thread_alt(caller) {
+        x(14).saturating_sub(WOW64_DISPATCH_ROOM)
+    } else {
+        x(4)
+    }
+}
+
+/// The room left below a WoW64 thread's 64-bit stack pointer for the
+/// exception frame the hook builds there for a fault in 32-bit code, and
+/// wow64's copy of it.
+const WOW64_DISPATCH_ROOM: u64 = 0x4000;
+
 /// [`native_sp`]'s value as an address, whichever its width.
 fn sp_get(cx: impl wasmtime::AsContextMut, g: &wasmtime::Global) -> u64 {
     match g.get(cx) {
@@ -6066,7 +6380,7 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
@@ -6142,7 +6456,7 @@ fn guest_unix_call(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
@@ -6178,6 +6492,21 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     let Some(hook) = fault_hook_of(caller.data()) else { return Ok(false) };
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
+    // GEX_TRACE_GUEST_FAULT: each fault the hook is given, with the
+    // thread's mode and stack, and the wasm frames that raised it.
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        let gm = GuestMem::new(memory.bytes());
+        let cs = gm.read_u32(ctx_addr + ctx::CS as u64).unwrap_or(0);
+        let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+        let r14 = gm.read_u64(ctx_addr + ctx::X as u64 + 8 * 14).unwrap_or(0);
+        let src = gm.read_u64(ctx_addr + ctx::LAST_SOURCE as u64).unwrap_or(0);
+        let last = gm.read_u64(ctx_addr + ctx::LAST_TARGET as u64).unwrap_or(0);
+        eprintln!("gex: guest fault {code:#x} at {pc:#x} (address {addr:#x}, kind {kind}), cs {cs:#x}, sp {sp:#x}, r14 {r14:#x}, last target {last:#x} from block {src:#x}");
+        let bt = wasmtime::WasmBacktrace::force_capture(&*caller);
+        for fr in bt.frames().iter().take(12) {
+            eprintln!("gex:   {}", fr.func_name().unwrap_or("?"));
+        }
+    }
     {
         let mut gm = GuestMem::new(memory.bytes());
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
@@ -6200,7 +6529,7 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
             let cur = sp_get(&mut *caller, g);
-            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let esp = hook_stack(&*caller, memory.bytes(), ctx_addr);
             let new = (cur.min(esp).saturating_sub(4096)) & !15;
             sp_set(&mut *caller, g, new)?;
             Some(cur)
@@ -6331,8 +6660,13 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
     let args = gex_abi::ftab::need_args(need).filter(|_| pad);
-    let unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
-    let span = args.unwrap_or(CALLOUT_UNWOUND);
+    let mut unwound = args.unwrap_or(if pad { NATIVE_UNWOUND } else { CALLOUT_UNWOUND });
+    let mut span = args.unwrap_or(CALLOUT_UNWOUND);
+    // WoW64's stops: reached with the stack anywhere, never unwound past.
+    let mut sp_want = sp_want;
+    if gex_kernel::win::tramp::any_stack(ret) {
+        (sp_want, span, unwound) = (0, u64::MAX, u64::MAX);
+    }
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
     // translate it first (32-bit Wine: the trampoline page's NATIVE_RETURN_PAD, which
@@ -6341,7 +6675,17 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // An AOT-only process translates nothing (`aot_only`).
     if ret != 0 && !crate::aot_only::enabled() {
         let page = ret / gex_abi::DISPATCH_PAGE;
-        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(1);
+        // (in the directory of the thread's mode: a WoW64 thread's 32-bit
+        // native code returns to 32-bit code)
+        let alt = thread_alt(caller);
+        if alt {
+            let shared = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)).ok_or_else(|| anyhow!("no translation state"))?;
+            ensure_alt_dir(caller, &shared)?;
+        }
+        let dir = alt.then(|| other_dir(&*caller));
+        let entry = |m: &gex_mem::GuestMemory| {
+            gex_abi::dir_entry_addr(gex_abi::page_key(ret, alt), dir.unwrap_or(0)).and_then(|a| GuestMem::new(m.bytes()).read_u32(a).ok()).unwrap_or(1)
+        };
         if page < gex_abi::dispatch_max_pages() && entry(&memory) == 0 {
             translate_and_install(caller, ret)?;
             if entry(&memory) == 0 && std::env::var_os("GEX_WINE32_TRACE").is_some() {
@@ -6349,7 +6693,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             }
         }
     }
-    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, slot: None, live: false });
+    let alt = thread_alt(caller);
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;
@@ -6357,7 +6702,11 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let result = loop {
         let r = match next.take() {
             Some(f) => f.call(&mut *caller, &[Val::I32(ctx_i)], &mut []),
-            None => enter.call(&mut *caller, &[Val::I32(ctx_i), Val::I64(pc as i64)], &mut []),
+            None => match alt_enter_for(caller, pc) {
+                Ok(Some(alt)) => alt.call(&mut *caller, &[Val::I32(ctx_i), Val::I64(pc as i64)], &mut []),
+                Ok(None) => enter.call(&mut *caller, &[Val::I32(ctx_i), Val::I64(pc as i64)], &mut []),
+                Err(e) => Err(wasmtime::Error::from_anyhow(e)),
+            },
         };
         if let Some(child) = caller.data_mut().pending_spawn.take() {
             let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
@@ -6626,7 +6975,7 @@ fn retire_translations(
     pe_units::forget_gone(&mut sh.elf_units, &gone);
     let mut pages = 0usize;
     for &(start, end) in ranges {
-        sh.translated.retain(|a| *a < start || *a >= end);
+        sh.translated.retain(|a| (*a & !gex_abi::ALT_ADDR) < start || (*a & !gex_abi::ALT_ADDR) >= end);
         let (first, last) = (
             start / gex_abi::DISPATCH_PAGE,
             (end - 1) / gex_abi::DISPATCH_PAGE,
@@ -6642,6 +6991,17 @@ fn retire_translations(
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
             }
+            // The same page's code in the other mode, if any.
+            let key = page | gex_abi::ALT_PAGE;
+            if sh.page_table.forget(key).is_some() {
+                pages += 1;
+                jit_stats::RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(off) = gex_abi::dir_entry_addr(key, sh.alt_dir).map(|a| a as usize) {
+                if off + 4 <= data.len() {
+                    data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+                }
+            }
         }
     }
     ftab::on_retire(&mut sh, memory.bytes(), ranges, &gone);
@@ -6654,10 +7014,12 @@ fn retire_translations(
 }
 
 /// Publish page-directory entries so translated code becomes reachable.
-fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> Result<()> {
+fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)], alt_dir: u64) -> Result<()> {
     let data = memory.bytes();
     for (page, base) in entries {
-        let off = (gex_abi::dispatch_dir() + page * 4) as usize;
+        let Some(off) = gex_abi::dir_entry_addr(*page, alt_dir).map(|a| a as usize) else {
+            bail!("dispatch directory entry for page {page:#x} has no directory");
+        };
         if off + 4 > data.len() {
             bail!("dispatch directory entry for page {page} is out of range");
         }

@@ -502,8 +502,11 @@ impl Translation<'_> {
         let mut images = Vec::new();
         let mut illegal = 0;
         let mut pins = Vec::new();
-        let mut first_slot = 0u64;
-        for (n, &i) in order.iter().chain(others.iter()).enumerate().filter(|_| programs) {
+        // With the programs on their units, a program starts from the seed
+        // module, and what is built here (its code in the process's other
+        // mode) is numbered after the seed's slots.
+        let mut first_slot = if programs { 0u64 } else { gex_xlate::seed_module(!web).metadata().next_slot };
+        for (n, &i) in order.iter().chain(others.iter()).enumerate() {
             let p = &self.placed[i];
             let o = &p.obj;
             let in_closure = n < order.len();
@@ -560,7 +563,11 @@ impl Translation<'_> {
                 first_slot: if own || n == 0 { 0 } else { first_slot },
                 ..Options::default()
             };
-            let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
+            let (modules, stats) = if programs {
+                gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE)
+            } else {
+                (Vec::new(), Default::default())
+            };
             if in_closure {
                 first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
             }
@@ -589,7 +596,51 @@ impl Translation<'_> {
                 });
             }
             illegal += stats.illegal_blocks;
-            if o.role == "library" {
+            // The blocks the session ran in the process's other mode (a
+            // WoW64 program's 32-bit code): that mode's own module, for
+            // its own directory, numbered after this image's slots.
+            let other: Vec<u64> = self
+                .profile
+                .and_then(|pr| pr.objects.get(&o.id))
+                .map(|op| op.other_mode_blocks.keys().map(|off| off.wrapping_add(image.bias)).filter(|a| *a >= tlo && *a < thi).collect())
+                .unwrap_or_default();
+            if !other.is_empty() {
+                let _mode = gex_xlate::compat_scope(!image.class32);
+                let next = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
+                let alt_opts = Options {
+                    lazy: true,
+                    seeds_only: true,
+                    extra_entries: other,
+                    complete_pages: false,
+                    shared_memory: !web,
+                    linkage: gex_xlate::Linkage::Shared,
+                    first_slot: next,
+                    ..Options::default()
+                };
+                let (alt_modules, alt_stats) = gex_xlate::translate_image_split(&image, &alt_opts, gex_xlate::MAX_FUNCS_PER_MODULE);
+                if in_closure {
+                    first_slot = alt_modules.last().map_or(first_slot, |m| m.metadata().next_slot);
+                }
+                for (part, module) in alt_modules.iter().enumerate() {
+                    gex_native::validate_module(&module.wasm)
+                        .with_context(|| format!("the other-mode translation of {} is not valid wasm", o.path))?;
+                    let rel = format!("{out}/{name}-{}.other{part}.wasm", &hex[..12.min(hex.len())]);
+                    std::fs::write(self.dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
+                    images.push(BuiltImage {
+                        kind: "shared".to_string(),
+                        identity: identity.clone(),
+                        base: image.bias,
+                        module: rel,
+                        object: o.id.clone(),
+                        path: o.path.clone(),
+                        blocks: if part == 0 { alt_stats.blocks as u64 } else { 0 },
+                        bytes: module.wasm.len() as u64,
+                        image: String::new(),
+                    });
+                }
+                illegal += alt_stats.illegal_blocks;
+            }
+            if programs && o.role == "library" {
                 pins.push((o.path.clone(), image.bias));
             }
         }
@@ -749,7 +800,14 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     // The programs are function-tier units too, unless the user replaces
     // functions in them: a replacement is made in an image module's
     // translation (`intrinsics`), which a unit does not take.
-    let program_units = replacements.is_empty();
+    // Nor a program that ran code in the process's other mode (a WoW64
+    // program's 32-bit code): the far transfers back enter its own code
+    // mid-function, where a unit has no entry, and the tier-1 image takes
+    // the session's blocks as they ran.
+    let other_mode = profile.as_ref().is_some_and(|pr| {
+        placed.iter().any(|p| p.obj.role == "exe" && pr.objects.get(&p.obj.id).is_some_and(|o| !o.other_mode_blocks.is_empty()))
+    });
+    let program_units = replacements.is_empty() && !other_mode;
     let (mut images, pins, illegal) = t.translate("build/modules", false, !program_units)?;
     let units = t.units("build/cgen", program_units)?;
     if !units.is_empty() && !config.jit_fallback {

@@ -210,6 +210,10 @@ pub struct Context<'a> {
     /// has one: `PAGE_STALE` passes its value, where this module's dense
     /// blocks really are in the process running it.
     pub dense_global: Option<u32>,
+    /// The module's imported other directory ([`gex_abi::imports::ALT_DIR`])
+    /// when its code is in the process's other mode: every directory lookup
+    /// reads that one.
+    pub alt_dir: Option<u32>,
     /// Every address some block of `gir` branches back to (a successor at or
     /// below the branching block's start). A region needs a back edge to its
     /// entry, so a block not in here grows none and the walk is skipped.
@@ -338,9 +342,9 @@ fn page_check_ballast() -> usize {
 
 /// The pages `[start, end)` touches that the module numbered, with their
 /// entries.
-fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64) -> Vec<(u64, u32)> {
-    let first = start / gex_abi::DISPATCH_PAGE;
-    let last = end.max(start + 1).saturating_sub(1) / gex_abi::DISPATCH_PAGE;
+fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64, alt: bool) -> Vec<(u64, u32)> {
+    let first = gex_abi::page_key(start, alt);
+    let last = gex_abi::page_key(end.max(start + 1).saturating_sub(1), alt);
     (first..=last).filter_map(|p| bases.get(&p).map(|&b| (p, b))).collect()
 }
 
@@ -547,12 +551,12 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
-        let mut pages = checked_pages(bases, block.start, block.end);
+        let mut pages = checked_pages(bases, block.start, block.end, cx.alt_dir.is_some());
         // A region carries its members: their pages too.
         if let Some(region) = &region {
             for a in region.iter() {
                 if let Some(b) = cx.gir.get(a) {
-                    pages.extend(checked_pages(bases, b.start, b.end));
+                    pages.extend(checked_pages(bases, b.start, b.end, cx.alt_dir.is_some()));
                 }
             }
         }
@@ -606,12 +610,12 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
-        let mut pages = checked_pages(bases, block.start, block.end);
+        let mut pages = checked_pages(bases, block.start, block.end, cx.alt_dir.is_some());
         // A region carries its members: their pages too.
         if let Some(region) = &region {
             for a in region.iter() {
                 if let Some(b) = cx.gir.get(a) {
-                    pages.extend(checked_pages(bases, b.start, b.end));
+                    pages.extend(checked_pages(bases, b.start, b.end, cx.alt_dir.is_some()));
                 }
             }
         }
@@ -5262,13 +5266,30 @@ impl<'a> Emitter<'a> {
         self.f.byte(0xa7); // i32.wrap_i64
         self.f.i32_const(4);
         self.f.byte(0x6c); // i32.mul
-        self.f.addr_i32();
-        self.f.load64(0x28, 2, gex_abi::dispatch_dir());
+        self.load_dir_entry();
         self.f.i32_const(0);
         self.f.local_get(self.scratch_page);
         self.f.i64_const(gex_abi::dispatch_max_pages() as i64);
         self.f.byte(code::I64_LT_U);
         self.f.select();
+    }
+
+    /// The directory entry at the byte offset (an `i32`, page * 4) on the
+    /// stack: in the process's directory, or for a module of code in its
+    /// other mode the other one.
+    fn load_dir_entry(&mut self) {
+        match self.cx.alt_dir {
+            Some(g) => {
+                self.f.addr_i32();
+                self.f.global_get(g);
+                self.f.addr_add();
+                self.f.load64(0x28, 2, 0);
+            }
+            None => {
+                self.f.addr_i32();
+                self.f.load64(0x28, 2, gex_abi::dispatch_dir());
+            }
+        }
     }
 
     /// Drop the table index from an entry on the stack, leaving the base slot.
@@ -5400,9 +5421,18 @@ impl<'a> Emitter<'a> {
         if pages.is_empty() {
             return;
         }
-        for (k, (page, base)) in pages.iter().enumerate() {
-            self.f.addr_const(gex_abi::dispatch_dir() + page * 4);
-            self.f.load(0x28, 2, 0); // i32.load
+        for (k, (key, base)) in pages.iter().enumerate() {
+            let (page, _) = gex_abi::key_page(*key);
+            match self.cx.alt_dir {
+                Some(_) => {
+                    self.f.i32_const((page * 4) as i32);
+                    self.load_dir_entry();
+                }
+                None => {
+                    self.f.addr_const(gex_abi::dispatch_dir() + page * 4);
+                    self.f.load(0x28, 2, 0); // i32.load
+                }
+            }
             self.f.i32_const(*base as i32);
             self.f.byte(0x47); // i32.ne
             if k > 0 {

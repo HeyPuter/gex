@@ -15,6 +15,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
 #               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
+#   wwl-P       with WINE64_WOW64=1, the i386 and x86_64 PE winewayland.drv
+#               (a tree of its own: the display driver's PE halves)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
@@ -26,22 +28,35 @@
 #               EGL, guest/gl/gexgl.c), secur32 (+ GnuTLS) and
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
 #               in the loader; WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
-#   srv-K       the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD)
+#   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
+#               that script and the 32-bit configure options it compiles with
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
-#   dist64-K-S-fF-twin  with WINE64_TWIN=1, that install plus the memory64
+#   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S-fF  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
+#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; less winegstreamer: -nogst)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
-#   pen64-K-N   the native PE core : WINE64_NATIVE_DLLS (default ntdll,
-#               kernelbase, kernel32, msvcrt, ucrtbase, and winewayland.drv,
-#               the display driver's PE side) made in b64-K-S and
-#               linked as one module behind their skeletons
-#               (stage-native64.sh)
+#   pen64-K-N   the native PE side: WINE64_NATIVE_DLLS (default ntdll,
+#               kernelbase, kernel32, msvcrt, ucrtbase, winewayland.drv (the
+#               display driver's PE side), WoW64's DLLs, wineboot, services
+#               and explorer) made in b64-K-S and linked as one module behind
+#               their skeletons, and every other module that tree builds as
+#               one of its own (stage-native64.sh)
 #   pen64-K-N-twin  with WINE64_TWIN=1, that core plus the memory64 build's
 #               module as winepe.wasm.m64 (WINE64_NATIVE then names it)
+#   b32-K-B     with WINE64_WOW64=1, the wasm32 build tree of the i386 PE side
+#               (wine32/wine-build.sh wasm; B: that script, 32-bit Wine's
+#               sysroot and libraries)
+#   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
+#               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
+#   dist64-...-nN[-N32|-i386t]  the install with the native PE side in place
+#               of the PE builtins, both arches (-i386t: WoW64's i386 side
+#               translated, WINE64_WOW64_I386_TRANSLATED=1): WINE64_DIST
+#               (WINE64_NATIVE_PE=0: the install above, translated)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
 # S those, gex's link tools, gex-gl's guest library and the OSSv4 header
@@ -64,12 +79,13 @@ W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
 J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
+V=$(cat "$here/link-wineserver.sh" "$here/wine32/wine-build.sh" | sha256sum | cut -c1-6)
 pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine64.pins")
 [ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine64.pins' $(printf %.12s "$pin")" >&2
 log() { echo "wine64-dist: $*" >&2; }
 # The server's prerequisite first, so a missing one fails now, not after
 # the Wine builds: a configured 32-bit Wine build tree and its sysroot.
-if [ ! -e "$C/srv-$K/.done" ]; then
+if [ ! -e "$C/srv-$K-$V/.done" ]; then
 	own=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
 	ownb=$(sed -n 's/^WINE32_BUILD=//p' <<< "$own")
 	if [ -z "${WINE32_BUILD:-}" ]; then
@@ -94,9 +110,45 @@ TP=$(git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|config
 # those, the link and gex-gl's guest library (linked into the loader).
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$here"/wine64-deps.sh "$here"/wine32.pins \
 	"$here"/ffi64/*; } | sha256sum | cut -c1-10)
-S=$( { echo "$DH"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
+# dpnsvr and vcruntime140_1 (configure enables them for x86_64, not wasm64,
+# which serves x86-64 programs), and dmsynth with its FluidSynth (C, enabled
+# only with a C++ compiler): x86-64 builtins as wasm64 modules too (part of S)
+B64_MODS="--enable-dpnsvr --enable-vcruntime140_1 --enable-dmsynth --enable-fluidsynth"
+S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
+# WINE64_WOW64=1: WoW64, 32-bit programs in the 64-bit process: the PE side
+# built for i386 too (lib/wine/i386-windows from this commit, whose
+# __wine_unix_call codes are this Unix side's) and a wow64 prefix
+# (syswow64). P gets -wow64-F (F: the i386 CFLAGS below); the default
+# build is unchanged.
+# The i386 side's CFLAGS: -mpreferred-stack-boundary=2 (configure's, with
+# -msse2) makes MinGW GCC 12 fail on a 64-bit integer to float conversion
+# (an internal compiler error in oleaut32's VarR4FromUI8), so the stack is
+# kept 16-byte aligned and only an incoming 4-byte alignment assumed, which
+# is all the i386 ABI promises a callee.
+WOW=${WINE64_WOW64:-0}; ARCHS=x86_64; CF32=()
+WS=; if [ "$WOW" != 0 ]; then
+	CF32=(i386_CFLAGS="-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2")
+	WS=-wow64-$(echo "${CF32[*]}" | sha256sum | cut -c1-6); P=$P$WS; ARCHS=i386,x86_64
+	S=$S-wow64  # the Unix side registers its libraries' WoW64 tables (link-wine64.sh)
+fi
+# The install leaves Win16 and VxD out (no 16-bit program runs on gex): the
+# 16-bit modules (.dll16 .drv16 .exe16 .mod16), the VxDs, winevdm (the
+# 16-bit program host), and wow32 and w32skrnl, which import krnl386.exe16
+# and so load only beside it. WINE_WIN16=1 keeps them, as before (the
+# install's name then has no -no16).
+WIN16_GLOB='*.dll16 *.drv16 *.exe16 *.mod16 *.vxd winevdm.exe wow32.dll w32skrnl.dll'
+W16=; [ "$WOW" = 0 ] || [ "${WINE_WIN16:-0}" != 0 ] || W16=-no16-$(echo "$WIN16_GLOB" | sha256sum | cut -c1-4)
+# And icu (Windows' ICU API, which few programs use: its ICU is C++ that has no
+# wasm build yet), with icuin and icuuc, which only forward to it: out of
+# both arches. WINE_ICU=1 keeps them, as before (no -noicu in the name).
+ICU_GLOB='icu.dll icuin.dll icuuc.dll'
+WICU=; [ "${WINE_ICU:-0}" != 0 ] || WICU=-noicu
+# And winegstreamer (its media framework, GStreamer, is not in the build:
+# the DLL would only fail to start), out of both arches. WINE_GSTREAMER=1
+# keeps it (no -nogst in the name).
+WGST=; [ "${WINE_GSTREAMER:-0}" != 0 ] || WGST=-nogst
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -135,21 +187,38 @@ log "raster fonts ($F)"; step fon-$F fon_make
 # what a new commit changed: git touches only the files it rewrites), and
 # its install copied into pe64-P. A pin bump that changes one DLL took
 # about 40 minutes from scratch. WINE64_PE_FRESH=1 starts that tree over.
-WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)
+WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)$WS
 pe_build() {
 	local out=$PWD
 	(
 		flock 9
 		[ "${WINE64_PE_FRESH:-0}" = 1 ] && rm -rf "$WK"
 		mkdir -p "$WK"; cd "$WK"
-		[ -f Makefile ] || "$W/configure" --enable-archs=x86_64 --with-wine-tools="$T" --disable-tests $without
+		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
 		nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
 		rm -rf install; nice -n 10 make install prefix="$WK/install"
 		cp -a --reflink=auto install "$out/install"
 	) 9>"$WK.lock"
 }
-log "x86_64 PE DLLs ($P)"; step pe64-$P pe_build
+log "$ARCHS PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
+
+# WoW64: the display driver's PE halves. A 32-bit process's user32 loads
+# the i386 one from lib/wine/i386-windows; the prefix needs both in its
+# system directories, since a process loads a driver only from there (the
+# 64-bit one is the native core's when there is one). They need no Wayland
+# libraries, but the PE tree's configure (--without-wayland: no host
+# libraries) leaves the whole module out, and enabling the module there has
+# `make` build its Unix half as well, which cannot build without them. A
+# tree of its own, configured with the module enabled, makes the PE files
+# alone; the Unix half is the loader's (link-wine64.sh, with its WoW64 table).
+wwl_build() {
+	"$W/configure" --enable-archs=i386,x86_64 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv dlls/winewayland.drv/x86_64-windows/winewayland.drv
+}
+WD=; WL=; if [ "$WOW" != 0 ]; then
+	log "winewayland.drv's PE halves ($P)"; step wwl-$P wwl_build; WD=-wwl2; WL=$C/wwl-$P/dlls/winewayland.drv
+fi
 
 pfx_make() {
 	# The native Wine makes the prefix; a bare server of its own, no display.
@@ -176,9 +245,13 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0) | sha256sum | cut -c1-10)
+# WoW64: the display driver in system32 and syswow64 (wwl's: the prefix's
+# Wine has none), where a process loads it from.
+R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
+	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
+	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
@@ -201,26 +274,35 @@ b64_build() {
 	# wcc64: the Wine trees' paths as /wine, not this host's.
 	export GEX_WCC_MAP="$W=/wine:$PWD=/wine-build:$T=/wine-tools:$DEPS=/wine-deps"
 	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
-		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
+		--disable-tests --without-mingw --enable-archs= --without-unwind $o $B64_MODS \
 		CC="$WCC" CXX="$WCXX" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
 		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
 	mkdir -p out
-	WINE64_MEM64=$M64 WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
+	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
 srv_link() {
+	# (a tree configured before wine32/wine-build.sh kept inotify has none)
+	grep -q '^#define HAVE_SYS_INOTIFY_H 1' "$WINE32_BUILD/include/config.h" ||
+		{ echo "wine64-dist: $WINE32_BUILD was configured without inotify (make -C tools/wine-wasm build)"; return 1; }
 	"$here/link-wineserver.sh" "$WINE32_BUILD" "$W" "$PWD/obj" "$PWD"
 }
-log "wineserver ($K)"; step srv-$K srv_link
+log "wineserver ($K, $V)"; step srv-$K-$V srv_link
 
 dist_make() {
 	local d=$PWD
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
-	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
+	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
+	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
+	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" lib/wine/i386-windows/
+	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" lib/wine/x86_64-windows/
+	[ -z "$W16" ] || (cd lib/wine/i386-windows && rm -f $WIN16_GLOB)
+	[ -z "$WICU" ] || for a in x86_64-windows i386-windows; do [ ! -d lib/wine/$a ] || (cd lib/wine/$a && rm -f $ICU_GLOB); done
+	[ -z "$WGST" ] || for a in x86_64-windows i386-windows; do rm -f lib/wine/$a/winegstreamer.dll; done
 	cp -a "$N/share/wine" share/
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
@@ -230,7 +312,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F)"; step dist64-$K-$S-f$F dist_make
+log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WGST)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -241,21 +323,102 @@ ntdll_native() {
 # (the lone PE ntdll: the lowered flavour's only)
 [ "$M64" != 0 ] || { log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native; }
 
+# The native PE side, the install's default: the PE builtins as native wasm
+# modules (pelink.py, stage-native64.sh) in place of their x86-64 code. The
+# core, WINE64_NATIVE_DLLS, is one module (winepe.wasm); every other module the
+# wasm64 tree builds that the install has is a module of its own beside it
+# (WINE64_SPLIT_DLLS names them instead). No builtin is left x86 code: the
+# install fails when any PE image still holds machine code (pescan.py), unless
+# WINE64_NATIVE_PARTIAL=1. The install's name then gets -nNK.
+# WINE64_NATIVE_PE=0: the PE builtins as they are, translated (for comparison;
+# the core is still made).
+NPE=${WINE64_NATIVE_PE:-1}
 D=${WINE64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
-NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+# WoW64's own DLLs, and the programs every process start runs, in the core too
+if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
+	[ "$WOW" = 0 ] || D="$D wow64.dll wow64win.dll wow64cpu.dll"
+	D="$D wineboot.exe services.exe explorer.exe"
+fi
+SP=${WINE64_SPLIT_DLLS:-}
+# (the memory64 flavour: the core alone, as before; its twin pairs only winepe.wasm)
+SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || [ "$M64" != 0 ] || SPA=all
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
-	local b=$C/b64-$K-$S t
+	local b=$C/b64-$K-$S t sp=$SP
 	t="libs/gexrt/libgexrt.a"
-	for dll in $D; do t="$t dlls/${dll%.dll}/wasm64-windows/$dll"; done
+	for dll in $D; do t="$t $(pe_target "$b" "$dll")"; done
+	if [ -n "$SPA" ]; then
+		# every PE module, as far as each builds; one that fails is still
+		# machine code, which native_make's scan refuses
+		( cd "$b" && nice -n 10 make -k -j"$J" ) || true
+		sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
+			while read -r m; do case " $D " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
+	fi
+	for dll in $sp; do t="$t $(pe_target "$b" "$dll")"; done
 	# shellcheck disable=SC2086
 	( cd "$b" && nice -n 10 make -j"$J" $t ) || return 1
-	# shellcheck disable=SC2086
-	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
+	echo "$sp" > split.txt
+	stage_split "$b" "$W" "$PWD/native" $D
 }
-DIST=$C/dist64-$K-$S-f$F
+# stage-native64.sh ARGS over the split modules in split.txt. A split module
+# importing what no module exports (a source the wasm tree does not build) is
+# named and left out, so that the rest link and native_make's scan lists every
+# module still machine code in one build.
+stage_split() {
+	local i bad
+	for i in 1 2 3; do
+		# shellcheck disable=SC2046
+		WINE64_SPLIT_DLLS="$(echo $(cat split.txt))" nice -n 10 "$here/stage-native64.sh" "$@" 2> stage.err && { cat stage.err >&2; return 0; }
+		cat stage.err >&2
+		bad=$(sed -n 's/^  \([^ :]*\)\.wasm: .*/\1/p' stage.err | grep -vx winepe) || return 1
+		log "NOT NATIVE: imports no module exports: $(echo $bad)"
+		grep -vxF -f <(echo "$bad") split.txt > split.tmp || true
+		mv split.tmp split.txt
+	done
+	return 1
+}
+pe_target() { # BUILD DLL: the tree's make target for DLL's wasm64 build
+	# a module named with its extension (msacm32.drv) has its own directory
+	if [ -d "$1/dlls/$2" ]; then echo "dlls/$2/wasm64-windows/$2"
+	elif [ -d "$1/dlls/${2%.*}" ]; then echo "dlls/${2%.*}/wasm64-windows/$2"
+	elif [ -d "$1/programs/$2" ]; then echo "programs/$2/wasm64-windows/$2"
+	else echo "programs/${2%.*}/wasm64-windows/$2"; fi
+}
 NATIVE=$C/pen64-$K-$NK/native
+# WoW64's i386 PE side native as well: a wasm32 build tree of this Wine tree
+# (wine32/wine-build.sh wasm, with 32-bit Wine's sysroot and libraries and
+# this tree's tools), its modules staged as the x86_64 ones are
+# (stage-native64.sh --i386): the core, WINE64_NATIVE_DLLS32, one module, and
+# every other module the tree builds that the install's i386-windows has, one
+# of its own. The install's name gets -N32 too.
+# WINE64_WOW64_I386_TRANSLATED=1: the i386 side stays the PE builtins as they
+# are, translated (until its native modules run WoW64's programs), and the
+# install's name gets -i386t; its x86_64 side is native as ever.
+I386T=${WINE64_WOW64_I386_TRANSLATED:-0}
+N32=; NATIVE32=
+if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ] && [ "$I386T" = 0 ]; then
+	p32=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
+	SR32=$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32"); DEPS32=$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")
+	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
+	B32K=$( { echo "$SR32 $DEPS32"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
+	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
+	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+	NATIVE32=$C/pen32-$K-$N32/native
+fi
+b32_build() {
+	GEX_WASM_SYSROOT=$SR32 WINE32_JOBS=$J nice -n 10 "$here/wine32/wine-build.sh" wasm "$W" "$T" "$PWD" "$DEPS32"
+}
+pe_native32() {
+	local b=$C/b32-$K-$B32K sp
+	sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
+		while read -r m; do case " $D32 " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/i386-windows/$m" ] && echo "$m"; done)
+	echo "$sp" > split.txt
+	# shellcheck disable=SC2086
+	GEX_WASM_SYSROOT=$SR32 stage_split --i386 "$b" "$W" "$PWD/native" $D32
+}
 if [ "$M64" != 0 ]; then
 	# The memory64 flavour: its loader; with WINE64_M64_NATIVE=1 (the twin's
 	# half) its PE core too, a module for a 64-bit memory (pelink.py sees
@@ -268,6 +431,37 @@ if [ "$M64" != 0 ]; then
 	exit 0
 fi
 log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
+if [ -n "$N32" ]; then
+	log "i386 wasm32 tree ($K, $B32K)"; step b32-$K-$B32K b32_build
+	log "i386 native PE side ($K, $N32)"; step pen32-$K-$N32 pe_native32
+fi
+# The install with the native PE side in place of the PE builtins (rm first:
+# the copy's files are hard links)
+native_make() {
+	cp -al "$DIST/." .
+	rm -f .done
+	local a n
+	for a in x86_64:$NATIVE i386:$NATIVE32; do
+		n=${a#*:}; [ -n "$n" ] || continue
+		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
+	done
+	# no builtin runs translated: a PE image left with machine code fails the
+	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported).
+	# The i386 side under WINE64_WOW64_I386_TRANSLATED=1 is listed, not refused.
+	if [ -n "$SPA" ]; then
+		python3 "$here/pescan.py" lib/wine/x86_64-windows ${NATIVE32:+lib/wine/i386-windows} >&2 ||
+			[ "${WINE64_NATIVE_PARTIAL:-0}" = 1 ] || { log "PE images with machine code (above): the dist is not native"; return 1; }
+		if [ "$WOW" != 0 ] && [ -z "$NATIVE32" ]; then
+			python3 "$here/pescan.py" lib/wine/i386-windows >&2 || true
+			log "i386-windows translated: WINE64_WOW64_I386_TRANSLATED=1 is on"
+		fi
+	fi
+}
+if [ "$NPE" != 0 ]; then
+	NI=-n$NK${N32:+-$N32}; [ "$WOW" = 0 ] || [ "$I386T" = 0 ] || NI=$NI-i386t
+	log "native install ($K, $NK${N32:+, $N32}$([ "${NI%-i386t}" = "$NI" ] || echo ", i386 translated"))"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI
+fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as
 # x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's wine; one PE side, one
@@ -286,8 +480,9 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 		rm -f .done
 		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
 	}
-	log "twin install ($K, $S, $F)"; step dist64-$K-$S-f$F-twin twin_make
-	DIST=$C/dist64-$K-$S-f$F-twin
+	# (named after the install it copies: a twin of another install is another twin)
+	log "twin install ($K, $S, $F, $V)"; step "${DIST##*/}-twin" twin_make
+	DIST=$DIST-twin
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done
@@ -302,3 +497,4 @@ echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
 echo "WINE64_NATIVE=$NATIVE"
+[ -z "$NATIVE32" ] || echo "WINE64_NATIVE32=$NATIVE32"

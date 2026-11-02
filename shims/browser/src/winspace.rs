@@ -62,7 +62,7 @@ mod stub {
     }
 
     /// As the shared build's; no process takes the compact space here.
-    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (0x195f_0000, 0x197f_0000);
+    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (0x195f_0000, 0x19df_0000);
 
     pub(crate) fn wine64_compact_space() -> u64 {
         0
@@ -245,7 +245,7 @@ mod imp {
     /// data export's RVA is its offset from the skeleton's base, so every
     /// skeleton is below it), and low, so that the memory need not be long
     /// and every guest access to it is under `gex_abi::KUSER_GUARD`.
-    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (WINE64_COMPACT_IMAGES.1, WINE64_COMPACT_IMAGES.1 + 0x20_0000);
+    pub(crate) const WINE64_COMPACT_PE_DATA: (u64, u64) = (WINE64_COMPACT_IMAGES.1, WINE64_COMPACT_IMAGES.1 + 0x80_0000);
     /// The end of 64-bit Wine's compact island, a 64 KiB guard above the window.
     const WINE64_COMPACT_ISLAND_END: u64 = WINE64_COMPACT_PE_DATA.1 + 0x1_0000;
     const _: () = assert!(WINE64_COMPACT_ISLAND_END < DLL_BAND_END && WINE64_COMPACT_IMAGES.0 > DLL_BAND);

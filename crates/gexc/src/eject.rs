@@ -17,6 +17,11 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
+  gexc eject prepare <user/eject.json> <bundle.tar> <out.tar> [--prefix /pfx]
+                                   a Wine bundle with the config's prefix
+                                   settings (services, helpers, desktop), to
+                                   record so the bundle split matches the site
+                                   (crates/gex-eject/README.md, \"Services\")
   gexc eject override <project> <object> <symbol|0xoffset> [--size N]
                                    print a user/eject.json replacement entry
                                    for a function, with the object's hash and
@@ -40,6 +45,27 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 bail!("gexc eject build takes only the project directory");
             }
             build(&dir)?;
+            Ok(None)
+        }
+        Some("prepare") => {
+            // A Wine bundle as the site of a user/eject.json starts it (its
+            // services, helpers and desktop settings in the prefix), for
+            // the recording the eject then takes.
+            let usage = "gexc eject prepare <user/eject.json> <bundle.tar> <out.tar> [--prefix /pfx]";
+            let mut pos = Vec::new();
+            let mut prefix = "/pfx".to_string();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--prefix" {
+                    i += 1;
+                    prefix = args.get(i).context(usage)?.clone();
+                } else {
+                    pos.push(PathBuf::from(&args[i]));
+                }
+                i += 1;
+            }
+            let [config, input, out] = &pos[..] else { bail!("{usage}") };
+            gex_eject::wine32::prepare_bundle(config, input, out, &prefix)?;
             Ok(None)
         }
         Some("prune") => {

@@ -497,15 +497,26 @@ fn identity_line(image: &gex_ld::Image, base: u64, key: &str, identity: &str, pa
 /// own, so the page never takes a key its own hashing would not give. A
 /// 64-bit memory's and a compact process's are marked (`gex_key::IdentityLine`,
 /// the shim's `KNOWN`).
+/// An image the recording used more than one unit for (a WoW64 page's
+/// 64-bit win32u.dll, whose unit's key differs between a 64-bit process
+/// and a 32-bit one) gets no line: the page hashes it per process.
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
     let tar = crate::reach::Tar::parse(&bytes)?;
+    let mut per_path = std::collections::HashMap::<String, usize>::new();
+    for u in units {
+        *per_path.entry(json::str_field(u, "path", what)?).or_default() += 1;
+    }
     let mut lines = Vec::new();
     let mut skipped = 0;
     for u in units {
         let key = json::str_field(u, "key", what)?;
         let path = json::str_field(u, "path", what)?;
+        if per_path[&path] > 1 {
+            skipped += 1;
+            continue;
+        }
         let site = site_key(&key);
         let found = (|| -> Option<String> {
             let data = tar.read(&path)?;
@@ -651,12 +662,8 @@ const STRIP_PROGRAMS: &[&str] = &["winemenubuilder.exe"];
 
 /// `services`, each `(name, start, required)`: a required service the prefix
 /// has no key for fails the build, another is passed over.
-fn set_services(v: &Json, web: &Path, services: &[(String, u32, bool)]) -> Result<()> {
-    let what = crate::project::PROJECT_FILE;
-    let path = web.join("rootfs.tar");
-    let mut bytes = std::fs::read(&path)?;
-    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
-    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+fn set_services(path: &Path, prefix: &str, services: &[(String, u32, bool)], say: &str) -> Result<()> {
+    let mut bytes = std::fs::read(path)?;
     let want = format!("{prefix}/system.reg");
     let (o, n) = {
         let tar = crate::reach::Tar::parse(&bytes)?;
@@ -689,9 +696,9 @@ fn set_services(v: &Json, web: &Path, services: &[(String, u32, bool)]) -> Resul
         said.push(format!("{name} {}", ["boot", "system", "auto", "demand", "disabled"][*start as usize]));
     }
     // A new file: the one there may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &bytes, false)?;
-    eprintln!("gexc eject build: \"services\": {}", said.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &bytes, false)?;
+    eprintln!("{say}: \"services\": {}", said.join(", "));
     Ok(())
 }
 
@@ -727,12 +734,8 @@ fn run_services_without(text: &str, names: &[&str]) -> (String, Vec<String>) {
 /// Takes `names` out of the prefix's `RunServices` (the programs
 /// `wineboot --init` starts each session) in web/rootfs.tar's `system.reg`.
 /// A name the key does not have is passed over. Returns the ones taken out.
-fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>> {
-    let what = crate::project::PROJECT_FILE;
-    let path = web.join("rootfs.tar");
-    let bytes = std::fs::read(&path)?;
-    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
-    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+fn drop_run_services(path: &Path, prefix: &str, names: &[&str], say: &str) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path)?;
     let want = format!("{prefix}/system.reg");
     let text = {
         let tar = crate::reach::Tar::parse(&bytes)?;
@@ -745,9 +748,9 @@ fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>
     }
     let new = crate::reach::tar_put(&bytes, &want, out.as_bytes())?;
     // web/rootfs.tar may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &new, false)?;
-    eprintln!("gexc eject build: RunServices without {}", gone.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &new, false)?;
+    eprintln!("{say}: RunServices without {}", gone.join(", "));
     Ok(gone)
 }
 
@@ -920,6 +923,60 @@ fn strip_dir(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
+const BUILD_SAYS: &str = "gexc eject build";
+
+/// What the config changes in the bundle's prefix itself, in the tar at
+/// PATH (the prefix at PREFIX in it): the services' start types
+/// (`"services"`, and the ones `"helpers": "strip"` disables) and the
+/// programs taken out of `RunServices` (`"helpers": "strip"`'s
+/// winemenubuilder, `"desktop": "none"`'s desktop). Setting them again is a
+/// no-op, so a bundle already prepared (`prepare_bundle`) builds the same.
+fn prefix_settings(config: &Config, path: &Path, prefix: &str, say: &str) -> Result<()> {
+    let mut services: Vec<(String, u32, bool)> = Vec::new();
+    if config.helpers_strip {
+        for n in STRIP_SERVICES {
+            if !config.services.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) {
+                services.push((n.to_string(), 4, false));
+            }
+        }
+    }
+    services.extend(config.services.iter().map(|(k, s)| (k.clone(), *s, true)));
+    if !services.is_empty() {
+        set_services(path, prefix, &services, say)?;
+    }
+    let mut run_off = Vec::new();
+    if config.helpers_strip {
+        run_off.push("winemenubuilder");
+    }
+    if config.desktop_none {
+        run_off.push("desktop");
+    }
+    if !run_off.is_empty() {
+        drop_run_services(path, prefix, &run_off, say)?;
+    }
+    Ok(())
+}
+
+/// `gexc eject prepare`: the bundle at IN as a site of CONFIG (a
+/// `user/eject.json`) starts, written to OUT, for the recording: the
+/// prefix's settings (`prefix_settings`) and, with `"helpers": "strip"`,
+/// no helper programs. A recording of it reads what the site's own start
+/// reads, so the bundle split ships that and not what a helper the site
+/// never starts read. The prefix is at PREFIX in the bundle ("/pfx").
+pub fn prepare_bundle(config: &Path, input: &Path, out: &Path, prefix: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config)?;
+    let config = Config::from_json(&text)?;
+    let say = "gexc eject prepare";
+    if out.exists() {
+        std::fs::remove_file(out)?;
+    }
+    std::fs::copy(input, out)?;
+    if config.helpers_strip {
+        strip_programs(out, say)?;
+    }
+    prefix_settings(&config, out, prefix.trim_matches('/'), say)
+}
+
 /// Whether `p` (a bundle or guest path) is one of STRIP_PROGRAMS.
 fn strip_program(p: &str) -> bool {
     STRIP_PROGRAMS.iter().any(|n| strip_dir(p).eq_ignore_ascii_case(n))
@@ -928,17 +985,16 @@ fn strip_program(p: &str) -> bool {
 /// `"helpers": "strip"`: web/rootfs.tar without STRIP_PROGRAMS, wherever
 /// the bundle has them (the prefix's system32 and Wine's own directories).
 /// Returns the paths left out.
-fn strip_programs(web: &Path) -> Result<Vec<String>> {
-    let path = web.join("rootfs.tar");
-    let bytes = std::fs::read(&path)?;
+fn strip_programs(path: &Path, say: &str) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path)?;
     let (out, gone) = crate::reach::tar_drop(&bytes, &strip_program)?;
     if gone.is_empty() {
         return Ok(gone);
     }
     // web/rootfs.tar may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &out, false)?;
-    eprintln!("gexc eject build: \"helpers\": left out {}", gone.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &out, false)?;
+    eprintln!("{say}: \"helpers\": left out {}", gone.join(", "));
     Ok(gone)
 }
 
@@ -1198,7 +1254,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     // units without theirs.
     let kept_units: Vec<Json>;
     let units = if config.helpers_strip {
-        strip_programs(&web)?;
+        strip_programs(&web.join("rootfs.tar"), BUILD_SAYS)?;
         kept_units = units
             .iter()
             .filter(|u| !u.get("path").and_then(|x| x.as_str()).is_some_and(strip_program))
@@ -1209,28 +1265,11 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         units
     };
     let pins = pin_bases(&v, units, &web)?;
-    let mut services: Vec<(String, u32, bool)> = Vec::new();
-    if config.helpers_strip {
-        for n in STRIP_SERVICES {
-            if !config.services.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) {
-                services.push((n.to_string(), 4, false));
-            }
-        }
-    }
-    services.extend(config.services.iter().map(|(k, s)| (k.clone(), *s, true)));
-    if !services.is_empty() {
-        set_services(&v, &web, &services)?;
-    }
-    let mut run_off = Vec::new();
-    if config.helpers_strip {
-        run_off.push("winemenubuilder");
-    }
-    if config.desktop_none {
-        run_off.push("desktop");
-    }
-    if !run_off.is_empty() {
-        drop_run_services(&v, &web, &run_off)?;
-    }
+    let prefix = {
+        let env = json::str_list(json::field(&v, "page", crate::project::PROJECT_FILE)?, "env", crate::project::PROJECT_FILE)?;
+        env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string()
+    };
+    prefix_settings(&config, &web.join("rootfs.tar"), &prefix, BUILD_SAYS)?;
     if config.wineboot_skip {
         put_volatile_keys(&v, &web)?;
     }

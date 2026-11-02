@@ -481,7 +481,7 @@ fn translate_root(addr: u64) -> Option<u32> {
         }
         g
     };
-    let class32 = gex_abi::X86 && gex_xlate::arch::compat();
+    let class32 = gex_abi::X86 && gex_xlate::default_compat();
     trace(&format!("translate {addr:#x}"));
     // Declined (or not holding `addr`): the pages numbered for it get their
     // directory entries anyway, as an install would give them. A page with a

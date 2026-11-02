@@ -88,6 +88,7 @@ pub fn header() -> String {
         ("TID", ctx::TID),
         ("LAST_TARGET", ctx::LAST_TARGET),
         ("LAST_SOURCE", ctx::LAST_SOURCE),
+        ("CS", ctx::CS),
         ("LAST_SYSCALL", ctx::LAST_SYSCALL),
         ("V", ctx::V),
         ("X87", ctx::X87),

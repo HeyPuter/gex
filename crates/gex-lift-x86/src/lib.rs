@@ -79,6 +79,14 @@ pub mod sysreg {
     /// `GEX_TRACE_INSNS`: written with the pc before an instruction; the
     /// host logs the context.
     pub const TRACE: i32 = -103;
+    /// A far `jmp`/`call`/`ret` or `iret`: written with `offset | selector
+    /// << 32`; the host checks the selector and sets `ctx::CS`.
+    pub const FAR: i32 = -104;
+    /// A far transfer whose block then reads [`FAR_NEXT`] for the address
+    /// to dispatch: written as [`FAR`] is.
+    pub const FAR_IN_PLACE: i32 = -105;
+    /// Read after [`FAR_IN_PLACE`]: the address the block dispatches.
+    pub const FAR_NEXT: i32 = -106;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
@@ -293,7 +301,10 @@ impl<'a> Lifter<'a> {
                 let m = self.k32(0xff);
                 self.b.bin(BinOp::And, Ty::I32, v, m)
             }
-            Reg::Seg(_) => self.k32(0),
+            Reg::Seg(seg) => {
+                let sel = self.sel_of(seg);
+                self.k32(sel)
+            }
             // Vector and x87 registers are read by their own paths.
             Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => self.k64(0),
         }
@@ -858,7 +869,7 @@ impl<'a> Lifter<'a> {
             Op::Push => {
                 let v = match i.op0() {
                     Operand::Imm(imm) => self.k(ty, (imm as u64) & w.mask()),
-                    Operand::Reg(Reg::Seg(_)) => self.k(ty, 0),
+                    Operand::Reg(Reg::Seg(seg)) => self.sel_val(seg, w),
                     o => self.rd(o, w),
                 };
                 self.push(w, v);
@@ -1362,6 +1373,67 @@ impl<'a> Lifter<'a> {
                     is_ret: true,
                 })
             }
+            Op::JmpFar | Op::CallFar => {
+                let (sel, off) = match (i.op0(), i.ops[1]) {
+                    (Operand::Imm(off), Some(Operand::Imm(sel))) => (self.k32(sel as u32), self.k64(off as u64)),
+                    (Operand::Mem(m), _) => {
+                        let off = self.load(&m, w);
+                        let off = if w == Width::Q { off } else { self.b.extend(off, false) };
+                        let (addr, offset) = self.addr(&m);
+                        let sel = self.b.def(Expr::Load {
+                            addr,
+                            offset: offset + w.bytes() as i64,
+                            sz: MemSz::B2,
+                            signed: false,
+                            ty: Ty::I32,
+                            order: Order::Relaxed,
+                        });
+                        (sel, off)
+                    }
+                    _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+                };
+                if i.op == Op::CallFar {
+                    // The caller's selector, then the return offset, each a
+                    // slot of the operand width.
+                    let cs = self.sel_val(Seg::Cs, w);
+                    self.push(w, cs);
+                    let ret = if w == Width::Q { self.k64(next) } else { self.k(ty_of(w), next & 0xffff_ffff) };
+                    self.push(w, ret);
+                    self.b.set_call_return(next);
+                }
+                self.far(pc, sel, off)
+            }
+            Op::RetFar => {
+                let off = self.pop(w);
+                let off = if w == Width::Q { off } else { self.b.extend(off, false) };
+                let sel = self.pop(w);
+                let sel = if w == Width::Q { self.b.wrap(sel) } else { sel };
+                if let Some(Operand::Imm(n)) = i.ops[0] {
+                    let sp = self.rd64(RSP);
+                    let k = self.k64(n as u64);
+                    let sp = self.b.bin(BinOp::Add, Ty::I64, sp, k);
+                    self.wr64(RSP, sp);
+                }
+                self.far(pc, sel, off)
+            }
+            Op::Iret => {
+                let off = self.pop(w);
+                let off = if w == Width::Q { off } else { self.b.extend(off, false) };
+                let sel = self.pop(w);
+                let sel = if w == Width::Q { self.b.wrap(sel) } else { sel };
+                let fl = self.pop(w);
+                let fl = if w == Width::Q { self.b.wrap(fl) } else { fl };
+                // 64-bit mode's iret pops the stack pointer and segment too,
+                // whatever mode it returns to.
+                if self.wa() == Width::Q {
+                    let sp = self.pop(w);
+                    let sp = if w == Width::Q { sp } else { self.b.extend(sp, false) };
+                    let _ss = self.pop(w);
+                    self.wr64(RSP, sp);
+                }
+                self.set_rflags(fl);
+                self.far(pc, sel, off)
+            }
             Op::Leave => {
                 let rbp = self.rd64(RBP);
                 self.wr64(RSP, rbp);
@@ -1517,28 +1589,7 @@ impl<'a> Lifter<'a> {
             Op::Popf => {
                 let v = self.pop(w);
                 let v = if w == Width::Q { self.b.wrap(v) } else { v };
-                self.unpack_flags_low(v);
-                let ten = self.k32(10);
-                let d = self.b.bin(BinOp::ShrU, Ty::I32, v, ten);
-                let one = self.k32(1);
-                let d = self.b.bin(BinOp::And, Ty::I32, d, one);
-                self.write_flag(GuestReg::D, d);
-                let eleven = self.k32(11);
-                let o = self.b.bin(BinOp::ShrU, Ty::I32, v, eleven);
-                let o = self.b.bin(BinOp::And, Ty::I32, o, one);
-                self.write_flag(GuestReg::V, o);
-                // AC (18) and ID (21) are kept for the next pushf; the other
-                // system flags (IF, IOPL, ...) cannot be changed in user mode.
-                let mask = self.k32(0x24_0000);
-                let sys = self.b.bin(BinOp::And, Ty::I32, v, mask);
-                let base = self.b.read(GuestReg::CtxAddr);
-                self.b.stmt(Stmt::Store {
-                    addr: base,
-                    offset: gex_abi::ctx::EFLAGS_SYS as i64,
-                    val: sys,
-                    sz: MemSz::B4,
-                    order: Order::Relaxed,
-                });
+                self.set_rflags(v);
                 Flow::Next
             }
 
@@ -2610,6 +2661,90 @@ impl<'a> Lifter<'a> {
             v = self.b.bin(BinOp::Or, Ty::I32, v, t);
         }
         v
+    }
+
+    /// The selector of the code being lifted, as a far call pushes it:
+    /// 0x23 in 32-bit code, 0x33 in 64-bit code.
+    /// [`Self::sel_of`] at width `w`.
+    fn sel_val(&mut self, seg: Seg, w: Width) -> Value {
+        let sel = self.sel_of(seg) as u64;
+        if w == Width::Q {
+            self.k64(sel)
+        } else {
+            self.k(ty_of(w), sel)
+        }
+    }
+
+    /// What a segment register reads in this block, as under Linux: %cs
+    /// names the block's mode (`ctx::CS` is always it), %ss the user data
+    /// segment, as do %ds and %es in 32-bit code (64-bit code leaves them
+    /// null); %fs and %gs read null, their bases being set apart from them.
+    /// Loads are not kept, so each reads the same everywhere in a mode.
+    fn sel_of(&self, seg: Seg) -> u32 {
+        const USER_DS: u32 = 0x2b;
+        let compat = self.wa() == Width::D;
+        match seg {
+            Seg::Cs if compat => gex_abi::ctx::CS_COMPAT,
+            Seg::Cs => gex_abi::ctx::CS_LONG,
+            Seg::Ss => USER_DS,
+            Seg::Ds | Seg::Es if compat => USER_DS,
+            _ => 0,
+        }
+    }
+
+    /// A far transfer to `sel:off` (`sel` an `I32`, `off` an `I64`): the
+    /// host checks the selector and sets the thread's mode
+    /// ([`sysreg::FAR_IN_PLACE`]; any selector but a code segment's is #GP,
+    /// an access violation), then the block dispatches what the host names
+    /// ([`sysreg::FAR_NEXT`]): the offset, or for a change of mode an
+    /// address this mode's directory never holds, whose miss the host
+    /// answers with the target's translation in the new mode. The thread
+    /// stays in wasm across the change.
+    fn far(&mut self, pc: u64, sel: Value, off: Value) -> Flow {
+        let sel = self.b.extend(sel, false);
+        let sh = self.k64(32);
+        let sel = self.b.bin(BinOp::Shl, Ty::I64, sel, sh);
+        let v = self.b.bin(BinOp::Or, Ty::I64, off, sel);
+        let pcv = self.k64(pc);
+        let id = self.k32(sysreg::FAR_IN_PLACE as u32);
+        self.b.stmt(Stmt::HostCall {
+            func: HostFunc::SysRegWrite,
+            args: vec![pcv, id, v],
+        });
+        let next = self.k32(sysreg::FAR_NEXT as u32);
+        let target = self.b.def(Expr::HostCall {
+            func: HostFunc::SysRegRead,
+            args: vec![pcv, next],
+            ty: Ty::I64,
+        });
+        Flow::End(Term::Indirect { target, is_ret: false })
+    }
+
+    /// The user-writable flags from a popped `rflags` (an `I32`): what
+    /// `popf` and `iret` restore.
+    fn set_rflags(&mut self, v: Value) {
+        self.unpack_flags_low(v);
+        let ten = self.k32(10);
+        let d = self.b.bin(BinOp::ShrU, Ty::I32, v, ten);
+        let one = self.k32(1);
+        let d = self.b.bin(BinOp::And, Ty::I32, d, one);
+        self.write_flag(GuestReg::D, d);
+        let eleven = self.k32(11);
+        let o = self.b.bin(BinOp::ShrU, Ty::I32, v, eleven);
+        let o = self.b.bin(BinOp::And, Ty::I32, o, one);
+        self.write_flag(GuestReg::V, o);
+        // AC (18) and ID (21) are kept for the next pushf; the other
+        // system flags (IF, IOPL, ...) cannot be changed in user mode.
+        let mask = self.k32(0x24_0000);
+        let sys = self.b.bin(BinOp::And, Ty::I32, v, mask);
+        let base = self.b.read(GuestReg::CtxAddr);
+        self.b.stmt(Stmt::Store {
+            addr: base,
+            offset: gex_abi::ctx::EFLAGS_SYS as i64,
+            val: sys,
+            sz: MemSz::B4,
+            order: Order::Relaxed,
+        });
     }
 
     /// Full RFLAGS as an `I32`: the low byte plus IF (bit 9, always set for

@@ -29,6 +29,8 @@ pub(crate) struct Shared {
     pub modules: Vec<Module>,
     /// The runtime module (`gex_cgen::runtime`), compiled once.
     runtime: Option<Module>,
+    /// The runtime module of the process's other mode (`runtime::module_alt`).
+    runtime_alt: Option<Module>,
     /// The page checks of each run-time translation, by install: the
     /// `PAGE_GEN` value of every page it covers, as it was translated.
     checks: HashMap<u32, Vec<(u64, u32)>>,
@@ -52,6 +54,11 @@ pub(crate) struct Shared {
     /// not retire them (the bytes are not what runs). A game's mod sandbox
     /// may overwrite a hundred or more of a DLL's entry points.
     pub providers: std::collections::HashSet<u32>,
+    /// Installs of the process's other mode (`wasmdll::WinePe::alt`: an i386
+    /// Wine module in an x86-64 process): code in that mode calls their
+    /// addresses, so they are served, and their bridges are, in the other
+    /// dispatch directory (`gex_abi::ALT_PAGE`), never in the process's own.
+    pub alt_installs: std::collections::HashSet<u32>,
     /// Which guest process this is, for the run-time translator
     /// (`ftab::Request::process`): one per process image, shared with a
     /// forked child until it `execve`s.
@@ -82,6 +89,12 @@ pub(crate) struct Store {
     pub table: Table,
     pub resolve: wasmtime::Func,
     pub bridge: wasmtime::Func,
+    /// The other mode's bridge (`runtime::module_alt`), made at its first
+    /// bridge in the other directory.
+    pub bridge_alt: Option<wasmtime::Func>,
+    /// Its `enter`: the run loop's way into the other mode before any of
+    /// that mode's code is translated in this store (`alt_enter_for`).
+    pub enter_alt: Option<wasmtime::Func>,
     /// The run loop (`gex_cgen::runtime::ROOT`), which an AOT-only process
     /// enters through (`aot_only::bind_root`).
     pub root: wasmtime::Func,
@@ -232,7 +245,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, replayed: 0 });
     Ok(())
 }
 
@@ -271,7 +284,7 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
                 let dy = dylink.get(&inst.module).cloned();
                 let inst_i = instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied(), dy.as_deref())?;
                 if let Some(dy) = dy {
-                    crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.module, &inst_i, &dy)?;
+                    crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.base, inst.module, &inst_i, &dy)?;
                 }
                 if crate::wasm_trace() && t0.elapsed().as_millis() >= 10 {
                     eprintln!("gex: instantiated install {i} (base {}) in {:.3}s", inst.base, t0.elapsed().as_secs_f64());
@@ -388,7 +401,7 @@ fn instantiate(
         if module.imports().any(|i| i.module() == gex_abi::IMPORT_MODULE && i.name() == gex_dylink::DL_SIZE) {
             crate::dylink::define_checked(&mut c, &mut l)?;
         }
-        crate::dylink::define_imports(&mut c, &mut l, table, module, dy)?;
+        crate::dylink::define_imports(&mut c, &mut l, table, base, module, dy)?;
     }
     let inst = l.instantiate(&mut c, module).with_context(|| match dy {
         Some(d) => format!("instantiating {}", d.path),
@@ -497,6 +510,29 @@ pub(crate) fn table_func(cx: &mut Caller<'_, HostState>, idx: u32) -> Result<was
     }
 }
 
+thread_local! {
+    /// What this thread publishes is of the process's other mode
+    /// ([`OtherMode`]).
+    static PUBLISH_ALT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, every install this thread publishes is of the process's other
+/// mode (`Shared::alt_installs`), and its bridges go in the other directory:
+/// a WoW64 process's i386 image's unit and providers (`pe_units`).
+pub(crate) struct OtherMode(bool);
+
+impl OtherMode {
+    pub(crate) fn enter(alt: bool) -> Self {
+        OtherMode(PUBLISH_ALT.with(|c| c.replace(alt)))
+    }
+}
+
+impl Drop for OtherMode {
+    fn drop(&mut self) {
+        PUBLISH_ALT.with(|c| c.set(self.0));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_pairs_at(
     sh: &Arc<Mutex<JitShared>>,
@@ -528,6 +564,10 @@ fn publish_pairs_at(
         );
         s.ftab.modules.push(module);
         let n = s.ftab.map.publish(len, m, tier, pairs);
+        // before its bridges, which go in that mode's directory
+        if PUBLISH_ALT.with(|c| c.get()) {
+            s.ftab.alt_installs.insert(n);
+        }
         if !checks.is_empty() {
             s.ftab.checks.insert(n, checks.clone());
         }
@@ -555,11 +595,15 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
     let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
     let mut dirs: Vec<(u64, u32)> = pages.to_vec();
     let mut slots = Vec::with_capacity(entries.len());
+    let mut keys = Vec::with_capacity(entries.len());
     for &a in entries {
-        let page = a / gex_abi::DISPATCH_PAGE;
-        if page >= gex_abi::dispatch_max_pages() {
+        if a / gex_abi::DISPATCH_PAGE >= gex_abi::dispatch_max_pages() {
             continue;
         }
+        // in the directory of the mode the function's callers run in
+        let alt = binding_alt(&s, a);
+        keys.push(gex_abi::addr_key(a, alt));
+        let page = gex_abi::page_key(a, alt);
         let base = match s.page_table.lookup(page) {
             Some(b) => b,
             None => {
@@ -575,9 +619,10 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
         if !dirs.iter().any(|&(p, _)| p == page) {
             dirs.push((page, base));
         }
-        slots.push(gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32));
+        let slot = gex_abi::dispatch_entry(gex_abi::dispatch_entry_table(base), gex_abi::dispatch_index(a, base) as u32);
+        slots.push(slot | if alt { ALT_BRIDGE } else { 0 });
     }
-    s.translated.extend(entries.iter().copied());
+    s.translated.extend(keys);
     let unit = Arc::new(CompiledUnit {
         module: None,
         module_id: 0,
@@ -624,15 +669,24 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 /// providers (a Detours hook in a 32-bit Wine builtin's skeleton): lifted, the
 /// untouched exports beside the hook ran their `ud2` stubs
 /// (c000001d).
-pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64) -> bool {
-    !s.ftab.tier1_only.contains(&addr) && s.ftab.map.get(addr).is_some_and(|f| current(s, memory, addr, f))
+pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64, alt: bool) -> bool {
+    !s.ftab.tier1_only.contains(&addr)
+        && s.ftab.map.get(addr).is_some_and(|f| s.ftab.alt_installs.contains(&f.install) == alt && current(s, memory, addr, f))
+}
+
+/// Whether the function bound at `addr` is one of the process's other mode
+/// (`Shared::alt_installs`).
+pub(crate) fn binding_alt(s: &JitShared, addr: u64) -> bool {
+    !s.ftab.alt_installs.is_empty() && s.ftab.map.get(addr).is_some_and(|f| s.ftab.alt_installs.contains(&f.install))
 }
 
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     if s.ftab.providers.contains(&f.install) {
-        return true;
+        // A binding of 64-bit Wine's PE module where its skeleton no longer
+        // is serves nothing (`wasmdll::WinePe::binding_is_stale`).
+        return !s.wine_pe.as_ref().is_some_and(|wp| wp.install == f.install && wp.binding_is_stale(memory, addr));
     }
     match inst.tier {
         Tier::Unit => {
@@ -826,6 +880,11 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
     if !libs_allow(caller, addr) {
         return None;
     }
+    // Functions are of the process's own mode: the other mode's code (a
+    // WoW64 thread's 32-bit code) stays on tier-1, in its own directory.
+    if crate::thread_alt(caller) {
+        return None;
+    }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let mm = k.mem.lock();
         let v = mm.vmas();
@@ -853,7 +912,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         ro,
         wx,
         provided: crate::elfprov::provided(sh),
-        class32: gex_abi::X86 && gex_xlate::arch::compat(),
+        class32: gex_abi::X86 && gex_xlate::default_compat(),
         epoch,
         queued_at: std::time::Instant::now(),
         cache: caller.data().jit.as_ref().and_then(|jit| jit.cache.clone()),
@@ -997,7 +1056,7 @@ pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool>
     let known = {
         let sh = shared(caller)?;
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
-        if s.ftab.tier1_only.contains(&pc) {
+        if s.ftab.tier1_only.contains(&pc) || binding_alt(&s, pc) {
             return Ok(false);
         }
         s.ftab.map.get(pc).is_some()
@@ -1014,6 +1073,24 @@ pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool>
     Ok(true)
 }
 
+/// [`serve`] for a miss in the process's other mode (a WoW64 thread's 32-bit
+/// code): only a function of that mode bound there (an i386 Wine module's
+/// export or entry thunk) serves it, through a bridge in the other
+/// directory. Nothing is translated for it.
+pub(crate) fn serve_alt(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    let sh = shared(caller)?;
+    {
+        let s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let memory = caller.data().memory.as_ref().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        if !serves(&s, memory.bytes(), pc, true) {
+            return Ok(false);
+        }
+    }
+    publish_bridges(&sh, &[pc], &[])?;
+    replay_registry(caller)?;
+    Ok(true)
+}
+
 /// Index 1: code no function holds, under the `F_body` contract -- tier-1
 /// run nested until the guest returns to `ret` (the call-out).
 fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -> Result<i32> {
@@ -1022,7 +1099,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
     let c = ctx as u32 as u64;
     let target = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
     let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
-    let delta = match (gex_abi::X86, gex_xlate::arch::compat()) {
+    // A function's frame, in the mode the thread runs in (a WoW64 thread's
+    // 32-bit code: the native i386 module's guest call into it).
+    let delta = match (gex_abi::X86, gex_xlate::default_compat() != crate::thread_alt(caller)) {
         (false, _) => 0,
         (true, false) => 8,
         (true, true) => 4,
@@ -1043,18 +1122,98 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, need: u32, ret: u64) -
     call_out(caller, ctx, target, ret, sp + delta, need)
 }
 
+/// The bit a bridge's packed slot ([`publish_bridges`]) carries when the
+/// slot is the other directory's: the other mode's bridge goes there, which
+/// dispatches where the function left through that directory. (A packed
+/// slot's table is below `DISPATCH_TABLES`, so the top bit is free.)
+pub(crate) const ALT_BRIDGE: u32 = 1 << 31;
+
 /// Write the bridge into this store's dispatch tables at `slots`, each a
-/// table and slot packed as a directory entry (`gex_abi::dispatch_entry`).
+/// table and slot packed as a directory entry (`gex_abi::dispatch_entry`),
+/// [`ALT_BRIDGE`] marking the other mode's.
 pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots: &[u32]) -> Result<()> {
     ensure(cx.as_context_mut())?;
+    if slots.iter().any(|&p| p & ALT_BRIDGE != 0) {
+        ensure_alt(cx.as_context_mut())?;
+    }
     let jit = cx.as_context().data().jit.as_ref().unwrap();
-    let (tables, bridge) = (jit.tables.clone(), jit.ftab.as_ref().unwrap().bridge.clone());
+    let st = jit.ftab.as_ref().unwrap();
+    let (tables, bridge, bridge_alt) = (jit.tables.clone(), st.bridge.clone(), st.bridge_alt.clone());
     for &packed in slots {
-        let s = crate::Slot::of_entry(packed);
+        let s = crate::Slot::of_entry(packed & !ALT_BRIDGE);
         let table = tables.get(s.table).ok_or_else(|| anyhow!("a bridge in dispatch table {}, past the last", s.table))?;
-        table.set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(bridge.clone())))?;
+        let f = if packed & ALT_BRIDGE != 0 { bridge_alt.clone().unwrap() } else { bridge.clone() };
+        table.set(cx.as_context_mut(), s.index, wasmtime::Ref::Func(Some(f)))?;
     }
     Ok(())
+}
+
+/// Make this store's other-mode bridge (`runtime::module_alt`), once the
+/// process has its other directory.
+pub(crate) fn ensure_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> {
+    let jit = cx.as_context().data().jit.as_ref().unwrap();
+    if jit.ftab.as_ref().is_some_and(|st| st.bridge_alt.is_some()) {
+        return Ok(());
+    }
+    let (sh, linker, tables) = (Arc::clone(&jit.shared), jit.linker.clone(), jit.tables.clone());
+    let table = jit.ftab.as_ref().unwrap().table;
+    let memory = cx.as_context().data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let (rm, alt_dir) = {
+        let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let m = match &s.ftab.runtime_alt {
+            Some(m) => m.clone(),
+            None => {
+                let m = gex_cache::compile(cx.as_context().engine(), &gex_cgen::runtime::module_alt())
+                    .context("compiling the other mode's runtime module")?;
+                s.ftab.runtime_alt = Some(m.clone());
+                m
+            }
+        };
+        (m, s.alt_dir)
+    };
+    if alt_dir == 0 {
+        bail!("a bridge in the other directory before there is one");
+    }
+    let mut l = linker;
+    l.allow_shadowing(true);
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::ftab::TABLE, table)?;
+    for i in 0..gex_abi::DISPATCH_TABLES {
+        let t = match tables.get(i) {
+            Some(t) => *t,
+            None => Table::new(cx.as_context_mut(), wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None), wasmtime::Ref::Func(None))?,
+        };
+        l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::dispatch_table(i), t)?;
+    }
+    let g = wasmtime::Global::new(
+        cx.as_context_mut(),
+        wasmtime::GlobalType::new(
+            if gex_abi::mem64() { wasmtime::ValType::I64 } else { wasmtime::ValType::I32 },
+            wasmtime::Mutability::Const,
+        ),
+        if gex_abi::mem64() { Val::I64(alt_dir as i64) } else { Val::I32(alt_dir as u32 as i32) },
+    )?;
+    l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_abi::imports::ALT_DIR, g)?;
+    let inst = l.instantiate(cx.as_context_mut(), &rm).context("instantiating the other mode's runtime module")?;
+    let get = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, n: &str| {
+        inst.get_func(&mut *cx, n).ok_or_else(|| anyhow!("the other mode's runtime module exports no {n}"))
+    };
+    let mut c = cx.as_context_mut();
+    let bridge = get(&mut c, gex_cgen::runtime::BRIDGE)?;
+    let enter = get(&mut c, gex_cgen::runtime::ENTER)?;
+    let jit = c.data_mut().jit.as_mut().unwrap();
+    jit.instances.push(inst);
+    let st = jit.ftab.as_mut().unwrap();
+    st.bridge_alt = Some(bridge);
+    st.enter_alt = Some(enter);
+    Ok(())
+}
+
+/// The other mode's runtime `enter`, made now if this store has none.
+pub(crate) fn enter_alt(mut cx: impl AsContextMut<Data = HostState>) -> Result<wasmtime::Func> {
+    ensure(cx.as_context_mut())?;
+    ensure_alt(cx.as_context_mut())?;
+    Ok(cx.as_context().data().jit.as_ref().unwrap().ftab.as_ref().unwrap().enter_alt.clone().unwrap())
 }
 
 /// Retire the run-time translations whose entries lie in the retired

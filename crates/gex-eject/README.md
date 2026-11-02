@@ -678,6 +678,15 @@ service the program asks about at start-up (a scanner service, say) can be
 `disabled` if the browser has no such device, at the cost of the features
 that need it.
 
+A recording of the plain bundle runs every service the prefix starts,
+and the bundle split ships the files they read even when the site disables
+them. Record the bundle as the site starts it instead:
+`gexc eject prepare user/eject.json bundle.tar prepared.tar` writes it with
+the config's `"services"`, `"helpers"` and `"desktop"` prefix settings (and
+without the helper programs `"helpers": "strip"` leaves out); record
+`prepared.tar`, eject that recording, and the build's own settings, already
+in place, change nothing.
+
 ### Helpers
 
 `"helpers": "strip"` leaves out of the site the parts of Wine's start-up a
