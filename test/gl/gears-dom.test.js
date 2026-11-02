@@ -13,12 +13,13 @@ export const meta = { hosts: ['browser'], images: ['gl-probes'], timeout: 300 };
 export default async function (t) {
   const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
   if (!adapter) return t.skip('no WebGPU adapter here');
-  // The default build's DOM desktop gives its Mesa a WebGPU canvas, and on
-  // software WebGPU (headless runs) that canvas's first texture loses every
-  // device (compositor-worker.js `presentMode`). The single-thread build's
-  // Mesa has a texture instead (gl-in-realm.js).
+  // The default build's DOM desktop gives its Mesa a hidden WebGPU canvas,
+  // and on software WebGPU (SwiftShader, headless runs) that canvas's first
+  // texture loses every device (compositor-worker.js `presentMode`); on a
+  // GPU it draws (--gpu). The single-thread build's Mesa has a texture
+  // instead (gl-in-realm.js), so it runs either way.
   const software = adapter.info?.isFallbackAdapter || adapter.info?.architecture === 'swiftshader';
-  if (software && typeof SharedArrayBuffer === 'function') return t.skip('software WebGPU: the DOM desktop\'s WebGPU canvas loses the device');
+  if (software && typeof SharedArrayBuffer === 'function') return t.skip('software WebGPU only: SwiftShader loses the device at the DOM desktop\'s hidden WebGPU canvas (it draws on a GPU)');
   const tar = `gl-probes-${t.arch === 'x86' ? 'x86' : 'a64'}.tar`;
   if (!(await fetch(t.work(tar), { method: 'HEAD' })).ok) return t.skip(`no ${tar} (fixtures/images.mjs)`);
   const want = (await (await fetch(t.work('gl-probes.json'))).json())['gles-gears']?.covered;

@@ -34,6 +34,8 @@
 //            gl-probes.json, each probe's line from a run on the host's own
 //            Mesa (software, surfaceless), which the guest's run must print;
 //            and gles-gears (/probes/gles-gears) with its coverage there.
+//            x86's also has gles-window (/probes/gles-window), an X client
+//            with the host's Xlib beside it, when the host has Xlib.
 //            Needs gcc, the host's EGL and GL headers and libraries, and
 //            third_party/opengl-registry.
 
@@ -175,6 +177,8 @@ export const images = {
     h.update(readFileSync(version));
     const gears = join(probes, 'gles-gears.c');
     h.update(readFileSync(gears));
+    const window = join(probes, 'gles-window.c');
+    h.update(readFileSync(window));
     h.update(readFileSync(new URL(import.meta.url))); // how it is built
     h.update(String(existsSync(musl)));
     const key = h.digest('hex');
@@ -219,7 +223,8 @@ export const images = {
     }
     // Each arch's tree: its guest GL, its loader and libc, the probes.
     const arches = {
-      x86: { cc: 'gcc', lib: 'usr/lib/x86_64-linux-gnu', runtime: [['/lib64/ld-linux-x86-64.so.2', 'lib64/ld-linux-x86-64.so.2'], ['/lib/x86_64-linux-gnu/libc.so.6', 'usr/lib/x86_64-linux-gnu/libc.so.6'], ['/lib/x86_64-linux-gnu/libm.so.6', 'usr/lib/x86_64-linux-gnu/libm.so.6']] },
+      // x86's has the host's Xlib too, for gles-window (an X client).
+      x86: { cc: 'gcc', lib: 'usr/lib/x86_64-linux-gnu', x11: ['libX11.so.6', 'libxcb.so.1', 'libXau.so.6', 'libXdmcp.so.6', 'libbsd.so.0', 'libmd.so.0'].map((f) => `/lib/x86_64-linux-gnu/${f}`), runtime: [['/lib64/ld-linux-x86-64.so.2', 'lib64/ld-linux-x86-64.so.2'], ['/lib/x86_64-linux-gnu/libc.so.6', 'usr/lib/x86_64-linux-gnu/libc.so.6'], ['/lib/x86_64-linux-gnu/libm.so.6', 'usr/lib/x86_64-linux-gnu/libm.so.6']] },
       a64: existsSync(musl) && { cc: join(musl, 'bin/aarch64-linux-musl-gcc'), lib: 'usr/lib', runtime: [[join(musl, 'aarch64-linux-musl/lib/libc.so'), 'lib/ld-musl-aarch64.so.1']] },
     };
     for (const [a, x] of Object.entries(arches)) {
@@ -238,6 +243,11 @@ export const images = {
       for (const n of names) run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes', n), src[n], ...link]);
       run(x.cc, ['-O2', `-I${inc}`, '-o', join(tree, 'probes/gl-version'), version, ...link]);
       run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-gears'), gears, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-lm']);
+      if (x.x11?.every((f) => existsSync(f))) {
+        for (const f of x.x11) copyFileSync(realpathSync(f), join(tree, x.lib, f.replace(/^.*\//, '')));
+        mkdirSync(join(tree, 'tmp'), { recursive: true });
+        run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window'), window, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
+      }
       execFileSync('tar', ['-cf', join(work, `gl-probes-${a}.tar`), '-C', tree, '.']);
     }
     writeFileSync(join(work, 'gl-probes.json'), JSON.stringify(expect, null, 1));
