@@ -90,6 +90,9 @@ pub struct FuncMap {
     /// index is retired only when the last of them goes.
     refs: std::collections::HashMap<u32, u32>,
     installs: Vec<Install>,
+    /// Installs whose functions stay in the tables while no address maps
+    /// to them ([`FuncMap::keep`]).
+    kept: std::collections::HashSet<u32>,
     log: Vec<Event>,
     /// Indices handed out and later retired, for statistics.
     pub retired: u64,
@@ -103,7 +106,7 @@ impl Default for FuncMap {
 
 impl FuncMap {
     pub fn new() -> FuncMap {
-        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), log: Vec::new(), retired: 0 }
+        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), kept: Default::default(), log: Vec::new(), retired: 0 }
     }
 
     /// Map `addr` to `f`, and retire the index it had if nothing else
@@ -122,6 +125,9 @@ impl FuncMap {
         *n = n.saturating_sub(1);
         if *n == 0 {
             self.refs.remove(&idx);
+            if self.install_of(idx).is_some_and(|i| self.kept.contains(&i)) {
+                return;
+            }
             self.log.push(Event::Retire(idx));
             self.retired += 1;
         }
@@ -147,6 +153,28 @@ impl FuncMap {
     /// a unit installed one.
     pub fn twin(&self, addr: u64) -> Option<Func> {
         self.by_addr.get(&(addr | gex_abi::ftab::TWIN)).copied()
+    }
+
+    /// The install holding index `idx`, if any.
+    fn install_of(&self, idx: u32) -> Option<u32> {
+        // In index order (`publish`, `publish_at` past `next`).
+        let i = self.installs.partition_point(|x| x.base <= idx);
+        let n = i.checked_sub(1)?;
+        let x = &self.installs[n];
+        (idx < x.base + x.len.max(1)).then_some(n as u32)
+    }
+
+    /// Install `i`'s functions are the module's own for its whole life,
+    /// whichever addresses map to them (Wine's PE module, bound at each DLL's
+    /// skeleton as it maps): an index no address maps to any more is never
+    /// retired. Its function is also a C function pointer of the module's,
+    /// which native code calls by its index (the resolve stub there: an
+    /// indirect call type mismatch); and a DLL freed and loaded again, at
+    /// the base another DLL had meanwhile, maps its exports back to the
+    /// indices that DLL's mapping had retired, where the resolve stub
+    /// resolved each address to the same index for ever.
+    pub fn keep(&mut self, i: u32) {
+        self.kept.insert(i);
     }
 
     pub fn installs(&self) -> &[Install] {
@@ -546,6 +574,28 @@ mod tests {
         let before = m.log_len();
         m.bind(b, &[(0x5000, 1)]);
         assert!(m.log_from(before).is_empty());
+    }
+
+    #[test]
+    fn a_kept_install_keeps_its_indices() {
+        // One DLL's skeleton at 0x7fae_0000 (its entry bound to slot 1 of
+        // the module), freed; another DLL at the same base takes the
+        // address (slot 5); the first loaded again there.
+        let mut m = FuncMap::new();
+        let a = m.publish(8, 7, Tier::Unit, &[(0x7fae_1000, 1)]);
+        m.keep(a);
+        let first = m.get(0x7fae_1000).unwrap().idx;
+        let before = m.log_len();
+        m.bind(a, &[(0x7fae_1000, 5)]);
+        m.bind(a, &[(0x7fae_1000, 1)]);
+        assert_eq!(m.retire(0x7fae_1000), Some(first));
+        assert!(m.log_from(before).is_empty(), "a kept install's index was retired");
+        // Another install's index is retired as before.
+        m.publish(2, 9, Tier::Jit, &[(0x5000, 0)]);
+        let idx = m.get(0x5000).unwrap().idx;
+        let before = m.log_len();
+        m.publish(1, 10, Tier::Jit, &[(0x5000, 0)]);
+        assert!(m.log_from(before).contains(&Event::Retire(idx)));
     }
 
     #[test]

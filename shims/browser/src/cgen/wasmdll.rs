@@ -65,6 +65,11 @@ struct WinePe {
     /// (pelink's `gexw.dllslots`).
     data_size: u64,
     dll_slots: Vec<DllRange>,
+    /// Each DLL's data as it was before its first load ran anything
+    /// ([`snap_data`]), to start it afresh when it is loaded again; and the
+    /// DLLs whose snapshot waits for the module's data initialisation.
+    snaps: HashMap<String, std::sync::Arc<Vec<DataSnap>>>,
+    snap_todo: Vec<String>,
     /// An LLP64 module (64-bit Wine, its skeletons PE32+): pointers in its data are
     /// 8 bytes, the entry pairs 16 (as natively).
     ptr64: bool,
@@ -106,6 +111,30 @@ struct DllRange {
     func: bool,
     lo: u64,
     hi: u64,
+}
+
+/// One piece of a DLL's data range: its bytes, or (`None`) `len` zeros.
+struct DataSnap {
+    at: u64,
+    len: u64,
+    bytes: Option<Vec<u8>>,
+}
+
+/// A DLL's data (its `gexw.dllslots` data ranges, past the module's data
+/// at `data`) in 4 KiB pieces, the zero ones not kept (as natively).
+fn snap_data(data: u64, ranges: &[DllRange], dll: &str) -> Vec<DataSnap> {
+    let memory = crate::guest_bytes();
+    let mut out = Vec::new();
+    for r in ranges.iter().filter(|r| !r.func && r.dll == dll) {
+        let mut a = data + r.lo;
+        while a < data + r.hi {
+            let len = (data + r.hi - a).min(4096);
+            let Some(b) = memory.get(a as usize..(a + len) as usize) else { break };
+            out.push(DataSnap { at: a, len, bytes: b.iter().any(|&x| x != 0).then(|| b.to_vec()) });
+            a += len;
+        }
+    }
+    out
 }
 
 /// pelink's `gexw.dllslots` custom section: lines `dll f|d LO HI` (hex).
@@ -312,6 +341,15 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // the dist's skeletons by links (soju's bundles)
     let real = crate::sigs::proc_home().ns().canonical(path);
     let dir = real.rsplit_once('/').map(|(d, _)| d.to_string());
+    // A DLL freed and loaded again maps anew, often at another base (the
+    // Start menu's Control Panel applets: setupapi, cfgmgr32, rpcrt4): its
+    // first mapping is gone, released to a PROT_NONE reservation or with
+    // the new one at its place, and this one is the loaded DLL's (as
+    // natively): winecrt0's base of it and `image_of` follow it. Asked
+    // before the modules' lock, which `forget_gone` takes apart from the
+    // map's.
+    let old = lock(&WINE_PE).mods.iter().filter(|w| w.ptr64 == pe.is64).find_map(|w| w.mapped.get(&dll).copied());
+    let released = old.is_some_and(|o| o == base || crate::sigs::proc_home().mm().lock().vma_at(o).is_none_or(|v| v.prot == 0));
     let mut g = lock(&WINE_PE);
     let before = g.mods.len();
     // The module: installed once, at the first skeleton that names it. A
@@ -393,9 +431,32 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // winecrt0's base of this DLL: the skeleton's (after the module's data
     // initialisation: at its first instantiation, or now once it had one)
     let wp = &mut g.mods[idx];
-    let first_mapping = !wp.mapped.contains_key(&dll);
+    let first_mapping = !wp.mapped.contains_key(&dll) || released;
     if first_mapping {
         wp.mapped.insert(dll.clone(), base);
+    }
+    // Loaded again, the DLL starts from its data as it was before its
+    // first load: Windows maps a fresh copy, and Wine's DLLs count on it (a
+    // one-time initialisation's flag set and what it made freed by the
+    // detach). First loaded, that is what is kept (as natively).
+    if released {
+        if let Some(snap) = wp.snaps.get(&dll).cloned() {
+            for p in snap.iter() {
+                let bytes = p.bytes.clone().unwrap_or_else(|| vec![0; p.len as usize]);
+                if !wp.installed {
+                    wp.pending.push((p.at, bytes));
+                } else if let Some(dst) = crate::guest_bytes().get_mut(p.at as usize..(p.at + p.len) as usize) {
+                    dst.copy_from_slice(&bytes);
+                }
+            }
+        }
+    } else if first_mapping {
+        if wp.installed {
+            let snap = std::sync::Arc::new(snap_data(wp.data, &wp.dll_slots, &dll));
+            wp.snaps.insert(dll.clone(), snap);
+        } else {
+            wp.snap_todo.push(dll.clone());
+        }
     }
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         let at = wp.data + *off as u64;
@@ -755,6 +816,8 @@ fn install_module(
         mapped: Default::default(),
         data_size: size as u64,
         dll_slots,
+        snaps: HashMap::new(),
+        snap_todo: Vec::new(),
         ptr64: is64,
         alt,
         name: name.to_string(),
@@ -764,7 +827,13 @@ fn install_module(
         thunks: Vec::new(),
     });
     let idx = g.mods.len() - 1;
-    let install = ftab(|m| m.publish(len, PROVIDER | number, Tier::Unit, &[]));
+    // bound at each DLL's skeleton, freed and loaded again: its slots are
+    // its functions however the addresses come and go (as natively)
+    let install = ftab(|m| {
+        let i = m.publish(len, PROVIDER | number, Tier::Unit, &[]);
+        m.keep(i);
+        i
+    });
     if alt {
         lock(&ALT_INSTALLS).insert(install);
     }
@@ -1119,6 +1188,12 @@ pub extern "C" fn gex_wasmdll_installed() {
             .filter(|w| !w.installed)
             .map(|wp| {
                 wp.installed = true;
+                // (before the pending writes: the DLLs mapped so far have
+                // run nothing yet)
+                for dll in std::mem::take(&mut wp.snap_todo) {
+                    let snap = std::sync::Arc::new(snap_data(wp.data, &wp.dll_slots, &dll));
+                    wp.snaps.insert(dll, snap);
+                }
                 let pending = std::mem::take(&mut wp.pending);
                 let entries = wp.data_exports.get("__gexw_entries").copied();
                 let decl = wp.data_exports.get("__gexw_entries_decl").copied();
