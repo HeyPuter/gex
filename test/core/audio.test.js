@@ -3,7 +3,7 @@ import { System } from '../../web/runtime/src/index.js';
 import { Filesystem } from '../../web/runtime/src/fs.js';
 import { WebAudio } from '../../web/runtime/src/audio.js';
 
-export const meta = { single: 'WebAudio plays out of shared memory, which the single-thread build has none of yet', hosts: ['browser'], images: ['busybox'], timeout: 180 };
+export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
 
 export default async function (t) {
   const { say, check, eq, timeout, until } = t;

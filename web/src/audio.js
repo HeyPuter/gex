@@ -15,7 +15,11 @@
 // Browsers start an AudioContext suspended until the page has a user
 // gesture: the first pointer or key event anywhere resumes it.
 //
-// The single-thread (no SharedArrayBuffer) build plays nothing yet.
+// The single-thread build (no SharedArrayBuffer) has the rings in its system
+// Worker: the worklet plays a copy of its own, which the Worker fills
+// (`mirrorAudio` there, over a port of their own), and sends back what it
+// read and its heartbeat about every 10 ms -- the device's clock, later by
+// that much.
 //
 // Latency, measured: each report (`__gexAudio.last`) has `backlog` (ms of
 // frames in the rings when a quantum starts, the most of any slot: avg,
@@ -35,8 +39,19 @@ class GexDsp extends AudioWorkletProcessor {
     super();
     this.words = null;
     this.port.onmessage = (e) => {
-      const { buffer, at, clock, loop } = e.data;
+      let { buffer, at, clock, loop } = e.data;
       if (e.data.latencyUs !== undefined) { if (this.words) Atomics.store(this.words, 6, e.data.latencyUs); return; }
+      // The single-thread build's: a copy of the rings here, filled from the
+      // system Worker's on \`mirror\` (a port), what was read sent back.
+      const m = e.data.mirror;
+      if (m) {
+        buffer = new ArrayBuffer((HDR + 8 * SW) * 4 + m.slots * m.cap * 8 + m.ccap * 8);
+        at = 0;
+        const w = new Uint32Array(buffer, 0, HDR + 8 * SW);
+        w[2] = m.slots; w[3] = m.cap; w[8] = m.ccap;
+        this.mirror = m.port;
+        this.mirror.onmessage = (ev) => this.fill(ev.data);
+      }
       // ?audioclock=0: not the device's clock (it keeps the wall clock), and
       // the larger start the drift needs: as before, for measuring.
       this.clock = clock !== false;
@@ -58,13 +73,30 @@ class GexDsp extends AudioWorkletProcessor {
     // output latency, measured.
     this.bsum = 0; this.bmin = Infinity; this.bmax = 0; this.bn = 0; this.active = 0;
   }
+  // The system Worker's new frames, single-thread build: \`[slot, stream, rate,
+  // gen, from, w, frames]\` each, the frames from \`from\` (the start of a new
+  // generation, which plays from there rather than from its writer's place).
+  fill(list) {
+    const W = this.words;
+    if (!W) return;
+    for (const [s, stream, rate, gen, from, w, frames] of list) {
+      const sl = this.slots[s], b = sl.base, cap = this.cap;
+      for (let i = 0, p = from; i < frames.length; i += 2, p = (p + 1) >>> 0) {
+        const k = (p % cap) * 2;
+        sl.f[k] = frames[i]; sl.f[k + 1] = frames[i + 1];
+      }
+      if (gen !== W[b + 2]) sl.start = from;
+      W[b] = stream; W[b + 1] = rate; W[b + 2] = gen;
+      Atomics.store(W, b + 3, w);
+    }
+  }
   // Add slot \`sl\`'s next \`n\` frames, resampled, into L/R. Whether it played.
   mix(sl, L, R, n) {
     const W = this.words, b = sl.base;
     const w = Atomics.load(W, b + 3);
     const rate = W[b + 1] || sampleRate;
     const gen = Atomics.load(W, b + 2);
-    if (sl.ri === null || gen !== sl.gen) { sl.gen = gen; sl.ri = w; sl.fr = 0; sl.waiting = true; sl.lastW = w; sl.still = 0; }
+    if (sl.ri === null || gen !== sl.gen) { sl.gen = gen; sl.ri = sl.start ?? w; sl.start = undefined; sl.fr = 0; sl.waiting = true; sl.lastW = w; sl.still = 0; }
     let avail = (w - sl.ri) >>> 0;
     // Lapped (or wrapped past), or far behind the writer: the newest frames, a short latency.
     if (avail > this.cap || avail > HIGH * rate) { sl.ri = (w - Math.floor(BACK * rate)) >>> 0; avail = (w - sl.ri) >>> 0; sl.fr = 0; }
@@ -121,6 +153,13 @@ class GexDsp extends AudioWorkletProcessor {
       for (let i = 0; i < n; i++) { const k = (cw % cc) * 2; C[k] = L[i]; C[k + 1] = R[i]; cw = (cw + 1) >>> 0; }
       Atomics.store(W, 7, cw);
     }
+    // The single-thread build: what was read, and the clock, back to the
+    // system Worker's rings (every fourth quantum, about 10 ms).
+    if (this.mirror && this.tick % 4 === 0) {
+      const r = [], u = [];
+      for (const sl of this.slots) { r.push(sl.ri === null ? null : W[sl.base + 4]); u.push(W[sl.base + 6]); }
+      this.mirror.postMessage({ head: [W[4], W[5], W[6], W[9]], r, u });
+    }
     // About twice a second: what was played, for the page's checks.
     if (++this.tick % 200 === 0 && this.n) {
       const backlog = this.bn ? { avg: +(this.bsum / this.bn).toFixed(1), min: +this.bmin.toFixed(1), max: +this.bmax.toFixed(1) } : null;
@@ -152,8 +191,10 @@ export function canPlayAudio(memory) {
 /** A player of the ring (`startAudio`): `{ ctx, ready, info, close() }`,
  *  or null where audio cannot play. Every player is its own context; the
  *  rings are read by one at a time. */
-export function playAudio({ memory, at, clock = true, latency = 'interactive', loop = false, context = null }) {
-  if (!at || !canPlayAudio(memory)) return null;
+export function playAudio({ memory, at, clock = true, latency = 'interactive', loop = false, context = null, mirror = null }) {
+  // `mirror`: the single-thread build's rings, in its system Worker:
+  // `{ slots, cap, ccap, connect(port) }`, the port the Worker fills them by.
+  if (mirror ? typeof AudioWorkletNode !== 'function' : (!at || !canPlayAudio(memory))) return null;
   // `?audiolatency=S`: the context's latency hint in seconds (the browser
   // picks its nearest; 0 asks for its smallest), for measuring.
   // `context`: one the caller made (in a gesture's handler, so it may run).
@@ -193,7 +234,13 @@ export function playAudio({ memory, at, clock = true, latency = 'interactive', l
       info.history.push(e.data);
       if (info.history.length > 64) info.history.shift();
     };
-    node.port.postMessage({ buffer: memory.buffer, at, clock, loop });
+    if (mirror) {
+      const { port1, port2 } = new MessageChannel();
+      node.port.postMessage({ mirror: { slots: mirror.slots, cap: mirror.cap, ccap: mirror.ccap, port: port1 }, clock, loop }, [port1]);
+      mirror.connect(port2);
+    } else {
+      node.port.postMessage({ buffer: memory.buffer, at, clock, loop });
+    }
     node.port.postMessage({ latencyUs: Math.round(1e6 * ((ctx.baseLatency ?? 0) + (ctx.outputLatency ?? 0))) });
     node.connect(ctx.destination);
     info.node = node;

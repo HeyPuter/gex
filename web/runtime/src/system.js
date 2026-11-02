@@ -466,6 +466,8 @@ export class System extends EventTarget {
       // The game controller table is the Worker's: a copy here, written back
       // (input.js `Gamepads`).
       joy: { table: () => k.ask('joyTable'), write: (at, words) => k.post({ joy: { at, words } }) },
+      // So are the audio rings: the worklet keeps a copy (web/src/audio.js).
+      audio: { ring: () => k.ask('audioRing'), connect: (port) => k.post({ audio: { port } }, [port]) },
       spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
       onStop: (fn) => stops.push(fn),
       stop: () => {

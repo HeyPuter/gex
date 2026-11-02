@@ -78,6 +78,60 @@ setPageFsAsk((req, cap) => new Promise((resolve) => {
 
 const words = () => new Int32Array(kernel.memory.buffer);
 let callsDone = Promise.resolve();
+let audioTimer = 0;
+
+/** The audio rings at `at` (shims/kernel/src/audio.rs), kept in the page's
+ *  worklet's copy (web/src/audio.js) over `port`: each slot's new frames
+ *  every 5 ms, from where a new generation starts; and what the worklet read
+ *  and its clock, as it sends them, written back here for the device. */
+function mirrorAudio(at, port) {
+  const HDR = 32, SW = 16, OFF = (HDR + 8 * SW) * 4;
+  const sent = [], gens = [];
+  // A view each time: the kernel's memory may have grown since.
+  const head = () => new Uint32Array(kernel.memory.buffer, at, HDR + 8 * SW);
+  port.onmessage = ({ data: { head: h, r, u } }) => {
+    const W = head();
+    W[4] = h[0]; W[5] = h[1]; W[6] = h[2]; W[9] = h[3];
+    // (Null for a slot the worklet has not played: the device's own stays.)
+    for (let s = 0; s < r.length; s++) {
+      if (r[s] === null) continue;
+      W[HDR + s * SW + 4] = r[s];
+      W[HDR + s * SW + 6] = u[s];
+    }
+  };
+  return setInterval(() => {
+    const W = head();
+    const slots = W[2], cap = W[3];
+    const list = [], transfer = [];
+    for (let s = 0; s < slots; s++) {
+      const b = HDR + s * SW;
+      const gen = W[b + 2], w = W[b + 3];
+      // The first time, every slot as it is, with none of its frames: the
+      // worklet starts reading where the writer is.
+      const first = sent[s] === undefined;
+      if (first) sent[s] = w;
+      let from = sent[s];
+      if (!first && gen === gens[s] && from === w) continue;
+      gens[s] = gen;
+      let n = (w - from) >>> 0;
+      if (n > cap) {
+        from = (w - cap) >>> 0;
+        n = cap;
+      }
+      const ring = new Float32Array(kernel.memory.buffer, at + OFF + s * cap * 8, cap * 2);
+      const frames = new Float32Array(n * 2);
+      for (let i = 0, p = from; i < n; i++, p = (p + 1) >>> 0) {
+        const q = (p % cap) * 2;
+        frames[2 * i] = ring[q];
+        frames[2 * i + 1] = ring[q + 1];
+      }
+      list.push([s, W[b], W[b + 1], gen, from, w, frames]);
+      transfer.push(frames.buffer);
+      sent[s] = w;
+    }
+    if (list.length) port.postMessage(list, transfer);
+  }, 5);
+}
 const promised = new Map();
 /** The page's kernel call `f`, on a stack that may suspend. */
 const invoke = (f, args) => {
@@ -247,12 +301,21 @@ const ops = {
     const n = 16 + all[(at >>> 2) + 2] * all[(at >>> 2) + 3];
     return { value: { at, words: all.slice(at >>> 2, (at >>> 2) + n) } };
   },
+  // The audio rings (audio.js `WebAudio`): where, and their sizes, for the
+  // page's worklet to keep a copy of (`{ audio }`, `mirrorAudio`).
+  audioRing() {
+    const at = k.k_audio_ring() >>> 0;
+    if (!at) return { value: { at: 0 } };
+    const all = words();
+    return { value: { at, slots: all[(at >>> 2) + 2], cap: all[(at >>> 2) + 3], ccap: all[(at >>> 2) + 8] } };
+  },
   useKernelStacks({ stacks }) {
     host.useKernelStacks(stacks);
     return { value: null };
   },
   async stop() {
     clearInterval(compTimer);
+    clearInterval(audioTimer);
     comp?.compositor.stop();
     glr?.stop();
     await host?.stop();
@@ -265,7 +328,12 @@ globalThis.onmessage = async ({ data: m }) => {
   // or its DOM desktop's writes on the arena.
   if (m?.comp) return void comp?.send(m.comp);
   if (m?.wl) return void mirror?.call(m.wl.fn, m.wl.args);
-  // Its GL windows' canvases (gl-relay.js).
+  // The page's audio worklet's own port: its copy of the rings filled from here.
+  if (m?.audio) {
+    clearInterval(audioTimer);
+    audioTimer = mirrorAudio(k.k_audio_ring() >>> 0, m.audio.port);
+    return;
+  }
   // The page's game controllers, written into the kernel's table, then
   // their readers woken (a kernel call, in turn with the page's).
   if (m?.joy) {
@@ -273,6 +341,7 @@ globalThis.onmessage = async ({ data: m }) => {
     callsDone = callsDone.then(() => runCallsAsync(k, mem, [{ f: 'k_joy_notify' }], invoke)).catch(() => {});
     return;
   }
+  // Its GL windows' canvases (gl-relay.js).
   if (m?.glc) return void (m.glc.stop ? glr?.stop() : glr?.canvas(m.glc));
   if (m?.call === undefined) return;
   try {

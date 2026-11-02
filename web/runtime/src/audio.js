@@ -25,11 +25,16 @@ export class WebAudio extends EventTarget {
     this.#ready = new Promise((resolve, reject) => {
       i.afterBoot(async (s) => {
         try {
-          const at = (await i.kernel().r('k_audio_ring')) >>> 0;
+          // The single-thread build's rings are its Worker's: the worklet
+          // plays a copy (web/src/audio.js `mirror`).
+          const ring = s.audio ? await s.audio.ring() : null;
+          const at = ring ? ring.at : (await i.kernel().r('k_audio_ring')) >>> 0;
           if (this.#closed) return resolve(this);
           const { playAudio } = await import('../../src/audio.js');
-          this.#player = playAudio({ memory: s.kernel.memory, at, latency, context: ctx });
-          if (!this.#player) throw new Error('WebAudio: this browser has no AudioWorklet over shared memory');
+          this.#player = ring
+            ? (at ? playAudio({ mirror: { ...ring, connect: s.audio.connect }, latency, context: ctx }) : null)
+            : playAudio({ memory: s.kernel.memory, at, latency, context: ctx });
+          if (!this.#player) throw new Error(ring ? 'WebAudio: this browser has no AudioWorklet' : 'WebAudio: this browser has no AudioWorklet over shared memory');
           await this.#player.ready;
           const c = this.#player.ctx;
           const said = () => { if (c.state === 'running') this.dispatchEvent(new Event('running')); };
