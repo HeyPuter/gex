@@ -1731,12 +1731,13 @@ impl FdIo<'_> {
         };
         // Watching something that is not open is an error, and a program that
         // gets silence instead waits for a readiness that cannot arrive.
-        let source = if op != unix::epoll_op::DEL {
-            self.fds.get(fd)?.handle.wait_queue()
-        } else {
-            0
-        };
-        set.ctl_queue(op, fd, events, data, source)
+        let file = if op != unix::epoll_op::DEL { Some(self.fds.get(fd)?) } else { None };
+        let source = file.as_ref().map_or(0, |f| f.handle.wait_queue());
+        let r = set.ctl_queue(op, fd, events, data, source)?;
+        if let Some(f) = file {
+            set.note_file(fd, &f.handle, f.writable);
+        }
+        Ok(r)
     }
 
     /// A `readv`'s vectors when there is more than one with room in it,
@@ -2467,7 +2468,7 @@ impl FdIo<'_> {
             .iter()
             .filter_map(|w| {
                 let file = self.fds.get(w.fd).ok()?;
-                set.rechain(w.fd, file.handle.wait_queue());
+                set.note_file(w.fd, &file.handle, file.writable);
                 Some(PollFd {
                     addr: 0,
                     fd: w.fd,
@@ -13302,6 +13303,46 @@ mod tests {
         let mut b = s.as_bytes().to_vec();
         b.push(0);
         m.write(addr, &b).unwrap();
+    }
+
+    /// An epoll descriptor in a `poll` set is readable only while a wait on
+    /// it would report something, and never writable. Always readable, GLib
+    /// main loops that poll one (kded6's, plasmashell's) went round
+    /// `ppoll` and an empty `epoll_wait` at a core each, for good.
+    #[test]
+    fn an_epoll_descriptor_polls_readable_only_with_something_to_report() {
+        const EPOLLIN: u32 = 0x001;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        let at = k.ctx_addr;
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        // `ppoll` of the one descriptor for POLLIN|POLLOUT, not waiting: its revents.
+        let poll = |k: &mut Kernel, m: &mut GuestMem<'_>, fd: u64| -> u32 {
+            m.write_u64(0x20500, 0).unwrap();
+            m.write_u64(0x20508, 0).unwrap();
+            m.write_u32(0x20600, fd as u32).unwrap();
+            m.write_u32(0x20604, 0x5).unwrap();
+            let n = call(k, m, nr::PPOLL, &[0x20600, 1, 0x20500, 0, 8]);
+            assert!(n >= 0, "ppoll: {n}");
+            m.read_u32(0x20604).unwrap() >> 16
+        };
+        assert_eq!(call(&mut k, &mut m, nr::PIPE2, &[0x20010, 0]), 0);
+        let (rfd, wfd) = (m.read_u32(0x20010).unwrap() as u64, m.read_u32(0x20014).unwrap() as u64);
+        let ep = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty set");
+        m.write_u32(0x20300, EPOLLIN).unwrap();
+        m.write_u64(if gex_abi::X86 { 0x20304 } else { 0x20308 }, 7).unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[ep, 1, rfd, 0x20300]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty pipe");
+        m.write(0x21000, b"a").unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
+        assert_eq!(poll(&mut k, &mut m, ep), 1, "the pipe written: POLLIN only");
+        assert_eq!(call(&mut k, &mut m, nr::READ, &[rfd, 0x21100, 8]), 1);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "the pipe read again");
     }
 
     /// `EPOLLET` as Linux has it: an edge-triggered watch reports at each
