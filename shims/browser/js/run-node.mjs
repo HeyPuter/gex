@@ -716,6 +716,8 @@ const host = new ProcessHost({
     else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
   },
   onExit: (m, pid) => {
+    // A process that threw has no exit numbers to report (`#onExit`).
+    if (m.threw) return;
     // GEX_DL_FILE=PATH: the discovery log (GEX_DISCOVER_SKIP=256), to PATH.PID.
     if (process.env.GEX_DL_FILE && m.dl) appendFileSync(`${process.env.GEX_DL_FILE}.${pid}`, m.dl);
     // How much of the run was translating vs. running translated code. Per

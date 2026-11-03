@@ -593,6 +593,8 @@ export class ProcessHost {
     onFork = () => {},
     // Every process's exit message, whole. `start` resolves with pid 1's
     // status; this hands a host the rest of what a Worker reports on exit.
+    // A process that threw comes here too, with `{ threw: true, message }`
+    // and none of an exit's numbers.
     onExit = () => {},
     readStdin = null,
     // Anything a Worker posts that this file has no meaning for.
@@ -2055,7 +2057,14 @@ export class ProcessHost {
         resolve(m.status);
         break;
       case 'threw':
-        if (!String(pid).includes(':')) forgetMemory(pid);
+        if (!String(pid).includes(':')) {
+          // A process that fell over has ended as surely as one that exited:
+          // its host lets go of it the same way, or its windows stay on the
+          // screen, drawn from a block nobody writes again. Before the
+          // release, as for an exit.
+          this.#onExit({ threw: true, message: m.message }, pid);
+          forgetMemory(pid);
+        }
         this.#release(pid, w);
         // Here as well as in the Worker: only this side knows which process
         // fell over, and a child's promise often has nobody awaiting it.
