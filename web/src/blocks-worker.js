@@ -15,8 +15,6 @@ onmessage = async ({ data: { memory, ctl, name, verify } }) => {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(storeDir(name), { create: true });
     h = await openHandle(await dir.getFileHandle(STORE_FILE, { create: true }));
-    // Nothing is kept across loads yet.
-    h.truncate(0);
   } catch (e) {
     postMessage({ kind: 'ready', ok: false, why: String(e?.message ?? e) });
     return;

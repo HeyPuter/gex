@@ -706,8 +706,8 @@ pub fn translate(
         151 => nr::MLOCKALL,
         152 => nr::MUNLOCKALL,
         325 => nr::MLOCK2,
-        // Advisory: fadvise64, readahead, sync_file_range, sched_setaffinity.
-        221 | 187 | 277 | 203 => nr::NOOP_OK,
+        // Advisory: fadvise64, readahead, sched_setaffinity.
+        221 | 187 | 203 => nr::NOOP_OK,
         _ => UNKNOWN,
     }
 }

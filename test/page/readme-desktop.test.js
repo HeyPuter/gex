@@ -16,12 +16,11 @@ export const meta = {
 const MODULES = {
   '@gex/runtime': 'index.js',
   '@gex/runtime/fs': 'fs.js',
-  '@gex/runtime/persist/idb': 'persist/idb.js',
   '@gex/runtime/net/wisp': 'net/wisp.mjs',
   '@gex/runtime/windows/host': 'windows/host.js',
 };
 // `--package`: the built entries instead (lib/package.mjs's names).
-const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'persist/idb.js': 'persist-idb.mjs', 'net/wisp.mjs': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
+const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'net/wisp.mjs': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
 
 // Not `new URL(..., import.meta.url)` written out: vite would rewrite that
 // as an asset's URL.
@@ -70,6 +69,8 @@ export default async function (t) {
     closeTerminalWindow: () => { closedTerminal = true; },
     openBrowserWindow: (url) => opened.push(url),
   });
+  // The README's store keeps its root across loads: a run starts from the tree.
+  await (await navigator.storage.getDirectory()).removeEntry('gex-fs-debian', { recursive: true }).catch(() => {});
   const url = URL.createObjectURL(new Blob([`${code}\nexport { sys, fs, hw, sh };\n`], { type: 'text/javascript' }));
   const { sys, hw, sh } = await t.timeout(import(/* @vite-ignore */ url), 90000, 'the README\'s blocks');
   t.eq('the system runs', sys.state.phase, 'running');

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The runtime API as an npm package (web/runtime/README.md): its modules built
-# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs, persist*.mjs, net-wisp.mjs, audio.mjs, gl.mjs, input.mjs) and
+# with vite into DIR, flat, one per entry (index.mjs, fs.mjs, windows-*.mjs, net-wisp.mjs, audio.mjs, gl.mjs, input.mjs) and
 # their shared chunks and Workers beside them, and the files a system
 # fetches, each by its own URL: the shared-memory shim, kernel and seed of each guest
 # architecture this tree has built (shims/browser/build.sh, GEX_ARCH=x86
@@ -133,7 +133,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', persist: '$RT/src/persist.js', 'persist-idb': '$RT/src/persist/idb.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -257,8 +257,6 @@ cat > "$OUT/package.json" <<PKG
     "./windows/host": { "types": "./windows-host.d.ts", "default": "./windows-host.mjs" },
     "./windows/single": { "types": "./windows-single.d.ts", "default": "./windows-single.mjs" },
     "./windows/compositor": { "types": "./windows-compositor.d.ts", "default": "./windows-compositor.mjs" },
-    "./persist": { "types": "./persist.d.ts", "default": "./persist.mjs" },
-    "./persist/idb": { "types": "./persist-idb.d.ts", "default": "./persist-idb.mjs" },
     "./net/wisp": { "types": "./net-wisp.d.ts", "default": "./net-wisp.mjs" },
     "./audio": { "types": "./audio.d.ts", "default": "./audio.mjs" },
     "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },

@@ -151,20 +151,25 @@ function writebackOf(writeback, who) {
   return writeback;
 }
 
+/** Never kept across loads: what the kernel makes, and scratch. */
+const ALWAYS_EXCLUDED = Object.freeze(['/tmp', '/run', '/proc', '/sys', '/dev']);
+
 export class Filesystem extends EventTarget {
   #sys;
   #cache;
   #writeback;
   #sources = [];
   #mounts = new Map(); // path -> { mount, id }
-  #persist = null; // a Persist's hooks
+  #exclude;
 
   /** Abstract: a page makes a `MemoryFilesystem`, an `OPFSFilesystem`, or
    *  a subclass of its own that implements the store's methods. `cache`:
    *  MiB of the store held in the kernel's memory (default 256);
    *  `writeback`: ms a written block may stay only there before it goes to
-   *  the store (default 5000). */
-  constructor(sys, { cache, writeback } = {}) {
+   *  the store (default 5000); `exclude`: more paths of the root its store
+   *  does not keep across loads (beside /tmp, /run, /proc, /sys, /dev and
+   *  the mounts). */
+  constructor(sys, { cache, writeback, exclude = [] } = {}) {
     if (new.target === Filesystem) {
       throw new TypeError('Filesystem is abstract: make a MemoryFilesystem(sys), an OPFSFilesystem(sys, { name }), or a subclass that implements its store');
     }
@@ -175,6 +180,8 @@ export class Filesystem extends EventTarget {
     }
     this.#cache = cacheOf(cache, new.target.name);
     this.#writeback = writebackOf(writeback, new.target.name);
+    if (!Array.isArray(exclude) || exclude.some((p) => typeof p !== 'string' || !p.startsWith('/'))) throw new TypeError(`${new.target.name}: exclude is a list of absolute paths`);
+    this.#exclude = exclude;
     const i = internals(sys, 'Filesystem');
     i.attach('filesystem', this, { beforeBoot: true });
     this.#sys = i;
@@ -189,13 +196,9 @@ export class Filesystem extends EventTarget {
       /** For the system's start: the mounts made before boot,
        *  in place before the first program. */
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
-      /** A Persist on this filesystem (persist.js): one, made before boot. */
-      persist: (part, hooks) => {
-        i.attach('persistence', part, { beforeBoot: true });
-        this.#persist = hooks;
-        i.afterBoot(() => hooks.running(i));
-      },
-      persistArgs: () => this.#persist?.startArgs() ?? null,
+      phase: () => this.#sys.phase,
+      /** The paths the store does not keep (system.js `#start`). */
+      exclude: () => [...ALWAYS_EXCLUDED, ...this.#exclude, ...[...this.#mounts.keys()]],
       /** A program's image as an untarred bundle has it (kfs.js
        *  `layImage`): a preset's (web/src/run-program.js), not the API's. */
       addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
@@ -206,8 +209,9 @@ export class Filesystem extends EventTarget {
   // by offset in blocks of 64 KiB. A subclass implements these; the kernel
   // calls them as its cache fills and writes back, one call at a time.
 
-  /** Make the store ready, before boot (optional). Its contents are not
-   *  kept across boots yet: the system empties it with `truncate(0)`. */
+  /** Make the store ready, before boot (optional). What it holds is the
+   *  root a load before kept (empty: none); a store that is to start over
+   *  empties itself here. */
   async open() {}
 
   /** `length` bytes at `offset` (a Uint8Array; shorter past the end, which
@@ -285,11 +289,9 @@ export class Filesystem extends EventTarget {
     }).then(() => {});
   }
 
-  /** For boot: the layers, in order (later wins), and what a Persist kept,
-   *  laid over them. */
+  /** For boot: the layers, in order (later wins). */
   async #seed(opts) {
     opts.layers = await Promise.all(this.#sources);
-    opts.records = this.#persist ? await this.#persist.load() : [];
     this.#sources.length = 0;
   }
 
@@ -551,6 +553,31 @@ export class OPFSFilesystem extends Filesystem {
   }
 
   async flush() {}
+
+  /** Forget what the store `name` keeps: the next boot on it starts from
+   *  the sources alone. Not while a system holds it. */
+  static async erase(name) {
+    const root = await navigator.storage.getDirectory();
+    // A system just stopped: its store Worker lets the file go a moment
+    // after it was terminated.
+    for (let i = 0; ; i++) {
+      try {
+        return await root.removeEntry(`gex-fs-${name}`, { recursive: true });
+      } catch (e) {
+        if (e?.name === 'NotFoundError') return;
+        if (e?.name !== 'NoModificationAllowedError' || i >= 100) throw e;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+  }
+
+  /** {@link OPFSFilesystem.erase} of this filesystem's store: before boot,
+   *  or once its system has stopped. */
+  async erase() {
+    const phase = this[INTERNAL].phase();
+    if (phase !== 'new' && phase !== 'stopped' && phase !== 'failed') throw new Error(`OPFSFilesystem: erase() while the system is ${phase}`);
+    await OPFSFilesystem.erase(this.#name);
+  }
 }
 
 /** An OPFS failure with a code: the origin's quota is ENOSPC. */

@@ -2,7 +2,7 @@
 // Message in: { module, memory }; out: { paths } or { error }.
 //
 // It runs on a kernel stack slot of its own (lazy-fetch.mjs `HELPER_STACKS`):
-// it may ask while the page persists and has a terminal. fs-opened.js asks
+// it may ask while the page's terminal does. fs-opened.js asks
 // one at a time, so two of these never share it.
 
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';

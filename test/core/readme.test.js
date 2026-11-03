@@ -12,8 +12,6 @@ import * as fsMod from '../../web/runtime/src/fs.js';
 import * as host from '../../web/runtime/src/windows/host.js';
 import * as single from '../../web/runtime/src/windows/single.js';
 import * as compositor from '../../web/runtime/src/windows/compositor.js';
-import * as persist from '../../web/runtime/src/persist.js';
-import * as idb from '../../web/runtime/src/persist/idb.js';
 import * as wisp from '../../web/runtime/src/net/wisp.mjs';
 import * as audio from '../../web/runtime/src/audio.js';
 import * as gl from '../../web/runtime/src/gl.js';
@@ -25,13 +23,11 @@ export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
 const M = {
   '@gex/runtime': index, '@gex/runtime/fs': fsMod, '@gex/runtime/windows/host': host,
   '@gex/runtime/windows/single': single, '@gex/runtime/windows/compositor': compositor,
-  '@gex/runtime/persist': persist, '@gex/runtime/persist/idb': idb,
   '@gex/runtime/net/wisp': wisp, '@gex/runtime/audio': audio, '@gex/runtime/gl': gl, '@gex/runtime/input': input,
 };
 // The single-thread build (system.js `SINGLE`).
 const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
-const DB = 'debian';
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes
  *  first when its blocks start from a system they do not make (`pre`:
@@ -44,7 +40,7 @@ const PHASES = [
     v.sh.pty.write('exit\n');
     t.eq('intro: bash -l exits', (await t.timeout(v.sh.exited, 30000, 'bash exit')).code, 0);
   } },
-  { blocks: [1, 2, 3], windows: true, before: () => dropDb(DB), check: async (t, v) => {
+  { blocks: [1, 2, 3], windows: true, before: () => fsMod.OPFSFilesystem.erase('debian'), check: async (t, v) => {
     t.eq('desktop: running', v.sys.state.phase, 'running');
     t.check('desktop: hw.env names the display', !!(v.hw.env.WAYLAND_DISPLAY && v.hw.env.DISPLAY), JSON.stringify(v.hw.env));
     await t.until(() => /\S/.test(v.term.text), 'terminals: bash -l says something on its terminal', 60000);
@@ -67,9 +63,10 @@ const PHASES = [
     const sums = r.stdout.trim().split('\n').map((l) => l.split(' ')[0]);
     t.check('a store of the page\'s own: 40 MiB copied through it', r.code === 0 && sums.length === 2 && sums[0] === sums[1], `exit ${r.code}: ${r.stdout}${r.stderr}`);
   } },
-  { blocks: [5], pre: 'new', before: () => dropDb('my-tree'), check: async (t, v) => {
-    const s = await v.persist.save();
-    t.check('persistence: save()', typeof s?.stored === 'number' && typeof s?.bytes === 'number', JSON.stringify(s));
+  { blocks: [5], before: () => fsMod.OPFSFilesystem.erase('my-tree'), check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', 'echo kept > /root/kept && sync'], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'kept');
+    t.eq('persistence: a file written and synced', [r.code, r.stderr], [0, '']);
+    t.eq('persistence: sys.sync()', await v.sys.sync().then(() => 'ok', (e) => e.code ?? e.message), 'ok');
   } },
   { blocks: [6, 7], pre: 'booted', check: async (t, v) => {
     t.check('network: the last one set, a Wisp', v.sys.network instanceof wisp.Wisp && v.sys.network.url === 'wss://wisp.example/', String(v.sys.network?.url));
@@ -100,10 +97,6 @@ function guestLine(block, start) {
   return lines[i].slice(lines[i].indexOf(start)).trim();
 }
 
-function dropDb(name) {
-  return new Promise((r, j) => { const q = indexedDB.deleteDatabase(name); q.onsuccess = r; q.onerror = j; });
-}
-
 /** A block as the body of an async function: its imports from the modules
  *  above, its trees the slim image. */
 function prepare(code, tree) {
@@ -124,7 +117,7 @@ const showToast = (title) => { calls.showToast = title; };
 const openBrowserWindow = (url) => { calls.openBrowserWindow = url; };
 const closeTerminalWindow = () => { calls.closeTerminalWindow = true; };
 `;
-const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'persist', 'gl', 'off', 'term', 'button'];
+const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button'];
 
 export default async function (t) {
   const { eq, check, say } = t;
@@ -171,8 +164,7 @@ function members(t) {
     'Process': [index.Process.prototype, ['pid', 'kill', 'windows', 'addEventListener']],
     'Filesystem': [fsMod.Filesystem.prototype, ['open', 'read', 'write', 'size', 'truncate', 'flush', 'addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
     'Mount': [fsMod.Mount.prototype, ['unmount']],
-    'Persist': [persist.Persist.prototype, ['save', 'reset', 'stats']],
-    'IdbPersist': [idb.IdbPersist.prototype, ['save', 'reset', 'stats']],
+    'OPFSFilesystem': [fsMod.OPFSFilesystem.prototype, ['erase']],
     'Wisp': [wisp.Wisp.prototype, ['url', 'connect', 'datagram', 'close', 'addEventListener']],
     'WebAudio': [audio.WebAudio.prototype, ['ready', 'context', 'stats', 'close']],
     'MesaGl': [gl.MesaGl.prototype, ['start']],

@@ -20,27 +20,12 @@ pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// `MemoryFilesystem({ max })`).
 pub static TMPFS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The directory a page keeps (its persist store's root, `watch`), without
-/// its leading `/`, and how many times the program has finished a change
-/// under it: a close after a write (or a create or truncation), a rename
-/// into or out of it, an unlink. The store snapshots soon after the count moves
-/// (web/src/persist-worker.js), so a save outlives the page without waiting
-/// for a timer. Unset, nothing is counted.
-static WATCHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-pub static SAVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Moves at every change of a tree or of a file's contents or times: the
+/// root's persistence (persist.rs) writes a generation only after it has.
+pub static META: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Count changes finished under `root` ([`SAVES`]); the first root set stays.
-pub fn watch(root: &str) {
-    let _ = WATCHED.set(root.trim_matches('/').to_string());
-}
-
-/// A change to `path` (a tmpfs path, no leading `/`) finished: counted when
-/// it is under the watched directory.
-fn saved(path: &str) {
-    let Some(w) = WATCHED.get() else { return };
-    if path.starts_with(w.as_str()) && (w.is_empty() || path.len() == w.len() || path.as_bytes()[w.len()] == b'/') {
-        SAVES.fetch_add(1, Ordering::Relaxed);
-    }
+fn moved() {
+    META.fetch_add(1, Ordering::Relaxed);
 }
 
 /// This filesystem's half of an [`inotify::Key`](crate::inotify::Key).
@@ -116,9 +101,6 @@ fn note_capacity(before: usize, after: usize) {
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
-/// The fixed part of one [`TmpFs::tree`] entry.
-pub const TREE_ENTRY: usize = 40;
-
 /// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
 pub const LAZY_MTIME: i64 = 0;
 
@@ -157,8 +139,8 @@ pub struct FileNode {
     /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
     /// rename. Not a time set (`utimensat`, which a program can aim at any
     /// file), not a lazy file's contents arriving, not the seeding itself.
-    /// What a page's persist store snapshots (web/src/persist-worker.js),
-    /// so a snapshot never reads a file the program did not touch.
+    /// What the kept root records (persist.rs), so that a generation never
+    /// reads a file the program did not touch.
     written: core::sync::atomic::AtomicBool,
     /// [`FileHandle::changes`]: bumped with the contents' lock held, so a
     /// reader that saw the same count before and after its read read
@@ -223,6 +205,7 @@ impl FileNode {
     /// One more change of the contents; called with `data` locked (the
     /// count's reader pairs with this through that lock: [`FileNode::changes`]).
     fn changed(&self) {
+        moved();
         self.changes.fetch_add(1, Ordering::AcqRel);
     }
     fn touch(&self) {
@@ -244,6 +227,7 @@ impl FileNode {
     }
     /// Modified at `secs`: the change time with it, once the times are kept.
     fn stamp(&self, secs: i64) {
+        moved();
         self.mtime.store(secs, Ordering::Relaxed);
         let mut t = self.times.lock().unwrap();
         if *t != super::Times::default() {
@@ -255,6 +239,7 @@ impl FileNode {
     /// `utimensat`/`futimens`: either time (`None`: leave it), and the
     /// change time is `now`.
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) {
+        moved();
         let mut t = self.times.lock().unwrap();
         if *t == super::Times::default() {
             let m = self.mtime.load(Ordering::Relaxed);
@@ -757,6 +742,7 @@ struct Shared {
 impl Shared {
     /// The tree to change.
     fn lock(&self) -> LockResult<RwLockWriteGuard<'_, Inner>> {
+        moved();
         self.m.write()
     }
     /// The tree to look at.
@@ -764,6 +750,9 @@ impl Shared {
         self.m.read()
     }
 }
+
+#[path = "persist.rs"]
+pub mod persist;
 
 /// An in-memory filesystem.
 pub struct TmpFs {
@@ -837,10 +826,6 @@ impl TmpFs {
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
                 Err(Errno::EAGAIN) => continue,
                 r => {
-                    if r.is_ok() {
-                        saved(from);
-                        saved(to);
-                    }
                     return r;
                 }
             }
@@ -1045,40 +1030,6 @@ impl TmpFs {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every node, for a persist store's diff of the tree (web/runtime
-    /// persist.js): no file's bytes, so nothing lazy is fetched. Each is
-    /// [`TREE_ENTRY`] bytes, little-endian -- kind (0 file, 1 directory, 2
-    /// symlink, 3 socket), written ([`FileNode::written`]), two spare, mode,
-    /// size, changes ([`FileNode::changes`], 0 for not a file), mtime, the
-    /// path's length and the target's -- then the path (no leading `/`) and
-    /// a symlink's target.
-    pub fn tree(&self) -> Vec<u8> {
-        let inner = self.inner.read().unwrap();
-        let mut out = Vec::with_capacity(inner.nodes.len() * (TREE_ENTRY + 32));
-        for (p, n) in inner.nodes.iter() {
-            let (kind, written, size, changes, mtime, target): (u8, bool, u64, u64, i64, &str) = match n {
-                Node::File(f) => (0, f.written.load(Ordering::Relaxed), f.size(), f.changes.load(Ordering::Acquire), f.mtime.load(Ordering::Relaxed), ""),
-                Node::Dir => (1, false, 0, 0, inner.mtimes.get(p).copied().unwrap_or(0), ""),
-                Node::Symlink(t) => (2, false, t.len() as u64, 0, inner.mtimes.get(p).copied().unwrap_or(0), t.as_str()),
-                Node::Socket => (3, false, 0, 0, 0, ""),
-            };
-            let default = if kind == 1 { Metadata::dir().mode } else if kind == 2 { 0o777 } else { 0o644 };
-            let mode = inner.modes.get(p).copied().unwrap_or(default);
-            out.push(kind);
-            out.push(written as u8);
-            out.extend_from_slice(&[0, 0]);
-            out.extend_from_slice(&mode.to_le_bytes());
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(&changes.to_le_bytes());
-            out.extend_from_slice(&mtime.to_le_bytes());
-            out.extend_from_slice(&(p.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(target.len() as u32).to_le_bytes());
-            out.extend_from_slice(p.as_bytes());
-            out.extend_from_slice(target.as_bytes());
-        }
-        out
     }
 
     /// Where file contents lie in this address space, for a session
@@ -1305,28 +1256,12 @@ struct TmpHandle {
     /// through a rename of the directory or of one above it, as a Linux
     /// descriptor follows its dentry (`Inner::dir_now`).
     dir: Option<u64>,
-    /// Whether this handle wrote or truncated: its close is then a change
-    /// finished ([`saved`]).
-    wrote: core::sync::atomic::AtomicBool,
     /// Opened to write: its close is `IN_CLOSE_WRITE`, else `IN_CLOSE_NOWRITE`.
     for_write: bool,
 }
 
-impl TmpHandle {
-    fn note_write(&self) {
-        if !self.wrote.load(Ordering::Relaxed) {
-            self.wrote.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 impl Drop for TmpHandle {
     fn drop(&mut self) {
-        // By the name it was opened by: a drop takes no lock. A save is
-        // closed before it is renamed into place, and the rename is counted.
-        if self.wrote.load(Ordering::Relaxed) {
-            saved(&self.path);
-        }
         if crate::inotify::any() {
             use crate::inotify::mask;
             let ev = if self.for_write { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE };
@@ -1412,7 +1347,12 @@ impl FileHandle for TmpHandle {
         Some(Ok(n as u64))
     }
 
-    fn sync(&self, _data_only: bool) -> Result<(), Errno> {
+    fn sync(&self, data_only: bool) -> Result<(), Errno> {
+        // With the root kept (persist.rs), `fsync` writes a generation: the
+        // file's blocks, and its name and size with the rest of the tree.
+        if !data_only && persist::on() {
+            return persist::sync();
+        }
         let Some(file) = &self.file else { return Ok(()) };
         match file.pg.lock().unwrap().as_ref() {
             Some(p) => p.sync(),
@@ -1445,7 +1385,6 @@ impl FileHandle for TmpHandle {
             file.changed();
             drop(pg);
             file.touch();
-            self.note_write();
             self.note_here(crate::inotify::mask::MODIFY);
             return Ok(buf.len() as u64);
         }
@@ -1462,7 +1401,6 @@ impl FileHandle for TmpHandle {
         drop(data);
         drop(pg);
         file.touch();
-        self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
         Ok(buf.len() as u64)
     }
@@ -1610,7 +1548,6 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EINVAL);
         };
         file.materialize()?;
-        self.note_write();
         let mut pg = file.paged_for(len);
         if let Some(p) = pg.as_mut() {
             p.truncate(len)?;
@@ -1772,7 +1709,6 @@ impl TmpFs {
             path,
             file,
             dir,
-            wrote: core::sync::atomic::AtomicBool::new(wrote),
             for_write: acc == oflags::O_WRONLY || acc == oflags::O_RDWR,
         };
         if crate::inotify::any() {
@@ -1923,7 +1859,6 @@ impl FileSystem for TmpFs {
                 let own = node_ino(&inner, path);
                 // Its mode too: a file made at the name later is a new one.
                 inner.forget(path);
-                saved(path);
                 if let Some(own) = own {
                     note_removed(&inner, fs_key(&self.inner), path, own);
                 }
@@ -2753,45 +2688,6 @@ mod lazy_tests {
         assert_eq!(fs.add_file_part("p/none", 0, b"x"), Err(Errno::ENOENT));
         fs.open("p/big", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
         assert_eq!(fs.written(), ["/p/big"].map(String::from).to_vec());
-    }
-
-    /// A change the program finishes under the watched directory moves
-    /// `SAVES`: a close after a write, a create or a truncation, a rename
-    /// into or out of it, an unlink. A read, an open alone, and anything
-    /// outside it do not. (The only test that sets the watch.)
-    #[test]
-    fn saves_count_finished_changes_under_the_watched_directory() {
-        watch("/watched-saves/");
-        let fs = TmpFs::new();
-        fs.mkdir("watched-saves", 0o755).unwrap();
-        fs.mkdir("watched-savesx", 0o755).unwrap();
-        fs.add_file("watched-saves/old", b"seed".to_vec());
-        fs.add_file("other", b"seed".to_vec());
-        let n = || SAVES.load(Ordering::Relaxed);
-        let mut buf = [0u8; 4];
-        let at = n();
-        fs.open("watched-saves/old", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
-        drop(fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap());
-        fs.open("other", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
-        fs.open("watched-savesx/f", oflags::O_CREAT | oflags::O_RDWR, 0o644).unwrap().write_at(0, b"x").unwrap();
-        assert_eq!(n(), at);
-        let h = fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap();
-        h.write_at(0, b"x").unwrap();
-        assert_eq!(n(), at, "counted at the close, not the write");
-        drop(h);
-        assert_eq!(n(), at + 1);
-        drop(fs.open("watched-saves/tmp", oflags::O_CREAT | oflags::O_WRONLY, 0o644).unwrap());
-        assert_eq!(n(), at + 2);
-        drop(fs.open("watched-saves/old", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap());
-        assert_eq!(n(), at + 3);
-        FileSystem::rename(&fs, "other", "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 4);
-        FileSystem::rename(&fs, "watched-saves/tmp", "outside").unwrap();
-        assert_eq!(n(), at + 5);
-        FileSystem::unlink(&fs, "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 6);
-        FileSystem::unlink(&fs, "outside").unwrap();
-        assert_eq!(n(), at + 6);
     }
 
     /// Requests of `/data/h`, each `(offset, len)`.

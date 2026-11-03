@@ -345,8 +345,9 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = (offset, len, advice);
         Ok(())
     }
-    /// `fsync` (`fdatasync` with `data_only`): what was written through any
-    /// handle on this file made durable. A file whose bytes are only in
+    /// `fsync` and `fdatasync`: what was written through any handle on this
+    /// file made durable, its size and name with it; `data_only`
+    /// (`sync_file_range`): its bytes only. A file whose bytes are only in
     /// memory has nothing to do.
     fn sync(&self, data_only: bool) -> Result<(), Errno> {
         let _ = data_only;

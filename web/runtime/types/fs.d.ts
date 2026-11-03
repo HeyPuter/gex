@@ -62,9 +62,12 @@ export type LazyList =
  *  subclass of its own that implements the store's methods (`new
  *  Filesystem(sys)` throws). */
 export declare abstract class Filesystem extends EventTarget {
-  /** `cache`: MiB of the store held in the system's memory (default 256, 16 to 4096). */
-  constructor(sys: System, options?: { cache?: number; writeback?: number });
-  /** The store, which a subclass implements: one array of bytes. Optional: ready it before boot. */
+  /** `cache`: MiB of the store held in the system's memory (default 256, 16 to 4096);
+   *  `writeback`: ms a written block waits (default 5000); `exclude`: more
+   *  absolute paths the store does not keep across loads. */
+  constructor(sys: System, options?: { cache?: number; writeback?: number; exclude?: string[] });
+  /** The store, which a subclass implements: one array of bytes, the root a
+   *  load before kept. Optional: ready it before boot (empty it to start over). */
   open(): Promise<void>;
   /** `length` bytes at `offset`; shorter past the end (zeros). */
   read(offset: number, length: number): Promise<Uint8Array>;
@@ -103,9 +106,13 @@ export declare class MemoryFilesystem extends Filesystem {
   flush(): Promise<void>;
 }
 
-/** File data in the page's OPFS, in the store `name`, with a cache of `cache` MiB in memory (default 256). */
+/** The root kept in the page's OPFS, in the store `name`, with a cache of `cache` MiB in memory (default 256). */
 export declare class OPFSFilesystem extends Filesystem {
-  constructor(sys: System, options: { name: string; cache?: number; writeback?: number });
+  constructor(sys: System, options: { name: string; cache?: number; writeback?: number; exclude?: string[] });
+  /** Forget what the store `name` keeps (not while a system holds it). */
+  static erase(name: string): Promise<void>;
+  /** Forget what this filesystem's store keeps: before boot, or once its system stopped. */
+  erase(): Promise<void>;
   read(offset: number, length: number): Promise<Uint8Array>;
   write(offset: number, bytes: Uint8Array): Promise<void>;
   size(): Promise<number>;

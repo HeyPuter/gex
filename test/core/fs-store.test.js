@@ -31,7 +31,10 @@ export default async function (t) {
     check('a subclass without its store throws', (() => { try { new Half(sys); return false; } catch (e) { return /write, size, truncate, flush/.test(e.message); } })());
     check('OPFSFilesystem names its store', (() => { try { new OPFSFilesystem(sys); return false; } catch (e) { return /name the store/.test(e.message); } })());
     // 40 MiB through a 16 MiB cache: written out to the store and read back.
-    const fs = new OPFSFilesystem(sys, { name: 'gex-test-store', cache: 16 });
+    // One store per arch (the two may run at once, in one origin), empty.
+    const name = `gex-test-store-${t.arch}`;
+    await OPFSFilesystem.erase(name);
+    const fs = new OPFSFilesystem(sys, { name, cache: 16 });
     fs.addTar(t.work('bb.tar.zst'));
     await timeout(sys.boot(), 60000, 'boot');
     const r = await sh(t, sys, 'dd if=/dev/urandom of=/root/a bs=1048576 count=40 2>/dev/null && cp /root/a /root/b');
@@ -41,6 +44,7 @@ export default async function (t) {
     const synced = await sys.sync().then(() => 'ok', (e) => e.code ?? e.message);
     eq('OPFS: sys.sync() writes the cache out to the store', synced, 'ok');
     await sys.shutdown();
+    await fs.erase();
     return t.reload();
   }
   // A max: a write past it is ENOSPC, and room comes back with a delete.

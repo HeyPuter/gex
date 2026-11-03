@@ -32,14 +32,13 @@ export const STORE_FILE = 'blocks';
 let own = null; // { h: handle, shared: reads straight into shared memory }
 
 /** Open this realm's own handle on the store `name` (the single-thread
- *  build's system Worker), emptied: it holds nothing across loads yet. */
+ *  build's system Worker), with what a load before kept in it. */
 export async function blocksOpen(name) {
   if (own) return true;
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(storeDir(name), { create: true });
   const fh = await dir.getFileHandle(STORE_FILE, { create: true });
   const h = await openHandle(fh);
-  h.truncate(0);
   own = { h, shared: sharedReads(h) };
   return true;
 }

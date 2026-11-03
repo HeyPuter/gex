@@ -399,13 +399,16 @@ path.
 What changes the build's output (its wasm, its bundle, what ships) is
 `user/eject.json`, at build time. Everything else is a `start()` option,
 whose default the build records: user/eject.json `"start"` (`args`, `env`,
-`cwd`, `size`, `mtimes`, `strace`, `trapstack`, `persist`, `filesystem`, `ready`) over the
+`cwd`, `size`, `mtimes`, `strace`, `trapstack`, `filesystem`, `ready`) over the
 recording's, and the page's options over both. A `"start"` key for a build
 setting (`"compositor"`, say) fails the build and says where it goes.
 `"filesystem"` is required: where the guest's files are kept, `"memory"`
 (gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
-origin private file system; web/runtime README, "Filesystem"). A new
-project's file says `"memory"`; a build whose file says neither fails.
+origin private file system, which keeps the whole root, a game's saves and
+the Wine prefix included, across loads; web/runtime README, "Persistence").
+A new project's file says `"memory"`; a build whose file says neither
+fails. The `"persist"` start option (one directory kept in IndexedDB) is
+gone and fails the build: what it saved is not read by an OPFS filesystem.
 
 ### A Linux program's web build
 

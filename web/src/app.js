@@ -25,7 +25,6 @@ import { makeControl as lazyCacheControl, lazyVersion } from '../../shims/browse
 import { globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { runProgram } from './run.js';
 import { openedFiles } from './fs-opened.js';
-import { restore, persist } from './persist.js';
 import { noRegSave } from './wine-env.js';
 import { logOn } from '../../shims/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
@@ -75,7 +74,6 @@ const PIECES = {
  *   cwd, exe   the working directory and program (a path in the bundle)
  *   uid        the guest's user and group id (default the build's, else 1000)
  *   mtimes     give the guest the bundle's file times
- *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
  *   filesystem where the guest's files are kept, required here or in the
  *              build (user/eject.json "start"): 'memory' (MemoryFilesystem,
  *              { kind: 'memory', max } with a limit) or { kind: 'opfs',
@@ -580,15 +578,6 @@ async function begin(opts, base, at, state, meter) {
     mark(`pieces in (${pieceList.pieces.length}, ${pieceList.files.length} files)`);
   }
   const files = { ...tree.files };
-  // A guest directory kept in IndexedDB: what the program left there last
-  // time, over the bundle's.
-  const keep = opts.persist === false ? null : (opts.persist ?? b.persist ?? null);
-  if (keep) {
-    const saved = await restore(keep.db, keep.dir);
-    for (const [p, d] of saved) files[p] = d;
-    state.restored = saved.length;
-    if (saved.length) say(`[app] restored ${saved.length} file(s) under ${keep.dir}\n`);
-  }
   // Hard links go to the guest as links, not copies: glibc knows a loaded
   // library by its inode.
   const hard = Object.fromEntries(Object.entries(tree.hard ?? {}).filter(([, t]) => files[t]));
@@ -626,7 +615,7 @@ async function begin(opts, base, at, state, meter) {
   if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
   // The wineserver's periodic registry saves only for a prefix the visit
   // keeps (wine-env.js).
-  noRegSave(env, keep);
+  noRegSave(env, filesystemValue(filesystem).kind !== 'memory');
   pageUser(env);
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
@@ -783,15 +772,6 @@ async function begin(opts, base, at, state, meter) {
   pruneFiles(fetcher).catch(() => {});
   // No fill to wait for: the boot's downloads are done.
   if (!fl) prefetchMesa('fetched');
-  if (keep) {
-    const p = persist(keep.db, keep.dir, await globalKernel(), {
-      every: Number(sw.persistms || 30000),
-      // `persistedWrote`: the files every snapshot of this visit stored,
-      // the ones it took of its own after a save included.
-      onSync: (m) => { state.persisted = m; state.persistedWrote = (state.persistedWrote ?? 0) + (m.wrote ?? 0); },
-    });
-    globalThis.__ntPersist = () => p?.sync();
-  }
 
   const term = {
     rows: 40,
@@ -1046,7 +1026,6 @@ function withStart(b, st) {
     if (typeof st.strace === 'number') out.switches.stracepid = String(st.strace);
   }
   if (st.trapstack) out.switches.trapstack = '1';
-  if (st.persist !== undefined) out.persist = st.persist || null;
   if (st.filesystem) out.filesystem = st.filesystem;
   if (st.ready) out.ready = st.ready;
   // "rootful": the X server is one fullscreen window the X session's own

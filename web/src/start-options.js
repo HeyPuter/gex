@@ -5,7 +5,7 @@
 
 /** Every option `start` reads (app.js lists what each is). */
 export const OPTIONS = [
-  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'persist', 'filesystem', 'network', 'wisp',
+  'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'filesystem', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
   'glLazy', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'ready',
 ];
@@ -32,6 +32,9 @@ export function checkOptions(opts) {
   };
   for (const k of Object.keys(opts)) {
     if (OPTIONS.includes(k)) continue;
+    // The guest directory kept in IndexedDB: an OPFS filesystem keeps the
+    // whole root now.
+    if (k === 'persist') throw new Error("start({ persist }): gone: a filesystem kept across loads keeps the whole root, filesystem: { kind: 'opfs', name }");
     const n = nearName(k, OPTIONS);
     throw new Error(`start({ ${k} }): no such option${n ? `; did you mean ${n}?` : ''} (the options: ${OPTIONS.join(', ')})`);
   }
@@ -49,7 +52,6 @@ export function checkOptions(opts) {
   if (given('wisp') && !/^wss?:\/\//.test(String(opts.wisp))) bad('wisp', 'a Wisp proxy\'s URL, ws://... or wss://...');
   if (given('network') && typeof opts.network?.connect !== 'function') bad('network', 'an object with connect(host, port)');
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
-  if (given('persist') && opts.persist !== false && !(typeof opts.persist === 'object' && typeof opts.persist.dir === 'string')) bad('persist', 'false, or {dir, db}');
   if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
   for (const k of ['onLog', 'onExit', 'onProgress']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');
   for (const k of ['debug', 'pageHosts']) if (given(k) && typeof opts[k] !== 'object') bad(k, 'an object, {name: value}');

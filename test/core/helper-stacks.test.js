@@ -1,16 +1,15 @@
-// The page's own helpers on the global kernel, all at once: persist
-// snapshots back to back (8 files of 2 MiB, so each is many kernel calls),
-// two fs-opened asks at a time over and over, and keystrokes into the page's
-// terminal in a loop, for 30 seconds. Each is a kernel instance on the one
+// The page's own helpers on the global kernel, all at once: two fs-opened
+// asks at a time over and over, and keystrokes into the page's terminal in a
+// loop, with the test's own Worker rewriting 8 files of 2 MiB between lines,
+// for 30 seconds. Each is a kernel instance on the one
 // shared memory with a stack slot and a thread-local block of its own
 // (lazy-fetch.mjs HELPER_STACKS, kernelThread); they shared one slot, and
 // every instance but the first shared one thread-local block at address 0.
 // The terminal runs in a Worker of its own (tty.mjs RemoteTty): on the page's
-// thread a key that met a kernel lock a snapshot held threw (Atomics.wait).
+// thread a key that met a kernel lock another helper held threw (Atomics.wait).
 // The test's own kernel calls run in a Worker too, on the slot a first guest
 // Worker would have.
 import { PageTty } from '../../shims/browser/js/tty.mjs';
-import { persist } from '../../web/src/persist.js';
 import { openedFiles } from '../../web/src/fs-opened.js';
 import { HELPER_STACKS, helperStackTop } from '../../shims/browser/js/lazy-fetch.mjs';
 
@@ -52,7 +51,7 @@ self.onmessage = async (e) => {
       for (const [i, p] of m.names.entries()) {
         const h = k.k_fs_open(0x100n, put(p, 0x100), 0o1101n, 0o644); // O_WRONLY|O_CREAT|O_TRUNC
         if (h < 0) { bad.push('open ' + p + ': ' + h); continue; }
-        // Big enough that a snapshot reading them all is many kernel calls.
+        // Big enough that rewriting them all is many kernel calls.
         const head = new TextEncoder().encode('round ' + m.round + ' file ' + i + '\\n');
         P.fill(0x61 + i, 0x10000, 0x10000 + m.bytes);
         P.set(head, 0x10000);
@@ -83,13 +82,10 @@ export default async function (t) {
   if (!(await fetch(KERNEL, { method: 'HEAD' }).then((r) => r.ok, () => false))) return t.skip(`${KERNEL} is not built`);
   const got = await run().catch((e) => ({ thrown: String(e?.stack ?? e) }));
   if (!t.check('the page ran', !got.thrown, got.thrown?.slice(0, 300))) return;
-  t.say(`${got.typed} lines typed (${got.duringSnapshot} while a snapshot ran), ${got.asks} fs-opened pairs, ${got.syncs} snapshots in ${SECONDS} s`);
+  t.say(`${got.typed} lines typed, ${got.asks} fs-opened pairs, ${got.round} rewrites in ${SECONDS} s`);
   t.check('the terminal runs in a Worker of its own (tty.mjs RemoteTty)', got.remote);
   t.check("every helper's results as expected", got.failCount === 0, `${got.failCount} wrong, first ${JSON.stringify(got.fails)}`);
-  t.check('every helper ran throughout (over 100 lines, 5 pairs, 5 snapshots)', got.typed > 100 && got.asks > 5 && got.syncs > 5, JSON.stringify({ typed: got.typed, asks: got.asks, syncs: got.syncs }));
-  t.check('terminal input arrived while a snapshot ran (50 lines)', got.duringSnapshot >= 50, `${got.duringSnapshot} lines`);
-  t.check('every snapshot stored all the files', got.syncErrors.length === 0 && got.shortSyncs === 0 && got.lastFiles >= 8,
-    `errors ${JSON.stringify(got.syncErrors)}, short ${got.shortSyncs}, last ${got.lastFiles}`);
+  t.check('every helper ran throughout (over 100 lines, 5 pairs, 5 rewrites)', got.typed > 100 && got.asks > 5 && got.round > 5, JSON.stringify({ typed: got.typed, asks: got.asks, rewrites: got.round }));
   for (const [kind, bad] of Object.entries(got.canaries)) t.check(`${kind}'s stack canary intact`, bad === 0, `${bad} of 64 bytes changed`);
   for (const [kind, x] of Object.entries(got.tls)) t.check(`${kind}'s thread-local block in its slot, panic count 0`, x.inSlot && x.panicCount === 0, JSON.stringify(x));
   t.check("the helpers' thread-local blocks are apart", got.tlsApart);
@@ -119,7 +115,7 @@ async function run() {
   const k = { k_stack_area: () => geo.area, k_stack_size: () => geo.size, k_stack_count: () => geo.count };
   const { size, tlsSize } = geo;
   const tlsAlign = Math.max(16, geo.tlsAlign);
-  const kinds = ['tty', 'persist', 'fsOpened'];
+  const kinds = ['tty', 'fsOpened'];
   const slot = {};
   for (const kind of kinds) {
     const top = helperStackTop(k, kind);
@@ -133,10 +129,8 @@ async function run() {
   const tty = await PageTty.open(spec);
   if (!tty) throw new Error('no PageTty');
   const remote = tty.ready() instanceof Promise;
-  const syncs = [];
-  const p = persist('helper-stacks-' + Date.now(), ROOTDIR, spec, { every: 1000, onSync: (m) => syncs.push(m) });
   const end = performance.now() + SECONDS * 1000;
-  let typed = 0, asks = 0, round = 0, readBack = '', duringSnapshot = 0, snapshotting = false;
+  let typed = 0, asks = 0, round = 0, readBack = '';
   const want = [];
   const asking = (async () => {
     while (performance.now() < end) {
@@ -146,42 +140,23 @@ async function run() {
       for (const f of names) if (!a.includes(f)) { fail('fs-opened ' + asks + ' has no ' + f); break; }
     }
   })();
-  // A snapshot in flight all the time, so keys meet one holding the kernel's
-  // locks: one after another, each reading 16 MiB through the kernel.
-  const snapping = (async () => {
-    while (performance.now() < end) {
-      snapshotting = true;
-      const m = await p.sync();
-      snapshotting = false;
-      if (m === null) await new Promise((r) => setTimeout(r, 1));
-    }
-  })();
   while (performance.now() < end) {
     const line = 'line ' + typed + ' abcdefghij';
     let echo = '';
-    const at = snapshotting;
     for (const ch of [...line, '\r']) {
       const r = await tty.key(ch);
       if (r.echo) echo += new TextDecoder().decode(r.echo);
     }
-    if (at && snapshotting) duringSnapshot++;
     if (echo !== line + '\r\n') fail('echo of ' + JSON.stringify(line) + ' was ' + JSON.stringify(echo));
     want.push(line + '\n');
     readBack += (await ask({ op: 'stdin' })).text;
     typed++;
-    if (typed % 200 === 0) await write(++round);
+    if (typed % 50 === 0) await write(++round);
   }
   await asking;
-  await snapping;
-  const last = await p.sync();
   if (readBack !== want.join('')) fail('terminal input read back ' + readBack.length + ' bytes, typed ' + want.join('').length);
-  const errors = syncs.filter((m) => m.error);
-  const short = syncs.filter((m) => !m.error && !m.skipped && m.files < N);
   const checks = {
-    typed, asks, syncs: syncs.length, round, duringSnapshot, remote,
-    syncErrors: errors.map((m) => m.error).slice(0, 3),
-    shortSyncs: short.length,
-    lastFiles: last?.files ?? null,
+    typed, asks, round, remote,
     canaries: Object.fromEntries(kinds.map((kind) => {
       const c = slot[kind].canary;
       let bad = 0;
@@ -197,7 +172,6 @@ async function run() {
     lowUnchanged: Array.from(K().subarray(0, 32)).join() === low0,
     fails: say.slice(0, 8), failCount: say.length,
   };
-  p.stop();
   tty.close?.();
   return checks;
 }

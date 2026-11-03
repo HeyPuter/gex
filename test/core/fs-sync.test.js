@@ -1,6 +1,7 @@
 // The filesystem's write-back (fs.js, gex_kernel::vfs::blocks): what a
 // program writes stays in the cache until fsync, sync(2), the page's
-// sys.sync() or the write-back's age sends it to the store, and each of those
+// sys.sync() or the write-back's age sends it to the store with a generation
+// of the kept root (gex_kernel::vfs::tmpfs::persist), and each of those
 // flushes the store; a full store is ENOSPC, a failing one EIO. Seen from a
 // store of the page's own, which counts what reaches it. One system per page,
 // so each phase is a load of its own (t.reload).
@@ -76,8 +77,8 @@ export default async function (t) {
     eq('stays in the cache', fs.written, 0);
     r = await sh(t, sys, 'dd if=/dev/zero of=/root/b bs=1048576 count=2 conv=fsync 2>/dev/null');
     eq('dd conv=fsync', r.code, 0);
-    check('fsync: the file reached the store and the store was flushed', fs.written >= 2 * MB && fs.flushes >= 1, `${fs.written} bytes, ${fs.flushes} flushes`);
-    check('fsync: only that file\'s blocks', fs.written < 4 * MB, `${fs.written} bytes`);
+    // A generation of the kept root: what else was dirty goes with it.
+    check('fsync: the file reached the store and the store was flushed', fs.written >= 4 * MB && fs.flushes >= 2, `${fs.written} bytes, ${fs.flushes} flushes`);
     const w = fs.written, f = fs.flushes;
     r = await sh(t, sys, 'dd if=/dev/zero of=/root/c bs=1048576 count=1 conv=fdatasync 2>/dev/null');
     check('fdatasync too', r.code === 0 && fs.written >= w + MB && fs.flushes > f, `${r.code}: ${fs.written - w} bytes, ${fs.flushes - f} flushes`);
@@ -103,9 +104,11 @@ export default async function (t) {
     check('and what was written is still there', r.code === 0 && /^4\+0 records in/.test(r.out), `${r.code}: ${r.out}`);
     await sys.sync();
   } else if (t.phase === 2) {
-    // The write-back's age: there without a sync, within a few seconds.
+    // The write-back's age: there without a sync, within a few seconds. (A
+    // slow dd may already see some of it out: the file's creation ages too,
+    // and the generation it makes takes every dirty block with it.)
     const r = await sh(t, sys, 'dd if=/dev/zero of=/root/a bs=1048576 count=2 2>/dev/null');
-    eq('a write', [r.code, fs.written], [0, 0]);
+    eq('a write', r.code, 0);
     await t.until(() => fs.written >= 2 * MB, 'the write-back: the blocks reach the store within 8 s of a 1 s age', 8000);
     check('the write-back: and flushes it', fs.flushes >= 1, `${fs.flushes} flushes`);
   } else {

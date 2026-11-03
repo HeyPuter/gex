@@ -2636,7 +2636,7 @@ fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> Result<(), gex_kernel::Err
 #[no_mangle]
 pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags: u32) -> u32 {
     gex_kernel::vfs::blocks::set_io(blocks_io);
-    gex_kernel::vfs::set_sync_all(gex_kernel::vfs::blocks::sync_all);
+    gex_kernel::vfs::set_sync_all(gex_kernel::vfs::tmpfs::persist::sync);
     if block != 0 {
         gex_kernel::vfs::blocks::set_check(flags & 1 != 0);
         gex_kernel::vfs::blocks::configure(block, (cache_mib as u64) << 20, inline as u64);
@@ -2644,24 +2644,48 @@ pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags
     BLOCKS_CTL.as_ptr() as u32
 }
 
-/// The periodic write-back (`gex_kernel::vfs::blocks::tick`): the blocks
-/// dirty for `age` ticks or more written to the store and the store made
-/// durable. The blocks written, or a negated errno.
+/// The periodic write-back (`gex_kernel::vfs::tmpfs::persist::tick`): a
+/// generation of the kept root written once a change or a dirty block has
+/// waited `age` ticks. 1 for one written, 0 for none due, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_blocks_tick(age: u32) -> i32 {
-    match gex_kernel::vfs::blocks::tick(age) {
+    match gex_kernel::vfs::tmpfs::persist::tick(age) {
         Ok(n) => n as i32,
         Err(e) => -e.0,
     }
 }
 
-/// `sync(2)` (`gex_kernel::vfs::sync_all`): 0 or a negated errno.
+/// `sync(2)` (`gex_kernel::vfs::tmpfs::persist::sync`): 0 or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_fs_sync_all() -> i32 {
-    match gex_kernel::vfs::blocks::sync_all() {
+    match gex_kernel::vfs::tmpfs::persist::sync() {
         Ok(()) => 0,
         Err(e) => -e.0,
     }
+}
+
+/// At boot, once the sources are laid and before the first program: the
+/// root kept in the store from now on, and what the store kept laid over
+/// it (`gex_kernel::vfs::tmpfs::persist::start`). `exclude`: the paths never
+/// kept, one per line. 0 nothing was kept, 1 restored, 2 the newest
+/// generation failed its checks and the one before was restored, 3 nothing
+/// kept could be read. The generation restored is `k_fs_restored_gen`.
+#[no_mangle]
+pub extern "C" fn k_fs_restore(exclude: gex_kmem::PAddr, exclude_len: u32) -> i32 {
+    use gex_kernel::vfs::tmpfs::persist::{start, Found};
+    let list = with_path(exclude, exclude_len, false, |s| s.lines().map(|l| l.trim_matches('/').to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>());
+    match start(rootfs(), list) {
+        Found::Fresh => 0,
+        Found::Restored => 1,
+        Found::FellBack => 2,
+        Found::Unreadable => 3,
+    }
+}
+
+/// The generation the boot restored ([`k_fs_restore`]).
+#[no_mangle]
+pub extern "C" fn k_fs_restored_gen() -> u32 {
+    gex_kernel::vfs::tmpfs::persist::BOOT_GEN.load(core::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// `fsync`, `fdatasync` (`data_only` 1) of an open file (`FileHandle::sync`).
@@ -2996,60 +3020,6 @@ pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
         unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
     }
     b.len() as i32
-}
-
-/// The files the program has made or changed since the root was seeded
-/// (`TmpFs::written`), one path per line, at `at`; their length, or `-ERANGE`
-/// with nothing written when `cap` will not hold them. A page's persist store
-/// (web/src/persist-worker.js) snapshots these and no others, so a snapshot
-/// never reads, or fetches, a file the program left alone.
-/// Every node of the shared root, without their bytes (`TmpFs::tree`): a
-/// persist store's diff. The length, or `-ERANGE` with the length needed in
-/// the first 4 bytes when `cap` is short.
-#[no_mangle]
-pub extern "C" fn k_fs_tree(at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let b = rootfs().tree();
-    if b.len() as u32 > cap {
-        if cap >= 4 {
-            let n = (b.len() as u32).to_le_bytes();
-            unsafe { gex_kmem::push_checked(at, n.as_ptr(), 4) };
-        }
-        return -34; // ERANGE
-    }
-    if !b.is_empty() {
-        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
-    }
-    b.len() as i32
-}
-
-#[no_mangle]
-pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let mut b = rootfs().written().join("\n");
-    if !b.is_empty() {
-        b.push('\n');
-    }
-    if b.len() as u32 > cap {
-        return -34; // ERANGE
-    }
-    if !b.is_empty() {
-        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
-    }
-    b.len() as i32
-}
-
-/// Count the changes the program finishes under the directory at `path` (a
-/// page's persist root): `k_fs_saves` then moves at each, and the persist
-/// store snapshots soon after (`tmpfs::watch`). One directory, the first set.
-#[no_mangle]
-pub extern "C" fn k_fs_watch(path: gex_kmem::PAddr, path_len: u32) {
-    with_path(path, path_len, false, gex_kernel::vfs::tmpfs::watch);
-}
-
-/// How many changes the program has finished under the watched directory
-/// (`k_fs_watch`), wrapping: one load, asked on a timer.
-#[no_mangle]
-pub extern "C" fn k_fs_saves() -> u32 {
-    gex_kernel::vfs::tmpfs::SAVES.load(core::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// A path's metadata, without opening it -- which matters for a symlink and

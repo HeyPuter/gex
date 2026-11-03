@@ -1,6 +1,6 @@
 // `System`: the kernel, started with `boot()`, and the programs a page runs
 // in it. Everything else a system has -- its files, windows, network,
-// persistence, sound, GL -- is a class of its own that takes the system as
+// sound, GL -- is a class of its own that takes the system as
 // its first argument (web/runtime/README.md).
 //
 // Built from the page runtime's pieces (web/src/runtime.js: the kernel, the
@@ -9,7 +9,7 @@
 // `spawn` asks for starts in a Worker of its own from an exec record
 // (host.mjs `spawnExec`). The page reaches the kernel through its exports
 // (kernel.js, over a kernel-call Worker): the programs' terminals and pipes
-// (programs.js), the guest's files (kfs.js), persistence (kpersist.js).
+// (programs.js), the guest's files (kfs.js).
 
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
@@ -20,7 +20,6 @@ import { PageFsHost } from './mount.js';
 import { Kernel, errno } from './kernel.js';
 import { Files } from './kfs.js';
 import { Programs } from './programs.js';
-import { Changes } from './kpersist.js';
 import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../shims/browser/js/mode.mjs';
 import { serveSlots } from '../../../shims/browser/js/blocks.mjs';
@@ -116,7 +115,6 @@ export class System extends EventTarget {
   #kernel = null;
   #files = null;
   #programs = null;
-  #changes = null;
   /** The running system: { host, kernel, term, rt, compositor, wlChannel,
    *  spawnExec, onStop, stop }. */
   #sys = null;
@@ -215,13 +213,11 @@ export class System extends EventTarget {
       /** `fn(m)` for each event of kind `ev` the system's programs raise
        *  (a part's own: 'watch', ...). */
       on: (ev, fn) => (this.#listeners.get(ev) ?? this.#listeners.set(ev, []).get(ev)).push(fn),
-      /** The kernel's exports (kernel.js), the guest's files (kfs.js), the
-       *  programs, watches and X hold (programs.js), and persistence's
-       *  changes (kpersist.js), once the system runs. */
+      /** The kernel's exports (kernel.js), the guest's files (kfs.js), and
+       *  the programs, watches and X hold (programs.js), once the system runs. */
       kernel: () => this.#kernel,
       files: () => this.#files,
       programs: () => this.#programs,
-      changes: () => this.#changes,
       /** The guest's sockets from now on (web/src/net.js `Sockets`): a
        *  preset's, with its page-served hosts. `sys.network` sets theirs. */
       sockets: (sockets) => {
@@ -255,7 +251,7 @@ export class System extends EventTarget {
   }
 
   /** Start the kernel. Subsystems that must exist before boot
-   *  (the filesystem, windows, persistence) are made first. With
+   *  (the filesystem, windows) are made first. With
    *  arguments, as `spawn`'s, the program that is pid 1 (`argv[0]` its
    *  path), which then owns the processes: `spawn` throws, the page reaches
    *  programs through what the init starts (terminals, windows,
@@ -322,8 +318,8 @@ export class System extends EventTarget {
       }
     }
 
-    // The filesystem's layers and persistence's records (fs.js).
-    const opts = { layers: [], records: [] };
+    // The filesystem's layers (fs.js).
+    const opts = { layers: [] };
     for (const fn of this.#beforeBoot) await fn(opts);
 
     // The translated architecture, beside which wasm32 programs run: the
@@ -404,10 +400,10 @@ export class System extends EventTarget {
       },
     };
     const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-    const { layers, records } = opts;
-    opts.layers = opts.records = null;
+    const { layers } = opts;
+    opts.layers = null;
     try {
-      await this.#start(this.#sys, layers, records, fsi);
+      await this.#start(this.#sys, layers, fsi);
     } catch (e) {
       this.#sys.stop();
       throw e;
@@ -504,8 +500,8 @@ export class System extends EventTarget {
       },
     };
     const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-    const { layers, records } = opts;
-    opts.layers = opts.records = null;
+    const { layers } = opts;
+    opts.layers = null;
     try {
       // The page's side of the scene: its compositor, and for a desktop of
       // windows its mirror of the arena (the clipboard's channel).
@@ -515,7 +511,7 @@ export class System extends EventTarget {
         this.#sys.wlChannel = r.wlChannel ?? null;
       }
       single.gl?.attach(this.#sys.compositor, single.listeners, k);
-      await this.#start(this.#sys, layers, records, fsi, k);
+      await this.#start(this.#sys, layers, fsi, k);
     } catch (e) {
       this.#sys.stop();
       k.terminate();
@@ -525,11 +521,10 @@ export class System extends EventTarget {
   }
 
   /** The kernel's first instance (kernel.js), from the page: the
-   *  filesystem's layers and what persistence kept laid into the root before
-   *  the first program, the page's mounts, host calls, persistence's seed,
-   *  pid 1; then the kernel's stacks handed to the processes' host (gex.mjs
+   *  filesystem's layers and what its store kept laid into the root before
+   *  the first program, the page's mounts, host calls, pid 1; then the kernel's stacks handed to the processes' host (gex.mjs
    *  `kernelStacks`). */
-  async #start(s, layers, records, fsi, started = null) {
+  async #start(s, layers, fsi, started = null) {
     // Its reads of lazy files as a process's: by the page's owner of them,
     // or a rest bundle's with a decoder of its own (kernel-worker.js).
     const k = started ?? await Kernel.start({
@@ -537,7 +532,6 @@ export class System extends EventTarget {
     });
     this.#kernel = k;
     this.#files = new Files(k);
-    this.#changes = new Changes(k, this.#files);
     this.#programs = new Programs(k, this.#files, {
       data: (h, bytes) => this.#procs.get(h)?.[INTERNAL].data(bytes),
       end: (h) => this.#procs.get(h)?.[INTERNAL].data(null),
@@ -548,7 +542,8 @@ export class System extends EventTarget {
     // Where the files' contents go (fs.js), before any file is laid.
     await this.#store(s, k, fsi?.store?.());
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
-    if (records.length) await this.#files.restore(records);
+    // What the store kept (gex_kernel::vfs::tmpfs::persist), over them.
+    if (this.#stored) await this.#restore(k, fsi);
     // The steps below are not waited for one by one: the kernel's Worker
     // takes its batches in order, so what is asked in one turn goes in one
     // message, and each round trip to it at boot is one the first program
@@ -565,8 +560,6 @@ export class System extends EventTarget {
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
     step(k.r('k_host_calls_serve'));
-    const keep = fsi?.persistArgs?.();
-    if (keep) await this.#changes.start(keep);
     step(this.#programs.start({ init: !!this.#init }));
     const opt = (f, ...a) => (k.has(f) ? [{ f, a }] : []);
     const list = [
@@ -804,6 +797,20 @@ export class System extends EventTarget {
     return p;
   }
 
+  /** The root the store kept laid over the sources'. A generation that
+   *  failed its checks is said, and the one before it is booted; a store
+   *  that holds nothing whole boots the sources alone. */
+  async #restore(k, fsi) {
+    const exclude = fsi.exclude().join('\n');
+    const r = await k.r('k_fs_restore', { in: exclude });
+    if (r === 2) {
+      const gen = await k.r('k_fs_restored_gen');
+      console.error(`[gex] the filesystem's store: its last generation was torn or failed its checks; booted the one before it (${gen >>> 0})`);
+    } else if (r === 3) {
+      console.error("[gex] the filesystem's store: nothing it kept could be read back; booted the sources alone");
+    }
+  }
+
   /** The filesystem's store (fs.js `storeOf`) set up in the kernel: a
    *  memory root's limit, or an OPFS store's block store, answered by the
    *  page's store Worker (the default build) or the system Worker itself
@@ -831,7 +838,6 @@ export class System extends EventTarget {
       }
       try {
         await st.fs.open();
-        await st.fs.truncate(0);
       } catch (e) {
         throw new Error(`${st.fs.constructor.name}: the store would not open: ${e?.message ?? e}`);
       }

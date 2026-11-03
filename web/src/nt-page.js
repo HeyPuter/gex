@@ -6,7 +6,6 @@
 //   /nt.html?tar=/gex/nt/bundle.tar&exe=/t/window.exe&args=30&size=1024x768
 //            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t][&hostx=1]
 //            [&cgen=2&cgenurl=/project/build/web/cgen&aot=1]   (an ejected project)
-//            [&persist=/guest/dir&persistdb=NAME]   (that directory in IndexedDB)
 //            [&compositor=0]   (no scene compositor: a canvas per window, bare-desktop.js)
 //
 // The exe may also be a Linux ELF (an i386 or x86-64 program with its
@@ -34,7 +33,7 @@ async function main() {
     ? [Math.max(640, document.documentElement.clientWidth), Math.max(480, document.documentElement.clientHeight)]
     : (q.get('size') || '1024x768').split('x').map(Number);
   const switches = Object.fromEntries(q);
-  for (const k of ['tar', 'exe', 'args', 'argv', 'env', 'cwd', 'size', 'persist', 'persistdb', 'lazy', 'fill', 'preload', 'pack', 'zstd', 'mtimes', 'gl', 'glbackend', 'hostx', 'provsrc', 'stateful', 'memories']) delete switches[k];
+  for (const k of ['tar', 'exe', 'args', 'argv', 'env', 'cwd', 'size', 'lazy', 'fill', 'preload', 'pack', 'zstd', 'mtimes', 'gl', 'glbackend', 'hostx', 'provsrc', 'stateful', 'memories']) delete switches[k];
   // `provsrc=url,...`: provider sources from outside gex (GEX_PROVIDER_DIRS
   // natively), each named by its file's stem.
   const providerSources = q.get('provsrc')
@@ -85,7 +84,6 @@ async function main() {
       lazy: q.get('lazy'),
       // `fill=`: the background fill's list (web/page-site.mjs --boot-units).
       fill: q.get('fill'),
-      persist: q.get('persist') ? { dir: q.get('persist'), db: q.get('persistdb') || `gex-persist:${location.pathname}` } : null,
       // `stateful=dll=file,...`: stateful providers, modules under the unit cache.
       stateful: q.get('stateful'),
       providerSources,

@@ -6339,7 +6339,8 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         // in memory has nothing to flush, so it is the fd's validation alone.
         // (Without them sqlite's journal sync was ENOSYS, which it reports
         // as SQLITE_IOERR and refuses to write a file-backed database.)
-        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32)?.handle.sync(n == nr::FDATASYNC).map(|_| 0),
+        // The file's size and names with it: a generation of the kept root.
+        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32)?.handle.sync(false).map(|_| 0),
         nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
         // Restartable sequences are an optimisation the guest can live
         // without, and both libcs treat ENOSYS as "not available".

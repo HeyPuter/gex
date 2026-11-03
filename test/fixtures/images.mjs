@@ -124,8 +124,8 @@ export const images = {
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
-    // The same for core/runprogram, which reads it: core/persist counts the
-    // fetches of lazy.bin (none) while the two may run at once.
+    // The same for core/runprogram, which reads it, apart from core/dir-times's
+    // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no

@@ -46,7 +46,6 @@ Every option is optional. A default comes from the build
 | `cwd`, `exe` | the working directory; the program, as a path in the bundle |
 | `uid` | the guest's user and group id (default the build's, else 1000) |
 | `mtimes` | `true`: the guest sees the bundle's file times |
-| `persist` | `false`, or `{dir, db}`: a guest directory kept in IndexedDB |
 | `wisp` | a Wisp proxy's URL, `ws://` or `wss://`: the guest's TCP and DNS go over it; offline without it |
 | `pageHosts` | `{host: path}`: hosts the page answers itself over plain HTTP, from files under `path` |
 | `strace` | `true` (every process) or a pid: narrate system calls |

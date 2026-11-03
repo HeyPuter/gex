@@ -1,6 +1,5 @@
 // A Worker's own instance of the global kernel, for the page's helpers that
-// write or read the guest's filesystem while it runs (persist-worker.js,
-// drop-worker.js). The helper calls `k_fs_*` with its
+// write or read the guest's filesystem while it runs (drop-worker.js). The helper calls `k_fs_*` with its
 // paths and bytes in a scratch "process" memory of its own; a Worker and not
 // the page because the kernel's locks may wait, and the page's thread cannot.
 

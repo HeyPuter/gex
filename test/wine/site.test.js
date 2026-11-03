@@ -4,13 +4,12 @@
 // pieces, its lazy list and rest bundle), the windows handed to the page
 // (HostWindows), Mesa when the build has GL, and the build's program
 // spawned. Up when a window with the launch file's title shows. Then the
-// root kept by IdbPersist across a reload.
+// root kept by an OPFSFilesystem across a reload.
 
 import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
 import { HostWindows } from '../../web/runtime/src/windows/host.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
-import { IdbPersist } from '../../web/runtime/src/persist/idb.js';
 
 // Alone: a Wine desktop's processes beside other tests' pages ran the
 // renderer out of address space.
@@ -18,7 +17,7 @@ export const meta = { hosts: ['browser'], arches: ['x86'], images: ['wine-site']
   html: `<style>html, body { margin: 0; } #desk { position: relative; width: 1280px; height: 820px; overflow: hidden; }</style>
 <div id="desk"></div>` };
 
-const DB = 'rt-wine-site-test';
+const STORE = 'rt-wine-site-test';
 const KEPT = '/pfx/drive_c/users/kept-by-the-page.txt';
 
 export default async function (t) {
@@ -43,7 +42,7 @@ export default async function (t) {
   };
 
   const phase = t.phase;
-  if (phase === 1) await new Promise((r, j) => { const q = indexedDB.deleteDatabase(DB); q.onsuccess = r; q.onerror = j; });
+  if (phase === 1) await OPFSFilesystem.erase(STORE);
   const sys = new System({
     baseUrl: t.baseUrl,
     // Not the build's units: they were compiled for the runtime the site
@@ -51,7 +50,7 @@ export default async function (t) {
     arch: 'x86',
     debug: t.debug(),
   });
-  const fs = new MemoryFilesystem(sys);
+  const fs = new OPFSFilesystem(sys, { name: STORE });
   const tar = 'project/build/web/rootfs.tar';
   fs.addTar(at(packed(tar) ? `${tar}.zst` : tar));
   // The bundle's larger files, kept out of its tar (eject-site.mjs --pieces):
@@ -67,7 +66,6 @@ export default async function (t) {
   // The lazy files (with the rest bundle's, `rest.bin#OFFSET`), by the
   // list's URL: its base is the site's, which is not at the origin's root.
   if (params.lazy) fs.addTar(null, { lazy: at(params.lazy) });
-  const persist = new IdbPersist(fs, { db: DB, quiet: 300 });
 
   const [w, h] = typeof nt.size === 'string' && /^\d+x\d+$/.test(nt.size) ? nt.size.split('x').map(Number) : [1280, 800];
   const hw = new HostWindows(sys, { width: w, height: h, scale: 1 });
@@ -89,8 +87,8 @@ export default async function (t) {
 
   if (phase === 2) {
     eq('a file the page wrote before the reload', await fs.readFile(KEPT, { encoding: 'utf-8' }).catch((e) => `(${e.message})`), 'kept\n');
-    await persist.reset();
     await sys.shutdown();
+    await fs.erase();
     return;
   }
 
@@ -127,7 +125,7 @@ export default async function (t) {
 
   // The root kept across a reload.
   await fs.writeFile(KEPT, 'kept\n');
-  await persist.save();
+  await sys.sync();
   await sys.shutdown();
   return t.reload();
 }
