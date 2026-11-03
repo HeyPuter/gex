@@ -458,6 +458,14 @@ pub(crate) fn restarts(class: signal::Restart) -> bool {
     view.restarts(class)
 }
 
+/// This Worker's process's shared file mappings, caught up with what other
+/// processes wrote back (`SharedMapView::catch_up`). No kernel lock.
+pub(crate) fn catch_up_shared(gm: &mut GuestMem<'_>) {
+    if let Some(home) = home() {
+        home.mm.shared_maps().catch_up(gm);
+    }
+}
+
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
 /// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
 /// and its signal included, without the kernel.

@@ -14593,6 +14593,9 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
         trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={}\n", op.is_some()));
     }
     let mut gm = GuestMem::new(guest_bytes());
+    // What other processes wrote back while the call waited
+    // (`Kernel::finish_blocking`, as the native host's).
+    sigs::catch_up_shared(&mut gm);
     let Some(op) = op else {
         // A futex thread arriving with nothing to finish must still receive
         // a legal result. Linux permits spurious futex wakes, and zero is

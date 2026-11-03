@@ -8957,7 +8957,8 @@ impl SharedMapView {
         }
     }
 
-    /// At a system call's entry: when any process has written a shared
+    /// At a system call's entry, and at the end of a wait (its wake can be
+    /// what orders this process after another's write-back): when any process has written a shared
     /// mapping back since this one last looked, this process's mappings of
     /// files that changed take in what they hold now -- except pages it
     /// changed itself since its last sync, which wait for its next lock.
@@ -10505,6 +10506,11 @@ impl Kernel {
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // What other processes wrote back while the call waited: the wait's
+        // end can be what orders this process after their writes (a pipe
+        // read of a byte written after a commit), with no system call of
+        // its own before it reads the mapping ([`SharedMapView::catch_up`]).
+        self.mem.shared_maps().catch_up(m);
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
         // new socket in.
