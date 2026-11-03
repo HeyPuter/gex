@@ -978,7 +978,7 @@ fn run_job(j: &Job) -> Result<bool> {
         if !p.iter().any(|&(q, _)| q == page) {
             p.push((page, g));
         }
-        g
+        (gex_abi::page_gen() + 4 * page, g)
     };
     let req = gex_kernel::ftab::Request {
         process: j.process,

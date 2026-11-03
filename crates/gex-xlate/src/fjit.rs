@@ -192,7 +192,9 @@ impl Jit {
 
     /// A module for the function at `addr` (see the module documentation),
     /// or `None` to leave it to the fallback. `page_gen` gives each page's
-    /// `PAGE_GEN` value, which the functions check on entry.
+    /// `PAGE_GEN` word (its guest address and value: the process's
+    /// directory, or the other mode's for code of that mode), which the
+    /// functions check on entry.
     pub fn translate(
         &self,
         mem: &[u8],
@@ -200,7 +202,7 @@ impl Jit {
         executable: &dyn Fn(u64) -> bool,
         read_only: &dyn Fn(u64, u64) -> bool,
         volatile: &dyn Fn(u64) -> bool,
-        page_gen: &dyn Fn(u64) -> u32,
+        page_gen: &dyn Fn(u64) -> (u64, u32),
         class32: bool,
     ) -> Option<Vec<u8>> {
         self.translate_in(0, mem, addr, executable, read_only, volatile, page_gen, class32)
@@ -217,7 +219,7 @@ impl Jit {
         executable: &dyn Fn(u64) -> bool,
         read_only: &dyn Fn(u64, u64) -> bool,
         volatile: &dyn Fn(u64) -> bool,
-        page_gen: &dyn Fn(u64) -> u32,
+        page_gen: &dyn Fn(u64) -> (u64, u32),
         class32: bool,
     ) -> Option<Vec<u8>> {
         self.translate_skipping(process, mem, addr, executable, &|_| false, read_only, volatile, page_gen, class32)
@@ -239,16 +241,17 @@ impl Jit {
         skip: &dyn Fn(u64) -> bool,
         read_only: &dyn Fn(u64, u64) -> bool,
         volatile: &dyn Fn(u64) -> bool,
-        page_gen: &dyn Fn(u64) -> u32,
+        page_gen: &dyn Fn(u64) -> (u64, u32),
         class32: bool,
     ) -> Option<Vec<u8>> {
         if class32 && !gex_abi::X86 {
             return None;
         }
-        // Code of the process's other mode (a WoW64 process's i386 images,
-        // reached through the table: native i386 Wine calling a guest
-        // callback) is not this translator's: lifted in this mode it would
-        // run as the wrong instruction set. Tier-1 runs it, in its mode.
+        // Code of a PE image of the other class than `class32` (a WoW64
+        // process's i386 images, asked for as 64-bit code) would run as the
+        // wrong instruction set: left to tier-1, which runs it in its mode.
+        // A caller that lifts such images passes their class (the page's
+        // fjit, keying their pages in the other mode's directory).
         if gex_abi::X86 && pe_class32_at(mem, addr, executable, read_only).is_some_and(|c| c != class32) {
             return None;
         }

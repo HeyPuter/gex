@@ -280,10 +280,10 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     if let Linkage::Runtime { table, pages } = &m.linkage {
         let none: &[(u64, u32)] = &[];
         let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
-        for &(page, gen) in pages {
+        for &(word, gen) in pages {
             let fb = b.f();
             fb.addr_const(0);
-            fb.load64(0x28, 2, gex_abi::page_gen() + 4 * page); // i32.load
+            fb.load64(0x28, 2, word); // i32.load
             fb.i32_const(gen as i32);
             fb.byte(0x47); // i32.ne
             fb.if_void();

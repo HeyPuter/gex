@@ -325,10 +325,11 @@ pub struct Request<'a> {
     /// tier-1 guards each block there (`Block::guard`) and the function
     /// JIT leaves it alone.
     pub volatile: &'a dyn Fn(u64) -> bool,
-    /// The value `gex_abi::PAGE_GEN` holds for a page (guest address /
-    /// `DISPATCH_PAGE`) now, never 0: what the translation's page checks
-    /// compare against. Asking numbers the page if it was not.
-    pub page_gen: &'a dyn Fn(u64) -> u32,
+    /// The `gex_abi::PAGE_GEN` word of a page (guest address /
+    /// `DISPATCH_PAGE`): its guest address, and the value it holds now,
+    /// never 0, which the translation's page checks compare against.
+    /// Asking numbers the page if it was not.
+    pub page_gen: &'a dyn Fn(u64) -> (u64, u32),
     /// An i386 (compatibility-mode) program.
     pub class32: bool,
 }
