@@ -1160,10 +1160,6 @@ async function handle(msg) {
         },
       );
       if (!entry) throw new Error('the program could not be loaded');
-      // Where `/dev/dsp`'s output is, for the page to play (once per page;
-      // every process tells it, the first one wins).
-      const ring = gex.audioRing?.();
-      if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
       // The files are in the kernel's filesystem now, copied. The views here
       // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for a
       // demo), which stays resident while anything views it: let go,
@@ -1190,6 +1186,14 @@ async function handle(msg) {
         msg.transfer = null;
         port.post({ kind: 'files-loaded' });
       }
+    }
+    // Where `/dev/dsp`'s output is, for the page to play (once per page;
+    // every process tells it, the first one wins): a loaded process's and an
+    // adopted one's, which is every process the runtime API's system starts
+    // (host.mjs `spawnExec`).
+    if (msg.kind !== 'thread') {
+      const ring = gex.audioRing?.();
+      if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
     }
 
     // Statically recompile each object once it proves hot, rather than meeting
