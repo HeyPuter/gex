@@ -59,6 +59,7 @@ pub mod raw {
     pub const PAUSE: u64 = 29;
     pub const ACCESS: u64 = 33;
     pub const SYNC: u64 = 36;
+    pub const SYNCFS: u64 = 344;
     pub const KILL: u64 = 37;
     pub const RENAME: u64 = 38;
     pub const MKDIR: u64 = 39;
@@ -591,6 +592,10 @@ pub fn translate(
             nr::FACCESSAT2
         }
         x::SYNC => nr::SYNC,
+        x::SYNCFS => {
+            a[0] = sext(a[0]);
+            nr::SYNCFS
+        }
         x::FSYNC => {
             a[0] = sext(a[0]);
             nr::FSYNC

@@ -3,7 +3,8 @@
 //! (names, inodes, modes, times) stays in tmpfs. Off unless the host
 //! configures it ([`configure`]) before files are made; a file made while it
 //! is off keeps its bytes in a `Vec` as before, and so does one no longer than
-//! what stays inline.
+//! what stays inline, and a seeded one (the image's, laid at boot) until a
+//! program's write moves it here: boot writes nothing to the store.
 //!
 //! The host's half is one function ([`set_io`]): read or write `buf` at
 //! `offset` of the one store file, or make that file at least so long. Block
@@ -11,23 +12,29 @@
 //! block list.
 //!
 //! The cache is write-back: a block written stays here, dirty, until it is
-//! evicted (CLOCK), when it is written to the store, with the dirty blocks
-//! next to it there. A read that misses fetches the block; a run of
-//! sequential misses reads ahead, in one request. Every request's result is
-//! checked: one the store could not make is EIO, its block kept dirty.
+//! evicted (CLOCK), it has been dirty for the host's write-back age
+//! ([`tick`]), or a sync asks for it ([`sync_all`], [`PFile::sync`]); it is
+//! written to the store with the dirty blocks next to it there, and a sync
+//! or a tick that wrote anything then asks the store to make it durable
+//! ([`OP_FLUSH`]). A read that misses fetches the block; a run of sequential
+//! misses reads ahead, in one request. Every request's result is checked:
+//! one the store could not make is EIO (ENOSPC when it was full), its block
+//! kept dirty.
 
 use crate::errno::Errno;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// `(op, offset, buf)`: true when done.
-pub type BlockIo = fn(u32, u64, &mut [u8]) -> bool;
+/// `(op, offset, buf)`: done, or why not (EIO; ENOSPC for a full store).
+pub type BlockIo = fn(u32, u64, &mut [u8]) -> Result<(), Errno>;
 static IO: OnceLock<BlockIo> = OnceLock::new();
 pub const OP_READ: u32 = 1;
 pub const OP_WRITE: u32 = 2;
 /// Make the store file at least `offset` bytes long (no buffer).
 pub const OP_GROW: u32 = 4;
+/// Make what was written durable (no offset, no buffer).
+pub const OP_FLUSH: u32 = 8;
 
 pub fn set_io(f: BlockIo) {
     let _ = IO.set(f);
@@ -183,8 +190,24 @@ struct Slot {
     key: u64,
     valid: bool,
     dirty: bool,
+    /// The [`tick`] it was made dirty in.
+    since: u32,
     off: u64,
     data: Box<[u8]>,
+}
+
+/// The write-back's clock: one per [`tick`].
+static EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// `f` on a slot's bytes and dirty bit, its age started when it becomes dirty.
+fn on_slot<R>(s: &mut Slot, f: impl FnOnce(&mut [u8], &mut bool) -> R) -> R {
+    let was = s.dirty;
+    let Slot { data, dirty, .. } = &mut *s;
+    let r = f(data, dirty);
+    if s.dirty && !was {
+        s.since = EPOCH.load(Ordering::Relaxed);
+    }
+    r
 }
 
 struct Cell {
@@ -225,9 +248,7 @@ fn io(op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         bump(IO_W, 1);
         bump(IO_WB, buf.len() as u64);
     }
-    if !f(op, off, buf) {
-        return Err(Errno::EIO);
-    }
+    f(op, off, buf)?;
     if CHECK.load(Ordering::Relaxed) {
         if op == OP_WRITE {
             note_written(off, buf);
@@ -259,8 +280,7 @@ fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) 
             if s.key == loc.key && s.valid {
                 cell.used.store(true, Ordering::Relaxed);
                 bump(HIT, 1);
-                let Slot { data, dirty, .. } = &mut *s;
-                return Ok(f(data, dirty));
+                return Ok(on_slot(&mut s, f));
             }
             // Moved on, or still arriving and failed: look again.
             continue;
@@ -273,7 +293,7 @@ fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) 
                 let c = Arc::new(Cell {
                     busy: AtomicBool::new(true),
                     used: AtomicBool::new(true),
-                    m: Mutex::new(Slot { key: NONE, valid: false, dirty: false, off: 0, data: vec![0u8; bs].into_boxed_slice() }),
+                    m: Mutex::new(Slot { key: NONE, valid: false, dirty: false, since: 0, off: 0, data: vec![0u8; bs].into_boxed_slice() }),
                 });
                 bump(HELD, bs as u64);
                 ix.cells.push(Arc::clone(&c));
@@ -353,8 +373,7 @@ fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) 
         s.dirty = false;
         cell.busy.store(false, Ordering::Relaxed);
         cell.used.store(true, Ordering::Relaxed);
-        let Slot { data, dirty, .. } = &mut *s;
-        return Ok(f(data, dirty));
+        return Ok(on_slot(&mut s, f));
     }
 }
 
@@ -418,6 +437,72 @@ fn write_back(s: &mut Slot, bs: usize) -> Result<(), Errno> {
         g.dirty = false;
     }
     Ok(())
+}
+
+/// Every slot held here.
+fn cells() -> Vec<Arc<Cell>> {
+    index(|ix| ix.cells.clone())
+}
+
+/// Write back what is dirty in `s`, if it is (with its neighbours).
+fn clean(s: &mut Slot) -> Result<bool, Errno> {
+    if !(s.valid && s.dirty && s.key != NONE) {
+        return Ok(false);
+    }
+    write_back(s, block() as usize)?;
+    Ok(true)
+}
+
+/// The store made durable, when it is on.
+fn flush() -> Result<(), Errno> {
+    if block() == 0 {
+        return Ok(());
+    }
+    io(OP_FLUSH, 0, &mut [])
+}
+
+/// `sync(2)` and `syncfs`: every dirty block written to the store, then the
+/// store made durable. A block that could not be written stays dirty, and
+/// the first failure is the answer, after the rest were tried.
+pub fn sync_all() -> Result<(), Errno> {
+    if block() == 0 {
+        return Ok(());
+    }
+    let mut first = Ok(());
+    for c in cells() {
+        let mut s = c.m.lock().unwrap();
+        if let Err(e) = clean(&mut s) {
+            first = first.and(Err(e));
+        }
+    }
+    first.and(flush())
+}
+
+/// The periodic write-back, called by the host every so often: the blocks
+/// dirty for `age` ticks or more are written to the store, and if any were,
+/// the store is made durable. A slot busy now is left for the next tick.
+/// The blocks written, or the first failure.
+pub fn tick(age: u32) -> Result<u32, Errno> {
+    let now = EPOCH.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if block() == 0 {
+        return Ok(0);
+    }
+    let (mut n, mut first) = (0, Ok(()));
+    for c in cells() {
+        let Ok(mut s) = c.m.try_lock() else { continue };
+        if s.dirty && now.wrapping_sub(s.since) >= age {
+            match clean(&mut s) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => first = first.and(Err(e)),
+            }
+        }
+    }
+    first?;
+    if n > 0 {
+        flush()?;
+    }
+    Ok(n)
 }
 
 fn cached(key: u64) -> bool {
@@ -538,11 +623,15 @@ impl PFile {
                 let have = RESERVED.load(Ordering::Relaxed);
                 if a.0 as u64 >= have {
                     // Grown ahead, so that a quota failure comes here, at
-                    // allocation, as ENOSPC, not at a write-back.
-                    let want = have + (GROW / bs).max(1);
+                    // allocation, as ENOSPC, not at a write-back; one block
+                    // at a time once the room left is less than that.
+                    let mut want = have + (GROW / bs).max(1);
                     if io(OP_GROW, want * bs, &mut []).is_err() {
-                        self.map[b as usize] = 0;
-                        return Err(Errno::ENOSPC);
+                        want = have + 1;
+                        if io(OP_GROW, want * bs, &mut []).is_err() {
+                            self.map[b as usize] = 0;
+                            return Err(Errno::ENOSPC);
+                        }
                     }
                     RESERVED.store(want, Ordering::Relaxed);
                 }
@@ -599,6 +688,27 @@ impl PFile {
         Ok(())
     }
 
+    /// `fsync` and `fdatasync`: this file's dirty blocks written to the
+    /// store, then the store made durable (the tree is the kernel's memory:
+    /// it is kept with persistence, not here).
+    pub fn sync(&self) -> Result<(), Errno> {
+        let mut first = Ok(());
+        for b in 0..self.map.len() {
+            if self.map[b] == 0 {
+                continue;
+            }
+            let key = self.loc(b as u64).key;
+            let Some(cell) = index(|ix| ix.map.get(&key).map(|&i| Arc::clone(&ix.cells[i as usize]))) else { continue };
+            let mut s = cell.m.lock().unwrap();
+            if s.key == key {
+                if let Err(e) = clean(&mut s) {
+                    first = first.and(Err(e));
+                }
+            }
+        }
+        first.and(flush())
+    }
+
     fn free_block(&mut self, b: usize) {
         if self.map[b] == 0 {
             return;
@@ -629,8 +739,9 @@ mod tests {
     use crate::vfs::{FileSystem, TmpFs};
 
     static STORE_FILE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static FLUSHES: AtomicU32 = AtomicU32::new(0);
 
-    fn fake(op: u32, off: u64, buf: &mut [u8]) -> bool {
+    fn fake(op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         let mut f = STORE_FILE.lock().unwrap();
         let (a, b) = (off as usize, off as usize + buf.len());
         match op {
@@ -650,9 +761,55 @@ mod tests {
                     f.resize(off as usize, 0);
                 }
             }
-            _ => return false,
+            OP_FLUSH => {
+                FLUSHES.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => return Err(Errno::EIO),
         }
-        true
+        Ok(())
+    }
+
+    /// What a file's writes left in the cache reaches the store at its
+    /// fsync, at sync, or once it has been dirty for the write-back's age,
+    /// and each of those flushes the store; a tick with nothing old enough
+    /// writes and flushes nothing.
+    #[test]
+    #[ignore]
+    fn sync_and_the_write_back_age_reach_the_store() {
+        set_io(fake);
+        configure(4096, 64 * 4096, 0);
+        let fs = TmpFs::new();
+        let o = crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR;
+        let a = fs.open("a", o, 0o644).unwrap();
+        let w0 = stats()[IO_W];
+        a.write_at(0, &[1u8; 8192]).unwrap();
+        assert_eq!(stats()[IO_W], w0, "a write stays in the cache");
+        let f0 = FLUSHES.load(Ordering::Relaxed);
+        a.sync(false).unwrap();
+        assert_eq!(FLUSHES.load(Ordering::Relaxed), f0 + 1);
+        assert!(stats()[IO_W] > w0);
+        // Where file a's blocks are is the allocator's: find them by content.
+        assert!(STORE_FILE.lock().unwrap().windows(8192).any(|w| w.iter().all(|&x| x == 1)));
+        // The age: nothing at the first tick, the block at the second.
+        let b = fs.open("b", o, 0o644).unwrap();
+        b.write_at(0, &[2u8; 4096]).unwrap();
+        let w1 = stats()[IO_W];
+        assert_eq!(tick(2).unwrap(), 0);
+        assert_eq!(stats()[IO_W], w1);
+        assert!(tick(2).unwrap() >= 1);
+        assert!(STORE_FILE.lock().unwrap().windows(4096).any(|w| w.iter().all(|&x| x == 2)));
+        let f1 = FLUSHES.load(Ordering::Relaxed);
+        assert_eq!(tick(2).unwrap(), 0, "nothing dirty is left");
+        assert_eq!(FLUSHES.load(Ordering::Relaxed), f1);
+        // sync(2): every file's.
+        let c = fs.open("c", o, 0o644).unwrap();
+        c.write_at(0, &[3u8; 4096]).unwrap();
+        sync_all().unwrap();
+        assert!(STORE_FILE.lock().unwrap().windows(4096).any(|w| w.iter().all(|&x| x == 3)));
+        for n in ["a", "b", "c"] {
+            fs.unlink(n).unwrap();
+        }
+        configure(0, 0, 0);
     }
 
     /// Files written, rewritten in part, truncated and read back through a

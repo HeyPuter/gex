@@ -218,7 +218,8 @@ processes and memory.
 | `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. |
 | Events | On the system itself (`sys.addEventListener`): `running` when it boots, `stopped` when it ends, `console` (`text`) for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
-| `shutdown()` | Ends every program and the kernel. |
+| `sync()` | What the programs wrote made durable in the filesystem's store, as `sync(2)` (nothing to do for a `MemoryFilesystem`). Rejects with the store's error (`code` `EIO`, `ENOSPC`). |
+| `shutdown()` | Ends every program and the kernel, after a `sync()`. |
 
 ## Process
 
@@ -240,11 +241,22 @@ Where the contents are kept is the subclass the page makes:
 | Class | Keeps file contents |
 | --- | --- |
 | `new MemoryFilesystem(sys, { max })` | In the system's memory. `max` (bytes, optional): writes past it fail with `ENOSPC`; without it, as much as the memory holds. |
-| `new OPFSFilesystem(sys, { name, cache })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. Small files (16 KiB or less) stay in memory. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
+| `new OPFSFilesystem(sys, { name, cache, writeback })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. A written block reaches the store within `writeback` ms (default 5000, 100 to 600000) or at a sync. Small files (16 KiB or less) stay in memory, and so do the files `addTar` and `addFiles` lay until a program writes one (boot writes nothing to the store); lazy files are fetched as before. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
 | A subclass of the page's own | Wherever its methods keep them (below). |
 
 `new Filesystem(sys)` throws. A store's contents are not kept across loads
 yet: the system empties the store when it boots.
+
+With a store, the cache is write-back, as a disk's page cache is: what a
+program writes is in memory first. `sync(2)`, `syncfs`, `fsync`,
+`fdatasync` and `sync_file_range` write it out and flush the store before
+they return (the page's `sys.sync()` too, and `shutdown()`), a block is
+written out once it has waited `writeback` ms, and a page being hidden or
+left syncs. A write-out the store fails is `EIO` (`ENOSPC` when the store
+is full) to the call that needed it (a sync, or a write that needed room in
+the cache), and the data stays in memory, tried again. A `MAP_SHARED` mapping's
+pages reach the file at `msync` and `munmap`; `sync` does not reach into
+other programs' mappings.
 
 A store of the page's own is a subclass that implements the store's
 methods: one array of bytes, which the kernel reads and writes by offset in

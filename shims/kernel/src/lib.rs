@@ -2610,17 +2610,22 @@ fn fetch_lazy(url: &str, offset: u64, into: &mut [u8]) -> bool {
 extern "C" {
     /// `op` (gex_kernel::vfs::blocks OP_*) at `offset` of the store file,
     /// on the `len` bytes at `dst`; `ctl` is `BLOCKS_CTL`'s address.
-    /// Returns `len` when done, negative when not.
+    /// Returns `len` when done (0 for a grow or a flush), -28 when the
+    /// store is full, another negative number when it failed.
     fn block_io(op: u32, ctl: u32, offset: u64, dst: u32, len: u32) -> i32;
 }
 
 static BLOCKS_CTL: [core::sync::atomic::AtomicI32; 1024] = [const { core::sync::atomic::AtomicI32::new(0) }; 1024];
 
-fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> bool {
+fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> Result<(), gex_kernel::Errno> {
     // SAFETY: the buffer is in this module's memory and stays borrowed for
     // the call only.
     let n = unsafe { block_io(op, BLOCKS_CTL.as_ptr() as u32, offset, buf.as_mut_ptr() as u32, buf.len() as u32) };
-    n >= 0 && n as usize == buf.len()
+    match n {
+        n if n >= 0 && n as usize == buf.len() => Ok(()),
+        -28 => Err(gex_kernel::Errno::ENOSPC),
+        _ => Err(gex_kernel::Errno::EIO),
+    }
 }
 
 /// Turn the block store on for files made from now on (`block` 0: only
@@ -2631,11 +2636,39 @@ fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> bool {
 #[no_mangle]
 pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags: u32) -> u32 {
     gex_kernel::vfs::blocks::set_io(blocks_io);
+    gex_kernel::vfs::set_sync_all(gex_kernel::vfs::blocks::sync_all);
     if block != 0 {
         gex_kernel::vfs::blocks::set_check(flags & 1 != 0);
         gex_kernel::vfs::blocks::configure(block, (cache_mib as u64) << 20, inline as u64);
     }
     BLOCKS_CTL.as_ptr() as u32
+}
+
+/// The periodic write-back (`gex_kernel::vfs::blocks::tick`): the blocks
+/// dirty for `age` ticks or more written to the store and the store made
+/// durable. The blocks written, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_blocks_tick(age: u32) -> i32 {
+    match gex_kernel::vfs::blocks::tick(age) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+/// `sync(2)` (`gex_kernel::vfs::sync_all`): 0 or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_fs_sync_all() -> i32 {
+    match gex_kernel::vfs::blocks::sync_all() {
+        Ok(()) => 0,
+        Err(e) => -e.0,
+    }
+}
+
+/// `fsync`, `fdatasync` (`data_only` 1) of an open file (`FileHandle::sync`).
+#[no_mangle]
+pub extern "C" fn k_fs_sync(handle: i32, data_only: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.sync(data_only != 0))
 }
 
 /// The store's counters (`gex_kernel::vfs::blocks::stats`), u64s.

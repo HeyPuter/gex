@@ -143,17 +143,28 @@ function cacheOf(cache, who) {
   return cache;
 }
 
+/** The write-back's age option: ms a written block may stay only in the
+ *  cache, 100 to 600000, default 5000. */
+function writebackOf(writeback, who) {
+  writeback ??= 5000;
+  if (!Number.isInteger(writeback) || writeback < 100 || writeback > 600000) throw new TypeError(`${who}: writeback is ms, 100 to 600000`);
+  return writeback;
+}
+
 export class Filesystem extends EventTarget {
   #sys;
   #cache;
+  #writeback;
   #sources = [];
   #mounts = new Map(); // path -> { mount, id }
   #persist = null; // a Persist's hooks
 
   /** Abstract: a page makes a `MemoryFilesystem`, an `OPFSFilesystem`, or
    *  a subclass of its own that implements the store's methods. `cache`:
-   *  MiB of the store held in the kernel's memory (default 256). */
-  constructor(sys, { cache } = {}) {
+   *  MiB of the store held in the kernel's memory (default 256);
+   *  `writeback`: ms a written block may stay only there before it goes to
+   *  the store (default 5000). */
+  constructor(sys, { cache, writeback } = {}) {
     if (new.target === Filesystem) {
       throw new TypeError('Filesystem is abstract: make a MemoryFilesystem(sys), an OPFSFilesystem(sys, { name }), or a subclass that implements its store');
     }
@@ -163,6 +174,7 @@ export class Filesystem extends EventTarget {
       if (missing.length) throw new TypeError(`${new.target.name}: a Filesystem's store implements ${missing.join(', ')}`);
     }
     this.#cache = cacheOf(cache, new.target.name);
+    this.#writeback = writebackOf(writeback, new.target.name);
     const i = internals(sys, 'Filesystem');
     i.attach('filesystem', this, { beforeBoot: true });
     this.#sys = i;
@@ -170,9 +182,10 @@ export class Filesystem extends EventTarget {
     this[INTERNAL] = {
       sources: () => this.#sources,
       cache: () => this.#cache,
+      writeback: () => this.#writeback,
       /** Where the contents are kept, as the system wires it
        *  (system.js `#store`): a built-in's own, or this store's methods. */
-      store: () => this[FAST]?.() ?? { kind: 'page', cache: this.#cache, block: BLOCK, inline: INLINE, fs: this },
+      store: () => this[FAST]?.() ?? { kind: 'page', cache: this.#cache, writeback: this.#writeback, block: BLOCK, inline: INLINE, fs: this },
       /** For the system's start: the mounts made before boot,
        *  in place before the first program. */
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
@@ -485,21 +498,22 @@ const CHUNK = 1 << 20;
 
 /** The root's file contents in a block store in the origin private file
  *  system, named `name`, with `cache` MiB of it (default 256) held in the
- *  kernel's memory: a root larger than the page's memory. The kernel reaches
+ *  kernel's memory: a root larger than the page's memory. A written block
+ *  reaches the store within `writeback` ms (default 5000), or at a sync. The kernel reaches
  *  the store through a Worker of its own with a sync access handle; the
  *  store's methods reach the same file from the page, for a caller that
  *  uses them while no system holds it. */
 export class OPFSFilesystem extends Filesystem {
   #name;
 
-  constructor(sys, { name, cache } = {}) {
+  constructor(sys, { name, cache, writeback } = {}) {
     name = String(name ?? '');
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new TypeError('OPFSFilesystem: name the store ({ name }: letters, digits, . _ -)');
-    super(sys, { cache });
+    super(sys, { cache, writeback });
     this.#name = name;
   }
 
-  [FAST]() { return { kind: 'opfs', name: this.#name, cache: this[INTERNAL].cache(), block: BLOCK, inline: INLINE }; }
+  [FAST]() { return { kind: 'opfs', name: this.#name, cache: this[INTERNAL].cache(), writeback: this[INTERNAL].writeback(), block: BLOCK, inline: INLINE }; }
 
   async #file() {
     const root = await navigator.storage.getDirectory();

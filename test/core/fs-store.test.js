@@ -38,6 +38,8 @@ export default async function (t) {
     eq('OPFS: 40 MiB written and copied through a 16 MiB cache', [r.code, r.out], [0, '']);
     const [a, b] = [await fs.readFile('/root/a'), await fs.readFile('/root/b')];
     check('OPFS: the page reads both back, the same', a.length === 40 << 20 && indexedEqual(a, b), `${a.length} and ${b.length} bytes`);
+    const synced = await sys.sync().then(() => 'ok', (e) => e.code ?? e.message);
+    eq('OPFS: sys.sync() writes the cache out to the store', synced, 'ok');
     await sys.shutdown();
     return t.reload();
   }

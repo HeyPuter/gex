@@ -184,18 +184,14 @@ impl Drop for FileNode {
 }
 
 impl FileNode {
-    fn new(mut data: Vec<u8>, ino: u64) -> FileNode {
-        let pg = super::blocks::wants(data.len() as u64).then(|| {
-            let mut p = super::blocks::PFile::new();
-            if !data.is_empty() {
-                let _ = p.write(0, &data);
-                data = Vec::new();
-            }
-            p
-        });
+    /// A file with `data`: a seeded one's bytes (the image's, a bundle's),
+    /// kept here as they were laid, not written to the block store; the file
+    /// moves to the store when a program's write takes it past what stays
+    /// inline ([`FileNode::paged_for`]).
+    fn new(data: Vec<u8>, ino: u64) -> FileNode {
         note_capacity(0, data.capacity());
         FileNode {
-            pg: Mutex::new(pg),
+            pg: Mutex::new(None),
             data: Mutex::new(data),
             lazy: Mutex::new(None),
             ino,
@@ -992,7 +988,9 @@ impl TmpFs {
             Some(Node::File(f)) => Arc::clone(f),
             _ => return Err(Errno::ENOENT),
         };
-        if let Some(p) = f.paged_for(offset + bytes.len() as u64).as_mut() {
+        // Seeding stays where it was laid: only a file a program already
+        // moved to the store takes its parts there.
+        if let Some(p) = f.pg.lock().unwrap().as_mut() {
             return p.write(offset, bytes).map(|_| ());
         }
         let mut data = f.data.lock().unwrap();
@@ -1412,6 +1410,14 @@ impl FileHandle for TmpHandle {
         let n = len.min(data.len() - start);
         f(&data[start..start + n]);
         Some(Ok(n as u64))
+    }
+
+    fn sync(&self, _data_only: bool) -> Result<(), Errno> {
+        let Some(file) = &self.file else { return Ok(()) };
+        match file.pg.lock().unwrap().as_ref() {
+            Some(p) => p.sync(),
+            None => Ok(()),
+        }
     }
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {

@@ -14,7 +14,11 @@
 // quota while `estimate()` still reports room; a handle gone dead). Every
 // count is checked here, and anything but the whole request is a failure.
 
-export const OP_READ = 1, OP_WRITE = 2, OP_GROW = 4;
+export const OP_READ = 1, OP_WRITE = 2, OP_GROW = 4, OP_FLUSH = 8;
+/** A full store, to the kernel (its ENOSPC); any other failure is -1 (EIO). */
+export const NOSPACE = -28;
+// A sync access handle's count when the origin is out of quota (-8, unsigned).
+const HANDLE_NOSPACE = 0xfffffff8;
 // The slots (Int32 indices into BLOCKS_CTL): [0] requests asked (the store
 // waits on it), [1] the store is up; slot i at SLOT0 + i * SLOTW:
 // [0] state, [1] op, [2] dst, [3] len, [4] result, [10..11] offset.
@@ -74,8 +78,8 @@ let verifyWrites = false;
 /** Debugging: every write read straight back and compared. */
 export function blocksVerify(on) { verifyWrites = !!on; }
 
-/** One op on handle `h` against `memory`'s `len` bytes at `dst`: `len`, or
- *  -1 (the kernel's EIO, or ENOSPC for a grow). */
+/** One op on handle `h` against `memory`'s `len` bytes at `dst`: `len` (0
+ *  for a grow or a flush), NOSPACE, or -1 (the kernel's EIO). */
 export function handleOp(h, sharedOk, memory, op, off, dst, len) {
   const isShared = typeof SharedArrayBuffer === 'function' && memory.buffer instanceof SharedArrayBuffer;
   const view = new Uint8Array(memory.buffer, dst, len);
@@ -92,8 +96,17 @@ export function handleOp(h, sharedOk, memory, op, off, dst, len) {
   }
   if (op === OP_GROW) {
     // `off` is the length wanted; a failure is the origin's quota.
-    if (h.getSize() < off) h.truncate(off);
-    return h.getSize() >= off ? 0 : -1;
+    try {
+      if (h.getSize() < off) h.truncate(off);
+    } catch (e) {
+      if (e?.name === 'QuotaExceededError') return NOSPACE;
+      throw e;
+    }
+    return h.getSize() >= off ? 0 : NOSPACE;
+  }
+  if (op === OP_FLUSH) {
+    h.flush();
+    return 0;
   }
   if (op === OP_WRITE) {
     let b = view;
@@ -101,7 +114,8 @@ export function handleOp(h, sharedOk, memory, op, off, dst, len) {
       b = bounceOf(len);
       b.set(view);
     }
-    if (h.write(b, { at: off }) !== len) return -1;
+    const n = h.write(b, { at: off });
+    if (n !== len) return (n >>> 0) === HANDLE_NOSPACE ? NOSPACE : -1;
     if (verifyWrites) {
       const back = new Uint8Array(len);
       const m = h.read(back, { at: off });
@@ -174,8 +188,13 @@ export async function storeOp(fs, op, off, len, bytes) {
       if (await fs.size() < off) await fs.truncate(off);
       return [0, null];
     }
+    if (op === OP_FLUSH) {
+      await fs.flush();
+      return [0, null];
+    }
   } catch (e) {
-    if (e?.code !== 'ENOSPC') console.error(`[blocks] the store's ${['', 'read', 'write', '', 'truncate'][op]} at ${off}+${len}: ${e?.message ?? e}`);
+    if (e?.code === 'ENOSPC') return [NOSPACE, null];
+    console.error(`[blocks] the store's ${{ 1: 'read', 2: 'write', 4: 'truncate', 8: 'flush' }[op]} at ${off}+${len}: ${e?.message ?? e}`);
   }
   return [-1, null];
 }

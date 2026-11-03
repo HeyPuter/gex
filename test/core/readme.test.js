@@ -167,7 +167,7 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
 /** Every class the README's tables name, with their members. */
 function members(t) {
   const want = {
-    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
+    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'sync', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
     'Process': [index.Process.prototype, ['pid', 'kill', 'windows', 'addEventListener']],
     'Filesystem': [fsMod.Filesystem.prototype, ['open', 'read', 'write', 'size', 'truncate', 'flush', 'addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
     'Mount': [fsMod.Mount.prototype, ['unmount']],

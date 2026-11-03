@@ -504,6 +504,10 @@ extern "C" {
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
     fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32;
+    /// `fsync`/`fdatasync` of an open file, and `sync(2)`: the root's
+    /// contents in the page's store made durable (0 or a negated errno).
+    fn k_fs_sync(handle: i32, data_only: u32) -> i32;
+    fn k_fs_sync_all() -> i32;
     fn k_fs_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
@@ -1083,6 +1087,15 @@ extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 
     let r = unsafe { k_fs_advise(handle, offset, len, advice) };
     gex_kernel::phase::mark(8);
     r
+}
+extern "C" fn rf_sync(handle: i32, data_only: u32) -> i32 {
+    unsafe { k_fs_sync(handle, data_only) }
+}
+fn sync_all_global() -> Result<(), gex_kernel::Errno> {
+    match unsafe { k_fs_sync_all() } {
+        0 => Ok(()),
+        e => Err(gex_kernel::Errno(-e)),
+    }
 }
 extern "C" fn rf_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     gex_kernel::phase::mark(7);
@@ -1822,6 +1835,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    gex_kernel::vfs::set_sync_all(sync_all_global);
     gex_kernel::inotify::set_remote(gex_kernel::inotify::Remote {
         create: ri_create,
         dup: ri_dup,
@@ -1843,6 +1857,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             meta: rf_meta,
             truncate: rf_truncate,
             advise: rf_advise,
+            sync: rf_sync,
             read_dir: rf_read_dir,
             path_meta: rf_path_meta,
             read_link: rf_read_link,

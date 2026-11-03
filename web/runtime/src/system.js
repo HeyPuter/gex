@@ -17,7 +17,7 @@ import { NetSwitch } from './netswitch.js';
 import { Sockets, dialFor } from '../../src/net.js';
 import { GuestConnection } from './connection.js';
 import { PageFsHost } from './mount.js';
-import { Kernel } from './kernel.js';
+import { Kernel, errno } from './kernel.js';
 import { Files } from './kfs.js';
 import { Programs } from './programs.js';
 import { Changes } from './kpersist.js';
@@ -126,6 +126,8 @@ export class System extends EventTarget {
   #early = new Map(); // pid -> exit status heard before the pid was known
   /** Whether the Workers read a rest bundle (boot's layers had one). */
   #restBundle = false;
+  /** The filesystem keeps its contents in a store (fs.js): sync has work. */
+  #stored = false;
   #nextHandle = 1;
   #booting = null;
   #arch = null;
@@ -808,6 +810,10 @@ export class System extends EventTarget {
    *  (the single-thread build). The debug switch `blockscheck` sums every
    *  block written and checks it read back (and reads every write back). */
   async #store(s, k, st) {
+    // The origin's storage kept under pressure, not evicted with the cache
+    // (granted or not as the browser decides; it asks nothing of the user
+    // in Chromium).
+    const persistent = () => navigator.storage?.persist?.().catch(() => {});
     if (!st) return;
     if (st.kind === 'memory') {
       if (st.max) await k.r('k_fs_limit', st.max % 0x100000000, Math.floor(st.max / 0x100000000));
@@ -831,8 +837,10 @@ export class System extends EventTarget {
       }
       this.#sys.onStop(serveSlots(s.kernel.memory, ctl >>> 0, st.fs));
     } else if (SP_CODE && SINGLE) {
+      persistent();
       await k.ask('blocksOpen', { name: st.name, verify: check });
     } else {
+      persistent();
       const w = new Worker(new URL('../../src/blocks-worker.js', import.meta.url), { type: 'module', name: 'gex-blocks' });
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
@@ -846,6 +854,37 @@ export class System extends EventTarget {
       this.#sys.onStop(() => w.terminate());
     }
     await k.r('k_blocks_config', st.block, st.cache, st.inline, check ? 1 : 0);
+    this.#stored = true;
+    // The write-back: a block written reaches the store within `writeback`
+    // ms (a tick every second at most, a block written back once it has
+    // been dirty for `age` of them).
+    const every = Math.min(1000, st.writeback);
+    const age = Math.max(1, Math.round(st.writeback / every));
+    let busy = false, said = 0;
+    const timer = setInterval(() => {
+      if (busy || this.#state.phase !== 'running') return;
+      busy = true;
+      k.r('k_blocks_tick', age).then((r) => {
+        // A failure is said once per kind: the blocks stay dirty and are
+        // tried again at the next tick.
+        if (r < 0 && r !== said) console.error(`[gex] the filesystem's store failed a write-back: ${errno(r, '').code}; written data is kept in memory and tried again`);
+        said = r < 0 ? r : 0;
+      }, () => {}).finally(() => { busy = false; });
+    }, every);
+    // A page going away writes what it can first.
+    const hide = () => { if (document.visibilityState === 'hidden') this.sync().catch(() => {}); };
+    const leave = () => this.sync().catch(() => {});
+    if (typeof document === 'object') {
+      document.addEventListener('visibilitychange', hide);
+      addEventListener('pagehide', leave);
+    }
+    this.#sys.onStop(() => {
+      clearInterval(timer);
+      if (typeof document === 'object') {
+        document.removeEventListener('visibilitychange', hide);
+        removeEventListener('pagehide', leave);
+      }
+    });
   }
 
   /** The lazy files' owner for boot's `layers` (see boot): its control
@@ -907,9 +946,22 @@ export class System extends EventTarget {
     return { code, signal, stdout: await out, stderr: await err };
   }
 
+  /** `sync(2)`: what the programs wrote made durable in the filesystem's
+   *  store (written back from the cache and the store flushed). Nothing to
+   *  do for a MemoryFilesystem. Rejects with the error (`code` EIO, ENOSPC)
+   *  when the store could not take it. */
+  async sync() {
+    if (this.#state.phase !== 'running') throw new Error(`sync: the system is ${this.#state.phase}, not running`);
+    if (!this.#stored) return;
+    const r = await this.#kernel.r('k_fs_sync_all');
+    if (r < 0) throw errno(r, '/');
+  }
+
   /** Stop every program and the kernel. */
   async shutdown() {
     if (this.#state.phase === 'stopped') return;
+    // What was written goes to the store before the store goes.
+    if (this.#state.phase === 'running' && this.#stored) await this.sync().catch((e) => console.error(`[gex] shutdown: the filesystem's store could not take what was written: ${e.code ?? e.message}`));
     this.#state.phase = 'stopped';
     for (const p of this.#procs.values()) p[INTERNAL].exit({ code: 137, signal: 9, shutdown: true });
     this.#procs.clear();

@@ -63,7 +63,7 @@ export type LazyList =
  *  Filesystem(sys)` throws). */
 export declare abstract class Filesystem extends EventTarget {
   /** `cache`: MiB of the store held in the system's memory (default 256, 16 to 4096). */
-  constructor(sys: System, options?: { cache?: number });
+  constructor(sys: System, options?: { cache?: number; writeback?: number });
   /** The store, which a subclass implements: one array of bytes. Optional: ready it before boot. */
   open(): Promise<void>;
   /** `length` bytes at `offset`; shorter past the end (zeros). */
@@ -105,7 +105,7 @@ export declare class MemoryFilesystem extends Filesystem {
 
 /** File data in the page's OPFS, in the store `name`, with a cache of `cache` MiB in memory (default 256). */
 export declare class OPFSFilesystem extends Filesystem {
-  constructor(sys: System, options: { name: string; cache?: number });
+  constructor(sys: System, options: { name: string; cache?: number; writeback?: number });
   read(offset: number, length: number): Promise<Uint8Array>;
   write(offset: number, bytes: Uint8Array): Promise<void>;
   size(): Promise<number>;
