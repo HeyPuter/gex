@@ -281,14 +281,27 @@ impl Tty {
     /// `TCSETS`. Short input sets only what it covers, which is how a
     /// kernel-sized `struct termios` of 36 bytes leaves the rest alone.
     pub fn set_termios(&self, src: &[u8]) {
+        // The page's own terminal: what was typed of a line when its program
+        // leaves canonical mode is dropped (its reader is the page's, not
+        // this one's; see `set_termios_keeping`).
+        let _ = self.set_termios_keeping(src);
+    }
+
+    /// Set the termios, and hand back what was typed of a line when this
+    /// leaves canonical mode. Linux keeps those bytes: they become input a
+    /// non-canonical read returns at once. That is a shell's typeahead: keys
+    /// typed while `clear` runs (the terminal cooked again for the command)
+    /// arrive before readline has the terminal raw, and readline reads them
+    /// then. Dropping them lost the first key typed after a command (`ls`
+    /// ran as `s`).
+    pub fn set_termios_keeping(&self, src: &[u8]) -> Vec<u8> {
         let mut s = self.lock();
         let n = src.len().min(60);
         s.termios[..n].copy_from_slice(&src[..n]);
-        // Leaving canonical mode abandons a part-typed line, as Linux does:
-        // the bytes belong to a discipline that is no longer running.
         if s.lflag() & lflag::ICANON == 0 {
-            s.line.clear();
+            return s.line.drain(..).map(|(c, _)| c).collect();
         }
+        Vec::new()
     }
 
     /// `TIOCGLCKTRMIOS` and its setter, which nothing enforces.

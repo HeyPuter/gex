@@ -72,6 +72,8 @@ pub struct Remote {
     pub queue: extern "C" fn(pid: i32) -> u32,
     /// What `/proc/<pid>` says about a process: see [`ProcTable::set_info`].
     pub set_info: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
+    /// Its ids and capabilities: see [`ProcTable::set_creds`].
+    pub set_creds: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
     /// Every process, encoded by [`encode_entries`], into `cap` bytes at `at`;
     /// returns the full length (larger than `cap`: ask again with more room).
     pub snapshot: extern "C" fn(at: crate::PAddr, cap: u32) -> i32,
@@ -98,6 +100,10 @@ pub struct ProcEntry {
     pub info: Vec<u8>,
     /// Its threads besides the first (whose id is the pid), in order.
     pub tids: Vec<i32>,
+    /// Its ids and capability sets as it last published them
+    /// ([`crate::syscalls::Creds::save`]; empty: never, a parent's at a
+    /// spawn). `/proc/<pid>/status`'s `Uid:`, `Gid:` and `Cap*:` lines.
+    pub creds: Vec<u8>,
 }
 
 impl ProcEntry {
@@ -129,13 +135,14 @@ impl ProcEntry {
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
-        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32] {
+        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32, e.creds.len() as i32] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         for t in &e.tids {
             out.extend_from_slice(&t.to_le_bytes());
         }
         out.extend_from_slice(&e.info);
+        out.extend_from_slice(&e.creds);
         while out.len() % 4 != 0 {
             out.push(0);
         }
@@ -146,10 +153,10 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
 pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let mut out = Vec::new();
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
-    while b.len() >= 28 {
-        let (t, n) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize);
-        let at = 28 + 4 * t;
-        if b.len() < at + n {
+    while b.len() >= 32 {
+        let (t, n, c) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize, word(b, 7).max(0) as usize);
+        let at = 32 + 4 * t;
+        if b.len() < at + n + c {
             break;
         }
         out.push(ProcEntry {
@@ -158,10 +165,11 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
             pgid: word(b, 2),
             sid: word(b, 3),
             zombie: word(b, 4) != 0,
-            tids: (0..t).map(|i| word(b, 7 + i)).collect(),
+            tids: (0..t).map(|i| word(b, 8 + i)).collect(),
             info: b[at..at + n].to_vec(),
+            creds: b[at + n..at + n + c].to_vec(),
         });
-        b = &b[(at + n + 3) & !3..];
+        b = &b[(at + n + c + 3) & !3..];
     }
     out
 }
@@ -200,6 +208,8 @@ struct Proc {
     queue: crate::wait::Queue,
     /// See [`ProcTable::set_info`].
     info: Vec<u8>,
+    /// Its ids and capabilities ([`ProcEntry::creds`]).
+    creds: Vec<u8>,
     /// Its address space, for another process's `process_vm_readv` and
     /// `process_vm_writev`: see [`ProcTable::set_vm`]. `None` once it exits.
     vm: Option<Arc<PeerVm>>,
@@ -302,6 +312,7 @@ impl ProcTable {
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
+                    creds: Vec::new(),
                     vm: None,
                     host_child: false,
                 }],
@@ -323,9 +334,10 @@ impl ProcTable {
         let mut t = self.lock();
         let pid = t.next_pid;
         t.next_pid += 1;
-        let (pgid, sid) = match t.procs.iter().find(|p| p.pid == ppid) {
-            Some(p) => (p.pgid, p.sid),
-            None => (pid, pid),
+        // (and the parent's ids, which a fork copies, until the child says)
+        let (pgid, sid, creds) = match t.procs.iter().find(|p| p.pid == ppid) {
+            Some(p) => (p.pgid, p.sid, p.creds.clone()),
+            None => (pid, pid, Vec::new()),
         };
         // The virtual init runs nothing, so a child of it is the host's.
         let host_child = ppid == INIT_PID && self.virtual_init.load(Ordering::Acquire);
@@ -341,6 +353,7 @@ impl ProcTable {
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
+            creds,
             vm: None,
             host_child,
         });
@@ -421,6 +434,18 @@ impl ProcTable {
         }
     }
 
+    /// Process `pid`'s ids and capabilities as they are now
+    /// ([`crate::syscalls::Creds::save`]), for the others' `/proc/<pid>/status`.
+    pub fn set_creds(&self, pid: i32, creds: &[u8]) {
+        let creds = &creds[..creds.len().min(256)];
+        if let Some(r) = self.remote {
+            return (r.set_creds)(pid, creds.as_ptr() as usize as crate::PAddr, creds.len() as u32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.creds = creds.to_vec();
+        }
+    }
+
     /// Every process in the table, for `/proc`'s listing.
     pub fn entries(&self) -> Vec<ProcEntry> {
         if let Some(r) = self.remote {
@@ -450,7 +475,7 @@ impl ProcTable {
                 .map(|p| {
                     let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
                     tids.sort_unstable();
-                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), tids };
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids };
                     (e, Arc::clone(&p.child.status))
                 })
                 .collect()

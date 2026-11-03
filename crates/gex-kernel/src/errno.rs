@@ -39,6 +39,7 @@ impl Errno {
     pub const EPIPE: Errno = Errno(32);
     pub const ERANGE: Errno = Errno(34);
     pub const EDEADLK: Errno = Errno(35);
+    pub const EOVERFLOW: Errno = Errno(75);
     pub const ENAMETOOLONG: Errno = Errno(36);
     pub const ENOSYS: Errno = Errno(38);
     pub const ENOTEMPTY: Errno = Errno(39);

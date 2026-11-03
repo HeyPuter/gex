@@ -728,7 +728,7 @@ impl Socket {
                     port = self.ports.udp_ephemeral();
                 }
                 let n = udp_name(port);
-                let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
                 if id >= 0 {
                     self.udp_remote.lock().unwrap().listener = Some(id);
                     *self.local.lock().unwrap() = Some((addr, port));
@@ -826,7 +826,7 @@ impl Socket {
                 }
             }
             let n = tcp_name(port);
-            let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+            let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
             if id < 0 {
                 return Err(if -id == Errno::EADDRINUSE.0 || -id == 98 { Errno::EADDRINUSE } else { Errno(-id) });
             }
@@ -1014,7 +1014,7 @@ impl Socket {
         if self.kind == Kind::Tcp && is_local(addr) {
             if let Some(r) = self.remote {
                 let n = tcp_name(port);
-                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
                 if id >= 0 {
                     *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
                     *self.local.lock().unwrap() = Some((0x7f00_0001, self.ports.ephemeral()));
@@ -1147,7 +1147,7 @@ impl Socket {
             return Some(id);
         }
         let n = udp_name(port);
-        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
         (id >= 0).then(|| {
             u.outbound.insert(port, id);
             id

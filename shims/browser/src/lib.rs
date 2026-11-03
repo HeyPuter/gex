@@ -458,6 +458,9 @@ extern "C" {
     /// exact, where re-reading the guest word only guesses.
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
+    fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
+    fn k_lock_queue() -> u32;
+    fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;
     fn k_tid_new(pid: i32) -> i32;
     fn k_tid_end(tid: i32);
@@ -488,6 +491,7 @@ extern "C" {
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
     fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
@@ -680,8 +684,11 @@ extern "C" {
     // Unix sockets. An X server binds a name and its client connects to it,
     // and with a Worker per process those are two memories -- so the name has
     // to be somewhere neither of them owns.
-    fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    // With the caller's pid, uid and gid: what the far end's SO_PEERCRED
+    // reports (`k_sock_peer_cred`).
+    fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32;
     fn k_sock_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32);
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
@@ -694,7 +701,7 @@ extern "C" {
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32, how: u32) -> i32;
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
+    fn k_sock_pair(out: gex_kernel::PAddr, pid: i32, uid: u32, gid: u32) -> i32;
     fn k_sock_dup(id: i32) -> i32;
     /// Internet sockets moved to the global kernel (`net::InetRemote`).
     fn k_inet_adopt(state: gex_kernel::PAddr, len: u32) -> i32;
@@ -963,6 +970,9 @@ extern "C" fn r_halt_code() -> i32 {
 extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
     unsafe { k_proc_set_info(pid, at, len) }
 }
+extern "C" fn r_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_creds(pid, at, len) }
+}
 extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_proc_snapshot(at, cap) }
 }
@@ -1019,6 +1029,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             request_halt: r_request_halt,
             halt_code: r_halt_code,
             set_info: r_set_info,
+            set_creds: r_set_creds,
             snapshot: r_snapshot,
             new_tid: r_new_tid,
             end_tid: r_end_tid,
@@ -1530,8 +1541,8 @@ extern "C" fn rpty_close_end(id: i32, master: i32) {
     unsafe { k_pty_close_end(id, master, my_pid()) };
     pty_note("closes", id, master, my_pid());
 }
-extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    let r = unsafe { k_pty_read(id, master, at, len) };
+fn rpty_read(id: i32, master: i32, buf: &mut [u8]) -> i32 {
+    let r = unsafe { k_pty_read(id, master, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) };
     // End of file on the master is how a terminal emulator learns its shell is
     // gone -- and if it is wrong, the emulator kills the session. Worth saying.
     if r == 0 && master != 0 {
@@ -1539,8 +1550,8 @@ extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -
     }
     r
 }
-extern "C" fn rpty_write(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_pty_write(id, master, at, len) }
+fn rpty_write(id: i32, master: i32, buf: &[u8]) -> i32 {
+    unsafe { k_pty_write(id, master, buf.as_ptr() as gex_kernel::PAddr, buf.len() as u32) }
 }
 extern "C" fn rpty_readable(id: i32, master: i32) -> i32 {
     unsafe { k_pty_readable(id, master) }
@@ -1557,11 +1568,11 @@ extern "C" fn rpty_get_lock(id: i32) -> i32 {
 extern "C" fn rpty_set_lock(id: i32, locked: i32) {
     unsafe { k_pty_set_lock(id, locked) }
 }
-extern "C" fn rpty_get_termios(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_pty_get_termios(id, at, len) }
+fn rpty_get_termios(id: i32, buf: &mut [u8]) -> i32 {
+    unsafe { k_pty_get_termios(id, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) }
 }
-extern "C" fn rpty_set_termios(id: i32, at: gex_kernel::PAddr, len: u32, flush: i32) -> i32 {
-    unsafe { k_pty_set_termios(id, at, len, flush) }
+fn rpty_set_termios(id: i32, src: &[u8], flush: i32) -> i32 {
+    unsafe { k_pty_set_termios(id, src.as_ptr() as gex_kernel::PAddr, src.len() as u32, flush) }
 }
 extern "C" fn rpty_winsize(id: i32) -> u64 {
     unsafe { k_pty_winsize(id) }
@@ -1623,14 +1634,17 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
     })
 }
 
-extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_sock_bind(path, path_len) }
+extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_bind(path, path_len, pid, uid, gid) }
 }
 extern "C" fn rs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) {
     unsafe { k_sock_rename(from, from_len, to, to_len) }
 }
-extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_sock_connect(path, path_len) }
+extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_connect(path, path_len, pid, uid, gid) }
+}
+extern "C" fn rs_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_peer_cred(id, out) }
 }
 extern "C" fn rs_accept(listener: i32) -> i32 {
     unsafe { k_sock_accept(listener) }
@@ -1665,8 +1679,8 @@ extern "C" fn rs_shutdown(id: i32, how: u32) -> i32 {
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
 }
-extern "C" fn rs_pair(out: gex_kernel::PAddr) -> i32 {
-    unsafe { k_sock_pair(out) }
+extern "C" fn rs_pair(out: gex_kernel::PAddr, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_pair(out, pid, uid, gid) }
 }
 extern "C" fn rs_dup(id: i32) -> i32 {
     unsafe { k_sock_dup(id) }
@@ -1733,6 +1747,18 @@ fn shared_dns_name(addr: u32) -> Option<String> {
     (n >= 0).then(|| String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned())
 }
 
+fn gl_call(req: &[u8], out: &mut [u8]) -> i64 {
+    unsafe { k_lock_call(req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, my_pid()) }
+}
+
+fn gl_queue() -> u32 {
+    unsafe { k_lock_queue() }
+}
+
+fn gl_seq() -> u64 {
+    unsafe { k_lock_seq() }
+}
+
 fn gi_adopt(state: &[u8]) -> i32 {
     unsafe { k_inet_adopt(state.as_ptr() as gex_kernel::PAddr, state.len() as u32) }
 }
@@ -1765,6 +1791,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     // And one table of DNS answers: a name one process resolved means the
     // same address in the process that connects to it.
     gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
+    // And the file locks every process contends for.
+    gex_kernel::locks::share_locks(gex_kernel::locks::LockRemote { call: gl_call, queue: gl_queue, seq: gl_seq });
     // And internet sockets that more than one process holds live there too.
     net::share_inet(net::InetRemote { adopt: gi_adopt, op: gi_op, write: gi_write, dup: gi_dup, close: gi_close });
     // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
@@ -1776,6 +1804,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         queue: rs_queue,
         bind: rs_bind,
         connect: rs_connect,
+        peer_cred: rs_peer_cred,
         accept: rs_accept,
         pending: rs_pending,
         read: rs_read,
@@ -3554,6 +3583,10 @@ enum Waiting {
     /// signals): until one of its set is pending, until this deadline, or a
     /// signal outside the set ends it.
     SigWait(Option<u64>),
+    /// Waiting for a file lock another process holds (`BlockOp::FileLock`,
+    /// which says which): until the table would grant it, woken by its
+    /// releases' queue; then the call again.
+    Lock,
     /// Waiting to take a priority-inheritance lock held by another thread:
     /// until its futex is woken (`gen`, as `Futex::wake_gen`), the lock word
     /// shows no owner, or `deadline`.
@@ -4180,6 +4213,7 @@ fn install_panic_hook() {
             // wasm32 does not have), so the trap's report asks
             // (`gex_panic_reporting`) and says one happened.
             PANIC_REPORTING.with(|r| r.set(true));
+            PANICKED.with(|r| r.set(true));
             let text = format!("gex: panic in the shim: {info}\n");
             // A long message (a diagnostic's dump) first as its head, alone,
             // so a log that drops or cuts long lines still has the panic.
@@ -4231,6 +4265,9 @@ fn install_panic_hook() {
 thread_local! {
     /// This Worker is inside the panic hook (see `install_panic_hook`).
     static PANIC_REPORTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's shim has panicked: the trap that follows is the
+    /// runtime's, whatever the engine calls it ([`gex_guest_trap`]).
+    static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// TEST: the hook panics once, for `gex_debug_panic(2)`.
     static DEBUG_PANIC_IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -8490,11 +8527,13 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = my_ctx();
-        // The number and arguments where this architecture's ABI puts them;
-        // the number canonicalised so the names below match on x86-64 too.
-        let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
-        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
-        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
+        // The number and arguments as the call was read above, where its
+        // ABI puts them (an i386-ABI process's, and so an AArch64 build's
+        // wasm32 program's, are not the 64-bit slots: read from those, its
+        // calls showed as `unknown#0` with their arguments shifted); the
+        // number canonical, so the names below match on x86-64 too.
+        let g = |i: usize| regs.a[i];
+        let n = this_nr;
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `execve`'s path is arg 0, the
@@ -8505,10 +8544,17 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 .unwrap_or_default()
         };
         use gex_kernel::syscalls::nr;
+        // A legacy call the kernel makes as its `*at` form (`open` as
+        // `openat`, ...) has its path first: the raw number says which.
+        let legacy = if compat {
+            matches!(regs.raw, 5 | 8 | 10 | 33 | 38 | 39 | 40 | 85 | 106 | 107 | 195 | 196)
+        } else {
+            gex_abi::X86 && matches!(regs.raw, 2 | 4 | 6 | 21 | 82 | 83 | 84 | 85 | 87 | 89)
+        };
         let named = match n {
             nr::EXECVE => Some(path(g(0))),
             nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT
-            | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT => Some(path(g(1))),
+            | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT => Some(path(g(if legacy { 0 } else { 1 }))),
             _ => None,
         };
         // For calls whose first argument is a descriptor, what it *is*: an fd
@@ -8540,7 +8586,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         };
         let caller = object_off_at(ret);
         // An unknown call shows its raw number: "unknown" alone cannot be looked up.
-        let raw_nr = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let raw_nr = regs.raw;
         let name = match gex_kernel::syscalls::syscall_name(n) {
             "unknown" => format!("unknown#{raw_nr}"),
             s => s.to_string(),
@@ -8925,6 +8971,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::AcceptWait { socket } => {
                         Waiting::Accept(Arc::clone(socket))
                     }
+                    gex_kernel::BlockOp::FileLock { .. } => Waiting::Lock,
                     // `sigsuspend` waits for a signal, and only a signal: one
                     // from another process notifies this process's wait queue
                     // (the process table does), one from a thread of its own
@@ -9880,8 +9927,9 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
-    v.extend_from_slice(&k.creds.uid().to_le_bytes());
-    v.extend_from_slice(&k.creds.gid().to_le_bytes());
+    v.extend_from_slice(&k.creds.save());
+    // And the root a `chroot` made, the rest.
+    v.extend_from_slice(k.vfs.root().as_bytes());
     v
 }
 
@@ -9892,7 +9940,8 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
     let mut limits = k.rlimits.get();
-    if rest.len() != 4 + limits.len() * 16 + 8 {
+    let ids = 4 + limits.len() * 16;
+    if rest.len() < ids + gex_kernel::syscalls::Creds::SAVED {
         return;
     }
     k.signals = sig;
@@ -9905,9 +9954,17 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
     k.rlimits.set(limits);
-    let at = 4 + limits.len() * 16;
-    k.creds.set_uid(u32::from_le_bytes(rest[at..at + 4].try_into().unwrap()));
-    k.creds.set_gid(u32::from_le_bytes(rest[at + 4..at + 8].try_into().unwrap()));
+    let saved = ids + gex_kernel::syscalls::Creds::SAVED;
+    k.creds.restore(&rest[ids..saved]);
+    let root = String::from_utf8_lossy(&rest[saved..]);
+    if !root.is_empty() && root != "/" {
+        // The directory came over in the chrooted namespace's terms, and
+        // was set before there was one.
+        let cwd = k.cwd();
+        if k.vfs.chroot(&root).is_ok() {
+            let _ = k.set_cwd(&cwd);
+        }
+    }
 }
 
 #[no_mangle]
@@ -11751,6 +11808,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Handlers are addresses in the image being replaced; see Signals::exec.
     let leader = h.kernel.pid;
     h.kernel.exec_signals(leader);
+    h.kernel.creds.exec();
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its
@@ -13537,6 +13595,10 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
             _ => true,
         },
         Waiting::Accept(socket) => socket.poll_readable(),
+        Waiting::Lock => match blocked_on {
+            Some(gex_kernel::BlockOp::FileLock { locks, req }) => locks.would_grant(req),
+            _ => true,
+        },
         Waiting::Signal => false,
         // One of the set pending: the thread's own, or the process's (what
         // other processes sent is collected before this is asked,
@@ -13638,7 +13700,7 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
 
 /// What a parked thread is waiting for, in one word for a census: only the
 /// shape of the wait matters, not the handles and futex parks `Waiting` holds.
-fn waiting_name(w: &Waiting) -> &'static str {
+pub(crate) fn waiting_name(w: &Waiting) -> &'static str {
     match w {
         Waiting::Runnable => "runnable",
         Waiting::Elsewhere => "another worker",
@@ -13648,6 +13710,7 @@ fn waiting_name(w: &Waiting) -> &'static str {
         Waiting::Read(_) => "read",
         Waiting::Write(_) => "write",
         Waiting::Accept(_) => "accept",
+        Waiting::Lock => "lock",
         Waiting::Child => "wait4",
         Waiting::Net(Some(_)) => "net+timeout",
         Waiting::Net(None) => "net",
@@ -14322,6 +14385,8 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A `recvmsg` on a blocking socket: until it is readable, then made
         // again (`Owed::reissue`).
         gex_kernel::BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
+        // A file lock held in the way, as the kernel's park.
+        gex_kernel::BlockOp::FileLock { .. } => Waiting::Lock,
         // A blocking `connect`, as the kernel's park: until the
         // connection is up, refused or gone (`wait_ready`'s `Net`).
         gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
@@ -14620,6 +14685,9 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
         trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={}\n", op.is_some()));
     }
     let mut gm = GuestMem::new(guest_bytes());
+    // What other processes wrote back while the call waited
+    // (`Kernel::finish_blocking`, as the native host's).
+    sigs::catch_up_shared(&mut gm);
     let Some(op) = op else {
         // A futex thread arriving with nothing to finish must still receive
         // a legal result. Linux permits spurious futex wakes, and zero is
@@ -14744,6 +14812,9 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
+        // A file lock that may be free now: the call again (`PI_RETRY`),
+        // which takes it or parks once more.
+        gex_kernel::BlockOp::FileLock { .. } => Err(PI_RETRY),
         // Take the lock if it is free (the waiters bit stays set, so the
         // next unlock goes through the kernel); else `PI_RETRY`: the caller
         // makes the syscall again, which parks once more.
@@ -18198,18 +18269,32 @@ fn kuser_unfolded(arg: i64, resumable: bool) {
 }
 
 /// A "memory access out of bounds" trap the run loop caught (gex.mjs):
-/// the guest's, a null pointer's read or write at the null guard
-/// (`gex_abi::NULL_GUARD`) or a wild pointer past the end, unless this
-/// thread was in a syscall or translating, where it is the runtime's own
-/// crash (0: JS reports it as one). The guest's is a fault at the context's
-/// pc as the faulting code last wrote it back (a block's start in tier-1),
-/// its address unknown (0, a null pointer's): an access violation for a
-/// process with a fault hook (32-bit Wine), else SIGSEGV for its handler, else the
-/// process dies of it. 1: the trap is a handoff, the resume set or the
-/// process ended.
+/// [`gex_guest_trap`] with `SIGSEGV`.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
-    if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() {
+    gex_guest_trap(ctx_addr, 11)
+}
+
+/// A trap in guest code the run loop caught (gex.mjs `guestTrapSignal`), as
+/// the signal Linux raises for the same fault: `SIGSEGV` for an access out of
+/// bounds (a null pointer's read or write at the null guard,
+/// `gex_abi::NULL_GUARD`, or a wild pointer past the end), a call through a
+/// null or wrong function pointer (a wasm32 program's indirect call) and a
+/// stack overflow; `SIGFPE` for an integer division by zero or overflow;
+/// `SIGILL` for `unreachable` (`__builtin_trap`, as `ud2` is natively);
+/// `SIGBUS` for a misaligned atomic. Unless this thread was in a syscall,
+/// translating or panicking, where it is the runtime's own crash (0: JS
+/// reports it as one). The guest's is a fault at the context's pc as the
+/// faulting code last wrote it back (a block's start in tier-1), its
+/// address unknown (0, a null pointer's): an access violation for a process
+/// with a fault hook (32-bit Wine; `SIGSEGV` only, any other is reported as a
+/// crash there as before), else the signal for its handler, else the process
+/// dies of it. 1: the trap is a handoff, the resume set or the process
+/// ended. Before this, every trap but an access out of bounds ended the
+/// process as `SIGKILL` (`gex_abandon`), status 137 to its parent.
+#[no_mangle]
+pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
+    if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() || PANICKED.with(|p| p.get()) {
         return 0;
     }
     // Nor while this Worker translates with the JIT state out (`jitout`):
@@ -18222,6 +18307,9 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     if jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
         return 0;
     }
+    if !matches!(signo, 4 | 7 | 8 | 11) {
+        return 0;
+    }
     let c = match my_ctx() {
         0 => ctx_addr as u64,
         m => m,
@@ -18229,12 +18317,24 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     let mut gm = GuestMem::new(guest_bytes());
     let Ok(pc) = gm.read_u64(c + ctx::PC as u64) else { return 0 };
     if cgen::fault_hook() != 0 {
+        if signo != 11 {
+            return 0;
+        }
         cgen::fault_stage(0xc000_0005, 0, 0);
         set_resume(pc);
         set_resume_ctx(c);
         return 1;
     }
-    match sigs::fault(&mut gm, c, 11, pc, 0) {
+    // A wasm32 program's handler runs from a frame its own code finds at a
+    // syscall's return (libgex `__gex_signal_frames`), and the frames that
+    // trapped are gone: it dies of the signal, as with a handler that
+    // returns. Translated code's handler is guest code, run from the frame.
+    if WASM32.load(std::sync::atomic::Ordering::Acquire) {
+        trace_line(&format!("gex: wasm32 program trapped at pc={pc:#x} (signal {signo})\n"));
+        exit_here(-(signo as i32), Some(pc));
+        return 1;
+    }
+    match sigs::fault(&mut gm, c, signo, pc, 0) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
@@ -18243,8 +18343,14 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
             set_resume_ctx(c);
         }
         _ => {
-            trace_line(&format!("gex: guest memory access out of bounds at pc={pc:#x} (SIGSEGV)\n"));
-            exit_here(-11, Some(pc));
+            let what = match signo {
+                4 => "an unreachable instruction (SIGILL)",
+                7 => "a misaligned atomic access (SIGBUS)",
+                8 => "an integer division by zero or overflow (SIGFPE)",
+                _ => "a memory access out of bounds or a bad indirect call (SIGSEGV)",
+            };
+            trace_line(&format!("gex: guest trapped at pc={pc:#x}: {what}\n"));
+            exit_here(-(signo as i32), Some(pc));
         }
     }
     1

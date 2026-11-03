@@ -25,6 +25,7 @@ pub mod wasmprog;
 pub(crate) mod dylink;
 pub mod wasmdll;
 mod ready;
+mod pty;
 mod sys_waits;
 mod stall;
 pub(crate) mod ftab;
@@ -1142,12 +1143,23 @@ fn run_program_with(
             Arc::new(ProcCell::default()),
         ),
     };
-    // Report the host's identity: with hostfs passthrough, a guest that
-    // stats a file and then calls getuid must see a consistent answer.
-    let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
+    // The run's first program is the host's identity (with hostfs
+    // passthrough, a guest that stats a file and then calls getuid must see
+    // a consistent answer) or `--uid`'s. An exec keeps the process's ids,
+    // a `setuid` before it included, with the capabilities the new program
+    // starts with (`Creds::exec`).
+    let creds = if !fresh {
+        kernel.creds.exec();
+        kernel.creds.clone()
+    } else {
+        let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
+        gex_kernel::syscalls::Creds::new(uid, gid)
+    };
+    // The ids the auxiliary vector gives the program (AT_UID, AT_EUID).
+    let (kernel_uid, kernel_gid) = (creds.uid(), creds.gid());
     let mut kernel = Kernel {
         trace: opts.trace,
-        creds: gex_kernel::syscalls::Creds::new(uid, gid),
+        creds,
         argv: opts.args.clone(),
         envp: opts.env.clone(),
         ..kernel
@@ -1379,8 +1391,8 @@ fn run_program_with(
         program,
         opts,
         Identity {
-            uid,
-            gid,
+            uid: kernel_uid,
+            gid: kernel_gid,
             interp_base: program.interp_base(),
             entry_hook: 0,
         },
@@ -2082,6 +2094,18 @@ fn perform_block(
                 blocked::sigwait(seen, left.min(std::time::Duration::from_millis(1)));
             }
         }
+        // `F_SETLKW`, `F_OFD_SETLKW` or a blocking `flock`: the request
+        // again at every release (each one's call wakes the parked,
+        // `wakes_fd_waiters`), until it is granted, a signal ends it, or it
+        // would now deadlock.
+        BlockOp::FileLock { locks, req } => loop {
+            let seen = ready::seq();
+            match locks.apply(&req) {
+                Err(Errno::EAGAIN) => {}
+                r => return r,
+            }
+            turn!(file_lock, seen);
+        },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
@@ -2184,7 +2208,7 @@ mod blocked {
             }
         )*};
     }
-    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept);
+    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept, file_lock);
 
     /// A sleep's (nanosleep, a Windows program's `Sleep`).
     #[inline(never)]
@@ -2294,6 +2318,35 @@ fn run_thread_loop(
                 // SIGSEGV, as it would natively, or its handler runs. The
                 // translated code cannot say which instruction faulted, so
                 // the handler sees the context as last written back.
+                // Any other trap in guest code the same way, as the signal
+                // Linux raises for it ([`trap_signal`]); it used to end the
+                // process as a failed child, status 127.
+                let other = trap_signal(&e).filter(|&s| {
+                    s != signal::SIGSEGV as u32
+                        || !matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds))
+                });
+                let other = other.filter(|_| fault_hook_of(store.data()).is_none() && !crate::dylink::behind(store.data()));
+                if let Some(signo) = other {
+                    let detail = e.downcast_ref::<wasmtime::Trap>().map(|t| t.to_string()).unwrap_or_default();
+                    let at = store.data().memory.clone().map(|m| read_u64(m.bytes(), (ctx_addr + ctx::PC as u64) as usize)).unwrap_or(0);
+                    // A wasm32 program's handler runs from a frame its own code
+                    // finds at a syscall's return (libgex `__gex_signal_frames`),
+                    // and the frames that trapped are gone: it dies of the
+                    // signal, as with a handler that returns. Translated code's
+                    // handler is guest code, run from the frame.
+                    let wasm32 = store.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program);
+                    if let (false, Some(memory)) = (wasm32, store.data().memory.clone()) {
+                        let mut gm = GuestMem::new(memory.bytes());
+                        if let gex_kernel::signal::Delivery::Resume(target) =
+                            store.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signo, at, 0))
+                        {
+                            note_resume(store.data_mut(), target, "trap signal");
+                            pc = target;
+                            continue;
+                        }
+                    }
+                    return Ok(Stopped::Exited(Exit::Signal { signal: signo as i32, pc: at, detail, internal: false }));
+                }
                 if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
                     let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
                     // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
@@ -2803,6 +2856,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     (127, 127 << 8)
                 }
             };
+            // Its record locks, however it ended (a descriptor table the
+            // process drops closes nothing), and whoever waits for them.
+            kernel.lock().unwrap_or_else(|e| e.into_inner()).file_locks.release_pid(pid, None);
+            ready::notify();
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
@@ -3427,6 +3484,10 @@ fn mount_filesystems(
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
+    // Pseudoterminals (`/dev/ptmx`, `/dev/pts`): a terminal emulator's
+    // shell. The pairs live in this host process (`pty.rs`).
+    devfs.add_pts(Arc::new(crate::pty::in_use));
+    kernel.ptys = Some(crate::pty::remote(Arc::clone(&kernel.procs)));
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
@@ -7344,6 +7405,26 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
     };
     let pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     Ok((pc != 0).then_some(pc))
+}
+
+/// The signal Linux raises for the fault a trap in guest code stands for:
+/// SIGSEGV for an access out of bounds, a call through a null or
+/// mismatched function pointer or past the table (a wasm32 program's
+/// indirect call) and a stack overflow; SIGFPE for an integer division by
+/// zero or overflow; SIGILL for `unreachable` (`__builtin_trap`, as `ud2`);
+/// SIGBUS for a misaligned atomic. None for anything else. Every trap is the
+/// guest's here: the runtime's own code is the host's, not wasm.
+fn trap_signal(e: &anyhow::Error) -> Option<u32> {
+    use wasmtime::Trap as T;
+    Some(match e.downcast_ref::<T>()? {
+        T::MemoryOutOfBounds | T::BadSignature | T::TableOutOfBounds | T::IndirectCallToNull | T::StackOverflow => {
+            signal::SIGSEGV as u32
+        }
+        T::IntegerDivisionByZero | T::IntegerOverflow => signal::SIGFPE as u32,
+        T::UnreachableCodeReached => signal::SIGILL as u32,
+        T::HeapMisaligned => 7,
+        _ => return None,
+    })
 }
 
 fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {

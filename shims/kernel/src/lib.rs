@@ -1679,6 +1679,54 @@ pub extern "C" fn k_task_owner(id: i32) -> i32 {
     procs().task_owner(id).unwrap_or(0)
 }
 
+/// Every process's file locks (`gex_kernel::locks`), made on first use
+/// (its queue needs the wait hooks).
+fn locks() -> &'static gex_kernel::locks::FileLocks {
+    static L: std::sync::OnceLock<gex_kernel::locks::FileLocks> = std::sync::OnceLock::new();
+    L.get_or_init(gex_kernel::locks::FileLocks::new)
+}
+
+/// One lock call from process `caller` (`gex_kernel::locks::encode`'s
+/// bytes at `req`): its answer, or a negated errno; `F_GETLK`'s holder
+/// written to `out`.
+#[no_mangle]
+pub extern "C" fn k_lock_call(req: gex_kmem::PAddr, req_len: u32, out: gex_kmem::PAddr, out_len: u32, caller: i32) -> i64 {
+    note_panics();
+    let mut b = vec![0u8; req_len as usize];
+    if req_len > 0 {
+        unsafe { gex_kmem::pull_checked(b.as_mut_ptr(), req, req_len) };
+    }
+    let mut o = vec![0u8; out_len.min(64) as usize];
+    let r = locks().serve(caller, &b, &mut o);
+    // A lock granted on a file this kernel holds: the file's change count
+    // with the answer, so the caller's shared mappings of it need no call
+    // of their own to know nobody changed it (`FileLocks::set_seen`).
+    use gex_kernel::locks::call;
+    if r >= 0 && o.len() >= 8 && matches!(b.first(), Some(&(call::FLOCK | call::SET | call::SET_WAIT))) {
+        if let Some(h) = gex_kernel::locks::decode(&b).filter(|d| d.handle >= 0).and_then(|d| handle_at(d.handle)) {
+            o[..8].copy_from_slice(&h.changes().to_le_bytes());
+        }
+    }
+    if !o.is_empty() {
+        unsafe { gex_kmem::push_checked(out, o.as_ptr(), o.len() as u32) };
+    }
+    r
+}
+
+/// How many shared-mapping write-backs there have been (`locks::write_seq`):
+/// one load, at the system call entry of every process that maps a file shared.
+#[no_mangle]
+pub extern "C" fn k_lock_seq() -> u64 {
+    gex_kernel::locks::write_seq()
+}
+
+/// The queue every lock release notifies.
+#[no_mangle]
+pub extern "C" fn k_lock_queue() -> u32 {
+    note_panics();
+    locks().queue_id()
+}
+
 /// Record that `pid` has exited. `status` is an exit code, or the negated
 /// signal number when it died of one (the `ProcTable::exit` convention);
 /// [`k_wait`] turns the two into the one word a parent reads.
@@ -1688,6 +1736,8 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     // it like any other signal so a delivery can be traced back to the process
     // that ended -- "why did the terminal think its shell died" needs the pid.
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
+    // Its record locks, however it ended.
+    locks().release_pid(pid, None);
     procs().exit(pid, status);
 }
 
@@ -1937,6 +1987,17 @@ pub extern "C" fn k_request_halt(code: i32) {
 #[no_mangle]
 pub extern "C" fn k_halt_code() -> i32 {
     procs().halt_code().unwrap_or(-1)
+}
+
+/// A process's ids and capabilities, for the others' `/proc/<pid>/status`.
+#[no_mangle]
+pub extern "C" fn k_proc_set_creds(pid: i32, at: gex_kmem::PAddr, len: u32) {
+    let len = len.min(256);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    procs().set_creds(pid, &buf);
 }
 
 /// A process's name and command line, for the others' `/proc/<pid>`.
@@ -2481,7 +2542,7 @@ pub extern "C" fn k_pty_set_termios(id: i32, at: gex_kmem::PAddr, len: u32, flus
     if flush != 0 {
         p.flush(gex_kernel::tty::TCIFLUSH);
     }
-    p.tty.set_termios(&buf);
+    p.set_termios(&buf);
     0
 }
 
@@ -3622,7 +3683,7 @@ static POPULATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 // instead, local to each other (`gex_kernel::unix` unchanged); each process
 // holds an id.
 
-use gex_kernel::unix::{SocketNames, UnixSocket};
+use gex_kernel::unix::{Cred, SocketNames, UnixSocket};
 
 /// Every name a guest has bound, in the memory every Worker shares.
 fn names() -> &'static SocketNames {
@@ -3664,13 +3725,17 @@ fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
 
 /// Bind and listen in one: a remote socket has no state between `bind` and
 /// `listen` worth modelling. Returns a listener id, or a negated errno.
+/// `pid`, `uid` and `gid` are the binding process's, which a client's
+/// `SO_PEERCRED` reports (a caller with none to give, the page's own
+/// JavaScript, passes zeros: root).
 #[no_mangle]
-pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    sock_bind(path_of_raw(path, path_len))
+pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    sock_bind(path_of_raw(path, path_len), Cred { pid, uid, gid })
 }
 
-fn sock_bind(p: String) -> i32 {
+fn sock_bind(p: String, cred: Cred) -> i32 {
     let s = std::sync::Arc::new(UnixSocket::new(true));
+    s.set_cred(cred);
     if let Err(e) = s.bind(&p) {
         return -e.0;
     }
@@ -3693,14 +3758,16 @@ pub extern "C" fn k_sock_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_km
     names().rename_name(&from, to.as_deref());
 }
 
-/// Connect to a name. Returns this end's id, or a negated errno.
+/// Connect to a name, as `pid`, `uid` and `gid` (what the server's
+/// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    sock_connect(path_of_raw(path, path_len))
+pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    sock_connect(path_of_raw(path, path_len), Cred { pid, uid, gid })
 }
 
-fn sock_connect(p: String) -> i32 {
+fn sock_connect(p: String, cred: Cred) -> i32 {
     let s = std::sync::Arc::new(UnixSocket::new(true));
+    s.set_cred(cred);
     match names().connect(&s, &p) {
         // The listener's queue is notified by the connect itself.
         Ok(_) => keep(s),
@@ -3816,10 +3883,27 @@ pub extern "C" fn k_sock_close(id: i32) {
     }
 }
 
-/// A connected stream pair, for `socketpair`: both ids as two `u32`s at `out`.
+/// The far end's credentials, as the two ends were joined: pid, uid and
+/// gid as three `u32`s at `out` in the caller's memory. `-ENOTCONN` when
+/// there are none.
 #[no_mangle]
-pub extern "C" fn k_sock_pair(out: gex_kmem::PAddr) -> i32 {
+pub extern "C" fn k_sock_peer_cred(id: i32, out: gex_kmem::PAddr) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let Some(c) = s.peer_cred() else { return -107 };
+    let mut bytes = [0u8; 12];
+    bytes[..4].copy_from_slice(&c.pid.to_le_bytes());
+    bytes[4..8].copy_from_slice(&c.uid.to_le_bytes());
+    bytes[8..].copy_from_slice(&c.gid.to_le_bytes());
+    unsafe { gex_kmem::push_checked(out, bytes.as_ptr(), 12) };
+    0
+}
+
+/// A connected stream pair, for `socketpair` by `pid`, `uid` and `gid`:
+/// both ids as two `u32`s at `out`.
+#[no_mangle]
+pub extern "C" fn k_sock_pair(out: gex_kmem::PAddr, pid: i32, uid: u32, gid: u32) -> i32 {
     let (a, b) = UnixSocket::pair();
+    UnixSocket::set_pair_cred(&a, &b, Cred { pid, uid, gid });
     let ids = [keep(a) as u32, keep(b) as u32];
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&ids[0].to_le_bytes());
@@ -3890,12 +3974,21 @@ unsafe fn kernel_bytes_mut<'a>(at: gex_kmem::PAddr, len: u32) -> &'a mut [u8] {
 // The `k_sock_*` calls a moved socket makes from here, its buffers in this
 // module's memory rather than a process's (the loopback ports and UDP's
 // streams are unix sockets in the table above).
-extern "C" fn kl_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned())
+extern "C" fn kl_sock_bind(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid })
 }
 
-extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned())
+extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid })
+}
+
+extern "C" fn kl_sock_peer_cred(id: i32, out: gex_kmem::PAddr) -> i32 {
+    let Some(c) = sock_at(id).and_then(|s| s.peer_cred()) else { return -107 };
+    let b = unsafe { kernel_bytes_mut(out, 12) };
+    b[..4].copy_from_slice(&c.pid.to_le_bytes());
+    b[4..8].copy_from_slice(&c.uid.to_le_bytes());
+    b[8..].copy_from_slice(&c.gid.to_le_bytes());
+    0
 }
 
 extern "C" fn kl_sock_exists(path: gex_kmem::PAddr, path_len: u32) -> i32 {
@@ -3941,7 +4034,7 @@ extern "C" fn kl_sock_read_fds(
     n
 }
 
-extern "C" fn kl_sock_pair(_out: gex_kmem::PAddr) -> i32 {
+extern "C" fn kl_sock_pair(_out: gex_kmem::PAddr, _pid: i32, _uid: u32, _gid: u32) -> i32 {
     -38
 }
 
@@ -3954,6 +4047,7 @@ fn kernel_sockets() -> gex_kernel::unix::Remote {
         queue: k_sock_queue,
         bind: kl_sock_bind,
         connect: kl_sock_connect,
+        peer_cred: kl_sock_peer_cred,
         accept: k_sock_accept,
         pending: k_sock_pending,
         read: kl_sock_read,

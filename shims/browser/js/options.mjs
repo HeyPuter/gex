@@ -87,6 +87,9 @@ export const OPTIONS = [
   // one pid, or of one program's processes.
   ['strace',         'GEX_STRACE',           'strace',        null,                    'flag',   'opts',  false],
   ['stracePid',      'GEX_STRACE_PID',       'stracepid',     'GEX_STRACE_PID',        'num',    'opts',  false],
+  // A parked thread says what it waits on once its wait has lasted N s,
+  // 2N, 4N... (waitq.rs `PARK_REPORT_NS`): a hung page's threads.
+  ['parkReport',     'GEX_PARK_REPORT',      'parkreport',    'GEX_PARK_REPORT',       'num',    'opts',  false],
   ['straceExe',      'GEX_STRACE_EXE',       'straceexe',     null,                    'str',    'opts',  false],
 ];
 

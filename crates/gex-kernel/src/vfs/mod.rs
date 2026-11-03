@@ -21,6 +21,7 @@ pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
 pub mod blocks;
+pub mod subtree;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
@@ -1035,6 +1036,16 @@ impl VfsView {
         self.change(|ns| ns.unmount(path))
     }
 
+    /// [`Namespace::chroot`] of the namespace as published.
+    pub fn chroot(&self, dir: &str) -> Result<(), Errno> {
+        let mut err = Ok(());
+        self.change(|ns| {
+            err = ns.chroot(dir);
+            err.is_ok()
+        });
+        err
+    }
+
     /// Mount `fs` at `at` unless something is mounted there already:
     /// whether it did.
     pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
@@ -1123,7 +1134,28 @@ impl Vfs {
         let ns = self.view.0.get();
         self.ns.mounts.clone_from(&ns.mounts);
         self.ns.others.clone_from(&ns.others);
+        if self.ns.root != ns.root {
+            // A `chroot`: the directory too, as it left it.
+            self.ns.root.clone_from(&ns.root);
+            if self.held.is_none() {
+                self.ns.cwd.clone_from(&ns.cwd);
+            }
+        }
         self.mounts = now;
+    }
+
+    /// `chroot` to `path` ([`VfsView::chroot`]): a directory, its links
+    /// followed. `path` is in the namespace as it is now; a host restoring
+    /// a process gives the root it had ([`Namespace::root`]), which names
+    /// the same directory while this one's root is still `/`.
+    pub fn chroot(&mut self, path: &str) -> Result<(), Errno> {
+        let dir = self.ns.canonical(&normalize(path, &self.ns.cwd));
+        if self.ns.metadata(&dir)?.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        self.view.0.chroot(&dir)?;
+        self.refresh();
+        Ok(())
     }
 
     /// Mount `fs` at `at` ([`VfsView::mount`]).
@@ -1183,6 +1215,9 @@ pub struct Namespace {
     others: String,
     /// Current working directory, always absolute and normalised.
     pub cwd: String,
+    /// Where this namespace's `/` is in the one the process started with:
+    /// `/` until a `chroot` ([`Namespace::chroot`]).
+    root: String,
 }
 
 impl Namespace {
@@ -1191,7 +1226,53 @@ impl Namespace {
             mounts: BTreeMap::new(),
             others: String::new(),
             cwd: "/".to_string(),
+            root: "/".to_string(),
         }
+    }
+
+    /// Where `/` is in the namespace the process started with.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Absolute `abs` as the namespace the process started with names it:
+    /// what is the same object in every process's view whatever its root
+    /// (a socket's name in the table every process shares).
+    pub fn outer_path<'a>(&self, abs: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.root == "/" || !abs.starts_with('/') {
+            return std::borrow::Cow::Borrowed(abs);
+        }
+        std::borrow::Cow::Owned(if abs == "/" { self.root.clone() } else { format!("{}{abs}", self.root) })
+    }
+
+    /// `chroot` to `dir` (absolute, normal, its links followed, a
+    /// directory): the mounts at and under it, moved up to `/`, and the
+    /// filesystem it is in as the root, from it down ([`subtree::Subtree`]).
+    /// A mount elsewhere is out of sight. The directory stays where it was
+    /// when inside; outside, it is the new root (Linux leaves one outside
+    /// where it is, a way out of the root that this namespace, which names
+    /// directories by path, cannot give).
+    fn chroot(&mut self, dir: &str) -> Result<(), Errno> {
+        if dir == "/" {
+            return Ok(());
+        }
+        let mut mounts = BTreeMap::new();
+        for (at, fs) in &self.mounts {
+            if within(at, dir) {
+                let moved = if at.len() == dir.len() { "/".to_string() } else { at[dir.len()..].to_string() };
+                mounts.insert(moved, fs.clone());
+            }
+        }
+        if !mounts.contains_key("/") {
+            let (fs, rel) = self.mount_of(dir.to_string())?;
+            let root: Arc<dyn FileSystem> = if rel.is_empty() { fs.clone() } else { Arc::new(subtree::Subtree::new(fs.clone(), &rel)) };
+            mounts.insert("/".to_string(), root);
+        }
+        self.mounts = mounts;
+        self.list_others();
+        self.cwd = if within(&self.cwd, dir) && self.cwd.len() > dir.len() { self.cwd[dir.len()..].to_string() } else { "/".to_string() };
+        self.root = self.outer_path(dir).into_owned();
+        Ok(())
     }
 
     fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
@@ -1842,6 +1923,61 @@ mod tests {
         for p in ["", "a", "//", "/a/", "/a//b", "/a/./b", "/a/..", "/."] {
             assert!(!is_normal(p), "{p}");
         }
+    }
+
+    /// `chroot`: the root a directory of the old one's filesystem, its
+    /// mounts under it moved up, the rest out of sight; absolute links and
+    /// `..` resolve inside it; a socket's name is the outer path; a second
+    /// chroot nests; a fork's copy keeps it.
+    #[test]
+    fn chroot_resolves_inside_the_new_root() {
+        let root = Arc::new(TmpFs::new());
+        root.add_dir("srv");
+        root.add_dir("srv/jail");
+        root.add_dir("srv/jail/etc");
+        root.add_dir("srv/jail/inner");
+        root.add_dir("srv/jail/proc");
+        root.add_file("srv/jail/etc/f", b"inside".to_vec());
+        root.add_file("srv/jail/inner/g", b"deeper".to_vec());
+        root.add_dir("etc");
+        root.add_file("etc/f", b"outside".to_vec());
+        root.symlink("/etc", "srv/jail/link").unwrap();
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        let proc_fs = Arc::new(TmpFs::new());
+        proc_fs.add_file("version", b"p".to_vec());
+        v.mount("/srv/jail/proc", proc_fs);
+        v.mount("/elsewhere", Arc::new(TmpFs::new()));
+        v.set_cwd("/srv/jail/inner").unwrap();
+        let read = |v: &Vfs, p: &str| {
+            let h = v.open(p, 0, 0).map_err(|e| e.0)?;
+            let mut b = [0u8; 16];
+            let n = h.read_at(0, &mut b).map_err(|e| e.0)?;
+            Ok::<_, i32>(String::from_utf8_lossy(&b[..n as usize]).into_owned())
+        };
+        assert_eq!(read(&v, "/etc/f").unwrap(), "outside");
+        assert_eq!(v.chroot("/srv/jail/etc/f").err(), Some(Errno::ENOTDIR));
+        v.chroot("/srv/jail").unwrap();
+        assert_eq!(v.root(), "/srv/jail");
+        assert_eq!(v.cwd, "/inner");
+        for p in ["/etc/f", "/link/f", "/../../etc/f", "/inner/../etc/f"] {
+            assert_eq!(read(&v, p).unwrap(), "inside", "{p}");
+        }
+        assert_eq!(read(&v, "/proc/version").unwrap(), "p");
+        assert!(v.metadata("/elsewhere").is_err());
+        assert!(v.metadata("/srv").is_err());
+        assert_eq!(v.read_link("/link").unwrap(), "/etc");
+        assert_eq!(v.outer_path("/run/s"), "/srv/jail/run/s");
+        assert_eq!(v.outer_path("\0abstract"), "\0abstract");
+        let child = v.clone();
+        assert_eq!(read(&child, "/etc/f").unwrap(), "inside");
+        assert_eq!(child.root(), "/srv/jail");
+        v.chroot("/inner").unwrap();
+        assert_eq!(v.root(), "/srv/jail/inner");
+        assert_eq!(v.cwd, "/");
+        assert_eq!(read(&v, "/g").unwrap(), "deeper");
+        // The published view has it too.
+        assert_eq!(v.view().get().root(), "/srv/jail/inner");
     }
 
     #[test]

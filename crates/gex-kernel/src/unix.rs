@@ -238,6 +238,8 @@ pub struct UnixSocket {
     peer_cred: Mutex<Option<Cred>>,
     /// Its last descriptor has closed ([`Self::release`]).
     gone: AtomicBool,
+    /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
+    passcred: AtomicBool,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -260,7 +262,17 @@ impl UnixSocket {
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
             gone: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    /// `SO_PASSCRED`, set and read.
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     /// Record the credentials of the process making this end (before its
@@ -1470,142 +1482,8 @@ impl FileHandle for MemFd {
     }
 }
 
-/// Whole-file advisory locks: `flock`.
-///
-/// A lock belongs to the *open file description*, so `dup`/`fork` share one and
-/// two separate `open`s of a path contend -- the rule that makes `flock` a
-/// parent/child mutex.
-///
-/// Deliberate deviation: a blocking request that cannot be granted returns
-/// `EWOULDBLOCK` rather than waiting (nothing here contends in practice), since
-/// granting it anyway would let two writers believe they are alone.
-#[derive(Debug, Default)]
-pub struct FileLocks {
-    held: Mutex<Vec<Held>>,
-}
-
-#[derive(Debug)]
-struct Held {
-    /// What is locked. Two `open`s of one path contend; two paths do not.
-    file: String,
-    /// Who holds it: the open file description, not the process.
-    key: usize,
-    exclusive: bool,
-}
-
-/// `flock`'s operations.
-pub mod lock_op {
-    pub const SH: u64 = 1;
-    pub const EX: u64 = 2;
-    pub const NB: u64 = 4;
-    pub const UN: u64 = 8;
-}
-
-impl FileLocks {
-    pub fn new() -> FileLocks {
-        FileLocks::default()
-    }
-
-    /// Apply an operation for one open file description. `file` names the
-    /// resource, `key` the owner -- both matter, or a lock on one file wrongly
-    /// conflicts with every other.
-    pub fn flock(&self, file: &str, key: usize, op: u64) -> SysResult {
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        if op & lock_op::UN != 0 {
-            held.retain(|h| h.key != key);
-            return Ok(0);
-        }
-        let exclusive = op & lock_op::EX != 0;
-        if !exclusive && op & lock_op::SH == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let conflict = held
-            .iter()
-            .any(|h| h.file == file && h.key != key && (exclusive || h.exclusive));
-        if conflict {
-            return Err(Errno::EWOULDBLOCK);
-        }
-        // Re-locking the same description converts the mode, not stacks a lock.
-        held.retain(|h| !(h.file == file && h.key == key));
-        held.push(Held {
-            file: file.to_string(),
-            key,
-            exclusive,
-        });
-        Ok(0)
-    }
-
-    /// Drop everything a description held, when it is closed.
-    pub fn release(&self, key: usize) {
-        self.held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|h| h.key != key);
-    }
-}
-
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
-
-    #[test]
-    fn an_exclusive_lock_excludes_another_description() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
-        assert_eq!(
-            l.flock("/a", 2, lock_op::EX | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-        assert_eq!(
-            l.flock("/a", 2, lock_op::SH | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-        l.flock("/a", 1, lock_op::UN).unwrap();
-        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
-    }
-
-    #[test]
-    fn a_lock_on_one_file_says_nothing_about_another() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
-        assert_eq!(l.flock("/b", 2, lock_op::EX), Ok(0));
-        assert_eq!(l.flock("/c", 3, lock_op::EX), Ok(0));
-    }
-
-    #[test]
-    fn shared_locks_coexist() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
-        assert_eq!(l.flock("/a", 2, lock_op::SH), Ok(0));
-        assert_eq!(
-            l.flock("/a", 3, lock_op::EX | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-    }
-
-    #[test]
-    fn the_same_description_may_relock_and_convert() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
-        assert_eq!(
-            l.flock("/a", 1, lock_op::EX),
-            Ok(0),
-            "converting is not contention"
-        );
-        assert_eq!(
-            l.flock("/a", 2, lock_op::SH | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-    }
-
-    #[test]
-    fn closing_releases() {
-        let l = FileLocks::new();
-        l.flock("/a", 1, lock_op::EX).unwrap();
-        l.release(1);
-        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
-    }
-}
+/// Advisory locks, `flock`'s and `fcntl`'s ([`crate::locks`]).
+pub use crate::locks::{lock_op, FileLocks};
 
 /// An `epoll` set: the descriptors a program watches and what it wants told
 /// about each. `epoll_wait` turns the registrations back into the list `poll`
@@ -1896,10 +1774,17 @@ mod epoll_tests {
 /// kernel and each end is just an id; only the id and the bytes cross.
 #[derive(Clone, Copy, Debug)]
 pub struct Remote {
-    /// Bind and listen in one. Returns a listener id or a negated errno.
-    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// Connect to a name. Returns this end's id, or a negated errno.
-    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    /// Bind and listen in one, as the process `pid` with ids `uid` and
+    /// `gid` (what a client's `SO_PEERCRED` reports). Returns a listener id
+    /// or a negated errno.
+    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// Connect to a name, as `pid`, `uid` and `gid` (what the server's
+    /// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
+    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// The far end's `struct ucred` as it was when the two were joined:
+    /// pid, uid and gid as three little-endian words at `out`. Zero, or a
+    /// negated errno (`ENOTCONN`: no peer, or none known).
+    pub peer_cred: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
     /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
     pub accept: extern "C" fn(listener: i32) -> i32,
     pub pending: extern "C" fn(listener: i32) -> i32,
@@ -1915,9 +1800,10 @@ pub struct Remote {
     /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
     pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// A connected pair, as `socketpair` makes: both ids written as two
-    /// little-endian `u32`s at `out`. Zero or a negated errno.
-    pub pair: extern "C" fn(out: crate::PAddr) -> i32,
+    /// A connected pair, as `socketpair` makes, by `pid`, `uid` and `gid`
+    /// (each end's peer): both ids written as two little-endian `u32`s at
+    /// `out`. Zero or a negated errno.
+    pub pair: extern "C" fn(out: crate::PAddr, pid: i32, uid: u32, gid: u32) -> i32,
     /// Another id on the same end, for a descriptor that is going to another
     /// process (a fork, or `SCM_RIGHTS`) and must outlive this one closing.
     pub dup: extern "C" fn(id: i32) -> i32,
@@ -1965,6 +1851,8 @@ pub struct RemoteUnix {
     pub peer: Option<String>,
     pub remote: Remote,
     nonblocking: AtomicBool,
+    /// `SO_PASSCRED` (this process's, as the option is the descriptor's).
+    passcred: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteUnix {
@@ -1979,6 +1867,16 @@ impl std::fmt::Debug for RemoteUnix {
 }
 
 impl RemoteUnix {
+    /// The far end's credentials ([`Remote::peer_cred`]), when known.
+    pub fn peer_cred(&self) -> Option<Cred> {
+        let mut b = [0u8; 12];
+        if (self.remote.peer_cred)(self.id, b.as_mut_ptr() as crate::PAddr) != 0 {
+            return None;
+        }
+        let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        Some(Cred { pid: w(0) as i32, uid: w(1), gid: w(2) })
+    }
+
     pub fn new(id: i32, listening: bool, peer: Option<String>, remote: Remote) -> RemoteUnix {
         RemoteUnix {
             id,
@@ -1986,7 +1884,16 @@ impl RemoteUnix {
             peer,
             remote,
             nonblocking: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     pub fn set_nonblocking(&self, on: bool) {

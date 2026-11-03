@@ -336,14 +336,14 @@ fn gather(home: &Home) {
         gex_kernel::proc::signal_seq()
     };
     if SEQ_SEEN.with(|c| c.replace(seq)) != seq {
-        home.sig.collect(&home.procs, home.pid, home.creds.uid());
+        home.sig.collect(&home.procs, home.pid, home.creds.ruid());
         // Another process's `tgkill` to this Worker's thread: its own, so
         // taken here (the kernel's `collect_signals` takes the rest, and
         // drops those for threads gone).
         MINE.with(|m| {
             if let Some((tid, t)) = m.borrow().as_ref() {
                 for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
-                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.uid() });
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.ruid() });
                 }
             }
         });
@@ -442,7 +442,7 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         // Linux sends it as the writer itself sending it (SI_USER).
         view.raise_from(
             signal::sig::SIGPIPE,
-            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.uid() },
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.ruid() },
         );
     }
     if suspended.is_some() {
@@ -463,6 +463,14 @@ pub(crate) fn restarts(class: signal::Restart) -> bool {
     let Some(view) = view(home) else { return false };
     gather(home);
     view.restarts(class)
+}
+
+/// This Worker's process's shared file mappings, caught up with what other
+/// processes wrote back (`SharedMapView::catch_up`). No kernel lock.
+pub(crate) fn catch_up_shared(gm: &mut GuestMem<'_>) {
+    if let Some(home) = home() {
+        home.mm.shared_maps().catch_up(gm);
+    }
 }
 
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
@@ -500,7 +508,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     };
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid, creds: &home.creds, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
+        io: FdIo { fds, compat, wasm32: crate::WASM32.load(std::sync::atomic::Ordering::Relaxed), ns: &ns, pid: home.pid, creds: &home.creds, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
         map: map(),
         path: PathIo {
             ns: &ns,

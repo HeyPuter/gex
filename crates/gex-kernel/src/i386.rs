@@ -54,6 +54,13 @@ pub mod raw {
     pub const GETPID: u64 = 20;
     pub const MOUNT: u64 = 21;
     pub const SETUID16: u64 = 23;
+    pub const CHROOT: u64 = 61;
+    pub const SETFSUID16: u64 = 138;
+    pub const SETFSGID16: u64 = 139;
+    pub const CAPGET: u64 = 184;
+    pub const CAPSET: u64 = 185;
+    pub const SETFSUID: u64 = 215;
+    pub const SETFSGID: u64 = 216;
     pub const GETUID16: u64 = 24;
     pub const ALARM: u64 = 27;
     pub const PAUSE: u64 = 29;
@@ -394,6 +401,15 @@ fn widen_time(m: &mut GuestMem<'_>, p: u64, scratch: u64, scale: u64) -> u64 {
 /// returns), without its arguments: for a host deciding, before the kernel
 /// runs, what kind of call this is (whether it can wake anyone, whether it
 /// can read `/proc`).
+/// A 16-bit call's user or group id as the 32-bit calls take it: its low
+/// 16 bits, 0xffff (-1, "leave alone") widened to -1 (Linux's `low2highuid`).
+fn id16(v: u64) -> u64 {
+    match v as u16 {
+        0xffff => u32::MAX as u64,
+        id => id as u64,
+    }
+}
+
 pub fn canonical_number(raw: u64) -> u64 {
     let mut a = [0u64; 6];
     let mut scratch = [0u8; 256];
@@ -509,16 +525,24 @@ pub fn translate(
             }
             nr::SETXATTR + (n - x::SETXATTR)
         }
-        x::LCHOWN | x::LCHOWN16 => {
+        x::LCHOWN => {
             *a = [AT_FDCWD, a[0], a[1], a[2], AT_SYMLINK_NOFOLLOW, 0];
+            nr::FCHOWNAT
+        }
+        x::LCHOWN16 => {
+            *a = [AT_FDCWD, a[0], id16(a[1]), id16(a[2]), AT_SYMLINK_NOFOLLOW, 0];
             nr::FCHOWNAT
         }
         x::CHOWN => {
             *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
             nr::FCHOWNAT
         }
-        x::FCHOWN | x::FCHOWN16 => {
+        x::FCHOWN => {
             a[0] = sext(a[0]);
+            nr::FCHOWN
+        }
+        x::FCHOWN16 => {
+            *a = [sext(a[0]), id16(a[1]), id16(a[2]), 0, 0, 0];
             nr::FCHOWN
         }
         x::FCHOWNAT => {
@@ -560,10 +584,30 @@ pub fn translate(
         x::GETEUID | x::GETEUID16 => nr::GETEUID,
         x::GETGID | x::GETGID16 => nr::GETGID,
         x::GETEGID | x::GETEGID16 => nr::GETEGID,
-        x::SETUID | x::SETUID16 => nr::SETUID,
-        x::SETGID | x::SETGID16 => nr::SETGID,
-        x::SETREUID | x::SETREUID16 => nr::SETREUID,
-        x::SETREGID | x::SETREGID16 => nr::SETREGID,
+        x::SETUID => nr::SETUID,
+        x::SETGID => nr::SETGID,
+        x::SETREUID => nr::SETREUID,
+        x::SETREGID => nr::SETREGID,
+        // The 16-bit ids' -1 (keep) is 0xffff, and the rest of the
+        // register is not the caller's.
+        x::SETUID16 | x::SETGID16 | x::SETREUID16 | x::SETREGID16 | x::SETFSUID16 | x::SETFSGID16 => {
+            for v in a.iter_mut().take(2) {
+                *v = id16(*v);
+            }
+            match n {
+                x::SETUID16 => nr::SETUID,
+                x::SETGID16 => nr::SETGID,
+                x::SETREUID16 => nr::SETREUID,
+                x::SETREGID16 => nr::SETREGID,
+                x::SETFSUID16 => nr::SETFSUID,
+                _ => nr::SETFSGID,
+            }
+        }
+        x::SETFSUID => nr::SETFSUID,
+        x::SETFSGID => nr::SETFSGID,
+        x::CAPGET => nr::CAPGET,
+        x::CAPSET => nr::CAPSET,
+        x::CHROOT => nr::CHROOT,
         x::SETRESUID => nr::SETRESUID,
         x::GETRESUID => nr::GETRESUID,
         x::SETRESGID => nr::SETRESGID,
@@ -690,11 +734,12 @@ pub fn translate(
         }
         x::FCNTL | x::FCNTL64 => {
             // F_GETLK64/F_SETLK64/F_SETLKW64 (12-14) are i386's names for the
-            // lock commands with a flock64; the canonical ones are 5-7. The
-            // kernel reads no field of either struct but l_type, which is
-            // first in both (`Kernel::sys_fcntl`).
+            // lock commands with a flock64, which the canonical ones (5-7)
+            // read in an i386 process; i386's own 5-7 take a `struct flock`
+            // of 32-bit offsets (`syscalls::LK32`).
             a[0] = sext(a[0]);
             a[1] = match a[1] {
+                5..=7 => a[1] | crate::syscalls::LK32,
                 12 => 5,
                 13 => 6,
                 14 => 7,
