@@ -6054,10 +6054,41 @@ pub(crate) enum CalloutSignal {
 }
 
 /// Call-outs nested deeper than this leave instead: each holds a host frame
-/// and a nested wasm call.
+/// and a nested wasm call. Native Wine's guest calls, which cannot leave,
+/// nest as deep as the guest thread's stack and the host's have room for
+/// (`native_call_spent`).
 const CALLOUT_MAX_DEPTH: usize = 32;
-/// The same for native Wine's guest calls, which cannot leave.
-const CALLOUT_MAX_DEPTH_NATIVE: usize = 400;
+
+thread_local! {
+    /// The host's stack pointer at this thread's outermost call-out.
+    static CALLOUT_HOST_SP0: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Why a guest call from native Wine cannot be made: its thread's guest
+/// stack is spent (`win::tramp::native_call_stack_spent`; native Wine's
+/// frames, on that stack, have no guard page), or the host's stack has used
+/// three quarters of the wasm stack since the thread's outermost call-out
+/// (each level holds its native Wine frames and the host's, a few KiB; the
+/// rest is room for what ran below that call-out, short of wasmtime's own
+/// overflow, which would end gexc).
+fn native_call_spent(caller: &Caller<'_, HostState>, ctx_addr: u64, sp: u64) -> Option<&'static str> {
+    let here = 0u8;
+    let host = std::hint::black_box(&here) as *const u8 as usize;
+    if caller.data().callouts.is_empty() {
+        CALLOUT_HOST_SP0.with(|s| s.set(host));
+    } else if CALLOUT_HOST_SP0.with(|s| s.get()).saturating_sub(host) > wasm_stack_bytes() / 4 * 3 {
+        return Some("the host's stack");
+    }
+    if !gex_abi::X86 {
+        return None;
+    }
+    let memory = caller.data().memory.as_ref()?;
+    let class32 = gex_xlate::default_compat() != thread_alt(caller);
+    let teb = read_u64(memory.bytes(), (ctx_addr + if class32 { ctx::FS_BASE } else { ctx::GS_BASE } as u64) as usize);
+    let m = GuestMem::new(memory.bytes());
+    let read = |a: u64| if class32 { m.read_u32(a).ok().map(u64::from) } else { m.read_u64(a).ok() };
+    gex_kernel::win::tramp::native_call_stack_spent(class32, teb, sp, read).then_some("the thread's stack")
+}
 
 /// How far above `sp_want` a safepoint must find the stack pointer to call
 /// a call-out's caller unwound (well past any argument popping), and how far
@@ -6656,8 +6687,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // would never run again and the guest's return to the pad find no
     // call-out. Those nest as deep as the program's callbacks do.
     let pad = ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
-    if pad && caller.data().callouts.len() >= CALLOUT_MAX_DEPTH_NATIVE {
-        eprintln!("gex: native Wine's guest calls nest deeper than {CALLOUT_MAX_DEPTH_NATIVE}: the process ends (stack overflow)");
+    if let Some(what) = pad.then(|| native_call_spent(caller, ctx_i as u32 as u64, sp_want)).flatten() {
+        eprintln!("gex: native Wine's guest calls nest deeper than {what} has room for: the process ends (stack overflow)");
         caller.data_mut().exit = Some(Exit::Status(0xfd));
         return Err(StopExecution.into());
     }

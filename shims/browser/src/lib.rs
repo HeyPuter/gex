@@ -5154,6 +5154,23 @@ pub(crate) fn stack_guard_check() -> Option<(u32, u32, u32)> {
     Some((lo, (top_bad as u32 + 1) * 4, STACK_LEAST.with(|l| l.get())))
 }
 
+/// How much of this Worker's shim stack is left above its guard, read from
+/// the address of a local; `None` with no guard (no slot of its own).
+#[cfg(feature = "shared-memory")]
+pub(crate) fn stack_room() -> Option<u32> {
+    let lo = STACK_LO.with(|l| l.get());
+    if lo == 0 {
+        return None;
+    }
+    let here = 0u8;
+    Some((std::hint::black_box(&here) as *const u8 as u32).saturating_sub(lo + slots::GUARD as u32))
+}
+
+#[cfg(not(feature = "shared-memory"))]
+pub(crate) fn stack_room() -> Option<u32> {
+    None
+}
+
 /// This Worker's shim stack overran its bottom: said once per Worker, at
 /// `site`. A stack that runs down past its megabyte lands on whatever the
 /// arena handed out below it -- a heap span, another Worker's thread-locals

@@ -118,6 +118,30 @@ pub mod tramp {
         pc >= NATIVE_RETURN_PAD && pc < super::TRAMPOLINES_END
     }
 
+    /// What a guest call from native Wine must find left of its thread's
+    /// stack: native Wine's own frames run on that stack (below the guest's
+    /// stack pointer, as Windows' do), as wasm code whose stores no guard
+    /// page stops, so the stack's end is checked before each such call
+    /// instead, with room for the native frames until the next.
+    pub const NATIVE_CALL_ROOM: u64 = 32 << 10;
+
+    /// Whether a guest call from native Wine with the stack at `sp` finds
+    /// its thread's stack spent: less than [`NATIVE_CALL_ROOM`] above the
+    /// stack's reserved bottom (the TEB's `DeallocationStack`, the guard
+    /// pages included). `teb` is the thread's TEB (the FS base for 32-bit
+    /// code, the GS base for 64-bit), in the layout of `class32`; `read`
+    /// reads a guest word of that width. A stack the TEB does not describe
+    /// (no TEB yet, or `sp` outside it) is never spent.
+    pub fn native_call_stack_spent(class32: bool, teb: u64, sp: u64, read: impl Fn(u64) -> Option<u64>) -> bool {
+        if teb == 0 {
+            return false;
+        }
+        // NT_TIB's StackBase, and DeallocationStack
+        let (base, bottom) = if class32 { (teb + 4, teb + 0xe0c) } else { (teb + 8, teb + 0x1478) };
+        let (Some(base), Some(bottom)) = (read(base), read(bottom)) else { return false };
+        bottom != 0 && sp > bottom && sp <= base && sp - bottom < NATIVE_CALL_ROOM
+    }
+
     /// Whether `pc` is one of WoW64's stops, which no code jumps to: reached
     /// with no call-out of the thread waiting there, it is a stray arrival.
     pub const fn wow64_stop(pc: u64) -> bool {
