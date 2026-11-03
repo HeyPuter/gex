@@ -10,6 +10,10 @@
 // is self-contained: `guest/gl/gexgl.c` writes every command's data inline with
 // `put_blob`, so the page never needs to follow a guest pointer.
 
+// The host's clock object, looked up once in this realm: `performance` is a
+// Blink attribute of the global scope, and reading it costs more than `now()`.
+const perf = globalThis.performance;
+
 const STATE = 0; // 0 idle, 1 request, 2 reply
 const RESULT = 1;
 // Which guest process the request belongs to. The host keeps a GL context per
@@ -228,7 +232,7 @@ export class GlProxy {
    */
   submit(memory, ring, client = 0, async = false, noteWait = null) {
     if (this.#ctl[STATS] !== 1) return this.#submit(memory, ring, client, async, noteWait);
-    const t0 = performance.now();
+    const t0 = perf.now();
     this.#claimMs = 0;
     this.#copyMs = 0;
     try {
@@ -237,7 +241,7 @@ export class GlProxy {
       const ctl = this.#ctl;
       Atomics.add(ctl, CLAIM_US, Math.round(this.#claimMs * 1000));
       Atomics.add(ctl, COPY_US, Math.round(this.#copyMs * 1000));
-      Atomics.add(ctl, PROXY_US, Math.round((performance.now() - t0) * 1000));
+      Atomics.add(ctl, PROXY_US, Math.round((perf.now() - t0) * 1000));
       Atomics.add(ctl, STAT_N, 1);
     }
   }
@@ -250,10 +254,10 @@ export class GlProxy {
       this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
       return;
     }
-    const t0 = performance.now();
+    const t0 = perf.now();
     this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
-    this.#copyMs += performance.now() - t0;
-    new Float64Array(this.#ctl.buffer, TIME_AT, 1)[0] = performance.timeOrigin + performance.now();
+    this.#copyMs += perf.now() - t0;
+    new Float64Array(this.#ctl.buffer, TIME_AT, 1)[0] = perf.timeOrigin + perf.now();
   }
 
   #submit(memory, ring, client, async, noteWait) {
@@ -278,7 +282,7 @@ export class GlProxy {
     for (;;) {
       const held = Atomics.compareExchange(ctl, LOCK, 0, mine);
       if (held === 0) break;
-      if (!t0) t0 = performance.now();
+      if (!t0) t0 = perf.now();
       // Waiting on the value the claim just saw, not on a fresh read of it: a
       // re-read races with the release, `wait` returns "not-equal" at once,
       // and the loop becomes a spin that eats the core its guest runs on --
@@ -294,8 +298,8 @@ export class GlProxy {
       }
     }
     if (t0) {
-      noteWait?.(performance.now() - t0);
-      this.#claimMs += performance.now() - t0;
+      noteWait?.(perf.now() - t0);
+      this.#claimMs += perf.now() - t0;
     }
     // What this client's last unwaited batch left: the host has run it (the
     // claim was released after it), so this is its final word.

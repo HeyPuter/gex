@@ -567,16 +567,20 @@ export function dragState(channel, block) {
   return { serial: v >>> 4, flags: v & 15 };
 }
 
+// The host's clock object, looked up once in this realm: `performance` is a
+// Blink attribute of the global scope, and reading it costs more than `now()`.
+const perf = globalThis.performance;
+
 /** Resolves with block `block`'s word for drag `serial` once `want(flags)`
  *  holds, or null after `ms`. */
 export async function waitDrag(channel, block, serial, want, ms) {
   const a = new Int32Array(channel.arena);
   const at = blockBase(block) + B_DRAG;
-  const end = performance.now() + ms;
+  const end = perf.now() + ms;
   for (;;) {
     const v = Atomics.load(a, at);
     if (v >>> 4 === serial >>> 0 && want(v & 15)) return v & 15;
-    const left = end - performance.now();
+    const left = end - perf.now();
     if (left <= 0) return null;
     if (typeof Atomics.waitAsync === 'function' && isShared(channel.arena)) {
       const r = Atomics.waitAsync(a, at, v, Math.min(left, 100));

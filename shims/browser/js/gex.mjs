@@ -1086,6 +1086,11 @@ function wasmProgramFlags(elf) {
  * exact in a double. */
 const ORIGIN_NS = BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n;
 
+// The host's clock object, looked up once in this realm: `performance` is a
+// Blink attribute of the global scope, and reading it costs more than `now()`
+// (a guest clock read is one such call).
+const perf = globalThis.performance;
+
 /**
  * Nanoseconds since the Unix epoch, as the guest's clocks and deadlines read
  * them: monotonic and fine-grained (about 5 us with cross-origin isolation),
@@ -1096,7 +1101,7 @@ const ORIGIN_NS = BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n;
  * lock-free clock calls compare one Worker's reading with another's.
  */
 export function hostNowNs() {
-  return ORIGIN_NS + BigInt(Math.round(performance.now() * 1e6));
+  return ORIGIN_NS + BigInt(Math.round(perf.now() * 1e6));
 }
 
 export class Env {
@@ -2100,7 +2105,7 @@ export class Gex {
           const was = Atomics.load(g, 0);
           if (was === 0 || (was < 0 && Atomics.compareExchange(g, 0, was, 0) === was)) globalThis.GEX_ASK_OTHER();
           // A slow link's few MB, but never for ever.
-          for (const until = performance.now() + OTHER_WAIT_MS; performance.now() < until;) {
+          for (const until = perf.now() + OTHER_WAIT_MS; perf.now() < until;) {
             const s = Atomics.load(g, 0);
             if (s === 1 || s < 0) return s;
             Atomics.wait(g, 0, s, 1000);
@@ -2170,7 +2175,7 @@ export class Gex {
         now: () => this.#env.now(),
         // The clock's hot path (lib.rs `host_now_ns`): an f64 per call, the
         // BigInt origin once per thread. `hostNowNs` is the same sum.
-        perf_now: () => performance.now(),
+        perf_now: () => perf.now(),
         clock_origin: () => ORIGIN_NS,
         // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
         // runs nested until the guest returns to the function body that

@@ -81,6 +81,10 @@ import { setFill, fillFile, lazyReady } from './lazy-fetch.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
 import { setPageFs } from './page-fs.mjs';
+// The host's clock object, looked up once in this realm: `performance` is a
+// Blink attribute of the global scope, and reading it costs more than `now()`.
+const perf = globalThis.performance;
+
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
@@ -953,8 +957,8 @@ async function handle(msg) {
     let outputSeen = 0;
     const outputNow = () => {
       if (!outputPlan.length) return 0;
-      outputStart ??= performance.now();
-      const t = performance.now() - outputStart;
+      outputStart ??= perf.now();
+      const t = perf.now() - outputStart;
       let size = 0;
       for (const p of outputPlan) if (p.at <= t) size = p.size;
       return size;
