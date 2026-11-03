@@ -898,6 +898,9 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         Some((_, id)) => id,
         None => gex_key::image_identity(image).trim_start_matches("image:").to_string(),
     };
+    // An image with no code and nothing to bind (a resource-only DLL, such
+    // as Wine's tzres.dll) has no unit to fetch: it is placed, not wanted.
+    let want = !pages.is_empty() || !providers.is_empty();
     let mut units = lock(&UNITS);
     units.push(Unit {
         identity,
@@ -917,7 +920,9 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
     if at != 0 {
         lock(&MAPPED_AT).push((units.len() - 1, at, crate::host_now_ns()));
     }
-    u_want(units.len() - 1);
+    if want {
+        u_want(units.len() - 1);
+    }
 }
 
 thread_local! {
