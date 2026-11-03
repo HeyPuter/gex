@@ -17,6 +17,8 @@
 //            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
 //            compiler, its one arch, its libraries, a DLL); win-progs.json says which
 //            did not build, and why.
+//   win-media  win-media.tar: media files for wine/media (MEDIA), made with the
+//            host's ffmpeg.
 //   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
 //            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
 //            GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at
@@ -64,13 +66,21 @@ const PROBES = {
  *  in it: a test gives each as a lazy file. */
 const SIDES = ['rt-side'];
 
+/** The `win-media` image's files (wine/media): 3 s of a test picture and a
+ *  440 Hz tone, H.264 and AAC in MP4, WMV2 and WMA2 in ASF. */
+const SRC = ['-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=25:duration=3', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=3'];
+const MEDIA = {
+  'h264-aac.mp4': [...SRC, '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-c:a', 'aac', '-b:a', '96k', '-shortest'],
+  'wmv2-wma2.wmv': [...SRC, '-c:v', 'wmv2', '-b:v', '600k', '-c:a', 'wmav2', '-b:a', '96k', '-shortest'],
+};
+
 /** What each image leaves in the work directory: with `--prebuilt`, an
  *  image whose files are not there is missing. */
 // The `wine64-units` image: Wine's DLLs that get a unit (where every
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -373,6 +383,28 @@ export const images = {
     }
     writeFileSync(join(work, 'win-progs.json'), JSON.stringify({ failed }, null, 1));
     execFileSync('tar', ['-cf', join(work, 'win-progs.tar'), '-C', dir, '.']);
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
+  async 'win-media'(work) {
+    // Made with the host's FFmpeg (libx264), each the same bytes for the same
+    // FFmpeg: no timestamps, one thread.
+    const h = createHash('sha256').update(JSON.stringify(MEDIA));
+    const v = spawnSync('ffmpeg', ['-hide_banner', '-version'], { encoding: 'utf8' });
+    if (v.error || v.status !== 0) return 'no ffmpeg (the media for wine/media)';
+    h.update(v.stdout.split('\n')[0]);
+    const key = h.digest('hex');
+    const keyFile = join(work, 'win-media.key');
+    if (existsSync(join(work, 'win-media.tar')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    const dir = join(work, 'win-media');
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    for (const [name, args] of Object.entries(MEDIA)) {
+      const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '1', ...args, '-fflags', '+bitexact', '-flags', '+bitexact', join(dir, name)], { encoding: 'utf8' });
+      if (r.status !== 0) return `ffmpeg could not make ${name}: ${(r.stderr ?? '').trim().split('\n').pop()}`;
+    }
+    execFileSync('tar', ['-cf', join(work, 'win-media.tar'), '-C', dir, '.']);
     writeFileSync(keyFile, key);
     return null;
   },
