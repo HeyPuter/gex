@@ -1010,6 +1010,12 @@ pub mod imports {
     /// return. The fix is a fold in the translator, not an emulation.
     pub const BRK_KUSER_UNFOLDED: i32 = -8;
 
+    /// [`BRK_KUSER_UNFOLDED`] from code that goes on after the import
+    /// returns (the function JIT's bodies, which leave for the context's PC):
+    /// the access violation is delivered in place where the host can, under
+    /// the native frames the code was called from, and the import returns.
+    pub const BRK_KUSER_UNFOLDED_RESUMABLE: i32 = -9;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";

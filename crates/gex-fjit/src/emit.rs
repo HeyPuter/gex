@@ -13,7 +13,7 @@ use gex_emit::tier1::fmode::{Deferred, FnBody, Operand};
 use gex_emit::tier1::Context;
 use gex_emit::wasm::ValType;
 use gex_ir::func::{Callee, FTerm, Function, RegSet, Summary};
-use gex_ir::{Expr, GuestReg, Stmt, Value};
+use gex_ir::{Expr, GuestReg, HostFunc, Stmt, Value};
 use std::collections::HashMap;
 
 
@@ -280,10 +280,10 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     if let Linkage::Runtime { table, pages } = &m.linkage {
         let none: &[(u64, u32)] = &[];
         let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
-        for &(page, gen) in pages {
+        for &(word, gen) in pages {
             let fb = b.f();
             fb.addr_const(0);
-            fb.load64(0x28, 2, gex_abi::page_gen() + 4 * page); // i32.load
+            fb.load64(0x28, 2, word); // i32.load
             fb.i32_const(gen as i32);
             fb.byte(0x47); // i32.ne
             fb.if_void();
@@ -864,6 +864,21 @@ impl E<'_, '_> {
         let mut keep: Vec<Value> = Vec::new();
         blk.term.for_each_use(|v| keep.push(v));
         let defer = trailing_flag_writes(&blk.stmts);
+        // Faults are delivered in place, at their instruction's pc; `int3`
+        // and `ud2` carry on at the next instruction (as gex-cgen's
+        // `block_stmts` gives a unit's).
+        let pcs = blk
+            .stmts
+            .iter()
+            .enumerate()
+            .map(|(k, st)| {
+                let pc = blk.pcs.get(k).copied().unwrap_or(blk.start);
+                let next = matches!(st, Stmt::HostCall { func: HostFunc::Breakpoint | HostFunc::Illegal, .. })
+                    .then(|| blk.insts.iter().position(|&a| a == pc).and_then(|j| blk.insts.get(j + 1).copied()).unwrap_or(blk.end));
+                (pc, next)
+            })
+            .collect();
+        self.b.stmt_pcs(pcs);
         let d = self.b.block(blk.start, &blk.stmts, &keep, &defer);
         // A terminator has at most one value; it outlives the block's
         // numbering, which code inlined into the terminator reuses.

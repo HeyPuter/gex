@@ -70,7 +70,7 @@ todo=$(mktemp); locks=$(mktemp -d); trap 'rm -f "$todo"; rm -rf "$locks"' EXIT
   sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 " -" } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
 # The flavour, per inputs id (a 64-bit Wine's WoW64 processes and its other
 # ones differ), from the first image of that id whose key the log names.
-declare -A flag
+declare -A flag=()
 while read -r p b in _; do
   [ -z "${flag[$in]+x}" ] || continue
   # (that id's line: an image both kinds load, at one base, has a key per id)
@@ -102,8 +102,8 @@ one() {
   exec {l}> "$locks/${p//\//_}-$b"; flock "$l"
   fl=${flag[$in]:-$any}
   f=$(file "$p")
-  [ -n "$f" ] || { echo "wine32/units: unmapped $p"; return; }
-  [ -f "$f" ] || { echo "wine32/units: missing $f ($p)"; return; }
+  [ -n "$f" ] || { echo "wine32/units: FAIL: unmapped $p" >&2; touch "$locks/failed"; return; }
+  [ -f "$f" ] || { echo "wine32/units: FAIL: missing $f ($p)" >&2; touch "$locks/failed"; return; }
   r=$(build "$f" "$b" ${fl#plain})
   if [ "$key" != - ] && [ ! -f "$U/$key/c.wasm" ]; then
     for o in plain --wine32-kuser --wine64-compact --mem64; do
@@ -112,6 +112,7 @@ one() {
     done
   fi
   echo "$p $b: $r"
+  [ "$key" = - ] || [ -f "$U/$key/c.wasm" ] || { echo "wine32/units: FAIL: $p $b: no flavour makes the key the run asked for ($key)" >&2; touch "$locks/failed"; }
   exec {l}>&-
 }
 { while read -r p b in key; do
@@ -126,3 +127,4 @@ grep -ao 'missing unit: \[the trampolines\].*gexc cgen-image --nt-trampolines[0-
   echo "wine32/units: the trampolines ($o): $(nice -n 19 "$G" cgen-image $o 2>&1 | tail -1 | cut -c1-140)"
 done
 echo "wine32/units: $U"
+[ ! -e "$locks/failed" ]

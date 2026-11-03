@@ -1931,6 +1931,22 @@ pub(crate) fn index_of(addr: u64) -> Option<u32> {
 /// Whether a unit built ahead of time (or a provider) serves the function at
 /// `addr`: not the JIT's own functions, whose resume points are published
 /// at addresses inside functions.
+/// Whether `addr` is in an image whose unit is still to come: one mapped and
+/// left for its first miss ([`wine32_miss`] places it), or one placed whose
+/// unit JS has not yet brought. The function JIT leaves such code alone, so
+/// the miss path places the image and its unit serves it (and a recording
+/// names its key); it lifts only what no unit is coming for.
+pub(crate) fn unit_due(addr: u64) -> bool {
+    if WINE32_ANY_DEFERRED.load(Ordering::Acquire) && lock(&WINE32_DEFERRED).iter().any(|p| addr >= p.base && addr < p.base + p.size) {
+        return true;
+    }
+    if !wanted_any() {
+        return false;
+    }
+    let page = addr / gex_abi::DISPATCH_PAGE;
+    lock(&UNITS).iter().enumerate().any(|(u, x)| u_state(u) & U_WANTED != 0 && x.pages.iter().any(|&(p, _)| p == page))
+}
+
 pub(crate) fn unit_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
 }

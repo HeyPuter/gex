@@ -232,25 +232,28 @@ pub(crate) fn current(install: u32) -> bool {
     lock(&CHECKS)
         .as_ref()
         .and_then(|c| c.get(&install))
-        .is_none_or(|c| c.iter().all(|&(p, g)| word(gex_abi::page_gen() + 4 * p) == g))
+        .is_none_or(|c| c.iter().all(|&(w, g)| word(w) == g))
 }
 
-/// The `PAGE_GEN` value of `page`, numbering it (its directory written when
-/// the translation is installed: `fresh`) if it has no translation yet.
-fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
-    if page >= gex_abi::dispatch_max_pages() {
-        return u32::MAX;
+/// The `PAGE_GEN` word of page key `key` (`gex_abi::page_key`: its mode's
+/// directory) and its value, numbering the page (its directory written
+/// when the translation is installed: `fresh`) if it has no translation
+/// yet.
+fn page_gen(key: u64, fresh: &mut Vec<(u64, u32)>) -> (u64, u32) {
+    let at = crate::dir_word(key);
+    if at == u64::MAX {
+        return (gex_abi::page_gen() + 4 * gex_abi::key_page(key).0, u32::MAX);
     }
-    let have = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::page_gen() + 4 * page).unwrap_or(0);
+    let have = GuestMem::new(crate::guest_bytes()).read_u32(at).unwrap_or(0);
     if have != 0 {
-        return have;
+        return (at, have);
     }
-    crate::with_jit_only(|j| match j.page_table.lookup(page) {
-        Some(b) => b,
+    crate::with_jit_only(|j| match j.page_table.lookup(key) {
+        Some(b) => (at, b),
         None => {
-            let b = j.page_table.base(page);
-            fresh.push((page, b));
-            b
+            let b = j.page_table.base(key);
+            fresh.push((key, b));
+            (at, b)
         }
     })
 }
@@ -413,6 +416,17 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     r
 }
 
+/// The guest memory as far as it exists now: `guest_bytes` spans the whole
+/// address space, and recovery reads the slots of `call [addr]` and `jmp
+/// [addr]` straight from it. A slot past the memory's end (Wine's system
+/// call stubs' `call [0x7ffe1000]`, in a process whose memory stops below
+/// the shared user data) is then out of bounds: a trap in the shim, which
+/// the thread took for a fault at its last PC.
+fn mem_now() -> &'static [u8] {
+    let mem = crate::guest_bytes();
+    &mem[..(crate::warch::memory_size(0) as usize).saturating_mul(65536).min(mem.len())]
+}
+
 fn translate_root(addr: u64) -> Option<u32> {
     if !on() || is_tier1_only(addr) || !lib_wanted(addr) {
         return None;
@@ -436,7 +450,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
         return None;
     }
-    if mid_function(addr) {
+    if mid_function(addr) || crate::cgen::unit_due(addr) {
         return None;
     }
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
@@ -472,17 +486,31 @@ fn translate_root(addr: u64) -> Option<u32> {
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.
     let volatile = |a: u64| wx.iter().any(|&(s, e)| a >= s && a < e);
+    // The mode the code is in: a WoW64 process's i386 images are lifted in
+    // compatibility mode, their pages keyed in the other directory
+    // (`gex_abi::ALT_PAGE`), which tier-1 in that mode dispatches through
+    // and so has made. Code in no PE image is lifted in the process's own
+    // mode, and not at all for a thread in the other.
+    let own = gex_abi::X86 && gex_xlate::default_compat();
+    let class32 = match gex_abi::X86.then(|| gex_xlate::fjit::pe_class32_at(mem_now(), addr, &executable, &read_only)).flatten() {
+        Some(c) => c,
+        None if crate::thread_alt() => return None,
+        None => own,
+    };
+    let alt = class32 != own;
+    if alt && crate::gex_alt_dir() == 0 {
+        return None;
+    }
     let fresh = std::cell::RefCell::new(Vec::new());
     let checks = std::cell::RefCell::new(Vec::<(u64, u32)>::new());
     let pg = |page: u64| {
-        let g = page_gen(page, &mut fresh.borrow_mut());
+        let (w, g) = page_gen(gex_abi::page_key(page * gex_abi::DISPATCH_PAGE, alt), &mut fresh.borrow_mut());
         let mut c = checks.borrow_mut();
-        if !c.iter().any(|&(q, _)| q == page) {
-            c.push((page, g));
+        if !c.iter().any(|&(q, _)| q == w) {
+            c.push((w, g));
         }
-        g
+        (w, g)
     };
-    let class32 = gex_abi::X86 && gex_xlate::default_compat();
     trace(&format!("translate {addr:#x}"));
     // Declined (or not holding `addr`): the pages numbered for it get their
     // directory entries anyway, as an install would give them. A page with a
@@ -494,21 +522,14 @@ fn translate_root(addr: u64) -> Option<u32> {
     let declined = |fresh: Vec<(u64, u32)>| {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         let mut gm = GuestMem::new(crate::guest_bytes());
-        for (p, b) in fresh {
-            let at = gex_abi::dispatch_dir() + p * 4;
-            if gm.read_u32(at).unwrap_or(0) == 0 {
+        for (key, b) in fresh {
+            let at = crate::dir_word(key);
+            if at != u64::MAX && gm.read_u32(at).unwrap_or(0) == 0 {
                 let _ = gm.write_u32(at, b);
             }
         }
     };
-    // The memory as far as it exists now: `guest_bytes` spans the whole
-    // address space, and recovery reads the slots of `call [addr]` and `jmp
-    // [addr]` straight from it. A slot past the memory's end (Wine's system
-    // call stubs' `call [0x7ffe1000]`, in a process whose memory stops below
-    // the shared user data) is then out of bounds: a trap in the shim,
-    // which the thread took for a fault at its last PC.
-    let mem = crate::guest_bytes();
-    let mem = &mem[..(crate::warch::memory_size(0) as usize).saturating_mul(65536).min(mem.len())];
+    let mem = mem_now();
     let t0 = crate::now_ns();
     let wasm = jit.translate_skipping(0, mem, addr, &executable, &served, &read_only, &volatile, &pg, class32);
     TRANSLATE_NS.fetch_add(crate::now_ns().saturating_sub(t0), Ordering::Relaxed);
@@ -549,7 +570,7 @@ fn translate_root(addr: u64) -> Option<u32> {
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, mut dirs, slots) = crate::cgen::bridges(&entries);
+    let (regs, mut dirs, slots) = crate::cgen::bridges_mode(&entries, alt);
     for d in fresh.into_inner() {
         if !dirs.contains(&d) {
             dirs.push(d);

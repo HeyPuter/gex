@@ -155,6 +155,7 @@ pub fn header() -> String {
         if gex_abi::kuser_fold() {
             let _ = writeln!(w, "#define GEX_KUSER_GUARD 0x{:x}ull", gex_abi::KUSER_GUARD);
             let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED ({})", imports::BRK_KUSER_UNFOLDED);
+            let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED_RESUMABLE ({})", imports::BRK_KUSER_UNFOLDED_RESUMABLE);
             w.push_str(&kuser_helpers());
         }
     }
@@ -255,6 +256,15 @@ GEX_INLINE uint32_t gex_k(int ctx, uint64_t pc, uint64_t a) {
         gex_kuser_miss(ctx, pc, a);
     return (uint32_t)a;
 }
+/* gex_k in a body that goes on after a fault (one with a fault exit): the
+ * host delivers the access violation in place where it can, so the native
+ * frames that called the body keep theirs, and the body leaves for the
+ * context's PC (`exit`, its fault exit). Only the slow path differs. */
+__attribute__((noinline, cold, unused)) static void gex_kuser_fault(int ctx, uint64_t pc, uint64_t a) {
+    GEX_C64(GEX_CTX_PC) = pc;
+    gex_breakpoint(ctx, (int64_t)((pc & 0xffffffffull) | (a << 32)), GEX_BRK_KUSER_UNFOLDED_RESUMABLE);
+}
+#define gex_k_r(ctx, pc, a, exit) ({ uint64_t gex_ka_ = (a); if (__builtin_expect(gex_ka_ >= GEX_KUSER_GUARD, 0)) { gex_kuser_fault((ctx), (pc), gex_ka_); exit } (uint32_t)gex_ka_; })
 "#;
 
 /// The null guard (gex-emit `null_guard_on`), a debugging opt-in: off, the
