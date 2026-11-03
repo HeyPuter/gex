@@ -41,6 +41,11 @@ here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
 # DLLs a program's activation context may redirect (to comctl32_v6.dll)
 ACTCTX_DLLS = ('comctl32.dll',)
+# A DLL the loader finds by another name: comctl32's version 6 is
+# comctl32.dll in its side-by-side directory, which a program's manifest
+# (its activation context) names; LoadLibraryA("comctl32_v6.dll") finds
+# nothing.
+LOAD_NAME = {'comctl32_v6.dll': 'comctl32.dll'}
 DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
 BUILD = None  # the Wine build tree (pelink's main)
@@ -1059,7 +1064,7 @@ static void *gexw_ntdll_proc(const char *name)
 }
 ''')
                 resolve = lambda owner, n: (f'gexw_ntdll_proc("{n}")' if guest_ntdll and owner == 'ntdll.dll'
-                                            else f'gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}")')
+                                            else f'gexw_GetProcAddress(gexw_LoadLibraryA("{LOAD_NAME.get(owner, owner)}"), "{n}")')
                 stdcalls, varargs = {}, {}
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
@@ -1109,7 +1114,7 @@ static void *gexw_ntdll_proc(const char *name)
                             for k, _, n in (m for m in mine if m[1] == o):
                                 f.write(f'    if (!gp[{k}]) gp[{k}] = gexw_ntdll_proc("{n}");\n')
                             continue
-                        f.write(f'    {{ void *h = gexw_GetModuleHandleA("{o}");\n      if (h) {{\n')
+                        f.write(f'    {{ void *h = gexw_GetModuleHandleA("{LOAD_NAME.get(o, o)}");\n      if (h) {{\n')
                         for k, _, n in (m for m in mine if m[1] == o):
                             f.write(f'        if (!gp[{k}]) gp[{k}] = gexw_GetProcAddress(h, "{n}");\n')
                         f.write('      }\n    }\n')
@@ -1251,6 +1256,17 @@ static void *gexw_ntdll_proc(const char *name)
             if not g:
                 for n in sorted(KEEP_EXPORTS):
                     f.write(f'--export-if-defined={n}\n')
+            # PELINK_EXPORT_ALL=1: every export of its DLLs, for modules
+            # linked later against this one (gexcc's Windows programs: their
+            # imports are whatever their code calls)
+            if os.environ.get('PELINK_EXPORT_ALL'):
+                for mod, _, ex, _ in dlls:
+                    if grp(mod) != g:
+                        continue
+                    for line in open(ex):
+                        w = line.split()
+                        if w and not w[0].startswith('__wine'):
+                            f.write(f'--export-if-defined={mod}!{w[0]}\n')
             # what the other mode's modules call (wasmdll's CROSS_MODE)
             for n in CROSS_MODE:
                 f.write(f'--export-if-defined={n}\n')

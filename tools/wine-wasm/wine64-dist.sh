@@ -38,7 +38,7 @@
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
 #   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
-#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; less winegstreamer: -nogst)
+#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; less winegstreamer: -nogst)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -56,9 +56,11 @@
 #               sysroot and libraries)
 #   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
 #               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
-#   dist64-...-nN[-N32|-i386t]  the install with the native PE side in place
+#   dist64-...-nN[-N32|-i386t]-sX  the install with the native PE side in place
 #               of the PE builtins, both arches (-i386t: WoW64's i386 side
-#               translated, WINE64_WOW64_I386_TRANSLATED=1): WINE64_DIST
+#               translated, WINE64_WOW64_I386_TRANSLATED=1), its modules
+#               stripped for release (X: stripnames.py; -dbg in place of -sX
+#               with WINE64_STRIP=0, names kept): WINE64_DIST
 #               (WINE64_NATIVE_PE=0: the install above, translated)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
@@ -143,11 +145,17 @@ fi
 # install's name then has no -no16).
 WIN16_GLOB='*.dll16 *.drv16 *.exe16 *.mod16 *.vxd winevdm.exe wow32.dll w32skrnl.dll'
 W16=; [ "$WOW" = 0 ] || [ "${WINE_WIN16:-0}" != 0 ] || W16=-no16-$(echo "$WIN16_GLOB" | sha256sum | cut -c1-4)
-# And icu (Windows' ICU API, which few programs use: its ICU is C++ that has no
-# wasm build yet), with icuin and icuuc, which only forward to it: out of
-# both arches. WINE_ICU=1 keeps them, as before (no -noicu in the name).
+# icu (Windows' ICU API), with icuin and icuuc, which only forward to it: a
+# native wasm64 module like the rest (Wine's C++ libraries, built without
+# exceptions). WINE_ICU=0 leaves them out of both arches (-noicu in the name).
 ICU_GLOB='icu.dll icuin.dll icuuc.dll'
-WICU=; [ "${WINE_ICU:-0}" != 0 ] || WICU=-noicu
+WICU=; [ "${WINE_ICU:-1}" != 0 ] || WICU=-noicu
+# ICU's data (share/wine/nls/icudtl.dat) with the locale data of
+# WINE_ICU_LOCALES only (and their parents and root; icudat.py: the converters,
+# normalization, break rules, time zones and the other non-locale data stay).
+# all: every locale, as Wine ships it (no -icuL in the name).
+ICU_LOCALES=${WINE_ICU_LOCALES:-en en_US}
+WIL=; [ -n "$WICU" ] || [ "$ICU_LOCALES" = all ] || WIL=-icuL$( { echo "$ICU_LOCALES"; cat "$here/icudat.py"; } | sha256sum | cut -c1-6)
 # And winegstreamer (its media framework, GStreamer, is not in the build:
 # the DLL would only fail to start), out of both arches. WINE_GSTREAMER=1
 # keeps it (no -nogst in the name).
@@ -307,6 +315,8 @@ dist_make() {
 	[ -z "$WICU" ] || for a in x86_64-windows i386-windows; do [ ! -d lib/wine/$a ] || (cd lib/wine/$a && rm -f $ICU_GLOB); done
 	[ -z "$WGST" ] || for a in x86_64-windows i386-windows; do rm -f lib/wine/$a/winegstreamer.dll; done
 	cp -a "$N/share/wine" share/
+	[ -z "$WIL" ] || { python3 "$here/icudat.py" share/wine/nls/icudtl.dat share/wine/nls/icudtl.dat.t $ICU_LOCALES &&
+		mv share/wine/nls/icudtl.dat.t share/wine/nls/icudtl.dat; }
 	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
 	# the .ttf and the raster .fon made from them
@@ -315,7 +325,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WGST)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST dist_make
+log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WIL$WGST)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -347,8 +357,9 @@ if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && { [ "$M64" = 0 ] || [ 
 fi
 SP=${WINE64_SPLIT_DLLS:-}
 SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || { [ "$M64" != 0 ] && [ "$M64N" = 0 ]; } || SPA=all
-NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
-DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST
+# PELINK_EXPORT_ALL changes the core (every DLL export), so it is part of the key
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}${PELINK_EXPORT_ALL:+ export-all}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
@@ -451,6 +462,13 @@ native_make() {
 		n=${a#*:}; [ -n "$n" ] || continue
 		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
 	done
+	# a release install's modules without the names gex never reads (and
+	# producers, debug info): gexcc-win's stripnames.py, as its programs'
+	if [ "$STRIP" != 0 ]; then
+		find lib/wine/x86_64-windows ${NATIVE32:+lib/wine/i386-windows} -maxdepth 1 -type f \( -name '*.wasm' -o -name '*.wasm.m64' \) -print0 |
+			xargs -0 -r -P"$J" -n 16 sh -c 'for f; do python3 "$0" "$f" "$f.s" && mv "$f.s" "$f" || exit 1; done' "$here/../gexcc/windows/stripnames.py" ||
+			{ log "stripnames failed"; return 1; }
+	fi
 	# no builtin runs translated: a PE image left with machine code fails the
 	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported).
 	# The i386 side under WINE64_WOW64_I386_TRANSLATED=1 is listed, not refused.
@@ -463,10 +481,14 @@ native_make() {
 		fi
 	fi
 }
+# WINE64_STRIP=0: the native modules keep their names, for a debug install
+# (its name gets -dbg)
+STRIP=${WINE64_STRIP:-1}
 if [ "$NPE" != 0 ]; then
 	NI=-n$NK${N32:+-$N32}; [ "$WOW" = 0 ] || [ "$I386T" = 0 ] || NI=$NI-i386t
-	log "native install ($K, $NK${N32:+, $N32}$([ "${NI%-i386t}" = "$NI" ] || echo ", i386 translated"))"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI native_make
-	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WGST$NI
+	if [ "$STRIP" = 0 ]; then NI=$NI-dbg; else NI=$NI-s$(sha256sum < "$here/../gexcc/windows/stripnames.py" | cut -c1-6); fi
+	log "native install ($K, $NK${N32:+, $N32}$([ "${NI%-i386t}" = "$NI" ] || echo ", i386 translated"))"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI
 fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as
