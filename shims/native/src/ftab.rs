@@ -75,6 +75,7 @@ impl Shared {
             map: self.map.clone(),
             modules: self.modules.clone(),
             runtime: self.runtime.clone(),
+            runtime_alt: self.runtime_alt.clone(),
             checks: self.checks.clone(),
             tier1_only: self.tier1_only.clone(),
             epoch: self.epoch,
@@ -83,6 +84,7 @@ impl Shared {
             dylink: self.dylink.clone(),
             dyproc: self.dyproc.clone(),
             providers: self.providers.clone(),
+            alt_installs: self.alt_installs.clone(),
             process: Process::default(),
         }
     }

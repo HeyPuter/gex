@@ -537,6 +537,7 @@ impl JitShared {
         JitShared {
             page_table: self.page_table.clone(),
             translated: self.translated.clone(),
+            alt_dir: self.alt_dir,
             registry: self.registry.clone(),
             slot_owner: self.slot_owner.clone(),
             remiss: Default::default(),
@@ -546,6 +547,9 @@ impl JitShared {
             ftab: self.ftab.fork_copy(),
             wasm_program: self.wasm_program,
             wine_pe: self.wine_pe.clone(),
+            wine_pe_split: self.wine_pe_split.clone(),
+            wine_pe_late: self.wine_pe_late.clone(),
+            wine_pe_canon: self.wine_pe_canon.clone(),
             relocated: Arc::new(Mutex::new(self.relocated.lock().unwrap_or_else(|e| e.into_inner()).clone())),
             trampolines: self.trampolines,
             elf_units: self.elf_units.clone(),

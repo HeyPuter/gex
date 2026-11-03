@@ -690,6 +690,7 @@ fn install_shared(
 /// one defines that was not installed when the caller was: through the
 /// slot `off` after the caller's own, filled in each store once both are
 /// instantiated there.
+#[derive(Clone)]
 pub(crate) struct Late {
     importer: u32,
     off: u32,
