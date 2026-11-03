@@ -5,7 +5,8 @@
 //   busybox  bb.tar.zst: BUSYBOX (a wasm32 busybox) and its applets, the probe
 //            programs (probe/*.c, built with GEXCC or gexcc), /etc/xattr with
 //            an extended attribute; and lazy.bin and lazy-program.bin, a lazy
-//            file's bytes (one test's each). Kept
+//            file's bytes (one test's each), and rt-side.so, a side module
+//            rt-dlstatic loads (a lazy file's). Kept
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
@@ -55,7 +56,13 @@ const PROBES = {
   'rt-wl': ['-lwayland-client', '-lffi'],
   'rt-joy': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
+  // static, serving what rt-side.so imports (SIDES)
+  'rt-dlstatic': ['-pthread', ...['malloc', 'snprintf', 'strlen', 'fprintf', 'stderr', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'sin', 'cos'].map((s) => `-Wl,--export=${s}`)],
 };
+
+/** Side modules (GEXCC_SHARED=1 -shared), made beside the image rather than
+ *  in it: a test gives each as a lazy file. */
+const SIDES = ['rt-side'];
 
 /** What each image leaves in the work directory: with `--prebuilt`, an
  *  image whose files are not there is missing. */
@@ -63,7 +70,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -120,7 +127,8 @@ export const images = {
     const h = createHash('sha256');
     if (bb && existsSync(bb)) h.update(readFileSync(bb));
     h.update(applets.join('\n'));
-    for (const name of Object.keys(PROBES)) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
+    for (const name of [...Object.keys(PROBES), ...SIDES]) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
+    h.update(JSON.stringify(PROBES));
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
@@ -130,7 +138,7 @@ export const images = {
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.
-    if (have && (!bb || have === key)) return null;
+    if (have && (!bb || have === key) && SIDES.every((n) => existsSync(join(work, `${n}.so`)))) return null;
     if (!bb || !existsSync(bb)) return 'BUSYBOX: a wasm32 busybox';
     const tree = join(work, 'tree');
     rmSync(tree, { recursive: true, force: true });
@@ -140,6 +148,10 @@ export const images = {
     const cc = process.env.GEXCC || 'gexcc';
     for (const [name, libs] of Object.entries(PROBES)) {
       execFileSync(cc, ['-O2', '-Wall', '-o', join(tree, 'bin', name), join(HERE, 'probe', `${name}.c`), ...libs], { stdio: ['ignore', 'ignore', 'inherit'] });
+    }
+    for (const name of SIDES) {
+      execFileSync(cc, ['-O2', '-Wall', '-fPIC', '-shared', '-o', join(work, `${name}.so`), join(HERE, 'probe', `${name}.c`)],
+        { stdio: ['ignore', 'ignore', 'inherit'], env: { ...process.env, GEXCC_SHARED: '1' } });
     }
     execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
     execFileSync('tar', ['--xattrs', '-cf', join(work, 'bb.tar'), '-C', tree, '.']);
