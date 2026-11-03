@@ -9,7 +9,7 @@ import { bootWine } from '../lib/wine.mjs';
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 4800 };
 
 // [case, program, its arch, args, programs it starts, what it prints when it
-// passes (default "wowNN CASE ok")]
+// passes (default "wowNN CASE ok"), the null driver (default yes)]
 const CASES = [
   ['hello', 'wow32.exe', 'x86', ['hello']],
   ['wow', 'wow32.exe', 'x86', ['wow']],
@@ -24,13 +24,14 @@ const CASES = [
   ['xmmcb', 'wow64c.exe', 'x64', ['xmmcb']],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)
   ['timerproc', 'timerproc.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
-  // 32-bit OpenGL and Direct3D with no context ever current on the thread
-  ['wglnoctx', 'wglnoctx.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
+  // 32-bit OpenGL and Direct3D with no context ever current on the thread,
+  // with Wine's usual driver (as wine/cases has it)
+  ['wglnoctx', 'wglnoctx.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/, false],
 ];
 
 export default async function (t) {
-  const [name, exe, arch, args, also = [], want] = CASES[t.phase - 1];
-  const w = await bootWine(t, { wow64: true });
+  const [name, exe, arch, args, also = [], want, nullDriver = true] = CASES[t.phase - 1];
+  const w = await bootWine(t, { wow64: true, nullDriver });
   const ok = want ?? new RegExp(`^wow(32|64c) ${name.replace(/\d+$/, '')}[a-z0-9]* ok`, 'm');
   const r = await t.time(name, async () => {
     for (const [e, a] of also) await w.put(e, a);
