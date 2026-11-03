@@ -29,6 +29,13 @@ const CASES = [
   ['wndproc_seh', 0, allOk, 'wndproc_seh.exe', [], true],
   ['wndproc_uncaught', 0, allOk, 'wndproc_uncaught.exe', [], true],
   ['nestsp', 0, allOk, 'nestsp.exe', [], true],
+  // A timer procedure of Wine's own (comctl32's list view), which
+  // DispatchMessage calls.
+  ['timerproc', 0, allOk, 'timerproc.exe', [], true],
+  // OpenGL and Direct3D with no context ever current on the thread, with
+  // Wine's usual driver: the null driver's windows draw GL into framebuffer
+  // objects (win32u), which take GL 4.5's glCreateFramebuffers.
+  ['wglnoctx', 0, allOk, 'wglnoctx.exe'],
   ['qpcmono', 0, allOk, 'qpcmono.exe'],
   // 2000 writes a case: on the page every read is a server request.
   // Fewer writes in the single-thread build (a page without
