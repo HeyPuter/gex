@@ -245,6 +245,13 @@ impl Jit {
         if class32 && !gex_abi::X86 {
             return None;
         }
+        // Code of the process's other mode (a WoW64 process's i386 images,
+        // reached through the table: native i386 Wine calling a guest
+        // callback) is not this translator's: lifted in this mode it would
+        // run as the wrong instruction set. Tier-1 runs it, in its mode.
+        if gex_abi::X86 && pe_class32_at(mem, addr, executable, read_only).is_some_and(|c| c != class32) {
+            return None;
+        }
         let _mode = crate::compat_scope(class32);
         let started = now_us();
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
@@ -448,6 +455,42 @@ impl Jit {
     fn lock_line(&self) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!("lock {} of {} contended", self.contended.load(Relaxed), self.locks.load(Relaxed))
+    }
+}
+
+/// Whether the PE image holding `addr` is i386 code (`Some(true)`) or
+/// x86-64 (`Some(false)`), from its headers in memory; `None` when `addr` is
+/// in no PE image found. The headers are looked for at each page boundary
+/// below `addr`, through the image's own pages (code or read-only), as far
+/// as 256 MiB down.
+pub fn pe_class32_at(mem: &[u8], addr: u64, executable: &dyn Fn(u64) -> bool, read_only: &dyn Fn(u64, u64) -> bool) -> Option<bool> {
+    const PAGE: u64 = 0x1000;
+    let rd16 = |a: u64| mem.get(a as usize..a as usize + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let rd32 = |a: u64| mem.get(a as usize..a as usize + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let mut page = addr & !(PAGE - 1);
+    let floor = page.saturating_sub(0x1000_0000);
+    loop {
+        if !(executable(page) || read_only(page, PAGE)) {
+            return None;
+        }
+        if rd16(page) == Some(0x5a4d) {
+            let lfanew = rd32(page + 0x3c)? as u64;
+            if lfanew < PAGE - 0x40 && rd32(page + lfanew) == Some(0x0000_4550) {
+                let size = rd32(page + lfanew + 24 + 56)? as u64;
+                if addr < page + size {
+                    return match rd16(page + lfanew + 4)? {
+                        0x14c => Some(true),
+                        0x8664 => Some(false),
+                        _ => None,
+                    };
+                }
+                return None;
+            }
+        }
+        if page < floor + PAGE {
+            return None;
+        }
+        page -= PAGE;
     }
 }
 
