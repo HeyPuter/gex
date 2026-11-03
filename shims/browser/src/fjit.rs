@@ -466,7 +466,8 @@ fn translate_root(addr: u64) -> Option<u32> {
     let executable = |a: u64| {
         let page_ok = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e) && !replaced.iter().any(|&(lo, hi)| a >= lo && a < hi) && (!rules || lib_wanted(a));
         let ok = if ranged { page_ok(a) } else { *page_memo.borrow_mut().entry(a >> 12).or_insert_with(|| page_ok(a)) };
-        ok && !provided.contains(&a)
+        // Native Wine's return pad and the stops after it: the miss path's.
+        ok && !provided.contains(&a) && !(gex_abi::X86 && gex_kernel::win::tramp::filler(a))
     };
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.

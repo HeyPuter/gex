@@ -110,6 +110,14 @@ pub mod tramp {
         ret == WOW64_STOP_SYSCALL || ret == WOW64_RETURN_MARK
     }
 
+    /// Whether `pc` is in the page's tail of filler from the return pad on
+    /// (the pad, WoW64's stops, the return mark): addresses the guest
+    /// reaches but no code has, which a translator must leave to the miss
+    /// path that knows them, never decode.
+    pub const fn filler(pc: u64) -> bool {
+        pc >= NATIVE_RETURN_PAD && pc < super::TRAMPOLINES_END
+    }
+
     /// Whether `pc` is one of WoW64's stops, which no code jumps to: reached
     /// with no call-out of the thread waiting there, it is a stray arrival.
     pub const fn wow64_stop(pc: u64) -> bool {
