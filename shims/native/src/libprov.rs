@@ -187,6 +187,27 @@ pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> 
     bail!("mapping {name}: no {len:#x} bytes free above {FLOOR:#x}")
 }
 
+/// Data an i386 skeleton's export table points at in a WoW64 process (the
+/// other mode's native PE modules): above the images, so the RVA from any
+/// skeleton's base is positive, and below 2 GiB, where a 32-bit program that
+/// is not large-address-aware may see it (its pointers signed, and
+/// `NtQueryVirtualMemory` refuses addresses past its highest user address).
+/// Top-down from Windows' KUSER_SHARED_DATA page, the first free range.
+pub(crate) fn alloc_below_2g(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    use gex_kernel::mem::{flags, prot};
+    const FLOOR: u64 = 0x2000_0000;
+    const STEP: u64 = 0x1_0000;
+    let len = (size + 0xffff) & !0xffff;
+    let mut at = (gex_abi::KUSER_WINDOWS.saturating_sub(len)) & !0xffff;
+    while at >= FLOOR {
+        if let Ok(a) = map_anon(state, at, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name) {
+            return Ok(a);
+        }
+        at -= STEP;
+    }
+    bail!("mapping {name}: no {len:#x} bytes free in [{FLOOR:#x}, {:#x})", gex_abi::KUSER_WINDOWS)
+}
+
 /// A provider's code region: its thread entry at 0, the return addresses
 /// its guest calls push in [0x100, 0x1000), reverse slots from
 /// `REVERSE_FIRST`, one per `REVERSE_STRIDE` bytes.

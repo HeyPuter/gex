@@ -191,7 +191,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     for (unsigned i = 0; i < FT->getNumParams(); i++) {
       Type *P = FT->getParamType(i);
       if (Type *BT = CB.getParamByValType(i)) words += (DL.getTypeAllocSize(BT) + 3) / 4;
-      else if (P->isIntegerTy(64) || P->isDoubleTy()) words += 2;
+      else if (P->isIntegerTy(64) || P->isDoubleTy() || P->isFP128Ty()) words += 2;
       else words += 1;
     }
     Value *Buf = B.CreateAlloca(I32, B.getInt32(words ? words : 1));
@@ -204,8 +204,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
         uint64_t sz = DL.getTypeAllocSize(BT);
         B.CreateMemCpy(slot(w), Align(4), A, Align(1), sz);
         w += (sz + 3) / 4;
-      } else if (P->isIntegerTy(64) || P->isDoubleTy()) {
-        Value *V = P->isDoubleTy() ? B.CreateBitCast(A, I64) : (Value *)A;
+      } else if (P->isIntegerTy(64) || P->isDoubleTy() || P->isFP128Ty()) {
+        // (wasm32's long double is 128 bits wide; Windows' on i386, a double)
+        Value *V = P->isIntegerTy(64) ? (Value *)A
+                 : B.CreateBitCast(P->isFP128Ty() ? B.CreateFPTrunc(A, B.getDoubleTy()) : (Value *)A, I64);
         B.CreateStore(B.CreateTrunc(V, I32), slot(w));
         B.CreateStore(B.CreateTrunc(B.CreateLShr(V, 32), I32), slot(w + 1));
         w += 2;
@@ -226,7 +228,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (R->isFloatingPointTy()) {
       Function *Call = getTarget(M, "__gexw_guest_call_fp", FunctionType::get(B.getDoubleTy(), {I32, Ptr, I32}, false));
       Value *V = B.CreateCall(Call, {T, Buf, B.getInt32(words)});
-      B.CreateRet(R->isFloatTy() ? B.CreateFPTrunc(V, R) : V);
+      B.CreateRet(R->isFloatTy() ? B.CreateFPTrunc(V, R) : R->isFP128Ty() ? B.CreateFPExt(V, R) : V);
     } else {
       Function *Call = getTarget(M, "__gexw_guest_call", FunctionType::get(I64, {I32, Ptr, I32}, false));
       Value *V = B.CreateCall(Call, {T, Buf, B.getInt32(words)});

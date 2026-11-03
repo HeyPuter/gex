@@ -523,6 +523,7 @@ pub fn translate(
         x::FSYNC => nr::FSYNC,
         x::FDATASYNC => nr::FDATASYNC,
         x::FTRUNCATE => nr::FTRUNCATE,
+        x::TRUNCATE => nr::TRUNCATE,
         x::GETCWD => nr::GETCWD,
         x::CHDIR => nr::CHDIR,
         x::FCHDIR => nr::FCHDIR,

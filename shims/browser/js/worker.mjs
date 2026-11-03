@@ -1160,10 +1160,6 @@ async function handle(msg) {
         },
       );
       if (!entry) throw new Error('the program could not be loaded');
-      // Where `/dev/dsp`'s output is, for the page to play (once per page;
-      // every process tells it, the first one wins).
-      const ring = gex.audioRing?.();
-      if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
       // The files are in the kernel's filesystem now, copied. The views here
       // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for a
       // demo), which stays resident while anything views it: let go,
@@ -1190,6 +1186,14 @@ async function handle(msg) {
         msg.transfer = null;
         port.post({ kind: 'files-loaded' });
       }
+    }
+    // Where `/dev/dsp`'s output is, for the page to play (once per page;
+    // every process tells it, the first one wins): a loaded process's and an
+    // adopted one's, which is every process the runtime API's system starts
+    // (host.mjs `spawnExec`).
+    if (msg.kind !== 'thread') {
+      const ring = gex.audioRing?.();
+      if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
     }
 
     // Statically recompile each object once it proves hot, rather than meeting
@@ -1302,7 +1306,34 @@ async function handle(msg) {
         gex.memory.grow(0n);
       }
     }
-    const status = gone ? 0 : await gex.run(entry, ctx);
+    let status = gone ? 0 : await gex.run(entry, ctx);
+    // A thread that ended while its process runs on as the same program:
+    // its Worker waits for one of the process's next threads, as a spare
+    // does, if the host keeps it (`park`, answered by `spareGo`), and runs
+    // it. A Wine program that starts its threads one after another then
+    // waits for no Worker's start between them.
+    while (asThread && msg.park && !gone && !msg.snap && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
+      && (ex.gex_exec_gen?.() ?? 0) === execGen && gex.parkThread?.()) {
+      spareGot = null;
+      port.post({ kind: 'park', status, gen: execGen });
+      const next = { spare: true, parked: true, spareGo: () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; })) };
+      ({ entry, ctx, gone } = await gex.adoptThread(null, null, next));
+      if (gone) {
+        status = 0;
+        break;
+      }
+      msg.tid = next.tid;
+      msg.ctx = next.ctx;
+      msg.pc = next.pc;
+      if (next.procOpts) msg.procOpts = next.procOpts;
+      execGen = gex.adoptGen ?? ex.gex_exec_gen?.() ?? 0;
+      try {
+        gex.memory.grow(0);
+      } catch {
+        gex.memory.grow(0n);
+      }
+      status = await gex.run(entry, ctx);
+    }
     // The process's exec went to another Worker (a program of the other
     // memory flavour, lib.rs `exec_away`): this one ends, the process does
     // not. The host starts the exec as a posix_spawn child's.

@@ -15,7 +15,7 @@
 # target/x86/release/gexc). The PE side is Wine's own DLLs (the host's
 # staged x86 Wine prefix, GEX_WINE_PREFIX, with the core DLLs from WINE):
 # no Windows binaries.
-# Env: GEXC; WINE32_JOBS (default 12). The log of a build is CACHE/wine32-dist-KEY.log.
+# Env: GEXC; WINE32_JOBS (default 12); WINE32_STRIP=0 (the PE modules keep their names: -dbg). The log of a build is CACHE/wine32-dist-KEY.log.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)

@@ -320,6 +320,13 @@ pub(crate) fn bind_free(home: &Home, tid: i32) {
     });
 }
 
+/// This Worker's thread is over and the Worker waits for another
+/// (`gex_thread_park`): bound to none.
+pub(crate) fn unbind() {
+    MINE.with(|m| m.borrow_mut().take());
+    VIEW.with(|v| v.borrow_mut().take());
+}
+
 /// Bring in what other processes have sent this one, when anyone has sent
 /// anything since this Worker last looked, and what its timers have raised.
 fn gather(home: &Home) {

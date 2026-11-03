@@ -754,6 +754,14 @@ struct Emitter<'a> {
     /// (returning 0: the caller goes on at the context's PC); 0 when the
     /// host never returns from a fault.
     resumable_pc: u64,
+    /// Function mode, with `resumable_pc`: where the statement being
+    /// emitted carries on when it is a fault the host may deliver in place
+    /// (`int3`'s or `ud2`'s `HostCall`): the next instruction's pc.
+    fault_next: Option<u64>,
+    /// Function mode, with `resumable_pc`: the pc of the instruction the
+    /// statement being emitted is of, where a fault it raises in place is
+    /// (with the registers written back there).
+    stmt_pc: Option<u64>,
     /// Function mode: the local the next `def` leaves its value in (a
     /// register's, when a `WriteReg` of the value follows at once). Taken
     /// by `def`'s common tail; left set by a definition that has no local.
@@ -827,6 +835,8 @@ impl<'a> Emitter<'a> {
             region_writes: Default::default(),
             func_regs: None,
             resumable_pc: 0,
+            fault_next: None,
+            stmt_pc: None,
             def_into: None,
             fp_result: false,
             value_fp: Vec::new(),
@@ -1799,17 +1809,61 @@ impl<'a> Emitter<'a> {
 
     /// `BRK_KUSER_UNFOLDED` for the address in the scratch local, at the
     /// block's start (the host writes that pc back); it does not return.
+    /// In function mode with resumable faults, the registers written back
+    /// first, at the faulting instruction's pc, and
+    /// `BRK_KUSER_UNFOLDED_RESUMABLE`: the host delivers the access
+    /// violation in place and returns, and the function leaves for the
+    /// context's PC.
     fn kuser_fault_call(&mut self) {
+        let resumable = self.func_regs.is_some() && self.resumable_pc != 0;
+        let pc = if resumable { self.stmt_pc.unwrap_or(self.block_start) } else { self.block_start };
+        if resumable {
+            self.flush_conditional();
+        }
         let t = self.scratch_i64;
         self.f.local_get(self.ctx_local);
-        self.f.i64_const(self.block_start as i64);
+        self.f.i64_const(pc as i64);
         self.f.local_get(t);
         self.f.i64_const(32);
         self.f.byte(code::I64_SHL);
         self.f.byte(code::I64_OR);
-        self.f.i32_const(gex_abi::imports::BRK_KUSER_UNFOLDED);
+        self.f.i32_const(if resumable { gex_abi::imports::BRK_KUSER_UNFOLDED_RESUMABLE } else { gex_abi::imports::BRK_KUSER_UNFOLDED });
         self.f.call(self.cx.breakpoint);
-        self.f.unreachable();
+        if resumable {
+            self.f.i32_const(0);
+            self.f.ret();
+        } else {
+            self.f.unreachable();
+        }
+    }
+
+    /// Function mode: `int3`'s or `ud2`'s host call as a fault the host may
+    /// deliver in place (`resumable_pc` on its pc), as gex-cgen's units make
+    /// it. The registers and PC (the next instruction, `next`) are written
+    /// back first, so a host that returns without delivering anything (a
+    /// trace point) carries on; any other PC is a handler's target, which the
+    /// function leaves for (returning 0). Delivered by trapping out instead,
+    /// such a fault unwinds every wasm frame down to the nearest run loop:
+    /// those of the native code that called the function too, a native
+    /// `__TRY` whose handler then catches the exception among them.
+    fn resumable_fault(&mut self, func: HostFunc, args: &[Value], next: u64) {
+        self.flush();
+        self.store_pc(next);
+        self.f.local_get(self.ctx_local);
+        self.push(args[0]);
+        self.f.i64_const(self.resumable_pc as i64);
+        self.f.byte(code::I64_OR);
+        self.push(args[1]);
+        self.f.call(self.import_index(func));
+        self.invalidate();
+        self.ctx_base();
+        self.f.load(0x29, 3, ctx::PC as u32);
+        self.f.i64_const(next as i64);
+        self.f.byte(code::I64_NE);
+        self.f.if_void();
+        self.f.i32_const(0);
+        self.f.ret();
+        self.f.end();
     }
 
     /// The fault the body's KUSER guards branch to: the body becomes
@@ -1859,6 +1913,11 @@ impl<'a> Emitter<'a> {
                     let opcode = store_op(ty, *sz);
                     self.f.store(opcode, natural_align(*sz), static_off);
                 }
+            }
+            Stmt::HostCall { func: func @ (HostFunc::Breakpoint | HostFunc::Illegal), args }
+                if self.resumable_pc != 0 && self.fault_next.is_some() && args.len() == 2 =>
+            {
+                self.resumable_fault(*func, args, self.fault_next.unwrap());
             }
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);

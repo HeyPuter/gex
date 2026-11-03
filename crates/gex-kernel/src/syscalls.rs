@@ -41,6 +41,7 @@ pub mod nr {
     pub const SENDFILE: u64 = 71;
     pub const COPY_FILE_RANGE: u64 = 285;
     pub const SPLICE: u64 = 76;
+    pub const TRUNCATE: u64 = 45;
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
@@ -1690,11 +1691,19 @@ impl FdIo<'_> {
     /// `ftruncate`.
     pub fn ftruncate(&self, m: &mut GuestMem<'_>, fd: i32, len: u64) -> SysResult {
         let f = self.fds.get(fd)?;
+        self.truncate_file(m, &f, len)
+    }
+
+    /// `ftruncate` or `truncate` on `f`: the file `len` bytes long.
+    pub fn truncate_file(&self, m: &mut GuestMem<'_>, f: &OpenFile, len: u64) -> SysResult {
+        if (len as i64) < 0 {
+            return Err(Errno::EINVAL);
+        }
         f.handle.truncate(len)?;
         // A shared mapping's bytes past the new end are no longer the file's:
         // zero, as the file now reads there once it grows again.
         if any_shared(self.shared) {
-            for (at, _, k) in shared_spans(self.shared, &f, len, u64::MAX - len) {
+            for (at, _, k) in shared_spans(self.shared, f, len, u64::MAX - len) {
                 let _ = m.zero(at, k as usize);
             }
         }
@@ -4013,6 +4022,18 @@ impl PathIo<'_> {
         Ok(0)
     }
 
+    /// What `truncate(path, length)` truncates: the file `path` names (its
+    /// links followed), opened for writing as `ftruncate`'s descriptor
+    /// would be. A directory is `EISDIR`.
+    pub fn truncate_target(&self, m: &GuestMem<'_>, path: u64) -> Result<Arc<OpenFile>, Errno> {
+        let p = self.at_path(m, AT_FDCWD, path)?;
+        if self.ns.metadata(&p)?.file_type == FileType::Directory {
+            return Err(Errno::EISDIR);
+        }
+        let h = self.ns.open(&p, oflags::O_WRONLY, 0)?;
+        Ok(OpenFile::new(h, p, oflags::O_WRONLY, false, true))
+    }
+
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)
@@ -5678,7 +5699,7 @@ pub fn process_vm(procs: &ProcTable, m: &mut GuestMem<'_>, compat: bool, write: 
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
-        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::TRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
             | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV
     )
 }
@@ -6930,6 +6951,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_CTL => nr::EPOLL_CTL,
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE | x::FTRUNCATE64 => nr::FTRUNCATE,
+            x::TRUNCATE | x::TRUNCATE64 => nr::TRUNCATE,
             x::FADVISE64 | x::FADVISE64_64 => nr::FADVISE64,
             x::STATFS64 => nr::STATFS,
             x::FSTATFS64 => nr::FSTATFS,
@@ -7031,6 +7053,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_CTL => nr::EPOLL_CTL,
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE => nr::FTRUNCATE,
+            x::TRUNCATE => nr::TRUNCATE,
             x::STATFS => nr::STATFS,
             x::FSTATFS => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
@@ -7458,6 +7481,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::PIPE2 => f.io.pipe2(m, a[0], a[1]),
             nr::FTRUNCATE => f.io.ftruncate(m, a[0] as i32, a[1]),
+            nr::TRUNCATE => f.path.truncate_target(m, a[0]).and_then(|t| f.io.truncate_file(m, &t, a[1])),
             nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
             nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
             // As the kernel's arms: nice 0, and a change taken and ignored.
@@ -8463,7 +8487,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FCHOWNAT
         | nr::FCHMODAT
         | nr::STATX => a[1],
-        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 => a[0],
+        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 | nr::TRUNCATE => a[0],
         nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => a[1],
         // `symlinkat` names the link it creates third, not second.
         nr::SYMLINKAT => a[2],
@@ -10653,6 +10677,7 @@ impl Kernel {
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(m, a[0] as i32, a[1]),
+            nr::TRUNCATE => self.path_io().truncate_target(m, a[0]).and_then(|f| self.fd_io().truncate_file(m, &f, a[1])),
             nr::FADVISE64 => self.fd_io().fadvise(a[0] as i32, a[1], a[2], a[3]),
             // `set_tid_address` and `unshare`.
             n if is_thread_own(n) => {
@@ -12507,6 +12532,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::RENAMEAT => "renameat",
         nr::RENAMEAT2 => "renameat2",
         nr::FTRUNCATE => "ftruncate",
+        nr::TRUNCATE => "truncate",
         nr::FADVISE64 => "fadvise64",
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
@@ -15002,6 +15028,25 @@ mod tests {
             set_args(&mut m, at, nr::FTRUNCATE, &[999, 0]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
+            // truncate: by name, shorter and longer; no such file, a
+            // directory, a negative length.
+            for len in [10u64, 5000] {
+                set_args(&mut m, at, nr::TRUNCATE, &[0x20400, len]);
+                k.syscall(&mut m, 0);
+                assert_eq!(ret(&m, at), 0);
+                assert_eq!(k.fds.get(fd as i32).unwrap().handle.metadata().unwrap().size, len);
+            }
+            m.write(0x20410, b"/nope\0").unwrap();
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20410, 0]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::ENOENT.0 as i64));
+            m.write(0x20420, b"/\0").unwrap();
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20420, 0]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::EISDIR.0 as i64));
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20400, u64::MAX]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
             for f in [r, w, ep, fd] {
                 set_args(&mut m, at, nr::CLOSE, &[f]);
                 k.syscall(&mut m, 0);

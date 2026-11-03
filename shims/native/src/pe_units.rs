@@ -1961,6 +1961,13 @@ fn wine32_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe
             exports.insert(n.clone(), e.rva);
         }
     }
+    // A WoW64 process's i386 image: its providers are of the other mode,
+    // bound in that mode's directory (as its unit would be, `wine32_place`).
+    let alt = other_mode(pe);
+    if alt {
+        crate::ensure_alt_dir(caller, &shared)?;
+    }
+    let _mode = crate::ftab::OtherMode::enter(alt);
     for lp in crate::libprov::for_dll(&pe.exports.dll_name) {
         let n = crate::libprov::install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, base, pe.entry_rva)?;
         if trace() || std::env::var_os("GEX_WINE32_TRACE").is_some() {

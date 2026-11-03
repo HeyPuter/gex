@@ -778,13 +778,13 @@ impl<'a> Emitter<'a> {
                 if (ea >= g || !on) && ea < gex_abi::KUSER_GUARD {
                     return format!("GEX_P(0x{ea:x}u)");
                 }
-                return format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, 0x{ea:x}ull))");
+                return format!("GEX_P({})", self.kuser_guard(pc, &format!("0x{ea:x}ull")));
             }
             let a = self.v(addr);
             return if offset == 0 {
-                format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, (uint64_t)({a})))")
+                format!("GEX_P({})", self.kuser_guard(pc, &format!("(uint64_t)({a})")))
             } else {
-                format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, (uint64_t)({a}) + (uint64_t){offset}ll))")
+                format!("GEX_P({})", self.kuser_guard(pc, &format!("(uint64_t)({a}) + (uint64_t){offset}ll")))
             };
         }
         // An i386 base-plus-displacement address (`value_disp`): the
@@ -841,13 +841,24 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// The KUSER guard on the 64-bit address expression `a`, in the block at
+    /// `pc` (`gex_k`): in a body with a fault exit, the form whose slow path
+    /// has the fault delivered in place and leaves by that exit (`gex_k_r`),
+    /// as a resumable `int3` does.
+    fn kuser_guard(&self, pc: u64, a: &str) -> String {
+        match self.fault_exit {
+            Some(exit) => format!("gex_k_r(ctx, 0x{pc:x}ull, {a}, {exit})"),
+            None => format!("gex_k(ctx, 0x{pc:x}ull, {a})"),
+        }
+    }
+
     /// The guarded 32-bit address of a bulk operation's operand (no offset).
     fn bulk_address(&self, v: &str) -> String {
         if gex_abi::mem64() {
             return format!("(uint64_t)({v})");
         }
         if gex_abi::kuser_fold() {
-            return format!("gex_k(ctx, 0x{:x}ull, (uint64_t)({v}))", self.block.start);
+            return self.kuser_guard(self.block.start, &format!("(uint64_t)({v})"));
         }
         if no_guard() || self.unguarded() {
             format!("(uint32_t)({v})")

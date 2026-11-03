@@ -97,6 +97,33 @@ const bundles = new Map();
 // Decoded frames, `URL#k` -> promise of the bytes, most recently used last.
 const decoded = new Map();
 const FRAMES_KEPT = 4;
+// Fetched frames as they came, compressed, `URL#k` -> bytes, most recently
+// used last, up to PACKED_BUDGET bytes: a decoded frame that was let go is
+// decoded again from here, not fetched again. Only the last few frames are
+// kept decoded (8 MiB each), and a program's reads move between frames, so
+// a launch fetched the same frames over and over (Notepad++ in the Wine
+// desktop page: 33 fetches of 17 frames, about 43 MB for 24).
+const packed = new Map();
+const PACKED_BUDGET = 96 << 20;
+let packedBytes = 0;
+function keepPacked(key, z) {
+  if (z.length > PACKED_BUDGET) return;
+  packed.set(key, z);
+  packedBytes += z.length;
+  for (const [k, v] of packed) {
+    if (packedBytes <= PACKED_BUDGET) break;
+    packed.delete(k);
+    packedBytes -= v.length;
+  }
+}
+function packedFrame(key) {
+  const z = packed.get(key);
+  if (z) {
+    packed.delete(key);
+    packed.set(key, z);
+  }
+  return z;
+}
 let zstdUrl = null, zstd = null;
 async function decoder() {
   // `true`: the one bundled with this Worker (the runtime package's).
@@ -130,10 +157,15 @@ function frameOf(url, b, k) {
   } else {
     if (failed.held(key)) return Promise.reject(heldError);
     const [o, n] = b.frames[k];
-    f = Promise.all([getRange(url, o, o + n), decoder()]).then(([z, d]) => {
-      net += z.length;
-      return d.decode(z, k === b.frames.length - 1 ? 0 : b.frame);
+    const kept = packedFrame(key);
+    const z = kept ? Promise.resolve(kept) : getRange(url, o, o + n).then((got) => {
+      net += got.length;
+      // Its own copy: a range cut from a whole-file answer would hold the file.
+      const own = got.byteOffset || got.length !== got.buffer.byteLength ? got.slice() : got;
+      keepPacked(key, own);
+      return own;
     });
+    f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));
     f.catch(() => { decoded.delete(key); failed.failed(key); });
   }
   decoded.set(key, f);

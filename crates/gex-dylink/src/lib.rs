@@ -23,7 +23,63 @@
 //! `f`, the same in every module, so function pointers compare equal across
 //! modules as C requires.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// The crate's maps and sets, keyed by symbol names and indices: hashed
+/// with [`FxHasher`], not std's SipHash, which was most of the loader's time
+/// in a process binding a large C++ library's tens of thousands of symbols.
+pub type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+
+/// rustc's Fx hash: a rotate, xor and multiply per word. Not resistant to
+/// chosen keys, which only a process's own libraries give.
+#[derive(Clone, Copy, Default)]
+pub struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut b: &[u8]) {
+        while b.len() >= 8 {
+            self.add(u64::from_le_bytes(b[..8].try_into().unwrap()));
+            b = &b[8..];
+        }
+        if b.len() >= 4 {
+            self.add(u32::from_le_bytes(b[..4].try_into().unwrap()) as u64);
+            b = &b[4..];
+        }
+        for &c in b {
+            self.add(c as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
@@ -179,7 +235,7 @@ impl Info {
     pub fn parse(wasm: &[u8]) -> Result<Info> {
         use wasmparser::{Payload, TypeRef};
         let mut info = Info::default();
-        let mut weak = HashSet::new();
+        let mut weak = HashSet::default();
         for payload in wasmparser::Parser::new(0).parse_all(wasm) {
             match payload? {
                 Payload::CustomSection(c) if c.name() == "dylink.0" => {
@@ -330,7 +386,7 @@ impl Info {
     }
 
     fn make_slots(&self) -> (u32, HashMap<u32, u32>) {
-        let mut at: HashMap<u32, u32> = HashMap::new();
+        let mut at: HashMap<u32, u32> = HashMap::default();
         for (k, &f) in self.elem.iter().enumerate() {
             at.entry(f).or_insert(k as u32);
         }
@@ -434,7 +490,7 @@ pub fn selfbind(wasm: &[u8]) -> Result<Vec<u8>> {
     use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
     let info = Info::parse(wasm)?;
     // imported function index -> the defined function it becomes
-    let mut bound: HashMap<u32, u32> = HashMap::new();
+    let mut bound: HashMap<u32, u32> = HashMap::default();
     let mut fi = 0u32;
     for imp in &info.imports {
         if imp.kind != Kind::Func {
@@ -1065,9 +1121,9 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut nimp = 0u32;
     let mut functypes: Vec<u32> = Vec::new();
     let mut nparams: Vec<(usize, usize)> = Vec::new();
-    let mut targets: HashMap<u32, String> = HashMap::new();
+    let mut targets: HashMap<u32, String> = HashMap::default();
     // per function to split: its pieces' byte ranges in `wasm`, and its locals' bytes
-    let mut pieces: HashMap<u32, (Vec<std::ops::Range<usize>>, std::ops::Range<usize>)> = HashMap::new();
+    let mut pieces: HashMap<u32, (Vec<std::ops::Range<usize>>, std::ops::Range<usize>)> = HashMap::default();
     let mut fi = 0u32;
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -1148,7 +1204,7 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut order: Vec<u32> = pieces.keys().copied().collect();
     order.sort();
     let mut next = nimp + functypes.len() as u32;
-    let mut first: HashMap<u32, u32> = HashMap::new();
+    let mut first: HashMap<u32, u32> = HashMap::default();
     for i in &order {
         first.insert(*i, next);
         next += pieces[i].0.len() as u32;
@@ -1338,7 +1394,39 @@ pub enum Bind {
 #[derive(Clone, Debug, Default)]
 pub struct Link {
     pub mods: Vec<Loaded>,
+    /// [`Link::lookup`]'s index, kept up with `mods` as they are added.
+    pub scope: Scope,
 }
+
+/// The first module in scope order defining each function and each data
+/// symbol, of the first `upto` modules: a lookup is one hash, not one per
+/// module until a definition (a library binding tens of thousands of
+/// symbols against a hundred others). Modules are only ever added to a
+/// link map, after the ones there.
+#[derive(Default)]
+pub struct Scope(std::sync::Mutex<ScopeIndex>);
+
+#[derive(Default)]
+struct ScopeIndex {
+    upto: usize,
+    /// The defining module of a function (`.0`) and a global (`.1`).
+    first: HashMap<String, (u32, u32)>,
+}
+
+impl Clone for Scope {
+    /// Empty: the clone's modules may change apart from these.
+    fn clone(&self) -> Scope {
+        Scope::default()
+    }
+}
+
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scope")
+    }
+}
+
+const NONE: u32 = u32::MAX;
 
 /// Imports the shim provides.
 pub fn shim_import(m: &str, name: &str) -> bool {
@@ -1449,6 +1537,31 @@ impl Link {
 
     /// The first module in scope order defining `name` as `kind`.
     pub fn lookup(&self, name: &str, kind: Kind) -> Option<usize> {
+        if matches!(kind, Kind::Func | Kind::Global) {
+            let mut x = self.scope.0.lock().unwrap_or_else(|e| e.into_inner());
+            if x.upto > self.mods.len() {
+                *x = ScopeIndex::default();
+            }
+            for i in x.upto..self.mods.len() {
+                let m = &self.mods[i].info;
+                for (n, e) in &m.exports {
+                    let slot = match e.kind {
+                        Kind::Func if e.index >= m.func_imports => 0,
+                        Kind::Global if e.index >= m.global_imports => 1,
+                        _ => continue,
+                    };
+                    let f = x.first.entry(n.clone()).or_insert((NONE, NONE));
+                    let at = if slot == 0 { &mut f.0 } else { &mut f.1 };
+                    if *at == NONE {
+                        *at = i as u32;
+                    }
+                }
+            }
+            x.upto = self.mods.len();
+            let f = x.first.get(name)?;
+            let at = if kind == Kind::Func { f.0 } else { f.1 };
+            return (at != NONE).then_some(at as usize);
+        }
         self.mods.iter().position(|m| {
             m.info.exports.get(name).is_some_and(|e| {
                 e.kind == kind
@@ -1481,7 +1594,7 @@ impl Link {
 
     /// What each import of module `i` is bound to, given which modules are
     /// instantiated before it (`done`).
-    pub fn bind(&self, i: usize, done: &HashSet<usize>) -> Result<Vec<Bind>> {
+    pub fn bind<S: std::hash::BuildHasher>(&self, i: usize, done: &std::collections::HashSet<usize, S>) -> Result<Vec<Bind>> {
         let m = &self.mods[i];
         let mut out = Vec::with_capacity(m.info.imports.len());
         for imp in &m.info.imports {
@@ -1722,6 +1835,39 @@ pub fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn module(name: &str, func_imports: u32, exports: &[(&str, Kind, u32)]) -> Loaded {
+        let info = Info {
+            func_imports,
+            global_imports: 1,
+            exports: exports.iter().map(|&(n, kind, index)| (n.to_string(), Export { kind, index })).collect(),
+            ..Default::default()
+        };
+        Loaded { name: name.into(), path: name.into(), info, memory_base: 0, table_base: 0 }
+    }
+
+    #[test]
+    fn lookup_takes_the_first_definition_in_scope_order() {
+        let mut l = Link::default();
+        // an export of an import is no definition
+        l.mods.push(module("prog", 2, &[("f", Kind::Func, 1), ("g", Kind::Global, 0)]));
+        l.mods.push(module("liba", 0, &[("f", Kind::Func, 3), ("t", Kind::Table, 0)]));
+        l.mods.push(module("libb", 0, &[("f", Kind::Func, 4), ("g", Kind::Global, 2), ("h", Kind::Func, 0)]));
+        assert_eq!(l.lookup("f", Kind::Func), Some(1));
+        assert_eq!(l.lookup("g", Kind::Global), Some(2));
+        assert_eq!(l.lookup("g", Kind::Func), None);
+        assert_eq!(l.lookup("t", Kind::Table), Some(1));
+        assert_eq!(l.lookup("nope", Kind::Func), None);
+        // a module added later (dlopen) comes after the ones there
+        l.mods.push(module("libc", 0, &[("h", Kind::Func, 1), ("k", Kind::Func, 2)]));
+        assert_eq!(l.lookup("h", Kind::Func), Some(2));
+        assert_eq!(l.lookup("k", Kind::Func), Some(3));
+        // a clone keeps its own index
+        let mut c = l.clone();
+        c.mods.truncate(3);
+        assert_eq!(c.lookup("k", Kind::Func), None);
+        assert_eq!(l.lookup("k", Kind::Func), Some(3));
+    }
 
     #[test]
     fn forkreach_roundtrip() {

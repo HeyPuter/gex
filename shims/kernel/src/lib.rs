@@ -2689,6 +2689,16 @@ fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> Result<(), gex_kernel::Err
     }
 }
 
+fn blocks_write(offset: u64, buf: &[u8]) -> Result<(), gex_kernel::Errno> {
+    // SAFETY: as blocks_io's; the host only reads a write's bytes.
+    let n = unsafe { block_io(gex_kernel::vfs::blocks::OP_WRITE, BLOCKS_CTL.as_ptr() as u32, offset, buf.as_ptr() as u32, buf.len() as u32) };
+    match n {
+        n if n >= 0 && n as usize == buf.len() => Ok(()),
+        -28 => Err(gex_kernel::Errno::ENOSPC),
+        _ => Err(gex_kernel::Errno::EIO),
+    }
+}
+
 /// Turn the block store on for files made from now on (`block` 0: only
 /// the slots' address): blocks of `block` bytes, `cache_mib` MiB of them
 /// held here, files up to `inline` bytes kept in this memory; `flags` bit 0
@@ -2697,6 +2707,7 @@ fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> Result<(), gex_kernel::Err
 #[no_mangle]
 pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags: u32) -> u32 {
     gex_kernel::vfs::blocks::set_io(blocks_io);
+    gex_kernel::vfs::blocks::set_io_write(blocks_write);
     gex_kernel::vfs::set_sync_all(gex_kernel::vfs::tmpfs::persist::sync);
     if block != 0 {
         gex_kernel::vfs::blocks::set_check(flags & 1 != 0);
@@ -2754,6 +2765,18 @@ pub extern "C" fn k_fs_restored_gen() -> u32 {
 pub extern "C" fn k_fs_sync(handle: i32, data_only: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     as_unit(h.sync(data_only != 0))
+}
+
+/// The kept root's counters (`gex_kernel::vfs::tmpfs::persist::stats`), u64s.
+#[no_mangle]
+pub extern "C" fn k_fs_persist_stats(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let s = gex_kernel::vfs::tmpfs::persist::stats();
+    let b: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if (b.len() as u32) > cap {
+        return -34;
+    }
+    unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    b.len() as i32
 }
 
 /// The store's counters (`gex_kernel::vfs::blocks::stats`), u64s.

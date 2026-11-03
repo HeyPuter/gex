@@ -585,6 +585,9 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 16 != 0 {
         gex_cgen::image::set_icall_count(true);
     }
+    // Bit 5 (32): units on only because the function JIT is (no `cgen=`):
+    // an image without one says nothing.
+    QUIET_MISS.store(mode & 32 != 0, Ordering::Relaxed);
     let mut mode = mode & 3;
     if mode != 0 && TSO.load(Ordering::Relaxed) {
         tso_refuses_units();
@@ -1173,6 +1176,10 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
     units.get(u as usize).map_or(0, |x| put_str(&x.path, buf, cap))
 }
 
+/// Units are on only for the function JIT's sake (`gex_cgen_set_mode` bit 5):
+/// a missing one is no news.
+static QUIET_MISS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// JS has no unit for `u`: the image runs on tier-1. Under `--cgen` a program
 /// image (not a Wine DLL) without one is refused: returns 1, and JS stops.
 #[no_mangle]
@@ -1186,6 +1193,9 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
             x.path, x.base, x.key
         ));
         return 1;
+    }
+    if QUIET_MISS.load(Ordering::Relaxed) {
+        return 0;
     }
     // A unit gexc builds apart from any image (the NT trampolines: every
     // system call and Unix call goes through them): no "unitless" image
@@ -1921,6 +1931,22 @@ pub(crate) fn index_of(addr: u64) -> Option<u32> {
 /// Whether a unit built ahead of time (or a provider) serves the function at
 /// `addr`: not the JIT's own functions, whose resume points are published
 /// at addresses inside functions.
+/// Whether `addr` is in an image whose unit is still to come: one mapped and
+/// left for its first miss ([`wine32_miss`] places it), or one placed whose
+/// unit JS has not yet brought. The function JIT leaves such code alone, so
+/// the miss path places the image and its unit serves it (and a recording
+/// names its key); it lifts only what no unit is coming for.
+pub(crate) fn unit_due(addr: u64) -> bool {
+    if WINE32_ANY_DEFERRED.load(Ordering::Acquire) && lock(&WINE32_DEFERRED).iter().any(|p| addr >= p.base && addr < p.base + p.size) {
+        return true;
+    }
+    if !wanted_any() {
+        return false;
+    }
+    let page = addr / gex_abi::DISPATCH_PAGE;
+    lock(&UNITS).iter().enumerate().any(|(u, x)| u_state(u) & U_WANTED != 0 && x.pages.iter().any(|&(p, _)| p == page))
+}
+
 pub(crate) fn unit_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
 }
@@ -2304,13 +2330,15 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // left, its C caller never runs again, and the guest's return to the pad
     // finds no call-out (a callback that calls back in: qsort's comparator
     // sorting).
+    // Native Wine's nest as deep as the guest thread's stack and the shim's
+    // have room for (the host's: the glue's `stackRoom`).
     let pad = ret as u64 == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
-    let limit = if pad || libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
+    if let Some(what) = pad.then(|| native_call_spent(&gm, c)).flatten() {
+        crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {what} has room for: the process ends (stack overflow)\n"));
+        crate::end_process(0xc000_00fd);
+    }
+    let limit = if pad { usize::MAX } else if libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
     if CALLOUTS.with(|c| c.borrow().len()) >= limit {
-        if pad {
-            crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {limit}: the process ends (stack overflow)\n"));
-            crate::end_process(0xc000_00fd);
-        }
         if limit == CALLOUT_MAX_DEPTH_PROVIDER {
             crate::warn_line(&format!("gex: a provider's guest calls nest deeper than {limit}\n"));
         }
@@ -2465,9 +2493,32 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 /// `gex_set_callout(2)`: say every stateful provider's guest call.
 static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The same for a stateful provider's or native Wine's guest calls, which
-/// cannot leave.
+/// The same for a stateful provider's guest calls, which cannot leave.
+/// Native Wine's, which cannot either, nest as deep as the stacks have room
+/// for (`native_call_spent`).
 const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
+
+/// What a guest call from native Wine must find left of this Worker's shim
+/// stack: a level's call-out holds a few hundred bytes of it.
+const NATIVE_CALL_SHIM_ROOM: u32 = 64 << 10;
+
+/// Why a guest call from native Wine (context `c`) cannot be made: its
+/// thread's guest stack is spent (`win::tramp::native_call_stack_spent`;
+/// native Wine's frames, on that stack, have no guard page), or the shim's
+/// is nearly (its guard is checked only at system calls).
+fn native_call_spent(gm: &GuestMem, c: u64) -> Option<&'static str> {
+    if crate::stack_room().is_some_and(|r| r < NATIVE_CALL_SHIM_ROOM) {
+        return Some("the shim's stack");
+    }
+    if !gex_abi::X86 {
+        return None;
+    }
+    let class32 = gex_xlate::default_compat() != crate::thread_alt();
+    let teb = gm.read_u64(c + if class32 { gex_abi::ctx::FS_BASE } else { gex_abi::ctx::GS_BASE } as u64).unwrap_or(0);
+    let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    let read = |a: u64| if class32 { gm.read_u32(a).ok().map(u64::from) } else { gm.read_u64(a).ok() };
+    gex_kernel::win::tramp::native_call_stack_spent(class32, teb, sp, read).then_some("the thread's stack")
+}
 
 /// A call-out the glue opens inside others when the host's stack has no room
 /// for one more (`#callOutSteps`): a native Wine module's guest call (64-bit
@@ -2536,6 +2587,25 @@ thread_local! {
     /// 1 + the call-out whose loop called `enter` last with nothing nested
     /// since (`gex_callout_leave_ok`), or 0.
     static LEAVE_OK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this Worker's thread ended with none of its call-outs, NT
+/// callbacks or provider guest calls open (`gex_thread_park`): its wasm
+/// frames all gone back to the run loop.
+pub(crate) fn park_clear() -> bool {
+    CALLOUTS.with(|c| c.borrow().is_empty()) && CB_DEPTH.with(|c| c.get()) == 0 && libprov::park_clear()
+}
+
+/// This Worker's thread is over and the Worker waits for another
+/// (`gex_thread_park`): no fault or signal of the old thread's is staged.
+pub(crate) fn park_reset() {
+    OPENED_SPAN.with(|c| c.set(-1));
+    OPENED_DEPTH.with(|c| c.set(-1));
+    HIT.with(|c| c.set(-1));
+    LEAVE_OK.with(|c| c.set(0));
+    FAULT_PENDING.with(|c| c.set(None));
+    SIGNAL_PENDING.with(|c| c.set(None));
+    FAULT_NEST.with(|c| c.borrow_mut().clear());
 }
 
 /// JS's call-out loop `depth` is about to call `enter` (`depth + 1`), or

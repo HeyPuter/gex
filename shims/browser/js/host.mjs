@@ -141,6 +141,12 @@ const SPARE_MAX = 8;
  *  one that waits longer holds a whole thread's instantiation for a start
  *  that may never come. */
 const SPARE_IDLE_MS = 5000;
+/** How many Workers whose thread ended one process keeps waiting for its
+ *  next threads (`park`), within SPARE_MAX. A program that starts short
+ *  threads one after another needs one. */
+const PARKED_MAX = 2;
+/// How many threads a Worker has run (`park`), the last included.
+const THREADS_RUN = Symbol('gex.threadsRun');
 /** A test-only switch: whether a running fork child's
  *  record, its parent's modules with it, can be collected once the child's
  *  Worker has it. Node only, with `--expose-gc`. */
@@ -532,6 +538,9 @@ export class ProcessHost {
    *  Worker, `{ status }` from the thread Worker that carried it. */
   #carried = new Map();
   #threads = 0;
+  /** Each thread Worker's `ref` (`#threadWorker`): the key its messages
+   *  come under, which `#park` renames. */
+  #refOf = new WeakMap();
   /** Spare thread Workers waiting for their process's next thread, oldest
    *  first: `{ proc, key, w, ref, gen }` (`#startSpare`). */
   #spares = [];
@@ -593,6 +602,8 @@ export class ProcessHost {
     onFork = () => {},
     // Every process's exit message, whole. `start` resolves with pid 1's
     // status; this hands a host the rest of what a Worker reports on exit.
+    // A process that threw comes here too, with `{ threw: true, message }`
+    // and none of an exit's numbers.
     onExit = () => {},
     readStdin = null,
     // Anything a Worker posts that this file has no meaning for.
@@ -1342,6 +1353,7 @@ export class ProcessHost {
     // Keyed by the thread, so its end stops the right Worker and frees the
     // right kernel stack.
     const ref = { key };
+    this.#refOf.set(w2, ref);
     const deliver = (mm) => this.#onMessage(ref.key, w2, mm, () => {}, () => {});
     w2.addEventListener?.('message', (e) => deliver(e.data));
     w2.on?.('message', deliver);
@@ -1381,9 +1393,18 @@ export class ProcessHost {
       moduleStore: rec.moduleStore,
       compat: rec.compat,
       procOpts: rec.procOpts,
+      park: true,
     });
     const sp = { proc, key, w, ref, gen: rec.execGen };
     this.#spares.push(sp);
+    this.#spareIdle(sp);
+    if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
+    while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
+  }
+
+  /** Spare `sp` let go when SPARE_IDLE_MS passes without a thread for it. */
+  #spareIdle(sp) {
+    const { key } = sp;
     const idle = setTimeout(() => {
       const i = this.#spares.indexOf(sp);
       if (i < 0) return;
@@ -1393,14 +1414,51 @@ export class ProcessHost {
     }, SPARE_IDLE_MS);
     // Not what keeps a host's event loop alive.
     idle.unref?.();
-    if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
+  }
+
+  /** Thread Worker `key` of process `proc`, its thread ended (`park`):
+   *  kept as the process's spare, under a spare's key, for its next thread
+   *  of program `gen` (the Worker's, which `#takeSpare` checks). A process
+   *  need not have offered spares: a Wine process, whose modules are not a
+   *  wasm32 program's, never does. False when it is not kept (the process
+   *  has another program now, PARKED_MAX of its Workers wait already, or
+   *  this one has run REUSE_MAX threads): it is let go and ends as before. */
+  #park(proc, key, w, gen) {
+    const rec = this.#spareRec.get(proc);
+    const ref = this.#refOf.get(w);
+    const ran = (w[THREADS_RUN] ?? 1) + 1;
+    const no = !ref ? 'no ref' : rec && rec.execGen !== gen ? 'another program' : this.#foreign(proc) ? 'other flavour'
+      : this.#inDoor(key) ? 'in a door call' : ran > REUSE_MAX ? 'REUSE_MAX threads run'
+      : this.#spares.filter((x) => x.proc === proc && x.parked).length >= PARKED_MAX ? 'PARKED_MAX waiting' : '';
+    if (no) {
+      if (logNamed('spare')) console.warn(`[spare] ${key}: ended, its Worker not kept (${no})`);
+      return false;
+    }
+    w[THREADS_RUN] = ran;
+    const spareKey = `${proc}:spare${++this.#spareSeq}`;
+    this.#workers.delete(key);
+    this.#workers.set(spareKey, w);
+    workerRan(w, spareKey);
+    const slice = this.#stackOf.get(key);
+    if (slice !== undefined) {
+      this.#stackOf.delete(key);
+      this.#stackOf.set(spareKey, slice);
+    }
+    ref.key = spareKey;
+    const sp = { proc, key: spareKey, w, ref, gen, parked: true };
+    this.#spares.push(sp);
+    this.#spareIdle(sp);
+    if (logNamed('spare')) console.warn(`[spare] ${spareKey}: ${key} ended, waits for the next thread (${this.#spares.length} waiting on the page)`);
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
+    return true;
   }
 
   /** Process `proc`'s spare for a thread of its program `gen`, taken; null
    *  with none (one caught up with an earlier program is let go). */
   #takeSpare(proc, gen) {
-    const i = this.#spares.findIndex((x) => x.proc === proc);
+    // A ready one first: a parked Worker, or a spare that has started.
+    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || !this.#pending.has(x.ref.key)));
+    if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc);
     if (i < 0) return null;
     const [sp] = this.#spares.splice(i, 1);
     if (gen === sp.gen) return sp;
@@ -1849,10 +1907,17 @@ export class ProcessHost {
           const { tid, ctx, pc, procOpts } = m.thread;
           spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
         } else {
-          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread });
+          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared });
         }
         // The next spare, for a process that starts more than one thread.
         if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);
+        break;
+      }
+      case 'park': {
+        // A thread has ended and its process runs on (`Gex#parkThread`): its
+        // Worker waits for the process's next thread, or is let go.
+        const proc = String(pid).split(':')[0];
+        if (!this.#park(proc, pid, w, m.gen)) w.postMessage({ kind: 'spareGo', thread: null });
         break;
       }
       case 'threadSpare': {
@@ -2055,7 +2120,14 @@ export class ProcessHost {
         resolve(m.status);
         break;
       case 'threw':
-        if (!String(pid).includes(':')) forgetMemory(pid);
+        if (!String(pid).includes(':')) {
+          // A process that fell over has ended as surely as one that exited:
+          // its host lets go of it the same way, or its windows stay on the
+          // screen, drawn from a block nobody writes again. Before the
+          // release, as for an exit.
+          this.#onExit({ threw: true, message: m.message }, pid);
+          forgetMemory(pid);
+        }
         this.#release(pid, w);
         // Here as well as in the Worker: only this side knows which process
         // fell over, and a child's promise often has nobody awaiting it.

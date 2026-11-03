@@ -953,8 +953,12 @@ impl WaylandDevice {
                 }
             }
             changed |= s.client.take_dirty();
+            // Not a client that is going: its surfaces were published after
+            // its hang-up as before it, so the window of a client that closed
+            // its connection stayed on the screen while its process lived on.
+            let stays = !gone && s.client.failed.is_none();
             for info in s.client.scene() {
-                if scene.len() / REC >= MAX_SURFACES {
+                if !stays || scene.len() / REC >= MAX_SURFACES {
                     break;
                 }
                 push_record(&mut scene, s.idx, &info);
@@ -977,7 +981,7 @@ impl WaylandDevice {
                     crate::write_stderr(&format!("[wl] client {} disconnected\n", s.idx));
                 }
             }
-            !gone && s.client.failed.is_none()
+            stays
         });
         // A client that went away changes the scene by its absence.
         let live = sessions.len();

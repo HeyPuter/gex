@@ -67,6 +67,7 @@ export function sharedReads(h) {
   }
 }
 
+const zero = new Uint8Array(1);
 let bounce = null;
 function bounceOf(n) {
   if (!bounce || bounce.length < n) bounce = new Uint8Array(Math.max(n, 1 << 20));
@@ -94,13 +95,14 @@ export function handleOp(h, sharedOk, memory, op, off, dst, len) {
     return len;
   }
   if (op === OP_GROW) {
-    // `off` is the length wanted; a failure is the origin's quota.
-    try {
-      if (h.getSize() < off) h.truncate(off);
-    } catch (e) {
-      if (e?.name === 'QuotaExceededError') return NOSPACE;
-      throw e;
-    }
+    // `off` is the length wanted, made by writing its last byte, not by
+    // truncate: in a context whose storage is in memory (a private window,
+    // a test's fresh context) a truncate to between 1 and 2 GiB ends the
+    // browser, and one past 2 GiB does nothing; a write there past about
+    // 2 GiB is refused (no space), which is the store's ENOSPC.
+    if (h.getSize() >= off) return 0;
+    const n = h.write(zero, { at: off - 1 });
+    if (n !== 1) return (n >>> 0) === HANDLE_NOSPACE ? NOSPACE : -1;
     return h.getSize() >= off ? 0 : NOSPACE;
   }
   if (op === OP_FLUSH) {
@@ -184,6 +186,8 @@ export async function storeOp(fs, op, off, len, bytes) {
       return [len, null];
     }
     if (op === OP_GROW) {
+      // A page's store grows by its own truncate (Filesystem's contract,
+      // where it says ENOSPC), not as handleOp grows the OPFS file.
       if (await fs.size() < off) await fs.truncate(off);
       return [0, null];
     }

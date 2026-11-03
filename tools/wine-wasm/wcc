@@ -37,6 +37,13 @@ args = sys.argv[1:]
 plugin = os.path.join(sysroot, 'lib', 'GexIcall.so')
 if '-D_WIN32' in args and os.path.exists(plugin) and not os.environ.get('GEX_WASM_NO_ICALL'):
     CC += ['-fpass-plugin=' + plugin]
+# C++ on the PE side (Wine's libc++, icu) sees a Windows target, as wcc64's
+# does: Linux's predefined macros would send libc++'s headers to musl's.
+# Static destructors are not registered: a module's terminators never run,
+# and Windows has no __cxa_atexit.
+if '-D_WIN32' in args and CC[0] == 'clang++':
+    CC += ['-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__',
+           '-DWINE_UNICODE_NATIVE', '-fno-c++-static-destructors']
 # Unix-side code (programs, their libraries) lowers setjmp onto the legacy
 # exception instructions: binaryen's asyncify (fork, below) can instrument
 # try/catch but not try_table. The link step translates the result to the

@@ -12,9 +12,11 @@
 //! registry (musl's src/env/wasm32/__gex_dso.c), which runs their
 //! constructors and lays out their thread-local blocks.
 //!
-//! A fork's child shares the process's registry and function map
-//! natively, so it instantiates the same modules at the same table bases;
-//! the data, relocated, is the parent's copy.
+//! A fork's child gets a copy of the process's registry and function map
+//! natively (`JitShared::fork_copy`), so it instantiates the same modules
+//! at the same table bases; the data, relocated, is the parent's copy. A
+//! library either then dlopens is its own: mapped, initialised and
+//! published in that process alone.
 
 use super::*;
 use gex_dylink::{Bind, Info, Kind, Link, Loaded};
@@ -123,7 +125,7 @@ fn publish(
     p: &mut DyProcess,
     from: usize,
     bytes: Vec<Vec<u8>>,
-    pairs_of: impl Fn(usize, &Loaded, &HashMap<u32, u32>) -> Vec<(u64, u32)>,
+    pairs_of: impl Fn(usize, &Loaded, &gex_dylink::HashMap<u32, u32>) -> Vec<(u64, u32)>,
 ) -> Result<Vec<usize>> {
     // data, where its own mmap would put it (the program's is its image's)
     for m in p.link.mods[from..].iter_mut() {
@@ -228,7 +230,7 @@ pub(crate) fn install_program(
         .unwrap_or_default();
     let origin = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| ".".into());
     let mut p = DyProcess {
-        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base as u32, table_base: 0 }] },
+        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base as u32, table_base: 0 }], ..Default::default() },
         module_of: Vec::new(),
         ldpath,
         origin,

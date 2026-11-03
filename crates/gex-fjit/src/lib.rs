@@ -105,15 +105,16 @@ pub fn build(
 
 /// A run-time translation of `functions` (memory form, verified; the first
 /// is the one asked for) for the function table: the module, the entries it
-/// holds, what the emitter did. `page_gen` gives the `PAGE_GEN` value of a
-/// page, which each function checks on entry for every page it covers.
+/// holds, what the emitter did. `page_gen` gives the `PAGE_GEN` word of a
+/// page (its guest address and value), which each function checks on entry
+/// for every page it covers.
 /// `intrinsics` are tier-1's blocks for the entries it serves with a host
 /// builtin (`gex_xlate::intrinsic`): those functions are formed from them.
 pub fn runtime(
     functions: Vec<Function>,
     summaries: &HashMap<u64, Summary>,
     class32: bool,
-    page_gen: &dyn Fn(u64) -> u32,
+    page_gen: &dyn Fn(u64) -> (u64, u32),
     intrinsics: &[Block],
     ret_pops: &HashMap<u64, u64>,
 ) -> Result<(Vec<u8>, Vec<u64>, Stats)> {
@@ -130,7 +131,7 @@ pub fn runtime(
             .collect();
         ps.sort_unstable();
         ps.dedup();
-        pages.insert(f.entry, ps.into_iter().map(|p| (p, page_gen(p))).collect());
+        pages.insert(f.entry, ps.into_iter().map(page_gen).collect());
     }
     let pages = &pages;
     for f in &mut functions {
