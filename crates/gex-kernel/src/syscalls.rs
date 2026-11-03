@@ -2482,6 +2482,24 @@ impl FdIo<'_> {
             .collect()
     }
 
+    /// Every epoll set among `fds` (and the sets they watch, `depth` deep)
+    /// learns its watched descriptors' open files from this process's
+    /// table ([`unix::EpollSet::note_file`]) before it is asked whether it
+    /// is readable: a set polled before any wait on it (a fork's copy, one
+    /// only ever polled) knows them by its first poll, and a watch whose
+    /// descriptor is not open here reports nothing, as Linux drops it.
+    fn note_epoll_sets(&self, fds: &[PollFd], depth: u32) {
+        if depth == 0 {
+            return;
+        }
+        for p in fds {
+            if let Some(set) = p.handle.as_ref().and_then(|h| Arc::clone(h).as_epoll()) {
+                let inner = self.epoll_pollfds(&set);
+                self.note_epoll_sets(&inner, depth - 1);
+            }
+        }
+    }
+
     /// The poll family's question (`ppoll`, `pselect6`, `epoll_pwait`,
     /// `epoll_pwait2`: canonical `n`, arguments `a`): the descriptors, how
     /// the answer is written, and how long the call may wait (`None`: not at
@@ -2507,6 +2525,7 @@ impl FdIo<'_> {
                 let set = self.epoll_of(a[0] as i32)?;
                 let generation = set.generation();
                 let fds = self.epoll_pollfds(&set);
+                self.note_epoll_sets(&fds, 4);
                 // `epoll_pwait` takes milliseconds, negative for ever;
                 // `epoll_pwait2` a `timespec`.
                 let wait = if n == nr::EPOLL_PWAIT2 {
@@ -2528,12 +2547,20 @@ impl FdIo<'_> {
                 };
                 Ok((fds, report, wait))
             }
-            nr::PPOLL => Ok((self.collect_pollfds(m, a[0], a[1]).ok_or(Errno::EFAULT)?, PollReport::Poll, timespec(a[2])?)),
-            nr::PSELECT6 => Ok((
-                self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
-                PollReport::Select { nfds: a[0] as u32, readfds: a[1], writefds: a[2], exceptfds: a[3] },
-                timespec(a[4])?,
-            )),
+            nr::PPOLL => {
+                let fds = self.collect_pollfds(m, a[0], a[1]).ok_or(Errno::EFAULT)?;
+                self.note_epoll_sets(&fds, 4);
+                Ok((fds, PollReport::Poll, timespec(a[2])?))
+            }
+            nr::PSELECT6 => {
+                let fds = self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?;
+                self.note_epoll_sets(&fds, 4);
+                Ok((
+                    fds,
+                    PollReport::Select { nfds: a[0] as u32, readfds: a[1], writefds: a[2], exceptfds: a[3] },
+                    timespec(a[4])?,
+                ))
+            }
             _ => Err(Errno::ENOSYS),
         }
     }
@@ -13338,11 +13365,21 @@ mod tests {
         m.write_u64(if gex_abi::X86 { 0x20304 } else { 0x20308 }, 7).unwrap();
         assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[ep, 1, rfd, 0x20300]), 0);
         assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty pipe");
+        // A set watching that set (GLib's loop over a library's own epoll).
+        let outer = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[outer, 1, ep, 0x20300]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty pipe");
+        assert_eq!(poll(&mut k, &mut m, outer), 0, "an empty pipe, two sets deep");
         m.write(0x21000, b"a").unwrap();
         assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
         assert_eq!(poll(&mut k, &mut m, ep), 1, "the pipe written: POLLIN only");
+        assert_eq!(poll(&mut k, &mut m, outer), 1, "the pipe written, two sets deep");
         assert_eq!(call(&mut k, &mut m, nr::READ, &[rfd, 0x21100, 8]), 1);
         assert_eq!(poll(&mut k, &mut m, ep), 0, "the pipe read again");
+        assert_eq!(poll(&mut k, &mut m, outer), 0, "the pipe read again, two sets deep");
+        // The watched descriptor closed: its watch reports nothing.
+        assert_eq!(call(&mut k, &mut m, nr::CLOSE, &[rfd]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "the pipe closed");
     }
 
     /// `EPOLLET` as Linux has it: an edge-triggered watch reports at each

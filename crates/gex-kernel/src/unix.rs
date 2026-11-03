@@ -1732,14 +1732,15 @@ impl FileHandle for EpollSet {
 
     /// Readable when a watch has something to report, as `epoll_wait` would
     /// return it, not always: a set in a `poll` loop (GLib's main loop
-    /// polling an epoll descriptor, nested sets) otherwise spins a core. A
-    /// watch whose file the set has not seen yet (a fork's copy before its
-    /// first wait) answers yes, so nothing is missed.
+    /// polling an epoll descriptor, nested sets) otherwise spins a core.
+    /// The poll path tells the set its files before it asks
+    /// (`note_epoll_sets`), so a watch with none is one whose descriptor is
+    /// not open, and it reports nothing.
     fn poll_readable(&self) -> bool {
         let files = self.files.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.watches().iter().any(|x| {
             let Some((_, file, writable)) = files.iter().find(|f| f.0 == x.fd) else {
-                return true;
+                return false;
             };
             let Some(h) = file.upgrade() else {
                 return false;
