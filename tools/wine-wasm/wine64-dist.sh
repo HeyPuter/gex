@@ -39,7 +39,7 @@
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
 #   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so}, x86_64-windows,
+#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so and its gex-rest-only}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
 #               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
@@ -348,7 +348,10 @@ dist_make() {
 	local d=$PWD
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
-	[ -z "$GS" ] || cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/
+	# (gex-rest-only: a site keeps the side module out of its boot bundle, in
+	# the rest bundle, fetched on the first dlopen: web/site-bundle.mjs)
+	[ -z "$GS" ] || { cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/ &&
+		echo winegstreamer.so > lib/wine/x86_64-unix/gex-rest-only; }
 	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/

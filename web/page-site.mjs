@@ -37,7 +37,7 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFill, extract, pack, pruneTree, readPathList, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
+import { buildFill, buildRest, extract, hasRestOnly, pack, pruneTree, readLessRestOnly, readPathList, restOnly, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const web = dirname(fileURLToPath(import.meta.url));
 // A wine32 recording's format (tools/eject/record-wine32.mjs), and the name ones made before the rename carry.
@@ -108,20 +108,42 @@ for (const f of ['zstddec-stream.mjs', 'zstddec.wasm', 'zstddec-LICENSE']) copyF
 let tar = tarIn;
 let lazyNote = '';
 const recording = JSON.parse(readFileSync(paramsIn, 'utf8'));
-if (flag('--strip') || flag('--prune') || flag('--dedupe') || flag('--split')) {
+// A dist's rest-only files (site-bundle.mjs `REST_ONLY`: a side module the
+// loader dlopens when a program first needs it) leave the bundle whatever
+// the recording read, with or without --split, for the rest bundle,
+// /lazy/rest.bin: compressed, fetched by its frames on the first read.
+const restOnlyIn = hasRestOnly(tar);
+if (flag('--strip') || flag('--prune') || flag('--dedupe') || flag('--split') || restOnlyIn) {
   const tree = extract(tar, work);
   if (flag('--strip')) stripTree(tree.x, stripper(work, true));
   if (flag('--prune')) pruneTree(tree.x);
+  let read = null;
   if (flag('--split')) {
     if (!WINE32_FORMATS.includes(recording.format) || !Array.isArray(recording.files_read)) {
       console.error(`page-site: --split needs a recording with files_read as --params (${paramsIn})`);
       process.exit(1);
     }
-    const read = new Set(recording.files_read);
-    read.add(new URL(recording.url).searchParams.get('exe')); // the page reads the loader from the bundle itself
-    const lazy = splitTree(tree.x, read, join(out, 'lazy'));
+    read = new Set(recording.files_read);
+  }
+  const only = restOnlyIn ? restOnly(tree.x) : new Set();
+  if (restOnlyIn) read = readLessRestOnly(tree.x, read);
+  if (read) {
+    // the page reads the loader from the bundle itself
+    const exe = WINE32_FORMATS.includes(recording.format) ? new URL(recording.url).searchParams.get('exe') : recording.exe;
+    if (exe) read.add(exe);
+    const store = join(out, 'lazy');
+    let lazy = splitTree(tree.x, read, store);
+    const rest = lazy.filter((f) => only.has(f[0]));
+    if (rest.length) {
+      const loose = lazy.filter((f) => !only.has(f[0]));
+      const r = buildRest(rest, store, { bin: join(store, 'rest.bin'), work, frame: 8 * 1048576, zlev: Number(level) > 19 ? `--ultra -${level}` : `-${level}` });
+      const keep = new Set(loose.map((f) => f[2]));
+      for (const f of rest) if (!keep.has(f[2])) rmSync(join(store, f[2]), { force: true });
+      lazy = [...loose, ...r.files];
+      lazyNote += `; rest bundle: ${rest.length} files, ${(r.bytes / 1048576).toFixed(1)} MiB compressed`;
+    }
     writeFileSync(join(out, 'lazy.json'), JSON.stringify({ base: '/lazy/', files: lazy }));
-    lazyNote = `; bundle split: ${read.size} read, ${lazy.length} lazy (${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(1)} MiB)`;
+    lazyNote = `; bundle split: ${read.size} read, ${lazy.length} lazy (${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(1)} MiB)` + lazyNote;
   }
   tar = join(work, 'bundle.tar');
   pack(tree, tar, work, flag('--dedupe'));

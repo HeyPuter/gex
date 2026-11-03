@@ -21,13 +21,15 @@
 // the library fetches and decodes itself (app.js, pack.json). No service
 // worker: the host sends the isolation headers (serve.mjs, _headers).
 // --late FILE and --boot-units FILE: what goes in the background fill (below).
+// A dist's rest-only files (site-bundle.mjs `REST_ONLY`, side modules such as
+// Wine's winegstreamer.so) are always in the rest bundle, never the bundle.
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, openSync, writeSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFill, extract, pack, placeHeads, pruneTree, readPathList, restPaths, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
+import { buildFill, buildRest, extract, hasRestOnly, pack, placeHeads, pruneTree, readLessRestOnly, readPathList, restPaths, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const av = process.argv.slice(2);
@@ -134,75 +136,13 @@ function coldPack(dir, path) {
   rmSync(z, { recursive: true, force: true });
 }
 
-/** The rest bundle: the bundle split's lazy files (`lazy`, [path, size,
- *  hash, mtime], their bytes in `store` by hash) as one uncompressed tar,
- *  each content once, in read order (--rest-order) and then by path, so files
- *  read together sit together; its stream cut into frames of `restFrame`
- *  bytes, each zstd-compressed on its own (one stream would have to be read
- *  from its start), concatenated as project/build/web/rest.bin, and
- *  rest.bin.json: `frame`, `frames` ([offset, length] of each in rest.bin),
- *  `size` (the tar's). A lazy file's entry names `rest.bin#OFFSET`, OFFSET
- *  its bytes in the tar, which the page reads by the frames over it
- *  (lazy-fetch.mjs). Returns the lazy entries. */
+/** The rest bundle (site-bundle.mjs `restBundle`) at
+ *  project/build/web/rest.bin, in --rest-order's order. */
 function restBundle(lazy, store) {
-  const rank = new Map();
-  if (restOrder) readPathList(restOrder).forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
-  const order = [...lazy].sort((a, b) => (rank.get(a[0]) ?? Infinity) - (rank.get(b[0]) ?? Infinity) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  const dir = join(`${out.replace(/\/+$/, '')}.work`, 'rest');
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { recursive: true });
-  // The tar, written a frame at a time: frame k holds tar bytes [k * frame, (k + 1) * frame).
-  const where = new Map(); // hash -> its bytes' offset in the tar
-  let at = 0, k = 0, cur = [], curLen = 0;
-  const flush = (final) => {
-    while (curLen >= restFrame || (final && curLen > 0)) {
-      const all = Buffer.concat(cur);
-      const n = Math.min(restFrame, all.length);
-      writeFileSync(join(dir, String(k++).padStart(6, '0')), all.subarray(0, n));
-      cur = [all.subarray(n)];
-      curLen = all.length - n;
-    }
-  };
-  const put = (b) => { cur.push(b); curLen += b.length; at += b.length; if (curLen >= restFrame) flush(false); };
-  const header = (name, size) => {
-    const h = Buffer.alloc(512);
-    h.write(name, 0, 100, 'utf8');
-    h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
-    h.write(size.toString(8).padStart(11, '0') + '\0', 124);
-    h.write('00000000000\0', 136);
-    h.fill(' ', 148, 156); h.write('0', 156); h.write('ustar\x0000', 257);
-    let sum = 0;
-    for (const c of h) sum += c;
-    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-    return h;
-  };
-  for (const [, size, hash] of order) {
-    if (where.has(hash)) continue;
-    put(header(hash, size));
-    where.set(hash, at);
-    put(readFileSync(join(store, hash)));
-    if (size % 512) put(Buffer.alloc(512 - (size % 512)));
-  }
-  put(Buffer.alloc(1024));
-  const tarSize = at;
-  flush(true);
-  // Each frame on its own; many zstd processes at once.
-  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd ${zlev} -q -f`], { cwd: dir });
-  const frames = [];
-  let off = 0;
-  mkdirSync(join(out, 'project/build/web'), { recursive: true });
-  const fd = openSync(join(out, 'project/build/web/rest.bin'), 'w');
-  for (let i = 0; i < k; i++) {
-    const z = readFileSync(join(dir, `${String(i).padStart(6, '0')}.zst`));
-    frames.push([off, z.length]);
-    writeSync(fd, z);
-    off += z.length;
-  }
-  closeSync(fd);
-  writeFileSync(join(out, 'project/build/web/rest.bin.json'), JSON.stringify({ frame: restFrame, size: tarSize, frames }));
-  rmSync(dir, { recursive: true, force: true });
-  console.log(`eject-site: the rest bundle: ${lazy.length} files (${where.size} distinct), tar ${mb(tarSize)} MB, ${frames.length} frames of ${restFrame / 1048576} MiB, ${mb(off)} MB compressed`);
-  return lazy.map(([path, size, hash, mtime]) => [path, size, `rest.bin#${where.get(hash)}`, mtime]);
+  const r = buildRest(lazy, store, { bin: join(out, 'project/build/web/rest.bin'), work: `${out.replace(/\/+$/, '')}.work`,
+    frame: restFrame, zlev, order: restOrder ? readPathList(restOrder) : null });
+  console.log(`eject-site: the rest bundle: ${lazy.length} files (${r.distinct} distinct), tar ${mb(r.tarSize)} MB, ${r.frames} frames of ${restFrame / 1048576} MiB, ${mb(r.bytes)} MB compressed`);
+  return r.files;
 }
 
 /** How many pieces each class of the bundle's files (stable, the rest) is
@@ -468,7 +408,7 @@ function wine32Site() {
   // stay in the bundle; every other file is a lazy file (app.js `lazy`),
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
-  const split = wine32.bundle?.split ? new Set(wine32.bundle.read ?? []) : null;
+  let split = wine32.bundle?.split ? new Set(wine32.bundle.read ?? []) : null;
   // The bundle's files in the order the recorded run first read them.
   const readOrder = split ? [...split] : null;
   // --rest-paths FILE (guest paths, one a line): files the run read that
@@ -503,9 +443,14 @@ function wine32Site() {
   let lazySource = new Map(); // a lazy file's guest path (lower case) -> its bytes in the store
   const piecesOn = flag('--pieces');
   let piecesIndex = null;
-  if (strip || flag('--prune') || flag('--dedupe') || split || piecesOn) {
+  // A dist's rest-only files (site-bundle.mjs `REST_ONLY`, a side module
+  // dlopened when a program first needs it): out of the read set, or out of a
+  // bundle not split (which then is, with every other file in it).
+  const restOnlyIn = hasRestOnly(tar);
+  if (strip || flag('--prune') || flag('--dedupe') || split || piecesOn || restOnlyIn) {
     const tree = extract(tar, work);
     const { x } = tree;
+    if (restOnlyIn) split = readLessRestOnly(x, split);
     if (strip) stripTree(x, stripped);
     if (flag('--prune')) pruneTree(x);
     if (split) {
