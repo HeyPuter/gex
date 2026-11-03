@@ -68,9 +68,13 @@ todo=$(mktemp); locks=$(mktemp -d); trap 'rm -f "$todo"; rm -rf "$locks"' EXIT
   sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*\(-p[0-9a-f]*\)\?)/\1 \2 -/p' "$log"
   sed -n 's/^gex-\(w3\|wine32\): \(\/\S*\) at \(0x[0-9a-f]*\): no function-tier unit.*/\2 \3 -/p' "$log"; } |
   sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 " -" } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
+# A run that named no image without a unit has no image unit to build, which
+# for a run made to find them is an error (its images ran without asking for
+# one: the function JIT took their code, say). The trampolines are still built.
+[ -s "$todo" ] || { echo "wine32/units: FAIL: $log names no image without a unit" >&2; touch "$locks/failed"; }
 # The flavour, per inputs id (a 64-bit Wine's WoW64 processes and its other
 # ones differ), from the first image of that id whose key the log names.
-declare -A flag
+declare -A flag=()
 while read -r p b in _; do
   [ -z "${flag[$in]+x}" ] || continue
   # (that id's line: an image both kinds load, at one base, has a key per id)
@@ -112,6 +116,7 @@ one() {
     done
   fi
   echo "$p $b: $r"
+  [ "$key" = - ] || [ -f "$U/$key/c.wasm" ] || { echo "wine32/units: FAIL: $p $b: no flavour makes the key the run asked for ($key)" >&2; touch "$locks/failed"; }
   exec {l}>&-
 }
 { while read -r p b in key; do
@@ -126,3 +131,4 @@ grep -ao 'missing unit: \[the trampolines\].*gexc cgen-image --nt-trampolines[0-
   echo "wine32/units: the trampolines ($o): $(nice -n 19 "$G" cgen-image $o 2>&1 | tail -1 | cut -c1-140)"
 done
 echo "wine32/units: $U"
+[ ! -e "$locks/failed" ]
