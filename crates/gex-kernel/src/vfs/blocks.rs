@@ -20,6 +20,19 @@
 //! misses reads ahead, in one request. Every request's result is checked:
 //! one the store could not make is EIO (ENOSPC when it was full), its block
 //! kept dirty.
+//!
+//! A read or write of [`BYPASS`] bytes or more moves the whole blocks it
+//! spans that are not held here straight between the store and the
+//! caller's buffer, a run of them adjacent in the store in one request, and
+//! keeps none of them: a big copy does not pass through the cache twice nor
+//! push out what is in it. A direct write the store refuses goes through the
+//! cache instead, so its data is kept as any other write's.
+//!
+//! CLOCK is scan-resistant: a block comes in unreferenced, and only a second
+//! use (a later read or write of it, not the one that brought it in nor a
+//! read running on within the same block) marks it referenced, and the hand
+//! passes over referenced blocks while they are at most three quarters of
+//! the cache: a scan of blocks used once cycles through the rest.
 
 use crate::errno::Errno;
 use std::collections::HashMap;
@@ -118,6 +131,8 @@ fn forget_sum(off: u64) {
 }
 /// Readahead's largest run, in bytes.
 const AHEAD_MAX: u64 = 1 << 20;
+/// The shortest read or write that skips the cache for its whole blocks.
+pub const BYPASS: u64 = 1 << 20;
 
 /// Turn it on (`block` 0: off): blocks of `block` bytes, at most `cache`
 /// bytes of them held here; files up to `inline` bytes keep their bytes in
@@ -145,7 +160,7 @@ pub fn block() -> u64 {
 }
 
 /// Counters, for the report: see [`stats`].
-pub static ST: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+pub static ST: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 const HIT: usize = 0;
 const MISS: usize = 1;
 const IO_R: usize = 2;
@@ -164,12 +179,15 @@ const UNWRITTEN: usize = 14;
 const FIRST_BAD: usize = 15;
 const FIRST_UNWRITTEN: usize = 16;
 const BAD_WHAT: usize = 17;
+const DIRECT_R: usize = 18;
+const DIRECT_W: usize = 19;
 
 /// hits, misses, store reads, bytes, store writes, bytes, evictions, dirty
 /// evictions, read-ahead blocks, blocks allocated, freed, bytes held here,
 /// dirty neighbours written with an evicted block; with the check on, blocks
-/// read back wrong, read never written, and the first of each (+1).
-pub fn stats() -> [u64; 18] {
+/// read back wrong, read never written, and the first of each (+1); blocks
+/// read and written straight to the caller ([`BYPASS`]).
+pub fn stats() -> [u64; 20] {
     core::array::from_fn(|i| ST[i].load(Ordering::Relaxed))
 }
 
@@ -197,9 +215,14 @@ struct Slot {
     dirty: bool,
     /// The [`tick`] it was made dirty in.
     since: u32,
+    /// Brought in and not used again since (scan resistance: see the module).
+    fresh: bool,
     off: u64,
     data: Box<[u8]>,
 }
+
+/// How many slots are marked used twice (CLOCK's protected set).
+static PROTECTED: AtomicU64 = AtomicU64::new(0);
 
 /// The write-back's clock: one per [`tick`].
 static EPOCH: AtomicU32 = AtomicU32::new(0);
@@ -276,14 +299,22 @@ enum Fill<'a> {
 }
 
 /// The block at `loc` held here (fetched or made as `fill` says), and `f`
-/// run on its bytes and dirty bit.
-fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) -> R) -> Result<R, Errno> {
+/// run on its bytes and dirty bit. `touch`: this is a use of the block that
+/// counts for CLOCK (a read-ahead's fill, a truncation, a read on within the
+/// block last read are not).
+fn with_block<R>(loc: Loc, fill: Fill<'_>, touch: bool, f: impl FnOnce(&mut [u8], &mut bool) -> R) -> Result<R, Errno> {
     let bs = block() as usize;
     loop {
         if let Some(cell) = index(|ix| ix.map.get(&loc.key).map(|&i| Arc::clone(&ix.cells[i as usize]))) {
             let mut s = cell.m.lock().unwrap();
             if s.key == loc.key && s.valid {
-                cell.used.store(true, Ordering::Relaxed);
+                if touch {
+                    if s.fresh {
+                        s.fresh = false;
+                    } else if !cell.used.swap(true, Ordering::Relaxed) {
+                        PROTECTED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 bump(HIT, 1);
                 return Ok(on_slot(&mut s, f));
             }
@@ -297,21 +328,35 @@ fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) 
             if ix.cells.len() * bs < budget.max(bs * 4) {
                 let c = Arc::new(Cell {
                     busy: AtomicBool::new(true),
-                    used: AtomicBool::new(true),
-                    m: Mutex::new(Slot { key: NONE, valid: false, dirty: false, since: 0, off: 0, data: vec![0u8; bs].into_boxed_slice() }),
+                    used: AtomicBool::new(false),
+                    m: Mutex::new(Slot { key: NONE, valid: false, dirty: false, since: 0, fresh: false, off: 0, data: vec![0u8; bs].into_boxed_slice() }),
                 });
                 bump(HELD, bs as u64);
                 ix.cells.push(Arc::clone(&c));
                 return (c, ix.cells.len() as u32 - 1);
             }
+            let n = ix.cells.len();
+            let mut seen = 0;
             loop {
-                let h = ix.hand % ix.cells.len();
+                let h = ix.hand % n;
                 ix.hand = h + 1;
+                seen += 1;
                 let c = &ix.cells[h];
                 if c.busy.load(Ordering::Relaxed) {
                     continue;
                 }
-                if c.used.swap(false, Ordering::Relaxed) {
+                if c.used.load(Ordering::Relaxed) {
+                    // A block used twice passes while those are at most
+                    // three quarters of the cache (the rest is where blocks
+                    // used once come and go); past that, or once the hand
+                    // has gone round with nothing to take, it loses its
+                    // mark and goes next time round.
+                    if PROTECTED.load(Ordering::Relaxed) as usize * 4 <= n * 3 && seen <= n {
+                        continue;
+                    }
+                    if c.used.swap(false, Ordering::Relaxed) {
+                        PROTECTED.fetch_sub(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 c.busy.store(true, Ordering::Relaxed);
@@ -376,8 +421,11 @@ fn with_block<R>(loc: Loc, fill: Fill<'_>, f: impl FnOnce(&mut [u8], &mut bool) 
         }
         s.valid = true;
         s.dirty = false;
+        // In unreferenced: its first use is this one, or for a read-ahead's
+        // block the read that reaches it.
+        s.fresh = !touch;
         cell.busy.store(false, Ordering::Relaxed);
-        cell.used.store(true, Ordering::Relaxed);
+        cell.used.store(false, Ordering::Relaxed);
         return Ok(on_slot(&mut s, f));
     }
 }
@@ -522,6 +570,9 @@ fn forget(key: u64) {
         s.key = NONE;
         s.valid = false;
         s.dirty = false;
+        if cell.used.swap(false, Ordering::Relaxed) {
+            PROTECTED.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -553,6 +604,7 @@ impl PFile {
         }
         let bs = block();
         let end = (offset + buf.len() as u64).min(self.size);
+        let direct = end - offset >= BYPASS;
         let mut at = offset;
         while at < end {
             let b = at / bs;
@@ -562,16 +614,78 @@ impl PFile {
             if self.map.get(b as usize).copied().unwrap_or(0) == 0 {
                 buf[o..o + n].fill(0);
             } else {
+                if direct && from == 0 {
+                    let k = self.run(b, (end - at) / bs);
+                    if k > 0 {
+                        let len = (k * bs) as usize;
+                        io(OP_READ, self.loc(b).off, &mut buf[o..o + len])?;
+                        bump(DIRECT_R, k);
+                        self.last = b + k - 1;
+                        at += k * bs;
+                        continue;
+                    }
+                }
                 let loc = self.loc(b);
                 if !cached(loc.key) {
                     self.ahead(b)?;
                 }
-                with_block(loc, Fill::Load, |d, _| buf[o..o + n].copy_from_slice(&d[from..from + n]))?;
+                let touch = self.last != b;
+                with_block(loc, Fill::Load, touch, |d, _| buf[o..o + n].copy_from_slice(&d[from..from + n]))?;
             }
             self.last = b;
             at += n as u64;
         }
         Ok(end - offset)
+    }
+
+    /// From block `b`, how many of the next `max` have a place, sit one
+    /// after another in the store and are not held here: a run a direct
+    /// read takes in one request.
+    fn run(&self, b: u64, max: u64) -> u64 {
+        let bs = block();
+        let first = self.loc(b).off;
+        let mut k = 0;
+        while k < max {
+            if self.map.get((b + k) as usize).copied().unwrap_or(0) == 0 {
+                break;
+            }
+            let l = self.loc(b + k);
+            if l.off != first + k * bs || cached(l.key) {
+                break;
+            }
+            k += 1;
+        }
+        k
+    }
+
+    /// Blocks `b` onwards, up to `max` of them, wholly rewritten from
+    /// `data` straight to the store: a run of them that sits one after
+    /// another there (given places as needed), its copies held here
+    /// dropped. How many were written; 0 when none could be (no place for
+    /// `b`, or the store refused the write: the caller writes them through
+    /// the cache, which keeps them until the store takes them).
+    fn write_direct(&mut self, b: u64, max: u64, data: &[u8]) -> Result<u64, Errno> {
+        let bs = block();
+        self.alloc(b)?;
+        let first = self.loc(b).off;
+        let mut k = 1;
+        while k < max {
+            // Out of room part way: the run so far, and the rest through
+            // the cache (which says so).
+            if self.alloc(b + k).is_err() || self.loc(b + k).off != first + k * bs {
+                break;
+            }
+            k += 1;
+        }
+        for i in 0..k {
+            forget(self.loc(b + i).key);
+        }
+        let mut run = data[..(k * bs) as usize].to_vec();
+        if io(OP_WRITE, first, &mut run).is_err() {
+            return Ok(0);
+        }
+        bump(DIRECT_W, k);
+        Ok(k)
     }
 
     /// A miss at block `b`: after a read of `b - 1`, the run from `b` that is
@@ -606,7 +720,7 @@ impl PFile {
         for i in 0..n {
             let l = self.loc(b + i);
             let part = &run[(i * bs) as usize..((i + 1) * bs) as usize];
-            with_block(l, Fill::From(part), |_, _| ())?;
+            with_block(l, Fill::From(part), false, |_, _| ())?;
         }
         Ok(())
     }
@@ -633,21 +747,33 @@ impl PFile {
     pub fn write(&mut self, offset: u64, buf: &[u8]) -> Result<u64, Errno> {
         let bs = block();
         let end = offset + buf.len() as u64;
+        let mut direct = buf.len() as u64 >= BYPASS;
         let mut at = offset;
         while at < end {
             let b = at / bs;
             let from = (at % bs) as usize;
             let n = ((end - at) as usize).min(bs as usize - from);
             let o = (at - offset) as usize;
+            if direct && from == 0 && end - at >= bs {
+                let k = self.write_direct(b, (end - at) / bs, &buf[o..])?;
+                if k > 0 {
+                    self.last = b + k - 1;
+                    at += k * bs;
+                    continue;
+                }
+                direct = false;
+            }
             let fresh = self.alloc(b)?;
             // A block wholly rewritten, or one with nothing yet, is not read.
             let whole = from == 0 && n == bs as usize;
             let fill = if fresh || whole { Fill::Zero } else { Fill::Load };
             let loc = self.loc(b);
-            with_block(loc, fill, |d, dirty| {
+            let touch = self.last != b;
+            with_block(loc, fill, touch, |d, dirty| {
                 d[from..from + n].copy_from_slice(&buf[o..o + n]);
                 *dirty = true;
             })?;
+            self.last = b;
             at += n as u64;
         }
         self.size = self.size.max(end);
@@ -666,7 +792,7 @@ impl PFile {
             if len % bs != 0 && self.map.get(keep - 1).copied().unwrap_or(0) != 0 {
                 let from = (len % bs) as usize;
                 let loc = self.loc(keep as u64 - 1);
-                with_block(loc, Fill::Load, |d, dirty| {
+                with_block(loc, Fill::Load, false, |d, dirty| {
                     d[from..].fill(0);
                     *dirty = true;
                 })?;
@@ -815,6 +941,7 @@ pub fn rebuild(high: u32, used: &[bool]) {
 #[cfg(test)]
 pub fn reset() {
     *INDEX.lock().unwrap() = None;
+    PROTECTED.store(0, Ordering::Relaxed);
     *ALLOCATOR.lock().unwrap() = (1, Default::default());
     PENDING.lock().unwrap().clear();
     DEFER.store(false, Ordering::Relaxed);
@@ -883,6 +1010,8 @@ pub(crate) mod tests {
 
     pub(crate) static STORE_FILE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     static FLUSHES: AtomicU32 = AtomicU32::new(0);
+    /// The fake store refuses every write.
+    static FAIL: AtomicBool = AtomicBool::new(false);
 
     pub(crate) fn fake(op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         let mut f = STORE_FILE.lock().unwrap();
@@ -893,6 +1022,7 @@ pub(crate) mod tests {
                     *x = f.get(a + i).copied().unwrap_or(0);
                 }
             }
+            OP_WRITE if FAIL.load(Ordering::Relaxed) => return Err(Errno::EIO),
             OP_WRITE => {
                 if f.len() < b {
                     f.resize(b, 0);
@@ -952,6 +1082,102 @@ pub(crate) mod tests {
         for n in ["a", "b", "c"] {
             fs.unlink(n).unwrap();
         }
+        configure(0, 0, 0);
+    }
+
+    /// A read or write of a MiB or more moves its whole blocks straight
+    /// between the store and the caller, a block held here (dirty) read from
+    /// here in the middle of it; the ragged ends go through the cache; a
+    /// direct write the store refuses is kept in the cache instead, and
+    /// reaches the store once it takes writes again.
+    #[test]
+    #[ignore]
+    fn big_reads_and_writes_skip_the_cache() {
+        set_io(fake);
+        reset();
+        configure(4096, 400 * 4096, 0);
+        let bs = 4096usize;
+        let len = (2 << 20) + 100;
+        let mut want: Vec<u8> = (0..len).map(|i| (i * 13 + i / 4096) as u8).collect();
+        let mut f = PFile::new();
+        let (w0, m0) = (stats()[DIRECT_W], stats()[MISS]);
+        f.write(0, &want).unwrap();
+        assert_eq!(stats()[DIRECT_W] - w0, 512, "the whole blocks, straight to the store");
+        assert_eq!(stats()[MISS] - m0, 1, "the ragged end, through the cache");
+        // Block 2 rewritten in part: held here, dirty.
+        f.write(2 * bs as u64 + 10, &[0xee; 100]).unwrap();
+        want[2 * bs + 10..2 * bs + 110].fill(0xee);
+        let (r0, h0) = (stats()[DIRECT_R], stats()[HELD]);
+        let mut got = vec![0u8; len];
+        assert_eq!(f.read(0, &mut got).unwrap() as usize, len);
+        assert!(got == want, "a direct read and the dirty block held here");
+        assert_eq!(stats()[DIRECT_R] - r0, 511);
+        assert_eq!(stats()[HELD], h0, "nothing new held");
+        // In small pieces, through the cache: the same bytes.
+        let mut at = 0;
+        while at < len {
+            let mut b = vec![0u8; 7000.min(len - at)];
+            let n = f.read(at as u64, &mut b).unwrap() as usize;
+            assert!(b[..n] == want[at..at + n], "at {at}");
+            at += n;
+        }
+        // A refusing store: the write is kept here, and goes out at a sync.
+        FAIL.store(true, Ordering::Relaxed);
+        let more: Vec<u8> = (0..1 << 20).map(|i| (i * 7) as u8).collect();
+        let w1 = stats()[DIRECT_W];
+        f.write(4 << 20, &more).unwrap();
+        assert_eq!(stats()[DIRECT_W], w1);
+        assert!(sync_all().is_err(), "the store still refuses");
+        FAIL.store(false, Ordering::Relaxed);
+        sync_all().unwrap();
+        // Dropped from the cache: read back from the store, directly.
+        for b in 0..f.map.len() {
+            if f.map[b] != 0 {
+                forget(f.loc(b as u64).key);
+            }
+        }
+        let mut back = vec![0u8; 1 << 20];
+        let r1 = stats()[DIRECT_R];
+        f.read(4 << 20, &mut back).unwrap();
+        assert!(back == more);
+        assert_eq!(stats()[DIRECT_R] - r1, 256);
+        drop(f);
+        configure(0, 0, 0);
+    }
+
+    /// A block used twice stays held while a file four times the cache is
+    /// read through three times in small pieces: the scan's blocks come and
+    /// go in the rest of the cache.
+    #[test]
+    #[ignore]
+    fn a_scan_does_not_push_out_what_is_used() {
+        set_io(fake);
+        reset();
+        configure(4096, 16 * 4096, 0);
+        let mut hot = PFile::new();
+        hot.write(0, &[5u8; 2 * 4096]).unwrap();
+        let mut cold = PFile::new();
+        let data: Vec<u8> = (0..64 * 4096).map(|i| i as u8).collect();
+        cold.write(0, &data).unwrap();
+        let mut b = vec![0u8; 4096];
+        // Used, and used again: block 0, then 1, then 0.
+        for blk in [0u64, 1, 0] {
+            hot.read(blk * 4096, &mut b).unwrap();
+        }
+        for round in 0..3 {
+            let mut at = 0;
+            while at < data.len() {
+                let mut p = vec![0u8; 3000];
+                let n = cold.read(at as u64, &mut p).unwrap() as usize;
+                assert!(p[..n] == data[at..at + n], "round {round} at {at}");
+                at += n;
+            }
+        }
+        let m = stats()[MISS];
+        hot.read(0, &mut b).unwrap();
+        assert_eq!(stats()[MISS], m, "the block used twice is still held");
+        assert!(b.iter().all(|&x| x == 5));
+        drop((hot, cold));
         configure(0, 0, 0);
     }
 

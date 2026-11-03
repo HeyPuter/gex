@@ -257,6 +257,14 @@ the cache), and the data stays in memory, tried again. A `MAP_SHARED` mapping's
 pages reach the file at `msync` and `munmap`; `sync` does not reach into
 other programs' mappings.
 
+A single read or write of 1 MiB or more moves the whole blocks it covers
+straight between the store and the program's buffer, without keeping them
+in the cache (a write is in the store when it returns, but is durable only
+at a sync, as any other), so a big copy runs near the store's own speed and
+leaves the cache as it was. Blocks a program uses again are kept over ones
+read or written once: a file read through once, however large, does not
+push them out.
+
 A store of the page's own is a subclass that implements the store's
 methods: one array of bytes, which the kernel reads and writes by offset in
 blocks of 64 KiB as its cache fills and empties, one call at a time. Its
