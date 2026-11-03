@@ -93,5 +93,10 @@ for dll in "$@" "${splits[@]}"; do
     # shellcheck disable=SC2046
     "$winebuild" -w -b "$target" --cc-cmd="$cc" "${kind[@]}" --fake-module \
         --wasm-shared "$module" -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
+    # (its source directory's specs, whichever the lookup above took)
+    [ ! -f "$spec" ] || echo "$out/$dll $src/${dir#$build/}" >> "$tmp/skeletons"
 done
+# A skeleton without an export table whose spec has exports is a build error,
+# not a GetProcAddress that finds nothing at run time (skel-exports.py)
+[ ! -f "$tmp/skeletons" ] || python3 "$here/skel-exports.py" "$tmp/skeletons" || exit 1
 echo "$out: ${*} native ($(du -h "$out/winepe.wasm" | cut -f1) module)${splits:+, ${splits[*]} as modules of their own}"
