@@ -53,6 +53,16 @@ pub fn set_io(f: BlockIo) {
     let _ = IO.set(f);
 }
 
+/// A write of the store from bytes the host only reads: `(offset, bytes)`.
+pub type BlockWrite = fn(u64, &[u8]) -> Result<(), Errno>;
+static IO_WRITE: OnceLock<BlockWrite> = OnceLock::new();
+
+/// The host's write that takes the caller's bytes as they are (no copy);
+/// without one a write is copied into a buffer of its own for [`set_io`]'s.
+pub fn set_io_write(f: BlockWrite) {
+    let _ = IO_WRITE.set(f);
+}
+
 static BS: AtomicU32 = AtomicU32::new(0);
 static BUDGET: AtomicU64 = AtomicU64::new(0);
 static INLINE: AtomicU64 = AtomicU64::new(0);
@@ -133,6 +143,9 @@ fn forget_sum(off: u64) {
 const AHEAD_MAX: u64 = 1 << 20;
 /// The shortest read or write that skips the cache for its whole blocks.
 pub const BYPASS: u64 = 1 << 20;
+/// The longest request such a read or write makes (a longer one is several):
+/// the host's answer is a 32-bit signed count.
+const DIRECT_MAX: u64 = 64 << 20;
 
 /// Turn it on (`block` 0: off): blocks of `block` bytes, at most `cache`
 /// bytes of them held here; files up to `inline` bytes keep their bytes in
@@ -283,6 +296,21 @@ fn io(op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         } else if op == OP_READ {
             check_read(off, buf);
         }
+    }
+    Ok(())
+}
+
+/// A write to the store from `buf` as it is (the host's [`set_io_write`]),
+/// counted and checked as [`io`]'s.
+fn write_from(off: u64, buf: &[u8]) -> Result<(), Errno> {
+    let Some(w) = IO_WRITE.get() else {
+        return io(OP_WRITE, off, &mut buf.to_vec());
+    };
+    bump(IO_W, 1);
+    bump(IO_WB, buf.len() as u64);
+    w(off, buf)?;
+    if CHECK.load(Ordering::Relaxed) {
+        note_written(off, buf);
     }
     Ok(())
 }
@@ -615,7 +643,7 @@ impl PFile {
                 buf[o..o + n].fill(0);
             } else {
                 if direct && from == 0 {
-                    let k = self.run(b, (end - at) / bs);
+                    let k = self.run(b, ((end - at) / bs).min(DIRECT_MAX / bs));
                     if k > 0 {
                         let len = (k * bs) as usize;
                         io(OP_READ, self.loc(b).off, &mut buf[o..o + len])?;
@@ -680,8 +708,7 @@ impl PFile {
         for i in 0..k {
             forget(self.loc(b + i).key);
         }
-        let mut run = data[..(k * bs) as usize].to_vec();
-        if io(OP_WRITE, first, &mut run).is_err() {
+        if write_from(first, &data[..(k * bs) as usize]).is_err() {
             return Ok(0);
         }
         bump(DIRECT_W, k);
@@ -755,7 +782,7 @@ impl PFile {
             let n = ((end - at) as usize).min(bs as usize - from);
             let o = (at - offset) as usize;
             if direct && from == 0 && end - at >= bs {
-                let k = self.write_direct(b, (end - at) / bs, &buf[o..])?;
+                let k = self.write_direct(b, ((end - at) / bs).min(DIRECT_MAX / bs), &buf[o..])?;
                 if k > 0 {
                     self.last = b + k - 1;
                     at += k * bs;
