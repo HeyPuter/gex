@@ -602,6 +602,73 @@ function callOutFront(fn) {
  *  restores its own. A trap (`unreachable`: the shim's trap out) is not
  *  caught here: the JS loop that catches it puts the pointer back
  *  (`#progSpAt`). */
+/** A binding list (cgen/dylink.rs's format) split into the lines that are
+ *  the same in every process binding the module alike, and its numbers
+ *  (`V`, strings), which are not. */
+function bindSplit(text) {
+  const i = text.startsWith('V\t') ? 0 : text.lastIndexOf('\nV\t') + 1;
+  if (!i && !text.startsWith('V\t')) return [text, []];
+  return [text.slice(0, i), text.slice(i + 2, text.endsWith('\n') ? -1 : undefined).split(',')];
+}
+/** A binding list's lines, parsed: `ops` to apply to a module's imports,
+ *  each with the index of its number(s) in the list's `V`, its `late`
+ *  calls, the table slots to fill after instantiation (`extra`, [number
+ *  index, export]) and its thread-local block (`tls`). The single-thread
+ *  build's processes all run in one realm and bind the same libraries over
+ *  and over: there a module's lines are parsed once (`BIND_PLANS`, by the
+ *  lines), up to `BIND_PLAN_BYTES` of them, and a late module is made once
+ *  for the same slots (`LATE_MODS`, up to `LATE_MODS_MAX`). */
+const BIND_ASYNC = 0, BIND_GLOBAL = 1, BIND_EXPORT = 2, BIND_SLOT = 3, BIND_MISSING = 4;
+const BIND_PLANS = new Map(), BIND_PLAN_BYTES = 64 << 20, LATE_MODS = new Map(), LATE_MODS_MAX = 4096;
+let bindPlanBytes = 0;
+function bindPlan(shape) {
+  const shared = SP_CODE && single.on;
+  const had = shared ? BIND_PLANS.get(shape) : undefined;
+  if (had) return had;
+  const plan = { ops: [], late: [], extra: [], tls: null };
+  let v = 0;
+  for (const line of shape.split('\n')) {
+    if (!line) continue;
+    const f = line.split('\t');
+    switch (f[0]) {
+      case 'S':
+        if (f[1] === 'env' && (f[2] === '__asyncify_state' || f[2] === '__asyncify_data')) plan.ops.push([BIND_ASYNC, 'env', f[2], f[2] === '__asyncify_state' ? 0 : 1]);
+        break;
+      case 'G':
+        plan.ops.push([BIND_GLOBAL, f[1], f[2], f[5] === '64', f[4] === '1', v++]);
+        break;
+      case 'E': {
+        const mod = v++;
+        plan.ops.push([BIND_EXPORT, f[1], f[2], mod, f[4], f[5] === 's' ? v++ : f[5] && f[5] !== '-' ? f[5] : null]);
+        break;
+      }
+      case 'L':
+        if (f[4]) plan.late.push([f[1], f[2], v++, f[4]]);
+        else plan.ops.push([BIND_SLOT, f[1], f[2], v++]);
+        break;
+      case 'M':
+        plan.ops.push([BIND_MISSING, f[1], f[2], f.slice(3).join('\t')]);
+        break;
+      case 'X':
+        plan.extra.push([v++, f[2]]);
+        break;
+      case 'T':
+        plan.tls = [Number(f[1]), Number(f[2])];
+        break;
+    }
+  }
+  if (shared && bindPlanBytes + shape.length <= BIND_PLAN_BYTES) {
+    BIND_PLANS.set(shape, plan);
+    bindPlanBytes += shape.length;
+  }
+  return plan;
+}
+/** A binding list's `X` lines: [slot, export]. */
+function bindExtra(text) {
+  const [shape, vals] = bindSplit(text);
+  return bindPlan(shape).extra.map(([i, n]) => [Number(vals[i]), n]);
+}
+
 /** A wasm32 module's late-bound functions (`L` in a binding list, each
  *  [mod, name, slot, sig]): a module of one function per binding, exported
  *  by its index, that calls table `e.t`'s slot with its own arguments.
@@ -5056,7 +5123,7 @@ export class Gex {
     // (`packExports`, a separate module key) unless GEX_LOG=nodlpack.
     const bindText = wasmprog ? this.#wasmprogBindRead(prov) : '';
     const xs = [];
-    for (const line of bindText.split('\n')) if (line.startsWith('X\t')) { const f = line.split('\t'); xs.push([Number(f[1]), f[2]]); }
+    xs.push(...bindExtra(bindText));
     let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
@@ -6016,67 +6083,66 @@ export class Gex {
   #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov)) {
     this.#wasmprogBindText = text;
     if (!text) return [];
-    const extra = [], late = [];
-    this.#wasmprogTls = null;
+    const [shape, vals] = bindSplit(text);
+    const plan = bindPlan(shape);
+    this.#wasmprogTls = plan.tls && [...plan.tls];
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
-    for (const line of text.split('\n')) {
-      if (!line) continue;
-      const f = line.split('\t');
-      switch (f[0]) {
-        case 'S':
-          if (f[1] === 'env' && (f[2] === '__asyncify_state' || f[2] === '__asyncify_data')) {
-            this.#wasmprogAsync ??= [0, 1].map(() => new WebAssembly.Global({ value: 'i32', mutable: true }, 0));
-            set('env', f[2], this.#wasmprogAsync[f[2] === '__asyncify_state' ? 0 : 1]);
-          }
+    for (const op of plan.ops) {
+      switch (op[0]) {
+        case BIND_ASYNC:
+          this.#wasmprogAsync ??= [0, 1].map(() => new WebAssembly.Global({ value: 'i32', mutable: true }, 0));
+          set('env', op[2], this.#wasmprogAsync[op[3]]);
           break;
-        case 'G': {
-          const g = f[5] === '64'
-            ? new WebAssembly.Global({ value: 'i64', mutable: f[4] === '1' }, BigInt(f[3]))
-            : new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
-          if (f[4] === '1') this.#wasmprogMuts.push(g);
-          set(f[1], f[2], g);
+        case BIND_GLOBAL: {
+          const [, m, name, wide, mutable, i] = op, v = vals[i];
+          const g = wide
+            ? new WebAssembly.Global({ value: 'i64', mutable }, BigInt(v))
+            : new WebAssembly.Global({ value: 'i32', mutable }, Number(v) | 0);
+          if (mutable) this.#wasmprogMuts.push(g);
+          set(m, name, g);
           break;
         }
-        case 'E': {
-          const from = st.dyl.get(Number(f[3]));
+        case BIND_EXPORT: {
+          const [, m, name, mi, exp, packed] = op, mod = Number(vals[mi]);
+          const from = st.dyl.get(mod);
           // a packed module's (`packExports`): from its slot or value
-          let x = from?.exports[f[4]];
-          if (x === undefined && from && f[5] && f[5] !== '-') {
-            x = f[5][0] === 'g'
-              ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(f[5].slice(1)) | 0)
-              : st.ftab.get(tIdx(this.#wide, Number(f[5])));
+          let x = from?.exports[exp];
+          if (x === undefined && from && packed) {
+            x = typeof packed === 'string'
+              ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(packed.slice(1)) | 0)
+              : st.ftab.get(tIdx(this.#wide, Number(vals[packed])));
           }
-          if (x === undefined) throw new Error(`wasm32 module ${prov}: ${f[1]}.${f[2]}: ${f[4]} of module ${f[3]} is not instantiated in this Worker`);
-          set(f[1], f[2], x);
+          if (x === undefined) throw new Error(`wasm32 module ${prov}: ${m}.${name}: ${exp} of module ${mod} is not instantiated in this Worker`);
+          set(m, name, x);
           break;
         }
-        case 'L': {
-          // In wasm, for a type the list gives: the call stays a wasm
-          // frame, which the single-thread build's fiber can suspend
-          // through, as it cannot through a JS one.
-          if (f[4]) { late.push([f[1], f[2], Number(f[3]), f[4]]); break; }
-          const slot = tIdx(this.#wide, Number(f[3])), t = st.ftab;
-          set(f[1], f[2], (...a) => t.get(slot)(...a));
+        case BIND_SLOT: {
+          const slot = tIdx(this.#wide, Number(vals[op[3]])), t = st.ftab;
+          set(op[1], op[2], (...a) => t.get(slot)(...a));
           break;
         }
-        case 'M': {
-          const msg = f.slice(3).join('\t');
-          set(f[1], f[2], () => { throw new Error(msg); });
+        case BIND_MISSING: {
+          const msg = op[3];
+          set(op[1], op[2], () => { throw new Error(msg); });
           break;
         }
-        case 'X':
-          extra.push([Number(f[1]), f[2]]);
-          break;
-        case 'T':
-          this.#wasmprogTls = [Number(f[1]), Number(f[2])];
-          break;
       }
     }
-    if (late.length) {
-      const x = new WebAssembly.Instance(lateCalls(late, this.#wide), { e: { t: st.ftab } }).exports;
-      late.forEach(([m, name], i) => set(m, name, x[i]));
+    if (plan.late.length) {
+      // In wasm, for a type the list gives: the call stays a wasm frame,
+      // which the single-thread build's fiber can suspend through, as it
+      // cannot through a JS one.
+      const late = plan.late.map(([m, name, i, sig]) => [m, name, Number(vals[i]), sig]);
+      const shared = SP_CODE && single.on, key = shared && `${this.#wide ? 'w' : ''}${late.map((l) => `${l[2]}${l[3]}`).join()}`;
+      let mod = shared ? LATE_MODS.get(key) : undefined;
+      if (!mod) {
+        mod = lateCalls(late, this.#wide);
+        if (shared && LATE_MODS.size < LATE_MODS_MAX) LATE_MODS.set(key, mod);
+      }
+      const x = new WebAssembly.Instance(mod, { e: { t: st.ftab } }).exports;
+      plan.late.forEach(([m, name], i) => set(m, name, x[i]));
     }
-    return extra;
+    return plan.extra.map(([i, n]) => [Number(vals[i]), n]);
   }
 
   /** Wine's PE module `prov`'s binding list (cgen/wasmdll.rs, the format of
@@ -6984,11 +7050,13 @@ export class Gex {
     const extra = [];
     const got = [];
     let size = d.base + dylinkTableSize(d.module);
-    for (const line of d.binds.split('\n')) {
+    const [lines, nums] = bindSplit(d.binds);
+    let at = 0;
+    for (const line of lines.split('\n')) {
       if (!line) continue;
       const f = line.split('\t');
-      if (f[0] === 'X') { extra.push([Number(f[1]), f[2]]); size = Math.max(size, Number(f[1]) + 1); }
-      else if (f[0] === 'G') got.push(f);
+      if (f[0] === 'X') { const slot = Number(nums[at++]); extra.push([slot, f[2]]); size = Math.max(size, slot + 1); }
+      else if (f[0] === 'G') { f[3] = nums[at++]; got.push(f); }
       else if (f[0] === 'S') { if (f[1] === 'env' && f[2].startsWith('__asyncify_')) got.push(['G', 'env', f[2], '0', '1']); }
       else throw new Error(`door: the server program's binding ${f[0]} ${f[1]}.${f[2]} is not supported`);
     }
