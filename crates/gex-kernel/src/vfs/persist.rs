@@ -38,10 +38,12 @@ fn sb_at(gen: u64) -> u64 {
 }
 const CHAIN_MAGIC: u32 = 0x4252_5847; // "GXRB"
 const HDR: usize = 32;
-/// The journal is folded into a new checkpoint once it takes more blocks
-/// than the last checkpoint, or than this (each generation's segment takes
-/// a block of its own at least).
-const FOLD_MIN: u64 = 32;
+/// The journal is folded into a new checkpoint once its records are more
+/// bytes than the last checkpoint's, or once it takes this many blocks
+/// (each generation's segment takes a block of its own at least, written
+/// only as far as it is used): a checkpoint is written once per its own
+/// size of journal, not once per its size in generations.
+const JOURNAL_MAX: u64 = 512;
 
 const CRC_TABLE: [u32; 256] = {
     let mut t = [0u32; 256];
@@ -307,6 +309,38 @@ pub static GENS: AtomicU64 = AtomicU64::new(0);
 pub static PUTS: AtomicU64 = AtomicU64::new(0);
 pub static DROPS: AtomicU64 = AtomicU64::new(0);
 pub static CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+/// Commits asked for (by a sync, by the tick), paths the walks looked at,
+/// records they made, and the metadata bytes written (checkpoints among
+/// them): [`stats`].
+pub static ST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const S_SYNC: usize = 0;
+const S_TICK: usize = 1;
+const S_NODES: usize = 2;
+const S_RECS: usize = 3;
+const S_BYTES: usize = 4;
+const S_CK_BYTES: usize = 5;
+const S_EMPTY: usize = 6;
+
+/// gens, records put, paths dropped, checkpoints; commits by a sync, by
+/// the tick; paths walked, records walked; metadata bytes, checkpoint
+/// bytes; commits with nothing changed.
+pub fn stats() -> [u64; 11] {
+    let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    [
+        l(&GENS),
+        l(&PUTS),
+        l(&DROPS),
+        l(&CHECKPOINTS),
+        l(&ST[S_SYNC]),
+        l(&ST[S_TICK]),
+        l(&ST[S_NODES]),
+        l(&ST[S_RECS]),
+        l(&ST[S_BYTES]),
+        l(&ST[S_CK_BYTES]),
+        l(&ST[S_EMPTY]),
+    ]
+}
+
 /// The generation the last boot read back, and what it found (k_fs_restore).
 pub static BOOT_GEN: AtomicU64 = AtomicU64::new(0);
 pub static LAST_ERR: AtomicI64 = AtomicI64::new(0);
@@ -386,6 +420,7 @@ impl State {
     /// Every path that differs from the sources, as records to be.
     fn walk(&self) -> Vec<(String, Pre)> {
         let inner = self.fs.inner.read().unwrap();
+        ST[S_NODES].fetch_add((inner.nodes.len() + self.seed.len()) as u64, Ordering::Relaxed);
         let mut out = Vec::new();
         for (p, n) in inner.nodes.iter() {
             if self.excluded(p) {
@@ -453,6 +488,7 @@ impl State {
 
     fn commit_with(&mut self, seen: u64) -> Result<(), Errno> {
         let walked = self.walk();
+        ST[S_RECS].fetch_add(walked.len() as u64, Ordering::Relaxed);
         let mut sigs: HashMap<String, u64> = HashMap::with_capacity(walked.len());
         let mut changed = Vec::new();
         for (p, pre) in &walked {
@@ -464,6 +500,7 @@ impl State {
         }
         let dropped: Vec<&String> = self.committed.keys().filter(|p| !sigs.contains_key(*p)).collect();
         if changed.is_empty() && dropped.is_empty() {
+            ST[S_EMPTY].fetch_add(1, Ordering::Relaxed);
             self.seen = seen;
             self.since = None;
             blocks::write_back_all()?;
@@ -485,7 +522,7 @@ impl State {
         let room = (blocks::block() as usize - HDR) as u64;
         let ck_blocks = self.sb.ck.div_ceil(room);
         let journal = self.sb.chain as u64 - ck_blocks + (j.0.len() as u64).div_ceil(room);
-        let fold = self.sb.head == 0 || journal > ck_blocks.max(FOLD_MIN);
+        let fold = self.sb.head == 0 || journal > JOURNAL_MAX || self.sb.jb + j.0.len() as u64 > self.sb.ck.max(room);
         let payload = if fold {
             let mut c = W::default();
             c.u8(TAG_MARK);
@@ -502,6 +539,10 @@ impl State {
         blocks::write_back_all()?;
         let prev = if fold { 0 } else { self.sb.head };
         let new = write_chain(&payload, gen, prev)?;
+        ST[S_BYTES].fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if fold {
+            ST[S_CK_BYTES].fetch_add(payload.len() as u64, Ordering::Relaxed);
+        }
         let sb = Sb {
             gen,
             head: *new.last().unwrap() + 1,
@@ -863,7 +904,10 @@ pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
 pub fn sync() -> Result<(), Errno> {
     let mut g = STATE.lock().unwrap();
     match g.as_mut() {
-        Some(st) => st.commit(),
+        Some(st) => {
+            ST[S_SYNC].fetch_add(1, Ordering::Relaxed);
+            st.commit()
+        }
         None => blocks::sync_all(),
     }
 }
@@ -889,6 +933,7 @@ pub fn tick(age: u32) -> Result<u32, Errno> {
     if !due {
         return Ok(0);
     }
+    ST[S_TICK].fetch_add(1, Ordering::Relaxed);
     st.commit()?;
     Ok(1)
 }
