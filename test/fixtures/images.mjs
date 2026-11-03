@@ -63,7 +63,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -110,6 +110,26 @@ export const images = {
     mkdirSync(join(site, 'gex'), { recursive: true });
     for (const f of readdirSync(pub)) {
       if (f !== 'gex_browser.x86.m64.shared.wasm') symlinkSync(join(pub, f), join(site, 'gex', f));
+    }
+    return null;
+  },
+
+  // test/fixtures/programs/mount-tmpfs.c as a static musl program for each
+  // translated architecture (zig), for core/mount-tmpfs: the native ABIs'
+  // own mount(2) numbers.
+  async 'native-progs'(work) {
+    const zig = process.env.ZIG || 'zig';
+    for (const name of ['mount-tmpfs']) {
+      const src = join(HERE, `programs/${name}.c`);
+      const key = createHash('sha256').update(readFileSync(src)).digest('hex');
+      for (const [arch, target] of [['x86', 'x86_64-linux-musl'], ['a64', 'aarch64-linux-musl']]) {
+        const out = join(work, `${name}.${arch}`), keyFile = `${out}.key`;
+        if (existsSync(out) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) continue;
+        const r = spawnSync(zig, ['cc', '-target', target, '-O2', '-static', '-o', out, src], { stdio: ['ignore', 'ignore', 'pipe'] });
+        if (r.error) return `no ${zig} (ZIG)`;
+        if (r.status !== 0) throw new Error(`${name}.c: ${r.stderr}`);
+        writeFileSync(keyFile, key);
+      }
     }
     return null;
   },
