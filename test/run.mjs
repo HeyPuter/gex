@@ -382,8 +382,14 @@ async function startBrowser() {
 /** The test in a page of its own (a fresh browser context, so its storage
  *  is its own too), every Worker's console relayed. */
 async function runPage(test, arch, say, timeout) {
-  const { browserContextId } = await cdp.send('Target.createBrowserContext', {});
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
+  // `meta.profile` (or GEX_TEST_PROFILE_CONTEXT=1): the profile's own
+  // context, its storage on disk as a user's is. A fresh context's is in
+  // memory, and its origin private file system has limits of its own (a
+  // file stops near 2 GiB; growing one past 1 GiB by truncate ends the
+  // browser).
+  const own = test.meta.profile || process.env.GEX_TEST_PROFILE_CONTEXT === '1';
+  const { browserContextId } = own ? {} : await cdp.send('Target.createBrowserContext', {});
+  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', ...(browserContextId ? { browserContextId } : {}) });
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   const names = new Map([[sessionId, 'page']]);
   const mine = new Set([sessionId]);
@@ -475,7 +481,7 @@ async function runPage(test, arch, say, timeout) {
   }
   for (const f of off) f();
   await cdp.send('Target.closeTarget', { targetId }).catch(() => {});
-  await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+  if (browserContextId) await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
   const res = v?.res ?? { checks: 0, fail: [], times: {} };
   if (!v?.done) {
     const what = crashed ?? `timed out after ${timeout / 1000} s`;
