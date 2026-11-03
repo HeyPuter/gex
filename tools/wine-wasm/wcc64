@@ -53,6 +53,14 @@ if '-D_WIN32' in args:
     CC = CC[:1] + flags['WASM64_CFLAGS'].split() + (['-DGEX_MEMORY64=1'] if mem64 else [])
     CC += ['-nostdlibinc', '-fplugin=' + os.path.join(lib, 'GexLLP64.so'), '-include', os.path.join(lib, 'llp64.h'),
            '-mms-bitfields', '-fshort-wchar']
+    # C++ on the PE side (Wine's libc++, icu) sees a Windows target, as
+    # MinGW's does: Linux's predefined macros would send libc++'s headers to
+    # glibc's (C keeps them, as it always has). Static destructors are not
+    # registered: a wasm module's terminators never run (gexrt's empty
+    # .CRT$XT table), and Windows has no __cxa_atexit
+    if CC[0] == 'clang++':
+        CC += ['-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__',
+               '-DWINE_UNICODE_NATIVE', '-fno-c++-static-destructors']
     if not os.environ.get('GEX_WASM_NO_ICALL'):
         CC += ['-fpass-plugin=' + os.path.join(lib, 'GexIcall.so')]
 # The snapshot flavour's sysroot (build-sysroot64.sh GEX_SNAPSHOT=1, which

@@ -30,3 +30,15 @@ GEX_WASM64_SYSROOT=SR/sysroot tools/wine-wasm/wine64-dist.sh wine64 CACHE
 ```
 
 `wine64-dist.sh` prints where the install and its prefix are.
+
+## Known gaps
+
+The 64-bit install has no:
+
+- **GStreamer**: winegstreamer is left out (`WINE_GSTREAMER=1` keeps it, but
+  it cannot start), so media that Wine decodes through GStreamer does not play.
+- **Gecko**: wine-gecko, the engine behind mshtml, is not shipped. Pages
+  run with `mshtml=` in `WINEDLLOVERRIDES`, and HTML views (mshtml, the
+  WebBrowser control, hh.exe) do not render.
+- **Mono**: wine-mono is not shipped, and pages run with `mscoree=`, so .NET
+  Framework programs do not start.
