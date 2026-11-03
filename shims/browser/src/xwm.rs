@@ -26,7 +26,8 @@ pub(crate) fn connect(cx: &crate::wl::ProcCx) -> Option<Xwm> {
 fn open(cx: &crate::wl::ProcCx) -> Option<Arc<dyn FileHandle>> {
     for name in X_SOCKETS {
         if let Some(r) = cx.unix_remote {
-            let id = (r.connect)(name.as_ptr() as gex_kernel::PAddr, name.len() as u32);
+            // (the window manager is the page's, not the process's: root, no pid)
+            let id = (r.connect)(name.as_ptr() as gex_kernel::PAddr, name.len() as u32, 0, 0, 0);
             if id >= 0 {
                 unsafe {
                     crate::write_stderr(&format!(

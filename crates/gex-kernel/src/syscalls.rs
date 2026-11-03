@@ -136,6 +136,11 @@ pub mod nr {
     pub const GETRESUID: u64 = 148;
     pub const SETRESGID: u64 = 149;
     pub const GETRESGID: u64 = 150;
+    pub const SETFSUID: u64 = 151;
+    pub const SETFSGID: u64 = 152;
+    pub const CAPGET: u64 = 90;
+    pub const CAPSET: u64 = 91;
+    pub const CHROOT: u64 = 51;
     pub const TIMES: u64 = 153;
     pub const SETPGID: u64 = 154;
     pub const GETPGID: u64 = 155;
@@ -1964,6 +1969,31 @@ impl FdIo<'_> {
         Ok(cmsg_len)
     }
 
+    /// The `SCM_CREDENTIALS` message a socket with `SO_PASSCRED` gets with
+    /// what it reads: the sender's `struct ucred`, here the far end's as
+    /// the two were joined (`SO_PEERCRED`'s: a process that changes its ids
+    /// after connecting is still reported as it was). A peer not known is
+    /// Linux's overflow ids, as for a sender in no namespace of the
+    /// reader's. The bytes written: none when there is no room.
+    fn write_scm_creds(&self, m: &mut GuestMem<'_>, control: u64, len: u64, peer: Option<unix::Cred>) -> Result<u64, Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_CREDENTIALS: u32 = 2;
+        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
+        let cmsg_len = hdr + 12;
+        let used = self.cmsg_align(cmsg_len);
+        if control == 0 || used > len {
+            return Ok(0);
+        }
+        let c = peer.unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534 });
+        self.msg_wr(m, control, 0, cmsg_len)?;
+        m.write_u32(control + w, SOL_SOCKET)?;
+        m.write_u32(control + w + 4, SCM_CREDENTIALS)?;
+        m.write_u32(control + hdr, c.pid as u32)?;
+        m.write_u32(control + hdr + 4, c.uid)?;
+        m.write_u32(control + hdr + 8, c.gid)?;
+        Ok(used)
+    }
+
     /// `sendmsg`, which is how glibc writes to a socket, and the only way to
     /// pass a descriptor to another process.
     pub fn sendmsg(&self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
@@ -2136,7 +2166,8 @@ impl FdIo<'_> {
         if name != 0 {
             m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
         }
-        let written = self.write_scm_rights(m, control, controllen, files)?;
+        let creds = if sock.passcred() { self.write_scm_creds(m, control, controllen, sock.peer_cred())? } else { 0 };
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files)?;
         self.msg_wr(m, msg, 5, written)?;
         m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
         Ok(n)
@@ -2247,7 +2278,11 @@ impl FdIo<'_> {
             }
         }
         let given = !received.is_empty();
-        let written = self.write_scm_rights(m, control, controllen, received)?;
+        let creds = match &unix_sock {
+            Some(s) if s.passcred() => self.write_scm_creds(m, control, controllen, s.peer_cred())?,
+            _ => 0,
+        };
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, received)?;
         self.msg_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
         // of room.
@@ -3470,7 +3505,7 @@ impl PathIo<'_> {
         let p = self.at_path(m, dirfd, path)?;
         // A root guest (`--uid 0`) may read and write anything; execute
         // still needs an execute bit, which the host checks.
-        let mode = if self.creds.uid() == 0 { mode & 1 } else { mode & 7 };
+        let mode = if self.creds.ruid() == 0 { mode & 1 } else { mode & 7 };
         self.ns.access(&p, mode).map(|_| 0)
     }
 
@@ -3870,6 +3905,9 @@ impl PathIo<'_> {
     /// published view, its one writer; the kernel's copy follows at its
     /// next call ([`crate::vfs::Vfs::refresh`]).
     pub fn mount_call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        if n == nr::CHROOT {
+            return self.chroot(m, a[0]);
+        }
         if n == nr::UMOUNT2 {
             let target = self.at_path(m, AT_FDCWD, a[0])?;
             return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
@@ -3915,6 +3953,31 @@ impl PathIo<'_> {
             }
             _ => Err(Errno::ENODEV),
         }
+    }
+
+    /// `chroot(path)`: the namespace's root, as published, now `path`
+    /// ([`crate::vfs::Namespace::chroot`]), for every thread of the process
+    /// (Linux's is the calling thread's fs_struct, which its threads
+    /// share); the caller's directory moved with it. Needs
+    /// `CAP_SYS_CHROOT`, as on Linux.
+    fn chroot(&self, m: &GuestMem<'_>, path: u64) -> SysResult {
+        const CAP_SYS_CHROOT: u64 = 1 << 18;
+        let p = self.at_path(m, AT_FDCWD, path)?;
+        let dir = self.ns.canonical(&p);
+        if self.ns.metadata(&dir)?.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.creds.caps()[0] & CAP_SYS_CHROOT == 0 {
+            return Err(Errno::EPERM);
+        }
+        self.view.chroot(&dir)?;
+        let cwd = self.fs.get();
+        let inside = cwd.len() > dir.len() && cwd.starts_with(&dir) && (dir == "/" || cwd.as_bytes()[dir.len()] == b'/');
+        if dir != "/" {
+            let new = if inside { cwd[dir.len()..].to_string() } else { "/".to_string() };
+            self.fs.set(new, None);
+        }
+        Ok(0)
     }
 
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
@@ -4661,11 +4724,25 @@ impl NetIo<'_> {
                     io.write_sockaddr(m, ip, port, a[1], a[2])
                 }
             },
-            // Nothing here has an option worth setting -- no timeouts, no
-            // buffer sizes that mean anything -- and refusing makes libraries
-            // treat the socket as broken.
-            // agreed to without effect, on a descriptor that exists
-            nr::SETSOCKOPT => io.fds.get(fd).map(|_| 0),
+            // `SO_PASSCRED` on a unix socket (`SCM_CREDENTIALS` on each
+            // `recvmsg`, [`FdIo::write_scm_creds`]). Nothing else here has an
+            // option worth setting -- no timeouts, no buffer sizes that mean
+            // anything -- and refusing makes libraries treat the socket as
+            // broken: agreed to without effect, on a descriptor that exists.
+            nr::SETSOCKOPT => {
+                const SOL_SOCKET: u64 = 1;
+                const SO_PASSCRED: u64 = 16;
+                io.fds.get(fd)?;
+                if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED && a[3] != 0 && a[4] >= 4 {
+                    let on = m.read_u32(a[3])? != 0;
+                    if let Ok(s) = io.unix_of(fd) {
+                        s.set_passcred(on);
+                    } else if let Ok(s) = io.remote_unix_of(fd) {
+                        s.set_passcred(on);
+                    }
+                }
+                Ok(0)
+            }
             nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
             // global kernel; the proxied network's as it can; anything else
@@ -4837,7 +4914,8 @@ impl NetIo<'_> {
         const SOCK_STREAM: u64 = 1;
         if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
             let mut ids = [0u8; 8];
-            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
+            let me = io.cred();
+            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr, me.pid, me.uid, me.gid);
             if rc < 0 {
                 return Err(Errno(-rc));
             }
@@ -4887,7 +4965,10 @@ impl NetIo<'_> {
         if let Ok(d) = io.dgram_of(fd) {
             let path = Kernel::sockaddr_un(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
-            d.bind(&path)?;
+            // Named in the table every process shares as the namespace the
+            // process started with names it (a `chroot`'s root in front).
+            let name = io.ns.outer_path(&path).into_owned();
+            d.bind(&name)?;
             if !path.starts_with('\0') {
                 let _ = io.ns.mksocket(&path);
             }
@@ -4898,6 +4979,9 @@ impl NetIo<'_> {
         // A filesystem socket resolves against the guest's root the way any
         // other path does; an abstract one has no filesystem existence.
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // Named in the table every process shares as the namespace the
+        // process started with names it (a `chroot`'s root in front).
+        let name = io.ns.outer_path(&path).into_owned();
         // In the global kernel when there is one, because the client that
         // will connect is another process -- and with a Worker per process
         // that is another memory, where a name bound here means nothing.
@@ -4906,7 +4990,8 @@ impl NetIo<'_> {
         // and `listen` is local to itself, and what the far end can see is
         // only whether the name answers.
         if let Some(r) = self.unix_remote {
-            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            let me = io.cred();
+            let id = (r.bind)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid);
             if id < 0 {
                 return Err(Errno(-id));
             }
@@ -4919,9 +5004,9 @@ impl NetIo<'_> {
             }
             return Ok(0);
         }
-        sock.bind(&path)?;
-        if let Err(e) = self.socket_names.bind(&path, sock.clone()) {
-            sock.unbind_failed(&path);
+        sock.bind(&name)?;
+        if let Err(e) = self.socket_names.bind(&name, sock.clone()) {
+            sock.unbind_failed(&name);
             return Err(e);
         }
         // And a node in the filesystem, so the name can be seen as well as
@@ -4942,17 +5027,24 @@ impl NetIo<'_> {
         if let Ok(d) = io.dgram_of(fd) {
             let path = Kernel::sockaddr_un(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
-            return d.connect(&path);
+            // Named in the table every process shares as the namespace the
+            // process started with names it (a `chroot`'s root in front).
+            let name = io.ns.outer_path(&path).into_owned();
+            return d.connect(&name);
         }
         let sock = io.unix_of(fd)?;
         let path = Kernel::sockaddr_un(m, addr, len)?;
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // Named in the table every process shares as the namespace the
+        // process started with names it (a `chroot`'s root in front).
+        let name = io.ns.outer_path(&path).into_owned();
         // The global kernel first, because that is where a name another
         // process bound will be. A host-bound name -- the virtio-gpu socket --
         // is in *this* process's table and never in the kernel's, so the
         // local path is still tried when the kernel does not know the name.
         if let Some(r) = self.unix_remote {
-            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            let me = io.cred();
+            let id = (r.connect)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid);
             if id >= 0 {
                 let flags = io.fds.get(fd)?.flags();
                 let cloexec = io.fds.cloexec(fd).unwrap_or(false);
@@ -4965,10 +5057,10 @@ impl NetIo<'_> {
         // then the system-wide table, which is where a guest server (an X
         // server's socket) lives.
         sock.set_cred(io.cred());
-        if let Ok(r) = self.host_names.connect(&sock, &path) {
+        if let Ok(r) = self.host_names.connect(&sock, &name) {
             return Ok(r);
         }
-        self.socket_names.connect(&sock, &path)
+        self.socket_names.connect(&sock, &name)
     }
 }
 
@@ -4986,6 +5078,10 @@ fn install_unix(io: &FdIo<'_>, sock: Arc<unix::UnixSocket>, flags: u64, cloexec:
 /// starts as an ordinary local socket and is swapped when its name is
 /// known.
 fn install_remote_unix(io: &FdIo<'_>, fd: i32, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<(), Errno> {
+    // An option set on the local socket it replaces.
+    if io.unix_of(fd).is_ok_and(|s| s.passcred()) {
+        sock.set_passcred(true);
+    }
     let handle: Arc<dyn crate::vfs::FileHandle> = sock;
     let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
     io.fds.install(fd, file, cloexec)?;
@@ -5195,10 +5291,10 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
     // every ABI), as it was when the two were joined. Every byte is written:
     // dbus-daemon reads the struct off its stack uninitialised and compares
     // the uid with the one a client claims, so a struct left as the caller
-    // had it refused every wasm32 client's authentication. A peer this
-    // kernel did not see made (in the global kernel, or a host's end) has
-    // no pid to give (0) and this process's user and group, the only ones
-    // there are.
+    // had it refused every wasm32 client's authentication. A socket in the
+    // global kernel asks it (`unix::Remote::peer_cred`). A peer neither
+    // kernel saw made (a host's end) has no pid to give (0) and this
+    // process's user and group, the only ones there are.
     const SO_PEERCRED: u64 = 17;
     if level == SOL_SOCKET && name == SO_PEERCRED {
         let me = io.cred();
@@ -5206,6 +5302,7 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
             .unix_of(fd)
             .ok()
             .and_then(|s| s.peer_cred())
+            .or_else(|| io.remote_unix_of(fd).ok().and_then(|s| s.peer_cred()))
             .unwrap_or(unix::Cred { pid: 0, uid: me.uid, gid: me.gid });
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&peer.pid.to_le_bytes());
@@ -5233,8 +5330,13 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
     let (v, len): (u64, u64) = match (level, name) {
         // SO_DEBUG, SO_REUSEADDR, SO_DONTROUTE, SO_BROADCAST, SO_KEEPALIVE,
         // SO_OOBINLINE, SO_NO_CHECK, SO_PRIORITY, SO_REUSEPORT,
-        // SO_PASSCRED, SO_TIMESTAMP, SO_PASSSEC, SO_MARK
-        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 16 | 29 | 34 | 36) => (0, 4),
+        // SO_TIMESTAMP, SO_PASSSEC, SO_MARK
+        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 29 | 34 | 36) => (0, 4),
+        // SO_PASSCRED, as set
+        (SOL_SOCKET, 16) => {
+            let on = io.unix_of(fd).map(|s| s.passcred()).or_else(|_| io.remote_unix_of(fd).map(|s| s.passcred())).unwrap_or(false);
+            (on as u64, 4)
+        }
         // SO_SNDBUF, SO_RCVBUF: Linux's defaults, as it reports them
         (SOL_SOCKET, 7) => (212_992, 4),
         (SOL_SOCKET, 8) => (212_992, 4),
@@ -5685,46 +5787,315 @@ pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u6
     }
 }
 
-/// A process's user and group ids. Its threads share one (a `setuid` on
-/// any is every thread's, as Linux's process-wide set), a fork copies it,
-/// and an `exec` keeps it. Read at each use (the owner a stat reports, the
-/// sender a signal names, `getuid`), so a change is seen by every thread's
-/// next call, with or without a kernel lock. Each set call changes one
-/// word, so two atomics are the whole of it.
+/// A process's user and group ids, real, effective and saved, and its
+/// capability sets. Its threads share one (a `setuid` on any is every
+/// thread's, as Linux's process-wide set), a fork copies it, and an `exec`
+/// keeps the ids ([`Creds::exec`] recomputes the capabilities). Read at each
+/// use (the owner a stat reports, the sender a signal names, `getuid`), so
+/// a change is seen by every thread's next call, with or without a kernel
+/// lock. A set call stores word by word: two threads setting at once may
+/// interleave, which no program relies on.
+///
+/// The filesystem ids are the effective ones (no `setfsuid`), and there
+/// are no file capabilities, no ambient set and no bounding set narrower
+/// than every capability.
 #[derive(Debug)]
 pub struct Creds {
-    uid: std::sync::atomic::AtomicU32,
-    gid: std::sync::atomic::AtomicU32,
+    /// Real, effective, saved.
+    uid: [std::sync::atomic::AtomicU32; 3],
+    gid: [std::sync::atomic::AtomicU32; 3],
+    /// Effective, permitted, inheritable.
+    caps: [std::sync::atomic::AtomicU64; 3],
+    /// `PR_SET_KEEPCAPS`: a uid change away from root keeps the permitted
+    /// set (it clears at exec).
+    keep_caps: std::sync::atomic::AtomicBool,
 }
 
+/// Every capability Linux 6.x has (`CAP_LAST_CAP` 40): root's sets.
+pub const CAPS_ALL: u64 = (1 << 41) - 1;
+const CAP_SETPCAP: u64 = 1 << 8;
+
+const RE: usize = 0;
+const EF: usize = 1;
+const SV: usize = 2;
+
 impl Creds {
+    fn blank(uid: u32, gid: u32) -> Creds {
+        Creds {
+            uid: [uid.into(), uid.into(), uid.into()],
+            gid: [gid.into(), gid.into(), gid.into()],
+            caps: [0.into(), 0.into(), 0.into()],
+            keep_caps: false.into(),
+        }
+    }
+
     pub fn new(uid: u32, gid: u32) -> Arc<Creds> {
-        Arc::new(Creds { uid: uid.into(), gid: gid.into() })
+        let c = Creds::blank(uid, gid);
+        c.exec();
+        Arc::new(c)
     }
 
+    /// A fork's copy, every id and set as they are.
+    pub fn fork(&self) -> Arc<Creds> {
+        let c = Creds::blank(0, 0);
+        c.restore(&self.save());
+        Arc::new(c)
+    }
+
+    fn ld32(a: &std::sync::atomic::AtomicU32) -> u32 {
+        a.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn st32(a: &std::sync::atomic::AtomicU32, v: u32) {
+        a.store(v, std::sync::atomic::Ordering::Release)
+    }
+
+    /// The effective uid: what permission, ownership and peer credentials
+    /// go by.
     pub fn uid(&self) -> u32 {
-        self.uid.load(std::sync::atomic::Ordering::Acquire)
+        Self::ld32(&self.uid[EF])
     }
 
+    /// The effective gid.
     pub fn gid(&self) -> u32 {
-        self.gid.load(std::sync::atomic::Ordering::Acquire)
+        Self::ld32(&self.gid[EF])
     }
 
-    /// Become `uid` (a host's identity, or the guest's `setuid`).
+    /// The real uid: `getuid`, and the sender a signal names.
+    pub fn ruid(&self) -> u32 {
+        Self::ld32(&self.uid[RE])
+    }
+
+    pub fn rgid(&self) -> u32 {
+        Self::ld32(&self.gid[RE])
+    }
+
+    /// Real, effective and saved uids.
+    pub fn uids(&self) -> [u32; 3] {
+        [self.ruid(), self.uid(), Self::ld32(&self.uid[SV])]
+    }
+
+    pub fn gids(&self) -> [u32; 3] {
+        [self.rgid(), self.gid(), Self::ld32(&self.gid[SV])]
+    }
+
+    /// Effective, permitted and inheritable capabilities.
+    pub fn caps(&self) -> [u64; 3] {
+        self.caps.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn set_caps(&self, v: [u64; 3]) {
+        for (c, v) in self.caps.iter().zip(v) {
+            c.store(v, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Become `uid`, real, effective and saved (a host's identity), with
+    /// root's capabilities if it is root and none if not.
     pub fn set_uid(&self, uid: u32) {
-        self.uid.store(uid, std::sync::atomic::Ordering::Release);
+        for a in &self.uid {
+            Self::st32(a, uid);
+        }
+        self.exec();
     }
 
     pub fn set_gid(&self, gid: u32) {
-        self.gid.store(gid, std::sync::atomic::Ordering::Release);
+        for a in &self.gid {
+            Self::st32(a, gid);
+        }
     }
+
+    /// The ids and sets as bytes, for a process another memory goes on in
+    /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte.
+    pub fn save(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(Self::SAVED);
+        for id in self.uids().into_iter().chain(self.gids()) {
+            v.extend_from_slice(&id.to_le_bytes());
+        }
+        for c in self.caps() {
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+        v.push(self.keep_caps.load(std::sync::atomic::Ordering::Acquire) as u8);
+        v
+    }
+
+    /// The length of [`Creds::save`]'s bytes.
+    pub const SAVED: usize = 6 * 4 + 3 * 8 + 1;
+
+    /// [`Creds::save`]'s bytes back; anything else changes nothing.
+    pub fn restore(&self, b: &[u8]) {
+        if b.len() != Self::SAVED {
+            return;
+        }
+        let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        for i in 0..3 {
+            Self::st32(&self.uid[i], w(i));
+            Self::st32(&self.gid[i], w(3 + i));
+        }
+        let c = |i: usize| u64::from_le_bytes(b[24 + i * 8..32 + i * 8].try_into().unwrap());
+        self.set_caps([c(0), c(1), c(2)]);
+        self.keep_caps.store(b[48] != 0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The capabilities an `execve` leaves, as Linux computes them for a
+    /// file with none of its own: everything for a program run by root
+    /// (real or effective), effective only when the effective uid is;
+    /// nothing otherwise. The inheritable set stays; `PR_SET_KEEPCAPS`
+    /// clears.
+    pub fn exec(&self) {
+        let [r, e, _] = self.uids();
+        let [_, _, inh] = self.caps();
+        let permitted = if r == 0 || e == 0 { CAPS_ALL } else { 0 };
+        let effective = if e == 0 { permitted } else { 0 };
+        self.set_caps([effective, permitted, inh]);
+        self.keep_caps.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS`.
+    pub fn keep_caps(&self) -> bool {
+        self.keep_caps.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_keep_caps(&self, on: bool) {
+        self.keep_caps.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The capability changes a uid change makes (Linux's
+    /// `cap_emulate_setxuid`): leaving root altogether (no id 0 left)
+    /// drops the permitted and effective sets, unless `PR_SET_KEEPCAPS`
+    /// keeps the permitted; an effective uid leaving 0 drops the effective
+    /// set, and one becoming 0 takes the permitted set as effective.
+    fn after_uid_change(&self, old: [u32; 3]) {
+        let new = self.uids();
+        let [mut eff, mut perm, inh] = self.caps();
+        if old.contains(&0) && !new.contains(&0) {
+            if !self.keep_caps() {
+                perm = 0;
+            }
+            eff = 0;
+        }
+        if old[1] == 0 && new[1] != 0 {
+            eff = 0;
+        }
+        if old[1] != 0 && new[1] == 0 {
+            eff = perm;
+        }
+        // A process that was not root at all and is now (every change is
+        // granted, [`cred_call`]): root's sets, as a set-user-ID-root
+        // program's exec would have given it.
+        if !old.contains(&0) && new[1] == 0 {
+            (eff, perm) = (CAPS_ALL, CAPS_ALL);
+        }
+        self.set_caps([eff, perm, inh]);
+    }
+
+    /// `setresuid`/`setresgid` and the calls made of it: each id `None`
+    /// to keep.
+    fn set_res(ids: &[std::sync::atomic::AtomicU32; 3], want: [Option<u32>; 3]) {
+        for (a, v) in ids.iter().zip(want) {
+            if let Some(v) = v {
+                Self::st32(a, v);
+            }
+        }
+    }
+
+    /// `setuid(id)` (`gid`: `setgid`), as root's: every id.
+    fn setid(&self, gid: bool, id: u32) {
+        Self::set_res(if gid { &self.gid } else { &self.uid }, [Some(id); 3]);
+    }
+
+    /// `setreuid(r, e)` (`gid`: `setregid`). When the real id is set, or
+    /// the effective one set to other than the old real, the saved id
+    /// becomes the new effective.
+    fn setreid(&self, gid: bool, r: Option<u32>, e: Option<u32>) {
+        let ids = if gid { &self.gid } else { &self.uid };
+        let (or, oe) = (Self::ld32(&ids[RE]), Self::ld32(&ids[EF]));
+        let saved = (r.is_some() || e.is_some_and(|e| e != or)).then_some(e.unwrap_or(oe));
+        Self::set_res(ids, [r, e, saved]);
+    }
+
+    /// `capget`'s answer for this process.
+    pub fn capget(&self) -> [u64; 3] {
+        self.caps()
+    }
+
+    /// `capset`: the inheritable set within the old inheritable and
+    /// permitted (any, with CAP_SETPCAP), the permitted within the old
+    /// permitted, the effective within the new permitted; `EPERM` else.
+    pub fn capset(&self, eff: u64, perm: u64, inh: u64) -> Result<(), Errno> {
+        let [ceff, cperm, cinh] = self.caps();
+        let inh_room = if ceff & CAP_SETPCAP != 0 { CAPS_ALL } else { cinh | cperm };
+        if inh & !inh_room != 0 || perm & !cperm != 0 || eff & !perm != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.set_caps([eff, perm, inh]);
+        Ok(())
+    }
+}
+
+/// `capget`/`capset`'s header versions: 1 has one 32-bit data struct, 2
+/// and 3 two.
+const CAP_V1: u32 = 0x1998_0330;
+const CAP_V2: u32 = 0x2007_1026;
+const CAP_V3: u32 = 0x2008_0522;
+
+/// `capget(hdr, data)` and `capset(hdr, data)` on this process's sets
+/// ([`Creds`]). Another live process's sets are not kept where this
+/// process can read them, so `capget` of one answers as Linux does for a
+/// process run by root, every capability; `capset` of one is `EPERM`, as
+/// on Linux.
+fn cap_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, set: bool, a: [u64; 6]) -> SysResult {
+    let (hdr, data) = (a[0], a[1]);
+    let version = m.read_u32(hdr)?;
+    let target = m.read_u32(hdr + 4)? as i32;
+    let words = match version {
+        CAP_V1 => 1,
+        CAP_V2 | CAP_V3 => 2,
+        _ => {
+            // The version this kernel prefers, written back for libcap to
+            // ask again with; a probe with no data is not an error.
+            m.write_u32(hdr, CAP_V3)?;
+            return if data == 0 && !set { Ok(0) } else { Err(Errno::EINVAL) };
+        }
+    };
+    if target < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let me = target == 0 || target == pid;
+    if set {
+        if !me {
+            return Err(Errno::EPERM);
+        }
+        let mut v = [0u64; 3];
+        for w in 0..words {
+            for (i, s) in v.iter_mut().enumerate() {
+                *s |= u64::from(m.read_u32(data + w * 12 + i as u64 * 4)?) << (32 * w);
+            }
+        }
+        return creds.capset(v[0], v[1], v[2]).map(|_| 0);
+    }
+    let sets = if me {
+        creds.capget()
+    } else if procs.task_owner(target).is_some() {
+        [CAPS_ALL, CAPS_ALL, 0]
+    } else {
+        return Err(Errno::ESRCH);
+    };
+    if data != 0 {
+        for w in 0..words {
+            for (i, s) in sets.iter().enumerate() {
+                m.write_u32(data + w * 12 + i as u64 * 4, (s >> (32 * w)) as u32)?;
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// The credential, session and process group calls: `get[e]uid`,
 /// `mount` and `umount2`: the namespace's mount table, which its
 /// published view ([`crate::vfs::VfsView`]) writes. Canonical.
 pub fn is_mount(n: u64) -> bool {
-    matches!(n, nr::MOUNT | nr::UMOUNT2)
+    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT)
 }
 
 /// The calls on the calling thread's own state alone:
@@ -6073,6 +6444,10 @@ pub fn is_cred(n: u64) -> bool {
             | nr::SETRESGID
             | nr::GETRESUID
             | nr::GETRESGID
+            | nr::SETFSUID
+            | nr::SETFSGID
+            | nr::CAPGET
+            | nr::CAPSET
             | nr::SETSID
             | nr::GETSID
             | nr::GETPGID
@@ -6083,36 +6458,58 @@ pub fn is_cred(n: u64) -> bool {
 /// A call [`is_cred`] admits, made, for the kernel's arms and
 /// [`free_call`] alike, as process `pid`.
 ///
-/// There is no privilege model here: the guest is the whole system, so a
-/// request to become another user is recorded and granted. Refusing would
-/// be the less honest answer, since nothing gex does is protected by the
-/// uid in the first place. Real, effective and saved ids are one value, so
-/// the `setre*`/`setres*` forms set the effective one and the `getres*`
-/// forms report it three times; all ones means "leave alone".
+/// There is no privilege check on the id changes: the guest is the whole
+/// system, and there are no set-user-ID programs (a file's owner is the
+/// process's own), so a request to become another user is recorded and
+/// granted, as root's would be. Refusing would be the less honest answer,
+/// since nothing gex does is protected by the uid in the first place. The
+/// real, effective and saved ids are each kept, set as Linux sets them for
+/// root, and the capability sets follow a uid change as Linux's do
+/// ([`Creds::after_uid_change`]): what peer credentials, `getuid` and
+/// `geteuid` report is what Linux's would. All ones means "leave alone".
 pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
-    let set = |want: u64, apply: &dyn Fn(u32)| {
-        if want as u32 != u32::MAX {
-            apply(want as u32);
-        }
-        Ok(0)
-    };
-    let getres = |m: &mut GuestMem<'_>, id: u32| {
-        for slot in [a[0], a[1], a[2]] {
+    // -1 keeps an id (the 16-bit calls' 0xffff arrives as -1 too,
+    // `i386::canonical`).
+    let id = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
+    let getres = |m: &mut GuestMem<'_>, ids: [u32; 3]| {
+        for (slot, id) in [a[0], a[1], a[2]].into_iter().zip(ids) {
             if slot != 0 {
                 m.write_u32(slot, id)?;
             }
         }
         Ok(0)
     };
+    let uid_change = |f: &dyn Fn()| {
+        let old = creds.uids();
+        f();
+        creds.after_uid_change(old);
+        Ok(0)
+    };
     match n {
-        nr::GETUID | nr::GETEUID => Ok(creds.uid() as u64),
-        nr::GETGID | nr::GETEGID => Ok(creds.gid() as u64),
-        nr::SETUID => set(a[0], &|v| creds.set_uid(v)),
-        nr::SETGID => set(a[0], &|v| creds.set_gid(v)),
-        nr::SETREUID | nr::SETRESUID => set(a[1], &|v| creds.set_uid(v)),
-        nr::SETREGID | nr::SETRESGID => set(a[1], &|v| creds.set_gid(v)),
-        nr::GETRESUID => getres(m, creds.uid()),
-        nr::GETRESGID => getres(m, creds.gid()),
+        nr::GETUID => Ok(creds.ruid() as u64),
+        nr::GETEUID => Ok(creds.uid() as u64),
+        nr::GETGID => Ok(creds.rgid() as u64),
+        nr::GETEGID => Ok(creds.gid() as u64),
+        nr::SETUID => match id(a[0]) {
+            Some(v) => uid_change(&|| creds.setid(false, v)),
+            None => Err(Errno::EINVAL),
+        },
+        nr::SETGID => match id(a[0]) {
+            Some(v) => Ok(creds.setid(true, v)).map(|_| 0),
+            None => Err(Errno::EINVAL),
+        },
+        nr::SETREUID => uid_change(&|| creds.setreid(false, id(a[0]), id(a[1]))),
+        nr::SETREGID => Ok(creds.setreid(true, id(a[0]), id(a[1]))).map(|_| 0),
+        nr::SETRESUID => uid_change(&|| Creds::set_res(&creds.uid, [id(a[0]), id(a[1]), id(a[2])])),
+        nr::SETRESGID => Ok(Creds::set_res(&creds.gid, [id(a[0]), id(a[1]), id(a[2])])).map(|_| 0),
+        nr::GETRESUID => getres(m, creds.uids()),
+        nr::GETRESGID => getres(m, creds.gids()),
+        // The filesystem ids are the effective ones: the old one back, and
+        // nothing changed (Linux answers the old one whatever it does).
+        nr::SETFSUID => Ok(creds.uid() as u64),
+        nr::SETFSGID => Ok(creds.gid() as u64),
+        nr::CAPGET => cap_call(creds, procs, pid, m, false, a),
+        nr::CAPSET => cap_call(creds, procs, pid, m, true, a),
         nr::SETSID => procs.setsid(pid).map(|s| s as u64),
         nr::GETSID => procs.sid(pid, a[0] as i32).map(|s| s as u64),
         nr::GETPGID => procs.pgid(pid, a[0] as i32).map(|g| g as u64),
@@ -6274,7 +6671,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         // group entirely. Whether or not anything is still in the inbox:
         // another thread's collect may have taken it and not yet raised it,
         // and collecting waits for that one (`ProcSig::collect`).
-        to.signals.process().collect(to.procs, to.pid, to.creds.uid());
+        to.signals.process().collect(to.procs, to.pid, to.creds.ruid());
         return Ok(0);
     }
     // `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
@@ -6305,7 +6702,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         return Err(Errno::ESRCH);
     }
     if signo > 0 {
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.uid() };
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid() };
         match target {
             Some(t) => t.raise_from(signo, source),
             None => to.signals.raise_from(signo, source),
@@ -6319,9 +6716,23 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
 pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
     match n {
         nr::UNAME => uname(m, io.compat, a[0]),
-        // Names, death signals and dumpability: all things a process may
-        // set about itself that change nothing observable here.
-        nr::PRCTL => Ok(0),
+        // The capability options ([`Creds`]): `PR_GET_KEEPCAPS` and
+        // `PR_SET_KEEPCAPS`, and the bounding set, every capability (a
+        // drop is not kept; `PR_CAPBSET_READ` of one past the last is
+        // `EINVAL`, which libcap counts them by). Names, death signals,
+        // dumpability and the rest: all things a process may set about
+        // itself that change nothing observable here.
+        nr::PRCTL => match a[0] {
+            7 => Ok(io.creds.keep_caps() as u64),
+            8 if a[1] <= 1 => {
+                io.creds.set_keep_caps(a[1] == 1);
+                Ok(0)
+            }
+            8 => Err(Errno::EINVAL),
+            23 if a[1] <= 40 => Ok(1),
+            23 => Err(Errno::EINVAL),
+            _ => Ok(0),
+        },
         // Everything written made durable: the block store's dirty blocks
         // written out and the store flushed (vfs::sync_all); with the files
         // in memory, nothing. MAP_SHARED pages still in a process's memory
@@ -6917,7 +7328,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
-        f.signals.process().collect(f.procs, f.pid, f.creds.uid());
+        f.signals.process().collect(f.procs, f.pid, f.creds.ruid());
         r
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
@@ -7126,7 +7537,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     };
     if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
         // Linux sends it as the writer itself sending it (SI_USER).
-        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.uid() });
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid() });
     }
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
@@ -7786,8 +8197,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => creds.uid(),
-            x::GETGID | x::GETEGID => creds.gid(),
+            x::GETUID => creds.ruid(),
+            x::GETEUID => creds.uid(),
+            x::GETGID => creds.rgid(),
+            x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else if gex_abi::X86 {
@@ -7796,8 +8209,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => creds.uid(),
-            x::GETGID | x::GETEGID => creds.gid(),
+            x::GETUID => creds.ruid(),
+            x::GETEUID => creds.uid(),
+            x::GETGID => creds.rgid(),
+            x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else {
@@ -7805,8 +8220,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             nr::GETPID => ids.pid,
             nr::GETPPID if ids.ppid != 0 => ids.ppid,
             nr::GETTID => ids.tid,
-            nr::GETUID | nr::GETEUID => creds.uid(),
-            nr::GETGID | nr::GETEGID => creds.gid(),
+            nr::GETUID => creds.ruid(),
+            nr::GETEUID => creds.uid(),
+            nr::GETGID => creds.rgid(),
+            nr::GETEGID => creds.gid(),
             _ => return false,
         }
     };
@@ -9108,7 +9525,7 @@ impl Kernel {
             envp: self.envp.clone(),
             // The child's own ids from here on: a set in either is not the
             // other's.
-            creds: Creds::new(self.creds.uid(), self.creds.gid()),
+            creds: self.creds.fork(),
             trace: self.trace,
             // A fork resets pending signals but keeps the dispositions.
             signals: self.signals.fork(),
@@ -9587,7 +10004,7 @@ impl Kernel {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
-                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
                 );
             }
         }
@@ -9893,7 +10310,7 @@ impl Kernel {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,
                 // Linux sends it as the writer itself sending it (SI_USER).
-                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
             );
         }
         let ret = encode(r);
@@ -10154,7 +10571,7 @@ impl Kernel {
         if self.procs.has_signals(self.pid) {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
-                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.uid() };
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid() };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
                 } else if let Some(t) = self.thread_signals.get(tid) {
@@ -10170,7 +10587,7 @@ impl Kernel {
                 crate::wait::notify(self.procs.queue(self.pid));
             }
         }
-        let inbox = self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
+        let inbox = self.signals.process().collect(&self.procs, self.pid, self.creds.ruid());
         if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
         }
@@ -11135,7 +11552,7 @@ impl Kernel {
         if !self.procs.has_signals(self.pid) {
             return;
         }
-        self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
+        self.signals.process().collect(&self.procs, self.pid, self.creds.ruid());
     }
 
     /// `mount`, for the filesystems gex has.
@@ -11727,6 +12144,11 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETGROUPS => "getgroups",
         nr::SETGROUPS => "setgroups",
         nr::PRCTL => "prctl",
+        nr::CHROOT => "chroot",
+        nr::CAPGET => "capget",
+        nr::CAPSET => "capset",
+        nr::SETFSUID => "setfsuid",
+        nr::SETFSGID => "setfsgid",
         nr::SYNC => "sync",
         nr::STATX => "statx",
         nr::MOUNT => "mount",
@@ -13240,6 +13662,62 @@ mod tests {
         assert_eq!(child.creds.uid(), 4321);
         child.creds.set_uid(5);
         assert_eq!(k.creds.uid(), 4321);
+    }
+
+    /// The real, effective and saved ids each call sets, as Linux sets
+    /// them for root, and the capability sets that follow (`Creds`).
+    #[test]
+    fn set_ids_and_capabilities_as_linux_for_root() {
+        let all = CAPS_ALL;
+        let c = Creds::new(0, 0);
+        assert_eq!(c.caps(), [all, all, 0]);
+        let run = |c: &Creds, n: u64, a: [u64; 3]| {
+            let mut buf = [0u8; 64];
+            let mut m = GuestMem::new(&mut buf);
+            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0]).unwrap();
+        };
+        let keep = u32::MAX as u64;
+        run(&c, nr::SETRESUID, [keep, 997, keep]);
+        assert_eq!(c.uids(), [0, 997, 0]);
+        assert_eq!(c.caps(), [0, all, 0]);
+        run(&c, nr::SETRESUID, [keep, 0, keep]);
+        assert_eq!(c.caps(), [all, all, 0]);
+        run(&c, nr::SETREUID, [keep, 998, 0]);
+        assert_eq!(c.uids(), [0, 998, 998]);
+        // The real id alone: no root id left, so no capabilities.
+        run(&c, nr::SETREUID, [995, keep, 0]);
+        assert_eq!(c.uids(), [995, 998, 998]);
+        assert_eq!(c.caps(), [0, 0, 0]);
+        // From root, the real id alone: the effective root keeps them.
+        let d = Creds::new(0, 0);
+        run(&d, nr::SETREUID, [995, keep, 0]);
+        assert_eq!((d.uids(), d.caps()), ([995, 0, 0], [all, all, 0]));
+        run(&c, nr::SETUID, [996, 0, 0]);
+        assert_eq!(c.uids(), [996, 996, 996]);
+        assert_eq!(c.caps(), [0, 0, 0]);
+        // A fork's copy, and an exec's sets.
+        let f = c.fork();
+        assert_eq!((f.uids(), f.caps()), ([996; 3], [0; 3]));
+        f.exec();
+        assert_eq!(f.caps(), [0; 3]);
+        // Granted, as root's would be, with root's sets.
+        run(&f, nr::SETUID, [0, 0, 0]);
+        assert_eq!((f.uids(), f.caps()), ([0; 3], [all, all, 0]));
+        // PR_SET_KEEPCAPS keeps the permitted set across leaving root.
+        let k = Creds::new(0, 0);
+        k.set_keep_caps(true);
+        run(&k, nr::SETUID, [996, 0, 0]);
+        assert_eq!(k.caps(), [0, all, 0]);
+        // capset within the sets only.
+        let r = Creds::new(0, 0);
+        assert_eq!(r.capset(all & !(1 << 13), all, 0), Ok(()));
+        assert_eq!(r.capset(all, all & !(1 << 13), 0), Err(Errno::EPERM));
+        assert_eq!(r.capset(all & !(1 << 13), all & !(1 << 13), 0), Ok(()));
+        assert_eq!(r.capset(all, all, 0), Err(Errno::EPERM));
+        // The bytes a page's other Worker restores from.
+        let b = Creds::new(0, 0);
+        b.restore(&c.save());
+        assert_eq!((b.uids(), b.gids(), b.caps()), (c.uids(), c.gids(), c.caps()));
     }
 
     /// `kill`, `tkill` and `tgkill` answer as the kernel's arms do,

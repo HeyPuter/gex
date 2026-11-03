@@ -680,8 +680,11 @@ extern "C" {
     // Unix sockets. An X server binds a name and its client connects to it,
     // and with a Worker per process those are two memories -- so the name has
     // to be somewhere neither of them owns.
-    fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    // With the caller's pid, uid and gid: what the far end's SO_PEERCRED
+    // reports (`k_sock_peer_cred`).
+    fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32;
     fn k_sock_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32);
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
@@ -694,7 +697,7 @@ extern "C" {
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32, how: u32) -> i32;
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
+    fn k_sock_pair(out: gex_kernel::PAddr, pid: i32, uid: u32, gid: u32) -> i32;
     fn k_sock_dup(id: i32) -> i32;
     /// Internet sockets moved to the global kernel (`net::InetRemote`).
     fn k_inet_adopt(state: gex_kernel::PAddr, len: u32) -> i32;
@@ -1623,14 +1626,17 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
     })
 }
 
-extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_sock_bind(path, path_len) }
+extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_bind(path, path_len, pid, uid, gid) }
 }
 extern "C" fn rs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) {
     unsafe { k_sock_rename(from, from_len, to, to_len) }
 }
-extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_sock_connect(path, path_len) }
+extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_connect(path, path_len, pid, uid, gid) }
+}
+extern "C" fn rs_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_peer_cred(id, out) }
 }
 extern "C" fn rs_accept(listener: i32) -> i32 {
     unsafe { k_sock_accept(listener) }
@@ -1665,8 +1671,8 @@ extern "C" fn rs_shutdown(id: i32, how: u32) -> i32 {
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
 }
-extern "C" fn rs_pair(out: gex_kernel::PAddr) -> i32 {
-    unsafe { k_sock_pair(out) }
+extern "C" fn rs_pair(out: gex_kernel::PAddr, pid: i32, uid: u32, gid: u32) -> i32 {
+    unsafe { k_sock_pair(out, pid, uid, gid) }
 }
 extern "C" fn rs_dup(id: i32) -> i32 {
     unsafe { k_sock_dup(id) }
@@ -1776,6 +1782,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         queue: rs_queue,
         bind: rs_bind,
         connect: rs_connect,
+        peer_cred: rs_peer_cred,
         accept: rs_accept,
         pending: rs_pending,
         read: rs_read,
@@ -9863,8 +9870,9 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
-    v.extend_from_slice(&k.creds.uid().to_le_bytes());
-    v.extend_from_slice(&k.creds.gid().to_le_bytes());
+    v.extend_from_slice(&k.creds.save());
+    // And the root a `chroot` made, the rest.
+    v.extend_from_slice(k.vfs.root().as_bytes());
     v
 }
 
@@ -9875,7 +9883,8 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
     let mut limits = k.rlimits.get();
-    if rest.len() != 4 + limits.len() * 16 + 8 {
+    let ids = 4 + limits.len() * 16;
+    if rest.len() < ids + gex_kernel::syscalls::Creds::SAVED {
         return;
     }
     k.signals = sig;
@@ -9888,9 +9897,17 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
     k.rlimits.set(limits);
-    let at = 4 + limits.len() * 16;
-    k.creds.set_uid(u32::from_le_bytes(rest[at..at + 4].try_into().unwrap()));
-    k.creds.set_gid(u32::from_le_bytes(rest[at + 4..at + 8].try_into().unwrap()));
+    let saved = ids + gex_kernel::syscalls::Creds::SAVED;
+    k.creds.restore(&rest[ids..saved]);
+    let root = String::from_utf8_lossy(&rest[saved..]);
+    if !root.is_empty() && root != "/" {
+        // The directory came over in the chrooted namespace's terms, and
+        // was set before there was one.
+        let cwd = k.cwd();
+        if k.vfs.chroot(&root).is_ok() {
+            let _ = k.set_cwd(&cwd);
+        }
+    }
 }
 
 #[no_mangle]
@@ -11668,6 +11685,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Handlers are addresses in the image being replaced; see Signals::exec.
     let leader = h.kernel.pid;
     h.kernel.exec_signals(leader);
+    h.kernel.creds.exec();
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its

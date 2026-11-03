@@ -1113,12 +1113,23 @@ fn run_program_with(
             Arc::new(ProcCell::default()),
         ),
     };
-    // Report the host's identity: with hostfs passthrough, a guest that
-    // stats a file and then calls getuid must see a consistent answer.
-    let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
+    // The run's first program is the host's identity (with hostfs
+    // passthrough, a guest that stats a file and then calls getuid must see
+    // a consistent answer) or `--uid`'s. An exec keeps the process's ids,
+    // a `setuid` before it included, with the capabilities the new program
+    // starts with (`Creds::exec`).
+    let creds = if !fresh {
+        kernel.creds.exec();
+        kernel.creds.clone()
+    } else {
+        let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
+        gex_kernel::syscalls::Creds::new(uid, gid)
+    };
+    // The ids the auxiliary vector gives the program (AT_UID, AT_EUID).
+    let (kernel_uid, kernel_gid) = (creds.uid(), creds.gid());
     let mut kernel = Kernel {
         trace: opts.trace,
-        creds: gex_kernel::syscalls::Creds::new(uid, gid),
+        creds,
         argv: opts.args.clone(),
         envp: opts.env.clone(),
         ..kernel
@@ -1350,8 +1361,8 @@ fn run_program_with(
         program,
         opts,
         Identity {
-            uid,
-            gid,
+            uid: kernel_uid,
+            gid: kernel_gid,
             interp_base: program.interp_base(),
             entry_hook: 0,
         },

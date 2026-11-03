@@ -238,6 +238,8 @@ pub struct UnixSocket {
     peer_cred: Mutex<Option<Cred>>,
     /// Its last descriptor has closed ([`Self::release`]).
     gone: AtomicBool,
+    /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
+    passcred: AtomicBool,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -260,7 +262,17 @@ impl UnixSocket {
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
             gone: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    /// `SO_PASSCRED`, set and read.
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     /// Record the credentials of the process making this end (before its
@@ -1896,10 +1908,17 @@ mod epoll_tests {
 /// kernel and each end is just an id; only the id and the bytes cross.
 #[derive(Clone, Copy, Debug)]
 pub struct Remote {
-    /// Bind and listen in one. Returns a listener id or a negated errno.
-    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// Connect to a name. Returns this end's id, or a negated errno.
-    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    /// Bind and listen in one, as the process `pid` with ids `uid` and
+    /// `gid` (what a client's `SO_PEERCRED` reports). Returns a listener id
+    /// or a negated errno.
+    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// Connect to a name, as `pid`, `uid` and `gid` (what the server's
+    /// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
+    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// The far end's `struct ucred` as it was when the two were joined:
+    /// pid, uid and gid as three little-endian words at `out`. Zero, or a
+    /// negated errno (`ENOTCONN`: no peer, or none known).
+    pub peer_cred: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
     /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
     pub accept: extern "C" fn(listener: i32) -> i32,
     pub pending: extern "C" fn(listener: i32) -> i32,
@@ -1915,9 +1934,10 @@ pub struct Remote {
     /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
     pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// A connected pair, as `socketpair` makes: both ids written as two
-    /// little-endian `u32`s at `out`. Zero or a negated errno.
-    pub pair: extern "C" fn(out: crate::PAddr) -> i32,
+    /// A connected pair, as `socketpair` makes, by `pid`, `uid` and `gid`
+    /// (each end's peer): both ids written as two little-endian `u32`s at
+    /// `out`. Zero or a negated errno.
+    pub pair: extern "C" fn(out: crate::PAddr, pid: i32, uid: u32, gid: u32) -> i32,
     /// Another id on the same end, for a descriptor that is going to another
     /// process (a fork, or `SCM_RIGHTS`) and must outlive this one closing.
     pub dup: extern "C" fn(id: i32) -> i32,
@@ -1965,6 +1985,8 @@ pub struct RemoteUnix {
     pub peer: Option<String>,
     pub remote: Remote,
     nonblocking: AtomicBool,
+    /// `SO_PASSCRED` (this process's, as the option is the descriptor's).
+    passcred: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteUnix {
@@ -1979,6 +2001,16 @@ impl std::fmt::Debug for RemoteUnix {
 }
 
 impl RemoteUnix {
+    /// The far end's credentials ([`Remote::peer_cred`]), when known.
+    pub fn peer_cred(&self) -> Option<Cred> {
+        let mut b = [0u8; 12];
+        if (self.remote.peer_cred)(self.id, b.as_mut_ptr() as crate::PAddr) != 0 {
+            return None;
+        }
+        let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        Some(Cred { pid: w(0) as i32, uid: w(1), gid: w(2) })
+    }
+
     pub fn new(id: i32, listening: bool, peer: Option<String>, remote: Remote) -> RemoteUnix {
         RemoteUnix {
             id,
@@ -1986,7 +2018,16 @@ impl RemoteUnix {
             peer,
             remote,
             nonblocking: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     pub fn set_nonblocking(&self, on: bool) {

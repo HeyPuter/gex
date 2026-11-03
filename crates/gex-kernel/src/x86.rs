@@ -260,6 +260,11 @@ pub mod raw {
     pub const GETUID: u64 = 102;
     pub const GETGID: u64 = 104;
     pub const SETUID: u64 = 105;
+    pub const SETFSUID: u64 = 122;
+    pub const SETFSGID: u64 = 123;
+    pub const CAPGET: u64 = 125;
+    pub const CAPSET: u64 = 126;
+    pub const CHROOT: u64 = 161;
     pub const SETGID: u64 = 106;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
@@ -584,6 +589,11 @@ pub fn translate(
         x::GETUID => nr::GETUID,
         x::GETGID => nr::GETGID,
         x::SETUID => nr::SETUID,
+        x::SETFSUID => nr::SETFSUID,
+        x::SETFSGID => nr::SETFSGID,
+        x::CAPGET => nr::CAPGET,
+        x::CAPSET => nr::CAPSET,
+        x::CHROOT => nr::CHROOT,
         x::SETGID => nr::SETGID,
         x::GETEUID => nr::GETEUID,
         x::GETEGID => nr::GETEGID,
