@@ -1371,6 +1371,14 @@ impl Link {
         self.mods.first().is_some_and(|m| m.info.needed.is_empty())
     }
 
+    /// The run path `dlopen` searches a bare soname in before
+    /// `LD_LIBRARY_PATH`: a static program's is its own directory
+    /// (`$ORIGIN`), where the side modules it may load lie beside it (it has
+    /// no `dylink.0` to name one); a dynamic one's is none.
+    pub fn dlopen_runpath(&self) -> Vec<String> {
+        if self.static_program() { vec!["$ORIGIN".to_string()] } else { Vec::new() }
+    }
+
     /// The program's libraries, breadth first from its `NEEDED`: for each,
     /// `find(soname, runpath)` gives its path and bytes (searching the run
     /// path, `LD_LIBRARY_PATH` and [`DEFAULT_DIRS`] is the caller's, through

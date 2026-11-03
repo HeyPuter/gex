@@ -414,7 +414,8 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     let (found, bytes) = {
         let state = caller.data_mut();
         let (o, lp) = (p.origin.clone(), p.ldpath.clone());
-        gex_dylink::search(path, &[], &o, &lp, |f| state.with_kernel(|k| k.read_file(f)).map(checked))?
+        let rp = p.link.dlopen_runpath();
+        gex_dylink::search(path, &rp, &o, &lp, |f| state.with_kernel(|k| k.read_file(f)).map(checked))?
     };
     let info = Info::parse(&bytes).with_context(|| format!("{found}: not a wasm shared library"))?;
     if !info.dylink {
