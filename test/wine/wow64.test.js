@@ -24,6 +24,8 @@ const CASES = [
   ['xmmcb', 'wow64c.exe', 'x64', ['xmmcb']],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)
   ['timerproc', 'timerproc.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
+  // 32-bit OpenGL and Direct3D with no context ever current on the thread
+  ['wglnoctx', 'wglnoctx.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
 ];
 
 export default async function (t) {

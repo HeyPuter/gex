@@ -32,6 +32,8 @@ const CASES = [
   // A timer procedure of Wine's own (comctl32's list view), which
   // DispatchMessage calls.
   ['timerproc', 0, allOk, 'timerproc.exe', [], true],
+  // OpenGL and Direct3D with no context ever current on the thread.
+  ['wglnoctx', 0, allOk, 'wglnoctx.exe', [], true],
   ['qpcmono', 0, allOk, 'qpcmono.exe'],
   // 2000 writes a case: on the page every read is a server request.
   // Fewer writes in the single-thread build (a page without
