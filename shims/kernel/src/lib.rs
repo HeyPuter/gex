@@ -2724,6 +2724,7 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
         // A process that ended holding directory renames off holds nothing.
         gex_kernel::vfs::set_owner_alive(|pid| procs().alive(pid));
         let fs = gex_kernel::vfs::TmpFs::new();
+        fs.use_store();
         // Directories a guest expects before anything is bundled: `open(O_CREAT)`
         // under a missing directory is `ENOENT`, not a directory being made.
         for d in ["/tmp", "/proc", "/dev", "/run", "/var", "/var/tmp"] {

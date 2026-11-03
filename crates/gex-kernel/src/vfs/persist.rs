@@ -770,17 +770,17 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                         let new = inner.next_ino;
                         inner.next_ino += 1;
                         let f = match body {
-                            Body::Inline(d) => FileNode::new(d.clone(), new),
+                            Body::Inline(d) => FileNode::new(d.clone(), new, true),
                             Body::Blocks(size, map) => {
                                 for &b in map {
                                     mark(b);
                                 }
-                                let f = FileNode::new(Vec::new(), new);
+                                let f = FileNode::new(Vec::new(), new, true);
                                 *f.pg.lock().unwrap() = Some(blocks::PFile::from_blocks(*size, map.clone()));
                                 f
                             }
                             Body::Lazy(url, size) => {
-                                let f = FileNode::new(Vec::new(), new);
+                                let f = FileNode::new(Vec::new(), new, true);
                                 *f.lazy.lock().unwrap() = Some(Lazy { url: url.clone(), size: *size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
                                 f
                             }
@@ -921,6 +921,7 @@ mod tests {
         blocks::reset();
         blocks::configure(BS as u32, 16 * BS, 512);
         let fs = TmpFs::new();
+        fs.use_store();
         fs.add_file("etc/seed", b"seeded".to_vec());
         fs.add_file("etc/big", vec![5u8; 3000]);
         fs.add_file("usr/bin/tool", b"#!".to_vec());

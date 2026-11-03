@@ -114,8 +114,8 @@ export default async function (t) {
     // and the generation it makes takes every dirty block with it.)
     const r = await sh(t, sys, 'dd if=/dev/zero of=/root/a bs=65536 count=32 2>/dev/null');
     eq('a write', r.code, 0);
-    await t.until(() => fs.written >= 2 * MB, 'the write-back: the blocks reach the store within 8 s of a 1 s age', 8000);
-    check('the write-back: and flushes it', fs.flushes >= 1, `${fs.flushes} flushes`);
+    // (The flush follows the blocks' writes: wait for both.)
+    await t.until(() => fs.written >= 2 * MB && fs.flushes >= 1, 'the write-back: the blocks reach the store within 8 s of a 1 s age, and it is flushed', 8000);
   } else {
     // A full store: ENOSPC to the program, and room again after a delete.
     fs.room = 8 * MB;

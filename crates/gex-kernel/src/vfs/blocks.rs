@@ -1052,6 +1052,7 @@ pub(crate) mod tests {
         set_io(fake);
         configure(4096, 64 * 4096, 0);
         let fs = TmpFs::new();
+        fs.use_store();
         let o = crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR;
         let a = fs.open("a", o, 0o644).unwrap();
         let w0 = stats()[IO_W];
@@ -1082,6 +1083,28 @@ pub(crate) mod tests {
         for n in ["a", "b", "c"] {
             fs.unlink(n).unwrap();
         }
+        configure(0, 0, 0);
+    }
+
+    /// Only a tmpfs that uses the store (the root) puts files there: one
+    /// mounted beside it (`/dev/shm`, a program's own) keeps them in memory.
+    #[test]
+    #[ignore]
+    fn only_the_root_uses_the_store() {
+        set_io(fake);
+        reset();
+        configure(4096, 16 * 4096, 0);
+        let o = crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR;
+        let shm = TmpFs::new();
+        let a0 = stats()[ALLOC];
+        shm.open("seg", o, 0o600).unwrap().write_at(0, &[1u8; 3 * 4096]).unwrap();
+        assert_eq!(stats()[ALLOC], a0, "in memory");
+        let root = TmpFs::new();
+        root.use_store();
+        root.open("f", o, 0o644).unwrap().write_at(0, &[2u8; 3 * 4096]).unwrap();
+        assert_eq!(stats()[ALLOC], a0 + 3, "in the store");
+        shm.unlink("seg").unwrap();
+        root.unlink("f").unwrap();
         configure(0, 0, 0);
     }
 
@@ -1191,6 +1214,7 @@ pub(crate) mod tests {
             set_io(fake);
             configure(4096, 8 * 4096, inline);
             let fs = TmpFs::new();
+            fs.use_store();
             let mut want: Vec<Vec<u8>> = Vec::new();
             let mut x: u64 = 7;
             let mut rnd = || {
@@ -1258,6 +1282,7 @@ pub(crate) mod tests {
             set_io(fake);
             configure(4096, 12 * 4096, inline);
             let fs = std::sync::Arc::new(TmpFs::new());
+            fs.use_store();
             let ts: Vec<_> = (0..8u64)
                 .map(|t| {
                     let fs = std::sync::Arc::clone(&fs);

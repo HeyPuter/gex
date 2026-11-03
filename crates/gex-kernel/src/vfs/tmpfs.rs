@@ -115,6 +115,8 @@ pub struct FileNode {
     /// the file is past what stays inline while the store is on; `data` is
     /// then empty.
     pg: Mutex<Option<super::blocks::PFile>>,
+    /// Whether its filesystem keeps contents in the store ([`TmpFs::use_store`]).
+    store: bool,
     /// Contents fetched on demand (`TmpFs::add_lazy`); `None` once the file
     /// is an ordinary one (never, or since a write made it one).
     lazy: Mutex<Option<Lazy>>,
@@ -170,10 +172,11 @@ impl FileNode {
     /// kept here as they were laid, not written to the block store; the file
     /// moves to the store when a program's write takes it past what stays
     /// inline ([`FileNode::paged_for`]).
-    fn new(data: Vec<u8>, ino: u64) -> FileNode {
+    fn new(data: Vec<u8>, ino: u64, store: bool) -> FileNode {
         note_capacity(0, data.capacity());
         FileNode {
             pg: Mutex::new(None),
+            store,
             data: Mutex::new(data),
             lazy: Mutex::new(None),
             ino,
@@ -189,7 +192,7 @@ impl FileNode {
     /// `end` bytes long and that is past what stays inline (blocks.rs).
     fn paged_for(&self, end: u64) -> std::sync::MutexGuard<'_, Option<super::blocks::PFile>> {
         let mut pg = self.pg.lock().unwrap();
-        if pg.is_none() && super::blocks::wants(end) {
+        if pg.is_none() && self.store && super::blocks::wants(end) {
             let mut data = self.data.lock().unwrap();
             let mut p = super::blocks::PFile::new();
             if !data.is_empty() && p.write(0, &data).is_err() {
@@ -737,6 +740,9 @@ impl Inner {
 struct Shared {
     m: RwLock<Inner>,
     gate: super::RenameGate,
+    /// Files made from now on keep their contents in the block store once
+    /// past what stays inline ([`TmpFs::use_store`]).
+    store: core::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -945,8 +951,20 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default() }),
+            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default() }),
         }
+    }
+
+    /// Keep the contents of files made from now on in the block store
+    /// (`super::blocks`, once it is configured), as the root does. Any other
+    /// tmpfs (`/dev/shm`, one a program mounts) keeps them in memory, as
+    /// Linux's tmpfs does.
+    pub fn use_store(&self) {
+        self.inner.store.store(true, Ordering::Relaxed);
+    }
+
+    fn stored(&self) -> bool {
+        self.inner.store.load(Ordering::Relaxed)
     }
 
     /// Pre-populate a file, for seeding a root filesystem at startup.
@@ -959,7 +977,7 @@ impl TmpFs {
         inner.set_ino(path.clone(), ino);
         inner.nodes.insert(
             path,
-            Node::File(Arc::new(FileNode::new(contents, ino))),
+            Node::File(Arc::new(FileNode::new(contents, ino, self.stored()))),
         );
     }
 
@@ -1012,7 +1030,7 @@ impl TmpFs {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
-        let f = FileNode::new(Vec::new(), ino);
+        let f = FileNode::new(Vec::new(), ino, self.stored());
         f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
@@ -1689,7 +1707,7 @@ impl TmpFs {
                     let ino = inner.next_ino;
                     inner.next_ino += 1;
                     inner.set_ino(path.clone(), ino);
-                    let f = Arc::new(FileNode::new(Vec::new(), ino));
+                    let f = Arc::new(FileNode::new(Vec::new(), ino, self.stored()));
                     f.mark_written();
                     wrote = true;
                     created = true;
