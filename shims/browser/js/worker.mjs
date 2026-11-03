@@ -1306,7 +1306,34 @@ async function handle(msg) {
         gex.memory.grow(0n);
       }
     }
-    const status = gone ? 0 : await gex.run(entry, ctx);
+    let status = gone ? 0 : await gex.run(entry, ctx);
+    // A thread that ended while its process runs on as the same program:
+    // its Worker waits for one of the process's next threads, as a spare
+    // does, if the host keeps it (`park`, answered by `spareGo`), and runs
+    // it. A Wine program that starts its threads one after another then
+    // waits for no Worker's start between them.
+    while (asThread && msg.park && !gone && !msg.snap && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
+      && (ex.gex_exec_gen?.() ?? 0) === execGen && gex.parkThread?.()) {
+      spareGot = null;
+      port.post({ kind: 'park', status, gen: execGen });
+      const next = { spare: true, parked: true, spareGo: () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; })) };
+      ({ entry, ctx, gone } = await gex.adoptThread(null, null, next));
+      if (gone) {
+        status = 0;
+        break;
+      }
+      msg.tid = next.tid;
+      msg.ctx = next.ctx;
+      msg.pc = next.pc;
+      if (next.procOpts) msg.procOpts = next.procOpts;
+      execGen = gex.adoptGen ?? ex.gex_exec_gen?.() ?? 0;
+      try {
+        gex.memory.grow(0);
+      } catch {
+        gex.memory.grow(0n);
+      }
+      status = await gex.run(entry, ctx);
+    }
     // The process's exec went to another Worker (a program of the other
     // memory flavour, lib.rs `exec_away`): this one ends, the process does
     // not. The host starts the exec as a posix_spawn child's.

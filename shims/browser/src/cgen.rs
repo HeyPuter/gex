@@ -2589,6 +2589,25 @@ thread_local! {
     static LEAVE_OK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether this Worker's thread ended with none of its call-outs, NT
+/// callbacks or provider guest calls open (`gex_thread_park`): its wasm
+/// frames all gone back to the run loop.
+pub(crate) fn park_clear() -> bool {
+    CALLOUTS.with(|c| c.borrow().is_empty()) && CB_DEPTH.with(|c| c.get()) == 0 && libprov::park_clear()
+}
+
+/// This Worker's thread is over and the Worker waits for another
+/// (`gex_thread_park`): no fault or signal of the old thread's is staged.
+pub(crate) fn park_reset() {
+    OPENED_SPAN.with(|c| c.set(-1));
+    OPENED_DEPTH.with(|c| c.set(-1));
+    HIT.with(|c| c.set(-1));
+    LEAVE_OK.with(|c| c.set(0));
+    FAULT_PENDING.with(|c| c.set(None));
+    SIGNAL_PENDING.with(|c| c.set(None));
+    FAULT_NEST.with(|c| c.borrow_mut().clear());
+}
+
 /// JS's call-out loop `depth` is about to call `enter` (`depth + 1`), or
 /// another loop is (0): whether a miss at that call-out's return may leave
 /// by returning (`DISPATCH_MISS_LEAVE`) instead of trapping.
