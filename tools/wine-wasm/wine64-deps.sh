@@ -10,7 +10,9 @@
 #   link-wine64.sh, since it changes with gex), and GnuTLS over nettle
 #   (crypt32's and secur32's schannel, through dlopen of libgnutls.so.30)
 #   with Mozilla's CA bundle (OUT/install/ca-certificates.crt, staged into
-#   the dist), as 32-bit Wine's. No OSS yet.
+#   the dist), as 32-bit Wine's, and FFmpeg's libavcodec, libavformat,
+#   libswscale and libswresample (winegstreamer's Unix side: its wg_*_ffmpeg.c
+#   files). No OSS yet.
 #
 #   tools/wine-wasm/wine64-deps.sh OUT DL
 #
@@ -26,7 +28,7 @@ out=$(realpath -m "${1:?OUT}") dl=$(realpath -m "${2:?DL}")
 export GEX_WCC_MAP="${GEX_WCC_MAP:+$GEX_WCC_MAP:}$out=/wine-deps"
 J=${JOBS:-12}
 eval "$(sed -n 's/^\([A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$here/wine32.pins")"
-for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT; do
+for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT FFMPEG; do
   u=${p}_URL s=${p}_SHA256; "$here/wine32/dl.sh" "${!u}" "${!s}" "$dl"
 done
 rm -rf "$out" && mkdir -p "$out/install/lib/pkgconfig" "$out/install/include" "$out/host" "$out/build" "$out/src"
@@ -133,6 +135,32 @@ tar xf "$dl/gnutls-$GNUTLS_VERSION.tar.xz"
     CC="$WCC" CFLAGS=-O2 > "$out/gnutls-configure.log" 2>&1 &&
   make -j"$J" > "$out/gnutls-make.log" 2>&1 && make install > "$out/gnutls-install.log" 2>&1)
 [ -f "$I/lib/libgnutls.a" ] || { echo "wine64-deps: GnuTLS failed ($out/gnutls-*.log)" >&2; exit 1; }
+# FFmpeg, LGPL only (no --enable-gpl or --enable-nonfree): the decoders,
+# demuxers and parsers of what Media Foundation, DirectShow and the WM reader
+# name (winegstreamer's wg_format types and the containers its parser opens),
+# no encoders, muxers, filters, devices, network or programs. Plain C (no
+# assembly), one thread per decoder unless winegstreamer asks for more.
+FF_DECODERS="h264 vc1 wmv1 wmv2 wmv3 mpeg1video mpeg2video mpeg4 msmpeg4v1 msmpeg4v2 msmpeg4v3 cinepak indeo3 indeo4
+  indeo5 msvideo1 msrle mjpeg rawvideo vp8 vp9 theora
+  aac aac_latm mp1 mp1float mp2 mp2float mp3 mp3float wmav1 wmav2 wmapro wmalossless wmavoice vorbis opus flac ac3 eac3
+  adpcm_ms adpcm_ima_wav gsm_ms pcm_s16le pcm_s16be pcm_u8 pcm_s24le pcm_s32le pcm_f32le pcm_f64le pcm_alaw pcm_mulaw"
+FF_DEMUXERS="mov asf avi mpegps mpegts mpegvideo mp3 aac wav ogg matroska flac h264 ac3"
+FF_PARSERS="h264 aac aac_latm mpegaudio mpegvideo mpeg4video vc1 vp8 vp9 opus vorbis flac ac3 mjpeg"
+tar xf "$dl/ffmpeg-$FFMPEG_VERSION.tar.xz"
+(cd ffmpeg-$FFMPEG_VERSION &&
+  ./configure --prefix="$I" --enable-cross-compile --target-os=linux --arch=wasm64 --cc="$WCC" \
+    --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --strip=llvm-strip --pkg-config=false \
+    --disable-everything --disable-autodetect --disable-programs --disable-doc --disable-network \
+    --disable-asm --disable-inline-asm --disable-x86asm --disable-runtime-cpudetect --disable-debug \
+    --disable-avdevice --disable-avfilter --enable-avcodec --enable-avformat --enable-avutil \
+    --enable-swresample --enable-swscale --enable-pthreads --enable-static --disable-shared \
+    $(for d in $FF_DECODERS; do printf ' --enable-decoder=%s' "$d"; done) \
+    $(for d in $FF_DEMUXERS; do printf ' --enable-demuxer=%s' "$d"; done) \
+    $(for d in $FF_PARSERS; do printf ' --enable-parser=%s' "$d"; done) \
+    --extra-cflags=-O2 > "$out/ffmpeg-configure.log" 2>&1 &&
+  make -j"$J" > "$out/ffmpeg-make.log" 2>&1 && make install > "$out/ffmpeg-install.log" 2>&1)
+[ -f "$I/lib/libavcodec.a" ] || { echo "wine64-deps: FFmpeg failed ($out/ffmpeg-*.log)" >&2; exit 1; }
+grep -q '^License: LGPL' "$out/ffmpeg-configure.log" || { echo "wine64-deps: FFmpeg is not LGPL ($out/ffmpeg-configure.log)" >&2; exit 1; }
 cp "$dl/$(basename "$CACERT_URL")" "$I/ca-certificates.crt"
 rm -rf "$S"
 echo "wine64-deps: $I"

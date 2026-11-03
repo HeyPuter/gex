@@ -14,8 +14,11 @@
 # the tree was configured --with-gnutls, and, when the tree was
 # configured with them (wine64-deps.sh's libraries: WINE64_DEPS), win32u
 # and dwrite (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
-# (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64); and wineoss.drv's
+# (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64); wineoss.drv's
 # (audio: OSSv4 against gex-kernel's /dev/dsp, as 32-bit Wine's).
+# WINE64_MEDIA=lazy: winegstreamer's too, over FFmpeg (WINE64_DEPS), as
+# winegstreamer.so beside OUT, which the loader dlopens when a program first
+# plays media.
 # WINE_BUILD is a wasm64 build tree of the Wine fork (configure
 # --host=wasm64-unknown-linux-musl CC=tools/wine-wasm/wcc64
 # CXX=tools/wine-wasm/wcc64++); the objects are made there first.
@@ -199,6 +202,38 @@ for spec in $uxl; do
 	done
 	reg="$reg $lib.so:data:__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
 done
+# WINE64_MEDIA=lazy: winegstreamer.so, the Unix side of winegstreamer (Media
+# Foundation's and DirectShow's decoders and media source, the WM reader),
+# over FFmpeg (WINE64_DEPS's: wine64-deps.sh) rather than GStreamer: the
+# tree's wg_*_ffmpeg.c and unixlib_ffmpeg.c, in place of its GStreamer files,
+# with the same template. Not linked in: a side module beside the loader
+# (OUT's directory), which ntdll dlopens on the first wg_* call; what it
+# imports (libc's functions, ntdll's debug channels) the loader exports
+# (-Wl,--export), and nothing more of it is in the loader. The PE side is
+# unchanged. Unset or 0 leaves it out.
+media=
+case ${WINE64_MEDIA:-0} in
+0) ;;
+lazy) [ -f "$WF/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { echo "link-wine64: WINE64_MEDIA=lazy, and $WF has no dlls/winegstreamer/unixlib_ffmpeg.c" >&2; exit 1; }
+	media=1 ;;
+*) echo "link-wine64: WINE64_MEDIA=$WINE64_MEDIA (0 or lazy)" >&2; exit 1 ;;
+esac
+if [ -n "$media" ]; then
+	: "${WINE64_DEPS:?set WINE64_DEPS to the install wine64-deps.sh made, for FFmpeg}"
+	[ -f "$WINE64_DEPS/lib/libavcodec.a" ] || { echo "link-wine64: no FFmpeg in $WINE64_DEPS (wine64-deps.sh)" >&2; exit 1; }
+	# its headers include widl's (mfobjects.h and the rest)
+	nice -n 10 make -j"$J" include/all >&2
+	mkdir -p gexwine64/winegstreamer
+	wgobjs=
+	for b in unixlib_ffmpeg wg_format_ffmpeg wg_parser_ffmpeg wg_transform_ffmpeg; do
+		out=gexwine64/winegstreamer/$b.o; wgobjs="$wgobjs $out"
+		fresh "$out" "$WF/dlls/winegstreamer/$b.c" && continue
+		cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/winegstreamer\/$b.c}
+		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/winegstreamer -I$WINE64_DEPS\/include}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
+		( eval "$cmd" >&2 ) || { echo "link-wine64: winegstreamer/$b.c failed" >&2; touch "$fail"; } &
+		while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done
+	done
+fi
 # WINE64_DIRK=1: d3d11.so, the Unix side of the D3D shim (dxvk's src/dirk/pe;
 # Mesa pins dxvk, and web/build-mesa-wasm.sh with GEX_MESA_DIRK=1 fetches it
 # into third_party/mesa/subprojects/dxvk), with the same template. Its
@@ -241,4 +276,15 @@ if [ "${WINE64_WOW64:-0}" != 0 ]; then
 	done
 fi
 python3 "$HERE/dlreg.py" $reg > gexwine64/reg.c
-"$HERE/wcc64" $M64 -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexwine64/reg.c $objs $libs
+# The side modules, and what of the loader each imports: the loader exports
+# it (from an archive when nothing else of the loader uses it: libm's).
+exports=
+if [ -n "$media" ]; then
+	so=$(dirname "$OUT")/winegstreamer.so
+	"$HERE/wcc64" $M64 -O1 -shared -Wl,--unresolved-symbols=import-dynamic -o "$so" $wgobjs \
+		"$WINE64_DEPS/lib/libavformat.a" "$WINE64_DEPS/lib/libavcodec.a" "$WINE64_DEPS/lib/libswscale.a" \
+		"$WINE64_DEPS/lib/libswresample.a" "$WINE64_DEPS/lib/libavutil.a" || exit 1
+	rm -f "$so.64.wasm"
+	exports=$(python3 "$HERE/side-imports.py" "$so" | sed 's/^/-Wl,--export=/') || exit 1
+fi
+"$HERE/wcc64" $M64 -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexwine64/reg.c $objs $libs $exports

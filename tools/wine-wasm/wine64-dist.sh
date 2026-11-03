@@ -19,26 +19,29 @@
 #               a native x86_64 Unix side, used only to make the prefix)
 #   wwl-P       with WINE64_WOW64=1, the i386 and x86_64 PE winewayland.drv
 #               (a tree of its own: the display driver's PE halves)
+#   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (wine64-deps.sh:
 #               FreeType, libwayland, libxml2, xkbcommon, EGL headers;
-#               GnuTLS over nettle and Mozilla's CA bundle, as 32-bit Wine's)
+#               GnuTLS over nettle and Mozilla's CA bundle, as 32-bit Wine's;
+#               FFmpeg)
 #   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
 #               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
 #               EGL, guest/gl/gexgl.c), secur32 (+ GnuTLS) and
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
-#               in the loader; WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
+#               in the loader, and with WINE64_MEDIA=lazy winegstreamer.so (+ FFmpeg) beside it;
+#               WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
 #               that script and the 32-bit configure options it compiles with
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
 #   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
+#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
-#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; less winegstreamer: -nogst)
+#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -118,7 +121,26 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 # which serves x86-64 programs), and dmsynth with its FluidSynth (C, enabled
 # only with a C++ compiler): x86-64 builtins as wasm64 modules too (part of S)
 B64_MODS="--enable-dpnsvr --enable-vcruntime140_1 --enable-dmsynth --enable-fluidsynth"
-S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
+# WINE64_MEDIA=lazy: winegstreamer (Media Foundation's and DirectShow's
+# decoders and media source, and the WM reader) over FFmpeg rather than
+# GStreamer: its Unix side the Wine tree's wg_*_ffmpeg.c and unixlib_ffmpeg.c
+# with FFmpeg (from deps64), a side module beside the loader that the loader
+# dlopens on a program's first media call (link-wine64.sh), so a page
+# fetches and compiles FFmpeg only then; its PE side unchanged: native from
+# the wasm trees (configured with the module, which configure leaves out
+# without GStreamer), and its PE halves from a tree of their own (wgs) for
+# the install's PE build and the prefix, where they are registered. -wgf in
+# the name. Unset or 0 leaves winegstreamer out of both arches (-nogst), as
+# does the memory64 flavour (no side module of its own yet).
+MEDIA=${WINE64_MEDIA:-0}
+case $MEDIA in
+0) ;;
+lazy) [ -f "$W/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { log "WINE64_MEDIA=lazy, and $W has no dlls/winegstreamer/unixlib_ffmpeg.c"; exit 1; }
+	[ "${WINE64_MEM64:-0}" = 0 ] || MEDIA=0 ;;
+*) log "WINE64_MEDIA=$MEDIA (0 or lazy)"; exit 1 ;;
+esac
+if [ "$MEDIA" != 0 ]; then WGST=-wgf; B64_MODS="$B64_MODS --enable-winegstreamer"; else WGST=-nogst; fi
+S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/side-imports.py "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
 # WINE64_WOW64=1: WoW64, 32-bit programs in the 64-bit process: the PE side
@@ -155,10 +177,6 @@ WICU=; [ "${WINE_ICU:-1}" != 0 ] || WICU=-noicu
 # all: every locale, as Wine ships it (no -icuL in the name).
 ICU_LOCALES=${WINE_ICU_LOCALES:-en en_US}
 WIL=; [ -n "$WICU" ] || [ "$ICU_LOCALES" = all ] || WIL=-icuL$( { echo "$ICU_LOCALES"; cat "$here/icudat.py"; } | sha256sum | cut -c1-6)
-# And winegstreamer (its media framework, GStreamer, is not in the build:
-# the DLL would only fail to start), out of both arches. WINE_GSTREAMER=1
-# keeps it (no -nogst in the name).
-WGST=; [ "${WINE_GSTREAMER:-0}" != 0 ] || WGST=-nogst
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -229,6 +247,16 @@ wwl_build() {
 WD=; WL=; if [ "$WOW" != 0 ]; then
 	log "winewayland.drv's PE halves ($P)"; step wwl-$P wwl_build; WD=-wwl2; WL=$C/wwl-$P/dlls/winewayland.drv
 fi
+# winegstreamer's PE halves the same way (its Unix half is the side module)
+wgs_build() {
+	"$W/configure" --enable-archs=$ARCHS --enable-winegstreamer --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	local a t=""; for a in ${ARCHS//,/ }; do t="$t dlls/winegstreamer/$a-windows/winegstreamer.dll"; done
+	# shellcheck disable=SC2086
+	nice -n 10 make -j"$J" $t
+}
+GS=; if [ "$MEDIA" != 0 ]; then
+	log "winegstreamer's PE halves ($P)"; step wgs-$P wgs_build; GS=$C/wgs-$P/dlls/winegstreamer
+fi
 
 pfx_make() {
 	# The native Wine makes the prefix; a bare server of its own, no display.
@@ -258,16 +286,30 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # for a click.
 # WoW64: the display driver in system32 and syswow64 (wwl's: the prefix's
 # Wine has none), where a process loads it from.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl) | sha256sum | cut -c1-10)
+# winegstreamer's halves there too, registered (its classes, filters and
+# transforms: DllRegisterServer is PE code alone, and its DllMain starts
+# without a Unix side), by the native Wine's regsvr32 of each arch.
+R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
+	if [ -n "$GS" ]; then
+		cp -p "$GS/x86_64-windows/winegstreamer.dll" pfx/drive_c/windows/system32/
+		env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
+			timeout 300 nice -n 10 "$N/bin/wine" regsvr32 /s winegstreamer.dll
+		if [ "$WOW" != 0 ]; then
+			cp -p "$GS/i386-windows/winegstreamer.dll" pfx/drive_c/windows/syswow64/
+			env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
+				timeout 300 nice -n 10 "$N/bin/wine" 'C:\windows\syswow64\regsvr32.exe' /s winegstreamer.dll
+		fi
+	fi
 	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
 		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
 	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
+	[ -z "$GS" ] || [ "$(grep -c 'winegstreamer.dll"$' pfx/system.reg)" -ge 10 ] || { echo "winegstreamer was not registered"; return 1; }
 }
 log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
@@ -290,7 +332,7 @@ b64_build() {
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
 		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
 	mkdir -p out
-	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
+	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_MEDIA=$MEDIA WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
@@ -306,6 +348,7 @@ dist_make() {
 	local d=$PWD
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
+	[ -z "$GS" ] || cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/
 	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
@@ -313,7 +356,8 @@ dist_make() {
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" lib/wine/x86_64-windows/
 	[ -z "$W16" ] || (cd lib/wine/i386-windows && rm -f $WIN16_GLOB)
 	[ -z "$WICU" ] || for a in x86_64-windows i386-windows; do [ ! -d lib/wine/$a ] || (cd lib/wine/$a && rm -f $ICU_GLOB); done
-	[ -z "$WGST" ] || for a in x86_64-windows i386-windows; do rm -f lib/wine/$a/winegstreamer.dll; done
+	if [ -n "$GS" ]; then for a in ${ARCHS//,/ }; do cp -p "$GS/$a-windows/winegstreamer.dll" lib/wine/$a-windows/; done
+	else for a in x86_64-windows i386-windows; do rm -f lib/wine/$a/winegstreamer.dll; done; fi
 	cp -a "$N/share/wine" share/
 	[ -z "$WIL" ] || { python3 "$here/icudat.py" share/wine/nls/icudtl.dat share/wine/nls/icudtl.dat.t $ICU_LOCALES &&
 		mv share/wine/nls/icudtl.dat.t share/wine/nls/icudtl.dat; }
@@ -416,12 +460,16 @@ if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
 	# the caller's 32-bit Wine (GEX_WASM_SYSROOT, WINE32_DEPS: its `make paths`) before ours
 	SR32=${GEX_WASM_SYSROOT:-$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32")}; DEPS32=${WINE32_DEPS:-$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")}
 	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
-	B32K=$( { echo "$SR32 $DEPS32"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
+	B32K=$( { echo "$SR32 $DEPS32${GS:+ winegstreamer}"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
 	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
 	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 	NATIVE32=$C/pen32-$K-$N32/native
 fi
+# (winegstreamer's PE side: configure takes enable_winegstreamer from the
+# environment as from --enable-winegstreamer, and 32-bit Wine's own tree,
+# which the same script configures, stays as it is)
 b32_build() {
+	if [ "$MEDIA" != 0 ]; then export enable_winegstreamer=yes; fi
 	GEX_WASM_SYSROOT=$SR32 WINE32_JOBS=$J nice -n 10 "$here/wine32/wine-build.sh" wasm "$W" "$T" "$PWD" "$DEPS32"
 }
 pe_native32() {
