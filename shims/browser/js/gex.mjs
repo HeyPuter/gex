@@ -5287,6 +5287,8 @@ export class Gex {
               ? this.#callOut(ctx >>> 0, target, ret, spWant)
               : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
             : this.#callOutFront(),
+          // The memory gex mapped for native modules, for Wine's views (cgen.rs `gex_host_data`).
+          host_data: (from, out, max) => e.gex_host_data?.(from >>> 0, addrNum(out), max >>> 0) ?? 0,
           image_mapped: (base, fd) => {
             const number = e.gex_image_mapped?.(addrBig(base), fd) ?? -1;
             if (number === -1) return;

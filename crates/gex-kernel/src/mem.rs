@@ -421,6 +421,11 @@ pub struct MemoryMap {
     /// Ranges a mapping without a fixed address is never placed in
     /// ([`Self::keep_fixed_only`]), sorted and disjoint.
     fixed_only: Vec<(u64, u64)>,
+    /// Writable memory the host mapped for native modules' own use (their
+    /// data, heaps, stacks), in the order mapped ([`Self::note_host_data`]):
+    /// Wine's ntdll makes a view of each (`gex.host_data`), so a program's
+    /// statics are committed memory to it.
+    host_data: Vec<(u64, u64)>,
     /// The end of the span the cursor last handed this map (`extend_arena`):
     /// where a free tail is looked for. Not simply the highest span, which
     /// may be an island above the cursor (see `back`).
@@ -613,6 +618,7 @@ impl MemoryMap {
             fresh: None,
             take_end: 0,
             fixed_only: Vec::new(),
+            host_data: Vec::new(),
             log: MapLog::default(),
         }
     }
@@ -680,6 +686,19 @@ impl MemoryMap {
     /// The parts of `[start, end)` not known to be zero, in order.
     pub fn dirty_parts(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         dirty_parts(&self.clean, start, end)
+    }
+
+    /// Note `[start, end)` as memory the host mapped for a native module
+    /// (see `host_data`).
+    pub fn note_host_data(&mut self, start: u64, end: u64) {
+        if end > start {
+            self.host_data.push((start, end));
+        }
+    }
+
+    /// The host's native-module memory, in the order mapped (see `host_data`).
+    pub fn host_data(&self) -> &[(u64, u64)] {
+        &self.host_data
     }
 
     /// The ranges known to hold only zeros (see `clean`).

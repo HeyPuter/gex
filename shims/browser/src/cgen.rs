@@ -1614,6 +1614,7 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
         let mut mm = crate::sigs::proc_home().mm().lock();
         let clean = mm.clean_ranges().to_vec();
         let start = mm.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
+        mm.note_host_data(start, start + len);
         Ok::<_, gex_kernel::Errno>((start, gex_kernel::mem::dirty_parts(&clean, start, start + len)))
     })()
     .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
@@ -1640,6 +1641,23 @@ fn builtin_data(file: &str, wasm: &[u8]) -> Result<u32, String> {
     let a = 1u64 << align;
     let data = provider_alloc_top_bytes((size as u64).max(16) + a, &format!("[provider {file} data]"))?;
     Ok(((data + a - 1) & !(a - 1)) as u32)
+}
+
+/// `gex.host_data(from, out, max)`: the memory gex mapped for native
+/// modules (their data, heaps, stacks) from the `from`th on, as (start, end)
+/// u32 pairs at `out`, at most `max`; how many there are in all. Wine's
+/// ntdll makes a view of each (`MemoryMap::note_host_data`).
+#[no_mangle]
+pub extern "C" fn gex_host_data(from: u32, out: u32, max: u32) -> u32 {
+    let ranges = crate::sigs::proc_home().mm().lock().host_data().to_vec();
+    let b = crate::guest_bytes();
+    for (i, &(lo, hi)) in ranges.iter().skip(from as usize).take(max as usize).enumerate() {
+        let at = out as usize + i * 8;
+        let Some(dst) = b.get_mut(at..at + 8) else { break };
+        dst[..4].copy_from_slice(&(lo as u32).to_le_bytes());
+        dst[4..].copy_from_slice(&(hi.min(0xffff_ffff) as u32).to_le_bytes());
+    }
+    ranges.len() as u32
 }
 
 /// `gex.provider_alloc_top(size)`: fresh read-write guest pages from the top
