@@ -782,8 +782,11 @@ fn install_module(
     // added to its base in 64 bits, so data below an image's base
     // would be past 4 GiB; and an i386 module's in a 64-bit process,
     // whose 64-bit side finds ntdll's data exports so, wow64's
-    // Wow64Transition)
-    let data = if is64 || alt {
+    // Wow64Transition, there too, but below 2 GiB, as the page's: the
+    // 32-bit program sees it)
+    let data = if alt {
+        crate::libprov::alloc_below_2g(state, (size as u64).max(16) + a, "[wine PE data]")?
+    } else if is64 {
         crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
     } else {
         crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?
