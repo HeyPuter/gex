@@ -1312,7 +1312,9 @@ async function handle(msg) {
     // does, if the host keeps it (`park`, answered by `spareGo`), and runs
     // it. A Wine program that starts its threads one after another then
     // waits for no Worker's start between them.
-    while (asThread && msg.park && !gone && !msg.snap && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
+    // Never in the single-thread build: its threads are fibers of one
+    // context, and a parked one would keep its process from exiting.
+    while (asThread && msg.park && !(SP_CODE && single.on) && !gone && !msg.snap && !ex.gex_thread_gone?.() && !ex.gex_exited?.()
       && (ex.gex_exec_gen?.() ?? 0) === execGen && gex.parkThread?.()) {
       spareGot = null;
       port.post({ kind: 'park', status, gen: execGen });

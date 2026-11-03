@@ -1393,7 +1393,7 @@ export class ProcessHost {
       moduleStore: rec.moduleStore,
       compat: rec.compat,
       procOpts: rec.procOpts,
-      park: true,
+      park: !(SP_CODE && single.on),
     });
     const sp = { proc, key, w, ref, gen: rec.execGen };
     this.#spares.push(sp);
@@ -1907,7 +1907,7 @@ export class ProcessHost {
           const { tid, ctx, pc, procOpts } = m.thread;
           spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
         } else {
-          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared });
+          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared && !(SP_CODE && single.on) });
         }
         // The next spare, for a process that starts more than one thread.
         if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);
