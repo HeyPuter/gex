@@ -81,6 +81,7 @@ pub struct Func {
 }
 
 /// The process's function table, host side.
+#[derive(Clone)]
 pub struct FuncMap {
     next: u32,
     by_addr: BTreeMap<u64, Func>,

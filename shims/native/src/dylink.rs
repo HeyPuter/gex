@@ -12,9 +12,11 @@
 //! registry (musl's src/env/wasm32/__gex_dso.c), which runs their
 //! constructors and lays out their thread-local blocks.
 //!
-//! A fork's child shares the process's registry and function map
-//! natively, so it instantiates the same modules at the same table bases;
-//! the data, relocated, is the parent's copy.
+//! A fork's child gets a copy of the process's registry and function map
+//! natively (`JitShared::fork_copy`), so it instantiates the same modules
+//! at the same table bases; the data, relocated, is the parent's copy. A
+//! library either then dlopens is its own: mapped, initialised and
+//! published in that process alone.
 
 use super::*;
 use gex_dylink::{Bind, Info, Kind, Link, Loaded};
