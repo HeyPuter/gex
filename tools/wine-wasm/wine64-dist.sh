@@ -455,6 +455,13 @@ native_make() {
 	cp -al "$DIST/." .
 	rm -f .done
 	local a n
+	# each skeleton exports every name its DLL's PE build (still in place
+	# here) does, but for those its spec keeps from the wasm arch
+	for a in x86_64:$NATIVE i386:$NATIVE32; do
+		n=${a#*:}; [ -n "$n" ] || continue
+		python3 "$here/skel-exports.py" --against "lib/wine/${a%%:*}-windows" "$n" "$W" "${a%%:*}" >&2 ||
+			{ log "skeletons short of their PE build's exports (above)"; return 1; }
+	done
 	for a in x86_64:$NATIVE i386:$NATIVE32; do
 		n=${a#*:}; [ -n "$n" ] || continue
 		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
