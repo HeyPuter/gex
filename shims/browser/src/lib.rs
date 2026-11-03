@@ -4213,6 +4213,7 @@ fn install_panic_hook() {
             // wasm32 does not have), so the trap's report asks
             // (`gex_panic_reporting`) and says one happened.
             PANIC_REPORTING.with(|r| r.set(true));
+            PANICKED.with(|r| r.set(true));
             let text = format!("gex: panic in the shim: {info}\n");
             // A long message (a diagnostic's dump) first as its head, alone,
             // so a log that drops or cuts long lines still has the panic.
@@ -4264,6 +4265,9 @@ fn install_panic_hook() {
 thread_local! {
     /// This Worker is inside the panic hook (see `install_panic_hook`).
     static PANIC_REPORTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's shim has panicked: the trap that follows is the
+    /// runtime's, whatever the engine calls it ([`gex_guest_trap`]).
+    static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// TEST: the hook panics once, for `gex_debug_panic(2)`.
     static DEBUG_PANIC_IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -18161,18 +18165,32 @@ fn kuser_unfolded(arg: i64) -> ! {
 }
 
 /// A "memory access out of bounds" trap the run loop caught (gex.mjs):
-/// the guest's, a null pointer's read or write at the null guard
-/// (`gex_abi::NULL_GUARD`) or a wild pointer past the end, unless this
-/// thread was in a syscall or translating, where it is the runtime's own
-/// crash (0: JS reports it as one). The guest's is a fault at the context's
-/// pc as the faulting code last wrote it back (a block's start in tier-1),
-/// its address unknown (0, a null pointer's): an access violation for a
-/// process with a fault hook (32-bit Wine), else SIGSEGV for its handler, else the
-/// process dies of it. 1: the trap is a handoff, the resume set or the
-/// process ended.
+/// [`gex_guest_trap`] with `SIGSEGV`.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
-    if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() {
+    gex_guest_trap(ctx_addr, 11)
+}
+
+/// A trap in guest code the run loop caught (gex.mjs `guestTrapSignal`), as
+/// the signal Linux raises for the same fault: `SIGSEGV` for an access out of
+/// bounds (a null pointer's read or write at the null guard,
+/// `gex_abi::NULL_GUARD`, or a wild pointer past the end), a call through a
+/// null or wrong function pointer (a wasm32 program's indirect call) and a
+/// stack overflow; `SIGFPE` for an integer division by zero or overflow;
+/// `SIGILL` for `unreachable` (`__builtin_trap`, as `ud2` is natively);
+/// `SIGBUS` for a misaligned atomic. Unless this thread was in a syscall,
+/// translating or panicking, where it is the runtime's own crash (0: JS
+/// reports it as one). The guest's is a fault at the context's pc as the
+/// faulting code last wrote it back (a block's start in tier-1), its
+/// address unknown (0, a null pointer's): an access violation for a process
+/// with a fault hook (32-bit Wine; `SIGSEGV` only, any other is reported as a
+/// crash there as before), else the signal for its handler, else the process
+/// dies of it. 1: the trap is a handoff, the resume set or the process
+/// ended. Before this, every trap but an access out of bounds ended the
+/// process as `SIGKILL` (`gex_abandon`), status 137 to its parent.
+#[no_mangle]
+pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
+    if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() || PANICKED.with(|p| p.get()) {
         return 0;
     }
     // Nor while this Worker translates with the JIT state out (`jitout`):
@@ -18185,6 +18203,9 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     if jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
         return 0;
     }
+    if !matches!(signo, 4 | 7 | 8 | 11) {
+        return 0;
+    }
     let c = match my_ctx() {
         0 => ctx_addr as u64,
         m => m,
@@ -18192,12 +18213,24 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
     let mut gm = GuestMem::new(guest_bytes());
     let Ok(pc) = gm.read_u64(c + ctx::PC as u64) else { return 0 };
     if cgen::fault_hook() != 0 {
+        if signo != 11 {
+            return 0;
+        }
         cgen::fault_stage(0xc000_0005, 0, 0);
         set_resume(pc);
         set_resume_ctx(c);
         return 1;
     }
-    match sigs::fault(&mut gm, c, 11, pc, 0) {
+    // A wasm32 program's handler runs from a frame its own code finds at a
+    // syscall's return (libgex `__gex_signal_frames`), and the frames that
+    // trapped are gone: it dies of the signal, as with a handler that
+    // returns. Translated code's handler is guest code, run from the frame.
+    if WASM32.load(std::sync::atomic::Ordering::Acquire) {
+        trace_line(&format!("gex: wasm32 program trapped at pc={pc:#x} (signal {signo})\n"));
+        exit_here(-(signo as i32), Some(pc));
+        return 1;
+    }
+    match sigs::fault(&mut gm, c, signo, pc, 0) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
@@ -18206,8 +18239,14 @@ pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
             set_resume_ctx(c);
         }
         _ => {
-            trace_line(&format!("gex: guest memory access out of bounds at pc={pc:#x} (SIGSEGV)\n"));
-            exit_here(-11, Some(pc));
+            let what = match signo {
+                4 => "an unreachable instruction (SIGILL)",
+                7 => "a misaligned atomic access (SIGBUS)",
+                8 => "an integer division by zero or overflow (SIGFPE)",
+                _ => "a memory access out of bounds or a bad indirect call (SIGSEGV)",
+            };
+            trace_line(&format!("gex: guest trapped at pc={pc:#x}: {what}\n"));
+            exit_here(-(signo as i32), Some(pc));
         }
     }
     1

@@ -959,6 +959,29 @@ function slotsNeeded(meta) {
 
 
 /**
+ * The signal Linux raises for the fault a trap in guest code stands for, by
+ * the engine's message (V8's, then SpiderMonkey's and JavaScriptCore's
+ * wording), or 0 for a trap that is no guest fault: SIGSEGV (11) for an
+ * access out of bounds, a call through a null or mismatched function pointer
+ * or past the table, and a stack overflow; SIGFPE (8) for an integer
+ * division by zero or overflow; SIGILL (4) for `unreachable`; SIGBUS (7) for
+ * a misaligned atomic. Whether the trap was the guest's at all is the shim's
+ * call (`gex_guest_trap`).
+ */
+function guestTrapSignal(err) {
+  const m = String(err?.message ?? '');
+  if (err instanceof WebAssembly.RuntimeError) {
+    if (/memory access out of bounds|index out of bounds|null function|signature mismatch|indirect call|table index/i.test(m)) return 11;
+    if (/divide by zero|division by zero|integer overflow|divide result unrepresentable/i.test(m)) return 8;
+    if (/unaligned|misaligned/i.test(m)) return 7;
+    if (/unreachable/i.test(m)) return 4;
+    return 0;
+  }
+  if (/maximum call stack size exceeded|too much recursion/i.test(m)) return 11;
+  return 0;
+}
+
+/**
  * Whether `elf` is a wasm32 program flagged as running i386 code (native
  * Wine's loader, 32-bit Wine): its GEXWASM header sits 0x40 bytes before the entry
  * point (cgen/wasmprog.rs), with the flags at offset 36.
@@ -7880,8 +7903,16 @@ export class Gex {
         // process's death by SIGSEGV -- and the trap is a handoff after all.
         // Not when the shim says the trap was its own (in a syscall, or
         // translating): that stays a crash.
-        const guestFault = crashed && ((/memory access out of bounds/.test(err?.message ?? '') &&
-          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1) || this.#handlerLost(err, ctx));
+        // Any other trap in guest code (a wasm32 program's call through a null
+        // or wrong function pointer, a division by zero, `__builtin_trap`, a
+        // stack overflow) is the signal Linux raises for it, the same way
+        // (`guestTrapSignal`); a stale dispatch table only once the retry
+        // below has failed.
+        const tsig = crashed ? guestTrapSignal(err) : 0;
+        let guestFault = crashed && ((/memory access out of bounds/.test(err?.message ?? '') &&
+          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1) || this.#handlerLost(err, ctx) ||
+          (tsig !== 0 && !/table index is out of bounds/.test(err?.message ?? '') &&
+            (this.#shim.exports.gex_guest_trap?.(ctx, tsig) ?? 0) === 1));
         if (crashed && !guestFault && this.#vfork.length && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
@@ -7890,7 +7921,7 @@ export class Gex {
           ({ pc, ctx } = this.#vforkLeave(err));
           continue;
         }
-        if (crashed && !guestFault) {
+        crash: if (crashed && !guestFault) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -7917,6 +7948,13 @@ export class Gex {
               pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
               continue;
             }
+          }
+          // Not a lagging table: a wasm32 program's call through a garbage
+          // function pointer, the guest's SIGSEGV.
+          if (tsig !== 0 && /table index is out of bounds/.test(err.message) &&
+            (eR.gex_guest_trap?.(ctx, tsig) ?? 0) === 1) {
+            guestFault = true;
+            break crash;
           }
           // Each question in its own try: after a crash the kernel may be
           // borrowed and a second call would trap on top of the first.
@@ -9006,7 +9044,10 @@ export class Gex {
             // The guest's own access out of bounds (a null pointer's): its
             // fault, staged for the hook below (32-bit Wine) or its SIGSEGV, as the
             // run loop does and natively's call-out loop.
-            if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1)) throw err;
+            // Any other trap in guest code likewise (`guestTrapSignal`).
+            const tsig = guestTrapSignal(err);
+            if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1) &&
+              !(tsig !== 0 && (e.gex_guest_trap?.(ctx, tsig) ?? 0) === 1)) throw err;
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === ri ? 1 : 0); }
