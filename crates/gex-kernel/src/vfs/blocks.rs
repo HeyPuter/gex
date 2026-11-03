@@ -862,13 +862,15 @@ fn free(p: u32) {
     }
 }
 
-/// A place in the store, the lowest free first, the store grown ahead when
-/// there is none.
-fn alloc_place() -> Result<u32, Errno> {
-    let mut a = ALLOCATOR.lock().unwrap();
-    if let Some(std::cmp::Reverse(p)) = a.1.pop() {
-        return Ok(p);
-    }
+/// Blocks kept back for persist.rs's records: on a full store, a delete's
+/// blocks are free only once a generation that no longer names them is
+/// written, and writing it needs blocks of its own. Files never take these.
+static RESERVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+const RESERVE_BLOCKS: usize = 64;
+
+/// The store's next block past the highest, the store grown ahead when it
+/// has none (ENOSPC when it cannot grow).
+fn grow_one(a: &mut (u32, std::collections::BinaryHeap<std::cmp::Reverse<u32>>)) -> Result<u32, Errno> {
     let bs = block();
     let have = RESERVED.load(Ordering::Relaxed);
     if a.0 as u64 >= have {
@@ -886,6 +888,31 @@ fn alloc_place() -> Result<u32, Errno> {
     }
     a.0 += 1;
     Ok(a.0 - 1)
+}
+
+/// A free block, the lowest first, else a new one.
+fn take(a: &mut (u32, std::collections::BinaryHeap<std::cmp::Reverse<u32>>)) -> Result<u32, Errno> {
+    match a.1.pop() {
+        Some(std::cmp::Reverse(p)) => Ok(p),
+        None => grow_one(a),
+    }
+}
+
+/// A place in the store for a file's block, the lowest free first, the
+/// store grown ahead when there is none; the records' reserve kept full
+/// first, while the root is kept.
+fn alloc_place() -> Result<u32, Errno> {
+    let mut a = ALLOCATOR.lock().unwrap();
+    if DEFER.load(Ordering::Relaxed) {
+        let mut r = RESERVE.lock().unwrap();
+        while r.len() < RESERVE_BLOCKS {
+            match take(&mut a) {
+                Ok(p) => r.push(p),
+                Err(_) => break,
+            }
+        }
+    }
+    take(&mut a)
 }
 
 /// For persist.rs: frees wait for the next generation from now on.
@@ -912,9 +939,11 @@ pub fn release(v: impl IntoIterator<Item = u32>) {
     }
 }
 
-/// A block for persist.rs's own records, outside the cache.
+/// A block for persist.rs's own records, outside the cache: the reserve's
+/// when the store has no other.
 pub fn alloc_meta() -> Result<u32, Errno> {
-    alloc_place()
+    let mut a = ALLOCATOR.lock().unwrap();
+    take(&mut a).or_else(|e| RESERVE.lock().unwrap().pop().ok_or(e))
 }
 
 /// How many blocks of the store are in use or free below the highest ever
@@ -927,6 +956,7 @@ pub fn high() -> u32 {
 /// taken (block 0 always), the rest free.
 pub fn rebuild(high: u32, used: &[bool]) {
     let mut a = ALLOCATOR.lock().unwrap();
+    RESERVE.lock().unwrap().clear();
     a.0 = high.max(1);
     a.1.clear();
     for p in 1..a.0 {
@@ -943,6 +973,7 @@ pub fn reset() {
     *INDEX.lock().unwrap() = None;
     PROTECTED.store(0, Ordering::Relaxed);
     *ALLOCATOR.lock().unwrap() = (1, Default::default());
+    RESERVE.lock().unwrap().clear();
     PENDING.lock().unwrap().clear();
     DEFER.store(false, Ordering::Relaxed);
     RESERVED.store(0, Ordering::Relaxed);
