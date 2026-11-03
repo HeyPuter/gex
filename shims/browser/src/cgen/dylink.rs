@@ -351,7 +351,7 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
         .unwrap_or_default();
     let origin = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| ".".into());
     let mut p = DyProc {
-        link: Link { mods: vec![Loaded { name: path.clone(), path: path.clone(), info, memory_base: mem_base, table_base: 0 }] },
+        link: Link { mods: vec![Loaded { name: path.clone(), path: path.clone(), info, memory_base: mem_base, table_base: 0 }], ..Default::default() },
         module_of: Vec::new(),
         ldpath,
         origin,
@@ -402,7 +402,7 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
     vals.end(&mut text);
     lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
     *lock(&DYPROC) = Some(DyProc {
-        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }] },
+        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }], ..Default::default() },
         module_of: vec![number],
         ldpath: Vec::new(),
         origin: String::new(),
