@@ -11116,24 +11116,39 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
 /// (`Gex#parkThread`), as a spare does, and is given it with
 /// [`gex_adopt_thread`]. What it kept of its thread goes back to how a new
 /// instance has it; its tables, its slot and what it installed stay. 1
-/// parked; 0 when the thread has not exited or the Worker still holds
-/// something a thread's end gives back, and the Worker ends as before.
+/// parked; below 0 when the thread has not exited or the Worker still holds
+/// something a thread's end gives back, and the Worker ends as before: -1
+/// the kernel lock held, -2 the process exited, -3 the thread went with an
+/// `execve`, -4 a vfork child runs here, -5 an exec goes to another Worker,
+/// -6 the JIT lock held, -7 a fork's holds, -8 a call-out, NT callback or
+/// provider guest call open, -9 the thread not exited.
 #[no_mangle]
 pub extern "C" fn gex_thread_park() -> i32 {
     #[cfg(feature = "shared-memory")]
     if DEPTH.with(|d| d.get()) != 0 {
-        return 0;
+        return -1;
     }
-    if exited()
-        || thread_gone()
-        || vfork::active()
-        || EXEC_AWAY.with(|c| c.get().is_some())
-        || JIT_HELD.with(|g| g.borrow().is_some())
-        || HOLDING.with(|h| !h.borrow().is_empty())
-        || !cgen::park_clear()
-        || !MY_RUN.with(|c| c.borrow().as_ref().is_some_and(|t| matches!(t.run.lock().unwrap_or_else(|e| e.into_inner()).waiting, Waiting::Exited)))
-    {
-        return 0;
+    let why = if exited() {
+        -2
+    } else if thread_gone() {
+        -3
+    } else if vfork::active() {
+        -4
+    } else if EXEC_AWAY.with(|c| c.get().is_some()) {
+        -5
+    } else if JIT_HELD.with(|g| g.borrow().is_some()) {
+        -6
+    } else if HOLDING.with(|h| !h.borrow().is_empty()) {
+        -7
+    } else if !cgen::park_clear() {
+        -8
+    } else if !MY_RUN.with(|c| c.borrow().as_ref().is_some_and(|t| matches!(t.run.lock().unwrap_or_else(|e| e.into_inner()).waiting, Waiting::Exited))) {
+        -9
+    } else {
+        0
+    };
+    if why != 0 {
+        return why;
     }
     waitq::leave();
     CURRENT.with(|c| c.set(0));

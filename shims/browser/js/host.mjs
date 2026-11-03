@@ -1415,16 +1415,23 @@ export class ProcessHost {
   }
 
   /** Thread Worker `key` of process `proc`, its thread ended (`park`):
-   *  kept as the process's spare, under a spare's key, for its next thread.
-   *  False when it is not kept (the process offers no spares or has another
-   *  program now, PARKED_MAX of its Workers wait already, or this one has
-   *  run REUSE_MAX threads): it is let go and ends as before. */
+   *  kept as the process's spare, under a spare's key, for its next thread
+   *  of program `gen` (the Worker's, which `#takeSpare` checks). A process
+   *  need not have offered spares: a Wine process, whose modules are not a
+   *  wasm32 program's, never does. False when it is not kept (the process
+   *  has another program now, PARKED_MAX of its Workers wait already, or
+   *  this one has run REUSE_MAX threads): it is let go and ends as before. */
   #park(proc, key, w, gen) {
     const rec = this.#spareRec.get(proc);
     const ref = this.#refOf.get(w);
     const ran = (w[THREADS_RUN] ?? 1) + 1;
-    if (!rec || !ref || rec.execGen !== gen || this.#foreign(proc) || this.#inDoor(key)
-      || ran > REUSE_MAX || this.#spares.filter((x) => x.proc === proc && x.parked).length >= PARKED_MAX) return false;
+    const no = !ref ? 'no ref' : rec && rec.execGen !== gen ? 'another program' : this.#foreign(proc) ? 'other flavour'
+      : this.#inDoor(key) ? 'in a door call' : ran > REUSE_MAX ? 'REUSE_MAX threads run'
+      : this.#spares.filter((x) => x.proc === proc && x.parked).length >= PARKED_MAX ? 'PARKED_MAX waiting' : '';
+    if (no) {
+      if (logNamed('spare')) console.warn(`[spare] ${key}: ended, its Worker not kept (${no})`);
+      return false;
+    }
     w[THREADS_RUN] = ran;
     const spareKey = `${proc}:spare${++this.#spareSeq}`;
     this.#workers.delete(key);
@@ -1898,7 +1905,7 @@ export class ProcessHost {
           const { tid, ctx, pc, procOpts } = m.thread;
           spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
         } else {
-          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !!this.#spareRec.get(proc) && !this.#foreign(proc) });
+          this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared });
         }
         // The next spare, for a process that starts more than one thread.
         if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);

@@ -6264,7 +6264,11 @@ export class Gex {
   parkThread() {
     const e = this.#shim?.exports;
     if (!e?.gex_thread_park || this.#released || this.#noSlot || this.#vfork.length || this.#dlTlsKept?.size) return false;
-    if (e.gex_thread_park() !== 1) return false;
+    const why = e.gex_thread_park();
+    if (why !== 1) {
+      if (logNamed('spare')) console.warn(`[spare] tid ${this.#threadTid}: its Worker ends, not parked (${why})`);
+      return false;
+    }
     this.freeThreadTls();
     this.#dlTlsNext = 0;
     for (const o of this.#tlsOwners) {
