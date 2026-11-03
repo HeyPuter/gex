@@ -393,6 +393,23 @@ pub struct FdTable {
     /// Whether `record_locks` names any file: one load on every change of
     /// the table while none does.
     record_any: std::sync::atomic::AtomicBool,
+    /// The write locks this process took (record ranges, and `flock`'s
+    /// exclusive locks as the whole file), by file and owner: releasing one
+    /// is where its stores to a shared mapping of the file go out
+    /// ([`crate::syscalls::sync_shared_file`]); releasing a read lock does
+    /// not look at the mapping at all. Not a fork's.
+    write_held: Mutex<Vec<WriteHeld>>,
+    /// Whether `write_held` has any.
+    write_any: std::sync::atomic::AtomicBool,
+}
+
+/// One write lock this process holds ([`FdTable::note_write_lock`]).
+#[derive(Clone, Debug)]
+struct WriteHeld {
+    file: String,
+    owner: u64,
+    start: u64,
+    end: u64,
 }
 
 /// Which files a process has record locks on, and in which table.
@@ -440,7 +457,70 @@ impl FdTable {
             limit: AtomicUsize::new(limit),
             record_locks: Mutex::new(None),
             record_any: std::sync::atomic::AtomicBool::new(false),
+            write_held: Mutex::new(Vec::new()),
+            write_any: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A write lock of `[start, end)` of `file` taken by `owner` (an
+    /// encoded `locks::Owner`, or a flock key with bit 62).
+    pub fn note_write_lock(&self, file: &str, owner: u64, start: u64, end: u64) {
+        let mut g = self.write_held.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.iter().any(|w| w.file == file && w.owner == owner && w.start <= start && end <= w.end) {
+            g.push(WriteHeld { file: file.to_string(), owner, start, end });
+        }
+        self.write_any.store(true, Ordering::SeqCst);
+    }
+
+    /// `owner` gives up (unlocks, or turns read) `[start, end)` of `file`:
+    /// whether that covers a write lock it held, which is then forgotten
+    /// over the range if `forget` (once the release is done).
+    pub fn release_write_lock(&self, file: &str, owner: u64, start: u64, end: u64, forget: bool) -> bool {
+        if !self.write_any.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut g = self.write_held.lock().unwrap_or_else(|e| e.into_inner());
+        if !forget {
+            return g.iter().any(|w| w.file == file && w.owner == owner && w.start < end && start < w.end);
+        }
+        let mut hit = false;
+        let mut kept = Vec::with_capacity(g.len());
+        for w in g.drain(..) {
+            if w.file != file || w.owner != owner || w.end <= start || end <= w.start {
+                kept.push(w);
+                continue;
+            }
+            hit = true;
+            if w.start < start {
+                kept.push(WriteHeld { end: start, ..w.clone() });
+            }
+            if end < w.end {
+                kept.push(WriteHeld { start: end, ..w });
+            }
+        }
+        *g = kept;
+        self.write_any.store(!g.is_empty(), Ordering::SeqCst);
+        hit
+    }
+
+    /// The process's record (not OFD or flock: `pid_owner`) write locks on
+    /// `file` dropped, as closing any of its descriptors does: whether there
+    /// were any. `any_owner` drops every owner's (the file's last close).
+    pub fn drop_write_locks(&self, file: &str, pid_owner: u64, any_owner: bool) -> bool {
+        if !self.write_any.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut g = self.write_held.lock().unwrap_or_else(|e| e.into_inner());
+        let before = g.len();
+        g.retain(|w| !(w.file == file && (any_owner || w.owner == pid_owner)));
+        let hit = g.len() != before;
+        self.write_any.store(!g.is_empty(), Ordering::SeqCst);
+        hit
+    }
+
+    /// Whether the process holds any write lock (one load when none).
+    pub fn holds_write_locks(&self) -> bool {
+        self.write_any.load(Ordering::SeqCst)
     }
 
     /// Process `pid` took a record lock on `file` in `locks`: its locks

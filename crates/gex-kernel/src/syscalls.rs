@@ -2565,11 +2565,25 @@ impl FdIo<'_> {
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
-            nr::CLOSE => self.close(a[0] as i32),
-            nr::CLOSE_RANGE => self.close_range(a[0], a[1], a[2]),
+            nr::CLOSE => {
+                self.closing_writes(m, a[0], a[0]);
+                self.close(a[0] as i32)
+            }
+            nr::CLOSE_RANGE => {
+                self.closing_writes(m, a[0], a[1]);
+                self.close_range(a[0], a[1], a[2])
+            }
             nr::DUP => self.dup(a[0] as i32),
-            nr::DUP2 => self.dup2(a[0] as i32, a[1] as i32),
-            nr::DUP3 => self.dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::DUP2 => {
+                if a[0] != a[1] {
+                    self.closing_writes(m, a[1], a[1]);
+                }
+                self.dup2(a[0] as i32, a[1] as i32)
+            }
+            nr::DUP3 => {
+                self.closing_writes(m, a[1], a[1]);
+                self.dup3(a[0] as i32, a[1] as i32, a[2])
+            }
             nr::FCNTL => self.fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::FLOCK => self.flock(m, a[0] as i32, a[1]),
             _ => return None,
@@ -10542,7 +10556,12 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::DUP2 if gex_abi::X86 || self.compat => {
+                if a[0] != a[1] {
+                    self.fd_io().closing_writes(m, a[1], a[1]);
+                }
+                self.sys_dup2(a[0] as i32, a[1] as i32)
+            }
             nr::TIME if gex_abi::X86 || self.compat => self.sys_time(m, a[0]),
             nr::ALARM if gex_abi::X86 || self.compat => self.sys_alarm(a[0]),
 
@@ -10553,13 +10572,19 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::CLOSE => self.sys_close(a[0] as i32),
+            nr::CLOSE => {
+                self.fd_io().closing_writes(m, a[0], a[0]);
+                self.sys_close(a[0] as i32)
+            }
             nr::LSEEK => self
                 .fds
                 .get(a[0] as i32)
                 .and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
             nr::DUP => self.sys_dup(a[0] as i32),
-            nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::DUP3 => {
+                self.fd_io().closing_writes(m, a[1], a[1]);
+                self.sys_dup3(a[0] as i32, a[1] as i32, a[2])
+            }
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
             // The calls that make or work a descriptor's object
             // ([`fd_object_call`], the free path's code).
@@ -10614,7 +10639,10 @@ impl Kernel {
             nr::FLOCK => self.fd_io().flock(m, a[0] as i32, a[1]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
-            nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
+            nr::CLOSE_RANGE => {
+                self.fd_io().closing_writes(m, a[0], a[1]);
+                self.sys_close_range(a[0], a[1], a[2])
+            }
             nr::CLOCK_GETTIME => self.sys_clock_gettime(m, a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(m, a[1]),
             nr::GETTIMEOFDAY => self.sys_gettimeofday(m, a[0]),
@@ -11145,14 +11173,22 @@ impl FdIo<'_> {
     pub fn flock(&self, m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
         use crate::locks::lock_op;
         let file = self.fds.get(fd)?;
-        // This process's stores go out before anyone else can take the lock
-        // (given up, or turned shared).
-        if op & (lock_op::UN | lock_op::SH) != 0 {
+        // This process's stores go out before anyone else can take the lock:
+        // an exclusive lock given up or turned shared (a writer holds one; a
+        // shared lock given up has nothing of its own to write).
+        let wkey = flock_owner(file.lock_key());
+        let gives_up = op & (lock_op::UN | lock_op::SH) != 0;
+        if gives_up && self.fds.release_write_lock(&file.path, wkey, 0, u64::MAX, false) {
             sync_shared_file(self.shared, m, &file, MapSync::Release, None);
         }
         let (r, seen) = self.file_locks.flock_seen(&file.path, file.lock_key(), op, file.handle.remote_id());
         if r.is_ok() {
             file.note_locks(self.file_locks);
+            if gives_up {
+                self.fds.release_write_lock(&file.path, wkey, 0, u64::MAX, true);
+            } else if op & lock_op::EX != 0 {
+                self.fds.note_write_lock(&file.path, wkey, 0, u64::MAX);
+            }
             if op & lock_op::UN == 0 {
                 sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
             }
@@ -11256,13 +11292,20 @@ impl FdIo<'_> {
             }
             return Ok(0);
         }
-        // This process's stores go out before anyone else can take the range
-        // (given up, or a write lock turned read).
-        if *typ != lk::WRLCK {
+        // This process's stores go out before anyone else can take the range:
+        // a write lock given up or turned read (writers hold one; giving up
+        // a read lock does not look at the mapping).
+        let wkey = owner.encode();
+        if *typ != lk::WRLCK && self.fds.release_write_lock(path, wkey, *start, *end, false) {
             sync_shared_file(self.shared, m, &file, MapSync::Release, None);
         }
         let (r, seen) = self.file_locks.set_seen(path, *owner, *pid, *typ, *start, *end, wait, file.handle.remote_id());
         r?;
+        if *typ == lk::WRLCK {
+            self.fds.note_write_lock(path, wkey, *start, *end);
+        } else {
+            self.fds.release_write_lock(path, wkey, *start, *end, true);
+        }
         if *typ != lk::UNLCK {
             match owner {
                 crate::locks::Owner::Pid(p) => self.fds.note_record_lock(self.file_locks, *p, path),
@@ -11271,6 +11314,27 @@ impl FdIo<'_> {
             sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
         }
         Ok(0)
+    }
+
+    /// Descriptors `lo..=hi` about to close: the process's record write
+    /// locks on their files go with any close (Linux's rule), so its stores
+    /// to shared mappings of those files go out first, as an unlock's do.
+    /// One load while it holds no write lock.
+    pub fn closing_writes(&self, m: &mut GuestMem<'_>, lo: u64, hi: u64) {
+        if !self.fds.holds_write_locks() {
+            return;
+        }
+        let me = crate::locks::Owner::Pid(self.pid).encode();
+        let files: Vec<Arc<OpenFile>> = if lo == hi {
+            self.fds.get(lo as i32).ok().into_iter().collect()
+        } else {
+            self.fds.list().into_iter().filter(|(fd, _)| (lo..=hi).contains(&(*fd as u64))).filter_map(|(fd, _)| self.fds.get(fd).ok()).collect()
+        };
+        for file in files {
+            if self.fds.drop_write_locks(&file.path, me, false) {
+                sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+            }
+        }
     }
 
     /// The park for a lock request that found the lock held and waits
@@ -11291,6 +11355,13 @@ impl FdIo<'_> {
             crate::locks::LockReq::Set { owner: crate::locks::Owner::Pid(p), file: path, .. } => self.fds.note_record_lock(self.file_locks, *p, path),
             _ => file.note_locks(self.file_locks),
         }
+        // And a write lock as held (an extra look at the mapping at its
+        // release, if it never is).
+        match &req {
+            crate::locks::LockReq::Set { file: path, owner, typ, start, end, .. } if *typ == crate::locks::lk::WRLCK => self.fds.note_write_lock(path, owner.encode(), *start, *end),
+            crate::locks::LockReq::Flock { file: path, key, op } if op & crate::locks::lock_op::EX != 0 => self.fds.note_write_lock(path, flock_owner(*key), 0, u64::MAX),
+            _ => {}
+        }
         Some(BlockOp::FileLock { locks: Arc::clone(self.file_locks), req })
     }
 }
@@ -11300,6 +11371,12 @@ impl FdIo<'_> {
 /// program's calls take i386's numbers too, and its 5-7 are the canonical
 /// ones (a 64-bit `struct flock`): the bit means nothing there.
 pub const LK32: u64 = 0x8000;
+
+/// A `flock` lock's owner among [`crate::file::FdTable::note_write_lock`]'s
+/// (bit 62 keeps it apart from the record-lock owners' encodings).
+fn flock_owner(key: u64) -> u64 {
+    key | 1 << 62
+}
 
 /// `F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_GETLK`, `F_OFD_SETLK`,
 /// `F_OFD_SETLKW`, and the i386 `struct flock` forms ([`LK32`]).

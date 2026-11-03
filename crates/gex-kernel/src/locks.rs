@@ -52,7 +52,7 @@ pub enum Owner {
 }
 
 impl Owner {
-    fn encode(self) -> u64 {
+    pub fn encode(self) -> u64 {
         match self {
             Owner::Pid(p) => 1 << 63 | p as u32 as u64,
             Owner::Desc(k) => k & !(1 << 63),
