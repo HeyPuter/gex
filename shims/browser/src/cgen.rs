@@ -2388,10 +2388,10 @@ extern "C" {
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).
     fn fault_call(idx: i32, ctx: i32, code: i32, addr: i64, kind: i32, sp: i64) -> i32;
-    /// Call the signal hook `idx` (`void(int ctx, unsigned pc)`) here, its
-    /// C frames below the guest's stack pointer `sp`: 1; 0 when this build
-    /// cannot.
-    fn signal_call(idx: i32, ctx: i32, pc: i32, sp: i64) -> i32;
+    /// Call the signal hook `idx` (`void(int ctx, unsigned pc)`, 64-bit
+    /// Wine's with a 64-bit `pc`) here, its C frames below the guest's stack
+    /// pointer `sp`: 1; 0 when this build cannot.
+    fn signal_call(idx: i32, ctx: i32, pc: i64, sp: i64) -> i32;
     /// Whether the host's stack has room for one more fault's dispatch: 1
     /// or 0.
     fn stack_room() -> i32;
@@ -3359,7 +3359,7 @@ pub(crate) fn signal_hook(c: u64, interrupted: u64) -> SignalHooked {
     let Some(sp) = hook_sp(c) else { return SignalHooked::No };
     // SAFETY: a host import taking scalars; nothing here holds a lock or a
     // borrow.
-    if unsafe { signal_call(idx as i32, c as i32, interrupted as u32 as i32, sp as i64) } != 0 {
+    if unsafe { signal_call(idx as i32, c as i32, interrupted as i64, sp as i64) } != 0 {
         return SignalHooked::Ran;
     }
     SIGNAL_PENDING.with(|s| s.set(Some((interrupted, sp))));
