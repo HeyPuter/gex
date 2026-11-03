@@ -105,7 +105,11 @@ base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__s
         # (system dirs: a program's own -I comes first, its config.h before Wine's)
         '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
 if cxx:
-    base = ['-include', here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER'] + base
+    # (COM methods that return a struct, Direct2D's GetSize and the rest, as
+    # Windows returns them and Wine's C implementations do: through a
+    # pointer the method also returns, the headers' explicit form)
+    base = ['-include', here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
+            '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
 base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec']
 # compile-only modes
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
