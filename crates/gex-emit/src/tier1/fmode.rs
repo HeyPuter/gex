@@ -45,6 +45,10 @@ pub struct FnBody<'a> {
     last: Vec<usize>,
     /// The block's values that live in a register's local.
     borrowed: Vec<u32>,
+    /// Each statement of the next [`Self::block`]: its instruction's pc, and
+    /// where it carries on after a fault delivered in place
+    /// ([`Self::stmt_pcs`]).
+    pcs: Vec<(u64, Option<u64>)>,
 }
 
 /// A last use past the block's statements (the terminator's).
@@ -105,13 +109,22 @@ impl<'a> FnBody<'a> {
         e.value_ctx = vec![false; n];
         e.value_ty = vec![Ty::I64; n];
         e.value_fp = vec![None; n];
-        FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
+        FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new(), pcs: Vec::new() }
     }
 
     /// Faults the function goes on after: their import's `pc` carries
     /// `bit`, and the function leaves (returns 0) when the import returns.
     pub fn resumable_faults(&mut self, bit: u64) {
         self.e.resumable_pc = bit;
+    }
+
+    /// For the next [`Self::block`], by statement: the pc of its
+    /// instruction, where a fault it raises is delivered in place (with
+    /// [`Self::resumable_faults`]), and for a fault statement (`int3`'s or
+    /// `ud2`'s `HostCall`) the pc it carries on at, its next instruction's,
+    /// which makes it one the host may deliver in place.
+    pub fn stmt_pcs(&mut self, pcs: Vec<(u64, Option<u64>)>) {
+        self.pcs = pcs;
     }
 
     /// The code, for the JIT's own control flow.
@@ -308,10 +321,13 @@ impl<'a> FnBody<'a> {
         let mut borrowed: Vec<u32> = Vec::new();
         let dummy = Block::new(start);
         let mut skip_write = usize::MAX;
+        let pcs = std::mem::take(&mut self.pcs);
         for (i, s) in stmts.iter().enumerate() {
             if sunk[i] || defer.contains(&i) {
                 continue;
             }
+            self.e.stmt_pc = pcs.get(i).map(|p| p.0);
+            self.e.fault_next = pcs.get(i).and_then(|p| p.1);
             if i == skip_write {
                 // The definition before left its value in the register.
                 if let Stmt::WriteReg { reg, .. } = s {
@@ -367,6 +383,8 @@ impl<'a> FnBody<'a> {
                 }
             }
         }
+        self.e.fault_next = None;
+        self.e.stmt_pc = None;
         self.borrowed = borrowed.clone();
         Deferred {
             writes: defer

@@ -4794,7 +4794,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // page through a pointer the translator could not fold. Named,
             // then an access violation for Wine's handler (SIGSEGV without
             // one); never a read there.
-            if imm == gex_abi::imports::BRK_KUSER_UNFOLDED {
+            if imm == gex_abi::imports::BRK_KUSER_UNFOLDED || imm == gex_abi::imports::BRK_KUSER_UNFOLDED_RESUMABLE {
                 let (pc, addr) = gex_abi::kuser_miss_unpack(pc);
                 let name = match wine32_image_at(pc) {
                     Some((n, off)) => format!("{n} +{off:#x}"),

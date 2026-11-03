@@ -15350,8 +15350,9 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
-    if raw == gex_abi::imports::BRK_KUSER_UNFOLDED {
-        kuser_unfolded(pc);
+    if raw == gex_abi::imports::BRK_KUSER_UNFOLDED || raw == gex_abi::imports::BRK_KUSER_UNFOLDED_RESUMABLE {
+        kuser_unfolded(pc, raw == gex_abi::imports::BRK_KUSER_UNFOLDED_RESUMABLE);
+        return;
     }
     let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
     let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
@@ -18079,8 +18080,13 @@ pub extern "C" fn gex_set_in_place(on: i32) {
 /// or above Windows' old KUSER page through a pointer the translator could
 /// not fold. Said by name, then an access violation for Wine's handler (the
 /// fault hook), as the wild-branch path raises one; without a hook, SIGSEGV.
-/// Never a read of the old page. Does not return.
-fn kuser_unfolded(arg: i64) -> ! {
+/// Never a read of the old page. Does not return, except `resumable`'s
+/// (`BRK_KUSER_UNFOLDED_RESUMABLE`: code that goes on after the import,
+/// the function JIT's) when the hook took the fault in place, so a native
+/// `__TRY` between the code and the run loop (the function called straight
+/// from native Wine) still has its frame when its handler takes the
+/// exception.
+fn kuser_unfolded(arg: i64, resumable: bool) {
     let (pc, addr) = gex_abi::kuser_miss_unpack(arg);
     {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -18094,6 +18100,9 @@ fn kuser_unfolded(arg: i64) -> ! {
         let mut gm = GuestMem::new(guest_bytes());
         let c = my_ctx();
         let _ = gm.write_u64(c + ctx::PC as u64, pc);
+        if resumable && cgen::fault_hook() != 0 && cgen::fault_in_place(c, 0xc000_0005, addr, 0) {
+            return;
+        }
         if cgen::fault_hook() != 0 {
             cgen::fault_stage(0xc000_0005, addr, 0);
             set_resume(pc);
