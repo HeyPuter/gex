@@ -51,6 +51,88 @@ def tools_dir():
     sys.exit('gexcc-win: no winebuild in ' + B)
 
 
+def _leb(b, i):
+    r = sh = 0
+    while True:
+        x = b[i]; i += 1
+        r |= (x & 0x7f) << sh; sh += 7
+        if not x & 0x80: return r, i
+
+
+def defined_params(path, name):
+    """The parameter count of the function NAME the wasm object PATH defines, or None."""
+    try:
+        data = open(path, 'rb').read()
+    except OSError:
+        return None
+    if data[:4] != b'\0asm': return None
+    i = 8; types = []; nimp = 0; funcs = []
+    while i < len(data):
+        sid = data[i]; size, i = _leb(data, i + 1); end = i + size
+        if sid == 1:
+            n, j = _leb(data, i)
+            for _ in range(n):
+                np_, j = _leb(data, j + 1); j += np_
+                nr, j = _leb(data, j); j += nr
+                types.append(np_)
+        elif sid == 2:
+            n, j = _leb(data, i)
+            for _ in range(n):
+                for _ in range(2):
+                    ln, j = _leb(data, j); j += ln
+                kind = data[j]; j += 1
+                if kind == 0: _, j = _leb(data, j); nimp += 1
+                elif kind in (1, 2):
+                    if kind == 1: j += 1
+                    fl, j = _leb(data, j); _, j = _leb(data, j)
+                    if fl & 1: _, j = _leb(data, j)
+                elif kind == 3: j += 2
+                elif kind == 4: _, j = _leb(data, j + 1)
+        elif sid == 3:
+            n, j = _leb(data, i)
+            for _ in range(n):
+                t, j = _leb(data, j); funcs.append(t)
+        elif sid == 0:
+            ln, j = _leb(data, i)
+            if data[j:j + ln] == b'linking':
+                _, j = _leb(data, j + ln)
+                while j < end:
+                    st = data[j]; sl, j = _leb(data, j + 1); send = j + sl
+                    if st == 8:  # WASM_SYMBOL_TABLE
+                        n, k = _leb(data, j)
+                        for _ in range(n):
+                            kind = data[k]; fl, k = _leb(data, k + 1)
+                            if kind in (0, 2, 4, 5):  # function, global, tag, table
+                                idx, k = _leb(data, k); nm = None
+                                if not fl & 0x10 or fl & 0x40:  # defined, or an explicit name
+                                    ln2, k = _leb(data, k); nm = data[k:k + ln2]; k += ln2
+                                if kind == 0 and nm == name.encode() and not fl & 0x10 and idx >= nimp:
+                                    return types[funcs[idx - nimp]]
+                            elif kind == 1:  # data
+                                ln2, k = _leb(data, k); k += ln2
+                                if not fl & 0x10:
+                                    for _ in range(3): _, k = _leb(data, k)
+                            elif kind == 3:  # section
+                                _, k = _leb(data, k)
+                    j = send
+        i = end
+    return None
+
+
+def compile_wmain(cmd, obj):
+    """Run the compile CMD of OBJ. The CRT calls wmain(argc, argv), and a call
+    of another type traps (clang renames only main by its parameters): an
+    object whose wmain is wmain(void) or wmain(argc, argv, envp) is compiled
+    again with it renamed __gexw_wmainN, which the link's adapter calls
+    (rt/wmain.c)."""
+    r = subprocess.call(cmd)
+    if r: return r
+    n = defined_params(obj, 'wmain')
+    if n in (0, 3):
+        r = subprocess.call(cmd + ['-Dwmain=__gexw_wmain%d' % n])
+    return r
+
+
 tool = os.path.basename(sys.argv[0])
 tool = tool[len('x86_64-w64-mingw32-'):] if tool.startswith('x86_64-w64-mingw32-') else tool
 args = sys.argv[1:]
@@ -115,7 +197,16 @@ base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-f
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
     if cxx and '-fno-exceptions' not in args:
         base += ['-fexceptions', '-fwasm-exceptions']
-    os.execv(cc, [cc] + base + args)
+    # -c: wmain's type is checked once the object is made (compile_wmain)
+    srcs = [a for a in args if a.endswith(('.c', '.cc', '.cpp', '.cxx')) and not a.startswith('-')]
+    if '-c' not in args or not srcs or any(a in ('-E', '-S', '-M', '-MM') for a in args):
+        os.execv(cc, [cc] + base + args)
+    o = args[args.index('-o') + 1] if '-o' in args else None
+    if o is None and len(srcs) == 1:
+        o = os.path.splitext(os.path.basename(srcs[0]))[0] + '.o'
+    if o is None:
+        os.execv(cc, [cc] + base + args)
+    sys.exit(compile_wmain([cc] + base + args, o))
 
 # link
 T = tools_dir()
@@ -159,7 +250,7 @@ tmp = tempfile.mkdtemp(prefix='gexcc-win-')
 try:
     for k, s in enumerate(srcs):
         o = os.path.join(tmp, '%d.o' % k)
-        r = subprocess.call([cc] + base + (['-fexceptions', '-fwasm-exceptions'] if cxx else []) + extra_cflags + ['-c', s, '-o', o])
+        r = compile_wmain([cc] + base + (['-fexceptions', '-fwasm-exceptions'] if cxx else []) + extra_cflags + ['-c', s, '-o', o], o)
         if r: sys.exit(r)
         objs.append(o)
     # libraries: a -lNAME found as libNAME.a on a -L path is linked in; the
@@ -196,6 +287,11 @@ try:
         elif not os.path.exists(lib):
             print('gexcc-win: no import library for %s' % d, file=sys.stderr)
     crt = [B + '/libs/winecrt0/libwinecrt0.a']
+    # a wmain of another type, renamed (compile_wmain): the CRT's wmain(argc, argv) calls it
+    adapt = []
+    if unicode and not shared:
+        n = next((n for n in (0, 3) for o in objs if defined_params(o, '__gexw_wmain%d' % n) is not None), None)
+        if n is not None: adapt = [LIB + '/wmain%d.o' % n]
     # the entry point runs the C++ constructors first (rt/start.c)
     entry = '__gexw_DllMainCRTStartup' if shared else '__gexw_wmainCRTStartup' if unicode else '__gexw_mainCRTStartup'
     wg = [T + '/tools/winegcc/winegcc', '-o', so, '--wine-objdir', B, '--winebuild', T + '/tools/winebuild/winebuild',
@@ -203,7 +299,7 @@ try:
           '-m' + (subsys or 'console'), '-Wl,--entry,' + entry,
           # (Wine's libuuid is one object of every GUID: a program defining
           # some itself, as MinGW's per-GUID libuuid allows, defines them twice)
-          '-Wl,--allow-multiple-definition'] + (['-municode'] if unicode else []) + (['-shared'] if shared else []) + defs + objs + [LIB + '/start_%s.o' % ('dll' if shared else 'wmain' if unicode else 'main')] + [LIB + '/wasm32_sjlj.o'] + archives + imp + crt
+          '-Wl,--allow-multiple-definition'] + (['-municode'] if unicode else []) + (['-shared'] if shared else []) + defs + objs + [LIB + '/start_%s.o' % ('dll' if shared else 'wmain' if unicode else 'main')] + [LIB + '/wasm32_sjlj.o'] + adapt + archives + imp + crt
     # (run in tmp: winebuild makes its temporary dir in its cwd, and the
     # export lists wcc64 writes beside its objects kept it from removing it)
     wg = [os.path.abspath(a) if not a.startswith('-') and os.path.exists(a) else a for a in wg]
