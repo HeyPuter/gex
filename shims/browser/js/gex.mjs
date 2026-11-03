@@ -4148,7 +4148,8 @@ export class Gex {
     // A spare (`#offerSpare`) claims its slot unpromised, and is promised
     // one when it is given its thread.
     this.#promise = !thread.spare;
-    await this.attach(shimWasm, guestWasm, { devices: false });
+    // A Worker whose last thread ended (`parkThread`) is attached already.
+    if (!thread.parked) await this.attach(shimWasm, guestWasm, { devices: false });
     if (thread.spare) {
       // Everything the process has installed so far, before it has a thread;
       // what it installs meanwhile is caught up with below, as any thread's.
@@ -5303,6 +5304,7 @@ export class Gex {
       const align = Number(inst.exports.__tls_align?.value ?? 1);
       const at = this.#dlTlsAlloc(prov, size, align);
       inst.exports.__wasm_init_tls(typeof inst.exports.__tls_size.value === 'bigint' ? BigInt(at) : at);
+      this.#tlsOwners.push({ prov, inst, size, align });
     }
     // A deferred unit's bridges were written when it was deferred.
     const bridges = deferred ? 0 : this.#cgenBridges(regsOf, tables);
@@ -6235,6 +6237,7 @@ export class Gex {
     const e = this.#shim.exports;
     const idx = this.#dlTlsKept ? e.gex_wasmprog_link_index(prov) : -1;
     const kept = idx >= 0 ? this.#dlTlsKept.get(idx) : undefined;
+    this.#tlsOwners.push({ prov, inst, size, align, st });
     if (kept !== undefined) {
       this.#dlTlsKept.delete(idx);
       inst.exports.__gex_set_tls_base(kept);
@@ -6244,6 +6247,34 @@ export class Gex {
     const at = this.#dlTlsAlloc(prov, size, align);
     inst.exports.__wasm_init_tls(at);
     st.dlTls.set(prov, at);
+  }
+
+  /** The modules of this Worker's that have a thread-local block of its
+   *  thread's (`#dlTlsInit`, a Wine PE module's): `{ prov, inst, size,
+   *  align, st }`, `st` for a `dlopen`ed one's. */
+  #tlsOwners = [];
+
+  /** This Worker's thread has ended and its process runs on as the same
+   *  program (`worker.mjs`): whether it waits for one of the process's next
+   *  threads, as a spare does (`adoptThread` with `parked`). The shim lets
+   *  go of the thread (`gex_thread_park`), and every module's thread-local
+   *  block is made again, as a new Worker's are when it installs them: the
+   *  next thread finds its thread-locals as their module starts them, none
+   *  of the last one's. False: the Worker ends as before. */
+  parkThread() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_thread_park || this.#released || this.#noSlot || this.#vfork.length || this.#dlTlsKept?.size) return false;
+    if (e.gex_thread_park() !== 1) return false;
+    this.freeThreadTls();
+    this.#dlTlsNext = 0;
+    for (const o of this.#tlsOwners) {
+      const at = this.#dlTlsAlloc(o.prov, o.size, o.align);
+      o.inst.exports.__wasm_init_tls(typeof o.inst.exports.__tls_size?.value === 'bigint' ? BigInt(at) : at);
+      o.st?.dlTls.set(o.prov, at);
+    }
+    this.#threadTid = 0;
+    this.adoptGen = undefined;
+    return true;
   }
 
   /** `size` bytes at `align` for a module's thread-local block in this

@@ -563,6 +563,11 @@ thread_local! {
     static GUEST_CALLS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
+/// No provider guest call open on this Worker (`gex_thread_park`).
+pub(crate) fn park_clear() -> bool {
+    GUEST_CALLS.with(|c| c.get()) == 0
+}
+
 /// `?fjitlibs=provcheck=1`: [`gex_libprov_guest_call`] checks that each
 /// provider guest call ends with the guest's stack just past the return
 /// address the call pushed (its SP when the call opens), and says when not.
