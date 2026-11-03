@@ -122,6 +122,17 @@ impl Pty {
         r.signals
     }
 
+    /// Set the terminal's termios. A line part-typed in canonical mode stays
+    /// input when the mode is left (`Tty::set_termios_keeping`): the slave
+    /// reads it next.
+    pub fn set_termios(&self, src: &[u8]) {
+        let kept = self.tty.set_termios_keeping(src);
+        if !kept.is_empty() {
+            self.lock().to_slave.extend(kept);
+            self.queue.notify();
+        }
+    }
+
     /// The slave wrote: program output. Output-processed, then queued for the
     /// master.
     pub fn slave_write(&self, bytes: &[u8]) {
@@ -471,6 +482,25 @@ mod tests {
         assert_eq!(p.master_read(&mut buf), Ok(3), "what it wrote first");
         assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EIO));
         assert!(p.master_readable(), "a hangup is readable, so poll wakes the reader");
+    }
+
+    /// Keys typed while the terminal is cooked (a command running) and before
+    /// the shell's line editor makes it raw again are read by the line
+    /// editor, not dropped: `ls` typed after `clear` ran as `s`.
+    #[test]
+    fn a_part_typed_line_is_input_once_canonical_mode_is_left() {
+        let p = super::Pty::new(0);
+        p.open_slave();
+        p.master_write(b"l");
+        let mut buf = [0u8; 8];
+        assert_eq!(p.slave_read(&mut buf), Err(crate::errno::Errno::EAGAIN), "cooked: no line yet");
+        let mut t = p.tty.termios();
+        let l = u32::from_le_bytes([t[12], t[13], t[14], t[15]]) & !(crate::tty::lflag::ICANON | crate::tty::lflag::ECHO);
+        t[12..16].copy_from_slice(&l.to_le_bytes());
+        p.set_termios(&t);
+        p.master_write(b"s");
+        assert_eq!(p.slave_read(&mut buf), Ok(2));
+        assert_eq!(&buf[..2], b"ls");
     }
 
     #[test]

@@ -163,7 +163,7 @@ fn set_termios(id: i32, src: &[u8], flush: i32) -> i32 {
     if flush != 0 {
         p.flush(gex_kernel::tty::TCIFLUSH);
     }
-    p.tty.set_termios(src);
+    p.set_termios(src);
     0
 }
 

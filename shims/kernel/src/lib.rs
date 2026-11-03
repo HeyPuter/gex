@@ -2542,7 +2542,7 @@ pub extern "C" fn k_pty_set_termios(id: i32, at: gex_kmem::PAddr, len: u32, flus
     if flush != 0 {
         p.flush(gex_kernel::tty::TCIFLUSH);
     }
-    p.tty.set_termios(&buf);
+    p.set_termios(&buf);
     0
 }
 
