@@ -8,7 +8,9 @@
 #   tools/wine-wasm/link-wine64.sh WINE_BUILD OUT   (GEX_WASM64_SYSROOT set)
 #
 # Also the Unix libraries crypt32, ws2_32, msv1_0, dnsapi and nsiproxy (as
-# 32-bit Wine's wine32/link-loader.sh), registered with dlreg.py, secur32 (+ GnuTLS) when
+# 32-bit Wine's wine32/link-loader.sh), mountmgr (volumes and their names),
+# localspl, winspool and wineps (the spooler and the PostScript driver),
+# registered with dlreg.py, secur32 (+ GnuTLS) when
 # the tree was configured --with-gnutls, and, when the tree was
 # configured with them (wine64-deps.sh's libraries: WINE64_DEPS), win32u
 # and dwrite (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
@@ -61,7 +63,7 @@ unixobjs() { # DIR LIB: the objects of DIR's LIB.so
 	sed -n "/^dlls\/$1\/$2.so:/,/^\t/p" Makefile | grep -o "dlls/$1/[a-z_0-9/-]*\.o" | sort -u
 }
 tls=""; grep -q 'define SONAME_LIBGNUTLS' include/config.h && tls="secur32:secur32"
-for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy $tls; do
+for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy mountmgr.sys:mountmgr localspl:localspl winspool.drv:winspool wineps.drv:wineps $tls; do
 	dir=${spec%%:*} lib=${spec##*:}
 	mkdir -p "gexwine64/$lib"
 	for c in $(unixobjs "$dir" "$lib"); do

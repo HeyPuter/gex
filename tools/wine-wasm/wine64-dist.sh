@@ -248,11 +248,12 @@ PX=$P-gex
 log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 
 # The session 32-bit Wine's prefixes have (wine32-session.reg):
-# the 64-bit loader has no Unix side for MountMgr, winebus,
-# wineusb or winebth either, so services.exe started a winedevice for each
-# only to see DriverEntry fail (c0000135), one after another, before
-# wineboot let the program start (a 64-bit Wine game
-# 5 s sooner). On a copy, so the session changes without a new wineboot.
+# the 64-bit loader has no Unix side for winebus, wineusb or winebth
+# either, so services.exe started a winedevice for each only to see
+# DriverEntry fail (c0000135), one after another, before wineboot let the
+# program start (a 64-bit Wine game 5 s sooner). MountMgr has one (its
+# DriverEntry succeeds), but stays demand-start: `net start mountmgr`
+# for a program that asks for volume names. On a copy, so the session changes without a new wineboot.
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
