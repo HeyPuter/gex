@@ -162,6 +162,10 @@ pub struct Info {
     /// [`Info::slots`], made once: the loader asks for it at every symbol it
     /// binds (a large C++ library binds tens of thousands).
     slots: std::sync::OnceLock<(u32, HashMap<u32, u32>)>,
+    /// Whether any export is an fpcast thunk ([`FPCAST_THUNK`]): only then
+    /// does a slot ask for one by name (most modules have none, and the
+    /// question made a string per exported function).
+    has_thunks: bool,
 }
 
 /// A function type as [`Info::sigs`] writes it.
@@ -235,7 +239,8 @@ impl Info {
     pub fn parse(wasm: &[u8]) -> Result<Info> {
         use wasmparser::{Payload, TypeRef};
         let mut info = Info::default();
-        let mut weak = HashSet::default();
+        // `module\x01field` of each weak import, looked up through one buffer
+        let mut weak: HashSet<String> = HashSet::default();
         for payload in wasmparser::Parser::new(0).parse_all(wasm) {
             match payload? {
                 Payload::CustomSection(c) if c.name() == "dylink.0" => {
@@ -277,11 +282,11 @@ impl Info {
                             4 => {
                                 let n = s.read_var_u32()?;
                                 for _ in 0..n {
-                                    let m = s.read_string()?.to_string();
-                                    let f = s.read_string()?.to_string();
+                                    let m = s.read_string()?;
+                                    let f = s.read_string()?;
                                     let flags = s.read_var_u32()?;
                                     if flags & SYM_BINDING_WEAK != 0 {
-                                        weak.insert((m, f));
+                                        weak.insert(format!("{m}\x01{f}"));
                                     }
                                 }
                             }
@@ -303,6 +308,7 @@ impl Info {
                     }
                 }
                 Payload::ImportSection(s) => {
+                    info.imports.reserve(s.count() as usize);
                     for imp in s {
                         let imp = imp?;
                         let wide = matches!(imp.ty, TypeRef::Global(g) if g.content_type == wasmparser::ValType::I64);
@@ -341,8 +347,10 @@ impl Info {
                     }
                 }
                 Payload::ExportSection(s) => {
+                    info.exports.reserve(s.count() as usize);
                     for e in s {
                         let e = e?;
+                        info.has_thunks |= e.name.starts_with(FPCAST_THUNK);
                         info.exports.insert(
                             e.name.to_string(),
                             Export {
@@ -368,10 +376,19 @@ impl Info {
                 _ => {}
             }
         }
-        for imp in &mut info.imports {
-            // `GOT.mem.x` / `GOT.func.x` carry `env.x`'s weakness
-            let key = (imp.module.clone(), imp.name.clone());
-            imp.weak = weak.contains(&key) || weak.contains(&("env".to_string(), imp.name.clone()));
+        if !weak.is_empty() {
+            let mut key = String::new();
+            let mut is_weak = |m: &str, f: &str| {
+                key.clear();
+                key.push_str(m);
+                key.push('\x01');
+                key.push_str(f);
+                weak.contains(&key)
+            };
+            for imp in &mut info.imports {
+                // `GOT.mem.x` / `GOT.func.x` carry `env.x`'s weakness
+                imp.weak = is_weak(&imp.module, &imp.name) || is_weak("env", &imp.name);
+            }
         }
         Ok(info)
     }
@@ -415,6 +432,9 @@ impl Info {
     /// when the module has one, else the function itself.
     pub fn table_target(&self, name: &str) -> Option<u32> {
         let e = self.exports.get(name)?;
+        if !self.has_thunks {
+            return Some(e.index);
+        }
         Some(self.exports.get(&format!("{FPCAST_THUNK}{name}")).map_or(e.index, |t| t.index))
     }
 
@@ -429,8 +449,8 @@ impl Info {
             .iter()
             .filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK))
             .filter_map(|(n, e)| {
-                let thunk = format!("{FPCAST_THUNK}{n}");
-                let fill = if self.exports.contains_key(&thunk) { thunk } else { n.clone() };
+                let thunk = if self.has_thunks { format!("{FPCAST_THUNK}{n}") } else { String::new() };
+                let fill = if self.has_thunks && self.exports.contains_key(&thunk) { thunk } else { n.clone() };
                 at.get(&e.index).filter(|&&s| s >= base).map(|&s| (s, fill))
             })
             .collect();
@@ -1409,8 +1429,37 @@ pub struct Scope(std::sync::Mutex<ScopeIndex>);
 #[derive(Default)]
 struct ScopeIndex {
     upto: usize,
-    /// The defining module of a function (`.0`) and a global (`.1`).
-    first: HashMap<String, (u32, u32)>,
+    /// The defining module of a function (`.0`) and a global (`.1`), by
+    /// the name's hash ([`name_hash`]): no copy of each of a hundred
+    /// thousand names per process. A lookup checks the module it finds
+    /// does define the name, and two names of one hash fall back to a scan.
+    first: std::collections::HashMap<u64, (u32, u32), std::hash::BuildHasherDefault<IdHasher>>,
+}
+
+/// A name's 64-bit hash, the scope index's key.
+fn name_hash(name: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = FxHasher::default();
+    h.write(name.as_bytes());
+    h.finish()
+}
+
+/// The scope index's hasher: its keys are hashes already.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) ^ b as u64;
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
 }
 
 impl Clone for Scope {
@@ -1542,6 +1591,8 @@ impl Link {
             if x.upto > self.mods.len() {
                 *x = ScopeIndex::default();
             }
+            let more: usize = self.mods[x.upto.min(self.mods.len())..].iter().map(|m| m.info.exports.len()).sum();
+            x.first.reserve(more);
             for i in x.upto..self.mods.len() {
                 let m = &self.mods[i].info;
                 for (n, e) in &m.exports {
@@ -1550,7 +1601,7 @@ impl Link {
                         Kind::Global if e.index >= m.global_imports => 1,
                         _ => continue,
                     };
-                    let f = x.first.entry(n.clone()).or_insert((NONE, NONE));
+                    let f = x.first.entry(name_hash(n)).or_insert((NONE, NONE));
                     let at = if slot == 0 { &mut f.0 } else { &mut f.1 };
                     if *at == NONE {
                         *at = i as u32;
@@ -1558,9 +1609,29 @@ impl Link {
                 }
             }
             x.upto = self.mods.len();
-            let f = x.first.get(name)?;
-            let at = if kind == Kind::Func { f.0 } else { f.1 };
-            return (at != NONE).then_some(at as usize);
+            let defines = |i: usize| {
+                let m = &self.mods[i].info;
+                m.exports.get(name).is_some_and(|e| {
+                    e.kind == kind
+                        && match kind {
+                            Kind::Func => e.index >= m.func_imports,
+                            _ => e.index >= m.global_imports,
+                        }
+                })
+            };
+            let at = x.first.get(&name_hash(name)).map_or(NONE, |f| if kind == Kind::Func { f.0 } else { f.1 });
+            drop(x);
+            if at == NONE {
+                return None;
+            }
+            // The first module of this hash defines the name, or another
+            // name of the same hash came first: the earliest definer then
+            // is found by a scan (no module before `at` defines a name of
+            // this hash, so none before it defines this one).
+            if defines(at as usize) {
+                return Some(at as usize);
+            }
+            return (at as usize + 1..self.mods.len()).find(|&i| defines(i));
         }
         self.mods.iter().position(|m| {
             m.info.exports.get(name).is_some_and(|e| {
