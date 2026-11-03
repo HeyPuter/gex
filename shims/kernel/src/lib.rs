@@ -1698,6 +1698,15 @@ pub extern "C" fn k_lock_call(req: gex_kmem::PAddr, req_len: u32, out: gex_kmem:
     }
     let mut o = vec![0u8; out_len.min(64) as usize];
     let r = locks().serve(caller, &b, &mut o);
+    // A lock granted on a file this kernel holds: the file's change count
+    // with the answer, so the caller's shared mappings of it need no call
+    // of their own to know nobody changed it (`FileLocks::set_seen`).
+    use gex_kernel::locks::call;
+    if r >= 0 && o.len() >= 8 && matches!(b.first(), Some(&(call::FLOCK | call::SET | call::SET_WAIT))) {
+        if let Some(h) = gex_kernel::locks::decode(&b).filter(|d| d.handle >= 0).and_then(|d| handle_at(d.handle)) {
+            o[..8].copy_from_slice(&h.changes().to_le_bytes());
+        }
+    }
     if !o.is_empty() {
         unsafe { gex_kmem::push_checked(out, o.as_ptr(), o.len() as u32) };
     }

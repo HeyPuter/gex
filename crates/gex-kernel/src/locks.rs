@@ -161,8 +161,16 @@ pub mod call {
 }
 
 /// A call as bytes: op, owner (or key), pid, type (or flock op), start,
-/// end, then the path.
+/// end, the file's handle in the global kernel (-1: none), then the path.
 pub fn encode(op: u8, owner: u64, pid: i32, typ: u64, start: u64, end: u64, file: &str) -> Vec<u8> {
+    encode_with(op, owner, pid, typ, start, end, -1, file)
+}
+
+/// [`encode`] naming the file's global-kernel handle too: a granted lock
+/// or flock call answers the file's change count with it, into the first
+/// 8 bytes of `out` ([`FileLocks::set_seen`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_with(op: u8, owner: u64, pid: i32, typ: u64, start: u64, end: u64, handle: i32, file: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(41 + file.len());
     b.push(op);
     b.extend_from_slice(&owner.to_le_bytes());
@@ -170,6 +178,7 @@ pub fn encode(op: u8, owner: u64, pid: i32, typ: u64, start: u64, end: u64, file
     b.extend_from_slice(&typ.to_le_bytes());
     b.extend_from_slice(&start.to_le_bytes());
     b.extend_from_slice(&end.to_le_bytes());
+    b.extend_from_slice(&handle.to_le_bytes());
     b.extend_from_slice(file.as_bytes());
     b
 }
@@ -182,11 +191,12 @@ pub struct Decoded {
     pub typ: u64,
     pub start: u64,
     pub end: u64,
+    pub handle: i32,
     pub file: String,
 }
 
 pub fn decode(b: &[u8]) -> Option<Decoded> {
-    if b.len() < 37 {
+    if b.len() < 41 {
         return None;
     }
     let u = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
@@ -197,7 +207,8 @@ pub fn decode(b: &[u8]) -> Option<Decoded> {
         typ: u(13),
         start: u(21),
         end: u(29),
-        file: String::from_utf8_lossy(&b[37..]).into_owned(),
+        handle: i32::from_le_bytes(b[37..41].try_into().unwrap()),
+        file: String::from_utf8_lossy(&b[41..]).into_owned(),
     })
 }
 
@@ -317,9 +328,22 @@ impl FileLocks {
     /// `flock` for one open file description: `EWOULDBLOCK` when another
     /// holds it in the way, blocking or not (the caller parks).
     pub fn flock(&self, file: &str, key: u64, op: u64) -> SysResult {
+        self.flock_seen(file, key, op, None).0
+    }
+
+    /// [`FileLocks::flock`], with the file's change count when granted in
+    /// the page and the global kernel holds the file as `handle` (one call
+    /// for both, where a lock taken needs both: [`crate::syscalls::sync_shared_file`]).
+    pub fn flock_seen(&self, file: &str, key: u64, op: u64, handle: Option<i32>) -> (SysResult, Option<u64>) {
         if let Some(r) = Self::remote() {
-            return remote_answer((r.call)(&encode(call::FLOCK, key, 0, op, 0, 0, file), &mut []));
+            let mut out = [0u8; 8];
+            let v = (r.call)(&encode_with(call::FLOCK, key, 0, op, 0, 0, handle.unwrap_or(-1), file), &mut out);
+            return (remote_answer(v), seen_count(v, &out));
         }
+        (self.flock_local(file, key, op), None)
+    }
+
+    fn flock_local(&self, file: &str, key: u64, op: u64) -> SysResult {
         let mut t = self.table();
         if op & lock_op::UN != 0 {
             let before = t.whole.len();
@@ -355,10 +379,24 @@ impl FileLocks {
     /// the way; `EDEADLK`, for a request that would wait (`wait`), when
     /// waiting would close a cycle of waiters.
     pub fn set(&self, file: &str, owner: Owner, pid: i32, typ: u32, start: u64, end: u64, wait: bool) -> SysResult {
+        self.set_seen(file, owner, pid, typ, start, end, wait, None).0
+    }
+
+    /// [`FileLocks::set`], with the file's change count as
+    /// [`FileLocks::flock_seen`] has it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_seen(&self, file: &str, owner: Owner, pid: i32, typ: u32, start: u64, end: u64, wait: bool, handle: Option<i32>) -> (SysResult, Option<u64>) {
         if let Some(r) = Self::remote() {
             let op = if wait { call::SET_WAIT } else { call::SET };
-            return remote_answer((r.call)(&encode(op, owner.encode(), pid, typ as u64, start, end, file), &mut []));
+            let mut out = [0u8; 8];
+            let v = (r.call)(&encode_with(op, owner.encode(), pid, typ as u64, start, end, handle.unwrap_or(-1), file), &mut out);
+            return (remote_answer(v), seen_count(v, &out));
         }
+        (self.set_local(file, owner, pid, typ, start, end, wait), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_local(&self, file: &str, owner: Owner, pid: i32, typ: u32, start: u64, end: u64, wait: bool) -> SysResult {
         if start >= end {
             return Ok(0);
         }
@@ -574,6 +612,12 @@ pub fn written(file: &str) -> u64 {
     }
     let w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     w.iter().find(|(f, _)| f == file).map_or(0, |(_, n)| *n)
+}
+
+/// The change count a granted remote lock call answered (0: none).
+fn seen_count(v: i64, out: &[u8; 8]) -> Option<u64> {
+    let c = u64::from_le_bytes(*out);
+    (v >= 0 && c != 0).then_some(c)
 }
 
 fn remote_answer(v: i64) -> SysResult {

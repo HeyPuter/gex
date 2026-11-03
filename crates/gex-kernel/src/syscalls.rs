@@ -4514,7 +4514,7 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
-            refresh(m, &map, true)?;
+            refresh(m, &map, true, None)?;
         }
         Ok(())
     }
@@ -7920,6 +7920,22 @@ fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(),
     }
     let from = map.start.max(lo);
     let to = (map.start + map.len).min(hi);
+    // The pages' hashes first, and nothing more when none changed: a lock
+    // given up over an untouched mapping costs no call to the file.
+    const P: u64 = crate::mem::PAGE_SIZE;
+    let first = (from.max(map.start) - map.start) / P;
+    let mut hashes = Vec::new();
+    let mut any = false;
+    while (map.start + (first + hashes.len() as u64) * P).max(from) < to {
+        let page = first + hashes.len() as u64;
+        let whole = map.start + page * P;
+        let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+        any |= map.pages.get(page as usize).map(|s| s.load(std::sync::atomic::Ordering::Relaxed)) != Some(h);
+        hashes.push(h);
+    }
+    if !any {
+        return Ok(());
+    }
     // Only what the file holds: a shared mapping's page past the
     // end of the file is not the file's (Linux never extends it).
     let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
@@ -7937,15 +7953,14 @@ fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(),
     let mut exact = known != 0 && at_start == known;
     // Only the pages that changed since the file last had them, in
     // runs: another process's writes to the other pages stand.
-    const P: u64 = crate::mem::PAGE_SIZE;
     let mut run: Option<u64> = None;
-    let mut page = (from - map.start) / P;
+    let mut page = first;
     loop {
         let ps = (map.start + page * P).max(from);
         let changed = ps < to && {
             let pe = (map.start + (page + 1) * P).min(to);
             let whole = map.start + page * P;
-            let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+            let h = hashes[(page - first) as usize];
             let slot = map.pages.get(page as usize);
             let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
             // A partial range writes back only its part, so the page's
@@ -7997,8 +8012,17 @@ fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(),
 /// the mapping: a page whose hash still matches is left as it is, this
 /// process's own stores in it included. Nothing to read when the file's
 /// change count is still the one the pages were the file's at.
-fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool) -> Result<(), Errno> {
+fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>) -> Result<(), Errno> {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    // The count the lock call brought, when it did: unchanged, nothing to ask.
+    // Without one, the count alone (no call where the filesystem keeps it
+    // here), or for a filesystem that keeps none the write generation.
+    if !force {
+        let c = seen.unwrap_or_else(|| map.file.handle.changes());
+        if if c != 0 { map.changes.load(Acquire) == c } else { map.seen.load(Acquire) == crate::locks::written(&map.file.path) } {
+            return Ok(());
+        }
+    }
     let (md, now) = map.file.handle.metadata_changes()?;
     let written = if now == 0 { crate::locks::written(&map.file.path) } else { 0 };
     if !force && (if now != 0 { map.changes.load(Acquire) == now } else { map.seen.load(Acquire) == written }) {
@@ -8043,7 +8067,10 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool) -> Result<(), Err
 /// processes' mappings meet -- which is where SQLite's WAL index, and
 /// anything else that locks around shared memory, looks for each other's
 /// writes. One empty-list test when the process maps nothing shared.
-pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync) {
+///
+/// `seen`: the file's change count as the lock call that granted the lock
+/// answered it (the page's global kernel does), which spares asking again.
+pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync, seen: Option<u64>) {
     let Some(view) = shared else { return };
     let maps = view.get();
     if maps.is_empty() || file.handle.is_stream() {
@@ -8054,7 +8081,7 @@ pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, fi
             let _ = write_back(m, map, 0, u64::MAX);
         }
         if sync != MapSync::Release {
-            let _ = refresh(m, map, false);
+            let _ = refresh(m, map, false, seen);
         }
     }
 }
@@ -10436,7 +10463,7 @@ impl Kernel {
         };
         if let (Some(fd), Ok(_)) = (self.retry_lock.take(), &r) {
             if let Ok(file) = self.fds.get(fd) {
-                sync_shared_file(Some(self.mem.shared_maps()), m, &file, MapSync::Acquire);
+                sync_shared_file(Some(self.mem.shared_maps()), m, &file, MapSync::Acquire, None);
             }
         }
         // A wait a signal ended that Linux would restart (signal(7)): the
@@ -11116,11 +11143,19 @@ impl FdIo<'_> {
     /// a stable name for it while it is open. Held in the way, a blocking
     /// request parks ([`FdIo::lock_park`]).
     pub fn flock(&self, m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
+        use crate::locks::lock_op;
         let file = self.fds.get(fd)?;
-        let r = self.file_locks.flock(&file.path, file.lock_key(), op);
+        // This process's stores go out before anyone else can take the lock
+        // (given up, or turned shared).
+        if op & (lock_op::UN | lock_op::SH) != 0 {
+            sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+        }
+        let (r, seen) = self.file_locks.flock_seen(&file.path, file.lock_key(), op, file.handle.remote_id());
         if r.is_ok() {
             file.note_locks(self.file_locks);
-            sync_shared_file(self.shared, m, &file, if op & crate::locks::lock_op::UN != 0 { MapSync::Release } else { MapSync::Acquire });
+            if op & lock_op::UN == 0 {
+                sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
+            }
         }
         r
     }
@@ -11221,14 +11256,20 @@ impl FdIo<'_> {
             }
             return Ok(0);
         }
-        self.file_locks.set(path, *owner, *pid, *typ, *start, *end, wait)?;
+        // This process's stores go out before anyone else can take the range
+        // (given up, or a write lock turned read).
+        if *typ != lk::WRLCK {
+            sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+        }
+        let (r, seen) = self.file_locks.set_seen(path, *owner, *pid, *typ, *start, *end, wait, file.handle.remote_id());
+        r?;
         if *typ != lk::UNLCK {
             match owner {
                 crate::locks::Owner::Pid(p) => self.fds.note_record_lock(self.file_locks, *p, path),
                 crate::locks::Owner::Desc(_) => file.note_locks(self.file_locks),
             }
+            sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
         }
-        sync_shared_file(self.shared, m, &file, if *typ == lk::UNLCK { MapSync::Release } else { MapSync::Acquire });
         Ok(0)
     }
 
