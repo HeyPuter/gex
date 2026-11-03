@@ -210,13 +210,14 @@ done
 # (OUT's directory), which ntdll dlopens on the first wg_* call; what it
 # imports (libc's functions, ntdll's debug channels) the loader exports
 # (-Wl,--export), and nothing more of it is in the loader. The PE side is
-# unchanged. Unset or 0 leaves it out.
+# unchanged. Unset, 0 or off leaves it out (wine64-dist.sh passes lazy by
+# default).
 media=
 case ${WINE64_MEDIA:-0} in
-0) ;;
+0|off) ;;
 lazy) [ -f "$WF/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { echo "link-wine64: WINE64_MEDIA=lazy, and $WF has no dlls/winegstreamer/unixlib_ffmpeg.c" >&2; exit 1; }
 	media=1 ;;
-*) echo "link-wine64: WINE64_MEDIA=$WINE64_MEDIA (0 or lazy)" >&2; exit 1 ;;
+*) echo "link-wine64: WINE64_MEDIA=$WINE64_MEDIA (lazy, or 0 or off)" >&2; exit 1 ;;
 esac
 if [ -n "$media" ]; then
 	: "${WINE64_DEPS:?set WINE64_DEPS to the install wine64-deps.sh made, for FFmpeg}"

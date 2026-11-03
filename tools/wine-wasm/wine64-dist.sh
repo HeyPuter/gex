@@ -19,7 +19,7 @@
 #               a native x86_64 Unix side, used only to make the prefix)
 #   wwl-P       with WINE64_WOW64=1, the i386 and x86_64 PE winewayland.drv
 #               (a tree of its own: the display driver's PE halves)
-#   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy)
+#   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy, the default)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
 #               reg-apply.py): WINE64_PREFIX
@@ -31,7 +31,7 @@
 #               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
 #               EGL, guest/gl/gexgl.c), secur32 (+ GnuTLS) and
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
-#               in the loader, and with WINE64_MEDIA=lazy winegstreamer.so (+ FFmpeg) beside it;
+#               in the loader, and winegstreamer.so (+ FFmpeg) beside it (WINE64_MEDIA=off: not);
 #               WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
 #               that script and the 32-bit configure options it compiles with
@@ -121,23 +121,27 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 # which serves x86-64 programs), and dmsynth with its FluidSynth (C, enabled
 # only with a C++ compiler): x86-64 builtins as wasm64 modules too (part of S)
 B64_MODS="--enable-dpnsvr --enable-vcruntime140_1 --enable-dmsynth --enable-fluidsynth"
-# WINE64_MEDIA=lazy: winegstreamer (Media Foundation's and DirectShow's
-# decoders and media source, and the WM reader) over FFmpeg rather than
-# GStreamer: its Unix side the Wine tree's wg_*_ffmpeg.c and unixlib_ffmpeg.c
-# with FFmpeg (from deps64), a side module beside the loader that the loader
-# dlopens on a program's first media call (link-wine64.sh), so a page
-# fetches and compiles FFmpeg only then; its PE side unchanged: native from
-# the wasm trees (configured with the module, which configure leaves out
-# without GStreamer), and its PE halves from a tree of their own (wgs) for
-# the install's PE build and the prefix, where they are registered. -wgf in
-# the name. Unset or 0 leaves winegstreamer out of both arches (-nogst), as
-# does the memory64 flavour (no side module of its own yet).
-MEDIA=${WINE64_MEDIA:-0}
+# WINE64_MEDIA=lazy (the default): winegstreamer (Media Foundation's and
+# DirectShow's decoders and media source, and the WM reader) over FFmpeg
+# rather than GStreamer: its Unix side the Wine tree's wg_*_ffmpeg.c and
+# unixlib_ffmpeg.c with FFmpeg (from deps64), a side module beside the loader
+# that the loader dlopens on a program's first media call (link-wine64.sh),
+# so a page fetches and compiles FFmpeg only then (the loader grows by the
+# exports it needs, 16 KB); its PE side unchanged: native from the wasm trees
+# (configured with the module, which configure leaves out without
+# GStreamer), and its PE halves from a tree of their own (wgs) for the
+# install's PE build and the prefix, where they are registered. -wgf in the
+# name. WINE64_MEDIA=off leaves winegstreamer out of both arches (-nogst),
+# as does the memory64 flavour (no side module of its own yet), and so does
+# the default for a Wine tree without the FFmpeg files.
+MEDIA=${WINE64_MEDIA:-default}
 case $MEDIA in
-0) ;;
+0|off) MEDIA=0 ;;
+default) MEDIA=lazy; [ -f "$W/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { MEDIA=0; log "winegstreamer left out: $W has no dlls/winegstreamer/unixlib_ffmpeg.c"; }
+	[ "${WINE64_MEM64:-0}" = 0 ] || MEDIA=0 ;;
 lazy) [ -f "$W/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { log "WINE64_MEDIA=lazy, and $W has no dlls/winegstreamer/unixlib_ffmpeg.c"; exit 1; }
 	[ "${WINE64_MEM64:-0}" = 0 ] || MEDIA=0 ;;
-*) log "WINE64_MEDIA=$MEDIA (0 or lazy)"; exit 1 ;;
+*) log "WINE64_MEDIA=$MEDIA (lazy, the default, or off)"; exit 1 ;;
 esac
 if [ "$MEDIA" != 0 ]; then WGST=-wgf; B64_MODS="$B64_MODS --enable-winegstreamer"; else WGST=-nogst; fi
 S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/side-imports.py "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
