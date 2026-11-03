@@ -1541,8 +1541,8 @@ extern "C" fn rpty_close_end(id: i32, master: i32) {
     unsafe { k_pty_close_end(id, master, my_pid()) };
     pty_note("closes", id, master, my_pid());
 }
-extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    let r = unsafe { k_pty_read(id, master, at, len) };
+fn rpty_read(id: i32, master: i32, buf: &mut [u8]) -> i32 {
+    let r = unsafe { k_pty_read(id, master, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) };
     // End of file on the master is how a terminal emulator learns its shell is
     // gone -- and if it is wrong, the emulator kills the session. Worth saying.
     if r == 0 && master != 0 {
@@ -1550,8 +1550,8 @@ extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -
     }
     r
 }
-extern "C" fn rpty_write(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_pty_write(id, master, at, len) }
+fn rpty_write(id: i32, master: i32, buf: &[u8]) -> i32 {
+    unsafe { k_pty_write(id, master, buf.as_ptr() as gex_kernel::PAddr, buf.len() as u32) }
 }
 extern "C" fn rpty_readable(id: i32, master: i32) -> i32 {
     unsafe { k_pty_readable(id, master) }
@@ -1568,11 +1568,11 @@ extern "C" fn rpty_get_lock(id: i32) -> i32 {
 extern "C" fn rpty_set_lock(id: i32, locked: i32) {
     unsafe { k_pty_set_lock(id, locked) }
 }
-extern "C" fn rpty_get_termios(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_pty_get_termios(id, at, len) }
+fn rpty_get_termios(id: i32, buf: &mut [u8]) -> i32 {
+    unsafe { k_pty_get_termios(id, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) }
 }
-extern "C" fn rpty_set_termios(id: i32, at: gex_kernel::PAddr, len: u32, flush: i32) -> i32 {
-    unsafe { k_pty_set_termios(id, at, len, flush) }
+fn rpty_set_termios(id: i32, src: &[u8], flush: i32) -> i32 {
+    unsafe { k_pty_set_termios(id, src.as_ptr() as gex_kernel::PAddr, src.len() as u32, flush) }
 }
 extern "C" fn rpty_winsize(id: i32) -> u64 {
     unsafe { k_pty_winsize(id) }

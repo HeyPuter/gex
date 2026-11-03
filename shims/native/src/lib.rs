@@ -25,6 +25,7 @@ pub mod wasmprog;
 pub(crate) mod dylink;
 pub mod wasmdll;
 mod ready;
+mod pty;
 mod sys_waits;
 mod stall;
 pub(crate) mod ftab;
@@ -3441,6 +3442,10 @@ fn mount_filesystems(
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
+    // Pseudoterminals (`/dev/ptmx`, `/dev/pts`): a terminal emulator's
+    // shell. The pairs live in this host process (`pty.rs`).
+    devfs.add_pts(Arc::new(crate::pty::in_use));
+    kernel.ptys = Some(crate::pty::remote(Arc::clone(&kernel.procs)));
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
