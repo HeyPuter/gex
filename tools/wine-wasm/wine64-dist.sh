@@ -406,7 +406,8 @@ I386T=${WINE64_WOW64_I386_TRANSLATED:-0}
 N32=; NATIVE32=
 if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ] && [ "$I386T" = 0 ]; then
 	p32=$(make -s -C "$here" paths) || { log "make -C tools/wine-wasm paths failed"; exit 1; }
-	SR32=$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32"); DEPS32=$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")
+	# the caller's 32-bit Wine (GEX_WASM_SYSROOT, WINE32_DEPS: its `make paths`) before ours
+	SR32=${GEX_WASM_SYSROOT:-$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32")}; DEPS32=${WINE32_DEPS:-$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")}
 	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
 	B32K=$( { echo "$SR32 $DEPS32"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
 	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
