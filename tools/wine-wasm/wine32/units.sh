@@ -68,10 +68,6 @@ todo=$(mktemp); locks=$(mktemp -d); trap 'rm -f "$todo"; rm -rf "$locks"' EXIT
   sed -n 's/.*image \(\S*\) at base \(0x[0-9a-f]*\): no function-tier unit (key [0-9a-f]*\(-p[0-9a-f]*\)\?)/\1 \2 -/p' "$log"
   sed -n 's/^gex-\(w3\|wine32\): \(\/\S*\) at \(0x[0-9a-f]*\): no function-tier unit.*/\2 \3 -/p' "$log"; } |
   sort -u | awk '{ k = $1 " " $2 } $3 != "-" { named[k] = 1; print; next } { bare[k] = $0 " -" } END { for (k in bare) if (!(k in named)) print bare[k] }' > "$todo"
-# A run that named no image without a unit has no image unit to build, which
-# for a run made to find them is an error (its images ran without asking for
-# one: the function JIT took their code, say). The trampolines are still built.
-[ -s "$todo" ] || { echo "wine32/units: FAIL: $log names no image without a unit" >&2; touch "$locks/failed"; }
 # The flavour, per inputs id (a 64-bit Wine's WoW64 processes and its other
 # ones differ), from the first image of that id whose key the log names.
 declare -A flag=()
@@ -106,8 +102,8 @@ one() {
   exec {l}> "$locks/${p//\//_}-$b"; flock "$l"
   fl=${flag[$in]:-$any}
   f=$(file "$p")
-  [ -n "$f" ] || { echo "wine32/units: unmapped $p"; return; }
-  [ -f "$f" ] || { echo "wine32/units: missing $f ($p)"; return; }
+  [ -n "$f" ] || { echo "wine32/units: FAIL: unmapped $p" >&2; touch "$locks/failed"; return; }
+  [ -f "$f" ] || { echo "wine32/units: FAIL: missing $f ($p)" >&2; touch "$locks/failed"; return; }
   r=$(build "$f" "$b" ${fl#plain})
   if [ "$key" != - ] && [ ! -f "$U/$key/c.wasm" ]; then
     for o in plain --wine32-kuser --wine64-compact --mem64; do
