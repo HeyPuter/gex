@@ -56,9 +56,11 @@
 #               sysroot and libraries)
 #   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
 #               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
-#   dist64-...-nN[-N32|-i386t]  the install with the native PE side in place
+#   dist64-...-nN[-N32|-i386t]-sX  the install with the native PE side in place
 #               of the PE builtins, both arches (-i386t: WoW64's i386 side
-#               translated, WINE64_WOW64_I386_TRANSLATED=1): WINE64_DIST
+#               translated, WINE64_WOW64_I386_TRANSLATED=1), its modules
+#               stripped for release (X: stripnames.py; -dbg in place of -sX
+#               with WINE64_STRIP=0, names kept): WINE64_DIST
 #               (WINE64_NATIVE_PE=0: the install above, translated)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
@@ -460,6 +462,13 @@ native_make() {
 		n=${a#*:}; [ -n "$n" ] || continue
 		for f in "$n"/*; do [ -f "$f" ] || continue; rm -f "lib/wine/${a%%:*}-windows/${f##*/}"; cp -p "$f" "lib/wine/${a%%:*}-windows/"; done
 	done
+	# a release install's modules without the names gex never reads (and
+	# producers, debug info): gexcc-win's stripnames.py, as its programs'
+	if [ "$STRIP" != 0 ]; then
+		find lib/wine/x86_64-windows ${NATIVE32:+lib/wine/i386-windows} -maxdepth 1 -type f \( -name '*.wasm' -o -name '*.wasm.m64' \) -print0 |
+			xargs -0 -r -P"$J" -n 16 sh -c 'for f; do python3 "$0" "$f" "$f.s" && mv "$f.s" "$f" || exit 1; done' "$here/../gexcc/windows/stripnames.py" ||
+			{ log "stripnames failed"; return 1; }
+	fi
 	# no builtin runs translated: a PE image left with machine code fails the
 	# dist (WINE64_NATIVE_PARTIAL=1 keeps it, while a module is being ported).
 	# The i386 side under WINE64_WOW64_I386_TRANSLATED=1 is listed, not refused.
@@ -472,8 +481,12 @@ native_make() {
 		fi
 	fi
 }
+# WINE64_STRIP=0: the native modules keep their names, for a debug install
+# (its name gets -dbg)
+STRIP=${WINE64_STRIP:-1}
 if [ "$NPE" != 0 ]; then
 	NI=-n$NK${N32:+-$N32}; [ "$WOW" = 0 ] || [ "$I386T" = 0 ] || NI=$NI-i386t
+	if [ "$STRIP" = 0 ]; then NI=$NI-dbg; else NI=$NI-s$(sha256sum < "$here/../gexcc/windows/stripnames.py" | cut -c1-6); fi
 	log "native install ($K, $NK${N32:+, $N32}$([ "${NI%-i386t}" = "$NI" ] || echo ", i386 translated"))"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI native_make
 	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI
 fi
