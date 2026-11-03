@@ -156,6 +156,8 @@ pub mod call {
     pub const RELEASE: u8 = 7;
     pub const RELEASE_PID_FILE: u8 = 8;
     pub const RELEASE_PID: u8 = 9;
+    pub const WROTE: u8 = 10;
+    pub const WRITTEN: u8 = 11;
 }
 
 /// A call as bytes: op, owner (or key), pid, type (or flock op), start,
@@ -528,9 +530,50 @@ impl FileLocks {
                 self.release_pid(d.pid, None);
                 0
             }
+            call::WROTE => note_written(&d.file) as i64,
+            call::WRITTEN => written(&d.file) as i64,
             _ => -(Errno::EINVAL.0 as i64),
         }
     }
+}
+
+// -- write generations -------------------------------------------------------
+//
+// How many times any process has written a shared mapping's pages back to a
+// file (by path): what a mapping of it in another process compares with the
+// count it last read the file at, for a file whose filesystem keeps no change
+// count of its own (a host directory natively), so that taking a lock costs
+// a look at one number when nobody else wrote ([`crate::syscalls::sync_shared_file`]).
+// Natively one table for the whole run (every process is in this host
+// process); in the page the global kernel's ([`share_locks`]).
+
+static WRITES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// A process wrote mapped pages of `file` back: the file's generation now.
+pub fn note_written(file: &str) -> u64 {
+    if let Some(r) = FileLocks::remote() {
+        return (r.call)(&encode(call::WROTE, 0, 0, 0, 0, 0, file), &mut []).max(0) as u64;
+    }
+    let mut w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    match w.iter_mut().find(|(f, _)| f == file) {
+        Some((_, n)) => {
+            *n += 1;
+            *n
+        }
+        None => {
+            w.push((file.to_string(), 1));
+            1
+        }
+    }
+}
+
+/// How many times mapped pages of `file` have been written back (0: never).
+pub fn written(file: &str) -> u64 {
+    if let Some(r) = FileLocks::remote() {
+        return (r.call)(&encode(call::WRITTEN, 0, 0, 0, 0, 0, file), &mut []).max(0) as u64;
+    }
+    let w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    w.iter().find(|(f, _)| f == file).map_or(0, |(_, n)| *n)
 }
 
 fn remote_answer(v: i64) -> SysResult {

@@ -673,6 +673,10 @@ pub struct Kernel {
     /// An `rt_sigtimedwait` that waited (`BlockOp::SigWait`): its arguments,
     /// to take the signal with once one of its set is pending.
     pub retry_sigwait: Option<[u64; 6]>,
+    /// A lock request on this descriptor parked (`BlockOp::FileLock`): once
+    /// the host has granted it, the file's shared mappings are brought up
+    /// to date ([`sync_shared_file`]), as the call itself does.
+    pub retry_lock: Option<i32>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
     /// enters with `int 0x80`, and its numbering and structures are the i386
     /// ones (see `crate::i386`). Set at exec from the image's class,
@@ -4130,7 +4134,9 @@ impl MapIo<'_> {
                 self.retire_code_why(a[0], a[1], "munmap", 0);
                 flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
             }
-            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
+            // MS_INVALIDATE (2): and what other processes wrote back since
+            // read in ([`sync_shared_file`]).
+            nr::MSYNC => self.flush_shared(m, a[0], a[1]).and_then(|_| if a[2] & 2 != 0 { self.refresh_shared(m, a[0], a[1]) } else { Ok(()) }).map(|_| 0),
             nr::MREMAP => self.mremap(m, a),
             nr::MPROTECT => self.mprotect(m, a),
             nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
@@ -4408,6 +4414,7 @@ impl MapIo<'_> {
                 });
             }
             if shared {
+                let path_of_map = file.path.clone();
                 let changes = if before != 0 && file.handle.changes() == before { before } else { 0 };
                 let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
                 let pages = match kept {
@@ -4422,6 +4429,7 @@ impl MapIo<'_> {
                     holders: vec![(start, len_aligned)],
                     pages,
                     changes: Arc::new(std::sync::atomic::AtomicU64::new(changes)),
+                    seen: Arc::new(std::sync::atomic::AtomicU64::new(crate::locks::written(&path_of_map))),
                 });
             }
             return Ok(start);
@@ -4497,6 +4505,20 @@ impl MapIo<'_> {
         let _ = self.flush_shared(m, 0, u64::MAX);
     }
 
+    /// `msync(MS_INVALIDATE)`: the shared mappings over `[addr, addr + len)`
+    /// given what their files hold now where another process wrote back.
+    pub fn refresh_shared(&self, m: &mut GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
+        };
+        for map in maps {
+            refresh(m, &map, true)?;
+        }
+        Ok(())
+    }
+
     /// Write a shared mapping's bytes back to the file behind it.
     pub fn flush_shared(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
         let (lo, hi) = (addr, addr.saturating_add(len));
@@ -4509,75 +4531,7 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
-            // A mapping of a descriptor opened read-only has nothing to
-            // write back (Linux refuses it PROT_WRITE): its stores are
-            // the process's own, as Wine's relocations of an image view
-            // are. Writing them was EBADF, and failed the next mmap.
-            if !map.file.writable {
-                continue;
-            }
-            let from = map.start.max(lo);
-            let to = (map.start + map.len).min(hi);
-            // Only what the file holds: a shared mapping's page past the
-            // end of the file is not the file's (Linux never extends it).
-            let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
-            let (size, at_start) = match map.file.handle.metadata_changes() {
-                Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
-                Err(_) => (u64::MAX, 0),
-            };
-            let to = to.min(map.start + size.saturating_sub(map.offset));
-            // Whether `pages` stay the file's at a count (`SharedMap::changes`):
-            // only if nothing else changed the file since they were (the count
-            // has not moved), and after the writes below only if those were
-            // the only changes and every page written had its hash kept.
-            use std::sync::atomic::Ordering::AcqRel;
-            let mut writes = 0u64;
-            let mut exact = known != 0 && at_start == known;
-            // Only the pages that changed since the file last had them, in
-            // runs: another process's writes to the other pages stand.
-            const P: u64 = crate::mem::PAGE_SIZE;
-            let mut run: Option<u64> = None;
-            let mut page = (from - map.start) / P;
-            loop {
-                let ps = (map.start + page * P).max(from);
-                let changed = ps < to && {
-                    let pe = (map.start + (page + 1) * P).min(to);
-                    let whole = map.start + page * P;
-                    let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
-                    let slot = map.pages.get(page as usize);
-                    let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
-                    // A partial range writes back only its part, so the page's
-                    // hash is the file's only when the whole page went.
-                    if was != Some(h) {
-                        if ps == whole && pe == (whole + P).min(map.start + map.len) {
-                            if let Some(s) = slot {
-                                s.store(h, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else {
-                            exact = false;
-                        }
-                    }
-                    was != Some(h)
-                };
-                match (changed, run) {
-                    (true, None) => run = Some(ps),
-                    (false, Some(rs)) => {
-                        let at = map.offset + (rs - map.start);
-                        map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
-                        writes += 1;
-                        run = None;
-                    }
-                    _ => {}
-                }
-                if ps >= to {
-                    break;
-                }
-                page += 1;
-            }
-            if known != 0 {
-                let now = if exact && writes > 0 { map.file.handle.changes() } else { at_start };
-                let _ = map.changes.compare_exchange(known, if exact && now == at_start + writes { now } else { 0 }, AcqRel, std::sync::atomic::Ordering::Relaxed);
-            }
+            write_back(m, &map, lo, hi)?;
         }
         Ok(())
     }
@@ -7954,6 +7908,167 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
 // they need the descriptor table and nothing else of the kernel, so the full
 // call and any caller holding only the table run the same code.
 
+/// Write a shared mapping's changed pages over guest `[lo, hi)` back to its
+/// file ([`MapIo::flush_shared`]).
+fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(), Errno> {
+    // A mapping of a descriptor opened read-only has nothing to
+    // write back (Linux refuses it PROT_WRITE): its stores are
+    // the process's own, as Wine's relocations of an image view
+    // are. Writing them was EBADF, and failed the next mmap.
+    if !map.file.writable {
+        return Ok(());
+    }
+    let from = map.start.max(lo);
+    let to = (map.start + map.len).min(hi);
+    // Only what the file holds: a shared mapping's page past the
+    // end of the file is not the file's (Linux never extends it).
+    let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
+    let (size, at_start) = match map.file.handle.metadata_changes() {
+        Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
+        Err(_) => (u64::MAX, 0),
+    };
+    let to = to.min(map.start + size.saturating_sub(map.offset));
+    // Whether `pages` stay the file's at a count (`SharedMap::changes`):
+    // only if nothing else changed the file since they were (the count
+    // has not moved), and after the writes below only if those were
+    // the only changes and every page written had its hash kept.
+    use std::sync::atomic::Ordering::AcqRel;
+    let mut writes = 0u64;
+    let mut exact = known != 0 && at_start == known;
+    // Only the pages that changed since the file last had them, in
+    // runs: another process's writes to the other pages stand.
+    const P: u64 = crate::mem::PAGE_SIZE;
+    let mut run: Option<u64> = None;
+    let mut page = (from - map.start) / P;
+    loop {
+        let ps = (map.start + page * P).max(from);
+        let changed = ps < to && {
+            let pe = (map.start + (page + 1) * P).min(to);
+            let whole = map.start + page * P;
+            let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+            let slot = map.pages.get(page as usize);
+            let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+            // A partial range writes back only its part, so the page's
+            // hash is the file's only when the whole page went.
+            if was != Some(h) {
+                if ps == whole && pe == (whole + P).min(map.start + map.len) {
+                    if let Some(s) = slot {
+                        s.store(h, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    exact = false;
+                }
+            }
+            was != Some(h)
+        };
+        match (changed, run) {
+            (true, None) => run = Some(ps),
+            (false, Some(rs)) => {
+                let at = map.offset + (rs - map.start);
+                map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
+                writes += 1;
+                run = None;
+            }
+            _ => {}
+        }
+        if ps >= to {
+            break;
+        }
+        page += 1;
+    }
+    if known != 0 {
+        let now = if exact && writes > 0 { map.file.handle.changes() } else { at_start };
+        let _ = map.changes.compare_exchange(known, if exact && now == at_start + writes { now } else { 0 }, AcqRel, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Other processes' mappings of the file see that it changed; this one's
+    // stays up to date with it unless somebody else wrote back meanwhile.
+    if writes > 0 {
+        let was = map.seen.load(std::sync::atomic::Ordering::Acquire);
+        let now = crate::locks::note_written(&map.file.path);
+        if now == was + 1 {
+            map.seen.store(now, std::sync::atomic::Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+/// What `map`'s file now holds where its pages differ from what they were
+/// last read or written back as (another process wrote them back), into
+/// the mapping: a page whose hash still matches is left as it is, this
+/// process's own stores in it included. Nothing to read when the file's
+/// change count is still the one the pages were the file's at.
+fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool) -> Result<(), Errno> {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let (md, now) = map.file.handle.metadata_changes()?;
+    let written = if now == 0 { crate::locks::written(&map.file.path) } else { 0 };
+    if !force && (if now != 0 { map.changes.load(Acquire) == now } else { map.seen.load(Acquire) == written }) {
+        return Ok(());
+    }
+    const P: u64 = crate::mem::PAGE_SIZE;
+    // Only what the file holds (a page past its end is not the file's).
+    let held = map.len.min(md.size.saturating_sub(map.offset));
+    let mut buf = vec![0u8; P as usize];
+    let mut page = 0u64;
+    while page * P < held {
+        let in_map = P.min(map.len - page * P) as usize;
+        let in_file = P.min(held - page * P) as usize;
+        buf[..in_map].fill(0);
+        let mut got = 0;
+        while got < in_file {
+            match map.file.handle.read_at(map.offset + page * P + got as u64, &mut buf[got..in_file])? {
+                0 => break,
+                n => got += n as usize,
+            }
+        }
+        let h = page_hash(&buf[..in_map]);
+        let slot = map.pages.get(page as usize);
+        if slot.map(|s| s.load(Relaxed)) != Some(h) {
+            m.write(map.start + page * P, &buf[..in_map])?;
+            if let Some(s) = slot {
+                s.store(h, Relaxed);
+            }
+        }
+        page += 1;
+    }
+    map.changes.store(now, Release);
+    map.seen.store(written, Release);
+    Ok(())
+}
+
+/// Make this process's shared mappings of `file` and the file agree, at a
+/// point where programs synchronise across processes (a lock taken or
+/// given up on it, `msync(MS_INVALIDATE)`): its changed pages written back,
+/// then what other processes wrote back read in. A mapping is a copy per
+/// process (separate memories), so this, not every access, is where two
+/// processes' mappings meet -- which is where SQLite's WAL index, and
+/// anything else that locks around shared memory, looks for each other's
+/// writes. One empty-list test when the process maps nothing shared.
+pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync) {
+    let Some(view) = shared else { return };
+    let maps = view.get();
+    if maps.is_empty() || file.handle.is_stream() {
+        return;
+    }
+    for map in maps.iter().filter(|s| s.file.same_file(file)) {
+        if sync != MapSync::Acquire {
+            let _ = write_back(m, map, 0, u64::MAX);
+        }
+        if sync != MapSync::Release {
+            let _ = refresh(m, map, false);
+        }
+    }
+}
+
+/// Which way a lock call synchronises a process's shared mappings with
+/// other processes' ([`sync_shared_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapSync {
+    /// A lock taken: what others wrote back comes in.
+    Acquire,
+    /// A lock given up: this process's stores go out.
+    Release,
+}
+
 // -- coherence with shared file mappings ------------------------------------
 //
 // A `MAP_SHARED` mapping is an eager copy of the file, written back at
@@ -8656,6 +8771,11 @@ pub struct SharedMap {
     /// same range take `pages` rather than hash it again
     /// ([`SharedMaps::recall`]).
     pub changes: Arc<std::sync::atomic::AtomicU64>,
+    /// The file's write generation ([`crate::locks::written`]) its pages
+    /// were last brought up to date at, for a file whose filesystem keeps
+    /// no count (`changes` 0): what [`sync_shared_file`] compares to know
+    /// that no other process has written it back since.
+    pub seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Page hashes of a file range a shared mapping held, kept past its
@@ -8821,6 +8941,7 @@ impl SharedMaps {
             .map(|s| SharedMap {
                 pages: s.pages.iter().map(|h| AtomicU64::new(h.load(Ordering::Relaxed))).collect(),
                 changes: Arc::new(AtomicU64::new(s.changes.load(Ordering::Relaxed))),
+                seen: Arc::new(AtomicU64::new(s.seen.load(Ordering::Relaxed))),
                 ..s.clone()
             })
             .collect();
@@ -8861,7 +8982,7 @@ impl SharedMaps {
             .collect::<Option<Arc<[std::sync::atomic::AtomicU64]>>>()?;
         // The count is not carried: the child's hashes are taken as unknown
         // against the file's count, and its next mapping hashes afresh.
-        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default() });
+        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default(), seen: Default::default() });
         Some(())
     }
 
@@ -8992,6 +9113,7 @@ pub struct PendingCall {
     pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
     pub retry_sigwait: Option<[u64; 6]>,
+    pub retry_lock: Option<i32>,
     /// The parked call's restart class and its syscall's return pc
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
@@ -9053,6 +9175,7 @@ impl Kernel {
             retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
             retry_sigwait: self.retry_sigwait.take(),
+            retry_lock: self.retry_lock.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
         };
@@ -9066,6 +9189,7 @@ impl Kernel {
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
         self.retry_sigwait = call.retry_sigwait;
+        self.retry_lock = call.retry_lock;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
@@ -9193,6 +9317,7 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             retry_sigwait: None,
+            retry_lock: None,
             started: 0,
             pins: Default::default(),
             place: None,
@@ -9572,6 +9697,7 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             retry_sigwait: None,
+            retry_lock: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             // The layout a closure build assumed holds in every process of
@@ -10095,7 +10221,11 @@ impl Kernel {
         if n == nr::FUTEX {
             return self.lock_pi_op(m, a);
         }
-        self.fd_io().eagain_park(m, n, a)
+        let op = self.fd_io().eagain_park(m, n, a);
+        if matches!(op, Some(BlockOp::FileLock { .. })) {
+            self.retry_lock = Some(a[0] as i32);
+        }
+        op
     }
 
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
@@ -10304,6 +10434,11 @@ impl Kernel {
             Some(a) if r.is_ok() => sigtimedwait(&self.signals, m, self.compat, a),
             _ => r,
         };
+        if let (Some(fd), Ok(_)) = (self.retry_lock.take(), &r) {
+            if let Ok(file) = self.fds.get(fd) {
+                sync_shared_file(Some(self.mem.shared_maps()), m, &file, MapSync::Acquire);
+            }
+        }
         // A wait a signal ended that Linux would restart (signal(7)): the
         // handler runs, then the call again ([`restart_call`]).
         let class = std::mem::replace(&mut self.block_restart, crate::signal::Restart::Never);
@@ -10980,11 +11115,12 @@ impl FdIo<'_> {
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open. Held in the way, a blocking
     /// request parks ([`FdIo::lock_park`]).
-    pub fn flock(&self, _m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
+    pub fn flock(&self, m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
         let file = self.fds.get(fd)?;
         let r = self.file_locks.flock(&file.path, file.lock_key(), op);
         if r.is_ok() {
             file.note_locks(self.file_locks);
+            sync_shared_file(self.shared, m, &file, if op & crate::locks::lock_op::UN != 0 { MapSync::Release } else { MapSync::Acquire });
         }
         r
     }
@@ -11092,6 +11228,7 @@ impl FdIo<'_> {
                 crate::locks::Owner::Desc(_) => file.note_locks(self.file_locks),
             }
         }
+        sync_shared_file(self.shared, m, &file, if *typ == lk::UNLCK { MapSync::Release } else { MapSync::Acquire });
         Ok(0)
     }
 
@@ -15628,8 +15765,8 @@ mod tests {
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         assert!(view.of(&a).is_none());
-        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default() });
-        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default() });
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default(), seen: Default::default() });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() });
         let held = view.get();
         assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
         assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
