@@ -3673,7 +3673,9 @@ export class Gex {
     if (!o.fjit || !e.gex_set_fjit) return;
     e.gex_set_fjit(o.fjit === 2 ? 2 : 1);
     if (o.fjitMax != null || o.fjitOnly) e.gex_fjit_limit?.(o.fjitMax ?? 0xffffffff, BigInt(o.fjitOnly ?? 0));
-    if (!(this.#cgenMode & 3)) this.useCgen(this.#cgenMode | 1);
+    // Units for the JIT's sake alone: an image without one is said only
+    // under GEX_LOG=unit (bit 5 quiets it otherwise).
+    if (!(this.#cgenMode & 3)) this.useCgen(this.#cgenMode | 1 | (logOn('unit') ? 0 : 32));
   }
 
   #childOpts(e, o, pid) {

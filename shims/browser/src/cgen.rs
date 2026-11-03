@@ -585,6 +585,9 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 16 != 0 {
         gex_cgen::image::set_icall_count(true);
     }
+    // Bit 5 (32): units on only because the function JIT is (no `cgen=`):
+    // an image without one says nothing.
+    QUIET_MISS.store(mode & 32 != 0, Ordering::Relaxed);
     let mut mode = mode & 3;
     if mode != 0 && TSO.load(Ordering::Relaxed) {
         tso_refuses_units();
@@ -1173,6 +1176,10 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
     units.get(u as usize).map_or(0, |x| put_str(&x.path, buf, cap))
 }
 
+/// Units are on only for the function JIT's sake (`gex_cgen_set_mode` bit 5):
+/// a missing one is no news.
+static QUIET_MISS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// JS has no unit for `u`: the image runs on tier-1. Under `--cgen` a program
 /// image (not a Wine DLL) without one is refused: returns 1, and JS stops.
 #[no_mangle]
@@ -1186,6 +1193,9 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
             x.path, x.base, x.key
         ));
         return 1;
+    }
+    if QUIET_MISS.load(Ordering::Relaxed) {
+        return 0;
     }
     // A unit gexc builds apart from any image (the NT trampolines: every
     // system call and Unix call goes through them): no "unitless" image
