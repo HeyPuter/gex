@@ -725,6 +725,40 @@ pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     })
 }
 
+/// A whole module loaded as it is (Wine's native PE modules and their core,
+/// a library provider), compiled once and kept in the shared cache
+/// ([`cache_dir`], under its budget and eviction, stored by temp file and
+/// rename) by its content and the engine's configuration
+/// ([`module_key`]): never beside the module's file, which may be another
+/// install's, read through a link. With [`precompiled_dir`] set (an ejected
+/// project), or without a compiler, as [`compile`].
+pub fn load_or_compile_module(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    let (Some(dir), Some(key)) = (cache_dir().filter(|_| precompiled_dir().is_none()), module_key(engine, wasm)) else {
+        return compile(engine, wasm);
+    };
+    memo(engine, wasm.len(), || format!("mod:{key}"), || {
+        Ok(load_or_compile(engine, &dir, &key, || Ok((wasm.to_vec(), Vec::new())))?.module)
+    })
+}
+
+/// [`load_or_compile_module`]'s key: the module's bytes and the engine's
+/// precompile compatibility (what `deserialize` checks), so engines of two
+/// configurations (a 64-bit memory's, a wasm32 one's) keep an entry each
+/// rather than recompiling over each other's. None without a compiler.
+#[cfg(feature = "compile")]
+pub fn module_key(engine: &Engine, wasm: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut h);
+    let e = h.finish().to_le_bytes();
+    Some(key_memo("module", [wasm, &e[..]]))
+}
+
+#[cfg(not(feature = "compile"))]
+pub fn module_key(_engine: &Engine, _wasm: &[u8]) -> Option<String> {
+    None
+}
+
 #[cfg(feature = "compile")]
 fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     // `GEX_COMPILE_TRACE`: every compile here, its size and time, and who
