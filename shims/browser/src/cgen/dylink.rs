@@ -15,22 +15,28 @@
 //! A binding list is one line per import, tab-separated:
 //!   `S mod name`            the Worker's own (memory, table, bases, stack
 //!                           pointer, asyncify globals, `gex.*`);
-//!   `G mod name value mut [64]`  a global (`GOT.mem`, `GOT.func`, a missing
+//!   `G mod name #value mut [64]`  a global (`GOT.mem`, `GOT.func`, a missing
 //!                           one: 0), `i64` with the `64` column (a wasm64 module);
-//!   `E mod name module export at`  provider module `module`'s export
-//!                           `export`; `at` is its table slot (a function),
-//!                           `g` and its value (a constant global) or `-`,
-//!                           for a module whose exports the page packed;
-//!   `L mod name slot [sig]` a function through table slot `slot` (a module
+//!   `E mod name #module export at`  provider module `module`'s export
+//!                           `export`; `at` is `s` and its table slot (`#slot`,
+//!                           a function), `g` and its value (a constant
+//!                           global) or `-`, for a module whose exports the
+//!                           page packed;
+//!   `L mod name #slot [sig]` a function through table slot `slot` (a module
 //!                           instantiated after this one), of type `sig`
 //!                           (`Info::sigs`) when it has one the page can write;
 //!   `M mod name message`    a function that throws `message`;
-//! then `X slot export` per table slot past the element segment to fill
+//! then `X #slot export` per table slot past the element segment to fill
 //! with an export after instantiation (or, packed, by an element segment
 //! the page adds), and, for a `dlopen`ed module with
 //! thread-local data, `T size align`: each Worker gives it a block of its
 //! own as it instantiates it (`__wasm_init_tls`), libc's registry having
 //! laid out only the blocks of the modules the program started with.
+//! A `#` column is empty: its number, which depends on where this process
+//! loaded the modules, is in the last line, `V` and the numbers in the
+//! lines' order, comma-separated. The rest is the same for a module in every
+//! process that binds it alike, so the page parses it once
+//! (gex.mjs `bindPlan`).
 //!
 //! A fork's child gets the link map as text (`gex_wasmprog_link`, put back
 //! with `gex_wasmprog_adopt_link`): it reads the same files and publishes
@@ -53,6 +59,27 @@ struct DyProc {
 }
 
 static DYPROC: Mutex<Option<DyProc>> = Mutex::new(None);
+
+/// A binding list's `#` columns, in order: its `V` line.
+#[derive(Default)]
+struct Vals(String);
+
+impl Vals {
+    fn push(&mut self, v: impl std::fmt::Display) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(',');
+        }
+        let _ = write!(self.0, "{v}");
+    }
+    fn end(self, text: &mut String) {
+        if !self.0.is_empty() {
+            text.push_str("V\t");
+            text.push_str(&self.0);
+            text.push('\n');
+        }
+    }
+}
 /// Binding lists, by provider module number.
 static BINDS: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
 thread_local! {
@@ -198,33 +225,48 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             entry_bridges(&pairs.iter().map(|&(a, _)| a).collect::<Vec<_>>())
         };
         let mut text = String::new();
+        let mut vals = Vals::default();
         for (imp, b) in m.info.imports.iter().zip(binds) {
             let (mo, na) = (&imp.module, &imp.name);
             let line = match b {
                 Bind::Shim => format!("S\t{mo}\t{na}"),
-                Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
+                Bind::GotMem(v) | Bind::GotFunc(v) => {
+                    vals.push(v);
+                    format!("G\t{mo}\t{na}\t\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" })
+                }
                 // and where the page finds it when the module's exports
                 // are packed (gex.mjs `packExports`): a function's table
                 // slot, a constant global's value
                 Bind::Export { module, name } => {
                     let d = &p.link.mods[module];
+                    vals.push(p.module_of[module]);
                     let at = match d.info.exports.get(&name) {
-                        Some(x) if x.kind == Kind::Func => d.info.slots().1.get(&x.index).map(|s| (d.table_base + s).to_string()),
+                        Some(x) if x.kind == Kind::Func => d.info.slots().1.get(&x.index).map(|s| {
+                            vals.push(d.table_base + s);
+                            "s".to_string()
+                        }),
                         Some(x) if x.kind == Kind::Global && x.index >= d.info.global_imports => d.info.global_init
                             .get((x.index - d.info.global_imports) as usize)
                             .copied()
                             .flatten()
                             .map(|v| format!("g{}", v as i32)),
                         _ => None,
-                    };
-                    format!("E\t{mo}\t{na}\t{}\t{name}\t{}", p.module_of[module], at.as_deref().unwrap_or("-"))
+                    }
+                    .unwrap_or_else(|| "-".to_string());
+                    format!("E\t{mo}\t{na}\t\t{name}\t{at}")
                 }
                 // and the import's type, which the page calls the slot with
-                Bind::Late { slot } => match m.info.sigs.get(imp.ty as usize).cloned().flatten() {
-                    Some(sig) => format!("L\t{mo}\t{na}\t{slot}\t{sig}"),
-                    None => format!("L\t{mo}\t{na}\t{slot}"),
-                },
-                Bind::Missing(_) if imp.kind == Kind::Global => format!("G\t{mo}\t{na}\t0\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" }),
+                Bind::Late { slot } => {
+                    vals.push(slot);
+                    match m.info.sigs.get(imp.ty as usize).cloned().flatten() {
+                        Some(sig) => format!("L\t{mo}\t{na}\t\t{sig}"),
+                        None => format!("L\t{mo}\t{na}\t"),
+                    }
+                }
+                Bind::Missing(_) if imp.kind == Kind::Global => {
+                    vals.push(0);
+                    format!("G\t{mo}\t{na}\t\t{}{}", imp.ty, if imp.wide { "\t64" } else { "" })
+                }
                 Bind::Missing(msg) => {
                     let msg = if msg.is_empty() { format!("{}: undefined weak symbol {na} called", m.path) } else { msg };
                     format!("M\t{mo}\t{na}\tsymbol lookup error: {}", msg.replace(['\t', '\n'], " "))
@@ -234,11 +276,13 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             text.push('\n');
         }
         for (s, n) in m.info.extra_slots() {
-            text.push_str(&format!("X\t{}\t{n}\n", m.table_base + s));
+            vals.push(m.table_base + s);
+            text.push_str(&format!("X\t\t{n}\n"));
         }
         if let Some((size, align)) = dl_tls(m, i >= p.startup)? {
             text.push_str(&format!("T\t{size}\t{align}\n"));
         }
+        vals.end(&mut text);
         let number = {
             let mut provs = lock(&PROVIDERS);
             provs.push(ProviderModule { file: format!("wasmprog:{}", m.path), regs, dirs, slots, memory_base: m.memory_base as u64 });
@@ -307,7 +351,7 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
         .unwrap_or_default();
     let origin = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| ".".into());
     let mut p = DyProc {
-        link: Link { mods: vec![Loaded { name: path.clone(), path: path.clone(), info, memory_base: mem_base, table_base: 0 }] },
+        link: Link { mods: vec![Loaded { name: path.clone(), path: path.clone(), info, memory_base: mem_base, table_base: 0 }], ..Default::default() },
         module_of: Vec::new(),
         ldpath,
         origin,
@@ -339,20 +383,26 @@ pub(super) fn static_program(info: Option<&Info>, elem_len: u32) -> u32 {
 pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base: u32, mem_base: u32) {
     let Some(info) = info else { return };
     let mut text = String::new();
+    let mut vals = Vals::default();
     // undefined weak symbols: null, as ELF leaves them (a strong one stays
     // an import nothing gives, and instantiating says so)
     for (mo, na, b, wide) in info.static_weak_binds().unwrap_or_default() {
         text.push_str(&match b {
-            Bind::GotMem(v) | Bind::GotFunc(v) => format!("G\t{mo}\t{na}\t{v}\t1{}\n", if wide { "\t64" } else { "" }),
+            Bind::GotMem(v) | Bind::GotFunc(v) => {
+                vals.push(v);
+                format!("G\t{mo}\t{na}\t\t1{}\n", if wide { "\t64" } else { "" })
+            }
             _ => format!("M\t{mo}\t{na}\tsymbol lookup error: {path}: undefined weak symbol {na} called\n"),
         });
     }
     for (s, n) in info.extra_slots() {
-        text.push_str(&format!("X\t{}\t{n}\n", base + s));
+        vals.push(base + s);
+        text.push_str(&format!("X\t\t{n}\n"));
     }
+    vals.end(&mut text);
     lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
     *lock(&DYPROC) = Some(DyProc {
-        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }] },
+        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }], ..Default::default() },
         module_of: vec![number],
         ldpath: Vec::new(),
         origin: String::new(),

@@ -812,6 +812,15 @@ pub fn translate(
             *a = [sext(a[0]), pair(a[1], a[2]), 0, 0, 0, 0];
             nr::FTRUNCATE
         }
+        // The length a signed 32-bit off_t, or the pair truncate64 passes.
+        x::TRUNCATE => {
+            a[1] = sext(a[1]);
+            nr::TRUNCATE
+        }
+        x::TRUNCATE64 => {
+            *a = [a[0], pair(a[1], a[2]), 0, 0, 0, 0];
+            nr::TRUNCATE
+        }
         x::PREAD64 => {
             *a = [sext(a[0]), a[1], a[2], pair(a[3], a[4]), 0, 0];
             nr::PREAD64
@@ -1162,7 +1171,7 @@ pub fn translate(
             nr::FSTATFS
         }
         x::STATFS | x::FSTATFS => UNKNOWN,
-        x::TRUNCATE | x::TRUNCATE64 | x::GETDENTS => UNKNOWN,
+        x::GETDENTS => UNKNOWN,
         _ => UNKNOWN,
     };
     (n, post)

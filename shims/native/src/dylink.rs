@@ -123,7 +123,7 @@ fn publish(
     p: &mut DyProcess,
     from: usize,
     bytes: Vec<Vec<u8>>,
-    pairs_of: impl Fn(usize, &Loaded, &HashMap<u32, u32>) -> Vec<(u64, u32)>,
+    pairs_of: impl Fn(usize, &Loaded, &gex_dylink::HashMap<u32, u32>) -> Vec<(u64, u32)>,
 ) -> Result<Vec<usize>> {
     // data, where its own mmap would put it (the program's is its image's)
     for m in p.link.mods[from..].iter_mut() {
@@ -228,7 +228,7 @@ pub(crate) fn install_program(
         .unwrap_or_default();
     let origin = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| ".".into());
     let mut p = DyProcess {
-        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base as u32, table_base: 0 }] },
+        link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base as u32, table_base: 0 }], ..Default::default() },
         module_of: Vec::new(),
         ldpath,
         origin,
