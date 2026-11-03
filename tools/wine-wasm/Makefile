@@ -32,6 +32,7 @@
 #              (wine32/launch.c; default clang --target=i686-w64-mingw32
 #              -fuse-ld=lld, which needs MinGW-w64's i686 headers and libraries)
 #   WINE32_JOBS    parallel jobs (default 12); everything runs under nice -n 19
+#   WINE32_STRIP   0: the dist's PE modules keep their names (a debug dist, -dbg)
 
 WINE32 := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT := $(abspath $(WINE32)/../..)
@@ -108,7 +109,14 @@ export WINE_ICU
 # WINE_GSTREAMER=1: the dist keeps winegstreamer, which it otherwise leaves out.
 WINE_GSTREAMER ?= 0
 export WINE_GSTREAMER
-DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))$(if $(filter 1,$(WINE_WIN16)),,-no16)$(if $(filter 1,$(WINE_ICU)),,-noicu)$(if $(filter 1,$(WINE_GSTREAMER)),,-nogst)
+# A release dist's PE modules (i386-windows/*.wasm) are without the names gex
+# never reads (and producers, debug info): gexcc-win's stripnames.py, as
+# wine64-dist.sh's are. The key gets -s<its hash>. WINE32_STRIP=0 keeps the
+# names, for a debug dist (-dbg).
+WINE32_STRIP ?= 1
+STRIPNAMES := $(WINE32)/../gexcc/windows/stripnames.py
+STRIP_KEY := $(if $(filter 0,$(WINE32_STRIP)),-dbg,-s$(shell sha256sum < $(STRIPNAMES) | cut -c1-6))
+DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(WINE32_TLS)),-notls)$(if $(filter 0,$(WINE32_MONO)),,-mono$(WINE_MONO_VERSION))$(if $(filter 1,$(WINE_WIN16)),,-no16)$(if $(filter 1,$(WINE_ICU)),,-noicu)$(if $(filter 1,$(WINE_GSTREAMER)),,-nogst)$(STRIP_KEY)
 DIST := $(C)/dist-$(DIST_KEY)
 BARE := $(C)/pfx-bare-$(DIST_KEY)
 INSTALLED := $(C)/pfx-installed-$(DIST_KEY)
@@ -176,6 +184,8 @@ $(DIST)/.done: $(BUILD)/.done-$(WINE_ID) $(GL_O)
 	rm -rf $(DIST).fon && JOBS=$(WINE32_JOBS) $(NICE) $(WINE32)/wine-fon.sh $(WINE_SRC) $(TOOLS)/include $(C)/dl $(DIST).fon
 	mv $(DIST).fon/*.fon $(DIST).tmp/share/wine/fonts/ && rmdir $(DIST).fon
 	$(if $(filter 0,$(WINE32_MONO)),,$(WINE32)/wine32/mono.sh $(C)/dl $(DIST).tmp)
+	$(if $(filter 0,$(WINE32_STRIP)),,find $(DIST).tmp/lib/wine/i386-windows -maxdepth 1 -type f -name '*.wasm' -print0 | \
+	  xargs -0 -r -P$(WINE32_JOBS) -n 16 sh -c 'for f; do python3 "$$0" "$$f" "$$f.s" && mv "$$f.s" "$$f" || exit 1; done' $(STRIPNAMES))
 	rm -rf $(DIST) $(BARE) && mv $(BARE).tmp $(BARE) && mv $(DIST).tmp $(DIST)
 	@echo "$(DIST_KEY) wine=$(WINE_ID) musl=$(MUSL_COMMIT) src=$(WINE_SRC)" > $(DIST)/.wine32-build
 	touch $@
