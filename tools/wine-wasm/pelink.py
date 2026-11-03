@@ -1256,6 +1256,14 @@ static void *gexw_ntdll_proc(const char *name)
             if not g:
                 for n in sorted(KEEP_EXPORTS):
                     f.write(f'--export-if-defined={n}\n')
+            # PELINK_EXPORTS=FILE: the DLL!name entries it lists (one a line,
+            # those of this module's DLLs), for modules linked later that call
+            # them (a site's gexcc programs: their imports)
+            if os.environ.get('PELINK_EXPORTS'):
+                for line in open(os.environ['PELINK_EXPORTS']):
+                    n = line.strip()
+                    if '!' in n and grp(n.split('!', 1)[0]) == g:
+                        f.write(f'--export-if-defined={n}\n')
             # PELINK_EXPORT_ALL=1: every export of its DLLs, for modules
             # linked later against this one (gexcc's Windows programs: their
             # imports are whatever their code calls)

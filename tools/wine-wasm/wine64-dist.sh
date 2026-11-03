@@ -357,8 +357,24 @@ if [ -z "${WINE64_NATIVE_DLLS:-}" ] && [ "$NPE" != 0 ] && { [ "$M64" = 0 ] || [ 
 fi
 SP=${WINE64_SPLIT_DLLS:-}
 SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || { [ "$M64" != 0 ] && [ "$M64N" = 0 ]; } || SPA=all
-# PELINK_EXPORT_ALL changes the core (every DLL export), so it is part of the key
-NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}${PELINK_EXPORT_ALL:+ export-all}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+# WINE64_EXPORT_ALL (default 1): each core (both arches) exports every
+# export of its DLLs, so that a program linked later against the install
+# (gexcc-win's, whose imports are DLL!name) finds whatever it calls.
+# WINE64_EXPORT_ALL=0: only what the install's own modules need, plus with
+# WINE64_EXPORTS=FILE the DLL!name lines it lists (a site's programs'
+# imports). Either changes the cores, so it is part of their keys.
+XK=
+if [ "${WINE64_EXPORT_ALL:-1}" != 0 ]; then
+	export PELINK_EXPORT_ALL=1; unset PELINK_EXPORTS; XK=" export-all"
+else
+	unset PELINK_EXPORT_ALL PELINK_EXPORTS
+	if [ -n "${WINE64_EXPORTS:-}" ]; then
+		[ -f "$WINE64_EXPORTS" ] || { log "no WINE64_EXPORTS file $WINE64_EXPORTS"; exit 1; }
+		PELINK_EXPORTS=$(realpath "$WINE64_EXPORTS"); export PELINK_EXPORTS
+		XK=" exports $(sort -u "$PELINK_EXPORTS" | sha256sum | cut -c1-10)"
+	fi
+fi
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
@@ -418,7 +434,7 @@ if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
 	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C tools/wine-wasm build"; exit 1; }
 	B32K=$( { echo "$SR32 $DEPS32"; cat "$here"/wine32/wine-build.sh "$here"/wcc; } | sha256sum | cut -c1-10)
 	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
-	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 	NATIVE32=$C/pen32-$K-$N32/native
 fi
 b32_build() {
