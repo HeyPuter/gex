@@ -1111,11 +1111,12 @@ fn alloc_pe_data_window(low: &mut u64, size: u64, name: &str) -> Result<u64, Str
     }
     let at = hi - len;
     *low = at;
-    let a = crate::sigs::proc_home()
-        .mm()
-        .lock()
-        .mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, name)
-        .map_err(|e| format!("mapping {name} at {at:#x}: errno {}", e.0))?;
+    let a = {
+        let mut mm = crate::sigs::proc_home().mm().lock();
+        let a = mm.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, name).map_err(|e| format!("mapping {name} at {at:#x}: errno {}", e.0))?;
+        mm.note_host_data(a, a + len);
+        a
+    };
     if let Some(b) = crate::guest_bytes().get_mut(a as usize..(a + len) as usize) {
         b.fill(0);
     }

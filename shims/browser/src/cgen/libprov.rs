@@ -184,7 +184,12 @@ fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     // Zeroed, as a guest's anonymous mapping is: a Windows space places by
     // first fit, so the range may be one Wine's own mappings used.
     let mut gm = GuestMem::new(crate::guest_bytes());
-    crate::sigs::proc_home().mm().mmap_anon(&mut gm, 0, len, prot, 0, true, name).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    let mm = crate::sigs::proc_home().mm();
+    let at = mm.mmap_anon(&mut gm, 0, len, prot, 0, true, name).map_err(|e| format!("mapping {name}: errno {}", e.0))?;
+    if prot & gex_kernel::mem::prot::WRITE != 0 {
+        mm.lock().note_host_data(at, at + len);
+    }
+    Ok(at)
 }
 
 /// A forked child's copy of the mapping [`alloc_low`] made in its parent

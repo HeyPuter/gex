@@ -787,7 +787,7 @@ fn install_module(
     let data = if alt {
         crate::libprov::alloc_below_2g(state, (size as u64).max(16) + a, "[wine PE data]")?
     } else if is64 {
-        crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
+        crate::libprov::alloc_above_code_data(state, (size as u64).max(16) + a, "[wine PE data]")?
     } else {
         crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?
     };

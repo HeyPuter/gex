@@ -154,7 +154,14 @@ pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64>
 fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     use gex_kernel::mem::prot;
     let len = (size + 0xfff) & !0xfff;
-    map_anon(state, 0, len, prot::READ | prot::WRITE, 0, false, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
+    let at = map_anon(state, 0, len, prot::READ | prot::WRITE, 0, false, name).map_err(|e| anyhow!("mapping {name}: errno {}", e.0))?;
+    note_host_data(state, at, len);
+    Ok(at)
+}
+
+/// Note a native module's memory for Wine's views (`MemoryMap::note_host_data`).
+pub(crate) fn note_host_data(state: &mut HostState, at: u64, len: u64) {
+    state.with_kernel(|k| k.mem.lock().note_host_data(at, at + len));
 }
 
 /// An anonymous mapping for the host's own use, zeroed as a guest's is
@@ -201,11 +208,19 @@ pub(crate) fn alloc_below_2g(state: &mut HostState, size: u64, name: &str) -> Re
     let mut at = (gex_abi::KUSER_WINDOWS.saturating_sub(len)) & !0xffff;
     while at >= FLOOR {
         if let Ok(a) = map_anon(state, at, len, prot::READ | prot::WRITE, flags::FIXED_NOREPLACE, false, name) {
+            note_host_data(state, a, len);
             return Ok(a);
         }
         at -= STEP;
     }
     bail!("mapping {name}: no {len:#x} bytes free in [{FLOOR:#x}, {:#x})", gex_abi::KUSER_WINDOWS)
+}
+
+/// [`alloc_above_code`] for a native module's data, noted for Wine's views.
+pub(crate) fn alloc_above_code_data(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    let at = alloc_above_code(state, size, name)?;
+    note_host_data(state, at, (size + 0xffff) & !0xffff);
+    Ok(at)
 }
 
 /// A provider's code region: its thread entry at 0, the return addresses
@@ -545,6 +560,22 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // LdrFindEntryForAddress, when no image holds the address).
     linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::IMAGE_OF, |caller: Caller<'_, HostState>, addr: i64| -> i64 {
         caller.data().jit.as_ref().map_or(0, |j| crate::wasmdll::image_of(&j.shared, addr as u64) as i64)
+    })?;
+    // The memory gex mapped for native modules (their data, heaps,
+    // stacks) from the `from`th on, as (start, end) u32 pairs at `out`, at
+    // most `max`: how many there are in all. Wine's ntdll makes a view of
+    // each (`MemoryMap::note_host_data`).
+    linker.func_wrap(IMPORT_MODULE, "host_data", |mut caller: Caller<'_, HostState>, from: i32, out: i32, max: i32| -> i32 {
+        let ranges = caller.data_mut().with_kernel(|k| k.mem.lock().host_data().to_vec());
+        let Some(m) = caller.data().memory.clone() else { return 0 };
+        let b = m.bytes();
+        for (i, &(lo, hi)) in ranges.iter().skip(from as u32 as usize).take(max as u32 as usize).enumerate() {
+            let at = out as u32 as usize + i * 8;
+            let Some(dst) = b.get_mut(at..at + 8) else { break };
+            dst[..4].copy_from_slice(&(lo as u32).to_le_bytes());
+            dst[4..].copy_from_slice(&(hi.min(0xffff_ffff) as u32).to_le_bytes());
+        }
+        ranges.len() as i32
     })?;
     // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
     // address against it at start; the browser's `gex_kuser_address`).
