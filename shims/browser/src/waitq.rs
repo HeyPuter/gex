@@ -124,6 +124,11 @@ fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u
         Waiting::Futex { parked, .. } => qs.push(unsafe { k_futex_queue(parked.addr()) }),
         Waiting::Pi { addr, .. } => qs.push(unsafe { k_futex_queue(*addr) }),
         Waiting::Read(h) | Waiting::Write(h) | Waiting::Accept(h) => handle(h, &mut qs),
+        Waiting::Lock => {
+            if let Some(gex_kernel::BlockOp::FileLock { locks, .. }) = blocked_on {
+                qs.push(locks.queue_id());
+            }
+        }
         Waiting::Net(_) => {
             if let Some(gex_kernel::BlockOp::Poll { fds, report, .. }) = blocked_on {
                 match report {
@@ -247,7 +252,7 @@ fn same_wait(a: &Waiting, b: &Waiting) -> bool {
         | (Waiting::Accept(x), Waiting::Accept(y)) => Arc::ptr_eq(x, y),
         (Waiting::Net(x), Waiting::Net(y)) => x == y,
         (Waiting::Pi { addr: a, gen: g, .. }, Waiting::Pi { addr: b, gen: k, .. }) => a == b && g == k,
-        (Waiting::Child, Waiting::Child) | (Waiting::Signal, Waiting::Signal) => true,
+        (Waiting::Child, Waiting::Child) | (Waiting::Signal, Waiting::Signal) | (Waiting::Lock, Waiting::Lock) => true,
         (Waiting::SigWait(x), Waiting::SigWait(y)) => x == y,
         _ => false,
     }

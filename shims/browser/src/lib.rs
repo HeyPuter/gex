@@ -458,6 +458,8 @@ extern "C" {
     /// exact, where re-reading the guest word only guesses.
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
+    fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
+    fn k_lock_queue() -> u32;
     fn k_spawn(ppid: i32) -> i32;
     fn k_tid_new(pid: i32) -> i32;
     fn k_tid_end(tid: i32);
@@ -1744,6 +1746,14 @@ fn shared_dns_name(addr: u32) -> Option<String> {
     (n >= 0).then(|| String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned())
 }
 
+fn gl_call(req: &[u8], out: &mut [u8]) -> i64 {
+    unsafe { k_lock_call(req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, my_pid()) }
+}
+
+fn gl_queue() -> u32 {
+    unsafe { k_lock_queue() }
+}
+
 fn gi_adopt(state: &[u8]) -> i32 {
     unsafe { k_inet_adopt(state.as_ptr() as gex_kernel::PAddr, state.len() as u32) }
 }
@@ -1776,6 +1786,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     // And one table of DNS answers: a name one process resolved means the
     // same address in the process that connects to it.
     gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
+    // And the file locks every process contends for.
+    gex_kernel::locks::share_locks(gex_kernel::locks::LockRemote { call: gl_call, queue: gl_queue });
     // And internet sockets that more than one process holds live there too.
     net::share_inet(net::InetRemote { adopt: gi_adopt, op: gi_op, write: gi_write, dup: gi_dup, close: gi_close });
     // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
@@ -3566,6 +3578,10 @@ enum Waiting {
     /// signals): until one of its set is pending, until this deadline, or a
     /// signal outside the set ends it.
     SigWait(Option<u64>),
+    /// Waiting for a file lock another process holds (`BlockOp::FileLock`,
+    /// which says which): until the table would grant it, woken by its
+    /// releases' queue; then the call again.
+    Lock,
     /// Waiting to take a priority-inheritance lock held by another thread:
     /// until its futex is woken (`gen`, as `Futex::wake_gen`), the lock word
     /// shows no owner, or `deadline`.
@@ -8920,6 +8936,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::AcceptWait { socket } => {
                         Waiting::Accept(Arc::clone(socket))
                     }
+                    gex_kernel::BlockOp::FileLock { .. } => Waiting::Lock,
                     // `sigsuspend` waits for a signal, and only a signal: one
                     // from another process notifies this process's wait queue
                     // (the process table does), one from a thread of its own
@@ -13477,6 +13494,10 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
             _ => true,
         },
         Waiting::Accept(socket) => socket.poll_readable(),
+        Waiting::Lock => match blocked_on {
+            Some(gex_kernel::BlockOp::FileLock { locks, req }) => locks.would_grant(req),
+            _ => true,
+        },
         Waiting::Signal => false,
         // One of the set pending: the thread's own, or the process's (what
         // other processes sent is collected before this is asked,
@@ -13588,6 +13609,7 @@ fn waiting_name(w: &Waiting) -> &'static str {
         Waiting::Read(_) => "read",
         Waiting::Write(_) => "write",
         Waiting::Accept(_) => "accept",
+        Waiting::Lock => "lock",
         Waiting::Child => "wait4",
         Waiting::Net(Some(_)) => "net+timeout",
         Waiting::Net(None) => "net",
@@ -14262,6 +14284,8 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A `recvmsg` on a blocking socket: until it is readable, then made
         // again (`Owed::reissue`).
         gex_kernel::BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
+        // A file lock held in the way, as the kernel's park.
+        gex_kernel::BlockOp::FileLock { .. } => Waiting::Lock,
         // A blocking `connect`, as the kernel's park: until the
         // connection is up, refused or gone (`wait_ready`'s `Net`).
         gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
@@ -14684,6 +14708,9 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
+        // A file lock that may be free now: the call again (`PI_RETRY`),
+        // which takes it or parks once more.
+        gex_kernel::BlockOp::FileLock { .. } => Err(PI_RETRY),
         // Take the lock if it is free (the waiters bit stays set, so the
         // next unlock goes through the kernel); else `PI_RETRY`: the caller
         // makes the syscall again, which parks once more.

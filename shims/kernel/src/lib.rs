@@ -1679,6 +1679,38 @@ pub extern "C" fn k_task_owner(id: i32) -> i32 {
     procs().task_owner(id).unwrap_or(0)
 }
 
+/// Every process's file locks (`gex_kernel::locks`), made on first use
+/// (its queue needs the wait hooks).
+fn locks() -> &'static gex_kernel::locks::FileLocks {
+    static L: std::sync::OnceLock<gex_kernel::locks::FileLocks> = std::sync::OnceLock::new();
+    L.get_or_init(gex_kernel::locks::FileLocks::new)
+}
+
+/// One lock call from process `caller` (`gex_kernel::locks::encode`'s
+/// bytes at `req`): its answer, or a negated errno; `F_GETLK`'s holder
+/// written to `out`.
+#[no_mangle]
+pub extern "C" fn k_lock_call(req: gex_kmem::PAddr, req_len: u32, out: gex_kmem::PAddr, out_len: u32, caller: i32) -> i64 {
+    note_panics();
+    let mut b = vec![0u8; req_len as usize];
+    if req_len > 0 {
+        unsafe { gex_kmem::pull_checked(b.as_mut_ptr(), req, req_len) };
+    }
+    let mut o = vec![0u8; out_len.min(64) as usize];
+    let r = locks().serve(caller, &b, &mut o);
+    if !o.is_empty() {
+        unsafe { gex_kmem::push_checked(out, o.as_ptr(), o.len() as u32) };
+    }
+    r
+}
+
+/// The queue every lock release notifies.
+#[no_mangle]
+pub extern "C" fn k_lock_queue() -> u32 {
+    note_panics();
+    locks().queue_id()
+}
+
 /// Record that `pid` has exited. `status` is an exit code, or the negated
 /// signal number when it died of one (the `ProcTable::exit` convention);
 /// [`k_wait`] turns the two into the one word a parent reads.
@@ -1688,6 +1720,8 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     // it like any other signal so a delivery can be traced back to the process
     // that ended -- "why did the terminal think its shell died" needs the pid.
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
+    // Its record locks, however it ended.
+    locks().release_pid(pid, None);
     procs().exit(pid, status);
 }
 

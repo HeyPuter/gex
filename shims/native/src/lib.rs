@@ -2064,6 +2064,18 @@ fn perform_block(
                 blocked::sigwait(seen, left.min(std::time::Duration::from_millis(1)));
             }
         }
+        // `F_SETLKW`, `F_OFD_SETLKW` or a blocking `flock`: the request
+        // again at every release (each one's call wakes the parked,
+        // `wakes_fd_waiters`), until it is granted, a signal ends it, or it
+        // would now deadlock.
+        BlockOp::FileLock { locks, req } => loop {
+            let seen = ready::seq();
+            match locks.apply(&req) {
+                Err(Errno::EAGAIN) => {}
+                r => return r,
+            }
+            turn!(file_lock, seen);
+        },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
@@ -2166,7 +2178,7 @@ mod blocked {
             }
         )*};
     }
-    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept);
+    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept, file_lock);
 
     /// A sleep's (nanosleep, a Windows program's `Sleep`).
     #[inline(never)]
@@ -2772,6 +2784,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     (127, 127 << 8)
                 }
             };
+            // Its record locks, however it ended (a descriptor table the
+            // process drops closes nothing), and whoever waits for them.
+            kernel.lock().unwrap_or_else(|e| e.into_inner()).file_locks.release_pid(pid, None);
+            ready::notify();
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }

@@ -433,6 +433,13 @@ pub enum BlockOp {
         /// (`si_uid` is left zero.)
         waitid: Option<WaitidOut>,
     },
+    /// `fcntl(F_SETLKW)`, `F_OFD_SETLKW` or a blocking `flock` with the
+    /// lock held in the way: until `locks` would grant `req`
+    /// ([`unix::FileLocks::would_grant`]; every release notifies its
+    /// `queue_id`). The host then makes the request (natively,
+    /// [`unix::FileLocks::apply`]) or the call again (the page), parking
+    /// again if another got there first.
+    FileLock { locks: Arc<unix::FileLocks>, req: crate::locks::LockReq },
 }
 
 /// Where and how `waitid` reports the child it found ([`waitid_child`]).
@@ -528,7 +535,8 @@ impl BlockOp {
             // `connect` is not in signal(7)'s list: an interrupted connect
             // goes on in the background and says `EINTR`.
             BlockOp::Connect { .. } => Restart::Never,
-            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WaitChild { .. } => {
+            // signal(7) lists `flock` and `F_SETLKW` with the reads and writes.
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WaitChild { .. } | BlockOp::FileLock { .. } => {
                 Restart::SaRestart
             }
         }
@@ -1235,6 +1243,10 @@ pub fn clock_call(
 pub struct FdIo<'a> {
     pub fds: &'a FdTable,
     pub compat: bool,
+    /// A wasm32 program ([`Kernel::wasm32`]): i386's numbering, its own
+    /// layouts where they differ (a `struct flock`'s 64-bit offsets are
+    /// 8-aligned).
+    pub wasm32: bool,
     /// The process's namespace, for a descriptor rebuilt from its name
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
@@ -1830,6 +1842,9 @@ impl FdIo<'_> {
     /// The park for a `read`/`readv` or `write`/`writev` that returned
     /// `EAGAIN` on a stream descriptor that should block.
     fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        if n == nr::FCNTL || n == nr::FLOCK {
+            return self.lock_park(m, n, a);
+        }
         let file = self.fds.get(a[0] as i32).ok()?;
         let (buf, len) = match n {
             nr::READ | nr::WRITE => (a[1], a[2]),
@@ -2552,7 +2567,7 @@ impl FdIo<'_> {
             nr::DUP2 => self.dup2(a[0] as i32, a[1] as i32),
             nr::DUP3 => self.dup3(a[0] as i32, a[1] as i32, a[2]),
             nr::FCNTL => self.fcntl_call(m, a[0] as i32, a[1], a[2]),
-            nr::FLOCK => self.flock(a[0] as i32, a[1]),
+            nr::FLOCK => self.flock(m, a[0] as i32, a[1]),
             _ => return None,
         })
     }
@@ -10095,6 +10110,7 @@ impl Kernel {
         FdIo {
             fds: &self.fds,
             compat: self.compat,
+            wasm32: self.wasm32,
             ns: &self.vfs,
             pid: self.pid,
             creds: &self.creds,
@@ -10433,7 +10449,7 @@ impl Kernel {
                 let cwd = self.vfs.cwd.clone();
                 self.net_io().call(&self.fd_io(), m, n, a, &cwd)
             }
-            nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
+            nr::FLOCK => self.fd_io().flock(m, a[0] as i32, a[1]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
@@ -10862,15 +10878,11 @@ impl FdIo<'_> {
         Ok(0)
     }
 
-    /// `fcntl` as the call is made: F_GETLK and F_OFD_GETLK answer through
-    /// memory, nobody holding a lock (see [`FdIo::fcntl`]), so the answer is
-    /// l_type = F_UNLCK, which is the first field in every `struct flock`
-    /// layout (i386's flock and flock64, x86-64's, wasm32's).
+    /// `fcntl` as the call is made: the record-lock commands read and write
+    /// a `struct flock` ([`FdIo::record_lock`]).
     pub fn fcntl_call(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
-        if cmd == 5 || cmd == 36 {
-            self.fds.get(fd)?;
-            const F_UNLCK: u16 = 2;
-            return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
+        if is_record_lock(cmd) {
+            return self.record_lock(m, fd, cmd, arg);
         }
         // The status flags in the guest's own spelling (an AArch64
         // program's `O_DIRECT` is not x86's).
@@ -10948,12 +10960,8 @@ impl FdIo<'_> {
                 f.set_flags(f.flags() & !SETTABLE | arg & SETTABLE);
                 Ok(0)
             }
-            // Advisory locks always succeed: gex runs one process tree over
-            // one namespace, so there is nobody to contend with.
-            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
-                self.fds.get(fd)?;
-                Ok(0)
-            }
+            // Through memory: `fcntl_call` (`record_lock`).
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => Err(Errno::EINVAL),
             // Sealing an anonymous shared file. Only a memfd has seals, and
             // Linux says EINVAL for anything else -- which is the answer
             // Xwayland was already getting, and it stopped rather than
@@ -10970,8 +10978,9 @@ impl FdIo<'_> {
     }
 
     /// `flock`. The open file description owns the lock, and its address is
-    /// a stable name for it while it is open.
-    pub fn flock(&self, fd: i32, op: u64) -> SysResult {
+    /// a stable name for it while it is open. Held in the way, a blocking
+    /// request parks ([`FdIo::lock_park`]).
+    pub fn flock(&self, _m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
         let file = self.fds.get(fd)?;
         let r = self.file_locks.flock(&file.path, file.lock_key(), op);
         if r.is_ok() {
@@ -10979,6 +10988,145 @@ impl FdIo<'_> {
         }
         r
     }
+
+    /// A record-lock command's `struct flock` at `arg`, as the request it
+    /// makes: the request, and whether it waits. `cmd` is canonical (5-7,
+    /// 36-38), or an i386 `struct flock`'s (`LK32` added: its offsets are
+    /// 32-bit).
+    fn lock_request(&self, m: &GuestMem<'_>, file: &Arc<OpenFile>, cmd: u64, arg: u64) -> Result<(crate::locks::LockReq, bool), Errno> {
+        use crate::locks::{lk, LockReq, Owner};
+        // (a wasm32 program's numbering is i386's, its struct the 64-bit one)
+        let small = cmd & LK32 != 0 && self.compat && !self.wasm32;
+        let packed = self.compat && !self.wasm32;
+        let cmd = cmd & !LK32;
+        // l_type, l_whence, l_start, l_len, l_pid: 64-bit offsets at 8 and 16
+        // (x86-64, AArch64, wasm32), i386's flock64 packed at 4 and 12, its
+        // flock's 32-bit at 4 and 8.
+        let h = m.read(arg, 4)?;
+        let (typ, whence) = (u16::from_le_bytes([h[0], h[1]]) as u32, u16::from_le_bytes([h[2], h[3]]));
+        let (start, len, pid_at) = if small {
+            (m.read_u32(arg + 4)? as i32 as i64, m.read_u32(arg + 8)? as i32 as i64, arg + 12)
+        } else if packed {
+            (m.read_u64(arg + 4)? as i64, m.read_u64(arg + 12)? as i64, arg + 20)
+        } else {
+            (m.read_u64(arg + 8)? as i64, m.read_u64(arg + 16)? as i64, arg + 24)
+        };
+        if typ > lk::UNLCK {
+            return Err(Errno::EINVAL);
+        }
+        let base = match whence {
+            0 => 0i64,
+            1 => file.offset() as i64,
+            2 => file.handle.metadata()?.size as i64,
+            _ => return Err(Errno::EINVAL),
+        };
+        let mut lo = base.checked_add(start).ok_or(Errno::EOVERFLOW)?;
+        let hi = if len > 0 {
+            lo.checked_add(len).ok_or(Errno::EOVERFLOW)? as u64
+        } else if len == 0 {
+            u64::MAX
+        } else {
+            let h = lo;
+            lo += len;
+            h as u64
+        };
+        if lo < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let ofd = matches!(cmd, 36..=38);
+        if ofd && m.read_u32(pid_at)? != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // A lock of a kind the descriptor cannot be used for (unlocking is
+        // always allowed).
+        if cmd != 5 && cmd != 36 && (typ == lk::RDLCK && !file.readable || typ == lk::WRLCK && !file.writable) {
+            return Err(Errno::EBADF);
+        }
+        let (owner, pid) = if ofd { (Owner::Desc(file.lock_key()), -1) } else { (Owner::Pid(self.pid), self.pid) };
+        let req = LockReq::Set { file: file.path.clone(), owner, pid, typ, start: lo as u64, end: hi };
+        Ok((req, matches!(cmd, 7 | 38)))
+    }
+
+    /// `F_GETLK`, `F_SETLK`, `F_SETLKW` and their OFD forms. A lock held in
+    /// the way answers `EAGAIN`, and a waiting one parks then
+    /// ([`FdIo::lock_park`]).
+    pub fn record_lock(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        use crate::locks::{lk, LockReq};
+        let file = self.fds.get(fd)?;
+        let (req, wait) = self.lock_request(m, &file, cmd, arg)?;
+        let LockReq::Set { file: path, owner, pid, typ, start, end } = &req else { unreachable!() };
+        let (small, plain) = (cmd & LK32 != 0 && self.compat && !self.wasm32, cmd & !LK32);
+        if plain == 5 || plain == 36 {
+            if *typ == lk::UNLCK {
+                return Err(Errno::EINVAL);
+            }
+            let got = self.file_locks.get(path, *owner, *typ, *start, *end);
+            let Some(c) = got else {
+                return m.write(arg, &(lk::UNLCK as u16).to_le_bytes()).map(|_| 0);
+            };
+            let len = if c.end == u64::MAX { 0 } else { c.end - c.start };
+            m.write(arg, &(c.typ as u16).to_le_bytes())?;
+            m.write(arg + 2, &0u16.to_le_bytes())?;
+            if small {
+                if c.start > i32::MAX as u64 || len > i32::MAX as u64 {
+                    return Err(Errno::EOVERFLOW);
+                }
+                m.write_u32(arg + 4, c.start as u32)?;
+                m.write_u32(arg + 8, len as u32)?;
+                m.write_u32(arg + 12, c.pid as u32)?;
+            } else if self.compat && !self.wasm32 {
+                m.write_u64(arg + 4, c.start)?;
+                m.write_u64(arg + 12, len)?;
+                m.write_u32(arg + 20, c.pid as u32)?;
+            } else {
+                m.write_u64(arg + 8, c.start)?;
+                m.write_u64(arg + 16, len)?;
+                m.write_u32(arg + 24, c.pid as u32)?;
+            }
+            return Ok(0);
+        }
+        self.file_locks.set(path, *owner, *pid, *typ, *start, *end, wait)?;
+        if *typ != lk::UNLCK {
+            match owner {
+                crate::locks::Owner::Pid(p) => self.fds.note_record_lock(self.file_locks, *p, path),
+                crate::locks::Owner::Desc(_) => file.note_locks(self.file_locks),
+            }
+        }
+        Ok(0)
+    }
+
+    /// The park for a lock request that found the lock held and waits
+    /// (`F_SETLKW`, `F_OFD_SETLKW`, `flock` without `LOCK_NB`).
+    fn lock_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let file = self.fds.get(a[0] as i32).ok()?;
+        let req = match n {
+            nr::FLOCK if a[1] & (crate::locks::lock_op::NB | crate::locks::lock_op::UN) == 0 => crate::locks::LockReq::Flock { file: file.path.clone(), key: file.lock_key(), op: a[1] },
+            nr::FCNTL if is_record_lock(a[1]) => match self.lock_request(m, &file, a[1], a[2]) {
+                Ok((req, true)) => req,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // Noted now for when the host grants it: the close rule and the
+        // description's release then cover it (nothing to drop if it never is).
+        match &req {
+            crate::locks::LockReq::Set { owner: crate::locks::Owner::Pid(p), file: path, .. } => self.fds.note_record_lock(self.file_locks, *p, path),
+            _ => file.note_locks(self.file_locks),
+        }
+        Some(BlockOp::FileLock { locks: Arc::clone(self.file_locks), req })
+    }
+}
+
+/// An i386 `struct flock`'s record-lock commands (32-bit offsets): the
+/// canonical number with this added ([`crate::i386`]'s `fcntl`). A wasm32
+/// program's calls take i386's numbers too, and its 5-7 are the canonical
+/// ones (a 64-bit `struct flock`): the bit means nothing there.
+pub const LK32: u64 = 0x8000;
+
+/// `F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_GETLK`, `F_OFD_SETLK`,
+/// `F_OFD_SETLKW`, and the i386 `struct flock` forms ([`LK32`]).
+fn is_record_lock(cmd: u64) -> bool {
+    matches!(cmd, 5..=7 | 36..=38) || matches!(cmd ^ LK32, 5..=7)
 }
 
 impl FdIo<'_> {
@@ -11680,9 +11828,6 @@ impl Kernel {
 
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
-    fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
-        self.fd_io().flock(fd, op)
-    }
 
 
 
@@ -12018,6 +12163,10 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::TKILL
             | nr::TGKILL
             | nr::TIMERFD_SETTIME
+            // A lock released: a blocked `F_SETLKW` or `flock` looks again.
+            | nr::FCNTL
+            | nr::FLOCK
+            | nr::DUP2
     )
 }
 
@@ -15637,6 +15786,65 @@ mod tests {
     }
 
     #[test]
+    fn record_locks_contend_park_and_go_with_any_descriptor() {
+        use crate::locks::{lk, LockReq, Owner};
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/lk\0").unwrap();
+        let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            let out = k.syscall(m, 0);
+            (out, ret(m, at))
+        };
+        let open = |m: &mut GuestMem<'_>, k: &mut Kernel| sys(m, k, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]).1 as u64;
+        let (fd, fd2) = (open(&mut m, &mut k), open(&mut m, &mut k));
+        // struct flock at 0x25000: type, whence, start, len, pid.
+        let flock = |m: &mut GuestMem<'_>, typ: u16, start: u64, len: u64| {
+            m.write(0x25000, &[0u8; 32]).unwrap();
+            m.write(0x25000, &typ.to_le_bytes()).unwrap();
+            m.write_u64(0x25008, start).unwrap();
+            m.write_u64(0x25010, len).unwrap();
+        };
+        let me = Owner::Pid(k.pid);
+        flock(&mut m, lk::WRLCK as u16, 10, 10);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 6, 0x25000]).1, 0, "F_SETLK");
+        let locks = Arc::clone(&k.file_locks);
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::RDLCK, 15, 16, false), Err(Errno::EAGAIN), "another process is kept out");
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 20, 30, false), Ok(0), "beside it is free");
+        // F_GETLK names the other process's lock and pid.
+        flock(&mut m, lk::WRLCK as u16, 0, 0);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 5, 0x25000]).1, 0);
+        assert_eq!(m.read(0x25000, 2).unwrap(), &(lk::WRLCK as u16).to_le_bytes());
+        assert_eq!((m.read_u64(0x25008).unwrap(), m.read_u64(0x25010).unwrap(), m.read_u32(0x25018).unwrap()), (20, 10, 999));
+        // F_SETLK in its way: EAGAIN; F_SETLKW: parks on the lock.
+        flock(&mut m, lk::RDLCK as u16, 25, 1);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 6, 0x25000]).1, -(Errno::EAGAIN.0 as i64));
+        let (out, _) = sys(&mut m, &mut k, nr::FCNTL, &[fd, 7, 0x25000]);
+        let SyscallOutcome::Blocking(BlockOp::FileLock { req, .. }) = out else { panic!("F_SETLKW parks: {out:?}") };
+        assert_eq!(req, LockReq::Set { file: "/lk".into(), owner: me, pid: k.pid, typ: lk::RDLCK, start: 25, end: 26 });
+        assert!(!locks.would_grant(&req));
+        locks.set("/lk", Owner::Pid(999), 999, lk::UNLCK, 0, u64::MAX, false).unwrap();
+        assert!(locks.would_grant(&req));
+        assert_eq!(locks.apply(&req), Ok(0));
+        // Closing the other descriptor of the file drops every lock the
+        // process has on it.
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 0, u64::MAX, false), Err(Errno::EAGAIN));
+        sys(&mut m, &mut k, nr::CLOSE, &[fd2]);
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 0, u64::MAX, false), Ok(0));
+        // An OFD lock is the description's, pid -1, and needs l_pid 0.
+        locks.set("/lk", Owner::Pid(999), 999, lk::UNLCK, 0, u64::MAX, false).unwrap();
+        flock(&mut m, lk::WRLCK as u16, 0, 5);
+        m.write_u32(0x25018, 1).unwrap();
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 37, 0x25000]).1, -(Errno::EINVAL.0 as i64));
+        flock(&mut m, lk::WRLCK as u16, 0, 5);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 37, 0x25000]).1, 0);
+        assert_eq!(locks.get("/lk", Owner::Pid(999), lk::RDLCK, 0, 1).map(|c| c.pid), Some(-1));
+        sys(&mut m, &mut k, nr::CLOSE, &[fd]);
+        assert_eq!(locks.get("/lk", Owner::Pid(999), lk::WRLCK, 0, u64::MAX), None, "all gone with the last descriptor");
+    }
+
+    #[test]
     fn free_fd_table_calls_answer_as_the_kernel_does() {
         use crate::unix::lock_op;
         let (mut buf, mut k) = setup();
@@ -15682,7 +15890,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[21, F_GETFD]));
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_DUPFD_CLOEXEC, 30]));
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[30, F_GETFD]));
-            m.write_u64(0x25000, !0).unwrap();
+            m.write(0x25000, &[0u8; 32]).unwrap();
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GETLK, 0x25000]));
             got.push(m.read(0x25000, 2).unwrap()[0] as i64);
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, oflags::O_NONBLOCK]));
@@ -16537,7 +16745,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::DUP3, [fd, 21, oflags::O_CLOEXEC]));
             got.push(sys(&mut m, &mut k, raw::FCNTL64, [21, 1, 0]));
             // F_GETLK64 (12) is the 32-bit ABI's F_GETLK.
-            m.write_u64(0x25000, !0).unwrap();
+            m.write(0x25000, &[0u8; 32]).unwrap();
             got.push(sys(&mut m, &mut k, raw::FCNTL64, [fd, 12, 0x25000]));
             got.push(m.read(0x25000, 2).unwrap()[0] as i32);
             got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 2, 0]));

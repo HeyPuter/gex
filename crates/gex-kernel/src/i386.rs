@@ -734,11 +734,12 @@ pub fn translate(
         }
         x::FCNTL | x::FCNTL64 => {
             // F_GETLK64/F_SETLK64/F_SETLKW64 (12-14) are i386's names for the
-            // lock commands with a flock64; the canonical ones are 5-7. The
-            // kernel reads no field of either struct but l_type, which is
-            // first in both (`Kernel::sys_fcntl`).
+            // lock commands with a flock64, which the canonical ones (5-7)
+            // read in an i386 process; i386's own 5-7 take a `struct flock`
+            // of 32-bit offsets (`syscalls::LK32`).
             a[0] = sext(a[0]);
             a[1] = match a[1] {
+                5..=7 => a[1] | crate::syscalls::LK32,
                 12 => 5,
                 13 => 6,
                 14 => 7,

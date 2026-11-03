@@ -70,7 +70,7 @@ impl std::fmt::Debug for TmpName {
 impl Drop for OpenFile {
     fn drop(&mut self) {
         if let Some(locks) = self.locks.get() {
-            locks.release(self as *const OpenFile as usize);
+            locks.release(self as *const OpenFile as usize as u64);
         }
         // If a `linkat` gave it another name (the atomic-write idiom), that
         // name keeps the inode.
@@ -160,8 +160,8 @@ impl OpenFile {
 
     /// Its `flock` key, the description's address: a stable name while it
     /// lives, and released before it is reused (`Drop`).
-    pub fn lock_key(self: &Arc<Self>) -> usize {
-        Arc::as_ptr(self) as usize
+    pub fn lock_key(self: &Arc<Self>) -> u64 {
+        Arc::as_ptr(self) as usize as u64
     }
 
     /// Note the `flock` table it has a lock in, for its `Drop` to release.
@@ -386,6 +386,20 @@ pub struct FdTable {
     generation: AtomicU64,
     /// `RLIMIT_NOFILE`'s soft limit: no descriptor at or above it.
     limit: AtomicUsize,
+    /// The files its process holds record locks on ([`FdTable::note_record_lock`]):
+    /// closing any descriptor of one drops them all, as on Linux. Not a
+    /// fork's: its child holds none.
+    record_locks: Mutex<Option<RecordLocks>>,
+    /// Whether `record_locks` names any file: one load on every change of
+    /// the table while none does.
+    record_any: std::sync::atomic::AtomicBool,
+}
+
+/// Which files a process has record locks on, and in which table.
+struct RecordLocks {
+    locks: Arc<crate::unix::FileLocks>,
+    pid: i32,
+    files: Vec<String>,
 }
 
 /// `RLIMIT_NOFILE`, as Linux starts a process: 1024 soft, and the hard
@@ -424,6 +438,36 @@ impl FdTable {
             cur: gex_atomic::rcu::Published::new(t, FD_READER_SLOTS),
             generation: AtomicU64::new(generation),
             limit: AtomicUsize::new(limit),
+            record_locks: Mutex::new(None),
+            record_any: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Process `pid` took a record lock on `file` in `locks`: its locks
+    /// there go when it closes any descriptor of the file (or at exit,
+    /// which closes them all).
+    pub fn note_record_lock(&self, locks: &Arc<crate::unix::FileLocks>, pid: i32, file: &str) {
+        let mut g = self.record_locks.lock().unwrap_or_else(|e| e.into_inner());
+        let r = g.get_or_insert_with(|| RecordLocks { locks: Arc::clone(locks), pid, files: Vec::new() });
+        r.pid = pid;
+        if !r.files.iter().any(|f| f == file) {
+            r.files.push(file.to_string());
+        }
+        self.record_any.store(true, Ordering::SeqCst);
+    }
+
+    /// Descriptors of these files closed: their record locks go.
+    fn closed_files(&self, gone: Vec<String>) {
+        let mut g = self.record_locks.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = g.as_mut() else { return };
+        for f in gone {
+            if let Some(i) = r.files.iter().position(|x| *x == f) {
+                r.files.swap_remove(i);
+                r.locks.release_pid(r.pid, Some(&f));
+            }
+        }
+        if r.files.is_empty() {
+            self.record_any.store(false, Ordering::SeqCst);
         }
     }
 
@@ -438,13 +482,32 @@ impl FdTable {
     /// before (a failed one included).
     fn update<R, E>(&self, f: impl FnOnce(&mut Table) -> Result<R, E>) -> Result<R, E> {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.cur.write(|old| {
+        // The paths of descriptors this change closes or replaces, while the
+        // process holds record locks.
+        let watch = self.record_any.load(Ordering::SeqCst);
+        let mut gone = Vec::new();
+        let r = self.cur.write(|old| {
             let mut t = old.clone();
             match f(&mut t) {
-                Ok(r) => (Some(t), Ok(r)),
+                Ok(r) => {
+                    if watch {
+                        for (i, e) in old.entries.iter().enumerate() {
+                            if let Some(a) = e {
+                                if !t.entries.get(i).is_some_and(|b| b.as_ref().is_some_and(|b| Arc::ptr_eq(a, b))) {
+                                    gone.push(a.path.clone());
+                                }
+                            }
+                        }
+                    }
+                    (Some(t), Ok(r))
+                }
                 Err(e) => (None, Err(e)),
             }
-        })
+        });
+        if !gone.is_empty() {
+            self.closed_files(gone);
+        }
+        r
     }
 
     /// `RLIMIT_NOFILE`'s soft limit (descriptors already above it stay).
