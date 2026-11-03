@@ -55,6 +55,21 @@ pub(crate) struct MyWait {
     /// The thread's own deadline, and what its descriptors become ready at
     /// by the clock alone (a timerfd).
     soonest: Option<u64>,
+    /// When it began, and how long it must have lasted before the next
+    /// `?parkreport` line about it (doubling).
+    since: u64,
+    next_say: u64,
+}
+
+/// `?parkreport=S` (`gex_set_park_report`): a parked thread looks again at
+/// least every S seconds and says, when its wait has lasted S, 2S, 4S...,
+/// what it waits on: which threads a hung page is stuck in, though their
+/// Workers cannot answer while parked. 0 (the default): never.
+pub(crate) static PARK_REPORT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_set_park_report(secs: u32) {
+    PARK_REPORT_NS.store(secs as u64 * 1_000_000_000, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// This Worker's slot. The slot is the Worker's kernel stack's number, so
@@ -233,6 +248,8 @@ pub(crate) fn enter(i: usize, t: &Run, why: u8, all_blocked: bool, ends_by_itsel
             all_blocked,
             ends_by_itself,
             soonest,
+            since: now,
+            next_say: PARK_REPORT_NS.load(std::sync::atomic::Ordering::Relaxed),
         });
         true
     });
@@ -310,8 +327,64 @@ pub(crate) fn idle_turn() -> Turn {
         if m.all_blocked && crate::all_futex_blocked() {
             return Turn::Stuck;
         }
-        Turn::Idle(m.why, m.ends_by_itself)
+        let idle = Turn::Idle(m.why, m.ends_by_itself);
+        if PARK_REPORT_NS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            drop(w);
+            say_long_park();
+        }
+        idle
     })
+}
+
+/// `?parkreport`: this Worker's wait, if it has lasted to its next line.
+fn say_long_park() {
+    let now = turn_now();
+    let line = WAIT.with(|w| {
+        let mut w = w.borrow_mut();
+        let m = w.as_mut()?;
+        let held = now.saturating_sub(m.since);
+        if m.next_say == 0 || held < m.next_say {
+            return None;
+        }
+        m.next_say = m.next_say.saturating_mul(2);
+        let what = match &m.blocked_on {
+            Some(gex_kernel::BlockOp::ReadStream { handle, .. }) => format!(" ({})", handle.debug_state()),
+            Some(gex_kernel::BlockOp::FutexWait { uaddr, .. }) => format!(" (futex {uaddr:#x})"),
+            Some(op) => match block_op_name(op) {
+                n if n == "other" || n == crate::waiting_name(&m.waiting) => String::new(),
+                n => format!(" ({n})"),
+            },
+            None => String::new(),
+        };
+        Some(format!(
+            "[park] pid {} t{} {}{what} for {} s (why {:#x}{})\n",
+            crate::my_pid(),
+            m.thread,
+            crate::waiting_name(&m.waiting),
+            held / 1_000_000_000,
+            m.why,
+            if m.all_blocked { ", all threads on futexes" } else { "" },
+        ))
+    });
+    if let Some(l) = line {
+        crate::warn_line(&l);
+    }
+}
+
+fn block_op_name(op: &gex_kernel::BlockOp) -> &'static str {
+    use gex_kernel::BlockOp as B;
+    match op {
+        B::ReadStream { .. } => "read",
+        B::WriteStream { .. } => "write",
+        B::Poll { .. } => "poll",
+        B::FutexWait { .. } => "futex",
+        B::FutexLockPi { .. } => "pi-lock",
+        B::Sleep(_) => "sleep",
+        B::AcceptWait { .. } => "accept",
+        B::FileLock { .. } => "file lock",
+        B::Connect { .. } => "connect",
+        _ => "other",
+    }
 }
 
 /// This Worker's registered wait was the last of its process's threads to
@@ -364,6 +437,10 @@ pub(crate) fn park_ns(now: u64) -> Option<u64> {
     let mut ns = at.map(|at| at.saturating_sub(now).max(50_000));
     if all_blocked {
         ns = Some(ns.map_or(DEADLOCK_LOOK_NS, |n| n.min(DEADLOCK_LOOK_NS)));
+    }
+    let every = PARK_REPORT_NS.load(std::sync::atomic::Ordering::Relaxed);
+    if every != 0 {
+        ns = Some(ns.map_or(every, |n| n.min(every)));
     }
     ns
 }

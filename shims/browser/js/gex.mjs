@@ -2421,6 +2421,7 @@ export class Gex {
       // syscalls is more output than a page survives.
       stracePid: opts.stracePid,
       straceExe: opts.straceExe,
+      parkReport: opts.parkReport,
       tty: opts.tty, uid: opts.uid, gid: opts.gid,
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
       dlChecked: opts.dlChecked,
@@ -2436,6 +2437,7 @@ export class Gex {
     // `?stracepid=N` for a process booted here, not forked or exec'd into
     // (`#childOpts` sees those): pid 1, or what the kernel says it is.
     const bootPid = this.#shim.exports.gex_my_pid?.() || 1;
+    if (opts.parkReport) this.#shim.exports.gex_set_park_report?.(opts.parkReport);
     if (opts.stracePid ? opts.stracePid === bootPid : opts.strace) { this.#shim.exports.gex_set_trace(1); this.#traced = true; }
     // An ejected project without a JIT fallback: a miss on code its build
     // never saw fails loudly instead of translating.
@@ -3709,6 +3711,7 @@ export class Gex {
     // not (`start({ strace: N })` sets both, as the KDE page's
     // `?strace=1&stracepid=N` does).
     if (o.stracePid ? o.stracePid === pid : o.strace) { e.gex_set_trace(1); this.#traced = true; }
+    if (o.parkReport) e.gex_set_park_report?.(o.parkReport);
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);

@@ -13617,7 +13617,7 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
 
 /// What a parked thread is waiting for, in one word for a census: only the
 /// shape of the wait matters, not the handles and futex parks `Waiting` holds.
-fn waiting_name(w: &Waiting) -> &'static str {
+pub(crate) fn waiting_name(w: &Waiting) -> &'static str {
     match w {
         Waiting::Runnable => "runnable",
         Waiting::Elsewhere => "another worker",
