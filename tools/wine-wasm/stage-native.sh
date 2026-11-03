@@ -51,7 +51,9 @@ for dll in "$@"; do
     dir=$build/dlls/$name
     [ -d "$dir" ] || dir=$build/dlls/$dll  # (winewayland.drv's directory keeps the extension)
     [ -d "$dir" ] || dir=$build/programs/$name
-    spec=$src/${dir#$build/}/$name.spec
+    # (a module named with its extension has its spec named so too: wshom.ocx.spec)
+    spec=$src/${dir#$build/}/$dll.spec
+    [ -f "$spec" ] || spec=$src/${dir#$build/}/$name.spec
     rm -f "$sys/$dll"
     # a program has no .spec: an exe skeleton, its entry point the module's
     # (a DLL with no .spec, a driver like winewayland.drv, exports nothing:
@@ -68,7 +70,12 @@ for dll in "$@"; do
     # shellcheck disable=SC2046
     "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
         --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
+    # (its source directory's specs, whichever the lookup above took)
+    [ ! -f "$spec" ] || echo "$sys/$dll $src/${dir#$build/}" >> "$tmp/skeletons"
 done
+# A skeleton without an export table whose spec has exports is a build error,
+# not a GetProcAddress that finds nothing at run time (skel-exports.py)
+[ ! -f "$tmp/skeletons" ] || python3 "$here/skel-exports.py" "$tmp/skeletons" || exit 1
 # Every i386 DLL at its fixed base (rebase.py, wine32-bases.txt), so a DLL's
 # function-tier unit matches wherever and whenever a process loads it. A DLL
 # missing from the table fails the stage: add it (rebase.py table).
