@@ -17,10 +17,10 @@ export default async function (t) {
   // Not literals, which vite would try to resolve as its own.
   const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
-  const { Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
+  const { MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
   const { CompositorWindows } = await import(/* @vite-ignore */ `${pkg}windows-compositor.mjs`);
   const sys = new System({ debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('kde/kde.tar.zst'), { lazy: t.work('kde/lazy.json') });
   const out = new CompositorWindows(sys, { canvas: document.getElementById('out'), scale: 1, x11: 'rootful' });
   const t0 = performance.now();

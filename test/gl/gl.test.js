@@ -2,7 +2,7 @@
 // Says so and passes where the browser has no WebGPU, or the build has no
 // Mesa (web/public/gex/gex-wgpu-replay.*).
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
 
@@ -13,7 +13,7 @@ export default async function (t) {
   const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
   if (!adapter) return t.skip('no WebGPU adapter here');
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const gl = new MesaGl(sys);
   new CompositorWindows(sys, { canvas: document.getElementById('out'), scale: 1 });

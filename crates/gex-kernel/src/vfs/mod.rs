@@ -20,6 +20,7 @@ pub mod peimage;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
+pub mod blocks;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
@@ -344,6 +345,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = (offset, len, advice);
         Ok(())
     }
+    /// `fsync` and `fdatasync`: what was written through any handle on this
+    /// file made durable, its size and name with it; `data_only`
+    /// (`sync_file_range`): its bytes only. A file whose bytes are only in
+    /// memory has nothing to do.
+    fn sync(&self, data_only: bool) -> Result<(), Errno> {
+        let _ = data_only;
+        Ok(())
+    }
     /// `fchmod` on what this handle is open on, when the handle can do it
     /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
@@ -606,6 +615,21 @@ impl FileHandle for PathHandle {
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(self.0.clone())
     }
+}
+
+static SYNC_ALL: std::sync::OnceLock<fn() -> Result<(), Errno>> = std::sync::OnceLock::new();
+
+/// Where `sync(2)` and `syncfs` go: the filesystem whose contents are kept
+/// away from this memory (the global kernel's block store,
+/// [`blocks::sync_all`], or a process's way to it). The first call wins;
+/// without one there is nothing to flush.
+pub fn set_sync_all(f: fn() -> Result<(), Errno>) {
+    let _ = SYNC_ALL.set(f);
+}
+
+/// `sync(2)`: everything written made durable ([`set_sync_all`]).
+pub fn sync_all() -> Result<(), Errno> {
+    SYNC_ALL.get().map_or(Ok(()), |f| f())
 }
 
 static OWNER_ALIVE: std::sync::OnceLock<fn(i32) -> bool> = std::sync::OnceLock::new();

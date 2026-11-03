@@ -40,6 +40,8 @@ pub struct Remote {
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
     /// [`FileHandle::advise`]: 0 or a negated errno.
     pub advise: extern "C" fn(handle: i32, offset: u64, len: u64, advice: u32) -> i32,
+    /// [`FileHandle::sync`] (`data_only` 1 for `fdatasync`): 0 or a negated errno.
+    pub sync: extern "C" fn(handle: i32, data_only: u32) -> i32,
     /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short
     /// (with the size it takes in the first 4 bytes, little-endian, when
     /// `cap` holds them).
@@ -569,6 +571,10 @@ impl FileHandle for RemoteHandle {
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         ok((self.remote.advise)(self.id, offset, len, advice)).map(|_| ())
+    }
+
+    fn sync(&self, data_only: bool) -> Result<(), Errno> {
+        ok((self.remote.sync)(self.id, data_only as u32)).map(|_| ())
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {

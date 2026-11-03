@@ -5,7 +5,7 @@
 //
 // A drop's files are read from the browser's File objects a chunk at a time
 // and written through `k_fs_open`/`k_fs_write`, as the program's own writes
-// are (so a persisted directory keeps them), into one directory: the one
+// are (so a kept root keeps them), into one directory: the one
 // the page named, or a new /tmp/drops/N. Nothing there is written over: a
 // top-level name it has already is numbered, "a (2).txt", as is one the
 // drop has twice. Directories are made

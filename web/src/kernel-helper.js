@@ -1,10 +1,10 @@
 // A Worker's own instance of the global kernel, for the page's helpers that
-// write or read the guest's filesystem while it runs (persist-worker.js,
-// drop-worker.js). The helper calls `k_fs_*` with its
+// write or read the guest's filesystem while it runs (drop-worker.js). The helper calls `k_fs_*` with its
 // paths and bytes in a scratch "process" memory of its own; a Worker and not
 // the page because the kernel's locks may wait, and the page's thread cannot.
 
 import { kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { blockIo } from '../../shims/browser/js/blocks.mjs';
 import { pageFs, pageFsSuspending, setPageFs } from '../../shims/browser/js/page-fs.mjs';
 
 /**
@@ -27,7 +27,7 @@ export async function helperKernel(spec, stackTop, pages = 16, { suspending = fa
     mem = new WebAssembly.Memory({ initial: pages, maximum: 65535, shared });
     try {
       inst = await WebAssembly.instantiate(spec.module, {
-        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory), page_fs: suspending ? pageFsSuspending(spec.memory) : pageFs(spec.memory) },
+        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory), block_io: blockIo(spec.memory), page_fs: suspending ? pageFsSuspending(spec.memory) : pageFs(spec.memory) },
       });
       break;
     } catch (e) {

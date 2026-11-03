@@ -218,6 +218,7 @@ export async function start() {
       // Against a deadline (`?wait=`): a program that wedges -- a closure run
       // can -- otherwise leaves the harness waiting for ever.
       const running = runProgram(io.term, {
+        filesystem: 'memory',
         elf: exe,
         files,
         hard,
@@ -264,6 +265,7 @@ export async function start() {
   // Not awaited: an interactive shell does not exit, and this is the process
   // every command runs inside.
   const done = runProgram(io.term, {
+    filesystem: 'memory',
     elf,
     files,
     hard,

@@ -2,16 +2,16 @@
 
 Linux programs in a web page: a kernel, the programs it runs, and their files.
 A page builds a `System`, gives it a filesystem, boots it, and runs programs in
-it with a terminal or with pipes. Windows, persistence, network, sound and GL
-are parts of their own, each a class that takes the system as its first
+it with a terminal or with pipes. Its filesystem may keep the root across
+loads. Windows, network, sound and GL are parts of their own, each a class that takes the system as its first
 argument.
 
 ```js
 import { System } from '@gex/runtime';
-import { Filesystem } from '@gex/runtime/fs';
+import { MemoryFilesystem } from '@gex/runtime/fs';
 
 const sys = new System();
-const fs = new Filesystem(sys);
+const fs = new MemoryFilesystem(sys);
 fs.addTar('/trees/base.tar.zst');
 await sys.boot();
 
@@ -45,26 +45,25 @@ debdemo builds one) runs apt as it comes, over the network below.
 
 ```js
 import { System } from '@gex/runtime';
-import { Filesystem } from '@gex/runtime/fs';
-import { IdbPersist } from '@gex/runtime/persist/idb';
+import { OPFSFilesystem } from '@gex/runtime/fs';
 import { Wisp } from '@gex/runtime/net/wisp';
 import { HostWindows } from '@gex/runtime/windows/host';
 
 const sys = new System({ xcache: true });              // translated code kept across loads
-const fs = new Filesystem(sys);
+const fs = new OPFSFilesystem(sys, { name: 'debian' }); // the root, kept in the page's OPFS
 fs.addTar('/gex-trees/debian.tar.zst', { lazy: '/gex-trees/debian-lazy.json' });
-new IdbPersist(fs, { db: 'debian' });                  // the root, kept
 sys.network = new Wisp('wss://wisp.example/');        // connections out (see Network)
 const hw = new HostWindows(sys, { width: innerWidth, height: innerHeight });
 await sys.boot();
 ```
 
-**Keep the root.** The `IdbPersist` keeps what programs change (installed
-packages, a home directory) and lays it back over the same tars at the next
-load. The tars must be the same at every load, so give a new tree a new
-`db`. Saves are a second after changes settle, every 30 s, and when the tab
-is hidden: a desktop need not call `save()`, though it may before it unloads.
-`/tmp`, `/run` and mounts are never kept.
+**Keep the root.** An `OPFSFilesystem` keeps what programs change
+(installed packages, a home directory) in its store and lays it back over
+the same tars at the next load. The tars must be the same at every load, so
+give a new tree a new `name`. What is written reaches the store within the
+filesystem's `writeback` (5 s), at a program's `fsync` or `sync`, and when
+the tab is hidden or left: a desktop need not call `sys.sync()`, though it
+may before it unloads. `/tmp`, `/run` and mounts are never kept.
 
 **Terminals.** A terminal is a `spawn` with a `pty`; its `data` events go to the
 desktop's terminal widget and its keys come back with `pty.write`. Resize
@@ -110,7 +109,7 @@ area changes, call `hw.setOutputSize(width, height)`.
 **The desktop's files.** `fs.mount('/mnt/desktop', provider)` shows a
 directory of the desktop's own filesystem to every program, while it runs
 (Mounts says what a provider implements). A mount is the desktop's to keep:
-persistence leaves it out.
+the filesystem's store leaves it out.
 
 **A launcher.** The tree's applications are its desktop entries:
 `fs.readdir('/usr/share/applications')`, each `.desktop` file read with
@@ -143,8 +142,8 @@ and a prefix, laid beside the Linux tree. A Windows program is then
 `wine 'C:\path\prog.exe'`, with `WINEPREFIX` naming the prefix. The
 first Wine program starts Wine's server and the services Wine runs; the
 next ones reuse them while they last. Its windows come as any other, framed by the program
-itself (`decorations: 'client'`) and `placed`. Persistence keeps the
-prefix's changes with the rest of the root. Each 64-bit Wine process takes a
+itself (`decorations: 'client'`) and `placed`. The filesystem's store keeps
+the prefix's changes with the rest of the root. Each 64-bit Wine process takes a
 memory of about 2 GiB (most of it reserved, not touched), so a desktop
 running several Windows programs at once should expect the tab's address
 space to reach well past 8 GiB.
@@ -218,7 +217,8 @@ processes and memory.
 | `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. |
 | Events | On the system itself (`sys.addEventListener`): `running` when it boots, `stopped` when it ends, `console` (`text`) for what the runtime says. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
-| `shutdown()` | Ends every program and the kernel. |
+| `sync()` | What the programs wrote made durable in the filesystem's store, as `sync(2)` (nothing to do for a `MemoryFilesystem`). Rejects with the store's error (`code` `EIO`, `ENOSPC`). |
+| `shutdown()` | Ends every program and the kernel, after a `sync()`. |
 
 ## Process
 
@@ -233,7 +233,105 @@ processes and memory.
 
 ## Filesystem
 
-One per system. Before boot, it is the tars and files a page adds, laid one
+One per system. `Filesystem` is abstract: it holds the tree, a cache of
+its files' contents in the system's memory, and the kernel's side of both.
+Where the contents are kept is the subclass the page makes:
+
+| Class | Keeps file contents |
+| --- | --- |
+| `new MemoryFilesystem(sys, { max })` | In the system's memory. `max` (bytes, optional): writes past it fail with `ENOSPC`; without it, as much as the memory holds. |
+| `new OPFSFilesystem(sys, { name, cache, writeback, exclude })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`), kept across loads (Persistence below). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. A written block reaches the store within `writeback` ms (default 5000, 100 to 600000) or at a sync. Small files (16 KiB or less) stay in memory, and so do the files `addTar` and `addFiles` lay until a program writes one (boot writes nothing to the store); lazy files are fetched as before. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
+| A subclass of the page's own | Wherever its methods keep them (below). |
+
+`new Filesystem(sys)` throws. A `MemoryFilesystem` keeps nothing across
+loads; a store does (Persistence below).
+
+With a store, the cache is write-back, as a disk's page cache is: what a
+program writes is in memory first. `sync(2)`, `syncfs`, `fsync`,
+`fdatasync` and `sync_file_range` write it out and flush the store before
+they return (the page's `sys.sync()` too, and `shutdown()`), a block is
+written out once it has waited `writeback` ms, and a page being hidden or
+left syncs. A write-out the store fails is `EIO` (`ENOSPC` when the store
+is full) to the call that needed it (a sync, or a write that needed room in
+the cache), and the data stays in memory, tried again. A `MAP_SHARED` mapping's
+pages reach the file at `msync` and `munmap`; `sync` does not reach into
+other programs' mappings.
+
+A single read or write of 1 MiB or more moves the whole blocks it covers
+straight between the store and the program's buffer, without keeping them
+in the cache (a write is in the store when it returns, but is durable only
+at a sync, as any other), so a big copy runs near the store's own speed and
+leaves the cache as it was. Blocks a program uses again are kept over ones
+read or written once: a file read through once, however large, does not
+push them out.
+
+A store of the page's own is a subclass that implements the store's
+methods: one array of bytes, which the kernel reads and writes by offset in
+blocks of 64 KiB as its cache fills and empties, one call at a time. Its
+constructor takes `cache`, `writeback` and `exclude` as `OPFSFilesystem`'s
+does. Its bytes are the root as a load before kept it: a store that is to
+start over empties itself in `open()`. It needs the default
+build: in the single-thread one (`@gex/runtime-single`) the boot rejects it,
+and the built-ins are the choice.
+
+| Method | Does |
+| --- | --- |
+| `open()` | Optional: make the store ready, before boot. |
+| `read(offset, length)` | A `Uint8Array` of `length` bytes at `offset`; shorter past the end, which reads as zeros. |
+| `write(offset, bytes)` | Writes them, growing the store. |
+| `size()`, `truncate(length)` | The store's length; set it (growing with zeros). |
+| `flush()` | Makes what was written durable. |
+
+Each is async. An error with `code: 'ENOSPC'` is a full store to the
+program that wrote; any other error is `EIO`.
+
+```js
+import { System } from '@gex/runtime';
+import { Filesystem } from '@gex/runtime/fs';
+
+const PIECE = 1 << 20;
+// The files' contents in 1 MiB pieces the page keeps (in a Map here).
+class PieceFilesystem extends Filesystem {
+  #pieces = new Map();
+  #size = 0;
+  #each(offset, length, fn) {
+    for (let at = 0; at < length;) {
+      const p = offset + at, n = Math.min(length - at, PIECE - (p % PIECE));
+      fn(Math.floor(p / PIECE), p % PIECE, at, n);
+      at += n;
+    }
+  }
+  async read(offset, length) {
+    const out = new Uint8Array(Math.max(0, Math.min(length, this.#size - offset)));
+    this.#each(offset, out.length, (i, o, at, n) => {
+      const piece = this.#pieces.get(i);
+      if (piece) out.set(piece.subarray(o, o + n), at);
+    });
+    return out;
+  }
+  async write(offset, bytes) {
+    this.#each(offset, bytes.length, (i, o, at, n) => {
+      if (!this.#pieces.has(i)) this.#pieces.set(i, new Uint8Array(PIECE));
+      this.#pieces.get(i).set(bytes.subarray(at, at + n), o);
+    });
+    this.#size = Math.max(this.#size, offset + bytes.length);
+  }
+  async size() { return this.#size; }
+  async truncate(length) {
+    for (const i of this.#pieces.keys()) if (i * PIECE >= length) this.#pieces.delete(i);
+    this.#pieces.get(Math.floor(length / PIECE))?.fill(0, length % PIECE);
+    this.#size = length;
+  }
+  async flush() {}
+}
+
+const sys = new System();
+const fs = new PieceFilesystem(sys, { cache: 16 });
+fs.addTar('/trees/base.tar.zst');
+await sys.boot();
+```
+
+Before boot, it is the tars and files a page adds, laid one
 over another in the order added (a later one wins). After boot, a tar or
 files are written into the running tree.
 
@@ -277,32 +375,47 @@ or a hard link between it and the rest of the tree is `EXDEV` (`mv` copies).
 
 ## Persistence
 
-The root, kept across page loads: a `Persist` on the filesystem, made
-before boot, lays what it kept over the sources before the first
-program, and keeps what the programs change from then on: about a second
-after their changes settle, every 30 s, when the page is hidden or left,
-and at `shutdown()`. Files, directories, symlinks, modes and deletions of
-the sources' paths; never `/tmp`, `/proc`, `/sys`, `/dev`, `/run` or a
-mount (its provider keeps its own). A snapshot reads only the files a
-program wrote: a lazy file nobody wrote is never fetched for it.
+A store (an `OPFSFilesystem`, or a subclass of the page's own) keeps the
+root across page loads. At boot, what it kept is laid over the sources before
+the first program. From then on it keeps what the programs change: files,
+directories, symlinks, modes, extended attributes, hard links, and
+deletions of the sources' paths. It never keeps `/tmp`, `/proc`, `/sys`,
+`/dev`, `/run`, a mount (its provider keeps its own) or the filesystem's
+`exclude`. A lazy file nobody wrote is never fetched for it.
+
+What is kept is written as a generation, beside the files' blocks in the
+store, when one of these happens:
+- a program calls `sync`, `syncfs`, `fsync` or `fdatasync`;
+- the page calls `sys.sync()` or `shutdown()`;
+- the page is hidden or left;
+- a change has waited the filesystem's `writeback` ms.
+
+Each generation is checksummed, and the one before stays whole until the
+next is written. If a boot finds the newest torn or failing its checks (a
+tab killed in the middle of one, a damaged store), it boots the one before
+and says so on the console. A file's bytes are not journalled: after such
+a boot, a file reads what was last written into the blocks it had.
 
 ```js
-import { IdbPersist } from '@gex/runtime/persist/idb';
-const persist = new IdbPersist(fs, { db: 'my-tree' });  // before boot
+import { System } from '@gex/runtime';
+import { OPFSFilesystem } from '@gex/runtime/fs';
+
+const sys = new System();
+const fs = new OPFSFilesystem(sys, { name: 'my-tree' });  // kept as 'my-tree'
+fs.addTar('/trees/my-tree.tar.zst');                      // the same at every load
 await sys.boot();
 ```
 
 | Member | Does |
 | --- | --- |
-| `new IdbPersist(fs, { db, exclude, every, quiet })` | Kept in the IndexedDB database `db`, one per tree. `exclude`: more paths never kept; `every` (ms, default 30000), `quiet` (default 1000). |
-| `new Persist(fs, store, opts)` (`@gex/runtime/persist`) | Kept by a store of the page's: `load()` resolves the records it holds, `store({ put, drop })` takes new records and the paths whose records go, `reset()` forgets them. A record is `{ path, kind, stamp }` and, by kind, `'file'` (`data`, `mode`, `mtime`), `'dir'` (`mode`), `'symlink'` (`target`), `'mode'` (a source file's mode), `'gone'` (a source path deleted, with all under it); a store keeps it as it is. |
-| `save()` | Store what changed now: `{ stored, dropped, bytes }`. |
-| `reset()` | Forget what is kept; saving stops. The next load is the sources alone. |
-| `stats` | `{ saves, stored, dropped, bytes, last, error }`. |
-| Events | `stored` (`stored`, `dropped`, `bytes`), `error`. |
+| `exclude` (constructor) | More absolute paths never kept, beside the ones above. |
+| `sys.sync()` | Writes a generation now. |
+| `OPFSFilesystem.erase(name)`, `fs.erase()` | Forget what the store keeps: the next boot is the sources alone. Before boot, or once the system has stopped. |
 
 A tree's sources must be the same at every load: what is kept is laid over
-them, path by path.
+them, path by path. A new tree gets a new store `name`. Nothing kept by the
+`IdbPersist` of earlier versions is read: those IndexedDB databases are left
+as they were, and a page may delete them.
 
 ## Network
 

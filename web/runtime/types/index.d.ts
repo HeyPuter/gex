@@ -102,6 +102,8 @@ export declare class System extends EventTarget {
   set network(network: Network | null);
   get net(): { connectGuest(port: number, options?: { host?: string }): Promise<GuestConnection> };
   describe(): { phase: Phase; arch: string | null; processes: { pid: number | null; argv: string[] }[]; pids: number[]; threads: number; memory: { kernel: number } };
+  /** What the programs wrote made durable in the filesystem's store (sync(2)). */
+  sync(): Promise<void>;
   shutdown(): Promise<void>;
 }
 

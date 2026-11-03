@@ -12,6 +12,7 @@ export default async function (t) {
   let exitSaid = null;
   const app = await timeout(start({
     container: document.getElementById('app'),
+    filesystem: 'memory',
     size: { w: 320, h: 240 },
     baseUrl: t.baseUrl,
     onLog: (s) => { logged += s; },

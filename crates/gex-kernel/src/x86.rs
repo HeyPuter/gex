@@ -289,6 +289,8 @@ pub mod raw {
     pub const ARCH_PRCTL: u64 = 158;
     pub const SETRLIMIT: u64 = 160;
     pub const SYNC: u64 = 162;
+    pub const SYNC_FILE_RANGE: u64 = 277;
+    pub const SYNCFS: u64 = 306;
     pub const MOUNT: u64 = 165;
     pub const UMOUNT2: u64 = 166;
     pub const REBOOT: u64 = 169;
@@ -613,6 +615,8 @@ pub fn translate(
         x::PRCTL => nr::PRCTL,
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
         x::SYNC => nr::SYNC,
+        x::SYNCFS => nr::SYNCFS,
+        x::SYNC_FILE_RANGE => nr::SYNC_FILE_RANGE,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
         x::REBOOT => nr::REBOOT,
@@ -702,8 +706,8 @@ pub fn translate(
         151 => nr::MLOCKALL,
         152 => nr::MUNLOCKALL,
         325 => nr::MLOCK2,
-        // Advisory: fadvise64, readahead, sync_file_range, sched_setaffinity.
-        221 | 187 | 277 | 203 => nr::NOOP_OK,
+        // Advisory: fadvise64, readahead, sched_setaffinity.
+        221 | 187 | 203 => nr::NOOP_OK,
         _ => UNKNOWN,
     }
 }

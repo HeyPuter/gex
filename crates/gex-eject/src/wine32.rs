@@ -444,7 +444,7 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                without wineboot, from a recording made with WINEGEX_RECORD_HARDWARE=1 (\"run\": \
                Wine's); see crates/gex-eject/README.md, \"Wineboot\". \
                \"start\": defaults for the app library's start() \
-               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
+               (args, env, cwd, size, mtimes, strace, trapstack, filesystem, ready), over the \
                recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
         ),
         (
@@ -462,8 +462,32 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
         ("helpers", s(if strip { "strip" } else { "keep" })),
         ("desktop", s(if strip { "none" } else { "explorer" })),
         ("wineboot", s("run")),
-        ("start", obj(vec![])),
+        // Where the guest's files are kept: a choice the project makes.
+        ("start", obj(vec![("filesystem", s("memory"))])),
     ]))
+}
+
+/// user/eject.json "start", as the launch carries it: with the project's
+/// `"filesystem"`, which the page's start() needs and has no default for.
+fn start_of(text: &str) -> Result<Json> {
+    let start = Json::parse(text).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?;
+    let ok = match start.get("filesystem") {
+        None => bail!(
+            "user/eject.json \"start\": no \"filesystem\": choose where the guest's files are kept, \
+             \"memory\" or {{\"kind\": \"opfs\", \"name\": \"...\"}} (crates/gex-eject/README.md, \"Build or start\")"
+        ),
+        Some(Json::Str(k)) => k == "memory",
+        Some(f @ Json::Obj(_)) => match json::opt_str(f, "kind").as_deref() {
+            Some("memory") => true,
+            Some("opfs") => json::opt_str(f, "name").is_some_and(|n| !n.is_empty()),
+            _ => false,
+        },
+        Some(_) => false,
+    };
+    if !ok {
+        bail!("user/eject.json \"start\": \"filesystem\" is \"memory\", {{\"kind\": \"memory\", \"max\": BYTES}} or {{\"kind\": \"opfs\", \"name\": \"...\", \"cache\": MIB}}");
+    }
+    Ok(start)
 }
 
 /// Whether the page runs ahead-of-time code only: `"translation"` off, the
@@ -1570,7 +1594,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         ("bundle", bundle),
         // user/eject.json "start": the app library's start() defaults, over
         // the recording's (crates/gex-eject/README.md, "The web build").
-        ("start", Json::parse(&config.start).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?),
+        ("start", start_of(&config.start)?),
     ]);
     write_file(&web.join("wine32.json"), json::write(&launch).as_bytes(), false)?;
     write_file(
@@ -1590,6 +1614,22 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         false,
     )?;
     Ok(Wine32Report { features_off: off, page_files, units: units.len() })
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::start_of;
+
+    #[test]
+    fn a_build_names_where_the_guests_files_are_kept() {
+        assert!(start_of(r#"{"filesystem": "memory", "args": ["a"]}"#).is_ok());
+        assert!(start_of(r#"{"filesystem": {"kind": "opfs", "name": "th07"}}"#).is_ok());
+        assert!(start_of(r#"{"filesystem": {"kind": "memory", "max": 1073741824}}"#).is_ok());
+        let none = start_of("{}").unwrap_err().to_string();
+        assert!(none.contains("no \"filesystem\""), "{none}");
+        assert!(start_of(r#"{"filesystem": "opfs"}"#).is_err());
+        assert!(start_of(r#"{"filesystem": {"kind": "opfs"}}"#).is_err());
+    }
 }
 
 #[cfg(test)]

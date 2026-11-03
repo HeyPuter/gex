@@ -78,6 +78,8 @@ pub mod nr {
     pub const FSTAT: u64 = 80;
     pub const FSYNC: u64 = 82;
     pub const FDATASYNC: u64 = 83;
+    pub const SYNC_FILE_RANGE: u64 = 84;
+    pub const SYNCFS: u64 = 267;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -5611,6 +5613,8 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
         nr::UNAME
             | nr::PRCTL
             | nr::SYNC
+            | nr::SYNCFS
+            | nr::SYNC_FILE_RANGE
             | nr::FSYNC
             | nr::FDATASYNC
             | nr::SET_ROBUST_LIST
@@ -6318,15 +6322,25 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         // Names, death signals and dumpability: all things a process may
         // set about itself that change nothing observable here.
         nr::PRCTL => Ok(0),
-        // Nothing here is written back to a device, so there is nothing
-        // to flush -- but an init script's last act is usually to call it.
-        nr::SYNC => Ok(0),
-        // `fdatasync` like `fsync`: everything is already durable (the VFS
-        // is in memory), so validating the fd and returning success is the
-        // honest answer. Missing it made sqlite's journal sync return
-        // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
-        // and refuses to write any file-backed database.
-        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32).map(|_| 0),
+        // Everything written made durable: the block store's dirty blocks
+        // written out and the store flushed (vfs::sync_all); with the files
+        // in memory, nothing. MAP_SHARED pages still in a process's memory
+        // reach the file at msync and munmap, not here.
+        nr::SYNC => crate::vfs::sync_all().map(|_| 0),
+        // One filesystem: the fd's is the root's (a mount's provider keeps
+        // its own, and flushes nothing here).
+        nr::SYNCFS => {
+            io.fds.get(a[0] as i32)?;
+            crate::vfs::sync_all().map(|_| 0)
+        }
+        // A range of the file written out: the file's data, as fdatasync.
+        nr::SYNC_FILE_RANGE => io.fds.get(a[0] as i32)?.handle.sync(true).map(|_| 0),
+        // `fsync` and `fdatasync`: the file's own (FileHandle::sync); a file
+        // in memory has nothing to flush, so it is the fd's validation alone.
+        // (Without them sqlite's journal sync was ENOSYS, which it reports
+        // as SQLITE_IOERR and refuses to write a file-backed database.)
+        // The file's size and names with it: a generation of the kept root.
+        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32)?.handle.sync(false).map(|_| 0),
         nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
         // Restartable sequences are an optimisation the guest can live
         // without, and both libcs treat ENOSYS as "not available".
@@ -11660,6 +11674,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FSTAT => "fstat",
         nr::FSYNC => "fsync",
         nr::FDATASYNC => "fdatasync",
+        nr::SYNC_FILE_RANGE => "sync_file_range",
+        nr::SYNCFS => "syncfs",
         nr::EXIT => "exit",
         nr::EXIT_GROUP => "exit_group",
         nr::SET_TID_ADDRESS => "set_tid_address",

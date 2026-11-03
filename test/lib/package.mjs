@@ -6,8 +6,6 @@ export const PACKAGE_ENTRIES = {
   'windows/host.js': 'windows-host.mjs',
   'windows/single.js': 'windows-single.mjs',
   'windows/compositor.js': 'windows-compositor.mjs',
-  'persist.js': 'persist.mjs',
-  'persist/idb.js': 'persist-idb.mjs',
   'net/wisp.mjs': 'net-wisp.mjs',
   'audio.js': 'audio.mjs',
   'gl.js': 'gl.mjs',

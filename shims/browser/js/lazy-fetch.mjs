@@ -250,12 +250,12 @@ export function processMemories(mem, is64 = false, spare = null) {
  * top of the kernel's stack array; the host hands guest Workers the slices
  * below them (host.mjs `#nextKernelStack`, which stops short of these). One
  * slot per kind: two kernel instances on one slot share a stack and a
- * thread-local block, and the persist Worker can run beside an fs-opened ask
- * and the terminal (all three on one slot before). Each kind runs at most one
- * instance at a time (fs-opened.js asks one at a time).
+ * thread-local block, and an fs-opened ask can run beside the terminal (both
+ * on one slot before). Each kind runs at most one instance at a time
+ * (fs-opened.js asks one at a time).
  */
-export const HELPER_STACKS = Object.freeze({ tty: 0, hostx: 1, persist: 2, fsOpened: 3 });
-export const HELPER_STACK_COUNT = 4;
+export const HELPER_STACKS = Object.freeze({ tty: 0, hostx: 1, fsOpened: 2 });
+export const HELPER_STACK_COUNT = 3;
 
 /** The stack top of helper `kind` (a `HELPER_STACKS` key) in kernel `k`. */
 export function helperStackTop(k, kind) {

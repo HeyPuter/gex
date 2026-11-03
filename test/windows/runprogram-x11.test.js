@@ -24,6 +24,7 @@ export default async function (t) {
     onData: () => ({ dispose() {} }), onResize: () => ({ dispose() {} }), focus() {},
   };
   runProgram(term, {
+    filesystem: 'memory',
     elf: tree.files['/bin/rt-x11'], args: ['/bin/rt-x11', 'demo'], files: tree.files, dirs: tree.dirs, modes: tree.modes, symlinks: tree.links, hard: tree.hard,
     env: ['DISPLAY=:0', 'PATH=/bin'], wl: desk, hostX: true, onDesktop: (x) => { raw = x; },
   }).then((r) => { out += `\n[ended ${JSON.stringify(r?.status)}]`; }, (e) => { out += `\n[threw ${e}]`; });

@@ -2599,6 +2599,122 @@ fn fetch_lazy(url: &str, offset: u64, into: &mut [u8]) -> bool {
     n >= 0 && n as usize == into.len()
 }
 
+// -- file contents in the page's block store (gex_kernel::vfs::blocks) ------
+//
+// The host's reads and writes of the one store file go through `block_io`
+// (shims/browser/js/blocks.mjs): a realm holding the store's handle (the
+// single-thread build's system Worker) does them itself; any other asks the
+// page's store Worker through the slots in `BLOCKS_CTL` and waits.
+
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// `op` (gex_kernel::vfs::blocks OP_*) at `offset` of the store file,
+    /// on the `len` bytes at `dst`; `ctl` is `BLOCKS_CTL`'s address.
+    /// Returns `len` when done (0 for a grow or a flush), -28 when the
+    /// store is full, another negative number when it failed.
+    fn block_io(op: u32, ctl: u32, offset: u64, dst: u32, len: u32) -> i32;
+}
+
+static BLOCKS_CTL: [core::sync::atomic::AtomicI32; 1024] = [const { core::sync::atomic::AtomicI32::new(0) }; 1024];
+
+fn blocks_io(op: u32, offset: u64, buf: &mut [u8]) -> Result<(), gex_kernel::Errno> {
+    // SAFETY: the buffer is in this module's memory and stays borrowed for
+    // the call only.
+    let n = unsafe { block_io(op, BLOCKS_CTL.as_ptr() as u32, offset, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    match n {
+        n if n >= 0 && n as usize == buf.len() => Ok(()),
+        -28 => Err(gex_kernel::Errno::ENOSPC),
+        _ => Err(gex_kernel::Errno::EIO),
+    }
+}
+
+/// Turn the block store on for files made from now on (`block` 0: only
+/// the slots' address): blocks of `block` bytes, `cache_mib` MiB of them
+/// held here, files up to `inline` bytes kept in this memory; `flags` bit 0
+/// checks every block read back against what was written (debugging).
+/// Returns the store's slots' address (`BLOCKS_CTL`).
+#[no_mangle]
+pub extern "C" fn k_blocks_config(block: u32, cache_mib: u32, inline: u32, flags: u32) -> u32 {
+    gex_kernel::vfs::blocks::set_io(blocks_io);
+    gex_kernel::vfs::set_sync_all(gex_kernel::vfs::tmpfs::persist::sync);
+    if block != 0 {
+        gex_kernel::vfs::blocks::set_check(flags & 1 != 0);
+        gex_kernel::vfs::blocks::configure(block, (cache_mib as u64) << 20, inline as u64);
+    }
+    BLOCKS_CTL.as_ptr() as u32
+}
+
+/// The periodic write-back (`gex_kernel::vfs::tmpfs::persist::tick`): a
+/// generation of the kept root written once a change or a dirty block has
+/// waited `age` ticks. 1 for one written, 0 for none due, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_blocks_tick(age: u32) -> i32 {
+    match gex_kernel::vfs::tmpfs::persist::tick(age) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+/// `sync(2)` (`gex_kernel::vfs::tmpfs::persist::sync`): 0 or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_fs_sync_all() -> i32 {
+    match gex_kernel::vfs::tmpfs::persist::sync() {
+        Ok(()) => 0,
+        Err(e) => -e.0,
+    }
+}
+
+/// At boot, once the sources are laid and before the first program: the
+/// root kept in the store from now on, and what the store kept laid over
+/// it (`gex_kernel::vfs::tmpfs::persist::start`). `exclude`: the paths never
+/// kept, one per line. 0 nothing was kept, 1 restored, 2 the newest
+/// generation failed its checks and the one before was restored, 3 nothing
+/// kept could be read. The generation restored is `k_fs_restored_gen`.
+#[no_mangle]
+pub extern "C" fn k_fs_restore(exclude: gex_kmem::PAddr, exclude_len: u32) -> i32 {
+    use gex_kernel::vfs::tmpfs::persist::{start, Found};
+    let list = with_path(exclude, exclude_len, false, |s| s.lines().map(|l| l.trim_matches('/').to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>());
+    match start(rootfs(), list) {
+        Found::Fresh => 0,
+        Found::Restored => 1,
+        Found::FellBack => 2,
+        Found::Unreadable => 3,
+    }
+}
+
+/// The generation the boot restored ([`k_fs_restore`]).
+#[no_mangle]
+pub extern "C" fn k_fs_restored_gen() -> u32 {
+    gex_kernel::vfs::tmpfs::persist::BOOT_GEN.load(core::sync::atomic::Ordering::Relaxed) as u32
+}
+
+/// `fsync`, `fdatasync` (`data_only` 1) of an open file (`FileHandle::sync`).
+#[no_mangle]
+pub extern "C" fn k_fs_sync(handle: i32, data_only: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.sync(data_only != 0))
+}
+
+/// The store's counters (`gex_kernel::vfs::blocks::stats`), u64s.
+#[no_mangle]
+pub extern "C" fn k_blocks_stats(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let s = gex_kernel::vfs::blocks::stats();
+    let b: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if (b.len() as u32) > cap {
+        return -34;
+    }
+    unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    b.len() as i32
+}
+
+/// The most the root's file contents may take in this memory, in bytes (0:
+/// no limit): a write past it is ENOSPC (`MemoryFilesystem({ max })`).
+#[no_mangle]
+pub extern "C" fn k_fs_limit(lo: u32, hi: u32) -> i32 {
+    gex_kernel::vfs::tmpfs::TMPFS_MAX.store(((hi as u64) << 32) | lo as u64, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 /// The root every process sees.
 fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     note_panics();
@@ -2608,6 +2724,7 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
         // A process that ended holding directory renames off holds nothing.
         gex_kernel::vfs::set_owner_alive(|pid| procs().alive(pid));
         let fs = gex_kernel::vfs::TmpFs::new();
+        fs.use_store();
         // Directories a guest expects before anything is bundled: `open(O_CREAT)`
         // under a missing directory is `ENOENT`, not a directory being made.
         for d in ["/tmp", "/proc", "/dev", "/run", "/var", "/var/tmp"] {
@@ -2904,60 +3021,6 @@ pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
         unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
     }
     b.len() as i32
-}
-
-/// The files the program has made or changed since the root was seeded
-/// (`TmpFs::written`), one path per line, at `at`; their length, or `-ERANGE`
-/// with nothing written when `cap` will not hold them. A page's persist store
-/// (web/src/persist-worker.js) snapshots these and no others, so a snapshot
-/// never reads, or fetches, a file the program left alone.
-/// Every node of the shared root, without their bytes (`TmpFs::tree`): a
-/// persist store's diff. The length, or `-ERANGE` with the length needed in
-/// the first 4 bytes when `cap` is short.
-#[no_mangle]
-pub extern "C" fn k_fs_tree(at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let b = rootfs().tree();
-    if b.len() as u32 > cap {
-        if cap >= 4 {
-            let n = (b.len() as u32).to_le_bytes();
-            unsafe { gex_kmem::push_checked(at, n.as_ptr(), 4) };
-        }
-        return -34; // ERANGE
-    }
-    if !b.is_empty() {
-        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
-    }
-    b.len() as i32
-}
-
-#[no_mangle]
-pub extern "C" fn k_fs_written(at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let mut b = rootfs().written().join("\n");
-    if !b.is_empty() {
-        b.push('\n');
-    }
-    if b.len() as u32 > cap {
-        return -34; // ERANGE
-    }
-    if !b.is_empty() {
-        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
-    }
-    b.len() as i32
-}
-
-/// Count the changes the program finishes under the directory at `path` (a
-/// page's persist root): `k_fs_saves` then moves at each, and the persist
-/// store snapshots soon after (`tmpfs::watch`). One directory, the first set.
-#[no_mangle]
-pub extern "C" fn k_fs_watch(path: gex_kmem::PAddr, path_len: u32) {
-    with_path(path, path_len, false, gex_kernel::vfs::tmpfs::watch);
-}
-
-/// How many changes the program has finished under the watched directory
-/// (`k_fs_watch`), wrapping: one load, asked on a timer.
-#[no_mangle]
-pub extern "C" fn k_fs_saves() -> u32 {
-    gex_kernel::vfs::tmpfs::SAVES.load(core::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// A path's metadata, without opening it -- which matters for a symlink and

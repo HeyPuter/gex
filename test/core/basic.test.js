@@ -1,18 +1,18 @@
 // System, spawn (pipes and a terminal), run, kill, and the Filesystem.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
 export default async function (t) {
   const { say, check, eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/etc/hello': 'hello from addFiles\n' });
   check('a second System throws', (() => { try { new System(); return false; } catch (e) { return /one system/.test(e.message); } })());
   check('an arch the runtime has none of throws', (() => { try { new System({ arch: 'mips' }); return false; } catch (e) { return e instanceof TypeError && /arch is one of x86, aarch64/.test(e.message); } })());
-  check('a second Filesystem throws', (() => { try { new Filesystem(sys); return false; } catch { return true; } })());
+  check('a second Filesystem throws', (() => { try { new MemoryFilesystem(sys); return false; } catch { return true; } })());
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');
   say(`booted in ${(performance.now() - t0).toFixed(0)} ms`);

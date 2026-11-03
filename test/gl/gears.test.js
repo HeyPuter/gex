@@ -3,7 +3,7 @@
 // must draw as much of the frame as it does on the host's own Mesa
 // (fixtures/images.mjs `gl-probes`), with no GL error.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
 
@@ -15,7 +15,7 @@ export default async function (t) {
   if (!(await fetch(t.work(tar), { method: 'HEAD' })).ok) return t.skip(`no ${tar} (fixtures/images.mjs)`);
   const want = (await (await fetch(t.work('gl-probes.json'))).json())['gles-gears']?.covered;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  new Filesystem(sys).addTar(t.work(tar));
+  new MemoryFilesystem(sys).addTar(t.work(tar));
   new CompositorWindows(sys, { canvas: document.getElementById('out') });
   const gl = new MesaGl(sys);
   await t.timeout(sys.boot(), 60000, 'boot');

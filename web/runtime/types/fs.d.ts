@@ -58,8 +58,24 @@ export type LazyList =
   | string
   | URL;
 
-export declare class Filesystem extends EventTarget {
-  constructor(sys: System);
+/** Abstract: a page makes a MemoryFilesystem, an OPFSFilesystem, or a
+ *  subclass of its own that implements the store's methods (`new
+ *  Filesystem(sys)` throws). */
+export declare abstract class Filesystem extends EventTarget {
+  /** `cache`: MiB of the store held in the system's memory (default 256, 16 to 4096);
+   *  `writeback`: ms a written block waits (default 5000); `exclude`: more
+   *  absolute paths the store does not keep across loads. */
+  constructor(sys: System, options?: { cache?: number; writeback?: number; exclude?: string[] });
+  /** The store, which a subclass implements: one array of bytes, the root a
+   *  load before kept. Optional: ready it before boot (empty it to start over). */
+  open(): Promise<void>;
+  /** `length` bytes at `offset`; shorter past the end (zeros). */
+  read(offset: number, length: number): Promise<Uint8Array>;
+  write(offset: number, bytes: Uint8Array): Promise<void>;
+  size(): Promise<number>;
+  /** An error with `code: 'ENOSPC'` when the store is full. */
+  truncate(length: number): Promise<void>;
+  flush(): Promise<void>;
   addTar(src: Source | null, options?: { at?: string; lazy?: LazyList }): Promise<unknown>;
   addFiles(files: Record<string, Source>, options?: { mode?: number }): Promise<unknown>;
   mount(path: string, provider: MountProvider): Mount;
@@ -78,4 +94,28 @@ export declare class Filesystem extends EventTarget {
   chmod(path: string, mode: number): Promise<void>;
   /** Returns a function that stops watching. */
   watch(path: string, fn: (e: WatchEvent) => void): () => void;
+}
+
+/** File data in the system's memory; writes past `max` bytes fail with ENOSPC. */
+export declare class MemoryFilesystem extends Filesystem {
+  constructor(sys: System, options?: { max?: number });
+  read(offset: number, length: number): Promise<Uint8Array>;
+  write(offset: number, bytes: Uint8Array): Promise<void>;
+  size(): Promise<number>;
+  truncate(length: number): Promise<void>;
+  flush(): Promise<void>;
+}
+
+/** The root kept in the page's OPFS, in the store `name`, with a cache of `cache` MiB in memory (default 256). */
+export declare class OPFSFilesystem extends Filesystem {
+  constructor(sys: System, options: { name: string; cache?: number; writeback?: number; exclude?: string[] });
+  /** Forget what the store `name` keeps (not while a system holds it). */
+  static erase(name: string): Promise<void>;
+  /** Forget what this filesystem's store keeps: before boot, or once its system stopped. */
+  erase(): Promise<void>;
+  read(offset: number, length: number): Promise<Uint8Array>;
+  write(offset: number, bytes: Uint8Array): Promise<void>;
+  size(): Promise<number>;
+  truncate(length: number): Promise<void>;
+  flush(): Promise<void>;
 }

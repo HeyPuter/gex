@@ -1,6 +1,6 @@
 // The guest's files from the page: the kernel's `k_fs_*` exports through the
 // kernel-call Worker (kernel.js), for the Filesystem (fs.js), the layers it
-// lays into the root and persistence.
+// lays into the root.
 
 import { errno } from './kernel.js';
 
@@ -192,7 +192,7 @@ export class Files {
    *  bytes, unpacked in the kernel as they come, pagetar.rs) laid at `at`,
    *  single files with their modes, lazy files (`[path, size, url, mode,
    *  mtime]`, mtime in seconds; either may be undefined).
-   *  Seeding, not a program's writes: persistence does not take it. The
+   *  Seeding, not a program's writes: the store keeps none of it. The
    *  count of files laid. */
   async lay({ tar, at = '/', files = {}, modes = {}, lazy = [] }) {
     const k = this.#k;
@@ -289,50 +289,6 @@ export class Files {
       if ((c.f === 'k_fs_add' || (!hasHard && c.f === 'k_fs_add_lazy')) && r < 0) throw errno(r, c.a[0].in);
     });
     return n;
-  }
-
-  /** What a store kept (persist.js's records), over the tree: deletions,
-   *  then the rest, parents first. */
-  async restore(records) {
-    for (const r of records) if (r.kind === 'gone') await this.rm(r.path, { recursive: true, force: true });
-    const list = [];
-    for (const r of records.filter((x) => x.kind !== 'gone').sort((a, b) => a.path.length - b.path.length)) {
-      const p = { in: r.path };
-      if (r.kind === 'file') {
-        list.push({ f: 'k_fs_add', a: [p, { in: r.data instanceof Uint8Array ? r.data : new Uint8Array(r.data ?? []) }] }, { f: 'k_fs_chmod', a: [p, r.mode ?? 0o644] });
-        if (r.mtime) list.push({ f: 'k_fs_set_mtime', a: [p, BigInt(Math.trunc(r.mtime))] });
-      } else if (r.kind === 'dir') {
-        list.push({ f: 'k_fs_add_dir', a: [p, r.mode ?? 0o755] }, { f: 'k_fs_chmod', a: [p, r.mode ?? 0o755] });
-      } else if (r.kind === 'symlink') {
-        list.push({ f: 'k_fs_unlink', a: [p] }, { f: 'k_fs_symlink', a: [{ in: r.target }, p] });
-      } else if (r.kind === 'mode') {
-        list.push({ f: 'k_fs_chmod', a: [p, r.mode] });
-      }
-    }
-    await batched(this.#k, list);
-  }
-
-  /** A file's bytes by its own name (a tree path: no link on it), `size`
-   *  of them; null when it cannot be opened. */
-  async readRaw(path, size) {
-    const h = await this.#k.r('k_fs_open', { in: path }, 0n, 0);
-    if (h < 0) return null;
-    try {
-      const list = [];
-      for (let off = 0; off < size; off += READ_MAX) list.push({ f: 'k_fs_read', a: [h, BigInt(off), { out: Math.min(READ_MAX, size - off) }], stop: true });
-      const parts = [];
-      let total = 0;
-      for (let i = 0; i < list.length; i += 8) {
-        for (const { r, out: [b] } of await this.#k.calls(list.slice(i, i + 8))) {
-          if (r <= 0) return concat(parts, total);
-          parts.push(b);
-          total += r;
-        }
-      }
-      return concat(parts, total);
-    } finally {
-      await this.#k.r('k_fs_close', h);
-    }
   }
 
   async mount(path, id) {

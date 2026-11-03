@@ -50,6 +50,7 @@ import { runCallsAsync, readsFiles } from './kernel-calls.js';
 import { lazyReady } from '../../../shims/browser/js/lazy-fetch.mjs';
 import { Sockets, pageRelay } from '../../src/net.js';
 import { setPageFsAsk } from '../../../shims/browser/js/page-fs.mjs';
+import { blocksOpen, blocksVerify } from '../../../shims/browser/js/blocks.mjs';
 
 enableSingle();
 
@@ -344,6 +345,14 @@ const ops = {
     if (!at) return { value: { at: 0 } };
     const all = words();
     return { value: { at, slots: all[(at >>> 2) + 2], cap: all[(at >>> 2) + 3], ccap: all[(at >>> 2) + 8] } };
+  },
+  // An OPFS filesystem's store (system.js `#store`): its handle held here,
+  // where the kernel and every process run, so their reads and writes of it
+  // are calls of this realm's own (blocks.mjs).
+  async blocksOpen({ name, verify }) {
+    blocksVerify(verify);
+    await blocksOpen(name);
+    return { value: true };
   },
   // The translation cache a load saved (system.js `#xcacheRestore`): named
   // and read here, where the runtime that saves it was loaded, and laid into

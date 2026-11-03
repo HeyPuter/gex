@@ -3,7 +3,7 @@
 // memory64 shim and seed the package ships, fetched then. The program is
 // page/mem64-pick's (test/fixtures/programs/mem64-pick.c).
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64'], timeout: 120 };
 
@@ -21,7 +21,7 @@ record gone: 32`;
 export default async function (t) {
   const { eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/g/pick': new URL(t.work('mem64-pick.x86')) }, { mode: 0o755 });
   await timeout(sys.boot(), 60000, 'boot');

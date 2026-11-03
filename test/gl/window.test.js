@@ -4,7 +4,7 @@
 // `showGlCanvas`), and the page showing them, as the browser composited it.
 // x86 only: gles-window is in that tree alone (it has the host's Xlib).
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { HostWindows } from '../../web/runtime/src/windows/host.js';
 import { MesaGl } from '../../web/runtime/src/gl.js';
 
@@ -21,7 +21,7 @@ export default async function (t) {
   if (adapter.info?.isFallbackAdapter || adapter.info?.architecture === 'swiftshader') return t.skip('software WebGPU only: SwiftShader loses the device at the window\'s WebGPU canvas (it draws on a GPU)');
   if (!(await fetch(t.work('gl-probes-x86.tar'), { method: 'HEAD' })).ok) return t.skip('no gl-probes-x86.tar (fixtures/images.mjs)');
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  new Filesystem(sys).addTar(t.work('gl-probes-x86.tar'));
+  new MemoryFilesystem(sys).addTar(t.work('gl-probes-x86.tar'));
   const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
   new MesaGl(sys);
   const desk = document.getElementById('desk');

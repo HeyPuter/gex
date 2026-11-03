@@ -9,9 +9,9 @@ export default async function (t) {
   // Not literals, which vite would try to resolve as its own.
   const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
-  const { Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
+  const { MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
   const sys = new System();
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');

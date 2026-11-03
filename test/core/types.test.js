@@ -17,7 +17,7 @@ function declarations(text) {
   const values = new Set();
   const classes = {};
   const interfaces = {};
-  for (const m of text.matchAll(/^export declare (?:const|function|class) (\w+)/gm)) values.add(m[1]);
+  for (const m of text.matchAll(/^export declare (?:const|function|class|abstract class) (\w+)/gm)) values.add(m[1]);
   for (const m of text.matchAll(/^export \{([^}]*)\}/gm)) for (const n of m[1].split(',')) if (n.trim()) values.add(n.trim().split(/\s+as\s+/).pop());
   const body = (start) => {
     let depth = 0;
@@ -41,7 +41,7 @@ function declarations(text) {
     out.push(line);
     return out.map((l) => l.replace(/\/\*\*.*?\*\/|\/\/.*$/g, '').trim()).filter((l) => l && !l.startsWith('*') && !l.startsWith('/*'));
   };
-  for (const m of text.matchAll(/^export declare class (\w+)[^{]*/gm)) {
+  for (const m of text.matchAll(/^export declare (?:abstract )?class (\w+)[^{]*/gm)) {
     const methods = new Set();
     const fields = new Set();
     for (const l of ownLines(body(m.index + m[0].length))) {

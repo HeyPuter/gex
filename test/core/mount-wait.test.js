@@ -2,7 +2,7 @@
 // go on meanwhile, two programs can wait on it at once, and each gets its own
 // answer (README "Mounts": "in its own thread only").
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { MemFs } from '../fixtures/memfs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
@@ -10,7 +10,7 @@ export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 
 export default async function (t) {
   const { check, eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const slow = new MemFs({ '/a': 'first\n', '/b': 'second\n' }, { delay: 1500 });
   fs.mount('/mnt/slow', slow);

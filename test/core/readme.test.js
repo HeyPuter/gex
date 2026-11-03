@@ -12,23 +12,22 @@ import * as fsMod from '../../web/runtime/src/fs.js';
 import * as host from '../../web/runtime/src/windows/host.js';
 import * as single from '../../web/runtime/src/windows/single.js';
 import * as compositor from '../../web/runtime/src/windows/compositor.js';
-import * as persist from '../../web/runtime/src/persist.js';
-import * as idb from '../../web/runtime/src/persist/idb.js';
 import * as wisp from '../../web/runtime/src/net/wisp.mjs';
 import * as audio from '../../web/runtime/src/audio.js';
 import * as gl from '../../web/runtime/src/gl.js';
 import * as input from '../../web/runtime/src/input.js';
+import { SP_CODE, MP_CODE } from '../../shims/browser/js/mode.mjs';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
 
 const M = {
   '@gex/runtime': index, '@gex/runtime/fs': fsMod, '@gex/runtime/windows/host': host,
   '@gex/runtime/windows/single': single, '@gex/runtime/windows/compositor': compositor,
-  '@gex/runtime/persist': persist, '@gex/runtime/persist/idb': idb,
   '@gex/runtime/net/wisp': wisp, '@gex/runtime/audio': audio, '@gex/runtime/gl': gl, '@gex/runtime/input': input,
 };
+// The single-thread build (system.js `SINGLE`).
+const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
-const DB = 'debian';
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes
  *  first when its blocks start from a system they do not make (`pre`:
@@ -41,7 +40,7 @@ const PHASES = [
     v.sh.pty.write('exit\n');
     t.eq('intro: bash -l exits', (await t.timeout(v.sh.exited, 30000, 'bash exit')).code, 0);
   } },
-  { blocks: [1, 2, 3], windows: true, before: () => dropDb(DB), check: async (t, v) => {
+  { blocks: [1, 2, 3], windows: true, before: () => fsMod.OPFSFilesystem.erase('debian'), check: async (t, v) => {
     t.eq('desktop: running', v.sys.state.phase, 'running');
     t.check('desktop: hw.env names the display', !!(v.hw.env.WAYLAND_DISPLAY && v.hw.env.DISPLAY), JSON.stringify(v.hw.env));
     await t.until(() => /\S/.test(v.term.text), 'terminals: bash -l says something on its terminal', 60000);
@@ -57,26 +56,34 @@ const PHASES = [
     const r = await t.timeout(v.sys.run(['xdg-open', 'https://example.org/'], { env: v.env }), 30000, 'xdg-open');
     t.eq('host calls: xdg-open opens the URL', [r.code, v.calls.openBrowserWindow], [0, 'https://example.org/']);
   } },
-  { blocks: [4], pre: 'new', before: () => dropDb('my-tree'), check: async (t, v) => {
-    const s = await v.persist.save();
-    t.check('persistence: save()', typeof s?.stored === 'number' && typeof s?.bytes === 'number', JSON.stringify(s));
+  { blocks: [4], refusedSingle: /needs the default build/, check: async (t, v) => {
+    // More than the 16 MiB cache, so the kernel writes it out to the
+    // page's store and reads it back.
+    const r = await t.timeout(v.sys.run(['sh', '-c', 'dd if=/dev/urandom of=/root/a bs=1M count=40 2>/dev/null && cp /root/a /root/b && md5sum /root/a /root/b && rm /root/a /root/b'], { env: { PATH: '/usr/bin:/bin' } }), 120000, 'store');
+    const sums = r.stdout.trim().split('\n').map((l) => l.split(' ')[0]);
+    t.check('a store of the page\'s own: 40 MiB copied through it', r.code === 0 && sums.length === 2 && sums[0] === sums[1], `exit ${r.code}: ${r.stdout}${r.stderr}`);
   } },
-  { blocks: [5, 6], pre: 'booted', check: async (t, v) => {
+  { blocks: [5], before: () => fsMod.OPFSFilesystem.erase('my-tree'), check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', 'echo kept > /root/kept && sync'], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'kept');
+    t.eq('persistence: a file written and synced', [r.code, r.stderr], [0, '']);
+    t.eq('persistence: sys.sync()', await v.sys.sync().then(() => 'ok', (e) => e.code ?? e.message), 'ok');
+  } },
+  { blocks: [6, 7], pre: 'booted', check: async (t, v) => {
     t.check('network: the last one set, a Wisp', v.sys.network instanceof wisp.Wisp && v.sys.network.url === 'wss://wisp.example/', String(v.sys.network?.url));
   } },
-  { blocks: [7], pre: 'booted', check: async (t, v) => {
-    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[7], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
+  { blocks: [8], pre: 'booted', check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[8], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
     t.eq('host calls: the guest reads "\\0true"', [r.code, r.stdout], [0, '\0true']);
     t.eq('host calls: notify ran', v.calls.showToast, 'built');
     v.off();
     t.eq('host calls: unregistered', v.sys.hostCalls.names().includes('notify'), false);
   } },
-  { blocks: [9], windows: true, pre: 'new', after: [8], boot: true, check: async (t, v) => {
+  { blocks: [10], windows: true, pre: 'new', after: [9], boot: true, check: async (t, v) => {
     t.check('GL: a MesaGl before boot, beside its windows', !!v.gl && !!v.hw, '');
     v.button.onclick();
     t.check('audio: the click made a WebAudio', true, '');
   } },
-  { blocks: [10], windows: true, pre: 'new', check: async (t, v) => {
+  { blocks: [11], windows: true, pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
     t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
   } },
@@ -88,10 +95,6 @@ function guestLine(block, start) {
   const lines = block.split('\n').map((l) => l.replace(/^\s*\/\/\s?/, ''));
   const i = lines.findIndex((l) => l.includes(start));
   return lines[i].slice(lines[i].indexOf(start)).trim();
-}
-
-function dropDb(name) {
-  return new Promise((r, j) => { const q = indexedDB.deleteDatabase(name); q.onsuccess = r; q.onerror = j; });
 }
 
 /** A block as the body of an async function: its imports from the modules
@@ -114,19 +117,19 @@ const showToast = (title) => { calls.showToast = title; };
 const openBrowserWindow = (url) => { calls.openBrowserWindow = url; };
 const closeTerminalWindow = () => { calls.closeTerminalWindow = true; };
 `;
-const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'persist', 'gl', 'off', 'term', 'button'];
+const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button'];
 
 export default async function (t) {
   const { eq, check, say } = t;
   if (t.phase === 1) {
-    eq('the README\'s examples', BLOCKS.length, 11);
+    eq('the README\'s examples', BLOCKS.length, 12);
     members(t);
   }
   const phase = PHASES[t.phase - 1];
   const tree = t.work('slim/debian-slim.tar.zst');
   await phase.before?.();
-  const pre = phase.pre === undefined ? '' : `const { System } = M['@gex/runtime']; const { Filesystem } = M['@gex/runtime/fs'];
-const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new Filesystem(sys); fs.addTar(${JSON.stringify(tree)});
+  const pre = phase.pre === undefined ? '' : `const { System } = M['@gex/runtime']; const { MemoryFilesystem } = M['@gex/runtime/fs'];
+const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new MemoryFilesystem(sys); fs.addTar(${JSON.stringify(tree)});
 ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
   const parts = [STUBS, pre, ...phase.blocks.map((i) => prepare(BLOCKS[i], tree))];
   if (phase.boot) parts.push('await sys.boot();');
@@ -142,10 +145,12 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
   try {
     v = await t.timeout(new AsyncFunction('M', 'BASE', 'DEBUG', 'calls', 'innerWidth', 'innerHeight', body)(M, t.baseUrl, t.debug(), {}, 1280, 720), 180000, `blocks ${phase.blocks}`);
   } catch (e) {
-    check(`blocks ${phase.blocks.join(', ')} run`, false, `${e.message}\n${body}`);
+    // What the single-thread build refuses, as the README says it does.
+    if (SINGLE && phase.refusedSingle) check(`blocks ${phase.blocks.join(', ')}: the single-thread build refuses them`, phase.refusedSingle.test(e.message), e.message);
+    else check(`blocks ${phase.blocks.join(', ')} run`, false, `${e.message}\n${body}`);
     return t.phase < PHASES.length ? t.reload() : undefined;
   }
-  check(`blocks ${phase.blocks.join(', ')} run`, true, '');
+  check(`blocks ${phase.blocks.join(', ')} run`, !(SINGLE && phase.refusedSingle), 'the single-thread build ran what it refuses');
   await phase.check(t, v);
   say(`phase ${t.phase}: blocks ${phase.blocks.join(', ')}`);
   await v.sys?.shutdown();
@@ -155,12 +160,11 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
 /** Every class the README's tables name, with their members. */
 function members(t) {
   const want = {
-    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
+    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'sync', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
     'Process': [index.Process.prototype, ['pid', 'kill', 'windows', 'addEventListener']],
-    'Filesystem': [fsMod.Filesystem.prototype, ['addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
+    'Filesystem': [fsMod.Filesystem.prototype, ['open', 'read', 'write', 'size', 'truncate', 'flush', 'addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
     'Mount': [fsMod.Mount.prototype, ['unmount']],
-    'Persist': [persist.Persist.prototype, ['save', 'reset', 'stats']],
-    'IdbPersist': [idb.IdbPersist.prototype, ['save', 'reset', 'stats']],
+    'OPFSFilesystem': [fsMod.OPFSFilesystem.prototype, ['erase']],
     'Wisp': [wisp.Wisp.prototype, ['url', 'connect', 'datagram', 'close', 'addEventListener']],
     'WebAudio': [audio.WebAudio.prototype, ['ready', 'context', 'stats', 'close']],
     'MesaGl': [gl.MesaGl.prototype, ['start']],

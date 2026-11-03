@@ -1,7 +1,7 @@
 // fs.mount: the page's own filesystems in the guest's tree, before boot and
 // while it runs.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 import { MemFs } from '../fixtures/memfs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
@@ -9,7 +9,7 @@ export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 
 export default async function (t) {
   const { say, check, eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const big = new Uint8Array(1 << 20).map((_, i) => (i * 7) & 0xff);
   const early = new MemFs({ '/hello': 'hello from the page\n', '/sub/deep.txt': 'deep\n', '/big': big });

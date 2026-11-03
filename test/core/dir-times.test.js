@@ -1,7 +1,7 @@
 // A folder's time, as a file manager lists it: never 0 (January 1970) for a
 // folder a tar, a lazy list, the page or a program made.
 import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 
@@ -10,7 +10,7 @@ const LAZY_TIME = 1_700_000_000;
 export default async function (t) {
   const { eq, check, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   // A tar with its folders' own entries.
   fs.addTar(t.work('bb.tar.zst'));
   // A lazy list as a site writes it (`[path, size, url, mtime, mode]`),

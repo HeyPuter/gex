@@ -15,28 +15,17 @@ use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuar
 /// buffer that grew geometrically keeps the larger allocation whatever its
 /// length says. For the memory census.
 pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The most file contents may take in this memory ([`TMPFS_BYTES`]), 0 for
+/// no limit: past it a write that needs more room is ENOSPC (the page's
+/// `MemoryFilesystem({ max })`).
+pub static TMPFS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The directory a page keeps (its persist store's root, `watch`), without
-/// its leading `/`, and how many times the program has finished a change
-/// under it: a close after a write (or a create or truncation), a rename
-/// into or out of it, an unlink. The store snapshots soon after the count moves
-/// (web/src/persist-worker.js), so a save outlives the page without waiting
-/// for a timer. Unset, nothing is counted.
-static WATCHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-pub static SAVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Moves at every change of a tree or of a file's contents or times: the
+/// root's persistence (persist.rs) writes a generation only after it has.
+pub static META: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Count changes finished under `root` ([`SAVES`]); the first root set stays.
-pub fn watch(root: &str) {
-    let _ = WATCHED.set(root.trim_matches('/').to_string());
-}
-
-/// A change to `path` (a tmpfs path, no leading `/`) finished: counted when
-/// it is under the watched directory.
-fn saved(path: &str) {
-    let Some(w) = WATCHED.get() else { return };
-    if path.starts_with(w.as_str()) && (w.is_empty() || path.len() == w.len() || path.as_bytes()[w.len()] == b'/') {
-        SAVES.fetch_add(1, Ordering::Relaxed);
-    }
+fn moved() {
+    META.fetch_add(1, Ordering::Relaxed);
 }
 
 /// This filesystem's half of an [`inotify::Key`](crate::inotify::Key).
@@ -112,9 +101,6 @@ fn note_capacity(before: usize, after: usize) {
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
-/// The fixed part of one [`TmpFs::tree`] entry.
-pub const TREE_ENTRY: usize = 40;
-
 /// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
 pub const LAZY_MTIME: i64 = 0;
 
@@ -125,6 +111,12 @@ static READ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
+    /// The contents as blocks in the host's store (`super::blocks`), once
+    /// the file is past what stays inline while the store is on; `data` is
+    /// then empty.
+    pg: Mutex<Option<super::blocks::PFile>>,
+    /// Whether its filesystem keeps contents in the store ([`TmpFs::use_store`]).
+    store: bool,
     /// Contents fetched on demand (`TmpFs::add_lazy`); `None` once the file
     /// is an ordinary one (never, or since a write made it one).
     lazy: Mutex<Option<Lazy>>,
@@ -149,8 +141,8 @@ pub struct FileNode {
     /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
     /// rename. Not a time set (`utimensat`, which a program can aim at any
     /// file), not a lazy file's contents arriving, not the seeding itself.
-    /// What a page's persist store snapshots (web/src/persist-worker.js),
-    /// so a snapshot never reads a file the program did not touch.
+    /// What the kept root records (persist.rs), so that a generation never
+    /// reads a file the program did not touch.
     written: core::sync::atomic::AtomicBool,
     /// [`FileHandle::changes`]: bumped with the contents' lock held, so a
     /// reader that saw the same count before and after its read read
@@ -162,9 +154,29 @@ pub struct FileNode {
     gone_mode: core::sync::atomic::AtomicU32,
 }
 
+/// A file's contents go with its last name and descriptor: their room is
+/// free again ([`TMPFS_BYTES`], which a max is measured against).
+impl Drop for FileNode {
+    fn drop(&mut self) {
+        if let Ok(d) = self.data.get_mut() {
+            note_capacity(d.capacity(), 0);
+        }
+        if let Ok(Some(l)) = self.lazy.get_mut() {
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl FileNode {
-    fn new(data: Vec<u8>, ino: u64) -> FileNode {
+    /// A file with `data`: a seeded one's bytes (the image's, a bundle's),
+    /// kept here as they were laid, not written to the block store; the file
+    /// moves to the store when a program's write takes it past what stays
+    /// inline ([`FileNode::paged_for`]).
+    fn new(data: Vec<u8>, ino: u64, store: bool) -> FileNode {
+        note_capacity(0, data.capacity());
         FileNode {
+            pg: Mutex::new(None),
+            store,
             data: Mutex::new(data),
             lazy: Mutex::new(None),
             ino,
@@ -176,9 +188,27 @@ impl FileNode {
             gone_mode: core::sync::atomic::AtomicU32::new(0o644),
         }
     }
+    /// The store's contents, made from `data` first when the file is to be
+    /// `end` bytes long and that is past what stays inline (blocks.rs).
+    fn paged_for(&self, end: u64) -> std::sync::MutexGuard<'_, Option<super::blocks::PFile>> {
+        let mut pg = self.pg.lock().unwrap();
+        if pg.is_none() && self.store && super::blocks::wants(end) {
+            let mut data = self.data.lock().unwrap();
+            let mut p = super::blocks::PFile::new();
+            if !data.is_empty() && p.write(0, &data).is_err() {
+                return pg;
+            }
+            let was = data.capacity();
+            *data = Vec::new();
+            note_capacity(was, 0);
+            *pg = Some(p);
+        }
+        pg
+    }
     /// One more change of the contents; called with `data` locked (the
     /// count's reader pairs with this through that lock: [`FileNode::changes`]).
     fn changed(&self) {
+        moved();
         self.changes.fetch_add(1, Ordering::AcqRel);
     }
     fn touch(&self) {
@@ -200,6 +230,7 @@ impl FileNode {
     }
     /// Modified at `secs`: the change time with it, once the times are kept.
     fn stamp(&self, secs: i64) {
+        moved();
         self.mtime.store(secs, Ordering::Relaxed);
         let mut t = self.times.lock().unwrap();
         if *t != super::Times::default() {
@@ -211,6 +242,7 @@ impl FileNode {
     /// `utimensat`/`futimens`: either time (`None`: leave it), and the
     /// change time is `now`.
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) {
+        moved();
         let mut t = self.times.lock().unwrap();
         if *t == super::Times::default() {
             let m = self.mtime.load(Ordering::Relaxed);
@@ -237,6 +269,9 @@ impl FileNode {
         if let Some(l) = self.lazy.lock().unwrap().as_ref() {
             return l.size;
         }
+        if let Some(p) = self.pg.lock().unwrap().as_ref() {
+            return p.size;
+        }
         self.data.lock().unwrap().len() as u64
     }
 
@@ -253,7 +288,21 @@ impl FileNode {
         if lazy.is_some() {
             return;
         }
+        let mut pg = self.pg.lock().unwrap();
         let mut data = self.data.lock().unwrap();
+        if let Some(p) = pg.as_mut() {
+            if p.size == 0 || p.size >= size {
+                return;
+            }
+            let mut all = vec![0u8; p.size as usize];
+            if p.read(0, &mut all).is_err() {
+                return;
+            }
+            let was = data.capacity();
+            *data = all;
+            note_capacity(was, data.capacity());
+            *pg = None;
+        }
         let have = data.len() as u64;
         let last = size % LAZY_CHUNK;
         let head = if have % LAZY_CHUNK == 0 {
@@ -292,6 +341,13 @@ impl FileNode {
         let Some(l) = lazy.as_mut() else { return Ok(()) };
         let mut all = vec![0u8; l.size as usize];
         l.read(0, &mut all)?;
+        if let Some(p) = self.paged_for(l.size).as_mut() {
+            p.truncate(0)?;
+            p.write(0, &all)?;
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+            *lazy = None;
+            return Ok(());
+        }
         let mut data = self.data.lock().unwrap();
         let was = data.capacity();
         *data = all;
@@ -684,11 +740,15 @@ impl Inner {
 struct Shared {
     m: RwLock<Inner>,
     gate: super::RenameGate,
+    /// Files made from now on keep their contents in the block store once
+    /// past what stays inline ([`TmpFs::use_store`]).
+    store: core::sync::atomic::AtomicBool,
 }
 
 impl Shared {
     /// The tree to change.
     fn lock(&self) -> LockResult<RwLockWriteGuard<'_, Inner>> {
+        moved();
         self.m.write()
     }
     /// The tree to look at.
@@ -696,6 +756,9 @@ impl Shared {
         self.m.read()
     }
 }
+
+#[path = "persist.rs"]
+pub mod persist;
 
 /// An in-memory filesystem.
 pub struct TmpFs {
@@ -769,10 +832,6 @@ impl TmpFs {
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
                 Err(Errno::EAGAIN) => continue,
                 r => {
-                    if r.is_ok() {
-                        saved(from);
-                        saved(to);
-                    }
                     return r;
                 }
             }
@@ -892,8 +951,20 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default() }),
+            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default() }),
         }
+    }
+
+    /// Keep the contents of files made from now on in the block store
+    /// (`super::blocks`, once it is configured), as the root does. Any other
+    /// tmpfs (`/dev/shm`, one a program mounts) keeps them in memory, as
+    /// Linux's tmpfs does.
+    pub fn use_store(&self) {
+        self.inner.store.store(true, Ordering::Relaxed);
+    }
+
+    fn stored(&self) -> bool {
+        self.inner.store.load(Ordering::Relaxed)
     }
 
     /// Pre-populate a file, for seeding a root filesystem at startup.
@@ -906,7 +977,7 @@ impl TmpFs {
         inner.set_ino(path.clone(), ino);
         inner.nodes.insert(
             path,
-            Node::File(Arc::new(FileNode::new(contents, ino))),
+            Node::File(Arc::new(FileNode::new(contents, ino, self.stored()))),
         );
     }
 
@@ -920,6 +991,11 @@ impl TmpFs {
             Some(Node::File(f)) => Arc::clone(f),
             _ => return Err(Errno::ENOENT),
         };
+        // Seeding stays where it was laid: only a file a program already
+        // moved to the store takes its parts there.
+        if let Some(p) = f.pg.lock().unwrap().as_mut() {
+            return p.write(offset, bytes).map(|_| ());
+        }
         let mut data = f.data.lock().unwrap();
         let start = offset as usize;
         let end = start + bytes.len();
@@ -954,7 +1030,7 @@ impl TmpFs {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
-        let f = FileNode::new(Vec::new(), ino);
+        let f = FileNode::new(Vec::new(), ino, self.stored());
         f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
@@ -972,40 +1048,6 @@ impl TmpFs {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every node, for a persist store's diff of the tree (web/runtime
-    /// persist.js): no file's bytes, so nothing lazy is fetched. Each is
-    /// [`TREE_ENTRY`] bytes, little-endian -- kind (0 file, 1 directory, 2
-    /// symlink, 3 socket), written ([`FileNode::written`]), two spare, mode,
-    /// size, changes ([`FileNode::changes`], 0 for not a file), mtime, the
-    /// path's length and the target's -- then the path (no leading `/`) and
-    /// a symlink's target.
-    pub fn tree(&self) -> Vec<u8> {
-        let inner = self.inner.read().unwrap();
-        let mut out = Vec::with_capacity(inner.nodes.len() * (TREE_ENTRY + 32));
-        for (p, n) in inner.nodes.iter() {
-            let (kind, written, size, changes, mtime, target): (u8, bool, u64, u64, i64, &str) = match n {
-                Node::File(f) => (0, f.written.load(Ordering::Relaxed), f.size(), f.changes.load(Ordering::Acquire), f.mtime.load(Ordering::Relaxed), ""),
-                Node::Dir => (1, false, 0, 0, inner.mtimes.get(p).copied().unwrap_or(0), ""),
-                Node::Symlink(t) => (2, false, t.len() as u64, 0, inner.mtimes.get(p).copied().unwrap_or(0), t.as_str()),
-                Node::Socket => (3, false, 0, 0, 0, ""),
-            };
-            let default = if kind == 1 { Metadata::dir().mode } else if kind == 2 { 0o777 } else { 0o644 };
-            let mode = inner.modes.get(p).copied().unwrap_or(default);
-            out.push(kind);
-            out.push(written as u8);
-            out.extend_from_slice(&[0, 0]);
-            out.extend_from_slice(&mode.to_le_bytes());
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(&changes.to_le_bytes());
-            out.extend_from_slice(&mtime.to_le_bytes());
-            out.extend_from_slice(&(p.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(target.len() as u32).to_le_bytes());
-            out.extend_from_slice(p.as_bytes());
-            out.extend_from_slice(target.as_bytes());
-        }
-        out
     }
 
     /// Where file contents lie in this address space, for a session
@@ -1232,28 +1274,12 @@ struct TmpHandle {
     /// through a rename of the directory or of one above it, as a Linux
     /// descriptor follows its dentry (`Inner::dir_now`).
     dir: Option<u64>,
-    /// Whether this handle wrote or truncated: its close is then a change
-    /// finished ([`saved`]).
-    wrote: core::sync::atomic::AtomicBool,
     /// Opened to write: its close is `IN_CLOSE_WRITE`, else `IN_CLOSE_NOWRITE`.
     for_write: bool,
 }
 
-impl TmpHandle {
-    fn note_write(&self) {
-        if !self.wrote.load(Ordering::Relaxed) {
-            self.wrote.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 impl Drop for TmpHandle {
     fn drop(&mut self) {
-        // By the name it was opened by: a drop takes no lock. A save is
-        // closed before it is renamed into place, and the rename is counted.
-        if self.wrote.load(Ordering::Relaxed) {
-            saved(&self.path);
-        }
         if crate::inotify::any() {
             use crate::inotify::mask;
             let ev = if self.for_write { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE };
@@ -1312,6 +1338,9 @@ impl FileHandle for TmpHandle {
         if let Some(l) = file.lazy.lock().unwrap().as_mut() {
             return l.read(offset, buf);
         }
+        if let Some(p) = file.pg.lock().unwrap().as_mut() {
+            return p.read(offset, buf);
+        }
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
@@ -1325,7 +1354,7 @@ impl FileHandle for TmpHandle {
 
     fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
         let file = self.file.as_ref()?;
-        if file.lazy.lock().unwrap().is_some() {
+        if file.lazy.lock().unwrap().is_some() || file.pg.lock().unwrap().is_some() {
             return None;
         }
         file.mark_read();
@@ -1334,6 +1363,19 @@ impl FileHandle for TmpHandle {
         let n = len.min(data.len() - start);
         f(&data[start..start + n]);
         Some(Ok(n as u64))
+    }
+
+    fn sync(&self, data_only: bool) -> Result<(), Errno> {
+        // With the root kept (persist.rs), `fsync` writes a generation: the
+        // file's blocks, and its name and size with the rest of the tree.
+        if !data_only && persist::on() {
+            return persist::sync();
+        }
+        let Some(file) = &self.file else { return Ok(()) };
+        match file.pg.lock().unwrap().as_ref() {
+            Some(p) => p.sync(),
+            None => Ok(()),
+        }
     }
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
@@ -1353,6 +1395,17 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EISDIR);
         };
         file.materialize()?;
+        // Held through the inline write too: a file that crosses the
+        // threshold meanwhile moves only after this write.
+        let mut pg = file.paged_for(offset + buf.len() as u64);
+        if let Some(p) = pg.as_mut() {
+            p.write(offset, buf)?;
+            file.changed();
+            drop(pg);
+            file.touch();
+            self.note_here(crate::inotify::mask::MODIFY);
+            return Ok(buf.len() as u64);
+        }
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
         if start + buf.len() > data.len() {
@@ -1364,8 +1417,8 @@ impl FileHandle for TmpHandle {
         data[start..start + buf.len()].copy_from_slice(buf);
         file.changed();
         drop(data);
+        drop(pg);
         file.touch();
-        self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
         Ok(buf.len() as u64)
     }
@@ -1513,8 +1566,11 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EINVAL);
         };
         file.materialize()?;
-        self.note_write();
-        {
+        let mut pg = file.paged_for(len);
+        if let Some(p) = pg.as_mut() {
+            p.truncate(len)?;
+            file.changed();
+        } else {
             let mut data = file.data.lock().unwrap();
             let was = data.capacity();
             reserve(&mut data, len as usize)?;
@@ -1616,7 +1672,10 @@ impl TmpFs {
                             if let Some(l) = f.lazy.lock().unwrap().take() {
                                 TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
                             }
-                            {
+                            if let Some(p) = f.pg.lock().unwrap().as_mut() {
+                                let _ = p.truncate(0);
+                                f.changed();
+                            } else {
                                 let mut data = f.data.lock().unwrap();
                                 let was = data.capacity();
                                 data.clear();
@@ -1648,7 +1707,7 @@ impl TmpFs {
                     let ino = inner.next_ino;
                     inner.next_ino += 1;
                     inner.set_ino(path.clone(), ino);
-                    let f = Arc::new(FileNode::new(Vec::new(), ino));
+                    let f = Arc::new(FileNode::new(Vec::new(), ino, self.stored()));
                     f.mark_written();
                     wrote = true;
                     created = true;
@@ -1668,7 +1727,6 @@ impl TmpFs {
             path,
             file,
             dir,
-            wrote: core::sync::atomic::AtomicBool::new(wrote),
             for_write: acc == oflags::O_WRONLY || acc == oflags::O_RDWR,
         };
         if crate::inotify::any() {
@@ -1819,7 +1877,6 @@ impl FileSystem for TmpFs {
                 let own = node_ino(&inner, path);
                 // Its mode too: a file made at the name later is a new one.
                 inner.forget(path);
-                saved(path);
                 if let Some(own) = own {
                     note_removed(&inner, fs_key(&self.inner), path, own);
                 }
@@ -1954,6 +2011,19 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
     let more = len.saturating_sub(data.len());
     if more == 0 || data.capacity() >= len {
         return Ok(());
+    }
+    let max = TMPFS_MAX.load(core::sync::atomic::Ordering::Relaxed);
+    if max != 0 {
+        // Under a max, the doubling only while it fits; then exactly `len`.
+        let held = TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed);
+        let doubled = len.max(data.capacity().saturating_mul(2));
+        if held + (doubled - data.capacity()) as u64 <= max {
+            return data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC);
+        }
+        if held + (len - data.capacity()) as u64 > max {
+            return Err(Errno::ENOSPC);
+        }
+        return data.try_reserve_exact(more).map_err(|_| Errno::ENOSPC);
     }
     data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC)
 }
@@ -2636,45 +2706,6 @@ mod lazy_tests {
         assert_eq!(fs.add_file_part("p/none", 0, b"x"), Err(Errno::ENOENT));
         fs.open("p/big", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
         assert_eq!(fs.written(), ["/p/big"].map(String::from).to_vec());
-    }
-
-    /// A change the program finishes under the watched directory moves
-    /// `SAVES`: a close after a write, a create or a truncation, a rename
-    /// into or out of it, an unlink. A read, an open alone, and anything
-    /// outside it do not. (The only test that sets the watch.)
-    #[test]
-    fn saves_count_finished_changes_under_the_watched_directory() {
-        watch("/watched-saves/");
-        let fs = TmpFs::new();
-        fs.mkdir("watched-saves", 0o755).unwrap();
-        fs.mkdir("watched-savesx", 0o755).unwrap();
-        fs.add_file("watched-saves/old", b"seed".to_vec());
-        fs.add_file("other", b"seed".to_vec());
-        let n = || SAVES.load(Ordering::Relaxed);
-        let mut buf = [0u8; 4];
-        let at = n();
-        fs.open("watched-saves/old", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
-        drop(fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap());
-        fs.open("other", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
-        fs.open("watched-savesx/f", oflags::O_CREAT | oflags::O_RDWR, 0o644).unwrap().write_at(0, b"x").unwrap();
-        assert_eq!(n(), at);
-        let h = fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap();
-        h.write_at(0, b"x").unwrap();
-        assert_eq!(n(), at, "counted at the close, not the write");
-        drop(h);
-        assert_eq!(n(), at + 1);
-        drop(fs.open("watched-saves/tmp", oflags::O_CREAT | oflags::O_WRONLY, 0o644).unwrap());
-        assert_eq!(n(), at + 2);
-        drop(fs.open("watched-saves/old", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap());
-        assert_eq!(n(), at + 3);
-        FileSystem::rename(&fs, "other", "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 4);
-        FileSystem::rename(&fs, "watched-saves/tmp", "outside").unwrap();
-        assert_eq!(n(), at + 5);
-        FileSystem::unlink(&fs, "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 6);
-        FileSystem::unlink(&fs, "outside").unwrap();
-        assert_eq!(n(), at + 6);
     }
 
     /// Requests of `/data/h`, each `(offset, len)`.

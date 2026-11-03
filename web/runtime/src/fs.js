@@ -3,6 +3,18 @@
 // kernel's root at boot (kfs.js `lay`).
 // After boot, a tar or files are written into the live tree, and the guest's
 // files can be read and written from the page.
+//
+// `Filesystem` is abstract: the tree, its block cache in the kernel's
+// memory and the kernel's wiring. Where the files' contents are kept is a
+// subclass, the backing store, and the caller makes one: `MemoryFilesystem`
+// (in the kernel's memory, unbounded unless given a maximum),
+// `OPFSFilesystem` (a block store in the origin private file system, with a
+// bounded cache of it in the kernel's memory), or its own, which implements
+// the store's methods (`read`, `write`, `size`, `truncate`, `flush`, and
+// `open` if it needs one). The built-ins answer the kernel by their own
+// paths (the kernel's memory; a store Worker with a sync access handle); a
+// page's own store is asked from the page (blocks.mjs `serveSlots`; the
+// default build only).
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
 
@@ -113,35 +125,111 @@ export class Mount extends EventTarget {
   }
 }
 
+/** Blocks of the store, and how large a file stays in the kernel's memory. */
+const BLOCK = 65536;
+const INLINE = 16384;
+
+/** A built-in's own way to the kernel, instead of the store's methods
+ *  (`MemoryFilesystem`, `OPFSFilesystem`): module-private. */
+const FAST = Symbol('fast store');
+
+/** The store's methods a subclass implements. */
+const STORE_METHODS = ['read', 'write', 'size', 'truncate', 'flush'];
+
+/** The block cache's size option: MiB, 16 to 4096, default 256. */
+function cacheOf(cache, who) {
+  cache ??= 256;
+  if (!Number.isInteger(cache) || cache < 16 || cache > 4096) throw new TypeError(`${who}: cache is MiB, 16 to 4096`);
+  return cache;
+}
+
+/** The write-back's age option: ms a written block may stay only in the
+ *  cache, 100 to 600000, default 5000. */
+function writebackOf(writeback, who) {
+  writeback ??= 5000;
+  if (!Number.isInteger(writeback) || writeback < 100 || writeback > 600000) throw new TypeError(`${who}: writeback is ms, 100 to 600000`);
+  return writeback;
+}
+
+/** Never kept across loads: what the kernel makes, and scratch. */
+const ALWAYS_EXCLUDED = Object.freeze(['/tmp', '/run', '/proc', '/sys', '/dev']);
+
 export class Filesystem extends EventTarget {
   #sys;
+  #cache;
+  #writeback;
   #sources = [];
   #mounts = new Map(); // path -> { mount, id }
-  #persist = null; // a Persist's hooks
+  #exclude;
 
-  constructor(sys) {
+  /** Abstract: a page makes a `MemoryFilesystem`, an `OPFSFilesystem`, or
+   *  a subclass of its own that implements the store's methods. `cache`:
+   *  MiB of the store held in the kernel's memory (default 256);
+   *  `writeback`: ms a written block may stay only there before it goes to
+   *  the store (default 5000); `exclude`: more paths of the root its store
+   *  does not keep across loads (beside /tmp, /run, /proc, /sys, /dev and
+   *  the mounts). */
+  constructor(sys, { cache, writeback, exclude = [] } = {}) {
+    if (new.target === Filesystem) {
+      throw new TypeError('Filesystem is abstract: make a MemoryFilesystem(sys), an OPFSFilesystem(sys, { name }), or a subclass that implements its store');
+    }
     super();
+    if (!this[FAST]) {
+      const missing = STORE_METHODS.filter((m) => this[m] === Filesystem.prototype[m]);
+      if (missing.length) throw new TypeError(`${new.target.name}: a Filesystem's store implements ${missing.join(', ')}`);
+    }
+    this.#cache = cacheOf(cache, new.target.name);
+    this.#writeback = writebackOf(writeback, new.target.name);
+    if (!Array.isArray(exclude) || exclude.some((p) => typeof p !== 'string' || !p.startsWith('/'))) throw new TypeError(`${new.target.name}: exclude is a list of absolute paths`);
+    this.#exclude = exclude;
     const i = internals(sys, 'Filesystem');
     i.attach('filesystem', this, { beforeBoot: true });
     this.#sys = i;
     i.beforeBoot((opts) => this.#seed(opts));
     this[INTERNAL] = {
       sources: () => this.#sources,
+      cache: () => this.#cache,
+      writeback: () => this.#writeback,
+      /** Where the contents are kept, as the system wires it
+       *  (system.js `#store`): a built-in's own, or this store's methods. */
+      store: () => this[FAST]?.() ?? { kind: 'page', cache: this.#cache, writeback: this.#writeback, block: BLOCK, inline: INLINE, fs: this },
       /** For the system's start: the mounts made before boot,
        *  in place before the first program. */
       mounts: () => [...this.#mounts].map(([path, m]) => [path, m.id]),
-      /** A Persist on this filesystem (persist.js): one, made before boot. */
-      persist: (part, hooks) => {
-        i.attach('persistence', part, { beforeBoot: true });
-        this.#persist = hooks;
-        i.afterBoot(() => hooks.running(i));
-      },
-      persistArgs: () => this.#persist?.startArgs() ?? null,
+      phase: () => this.#sys.phase,
+      /** The paths the store does not keep (system.js `#start`). */
+      exclude: () => [...ALWAYS_EXCLUDED, ...this.#exclude, ...[...this.#mounts.keys()]],
       /** A program's image as an untarred bundle has it (kfs.js
        *  `layImage`): a preset's (web/src/run-program.js), not the API's. */
       addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
     };
   }
+
+  // The store: the files' contents, one array of bytes the kernel addresses
+  // by offset in blocks of 64 KiB. A subclass implements these; the kernel
+  // calls them as its cache fills and writes back, one call at a time.
+
+  /** Make the store ready, before boot (optional). What it holds is the
+   *  root a load before kept (empty: none); a store that is to start over
+   *  empties itself here. */
+  async open() {}
+
+  /** `length` bytes at `offset` (a Uint8Array; shorter past the end, which
+   *  reads as zeros). */
+  async read(_offset, _length) { throw abstract('read'); }
+
+  /** Write `bytes` (a Uint8Array) at `offset`, growing the store. */
+  async write(_offset, _bytes) { throw abstract('write'); }
+
+  /** The store's length in bytes. */
+  async size() { throw abstract('size'); }
+
+  /** Set the store's length to `length` bytes (grows with zeros). A store
+   *  that is full throws an error with `code: 'ENOSPC'`. */
+  async truncate(_length) { throw abstract('truncate'); }
+
+  /** Make what was written durable. */
+  async flush() { throw abstract('flush'); }
 
   /** The guest's files (kfs.js), once the system runs. */
   #files(what) {
@@ -201,11 +289,9 @@ export class Filesystem extends EventTarget {
     }).then(() => {});
   }
 
-  /** For boot: the layers, in order (later wins), and what a Persist kept,
-   *  laid over them. */
+  /** For boot: the layers, in order (later wins). */
   async #seed(opts) {
     opts.layers = await Promise.all(this.#sources);
-    opts.records = this.#persist ? await this.#persist.load() : [];
     this.#sources.length = 0;
   }
 
@@ -354,3 +440,145 @@ export class Filesystem extends EventTarget {
   #watching = null;
 }
 
+
+const abstract = (m) => new TypeError(`Filesystem.${m}: a subclass's store implements it`);
+
+/** The root's file contents in the kernel's memory, as many bytes as the
+ *  page can hold, or at most `max` (a write past it is ENOSPC). Gone with
+ *  the page. The kernel keeps them itself; the store's methods are a plain
+ *  array of bytes for a caller that uses them directly. */
+export class MemoryFilesystem extends Filesystem {
+  #max;
+  #chunks = []; // 1 MiB each
+  #size = 0;
+
+  constructor(sys, { max } = {}) {
+    max ??= 0;
+    if (!Number.isSafeInteger(max) || max < 0) throw new TypeError('MemoryFilesystem: max is a number of bytes');
+    super(sys);
+    this.#max = max;
+  }
+
+  [FAST]() { return { kind: 'memory', max: this.#max }; }
+
+  async read(offset, length) {
+    const n = Math.max(0, Math.min(length, this.#size - offset));
+    const out = new Uint8Array(n);
+    for (let at = 0; at < n;) {
+      const p = offset + at, c = this.#chunks[Math.floor(p / CHUNK)], o = p % CHUNK, k = Math.min(n - at, CHUNK - o);
+      if (c) out.set(c.subarray(o, o + k), at);
+      at += k;
+    }
+    return out;
+  }
+
+  async write(offset, bytes) {
+    const end = offset + bytes.length;
+    if (end > this.#size) await this.truncate(end);
+    for (let at = 0; at < bytes.length;) {
+      const p = offset + at, i = Math.floor(p / CHUNK), o = p % CHUNK, k = Math.min(bytes.length - at, CHUNK - o);
+      (this.#chunks[i] ??= new Uint8Array(CHUNK)).set(bytes.subarray(at, at + k), o);
+      at += k;
+    }
+  }
+
+  async size() { return this.#size; }
+
+  async truncate(length) {
+    if (this.#max && length > this.#max) throw Object.assign(new Error('MemoryFilesystem: past its max'), { code: 'ENOSPC' });
+    if (length < this.#size) {
+      this.#chunks.length = Math.ceil(length / CHUNK);
+      const last = this.#chunks[this.#chunks.length - 1];
+      if (last && length % CHUNK) last.fill(0, length % CHUNK);
+    }
+    this.#size = length;
+  }
+
+  async flush() {}
+}
+const CHUNK = 1 << 20;
+
+/** The root's file contents in a block store in the origin private file
+ *  system, named `name`, with `cache` MiB of it (default 256) held in the
+ *  kernel's memory: a root larger than the page's memory. A written block
+ *  reaches the store within `writeback` ms (default 5000), or at a sync. The kernel reaches
+ *  the store through a Worker of its own with a sync access handle; the
+ *  store's methods reach the same file from the page, for a caller that
+ *  uses them while no system holds it. */
+export class OPFSFilesystem extends Filesystem {
+  #name;
+
+  constructor(sys, { name, cache, writeback } = {}) {
+    name = String(name ?? '');
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new TypeError('OPFSFilesystem: name the store ({ name }: letters, digits, . _ -)');
+    super(sys, { cache, writeback });
+    this.#name = name;
+  }
+
+  [FAST]() { return { kind: 'opfs', name: this.#name, cache: this[INTERNAL].cache(), writeback: this[INTERNAL].writeback(), block: BLOCK, inline: INLINE }; }
+
+  async #file() {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle(`gex-fs-${this.#name}`, { create: true });
+    return dir.getFileHandle('blocks', { create: true });
+  }
+
+  async read(offset, length) {
+    const f = await (await this.#file()).getFile();
+    return new Uint8Array(await f.slice(offset, offset + length).arrayBuffer());
+  }
+
+  async write(offset, bytes) {
+    const w = await (await this.#file()).createWritable({ keepExistingData: true });
+    try {
+      await w.write({ type: 'write', position: offset, data: bytes });
+      await w.close();
+    } catch (e) {
+      await w.abort().catch(() => {});
+      throw quota(e);
+    }
+  }
+
+  async size() { return (await (await this.#file()).getFile()).size; }
+
+  async truncate(length) {
+    const w = await (await this.#file()).createWritable({ keepExistingData: true });
+    try {
+      await w.truncate(length);
+      await w.close();
+    } catch (e) {
+      await w.abort().catch(() => {});
+      throw quota(e);
+    }
+  }
+
+  async flush() {}
+
+  /** Forget what the store `name` keeps: the next boot on it starts from
+   *  the sources alone. Not while a system holds it. */
+  static async erase(name) {
+    const root = await navigator.storage.getDirectory();
+    // A system just stopped: its store Worker lets the file go a moment
+    // after it was terminated.
+    for (let i = 0; ; i++) {
+      try {
+        return await root.removeEntry(`gex-fs-${name}`, { recursive: true });
+      } catch (e) {
+        if (e?.name === 'NotFoundError') return;
+        if (e?.name !== 'NoModificationAllowedError' || i >= 100) throw e;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+  }
+
+  /** {@link OPFSFilesystem.erase} of this filesystem's store: before boot,
+   *  or once its system has stopped. */
+  async erase() {
+    const phase = this[INTERNAL].phase();
+    if (phase !== 'new' && phase !== 'stopped' && phase !== 'failed') throw new Error(`OPFSFilesystem: erase() while the system is ${phase}`);
+    await OPFSFilesystem.erase(this.#name);
+  }
+}
+
+/** An OPFS failure with a code: the origin's quota is ENOSPC. */
+const quota = (e) => Object.assign(e instanceof Error ? e : new Error(String(e)), { code: e?.name === 'QuotaExceededError' ? 'ENOSPC' : 'EIO' });
