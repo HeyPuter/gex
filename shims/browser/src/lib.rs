@@ -8510,11 +8510,13 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = my_ctx();
-        // The number and arguments where this architecture's ABI puts them;
-        // the number canonicalised so the names below match on x86-64 too.
-        let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
-        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
-        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
+        // The number and arguments as the call was read above, where its
+        // ABI puts them (an i386-ABI process's, and so an AArch64 build's
+        // wasm32 program's, are not the 64-bit slots: read from those, its
+        // calls showed as `unknown#0` with their arguments shifted); the
+        // number canonical, so the names below match on x86-64 too.
+        let g = |i: usize| regs.a[i];
+        let n = this_nr;
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `execve`'s path is arg 0, the
@@ -8525,10 +8527,17 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 .unwrap_or_default()
         };
         use gex_kernel::syscalls::nr;
+        // A legacy call the kernel makes as its `*at` form (`open` as
+        // `openat`, ...) has its path first: the raw number says which.
+        let legacy = if compat {
+            matches!(regs.raw, 5 | 8 | 10 | 33 | 38 | 39 | 40 | 85 | 106 | 107 | 195 | 196)
+        } else {
+            gex_abi::X86 && matches!(regs.raw, 2 | 4 | 6 | 21 | 82 | 83 | 84 | 85 | 87 | 89)
+        };
         let named = match n {
             nr::EXECVE => Some(path(g(0))),
             nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT
-            | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT => Some(path(g(1))),
+            | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT => Some(path(g(if legacy { 0 } else { 1 }))),
             _ => None,
         };
         // For calls whose first argument is a descriptor, what it *is*: an fd
@@ -8560,7 +8569,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         };
         let caller = object_off_at(ret);
         // An unknown call shows its raw number: "unknown" alone cannot be looked up.
-        let raw_nr = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let raw_nr = regs.raw;
         let name = match gex_kernel::syscalls::syscall_name(n) {
             "unknown" => format!("unknown#{raw_nr}"),
             s => s.to_string(),

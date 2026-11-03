@@ -2433,7 +2433,10 @@ export class Gex {
       xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
-    if (opts.strace) { this.#shim.exports.gex_set_trace(1); this.#traced = true; }
+    // `?stracepid=N` for a process booted here, not forked or exec'd into
+    // (`#childOpts` sees those): pid 1, or what the kernel says it is.
+    const bootPid = this.#shim.exports.gex_my_pid?.() || 1;
+    if (opts.stracePid ? opts.stracePid === bootPid : opts.strace) { this.#shim.exports.gex_set_trace(1); this.#traced = true; }
     // An ejected project without a JIT fallback: a miss on code its build
     // never saw fails loudly instead of translating.
     if (opts.jit === false) {
@@ -3702,8 +3705,10 @@ export class Gex {
   #childOpts(e, o, pid) {
     this.#fjitOn(e, o);
     // `?strace=1` narrates every process; `?stracepid=N` only that one, which
-    // is what a run that must stay alive can afford.
-    if (o.strace || (o.stracePid && o.stracePid === pid)) { e.gex_set_trace(1); this.#traced = true; }
+    // is what a run that must stay alive can afford -- with `strace` set or
+    // not (`start({ strace: N })` sets both, as the KDE page's
+    // `?strace=1&stracepid=N` does).
+    if (o.stracePid ? o.stracePid === pid : o.strace) { e.gex_set_trace(1); this.#traced = true; }
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
