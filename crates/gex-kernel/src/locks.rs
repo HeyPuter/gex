@@ -136,6 +136,8 @@ pub struct LockRemote {
     pub call: fn(req: &[u8], out: &mut [u8]) -> i64,
     /// The table's release queue.
     pub queue: fn() -> u32,
+    /// [`write_seq`], the global kernel's.
+    pub seq: fn() -> u64,
 }
 
 static REMOTE: OnceLock<LockRemote> = OnceLock::new();
@@ -587,12 +589,25 @@ impl FileLocks {
 
 static WRITES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
+/// Write-backs of any file, all told: what a process with shared mappings
+/// compares at each system call's entry ([`crate::syscalls::SharedMapView::catch_up`]).
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many write-backs of shared mappings there have been, of any file.
+pub fn write_seq() -> u64 {
+    if let Some(r) = FileLocks::remote() {
+        return (r.seq)();
+    }
+    WRITE_SEQ.load(Ordering::Acquire)
+}
+
 /// A process wrote mapped pages of `file` back: the file's generation now.
 pub fn note_written(file: &str) -> u64 {
     if let Some(r) = FileLocks::remote() {
         return (r.call)(&encode(call::WROTE, 0, 0, 0, 0, 0, file), &mut []).max(0) as u64;
     }
     let mut w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    WRITE_SEQ.fetch_add(1, Ordering::AcqRel);
     match w.iter_mut().find(|(f, _)| f == file) {
         Some((_, n)) => {
             *n += 1;

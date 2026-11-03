@@ -460,6 +460,7 @@ extern "C" {
     fn k_futex_gen(addr: u64) -> u32;
     fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
     fn k_lock_queue() -> u32;
+    fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;
     fn k_tid_new(pid: i32) -> i32;
     fn k_tid_end(tid: i32);
@@ -1754,6 +1755,10 @@ fn gl_queue() -> u32 {
     unsafe { k_lock_queue() }
 }
 
+fn gl_seq() -> u64 {
+    unsafe { k_lock_seq() }
+}
+
 fn gi_adopt(state: &[u8]) -> i32 {
     unsafe { k_inet_adopt(state.as_ptr() as gex_kernel::PAddr, state.len() as u32) }
 }
@@ -1787,7 +1792,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     // same address in the process that connects to it.
     gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
     // And the file locks every process contends for.
-    gex_kernel::locks::share_locks(gex_kernel::locks::LockRemote { call: gl_call, queue: gl_queue });
+    gex_kernel::locks::share_locks(gex_kernel::locks::LockRemote { call: gl_call, queue: gl_queue, seq: gl_seq });
     // And internet sockets that more than one process holds live there too.
     net::share_inet(net::InetRemote { adopt: gi_adopt, op: gi_op, write: gi_write, dup: gi_dup, close: gi_close });
     // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.

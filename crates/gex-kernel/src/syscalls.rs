@@ -4528,7 +4528,7 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
-            refresh(m, &map, true, None)?;
+            refresh(m, &map, true, None, false)?;
         }
         Ok(())
     }
@@ -7246,6 +7246,9 @@ impl FreeCall {
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
     let FreeCall { n, raw, mut a } = call;
+    if let Some(v) = f.io.shared {
+        v.catch_up(m);
+    }
     let compat = f.io.compat;
     // The poll family in the canonical form: `poll`, `select` and
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
@@ -8026,7 +8029,12 @@ fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(),
 /// the mapping: a page whose hash still matches is left as it is, this
 /// process's own stores in it included. Nothing to read when the file's
 /// change count is still the one the pages were the file's at.
-fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>) -> Result<(), Errno> {
+///
+/// `keep_own`: a page this process changed since it last synced it is left
+/// as it is (and the mapping is not marked up to date, so the next lock
+/// brings it in): for a refresh at a point that is no synchronisation of
+/// the program's ([`SharedMapView::catch_up`]).
+fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>, keep_own: bool) -> Result<(), Errno> {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     // The count the lock call brought, when it did: unchanged, nothing to ask.
     // Without one, the count alone (no call where the filesystem keeps it
@@ -8047,6 +8055,7 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
     let held = map.len.min(md.size.saturating_sub(map.offset));
     let mut buf = vec![0u8; P as usize];
     let mut page = 0u64;
+    let mut kept = false;
     while page * P < held {
         let in_map = P.min(map.len - page * P) as usize;
         let in_file = P.min(held - page * P) as usize;
@@ -8060,7 +8069,10 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
         }
         let h = page_hash(&buf[..in_map]);
         let slot = map.pages.get(page as usize);
-        if slot.map(|s| s.load(Relaxed)) != Some(h) {
+        let was = slot.map(|s| s.load(Relaxed));
+        if was != Some(h) && keep_own && was != Some(page_hash(m.read(map.start + page * P, in_map)?)) {
+            kept = true;
+        } else if was != Some(h) {
             m.write(map.start + page * P, &buf[..in_map])?;
             if let Some(s) = slot {
                 s.store(h, Relaxed);
@@ -8068,8 +8080,10 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
         }
         page += 1;
     }
-    map.changes.store(now, Release);
-    map.seen.store(written, Release);
+    if !kept {
+        map.changes.store(now, Release);
+        map.seen.store(written, Release);
+    }
     Ok(())
 }
 
@@ -8095,7 +8109,7 @@ pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, fi
             let _ = write_back(m, map, 0, u64::MAX);
         }
         if sync != MapSync::Release {
-            let _ = refresh(m, map, false, seen);
+            let _ = refresh(m, map, false, seen, false);
         }
     }
 }
@@ -8921,6 +8935,11 @@ pub struct SharedMaps {
 /// change, so a reader holds one consistent list for as long as it likes.
 pub struct SharedMapView {
     cur: gex_atomic::rcu::Published<Arc<[SharedMap]>>,
+    /// Whether the process maps any file shared: all a system call of a
+    /// process that maps none looks at ([`SharedMapView::catch_up`]).
+    any: std::sync::atomic::AtomicBool,
+    /// [`crate::locks::write_seq`] when the mappings were last caught up.
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SharedMapView {
@@ -8931,7 +8950,36 @@ impl std::fmt::Debug for SharedMapView {
 
 impl SharedMapView {
     fn new(list: &[SharedMap]) -> SharedMapView {
-        SharedMapView { cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS) }
+        SharedMapView {
+            cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS),
+            any: std::sync::atomic::AtomicBool::new(!list.is_empty()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// At a system call's entry: when any process has written a shared
+    /// mapping back since this one last looked, this process's mappings of
+    /// files that changed take in what they hold now -- except pages it
+    /// changed itself since its last sync, which wait for its next lock.
+    /// A program that reads shared memory with no lock call of its own in
+    /// between (SQLite's second connection in a process whose first holds
+    /// the wal-index read lock: SQLite counts those locks itself) still
+    /// sees other processes' writes at its next system call. One load for
+    /// a process that maps nothing shared; one more (the global kernel's
+    /// count, in the page a call) for one that does.
+    pub fn catch_up(&self, m: &mut GuestMem<'_>) {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        if !self.any.load(Relaxed) {
+            return;
+        }
+        let now = crate::locks::write_seq();
+        let was = self.seq.load(Relaxed);
+        if now == was || self.seq.compare_exchange(was, now, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        for map in self.get().iter() {
+            let _ = refresh(m, map, false, None, true);
+        }
     }
 
     /// The mappings as they stand.
@@ -8957,6 +9005,7 @@ impl SharedMaps {
 
     fn publish(&self) {
         let l: Arc<[SharedMap]> = self.list.as_slice().into();
+        self.view.any.store(!l.is_empty(), std::sync::atomic::Ordering::Relaxed);
         self.view.cur.write(|_| (Some(l), ()));
     }
 
@@ -9824,6 +9873,8 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        // Other processes' write-backs into this one's shared mappings.
+        self.mem.shared_maps().catch_up(m);
         let out = self.syscall_cwd(m, pc);
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {

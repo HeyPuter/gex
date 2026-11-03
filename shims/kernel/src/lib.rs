@@ -1713,6 +1713,13 @@ pub extern "C" fn k_lock_call(req: gex_kmem::PAddr, req_len: u32, out: gex_kmem:
     r
 }
 
+/// How many shared-mapping write-backs there have been (`locks::write_seq`):
+/// one load, at the system call entry of every process that maps a file shared.
+#[no_mangle]
+pub extern "C" fn k_lock_seq() -> u64 {
+    gex_kernel::locks::write_seq()
+}
+
 /// The queue every lock release notifies.
 #[no_mangle]
 pub extern "C" fn k_lock_queue() -> u32 {
