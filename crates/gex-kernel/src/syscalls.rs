@@ -6468,6 +6468,15 @@ pub fn is_cred(n: u64) -> bool {
 /// ([`Creds::after_uid_change`]): what peer credentials, `getuid` and
 /// `geteuid` report is what Linux's would. All ones means "leave alone".
 pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    let r = cred_change(creds, procs, pid, m, n, a);
+    // A change the other processes' `/proc/<pid>/status` shows.
+    if r.is_ok() && !matches!(n, nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::GETRESUID | nr::GETRESGID | nr::CAPGET | nr::SETFSUID | nr::SETFSGID | nr::SETSID | nr::GETSID | nr::GETPGID | nr::SETPGID) {
+        procs.set_creds(pid, &creds.save());
+    }
+    r
+}
+
+fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
     // -1 keeps an id (the 16-bit calls' 0xffff arrives as -1 too,
     // `i386::canonical`).
     let id = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);

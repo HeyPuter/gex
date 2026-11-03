@@ -29,6 +29,12 @@ pub trait ProcSource: Send + Sync {
     fn fd_link(&self, fd: i32) -> Option<String> {
         self.fds().into_iter().find(|&(f, _)| f == fd).map(|(_, t)| t)
     }
+    /// `/proc/self/fdinfo/N`: the descriptor's position and flags, and for a
+    /// process descriptor its process (`Pid:`), as Linux writes them. polkit
+    /// opens a pidfd for the process it checks and finds the pid again here.
+    fn fd_info(&self, _fd: i32) -> Option<String> {
+        None
+    }
     /// `stat` for task `tid` of this process (its pid for the process
     /// itself), one of `threads`.
     fn stat(&self, tid: i32, threads: usize) -> String;
@@ -126,13 +132,34 @@ pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i3
 
 /// `/proc/<pid>/status`, the fields programs look for: task `id` of process
 /// `tgid`, which has `threads`.
-pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize) -> String {
+pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8]) -> String {
     let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
+    let (uid, gid, caps) = status_ids(creds);
     format!(
         "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
-         PPid:\t{ppid}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n\
-         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t{threads}\nvoluntary_ctxt_switches:\t0\n\
+         PPid:\t{ppid}\nTracerPid:\t0\n{uid}{gid}FDSize:\t64\n\
+         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n"
+    )
+}
+
+/// `status`'s `Uid:` and `Gid:` lines (real, effective, saved and
+/// filesystem ids, the last the effective one) and its `Cap*:` lines, from
+/// [`crate::syscalls::Creds::save`]'s bytes; root's, every capability, for
+/// a process that has published none.
+pub fn status_ids(creds: &[u8]) -> (String, String, String) {
+    let c = crate::syscalls::Creds::new(0, 0);
+    c.restore(creds);
+    let ([r, e, s], [gr, ge, gs]) = (c.uids(), c.gids());
+    let [eff, perm, inh] = c.caps();
+    (
+        format!("Uid:\t{r}\t{e}\t{s}\t{e}\n"),
+        format!("Gid:\t{gr}\t{ge}\t{gs}\t{ge}\n"),
+        format!(
+            "CapInh:\t{inh:016x}\nCapPrm:\t{perm:016x}\nCapEff:\t{eff:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n",
+            crate::syscalls::CAPS_ALL,
+            0
+        ),
     )
 }
 
@@ -290,7 +317,7 @@ impl ProcFs {
         let (id, threads) = (if tid != 0 { tid } else { e.pid }, e.tasks().len());
         Some(match rest {
             "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads).into_bytes(),
-            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads).into_bytes(),
+            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds).into_bytes(),
             "statm" => b"0 0 0 0 0 0 0\n".to_vec(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
@@ -312,6 +339,7 @@ impl ProcFs {
             "self/statm" => b"0 0 0 0 0 0 0\n".to_vec(),
             "self/mountinfo" => mountinfo(&s.mount_table()).into_bytes(),
             "self/mounts" | "mounts" => mounts(&s.mount_table()).into_bytes(),
+            p if p.starts_with("self/fdinfo/") => s.fd_info(p["self/fdinfo/".len()..].parse().ok()?)?.into_bytes(),
             "loadavg" => {
                 let n = s.others().len().max(1);
                 format!("0.00 0.00 0.00 1/{n} {}\n", s.pid()).into_bytes()
@@ -433,7 +461,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "task", "mountinfo", "mounts",
+                "fdinfo", "task", "mountinfo", "mounts",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -443,6 +471,13 @@ impl FileSystem for ProcFs {
                         file_type: FileType::Symlink,
                         ino: 1,
                     });
+                }
+                return Ok(Arc::new(GenDir { entries: out }));
+            }
+            "self/fdinfo" => {
+                let mut out = base_entries();
+                for (fd, _) in self.source.fds() {
+                    out.push(DirEntry { name: fd.to_string(), file_type: FileType::Regular, ino: 1 });
                 }
                 return Ok(Arc::new(GenDir { entries: out }));
             }
@@ -493,7 +528,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
@@ -571,7 +606,7 @@ mod tests {
             stat_line(tid, "prog", 'R', 7, 42, 1, None, threads)
         }
         fn status(&self, tid: i32, threads: usize) -> String {
-            status_text(tid, 42, "prog", 'R', 7, threads)
+            status_text(tid, 42, "prog", 'R', 7, threads, &[])
         }
         fn task_owner(&self, id: i32) -> Option<i32> {
             self.others().into_iter().find(|e| e.tasks().contains(&id)).map(|e| e.pid)
@@ -585,6 +620,7 @@ mod tests {
                 zombie: false,
                 info: info.to_vec(),
                 tids: tids.to_vec(),
+                creds: Vec::new(),
             };
             vec![
                 e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]),

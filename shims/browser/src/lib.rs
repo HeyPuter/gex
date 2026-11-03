@@ -488,6 +488,7 @@ extern "C" {
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
     fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
@@ -966,6 +967,9 @@ extern "C" fn r_halt_code() -> i32 {
 extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
     unsafe { k_proc_set_info(pid, at, len) }
 }
+extern "C" fn r_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_creds(pid, at, len) }
+}
 extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_proc_snapshot(at, cap) }
 }
@@ -1022,6 +1026,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             request_halt: r_request_halt,
             halt_code: r_halt_code,
             set_info: r_set_info,
+            set_creds: r_set_creds,
             snapshot: r_snapshot,
             new_tid: r_new_tid,
             end_tid: r_end_tid,

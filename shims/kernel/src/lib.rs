@@ -1939,6 +1939,17 @@ pub extern "C" fn k_halt_code() -> i32 {
     procs().halt_code().unwrap_or(-1)
 }
 
+/// A process's ids and capabilities, for the others' `/proc/<pid>/status`.
+#[no_mangle]
+pub extern "C" fn k_proc_set_creds(pid: i32, at: gex_kmem::PAddr, len: u32) {
+    let len = len.min(256);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    procs().set_creds(pid, &buf);
+}
+
 /// A process's name and command line, for the others' `/proc/<pid>`.
 #[no_mangle]
 pub extern "C" fn k_proc_set_info(pid: i32, at: gex_kmem::PAddr, len: u32) {
