@@ -279,6 +279,9 @@ impl Info {
                         let mut ops = g.init_expr.get_operators_reader();
                         let v = match ops.read() {
                             Ok(wasmparser::Operator::I32Const { value }) => Some(value as u32),
+                            // a wasm64 program lowered to wasm32 (its addresses
+                            // below 4 GiB)
+                            Ok(wasmparser::Operator::I64Const { value }) => u32::try_from(value).ok(),
                             _ => None,
                         };
                         info.global_init.push(v);
@@ -1350,6 +1353,8 @@ pub fn shim_import(m: &str, name: &str) -> bool {
                 | "__stack_pointer"
                 | "__memory_base"
                 | "__table_base"
+                // a lowered wasm64 module's i32 copy of it (ftab.rs)
+                | "__table_base32"
                 | "__asyncify_state"
                 | "__asyncify_data"
         ),
