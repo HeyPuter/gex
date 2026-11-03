@@ -302,8 +302,11 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         }
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
-    // 32-bit Wine's loader: refused when its inline probe reads another layout.
-    if flags & FLAG_GUEST_I386 != 0 {
+    // Wine's loader: refused when its inline probe reads another layout. Every
+    // 32-bit guest program is Wine's loader; a 64-bit one is when it is bound
+    // to the probe layout (abi_bound: its gex.abi section, or its gex.call_out
+    // import), as gex's own x86-64 guest programs are not.
+    if flags & FLAG_GUEST_I386 != 0 || (flags & FLAG_GUEST_X86_64 != 0 && gex_cgen::header::abi_bound(&wasm)) {
         if let Some(e) = abi_refusal(&wasm, &format!("Wine's loader {}", exe_path())) {
             return Err(e);
         }
