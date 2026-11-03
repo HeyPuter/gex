@@ -54,6 +54,7 @@ const PROBES = {
   'rt-probe': ['-lm'],
   'rt-wl': ['-lwayland-client', '-lffi'],
   'rt-joy': [],
+  'rt-truncate': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
 };
 
@@ -63,7 +64,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64'] };
+export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -114,12 +115,12 @@ export const images = {
     return null;
   },
 
-  // test/fixtures/programs/mount-tmpfs.c as a static musl program for each
-  // translated architecture (zig), for core/mount-tmpfs: the native ABIs'
-  // own mount(2) numbers.
+  // test/fixtures/programs/mount-tmpfs.c and truncate-path.c as static musl
+  // programs for each translated architecture (zig), for core/mount-tmpfs
+  // and core/truncate-path: the native ABIs' own syscall numbers.
   async 'native-progs'(work) {
     const zig = process.env.ZIG || 'zig';
-    for (const name of ['mount-tmpfs']) {
+    for (const name of ['mount-tmpfs', 'truncate-path']) {
       const src = join(HERE, `programs/${name}.c`);
       const key = createHash('sha256').update(readFileSync(src)).digest('hex');
       for (const [arch, target] of [['x86', 'x86_64-linux-musl'], ['a64', 'aarch64-linux-musl']]) {
@@ -141,6 +142,8 @@ export const images = {
     if (bb && existsSync(bb)) h.update(readFileSync(bb));
     h.update(applets.join('\n'));
     for (const name of Object.keys(PROBES)) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
+    // rt-truncate.c is programs/truncate-path.c.
+    h.update(readFileSync(join(HERE, 'programs/truncate-path.c')));
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
