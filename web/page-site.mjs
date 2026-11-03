@@ -100,6 +100,18 @@ walk(join(work, 'page'), (p, rel) => { mkdirSync(dirname(join(out, rel)), { recu
 for (const f of ['gex_browser.x86.shared.wasm', 'gex_kernel.x86.wasm', 'seed.x86.shared.wasm']) place(strip(join(web, 'public/gex', f)), `gex/${f}`);
 mkdirSync(join(out, 'vendor'), { recursive: true });
 for (const f of ['zstddec-stream.mjs', 'zstddec.wasm', 'zstddec-LICENSE']) copyFileSync(join(web, 'eject-site/vendor', f), join(out, 'vendor', f));
+const recording = JSON.parse(readFileSync(paramsIn, 'utf8'));
+// A page with OpenGL (`gl=1`, the parameters' or the recording's query): the
+// page's Mesa, which the page fetches itself, uncompressed.
+const glParam = recording.url ? new URL(recording.url).searchParams.get('gl') : recording.gl;
+if (String(glParam) === '1' || opts('--param').includes('gl=1')) {
+  const mesa = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'].filter((f) => existsSync(join(web, 'public/gex', f)));
+  if (mesa.length < 2) {
+    console.error('page-site: gl=1 needs the page\'s Mesa, web/public/gex/gex-wgpu-replay.{js,wasm} (web/build-mesa-wasm.sh)');
+    process.exit(1);
+  }
+  for (const f of mesa) copyFileSync(join(web, 'public/gex', f), join(out, 'gex', f));
+}
 
 // The bundle: stripped, pruned, deduplicated, and split as an ejected site's
 // (web/site-bundle.mjs): with --split, the files the recorded run opened stay
@@ -107,7 +119,6 @@ for (const f of ['zstddec-stream.mjs', 'zstddec.wasm', 'zstddec-LICENSE']) copyF
 // when a guest first opens it (app.js `lazy`).
 let tar = tarIn;
 let lazyNote = '';
-const recording = JSON.parse(readFileSync(paramsIn, 'utf8'));
 if (flag('--strip') || flag('--prune') || flag('--dedupe') || flag('--split')) {
   const tree = extract(tar, work);
   if (flag('--strip')) stripTree(tree.x, stripper(work, true));
