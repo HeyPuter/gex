@@ -2314,13 +2314,15 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // left, its C caller never runs again, and the guest's return to the pad
     // finds no call-out (a callback that calls back in: qsort's comparator
     // sorting).
+    // Native Wine's nest as deep as the guest thread's stack and the shim's
+    // have room for (the host's: the glue's `stackRoom`).
     let pad = ret as u64 == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
-    let limit = if pad || libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
+    if let Some(what) = pad.then(|| native_call_spent(&gm, c)).flatten() {
+        crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {what} has room for: the process ends (stack overflow)\n"));
+        crate::end_process(0xc000_00fd);
+    }
+    let limit = if pad { usize::MAX } else if libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
     if CALLOUTS.with(|c| c.borrow().len()) >= limit {
-        if pad {
-            crate::warn_line(&format!("gex: native Wine's guest calls nest deeper than {limit}: the process ends (stack overflow)\n"));
-            crate::end_process(0xc000_00fd);
-        }
         if limit == CALLOUT_MAX_DEPTH_PROVIDER {
             crate::warn_line(&format!("gex: a provider's guest calls nest deeper than {limit}\n"));
         }
@@ -2475,9 +2477,32 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 /// `gex_set_callout(2)`: say every stateful provider's guest call.
 static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The same for a stateful provider's or native Wine's guest calls, which
-/// cannot leave.
+/// The same for a stateful provider's guest calls, which cannot leave.
+/// Native Wine's, which cannot either, nest as deep as the stacks have room
+/// for (`native_call_spent`).
 const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
+
+/// What a guest call from native Wine must find left of this Worker's shim
+/// stack: a level's call-out holds a few hundred bytes of it.
+const NATIVE_CALL_SHIM_ROOM: u32 = 64 << 10;
+
+/// Why a guest call from native Wine (context `c`) cannot be made: its
+/// thread's guest stack is spent (`win::tramp::native_call_stack_spent`;
+/// native Wine's frames, on that stack, have no guard page), or the shim's
+/// is nearly (its guard is checked only at system calls).
+fn native_call_spent(gm: &GuestMem, c: u64) -> Option<&'static str> {
+    if crate::stack_room().is_some_and(|r| r < NATIVE_CALL_SHIM_ROOM) {
+        return Some("the shim's stack");
+    }
+    if !gex_abi::X86 {
+        return None;
+    }
+    let class32 = gex_xlate::default_compat() != crate::thread_alt();
+    let teb = gm.read_u64(c + if class32 { gex_abi::ctx::FS_BASE } else { gex_abi::ctx::GS_BASE } as u64).unwrap_or(0);
+    let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    let read = |a: u64| if class32 { gm.read_u32(a).ok().map(u64::from) } else { gm.read_u64(a).ok() };
+    gex_kernel::win::tramp::native_call_stack_spent(class32, teb, sp, read).then_some("the thread's stack")
+}
 
 /// A call-out the glue opens inside others when the host's stack has no room
 /// for one more (`#callOutSteps`): a native Wine module's guest call (64-bit
