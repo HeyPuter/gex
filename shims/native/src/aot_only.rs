@@ -158,8 +158,9 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, depth: i32,
         return crate::branch_not_executable(caller, target);
     }
     // A window-procedure thunk made at run time (gex_kernel::win::thunk):
-    // its store done here, then the call goes on to where it jumps.
-    if gex_kernel::compat32() {
+    // its store done here, then the call goes on to where it jumps. 32-bit
+    // code: a 32-bit Wine process's, or a WoW64 process's thread in that mode.
+    if gex_kernel::compat32() || crate::thread_alt(caller) {
         let next = gex_kernel::win::thunk::run(&mut GuestMem::new(memory.bytes()), ctx as u32 as u64, target);
         if let Some(next) = next {
             let _ = GuestMem::new(memory.bytes()).write_u64(ctx as u32 as u64 + ctx::LAST_TARGET as u64, next);

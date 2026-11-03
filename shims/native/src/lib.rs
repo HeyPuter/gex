@@ -4219,7 +4219,11 @@ fn cs_alt(cs: u32) -> bool {
 /// process's own mode (the caller's usual one), else a module of the other
 /// mode's -- translating `pc` first when no such module is in this store.
 fn alt_enter_for(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<wasmtime::Func>> {
-    if !thread_alt(caller) {
+    // An AOT-only process (`aot_only`) enters either mode by its base
+    // module's `enter`, whose root serves `pc` from the function table: no
+    // directory of either mode is ever filled, and the other mode's
+    // runtime `enter` dispatches through one.
+    if !thread_alt(caller) || crate::aot_only::enabled() {
         return Ok(None);
     }
     if caller.data().alt_enter.is_none() {
@@ -4240,7 +4244,7 @@ fn alt_enter_for(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<w
 
 /// [`alt_enter_for`] from a loop that holds the store, not a caller.
 fn alt_enter_in_store(store: &mut Store<HostState>, ctx_addr: u64, pc: u64) -> Result<Option<wasmtime::Func>> {
-    if !gex_abi::X86 {
+    if !gex_abi::X86 || crate::aot_only::enabled() {
         return Ok(None);
     }
     let Some(memory) = store.data().memory.clone() else { return Ok(None) };
