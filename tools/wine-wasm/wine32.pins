@@ -54,6 +54,12 @@ FFMPEG_VERSION   := 8.1.1
 FFMPEG_URL       := https://ffmpeg.org/releases/ffmpeg-8.1.1.tar.xz
 FFMPEG_SHA256    := b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
 
+# SDL2, winebus's game controllers in 64-bit Wine's Unix side
+# (wine64-deps.sh: its joystick, game controller and haptic parts only).
+SDL2_VERSION     := 2.32.10
+SDL2_URL         := https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+SDL2_SHA256      := 5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
+
 # Wine Mono, the .NET runtime mscoree loads for .NET programs (XNA
 # games, through Wine Mono's FNA). The version is the one this Wine's
 # mscoree asks for (WINE_MONO_VERSION in dlls/mscoree/mscoree_private.h); the

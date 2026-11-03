@@ -58,8 +58,24 @@ for r in regs:
 PY
 mkdir -p "$out/dosdevices"
 ln -s ../drive_c "$out/dosdevices/c:" && ln -s / "$out/dosdevices/z:"
-regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/wine32-session.reg")
+regs=("$@")
+if [ ${#regs[@]} -eq 0 ]; then
+	regs=("$here/wine32-session.reg")
+	# A prefix with game controllers (wine64-dist.sh's WINE64_PADS: winebus's
+	# service has "DemandStart"=1) keeps winebus's root device, which the
+	# session would remove.
+	if python3 -I - "$out/system.reg" <<'PY'
+import re, sys
+s = open(sys.argv[1], encoding='utf-8', errors='surrogateescape').read()
+sys.exit(0 if re.search(r'^\[System\\\\ControlSet001\\\\Services\\\\winebus\][^\[]*^"DemandStart"=dword:0*1$', s, re.M | re.I) else 1)
+PY
+	then
+		grep -v -i '^\[-HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Enum\\ROOT\\WINE\\WINEBUS\]' "$here/wine32-session.reg" > "$out/.session.reg"
+		regs=("$out/.session.reg")
+	fi
+fi
 python3 "$here/reg-apply.py" "$out/system.reg" "${regs[@]}"
+rm -f "$out/.session.reg"
 # the file's own time, a dist of links included: wineboot compares the
 # stamp with the wine.inf it reads, and reruns Wine's whole setup when they differ
 stat -L -c %Y "$dist/share/wine/wine.inf" > "$out/.update-timestamp"

@@ -19,6 +19,9 @@
 # WINE64_MEDIA=lazy: winegstreamer's too, over FFmpeg (WINE64_DEPS), as
 # winegstreamer.so beside OUT, which the loader dlopens when a program first
 # plays media.
+# WINE64_PADS=lazy: winebus's (game controllers), with SDL2 (WINE64_DEPS) as
+# libSDL2-2.0.so.0 beside OUT, which winebus dlopens when it starts (only
+# when the page has a controller).
 # WINE_BUILD is a wasm64 build tree of the Wine fork (configure
 # --host=wasm64-unknown-linux-musl CC=tools/wine-wasm/wcc64
 # CXX=tools/wine-wasm/wcc64++); the objects are made there first.
@@ -235,6 +238,31 @@ if [ -n "$media" ]; then
 		while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done
 	done
 fi
+# WINE64_PADS=lazy: winebus.so, the Unix side of winebus (the HID bus game
+# controllers come through), in the loader as the libraries above; its
+# SDL bus (the tree configured with SDL: wine64-dist.sh) dlopens
+# libSDL2-2.0.so.0, linked here from WINE64_DEPS's SDL2 as a side module
+# beside OUT (what winebus asks of it, the functions bus_sdl.c loads), as
+# winegstreamer.so is. A static program's dlopen finds a bare soname beside
+# the program (gex-dylink). Unset, 0 or off leaves both out.
+pads=
+case ${WINE64_PADS:-0} in
+0|off) ;;
+lazy) grep -q 'define SONAME_LIBSDL2' include/config.h || { echo "link-wine64: WINE64_PADS=lazy, and the tree was configured without SDL" >&2; exit 1; }
+	pads=1 ;;
+*) echo "link-wine64: WINE64_PADS=$WINE64_PADS (lazy, or 0 or off)" >&2; exit 1 ;;
+esac
+if [ -n "$pads" ]; then
+	: "${WINE64_DEPS:?set WINE64_DEPS to the install wine64-deps.sh made, for SDL2}"
+	[ -f "$WINE64_DEPS/lib/libSDL2.a" ] || { echo "link-wine64: no SDL2 in $WINE64_DEPS (wine64-deps.sh)" >&2; exit 1; }
+	mkdir -p gexwine64/winebus
+	for c in $(unixobjs winebus.sys winebus); do
+		b=$(basename "$c" .o)
+		compile "dlls/winebus.sys/$b.c" "$c" "gexwine64/winebus/$b.o" "-D__wine_unix_call_funcs=winebus__wine_unix_call_funcs \
+			-D__wine_unix_call_wow64_funcs=winebus__wine_unix_call_wow64_funcs"
+	done
+	reg="$reg winebus.so:data:__wine_unix_call_funcs=winebus__wine_unix_call_funcs"
+fi
 # WINE64_DIRK=1: d3d11.so, the Unix side of the D3D shim (dxvk's src/dirk/pe;
 # Mesa pins dxvk, and web/build-mesa-wasm.sh with GEX_MESA_DIRK=1 fetches it
 # into third_party/mesa/subprojects/dxvk), with the same template. Its
@@ -279,13 +307,27 @@ fi
 python3 "$HERE/dlreg.py" $reg > gexwine64/reg.c
 # The side modules, and what of the loader each imports: the loader exports
 # it (from an archive when nothing else of the loader uses it: libm's).
-exports=
+sides=
 if [ -n "$media" ]; then
 	so=$(dirname "$OUT")/winegstreamer.so
 	"$HERE/wcc64" $M64 -O1 -shared -Wl,--unresolved-symbols=import-dynamic -o "$so" $wgobjs \
 		"$WINE64_DEPS/lib/libavformat.a" "$WINE64_DEPS/lib/libavcodec.a" "$WINE64_DEPS/lib/libswscale.a" \
 		"$WINE64_DEPS/lib/libswresample.a" "$WINE64_DEPS/lib/libavutil.a" || exit 1
 	rm -f "$so.64.wasm"
-	exports=$(python3 "$HERE/side-imports.py" "$so" | sed 's/^/-Wl,--export=/') || exit 1
+	sides="$sides $so"
 fi
+if [ -n "$pads" ]; then
+	so=$(dirname "$OUT")/libSDL2-2.0.so.0
+	# shellcheck disable=SC2046
+	"$HERE/wcc64" $M64 -O1 -shared -Wl,--unresolved-symbols=import-dynamic -o "$so" \
+		$(grep -ohE 'LOAD_FUNCPTR\(SDL_[A-Za-z0-9_]+\)|dlsym\(sdl_handle, "SDL_[A-Za-z0-9_]+"' "$WF/dlls/winebus.sys/bus_sdl.c" |
+			grep -oE 'SDL_[A-Za-z0-9_]+' | sort -u | sed 's/^/-Wl,-u,/') "$WINE64_DEPS/lib/libSDL2.a" || exit 1
+	rm -f "$so.64.wasm"
+	sides="$sides $so"
+fi
+exports=
+for so in $sides; do
+	exports="$exports $(python3 "$HERE/side-imports.py" "$so")" || exit 1
+done
+[ -z "$sides" ] || exports=$(printf '%s\n' $exports | sort -u | sed 's/^/-Wl,--export=/')
 "$HERE/wcc64" $M64 -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexwine64/reg.c $objs $libs $exports

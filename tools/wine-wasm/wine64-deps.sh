@@ -12,7 +12,8 @@
 #   with Mozilla's CA bundle (OUT/install/ca-certificates.crt, staged into
 #   the dist), as 32-bit Wine's, and FFmpeg's libavcodec, libavformat,
 #   libswscale and libswresample (winegstreamer's Unix side: its wg_*_ffmpeg.c
-#   files). No OSS yet.
+#   files), and SDL2 (winebus's game controllers: bus_sdl.c, through
+#   dlopen of libSDL2-2.0.so.0). No OSS yet.
 #
 #   tools/wine-wasm/wine64-deps.sh OUT DL
 #
@@ -28,7 +29,7 @@ out=$(realpath -m "${1:?OUT}") dl=$(realpath -m "${2:?DL}")
 export GEX_WCC_MAP="${GEX_WCC_MAP:+$GEX_WCC_MAP:}$out=/wine-deps"
 J=${JOBS:-12}
 eval "$(sed -n 's/^\([A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$here/wine32.pins")"
-for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT FFMPEG; do
+for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT FFMPEG SDL2; do
   u=${p}_URL s=${p}_SHA256; "$here/wine32/dl.sh" "${!u}" "${!s}" "$dl"
 done
 rm -rf "$out" && mkdir -p "$out/install/lib/pkgconfig" "$out/install/include" "$out/host" "$out/build" "$out/src"
@@ -161,6 +162,22 @@ tar xf "$dl/ffmpeg-$FFMPEG_VERSION.tar.xz"
   make -j"$J" > "$out/ffmpeg-make.log" 2>&1 && make install > "$out/ffmpeg-install.log" 2>&1)
 [ -f "$I/lib/libavcodec.a" ] || { echo "wine64-deps: FFmpeg failed ($out/ffmpeg-*.log)" >&2; exit 1; }
 grep -q '^License: LGPL' "$out/ffmpeg-configure.log" || { echo "wine64-deps: FFmpeg is not LGPL ($out/ffmpeg-configure.log)" >&2; exit 1; }
+# SDL2: what winebus calls (joysticks, game controllers, haptics, events,
+# timers and threads), over evdev with no udev (gex-kernel's /dev/input,
+# which it scans); no video (nor its dummy drivers), audio, HIDAPI or
+# dynamic loading.
+tar xf "$dl/SDL2-$SDL2_VERSION.tar.gz"
+(cd SDL2-$SDL2_VERSION &&
+  ./configure --host=$HOST --prefix="$I" --enable-static --disable-shared \
+    --disable-audio --disable-video --disable-video-dummy --disable-video-offscreen --disable-render \
+    --disable-sensor --disable-power --disable-filesystem --disable-file --disable-misc --disable-locale \
+    --disable-hidapi --disable-hidapi-joystick --disable-hidapi-libusb --disable-joystick-virtual \
+    --disable-libudev --disable-dbus --disable-ime --disable-ibus --disable-fcitx --disable-assembly \
+    --disable-cpuinfo --disable-loadso --disable-rpath --disable-sdl2-config --disable-system-iconv --disable-libiconv \
+    --enable-joystick --enable-haptic --enable-events --enable-timers --enable-pthreads --enable-atomic \
+    CC="$WCC" CFLAGS=-O2 > "$out/sdl2-configure.log" 2>&1 &&
+  make -j"$J" > "$out/sdl2-make.log" 2>&1 && make install > "$out/sdl2-install.log" 2>&1)
+[ -f "$I/lib/libSDL2.a" ] || { echo "wine64-deps: SDL2 failed ($out/sdl2-*.log)" >&2; exit 1; }
 cp "$dl/$(basename "$CACERT_URL")" "$I/ca-certificates.crt"
 rm -rf "$S"
 echo "wine64-deps: $I"

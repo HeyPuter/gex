@@ -26,12 +26,13 @@
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (wine64-deps.sh:
 #               FreeType, libwayland, libxml2, xkbcommon, EGL headers;
 #               GnuTLS over nettle and Mozilla's CA bundle, as 32-bit Wine's;
-#               FFmpeg)
+#               FFmpeg; SDL2)
 #   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
 #               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
 #               EGL, guest/gl/gexgl.c), secur32 (+ GnuTLS) and
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as 32-bit Wine's)
-#               in the loader, and winegstreamer.so (+ FFmpeg) beside it (WINE64_MEDIA=off: not);
+#               and winebus in the loader, and winegstreamer.so (+ FFmpeg) and libSDL2-2.0.so.0
+#               beside it (WINE64_MEDIA=off, WINE64_PADS=off: not);
 #               WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
 #               that script and the 32-bit configure options it compiles with
@@ -39,9 +40,9 @@
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
 #   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
-#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so and its gex-rest-only}, x86_64-windows,
+#   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so,libSDL2-2.0.so.0 and their gex-rest-only}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
-#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst)
+#               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst; game controllers: -sdl)
 #               share/wine (with the .fon fonts), and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll , made in b64-K-S
@@ -144,6 +145,26 @@ lazy) [ -f "$W/dlls/winegstreamer/unixlib_ffmpeg.c" ] || { log "WINE64_MEDIA=laz
 *) log "WINE64_MEDIA=$MEDIA (lazy, the default, or off)"; exit 1 ;;
 esac
 if [ "$MEDIA" != 0 ]; then WGST=-wgf; B64_MODS="$B64_MODS --enable-winegstreamer"; else WGST=-nogst; fi
+# WINE64_PADS=lazy (the default): game controllers. winebus's Unix side in the
+# loader, its SDL bus over SDL2 (from deps64) as libSDL2-2.0.so.0, a side
+# module beside the loader in the site's rest bundle (gex-rest-only), and
+# the prefix keeps winebus's root device, but with "DemandStart"=1 on its
+# service: services.exe does not start it at boot, so a session with no
+# controller runs no winedevice for it and fetches no SDL. The page starts it
+# (`sc start winebus`, WineControllers in web/runtime/src/input.js) once a controller is
+# there. -sdl in the name. WINE64_PADS=off leaves all three out, as does
+# the memory64 flavour and the default for a Wine tree whose services.exe
+# has no DemandStart (it would start winebus at every boot).
+PADS=${WINE64_PADS:-default}
+case $PADS in
+0|off) PADS=0 ;;
+default) PADS=lazy; grep -q DemandStart "$W/programs/services/services.c" || { PADS=0; log "winebus left out: $W's services.exe has no DemandStart"; }
+	[ "${WINE64_MEM64:-0}" = 0 ] || PADS=0 ;;
+lazy) grep -q DemandStart "$W/programs/services/services.c" || { log "WINE64_PADS=lazy, and $W's services.exe has no DemandStart"; exit 1; }
+	[ "${WINE64_MEM64:-0}" = 0 ] || PADS=0 ;;
+*) log "WINE64_PADS=$PADS (lazy, the default, or off)"; exit 1 ;;
+esac
+PADT=; [ "$PADS" = 0 ] || { PADT=-sdl; B64_MODS="$B64_MODS --with-sdl"; }
 S=$( { echo "$DH $B64_MODS"; cat "$here"/link-wine64.sh "$here"/side-imports.py "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/wine32/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
@@ -293,12 +314,20 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # winegstreamer's halves there too, registered (its classes, filters and
 # transforms: DllRegisterServer is PE code alone, and its DllMain starts
 # without a Unix side), by the native Wine's regsvr32 of each arch.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs) | sha256sum | cut -c1-10)
+R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs; [ "$PADS" = 0 ] || echo pads) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
-	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
+	if [ "$PADS" = 0 ]; then python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
+	else
+		# winebus's root device kept, its driver started on demand only
+		{ grep -v -i '^\[-HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Enum\\ROOT\\WINE\\WINEBUS\]' "$here/wine32-session.reg"
+		  printf '\n[HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\winebus]\n"DemandStart"=dword:00000001\n'; } > session.reg
+		grep -q -i 'ROOT\\WINE\\WINEBUS' session.reg && { echo "session.reg still removes winebus's root device"; return 1; }
+		python3 "$here/reg-apply.py" pfx/system.reg session.reg && rm -f session.reg
+		grep -q -i '\\\\Enum\\\\ROOT\\\\WINE\\\\WINEBUS\]' pfx/system.reg || { echo "the prefix has no winebus root device"; return 1; }
+	fi
 	if [ -n "$GS" ]; then
 		cp -p "$GS/x86_64-windows/winegstreamer.dll" pfx/drive_c/windows/system32/
 		env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
@@ -327,6 +356,7 @@ b64_build() {
 	# FreeType, Wayland and gex-gl's EGL from deps64 (the sonames: dlreg's names)
 	# and GnuTLS (crypt32's and schannel's, unless WINE64_TLS=0)
 	local o=${without//--without-wayland/}; o=${o//--without-freetype/}; o=${o//--without-opengl/}
+	[ "$PADS" = 0 ] || o=${o//--without-sdl/}
 	[ "$TLS" = 0 ] || o="${o//--without-gnutls/} --with-gnutls"
 	# wcc64: the Wine trees' paths as /wine, not this host's.
 	export GEX_WCC_MAP="$W=/wine:$PWD=/wine-build:$T=/wine-tools:$DEPS=/wine-deps"
@@ -334,9 +364,9 @@ b64_build() {
 		--disable-tests --without-mingw --enable-archs= --without-unwind $o $B64_MODS \
 		CC="$WCC" CXX="$WCXX" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
-		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
+		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30 ac_cv_lib_soname_SDL2=libSDL2-2.0.so.0
 	mkdir -p out
-	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_MEDIA=$MEDIA WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
+	WINE64_MEM64=$M64 WINE64_WOW64=$WOW WINE64_MEDIA=$MEDIA WINE64_PADS=$PADS WINE64_DEPS=$DEPS/install JOBS=$J "$here/link-wine64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
@@ -352,10 +382,13 @@ dist_make() {
 	local d=$PWD
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
-	# (gex-rest-only: a site keeps the side module out of its boot bundle, in
+	# (gex-rest-only: a site keeps the side modules out of its boot bundle, in
 	# the rest bundle, fetched on the first dlopen: web/site-bundle.mjs)
+	rm -f lib/wine/x86_64-unix/gex-rest-only
 	[ -z "$GS" ] || { cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/ &&
-		echo winegstreamer.so > lib/wine/x86_64-unix/gex-rest-only; }
+		echo winegstreamer.so >> lib/wine/x86_64-unix/gex-rest-only; }
+	[ "$PADS" = 0 ] || { cp -p "$C/b64-$K-$S"/out/libSDL2-2.0.so.0 lib/wine/x86_64-unix/ &&
+		echo libSDL2-2.0.so.0 >> lib/wine/x86_64-unix/gex-rest-only; }
 	cp -p "$C/srv-$K-$V"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	[ "$WOW" = 0 ] || cp -a "$N/lib/wine/i386-windows" lib/wine/
@@ -376,7 +409,7 @@ dist_make() {
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WIL$WGST)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST dist_make
+log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WIL$WGST$PADT)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -410,7 +443,7 @@ SP=${WINE64_SPLIT_DLLS:-}
 SPA=; [ -n "$SP" ] || [ "$NPE" = 0 ] || { [ "$M64" != 0 ] && [ "$M64N" = 0 ]; } || SPA=all
 # PELINK_EXPORT_ALL changes the core (every DLL export), so it is part of the key
 NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}${PELINK_EXPORT_ALL:+ export-all}"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
-DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
@@ -541,8 +574,8 @@ STRIP=${WINE64_STRIP:-1}
 if [ "$NPE" != 0 ]; then
 	NI=-n$NK${N32:+-$N32}
 	if [ "$STRIP" = 0 ]; then NI=$NI-dbg; else NI=$NI-s$(sha256sum < "$here/../gexcc/windows/stripnames.py" | cut -c1-6); fi
-	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI native_make
-	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$NI
+	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$NI native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$NI
 fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as

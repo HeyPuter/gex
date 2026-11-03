@@ -601,6 +601,18 @@ environment so SDL scans even where libudev is installed. `pads` lists
 is pressed. `source` replaces `navigator.getGamepads` (a test's made-up
 controllers). Rumble is accepted and dropped.
 
+`new WineControllers(sys, gamepads, { wine, env })`: controllers for
+Windows programs. A 64-bit Wine install with controllers (SDL beside its
+loader) does not start Wine's controller bus, winebus, at boot, so a session
+with no controller pays nothing for it. This starts it in the Wine session
+(`wine sc start winebus`, with `wine` the loader's path and `env` the
+session's environment) the first time `gamepads` has a controller, or at
+once if it has one, once per system. Games then see the controller arrive
+through XInput, DirectInput and winmm. `state` is `idle`,
+`starting` or `started`; the `start` event has `code`, 0 when the driver
+started. As with SDL on Linux, a program that opens the controller sees
+its state from the next change (a press, a stick moved).
+
 ## Windows
 
 One windows part per system, made before boot. A program finds the
