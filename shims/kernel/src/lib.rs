@@ -2706,6 +2706,18 @@ pub extern "C" fn k_fs_sync(handle: i32, data_only: u32) -> i32 {
     as_unit(h.sync(data_only != 0))
 }
 
+/// The kept root's counters (`gex_kernel::vfs::tmpfs::persist::stats`), u64s.
+#[no_mangle]
+pub extern "C" fn k_fs_persist_stats(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let s = gex_kernel::vfs::tmpfs::persist::stats();
+    let b: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if (b.len() as u32) > cap {
+        return -34;
+    }
+    unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    b.len() as i32
+}
+
 /// The store's counters (`gex_kernel::vfs::blocks::stats`), u64s.
 #[no_mangle]
 pub extern "C" fn k_blocks_stats(at: gex_kmem::PAddr, cap: u32) -> i32 {

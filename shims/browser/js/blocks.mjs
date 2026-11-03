@@ -186,8 +186,9 @@ export async function storeOp(fs, op, off, len, bytes) {
       return [len, null];
     }
     if (op === OP_GROW) {
-      // By its last byte, as handleOp grows the store's file.
-      if (await fs.size() < off) await fs.write(off - 1, new Uint8Array(1));
+      // A page's store grows by its own truncate (Filesystem's contract,
+      // where it says ENOSPC), not as handleOp grows the OPFS file.
+      if (await fs.size() < off) await fs.truncate(off);
       return [0, null];
     }
     if (op === OP_FLUSH) {
