@@ -692,37 +692,46 @@ fn compile_uncached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
 }
 
 /// [`compile`], keeping what it compiles: a native wasm32 program (a
-/// gexcc build) is a whole module compiled at every exec, seconds for a
-/// large one, so its compiled form goes in the cache by content
-/// (`cache_dir()/wasm32`). A cached module from another engine
-/// configuration or wasmtime version fails to deserialize and is
-/// recompiled over.
+/// gexcc build) and the libraries it links are whole modules compiled at
+/// every exec, seconds for a large one, so their compiled forms go in the
+/// shared cache as [`load_or_compile_module`]'s do (under the cache's
+/// budget: they once went to `cache_dir()/wasm32`, which nothing evicted).
 pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
-    if precompiled_dir().is_some() {
-        return compile(engine, wasm);
-    }
-    let Some(dir) = cache_dir().map(|d| d.join("wasm32")) else {
+    load_or_compile_module(engine, wasm)
+}
+
+/// A whole module loaded as it is (Wine's native PE modules and their core,
+/// a library provider), compiled once and kept in the shared cache
+/// ([`cache_dir`], under its budget and eviction, stored by temp file and
+/// rename) by its content and the engine's configuration
+/// ([`module_key`]): never beside the module's file, which may be another
+/// install's, read through a link. With [`precompiled_dir`] set (an ejected
+/// project), or without a compiler, as [`compile`].
+pub fn load_or_compile_module(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    let (Some(dir), Some(key)) = (cache_dir().filter(|_| precompiled_dir().is_none()), module_key(engine, wasm)) else {
         return compile(engine, wasm);
     };
-    let name = content_name(wasm);
-    // And in memory for the host process: under 32-bit Wine every child
-    // execs the same 5.7 MB loader.
-    memo(engine, wasm.len(), || format!("cc:{name}"), || {
-        let path = dir.join(&name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            // SAFETY: written below by this runtime with an engine of the same
-            // kind; `deserialize` checks the engine configuration and version.
-            if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
-                return Ok(m);
-            }
-        }
-        let m = compile_here(engine, wasm)?;
-        #[cfg(feature = "compile")]
-        if let Ok(bytes) = m.serialize() {
-            store(&dir, &path, &bytes);
-        }
-        Ok(m)
+    memo(engine, wasm.len(), || format!("mod:{key}"), || {
+        Ok(load_or_compile(engine, &dir, &key, || Ok((wasm.to_vec(), Vec::new())))?.module)
     })
+}
+
+/// [`load_or_compile_module`]'s key: the module's bytes and the engine's
+/// precompile compatibility (what `deserialize` checks), so engines of two
+/// configurations (a 64-bit memory's, a wasm32 one's) keep an entry each
+/// rather than recompiling over each other's. None without a compiler.
+#[cfg(feature = "compile")]
+pub fn module_key(engine: &Engine, wasm: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut h);
+    let e = h.finish().to_le_bytes();
+    Some(key_memo("module", [wasm, &e[..]]))
+}
+
+#[cfg(not(feature = "compile"))]
+pub fn module_key(_engine: &Engine, _wasm: &[u8]) -> Option<String> {
+    None
 }
 
 #[cfg(feature = "compile")]
