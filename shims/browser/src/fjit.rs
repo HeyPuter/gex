@@ -450,7 +450,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
         return None;
     }
-    if mid_function(addr) {
+    if mid_function(addr) || crate::cgen::unit_due(addr) {
         return None;
     }
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
