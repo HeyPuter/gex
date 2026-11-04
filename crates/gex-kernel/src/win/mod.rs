@@ -251,3 +251,81 @@ pub fn trampoline_input(class32: bool) -> (gex_ld::Image, Vec<u64>) {
     };
     (image, starts)
 }
+
+/// The stubs of a native Wine DLL's PE skeleton (winebuild's
+/// `output_wasm_skeleton`), where gex binds the DLL's native exports.
+/// 32-bit Wine's are `ud2; ud2`. 64-bit Wine's are 16 bytes a hooking
+/// library can patch: `jmp [rip+0]`, the address after it (the stub's
+/// alias, [`skel::ALIAS`] bytes on) and the alias's `int3; int3`. A hook's
+/// trampoline copies the whole `jmp`, so the original it calls lands on the
+/// alias, which gex binds to the same native export once the stub is
+/// rewritten.
+pub mod skel {
+    /// The alias's offset from its stub.
+    pub const ALIAS: u64 = 14;
+
+    fn at<const N: usize>(m: &[u8], a: u64) -> Option<[u8; N]> {
+        let a = usize::try_from(a).ok()?;
+        m.get(a..a.checked_add(N)?)?.try_into().ok()
+    }
+
+    /// Whether the bytes at `a` are still an export's stub.
+    pub fn stub(m: &[u8], a: u64) -> bool {
+        match at::<4>(m, a) {
+            Some([0x0f, 0x0b, 0x0f, 0x0b]) => true,
+            Some([0xff, 0x25, 0, 0]) => at::<2>(m, a + 4) == Some([0, 0]) && alias_target(m, a) == Some(a + ALIAS),
+            _ => false,
+        }
+    }
+
+    /// The address the 64-bit stub at `a` jumps to (its alias, unless the
+    /// operand was rewritten).
+    pub fn alias_target(m: &[u8], a: u64) -> Option<u64> {
+        at::<8>(m, a + 6).map(u64::from_le_bytes)
+    }
+
+    /// Whether `a` is a 64-bit stub's alias: its `int3; int3`, [`ALIAS`]
+    /// bytes into a 16-byte stub. Not by the stub's operand: a 14-byte hook
+    /// (`jmp [rip+0]` and the detour's address) rewrote it, and the hook's
+    /// trampoline, which copied the original 14 bytes, still lands here.
+    pub fn alias(m: &[u8], a: u64) -> bool {
+        a % 16 == ALIAS && at::<2>(m, a) == Some([0xcc, 0xcc])
+    }
+
+    /// Whether the bytes at `a` are still the skeleton's: a stub or an alias.
+    pub fn intact(m: &[u8], a: u64) -> bool {
+        stub(m, a) || alias(m, a)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stub64(m: &mut [u8], a: u64) {
+            let i = a as usize;
+            m[i..i + 6].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+            m[i + 6..i + 14].copy_from_slice(&(a + ALIAS).to_le_bytes());
+            m[i + 14..i + 16].copy_from_slice(&[0xcc, 0xcc]);
+        }
+
+        #[test]
+        fn stubs_and_aliases() {
+            let mut m = vec![0u8; 64];
+            m[0..4].copy_from_slice(&[0x0f, 0x0b, 0x0f, 0x0b]);
+            stub64(&mut m, 16);
+            stub64(&mut m, 32);
+            assert!(stub(&m, 0) && intact(&m, 0));
+            assert!(stub(&m, 16) && !alias(&m, 16));
+            assert!(alias(&m, 30) && !stub(&m, 30) && intact(&m, 30));
+            assert_eq!(alias_target(&m, 32), Some(46));
+            // a 5-byte hook at 16: the stub is gone, its operand and alias stay
+            m[16..21].copy_from_slice(&[0xe9, 1, 2, 3, 4]);
+            assert!(!intact(&m, 16) && alias(&m, 30) && alias_target(&m, 16) == Some(30));
+            // a 14-byte one at 32 over the operand: the stub is gone, its alias stays
+            m[32..38].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+            m[38..46].copy_from_slice(&0x1234u64.to_le_bytes());
+            assert!(!stub(&m, 32) && !intact(&m, 32) && alias(&m, 46) && intact(&m, 46));
+            assert!(!intact(&m, 60) && !intact(&m, 1000));
+        }
+    }
+}

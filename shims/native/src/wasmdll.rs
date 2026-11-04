@@ -221,9 +221,10 @@ pub(crate) fn image_of(shared: &Arc<Mutex<JitShared>>, addr: u64) -> u64 {
 
 impl WinePe {
     /// Whether this module's binding at `addr` outlived its skeleton: the
-    /// bytes there are no longer the skeleton's stub (each export and the
-    /// entry point is `ud2; ud2`, tools/wine-wasm/specgen.py), so the code
-    /// there is the guest's and the native export has nothing to do with it.
+    /// bytes there are no longer the skeleton's stub or a stub's alias
+    /// (`gex_kernel::win::skel`), so the code there is the guest's (a hook,
+    /// whose trampoline reaches the export at the alias, [`bind_alias`])
+    /// and the native export has nothing to do with it.
     /// A view unmapped and its addresses reused (an image view, freed, then
     /// `VirtualAlloc`'d for the program's own code) is that: kept, the
     /// binding sent those calls to Wine's PE module. 64-bit Wine's module
@@ -234,8 +235,36 @@ impl WinePe {
         if !self.ptr64 || addr < 0x3f0000 {
             return false;
         }
-        memory.get(addr as usize..addr as usize + 4).is_some_and(|b| b != [0x0f, 0x0b, 0x0f, 0x0b])
+        memory.get(addr as usize..addr as usize + 4).is_some() && !gex_kernel::win::skel::intact(memory, addr)
     }
+}
+
+/// A miss at a 64-bit stub's alias (`gex_kernel::win::skel`) whose stub has
+/// a binding of a Wine PE module: a hook's trampoline, calling the original
+/// before a call through the rewritten stub retired that binding
+/// ([`bind_stub_alias`] then). The native export is bound at the alias too,
+/// for the caller to bridge.
+pub(crate) fn bind_alias(s: &mut JitShared, memory: &[u8], pc: u64) -> bool {
+    pc % 16 == gex_kernel::win::skel::ALIAS && bind_stub_alias(s, memory, pc - gex_kernel::win::skel::ALIAS)
+}
+
+/// Bind the native export of the 64-bit Wine PE stub at `stub` at its
+/// alias too, when the alias is still there and nothing is bound at it:
+/// before the stub's binding is retired (a hook rewrote it), or on a miss
+/// at the alias.
+pub(crate) fn bind_stub_alias(s: &mut JitShared, memory: &[u8], stub: u64) -> bool {
+    use gex_kernel::win::skel;
+    let alias = stub + skel::ALIAS;
+    if s.ftab.map.get(alias).is_some() || !skel::alias(memory, alias) {
+        return false;
+    }
+    let Some(f) = s.ftab.map.get(stub) else { return false };
+    if !s.wine_pe.iter().chain(s.wine_pe_split.iter()).any(|wp| wp.ptr64 && wp.install == f.install) {
+        return false;
+    }
+    let base = s.ftab.map.install(f.install).base;
+    s.ftab.map.bind(f.install, &[(alias, f.idx - base)]);
+    true
 }
 
 /// After an install's catch-up (the module instantiated, its data

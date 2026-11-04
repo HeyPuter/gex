@@ -289,6 +289,11 @@ use gex_kernel::ftab::REBRIDGE_LIMIT;
 /// back (JS writes it before the guest goes on, `#cgenServe`) and the
 /// dispatch is retried. False when it is not a provided address.
 pub(crate) fn rebridge(pc: u64) -> bool {
+    // A native Wine DLL's export reached at its stub's alias, through a
+    // hook's trampoline: bound there now, then bridged as below.
+    if super::wasmprog::guest_x86_64() {
+        super::wasmdll::bind_alias(pc);
+    }
     // Any provider's address, a 32-bit Wine builtin's export included: retiring its
     // page (a hook written beside it) forgot its bridge (`provider_serves`).
     if !(provided(pc) || super::provider_serves(pc)) || super::index_of(pc).is_none() {
