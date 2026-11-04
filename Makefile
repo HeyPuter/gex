@@ -15,6 +15,8 @@
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 #   WINE32_CACHE  32-bit Wine's sysroot, libraries and build tree (default CACHE/wine32)
+#   PAGE_FLAGS more page/build.sh flags for make page / page-sp (--no-assets after
+#            make assets, --debug)
 #   GEX_TOOLCHAIN, GEX_X86_TOOLCHAIN  musl cross toolchains to use instead of the
 #            pinned ones make toolchains fetches
 
@@ -127,13 +129,13 @@ page: toolchains
 	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp
+	$(PAGE_ENV) $(ROOT)/page/build.sh --mp $(PAGE_FLAGS)
 	@echo $(ROOT)/page/dist
 page-sp: toolchains
 	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --sp
+	$(PAGE_ENV) $(ROOT)/page/build.sh --sp $(PAGE_FLAGS)
 	@echo $(ROOT)/page/dist-sp
 assets: toolchains
 	$(ROOT)/page/build-assets.sh
