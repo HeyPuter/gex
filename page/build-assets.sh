@@ -96,9 +96,14 @@ if [ ! -x "$BB" ]; then
     fi
     echo "building busybox..."
     make -C "$SRC" defconfig >/dev/null
-    sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "$SRC/.config"
+    # The SHA instructions are x86's: 1.37.0's defconfig turns them on, and
+    # an aarch64 build of them does not compile.
+    sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+        -e 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' \
+        -e 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' "$SRC/.config"
     make -C "$SRC" -j"$(nproc)" \
-        CROSS_COMPILE="$TOOLCHAIN/bin/aarch64-linux-musl-" >/dev/null 2>&1
+        CROSS_COMPILE="$TOOLCHAIN/bin/aarch64-linux-musl-" > "$WORK/busybox-build.log" 2>&1 ||
+        { echo "busybox: the build failed ($WORK/busybox-build.log)" >&2; tail -5 "$WORK/busybox-build.log" >&2; exit 1; }
     cp "$SRC/busybox" "$BB"
 fi
 
