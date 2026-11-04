@@ -8,6 +8,7 @@ tools/wine-wasm/wine32/dll-bases.py      the same for a 32-bit Wine bundle (lega
 tools/wine-wasm/page-prefix.sh           a Wine prefix template for the page
 tools/wine-wasm/run.sh                   run a Windows program on a Wine dist (natively, or --page)
 tools/eject/record-wine32.mjs            record a 32-bit Wine page session for gex-eject (legacy)
+web/page-site.mjs                        a Wine program as a static site on nt.html (soju's WoW64 Paint pipeline)
 tools/wine-wasm/wcc                      clang for gex wasm32 programs, as Wine's build uses it
 tools/wine-wasm/wcc64                    the same for LP64 (64-bit Wine's Unix side)
 guest/steam/build-win.sh                 libsteam_api for a Windows game (make steam-api builds the Linux one)
