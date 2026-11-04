@@ -595,10 +595,8 @@ fn install_regions(
     cache: Option<&(std::path::PathBuf, String)>,
     memory: &gex_mem::GuestMemory,
 ) -> Result<()> {
-    // Region entries are tier-1 modules of the process's own mode.
-    if other_mode(&p.pe) {
-        return Ok(());
-    }
+    // Of the unit's mode: published under the unit's `OtherMode` scope, so
+    // a WoW64 process's i386 image has them bridged in the other directory.
     let Some(dir) = regions_dir(&pl.path) else { return Ok(()) };
     let path = dir.join("c.wasm");
     let Ok(wasm) = std::fs::read(&path) else { return Ok(()) };

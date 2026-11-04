@@ -1288,10 +1288,8 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
 pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
     let mut units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return -1 };
-    // Region entries are tier-1 modules of the process's own mode.
-    if x.alt {
-        return -1;
-    }
+    // Of the unit's mode: an image of the process's other mode has its
+    // region entries bridged in the other directory, as its entries are.
     let r = Unit {
         identity: x.identity.clone(),
         key_base: format!("regions/{}", x.key),
@@ -1304,7 +1302,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
         dirs: Vec::new(),
         slots: 0,
         providers: Vec::new(),
-        alt: false,
+        alt: x.alt,
     };
     units.push(r);
     (units.len() - 1) as i32
