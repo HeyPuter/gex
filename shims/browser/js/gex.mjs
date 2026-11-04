@@ -5362,7 +5362,7 @@ export class Gex {
     inst = new WebAssembly.Instance(mod, imports);
     if (peMod) {
       st.dyl.set(prov, inst);
-      this.#wasmdllLate(st);
+      this.#wasmdllLate(st, prov);
     }
     if (peSnap) {
       this.#snapPe = { inst, state: imports.env.__asyncify_state };
@@ -6266,31 +6266,65 @@ export class Gex {
   }
 
   /** Fill the slots between Wine's PE modules (cgen/wasmdll.rs `Late`)
-   *  whose two sides this Worker has instantiated. */
-  #wasmdllLate(st) {
+   *  whose two sides this Worker has instantiated: those of module `prov`
+   *  (just instantiated), or every one still open without it. The list is
+   *  read again only when it changed (`gex_wasmdll_lates_gen`), and each
+   *  entry is kept under its two modules until filled. */
+  #wasmdllLate(st, prov) {
     const e = this.#shim.exports;
-    const n = e.gex_wasmdll_lates ? e.gex_wasmdll_lates(0, 0) >>> 0 : 0;
-    if (!n) return;
-    const buf = e.gex_alloc(n) >>> 0;
-    let text;
-    try {
-      e.gex_wasmdll_lates(buf, n);
-      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
-    } finally {
-      e.gex_free?.(buf, n);
+    if (!e.gex_wasmdll_lates) return;
+    const gen = e.gex_wasmdll_lates_gen ? e.gex_wasmdll_lates_gen() >>> 0 : -1;
+    const fresh = [];
+    if (gen < 0 || gen !== st.lateGen) {
+      st.lateGen = gen;
+      const n = e.gex_wasmdll_lates(0, 0) >>> 0;
+      if (n) {
+        const buf = e.gex_alloc(n) >>> 0;
+        let text;
+        try {
+          e.gex_wasmdll_lates(buf, n);
+          text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+        } finally {
+          e.gex_free?.(buf, n);
+        }
+        const seen = st.lateSeen ??= new Set(), open = st.lateOpen ??= new Map();
+        const under = (m, l) => { const a = open.get(m); if (a) a.push(l); else open.set(m, [l]); };
+        for (const line of text.split('\n')) {
+          if (!line) continue;
+          const f = line.split('\t'), slot = Number(f[0]);
+          if (seen.has(slot)) continue;
+          seen.add(slot);
+          const l = { slot, importer: Number(f[1]), provider: Number(f[2]), name: f[3], done: false };
+          fresh.push(l);
+          under(l.importer, l);
+          under(l.provider, l);
+        }
+      }
     }
-    for (const line of text.split('\n')) {
-      if (!line) continue;
-      const [slot, importer, provider, name] = line.split('\t');
-      const p = st.dyl.get(Number(provider));
-      if (!p || !st.dyl.has(Number(importer))) continue;
-      const i = tIdx(this.#wide, Number(slot));
+    const open = st.lateOpen;
+    if (!open) return;
+    const fill = (l) => {
+      if (l.done) return;
+      const p = st.dyl.get(l.provider);
+      if (!p || !st.dyl.has(l.importer)) return;
+      l.done = true;
+      const i = tIdx(this.#wide, l.slot);
       const had = st.ftab.get(i);
-      if (had && had !== st.ftab.get(tIdx(this.#wide, 0))) continue;
-      const f = p.exports[name];
-      if (typeof f === 'function') {
-        st.ftab.set(i, f);
-        for (const r of st.lateReady?.get(Number(slot)) ?? []) r.value = 1;
+      if (had && had !== st.ftab.get(tIdx(this.#wide, 0))) return;
+      const f = p.exports[l.name];
+      if (typeof f !== 'function') return;
+      st.ftab.set(i, f);
+      for (const r of st.lateReady?.get(l.slot) ?? []) r.value = 1;
+    };
+    for (const l of fresh) fill(l);
+    if (prov !== undefined) {
+      for (const l of open.get(prov) ?? []) fill(l);
+      // (an entry left open waits for its other module, under whose number it is too)
+      open.delete(prov);
+    } else {
+      for (const [m, a] of open) {
+        for (const l of a) fill(l);
+        if (a.every((l) => l.done)) open.delete(m);
       }
     }
   }

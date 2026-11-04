@@ -187,6 +187,10 @@ struct WinePes {
     data_low: u64,
 }
 
+/// Bumped each time the late list changes (an entry added, or its provider
+/// installed): a Worker reads the list again only when it moved
+/// (`gex_wasmdll_lates_gen`).
+static LATE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Vec::new(), canon: std::collections::BTreeMap::new(), data_low: 0 });
 
 /// The core module's file name: the module a skeleton of a DLL linked as
@@ -891,6 +895,7 @@ fn install_module(
         g.late[k].provider = Some(number);
     }
     g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider, ptr64: is64 }));
+    LATE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     let wp = &mut g.mods[idx];
     wp.install = install;
     wp.base = base;
@@ -1350,6 +1355,12 @@ pub extern "C" fn gex_wasmdll_lates(buf: u32, cap: u32) -> u32 {
         }
     }
     super::put_str(&text, buf, cap)
+}
+
+/// The late list's generation: it changed when this did.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_lates_gen() -> u32 {
+    LATE_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// How many late bindings there are: a Worker writes each one's bridges.
