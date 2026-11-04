@@ -138,7 +138,10 @@ const failed = new FailedFrames();
 const heldError = new Error('given up a moment ago');
 async function getRange(url, lo, hi) {
   const body = await retryAsync(async () => {
-    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` } });
+    // Never the HTTP cache's copy: a range of an older bundle under the same
+    // URL would decode as garbage. A bundle with a hash keeps its frames in
+    // the page's own cache (`frameOf`) instead.
+    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store' });
     const b = new Uint8Array(await res.arrayBuffer());
     if (res.status === 206 && b.length === hi - lo) return b;
     if (res.status === 200 && b.length >= hi) return b.subarray(lo, hi);
@@ -147,6 +150,42 @@ async function getRange(url, lo, hi) {
   if (!body) throw new Error(`${url} @${lo}: no answer`);
   return body;
 }
+// A rest bundle whose index names its bytes' hash (BUNDLE.json `h`,
+// kde/mksite.sh) keeps its compressed frames in the page's Cache Storage
+// under the bundle's URL with that hash and the frame's number, so a second
+// visit reads them from there whatever caching headers the host sends, and a
+// new bundle (another hash) is never read from an old one's frames, which go
+// once it is seen. Without a hash, or a cache, frames come from the network.
+let store_ = null;
+const frameKey = (url, b, k) => {
+  const u = new URL(url, self.location.href);
+  u.hash = '';
+  u.search = `h=${b.h}&f=${k}`;
+  return u.href;
+};
+const kept_ = (n) => { kept += n; };
+async function stored(url, b, k) {
+  if (!store_ || !b.h) return null;
+  try {
+    const r = await store_.match(frameKey(url, b, k));
+    return r?.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+  } catch { return null; }
+}
+function store(url, b, k, bytes) {
+  if (store_ && b.h) store_.put(frameKey(url, b, k), new Response(bytes)).catch(() => {});
+}
+/** Frames of `url` under another hash than `h`: an earlier build's. */
+async function dropOld(url, h) {
+  if (!store_) return;
+  try {
+    const path = new URL(url, self.location.href).pathname;
+    for (const r of await store_.keys()) {
+      const u = new URL(r.url);
+      if (u.pathname === path && u.searchParams.has('f') && u.searchParams.get('h') !== h) await store_.delete(r);
+    }
+  } catch { /* kept */ }
+}
+
 // One fetch a frame however many readers want it: they share its promise
 // (`decoded`) while it is in flight.
 function frameOf(url, b, k) {
@@ -158,12 +197,20 @@ function frameOf(url, b, k) {
     if (failed.held(key)) return Promise.reject(heldError);
     const [o, n] = b.frames[k];
     const kept = packedFrame(key);
-    const z = kept ? Promise.resolve(kept) : getRange(url, o, o + n).then((got) => {
-      net += got.length;
-      // Its own copy: a range cut from a whole-file answer would hold the file.
-      const own = got.byteOffset || got.length !== got.buffer.byteLength ? got.slice() : got;
-      keepPacked(key, own);
-      return own;
+    const z = kept ? Promise.resolve(kept) : stored(url, b, k).then((have) => {
+      if (have) {
+        kept_(have.length);
+        keepPacked(key, have);
+        return have;
+      }
+      return getRange(url, o, o + n).then((got) => {
+        net += got.length;
+        // Its own copy: a range cut from a whole-file answer would hold the file.
+        const own = got.byteOffset || got.length !== got.buffer.byteLength ? got.slice() : got;
+        keepPacked(key, own);
+        store(url, b, k, own);
+        return own;
+      });
     });
     f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));
     f.catch(() => { decoded.delete(key); failed.failed(key); });
@@ -181,9 +228,11 @@ async function bundleRead(href, from, len) {
     const key = `${url}.json`;
     if (failed.held(key)) throw heldError;
     b = retryAsync(async () => {
-      const r = await fetch(key);
+      // The index of this deploy's bundle, never an older cached one.
+      const r = await fetch(key, { cache: 'no-cache' });
       return r.ok ? r.json() : null;
     }).then((j) => j ?? Promise.reject(new Error(`${key}: no answer`)));
+    b.then((j) => { if (j.h) dropOld(url, j.h); }, () => {});
     bundles.set(url, b);
     b.catch(() => { bundles.delete(url); failed.failed(key); });
   }
@@ -220,6 +269,7 @@ self.onmessage = async ({ data: m }) => {
     self.postMessage({ kind: 'ready', ok: false, why: 'no Atomics.waitAsync' });
     return;
   }
+  store_ = cache;
   self.postMessage({ kind: 'ready', ok: true });
   const busy = new Set();
   const serve = async (i) => {

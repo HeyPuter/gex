@@ -351,14 +351,18 @@ export function buildRest(lazy, store, { bin, work, frame: restFrame, zlev, orde
   let off = 0;
   mkdirSync(dirname(bin), { recursive: true });
   const fd = openSync(bin, 'w');
+  // `h`: the bundle's bytes' hash, under which the page keeps its frames
+  // (lazy-cache-worker.js), whatever caching headers the host sends.
+  const whole = createHash('sha256');
   for (let i = 0; i < k; i++) {
     const z = readFileSync(join(dir, `${String(i).padStart(6, '0')}.zst`));
     frames.push([off, z.length]);
     writeSync(fd, z);
+    whole.update(z);
     off += z.length;
   }
   closeSync(fd);
-  writeFileSync(`${bin}.json`, JSON.stringify({ frame: restFrame, size: tarSize, frames }));
+  writeFileSync(`${bin}.json`, JSON.stringify({ frame: restFrame, size: tarSize, h: whole.digest('hex').slice(0, 16), frames }));
   rmSync(dir, { recursive: true, force: true });
   const name = basename(bin);
   return { files: lazy.map(([path, size, hash, mtime]) => [path, size, `${name}#${where.get(hash)}`, mtime]), distinct: where.size, tarSize, frames: frames.length, bytes: off };
