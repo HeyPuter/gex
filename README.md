@@ -42,7 +42,7 @@ for debugging and for building what a page loads ahead of time.
   with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
   Desktop GL is supported up to 4.6.
 - **In the page, or ahead of time.** The same programs run in the browser
-  page (`web/`) and natively under `gexc`. An ejected project (below) runs
+  page (`page/`) and natively under `gexc`. An ejected project (below) runs
   only what was built for it ahead of time, as a static site whose
   JavaScript library a page of your own imports.
 
@@ -103,13 +103,13 @@ for debugging and for building what a page loads ahead of time.
 | `hosts/hostwl` | the compositor for an X server that runs in the page |
 | `hosts/native` | the native host, on wasmtime |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `web/` | the page, its build, and the Mesa and Xwayland builds |
-| `toolchain/gexcc` | the wasm32 C/C++ compiler and its sysroot |
-| `wine` | Wine for gex: dist, prefix, runner |
-| `tools/eject` | recording a Windows program for eject |
-| `tools/` (the rest) | generators for the GL transport and compatibility tables, staging the host's Wine PE files, profile and unit helpers |
+| `page/` | the page: its source, runtime assets and build (`make page`) |
+| `ports/` | the Mesa, Xwayland and Tint builds the page ships |
+| `site/` | eject and demo sites built from the page, and recording a Windows program for eject |
+| `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
+| `wine/` | Wine for gex: dist, prefix, runner |
+| `scripts/` | generators for the GL transport and compatibility tables, source fetching, the script lint, profile and unit helpers |
 | `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
-| `tests/` | the lifters' differential fuzzers, and page and eject tests that run under Node |
 | `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
 
 ## Building
@@ -177,9 +177,11 @@ $ out/gexcc/bin/gexcc -O2 -o hello hello.c && target/x86/release/gexc run hello
 - clang and `wasm-ld` (LLVM 22), and Node.js 22;
 - for the page: Emscripten (`emsdk`) and `wasm-tools`
   (`cargo install wasm-tools`);
-- for Wine: MinGW-w64 (`x86_64-w64-mingw32-gcc`, and i686 for WoW64);
-- for AArch64 tests: an `aarch64-linux-musl` cross toolchain, with
-  `qemu-aarch64` as the reference.
+- for Wine: the host's MinGW-w64 GCC 12 (`x86_64-w64-mingw32-gcc`, and
+  `i686-w64-mingw32-gcc` for WoW64); it is a prerequisite, not a pin;
+- for AArch64 tests: `qemu-aarch64` as the reference. The musl cross
+  toolchains are fetched by `make toolchains` at the versions in
+  `toolchain/pins`.
 
 Fetched sources (musl, LLVM, Wine) are kept in bare mirrors under
 `~/.cache/gex` (`CACHE=`). A rerun fetches nothing it already has. The

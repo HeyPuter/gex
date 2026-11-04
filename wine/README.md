@@ -35,9 +35,11 @@ What it fetches and builds, in order:
 - The Unix side as wasm. The native PE modules are linked as one core plus
   a module for each remaining DLL.
 - The prefix (`wineboot -i`, natively, as user `gex`), with the session in
-  `wine32-session.reg` applied.
+  `session.reg` applied.
 
-It needs `x86_64-w64-mingw32-gcc`, plus `i686-w64-mingw32-gcc` for WoW64.
+It needs the host's MinGW-w64 GCC 12: `x86_64-w64-mingw32-gcc`, plus
+`i686-w64-mingw32-gcc` for WoW64. It is a documented prerequisite, not a
+pin; another GCC version builds different PE files.
 
 ## Run a program
 

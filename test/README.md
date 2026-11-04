@@ -35,7 +35,7 @@ default on PATH), `GEX_TEST_SLIM` (a directory with a Debian image,
 /usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
 
-The browser host is vite on web/ (cross-origin isolated, the runtime from
+The browser host is vite on page/ (cross-origin isolated, the runtime from
 source) and one headless Chromium on WebGPU. Each test gets a page in a
 browser context of its own. The node host forks a Node process per test (and
 per phase).

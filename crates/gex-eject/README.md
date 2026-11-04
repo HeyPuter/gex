@@ -511,7 +511,7 @@ node gexdev/tests/eject/wine32-page.mjs site      # check: the site reaches the 
   (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
   browser shim, kernel and seed (`runtime/web/gex/`), `gex-project.json` and
   the page, `user/index.html` (written once, yours). `page_source` names the
-  gex checkout's `web/`: the library is built at build time, because the
+  gex checkout's `page/`: the library is built at build time, because the
   features decide what goes into it.
 - **The build** (`gexc eject build`) runs `site/build-eject-page.sh` with the
   features switched off, puts the project's runtime wasm in it, drops what a

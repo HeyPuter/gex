@@ -14,6 +14,9 @@
 #            (default ~/emsdk; GEX_CRT_SRC= names the builtins directory itself)
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
+#   WINE32_CACHE  32-bit Wine's sysroot, libraries and build tree (default CACHE/wine32)
+#   GEX_TOOLCHAIN, GEX_X86_TOOLCHAIN  musl cross toolchains to use instead of the
+#            pinned ones make toolchains fetches
 
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 include $(ROOT)/toolchain/pins
@@ -68,6 +71,7 @@ help-all: help
 	@echo 'make page-sp       the single-thread page (page/dist-sp)'
 	@echo 'make assets        the hosts, guest libraries and rootfs alone (page/public)'
 	@echo 'make xwayland      Xwayland for the page alone'
+	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
 	@echo 'make serve         serve page/dist (PORT, default 8088) and page/dist-sp (SP_PORT, 8089)'
 	@echo 'make runtime       the npm package @gex/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
@@ -203,7 +207,7 @@ gexcc: musl-src llvm-src
 	@echo $(GEXCC_PREFIX)/bin/gexcc
 
 # ---- 64-bit Wine ----
-# wine64-dist.sh caches every step in CACHE/wine64 by its inputs, so a rerun
+# wine/dist.sh caches every step in CACHE/wine64 by its inputs, so a rerun
 # only checks. It builds 32-bit Wine's wasm32 tree for the wineserver first
 # when missing (wine `make build`).
 wine-x64 wine: wine64-src sysroot64
