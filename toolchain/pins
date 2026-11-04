@@ -25,3 +25,15 @@ LLVM_COMMIT := 1bb69944033d8a7c2d79d654df0a513e818b3caf
 BUSYBOX_VERSION := 1.37.0
 BUSYBOX_URL     := https://busybox.net/downloads/busybox-1.37.0.tar.bz2
 BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
+
+# The guest-side cross compilers the page's assets are built with
+# (page/build-assets.sh: the gears, the guest GL driver, ld-musl for the
+# aarch64 and x86-64 guests): musl.cc's builds, fetched by make toolchains.
+MUSL_CROSS_AARCH64_URL    := https://musl.cc/aarch64-linux-musl-cross.tgz
+MUSL_CROSS_AARCH64_SHA256 := c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38
+MUSL_CROSS_X86_64_URL     := https://musl.cc/x86_64-linux-musl-cross.tgz
+MUSL_CROSS_X86_64_SHA256  := c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
+
+# The emsdk the page's Mesa and Xwayland are built with (EMSDK, default
+# ~/emsdk): make page checks its upstream/emscripten/emscripten-version.txt.
+EMSCRIPTEN_VERSION := 6.0.1

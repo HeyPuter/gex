@@ -12,7 +12,7 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="${1:-$HERE/out}"
-CC="${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}"
+CC="${GEX_CC:-${GEX_TOOLCHAIN:-$HOME/.cache/gex/toolchains/aarch64-linux-musl-cross}/bin/aarch64-linux-musl-gcc}"
 
 # A name as well as a path. `GEX_CC=aarch64-linux-gnu-gcc` used to be reported
 # as a missing compiler and *skipped* -- exit zero, no output, no libraries --

@@ -16,9 +16,12 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PUB="$HERE/public"
-WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}"
-TOOLCHAIN="${GEX_TOOLCHAIN:-$HOME/toolchains/aarch64-linux-musl-cross}"
-BUSYBOX_VERSION=1.36.1
+# Work files in this tree's target/ (never a /tmp other trees share).
+WORK="${GEX_ASSET_WORK:-$ROOT/target/web-build/assets}"
+# The cross compilers: make toolchains (toolchain/pins) unpacks these.
+TOOLCHAIN="${GEX_TOOLCHAIN:-$HOME/.cache/gex/toolchains/aarch64-linux-musl-cross}"
+# busybox at toolchain/pins' version, its tarball checked against the pin
+eval "$(sed -n 's/^\(BUSYBOX_[A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$ROOT/toolchain/pins")"
 
 mkdir -p "$PUB/gex" "$PUB/rootfs" "$WORK"
 
@@ -59,6 +62,12 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 # shared pair is what lets a process's threads each be a Worker.
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.shared.wasm"
 
+# The x86-64 guest's runtime (`?arch=x86`): its shim (plain, shared, and the
+# wasm64 one for a 64-bit memory), its kernel and its seeds, as .x86 files
+# beside the aarch64 ones. hosts/browser/build.sh builds the kernel with it.
+echo "building the x86-64 guest's shim, kernel and seed..."
+GEX_ARCH=x86 GEX_MEM64=1 "$ROOT/hosts/browser/build.sh" >/dev/null
+
 # Export providers' modules (glibc's mem*/str*, libm: gex-cgen providers/),
 # in a unit cache's layout under gex/cgen/: the page binds them when a
 # translated program maps the library they name, with no units
@@ -77,14 +86,13 @@ cp "$WORK/provcache/providers/"*.wasm "$PUB/gex/cgen/providers/"
 
 # -- busybox rootfs --------------------------------------------------------
 
-BB="$WORK/busybox"
+BB="$WORK/busybox-$BUSYBOX_VERSION-aarch64"
 if [ ! -x "$BB" ]; then
     SRC="$WORK/busybox-$BUSYBOX_VERSION"
     if [ ! -d "$SRC" ]; then
         echo "fetching busybox $BUSYBOX_VERSION..."
-        curl -fsSL "https://busybox.net/downloads/busybox-$BUSYBOX_VERSION.tar.bz2" \
-            -o "$WORK/busybox.tar.bz2"
-        tar -C "$WORK" -xf "$WORK/busybox.tar.bz2"
+        "$ROOT/wine/dl.sh" "$BUSYBOX_URL" "$BUSYBOX_SHA256" "$WORK"
+        tar -C "$WORK" -xf "$WORK/$(basename "$BUSYBOX_URL")"
     fi
     echo "building busybox..."
     make -C "$SRC" defconfig >/dev/null
@@ -249,7 +257,7 @@ fi
 
 # The same for the x86-64 guest (`?arch=x86`): served from fs/x86/, with an
 # x86_64 musl toolchain beside the aarch64 one (musl.cc's x86_64-linux-musl-cross).
-X86_TOOLCHAIN="${GEX_X86_TOOLCHAIN:-$HOME/toolchains/x86_64-linux-musl-cross}"
+X86_TOOLCHAIN="${GEX_X86_TOOLCHAIN:-$HOME/.cache/gex/toolchains/x86_64-linux-musl-cross}"
 X86_CC="$X86_TOOLCHAIN/bin/x86_64-linux-musl-gcc"
 if [ -x "$X86_CC" ] && [ -d /usr/include/GLES2 ]; then
     echo "building the x86-64 gears and GL driver..."

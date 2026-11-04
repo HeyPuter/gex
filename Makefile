@@ -27,6 +27,9 @@ NICE := nice -n 10
 EMSDK ?= $(HOME)/emsdk
 GEX_CRT_SRC ?= $(EMSDK)/upstream/emscripten/system/lib/compiler-rt/lib/builtins
 export GEX_CRT_SRC
+# 32-bit Wine's sysroot, libraries and build tree (wine/Makefile), under CACHE too
+WINE32_CACHE ?= $(CACHE)/wine32
+export WINE32_CACHE
 FETCH := $(ROOT)/scripts/fetch-pinned.sh
 short = $(shell printf %.12s $(1))
 
@@ -48,7 +51,7 @@ GEXCC_PREFIX ?= $(OUT)/gexcc
 
 .PHONY: help help-all help-tools gexc page page-sp assets mesa xwayland serve runtime \
         sysroot sysroot64 busybox gexcc gexcc-win wine wine-x64 native-libs steam-api \
-        eject-page eject-site test check check-gl regen-gl regen-mesa-hot lint wine32 \
+        eject-page eject-site test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
         musl-src musl64-src llvm-src wine64-src
 
 help:
@@ -98,24 +101,46 @@ gexc:
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
 # vite and the page's other npm packages, at package-lock.json's versions
 NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
-page:
+# The page's guest-side cross compilers (toolchain/pins), unpacked once in
+# CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others.
+TC := $(CACHE)/toolchains
+GEX_TOOLCHAIN ?= $(TC)/aarch64-linux-musl-cross
+GEX_X86_TOOLCHAIN ?= $(TC)/x86_64-linux-musl-cross
+export GEX_TOOLCHAIN GEX_X86_TOOLCHAIN
+toolchains: $(TC)/aarch64-linux-musl-cross/.pinned $(TC)/x86_64-linux-musl-cross/.pinned
+$(TC)/%-linux-musl-cross/.pinned:
+	$(ROOT)/wine/dl.sh $(MUSL_CROSS_$(call upper,$*)_URL) $(MUSL_CROSS_$(call upper,$*)_SHA256) $(CACHE)/dl
+	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC) && tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz
+	echo $(MUSL_CROSS_$(call upper,$*)_SHA256) > $@
+upper = $(subst x86_64,X86_64,$(subst aarch64,AARCH64,$(1)))
+
+# emcc from EMSDK at toolchain/pins' EMSCRIPTEN_VERSION, first on PATH
+EMCC_CHECK = v=$$(tr -d '"' < $(EMSDK)/upstream/emscripten/emscripten-version.txt 2>/dev/null); \
+  [ "$$v" = "$(EMSCRIPTEN_VERSION)" ] || { echo "make: EMSDK=$(EMSDK) has Emscripten '$$v', not toolchain/pins' $(EMSCRIPTEN_VERSION) (emsdk install $(EMSCRIPTEN_VERSION))"; exit 1; }
+PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
+
+page: toolchains
+	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(ROOT)/page/build.sh --mp
+	$(PAGE_ENV) $(ROOT)/page/build.sh --mp
 	@echo $(ROOT)/page/dist
-page-sp:
+page-sp: toolchains
+	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(ROOT)/page/build.sh --sp
+	$(PAGE_ENV) $(ROOT)/page/build.sh --sp
 	@echo $(ROOT)/page/dist-sp
-assets:
+assets: toolchains
 	$(ROOT)/page/build-assets.sh
 	@echo $(ROOT)/page/public
 mesa:
 	$(MESA_CHECKOUT)
-	$(ROOT)/page/build.sh --mp --gl-only
+	@$(EMCC_CHECK)
+	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --gl-only
 xwayland:
-	$(ROOT)/page/build.sh --mp --x-only
+	@$(EMCC_CHECK)
+	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --x-only
 PORT ?= 8088
 SP_PORT ?= 8089
 serve:

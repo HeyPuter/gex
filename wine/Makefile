@@ -19,7 +19,7 @@
 #
 # Settings (command line, environment, or wine/local.mk, which is
 # not tracked):
-#   WINE32_CACHE   outputs, mirrors and downloads (default ~/.cache/gex-wine32)
+#   WINE32_CACHE   outputs, mirrors and downloads (default ~/.cache/gex/wine32, the top-level Makefile's CACHE/wine32)
 #   WINE_DIR   build from this Wine worktree instead of the pin: no fetch;
 #              its build tree is incremental (one per WINE_DIR), its dist
 #              keyed by its tree hash, uncommitted changes included
@@ -42,7 +42,7 @@ include $(WINE32)/libs.pins
 include $(WINE32)/legacy32/wine32.pins
 -include $(WINE32)/local.mk
 
-WINE32_CACHE ?= $(HOME)/.cache/gex-wine32
+WINE32_CACHE ?= $(HOME)/.cache/gex/wine32
 WINE32_JOBS ?= 12
 GEXC ?= $(ROOT)/target/x86/release/gexc
 GEX_WINE_PREFIX ?= $(HOME)/.cache/gex/wine-$(WINE_X86_VERSION)

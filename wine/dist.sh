@@ -72,7 +72,7 @@
 # linker and the DLL list.
 # Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16); the
 # libraries' tarballs are kept in CACHE/dl, taken from WINE32_DL_SEED and
-# 32-bit Wine's downloads (WINE32_CACHE, default ~/.cache/gex-wine32) when there.
+# 32-bit Wine's downloads (WINE32_CACHE, default ~/.cache/gex/wine32) when there.
 # The server is compiled with a configured 32-bit Wine build tree's commands:
 # WINE32_BUILD and GEX_WASM_SYSROOT, or, unset, wine's own (`make
 # paths`, under WINE32_CACHE), made first when missing (`make build`: the 32-bit Wine
@@ -83,6 +83,8 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
+# temporary files (stage-native.sh's) under the cache unless TMPDIR says
+export TMPDIR=${TMPDIR:-$C/tmp}; mkdir -p "$TMPDIR"
 : "${GEX_WASM64_SYSROOT:?set GEX_WASM64_SYSROOT (toolchain/sysroot/build64.sh)}"
 J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
@@ -178,10 +180,15 @@ TLS=${WINE64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
 # (an internal compiler error in oleaut32's VarR4FromUI8), so the stack is
 # kept 16-byte aligned and only an incoming 4-byte alignment assumed, which
 # is all the i386 ABI promises a callee.
-WOW=${WINE64_WOW64:-0}; ARCHS=x86_64; CF32=()
+# The PE side's debug information names the Wine tree and this cache by fixed
+# names (/wine, /cache), so the same pins give the same bytes from any
+# checkout path. The P key takes the flags' form, not the paths.
+PEMAP="-ffile-prefix-map=$W=/wine -ffile-prefix-map=$C=/cache"
+P=$P-pm$(echo '-ffile-prefix-map=W=/wine -ffile-prefix-map=C=/cache' | sha256sum | cut -c1-4)
+WOW=${WINE64_WOW64:-0}; ARCHS=x86_64; CF32=(CROSSCFLAGS="-g -O2 $PEMAP")
 WS=; if [ "$WOW" != 0 ]; then
-	CF32=(i386_CFLAGS="-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2")
-	WS=-wow64-$(echo "${CF32[*]}" | sha256sum | cut -c1-6); P=$P$WS; ARCHS=i386,x86_64
+	CF32+=(i386_CFLAGS="-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2 $PEMAP")
+	WS=-wow64-$(echo "i386_CFLAGS=-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2" | sha256sum | cut -c1-6); P=$P$WS; ARCHS=i386,x86_64
 	S=$S-wow64  # the Unix side registers its libraries' WoW64 tables (link-wine64.sh)
 fi
 # The install leaves Win16 and VxD out (no 16-bit program runs on gex): the
@@ -231,7 +238,7 @@ T=$C/tools-$TP
 # tools build, without FreeType, makes no sfnt2fon)
 F=$( { git -C "$W" ls-tree -r HEAD fonts tools/sfnt2fon; cat "$here/wine-fon.sh"; grep '^FREETYPE_' "$here/libs.pins"; } | sha256sum | cut -c1-10)
 fon_make() {
-	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex-wine32}/dl" JOBS=$J nice -n 10 \
+	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" JOBS=$J nice -n 10 \
 		"$here/wine-fon.sh" "$W" "$T/include" "$C/dl" "$PWD/fon"
 }
 log "raster fonts ($F)"; step fon-$F fon_make
@@ -240,7 +247,7 @@ log "raster fonts ($F)"; step fon-$F fon_make
 # what a new commit changed: git touches only the files it rewrites), and
 # its install copied into pe64-P. A pin bump that changes one DLL took
 # about 40 minutes from scratch. WINE64_PE_FRESH=1 starts that tree over.
-WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)$WS
+WK=$C/pe64-work-$(echo "$W $T $PEMAP" | sha256sum | cut -c1-10)$WS
 pe_build() {
 	local out=$PWD
 	(
@@ -349,7 +356,7 @@ pfs_make() {
 log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
 deps64_build() {
-	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex-wine32}/dl" JOBS=$J nice -n 10 "$here/deps64.sh" "$PWD" "$C/dl"
+	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" JOBS=$J nice -n 10 "$here/deps64.sh" "$PWD" "$C/dl"
 }
 log "display libraries ($DH)"; step deps64-$DH deps64_build
 DEPS=$C/deps64-$DH

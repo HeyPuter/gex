@@ -26,7 +26,7 @@ OUT="${2:-$ROOT/gears.ppm}"
 
 WORK="${GEX_DEMO_WORK:-${TMPDIR:-/tmp}/gex-gl-demo}"
 GEXC="$ROOT/target/release/gexc"
-CC="${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}"
+CC="${GEX_CC:-${GEX_TOOLCHAIN:-$HOME/.cache/gex/toolchains/aarch64-linux-musl-cross}/bin/aarch64-linux-musl-gcc}"
 MUSL="$(dirname "$CC")/../aarch64-linux-musl/lib/libc.so"
 
 for tool in "$GEXC" "$CC"; do

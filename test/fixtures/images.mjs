@@ -32,7 +32,7 @@
 //   gl-probes  gl-probes-ARCH.tar: the guest GL (guest/gl/build.sh) and each
 //            self-checking probe in guest/gl/probes built against it
 //            (/probes/NAME), with a loader and libc: x86-64 glibc with gcc and
-//            the host's own, aarch64 musl with ~/toolchains/aarch64-linux-musl-cross
+//            the host's own, aarch64 musl with GEX_TOOLCHAIN (make toolchains)
 //            when it is there; and
 //            gl-probes.json, each probe's line from a run on the host's own
 //            Mesa (software, surfaceless), which the guest's run must print;
@@ -223,7 +223,7 @@ export const images = {
     for (const p of (process.env.GEX_TEST_GL_PROBES ?? '').split(':').filter(Boolean)) src[p.replace(/^.*\//, '').replace(/\.c$/, '')] = p;
     const names = Object.keys(src).sort();
     const version = join(ROOT, 'test/fixtures/programs/gl-version.c');
-    const musl = join(homedir(), 'toolchains/aarch64-linux-musl-cross');
+    const musl = process.env.GEX_TOOLCHAIN || join(homedir(), '.cache/gex/toolchains/aarch64-linux-musl-cross');
     const h = createHash('sha256');
     for (const f of readdirSync(join(ROOT, 'guest/gl')).sort()) {
       const p = join(ROOT, 'guest/gl', f);
