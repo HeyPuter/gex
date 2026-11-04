@@ -455,7 +455,7 @@ pub(crate) fn park() -> i32 {
     let now = turn_now();
     let ns = park_ns(now).map_or(-1, |n| n as i64);
     let seq = SEQ.with(|q| q.get());
-    let r = unsafe { k_ws_park(slot(), seq, ns) };
+    let r = crate::usage::parked(|| unsafe { k_ws_park(slot(), seq, ns) });
     stale_now();
     r
 }
@@ -465,7 +465,7 @@ pub(crate) fn park() -> i32 {
 pub(crate) fn park_bounded(ns: u64) -> i32 {
     let ns = park_ns(turn_now()).map_or(ns, |n| n.min(ns));
     let seq = SEQ.with(|q| q.get());
-    let r = unsafe { k_ws_park(slot(), seq, ns as i64) };
+    let r = crate::usage::parked(|| unsafe { k_ws_park(slot(), seq, ns as i64) });
     stale_now();
     r
 }

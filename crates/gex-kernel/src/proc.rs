@@ -84,6 +84,106 @@ pub struct Remote {
     pub end_tid: extern "C" fn(tid: i32),
     /// See [`ProcTable::task_owner`]; zero for no such task.
     pub task_owner: extern "C" fn(id: i32) -> i32,
+    /// See [`ProcTable::set_usage`].
+    pub set_usage: extern "C" fn(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64),
+    /// See [`ProcTable::cpu_total`].
+    pub cpu_total: extern "C" fn() -> u64,
+    /// See [`ProcTable::loadavg`], the three packed by [`pack_load`].
+    pub loadavg: extern "C" fn(now_ns: u64) -> u64,
+}
+
+/// What a process has used, as it last said ([`ProcTable::set_usage`]):
+/// processor time, memory, and when it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Processor time, nanoseconds. In the browser: the time its Workers
+    /// were not parked waiting (the browser says nothing of which core ran
+    /// them, or for how long the system had them descheduled).
+    pub cpu_ns: u64,
+    /// The processor time of its children it has collected, and of theirs.
+    pub child_cpu_ns: u64,
+    /// Bytes mapped and accessible ([`crate::mem::MemoryMap::vm_counters`]:
+    /// what its memory has grown to back), and bytes mapped at all.
+    pub rss: u64,
+    pub vsize: u64,
+    /// When it started, on the monotonic clock (nanoseconds since boot).
+    pub start_ns: u64,
+}
+
+/// The host's processor-time clock: this process's time (`thread` false) or
+/// the calling thread's, in nanoseconds ([`set_cpu_clock`]).
+static CPU_CLOCK: std::sync::OnceLock<fn(bool) -> u64> = std::sync::OnceLock::new();
+
+/// Set by a host that measures processor time (the browser's: the time its
+/// Workers were not parked). Without one the processor clocks count from the
+/// process's start.
+pub fn set_cpu_clock(f: fn(bool) -> u64) {
+    let _ = CPU_CLOCK.set(f);
+}
+
+/// See [`set_cpu_clock`].
+pub fn cpu_clock(thread: bool) -> Option<u64> {
+    CPU_CLOCK.get().map(|f| f(thread))
+}
+
+/// Linux's load average: an exponentially decaying average of how many
+/// tasks were running, sampled every five seconds, over one, five and
+/// fifteen minutes. Here "running" is measured, not sampled: over each
+/// interval, the processor time all processes used divided by its length
+/// (the mean number running). Fixed point, `LOAD_ONE` is 1.0.
+#[derive(Clone, Copy, Debug, Default)]
+struct Load {
+    avg: [u64; 3],
+    /// The end of the last interval counted, and the total processor time
+    /// then.
+    at_ns: u64,
+    cpu_ns: u64,
+}
+
+const LOAD_ONE: u64 = 1 << 11;
+const LOAD_EVERY_NS: u64 = 5_000_000_000;
+/// Linux's `EXP_1`, `EXP_5`, `EXP_15`: `LOAD_ONE / exp(5s / 1, 5, 15 min)`.
+const LOAD_EXP: [u64; 3] = [1884, 2014, 2037];
+
+impl Load {
+    /// Count the whole intervals up to `now_ns`, at `cpu_ns` of processor
+    /// time in all. The intervals since the last count share its mean.
+    fn advance(&mut self, now_ns: u64, cpu_ns: u64) {
+        if self.at_ns == 0 || now_ns < self.at_ns {
+            self.at_ns = now_ns;
+            self.cpu_ns = cpu_ns;
+            return;
+        }
+        let n = (now_ns - self.at_ns) / LOAD_EVERY_NS;
+        if n == 0 {
+            return;
+        }
+        let span = n * LOAD_EVERY_NS;
+        let used = cpu_ns.saturating_sub(self.cpu_ns) as u128;
+        let active = (used * LOAD_ONE as u128 / (now_ns - self.at_ns) as u128) as u64;
+        for _ in 0..n.min(1000) {
+            for (a, e) in self.avg.iter_mut().zip(LOAD_EXP) {
+                *a = (*a * e + active * (LOAD_ONE - e)) / LOAD_ONE;
+            }
+        }
+        // what the counted intervals used, at that mean
+        self.cpu_ns += (used * span as u128 / (now_ns - self.at_ns) as u128) as u64;
+        self.at_ns += span;
+    }
+
+    /// Hundredths, as `/proc/loadavg` prints them.
+    fn hundredths(&self) -> [u32; 3] {
+        self.avg.map(|a| ((a * 100 + LOAD_ONE / 2) / LOAD_ONE).min(0x1f_ffff) as u32)
+    }
+}
+
+/// Three load averages in hundredths, 21 bits each, in one `u64`.
+pub fn pack_load(l: [u32; 3]) -> u64 {
+    l[0] as u64 | (l[1] as u64) << 21 | (l[2] as u64) << 42
+}
+
+pub fn unpack_load(v: u64) -> [u32; 3] {
+    [(v & 0x1f_ffff) as u32, (v >> 21 & 0x1f_ffff) as u32, (v >> 42 & 0x1f_ffff) as u32]
 }
 
 /// One process as another process's `/proc` sees it.
@@ -104,6 +204,8 @@ pub struct ProcEntry {
     /// ([`crate::syscalls::Creds::save`]; empty: never, a parent's at a
     /// spawn). `/proc/<pid>/status`'s `Uid:`, `Gid:` and `Cap*:` lines.
     pub creds: Vec<u8>,
+    /// What it has used, as it last said.
+    pub usage: Usage,
 }
 
 impl ProcEntry {
@@ -130,12 +232,16 @@ impl ProcEntry {
 }
 
 /// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
-/// sid, zombie), the thread count and the info's length, the thread ids, the
-/// info, padded to four bytes.
+/// sid, zombie), the thread count and the info's length, the [`Usage`] as
+/// five `u64`s, the thread ids, the info, padded to four bytes.
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
         for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32, e.creds.len() as i32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let u = &e.usage;
+        for v in [u.cpu_ns, u.child_cpu_ns, u.rss, u.vsize, u.start_ns] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         for t in &e.tids {
@@ -153,9 +259,11 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
 pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let mut out = Vec::new();
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
-    while b.len() >= 32 {
+    let long = |b: &[u8], i: usize| u64::from_le_bytes(b[32 + i * 8..40 + i * 8].try_into().unwrap());
+    const HEAD: usize = 32 + 5 * 8;
+    while b.len() >= HEAD {
         let (t, n, c) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize, word(b, 7).max(0) as usize);
-        let at = 32 + 4 * t;
+        let at = HEAD + 4 * t;
         if b.len() < at + n + c {
             break;
         }
@@ -165,9 +273,10 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
             pgid: word(b, 2),
             sid: word(b, 3),
             zombie: word(b, 4) != 0,
-            tids: (0..t).map(|i| word(b, 8 + i)).collect(),
+            tids: (0..t).map(|i| word(b, HEAD / 4 + i)).collect(),
             info: b[at..at + n].to_vec(),
             creds: b[at + n..at + n + c].to_vec(),
+            usage: Usage { cpu_ns: long(b, 0), child_cpu_ns: long(b, 1), rss: long(b, 2), vsize: long(b, 3), start_ns: long(b, 4) },
         });
         b = &b[(at + n + c + 3) & !3..];
     }
@@ -216,6 +325,8 @@ struct Proc {
     /// Started by the host as a child of the virtual init, which the host
     /// collects (with `wait` as pid 1) rather than the table at its exit.
     host_child: bool,
+    /// See [`ProcTable::set_usage`].
+    usage: Usage,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -241,6 +352,36 @@ struct Table {
     procs: Vec<Proc>,
     /// Each live thread that is not its process's first, and its process.
     threads: std::collections::HashMap<i32, i32>,
+    /// The processor time of every process no longer in the table.
+    gone_cpu_ns: u64,
+    load: Load,
+}
+
+impl Table {
+    /// Take the processes `gone` says out of the table, their processor
+    /// time kept: in the total, and in their parent's children's time.
+    fn forget(&mut self, gone: impl Fn(&Proc) -> bool) {
+        let mut left = Vec::with_capacity(self.procs.len());
+        let mut owed = Vec::new();
+        for p in std::mem::take(&mut self.procs) {
+            if gone(&p) {
+                self.gone_cpu_ns += p.usage.cpu_ns;
+                owed.push((p.ppid, p.usage.cpu_ns + p.usage.child_cpu_ns));
+            } else {
+                left.push(p);
+            }
+        }
+        self.procs = left;
+        for (ppid, ns) in owed {
+            if let Some(p) = self.procs.iter_mut().find(|p| p.pid == ppid) {
+                p.usage.child_cpu_ns += ns;
+            }
+        }
+    }
+
+    fn cpu_total(&self) -> u64 {
+        self.gone_cpu_ns + self.procs.iter().map(|p| p.usage.cpu_ns).sum::<u64>()
+    }
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -315,7 +456,10 @@ impl ProcTable {
                     creds: Vec::new(),
                     vm: None,
                     host_child: false,
+                    usage: Usage::default(),
                 }],
+                gone_cpu_ns: 0,
+                load: Load::default(),
             }),
         }
     }
@@ -356,6 +500,7 @@ impl ProcTable {
             creds,
             vm: None,
             host_child,
+            usage: Usage::default(),
         });
         pid
     }
@@ -475,7 +620,7 @@ impl ProcTable {
                 .map(|p| {
                     let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
                     tids.sort_unstable();
-                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids };
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage };
                     (e, Arc::clone(&p.child.status))
                 })
                 .collect()
@@ -557,7 +702,7 @@ impl ProcTable {
             .map(|(pid, _)| pid)
             .collect();
         if !ended.is_empty() {
-            self.lock().procs.retain(|p| !(ended.contains(&p.pid) && p.ppid == INIT_PID));
+            self.lock().forget(|p| ended.contains(&p.pid) && p.ppid == INIT_PID);
         }
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
@@ -583,7 +728,7 @@ impl ProcTable {
                     Some(i) if t.procs[i].host_child => t.procs.iter().find(|p| p.pid == INIT_PID).map_or(0, |p| p.queue.id()),
                     Some(i) => {
                         t.procs[i].child.reaped.store(true, Ordering::Release);
-                        t.procs.remove(i);
+                        t.forget(|p| p.pid == pid);
                         0
                     }
                     None => 0,
@@ -610,8 +755,44 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
         }
+        self.lock().forget(|p| p.pid == pid);
+    }
+
+    /// What `pid` has used, said by the process itself as it goes: its
+    /// processor time, its memory, and when it started (see [`Usage`]).
+    /// Its children's time is the table's to keep.
+    pub fn set_usage(&self, pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64) {
+        if let Some(r) = self.remote {
+            return (r.set_usage)(pid, cpu_ns, rss, vsize, start_ns);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            // never back: a late word from a Worker that said less
+            let cpu_ns = cpu_ns.max(p.usage.cpu_ns);
+            // the process's start, not an `execve`'s
+            let start_ns = if p.usage.start_ns != 0 { p.usage.start_ns } else { start_ns };
+            p.usage = Usage { cpu_ns, rss, vsize, start_ns, ..p.usage };
+        }
+    }
+
+    /// The processor time every process has used, those gone included:
+    /// `/proc/stat`'s and `/proc/uptime`'s busy time.
+    pub fn cpu_total(&self) -> u64 {
+        if let Some(r) = self.remote {
+            return (r.cpu_total)();
+        }
+        self.lock().cpu_total()
+    }
+
+    /// The one, five and fifteen minute load averages at `now_ns` on the
+    /// monotonic clock, in hundredths (see [`Load`]).
+    pub fn loadavg(&self, now_ns: u64) -> [u32; 3] {
+        if let Some(r) = self.remote {
+            return unpack_load((r.loadavg)(now_ns));
+        }
         let mut t = self.lock();
-        t.procs.retain(|p| p.pid != pid);
+        let cpu = t.cpu_total();
+        t.load.advance(now_ns, cpu);
+        t.load.hundredths()
     }
 
     pub fn ppid(&self, pid: i32) -> i32 {
@@ -1069,6 +1250,44 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processor_time_outlives_the_process_and_goes_to_its_parent() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let b = t.spawn(a);
+        t.set_usage(a, 300, 4096, 8192, 5);
+        t.set_usage(b, 200, 4096, 4096, 7);
+        // never back, and the start is the first one said
+        t.set_usage(b, 150, 4096, 4096, 9);
+        let e = |pid| t.entries().into_iter().find(|e| e.pid == pid).unwrap().usage;
+        assert_eq!(e(b), Usage { cpu_ns: 200, child_cpu_ns: 0, rss: 4096, vsize: 4096, start_ns: 7 });
+        assert_eq!(t.cpu_total(), 500);
+        t.exit(b, 0);
+        t.reap(b);
+        assert_eq!(t.cpu_total(), 500, "a collected child's time stays in the total");
+        assert_eq!(e(a).child_cpu_ns, 200);
+        // and on the wire
+        let all = t.entries();
+        assert_eq!(decode_entries(&encode_entries(&all)), all);
+    }
+
+    #[test]
+    fn the_load_average_is_the_mean_running_count_decayed() {
+        let t = ProcTable::new();
+        let s = 1_000_000_000u64;
+        assert_eq!(t.loadavg(100 * s), [0, 0, 0]);
+        // one process busy all the time for a minute: 1 - 1/e of 1.00 over
+        // one minute, less over five and fifteen
+        t.set_usage(INIT_PID, 60 * s, 0, 0, 0);
+        let l = t.loadavg(160 * s);
+        assert!((62..=64).contains(&l[0]), "{l:?}");
+        assert!((17..=19).contains(&l[1]) && (5..=7).contains(&l[2]), "{l:?}");
+        // and idle for five more: it decays
+        let m = t.loadavg(460 * s);
+        assert!(m[0] < 2 && m[1] < l[1], "{m:?}");
+        assert_eq!(unpack_load(pack_load([123, 4567, 89])), [123, 4567, 89]);
+    }
 
     #[test]
     fn the_host_collects_what_it_started_and_a_virtual_init_its_orphans() {

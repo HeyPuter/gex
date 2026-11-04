@@ -1165,10 +1165,15 @@ pub fn clock_call(
         }
     };
     // Before the host has said when the process started (0): no time used.
-    let cpu = || {
+    // A host that measures processor time says it (`crate::proc::set_cpu_clock`).
+    let cpu_of = |thread: bool| {
+        if let Some(ns) = crate::proc::cpu_clock(thread) {
+            return ns as u128;
+        }
         let (s, n) = clock();
         if started == 0 { 0 } else { (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started) }
     };
+    let cpu = || cpu_of(false);
     let pair = |m: &mut GuestMem<'_>, at: u64, hi: u64, lo: u64, w32: bool| {
         if w32 {
             m.write_u32(at, hi as u32).and_then(|_| m.write_u32(at + 4, lo as u32))
@@ -1181,7 +1186,7 @@ pub fn clock_call(
             // As `sys_clock_gettime`, which a null buffer faults in.
             let (secs, nanos) = match clk {
                 2 | 3 => {
-                    let t = cpu();
+                    let t = cpu_of(clk == 3);
                     ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
                 }
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
@@ -7626,7 +7631,10 @@ pub fn clock_nanos_at(clock: ClockFn, started: u128, clk: u64) -> u128 {
         secs as u128 * 1_000_000_000 + nanos as u128
     };
     match clk {
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => wall().saturating_sub(started),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+            Some(ns) => ns as u128,
+            None => wall().saturating_sub(started),
+        },
         c if is_monotonic_clock(c) => {
             let (secs, nanos) = monotonic_from(clock());
             secs as u128 * 1_000_000_000 + nanos as u128
@@ -12300,7 +12308,10 @@ impl Kernel {
         const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
         let (secs, nanos) = match clk {
             CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-                let t = self.cpu_nanos();
+                let t = match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+                    Some(ns) => ns as u128,
+                    None => self.cpu_nanos(),
+                };
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
             c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
@@ -12346,6 +12357,10 @@ impl Kernel {
     /// ask for here). `openssl speed` divides by it, so zero printed every
     /// throughput as `infk`.
     pub fn cpu_nanos(&mut self) -> u128 {
+        // a host that measures it (`crate::proc::set_cpu_clock`)
+        if let Some(ns) = crate::proc::cpu_clock(false) {
+            return ns as u128;
+        }
         let now = self.now_nanos();
         if self.started == 0 {
             self.started = now;
