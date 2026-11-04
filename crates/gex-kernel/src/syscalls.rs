@@ -1034,6 +1034,23 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
+/// `getrusage`'s `who`: the process (`RUSAGE_SELF`, 0), its reaped
+/// children (`RUSAGE_CHILDREN`, -1) or the calling thread (`RUSAGE_THREAD`,
+/// 1); the time each has used, from `self_ns`, `child_ns` and `thread_ns`.
+fn rusage_ns(who: u64, self_ns: impl FnOnce() -> u128, child_ns: impl FnOnce() -> u128, thread_ns: impl FnOnce() -> u128) -> Result<u128, Errno> {
+    match who as u32 as i32 {
+        0 => Ok(self_ns()),
+        -1 => Ok(child_ns()),
+        1 => Ok(thread_ns()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// The time `pid`'s reaped children used, as the process table keeps it.
+pub fn child_cpu_of(procs: &ProcTable, pid: i32) -> u128 {
+    procs.entries().into_iter().find(|e| e.pid == pid).map_or(0, |e| e.usage.child_cpu_ns as u128)
+}
+
 /// A call's answer as the word its result register holds: the value, or
 /// the negated errno.
 fn result_word(r: SysResult) -> u64 {
@@ -1046,15 +1063,18 @@ fn result_word(r: SysResult) -> u64 {
 /// `times`: four `clock_t` -- user, system, and the same for reaped
 /// children -- counted in the hundredths of a second that `USER_HZ` means
 /// on Linux, and a return value on the same scale; `cpu_ns` the processor
-/// time used. i386's are 32-bit.
-fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, buf: u64) -> SysResult {
+/// time used, `child_ns` its reaped children's. i386's are 32-bit.
+fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, child_ns: u128, buf: u64) -> SysResult {
     let ticks = (cpu_ns / 10_000_000) as u64;
+    let child = (child_ns / 10_000_000) as u64;
     if buf != 0 && compat {
         m.zero(buf, 16)?;
         m.write_u32(buf, ticks as u32)?;
+        m.write_u32(buf + 8, child as u32)?;
     } else if buf != 0 {
         m.zero(buf, 32)?;
         m.write_u64(buf, ticks)?;
+        m.write_u64(buf + 16, child)?;
     }
     Ok(if compat { ticks as u32 as u64 } else { ticks })
 }
@@ -1091,7 +1111,8 @@ fn time_answer(m: &mut GuestMem<'_>, compat: bool, clock: ClockFn, tloc: u64) ->
 /// numbers here never takes its kernel for them. `compat` is
 /// [`Kernel::compat`] (the i386 numbering, number in
 /// `eax`, 32-bit layouts); `started` the process's start, which the
-/// processor-time clocks count from. The result goes where [`set_result`]
+/// processor-time clocks count from; `children` the time its reaped children
+/// used (`times`, `getrusage(RUSAGE_CHILDREN)`). The result goes where [`set_result`]
 /// puts it. Signal delivery, which the kernel does at every syscall
 /// boundary, is the host's to arrange (the page's safepoints).
 pub fn clock_call(
@@ -1100,6 +1121,7 @@ pub fn clock_call(
     compat: bool,
     clock: ClockFn,
     started: u128,
+    children: &dyn Fn() -> u128,
 ) -> bool {
     let (raw, a0, a1) = if compat {
         let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
@@ -1119,7 +1141,8 @@ pub fn clock_call(
         Res(u64, bool),
         // (buffer, 32-bit timeval)
         Tod(u64, bool),
-        Rusage(u64),
+        // (who, buffer)
+        Rusage(u64, u64),
         // (buffer): `times`, in the ABI's `clock_t`.
         Times(u64),
         // (where to store it, or 0): `time`, x86-64's and i386's.
@@ -1134,7 +1157,7 @@ pub fn clock_call(
             x::CLOCK_GETRES => Call::Res(a1, true),
             x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
             x::GETTIMEOFDAY => Call::Tod(a0, true),
-            x::GETRUSAGE => Call::Rusage(a1),
+            x::GETRUSAGE => Call::Rusage(a0, a1),
             x::TIMES => Call::Times(a0),
             x::TIME => Call::Time(a0),
             x::SCHED_YIELD => Call::Yield,
@@ -1147,7 +1170,7 @@ pub fn clock_call(
             228 => Call::Clock(a0, a1, false),
             229 => Call::Res(a1, false),
             96 => Call::Tod(a0, false),
-            98 => Call::Rusage(a1),
+            98 => Call::Rusage(a0, a1),
             100 => Call::Times(a0),
             201 => Call::Time(a0),
             24 => Call::Yield,
@@ -1158,7 +1181,7 @@ pub fn clock_call(
             nr::CLOCK_GETTIME => Call::Clock(a0, a1, false),
             nr::CLOCK_GETRES => Call::Res(a1, false),
             nr::GETTIMEOFDAY => Call::Tod(a0, false),
-            nr::GETRUSAGE => Call::Rusage(a1),
+            nr::GETRUSAGE => Call::Rusage(a0, a1),
             nr::TIMES => Call::Times(a0),
             nr::SCHED_YIELD => Call::Yield,
             _ => return false,
@@ -1203,21 +1226,26 @@ pub fn clock_call(
                 pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
             }
         }
-        Call::Rusage(buf) => {
-            if buf == 0 {
-                true
-            } else {
-                let ns = cpu();
+        Call::Rusage(who, buf) => match rusage_ns(who, cpu, &children, || cpu_of(true)) {
+            Err(e) => {
+                if gex_abi::X86 {
+                    let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+                }
+                let _ = set_result(m, ctx_addr, e.as_return());
+                return true;
+            }
+            Ok(_) if buf == 0 => true,
+            Ok(ns) => {
                 let (s, us) = ((ns / 1_000_000_000) as u64, (ns % 1_000_000_000 / 1000) as u64);
                 let size = if compat { 72 } else { 144 };
                 m.zero(buf, size).is_ok() && pair(m, buf, s, us, compat).is_ok()
             }
-        }
+        },
         // A pure yield: the caller's Worker is its own OS thread, and the
         // browser schedules those without being asked.
         Call::Yield => true,
         Call::Times(buf) => {
-            let r = times_answer(m, compat, cpu(), buf);
+            let r = times_answer(m, compat, cpu(), children(), buf);
             if gex_abi::X86 {
                 let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
             }
@@ -7354,7 +7382,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     }
     if n == CLOCK_OR_ID {
         let ids = Idents { pid: f.pid as u32, ppid: 0, tid: f.futex.tid };
-        if !clock_call(m, ctx_addr, compat, f.futex.clock, f.started) && !ident_call(m, ctx_addr, compat, &ids, f.creds) {
+        let children = || child_cpu_of(f.procs, f.pid);
+        if !clock_call(m, ctx_addr, compat, f.futex.clock, f.started, &children) && !ident_call(m, ctx_addr, compat, &ids, f.creds) {
             let _ = set_result(m, ctx_addr, Errno::ENOSYS.as_return());
         }
         let d = if f.signals.has_pending() {
@@ -10802,7 +10831,7 @@ impl Kernel {
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
             nr::TIMES => self.sys_times(m, a[0]),
-            nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
+            nr::GETRUSAGE => self.sys_getrusage(m, a[0], a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
             // A waitid that parks is `blocking_op`'s; one that gets here had bad arguments.
@@ -12373,22 +12402,28 @@ impl Kernel {
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let cpu = self.cpu_nanos();
-        times_answer(m, self.compat, cpu, buf)
+        times_answer(m, self.compat, cpu, child_cpu_of(&self.procs, self.pid), buf)
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
     /// context-switch counters stay zero, which is what a program that asks
     /// for them under emulation should expect to see.
-    fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
+    fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, who: u64, buf: u64) -> SysResult {
+        let own = self.cpu_nanos();
+        let ns = rusage_ns(
+            who,
+            || own,
+            || child_cpu_of(&self.procs, self.pid),
+            || crate::proc::cpu_clock(true).map_or(own, u128::from),
+        )?;
         if buf != 0 && self.compat {
             // i386: 32-bit timevals and longs (72 bytes)
-            let ns = self.cpu_nanos();
             m.zero(buf, 72)?;
             m.write_u32(buf, (ns / 1_000_000_000) as u32)?;
             m.write_u32(buf + 4, (ns % 1_000_000_000 / 1000) as u32)?;
         } else if buf != 0 {
             m.zero(buf, 144)?;
-            write_timeval(m, buf, self.cpu_nanos())?;
+            write_timeval(m, buf, ns)?;
         }
         Ok(0)
     }
@@ -12962,6 +12997,45 @@ mod tests {
         assert_eq!(k.fd_io().unix_of(pfd).err(), Some(Errno::ENOTSOCK));
     }
 
+    /// `times` and `getrusage(RUSAGE_CHILDREN)` count the reaped children's
+    /// time, the kernel's and the free path alike; a `who` past the three
+    /// is `EINVAL`.
+    #[test]
+    fn reaped_children_time_in_times_and_getrusage() {
+        if gex_abi::X86 {
+            return;
+        }
+        let (mut mem, mut k) = setup();
+        let at = k.ctx_addr;
+        let buf = 0x3000u64;
+        let child = k.procs.spawn(k.pid);
+        k.procs.set_usage(child, 2_500_000_000, 0, 0, 0);
+        k.procs.exit(child, 0);
+        k.procs.reap(child);
+        let procs = Arc::clone(&k.procs);
+        let pid = k.pid;
+        let children = move || child_cpu_of(&procs, pid);
+        for free in [false, true] {
+            let mut m = GuestMem::new(&mut mem);
+            let mut call = |m: &mut GuestMem<'_>, n: u64, args: &[u64]| {
+                m.zero(buf, 160).unwrap();
+                set_args(m, at, n, args);
+                if free {
+                    assert!(clock_call(m, at, false, k.clock, k.started, &children));
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[(-1i64) as u64, buf]), 0, "free {free}");
+            assert_eq!((m.read_u64(buf).unwrap(), m.read_u64(buf + 8).unwrap()), (2, 500_000), "free {free}");
+            call(&mut m, nr::TIMES, &[buf]);
+            assert_eq!(m.read_u64(buf + 16).unwrap(), 250, "cutime, free {free}");
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[7, buf]), -(Errno::EINVAL.0 as i64), "free {free}");
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[1, 0]), 0, "RUSAGE_THREAD, free {free}");
+        }
+    }
+
     /// `ident_call` answers the id calls as the kernel does, and declines
     /// what it was not given.
     #[test]
@@ -13029,7 +13103,7 @@ mod tests {
             m.zero(buf, 160).unwrap();
             m.write_u64(at + ctx::x(0) as u64, 0x5555).unwrap();
             set_args(&mut m, at, n, &args);
-            assert!(clock_call(&mut m, at, false, fixed, k.started), "call {n}");
+            assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0), "call {n}");
             assert_eq!(m.read(buf, 160).unwrap(), &want[..], "call {n} {args:?}");
             assert_eq!(ret(&m, at), want_ret, "call {n}");
         }
@@ -13038,17 +13112,17 @@ mod tests {
         // process's start is known (no time used), and the resolution.
         let mut m = GuestMem::new(&mut mem);
         set_args(&mut m, at, nr::GETPID, &[]);
-        assert!(!clock_call(&mut m, at, false, fixed, k.started));
+        assert!(!clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0]);
-        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         assert_eq!(ret(&m, at) as i64, -(Errno::EFAULT.0 as i64));
         m.write_u64(buf, !0).unwrap();
         set_args(&mut m, at, nr::GETRUSAGE, &[0, buf]);
-        assert!(clock_call(&mut m, at, false, fixed, 0));
+        assert!(clock_call(&mut m, at, false, fixed, 0, &|| 0));
         assert_eq!(m.read_u64(buf).unwrap(), 0);
         assert_eq!(ret(&m, at), 0);
         set_args(&mut m, at, nr::CLOCK_GETRES, &[1, buf]);
-        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         assert_eq!((m.read_u64(buf).unwrap(), m.read_u64(buf + 8).unwrap()), (0, 1));
         // i386: the number in eax, arguments in ebx/ecx, 32-bit layouts.
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 2]| {
@@ -13058,25 +13132,25 @@ mod tests {
         };
         let started = 1_699_999_990u128 * 1_000_000_000;
         set32(&mut m, crate::i386::raw::CLOCK_GETTIME, [0, buf]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf).unwrap(), 1_700_000_000);
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456_789);
         set32(&mut m, crate::i386::raw::GETTIMEOFDAY, [buf, 0]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
         m.write_u64(buf + 64, !0).unwrap();
         m.write_u64(buf + 72, !0).unwrap();
         set32(&mut m, crate::i386::raw::GETRUSAGE, [0, buf]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf).unwrap(), 10);
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
         assert_eq!(m.read_u64(buf + 64).unwrap(), 0, "the 72-byte i386 rusage is cleared");
         assert_eq!(m.read_u64(buf + 72).unwrap(), !0, "and nothing past it");
         set32(&mut m, crate::i386::raw::SCHED_YIELD, [0, 0]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u64(at + ctx::x(0) as u64).unwrap(), 0);
         set32(&mut m, crate::i386::raw::GETPID, [0, 0]);
-        assert!(!clock_call(&mut m, at, true, fixed, started));
+        assert!(!clock_call(&mut m, at, true, fixed, started, &|| 0));
     }
 
     /// What `clock_nanosleep` turns into: a sleep of the time left for an
@@ -14982,7 +15056,7 @@ mod tests {
         // own path answers it).
         m.write_u64(buf_at, !0).unwrap();
         set32(&mut m, raw::TIME, [buf_at, 0, 0]);
-        assert!(clock_call(&mut m, at, true, k.clock, k.started));
+        assert!(clock_call(&mut m, at, true, k.clock, k.started, &|| 0));
         assert_eq!(m.read_u32(buf_at + 4).unwrap(), u32::MAX, "only four bytes stored");
         assert_eq!(m.read_u32(buf_at).unwrap() as i32, r32(&m));
     }

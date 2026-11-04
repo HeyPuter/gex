@@ -258,7 +258,7 @@ fn door_syscall(s: &Server, ctx: u32) -> wasmtime::Result<()> {
     }
     {
         let mut gm = GuestMem::new(s.mem.bytes());
-        if gex_kernel::syscalls::clock_call(&mut gm, ctx as u64, true, gex_kernel::system_clock, 0) {
+        if gex_kernel::syscalls::clock_call(&mut gm, ctx as u64, true, gex_kernel::system_clock, 0, &|| 0) {
             return Ok(());
         }
     }

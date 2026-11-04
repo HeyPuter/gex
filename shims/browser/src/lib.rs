@@ -9435,7 +9435,10 @@ fn clock_syscall(ctx: i32) -> bool {
     } else {
         0
     };
-    if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started)
+    // `times`, `getrusage(RUSAGE_CHILDREN)`: what the table keeps of the
+    // reaped children (asked only by those).
+    let children = || crate::sigs::home().map_or(0, |h| gex_kernel::syscalls::child_cpu_of(h.procs(), h.pid));
+    if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started, &children)
         && !ident_syscall(&mut gm, at, abi == 1)
     {
         return false;
