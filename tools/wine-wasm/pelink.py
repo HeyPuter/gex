@@ -122,6 +122,30 @@ def spec_varargs(spec):
     return out
 
 
+def spec_i386_args(spec):
+    """The argument types of a .spec's i386 functions, {name: [type, ...]}
+    (int64 and int128 are 8 and 16 bytes on the stack: a struct by value is
+    one of them when its size is)."""
+    out = {}
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) < 3 or parts[1] not in ('stdcall', 'cdecl', 'thiscall', 'fastcall', 'varargs'):
+            continue
+        arch = [t.split('=', 1)[1] for t in parts[2:] if t.startswith('-arch=')]
+        if arch and not any(a in ('i386', 'win32') or (a.startswith('!') and a[1:] not in ('i386', 'win32'))
+                            for a in arch[0].split(',')):
+            continue
+        rest = ' '.join(t for t in parts[2:] if not t.startswith('-'))
+        m = re.match(r'([^\s(]+)\(([^)]*)\)', rest)
+        if m:
+            out[m.group(1)] = m.group(2).split()
+    return out
+
+
 # The words of a variadic call's buffer passed on to an i386 varargs export:
 # its callee pops none, so the ones past its arguments are only read.
 VARARGS_WORDS = 16
@@ -1085,10 +1109,12 @@ static void *gexw_ntdll_proc(const char *name)
                 resolve = lambda owner, n: (f'gexw_ntdll_proc("{n}")' if guest_ntdll and owner == 'ntdll.dll'
                                             else f'gexw_GetProcAddress(gexw_LoadLibraryA("{LOAD_NAME.get(owner, owner)}"), "{n}")')
                 stdcalls, varargs, owner_sigs, written_bv = {}, {}, {}, set()
+                spec_args, n_byval = {}, 0
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
                         stdcalls[owner] = spec_stdcalls(owner_spec(SRC, owner)) if SRC else set()
                         varargs[owner] = spec_varargs(owner_spec(SRC, owner)) if SRC and not WINE64 else set()
+                        spec_args[owner] = spec_i386_args(owner_spec(SRC, owner)) if SRC and not WINE64 else {}
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
                     # (x64 has one convention)
@@ -1104,14 +1130,22 @@ static void *gexw_ntdll_proc(const char *name)
                         types = ', '.join([ctype[c] for c in ps[:-1]] + ['int'] * VARARGS_WORDS)
                         args = ', '.join([f'a{i}' for i in range(len(ps) - 1)] +
                                          [f'((const int *)a{len(ps) - 1})[{j}]' for j in range(VARARGS_WORDS)])
-                    # A small struct by value (x64: 1, 2, 4 or 8 bytes, in its
-                    # argument's register): the caller hands over a pointer to
+                    # A struct by value: the caller hands over a pointer to
                     # it, as wasm passes one; the stub passes the struct on by
                     # value, so the ICALL pass's exit stub puts the struct in
-                    # its slot, not the pointer. (The owner's gexw.sig64 says
-                    # which; its .spec says int64. A larger one goes by
-                    # reference, as the pointer it already is.)
-                    if WINE64:
+                    # its slot (x64: 1, 2, 4 or 8 bytes, in its argument's
+                    # register; a larger one goes by reference, as the pointer
+                    # it already is) or on the i386 stack, not the pointer.
+                    # x64: the owner's gexw.sig64 says which (its .spec says
+                    # int64). i386: the .spec's int64 or int128 where the
+                    # caller passes a pointer.
+                    byval = {}
+                    if not WINE64:
+                        sa = spec_args[owner].get(n)
+                        if sa is not None and len(sa) == len(ps) and n not in varargs[owner]:
+                            byval = {i: {'int64': 8, 'int128': 16}[t] for i, t in enumerate(sa)
+                                     if t in ('int64', 'int128') and ps[i] == 'i'}
+                    else:
                         if owner not in owner_sigs:
                             owner_sigs[owner] = wasm_sig64(others[owner][:-len('.exports')]) if others[owner].endswith('.so.exports') else {}
                         osig = owner_sigs[owner].get(n, '')
@@ -1121,14 +1155,15 @@ static void *gexw_ntdll_proc(const char *name)
                         if len(ops) + lead == len(ps):
                             byval = {lead + j: int(t[1:]) for j, t in enumerate(ops)
                                      if t[0] == 'b' and int(t[1:]) in (2, 4, 8)}
-                            if byval:
-                                for sz in sorted(set(byval.values()) - written_bv):
-                                    f.write(f'struct gexw_bv{sz} {{ char c0; char c[{sz - 1}]; }};\n')
-                                    written_bv.add(sz)
-                                types = ', '.join(f'struct gexw_bv{byval[i]}' if i in byval else ctype[c]
-                                                  for i, c in enumerate(ps))
-                                args = ', '.join(f'*(const struct gexw_bv{byval[i]} *)(__SIZE_TYPE__)a{i}' if i in byval
-                                                 else f'a{i}' for i in range(len(ps)))
+                    if byval:
+                        n_byval += 1
+                        for sz in sorted(set(byval.values()) - written_bv):
+                            f.write(f'struct gexw_bv{sz} {{ char c0; char c[{sz - 1}]; }};\n')
+                            written_bv.add(sz)
+                        types = ', '.join(f'struct gexw_bv{byval[i]}' if i in byval else ctype[c]
+                                          for i, c in enumerate(ps))
+                        args = ', '.join(f'*(const struct gexw_bv{byval[i]} *)(__SIZE_TYPE__)a{i}' if i in byval
+                                         else f'a{i}' for i in range(len(ps)))
                     f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{sym}");\n')
                     # (bound by its DLL's entry point when the owner is a
                     # static import, else on first call, as a delay load)
@@ -1172,7 +1207,8 @@ static void *gexw_ntdll_proc(const char *name)
             obj = os.path.join(tmp, f'guestimports{g}.o')
             subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
             objs[g].append(obj)
-            print(f'{g or out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
+            print(f'{g or out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})'
+                  + (f', {n_byval} with a struct by value' if n_byval else ''))
 
     # (a DLL in a group without guest-import stubs binds nothing)
     for g in objs:
