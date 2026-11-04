@@ -262,8 +262,9 @@ self.onmessage = async ({ data: m }) => {
   try {
     cache = await caches.open(m.cache);
     // A store that opens but cannot hold anything (some insecure origins).
-    await cache.put('/__gex-probe', new Response('1'));
-    await cache.delete('/__gex-probe');
+    const probe = new URL('/__gex-probe', here()).href;
+    await cache.put(probe, new Response('1'));
+    await cache.delete(probe);
   } catch (e) {
     self.postMessage({ kind: 'ready', ok: false, why: String(e?.message ?? e) });
     return;
