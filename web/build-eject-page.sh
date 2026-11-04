@@ -2,7 +2,8 @@
 # An ejected program's web build (crates/gex-eject/README.md): gex's app
 # library (web/src/app.js) built with vite into DIR as app.mjs, its chunks
 # under assets/, and beside it under gex/ the x86 shared-memory shim, kernel
-# and seed (with the aarch64 set, the export providers), Mesa (the wgpu
+# and seed (with the aarch64 set, the export providers), stripped of their
+# names and DWARF unless GEX_KEEP_NAMES=1, Mesa (the wgpu
 # replay, web/build-mesa-wasm.sh) for programs with OpenGL, the X server
 # (web/build-xwayland-wasm.sh) for X11 programs, and under vendor/ the zstd
 # decoder. The page is the user's
@@ -72,6 +73,21 @@ for d in xwayland xwayland-st; do
     if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
     elif [ "$d" = xwayland ]; then echo "build-eject-page: no web/public/gex/$d (web/build-xwayland-wasm.sh): the build runs no X11 programs" >&2; fi
 done
+# A release page's wasm without its names and DWARF (nine tenths of the
+# shim and kernel; user 10-30: every release build), as web/runtime/build.sh
+# and web/build-all.sh strip theirs: the copies here, web/public keeps the
+# originals to symbolize with. Only those sections go, so the providers'
+# gex.* ones stay; Mesa's split-off half is left whole, as
+# web/build-all.sh leaves it. GEX_KEEP_NAMES=1 keeps them, for a debug page.
+if [ -z "${GEX_KEEP_NAMES:-}" ]; then
+    command -v wasm-tools > /dev/null || { echo "build-eject-page: no wasm-tools to strip with (or GEX_KEEP_NAMES=1)" >&2; exit 1; }
+    for w in "$OUT"/gex/gex_browser*.wasm "$OUT"/gex/gex_kernel*.wasm "$OUT"/gex/cgen/providers/*.wasm \
+             "$OUT"/gex/gex-wgpu-replay.wasm "$OUT"/gex/xwayland*/*.wasm; do
+        [ -f "$w" ] || continue
+        wasm-tools strip -d '^name$' -d '^\.debug_.*' -d '^external_debug_info$' -d '^sourceMappingURL$' "$w" -o "$w.strip"
+        mv -f "$w.strip" "$w"
+    done
+fi
 # The compositor bridge also zstd'd: the X server's Worker asks for
 # gexhostwl.wasm.zst first (hostx.js moduleBytes), 15 MB down to under 3.
 for w in "$OUT"/gex/xwayland*/gexhostwl.wasm; do
