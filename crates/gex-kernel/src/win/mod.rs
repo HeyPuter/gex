@@ -12,6 +12,22 @@ pub const NTDLL_HANDLE: u64 = 1;
 /// gex-private system call numbers, issued only by gex's own trampolines.
 pub mod thunk;
 
+/// The TEB exception frames (`Tib.ExceptionList`, at the TEB's start, each
+/// frame's `Prev` its first word, -1 ending the list) a fault in 64-bit
+/// Wine's native PE code leaves dead: that code's fault is a trap, which
+/// ends every wasm frame it ran in, and the frames winecrt0's `__TRY`
+/// pushed are on the stack below the guest's RSP, where the exception frame
+/// is built next. Those below `rsp`: native code a guest call ran is above
+/// the guest's stack, and translated code's own frames are not on the list.
+/// The first live frame, for the list's head, when it is not `head` already.
+pub fn first_live_teb_frame(head: u64, rsp: u64, read: impl Fn(u64) -> Option<u64>) -> Option<u64> {
+    let mut frame = head;
+    while frame != u64::MAX && frame != 0 && frame < rsp {
+        frame = read(frame)?;
+    }
+    (frame != head).then_some(frame)
+}
+
 pub mod nr {
     /// `__wine_unix_call_dispatcher(handle, code, args)`.
     pub const UNIX_CALL: u32 = 0x7f00_0001;

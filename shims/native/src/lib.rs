@@ -6661,6 +6661,7 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
         let mut gm = GuestMem::new(memory.bytes());
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
     }
+    drop_dead_teb_frames(caller, &memory, ctx_addr);
     let f = crate::ftab::table_func(caller, hook)?;
     // 64-bit Wine's hook (signal_wasm64.c) takes the address as 64 bits, 32-bit Wine's
     // (signal_wasm32.c) as 32.
@@ -6699,6 +6700,29 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     caller.data_mut().resume_cause = Some(format!("guest fault {code:#x}"));
     caller.data_mut().resume_at = Some(next);
     Ok(true)
+}
+
+/// A fault in 64-bit Wine's native PE code ends the call-out's wasm frames
+/// but not the TEB exception frames they pushed: unlinked before the hook
+/// (`gex_kernel::win::first_live_teb_frame`). Dispatched with them, the
+/// exception ran a clobbered frame's handler (a Notepad++ dialog
+/// procedure's fault in a user callback called handler 0, that of
+/// dispatch_user_callback's own frame).
+fn drop_dead_teb_frames(caller: &Caller<'_, HostState>, memory: &gex_mem::GuestMemory, ctx_addr: u64) {
+    let wine64 = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).is_some_and(|s| s.provider_sp64.is_some());
+    if !wine64 || thread_alt(caller) {
+        return;
+    }
+    let mut gm = GuestMem::new(memory.bytes());
+    let teb = gm.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+    let rsp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+    let (Ok(head), true) = (gm.read_u64(teb), teb != 0 && rsp != 0) else { return };
+    if let Some(live) = gex_kernel::win::first_live_teb_frame(head, rsp, |f| gm.read_u64(f).ok()) {
+        if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+            eprintln!("gex: guest fault: TEB exception frames {head:#x}..{live:#x} below rsp {rsp:#x} unlinked");
+        }
+        let _ = gm.write_u64(teb, live);
+    }
 }
 
 /// A branch to `pc`, which is not executable guest memory: the process's own fault hook takes it as an access

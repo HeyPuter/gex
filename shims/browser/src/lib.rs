@@ -18435,6 +18435,17 @@ pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
         if signo != 11 {
             return 0;
         }
+        // 64-bit Wine's native PE code that trapped left its TEB exception
+        // frames linked (gex_kernel::win::first_live_teb_frame), as natively
+        if cgen::wasmprog::guest_x86_64() && !thread_alt() {
+            let teb = gm.read_u64(c + ctx::GS_BASE as u64).unwrap_or(0);
+            let rsp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            if let (Ok(head), true) = (gm.read_u64(teb), teb != 0 && rsp != 0) {
+                if let Some(live) = gex_kernel::win::first_live_teb_frame(head, rsp, |f| gm.read_u64(f).ok()) {
+                    let _ = gm.write_u64(teb, live);
+                }
+            }
+        }
         cgen::fault_stage(0xc000_0005, 0, 0);
         set_resume(pc);
         set_resume_ctx(c);
