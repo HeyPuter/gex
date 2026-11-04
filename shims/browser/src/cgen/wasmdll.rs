@@ -1136,13 +1136,17 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
 
 /// A PE32+ module's data, from the top of [`crate::wine64_pe_data`] (reserved at
 /// the x86-64 split) down, below `low` (the last one's, 0 for none), zeroed.
+/// Packed by the page, not the 64 KiB granule: a process that loads every
+/// builtin (a prefix update's setupapi DefaultInstall registers them all in
+/// one rundll32) has 74 modules' data, 5.2 MB, which took 8.4 MiB rounded to
+/// granules.
 fn alloc_pe_data_window(low: &mut u64, size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
     let (lo, mut hi) = crate::wine64_pe_data();
     if *low != 0 {
         hi = hi.min(*low);
     }
-    let len = (size + 0xffff) & !0xffff;
+    let len = (size + 0xfff) & !0xfff;
     if hi < lo || len > hi - lo {
         return Err(format!("{name}: {len:#x} bytes do not fit the wine64 PE data window"));
     }
