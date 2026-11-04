@@ -391,6 +391,7 @@ pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, a
     let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
     match signal::setup_frame(&view, gm, ctx_addr, signo, addr, compat) {
         Ok(target) => {
+            home.sig.note_fault_handled(signo);
             fault_note(home.pid, signo, pc, addr);
             Delivery::Resume(target)
         }

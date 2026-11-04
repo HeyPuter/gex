@@ -14562,11 +14562,12 @@ fn killed(signal: i32, at: u64) -> i32 {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal} (a write with no reader)\n"));
     } else {
     warn_line(&format!(
-        "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  stderr: {}\n  threads:{}\n  \
+        "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  sent by: {}\n  stderr: {}\n  threads:{}\n  \
          this thread:{}\n  last calls (this thread):{}\n  address space:{}\n  futexes:{}",
         pid,
         signal,
         object_off_at(at),
+        sent_by(&home.sig),
         last_stderr(),
         // Every thread, not only the one that died. Two threads
         // sharing a register context would clobber each other and
@@ -14593,6 +14594,32 @@ fn killed(signal: i32, at: u64) -> i32 {
     ));
     }
     exit_process(-signal)
+}
+
+/// Who made the fatal signal pending, as its delivery found it
+/// (`ProcSig::fatal`), and the last fault signal a handler was given: a
+/// crash handler (KCrash) that re-raises a fault dies of its own `tgkill`,
+/// and the handled one says where the first came from.
+fn sent_by(sig: &gex_kernel::signal::ProcSig) -> String {
+    fn one((signo, src, own): (u32, Option<gex_kernel::signal::Source>, bool)) -> String {
+        let to = if own { "this thread" } else { "the process" };
+        match src {
+            Some(s) => {
+                let how = match s.code {
+                    gex_kernel::signal::SI_USER => "kill",
+                    gex_kernel::signal::SI_TKILL => "tgkill",
+                    _ => "?",
+                };
+                format!("signal {signo} to {to} by {how} from pid {} (si_code {})", s.pid, s.code)
+            }
+            None => format!("signal {signo} to {to}, no sender (a fault or the kernel)"),
+        }
+    }
+    let fatal = sig.fatal().map_or_else(|| "not a delivery (a fault or a failed return)".to_string(), one);
+    match sig.handled_fault() {
+        Some(h) => format!("{fatal}; earlier handled fault: {}", one(h)),
+        None => fatal,
+    }
 }
 
 /// The dying thread's registers that say where it was -- the first

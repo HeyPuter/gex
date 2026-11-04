@@ -170,6 +170,14 @@ pub struct ProcSig {
     /// raise, so a collect that finds the inbox empty because another is
     /// under way waits for that one's signals to be pending.
     collecting: Mutex<()>,
+    /// The signal a delivery last found fatal (no handler), who sent it,
+    /// and whether it was the thread's own: the death report's "sent by".
+    /// Written once per process at most, just before it dies.
+    fatal: Mutex<Option<(u32, Option<Source>, bool)>>,
+    /// The last fault signal (SEGV, BUS, ILL, FPE) a delivery gave a
+    /// handler, with its sender: a handler that re-raises it (KCrash) dies
+    /// of a signal whose first sending this says. Rare, so a lock.
+    handled: Mutex<Option<(u32, Option<Source>, bool)>>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -190,7 +198,25 @@ impl ProcSig {
             timers: Mutex::new([None; 3]),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
+            fatal: Mutex::new(None),
+            handled: Mutex::new(None),
         }
+    }
+
+    /// The signal a delivery found fatal, its sender and whether it was the
+    /// thread's own ([`dispatch`]); `None` when none was.
+    pub fn fatal(&self) -> Option<(u32, Option<Source>, bool)> {
+        *self.fatal.lock()
+    }
+
+    /// A synchronous fault given to a handler (no sender: the instruction).
+    pub fn note_fault_handled(&self, signal: u32) {
+        *self.handled.lock() = Some((signal, None, true));
+    }
+
+    /// The last fault signal a handler was given, and its sender.
+    pub fn handled_fault(&self) -> Option<(u32, Option<Source>, bool)> {
+        *self.handled.lock()
     }
 
     /// Mark a process-directed signal pending: whichever thread does not
@@ -1631,12 +1657,13 @@ pub fn dispatch(
     // Taken off the pending sets before anything else: another thread of the
     // process may be delivering at the same time, without the kernel lock,
     // and a process-directed signal is for one of them only.
-    let (signal, source) = loop {
+    let (signal, source, own) = loop {
         let Some(signal) = signals.next_deliverable() else {
             return Ok(Delivery::None);
         };
+        let own = signals.cur.pending() & bit(signal) != 0;
         if let Some(source) = signals.claim(signal) {
-            break (signal, source);
+            break (signal, source, own);
         }
     };
     let action = signals.action(signal);
@@ -1644,7 +1671,7 @@ pub fn dispatch(
         return Ok(Delivery::None);
     }
     if action.handler == SIG_DFL {
-        return Ok(match default_action(signal) {
+        let d = match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
             // The three a terminal raises, with no handler and no scheduler to
             // resume from: doing nothing matches a shell with no job control (a
@@ -1661,10 +1688,19 @@ pub fn dispatch(
                 signal,
                 core: false,
             },
-        });
+        };
+        if matches!(d, Delivery::Terminate { .. }) {
+            *signals.proc.fatal.lock() = Some((signal, source, own));
+        }
+        return Ok(d);
     }
     match build_frame(signals, m, ctx_addr, signal, 0, compat, Taken::Claimed(source)) {
-        Ok(resume) => Ok(Delivery::Resume(resume)),
+        Ok(resume) => {
+            if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+                *signals.proc.handled.lock() = Some((signal, source, own));
+            }
+            Ok(Delivery::Resume(resume))
+        }
         Err(e) => {
             // No frame: the signal stays pending, as it was.
             signals.cur.raise(signal, source);
@@ -1829,6 +1865,16 @@ mod tests {
                 core: false
             }
         );
+    }
+
+    #[test]
+    fn a_fatal_delivery_keeps_its_sender() {
+        let (mut buf, mut s) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        assert_eq!(s.process().fatal(), None);
+        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0 });
+        assert!(matches!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::Terminate { signal: sig::SIGSEGV, .. }));
+        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0 }), true)));
     }
 
     #[test]

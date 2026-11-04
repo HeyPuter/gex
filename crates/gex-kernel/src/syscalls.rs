@@ -10979,6 +10979,7 @@ impl Kernel {
             self.compat,
         ) {
             Ok(resume) => {
+                self.signals.process().note_fault_handled(signo);
                 self.fault_note(signo, pc, fault_address);
                 Delivery::Resume(resume)
             }
