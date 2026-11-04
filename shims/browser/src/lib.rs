@@ -18669,14 +18669,22 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
                 IDENT_SNAPSHOT.0.borrow_mut().clear();
                 let _ = j.page_table.base(page);
             }
-            // The same page's code in the other mode, if any (never dense).
+            // The same page's code in the other mode (a WoW64 process's
+            // 32-bit code), as the process's own above: its dense slots name
+            // nothing, or the next translation there, given the same base,
+            // dispatched to the old code's blocks.
             let key = page | gex_abi::ALT_PAGE;
-            if j.page_table.forget(key).is_some() {
-                j.retired_pages.insert(key);
-                let at = dir_word(key);
-                if at != u64::MAX {
-                    // SAFETY: as the process's own directory's word above.
-                    let entry = unsafe { (*(at as usize as *const AtomicU32)).swap(0, Ordering::AcqRel) };
+            let had = j.page_table.forget(key).is_some();
+            let at = dir_word(key);
+            if at != u64::MAX {
+                // SAFETY: as the process's own directory's word above.
+                let entry = unsafe { (*(at as usize as *const AtomicU32)).swap(0, Ordering::AcqRel) };
+                if had || entry != 0 {
+                    j.retired_pages.insert(key);
+                    forget_installed_on(j, key);
+                }
+                if entry != 0 {
+                    dense::clear_page(entry);
                     j.base_pages.remove(&entry);
                 }
             }
