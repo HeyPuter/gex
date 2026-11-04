@@ -8832,7 +8832,7 @@ export class Gex {
       this.#calloutSignal = { kind: 'return', i };
       // The innermost call-out's return with only tail calls since its
       // loop's `enter`: the stub returns, and that `enter` with it.
-      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(this.#callouts[i].ri + 1) ? 1 : 0;
+      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(this.#callouts[i].tok) ? 1 : 0;
     }
     const ref = this.#shim.exports.gex_dispatch_ref(target);
     const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
@@ -9051,7 +9051,14 @@ export class Gex {
     const ri = e.gex_callout_opened?.() ?? me;
     // `alt`: made from code in the mode its process's class is not (a WoW64
     // process's 32-bit code), whose frames are on the 32-bit stack.
-    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri, alt: (e.gex_ctx_alt?.(ctx) ?? 0) === 1 };
+    // `tok`: what this loop tells `gex_callout_leave_ok` as it calls `enter`,
+    // and `#watchHit` asks `gex_callout_may_return` with: ri + 1 for one the
+    // shim opened; for one it did not (an NT user-mode callback's, a guest
+    // call from native Wine), this list's index + 1 with the top bit set,
+    // which no shim index (a miss's `may_leave`) matches. Its watched return
+    // then leaves `enter` by returning too, not by a trap through JS.
+    const tok = ri >= 0 ? ri + 1 : (0x80000000 | (me + 1));
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, ri, tok, alt: (e.gex_ctx_alt?.(ctx) ?? 0) === 1 };
     // How far above spWant its return comes back (`span`), and past which
     // the stack has left its caller (`unwound`). A guest call from native
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
@@ -9085,6 +9092,12 @@ export class Gex {
     }
     let pc = BigInt.asUintN(64, target);
     let next = null;
+    // Whether this call-out ends at its own return (the loop gives 1): the
+    // frames of the one around it, between its `enter` and the call that
+    // made this one, are as they were, so its watched return may again
+    // leave by returning (the finally gives its token back).
+    let own = false;
+    const leave = (v) => { own = v === 1; return v; };
     try {
       // A snapshot's level entered again inside it (`#snapCallOut`): the
       // guest goes on where that leaves it.
@@ -9095,10 +9108,10 @@ export class Gex {
           if (next) {
             const f = next;
             next = null;
-            e.gex_callout_leave_ok?.(ri + 1);
+            e.gex_callout_leave_ok?.(tok);
             yield ['call', f, ctx];
           } else {
-            e.gex_callout_leave_ok?.(ri + 1);
+            e.gex_callout_leave_ok?.(tok);
             yield ['enter', ctx, pc];
           }
           // A watched return with only tail calls since this `enter`
@@ -9110,12 +9123,12 @@ export class Gex {
             // that did not come back) reach through the loops between.
             this.#calloutSignal = ret.i < me ? ret : null;
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
-            return ret.i === me ? 1 : 0;
+            return leave(ret.i === me ? 1 : 0);
           }
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
-          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return hit === ri ? 1 : 0; }
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return leave(hit === ri ? 1 : 0); }
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {
@@ -9137,7 +9150,7 @@ export class Gex {
               e.gex_resume_pc();
               e.gex_resume_ctx();
             }
-            return v;
+            return leave(v);
           };
           // An outer call-out's return (the stack unwound to a native caller's
           // frame, a 64-bit handler's target under a WoW64 thread's nested
@@ -9261,7 +9274,7 @@ export class Gex {
             if (mine) e.gex_callout_stray(1);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
-            return mine ? 1 : 0;
+            return leave(mine ? 1 : 0);
           }
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves. A call-out
@@ -9279,7 +9292,7 @@ export class Gex {
       // A return signal for this call-out or a deeper one is spent with it.
       if (this.#calloutSignal?.kind === 'return' && this.#calloutSignal.i >= me) this.#calloutSignal = null;
       if (anyStack) e.gex_wow64_waits?.(-1);
-      e.gex_callout_leave_ok?.(0);
+      e.gex_callout_leave_ok?.(own && me > 0 ? this.#callouts[me - 1].tok : 0);
       this.#unwatch(c);
       this.#callouts.pop();
       this.#calloutGuard();
