@@ -38,6 +38,8 @@ tools/gexcc/build-cxx-win.sh PREFIX LLVM_CHECKOUT    # C++
 PREFIX/bin/x86_64-w64-mingw32-gcc -O2 -mwindows -o app.exe app.c res.o -lcomctl32
 ```
 
-`-s` links a release module (the names gex does not read stripped). A dist
-that ships such programs builds its core with `PELINK_EXPORT_ALL=1`, so their
-calls into any of its DLLs bind. `windows/gexcc-win`'s header lists the rest.
+`-s` links a release module (the names gex does not read stripped). A dist's
+cores export every DLL export by default (`WINE64_EXPORT_ALL=1`), so such
+programs' calls into any of its DLLs bind; a site that ships known programs
+can build with `WINE64_EXPORT_ALL=0 WINE64_EXPORTS=FILE`, FILE listing their
+imports (`DLL!name`, one a line). `windows/gexcc-win`'s header lists the rest.
