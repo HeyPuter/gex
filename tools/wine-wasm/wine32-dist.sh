@@ -6,7 +6,9 @@
 #
 # prints WINE32_DIST=..., WINE32_PREFIX=... (Wayland), WINE32_PREFIX_NULL=... (the null
 # driver), WINE32_PREFIX_BARE=... (staged, not installed: for a wineboot of
-# one's own), WINE32_KEY=... and WINE32_WINE=..., to eval. It is this directory's
+# one's own), WINE32_KEY=..., WINE32_BUILD=..., WINE32_WINE_SRC=... and
+# GEX_WASM_SYSROOT=... (its wasm32 build tree, source and sysroot: a test that
+# links a native module of its own) and WINE32_WINE=..., to eval. It is this directory's
 # Makefile with WINE_DIR=WINE and WINE32_CACHE=CACHE: every output is cached
 # there by the Wine tree and gex's inputs (the sysroot's and libraries'
 # pins, these tools, guest/gl), so a rerun on the same commit only checks,
@@ -29,5 +31,5 @@ key=$(sed -n 's/^WINE32_KEY=//p' <<< "$paths"); log=$C/wine32-dist-$key.log
 echo "wine32-dist: Wine $K, $key (log $log)" >&2
 mk dist prefix prefix-null > "$log" 2>&1 ||
   { echo "wine32-dist: the build failed: $log" >&2; tail -5 "$log" >&2; exit 1; }
-grep -E '^(WINE32_DIST|WINE32_PREFIX|WINE32_PREFIX_NULL|WINE32_PREFIX_BARE|WINE32_KEY)=' <<< "$paths"
+grep -E '^(WINE32_DIST|WINE32_PREFIX|WINE32_PREFIX_NULL|WINE32_PREFIX_BARE|WINE32_KEY|WINE32_BUILD|WINE32_WINE_SRC|GEX_WASM_SYSROOT)=' <<< "$paths"
 echo "WINE32_WINE=$W"
