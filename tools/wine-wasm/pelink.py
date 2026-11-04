@@ -895,7 +895,12 @@ def link(dlls, out, gexrt, others=None):
             for name, vias in forward_owner.items():
                 if name in exporters and not fwd_first(mod, imports, name):
                     continue  # bound to its definition, above
-                pick = next((o for o in [mod] + imports if o in vias), vias[0])
+                # (none it imports: its default C runtime, else the core's,
+                # before a module of its own; user32's sqrt, which msvcrt,
+                # ucrtbase and crtdll all forward, was crtdll's, and every
+                # process loading user32 installed crtdll)
+                core_first = sorted(vias, key=lambda o: (bool(SPLIT.get(o)), o not in ('ucrtbase.dll', 'msvcrt.dll')))
+                pick = next((o for o in [mod] + imports + EAGER.get(mod, []) if o in vias), core_first[0])
                 if bind_guest(f, mod, imports, name, pick):
                     continue
                 target, want = fwd_def.get(f'{pick}!{name}', (None, None))
