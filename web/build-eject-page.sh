@@ -21,6 +21,9 @@ import base from '$WEB/vite.config.js';
 export default {
   ...base,
   root: '$WEB',
+  // URLs relative to app.mjs, so the site works under any path (a host's
+  // /labs/NAME/ as at its root): Workers and chunks are found beside it.
+  base: './',
   publicDir: false,
   logLevel: 'warn',
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true,
