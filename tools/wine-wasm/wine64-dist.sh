@@ -288,17 +288,19 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
+# And 64-bit Wine's own (wine64-session.reg): no winemenubuilder process
+# in each session, as 32-bit Wine's dist has none.
 # WoW64: the display driver in system32 and syswow64 (wwl's: the prefix's
 # Wine has none), where a process loads it from.
 # winegstreamer's halves there too, registered (its classes, filters and
 # transforms: DllRegisterServer is PE code alone, and its DllMain starts
 # without a Unix side), by the native Wine's regsvr32 of each arch.
-R=$( (cat "$here"/wine32-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs) | sha256sum | cut -c1-10)
+R=$( (cat "$here"/wine32-session.reg "$here"/wine64-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs) | sha256sum | cut -c1-10)
 pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
-	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg"
+	python3 "$here/reg-apply.py" pfx/system.reg "$here/wine32-session.reg" "$here/wine64-session.reg"
 	if [ -n "$GS" ]; then
 		cp -p "$GS/x86_64-windows/winegstreamer.dll" pfx/drive_c/windows/system32/
 		env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
