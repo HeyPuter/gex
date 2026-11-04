@@ -954,11 +954,12 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
 }
 
 /// Whether the binding of Wine's PE module at `pc` outlived its skeleton:
-/// the bytes there are no longer the skeleton's stub (each export is
-/// `ud2; ud2`, tools/wine-wasm/specgen.py), so the code is the guest's and
-/// the native export has nothing to do with it. Every binding of the
-/// install in that mapping whose stub is gone too is forgotten here, and
-/// the caller lets tier-1 translate `pc`.
+/// the bytes there are no longer the skeleton's stub
+/// (`gex_kernel::win::skel`), so the code is the guest's and the native
+/// export has nothing to do with it. Every binding of the install in that
+/// mapping whose stub is gone too is forgotten here, and the caller lets
+/// tier-1 translate `pc`. A hook rewrote a 64-bit stub: the native export is
+/// bound at the stub's alias first, where the hook's trampoline goes.
 ///
 /// [`forget_gone`] catches a view unmapped, but not every way new code
 /// lands where a skeleton was: one program's page start had two pages of
@@ -973,10 +974,11 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
     if installs.is_empty() || !ftab(|m| m.get(pc).is_some_and(|f| installs.contains(&f.install))) {
         return false;
     }
-    let gm = crate::GuestMem::new(crate::guest_bytes());
-    let stub = |a: u64| matches!(gm.read_u32(a), Ok(w) if w == 0x0b0f_0b0f);
+    use gex_kernel::win::skel;
+    let bytes: &[u8] = crate::guest_bytes();
+    let stub = |a: u64| skel::intact(bytes, a);
     // Unreadable or the stub still there: a live skeleton.
-    if gm.read_u32(pc).is_err() || stub(pc) {
+    if crate::GuestMem::new(crate::guest_bytes()).read_u32(pc).is_err() || stub(pc) {
         return false;
     }
     let (lo, hi) = {
@@ -990,12 +992,42 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
     let gone: Vec<u64> = ftab(|m| m.range(lo, hi).filter(|(a, f)| installs.contains(&f.install) && !stub(*a)).map(|(a, _)| a).collect());
     ftab(|m| {
         for &a in &gone {
+            bind_alias_of(m, bytes, a);
             m.retire(a);
             gex_kernel::ftab::fcache_clear(memory, a);
         }
     });
     crate::trace_line(&format!("gex: {} native bindings in {lo:#x}..{hi:#x} outlived their skeleton; forgotten\n", gone.len()));
     true
+}
+
+/// Bind the native export at `stub`'s alias too (`gex_kernel::win::skel`),
+/// when its operand still names the alias and nothing is bound there.
+fn bind_alias_of(m: &mut gex_kernel::ftab::FuncMap, bytes: &[u8], stub: u64) -> bool {
+    let alias = stub + gex_kernel::win::skel::ALIAS;
+    if gex_kernel::win::skel::alias_target(bytes, stub) != Some(alias) || m.get(alias).is_some() {
+        return false;
+    }
+    let Some(f) = m.get(stub) else { return false };
+    let base = m.install(f.install).base;
+    m.bind(f.install, &[(alias, f.idx - base)]);
+    true
+}
+
+/// A miss at a 64-bit stub's alias whose stub still has its binding: a
+/// hook's trampoline reached it before a call through the rewritten stub
+/// did. The native export is bound there, and the caller bridges it.
+pub(crate) fn bind_alias(pc: u64) -> bool {
+    use gex_kernel::win::skel;
+    if pc % 16 != skel::ALIAS || !in_skeleton(pc) {
+        return false;
+    }
+    let bytes: &[u8] = crate::guest_bytes();
+    if !skel::alias(bytes, pc) {
+        return false;
+    }
+    let installs = installs();
+    ftab(|m| m.get(pc - skel::ALIAS).is_some_and(|f| installs.contains(&f.install)) && bind_alias_of(m, bytes, pc - skel::ALIAS))
 }
 
 /// The function-table installs of Wine's PE modules.

@@ -745,9 +745,10 @@ fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     if s.ftab.providers.contains(&f.install) {
-        // A binding of 64-bit Wine's PE module where its skeleton no longer
-        // is serves nothing (`wasmdll::WinePe::binding_is_stale`).
-        return !s.wine_pe.as_ref().is_some_and(|wp| wp.install == f.install && wp.binding_is_stale(memory, addr));
+        // A binding of 64-bit Wine's PE modules, the core's or a split
+        // one's, where its skeleton no longer is serves nothing
+        // (`wasmdll::WinePe::binding_is_stale`).
+        return !s.wine_pe.iter().chain(s.wine_pe_split.iter()).any(|wp| wp.install == f.install && wp.binding_is_stale(memory, addr));
     }
     match inst.tier {
         Tier::Unit => {
@@ -1119,9 +1120,13 @@ fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, mem
 pub(crate) fn serve(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
     let known = {
         let sh = shared(caller)?;
-        let s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
         if s.ftab.tier1_only.contains(&pc) || binding_alt(&s, pc) {
             return Ok(false);
+        }
+        // A 64-bit Wine PE stub's alias, reached through a hook's trampoline.
+        if let Some(memory) = caller.data().memory.as_ref() {
+            crate::wasmdll::bind_alias(&mut s, memory.bytes(), pc);
         }
         s.ftab.map.get(pc).is_some()
     };
