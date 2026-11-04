@@ -2392,7 +2392,8 @@ export class Gex {
         wl_drag_status: (serial, flags) => this.#wl?.dragStatus(serial >>> 0, flags >>> 0),
         wl_clip_serial: () => this.#wl?.clipSerial?.() ?? 0,
         wl_clip_get: (ptr, max) => this.#wl?.clipGet?.(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
-        wl_clip_set: (ptr, len) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0) ?? 0,
+        wl_clip_set: (ptr, len, from) => this.#wl?.clipSet?.(this.#memory, ptr >>> 0, len >>> 0, from >>> 0) ?? 0,
+        wl_clip_from: () => this.#wl?.clipFrom?.() ?? 0,
     };
   }
 
