@@ -45,6 +45,11 @@ const TIME_AT = 32; // bytes: words 8 and 9
 const COPY_US = 10;
 const PROXY_US = 11;
 const STAT_N = 12;
+// 1 while the device's side waits on STATE itself (`serveGl`'s waitAsync
+// loop): a client's request needs no wake-up message then. A word, not a
+// field of the channel: each Worker holds its own clone of the channel
+// object, and a field set where the device runs is never seen by a client.
+const DIRECT = 13;
 // Per client, what its last unwaited batch left to say: one slot of
 // SLOT_WORDS words per `client % SLOTS` (key = the client's number + 1,
 // the frames that client's surface has shown as of that batch's PRESENT, and
@@ -166,13 +171,14 @@ export function serveGl(glDevice, channel) {
   };
   serve.stop = () => {
     active = false;
+    Atomics.store(ctl, DIRECT, 0);
     Atomics.notify(ctl, STATE);
   };
   // `waitAsync` is legal on the page thread and avoids a posted-message turn
   // for every synchronous GL query. The renderer still owns the ordinary DOM
   // canvas here, so WebGPU presentation remains visible and flicker-free.
   if (typeof Atomics.waitAsync === 'function') {
-    channel.direct = true;
+    Atomics.store(ctl, DIRECT, 1);
     (async () => {
       while (active) {
         const state = Atomics.load(ctl, STATE);
@@ -205,11 +211,13 @@ export class GlProxy {
   #words;
   #wake;
 
+  /** `wake()`: tell a device that does not wait on the channel itself
+   *  (no `Atomics.waitAsync` where it runs) that a request is there. */
   constructor(channel, wake) {
     this.#ctl = new Int32Array(channel.control);
     this.#data = new Uint8Array(channel.data);
     this.#words = new Uint32Array(channel.data);
-    this.#wake = wake;
+    this.#wake = () => { if (Atomics.load(this.#ctl, DIRECT) !== 1) wake(); };
   }
 
   /** Run the ring at `ring` in the guest `memory`, blocking for the reply.
