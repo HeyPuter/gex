@@ -1,0 +1,12 @@
+REGEDIT4
+
+; 64-bit Wine's prefixes' session, after wine32-session.reg (wine64-dist.sh
+; applies both with reg-apply.py):
+;
+; - No winemenubuilder from RunServices: wineboot --init started it in
+;   every session, a process of its own beside the services, for menu
+;   entries no page has. 32-bit Wine's dist has no winemenubuilder.exe, so
+;   its sessions never ran one.
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\RunServices]
+"winemenubuilder"=-

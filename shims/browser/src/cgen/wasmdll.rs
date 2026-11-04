@@ -187,6 +187,10 @@ struct WinePes {
     data_low: u64,
 }
 
+/// Bumped each time the late list changes (an entry added, or its provider
+/// installed): a Worker reads the list again only when it moved
+/// (`gex_wasmdll_lates_gen`).
+static LATE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Vec::new(), canon: std::collections::BTreeMap::new(), data_low: 0 });
 
 /// The core module's file name: the module a skeleton of a DLL linked as
@@ -891,6 +895,7 @@ fn install_module(
         g.late[k].provider = Some(number);
     }
     g.late.extend(lates.into_iter().map(|(off, name, provider)| Late { importer: number, slot: base + off, name, provider, ptr64: is64 }));
+    LATE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     let wp = &mut g.mods[idx];
     wp.install = install;
     wp.base = base;
@@ -1281,8 +1286,9 @@ pub extern "C" fn gex_wasmdll_thunks(number: u32, buf: u32, cap: u32) -> u32 {
 
 /// A module of thunks for calls into a module not yet installed (`L`): its
 /// function `k` (exported as `k`) calls `slots[k]`'s table entry, with
-/// `call_indirect` once the Worker has filled it (its imported global `r.k`
-/// set), else JS's import `s.k`, which catches up first. In wasm, so a
+/// `call_indirect` once the Worker has filled it (its flag set: byte
+/// `r.b + k` of the Worker's flag store, the memory `r.m`), else JS's
+/// import `s.k`, which catches up first. In wasm, so a
 /// call through it keeps no JS frame below the callee: the single-thread
 /// build suspends the whole stack at a blocking call, which a JS frame
 /// would refuse.
@@ -1307,15 +1313,18 @@ fn late_thunks(slots: &[(wasmparser::FuncType, u32)]) -> Vec<u8> {
     for (k, (ty, _)) in slots.iter().enumerate() {
         types.ty().function(ty.params().iter().map(vt), ty.results().iter().map(vt));
         imports.import("s", &k.to_string(), we::EntityType::Function(k as u32));
-        imports.import("r", &k.to_string(), we::GlobalType { val_type: we::ValType::I32, mutable: true, shared: false });
     }
+    // the Worker's ready flags, a byte each, this module's from `r.b` on
+    imports.import("r", "m", we::MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+    imports.import("r", "b", we::GlobalType { val_type: we::ValType::I32, mutable: false, shared: false });
     for (k, (ty, slot)) in slots.iter().enumerate() {
         let k = k as u32;
         funcs.function(k);
         exports.export(&k.to_string(), we::ExportKind::Func, n + k);
         let mut f = we::Function::new([]);
         let np = ty.params().len() as u32;
-        f.instruction(&we::Instruction::GlobalGet(k));
+        f.instruction(&we::Instruction::GlobalGet(0));
+        f.instruction(&we::Instruction::I32Load8U(we::MemArg { offset: k as u64, align: 0, memory_index: 0 }));
         f.instruction(&we::Instruction::I32Eqz);
         f.instruction(&we::Instruction::If(we::BlockType::Empty));
         for p in 0..np {
@@ -1350,6 +1359,12 @@ pub extern "C" fn gex_wasmdll_lates(buf: u32, cap: u32) -> u32 {
         }
     }
     super::put_str(&text, buf, cap)
+}
+
+/// The late list's generation: it changed when this did.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_lates_gen() -> u32 {
+    LATE_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// How many late bindings there are: a Worker writes each one's bridges.

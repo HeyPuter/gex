@@ -5,7 +5,7 @@
 
 Handles what the 32-bit Wine session files use: `[-HKEY_LOCAL_MACHINE\\KEY]` deletes
 KEY and its subkeys, `[HKEY_LOCAL_MACHINE\\KEY]` followed by `"Name"=dword:N`
-or `"Name"="str"` sets values in an existing key. CurrentControlSet is
+or `"Name"="str"` sets values in an existing key, and `"Name"=-` deletes one. CurrentControlSet is
 ControlSet001, as Wine's system.reg stores it. A key to set that is missing
 is an error (these files only change keys wineboot made).
 """
@@ -45,13 +45,20 @@ def main():
                     blocks = [b for b in blocks if not (name_of(b) and (name_of(b).group(1).lower() == lk or name_of(b).group(1).lower().startswith(lk + '\\\\')))]
                     key = None
                 continue
-            m = re.match(r'"([^"]+)"=(dword:[0-9a-fA-F]{8}|"[^"]*")$', line)
+            m = re.match(r'"([^"]+)"=(dword:[0-9a-fA-F]{8}|"[^"]*"|-)$', line)
             if not m or key is None:
                 sys.exit(f'{reg}: cannot apply: {line}')
             idx = [i for i, b in enumerate(blocks) if name_of(b) and name_of(b).group(1).lower() == key.lower()]
             if not idx:
                 sys.exit(f'{reg}: no key {key} in {path}')
             b = blocks[idx[0]]
+            if m.group(2) == '-':
+                # a value to delete that is missing is an error too
+                pat = re.compile(rf'^"{re.escape(m.group(1))}"=.*\n', re.M | re.I)
+                if not pat.search(b):
+                    sys.exit(f'{reg}: no value {m.group(1)} in {key} in {path}')
+                blocks[idx[0]] = pat.sub('', b)
+                continue
             val = f'"{m.group(1)}"={m.group(2)}'
             pat = re.compile(rf'^"{re.escape(m.group(1))}"=.*$', re.M | re.I)
             blocks[idx[0]] = pat.sub(val, b) if pat.search(b) else b.rstrip('\n') + '\n' + val + '\n'
