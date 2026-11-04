@@ -39,7 +39,7 @@ os.environ.setdefault('GEX_WASM64_SYSROOT', conf['SYSROOT64'])
 # (wcc64's and pelink's binaryen: the sysroot's)
 os.environ['PATH'] = os.environ['GEX_WASM64_SYSROOT'] + '/binaryen/bin:' + os.environ['PATH']
 CXX = os.environ.get('GEXCC_WIN_CXX') or conf.get('CXX', PREFIX + '/cxx')
-W = os.path.realpath(here + '/../../wine-wasm')
+W = os.path.realpath(here + '/../../../wine')
 
 
 def tools_dir():

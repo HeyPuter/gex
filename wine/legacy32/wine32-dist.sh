@@ -24,7 +24,7 @@ W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
 # a commit, not a working state: the key below is the checkout's tree
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine32-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
-mk() { make -s -C "$here" WINE_DIR="$W" WINE32_CACHE="$C" ${GEXC:+GEXC="$GEXC"} "$@"; }
+mk() { make -s -C "$here/.." WINE_DIR="$W" WINE32_CACHE="$C" ${GEXC:+GEXC="$GEXC"} "$@"; }
 paths=$(mk paths) || { echo "wine32-dist: make paths failed" >&2; exit 1; }
 # the log by the whole key: two builds of one commit with different gex inputs may run at once
 key=$(sed -n 's/^WINE32_KEY=//p' <<< "$paths"); log=$C/wine32-dist-$key.log

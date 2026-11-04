@@ -198,7 +198,7 @@ for spec in $uxl; do
 		out=gexwine64/$lib/$b.o; objs="$objs $out"
 		fresh "$out" "$WF/dlls/$dir/$b.c" && continue
 		cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/$dir\/$b.c}
-		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/$dir -I$HERE\/wine32\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
+		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/$dir -I$HERE\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
 		( eval "$cmd -D__wine_unix_call_funcs=${lib}__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=${lib}__wine_unix_call_wow64_funcs" >&2 ) ||
 			{ echo "link-wine64: $dir/$b.c failed" >&2; touch "$fail"; } &
 		while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done

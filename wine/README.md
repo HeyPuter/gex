@@ -1,4 +1,4 @@
-# wine-wasm
+# wine
 
 Wine for gex. Wine's own Unix side is built as wasm32 with gex's compilers:
 the loader, ntdll's Unix half, the wineserver and the drivers. On the

@@ -1,4 +1,4 @@
-# Shared by the wine-wasm scripts: clang's flags for wasm32 code that runs as
+# Shared by the Wine and sysroot scripts: clang's flags for wasm32 code that runs as
 # a gex native module (position-independent, shared memory, one instance per
 # thread). Kept to the features V8 and wasmtime 27 both have. No tail calls:
 # binaryen's asyncify (fork, wcc) cannot instrument them, and the libc is
