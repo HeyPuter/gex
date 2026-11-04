@@ -32,8 +32,6 @@ members = [
     "hosts/browser",
     "hosts/hostwl",
     "hosts/native",
-    "tests/diff-fuzz",
-    "tests/diff-fuzz-x86",
 ]
 
 [workspace.package]

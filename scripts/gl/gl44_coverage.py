@@ -55,12 +55,12 @@ def percent(have: int, total: int) -> float:
 
 
 def main() -> int:
-    root = pathlib.Path(__file__).resolve().parents[1]
+    root = pathlib.Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--guest",
         type=pathlib.Path,
-        default=root / "web/public/fs/libGLESv2.so.2",
+        default=root / "page/public/fs/libGLESv2.so.2",
         help="built guest libGLES shared object inspected with nm -D",
     )
     parser.add_argument(
