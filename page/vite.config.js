@@ -60,7 +60,14 @@ export default defineConfig({
   },
   // `worker.mjs` is an ES module with top-level await; the default `iife`
   // worker output cannot express that.
-  worker: { format: 'es', plugins: () => [pageMode] },
+  //
+  // Each Worker is one file, its dynamic imports inlined. Split, the chunks a
+  // Worker imports lazily take the helpers they share from the Worker's own
+  // file, an import cycle (worker -> wl-bridge -> worker). The page starts
+  // every guest Worker from one fetched copy of its module graph
+  // (worker-graph.js), which a cycle defeats: each Worker then fetched its
+  // files again, ~27 MB a desktop start on an origin without an HTTP cache.
+  worker: { format: 'es', plugins: () => [pageMode], rolldownOptions: { output: { inlineDynamicImports: true } } },
   resolve: {
     alias: {
       // The page runs the same `gex.mjs` the tests do, from the shim it
