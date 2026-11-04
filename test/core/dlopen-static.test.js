@@ -1,7 +1,8 @@
 // dlopen in a static program (fixtures/probe/rt-dlstatic.c): a program with
 // its libc inside it loads a side module (rt-side.c) whose imports, libc's
 // among them, are the program's exports, from a lazy file, fetched as
-// dlopen reads it; calls into it from two threads, each calling back into
+// dlopen reads it, found by its bare name beside the program (a static
+// program's run path is its own directory); calls into it from two threads, each calling back into
 // the program's libc; its constructor, its data and a second dlopen.
 import { runProgram } from '../../web/src/run.js';
 import { setGlobals } from '../../web/src/page-globals.js';
@@ -35,13 +36,13 @@ export default async function (t) {
   const run = runProgram(term, {
     filesystem: 'memory',
     elf: tree.files['/bin/rt-dlstatic'],
-    args: ['/bin/rt-dlstatic', '/usr/lib/rt-side.so'],
+    args: ['/bin/rt-dlstatic', 'rt-side.so'],
     files: tree.files,
-    dirs: [...(tree.dirs ?? []), '/usr/lib'],
+    dirs: tree.dirs ?? [],
     modes: tree.modes,
     hard: tree.hard,
     symlinks: tree.links ?? {},
-    lazy: [['/usr/lib/rt-side.so', side.length, sideAt]],
+    lazy: [['/bin/rt-side.so', side.length, sideAt]],
     env: ['PATH=/bin:/usr/bin', 'HOME=/root'],
     cwd: '/',
   });

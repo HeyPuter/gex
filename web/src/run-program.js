@@ -14,6 +14,7 @@ import { filesystemValue } from './start-options.js';
 import { CompositorWindows } from '../runtime/src/windows/compositor.js';
 import { SingleCanvas } from '../runtime/src/windows/single.js';
 import { MesaGl } from '../runtime/src/gl.js';
+import { Gamepads, WineControllers } from '../runtime/src/input.js';
 import { INTERNAL } from '../runtime/src/internal.js';
 import { guestArch, audioFrom } from './runtime.js';
 import { pageParams } from './page-env.js';
@@ -139,6 +140,9 @@ export async function runPreset(term, {
   const mesa = gl && windows ? new MesaGl(sys, { eager: !glLazy, d3d, source: glSource }) : null;
   if (network) i.sockets(network);
 
+  // (the files are gone from `files` after the boot)
+  const sdl = `${exe.replace(/\/[^/]*$/, '')}/libSDL2-2.0.so.0`;
+  const winePads = /\/wine$/.test(exe) && (files[sdl] !== undefined || lazy.some(([path]) => path === sdl));
   await sys.boot();
   // The kernel has the files: nothing here views the bundle's bytes now.
   for (const k of Object.keys(image)) delete image[k];
@@ -148,6 +152,13 @@ export async function runPreset(term, {
 
   const pty = tty ? { cols: term.cols ?? 80, rows: term.rows ?? 24 } : undefined;
   const p = sys.spawn(args, defined({ env: env.length ? env : DEFAULT_ENV, cwd, uid, gid: uid, pty }));
+  // A Wine with game controllers (SDL beside its loader, wine64-dist.sh):
+  // the page's controllers, and Wine's bus for them started once there is one.
+  if (winePads) {
+    const gamepads = new Gamepads(sys);
+    const wine = new WineControllers(sys, gamepads, { wine: exe, env: env.length ? env : DEFAULT_ENV });
+    wine.addEventListener('start', (e) => { if (e.code) i.say(`gex: winebus did not start (sc: ${e.code})\n`); });
+  }
   const disposers = [];
   if (p.pty) {
     p.pty.addEventListener('data', (e) => term.write(e.data));

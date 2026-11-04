@@ -350,3 +350,67 @@ export class Gamepads extends EventTarget {
     if (this.#raf) cancelAnimationFrame(this.#raf);
   }
 }
+
+/**
+ * `WineControllers`: game controllers for Wine's programs, through
+ * `gamepads` (a `Gamepads` of the same system). Wine's HID bus driver,
+ * winebus (its SDL bus reads `/dev/input`), does not start when Wine boots:
+ * a Wine install with controllers (wine64-dist.sh) marks its service
+ * "DemandStart", so a session with no controller runs no driver for it and
+ * fetches no SDL. This starts it, `sc start winebus` in the Wine session
+ * (`wine`, the Wine loader's path, with `env`, the session's environment:
+ * its WINEPREFIX), the first time the system has a controller: at the
+ * first `connect`, or at once when one is already there. Once per system;
+ * after a failure, again at the next `connect`. The games then see the
+ * controller arrive (XInput, DirectInput, winmm's joystick calls).
+ * Events: `start` (`code`: sc's exit status, 0 when the driver started).
+ */
+export class WineControllers extends EventTarget {
+  #sys;
+  #wine;
+  #env;
+  #gamepads;
+  #state = 'idle'; // 'idle', 'starting', 'started'
+  #onConnect = () => this.#start();
+  #closed = false;
+
+  constructor(sys, gamepads, { wine, env = [] } = {}) {
+    super();
+    if (!(gamepads instanceof Gamepads)) throw new TypeError('WineControllers takes a Gamepads as its second argument');
+    if (typeof wine !== 'string' || !wine) throw new TypeError('WineControllers: wine, the Wine loader\'s path');
+    internals(sys, 'WineControllers');
+    this.#sys = sys;
+    this.#wine = wine;
+    this.#env = Array.isArray(env) ? env.map(String) : Object.entries(env).map(([k, v]) => `${k}=${v}`);
+    this.#gamepads = gamepads;
+    gamepads.addEventListener('connect', this.#onConnect);
+    if (gamepads.pads.length) this.#start();
+  }
+
+  /** Whether winebus has been started: 'idle', 'starting' or 'started'. */
+  get state() {
+    return this.#state;
+  }
+
+  async #start() {
+    if (this.#closed || this.#state !== 'idle') return;
+    this.#state = 'starting';
+    let code = -1;
+    try {
+      // sc's status is the start's error. ERROR_SERVICE_ALREADY_RUNNING
+      // (1056, 32 as an exit status) is a start too: a program started it.
+      const r = await this.#sys.run([this.#wine, 'sc', 'start', 'winebus'], { env: this.#env });
+      code = r.code === (1056 & 0xff) ? 0 : r.code;
+    } catch {
+      code = -1;
+    }
+    this.#state = code === 0 ? 'started' : 'idle';
+    this.dispatchEvent(Object.assign(new Event('start'), { code }));
+  }
+
+  /** Stop listening (the driver, once started, stays). */
+  close() {
+    this.#closed = true;
+    this.#gamepads.removeEventListener('connect', this.#onConnect);
+  }
+}

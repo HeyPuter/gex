@@ -408,7 +408,8 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
         link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }], ..Default::default() },
         module_of: vec![number],
         ldpath: Vec::new(),
-        origin: String::new(),
+        // (its directory: where `dlopen` finds a bare soname, `Link::dlopen_runpath`)
+        origin: path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d }.to_string()).unwrap_or_else(|| ".".into()),
         startup: 1,
     });
 }
@@ -516,7 +517,8 @@ fn dlopen(path: &str) -> Result<u32, String> {
         return Ok(HANDLE_BASE + i as u32 * 16);
     }
     let (o, lp) = (p.origin.clone(), p.ldpath.clone());
-    let (found, b) = gex_dylink::search(path, &[], &o, &lp, read).map_err(|e| format!("{e:#}"))?;
+    let rp = p.link.dlopen_runpath();
+    let (found, b) = gex_dylink::search(path, &rp, &o, &lp, read).map_err(|e| format!("{e:#}"))?;
     let info = Info::parse(&b).map_err(|_| format!("{found}: not a wasm shared library"))?;
     if !info.dylink {
         return Err(format!("{found}: not a wasm shared library"));

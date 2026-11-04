@@ -31,3 +31,13 @@ export declare class Gamepads extends EventTarget {
   poll(): void;
   close(): void;
 }
+
+/** Wine's game controller bus (winebus), which a Wine install with
+ *  controllers starts on demand only, started (`sc start winebus` with
+ *  `wine` and `env`) the first time `gamepads` has a controller, once per
+ *  system. Events: `start` (`code`: 0 when the driver started). */
+export declare class WineControllers extends EventTarget {
+  constructor(sys: System, gamepads: Gamepads, options: { wine: string; env?: Record<string, string> | string[] });
+  get state(): 'idle' | 'starting' | 'started';
+  close(): void;
+}
