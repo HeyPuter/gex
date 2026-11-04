@@ -762,6 +762,14 @@ def link(dlls, out, gexrt, others=None):
                 and pick not in ACTCTX_DLLS and pick not in static_closure(mod))
     delay_eager = {}  # module -> delay imports it still loads first (a data import, an unknown signature)
     direct_refs = {}  # group -> the DLLs its code is bound to directly
+    # group -> the DLLs its delay thunks call into that the delay import
+    # forwards to (rpcrt4's CoTaskMemAlloc: a delay import of ole32's, which
+    # combase defines): loaded with the delay import, never ahead of the
+    # group, so marked as delayed too unless its code binds them directly.
+    # Bound directly, they installed ahead of it with their own static
+    # imports: rpcrt4 brought combase, ole32, user32, gdi32, win32u and
+    # coml2 into every process that loads it (sc, services, winedevice).
+    delay_targets = {}
 
     def fwd_first(mod, imports, name):
         """`name` is the module's through a forwarding DLL it imports ahead
@@ -869,7 +877,7 @@ def link(dlls, out, gexrt, others=None):
                         thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want, grp(mod), via))
                         f.write(f'{name} gexw-thunk {thunk}\n')
                         if via != pick:
-                            direct_refs.setdefault(grp(mod), set()).add(pick)
+                            delay_targets.setdefault(grp(mod), set()).add(pick)
                         continue
                     if os.environ.get('PELINK_DELAY_DEBUG'):
                         print(f'pelink: {mod} loads {via} first: {name} ({have} -> {want})', file=sys.stderr)
@@ -887,7 +895,12 @@ def link(dlls, out, gexrt, others=None):
             for name, vias in forward_owner.items():
                 if name in exporters and not fwd_first(mod, imports, name):
                     continue  # bound to its definition, above
-                pick = next((o for o in [mod] + imports if o in vias), vias[0])
+                # (none it imports: its default C runtime, else the core's,
+                # before a module of its own; user32's sqrt, which msvcrt,
+                # ucrtbase and crtdll all forward, was crtdll's, and every
+                # process loading user32 installed crtdll)
+                core_first = sorted(vias, key=lambda o: (bool(SPLIT.get(o)), o not in ('ucrtbase.dll', 'msvcrt.dll')))
+                pick = next((o for o in [mod] + imports + EAGER.get(mod, []) if o in vias), core_first[0])
                 if bind_guest(f, mod, imports, name, pick):
                     continue
                 target, want = fwd_def.get(f'{pick}!{name}', (None, None))
@@ -898,6 +911,8 @@ def link(dlls, out, gexrt, others=None):
                         thunk = f'{mod}.{name}'
                         thunks.append((f'gexw-thunk!{thunk}', have, target, want, grp(mod), pick))
                         f.write(f'{name} gexw-thunk {thunk}\n')
+                        if target.split('!', 1)[0] != pick:
+                            delay_targets.setdefault(grp(mod), set()).add(target.split('!', 1)[0])
                         continue
                     if os.environ.get('PELINK_DELAY_DEBUG'):
                         print(f'pelink: {mod} loads {pick} first: {name} ({have} -> {target} {want})', file=sys.stderr)
@@ -953,7 +968,8 @@ def link(dlls, out, gexrt, others=None):
                   f.write('static int dl[%d];\n' % len(delayed))
                   # each DLL only these thunks reach, marked for gex (wasmdll):
                   # its module is not installed ahead of this one
-                  for k, d in enumerate(x for x in delayed if x not in direct_refs.get(g, ())):
+                  marked = sorted((set(delayed) | {d for d in delay_targets.get(g, ()) if grp(d) != g}) - direct_refs.get(g, set()))
+                  for k, d in enumerate(marked):
                       f.write(f'__attribute__((export_name("gexw-delay!{d}"))) void dm{k}(void) {{}}\n')
                   f.write('static __attribute__((noinline)) void dl_load(int i, const char *name)\n{\n'
                           '    if (!gexw_dl_LoadLibraryA(name)) gexw_dl_RaiseException(0xc06d007e, 0, 0, 0);\n'
