@@ -36,6 +36,85 @@ const keyOf = (url, k) => {
   return chunkKey(url, versions[path], k);
 };
 
+// A host that answers a ranged request with the whole file (200: no Range
+// support, or a CDN that drops the header) is read once: that one answer is
+// kept as it streams in, and every later range of the URL is cut from it as
+// its bytes arrive, never fetched again (a whole download a read was the
+// rest bundle again and again). Said once per URL.
+const wholes = new Map();
+class Whole {
+  constructor(res) {
+    this.buf = new Uint8Array(Number(res.headers.get('Content-Length')) || (1 << 20));
+    this.have = 0;
+    this.done = false;
+    this.err = null;
+    this.waits = [];
+    this.finished = this.pump(res.body.getReader());
+  }
+  async pump(rd) {
+    try {
+      for (;;) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        if (this.have + value.length > this.buf.length) {
+          const nb = new Uint8Array(Math.max(this.buf.length * 2, this.have + value.length));
+          nb.set(this.buf.subarray(0, this.have));
+          this.buf = nb;
+        }
+        this.buf.set(value, this.have);
+        this.have += value.length;
+        net += value.length;
+        this.wake();
+      }
+      this.done = true;
+    } catch (e) {
+      this.err = e ?? new Error('cut short');
+    }
+    this.wake();
+    return this.done;
+  }
+  wake() {
+    this.waits = this.waits.filter((w) => (this.have >= w.hi || this.done || this.err ? (w.r(), false) : true));
+  }
+  /** Bytes [lo, hi) once they are here; short at the file's end. */
+  async slice(lo, hi) {
+    if (this.have < hi && !this.done && !this.err) await new Promise((r) => this.waits.push({ hi, r }));
+    if (this.have >= hi || this.done) return this.buf.slice(lo, Math.min(hi, this.have));
+    throw this.err;
+  }
+}
+/** Bytes [lo, hi) of `url` from the network (or its kept whole answer):
+ *  null if the host gave nothing usable. */
+async function fetchRange(url, lo, hi) {
+  let w = wholes.get(url);
+  if (!w) {
+    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store' });
+    if (res.status === 206) {
+      const b = new Uint8Array(await res.arrayBuffer());
+      net += b.length;
+      return b;
+    }
+    if (res.status !== 200 || !res.body) {
+      res.body?.cancel().catch(() => {});
+      return null;
+    }
+    w = wholes.get(url);
+    // Another read's whole answer is on its way already: this one is let go.
+    if (w) res.body.cancel().catch(() => {});
+    else {
+      w = new Whole(res);
+      wholes.set(url, w);
+      console.warn(`[lazy-cache] ${url}: the host ignores Range; its whole answer is kept and read from`);
+    }
+  }
+  try {
+    return await w.slice(lo, hi);
+  } catch {
+    if (wholes.get(url) === w) wholes.delete(url);
+    return null;
+  }
+}
+
 /** The bytes of `url` from `from`, `len` of them: each chunk from the cache,
  *  the missing ones fetched in runs and kept. */
 async function read(cache, url, from, len) {
@@ -58,18 +137,11 @@ async function read(cache, url, from, len) {
     // Tried a few times with waits between, then held as failed by chunk
     // (as a rest bundle's frame): reads of it fail at once until the hold ends.
     for (let c = k; c <= stop; c++) if (failed.held(`${url}#c${c}`)) throw heldError;
-    const got = await retryAsync(async () => {
-      const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi}` }, cache: 'no-store' });
-      const body = new Uint8Array(await res.arrayBuffer());
-      if (res.status === 206) return body;
-      if (res.status === 200) return body.subarray(lo, hi + 1);
-      return null;
-    });
+    const got = await retryAsync(() => fetchRange(url, lo, hi + 1));
     if (!got) {
       for (let c = k; c <= stop; c++) failed.failed(`${url}#c${c}`);
       throw new Error(`${url} @${lo}: no answer`);
     }
-    net += got.length;
     for (let c = k; c <= stop; c++) {
       const b = got.slice((c - k) * CHUNK, (c - k + 1) * CHUNK);
       if (!b.length) break;
@@ -141,11 +213,8 @@ async function getRange(url, lo, hi) {
     // Never the HTTP cache's copy: a range of an older bundle under the same
     // URL would decode as garbage. A bundle with a hash keeps its frames in
     // the page's own cache (`frameOf`) instead.
-    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store' });
-    const b = new Uint8Array(await res.arrayBuffer());
-    if (res.status === 206 && b.length === hi - lo) return b;
-    if (res.status === 200 && b.length >= hi) return b.subarray(lo, hi);
-    return null;
+    const b = await fetchRange(url, lo, hi);
+    return b && b.length === hi - lo ? b : null;
   });
   if (!body) throw new Error(`${url} @${lo}: no answer`);
   return body;
@@ -189,6 +258,19 @@ async function dropOld(url, h) {
   } catch { /* kept */ }
 }
 
+// A bundle read whole (a host that ignores Range): once all of it is here,
+// every frame is kept in the page's cache, so a later visit reads none of it
+// from the network again.
+const storedWhole = new Set();
+function storeWhole(url, b) {
+  const w = wholes.get(url);
+  if (!w || !b.h || storedWhole.has(w)) return;
+  storedWhole.add(w);
+  w.finished.then((ok) => {
+    if (ok) b.frames.forEach(([o, n], k) => store(url, b, k, w.buf.slice(o, o + n)));
+  });
+}
+
 // One fetch a frame however many readers want it: they share its promise
 // (`decoded`) while it is in flight.
 function frameOf(url, b, k) {
@@ -207,12 +289,10 @@ function frameOf(url, b, k) {
         return have;
       }
       return getRange(url, o, o + n).then((got) => {
-        net += got.length;
-        // Its own copy: a range cut from a whole-file answer would hold the file.
-        const own = got.byteOffset || got.length !== got.buffer.byteLength ? got.slice() : got;
-        keepPacked(key, own);
-        store(url, b, k, own);
-        return own;
+        keepPacked(key, got);
+        store(url, b, k, got);
+        storeWhole(url, b);
+        return got;
       });
     });
     f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));

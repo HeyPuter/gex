@@ -109,7 +109,19 @@ function sayOnce(key, line) {
   said.failed(key);
   console.error(line);
 }
+// A host that ignores Range answers a ranged read with the whole file (200):
+// kept here, URL -> its bytes, and later ranges of it cut from that, not
+// downloaded whole again a read. (Without the page's cache owner, so once a
+// Worker; with it, lazy-cache-worker.js keeps one for the page.)
+const wholes = new Map();
+function keptWhole(url, x, b) {
+  if (x.status !== 200 || wholes.has(url)) return;
+  wholes.set(url, b);
+  sayOnce(`whole:${url}`, `[lazy] ${url}: the host ignores Range; its whole answer is kept and read from`);
+}
 function syncGet(url, range) {
+  const w = range && wholes.get(url);
+  if (w) return w.length >= range[1] ? w.subarray(range[0], range[1]) : null;
   const x = new XMLHttpRequest();
   x.open('GET', url, false);
   x.responseType = 'arraybuffer';
@@ -119,6 +131,7 @@ function syncGet(url, range) {
   const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
   if (!range) return x.status === 200 ? got : null;
   if (x.status === 206 && got.length === range[1] - range[0]) return got;
+  keptWhole(url, x, got);
   if (x.status === 200 && got.length >= range[1]) return got.subarray(range[0], range[1]);
   return null;
 }
@@ -322,7 +335,8 @@ export function lazyFetch(memory) {
       return -1;
     }
     let last = 'no response';
-    const got = retrySync(() => {
+    const w = wholes.get(abs);
+    const got = w ? (w.length >= from + len ? w.subarray(from, from + len) : null) : retrySync(() => {
       const x = new XMLHttpRequest();
       // A path: against the page's origin (a Worker started from a blob
       // URL has `GEX_BASE`, its module's real URL; worker-graph.js).
@@ -342,6 +356,7 @@ export function lazyFetch(memory) {
       const b = new Uint8Array(x.response ?? new ArrayBuffer(0));
       last = `status ${x.status}, ${b.length} bytes`;
       // 206 is the range; a server without ranges sends the whole file (200).
+      keptWhole(abs, x, b);
       const at = x.status === 206 ? 0 : x.status === 200 ? from : -1;
       return at < 0 || b.length < at + len ? null : b.subarray(at, at + len);
     });
