@@ -220,7 +220,8 @@ const D_WORDS = 1 + D_BYTES / 4;
 
 // The clipboard (one a page, every process's clients and the page's own):
 // a lock, a number that moves with each new text, who set it (0 the page,
-// 1 a guest client), the text's length, then its bytes (UTF-8).
+// 1 a guest client, 2 a Wine client: one whose text Wine's other clients
+// already have), the text's length, then its bytes (UTF-8).
 const C_LOCK = 0;
 const C_SERIAL = 1;
 const C_FROM = 2;
@@ -244,8 +245,8 @@ function clipUnlock(a) {
   Atomics.notify(a, clipBase + C_LOCK);
 }
 
-/** Put `bytes` on the clipboard, from the page (`from` 0) or a guest (1):
- *  its new number. */
+/** Put `bytes` on the clipboard, from the page (`from` 0) or a guest (1, or
+ *  2 for a Wine client): its new number. */
 function clipPut(a, bytes, from) {
   const n = Math.min(bytes.length, C_BYTES);
   clipLock(a);
@@ -1155,10 +1156,16 @@ export class WlProxy {
     return n;
   }
 
-  /** A client's selection onto the clipboard (`wl_clip_set`): its number,
-   *  which this process has then seen. */
-  clipSet(memory, ptr, len) {
-    return (this.#clipSeen = clipPut(this.#a, new Uint8Array(memory.buffer, ptr, len), 1));
+  /** A client's selection onto the clipboard (`wl_clip_set`, `from` 1 or
+   *  2 as `clipPut`'s): its number, which this process has then seen. */
+  clipSet(memory, ptr, len, from = 1) {
+    return (this.#clipSeen = clipPut(this.#a, new Uint8Array(memory.buffer, ptr, len), from === 2 ? 2 : 1));
+  }
+
+  /** Who set the clipboard (`wl_clip_from`): 0 the page, 1 a guest client,
+   *  2 a Wine client. */
+  clipFrom() {
+    return Atomics.load(this.#a, clipBase + C_FROM) >>> 0;
   }
 
   /** The page's drag data, up to `max` bytes into `ptr` of `memory`: its

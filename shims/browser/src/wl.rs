@@ -64,12 +64,22 @@ extern "C" {
     /// returning its number.
     fn wl_clip_serial() -> u32;
     fn wl_clip_get(ptr: u32, max: u32) -> u32;
-    fn wl_clip_set(ptr: u32, len: u32) -> u32;
+    fn wl_clip_set(ptr: u32, len: u32, from: u32) -> u32;
+    fn wl_clip_from() -> u32;
 }
 
 /// The clipboard's text types, as offered to a client, best first; and the
 /// largest text carried.
 const CLIP_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"];
+/// What Wine's Wayland driver adds to the selections it sets: the Windows
+/// clipboard is already shared between Wine's processes (wineserver), so a
+/// Wine client ignores an offer that carries it rather than take the
+/// clipboard over with a copy of its own text.
+const WINE_TAG: &str = "application/x.winewayland.tag";
+/// Who set the page clipboard (`wl_clip_set`, `wl_clip_from`): the page, a
+/// client, a Wine client (whose text every other Wine client already has).
+const CLIP_FROM_CLIENT: u32 = 1;
+const CLIP_FROM_WINE: u32 = 2;
 const CLIP_MAX: usize = 1 << 20;
 
 /// The clipboard on one client's side (`Session::clip`).
@@ -83,6 +93,8 @@ struct SessionClip {
     writes: Vec<(Arc<OpenFile>, usize)>,
     /// The client's own selection being read: the read end and what came.
     read: Option<(Arc<OpenFile>, Vec<u8>)>,
+    /// Who that selection is from (`CLIP_FROM_*`).
+    read_from: u32,
 }
 
 /// `wl_drag_status` bits: a drop now would be taken; the drop was handed
@@ -482,7 +494,7 @@ impl Session {
     fn pump_clip(&mut self, out_fds: &mut Vec<Arc<OpenFile>>) {
         // An X client's copy, through the X window manager (Xwayland's).
         if let Some(text) = self.xwm.as_mut().and_then(|x| x.take_copied()) {
-            self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32) };
+            self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32, CLIP_FROM_CLIENT) };
         }
         let device = self.client.has_data_device();
         // The client's own selection: ask for its text over a pipe.
@@ -490,6 +502,8 @@ impl Session {
             self.clip.read = None;
             if let Some((source, mimes)) = change {
                 let mime = CLIP_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m));
+                let wine = mimes.iter().any(|x| x == WINE_TAG);
+                self.clip.read_from = if wine { CLIP_FROM_WINE } else { CLIP_FROM_CLIENT };
                 if let (Some(mime), Some(r)) = (mime, crate::global_pipes()) {
                     let id = (r.new)(crate::my_pid());
                     if id >= 0 {
@@ -516,7 +530,7 @@ impl Session {
                     Ok(0) => {
                         // The whole text: the page's clipboard now.
                         let text = std::mem::take(got);
-                        self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32) };
+                        self.clip.seen = unsafe { wl_clip_set(text.as_ptr() as u32, text.len() as u32, self.clip.read_from) };
                         self.clip.read = None;
                         break;
                     }
@@ -541,7 +555,14 @@ impl Session {
             }
             self.clip.text = buf;
             if device {
-                self.client.offer_selection(CLIP_MIMES);
+                // A Wine client's copy carries Wine's tag on to the others.
+                if unsafe { wl_clip_from() } == CLIP_FROM_WINE {
+                    let mut mimes = CLIP_MIMES.to_vec();
+                    mimes.push(WINE_TAG);
+                    self.client.offer_selection(&mimes);
+                } else {
+                    self.client.offer_selection(CLIP_MIMES);
+                }
             }
         }
         // Receives, written as far as each descriptor takes.
