@@ -12,3 +12,6 @@ site/page-site.mjs                        a Wine program as a static site on nt.
 wine/wcc                      clang for gex wasm32 programs, as Wine's build uses it
 wine/wcc64                    the same for LP64 (64-bit Wine's Unix side)
 guest/steam/build-win.sh                 libsteam_api for a Windows game (make steam-api builds the Linux one)
+guest/gl/demo.sh                         build and run the GL demo natively, to a PPM file
+wine/legacy32/wine32-dist.sh  a 32-bit Wine dist and prefixes from a given Wine checkout (legacy; the gate's 32-bit leg)
+wine/mksyscalls64.py          regenerate the wasm64 syscall tables in a Wine checkout
