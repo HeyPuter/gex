@@ -895,7 +895,10 @@ def link(dlls, out, gexrt, others=None):
                 # context names (comctl32_v6 for notepad), which its loader
                 # binds: a call bound to comctl32 itself reached a copy that
                 # was never attached in that process (its subclass atom 0).
-                if pick in ACTCTX_DLLS and mod.endswith('.exe') and have:
+                # So is a DLL's (shell32's PropertySheetW, in a process whose
+                # context names comctl32_v6, found its resources in the
+                # program's image: the copy's module handle 0).
+                if pick in ACTCTX_DLLS and mod not in ACTCTX_DLLS and mod not in LOAD_NAME and have:
                     sym = guest_sym(mod, f'{pick}.{name}', have)
                     guest_binds.append((f'gexw-guest!{sym}', have, pick, name, grp(mod), mod))
                     f.write(f'{name} gexw-guest {sym}\n')
