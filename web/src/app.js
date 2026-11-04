@@ -626,7 +626,10 @@ async function begin(opts, base, at, state, meter) {
   // None for a build that sets its zone itself: `tz: false` in its build
   // options, or GEX_KDE_TZ in its env (the KDE image ships zoneinfo, links
   // /etc/localtime and drops TZ; Qt would take a rule string for a zone id).
-  let pageTz = null;
+  // The zone's name goes beside the rules, as WINEGEX_TZNAME, for Wine to
+  // name the Windows zone by (its zone map) rather than search every zone in
+  // the registry for the rules, in every process it starts.
+  let pageTz = null, pageTzName = null;
   const ownZone = b.tz === false || env.some((e) => e.startsWith('GEX_KDE_TZ='));
   if (!ownZone && !mergeEnv([], opts.env).some((e) => e.startsWith('TZ='))) {
     let zone = null;
@@ -634,14 +637,15 @@ async function begin(opts, base, at, state, meter) {
     const tz = zone ? posixTz(zone) : null;
     if (tz && !env.some((e) => e.startsWith('TZ=') && !e.startsWith('TZ=:'))) {
       pageTz = `TZ=${tz}`;
-      env = [...env.filter((e) => !e.startsWith('TZ=')), pageTz];
+      pageTzName = `WINEGEX_TZNAME=${zone}`;
+      env = [...env.filter((e) => !e.startsWith('TZ=') && !e.startsWith('WINEGEX_TZNAME=')), pageTz, pageTzName];
     }
   }
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
   // How it was started (gex-eject's 32-bit Wine recorder keeps this), less
   // the viewer's time zone.
-  state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
+  state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz && e !== pageTzName), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
