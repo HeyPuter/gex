@@ -29,6 +29,10 @@ import { forkTransfer } from './fork-transfer.mjs';
 import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
+// The host's clock object, looked up once in this realm: `performance` is a
+// Blink attribute of the global scope, and reading it costs more than `now()`.
+const perf = globalThis.performance;
+
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
  *  console's info level. */
@@ -409,7 +413,7 @@ export class ProcessHost {
    *  holds on this thread, and how many it has been handed. */
   #relayCensus() {
     this.#relayed++;
-    const now = performance.now();
+    const now = perf.now();
     if (now < this.#relayCensusAt) return;
     this.#relayCensusAt = now + 60000;
     let n = 0, bytes = 0;
