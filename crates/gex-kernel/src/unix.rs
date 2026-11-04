@@ -1498,6 +1498,10 @@ pub use crate::locks::{lock_op, FileLocks};
 #[derive(Debug, Default)]
 pub struct EpollSet {
     watched: Mutex<Vec<Watch>>,
+    /// Each watched descriptor's open file (and whether it was opened for
+    /// writing), as `epoll_ctl` or a waiter last found it: what the set asks
+    /// when it is itself polled ([`FileHandle::poll_readable`]).
+    files: Mutex<Vec<(i32, Weak<dyn FileHandle>, bool)>>,
     queue: crate::wait::Queue,
     generation: AtomicU32,
 }
@@ -1578,6 +1582,7 @@ impl EpollSet {
                     crate::wait::unchain(x.source, me);
                 }
                 w.retain(|x| x.fd != fd);
+                self.files.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.0 != fd);
                 if w.len() == before {
                     return Err(Errno::ENOENT);
                 }
@@ -1603,6 +1608,15 @@ impl EpollSet {
                 x.source = source;
             }
         }
+    }
+
+    /// `fd`'s open file now, for [`FileHandle::poll_readable`]; chains the
+    /// set onto its queue as [`EpollSet::rechain`] does.
+    pub fn note_file(&self, fd: i32, file: &Arc<dyn FileHandle>, writable: bool) {
+        self.rechain(fd, file.wait_queue());
+        let mut f = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        f.retain(|x| x.0 != fd);
+        f.push((fd, Arc::downgrade(file), writable));
     }
 
     /// A set already holding `watches`: a fork's child's copy of its
@@ -1714,6 +1728,40 @@ impl FileHandle for EpollSet {
 
     fn wait_queue(&self) -> u32 {
         self.queue.id()
+    }
+
+    /// Readable when a watch has something to report, as `epoll_wait` would
+    /// return it, not always: a set in a `poll` loop (GLib's main loop
+    /// polling an epoll descriptor, nested sets) otherwise spins a core.
+    /// The poll path tells the set its files before it asks
+    /// (`note_epoll_sets`), so a watch with none is one whose descriptor is
+    /// not open, and it reports nothing.
+    fn poll_readable(&self) -> bool {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.watches().iter().any(|x| {
+            let Some((_, file, writable)) = files.iter().find(|f| f.0 == x.fd) else {
+                return false;
+            };
+            let Some(h) = file.upgrade() else {
+                return false;
+            };
+            let wakes = if x.events & epoll_flag::ET != 0 { h.wakes() } else { None };
+            let p = crate::syscalls::PollFd {
+                addr: 0,
+                fd: x.fd,
+                events: (x.events & 0xffff) as u16,
+                handle: Some(h),
+                writable: *writable,
+                epoll: None,
+                edge: false,
+            };
+            crate::syscalls::poll_revents(&p) != 0 && self.may_report(x.fd, wakes)
+        })
+    }
+
+    /// Never writable, as on Linux.
+    fn poll_writable(&self) -> bool {
+        false
     }
 
     fn wakes(&self) -> Option<u64> {
