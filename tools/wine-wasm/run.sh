@@ -186,10 +186,10 @@ if [ -n "$page" ]; then
   # desktop.ini hidden and system), which web/src/tar.js reads back.
   tar -C "$st" --xattrs --xattrs-include='user.*' -cf "$rt/web/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"
   env=() ; for ((i = 1; i < ${#envs[@]}; i += 2)); do env+=("${envs[i]}"); done
-  # 64-bit Wine: no doors; its 32-bit programs in the 64-bit process
-  # (WoW64) when the dist has the i386 side
+  # 64-bit Wine: its 32-bit programs in the 64-bit process (WoW64) when
+  # the dist has the i386 side
   if [ -n "$w64" ]; then
-    env+=(WINEGEX_DOOR=0); [ -d "$dist/lib/wine/i386-windows" ] && env+=(WINEGEX_WOW64=1)
+    [ -d "$dist/lib/wine/i386-windows" ] && env+=(WINEGEX_WOW64=1)
   fi
   log=$pg/$name.log
   BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:?--page needs BENCH_SH, a bench runner}" -s "$rt" -s "$units" -- \

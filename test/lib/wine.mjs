@@ -21,7 +21,7 @@ export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver =
   const more = parts?.(sys, fs);
   await t.timeout(sys.boot(), 120000, 'boot');
   const failed = JSON.parse(await (await fetchWork(t, 'win-progs.json')).text()).failed;
-  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1', WINEGEX_DOOR: '0' }), ...env };
+  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1' }), ...env };
   if (wow64) {
     try { await fs.stat('/wine64/lib/wine/i386-windows'); } catch { t.skip('the Wine install has no lib/wine/i386-windows: not a WoW64 build'); }
   }
