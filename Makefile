@@ -10,6 +10,8 @@
 #   WINE_DIR build 64-bit Wine from this Wine worktree, not wine64.pins' commit
 #   LLVM_SRC a checkout of llvm.pin's commit (libc++ for gexcc); without it
 #            make gexcc fetches LLVM_REPO (toolchain/pins) at the pin
+#   EMSDK    the emsdk whose compiler-rt builtins the sysroots are built with
+#            (default ~/emsdk; GEX_CRT_SRC= names the builtins directory itself)
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 
@@ -23,6 +25,9 @@ OUT ?= $(ROOT)/out
 CACHE ?= $(HOME)/.cache/gex
 JOBS ?= 16
 NICE := nice -n 10
+EMSDK ?= $(HOME)/emsdk
+GEX_CRT_SRC ?= $(EMSDK)/upstream/emscripten/system/lib/compiler-rt/lib/builtins
+export GEX_CRT_SRC
 FETCH := $(ROOT)/scripts/fetch-pinned.sh
 short = $(shell printf %.12s $(1))
 
@@ -163,7 +168,7 @@ gexcc: musl-src llvm-src
 	$(NICE) cargo build -q --release -p gex-dylink
 	@[ -x $(GEXC_X86) ] || $(NICE) cargo build -q --release -p gexc --features x86 --target-dir target/x86
 	$(ROOT)/tools/wine-wasm/wine32/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(CACHE)/dl
-	GEXC_X86=$(GEXC_X86) GEX_DYLINK=$(ROOT)/target/release/gex-dylink JOBS=$(JOBS) LLVM_SRC=$(LLVM_SRC) \
+	GEXC=$(GEXC_X86) GEXC_X86=$(GEXC_X86) GEX_DYLINK=$(ROOT)/target/release/gex-dylink JOBS=$(JOBS) LLVM_SRC=$(LLVM_SRC) \
 	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) $(NICE) sh $(ROOT)/tools/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)
 	@echo $(GEXCC_PREFIX)/bin/gexcc
 
