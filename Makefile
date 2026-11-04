@@ -95,7 +95,8 @@ gexc:
 	@echo $(GEXC_A64) $(GEXC_X86)
 
 # ---- the page ----
-MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa
+# Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
+MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
 # vite and the page's other npm packages, at package-lock.json's versions
 NPM_CI = [ $(ROOT)/web/node_modules/.package-lock.json -nt $(ROOT)/web/package-lock.json ] || (cd $(ROOT)/web && npm ci --no-audit --no-fund)
 page:
