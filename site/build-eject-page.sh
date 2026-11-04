@@ -15,6 +15,14 @@ set -e
 OUT=$(realpath -m "${1:?usage: site/build-eject-page.sh DIR}")
 WEB=$(cd "$(dirname "$0")/../page" && pwd)
 mkdir -p "$OUT"
+# GEX_PAGE_ONE_FILE=1: app.mjs one file, its lazy chunks inlined (as each
+# Worker is): a page that fetches everything its session loads up front
+# (the KDE site) then has app.mjs and one file per Worker, none importing
+# another, and no chunk imports app.mjs back (a second copy of it).
+ONE=false; [ "${GEX_PAGE_ONE_FILE:-}" = 1 ] && ONE=true
+# GEX_PAGE_MODE=mp|sp (vite.config.js): one build's code only; under mp the
+# single-thread X server (xwayland-st/) is not copied either. Unset: both.
+MODE=${GEX_PAGE_MODE:-}
 CONFIG=$(mktemp --suffix=.mjs -p "$WEB")
 trap 'rm -f "$CONFIG"' EXIT
 cat > "$CONFIG" <<CFG
@@ -32,7 +40,8 @@ export default {
              input: { app: '$WEB/src/app.js' },
              // A library: app.mjs keeps its exports (start, fromLaunch).
              preserveEntrySignatures: 'strict',
-             output: { entryFileNames: (c) => (c.name === 'app' ? 'app.mjs' : 'assets/[name]-[hash].js') },
+             output: { entryFileNames: (c) => (c.name === 'app' ? 'app.mjs' : 'assets/[name]-[hash].js'),
+                       inlineDynamicImports: $ONE },
            } },
 };
 CFG
@@ -73,6 +82,7 @@ done
 # Without it an X11 program stops at "x11 not available".
 for d in xwayland xwayland-st; do
     rm -rf "$OUT/gex/$d"
+    [ "$MODE" = mp ] && [ $d = xwayland-st ] && continue
     if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
     elif [ "$d" = xwayland ]; then echo "build-eject-page: no page/public/gex/$d (ports/xwayland/build.sh): the build runs no X11 programs" >&2; fi
 done

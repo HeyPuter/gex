@@ -157,8 +157,11 @@ async function getRange(url, lo, hi) {
 // new bundle (another hash) is never read from an old one's frames, which go
 // once it is seen. Without a hash, or a cache, frames come from the network.
 let store_ = null;
+// What a relative URL is relative to: the Worker's own URL, or, for one a
+// page started from a blob (its copy of this file), the URL it stands for.
+const here = () => globalThis.GEX_BASE ?? self.location.href;
 const frameKey = (url, b, k) => {
-  const u = new URL(url, self.location.href);
+  const u = new URL(url, here());
   u.hash = '';
   u.search = `h=${b.h}&f=${k}`;
   return u.href;
@@ -178,7 +181,7 @@ function store(url, b, k, bytes) {
 async function dropOld(url, h) {
   if (!store_) return;
   try {
-    const path = new URL(url, self.location.href).pathname;
+    const path = new URL(url, here()).pathname;
     for (const r of await store_.keys()) {
       const u = new URL(r.url);
       if (u.pathname === path && u.searchParams.has('f') && u.searchParams.get('h') !== h) await store_.delete(r);

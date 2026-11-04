@@ -49,11 +49,16 @@ const EBADF = 9;
  * `-pthread`, and emscripten's thread support works out where to load its
  * Worker from `import.meta.url` -- which is not a URL at all when the glue was
  * imported from a blob ("TypeError: Invalid URL", from `allocateUnusedWorker`,
- * before the server has run a line). The specifier is a variable and marked
+ * before the server has run a line): a page's kept copy (below) has its
+ * `import.meta.url` written as the glue's real URL. The specifier is a variable and marked
  * for the bundler to leave alone, so nothing tries to bundle 250 KB of glue.
  */
 async function loadGlue(url) {
-  return (await import(/* @vite-ignore */ url)).default;
+  // A page that fetched the glue up front (with the rest of what its session
+  // loads, before the tree: the KDE site's index.html) names its copy in
+  // `GEX_URL_MAP` (URL -> blob URL); a module is never fetched by import().
+  const kept = globalThis.GEX_URL_MAP?.[String(url).split('?')[0]];
+  return (await import(/* @vite-ignore */ kept ?? url)).default;
 }
 
 /** What a relative module URL is relative to, in a page or under Node. */
