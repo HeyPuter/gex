@@ -497,6 +497,8 @@ extern "C" {
     fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64);
     fn k_proc_cpu_total() -> u64;
     fn k_proc_loadavg(now_ns: u64) -> u64;
+    fn k_proc_rss_total() -> u64;
+    fn k_proc_count() -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
     // other side copies across with `memory.copy`, which is the only way it
@@ -989,6 +991,12 @@ extern "C" fn r_cpu_total() -> u64 {
 extern "C" fn r_loadavg(now_ns: u64) -> u64 {
     unsafe { k_proc_loadavg(now_ns) }
 }
+extern "C" fn r_rss_total() -> u64 {
+    unsafe { k_proc_rss_total() }
+}
+extern "C" fn r_count() -> i32 {
+    unsafe { k_proc_count() }
+}
 extern "C" fn r_new_tid(pid: i32) -> i32 {
     unsafe { k_tid_new(pid) }
 }
@@ -1051,6 +1059,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             set_usage: r_set_usage,
             cpu_total: r_cpu_total,
             loadavg: r_loadavg,
+            rss_total: r_rss_total,
+            count: r_count,
         },
     )))
 }

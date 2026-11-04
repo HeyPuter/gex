@@ -90,6 +90,9 @@ pub struct Remote {
     pub cpu_total: extern "C" fn() -> u64,
     /// See [`ProcTable::loadavg`], the three packed by [`pack_load`].
     pub loadavg: extern "C" fn(now_ns: u64) -> u64,
+    /// See [`ProcTable::memory`]: the bytes, and the count.
+    pub rss_total: extern "C" fn() -> u64,
+    pub count: extern "C" fn() -> i32,
 }
 
 /// What a process has used, as it last said ([`ProcTable::set_usage`]):
@@ -781,6 +784,16 @@ impl ProcTable {
             return (r.cpu_total)();
         }
         self.lock().cpu_total()
+    }
+
+    /// The memory every process has mapped and accessible, summed, and how
+    /// many processes there are (`sysinfo`'s free memory and count).
+    pub fn memory(&self) -> (u64, usize) {
+        if let Some(r) = self.remote {
+            return ((r.rss_total)(), (r.count)().max(0) as usize);
+        }
+        let t = self.lock();
+        (t.procs.iter().map(|p| p.usage.rss).sum(), t.procs.len())
     }
 
     /// The one, five and fifteen minute load averages at `now_ns` on the

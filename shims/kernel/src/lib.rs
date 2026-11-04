@@ -2037,6 +2037,18 @@ pub extern "C" fn k_proc_cpu_total() -> u64 {
     procs().cpu_total()
 }
 
+/// The processes' resident memory, summed (`ProcTable::memory`).
+#[no_mangle]
+pub extern "C" fn k_proc_rss_total() -> u64 {
+    procs().memory().0
+}
+
+/// How many processes (`ProcTable::memory`).
+#[no_mangle]
+pub extern "C" fn k_proc_count() -> i32 {
+    procs().memory().1 as i32
+}
+
 /// The load averages at `now_ns`, packed (`gex_kernel::proc::pack_load`).
 #[no_mangle]
 pub extern "C" fn k_proc_loadavg(now_ns: u64) -> u64 {

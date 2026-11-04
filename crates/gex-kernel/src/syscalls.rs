@@ -7530,7 +7530,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             // As the kernel's arms: nice 0, and a change taken and ignored.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
-            nr::SYSINFO => sysinfo(m, compat, a[0]),
+            nr::SYSINFO => sysinfo(m, compat, a[0], f.procs, f.futex.clock),
             nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
             _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
         }
@@ -12394,7 +12394,7 @@ impl Kernel {
     }
 
     fn sys_sysinfo(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        sysinfo(m, self.compat, buf)
+        sysinfo(m, self.compat, buf, &self.procs, self.clock)
     }
 
     fn sys_process_vm(&mut self, m: &mut GuestMem<'_>, write: bool, a: [u64; 6]) -> SysResult {
@@ -12455,10 +12455,19 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
 const ST_VALID: u64 = 0x20;
 
 /// `sysinfo`: a constant machine (4 GiB, half free, one process).
-pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64, procs: &ProcTable, clock: ClockFn) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
     }
+    // As `/proc` has them (`vfs::procfs`): the monotonic clock's uptime, the
+    // process table's load averages (fixed point, 1 << 16 is 1.0), free
+    // memory a fixed 4 GiB less what the processes have resident, and their
+    // count.
+    let up_ns = clock_ns(clock, 1);
+    let loads = procs.loadavg(up_ns).map(|h| h as u64 * 65536 / 100);
+    let (rss, count) = procs.memory();
+    let free = (4u64 << 30).saturating_sub(rss);
+    let count = count.clamp(1, u16::MAX as usize) as u16;
     // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
     // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
     // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
@@ -12469,17 +12478,23 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     // 32-bit process overwrote the stack canary.
     if compat {
         m.zero(buf, 64)?;
-        m.write_u32(buf, 1000)?; // uptime
+        m.write_u32(buf, (up_ns / 1_000_000_000) as u32)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u32(buf + 4 + 4 * i as u64, *l as u32)?;
+        }
         m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
-        m.write_u32(buf + 20, 1 << 19)?; // freeram
-        m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+        m.write_u32(buf + 20, (free >> 12) as u32)?; // freeram
+        m.write(buf + 40, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 52, 4096)?; // mem_unit
     } else {
         m.zero(buf, 112)?;
-        m.write_u64(buf, 1000)?; // uptime
+        m.write_u64(buf, up_ns / 1_000_000_000)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u64(buf + 8 + 8 * i as u64, *l)?;
+        }
         m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
-        m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+        m.write_u64(buf + 40, free)?; // freeram
+        m.write(buf + 80, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 104, 1)?; // mem_unit
     }
     Ok(0)
