@@ -268,9 +268,12 @@ pub mod skel {
         at::<8>(m, a + 6).map(u64::from_le_bytes)
     }
 
-    /// Whether `a` is a 64-bit stub's alias, its stub's operand naming it.
+    /// Whether `a` is a 64-bit stub's alias: its `int3; int3`, [`ALIAS`]
+    /// bytes into a 16-byte stub. Not by the stub's operand: a 14-byte hook
+    /// (`jmp [rip+0]` and the detour's address) rewrote it, and the hook's
+    /// trampoline, which copied the original 14 bytes, still lands here.
     pub fn alias(m: &[u8], a: u64) -> bool {
-        a >= ALIAS && at::<2>(m, a) == Some([0xcc, 0xcc]) && alias_target(m, a - ALIAS) == Some(a)
+        a % 16 == ALIAS && at::<2>(m, a) == Some([0xcc, 0xcc])
     }
 
     /// Whether the bytes at `a` are still the skeleton's: a stub or an alias.
@@ -302,10 +305,10 @@ pub mod skel {
             // a 5-byte hook at 16: the stub is gone, its operand and alias stay
             m[16..21].copy_from_slice(&[0xe9, 1, 2, 3, 4]);
             assert!(!intact(&m, 16) && alias(&m, 30) && alias_target(&m, 16) == Some(30));
-            // a 14-byte one at 32 over the operand: the alias no longer named
+            // a 14-byte one at 32 over the operand: the stub is gone, its alias stays
             m[32..38].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
             m[38..46].copy_from_slice(&0x1234u64.to_le_bytes());
-            assert!(!stub(&m, 32) && !alias(&m, 46));
+            assert!(!stub(&m, 32) && !intact(&m, 32) && alias(&m, 46) && intact(&m, 46));
             assert!(!intact(&m, 60) && !intact(&m, 1000));
         }
     }

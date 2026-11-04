@@ -1002,10 +1002,10 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
 }
 
 /// Bind the native export at `stub`'s alias too (`gex_kernel::win::skel`),
-/// when its operand still names the alias and nothing is bound there.
+/// when it is still the alias and nothing is bound there.
 fn bind_alias_of(m: &mut gex_kernel::ftab::FuncMap, bytes: &[u8], stub: u64) -> bool {
     let alias = stub + gex_kernel::win::skel::ALIAS;
-    if gex_kernel::win::skel::alias_target(bytes, stub) != Some(alias) || m.get(alias).is_some() {
+    if !gex_kernel::win::skel::alias(bytes, alias) || m.get(alias).is_some() {
         return false;
     }
     let Some(f) = m.get(stub) else { return false };

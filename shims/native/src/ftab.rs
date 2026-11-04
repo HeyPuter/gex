@@ -819,6 +819,9 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
                 return Ok(f.idx as i32);
             }
             stats::STALE.fetch_add(1, Relaxed);
+            // (a hook rewrote a 64-bit Wine PE stub: its trampoline calls
+            // the export at the stub's alias)
+            crate::wasmdll::bind_stub_alias(&mut s, memory.bytes(), addr);
             s.ftab.map.retire(addr);
             s.ftab.queued.remove(&addr);
             drop(s);
