@@ -10,7 +10,8 @@
 //! process's memory). The process says its total to the process table
 //! (`ProcTable::set_usage`, what another process's `/proc/<pid>/stat` and
 //! `/proc/stat` read) as a Worker parks, once it has grown by a clock tick,
-//! and as the process exits.
+//! every 50 ms of a stretch that does not park (at a system call: one that
+//! makes none is not seen until it does), and as the process exits.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,6 +37,8 @@ thread_local! {
     static MINE_NS: Cell<u64> = const { Cell::new(0) };
     /// When this Worker's busy stretch began (host clock), 0 while parked.
     static BUSY_SINCE: Cell<u64> = const { Cell::new(0) };
+    /// System calls since this Worker started, for [`tick`].
+    static CALLS: Cell<u32> = const { Cell::new(0) };
 }
 
 fn now() -> u64 {
@@ -82,6 +85,36 @@ pub(crate) fn park_end() {
             c.set(now());
         }
     });
+}
+
+/// A system call: every so often, a busy stretch long enough is folded into
+/// the process's time, and said, so a process that never parks (`yes`, a
+/// compile) is seen using what it uses. Not on every call: a clock read.
+pub(crate) fn tick() {
+    const EVERY: u32 = 64;
+    if CALLS.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n % EVERY != 0
+    }) {
+        return;
+    }
+    let since = BUSY_SINCE.with(|c| c.get());
+    if since == 0 {
+        return;
+    }
+    let t = now();
+    if t.saturating_sub(since) < 5 * SAY_EVERY_NS {
+        return;
+    }
+    // the stretch so far is the process's; the next starts now
+    BUSY_SINCE.with(|c| c.set(t));
+    let d = t - since;
+    MINE_NS.with(|c| c.set(c.get() + d));
+    let total = PROC_NS.fetch_add(d, Ordering::AcqRel) + d;
+    if total.saturating_sub(SAID_NS.load(Ordering::Acquire)) >= SAY_EVERY_NS {
+        say(total);
+    }
 }
 
 /// Whether this Worker is in a busy stretch.

@@ -8200,6 +8200,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         gp_fault(ctx, pc as u64 & 0x00ff_ffff_ffff_ffff);
     }
     leave_guest();
+    usage::tick();
     let mut pc = pc;
     loop {
         gex_kernel::phase::begin();
