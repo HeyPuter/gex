@@ -14615,11 +14615,14 @@ fn sent_by(sig: &gex_kernel::signal::ProcSig) -> String {
             None => format!("signal {signo} to {to}, no sender (a fault or the kernel)"),
         }
     }
-    let fatal = sig.fatal().map_or_else(|| "not a delivery (a fault or a failed return)".to_string(), one);
-    match sig.handled_fault() {
-        Some(h) => format!("{fatal}; earlier handled fault: {}", one(h)),
-        None => fatal,
+    let mut out = sig.fatal().map_or_else(|| "not a delivery (a fault or a failed return)".to_string(), one);
+    if let Some(h) = sig.handled_fault() {
+        out.push_str(&format!("; earlier handled fault: {}", one(h)));
     }
+    if let Some((from, pid, tid, signo)) = sig.fault_send() {
+        out.push_str(&format!("; this process's thread {from} last sent signal {signo} to pid {pid} thread {tid}"));
+    }
+    out
 }
 
 /// The dying thread's registers that say where it was -- the first

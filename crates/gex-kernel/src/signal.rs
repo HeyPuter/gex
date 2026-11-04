@@ -178,6 +178,11 @@ pub struct ProcSig {
     /// handler, with its sender: a handler that re-raises it (KCrash) dies
     /// of a signal whose first sending this says. Rare, so a lock.
     handled: Mutex<Option<(u32, Option<Source>, bool)>>,
+    /// The last fault signal one of this process's threads sent with
+    /// `kill`, `tkill` or `tgkill`: sending thread, target (pid; 0 for a
+    /// thread of this process), target thread (0 for `kill`), signal. What
+    /// says which thread of a process sent its own death.
+    fault_send: Mutex<Option<(i32, i32, i32, u32)>>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -200,6 +205,7 @@ impl ProcSig {
             timer_next: AtomicU64::new(NO_TIMER),
             fatal: Mutex::new(None),
             handled: Mutex::new(None),
+            fault_send: Mutex::new(None),
         }
     }
 
@@ -212,6 +218,19 @@ impl ProcSig {
     /// A synchronous fault given to a handler (no sender: the instruction).
     pub fn note_fault_handled(&self, signal: u32) {
         *self.handled.lock() = Some((signal, None, true));
+    }
+
+    /// A fault signal (SEGV, BUS, ILL, FPE) one of this process's threads
+    /// sent; any other is not kept.
+    pub fn note_send(&self, from_tid: i32, pid: i32, tid: i32, signal: u32) {
+        if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+            *self.fault_send.lock() = Some((from_tid, pid, tid, signal));
+        }
+    }
+
+    /// The last fault signal this process sent ([`ProcSig::note_send`]).
+    pub fn fault_send(&self) -> Option<(i32, i32, i32, u32)> {
+        *self.fault_send.lock()
     }
 
     /// The last fault signal a handler was given, and its sender.

@@ -6698,6 +6698,14 @@ pub struct KillTo<'a> {
 /// waiting elsewhere wakes them after (a signal for one is raised on its
 /// own pending word, which it sees when it looks).
 pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    {
+        let (pid, tid, signo) = match n {
+            nr::KILL => (a[0] as i32, 0, a[1] as u32),
+            nr::TKILL => (to.pid, a[0] as i32, a[1] as u32),
+            _ => (a[0] as i32, a[1] as i32, a[2] as u32),
+        };
+        to.signals.process().note_send(to.tid, pid, tid, signo);
+    }
     if n == nr::KILL {
         // `kill` addresses a process, which may be any process on the
         // system. It goes through the table, which leaves the signal
