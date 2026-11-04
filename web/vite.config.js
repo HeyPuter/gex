@@ -10,7 +10,30 @@ const ISOLATED = {
   'Cross-Origin-Embedder-Policy': 'require-corp',
 };
 
+// GEX_PAGE_MODE=mp|sp: the page carries one build's code (shims/browser/js/mode.mjs),
+// the other's dropped from the bundle, as web/runtime/build.sh does for the
+// packages. web/build-all.sh sets it per dist. Unset (vite dev): both.
+const MODE = process.env.GEX_PAGE_MODE || '';
+if (MODE && MODE !== 'mp' && MODE !== 'sp') throw new Error(`GEX_PAGE_MODE=${MODE}: mp or sp`);
+const pageMode = {
+  name: 'gex-page-mode',
+  enforce: 'pre',
+  load: (id) => MODE && /\/shims\/browser\/js\/mode\.mjs$/.test(id.split('?')[0])
+    ? `export const SP_CODE = ${MODE === 'sp'};\nexport const MP_CODE = ${MODE === 'mp'};\n`
+    : null,
+  // A Worker's chunk is emitted wherever `new Worker(new URL(...))` appears,
+  // dead branch or not, so the MP page drops the single-thread system
+  // Worker's construction here (kernel.js singleWorker throws before it).
+  transform(code, id) {
+    if (MODE !== 'mp' || !/\/runtime\/src\/kernel\.js$/.test(id.split('?')[0])) return null;
+    const single = "new Worker(new URL('./kernel-single-worker.js', import.meta.url), { type: 'module', name: 'gex-system' })";
+    if (!code.includes(single)) this.error('kernel.js no longer starts the single-thread Worker as vite.config.js expects');
+    return code.replace(single, 'null');
+  },
+};
+
 export default defineConfig({
+  plugins: [pageMode],
   server: {
     port: 5173,
     host: true,
@@ -37,7 +60,7 @@ export default defineConfig({
   },
   // `worker.mjs` is an ES module with top-level await; the default `iife`
   // worker output cannot express that.
-  worker: { format: 'es' },
+  worker: { format: 'es', plugins: () => [pageMode] },
   resolve: {
     alias: {
       // The page runs the same `gex.mjs` the tests do, from the shim it

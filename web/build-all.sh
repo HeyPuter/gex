@@ -201,7 +201,7 @@ dist() { # dist <mp|sp>
     for w in "$stage"/gex/xwayland*/gexhostwl.wasm; do
         if [ -f "$w" ]; then zstd -q -f -19 "$w" -o "$w.zst"; fi
     done
-    (cd "$HERE" && GEX_PUBLIC_DIR="$stage" GEX_OUT_DIR="$out" npm run --silent build > "$CACHE/vite-$f.log" 2>&1) ||
+    (cd "$HERE" && GEX_PAGE_MODE="$f" GEX_PUBLIC_DIR="$stage" GEX_OUT_DIR="$out" npm run --silent build > "$CACHE/vite-$f.log" 2>&1) ||
         { tail -20 "$CACHE/vite-$f.log"; exit 1; }
     node "$HERE/build-inputs.mjs" stamp "$out" "page=$PAGE_KEY"
     rm -rf "$stage"
