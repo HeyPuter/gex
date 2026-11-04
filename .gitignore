@@ -1,4 +1,5 @@
 target/
+/out/
 *.gexm
 web/node_modules/
 web/dist/

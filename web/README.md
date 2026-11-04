@@ -1,7 +1,7 @@
 # web
 
 gex in a browser: the runtime API (`runtime/`, the `@gex/runtime`
-package, `runtime/README.md`), gex's test page (`index.html`,
+package, `runtime/README.md`, built by `make runtime PKG=DIR`), gex's test page (`index.html`,
 `src/harness.js`), the library an ejected program ships, and the builds of
 what they load:
 
@@ -28,13 +28,16 @@ and Xwayland, with or without `-pthread`. The dists ship stripped wasm.
 Unstripped copies stay in `target/web-debug/<mp|sp>/`, and `--debug` ships
 them instead.
 
-```sh
-git submodule update --init third_party/mesa
-web/build-all.sh             # multi-process
-web/build-all.sh --sp        # single-thread
-web/build-all.sh --both
-node web/serve-dist.mjs 8088 --sp-port 8089
+```console
+$ make page                  # multi-process: web/dist
+$ make page-sp               # single-thread: web/dist-sp
+$ make serve                 # web/dist at http://localhost:8088/, web/dist-sp at :8089
 ```
+
+`make page` runs `web/build-all.sh --mp`. Its header lists the steps and
+the options for building one part alone; `make mesa`, `make xwayland` and
+`make assets` are three of them. Mesa comes from the `third_party/mesa`
+submodule, which `make mesa` checks out.
 
 The first Mesa build also builds Tint (`tint/build-tint.sh`), so it takes
 much longer than later ones. Stripping needs `wasm-tools`
@@ -42,8 +45,9 @@ much longer than later ones. Stripping needs `wasm-tools`
 
 ## Ejected programs
 
-`build-eject-page.sh` builds the page library that an ejected project ships.
-`eject-site.mjs PROJECT OUT` packs a built 32-bit Wine project into a static
+`make eject-page DIR=...` (`build-eject-page.sh`) builds the page library that
+an ejected project ships. `make eject-site PROJECT=... SITE=...`
+(`eject-site.mjs`) packs a built 32-bit Wine project into a static
 site: the library, its runtime and Mesa, zstd-compressed assets, and the
 headers the host must send. The site's `index.html` belongs to the project, so the
 library can be imported into a page of your own.

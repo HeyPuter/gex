@@ -1,0 +1,16 @@
+# The toolchain's pins, read by the top-level Makefile. Called by: make gexcc,
+# make busybox (and, through them, make test).
+#
+# musl for the wasm32 sysroot is MUSL_REPO/MUSL_COMMIT and the LP64 one
+# MUSL64_REPO/MUSL64_COMMIT; both are still in tools/wine-wasm's pin files,
+# which the Makefile includes beside this one. LLVM_COMMIT is in
+# tools/gexcc/llvm.pin.
+
+# The LLVM fork libc++ is built from (branch gex). It is not published yet:
+# until it is, `make gexcc` needs LLVM_SRC, a checkout of LLVM_COMMIT.
+LLVM_REPO :=
+
+# busybox, the guest's /bin/sh and coreutils (make busybox, gexcc's install).
+BUSYBOX_VERSION := 1.37.0
+BUSYBOX_URL     := https://busybox.net/downloads/busybox-1.37.0.tar.bz2
+BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4

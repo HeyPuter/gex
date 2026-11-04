@@ -4,6 +4,8 @@ One runner for every test, on two hosts: a headless Chromium page (`browser`)
 and a Node process (`node`), both through the runtime API (web/runtime).
 
 ```sh
+make test                                  # the same as node test/run.mjs, gexc built first
+make test ARGS="--group core --host node"  # with options
 node test/run.mjs                          # every test, every host it allows, a64
 node test/run.mjs --group core --host both --arch a64,x86
 node test/run.mjs basic windows/x11        # by name, or group/name

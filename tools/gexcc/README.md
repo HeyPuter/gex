@@ -8,11 +8,17 @@ program is a position-independent wasm module in the ELF container that
 under `gexc`, so configure checks and test suites can run it like a native
 binary.
 
-```sh
-tools/gexcc/install.sh PREFIX        # PREFIX/bin/gexcc, gexc++, the sysroot
-PREFIX/bin/gexcc -O2 -o hello hello.c
-gexc run hello
+```console
+$ make gexcc                         # out/gexcc (GEXCC_PREFIX=DIR elsewhere)
+...
+out/gexcc/bin/gexcc
+$ out/gexcc/bin/gexcc -O2 -o hello hello.c
+$ target/x86/release/gexc run hello
 ```
+
+`make gexcc` fetches musl and LLVM at their pins, then runs
+`tools/gexcc/install.sh PREFIX MUSL_SRC` with `LLVM_SRC` (C++) and busybox
+(the guest's `/bin/sh`).
 
 Libraries are static by default. `-shared` writes an archive, so a build that
 insists on `libfoo.so` still links. With `GEXCC_SHARED=1`, `-shared` writes a
@@ -21,8 +27,8 @@ packages with gexcc and assembles a Debian root filesystem around them. The
 `gexcc` script's header lists its options and environment.
 
 C++ needs libc++ built from `llvm.pin`'s commit of our LLVM tree (clang's
-version with our runtime changes): `LLVM_SRC=CHECKOUT tools/gexcc/install.sh
-PREFIX`, or `tools/gexcc/build-cxx.sh PREFIX CHECKOUT`.
+version with our runtime changes). `make gexcc` builds it, and
+`tools/gexcc/build-cxx.sh PREFIX CHECKOUT` rebuilds it alone.
 
 ## Windows programs
 
@@ -32,11 +38,13 @@ programs and DLLs as native wasm modules against 64-bit Wine's native PE
 side. A link writes a PE skeleton (`X.exe`) and its module (`X.exe.wasm`)
 beside it; Wine's loader runs the pair with no x86 code.
 
-```sh
-GEX_WASM64_SYSROOT=SYSROOT tools/gexcc/windows/install.sh PREFIX WINE_BUILD WINE_SRC
-tools/gexcc/build-cxx-win.sh PREFIX LLVM_CHECKOUT    # C++
-PREFIX/bin/x86_64-w64-mingw32-gcc -O2 -mwindows -o app.exe app.c res.o -lcomctl32
+```console
+$ make gexcc-win                     # after make wine: out/gexcc-win
+$ out/gexcc-win/bin/x86_64-w64-mingw32-gcc -O2 -mwindows -o app.exe app.c res.o -lcomctl32
 ```
+
+`make gexcc-win` runs `tools/gexcc/windows/install.sh` over `make wine`'s
+build tree and `tools/gexcc/build-cxx-win.sh` for C++.
 
 `-s` links a release module (the names gex does not read stripped). A dist's
 cores export every DLL export by default (`WINE64_EXPORT_ALL=1`), so such

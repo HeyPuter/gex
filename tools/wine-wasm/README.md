@@ -1,35 +1,53 @@
 # wine-wasm
 
-Wine for gex. Wine's own Unix side (the loader, ntdll's Unix half, the
-wineserver and the drivers) is built as wasm32 with gexcc. The Windows code
-it loads is x86, and gex translates it like any other guest code. Builds are
-reproducible from the pins in `wine32.pins`.
+Wine for gex. Wine's own Unix side is built as wasm32 with gex's compilers:
+the loader, ntdll's Unix half, the wineserver and the drivers. On the
+Windows side, Wine's builtin DLLs are native wasm modules; WoW64's i386 ones
+are still translated until their native builds pass. A program's own x86
+code is translated by gex like any other guest code. Everything is built
+from the pins in `wine64.pins` (Wine and musl) and `wine32.pins` (the Unix
+libraries).
 
-It needs an x86 `gexc` at `target/x86/release/gexc`
-(`cargo build --release -p gexc --features x86 --target-dir target/x86`),
-or `GEXC=` naming one.
+## Build it
 
-```sh
-make -C tools/wine-wasm              # the Wine install and a ready-to-run prefix
-make -C tools/wine-wasm prefix-null  # a prefix with the null display driver
-make -C tools/wine-wasm paths        # where the outputs are
-tools/wine-wasm/run.sh app.exe       # run a Windows program
+```console
+$ make wine
+...
+WINE64_DIST=~/.cache/gex/wine64/dist64-...
+WINE64_PREFIX=~/.cache/gex/wine64/pfs64-...
+WINE64_NATIVE=...
 ```
 
-Outputs go to a cache directory named after their inputs, so a rerun only
-rebuilds what changed. The `Makefile` header lists the settings.
+This is 64-bit Wine with WoW64. One process runs x86-64 and i386 Windows
+programs, and one prefix holds both (`system32` and `syswow64`).
+`make wine-x64` builds it without WoW64. The output lines are also saved in
+`out/wine.env` (or `out/wine-x64.env`), ready for `.`. Each step is cached in
+`~/.cache/gex/wine64` by what it is built from, so a rerun only checks. The
+first build takes about 40 minutes on 16 threads.
 
-64-bit Wine is in progress. It is built from the Wine and musl commits in
-`wine64.pins`, beside a 32-bit Wine build tree (`make build`, made first when
-missing):
+What it fetches and builds, in order:
+- 64-bit Wine at `WINE64_COMMIT`. `WINE_DIR=` builds a Wine worktree of
+  your own instead.
+- The LP64 sysroot, from musl at `MUSL64_COMMIT` (`make sysroot64`).
+- A configured 32-bit Wine build tree, which the wineserver is linked from
+  (`make -C tools/wine-wasm build`).
+- Wine's tools, natively, and its PE side with MinGW.
+- The Unix side as wasm. The native PE modules are linked as one core plus
+  a module for each remaining DLL.
+- The prefix (`wineboot -i`, natively, as user `gex`), with the session in
+  `wine32-session.reg` applied.
 
-```sh
-tools/wine-wasm/build-sysroot64.sh SR    # the LP64 sysroot; fetches the pinned musl
-git clone WINE64_REPO wine64 && git -C wine64 checkout WINE64_COMMIT
-GEX_WASM64_SYSROOT=SR/sysroot tools/wine-wasm/wine64-dist.sh wine64 CACHE
+It needs `x86_64-w64-mingw32-gcc`, plus `i686-w64-mingw32-gcc` for WoW64.
+
+## Run a program
+
+```console
+$ . out/wine.env
+$ tools/wine-wasm/run.sh --page TREE --dist $WINE64_DIST --prefix $WINE64_PREFIX app.exe
 ```
 
-`wine64-dist.sh` prints where the install and its prefix are.
+That runs `app.exe` in the page on a bench box (`BENCH_SH`; `run.sh -h`).
+A 32-bit program runs in the 64-bit process through WoW64.
 
 ## Known gaps
 
@@ -42,3 +60,11 @@ The 64-bit install has no:
   WebBrowser control, hh.exe) do not render.
 - **Mono**: wine-mono is not shipped, and pages run with `mscoree=`, so .NET
   Framework programs do not start.
+
+## Legacy: 32-bit Wine
+
+`make wine32` (this directory's `Makefile`, `wine32.pins`' Wine commit)
+builds the older 32-bit-only Wine. Its PE side is staged from the host's
+Wine 11.15 (`tools/nt-stage-wine.sh`). It stays only until WoW64 replaces it,
+and no new work goes into it. `tools/wine-wasm/run.sh app.exe` runs a program
+on it natively, and the `Makefile` header lists its settings.
