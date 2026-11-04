@@ -169,7 +169,7 @@ gexcc: musl-src llvm-src
 	@[ -x $(GEXC_X86) ] || $(NICE) cargo build -q --release -p gexc --features x86 --target-dir target/x86
 	$(ROOT)/tools/wine-wasm/wine32/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(CACHE)/dl
 	GEXC=$(GEXC_X86) GEXC_X86=$(GEXC_X86) GEX_DYLINK=$(ROOT)/target/release/gex-dylink JOBS=$(JOBS) LLVM_SRC=$(LLVM_SRC) \
-	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) $(NICE) sh $(ROOT)/tools/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)
+	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) GEXCC_CACHE=$(CACHE)/gexcc $(NICE) sh $(ROOT)/tools/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)
 	@echo $(GEXCC_PREFIX)/bin/gexcc
 
 # ---- 64-bit Wine ----

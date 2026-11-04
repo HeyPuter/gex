@@ -16,6 +16,9 @@
 # (default GEXC). GEX_BINARYEN: an existing binaryen install.
 # BUSYBOX_TAR: busybox 1.37.0's tarball, built as the guest's native
 # /bin/sh and coreutils. LLVM_SRC: a checkout of llvm.pin's commit, for libc++ (build-cxx.sh).
+# GEXCC_CACHE: a directory that keeps the sysroot, libc.so, libc++, busybox and the
+# GexPoll plugin by their
+# inputs between installs (below).
 set -eu
 PREFIX=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
@@ -35,8 +38,27 @@ mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 # (compiler-rt's sources by their own tree's names: assert()s in the builtins
 # name their files)
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
-GEX_WASM_EXTRA_CFLAGS="-fvisibility=default -ffile-prefix-map=$CRT=/compiler-rt/lib/builtins" GEX_WASM_LEGACY_EH=1 \
-  "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
+SX="-fvisibility=default -ffile-prefix-map=$CRT=/compiler-rt/lib/builtins"
+build_sysroot() { GEX_WASM_EXTRA_CFLAGS="$SX" GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$1" "$MUSL"; }
+# GEXCC_CACHE=DIR: the sysroot, libc.so, libc++, busybox and GexPoll are kept there under a key
+# of everything they are built from (the files' contents, not their times),
+# so a rerun with nothing changed copies them (make gexcc sets it).
+CK=${GEXCC_CACHE:-}
+treesum() { for p; do [ ! -e "$p" ] || find "$p" -name .git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 cat; done; }
+hash16() { { cat; clang --version; } | sha256sum | cut -c1-16; }
+if [ -n "$CK" ]; then
+  SK=$( { echo "$SX ${GEX_BINARYEN:-}"; treesum "$MUSL" "$CRT" "$WW/build-sysroot.sh" "$WW/flags.sh" \
+    "$WW/libgex" "$WW/libgex-snap" "$WW/icall"; } | hash16)
+  if [ ! -f "$CK/sysroot-$SK/.done" ]; then
+    rm -rf "$CK/sysroot-$SK.tmp" && mkdir -p "$CK"
+    build_sysroot "$CK/sysroot-$SK.tmp"
+    touch "$CK/sysroot-$SK.tmp/.done" && rm -rf "$CK/sysroot-$SK" && mv "$CK/sysroot-$SK.tmp" "$CK/sysroot-$SK"
+  fi
+  rm -rf "$PREFIX/build/sysroot" && cp -a "$CK/sysroot-$SK/sysroot" "$PREFIX/build/sysroot"
+  echo "sysroot: $PREFIX/build/sysroot (cached: $CK/sysroot-$SK)"
+else
+  build_sysroot "$PREFIX/build"
+fi
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
 # the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,
@@ -61,7 +83,14 @@ ld.lld -m elf_i386 -pie --no-dynamic-linker -T "$HERE/hoststub.ld" -o "$L/hostst
 llvm-objcopy -O binary "$L/hoststub.elf" "$L/hoststub.bin"
 rm -f "$L/hoststub.o" "$L/hoststub.elf"
 # gexcc's runtime (rt/: the loop safepoint) and the GexPoll pass plugin
-"$HERE/poll/build.sh" "$L"
+PK=
+[ -z "$CK" ] || PK=$( { treesum "$HERE/poll"; ${LLVM_CONFIG:-llvm-config} --version 2>/dev/null; } | hash16)
+if [ -n "$PK" ] && [ -f "$CK/poll-$PK/GexPoll.so" ]; then
+  cp "$CK/poll-$PK/GexPoll.so" "$L/"
+else
+  "$HERE/poll/build.sh" "$L"
+  [ -z "$PK" ] || { mkdir -p "$CK/poll-$PK" && cp "$L/GexPoll.so" "$CK/poll-$PK/GexPoll.so.tmp" && mv "$CK/poll-$PK/GexPoll.so.tmp" "$CK/poll-$PK/GexPoll.so"; }
+fi
 mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
 # the runtime's sources by their names in gex, not this checkout's path
@@ -286,7 +315,14 @@ EOF
 # installed: the native /bin/sh and coreutils gexcc programs see inside gex
 # (system(), popen, exec of sh, sleep, kill). A translated host shell takes
 # seconds per command.
-if [ -n "${BUSYBOX_TAR:-}" ]; then
+# (libc++ and busybox are built with the driver, its headers and runtime over
+# that sysroot: their keys)
+[ -z "$CK" ] || TK=$( { echo "$SK"; treesum "$HERE/gexcc" "$HERE/include" "$HERE/rt" "$HERE/config.site" "$WW/flags.sh"; } | hash16)
+[ -z "$CK" ] || [ -z "${BUSYBOX_TAR:-}" ] || BK=$( { echo "$TK"; cat "$BUSYBOX_TAR"; } | hash16)
+if [ -n "${BUSYBOX_TAR:-}" ] && [ -n "$CK" ] && [ -f "$CK/busybox-$BK/.done" ]; then
+  cp "$CK/busybox-$BK/busybox" "$CK/busybox-$BK/busybox.applets" "$L/"
+  echo "busybox: $L/busybox (cached: $CK/busybox-$BK)"
+elif [ -n "${BUSYBOX_TAR:-}" ]; then
   BB=$PREFIX/build/busybox
   rm -rf "$BB"; mkdir -p "$BB"
   tar xjf "$BUSYBOX_TAR" -C "$BB" --strip-components=1
@@ -298,13 +334,27 @@ if [ -n "${BUSYBOX_TAR:-}" ]; then
     { echo "busybox failed: $BB/build.log"; exit 1; }
   cp "$BB/busybox" "$L/busybox"
   GEXCC_BUSYBOX= "$B/gexcc-exec" run "$L/busybox" --list | tr '\n' ',' | sed 's/,$//' > "$L/busybox.applets"
+  if [ -n "$CK" ] && [ -s "$L/busybox.applets" ]; then
+    rm -rf "$CK/busybox-$BK" && mkdir -p "$CK/busybox-$BK" &&
+      cp "$L/busybox" "$L/busybox.applets" "$CK/busybox-$BK/" && touch "$CK/busybox-$BK/.done"
+  fi
 fi
 # shared libraries (GEXCC_SHARED=1): gex-dylink (cargo
 # build -p gex-dylink) and libc.so
 DL=${GEX_DYLINK:-$ROOT/target/release/gex-dylink}
 if [ -x "$DL" ]; then
   cp "$DL" "$L/gex-dylink"
-  "$HERE/shared/mklibc.sh" "$PREFIX"
+  LK=
+  [ -z "$CK" ] || LK=$( { echo "$TK v2"; treesum "$HERE/shared" "$DL" "$HERE/rt"; } | hash16)
+  if [ -n "$LK" ] && [ -f "$CK/libc-so-$LK/.done" ]; then
+    cp "$CK/libc-so-$LK/libc.so" "$CK/libc-so-$LK/libc_nonshared.a" "$PREFIX/sysroot/lib/" && cp "$CK/libc-so-$LK/dso.o" "$L/"
+    echo "libc.so: $PREFIX/sysroot/lib/libc.so (cached: $CK/libc-so-$LK)"
+  else
+    "$HERE/shared/mklibc.sh" "$PREFIX"
+    [ -z "$LK" ] || { rm -rf "$CK/libc-so-$LK" && mkdir -p "$CK/libc-so-$LK" &&
+      cp "$PREFIX/sysroot/lib/libc.so" "$PREFIX/sysroot/lib/libc_nonshared.a" "$L/dso.o" "$CK/libc-so-$LK/" &&
+      touch "$CK/libc-so-$LK/.done"; }
+  fi
 else
   echo "gexcc: no $DL: GEXCC_SHARED unavailable (cargo build --release -p gex-dylink)"
 fi
@@ -318,6 +368,19 @@ fi
 } > "$PREFIX/lib/gexcc/installed-from"
 echo "gexcc: $B/gexcc (sysroot $PREFIX/sysroot, runner $R)"
 # C++ (LLVM_SRC: a checkout of llvm.pin's commit)
-if [ -n "${LLVM_SRC:-}" ]; then
+if [ -n "${LLVM_SRC:-}" ] && [ -n "$CK" ]; then
+  XK=$( { echo "$TK $(git -C "$LLVM_SRC" rev-parse HEAD)"; git -C "$LLVM_SRC" status --porcelain --untracked-files=no
+    treesum "$HERE/build-cxx.sh" "$HERE/llvm-pin.sh" "$HERE/llvm.pin"; } | hash16)
+  if [ -f "$CK/cxx-$XK.tar" ]; then
+    tar -xf "$CK/cxx-$XK.tar" -C "$PREFIX/sysroot/"
+    echo "libc++: $PREFIX/sysroot/lib/libc++.a (cached: $CK/cxx-$XK.tar)"
+  else
+    "$HERE/build-cxx.sh" "$PREFIX" "$LLVM_SRC"
+    # what its install wrote (CMake's manifest), by path in the sysroot
+    SR=$(realpath "$PREFIX")/sysroot
+    sed "s|^$SR/||" "$PREFIX/build/cxx/install_manifest.txt" > "$PREFIX/build/cxx.files"
+    tar -cf "$CK/cxx-$XK.tar.tmp" -C "$SR/" -T "$PREFIX/build/cxx.files" && mv "$CK/cxx-$XK.tar.tmp" "$CK/cxx-$XK.tar"
+  fi
+elif [ -n "${LLVM_SRC:-}" ]; then
   "$HERE/build-cxx.sh" "$PREFIX" "$LLVM_SRC"
 fi
