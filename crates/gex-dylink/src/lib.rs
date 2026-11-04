@@ -335,6 +335,9 @@ impl Info {
                         let mut ops = g.init_expr.get_operators_reader();
                         let v = match ops.read() {
                             Ok(wasmparser::Operator::I32Const { value }) => Some(value as u32),
+                            // a wasm64 program lowered to wasm32 (its addresses
+                            // below 4 GiB)
+                            Ok(wasmparser::Operator::I64Const { value }) => u32::try_from(value).ok(),
                             _ => None,
                         };
                         info.global_init.push(v);
@@ -1438,6 +1441,8 @@ pub fn shim_import(m: &str, name: &str) -> bool {
                 | "__stack_pointer"
                 | "__memory_base"
                 | "__table_base"
+                // a lowered wasm64 module's i32 copy of it (ftab.rs)
+                | "__table_base32"
                 | "__asyncify_state"
                 | "__asyncify_data"
         ),
@@ -1447,6 +1452,13 @@ pub fn shim_import(m: &str, name: &str) -> bool {
 }
 
 impl Link {
+    /// Whether the program is a static one (it names no libraries): what a
+    /// library it `dlopen`s imports, its libc's included, is the program's
+    /// own exports (`-Wl,--export`), and no `libc.so` is loaded beside it.
+    pub fn static_program(&self) -> bool {
+        self.mods.first().is_some_and(|m| m.info.needed.is_empty())
+    }
+
     /// The program's libraries, breadth first from its `NEEDED`: for each,
     /// `find(soname, runpath)` gives its path and bytes (searching the run
     /// path, `LD_LIBRARY_PATH` and [`DEFAULT_DIRS`] is the caller's, through
@@ -1472,6 +1484,10 @@ impl Link {
         mut shed: impl FnMut(&str, Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<(String, String, Vec<u8>, Info)>> {
         let mut have: HashSet<String> = self.mods.iter().map(|m| m.name.clone()).collect();
+        // a static program is its own libc
+        if self.static_program() {
+            have.insert(LIBC_SONAME.to_string());
+        }
         let mut out = Vec::new();
         let mut q: VecDeque<(Vec<String>, Vec<String>)> = self.mods[first..]
             .iter()
@@ -1644,6 +1660,9 @@ impl Link {
         Ok(out)
     }
 }
+
+/// The soname of gexcc's shared libc, which every library names.
+pub const LIBC_SONAME: &str = "libc.so";
 
 /// `dlopen` handles gex gives (libgex's dl.c): above everything a 32-bit
 /// process maps data at, one per link-map entry.

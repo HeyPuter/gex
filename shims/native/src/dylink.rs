@@ -410,9 +410,6 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     let Some(mut p) = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.dyproc.clone() else {
         bail!("{path}: dlopen in a program not linked against shared libraries");
     };
-    if p.link.mods[0].info.needed.is_empty() {
-        bail!("{path}: dlopen in a static program (link it with GEXCC_SHARED=1)");
-    }
     if let Some(i) = p.link.loaded(path) {
         return Ok(HANDLE_BASE + i as u32 * 16);
     }

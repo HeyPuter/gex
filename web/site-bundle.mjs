@@ -5,8 +5,8 @@
 // and the tar written again, deduplicated by content.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, join, relative } from 'node:path';
 
 const sha = (b) => createHash('sha256').update(b).digest('hex');
 
@@ -82,6 +82,42 @@ export function stripTree(x, stripped) {
 /** --prune: the files the browser never reads (precompiled .cwasm, static archives). */
 export function pruneTree(x) {
   walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+}
+
+/** The name of a dist's rest-only list: files of its directory, one a line,
+ *  that a site keeps out of its boot bundle whatever a recorded run read (a
+ *  side module the loader dlopens only when a program needs it, such as
+ *  Wine's winegstreamer.so). They are lazy files of the compressed rest
+ *  bundle, fetched on the first read. */
+export const REST_ONLY = 'gex-rest-only';
+
+/** Whether TAR has a rest-only list (`REST_ONLY`). */
+export function hasRestOnly(tar) {
+  const names = execFileSync('tar', ['-tf', tar], { maxBuffer: 1 << 30 }).toString().split('\n');
+  return names.some((n) => n === REST_ONLY || n.endsWith(`/${REST_ONLY}`));
+}
+
+/** The guest paths (`/REL`) the rest-only lists of tree X name. */
+export function restOnly(x) {
+  const only = new Set();
+  walk(x, (p, rel) => {
+    if (rel.split('/').pop() !== REST_ONLY) return;
+    const dir = dirname(`/${rel}`);
+    for (const l of readFileSync(p, 'utf8').split('\n').map((v) => v.trim()).filter((v) => v && !v.startsWith('#'))) only.add(`${dir === '/' ? '' : dir}/${l}`);
+  });
+  return only;
+}
+
+/** The bundle split's read set with the rest-only files (`restOnly`) out of
+ *  it: READ less them, or, with no READ (a bundle not split), every file of X
+ *  but them. Null when there are none and no READ. */
+export function readLessRestOnly(x, read) {
+  const only = restOnly(x);
+  if (!only.size) return read;
+  if (read) { for (const p of only) read.delete(p); return read; }
+  const all = new Set();
+  walk(x, (p, rel) => { if (!only.has(`/${rel}`)) all.add(`/${rel}`); });
+  return all;
 }
 
 /**
@@ -241,4 +277,78 @@ export function buildFill({ late = [], lazy = [], store, boot = null, units = []
     }
   }
   return { bytes: Buffer.concat(parts), files, demand, keys, lateFiles: seen.size };
+}
+
+/** The rest bundle: the bundle split's lazy files (`lazy`, [path, size,
+ *  hash, mtime], their bytes in `store` by hash) as one uncompressed tar,
+ *  each content once, in read order (`order`) and then by path, so files
+ *  read together sit together; its stream cut into frames of `restFrame`
+ *  bytes, each zstd-compressed on its own (one stream would have to be read
+ *  from its start), concatenated as rest.bin, and
+ *  rest.bin.json: `frame`, `frames` ([offset, length] of each in rest.bin),
+ *  `size` (the tar's). A lazy file's entry names `rest.bin#OFFSET`, OFFSET
+ *  its bytes in the tar, which the page reads by the frames over it
+ *  (lazy-fetch.mjs). `bin`: where rest.bin goes (its index beside it, BIN.json),
+ *  `work` a scratch directory, `frame` the frames' size, `zlev` zstd's level
+ *  options, `order` guest paths first in the tar. Returns the lazy entries
+ *  (`files`) and the sizes. */
+export function buildRest(lazy, store, { bin, work, frame: restFrame, zlev, order: first = null }) {
+  const rank = new Map();
+  if (first) first.forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
+  const order = [...lazy].sort((a, b) => (rank.get(a[0]) ?? Infinity) - (rank.get(b[0]) ?? Infinity) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const dir = join(work, 'rest');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  // The tar, written a frame at a time: frame k holds tar bytes [k * frame, (k + 1) * frame).
+  const where = new Map(); // hash -> its bytes' offset in the tar
+  let at = 0, k = 0, cur = [], curLen = 0;
+  const flush = (final) => {
+    while (curLen >= restFrame || (final && curLen > 0)) {
+      const all = Buffer.concat(cur);
+      const n = Math.min(restFrame, all.length);
+      writeFileSync(join(dir, String(k++).padStart(6, '0')), all.subarray(0, n));
+      cur = [all.subarray(n)];
+      curLen = all.length - n;
+    }
+  };
+  const put = (b) => { cur.push(b); curLen += b.length; at += b.length; if (curLen >= restFrame) flush(false); };
+  const header = (name, size) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, 'utf8');
+    h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124);
+    h.write('00000000000\0', 136);
+    h.fill(' ', 148, 156); h.write('0', 156); h.write('ustar\x0000', 257);
+    let sum = 0;
+    for (const c of h) sum += c;
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    return h;
+  };
+  for (const [, size, hash] of order) {
+    if (where.has(hash)) continue;
+    put(header(hash, size));
+    where.set(hash, at);
+    put(readFileSync(join(store, hash)));
+    if (size % 512) put(Buffer.alloc(512 - (size % 512)));
+  }
+  put(Buffer.alloc(1024));
+  const tarSize = at;
+  flush(true);
+  // Each frame on its own; many zstd processes at once.
+  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd ${zlev} -q -f`], { cwd: dir });
+  const frames = [];
+  let off = 0;
+  mkdirSync(dirname(bin), { recursive: true });
+  const fd = openSync(bin, 'w');
+  for (let i = 0; i < k; i++) {
+    const z = readFileSync(join(dir, `${String(i).padStart(6, '0')}.zst`));
+    frames.push([off, z.length]);
+    writeSync(fd, z);
+    off += z.length;
+  }
+  closeSync(fd);
+  writeFileSync(`${bin}.json`, JSON.stringify({ frame: restFrame, size: tarSize, frames }));
+  rmSync(dir, { recursive: true, force: true });
+  const name = basename(bin);
+  return { files: lazy.map(([path, size, hash, mtime]) => [path, size, `${name}#${where.get(hash)}`, mtime]), distinct: where.size, tarSize, frames: frames.length, bytes: off };
 }

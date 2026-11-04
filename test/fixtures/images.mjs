@@ -5,7 +5,8 @@
 //   busybox  bb.tar.zst: BUSYBOX (a wasm32 busybox) and its applets, the probe
 //            programs (probe/*.c, built with GEXCC or gexcc), /etc/xattr with
 //            an extended attribute; and lazy.bin and lazy-program.bin, a lazy
-//            file's bytes (one test's each). Kept
+//            file's bytes (one test's each), and rt-side.so, a side module
+//            rt-dlstatic loads (a lazy file's). Kept
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
@@ -16,6 +17,8 @@
 //            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
 //            compiler, its one arch, its libraries, a DLL); win-progs.json says which
 //            did not build, and why.
+//   win-media  win-media.tar: media files for wine/media (MEDIA), made with the
+//            host's ffmpeg.
 //   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
 //            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
 //            GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at
@@ -56,6 +59,20 @@ const PROBES = {
   'rt-joy': [],
   'rt-truncate': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
+  // static, serving what rt-side.so imports (SIDES)
+  'rt-dlstatic': ['-pthread', ...['malloc', 'snprintf', 'strlen', 'fprintf', 'stderr', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'sin', 'cos'].map((s) => `-Wl,--export=${s}`)],
+};
+
+/** Side modules (GEXCC_SHARED=1 -shared), made beside the image rather than
+ *  in it: a test gives each as a lazy file. */
+const SIDES = ['rt-side'];
+
+/** The `win-media` image's files (wine/media): 3 s of a test picture and a
+ *  440 Hz tone, H.264 and AAC in MP4, WMV2 and WMA2 in ASF. */
+const SRC = ['-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=25:duration=3', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=3'];
+const MEDIA = {
+  'h264-aac.mp4': [...SRC, '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-c:a', 'aac', '-b:a', '96k', '-shortest'],
+  'wmv2-wma2.wmv': [...SRC, '-c:v', 'wmv2', '-b:v', '600k', '-c:a', 'wmav2', '-b:a', '96k', '-shortest'],
 };
 
 /** What each image leaves in the work directory: with `--prebuilt`, an
@@ -64,7 +81,7 @@ const PROBES = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
 export const images = {
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
@@ -141,9 +158,10 @@ export const images = {
     const h = createHash('sha256');
     if (bb && existsSync(bb)) h.update(readFileSync(bb));
     h.update(applets.join('\n'));
-    for (const name of Object.keys(PROBES)) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
+    for (const name of [...Object.keys(PROBES), ...SIDES]) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
     // rt-truncate.c is programs/truncate-path.c.
     h.update(readFileSync(join(HERE, 'programs/truncate-path.c')));
+    h.update(JSON.stringify(PROBES));
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
@@ -153,7 +171,7 @@ export const images = {
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.
-    if (have && (!bb || have === key)) return null;
+    if (have && (!bb || have === key) && SIDES.every((n) => existsSync(join(work, `${n}.so`)))) return null;
     if (!bb || !existsSync(bb)) return 'BUSYBOX: a wasm32 busybox';
     const tree = join(work, 'tree');
     rmSync(tree, { recursive: true, force: true });
@@ -163,6 +181,10 @@ export const images = {
     const cc = process.env.GEXCC || 'gexcc';
     for (const [name, libs] of Object.entries(PROBES)) {
       execFileSync(cc, ['-O2', '-Wall', '-o', join(tree, 'bin', name), join(HERE, 'probe', `${name}.c`), ...libs], { stdio: ['ignore', 'ignore', 'inherit'] });
+    }
+    for (const name of SIDES) {
+      execFileSync(cc, ['-O2', '-Wall', '-fPIC', '-shared', '-o', join(work, `${name}.so`), join(HERE, 'probe', `${name}.c`)],
+        { stdio: ['ignore', 'ignore', 'inherit'], env: { ...process.env, GEXCC_SHARED: '1' } });
     }
     execFileSync('sh', ['-c', 'echo xattr > "$1/etc/xattr" && setfattr -n user.rt -v kept "$1/etc/xattr"', 'sh', tree]);
     execFileSync('tar', ['--xattrs', '-cf', join(work, 'bb.tar'), '-C', tree, '.']);
@@ -384,6 +406,28 @@ export const images = {
     }
     writeFileSync(join(work, 'win-progs.json'), JSON.stringify({ failed }, null, 1));
     execFileSync('tar', ['-cf', join(work, 'win-progs.tar'), '-C', dir, '.']);
+    writeFileSync(keyFile, key);
+    return null;
+  },
+
+  async 'win-media'(work) {
+    // Made with the host's FFmpeg (libx264), each the same bytes for the same
+    // FFmpeg: no timestamps, one thread.
+    const h = createHash('sha256').update(JSON.stringify(MEDIA));
+    const v = spawnSync('ffmpeg', ['-hide_banner', '-version'], { encoding: 'utf8' });
+    if (v.error || v.status !== 0) return 'no ffmpeg (the media for wine/media)';
+    h.update(v.stdout.split('\n')[0]);
+    const key = h.digest('hex');
+    const keyFile = join(work, 'win-media.key');
+    if (existsSync(join(work, 'win-media.tar')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8') === key) return null;
+    const dir = join(work, 'win-media');
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    for (const [name, args] of Object.entries(MEDIA)) {
+      const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '1', ...args, '-fflags', '+bitexact', '-flags', '+bitexact', join(dir, name)], { encoding: 'utf8' });
+      if (r.status !== 0) return `ffmpeg could not make ${name}: ${(r.stderr ?? '').trim().split('\n').pop()}`;
+    }
+    execFileSync('tar', ['-cf', join(work, 'win-media.tar'), '-C', dir, '.']);
     writeFileSync(keyFile, key);
     return null;
   },

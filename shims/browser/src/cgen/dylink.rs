@@ -297,7 +297,10 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             Some(s) => (s.len, Some(s.key), Some(s.gone)),
             None => (wasm.len() as u32, None, None),
         };
-        lock(&PROGS).push(Prog { number, len: size, wasm, relocate, relocating: false, key, path: m.path.clone(), lowered: false, from_file, gone });
+        // built for wasm64 and lowered, as its program (64-bit Wine's loader
+        // and its side module): i64 bases (is_lowered, from the import's type)
+        let lowered = m.info.imports.iter().any(|imp| imp.module == "env" && imp.name == "__memory_base" && imp.wide);
+        lock(&PROGS).push(Prog { number, len: size, wasm, relocate, relocating: false, key, path: m.path.clone(), lowered, from_file, gone });
         let (_, ok) = ftab(|f| f.publish_at(m.table_base, len.max(1), PROVIDER | number, Tier::Unit, &pairs));
         if !ok {
             return Err(format!("{}: table range {}+{} is taken", m.path, m.table_base, len));
