@@ -10978,12 +10978,38 @@ impl Kernel {
             fault_address,
             self.compat,
         ) {
-            Ok(resume) => Delivery::Resume(resume),
+            Ok(resume) => {
+                self.fault_note(signo, pc, fault_address);
+                Delivery::Resume(resume)
+            }
             Err(_) => Delivery::Terminate {
                 signal: signo,
                 core: true,
             },
         }
+    }
+
+    /// A fault that goes to the program's handler, said in a traced process
+    /// (`gexc run --strace`; off by default and nothing done then: Wine's
+    /// processes take handled faults routinely). A crash handler that
+    /// re-raises the signal (KCrash) otherwise leaves nothing of the real
+    /// fault. (The page's is `sigs::fault_note`.)
+    fn fault_note(&self, signo: u32, pc: u64, addr: u64) {
+        if !self.trace {
+            return;
+        }
+        let at = self
+            .mem
+            .lock()
+            .vmas()
+            .iter()
+            .find(|v| pc >= v.start && pc < v.end)
+            .map(|v| {
+                let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+                format!("{} +{:#x}", n.rsplit('/').next().unwrap_or(n), pc - v.start)
+            })
+            .unwrap_or_default();
+        eprintln!("[gex:{}] {} at pc={pc:#x} {at} address {addr:#x}, to its handler", self.pid, signal::fault_name(signo));
     }
 
     /// Restore the context a handler frame captured.

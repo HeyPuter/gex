@@ -991,6 +991,17 @@ pub mod xframe {
     pub const GPR_ORDER: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
 }
 
+/// A fault signal's name, for a line that says one was taken.
+pub fn fault_name(signo: u32) -> &'static str {
+    match signo {
+        sig::SIGSEGV => "SIGSEGV",
+        sig::SIGBUS => "SIGBUS",
+        sig::SIGILL => "SIGILL",
+        sig::SIGFPE => "SIGFPE",
+        _ => "a fault signal",
+    }
+}
+
 /// Build a handler frame for `signal` and point the context at the handler.
 ///
 /// Returns the address to resume at. The caller has already established that
