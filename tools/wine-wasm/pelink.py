@@ -353,6 +353,25 @@ def wasm_exports(path):
     return out
 
 
+def wasm_sig64(path):
+    """A wasm module's gexw.sig64 lines (GexIcall's signatures of what it
+    defines, bN a struct of N bytes by value) as {name: signature}."""
+    try:
+        b = open(path, 'rb').read()
+    except OSError:
+        return {}
+    i = 8
+    while i < len(b):
+        sid = b[i]
+        size, j = leb_at(b, i + 1)
+        if sid == 0:
+            n, k = leb_at(b, j)
+            if b[k:k + n] == b'gexw.sig64':
+                return dict(l.split(' ', 1) for l in b[k + n:j + size].decode().splitlines() if ' ' in l)
+        i = j + size
+    return {}
+
+
 def dll_slots(path, mapfile, obj_dll):
     """Which DLL each of a linked module's table slots and data bytes is,
     for gex to find the module of an address (GetModuleHandleExW's
@@ -1065,7 +1084,7 @@ static void *gexw_ntdll_proc(const char *name)
 ''')
                 resolve = lambda owner, n: (f'gexw_ntdll_proc("{n}")' if guest_ntdll and owner == 'ntdll.dll'
                                             else f'gexw_GetProcAddress(gexw_LoadLibraryA("{LOAD_NAME.get(owner, owner)}"), "{n}")')
-                stdcalls, varargs = {}, {}
+                stdcalls, varargs, owner_sigs, written_bv = {}, {}, {}, set()
                 for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
                         stdcalls[owner] = spec_stdcalls(owner_spec(SRC, owner)) if SRC else set()
@@ -1085,6 +1104,31 @@ static void *gexw_ntdll_proc(const char *name)
                         types = ', '.join([ctype[c] for c in ps[:-1]] + ['int'] * VARARGS_WORDS)
                         args = ', '.join([f'a{i}' for i in range(len(ps) - 1)] +
                                          [f'((const int *)a{len(ps) - 1})[{j}]' for j in range(VARARGS_WORDS)])
+                    # A small struct by value (x64: 1, 2, 4 or 8 bytes, in its
+                    # argument's register): the caller hands over a pointer to
+                    # it, as wasm passes one; the stub passes the struct on by
+                    # value, so the ICALL pass's exit stub puts the struct in
+                    # its slot, not the pointer. (The owner's gexw.sig64 says
+                    # which; its .spec says int64. A larger one goes by
+                    # reference, as the pointer it already is.)
+                    if WINE64:
+                        if owner not in owner_sigs:
+                            owner_sigs[owner] = wasm_sig64(others[owner][:-len('.exports')]) if others[owner].endswith('.so.exports') else {}
+                        osig = owner_sigs[owner].get(n, '')
+                        ors, _, ops = osig.partition(':')
+                        ops = re.findall(r'b\d+|[a-zA-Z]', ops)
+                        lead = 1 if ors.startswith('s') else 0  # (a struct return's buffer)
+                        if len(ops) + lead == len(ps):
+                            byval = {lead + j: int(t[1:]) for j, t in enumerate(ops)
+                                     if t[0] == 'b' and int(t[1:]) in (2, 4, 8)}
+                            if byval:
+                                for sz in sorted(set(byval.values()) - written_bv):
+                                    f.write(f'struct gexw_bv{sz} {{ char c0; char c[{sz - 1}]; }};\n')
+                                    written_bv.add(sz)
+                                types = ', '.join(f'struct gexw_bv{byval[i]}' if i in byval else ctype[c]
+                                                  for i, c in enumerate(ps))
+                                args = ', '.join(f'*(const struct gexw_bv{byval[i]} *)(__SIZE_TYPE__)a{i}' if i in byval
+                                                 else f'a{i}' for i in range(len(ps)))
                     f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{sym}");\n')
                     # (bound by its DLL's entry point when the owner is a
                     # static import, else on first call, as a delay load)
@@ -1114,7 +1158,12 @@ static void *gexw_ntdll_proc(const char *name)
                             for k, _, n in (m for m in mine if m[1] == o):
                                 f.write(f'    if (!gp[{k}]) gp[{k}] = gexw_ntdll_proc("{n}");\n')
                             continue
-                        f.write(f'    {{ void *h = gexw_GetModuleHandleA("{LOAD_NAME.get(o, o)}");\n      if (h) {{\n')
+                        # (a program's, at its entry point: the DLL loaded
+                        # first, as its import table would have had the
+                        # loader do; GetModuleHandle finds it before its
+                        # first call, as a PE program's static import)
+                        get = 'gexw_LoadLibraryA' if mod.lower().endswith('.exe') else 'gexw_GetModuleHandleA'
+                        f.write(f'    {{ void *h = {get}("{LOAD_NAME.get(o, o)}");\n      if (h) {{\n')
                         for k, _, n in (m for m in mine if m[1] == o):
                             f.write(f'        if (!gp[{k}]) gp[{k}] = gexw_GetProcAddress(h, "{n}");\n')
                         f.write('      }\n    }\n')
