@@ -5896,6 +5896,13 @@ export class Gex {
     const key = this.#cgenStr(e.gex_cgen_key, r);
     const got = this.#env.loadUnit?.(key) ?? null;
     if (!got) return;
+    // Entries with no module this page can load (a cache the site was built
+    // from holding region entries its files lack): left out, the unit's
+    // code reaching those addresses through tier-1 as without them.
+    if (!this.#sharedModules.has(`cgen:${key}`) && !got.wasm) {
+      console.error(`gex-cgen: ${path}: region entries ${key} have no module here; left out`);
+      return;
+    }
     this.#cgenModule(key, got);
     const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
     const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
