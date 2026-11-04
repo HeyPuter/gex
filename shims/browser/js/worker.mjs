@@ -882,11 +882,10 @@ async function handle(msg) {
     });
   } else if (msg.glChannel) {
     const { GlProxy } = await bridge('gl');
-    gex.useGl(new GlProxy(msg.glChannel, () => {
-      // An OffscreenCanvas renderer waits on the control word directly. Keep
-      // thousands of synchronous query wake-ups off the page event loop.
-      if (!msg.glChannel.direct) port.post({ kind: 'gl' });
-    }));
+    // Posted only to a device that does not wait on the channel itself
+    // (GlProxy): an OffscreenCanvas renderer waits on the control word, and
+    // thousands of synchronous queries a second stay off the event loops.
+    gex.useGl(new GlProxy(msg.glChannel, () => port.post({ kind: 'gl' })));
   }
   // The GL device runs D3D too: /dev/gex-d3d beside /dev/gex-gl.
   if (msg.glChannel?.d3d) gex.useD3d(true);
