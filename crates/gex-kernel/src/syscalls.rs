@@ -1824,7 +1824,8 @@ impl FdIo<'_> {
             }
             nr::READV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                // (a terminal's polling read answers 0 instead: `polling_read`)
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 let (buf, len) = self.first_iovec(m, a)?;
@@ -1839,7 +1840,7 @@ impl FdIo<'_> {
             }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 Some(BlockOp::ReadStream {
@@ -1851,6 +1852,14 @@ impl FdIo<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Whether `fd` is a blocking descriptor of a terminal whose empty reads
+    /// return 0 ([`crate::vfs::FileHandle::empty_read_returns`]).
+    fn polling_read(&self, fd: u64) -> bool {
+        self.fds.get(fd as i32).is_ok_and(|f| {
+            f.flags() & crate::fs::oflags::O_NONBLOCK == 0 && f.handle.empty_read_returns()
+        })
     }
 
     /// The park for a `read`/`readv` or `write`/`writev` that returned
@@ -7576,6 +7585,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.io.call(m, n, a) else { unreachable!("free_class admitted a call FdIo does not make") };
         // Lost the room or the bytes to another Worker since the check:
         // park, as the full call does.
+        // (a terminal's polling read: 0, as the full call answers)
+        let r = if r == Err(Errno::EAGAIN) && matches!(n, nr::READ | nr::READV) && f.io.polling_read(a[0]) { Ok(0) } else { r };
         if r == Err(Errno::EAGAIN) {
             if let Some(op) = f.io.eagain_park(m, n, a) {
                 return FreeOutcome::Blocking(op, None);
@@ -10289,6 +10300,12 @@ impl Kernel {
         // returns that short count, which its callers loop on.
         // A blocking read can lose the same race to another reader of the
         // pipe (two readers of one pipe).
+        // A blocking read of a terminal in non-canonical mode with `VMIN` and
+        // `VTIME` 0 that found nothing: 0, at once (termios(3)), not a wait.
+        let outcome = match outcome {
+            Ok(Err(Errno::EAGAIN)) if matches!(n, nr::READ | nr::READV) && self.fd_io().polling_read(a[0]) => Ok(Ok(0)),
+            o => o,
+        };
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. });

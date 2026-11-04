@@ -13,6 +13,14 @@
 
 use std::sync::Mutex;
 
+/// Whether a read of a terminal with these termios (the kernel's layout)
+/// returns at once when there is nothing to read: non-canonical, `VMIN` 0
+/// and `VTIME` 0.
+pub fn polling_read(t: &[u8; 60]) -> bool {
+    let l = u32::from_le_bytes([t[12], t[13], t[14], t[15]]);
+    l & lflag::ICANON == 0 && t[CC_AT + cc::VMIN] == 0 && t[CC_AT + cc::VTIME] == 0
+}
+
 /// Indices into `c_cc`. The kernel's `NCCS` is 19 on this architecture, not
 /// the 32 a C library declares for its own larger structure.
 pub mod cc {
@@ -906,6 +914,20 @@ mod tests {
 
     fn typed(t: &Tty, s: &str) -> Input {
         t.input(s.as_bytes())
+    }
+
+    #[test]
+    fn only_raw_vmin_0_vtime_0_is_a_polling_read() {
+        // btop's key loop reads until a read gives 0: a cooked terminal, or a
+        // raw one with VMIN 1 or a VTIME, waits instead.
+        let mut t = COOKED;
+        assert!(!polling_read(&t));
+        t[12] &= !(lflag::ICANON as u8);
+        assert!(!polling_read(&t), "VMIN 1");
+        t[CC_AT + cc::VMIN] = 0;
+        assert!(polling_read(&t));
+        t[CC_AT + cc::VTIME] = 5;
+        assert!(!polling_read(&t), "VTIME 5");
     }
 
     #[test]
