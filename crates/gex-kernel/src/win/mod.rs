@@ -122,8 +122,12 @@ pub mod tramp {
     /// stack: native Wine's own frames run on that stack (below the guest's
     /// stack pointer, as Windows' do), as wasm code whose stores no guard
     /// page stops, so the stack's end is checked before each such call
-    /// instead, with room for the native frames until the next.
-    pub const NATIVE_CALL_ROOM: u64 = 32 << 10;
+    /// instead, with room for the native frames until the next. Wine's own
+    /// minimum (ntdll's `min_kernel_stack`, 8 KiB): a user-mode callback
+    /// whose stack comes within it is refused by Wine first
+    /// (`KeUserModeCallback`'s STATUS_STACK_OVERFLOW, which the program goes
+    /// on from), so only a guest call Wine does not bound ends the process.
+    pub const NATIVE_CALL_ROOM: u64 = 8 << 10;
 
     /// Whether a guest call from native Wine with the stack at `sp` finds
     /// its thread's stack spent: less than [`NATIVE_CALL_ROOM`] above the
