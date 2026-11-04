@@ -234,6 +234,7 @@ pub mod raw {
     pub const FDATASYNC: u64 = 75;
     pub const TRUNCATE: u64 = 76;
     pub const FTRUNCATE: u64 = 77;
+    pub const FADVISE64: u64 = 221;
     pub const GETDENTS: u64 = 78;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
@@ -717,8 +718,12 @@ pub fn translate(
         151 => nr::MLOCKALL,
         152 => nr::MUNLOCKALL,
         325 => nr::MLOCK2,
-        // Advisory: fadvise64, readahead, sched_setaffinity.
-        221 | 187 | 203 => nr::NOOP_OK,
+        // fadvise64 is the canonical one: gex's own advice (`vfs::FADV_GEX_IMAGE`,
+        // which 64-bit Wine's ntdll gives before an image mapping) and
+        // WILLNEED fetch a lazy file's parts.
+        x::FADVISE64 => nr::FADVISE64,
+        // Advisory: readahead, sched_setaffinity.
+        187 | 203 => nr::NOOP_OK,
         _ => UNKNOWN,
     }
 }

@@ -107,8 +107,12 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
         bail!("{path}: a wasm32 program, which needs a 32-bit memory, and this run has a 64-bit one (run its first program with --mem32)");
     }
-    // 32-bit Wine's loader: refused when its inline probe reads another layout.
-    if flags(program) & FLAG_GUEST_I386 != 0 {
+    // Wine's loader: refused when its inline probe reads another layout. Every
+    // 32-bit guest program is Wine's loader; a 64-bit one is when it is bound
+    // to the probe layout (abi_bound: its gex.abi section, or its gex.call_out
+    // import), as gex's own x86-64 guest programs are not.
+    let f = flags(program);
+    if f & FLAG_GUEST_I386 != 0 || (f & FLAG_GUEST_X86_64 != 0 && gex_cgen::header::abi_bound(&wasm)) {
         let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
         if let Some(e) = gex_cgen::header::abi_refusal(&wasm, &format!("Wine's loader {path}")) {
             bail!("{e}");

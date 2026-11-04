@@ -7054,6 +7054,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE => nr::FTRUNCATE,
             x::TRUNCATE => nr::TRUNCATE,
+            x::FADVISE64 => nr::FADVISE64,
             x::STATFS => nr::STATFS,
             x::FSTATFS => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
