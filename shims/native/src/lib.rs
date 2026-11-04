@@ -28,6 +28,7 @@ mod ready;
 mod pty;
 mod sys_waits;
 mod stall;
+mod usage;
 pub(crate) mod ftab;
 pub(crate) mod door;
 pub mod wayland;
@@ -2241,6 +2242,9 @@ fn run_thread_loop(
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
     store.data_mut().root_enter = Some(enter.clone());
+    // This host thread's processor time is its process's while it runs here.
+    usage::install();
+    let _cpu = store.data_mut().with_kernel(|k| usage::Counting::enter(k));
     // Units for code that is in place before the first instruction (the
     // interpreter, which gex's loader places): installed now, not at the
     // first syscall, or what runs before it -- ld.so relocating itself --
@@ -2876,6 +2880,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 k.fds.close_all();
             }
             procs.exit(pid, wstatus);
+            usage::forget(pid);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
@@ -4373,6 +4378,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { let r = (|| -> anyhow::Result<()> {
+            usage::tick();
             // A system call from the other mode's code (int 0x80, syscall or
             // sysenter in a WoW64 thread's 32-bit code): no such gate, #GP.
             // (Not gexrt's own call from a native i386 Wine module, marked
