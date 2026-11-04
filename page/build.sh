@@ -78,7 +78,7 @@ say() { printf '\n== %s\n' "$*"; }
 
 # -- 1. shared by both: shim, kernel, seeds, providers, rootfs ----------------
 if [ "$ASSETS" = 1 ]; then
-    say "runtime and assets (both flavours)"
+    say "runtime and assets"
     # build-assets.sh ends by refreshing page/dist through refresh-dist.sh,
     # which would call back into this script.
     GEX_NO_REFRESH_DIST=1 "$HERE/build-assets.sh"
