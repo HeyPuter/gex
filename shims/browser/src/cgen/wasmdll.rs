@@ -1286,8 +1286,9 @@ pub extern "C" fn gex_wasmdll_thunks(number: u32, buf: u32, cap: u32) -> u32 {
 
 /// A module of thunks for calls into a module not yet installed (`L`): its
 /// function `k` (exported as `k`) calls `slots[k]`'s table entry, with
-/// `call_indirect` once the Worker has filled it (its imported global `r.k`
-/// set), else JS's import `s.k`, which catches up first. In wasm, so a
+/// `call_indirect` once the Worker has filled it (its flag set: byte
+/// `r.b + k` of the Worker's flag store, the memory `r.m`), else JS's
+/// import `s.k`, which catches up first. In wasm, so a
 /// call through it keeps no JS frame below the callee: the single-thread
 /// build suspends the whole stack at a blocking call, which a JS frame
 /// would refuse.
@@ -1312,15 +1313,18 @@ fn late_thunks(slots: &[(wasmparser::FuncType, u32)]) -> Vec<u8> {
     for (k, (ty, _)) in slots.iter().enumerate() {
         types.ty().function(ty.params().iter().map(vt), ty.results().iter().map(vt));
         imports.import("s", &k.to_string(), we::EntityType::Function(k as u32));
-        imports.import("r", &k.to_string(), we::GlobalType { val_type: we::ValType::I32, mutable: true, shared: false });
     }
+    // the Worker's ready flags, a byte each, this module's from `r.b` on
+    imports.import("r", "m", we::MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+    imports.import("r", "b", we::GlobalType { val_type: we::ValType::I32, mutable: false, shared: false });
     for (k, (ty, slot)) in slots.iter().enumerate() {
         let k = k as u32;
         funcs.function(k);
         exports.export(&k.to_string(), we::ExportKind::Func, n + k);
         let mut f = we::Function::new([]);
         let np = ty.params().len() as u32;
-        f.instruction(&we::Instruction::GlobalGet(k));
+        f.instruction(&we::Instruction::GlobalGet(0));
+        f.instruction(&we::Instruction::I32Load8U(we::MemArg { offset: k as u64, align: 0, memory_index: 0 }));
         f.instruction(&we::Instruction::I32Eqz);
         f.instruction(&we::Instruction::If(we::BlockType::Empty));
         for p in 0..np {

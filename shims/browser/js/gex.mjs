@@ -6204,7 +6204,11 @@ export class Gex {
       e.gex_free?.(buf, n);
     }
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
-    const late = {}, lines = [];
+    const s = {}, lines = [];
+    const t = st.ftab, empty = t.get(tIdx(this.#wide, 0));
+    // the module's ready flags, a byte each from `base` in the Worker's
+    // store (`#lateFlags`), which its thunks read
+    let base = -1;
     for (const line of text.split('\n')) {
       if (!line) continue;
       const f = line.split('\t');
@@ -6223,26 +6227,19 @@ export class Gex {
         case 'L': {
           // a call through a slot filled once the module it calls into is
           // instantiated here (#wasmdllLate): a wasm thunk (cgen/wasmdll.rs
-          // `late_thunks`) calls the slot once filled, and before that this,
-          // which catches up first
-          const slot = tIdx(this.#wide, Number(f[3])), t = st.ftab, k = f[4];
-          const ready = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
-          const filled = () => { const fn = t.get(slot); return fn && fn !== t.get(tIdx(this.#wide, 0)) ? fn : null; };
-          (st.lateReady ??= new Map()).set(Number(f[3]), [...(st.lateReady.get(Number(f[3])) ?? []), ready]);
-          if (filled()) ready.value = 1;
-          (late.s ??= {})[k] = (...a) => {
-            let fn = filled();
-            if (!fn) {
-              this.#cgenCatchUp();
-              this.#wasmdllLate(st);
-              fn = filled();
-              if (!fn) throw new Error(`${f[2]}: its module is not installed`);
-            }
-            ready.value = 1;
-            return fn(...a);
-          };
-          (late.r ??= {})[k] = ready;
-          lines.push([f[1], f[2], k]);
+          // `late_thunks`) calls the slot once its flag is set, and before
+          // that this, which catches up first
+          if (base < 0) base = this.#lateFlagsTop(st);
+          const n = Number(f[3]), slot = tIdx(this.#wide, n), flag = base + Number(f[4]);
+          const ready = st.lateReady ??= new Map();
+          const had = ready.get(n);
+          if (had === undefined) ready.set(n, flag);
+          else if (typeof had === 'number') ready.set(n, [had, flag]);
+          else had.push(flag);
+          const fn = t.get(slot);
+          if (fn && fn !== empty) st.lateBytes[flag] = 1;
+          s[f[4]] = (...a) => this.#lateMiss(st, slot, flag, f[2], a);
+          lines.push([f[1], f[2], f[4]]);
           break;
         }
       }
@@ -6260,9 +6257,38 @@ export class Gex {
         }
         this.#wasmdllThunkMods.set(prov, mod);
       }
-      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s: late.s, r: late.r }).exports;
+      st.lateFlagsTop = base + lines.length;
+      const x = new WebAssembly.Instance(mod, { t: { t: st.ftab }, s, r: { m: st.lateFlags, b: new WebAssembly.Global({ value: 'i32', mutable: false }, base) } }).exports;
       for (const [m, name, k] of lines) set(m, name, x[k]);
     }
+  }
+
+  /** The next free byte of `st`'s ready-flag store (one per process, in this
+   *  Worker), which has room for one more module's flags after it. */
+  #lateFlagsTop(st) {
+    const top = st.lateFlagsTop ?? 0;
+    // no module has more `L` lines than this; grown before each module's
+    const room = 1 << 16;
+    if (!st.lateFlags) st.lateFlags = new WebAssembly.Memory({ initial: 1 });
+    const need = Math.ceil((top + room) / 65536) - st.lateFlags.buffer.byteLength / 65536;
+    if (need > 0) st.lateFlags.grow(need);
+    st.lateBytes = new Uint8Array(st.lateFlags.buffer);
+    return top;
+  }
+
+  /** A late call before its slot's flag is set: the Worker catches up, and
+   *  the slot then holds the callee (or the call fails). */
+  #lateMiss(st, slot, flag, name, a) {
+    const t = st.ftab, empty = t.get(tIdx(this.#wide, 0));
+    let fn = t.get(slot);
+    if (!fn || fn === empty) {
+      this.#cgenCatchUp();
+      this.#wasmdllLate(st);
+      fn = t.get(slot);
+      if (!fn || fn === empty) throw new Error(`${name}: its module is not installed`);
+    }
+    st.lateBytes[flag] = 1;
+    return fn(...a);
   }
 
   /** Fill the slots between Wine's PE modules (cgen/wasmdll.rs `Late`)
@@ -6314,7 +6340,9 @@ export class Gex {
       const f = p.exports[l.name];
       if (typeof f !== 'function') return;
       st.ftab.set(i, f);
-      for (const r of st.lateReady?.get(l.slot) ?? []) r.value = 1;
+      const r = st.lateReady?.get(l.slot);
+      if (typeof r === 'number') st.lateBytes[r] = 1;
+      else if (r) for (const k of r) st.lateBytes[k] = 1;
     };
     for (const l of fresh) fill(l);
     if (prov !== undefined) {
