@@ -121,10 +121,9 @@ musl-src:
 	GEX_SRC_SEED=$(MUSL_SEED) $(FETCH) $(MUSL_REPO) $(MUSL_COMMIT) $(CACHE)/mirror/musl.git $(MUSL_SRC)
 musl64-src:
 	GEX_SRC_SEED=$(MUSL64_SEED) $(FETCH) $(MUSL64_REPO) $(MUSL64_COMMIT) $(CACHE)/mirror/musl64.git $(MUSL64_SRC)
+# A given LLVM_SRC is used as it is (build-cxx.sh checks it is at the pin).
 llvm-src:
-	@[ -n "$(LLVM_REPO)$(LLVM_SEED)" ] || [ -e "$(LLVM_SRC)/.git" ] || \
-	  { echo "make gexcc: no LLVM_REPO in toolchain/pins yet; give LLVM_SRC (a checkout of $(LLVM_COMMIT)) or LLVM_SEED (a clone that has it)"; exit 1; }
-	GEX_SRC_SEED=$(LLVM_SEED) $(FETCH) --worktree "$(LLVM_REPO)" $(LLVM_COMMIT) $(CACHE)/mirror/llvm.git $(LLVM_SRC)
+	$(if $(filter file,$(origin LLVM_SRC)),GEX_SRC_SEED=$(LLVM_SEED) $(FETCH) --worktree $(LLVM_REPO) $(LLVM_COMMIT) $(CACHE)/mirror/llvm.git $(LLVM_SRC),@echo "LLVM from LLVM_SRC=$(LLVM_SRC)")
 wine64-src:
 	$(if $(WINE_DIR),@echo "64-bit Wine from WINE_DIR=$(WINE64_SRC)",GEX_SRC_SEED=$(WINE64_SEED) $(FETCH) --worktree $(WINE64_REPO) $(WINE64_COMMIT) $(CACHE)/mirror/wine64.git $(WINE64_SRC))
 
@@ -161,8 +160,8 @@ busybox: $(BUSYBOX)
 	@echo $(BUSYBOX)
 
 gexcc: musl-src llvm-src
-	cargo build -q --release -p gex-dylink
-	@[ -x $(GEXC_X86) ] || $(MAKE) gexc
+	$(NICE) cargo build -q --release -p gex-dylink
+	@[ -x $(GEXC_X86) ] || $(NICE) cargo build -q --release -p gexc --features x86 --target-dir target/x86
 	$(ROOT)/tools/wine-wasm/wine32/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(CACHE)/dl
 	GEXC_X86=$(GEXC_X86) GEX_DYLINK=$(ROOT)/target/release/gex-dylink JOBS=$(JOBS) LLVM_SRC=$(LLVM_SRC) \
 	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) $(NICE) sh $(ROOT)/tools/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)

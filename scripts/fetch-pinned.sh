@@ -10,7 +10,7 @@
 # worktree of the mirror, detached at COMMIT, for builds that read git (the
 # 64-bit Wine dist keys its steps by the tree's commits). Nothing happens when
 # OUT is already at COMMIT. The mirror is a bare repository, made on first
-# use, and fetched from only when it lacks COMMIT: by the commit itself, then,
+# use, and fetched from only when it lacks COMMIT: by the commit itself (shallow: its tree, not its history), then,
 # if the server will not serve a bare commit, every branch. GEX_SRC_SEED=DIR,
 # a local clone of the same repository, is fetched from first, so a machine
 # with a worktree of the fork needs no network.
@@ -33,7 +33,8 @@ fi
 if ! have; then
   [ -n "$repo" ] || { log "$commit is not in $mirror and no repository is pinned for it"; exit 1; }
   log "fetching $commit from $repo"
-  git --git-dir="$mirror" fetch -q "$repo" "$commit" 2>/dev/null ||
+  # the commit alone (shallow), else every branch
+  git --git-dir="$mirror" fetch -q --depth 1 "$repo" "$commit" 2>/dev/null ||
     git --git-dir="$mirror" fetch -q "$repo" '+refs/heads/*:refs/heads/*'
 fi
 have || { log "$commit is not in $repo"; exit 1; }

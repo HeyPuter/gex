@@ -6,9 +6,10 @@
 # which the Makefile includes beside this one. LLVM_COMMIT is in
 # tools/gexcc/llvm.pin.
 
-# The LLVM fork libc++ is built from (branch gex). It is not published yet:
-# until it is, `make gexcc` needs LLVM_SRC, a checkout of LLVM_COMMIT.
-LLVM_REPO :=
+# The LLVM fork libc++ is built from (branch gex), fetched at LLVM_COMMIT.
+# LLVM_SRC (a checkout of that commit) or LLVM_SEED (a clone that has it)
+# overrides the fetch.
+LLVM_REPO := https://github.com/MercuryWorkshop/llvm-project
 
 # busybox, the guest's /bin/sh and coreutils (make busybox, gexcc's install).
 BUSYBOX_VERSION := 1.37.0
