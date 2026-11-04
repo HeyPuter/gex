@@ -8038,7 +8038,7 @@ pub(crate) fn warn_line(s: &str) {
 }
 
 /// Write a line to the host's debug console, not the guest's stderr.
-fn trace_line(s: &str) {
+pub(crate) fn trace_line(s: &str) {
     unsafe { debug(s.as_ptr() as u32, s.len() as u32) };
 }
 
@@ -14253,7 +14253,7 @@ fn finish_mine(signalled: bool) -> i32 {
             1
         }
         Done::Ends(code) => {
-            exit_here(code, None);
+            exit_here(code, Some(ctx_pc()));
             2
         }
     }
@@ -14500,7 +14500,7 @@ fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
                 Done::At(c, pc) => Pick::Resumed(Some((c, pc))),
                 Done::Ends(code) => {
                     drop(r);
-                    exit_here(code, None);
+                    exit_here(code, Some(ctx_pc()));
                     Pick::Resumed(None)
                 }
             };
@@ -14599,11 +14599,12 @@ fn killed(signal: i32, at: u64) -> i32 {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal} (a write with no reader)\n"));
     } else {
     warn_line(&format!(
-        "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  stderr: {}\n  threads:{}\n  \
+        "[gex] pid {} killed by signal {}{from} at pc={at:#x} {}\n  sent by: {}\n  stderr: {}\n  threads:{}\n  \
          this thread:{}\n  last calls (this thread):{}\n  address space:{}\n  futexes:{}",
         pid,
         signal,
         object_off_at(at),
+        sent_by(&home.sig),
         last_stderr(),
         // Every thread, not only the one that died. Two threads
         // sharing a register context would clobber each other and
@@ -14632,12 +14633,44 @@ fn killed(signal: i32, at: u64) -> i32 {
     exit_process(-signal)
 }
 
+/// Who made the fatal signal pending, as its delivery found it
+/// (`ProcSig::fatal`), and the last fault signal a handler was given: a
+/// crash handler (KCrash) that re-raises a fault dies of its own `tgkill`,
+/// and the handled one says where the first came from.
+fn sent_by(sig: &gex_kernel::signal::ProcSig) -> String {
+    fn one((signo, src, own): (u32, Option<gex_kernel::signal::Source>, bool)) -> String {
+        let to = if own { "this thread" } else { "the process" };
+        match src {
+            Some(s) => {
+                let how = match s.code {
+                    gex_kernel::signal::SI_USER => "kill",
+                    gex_kernel::signal::SI_TKILL => "tgkill",
+                    _ => "?",
+                };
+                format!("signal {signo} to {to} by {how} from pid {} (si_code {})", s.pid, s.code)
+            }
+            None => format!("signal {signo} to {to}, no sender (a fault or the kernel)"),
+        }
+    }
+    let mut out = sig.fatal().map_or_else(|| "not a delivery (a fault or a failed return)".to_string(), one);
+    if let Some(h) = sig.handled_fault() {
+        out.push_str(&format!("; earlier handled fault: {}", one(h)));
+    }
+    if let Some((from, pid, tid, signo)) = sig.fault_send() {
+        out.push_str(&format!("; this process's thread {from} last sent signal {signo} to pid {pid} thread {tid}"));
+    }
+    out
+}
+
 /// The dying thread's registers that say where it was -- the first
 /// arguments, x8, the frame and link registers, sp -- and its callers by
 /// the frame-pointer chain (`[x29]` the caller's x29, `[x29+8]` its return
 /// address), each as object+offset: a fault's pc alone is the block it was
 /// in, not who called it with what.
 fn dying_frames() -> String {
+    if compat_abi() {
+        return dying_frames_i386();
+    }
     if gex_abi::X86 {
         return String::new();
     }
@@ -14688,10 +14721,55 @@ fn dying_frames() -> String {
     out
 }
 
+/// [`dying_frames`] for an i386-ABI process (a wasm32 program, an i386
+/// one): its own registers, `eax`..`edi` in their context slots, `esp` and
+/// `eip`, and the `ebp` chain (`[ebp]` the caller's, `[ebp+4]` its return
+/// address) where there is one. The AArch64 slots such a process never sets
+/// read as zeros, which looked like a frame wiped to nothing.
+fn dying_frames_i386() -> String {
+    let ctx_addr = ctx_addr_get();
+    let gm = GuestMem::new(guest_bytes());
+    let reg = |i: u8| gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0) & 0xffff_ffff;
+    let (esp, ebp) = (reg(4), reg(5));
+    let eip = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    let mut out = format!(
+        " eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} ebp={ebp:#x} esp={esp:#x} eip={eip:#x} {}",
+        reg(0),
+        reg(3),
+        reg(1),
+        reg(2),
+        reg(6),
+        reg(7),
+        object_off_at(eip),
+    );
+    // Bounded as the AArch64 walk: 24 frames, each above the last, within
+    // 8 MiB above esp.
+    let mut fp = ebp;
+    for _ in 0..24 {
+        if fp == 0 || fp & 3 != 0 || fp < esp || fp - esp > 8 << 20 {
+            break;
+        }
+        let ret = gm.read_u32(fp + 4).unwrap_or(0) as u64;
+        out.push_str(&format!("\n    #fp {ret:#x} {}", object_off_at(ret)));
+        let next = gm.read_u32(fp).unwrap_or(0) as u64;
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    out
+}
+
 /// End this Worker's process (`exit_process`), from outside the kernel: a
 /// signal's default action, met by a thread delivering to itself, or a
 /// halted machine. With `killed_at`, the thread's pc, a signal's death is
 /// reported as a syscall's is ([`killed`]). The stop value (2).
+/// This Worker's thread's context pc, for a death report: where a parked
+/// call that a fatal signal ended was made.
+fn ctx_pc() -> u64 {
+    GuestMem::new(guest_bytes()).read_u64(my_ctx() + ctx::PC as u64).unwrap_or(0)
+}
+
 fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
     match killed_at {
         Some(at) if code < 0 => killed(-code, at),
@@ -16640,7 +16718,7 @@ fn safepoint(ctx: i32, pc: i64) {
             }
             // The process ends, which is the kernel's.
             gex_kernel::signal::Delivery::Terminate { signal, .. } => {
-                exit_here(-(signal as i32), None);
+                exit_here(-(signal as i32), Some(pc as u64));
                 trap();
             }
         }

@@ -399,9 +399,29 @@ pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, a
     view.forget_source(signo);
     let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
     match signal::setup_frame(&view, gm, ctx_addr, signo, addr, compat) {
-        Ok(target) => Delivery::Resume(target),
+        Ok(target) => {
+            home.sig.note_fault_handled(signo);
+            fault_note(home.pid, signo, pc, addr);
+            Delivery::Resume(target)
+        }
         Err(_) => end,
     }
+}
+
+/// A fault that goes to the program's handler, said in a traced process
+/// (`?strace`, `straceexe=`; off by default and nothing done then: Wine's
+/// and .NET's processes take handled faults routinely). A crash handler
+/// that re-raises the signal (KCrash) otherwise leaves nothing of the real
+/// fault.
+fn fault_note(pid: i32, signo: u32, pc: u64, addr: u64) {
+    if !crate::tracing() {
+        return;
+    }
+    crate::trace_line(&format!(
+        "[gex] pid {pid}: {} at pc={pc:#x} {} address {addr:#x}, to its handler\n",
+        signal::fault_name(signo),
+        crate::object_off_at(pc),
+    ));
 }
 
 /// This Worker's thread's signal state as one `Signals`.
