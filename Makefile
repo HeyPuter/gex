@@ -123,6 +123,10 @@ upper = $(subst x86_64,X86_64,$(subst aarch64,AARCH64,$(1)))
 # emcc from EMSDK at toolchain/pins' EMSCRIPTEN_VERSION, first on PATH
 EMCC_CHECK = v=$$(tr -d '"' < $(EMSDK)/upstream/emscripten/emscripten-version.txt 2>/dev/null); \
   [ "$$v" = "$(EMSCRIPTEN_VERSION)" ] || { echo "make: EMSDK=$(EMSDK) has Emscripten '$$v', not toolchain/pins' $(EMSCRIPTEN_VERSION) (emsdk install $(EMSCRIPTEN_VERSION))"; exit 1; }
+# Mesa: only what the page loads (gex-wgpu-replay); GEX_MESA_PAGE_ONLY=0 also
+# links the softpipe replay and the smokes the Mesa tests use.
+GEX_MESA_PAGE_ONLY ?= 1
+export GEX_MESA_PAGE_ONLY
 PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
 
 page: toolchains
