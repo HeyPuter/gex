@@ -1,5 +1,5 @@
 /* Known tones through /dev/dsp, for the page's audio ring
- * (shims/kernel/src/audio.rs; test/page/audio.test.js reads it back);
+ * (hosts/kernel/src/audio.rs; test/page/audio.test.js reads it back);
  * a host without /dev/dsp cannot be its reference:
  * 441 Hz, S16 stereo at 44100 Hz for 0.5 s, then, after the device has been
  * quiet long enough for another stream to take it, a second open playing

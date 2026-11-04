@@ -20,24 +20,24 @@ crates/gex-cgen/providers/dlmalloc.inc
     dlmalloc by Doug Lea, released to the public domain (CC0), with
     Emscripten's changes (Copyright the Emscripten authors, MIT licence).
 
-tools/wine-wasm/wine32/oss/sys/soundcard.h
+wine/oss/sys/soundcard.h
     FreeBSD's sys/soundcard.h (OSSv4 API), Copyright Hannu Savolainen,
     4Front Technologies, Luigi Rizzo and others. BSD-2-Clause (in the file).
 
-web/eject-site/vendor/zstddec-stream.mjs, web/eject-site/vendor/zstddec.wasm
+page/vendor/zstddec/zstddec-stream.mjs, page/vendor/zstddec/zstddec.wasm
     zstddec, Copyright (c) 2020 Don McCurdy. MIT licence
-    (web/eject-site/vendor/zstddec-LICENSE).
+    (page/vendor/zstddec/zstddec-LICENSE).
 
-guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
+guest/gl/*-generated.inc, ports/mesa/src/*-generated-*.inc
     Generated from the Khronos OpenGL API registry (gl.xml), Copyright
     The Khronos Group Inc. Apache-2.0 (its text is the first part of
     third_party/wasmtime-49.0.2/LICENSE).
 
-web/tint/dawn-tint-emscripten.patch
+ports/tint/dawn-tint-emscripten.patch
     Changes to Dawn/Tint, under the licence of the project it applies
     to.
 
-tools/gexcc/patches/libcxx-*.patch
+toolchain/gexcc/patches/libcxx-*.patch
     Changes to LLVM's libc++, under the licence of the project they apply
     to (Apache-2.0 WITH LLVM-exception).
 

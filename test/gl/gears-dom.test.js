@@ -3,10 +3,10 @@
 // into a pbuffer through Mesa on WebGPU, then reading the last one back. It
 // must draw as much of the frame as it does on the host's own Mesa
 // (fixtures/images.mjs `gl-probes`), with no GL error.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], images: ['gl-probes'], timeout: 300 };
 

@@ -14,7 +14,7 @@
 //! Words after the architecture on the first line:
 //! * `stateful`: the provider may have static data and a C stack; the host
 //!   gives it both as it gives an ejected project's stateful providers
-//!   (shims/native libprov: data in guest pages from the NT allocator, one
+//!   (hosts/native libprov: data in guest pages from the NT allocator, one
 //!   stack per thread), and it may `#include` the files in [`INCLUDES`];
 //! * `nowine`: not for Wine's own build of the library (one whose DOS stub
 //!   says "Wine builtin DLL"), whose internals reach the same state by

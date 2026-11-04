@@ -3,8 +3,8 @@
 // the test programs at /progs/{x64,x86}. Then `run(exe, args)` copies a test
 // program into C:\ and runs it with Wine: `{ code, stdout, stderr }`, the
 // output's line ends Unix ones.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 

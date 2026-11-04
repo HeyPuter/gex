@@ -5,8 +5,8 @@ Called by: make lint.
     scripts/lint-scripts.py [-v]
 
 A script is a tracked file that is executable, ends in .sh, .py or .mjs, or is
-a Makefile, outside third_party, crates/*/src, the page's and runtime's module sources
-(web/src, web/runtime/src, shims/browser/js's modules) and test/ (run.mjs's own
+a Makefile or .mk, outside third_party, crates/*/src, the page's and runtime's module sources
+(page/src, page/runtime/src, hosts/browser/js's modules) and test/ (run.mjs's own
 tree). It passes when one of these holds:
   - the Makefile names it;
   - a file that is reached names it (its path from the tree's root, its path
@@ -32,13 +32,13 @@ for line in files:
     m, _, _, path = line.split(None, 3)
     mode[path] = m
 
-SOURCE = re.compile(r'^(third_party/|crates/[^/]+/src/|web/src/|web/runtime/src/|test/)')
+SOURCE = re.compile(r'^(third_party/|crates/[^/]+/src/|page/src/|page/runtime/src/|test/)')
 def is_script(p):
     if SOURCE.match(p):
         return False
-    if p.startswith('shims/browser/js/') and not os.path.basename(p).startswith('check-'):
+    if p.startswith('hosts/browser/js/') and not os.path.basename(p).startswith('check-'):
         return False
-    if p.endswith(('.sh', '.py', '.mjs')) or (os.path.basename(p) == 'Makefile' and p != 'Makefile'):
+    if p.endswith(('.sh', '.py', '.mjs', '.mk')) or (os.path.basename(p) == 'Makefile' and p != 'Makefile'):
         return True
     if mode[p] != '100755':
         return False

@@ -3,10 +3,10 @@
 // window's own GL canvas over the page's window (dom-compositor.js
 // `showGlCanvas`), and the page showing them, as the browser composited it.
 // x86 only: gles-window is in that tree alone (it has the host's Xlib).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: ['gl-probes'], timeout: 300, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };

@@ -1,0 +1,365 @@
+// A 32-bit Wine program's bundle as a site ships it, for every site builder (site/eject-site.mjs,
+// site/page-site.mjs): the tar extracted, its .wasm stripped, what the browser never
+// reads pruned, the bundle split (the files the recorded run opened stay in it, the
+// rest become lazy files the page reads from the host when a guest first opens one),
+// and the tar written again, deduplicated by content.
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, join, relative } from 'node:path';
+
+const sha = (b) => createHash('sha256').update(b).digest('hex');
+
+/** Each regular file (or symbolic link) under DIR: fn(path, path relative to BASE). */
+export function walk(dir, fn, base = dir) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walk(p, fn, base);
+    else if (e.isFile() || e.isSymbolicLink()) fn(p, relative(base, p));
+  }
+}
+
+/** A .wasm's copy without its debug sections (in WORK/strip, by content), or
+ *  SRC itself when `on` is false or it is no .wasm. */
+export function stripper(work, on) {
+  return (src) => {
+    if (!on || !src.endsWith('.wasm')) return src;
+    const dst = join(work, 'strip', sha(readFileSync(src)));
+    mkdirSync(dirname(dst), { recursive: true });
+    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
+    return dst;
+  };
+}
+
+/**
+ * TAR extracted into WORK/tarx. A read-only directory (a prefix's Start menu
+ * folders, which the shell reads desktop.ini names from only when read only)
+ * is made writable while files leave it, and packed with its own mode again
+ * (`pack`). Every directory's times are the bundle's again when it is packed:
+ * the files that leave it (the split) do not stamp it with the build's time,
+ * which a program may key a cache on (KDE's app database, a Windows app's),
+ * and the site is the same bytes each build.
+ */
+export function extract(tar, work) {
+  const x = join(work, 'tarx');
+  mkdirSync(x, { recursive: true });
+  execFileSync('tar', ['-xf', tar, '-C', x]);
+  const readOnly = [];
+  const unlock = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const p = join(d, e.name);
+      const mode = statSync(p).mode & 0o7777;
+      if (!(mode & 0o200)) { readOnly.push([p, mode]); chmodSync(p, mode | 0o700); }
+      unlock(p);
+    }
+  };
+  unlock(x);
+  const dirTimes = [];
+  const times = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const p = join(d, e.name);
+      const st = statSync(p);
+      dirTimes.push([p, st.atime, st.mtime]);
+      times(p);
+    }
+  };
+  times(x);
+  return { x, readOnly, dirTimes };
+}
+
+/** --strip: every .wasm of the tree stripped, with the file's own times. */
+export function stripTree(x, stripped) {
+  walk(x, (p) => {
+    if (!p.endsWith('.wasm')) return;
+    const st = statSync(p);
+    copyFileSync(stripped(p), p);
+    utimesSync(p, st.atime, st.mtime);
+  });
+}
+
+/** --prune: the files the browser never reads (precompiled .cwasm, static archives). */
+export function pruneTree(x) {
+  walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+}
+
+/** The name of a dist's rest-only list: files of its directory, one a line,
+ *  that a site keeps out of its boot bundle whatever a recorded run read (a
+ *  side module the loader dlopens only when a program needs it, such as
+ *  Wine's winegstreamer.so). They are lazy files of the compressed rest
+ *  bundle, fetched on the first read. */
+export const REST_ONLY = 'gex-rest-only';
+
+/** Whether TAR has a rest-only list (`REST_ONLY`). */
+export function hasRestOnly(tar) {
+  const names = execFileSync('tar', ['-tf', tar], { maxBuffer: 1 << 30 }).toString().split('\n');
+  return names.some((n) => n === REST_ONLY || n.endsWith(`/${REST_ONLY}`));
+}
+
+/** The guest paths (`/REL`) the rest-only lists of tree X name. */
+export function restOnly(x) {
+  const only = new Set();
+  walk(x, (p, rel) => {
+    if (rel.split('/').pop() !== REST_ONLY) return;
+    const dir = dirname(`/${rel}`);
+    for (const l of readFileSync(p, 'utf8').split('\n').map((v) => v.trim()).filter((v) => v && !v.startsWith('#'))) only.add(`${dir === '/' ? '' : dir}/${l}`);
+  });
+  return only;
+}
+
+/** The bundle split's read set with the rest-only files (`restOnly`) out of
+ *  it: READ less them, or, with no READ (a bundle not split), every file of X
+ *  but them. Null when there are none and no READ. */
+export function readLessRestOnly(x, read) {
+  const only = restOnly(x);
+  if (!only.size) return read;
+  if (read) { for (const p of only) read.delete(p); return read; }
+  const all = new Set();
+  walk(x, (p, rel) => { if (!only.has(`/${rel}`)) all.add(`/${rel}`); });
+  return all;
+}
+
+/**
+ * The bundle split: every file of the tree that READ (guest paths) does not
+ * name leaves it for STORE, once by content (named by its hash). A file with
+ * the same bytes as one the run read stays too: zstd's window stores it as a
+ * match, so it costs the download nothing, and a read the recording missed
+ * (Paint opens WinSxS's copy of gdiplus.dll in some runs) is not a lazy fetch
+ * of the whole raw file. Returns the lazy files, `[path, size, hash, mtime]`
+ * (the time for `mtimes=1`: wineboot compares wine.inf's with the prefix's).
+ */
+export function splitTree(x, read, store) {
+  mkdirSync(store, { recursive: true });
+  const lazy = [];
+  const kept = new Set();
+  walk(x, (p, rel) => { if (lstatSync(p).isFile() && read.has(`/${rel}`)) kept.add(sha(readFileSync(p))); });
+  walk(x, (p, rel) => {
+    const st = lstatSync(p);
+    if (!st.isFile() || read.has(`/${rel}`)) return;
+    const b = readFileSync(p);
+    const h = sha(b);
+    if (kept.has(h)) return;
+    if (!existsSync(join(store, h))) writeFileSync(join(store, h), b);
+    lazy.push([`/${rel}`, st.size, h, Math.trunc(st.mtimeMs / 1000)]);
+    rmSync(p);
+  });
+  return lazy;
+}
+
+/** eject-site.mjs --rest-paths lines: `PATH`, `PATH HEAD` (HEAD a whole
+ *  number of MiB) or `PATH HEAD tail`, as [path, head bytes or 0, tail]. */
+export const restPaths = (lines) => lines.map((l) => {
+  const m = /^(.*\S)\s+(\d+)(\s+tail)?$/.exec(l);
+  return m ? [m[1], Number(m[2]) * 1048576, !!m[3]] : [l, 0, false];
+});
+
+const LAZY_CHUNK = 1048576;
+
+/** The lazy files' heads (`heads`, guest path -> {head, tail}) back in the
+ *  tree `x` at their paths, each the first `head` bytes of its lazy copy in
+ *  `store` and, with `tail`, its last, partial chunk after them, with its
+ *  time: a lazy file of the rest bundle whose start the boot reads (the
+ *  title's music) or whose start and end (an archive's table at its end) has
+ *  those parts in the bundle too, at its first-read place, and the kernel
+ *  holds them as the file's chunks (tmpfs.rs `seed_head`). `heads` then maps
+ *  each to the copy's length; a file no shorter than its copy has none, and
+ *  a file a whole number of chunks long has no tail (both dropped). */
+export function placeHeads(x, lazy, store, heads) {
+  for (const [p, size, h, mtime] of lazy) {
+    const want = heads.get(p);
+    if (want === undefined) continue;
+    const { head, tail } = typeof want === 'number' ? { head: want, tail: false } : want;
+    const t = tail ? size % LAZY_CHUNK : 0;
+    if (tail && !t) console.log(`eject-site: ${p}: a whole number of chunks long, so no tail`);
+    if (head + t >= size || (!head && !t)) { heads.delete(p); continue; }
+    const all = readFileSync(join(store, h));
+    const dst = join(x, p.slice(1));
+    writeFileSync(dst, Buffer.concat([all.subarray(0, head), all.subarray(size - t)]));
+    utimesSync(dst, mtime, mtime);
+    heads.set(p, head + t);
+    console.log(`eject-site: ${p}: its first ${head / 1048576} MiB${t ? ` and its last ${t} bytes` : ''} in the bundle`);
+  }
+  for (const p of heads.keys()) if (!lazy.some((f) => f[0] === p)) heads.delete(p);
+}
+
+/** The tree as the tar TAR again: directories first, then the files, with
+ *  `dedupe` identical files next to each other (zstd's window stores the
+ *  second as a match). `order` (guest paths): those files first, in that
+ *  order (a recorded run's first reads), then the rest as before. */
+export function pack({ x, readOnly, dirTimes }, tar, work, dedupe, order = null) {
+  const dirs = [];
+  const byHash = new Map();
+  const all = (d, rel) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      const p = join(d, e.name);
+      if (e.isDirectory()) { dirs.push(r); all(p, r); continue; }
+      const k = dedupe && e.isFile() ? sha(readFileSync(p)) : `path:${r}`;
+      if (!byHash.has(k)) byHash.set(k, []);
+      byHash.get(k).push(r);
+    }
+  };
+  all(x, '');
+  let groups = [...byHash.values()];
+  if (order) {
+    // A group goes where its first-read member does.
+    const rank = new Map();
+    order.forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
+    const at = (g) => Math.min(...g.map((r) => rank.get(`/${r}`) ?? Infinity));
+    groups = groups.map((g, i) => [at(g), i, g]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map((e) => e[2]);
+  }
+  const list = join(work, 'tar-list');
+  writeFileSync(list, [...dirs, ...groups.flat()].join('\n') + '\n');
+  for (const [p, mode] of readOnly) chmodSync(p, mode);
+  // Deepest first; a directory removed since (none is) is skipped.
+  for (const [p, at, mt] of [...dirTimes].reverse()) if (existsSync(p)) utimesSync(p, at, mt);
+  execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
+  for (const [p, mode] of readOnly) chmodSync(p, mode | 0o700);
+}
+
+/** A unit's image path as a list of guest paths names it: Wine's drive path
+ *  (/pfx/dosdevices/c:/...) as the bundle's (/pfx/drive_c/...), lower case. */
+export const unitGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
+
+/** A list of guest paths, one a line, `#` comments (--late, --boot-units). */
+export const readPathList = (file) => readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+
+/**
+ * The background fill: bytes the page downloads after the boot's, while the
+ * guest runs (app.js `fill`; fill.json names where each file starts).
+ *
+ * - `late`: guest paths of lazy files (`lazy`, splitTree's list, their bytes in
+ *   `store`), each followed by its image's units (`unit:KEY/FILE`), which the
+ *   page compiles from the fill once their bytes are in;
+ * - `boot`: the images whose units the program loads before it is up (a
+ *   shell's taskbar). Every other unit follows, in the order the recording
+ *   first used them, then the ones it never used: shared as bytes and compiled
+ *   when a process first maps one (fill.json's `demand`); a process that maps
+ *   one before the fill has it waits for its bytes there (worker.mjs
+ *   `loadFile`). A unit that is no image's (gexc eject's "[nt trampolines]",
+ *   which every 32-bit process uses from its first system call) stays in the
+ *   boot.
+ *
+ * `units`: the recording's units ({ key, path, at }); `unitDir`: the unit cache
+ * (KEY/c.wasm, KEY/c.entries); `lazyUrl(hash)`: a lazy file's name in the
+ * fill. Returns { bytes, files: [[name, offset, size]], demand: [KEY], keys:
+ * every unit KEY in the fill, lateFiles: how many lazy files }.
+ */
+export function buildFill({ late = [], lazy = [], store, boot = null, units = [], unitDir, lazyUrl }) {
+  const usable = (u) => existsSync(join(unitDir, u.key, 'c.wasm')) && !existsSync(join(unitDir, u.key, 'cold'));
+  const byPath = new Map(lazy.map((f) => [f[0], f]));
+  const seen = new Set();
+  const keys = new Set();
+  const demand = [];
+  const files = [];
+  const parts = [];
+  let off = 0;
+  const put = (name, bytes) => { files.push([name, off, bytes.length]); parts.push(bytes); off += bytes.length; };
+  const putUnit = (u) => { keys.add(u.key); for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(unitDir, u.key, n))); };
+  for (const p of late) {
+    const f = byPath.get(p);
+    if (f && !seen.has(f[2])) {
+      seen.add(f[2]);
+      put(lazyUrl(f[2]), readFileSync(join(store, f[2])));
+    }
+    for (const u of units.filter((u) => unitGuest(u.path) === p.toLowerCase())) if (!keys.has(u.key) && usable(u)) putUnit(u);
+  }
+  if (boot) {
+    const at = (u) => (typeof u.at === 'number' ? u.at : Infinity);
+    const deferred = units
+      .filter((u) => !String(u.path ?? '').startsWith('[') && !boot.has(unitGuest(u.path)) && !keys.has(u.key) && usable(u))
+      .sort((a, b) => at(a) - at(b) || (a.key < b.key ? -1 : 1));
+    for (const u of deferred) {
+      if (keys.has(u.key)) continue;
+      demand.push(u.key);
+      putUnit(u);
+    }
+  }
+  return { bytes: Buffer.concat(parts), files, demand, keys, lateFiles: seen.size };
+}
+
+/** The rest bundle: the bundle split's lazy files (`lazy`, [path, size,
+ *  hash, mtime], their bytes in `store` by hash) as one uncompressed tar,
+ *  each content once, in read order (`order`) and then by path, so files
+ *  read together sit together; its stream cut into frames of `restFrame`
+ *  bytes, each zstd-compressed on its own (one stream would have to be read
+ *  from its start), concatenated as rest.bin, and
+ *  rest.bin.json: `frame`, `frames` ([offset, length] of each in rest.bin),
+ *  `size` (the tar's). A lazy file's entry names `rest.bin#OFFSET`, OFFSET
+ *  its bytes in the tar, which the page reads by the frames over it
+ *  (lazy-fetch.mjs). `bin`: where rest.bin goes (its index beside it, BIN.json),
+ *  `work` a scratch directory, `frame` the frames' size, `zlev` zstd's level
+ *  options, `order` guest paths first in the tar. Returns the lazy entries
+ *  (`files`) and the sizes. */
+export function buildRest(lazy, store, { bin, work, frame: restFrame, zlev, order: first = null }) {
+  const rank = new Map();
+  if (first) first.forEach((p, i) => { if (!rank.has(p)) rank.set(p, i); });
+  const order = [...lazy].sort((a, b) => (rank.get(a[0]) ?? Infinity) - (rank.get(b[0]) ?? Infinity) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const dir = join(work, 'rest');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  // The tar, written a frame at a time: frame k holds tar bytes [k * frame, (k + 1) * frame).
+  const where = new Map(); // hash -> its bytes' offset in the tar
+  let at = 0, k = 0, cur = [], curLen = 0;
+  const flush = (final) => {
+    while (curLen >= restFrame || (final && curLen > 0)) {
+      const all = Buffer.concat(cur);
+      const n = Math.min(restFrame, all.length);
+      writeFileSync(join(dir, String(k++).padStart(6, '0')), all.subarray(0, n));
+      cur = [all.subarray(n)];
+      curLen = all.length - n;
+    }
+  };
+  const put = (b) => { cur.push(b); curLen += b.length; at += b.length; if (curLen >= restFrame) flush(false); };
+  // A file of half a frame or more has frames of its own: zeros (which
+  // cost a few bytes compressed) to the next frame before it and after it,
+  // so reading it fetches and decodes no other file's bytes, and reading a
+  // small file never decodes a big one's (the first controller took
+  // winegstreamer's frames with SDL's).
+  const alone = restFrame / 2;
+  const align = () => { const r = at % restFrame; if (r) put(Buffer.alloc(restFrame - r)); };
+  const header = (name, size) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, 'utf8');
+    h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124);
+    h.write('00000000000\0', 136);
+    h.fill(' ', 148, 156); h.write('0', 156); h.write('ustar\x0000', 257);
+    let sum = 0;
+    for (const c of h) sum += c;
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    return h;
+  };
+  for (const [, size, hash] of order) {
+    if (where.has(hash)) continue;
+    const big = size >= alone;
+    // (its header in the frame before: the file's own bytes start its frame)
+    if (big && (at + 512) % restFrame) { const r = (at + 512) % restFrame; put(Buffer.alloc((restFrame - r) % restFrame)); }
+    put(header(hash, size));
+    where.set(hash, at);
+    put(readFileSync(join(store, hash)));
+    if (size % 512) put(Buffer.alloc(512 - (size % 512)));
+    if (big) align();
+  }
+  put(Buffer.alloc(1024));
+  const tarSize = at;
+  flush(true);
+  // Each frame on its own; many zstd processes at once.
+  execFileSync('sh', ['-c', `ls | grep -v '\\.zst$' | xargs -P 16 -n 8 zstd ${zlev} -q -f`], { cwd: dir });
+  const frames = [];
+  let off = 0;
+  mkdirSync(dirname(bin), { recursive: true });
+  const fd = openSync(bin, 'w');
+  for (let i = 0; i < k; i++) {
+    const z = readFileSync(join(dir, `${String(i).padStart(6, '0')}.zst`));
+    frames.push([off, z.length]);
+    writeSync(fd, z);
+    off += z.length;
+  }
+  closeSync(fd);
+  writeFileSync(`${bin}.json`, JSON.stringify({ frame: restFrame, size: tarSize, frames }));
+  rmSync(dir, { recursive: true, force: true });
+  const name = basename(bin);
+  return { files: lazy.map(([path, size, hash, mtime]) => [path, size, `${name}#${where.get(hash)}`, mtime]), distinct: where.size, tarSize, frames: frames.length, bytes: off };
+}

@@ -1,8 +1,8 @@
 // UDP through the page's network from a tool of the Debian image rather than
 // a probe: bash's /dev/udp (a connected socket, a write, a read), and its
 // /dev/tcp beside it, against a network in the page that echoes.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 180 };
 

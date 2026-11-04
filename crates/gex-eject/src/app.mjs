@@ -18,7 +18,7 @@ const ABSENT = { compositor: 'a desktop', gl: 'OpenGL', hostx: 'an X server', me
 const OPTIONS = ['container', 'args', 'env', 'cwd', 'onLog', 'onExit', 'onProgress', 'strace', 'translation', 'baseUrl', ...Object.keys(ABSENT)];
 const WINE_ONLY = ['canvas', 'size', 'exe', 'uid', 'mtimes', 'network', 'wisp', 'pageHosts', 'trapstack', 'debug', 'glLazy', 'launch', 'build', 'ready'];
 
-/** The option of `names` one edit or a case away (as web/src/start-options.js) from `k`, if any. */
+/** The option of `names` one edit or a case away (as page/src/start-options.js) from `k`, if any. */
 function nearName(k, names) {
   const low = k.toLowerCase();
   const near = (a, b) => {

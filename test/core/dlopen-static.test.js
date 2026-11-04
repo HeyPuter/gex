@@ -4,11 +4,11 @@
 // dlopen reads it, found by its bare name beside the program (a static
 // program's run path is its own directory); calls into it from two threads, each calling back into
 // the program's libc; its constructor, its data and a second dlopen.
-import { runProgram } from '../../web/src/run.js';
-import { setGlobals } from '../../web/src/page-globals.js';
-import { untar } from '../../web/src/tar.js';
-import { unzstd } from '../../web/src/zfetch.js';
-import { bytesOf } from '../../web/runtime/src/internal.js';
+import { runProgram } from '../../page/src/run.js';
+import { setGlobals } from '../../page/src/page-globals.js';
+import { untar } from '../../page/src/tar.js';
+import { unzstd } from '../../page/src/zfetch.js';
+import { bytesOf } from '../../page/runtime/src/internal.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 

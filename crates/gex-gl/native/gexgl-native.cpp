@@ -1,6 +1,6 @@
 /* The native host's decoder for the generated commands: the GL 4.4
- * transport (web/mesa/gl44-generated-cases.inc) and the registry's
- * compatibility-profile commands (web/mesa/gl-compat-generated-cases.inc),
+ * transport (ports/mesa/src/gl44-generated-cases.inc) and the registry's
+ * compatibility-profile commands (ports/mesa/src/gl-compat-generated-cases.inc),
  * the same cases the browser's Mesa decoder runs, here against the host's
  * GL. crates/gex-gl/src/host.rs hands this any opcode its own decoder does
  * not know (gexgl_native_one).
@@ -88,7 +88,7 @@ struct Reader {
 
 }  // namespace
 
-#include "../../../web/mesa/gexgl-compat-host.h"
+#include "../../../ports/mesa/src/gexgl-compat-host.h"
 
 namespace {
 
@@ -222,7 +222,7 @@ uint32_t uniform_components(GLuint program, GLint location) {
  * desktop GL library. */
 #include "gexgl-direct-calls.h"
 
-#include "../../../web/mesa/gl-compat-generated-decoders.inc"
+#include "../../../ports/mesa/src/gl-compat-generated-decoders.inc"
 
 /* The hand-written opcodes, by name (crates/gex-gl/src/proto.rs). */
 enum Op : uint32_t {
@@ -232,8 +232,8 @@ enum Op : uint32_t {
 bool one(uint32_t op, Reader& a) {
     switch (op) {
 #include "hand-cases.inc"
-#include "../../../web/mesa/gl44-generated-cases.inc"
-#include "../../../web/mesa/gl-compat-generated-cases.inc"
+#include "../../../ports/mesa/src/gl44-generated-cases.inc"
+#include "../../../ports/mesa/src/gl-compat-generated-cases.inc"
     default:
         return false;
     }

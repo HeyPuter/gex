@@ -1,6 +1,6 @@
 // System, spawn (pipes and a terminal), run, kill, and the Filesystem.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 

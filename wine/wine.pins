@@ -1,0 +1,14 @@
+# 64-bit Wine's pins: the Wine fork's commit make wine builds (wine/dist.sh),
+# and the commit of the 32-bit Wine tree its wineserver is still compiled
+# with (wine/Makefile build). The Unix libraries are in libs.pins, musl in
+# toolchain/pins. wine/dist.sh builds the Wine tree it is given and says so
+# when that tree is not at WINE64_COMMIT.
+
+# The Wine fork: branch w64/gex-surface.
+WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
+WINE64_COMMIT := e0dc1d6484ed26ce2d19417f64290efb24552cf9
+
+# The 32-bit Wine tree (branch wasm32-w3-next): the wineserver's build, and
+# the legacy 32-bit dist (make wine32).
+WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
+WINE_COMMIT := 5ae68e95f71b4af62e080237b6a6d8172bc0b916

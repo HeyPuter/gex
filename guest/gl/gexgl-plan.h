@@ -1,7 +1,7 @@
-/* Wire plans (tools/gen_gl_compat.py): what both ends of a generated
+/* Wire plans (scripts/gl/gen_gl_compat.py): what both ends of a generated
  * command agree on. A plan is a return token then one token per parameter;
  * this parses them and sizes their arrays, for the guest's interpreter
- * (gexgl.c) and the host decoders (web/mesa/gexgl-compat-host.h), so the
+ * (gexgl.c) and the host decoders (ports/mesa/src/gexgl-compat-host.h), so the
  * size an encoder sends is the one a decoder checks. C and C++. */
 #ifndef GEXGL_PLAN_H
 #define GEXGL_PLAN_H

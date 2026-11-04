@@ -1,17 +1,27 @@
-# The toolchain's pins, read by the top-level Makefile. Called by: make gexcc,
-# make busybox (and, through them, make test).
-#
-# musl for the wasm32 sysroot is MUSL_REPO/MUSL_COMMIT and the LP64 one
-# MUSL64_REPO/MUSL64_COMMIT; both are still in tools/wine-wasm's pin files,
-# which the Makefile includes beside this one. LLVM_COMMIT is in
-# tools/gexcc/llvm.pin.
+# The toolchain's pins: the sources the wasm32 and LP64 sysroots, gexcc's
+# libc++ and busybox are built from. The top-level Makefile and wine/Makefile
+# include this file; toolchain/gexcc/llvm-pin.sh and toolchain/sysroot/build64.sh
+# read it. Change a pin here and the outputs keyed by it rebuild.
 
-# The LLVM fork libc++ is built from (branch gex), fetched at LLVM_COMMIT.
+# The musl fork the wasm32 sysroot is built from (toolchain/sysroot/build32.sh):
+# branch mw/gex-wasm32-slim.
+MUSL_REPO   := https://github.com/MercuryWorkshop/musl-wasm.git
+MUSL_COMMIT := aacfa4bb863afebc1806c91a678bac5de134c79b
+
+# The musl fork the LP64 (wasm64) sysroot is built from (toolchain/sysroot/build64.sh).
+MUSL64_REPO   := https://github.com/MercuryWorkshop/musl-wasm64.git
+MUSL64_COMMIT := d18ccf68d0027ba752071b109d5bd08d89a4f7aa
+
+# The LLVM tree libc++, libc++abi and libunwind are built from
+# (toolchain/gexcc/build-cxx.sh, windows/build-cxx.sh): llvm-project at
+# llvmorg-22.1.8 (clang's version) with our runtime changes on its branch gex.
 # LLVM_SRC (a checkout of that commit) or LLVM_SEED (a clone that has it)
 # overrides the fetch.
-LLVM_REPO := https://github.com/MercuryWorkshop/llvm-project
+LLVM_REPO   := https://github.com/MercuryWorkshop/llvm-project
+LLVM_COMMIT := 1bb69944033d8a7c2d79d654df0a513e818b3caf
 
-# busybox, the guest's /bin/sh and coreutils (make busybox, gexcc's install).
+# busybox, the guest's /bin/sh and coreutils (make busybox, gexcc's install,
+# the page's rootfs).
 BUSYBOX_VERSION := 1.37.0
 BUSYBOX_URL     := https://busybox.net/downloads/busybox-1.37.0.tar.bz2
 BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4

@@ -1,11 +1,11 @@
-// A program that started and fell over (web/runtime programs.js `abandon`,
+// A program that started and fell over (page/runtime programs.js `abandon`,
 // called when its start's promise fails): its Worker has said its end (a
 // signal, gex_abandon) already, and the page's 127 for "never started" must
 // not overwrite it before pid 1's reaper collects it. With a kernel whose
 // table is the test's: the end is said, then the page abandons, then the
 // reaper looks, the order a busy page meets; and a program that never
 // started is still collected as 127.
-import { Programs } from '../../web/runtime/src/programs.js';
+import { Programs } from '../../page/runtime/src/programs.js';
 
 export const meta = { hosts: ['node', 'browser'], images: [], timeout: 30 };
 

@@ -22,6 +22,8 @@ if [ $wt = 1 ]; then
   [ -e "$out/.git" ] && [ "$(git -C "$out" rev-parse HEAD 2>/dev/null)" = "$commit" ] && exit 0
 else
   [ "$(cat "$out/.pinned" 2>/dev/null)" = "$commit" ] && exit 0
+  # a tree an older version made, marked .wine32-src: kept, and marked .pinned
+  [ "$(cat "$out/.wine32-src" 2>/dev/null)" = "$commit" ] && { echo "$commit" > "$out/.pinned"; exit 0; }
 fi
 have() { git --git-dir="$mirror" cat-file -e "$commit^{commit}" 2>/dev/null; }
 [ -d "$mirror" ] || { mkdir -p "$(dirname "$mirror")"; git init -q --bare "$mirror"; }

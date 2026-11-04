@@ -1,6 +1,6 @@
 /* The hand-written wire commands crates/gex-gl/src/host.rs does not decode
  * itself, for the native host: copied from the browser's decoder
- * (web/mesa/gexgl-mesa.cpp's `one`) by the list of opcodes host.rs lacks, so
+ * (ports/mesa/src/gexgl-mesa.cpp's `one`) by the list of opcodes host.rs lacks, so
  * a Linux guest's and opengl32's batches run the same on both hosts. Keep
  * them in step with that file. Included by gexgl-native.cpp, inside its
  * switch. */

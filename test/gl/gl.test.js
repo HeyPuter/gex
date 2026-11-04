@@ -1,10 +1,10 @@
 // MesaGl: the guest's GL device, and Mesa on WebGPU started on demand.
 // Says so and passes where the browser has no WebGPU, or the build has no
-// Mesa (web/public/gex/gex-wgpu-replay.*).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+// Mesa (page/public/gex/gex-wgpu-replay.*).
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<canvas id="out" width="640" height="480"></canvas>` };
 
@@ -19,7 +19,7 @@ export default async function (t) {
   new CompositorWindows(sys, { canvas: document.getElementById('out'), scale: 1 });
   check('a second throws', (() => { try { new MesaGl(sys); return false; } catch { return true; } })());
   await timeout(sys.boot(), 60000, 'boot');
-  // A translated program's /dev/gex-gl (shims/browser): said, not checked.
+  // A translated program's /dev/gex-gl (hosts/browser): said, not checked.
   // The i386 test tree has none, under runProgram alone too.
   const dev = await sys.run(['ls', '/dev/gex-gl'], { env: { PATH: '/bin' } });
   say(`  ls /dev/gex-gl: ${dev.code ? dev.stderr.trim() : dev.stdout.trim()}`);

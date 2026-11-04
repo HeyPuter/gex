@@ -1029,7 +1029,7 @@ impl ProcTable {
 
     /// Take the thread-directed signals sent to `pid`'s thread `tid`, or
     /// (`tid` 0) to any of its threads: (tid, signo, sender). A page's Worker
-    /// takes its own thread's without the kernel lock (shims/browser sigs.rs),
+    /// takes its own thread's without the kernel lock (hosts/browser sigs.rs),
     /// as it has no other thread's signal state; the kernel takes them all.
     pub fn take_thread_signals(&self, pid: i32, tid: i32) -> Vec<(i32, u32, i32)> {
         if let Some(r) = self.remote {

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""clang for gex wasm32 programs.
+
+Compiles like clang. A link (no -c/-S/-E) compiles any sources, runs wasm-ld
+for a position-independent executable that imports gex's shared memory and
+function table, and wraps it in the ELF container gexc runs (wasm-elf.py);
+the module stays beside it as OUT.wasm. `-shared` links a PIC side module
+instead (a Unix library: .so), with no container.
+
+GEX_WASM_SYSROOT names the sysroot (build-sysroot.sh)."""
+import os, subprocess, sys, tempfile
+
+here = os.path.dirname(os.path.realpath(__file__))
+flags = {}
+for line in open(os.path.join(here, '..', 'toolchain', 'sysroot', 'flags.sh')):
+    if '=' in line and not line.startswith('#'):
+        k, v = line.strip().split('=', 1)
+        v = v.strip('"')
+        for kk, vv in flags.items():
+            v = v.replace('$' + kk, vv)
+        flags[k] = v
+CFLAGS = flags['WASM_CFLAGS'].split()
+sysroot = os.environ.get('GEX_WASM_SYSROOT') or sys.exit('wcc: set GEX_WASM_SYSROOT')
+CC = ['clang'] + CFLAGS + ['--sysroot=' + sysroot, '-isystem', sysroot + '/include']
+if os.path.basename(sys.argv[0]).endswith('++'):
+    CC[0] = 'clang++'
+# No build host's paths in what ships (__FILE__, assertion and lock names,
+# debug info): this tree is /gex, the sysroot /sysroot, and GEX_WCC_MAP
+# (FROM=TO pairs, ':'-separated) names the rest, e.g. the Wine source tree.
+_maps = [(os.path.realpath(os.path.join(here, '..')), '/gex'), (os.path.realpath(sysroot), '/sysroot')]
+_maps += [tuple(m.split('=', 1)) for m in os.environ.get('GEX_WCC_MAP', '').split(':') if '=' in m]
+CC += ['-ffile-prefix-map=%s=%s' % m for m in _maps]
+
+args = sys.argv[1:]
+# Wine's PE-side code (-D_WIN32) gets the ICALL pass: its indirect calls may
+# reach guest code.
+plugin = os.path.join(sysroot, 'lib', 'GexIcall.so')
+if '-D_WIN32' in args and os.path.exists(plugin) and not os.environ.get('GEX_WASM_NO_ICALL'):
+    CC += ['-fpass-plugin=' + plugin]
+# C++ on the PE side (Wine's libc++, icu) sees a Windows target, as wcc64's
+# does: Linux's predefined macros would send libc++'s headers to musl's.
+# Static destructors are not registered: a module's terminators never run,
+# and Windows has no __cxa_atexit.
+if '-D_WIN32' in args and CC[0] == 'clang++':
+    CC += ['-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__',
+           '-DWINE_UNICODE_NATIVE', '-fno-c++-static-destructors']
+# Unix-side code (programs, their libraries) lowers setjmp onto the legacy
+# exception instructions: binaryen's asyncify (fork, below) can instrument
+# try/catch but not try_table. The link step translates the result to the
+# standard instructions (--translate-to-exnref), which is what gex runs.
+if '-D_WIN32' not in args:
+    CC = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in CC]
+if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
+       for a in args) or not args:
+    os.execvp(CC[0], CC + args)
+
+out = 'a.out'
+srcs, ld_in, ld_flags, cflags = [], [], [], []
+shared = False
+relocatable = False
+guest_i386 = False
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == '-o':
+        out = args[i + 1]; i += 2; continue
+    if a == '-shared':
+        shared = True
+    elif a == '-r':
+        relocatable = True
+    elif a.startswith('-Wl,'):
+        # (lld needs no archive groups: it searches archives as needed)
+        ld_flags += [x for x in a[4:].split(',') if x and x not in ('--start-group', '--end-group', '--sort-common', '--sort-section', 'alignment', '--warn-common', '--gex-guest-i386')]
+        guest_i386 = guest_i386 or '--gex-guest-i386' in a[4:].split(',')
+    elif a.startswith('-l') or a.startswith('-L'):
+        if a in ('-l', '-L'):
+            ld_in += [a + args[i + 1]]; i += 2; continue
+        if a not in ('-lc', '-lm', '-lpthread', '-ldl', '-lrt', '-lutil'):
+            ld_in.append(a)
+    elif a.endswith(('.c', '.cc', '.cpp', '.s', '.S')) and not a.startswith('-'):
+        srcs.append(a)
+    elif a.endswith(('.o', '.a', '.so', '.lo')) and not a.startswith('-'):
+        ld_in.append(a)
+    elif a in ('-pthread', '-rdynamic', '-static', '-pie', '-no-pie', '-fPIE', '-fpie'):
+        pass
+    elif a in ('-I', '-D', '-U', '-include', '-isystem', '-MF', '-MT', '-x'):
+        cflags += [a, args[i + 1]]; i += 2; continue
+    else:
+        cflags.append(a)
+    i += 1
+
+tmp = tempfile.mkdtemp(prefix='wcc-')
+import atexit, shutil
+atexit.register(shutil.rmtree, tmp, True)
+objs = []
+for k, s in enumerate(srcs):
+    o = os.path.join(tmp, '%d.o' % k)
+    r = subprocess.call(CC + cflags + ['-c', s, '-o', o])
+    if r:
+        sys.exit(r)
+    objs.append(o)
+
+lib = sysroot + '/lib'
+common = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory',
+          '--max-memory=4294967296', '-L' + lib]
+if relocatable:
+    # one relocatable object of the inputs (an archive's members only as
+    # referenced): a DLL for pelink.py
+    cmd = ['wasm-ld', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
+    sys.exit(subprocess.call(cmd))
+
+def imports(path):
+    """(module, name) of every function import of the module at path."""
+    w = open(path, 'rb').read()
+    def leb(p):
+        r = sh = 0
+        while True:
+            x = w[p]; p += 1
+            r |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                return r, p
+    def name(p):
+        n, p = leb(p)
+        return w[p:p + n].decode(), p + n
+    out, p = [], 8
+    while p < len(w):
+        sid = w[p]; n, q = leb(p + 1); end = q + n
+        if sid == 2:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                m, q = name(q); f, q = name(q)
+                kind = w[q]; q += 1
+                if kind == 0:
+                    _, q = leb(q); out.append((m, f))
+                elif kind == 1:
+                    q += 1; fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 2:
+                    fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 3:
+                    q += 2
+                elif kind == 4:
+                    q += 1; _, q = leb(q)
+            break
+        p = end
+    return out
+
+
+# Functions above fork's driver (src/process/wasm32/__gex_fork.c in the musl
+# fork): the unwind for a fork stops at the driver, so they keep no state.
+FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c',
+              '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
+
+
+# The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
+# leaves this file in its lib/): asyncify also instruments what reaches
+# gex.syscall, and a session snapshot unwinds a thread at a call that can
+# block (libgex-snap/call.c). Only there: another sysroot's programs are
+# linked as before, byte for byte.
+SNAPSHOT = os.path.exists(os.path.join(sysroot, 'lib', 'gex-snapshot'))
+if SNAPSHOT:
+    FORK_ROOTS = FORK_ROOTS + ['__gex_snap_resume']
+
+
+def finish(path):
+    """binaryen over a linked module: asyncify when it can fork (it imports
+    gex.fork_point: every function that can reach it saves and restores its
+    frame), and the legacy exception instructions translated to the standard
+    ones. Names kept (-g): gex binds the entries by name."""
+    opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
+    passes = []
+    imps = imports(path)
+    points = [i for i in [('gex', 'fork_point')] + ([('gex', 'syscall')] if SNAPSHOT else []) if i in imps]
+    if points:
+        names = ','.join(f'{m}.{n}' for m, n in points)
+        passes += ['--asyncify', '--pass-arg=asyncify-imports@' + names]
+        # Only what can reach a fork by a type-correct call graph
+        # (forkreach.py); asyncify's own analysis takes every indirect call
+        # for a fork point, which is nearly every function.
+        dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+        also = ['--also', ','.join(f'{m}.{n}' for m, n in points[1:])] if len(points) > 1 else []
+        reach = subprocess.run([sys.executable, os.path.join(here, '..', 'toolchain', 'gexcc', 'forkreach.py')] + also +
+                               [dis, path, f'{points[0][0]}.{points[0][1]}'] + FORK_ROOTS,
+                               capture_output=True, text=True)
+        if reach.returncode == 0 and not os.environ.get('GEX_WCC_FORK_ALL'):
+            lst = os.path.join(tmp, 'onlylist')
+            open(lst, 'w').write(reach.stdout.strip().replace(',', '\n') + '\n')
+            passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+        else:
+            passes += ['--pass-arg=asyncify-removelist@' + ','.join(FORK_ROOTS)]
+        passes += ['-O2']
+    passes += ['--translate-to-exnref']
+    feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+             '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
+    # (DWARF dropped: binaryen cannot rewrite clang's version 5)
+    r = subprocess.call([opt, path, '-g', '--strip-dwarf'] + feats + passes + ['-o', path])
+    if r:
+        sys.exit('wcc: wasm-opt failed on ' + path)
+
+
+if shared:
+    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags + \
+        [lib + '/libclang_rt.builtins-wasm32.a']
+    r = subprocess.call(cmd)
+    if r:
+        sys.exit(r)
+    finish(out)
+    sys.exit(0)
+# gex's support library (build-sysroot.sh, libgex/), before libc: its
+# dlopen, __dlsym and vfork replace libc's; the setjmp runtime and the
+# signal frames are only there.
+libgex = [lib + '/libgex.a'] if os.path.exists(lib + '/libgex.a') else []
+# (the snapshot flavour's part last, its own archive: the default build's
+# data and table slots keep their places)
+wasm = out + '.wasm'
+cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
+    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a'] + \
+    ([lib + '/libgex-snap.a'] if SNAPSHOT else [])
+r = subprocess.call(cmd)
+if r:
+    sys.exit(r)
+finish(wasm)
+# -Wl,--gex-guest-i386 (taken out of the wasm-ld flags above): the container
+# says the program runs i386 code (Wine's loader).
+sys.exit(subprocess.call([sys.executable, os.path.join(here, '..', 'toolchain', 'gexcc', 'wasm-elf.py'), wasm, out] + (['--guest-i386'] if guest_i386 else [])))

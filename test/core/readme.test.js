@@ -1,22 +1,22 @@
 // The runtime README's examples, run as written on the test page, and every
 // class and member its tables name, there. Each example is a ```js block of
-// web/runtime/README.md, in its order; a page has one System, so each phase
+// page/runtime/README.md, in its order; a page has one System, so each phase
 // (t.reload) runs the blocks that share one. What an example takes from the
 // page around it (a terminal widget, a desktop's frames, a button) is a stub
 // here; its `@gex/runtime` imports are the runtime's modules; its trees are the
 // slim Debian image (bash, uname). A block the README gains or loses fails
 // the block count, so a new example is never left unrun.
-import readme from '../../web/runtime/README.md?raw';
-import * as index from '../../web/runtime/src/index.js';
-import * as fsMod from '../../web/runtime/src/fs.js';
-import * as host from '../../web/runtime/src/windows/host.js';
-import * as single from '../../web/runtime/src/windows/single.js';
-import * as compositor from '../../web/runtime/src/windows/compositor.js';
-import * as wisp from '../../web/runtime/src/net/wisp.mjs';
-import * as audio from '../../web/runtime/src/audio.js';
-import * as gl from '../../web/runtime/src/gl.js';
-import * as input from '../../web/runtime/src/input.js';
-import { SP_CODE, MP_CODE } from '../../shims/browser/js/mode.mjs';
+import readme from '../../page/runtime/README.md?raw';
+import * as index from '../../page/runtime/src/index.js';
+import * as fsMod from '../../page/runtime/src/fs.js';
+import * as host from '../../page/runtime/src/windows/host.js';
+import * as single from '../../page/runtime/src/windows/single.js';
+import * as compositor from '../../page/runtime/src/windows/compositor.js';
+import * as wisp from '../../page/runtime/src/net/wisp.mjs';
+import * as audio from '../../page/runtime/src/audio.js';
+import * as gl from '../../page/runtime/src/gl.js';
+import * as input from '../../page/runtime/src/input.js';
+import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
 

@@ -3,8 +3,8 @@
 // back (whole, and from past 4 GiB). In the profile's own context
 // (`meta.profile`), whose storage is on disk as a user's is (a fresh
 // context's stops a file near 2 GiB: fs-store-full).
-import { System } from '../../web/runtime/src/index.js';
-import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['slim'], timeout: 1800, profile: true };
 

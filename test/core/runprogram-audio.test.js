@@ -1,14 +1,14 @@
-// runProgram's /dev/dsp (web/src/run-program.js `playAudio`): a program's
+// runProgram's /dev/dsp (page/src/run-program.js `playAudio`): a program's
 // tone is played by the page. runProgram's system starts every process
 // adopted (host.mjs `spawnExec`), and the page starts its player when a
 // process's Worker says where the audio ring is (worker.mjs 'audio'); an
 // adopted process that said nothing left /dev/dsp played to nobody in every
 // page built on runProgram (an ejected site's among them).
-import { runProgram } from '../../web/src/run.js';
-import { setGlobals } from '../../web/src/page-globals.js';
-import { untar } from '../../web/src/tar.js';
-import { unzstd } from '../../web/src/zfetch.js';
-import { bytesOf } from '../../web/runtime/src/internal.js';
+import { runProgram } from '../../page/src/run.js';
+import { setGlobals } from '../../page/src/page-globals.js';
+import { untar } from '../../page/src/tar.js';
+import { unzstd } from '../../page/src/zfetch.js';
+import { bytesOf } from '../../page/runtime/src/internal.js';
 
 // The single-thread build's runProgram plays no /dev/dsp: its 'audio' message
 // names a plain memory, which the page's player cannot read (WebAudio's

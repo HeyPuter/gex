@@ -1,23 +1,24 @@
 target/
 /out/
 *.gexm
-web/node_modules/
-web/dist/
-web/dist-sp/
-web/public/gex/
-web/public/rootfs/
-/web/public/fs/
+page/node_modules/
+page/dist/
+page/dist-sp/
+page/public/gex/
+page/public/rootfs/
+/page/public/fs/
 guest/gl/out*/
 guest/glx-init/out/
 __pycache__/
 
 # Scratch and build caches
-web/.work/
+ports/mesa/.work/
+/.work/
 # Run output and crash debris
 logs/
 *.core
 core.[0-9]*
 hs_err_pid*.log
 TestResults.qpa
-web/public/pkgs/
-web/public/gex-apt/
+page/public/pkgs/
+page/public/gex-apt/

@@ -3,23 +3,22 @@
 # prints the path it made on its last line.
 #
 # Settings (command line or environment):
-#   OUT      outputs of the targets below that are not in target/ or web/
+#   OUT      outputs of the targets below that are not in target/ or page/
 #            (default: out/ in this tree, gitignored)
 #   CACHE    fetched sources and their bare mirrors (default ~/.cache/gex)
 #   JOBS     parallel jobs for the long builds (default 16)
-#   WINE_DIR build 64-bit Wine from this Wine worktree, not wine64.pins' commit
-#   LLVM_SRC a checkout of llvm.pin's commit (libc++ for gexcc); without it
-#            make gexcc fetches LLVM_REPO (toolchain/pins) at the pin
+#   WINE_DIR build 64-bit Wine from this Wine worktree, not wine/wine.pins' commit
+#   LLVM_SRC a checkout of LLVM_COMMIT (toolchain/pins; libc++ for gexcc); without it
+#            make gexcc fetches LLVM_REPO at that commit
 #   EMSDK    the emsdk whose compiler-rt builtins the sysroots are built with
 #            (default ~/emsdk; GEX_CRT_SRC= names the builtins directory itself)
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-include $(ROOT)/tools/wine-wasm/wine32.pins
-include $(ROOT)/tools/wine-wasm/wine64.pins
-include $(ROOT)/tools/gexcc/llvm.pin
 include $(ROOT)/toolchain/pins
+include $(ROOT)/wine/wine.pins
+include $(ROOT)/wine/libs.pins
 
 OUT ?= $(ROOT)/out
 CACHE ?= $(HOME)/.cache/gex
@@ -39,9 +38,9 @@ MUSL64_SRC := $(CACHE)/src/musl64-$(call short,$(MUSL64_COMMIT))
 LLVM_SRC ?= $(CACHE)/src/llvm-$(call short,$(LLVM_COMMIT))
 WINE64_SRC := $(if $(WINE_DIR),$(abspath $(WINE_DIR)),$(CACHE)/src/wine64-$(call short,$(WINE64_COMMIT)))
 
-# The wasm32 sysroot is the one tools/wine-wasm's Makefile keys and caches
+# The wasm32 sysroot is the one wine's Makefile keys and caches
 # (32-bit Wine, 64-bit Wine's server and WoW64 build against the same one).
-WW := $(MAKE) -s --no-print-directory -C $(ROOT)/tools/wine-wasm
+WW := $(MAKE) -s --no-print-directory -C $(ROOT)/wine
 SYSROOT = $$($(WW) paths | sed -n 's/^GEX_WASM_SYSROOT=//p')
 SYSROOT64 := $(OUT)/sysroot64-$(call short,$(MUSL64_COMMIT))
 BUSYBOX := $(OUT)/busybox/busybox-$(BUSYBOX_VERSION)/busybox
@@ -54,7 +53,7 @@ GEXCC_PREFIX ?= $(OUT)/gexcc
 
 help:
 	@echo 'make gexc          gexc for AArch64, x86-64 and i386 guests (target/release, target/x86/release)'
-	@echo 'make page          the page, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (web/dist)'
+	@echo 'make page          the page, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (page/dist)'
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
 	@echo 'make mesa          Mesa for the page alone'
@@ -63,10 +62,10 @@ help:
 
 help-all: help
 	@echo
-	@echo 'make page-sp       the single-thread page (web/dist-sp)'
-	@echo 'make assets        the hosts, guest libraries and rootfs alone (web/public)'
+	@echo 'make page-sp       the single-thread page (page/dist-sp)'
+	@echo 'make assets        the hosts, guest libraries and rootfs alone (page/public)'
 	@echo 'make xwayland      Xwayland for the page alone'
-	@echo 'make serve         serve web/dist (PORT, default 8088) and web/dist-sp (SP_PORT, 8089)'
+	@echo 'make serve         serve page/dist (PORT, default 8088) and page/dist-sp (SP_PORT, 8089)'
 	@echo 'make runtime       the npm package @gex/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
 	@echo 'make sysroot64     the LP64 sysroot (musl at MUSL64_COMMIT)'
@@ -80,10 +79,10 @@ help-all: help
 	@echo 'make check         cargo test, the workspace (X86=1: with the x86 features)'
 	@echo 'make check-gl      the GL tables match their generators'
 	@echo 'make regen-gl      rewrite the GL tables from the Khronos registry'
-	@echo 'make regen-mesa-hot  rewrite web/mesa-hot.txt (PLAIN=, LOGS=)'
+	@echo 'make regen-mesa-hot  rewrite ports/mesa/hot.txt (PLAIN=, LOGS=)'
 	@echo 'make lint          every script is a target, called by one, or a public tool'
 	@echo 'make help-tools    the tools other repos and users call by path'
-	@echo 'make wine32        LEGACY: old 32-bit Wine (tools/wine-wasm Makefile), until it is removed'
+	@echo 'make wine32        LEGACY: old 32-bit Wine (wine Makefile), until it is removed'
 
 help-tools:
 	@sed -n 's/^\([^#].*\)/\1/p' $(ROOT)/scripts/public-tools
@@ -98,33 +97,33 @@ gexc:
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
 # vite and the page's other npm packages, at package-lock.json's versions
-NPM_CI = [ $(ROOT)/web/node_modules/.package-lock.json -nt $(ROOT)/web/package-lock.json ] || (cd $(ROOT)/web && npm ci --no-audit --no-fund)
+NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
 page:
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(ROOT)/web/build-all.sh --mp
-	@echo $(ROOT)/web/dist
+	$(ROOT)/page/build.sh --mp
+	@echo $(ROOT)/page/dist
 page-sp:
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(ROOT)/web/build-all.sh --sp
-	@echo $(ROOT)/web/dist-sp
+	$(ROOT)/page/build.sh --sp
+	@echo $(ROOT)/page/dist-sp
 assets:
-	$(ROOT)/web/build-assets.sh
-	@echo $(ROOT)/web/public
+	$(ROOT)/page/build-assets.sh
+	@echo $(ROOT)/page/public
 mesa:
 	$(MESA_CHECKOUT)
-	$(ROOT)/web/build-all.sh --mp --gl-only
+	$(ROOT)/page/build.sh --mp --gl-only
 xwayland:
-	$(ROOT)/web/build-all.sh --mp --x-only
+	$(ROOT)/page/build.sh --mp --x-only
 PORT ?= 8088
 SP_PORT ?= 8089
 serve:
-	node $(ROOT)/web/serve-dist.mjs $(PORT) --sp-port $(SP_PORT)
+	node $(ROOT)/page/serve.mjs $(PORT) --sp-port $(SP_PORT)
 PKG ?= $(OUT)/runtime
 runtime:
 	$(NPM_CI)
-	$(ROOT)/web/runtime/build.sh $(PKG)
+	$(ROOT)/page/runtime/build.sh $(PKG)
 	@echo $(PKG)
 
 # ---- pinned sources ----
@@ -142,7 +141,7 @@ wine64-src:
 ifeq ($(SNAPSHOT),1)
 sysroot: musl-src
 	rm -rf $(OUT)/sysroot-snap.tmp
-	GEX_SNAPSHOT=1 JOBS=$(JOBS) $(NICE) $(ROOT)/tools/wine-wasm/build-sysroot.sh $(OUT)/sysroot-snap.tmp $(MUSL_SRC) > $(OUT)/sysroot-snap.log 2>&1 || { tail -5 $(OUT)/sysroot-snap.log; exit 1; }
+	GEX_SNAPSHOT=1 JOBS=$(JOBS) $(NICE) $(ROOT)/toolchain/sysroot/build32.sh $(OUT)/sysroot-snap.tmp $(MUSL_SRC) > $(OUT)/sysroot-snap.log 2>&1 || { tail -5 $(OUT)/sysroot-snap.log; exit 1; }
 	rm -rf $(OUT)/sysroot-snap && mv $(OUT)/sysroot-snap.tmp $(OUT)/sysroot-snap
 	@echo $(OUT)/sysroot-snap/sysroot
 else
@@ -151,55 +150,55 @@ sysroot:
 	@echo $(SYSROOT)
 endif
 
-SYSROOT64_IN := $(ROOT)/tools/wine-wasm/build-sysroot64.sh $(ROOT)/tools/wine-wasm/flags64.sh $(ROOT)/tools/wine-wasm/wine64.pins \
-  $(wildcard $(ROOT)/tools/wine-wasm/llp64/* $(ROOT)/tools/wine-wasm/icall/* $(ROOT)/tools/wine-wasm/libgex/* $(ROOT)/tools/wine-wasm/libgex64/*)
+SYSROOT64_IN := $(ROOT)/toolchain/sysroot/build64.sh $(ROOT)/toolchain/sysroot/flags64.sh $(ROOT)/wine/wine.pins \
+  $(wildcard $(ROOT)/toolchain/sysroot/llp64/* $(ROOT)/toolchain/sysroot/icall/* $(ROOT)/toolchain/sysroot/libgex/* $(ROOT)/toolchain/sysroot/libgex64/*)
 $(SYSROOT64)/.done: $(SYSROOT64_IN)
 	$(MAKE) -s musl64-src
 	mkdir -p $(OUT) && rm -rf $(SYSROOT64).tmp
-	JOBS=$(JOBS) $(NICE) $(ROOT)/tools/wine-wasm/build-sysroot64.sh $(SYSROOT64).tmp $(MUSL64_SRC) > $(SYSROOT64).log 2>&1 || { tail -5 $(SYSROOT64).log; exit 1; }
+	JOBS=$(JOBS) $(NICE) $(ROOT)/toolchain/sysroot/build64.sh $(SYSROOT64).tmp $(MUSL64_SRC) > $(SYSROOT64).log 2>&1 || { tail -5 $(SYSROOT64).log; exit 1; }
 	rm -rf $(SYSROOT64) && mv $(SYSROOT64).tmp $(SYSROOT64) && touch $@
 sysroot64: $(SYSROOT64)/.done
 	@echo $(SYSROOT64)/sysroot
 
-$(BUSYBOX): $(ROOT)/tools/wine-wasm/build-busybox.sh $(ROOT)/tools/wine-wasm/busybox.config
+$(BUSYBOX): $(ROOT)/toolchain/busybox/build.sh $(ROOT)/toolchain/busybox/busybox.config
 	$(MAKE) -s sysroot >/dev/null
-	$(ROOT)/tools/wine-wasm/wine32/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(OUT)/busybox
+	$(ROOT)/wine/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(OUT)/busybox
 	rm -rf $(OUT)/busybox/busybox-$(BUSYBOX_VERSION)
 	tar xjf $(OUT)/busybox/$(notdir $(BUSYBOX_URL)) -C $(OUT)/busybox
-	GEX_WASM_SYSROOT=$(SYSROOT) $(NICE) $(ROOT)/tools/wine-wasm/build-busybox.sh $(OUT)/busybox $(BUSYBOX_VERSION) > $(OUT)/busybox/build.log 2>&1 || { tail -5 $(OUT)/busybox/build.log; exit 1; }
+	GEX_WASM_SYSROOT=$(SYSROOT) $(NICE) $(ROOT)/toolchain/busybox/build.sh $(OUT)/busybox $(BUSYBOX_VERSION) > $(OUT)/busybox/build.log 2>&1 || { tail -5 $(OUT)/busybox/build.log; exit 1; }
 busybox: $(BUSYBOX)
 	@echo $(BUSYBOX)
 
 gexcc: musl-src llvm-src
 	$(NICE) cargo build -q --release -p gex-dylink
 	@[ -x $(GEXC_X86) ] || $(NICE) cargo build -q --release -p gexc --features x86 --target-dir target/x86
-	$(ROOT)/tools/wine-wasm/wine32/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(CACHE)/dl
+	$(ROOT)/wine/dl.sh $(BUSYBOX_URL) $(BUSYBOX_SHA256) $(CACHE)/dl
 	GEXC=$(GEXC_X86) GEXC_X86=$(GEXC_X86) GEX_DYLINK=$(ROOT)/target/release/gex-dylink JOBS=$(JOBS) LLVM_SRC=$(LLVM_SRC) \
-	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) GEXCC_CACHE=$(CACHE)/gexcc $(NICE) sh $(ROOT)/tools/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)
+	  BUSYBOX_TAR=$(CACHE)/dl/$(notdir $(BUSYBOX_URL)) GEXCC_CACHE=$(CACHE)/gexcc $(NICE) sh $(ROOT)/toolchain/gexcc/install.sh $(GEXCC_PREFIX) $(MUSL_SRC)
 	@echo $(GEXCC_PREFIX)/bin/gexcc
 
 # ---- 64-bit Wine ----
 # wine64-dist.sh caches every step in CACHE/wine64 by its inputs, so a rerun
 # only checks. It builds 32-bit Wine's wasm32 tree for the wineserver first
-# when missing (tools/wine-wasm `make build`).
+# when missing (wine `make build`).
 wine-x64 wine: wine64-src sysroot64
 	@mkdir -p $(OUT)
 	$(if $(filter wine,$@),WINE64_WOW64=1) GEX_WASM64_SYSROOT=$(SYSROOT64)/sysroot JOBS=$(JOBS) \
-	  $(ROOT)/tools/wine-wasm/wine64-dist.sh $(WINE64_SRC) $(CACHE)/wine64 > $(OUT)/$@.env
+	  $(ROOT)/wine/dist.sh $(WINE64_SRC) $(CACHE)/wine64 > $(OUT)/$@.env
 	@cat $(OUT)/$@.env
 
 gexcc-win: wine llvm-src
-	. $(OUT)/wine.env && GEX_WASM64_SYSROOT=$(SYSROOT64)/sysroot $(NICE) bash $(ROOT)/tools/gexcc/windows/install.sh $(GEXCC_PREFIX)-win $$WINE64_BUILD $$WINE64_SRC
-	GEX_WASM64_SYSROOT=$(SYSROOT64)/sysroot $(NICE) bash $(ROOT)/tools/gexcc/build-cxx-win.sh $(GEXCC_PREFIX)-win $(LLVM_SRC)
+	. $(OUT)/wine.env && GEX_WASM64_SYSROOT=$(SYSROOT64)/sysroot $(NICE) bash $(ROOT)/toolchain/gexcc/windows/install.sh $(GEXCC_PREFIX)-win $$WINE64_BUILD $$WINE64_SRC
+	GEX_WASM64_SYSROOT=$(SYSROOT64)/sysroot $(NICE) bash $(ROOT)/toolchain/gexcc/windows/build-cxx.sh $(GEXCC_PREFIX)-win $(LLVM_SRC)
 	@echo $(GEXCC_PREFIX)-win/bin/x86_64-w64-mingw32-gcc
 
 # ---- libraries ----
 native-libs:
 	@[ -n "$(ZLIB_SRC)" ] && [ -n "$(ZSTD_SRC)" ] && [ -n "$(SQLITE_SRC)" ] || \
 	  { echo "make native-libs: set ZLIB_SRC, ZSTD_SRC and SQLITE_SRC (Debian's unpacked sources), with gexcc on PATH"; exit 1; }
-	sh $(ROOT)/tools/gexcc/native-libs/build.sh $(OUT)/native-libs
-	sh $(ROOT)/tools/gexcc/native-libs/build-zstd.sh $(OUT)/native-libs
-	sh $(ROOT)/tools/gexcc/native-libs/build-sqlite.sh $(OUT)/native-libs
+	sh $(ROOT)/toolchain/native-libs/build.sh $(OUT)/native-libs
+	sh $(ROOT)/toolchain/native-libs/build-zstd.sh $(OUT)/native-libs
+	sh $(ROOT)/toolchain/native-libs/build-sqlite.sh $(OUT)/native-libs
 	@echo $(OUT)/native-libs
 steam-api:
 	@[ -n "$(STEAM_API_JSON)" ] || { echo "make steam-api: set STEAM_API_JSON (the Steamworks SDK's steam_api.json)"; exit 1; }
@@ -209,11 +208,11 @@ steam-api:
 # ---- ejected programs ----
 DIR ?= $(OUT)/eject-page
 eject-page:
-	$(ROOT)/web/build-eject-page.sh $(DIR)
+	$(ROOT)/site/build-eject-page.sh $(DIR)
 	@echo $(DIR)
 eject-site:
 	@[ -n "$(PROJECT)" ] && [ -n "$(SITE)" ] || { echo "make eject-site: set PROJECT (an ejected project) and SITE (the output directory)"; exit 1; }
-	node $(ROOT)/web/eject-site.mjs $(PROJECT) $(SITE) $(SITE_ARGS)
+	node $(ROOT)/site/eject-site.mjs $(PROJECT) $(SITE) $(SITE_ARGS)
 	@echo $(SITE)
 
 # ---- tests and checks ----
@@ -226,19 +225,19 @@ check:
 , := ,
 check-gl:
 	git -C $(ROOT) submodule update --init third_party/opengl-registry
-	python3 $(ROOT)/tools/gen_gl_compat.py --check
-	python3 $(ROOT)/tools/gen_gl44_transport.py --check
+	python3 $(ROOT)/scripts/gl/gen_gl_compat.py --check
+	python3 $(ROOT)/scripts/gl/gen_gl44_transport.py --check
 regen-gl:
 	git -C $(ROOT) submodule update --init third_party/opengl-registry
-	python3 $(ROOT)/tools/gen_gl_compat.py
-	python3 $(ROOT)/tools/gen_gl44_transport.py
+	python3 $(ROOT)/scripts/gl/gen_gl_compat.py
+	python3 $(ROOT)/scripts/gl/gen_gl44_transport.py
 regen-mesa-hot:
 	@[ -n "$(PLAIN)" ] && [ -n "$(LOGS)" ] || { echo "make regen-mesa-hot: set PLAIN (gex-wgpu-replay.wasm.orig) and LOGS (profile logs)"; exit 1; }
-	python3 $(ROOT)/tools/mesa-hot.py $(PLAIN) $(LOGS) -o $(ROOT)/web/mesa-hot.txt
+	python3 $(ROOT)/ports/mesa/mesa-hot.py $(PLAIN) $(LOGS) -o $(ROOT)/ports/mesa/hot.txt
 lint:
 	$(ROOT)/scripts/lint-scripts.py
 
 # ---- legacy ----
 wine32:
-	$(MAKE) -C $(ROOT)/tools/wine-wasm
+	$(MAKE) -C $(ROOT)/wine dist prefix
 	@$(WW) paths

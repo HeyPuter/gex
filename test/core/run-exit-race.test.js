@@ -1,9 +1,9 @@
-// A program's output read as it ends (web/runtime programs.js `read`): a
+// A program's output read as it ends (page/runtime programs.js `read`): a
 // read the kernel answered "empty" while the program was still writing, and
 // whose answer came after its exit, is not its output's end. With a kernel
 // that answers so on cue: the first read finds the pipe empty and the
 // program ends meanwhile, and what it wrote is there for the next read.
-import { Programs } from '../../web/runtime/src/programs.js';
+import { Programs } from '../../page/runtime/src/programs.js';
 
 export const meta = { hosts: ['node', 'browser'], images: [], timeout: 30 };
 

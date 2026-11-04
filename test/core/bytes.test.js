@@ -2,9 +2,9 @@
 // after boot and two programs, the runtime's module state holds neither
 // (runtime.js `heldBytes`), and a second program still starts from the
 // host's compiled shim.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { heldBytes } from '../../web/src/runtime.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { heldBytes } from '../../page/src/runtime.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

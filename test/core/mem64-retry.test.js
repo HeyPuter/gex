@@ -4,7 +4,7 @@
 // program in a 64-bit memory while the fetch fails, again at once (failed
 // inside the backoff, with no second fetch), and, after the test makes the
 // runtime available, again after the backoff. In the browser the package
-// (web/runtime/build.sh), its first fetch of the memory64 shim failing as a
+// (page/runtime/build.sh), its first fetch of the memory64 shim failing as a
 // dropped connection would (the test server's `/__t/drop`, which reaches the
 // single-thread build's system Worker too); on the Node host a site laid out
 // as gex's whose memory64 shim is linked in only after the first failure.
@@ -40,14 +40,14 @@ export default async function (t) {
     const { join } = await import('node:path');
     const { mkdirSync, readdirSync, rmSync, symlinkSync } = await import('node:fs');
     const { pathToFileURL } = await import('node:url');
-    const pub = join(import.meta.dirname, '../../web/public/gex'), site = join(t.workDir, 'mem64-retry-site');
+    const pub = join(import.meta.dirname, '../../page/public/gex'), site = join(t.workDir, 'mem64-retry-site');
     rmSync(site, { recursive: true, force: true });
     mkdirSync(join(site, 'gex'), { recursive: true });
     const m64 = readdirSync(pub).filter((f) => f.startsWith(M64));
     for (const f of readdirSync(pub)) if (!m64.includes(f)) symlinkSync(join(pub, f), join(site, 'gex', f));
     allow = () => { for (const f of m64) symlinkSync(join(pub, f), join(site, 'gex', f)); };
-    const { System } = await import('../../web/runtime/src/index.js');
-    ({ MemoryFilesystem } = await import('../../web/runtime/src/fs.js'));
+    const { System } = await import('../../page/runtime/src/index.js');
+    ({ MemoryFilesystem } = await import('../../page/runtime/src/fs.js'));
     sys = new System({ baseUrl: `${pathToFileURL(site).href}/`, debug: t.debug() });
   }
   try {

@@ -3,8 +3,8 @@
 // are gone, for more processes than the page has receive rings (64): killed
 // alone, killed with a forked child holding the same sockets (moved to the
 // global kernel), and crashed.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 900 };
 

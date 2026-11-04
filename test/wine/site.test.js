@@ -6,10 +6,10 @@
 // spawned. Up when a window with the launch file's title shows. Then the
 // root kept by an OPFSFilesystem across a reload.
 
-import { System } from '../../web/runtime/src/index.js';
-import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+import { System } from '../../page/runtime/src/index.js';
+import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 // Alone: a Wine desktop's processes beside other tests' pages ran the
 // renderer out of address space.

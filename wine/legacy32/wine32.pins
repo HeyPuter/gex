@@ -1,0 +1,16 @@
+# Pins only the legacy 32-bit Wine dist (make wine32) uses; it goes with
+# wine/legacy32.
+
+# The i386 PE DLLs that are not built as wasm32 skeletons come from the
+# host's Wine release, staged and checked against wine/legacy32/nt-wine-11.15.manifest
+# by wine/legacy32/nt-stage-wine.sh (GEX_WINE_PREFIX, default ~/.cache/gex/wine-11.15).
+WINE_X86_VERSION := 11.15
+
+# Wine Mono, the .NET runtime mscoree loads for .NET programs (XNA
+# games, through Wine Mono's FNA). The version is the one this Wine's
+# mscoree asks for (WINE_MONO_VERSION in dlls/mscoree/mscoree_private.h); the
+# dist carries it at share/wine/mono/wine-mono-VERSION, where mscoree finds
+# it through WINEDATADIR (wine32/mono.sh). WINE32_MONO=0 leaves it out.
+WINE_MONO_VERSION := 11.2.0
+WINE_MONO_URL     := https://dl.winehq.org/wine/wine-mono/11.2.0/wine-mono-11.2.0-x86.tar.xz
+WINE_MONO_SHA256  := c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06

@@ -12,14 +12,14 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { Cdp, browserWsUrl } from '../web/test/cdp.mjs';
+import { Cdp, browserWsUrl } from '../test/lib/cdp.mjs';
 import { images, outputs } from './fixtures/images.mjs';
 import { packaged } from './lib/package.mjs';
-import { refuseStale } from '../web/build-inputs.mjs';
+import { refuseStale } from '../page/build-inputs.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
-const WEB = join(ROOT, 'web');
+const WEB = join(ROOT, 'page');
 const ARCHES = { a64: 'aarch64', x86: 'x86' };
 const HOSTS = ['browser', 'node'];
 
@@ -45,15 +45,15 @@ const { values: o, positionals } = parseArgs({
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
-// `--package DIR`: the runtime as web/runtime/build.sh built it into DIR, not
+// `--package DIR`: the runtime as page/runtime/build.sh built it into DIR, not
 // from source. The tests' imports of the runtime's entry modules go to the
 // built ones, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
-if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (web/runtime/build.sh DIR)`);
+if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (page/runtime/build.sh DIR)`);
 // `--single`: the single-thread build. Its pages are served without
 // cross-origin isolation, so they have no SharedArrayBuffer: the runtime from
 // source runs that build, and so must a package (--package, as
-// `web/runtime/build.sh --single` builds @gex/runtime-single). Browser only.
+// `page/runtime/build.sh --single` builds @gex/runtime-single). Browser only.
 // A test the single-thread build cannot run yet says why in its meta
 // (`single: 'why'`) and is skipped; one that needs longer there says so
 // (`singleTimeout`, seconds, in place of `timeout`).
@@ -134,12 +134,12 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
 if (o.prepare) process.exit(missing.size ? 1 : 0);
 
 // -- the build ---------------------------------------------------------------
-// Both hosts run web/public's kernel and shim (the page's JavaScript comes from
+// Both hosts run page/public's kernel and shim (the page's JavaScript comes from
 // source), which run the old code without a word when they are older than it.
 {
   const infix = (a) => (a === 'x86' ? '.x86' : '');
   const names = [...new Set(jobs.flatMap((j) => [`gex_kernel${infix(j.arch)}`, `gex_browser${infix(j.arch)}`]))];
-  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public'), 'gex'), names, 'shims/browser/build.sh (GEX_ARCH=x86 for .x86)');
+  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public'), 'gex'), names, 'hosts/browser/build.sh (GEX_ARCH=x86 for .x86)');
 }
 
 // -- the browser -------------------------------------------------------------

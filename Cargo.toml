@@ -19,7 +19,7 @@ members = [
     "crates/gex-dylink",
     "crates/gex-fjit",
     "crates/gex-kmem",
-    "shims/kernel",
+    "hosts/kernel",
     "crates/gex-xlate",
     "crates/gex-ld",
     "crates/gex-kernel",
@@ -29,9 +29,9 @@ members = [
     "crates/gex-gl",
     "crates/gex-eject",
     "crates/gexc",
-    "shims/browser",
-    "shims/hostwl",
-    "shims/native",
+    "hosts/browser",
+    "hosts/hostwl",
+    "hosts/native",
     "tests/diff-fuzz",
     "tests/diff-fuzz-x86",
 ]
@@ -69,7 +69,7 @@ gex-kmem = { path = "crates/gex-kmem" }
 gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }
 gex-kernel = { path = "crates/gex-kernel" }
-gex-native = { path = "shims/native", default-features = false }
+gex-native = { path = "hosts/native", default-features = false }
 gex-eject = { path = "crates/gex-eject", default-features = false }
 
 [profile.release]

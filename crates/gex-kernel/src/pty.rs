@@ -290,7 +290,7 @@ pub const fn tty_nr(n: u32) -> i32 {
 
 /// A pty pair that lives in another wasm module, reached by number and a table
 /// of `extern "C"` calls -- the [`crate::pipe::Remote`] shape, with the terminal
-/// added (natively, the pairs live in the host process: `shims/native`'s
+/// added (natively, the pairs live in the host process: `hosts/native`'s
 /// `pty.rs`). `id` names the pair; `master` picks the end. Data calls take the
 /// kernel's own buffer and return bytes or `-errno`.
 #[derive(Clone, Copy)]
@@ -438,7 +438,7 @@ impl crate::vfs::FileHandle for RemotePty {
         // What `TIOCSCTTY` means for a pty that lives in the global kernel.
         //
         // The session is recorded there, where the hangup rule can ask whether
-        // it is still alive (see `hangup_is_real` in shims/kernel) -- and so is
+        // it is still alive (see `hangup_is_real` in hosts/kernel) -- and so is
         // the foreground process group, because claiming a controlling terminal
         // is what makes the claimer's group the foreground one. Only a session
         // leader may claim, and a session leader's group is its own pid, which

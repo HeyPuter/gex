@@ -1,8 +1,8 @@
 // An init given to boot() runs as pid 1 and owns the processes:
 // the page spawns nothing, the init's children run and it collects them and
 // their orphans, and when it ends the system stops.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

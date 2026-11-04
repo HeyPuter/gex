@@ -1,4 +1,4 @@
-//! The generated compatibility-profile plans (tools/gen_gl_compat.py) are
+//! The generated compatibility-profile plans (scripts/gl/gen_gl_compat.py) are
 //! well-formed: every opcode is its own and past the hand-written and GL 4.4
 //! ones, every token is one the encoders and decoders know, and every count
 //! names a parameter the command has.

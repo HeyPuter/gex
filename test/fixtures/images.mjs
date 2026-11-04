@@ -10,7 +10,7 @@
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
-//   package  pkg/: the runtime package, web/runtime/build.sh (--single:
+//   package  pkg/: the runtime package, page/runtime/build.sh (--single:
 //            @gex/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
@@ -21,7 +21,7 @@
 //            host's ffmpeg.
 //   wine64   wine64.tar and wine64-lazy.json: 64-bit Wine's install
 //            (GEX_TEST_WINE64_DIST) at /wine64 and a page prefix made from
-//            GEX_TEST_WINE64_PREFIX (tools/wine-wasm/page-prefix.sh) at
+//            GEX_TEST_WINE64_PREFIX (wine/page-prefix.sh) at
 //            /pfx; files over 64 KiB are lazy, served from wine64/ in the
 //            work directory (fixtures/wine/pack.py).
 //   wine64-units  wine64-units/: function-tier units (a unit cache, `gexc
@@ -110,7 +110,7 @@ export const images = {
   // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
   // zig), for core/mem64: a system's memory64 process through the API.
   // And no-m64/: the runtime's files as gex's site lays them out (gex/...,
-  // links to web/public/gex), less the memory64 shim, for core/mem64-missing
+  // links to page/public/gex), less the memory64 shim, for core/mem64-missing
   // (and core/mem64-retry, which links it in later).
   async mem64(work) {
     const zig = process.env.ZIG || 'zig';
@@ -123,7 +123,7 @@ export const images = {
       if (r.status !== 0) throw new Error(`${name}.c: ${r.stderr}`);
       writeFileSync(keyFile, key);
     }
-    const pub = join(ROOT, 'web/public/gex'), site = join(work, 'no-m64');
+    const pub = join(ROOT, 'page/public/gex'), site = join(work, 'no-m64');
     rmSync(site, { recursive: true, force: true });
     mkdirSync(join(site, 'gex'), { recursive: true });
     for (const f of readdirSync(pub)) {
@@ -154,7 +154,7 @@ export const images = {
 
   async busybox(work) {
     const bb = process.env.BUSYBOX;
-    const applets = readFileSync(join(ROOT, 'tools/wine-wasm/busybox.applets'), 'utf8').split('\n').filter(Boolean);
+    const applets = readFileSync(join(ROOT, 'toolchain/busybox/busybox.applets'), 'utf8').split('\n').filter(Boolean);
     const h = createHash('sha256');
     if (bb && existsSync(bb)) h.update(readFileSync(bb));
     h.update(applets.join('\n'));
@@ -315,10 +315,10 @@ export const images = {
   async wine64(work) {
     const dist = process.env.GEX_TEST_WINE64_DIST;
     const pfx = process.env.GEX_TEST_WINE64_PREFIX;
-    if (!dist || !pfx) return 'set GEX_TEST_WINE64_DIST and GEX_TEST_WINE64_PREFIX (tools/wine-wasm/wine64-dist.sh)';
+    if (!dist || !pfx) return 'set GEX_TEST_WINE64_DIST and GEX_TEST_WINE64_PREFIX (wine/dist.sh)';
     if (!existsSync(join(dist, 'lib/wine/x86_64-unix/wine'))) return `no Wine loader in ${dist}`;
     const h = createHash('sha256').update(realpathSync(dist)).update(realpathSync(pfx));
-    for (const f of [join(dist, 'lib/wine/x86_64-unix/wine'), join(dist, 'lib/wine/x86_64-unix/ntdll.so'), join(pfx, 'system.reg'), join(ROOT, 'tools/wine-wasm/page-prefix.sh')]) {
+    for (const f of [join(dist, 'lib/wine/x86_64-unix/wine'), join(dist, 'lib/wine/x86_64-unix/ntdll.so'), join(pfx, 'system.reg'), join(ROOT, 'wine/page-prefix.sh')]) {
       if (existsSync(f)) h.update(f).update(String(statSync(f).mtimeMs)).update(String(statSync(f).size));
     }
     h.update(readFileSync(new URL(import.meta.url))).update(readFileSync(join(import.meta.dirname, 'wine/pack.py')));
@@ -329,8 +329,8 @@ export const images = {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir, { recursive: true });
     // The page's prefix: the installed one made current for the dist, its
-    // links resolved (tools/wine-wasm/page-prefix.sh).
-    execFileSync('bash', [join(ROOT, 'tools/wine-wasm/page-prefix.sh'), pfx, dist, join(dir, 'pfx')], { stdio: ['ignore', 'ignore', 'pipe'] });
+    // links resolved (wine/page-prefix.sh).
+    execFileSync('bash', [join(ROOT, 'wine/page-prefix.sh'), pfx, dist, join(dir, 'pfx')], { stdio: ['ignore', 'ignore', 'pipe'] });
     symlinkSync(realpathSync(dist), join(dir, 'dist'));
     // Small files in the tar; the rest fetched as read, from the work
     // directory (the dist through its link).
@@ -492,7 +492,7 @@ export const images = {
   // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
   // @gex/runtime-single.
   async package(work, { single = false } = {}) {
-    execFileSync(join(ROOT, 'web/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync(join(ROOT, 'page/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
     // A copy without the memory64 shim, for core/mem64-missing.
     const less = join(work, 'pkg-no-m64');
     rmSync(less, { recursive: true, force: true });

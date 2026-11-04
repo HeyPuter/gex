@@ -910,7 +910,7 @@ pub mod ftab {
 
 /// A counter the browser glue takes bootstrap stacks by: a Worker calls
 /// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
-/// one is the guest's low memory (shims/browser/js/gex.mjs `#workerStack`).
+/// one is the guest's low memory (hosts/browser/js/gex.mjs `#workerStack`).
 pub const BOOT_STACK_COUNTER: u64 = RESERVED_END - 192;
 
 /// Address of the context for thread slot `n`.

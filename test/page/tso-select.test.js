@@ -1,8 +1,8 @@
-// Which programs get the TSO flavour (web/src/runtime.js detectTso): none by
+// Which programs get the TSO flavour (page/src/runtime.js detectTso): none by
 // default, with tso=arm only on an arm64 host, with tso=1 / tso=0 always /
 // never. The host is faked through navigator.userAgentData; switches arrive
 // as GEX_* under Node.
-import { detectTso } from '../../web/src/runtime.js';
+import { detectTso } from '../../page/src/runtime.js';
 
 export const meta = { hosts: ['node'], arches: ['a64'], timeout: 60 };
 

@@ -1,6 +1,6 @@
 // /dev/dsp in the page: what a program plays reaches the global kernel's
-// audio ring (shims/kernel/src/audio.rs), which the page's AudioWorklet plays
-// (web/src/audio.js). Under run-node.mjs, with its tap (GEX_AUDIO_TAP), its
+// audio ring (hosts/kernel/src/audio.rs), which the page's AudioWorklet plays
+// (page/src/audio.js). Under run-node.mjs, with its tap (GEX_AUDIO_TAP), its
 // stand-in player (GEX_AUDIO_PLAYER) and loopback (GEX_AUDIO_LOOP):
 //   dsp-tone    441 Hz S16 stereo at 44.1 kHz, closed, then 882 Hz switched
 //               to F32 mono at 48 kHz: the second stream took the device

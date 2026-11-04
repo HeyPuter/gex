@@ -1,7 +1,7 @@
 //! Internet sockets moved to the global kernel (`net::Socket::move_out`): one
 //! socket held by two processes, as Wine's wineserver and its client hold
 //! every socket. The global kernel's side is played by a table here, in this
-//! process's memory (`shims/kernel` keeps the same table in the shared one).
+//! process's memory (`hosts/kernel` keeps the same table in the shared one).
 
 use gex_kernel::net::{op, share_inet, InetRemote, Kind, NoNet, Ports, Resolver, Socket};
 use gex_kernel::vfs::FileHandle;

@@ -2,7 +2,7 @@
 // missing fails with ENOENT while it still can, as an exec whose interpreter
 // is missing does: a fork child's execve, posix_spawn and the process's own
 // execve, which goes on in its old program. The page says why once, on the
-// console. In the browser, the package (web/runtime/build.sh) copied with its
+// console. In the browser, the package (page/runtime/build.sh) copied with its
 // memory64 shim deleted (the package image's pkg-no-m64), imported as a page
 // would; on the Node host, which runs the sources, a site laid out as gex's
 // without it.
@@ -25,8 +25,8 @@ export default async function (t) {
     ({ MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`));
     sys = new System({ debug: t.debug() });
   } else {
-    const { System } = await import('../../web/runtime/src/index.js');
-    ({ MemoryFilesystem } = await import('../../web/runtime/src/fs.js'));
+    const { System } = await import('../../page/runtime/src/index.js');
+    ({ MemoryFilesystem } = await import('../../page/runtime/src/fs.js'));
     sys = new System({ baseUrl: `${t.work('no-m64')}/`, debug: t.debug() });
   }
   const fs = new MemoryFilesystem(sys);

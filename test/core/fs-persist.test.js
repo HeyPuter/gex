@@ -8,8 +8,8 @@
 //   3. the boot says it fell back, and lands on the first generation; a
 //      generation written, then the newest superblock's checksum broken;
 //   4. the boot falls back again, to the one before.
-import { System } from '../../web/runtime/src/index.js';
-import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 400 };
 

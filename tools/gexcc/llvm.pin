@@ -1,4 +1,0 @@
-# The LLVM tree libc++, libc++abi and libunwind are built from (build-cxx.sh,
-# build-cxx-win.sh): llvm-project at llvmorg-22.1.8 (clang's version) with
-# our runtime changes on its branch gex.
-LLVM_COMMIT := 1bb69944033d8a7c2d79d654df0a513e818b3caf

@@ -10,11 +10,11 @@
 //!
 //! The queues themselves live with the host, because a waiter and a notifier
 //! can be in different processes (different memories): in the page they are
-//! in the global kernel module's shared memory (`shims/kernel`, `k_wq_*`),
+//! in the global kernel module's shared memory (`hosts/kernel`, `k_wq_*`),
 //! which every Worker reaches. This crate only names them, by a number, and
 //! asks the host through [`Hooks`]. A host with no hooks (native, the unit
 //! tests) gets queue 0 for everything and every call is a no-op: it wakes
-//! its waiters its own way (`shims/native/src/ready.rs`).
+//! its waiters its own way (`hosts/native/src/ready.rs`).
 //!
 //! A queue can also be *chained* onto another ([`chain`]): an epoll set's
 //! queue is chained onto the queue of every descriptor it watches, so a

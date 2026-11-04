@@ -7,9 +7,9 @@ fn main() {
     println!("cargo:rerun-if-changed=native/hand-cases.inc");
     println!("cargo:rerun-if-changed=src/proto.rs");
     for f in [
-        "../../web/mesa/gl44-generated-cases.inc",
-        "../../web/mesa/gl-compat-generated-cases.inc",
-        "../../web/mesa/gexgl-compat-host.h",
+        "../../ports/mesa/src/gl44-generated-cases.inc",
+        "../../ports/mesa/src/gl-compat-generated-cases.inc",
+        "../../ports/mesa/src/gexgl-compat-host.h",
         "../../guest/gl/gexgl-plan.h",
         "../../guest/gl/gexgl-pixel.h",
         "../../guest/gl/gl-pname-counts.h",
@@ -25,7 +25,7 @@ fn main() {
     // Mesa links statically; here every one goes through the proc table
     // (native/gexgl-native.cpp's GEX_GL_CALL), as the native host links only
     // EGL and GLES.
-    let cases = std::fs::read_to_string("../../web/mesa/gl44-generated-cases.inc").unwrap_or_default()
+    let cases = std::fs::read_to_string("../../ports/mesa/src/gl44-generated-cases.inc").unwrap_or_default()
         + &std::fs::read_to_string("native/hand-cases.inc").unwrap_or_default();
     let mut direct = std::collections::BTreeSet::new();
     let b = cases.as_bytes();

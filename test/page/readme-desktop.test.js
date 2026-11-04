@@ -1,4 +1,4 @@
-// web/runtime/README.md's "In a web desktop", run as written: its code
+// page/runtime/README.md's "In a web desktop", run as written: its code
 // blocks, read from the README at run time, in one module, with only the
 // changes SUBST lists (this test's tree is the busybox image, not Debian).
 // The page plays the desktop. Its terminal widget, browser window and frames
@@ -27,7 +27,7 @@ const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'net/wisp.mjs': 'net
 const HERE = import.meta.url;
 
 export default async function (t) {
-  const readme = await (await fetch(new URL('../../web/runtime/README.md', HERE))).text();
+  const readme = await (await fetch(new URL('../../page/runtime/README.md', HERE))).text();
   const from = readme.indexOf('\n## In a web desktop\n');
   const section = readme.slice(from, readme.indexOf('\n## ', from + 5));
   if (from < 0) return t.check('the README has its "In a web desktop" section', false);
@@ -54,7 +54,7 @@ export default async function (t) {
   code = code.replace(/from '(@gex\/runtime[^']*)'/g, (m, spec) => {
     const src = MODULES[spec];
     if (!src) throw new Error(`the README imports ${spec}, which this test does not map`);
-    return `from ${JSON.stringify(base ? new URL(BUILT[src], new URL(base, location.href)).href : new URL(`../../web/runtime/src/${src}`, HERE).href)}`;
+    return `from ${JSON.stringify(base ? new URL(BUILT[src], new URL(base, location.href)).href : new URL(`../../page/runtime/src/${src}`, HERE).href)}`;
   });
 
   // The desktop's fakes, the names the README's blocks use.

@@ -1,7 +1,7 @@
 // glibc's posix_spawn, from a parent of four threads (fixtures/programs/
 // spawn-threads.c, dynamically linked). glibc clones with
 // clone3(CLONE_VM | CLONE_VFORK) onto a stack of its own; the page runs the
-// child in the calling thread's Worker until its exec (shims/browser/src/
+// child in the calling thread's Worker until its exec (hosts/browser/src/
 // vfork.rs). Every child (24 spawns and a missing program) must have run in
 // place rather than as a copied fork, and their programs start on runtimes
 // their Workers made in the host's pool (`preattach`): at least one does,

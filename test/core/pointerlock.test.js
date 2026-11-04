@@ -2,11 +2,11 @@
 // takes the browser's lock, the mouse's movement reaches it as relative
 // motion, and Escape gives it back. Clicks are real (run.mjs sends them).
 // pointerlock-compositor.test.js: the same through the scene compositor.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
-import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
-import { PointerLock } from '../../web/runtime/src/input.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { PointerLock } from '../../page/runtime/src/input.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };

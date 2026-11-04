@@ -66,7 +66,7 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 /// two gexc builds give every image the same key exactly when they print
 /// the same id. `gexc cgen-image --inputs` prints it, for a cache of frozen
 /// units that must be rebuilt when a gex change moves the keys
-/// (tools/units-for.sh). Without the providers' part, a provider's change
+/// (scripts/units-for.sh). Without the providers' part, a provider's change
 /// moved its images' keys and kept the id, and a cached set gave those
 /// images no unit.
 pub fn inputs_id() -> String {

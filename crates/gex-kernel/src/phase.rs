@@ -1,5 +1,5 @@
 //! Where one system call's time goes, phase by phase: a measuring build's
-//! (feature `phases`; the page's `GEX_PHASE_MARKS=1 shims/browser/build.sh`),
+//! (feature `phases`; the page's `GEX_PHASE_MARKS=1 hosts/browser/build.sh`),
 //! read with the run's `GEX_PHASES=1` (`gex_set_phases`). Without the
 //! feature every mark compiles to nothing. The caller marks the end of each
 //! phase with [`mark`]; the time since the last mark goes to that phase.

@@ -397,7 +397,7 @@ pub fn configure_states(states: i32, activated: i32) -> u32 {
 }
 
 /// Words in one published surface record: the layout a host page reads
-/// (`shims/browser/js/wl-bridge.mjs`, the same numbers by name), written by
+/// (`hosts/browser/js/wl-bridge.mjs`, the same numbers by name), written by
 /// [`push_record`] for a guest's surfaces and the browser X server's alike.
 pub const REC: usize = 119;
 /// Where the title's UTF-8 bytes start, and how many there are room for.

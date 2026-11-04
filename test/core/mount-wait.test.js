@@ -1,8 +1,8 @@
 // A program's call on a slow mount waits in that program alone: the others
 // go on meanwhile, two programs can wait on it at once, and each gets its own
 // answer (README "Mounts": "in its own thread only").
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { MemFs } from '../fixtures/memfs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };

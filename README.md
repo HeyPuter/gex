@@ -25,10 +25,10 @@ for debugging and for building what a page loads ahead of time.
   passthrough, `/proc`, `/dev`). Each guest process gets its own address
   space. The kernel's shared state is one module that every process's
   Workers share.
-- **wasm32 Linux programs.** `tools/gexcc` is a C/C++ compiler for gex's
+- **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
-- **Windows programs, through Wine.** `tools/wine-wasm` builds Wine's own
+- **Windows programs, through Wine.** `wine` builds Wine's own
   Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
   itself is translated like any other x86 code. The build is 64-bit Wine
   with WoW64, which runs 64-bit and 32-bit Windows programs in one prefix.
@@ -55,7 +55,7 @@ for debugging and for building what a page loads ahead of time.
                                               ├─▶ gex-fjit   function JIT (GIR → wasm)
                                               └─▶ gex-cgen   function tier (GIR → C → clang → wasm)
 
- page: shims/browser (gex-kernel per process) + shims/kernel (shared kernel) + Mesa + Xwayland
+ page: hosts/browser (gex-kernel per process) + hosts/kernel (shared kernel) + Mesa + Xwayland
 ```
 
 - **Guest virtual address equals linear-memory offset.** gex is the
@@ -73,7 +73,7 @@ for debugging and for building what a page loads ahead of time.
 - **Ahead-of-time builds.** `gexc run --record` records what a run loaded
   and executed. `gexc eject` turns a recording into a project that builds
   everything ahead of time, and runs only what that build made.
-  `web/eject-site.mjs` makes the web build of an
+  `site/eject-site.mjs` makes the web build of an
   ejected project into a static site. The site is a JavaScript library that
   your own page imports.
 
@@ -98,14 +98,14 @@ for debugging and for building what a page loads ahead of time.
 | `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
 | `crates/gex-gl` | OpenGL ES passthrough for the native host |
 | `crates/gex-eject` | ejected projects, built and run ahead of time |
-| `shims/browser` | the browser host: the kernel compiled to wasm, beside each guest |
-| `shims/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
-| `shims/hostwl` | the compositor for an X server that runs in the page |
-| `shims/native` | the native host, on wasmtime |
+| `hosts/browser` | the browser host: the kernel compiled to wasm, beside each guest |
+| `hosts/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
+| `hosts/hostwl` | the compositor for an X server that runs in the page |
+| `hosts/native` | the native host, on wasmtime |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
 | `web/` | the page, its build, and the Mesa and Xwayland builds |
-| `tools/gexcc` | the wasm32 C/C++ compiler and its sysroot |
-| `tools/wine-wasm` | Wine for gex: dist, prefix, runner |
+| `toolchain/gexcc` | the wasm32 C/C++ compiler and its sysroot |
+| `wine` | Wine for gex: dist, prefix, runner |
 | `tools/eject` | recording a Windows program for eject |
 | `tools/` (the rest) | generators for the GL transport and compatibility tables, staging the host's Wine PE files, profile and unit helpers |
 | `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
@@ -142,11 +142,11 @@ $ gexc run --strace <elf>           # syscall trace
 ### Build the page
 
 ```console
-$ make page                         # the multi-process build, web/dist
+$ make page                         # the multi-process build, page/dist
 $ make serve                        # http://localhost:8088/
 ```
 
-`web/README.md` describes the two builds (`make page-sp` is the
+`page/README.md` describes the two builds (`make page-sp` is the
 single-thread one), the runtime package (`make runtime`) and ejected
 programs' sites.
 
@@ -159,7 +159,7 @@ WINE64_DIST=...
 WINE64_PREFIX=...
 ```
 
-`tools/wine-wasm/README.md` covers running a program on it.
+`wine/README.md` covers running a program on it.
 
 ### Build a program with gexcc
 

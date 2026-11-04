@@ -7,10 +7,10 @@
 // that is about gex, not GL) must exit 0. A probe needing more GL than this
 // adapter gives (a software adapter has no dual-source blending, so GL 3.2)
 // is left out, and said so; on a GPU (`--gpu`) none may be.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], images: ['gl-probes'], timeout: 1500, html: '<canvas id="out" width="640" height="480"></canvas>' };
 

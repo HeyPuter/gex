@@ -1,7 +1,7 @@
 // WebAudio: a program's /dev/dsp played by the page, at the player's pace.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { WebAudio } from '../../web/runtime/src/audio.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { WebAudio } from '../../page/runtime/src/audio.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
 

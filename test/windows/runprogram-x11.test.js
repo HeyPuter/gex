@@ -2,10 +2,10 @@
 // windows laid out by bare-desktop.js, which the page reads at
 // `__gexCompositor`) and an X client's window there, the X server started at
 // its first connection.
-import { setGlobals } from '../../web/src/page-globals.js';
-import { runProgram } from '../../web/src/run.js';
-import { untar } from '../../web/src/tar.js';
-import { unzstd } from '../../web/src/zfetch.js';
+import { setGlobals } from '../../page/src/page-globals.js';
+import { runProgram } from '../../page/src/run.js';
+import { untar } from '../../page/src/tar.js';
+import { unzstd } from '../../page/src/zfetch.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<div id="desk" style="position:relative;width:800px;height:600px"></div>` };
 

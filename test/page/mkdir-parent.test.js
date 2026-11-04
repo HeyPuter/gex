@@ -23,7 +23,7 @@ export default async function (t) {
   writeFileSync(f, 'data\n');
 
   // The single-Worker shim, alone, in this process.
-  const gexMod = await import(join(ROOT, 'shims/browser/js/gex.mjs'));
+  const gexMod = await import(join(ROOT, 'hosts/browser/js/gex.mjs'));
   if (g.arch === 'x86') {
     if (gexMod.setRealm) gexMod.setRealm({ arch: 'x86' });
     else globalThis.GEX_ARCH = 'x86';

@@ -2,8 +2,8 @@
 // repository): boot it, apt install from the repository mounted from the
 // page, reload, and the package is still installed (an OPFSFilesystem keeps
 // the root).
-import { System } from '../../web/runtime/src/index.js';
-import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
 import { HttpFs } from '../fixtures/httpfs.js';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 180 };

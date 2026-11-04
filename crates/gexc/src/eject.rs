@@ -10,9 +10,9 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (crates/gex-eject/README.md)
-  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
+  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/page [--unit-cache DIR]... [--features -compositor,...] [--build]
                                    the same for a Wine page (wine32, or wine64)
-                                   recorded by tools/eject/record-wine32.mjs: its
+                                   recorded by site/record-wine32.mjs: its
                                    bundle, units and runtime, and the features
                                    the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
   gexc eject build <project>       translate it ahead of time and bind the
@@ -199,7 +199,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     }
                     "--web-src" => {
                         i += 1;
-                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's web/ directory")?));
+                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's page/ directory")?));
                     }
                     "--unit-cache" => {
                         i += 1;
@@ -227,7 +227,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let out = out.context("gexc eject: where to? (--out <project>)")?;
             let runtime = std::env::current_exe().context("finding this gexc to copy into the project")?;
             if gex_eject::wine32::is_recording(&record) {
-                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/web (the page's source and the built runtime)")?;
+                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/page (the page's source and the built runtime)")?;
                 let s = gex_eject::wine32::eject(
                     &record,
                     &out,

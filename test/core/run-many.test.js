@@ -3,8 +3,8 @@
 // them, and 64 programs that write a line and end, in 12 rounds each. What
 // each wrote is all there when it has ended, under a loaded host too
 // (run-exit-race: one in a few hundred came back empty).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 // Longer in the single-thread build: one thread runs every process.
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300, singleTimeout: 600 };

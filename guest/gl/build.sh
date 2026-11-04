@@ -26,11 +26,11 @@ fi
 
 # Generate every registry-backed entry point before compiling the transport.
 # This deliberately fails closed if a pointer-shaped command has no explicit
-# wire policy in tools/gen_gl44_transport.py.
-python3 "$ROOT/tools/gen_gl44_transport.py"
+# wire policy in scripts/gl/gen_gl44_transport.py.
+python3 "$ROOT/scripts/gl/gen_gl44_transport.py"
 # And every other registry command with a wire plan: the guest's entry
-# points, opengl32's plans and the hosts' decoder (tools/gen_gl_compat.py).
-python3 "$ROOT/tools/gen_gl_compat.py"
+# points, opengl32's plans and the hosts' decoder (scripts/gl/gen_gl_compat.py).
+python3 "$ROOT/scripts/gl/gen_gl_compat.py"
 
 # The opcodes come from the Rust side, so the two cannot drift.
 python3 - "$ROOT" "$HERE" <<'PYEOF'
@@ -67,10 +67,10 @@ magic = re.search(r'pub const MAGIC: u32 = (0x[0-9a-fA-F_]+);', src).group(1)
 protocol_version = re.search(r'pub const PROTOCOL_VERSION: u32 = (\d+);', src).group(1)
 out += ["", f"#define GEXGL_MAGIC {magic.replace('_','')}u",
         f"#define GEXGL_PROTOCOL_VERSION {protocol_version}u"]
-dev = open(f'{root}/shims/native/src/gl.rs').read()
+dev = open(f'{root}/hosts/native/src/gl.rs').read()
 sub = re.search(r'pub const GEX_GL_SUBMIT: u64 = (0x[0-9a-fA-F_]+);', dev).group(1)
 out += [f"#define GEXGL_SUBMIT {sub.replace('_','')}u"]
-browser = open(f'{root}/shims/browser/src/gl.rs').read()
+browser = open(f'{root}/hosts/browser/src/gl.rs').read()
 surface_ioctl = re.search(r'pub const GEX_GL_SURFACE: u64 = (0x[0-9a-fA-F_]+);', browser)
 if surface_ioctl:
     out += [f"#define GEXGL_SURFACE {surface_ioctl.group(1).replace('_','')}u"]
@@ -97,7 +97,7 @@ for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', errs):
     js.append(f"    {m.group(1)}: {m.group(2)},")
 js += ["};", ""]
 import os
-webdir = f'{root}/web/src'
+webdir = f'{root}/page/src'
 if os.path.isdir(webdir):
     open(f'{webdir}/gl-proto.js', 'w').write("\n".join(js))
 PYEOF
@@ -119,7 +119,7 @@ link_guest_gl() {
         -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl
 }
 link_guest_gl
-if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \
+if [ -n "$(python3 "$ROOT/scripts/gl/gen_gl_extensions.py" \
         --library "$OUT/libGLESv2.so.2" --output "$INCLUDE" \
         --aliases "$ALIASES")" ]; then
     link_guest_gl

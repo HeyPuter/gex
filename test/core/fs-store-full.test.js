@@ -5,8 +5,8 @@
 // write past what the context holds is ENOSPC to the program with the page
 // and the system still up, and there is room again after a delete and a
 // sync (the generation that frees its blocks has room of its own).
-import { System } from '../../web/runtime/src/index.js';
-import { OPFSFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['slim'], timeout: 1800 };
 

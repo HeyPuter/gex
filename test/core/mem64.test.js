@@ -2,8 +2,8 @@
 // asks (GEX_MEM64=1) or its image's user.gex.mem64 record says so: the
 // memory64 shim and seed the package ships, fetched then. The program is
 // page/mem64-pick's (test/fixtures/programs/mem64-pick.c).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64'], timeout: 120 };
 

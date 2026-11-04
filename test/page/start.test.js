@@ -1,9 +1,9 @@
-// The eject library's start() (web/src/app.js, an ejected build's app.mjs)
+// The eject library's start() (page/src/app.js, an ejected build's app.mjs)
 // on the runtime API: a bundle (busybox's tree) and its program, run as the
 // first spawn of a system with the kernel's own pid 1, its windows laid out
 // in the page (SingleCanvas: an X client's window, the X server started at
 // its first connection), its output, its exit status, and kill().
-import { start } from '../../web/src/app.js';
+import { start } from '../../page/src/app.js';
 
 export const meta = {
   hosts: ['browser'], images: ['busybox'], timeout: 180,
@@ -13,7 +13,7 @@ export const meta = {
 export default async function (t) {
   const { say, check, eq, until, timeout } = t;
   const { arch, ...switches } = t.debug();
-  const zstd = new URL('../eject-site/vendor/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
+  const zstd = new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
   const build = (argv) => ({
     arch: arch ?? 'aarch64',
     tar: [t.work('bb.tar')],

@@ -1,10 +1,10 @@
 // gles-gears' frame rate on the guest GL: 600 frames into a pbuffer through
 // Mesa on WebGPU, after 30 to warm up, as `times` (ms for the 600, and frames
 // per second). A timed test: bench.sh only (`--timed`), on the GPU.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../web/runtime/src/gl.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { MesaGl } from '../../page/runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], images: ['gl-probes'], timeout: 600, timed: true, html: '<canvas id="out" width="640" height="480"></canvas>' };
 

@@ -7,7 +7,7 @@
 // wine/pads-none, pads-boot and pads-later (a page runs one system: one
 // each); skipped for an install without controllers (WINE64_PADS=off).
 import { bootWine } from './wine.mjs';
-import { Gamepads, WineControllers } from '../../web/runtime/src/input.js';
+import { Gamepads, WineControllers } from '../../page/runtime/src/input.js';
 
 const button = (pressed = false, value = pressed ? 1 : 0) => ({ pressed, value });
 /** An Xbox 360 pad, at rest, or (`held`) with A held and the left stick

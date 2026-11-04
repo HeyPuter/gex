@@ -1,4 +1,4 @@
-// The package web/runtime/build.sh makes (run.mjs builds it into the work
+// The package page/runtime/build.sh makes (run.mjs builds it into the work
 // directory), imported as a page would, with no baseUrl: it finds its files
 // itself.
 

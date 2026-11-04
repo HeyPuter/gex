@@ -1,8 +1,8 @@
 // truncate(2) by name, shorter and longer, on a file a shared mapping holds,
 // from each ABI's own call: x86-64's and aarch64's (static programs) and
 // wasm32's (i386 numbers, truncate64) (test/fixtures/programs/truncate-path.c).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox', 'native-progs'], timeout: 120 };
 

@@ -1,8 +1,8 @@
 // The guest's network (sys.network, a page's own), the page's connections into
 // the guest (sys.net.connectGuest) and the guest's calls to the page
 // (hostCalls, /dev/gex-host).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120 };
 

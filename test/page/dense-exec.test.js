@@ -1,5 +1,5 @@
 // A translated program that a native wasm program execs numbers its blocks
-// densely, as it does started on its own (shims/browser/js/gex.mjs `load`:
+// densely, as it does started on its own (hosts/browser/js/gex.mjs `load`:
 // the native program's own answer is not its children's run option). Wine's
 // starter is a native wasm32 program that execs Wine's loader; when the
 // starter's "no dense blocks" was handed down, the loader and every Wine
@@ -20,8 +20,8 @@ const programs = new URL('../fixtures/programs/', import.meta.url);
 export default async function (t) {
   const g = guest(t);
   const seed = g.pub('seed.x86.shared.wasm');
-  if (!process.env.GEX_WASM_SYSROOT) return t.skip('GEX_WASM_SYSROOT (tools/wine-wasm/build-sysroot.sh)');
-  const wcc = g.need(join(ROOT, 'tools/wine-wasm/wcc'), 'tools/wine-wasm/wcc');
+  if (!process.env.GEX_WASM_SYSROOT) return t.skip('GEX_WASM_SYSROOT (toolchain/sysroot/build32.sh)');
+  const wcc = g.need(join(ROOT, 'wine/wcc'), 'wine/wcc');
   // The x86 program, against the host's static libc; the native starter, wcc's.
   const hi = g.cc({ name: 'dense-hi', code: readFileSync(new URL('dense-hi.c', programs), 'utf8') }, { glibc: true, flags: ['-static'] });
   const ds = join(t.workDir, 'guest', 'dense-spawn');

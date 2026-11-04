@@ -125,7 +125,7 @@ pub struct Config {
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
     /// default for a config without the setting. `"instrument"` builds
     /// units that report the functions a run calls, for a recording of the
-    /// site to take its coverage from (tools/eject/record-wine32.mjs). Each unit keeps the
+    /// site to take its coverage from (site/record-wine32.mjs). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (crates/gex-eject/README.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the

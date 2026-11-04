@@ -234,7 +234,7 @@ impl DynSym {
 }
 
 /// The header a native wasm32 program's container carries 0x40 bytes below
-/// its entry (`tools/wine-wasm/wasm-elf.py`; shims' `wasmprog`).
+/// its entry (`toolchain/gexcc/wasm-elf.py`; shims' `wasmprog`).
 pub const WASM32_MAGIC: &[u8; 8] = b"GEXWASM\0";
 
 /// The span `[lowest, highest)` the loaded segments of a file cover, and the

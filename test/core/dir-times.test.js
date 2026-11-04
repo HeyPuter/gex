@@ -1,7 +1,7 @@
 // A folder's time, as a file manager lists it: never 0 (January 1970) for a
 // folder a tar, a lazy list, the page or a program made.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

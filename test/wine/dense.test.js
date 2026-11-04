@@ -1,5 +1,5 @@
 // Wine's processes, started through the runtime API, number their blocks
-// densely (shims/browser/js/gex.mjs `#adoptExec`: an exec into a fresh Worker
+// densely (hosts/browser/js/gex.mjs `#adoptExec`: an exec into a fresh Worker
 // is dense unless its options say otherwise). The API never asks for dense
 // blocks itself; with the classic dispatch tables instead, every Wine process
 // held tables of millions of entries, which V8 keeps in the renderer's one

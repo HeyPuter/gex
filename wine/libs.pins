@@ -1,0 +1,47 @@
+# The Unix libraries 64-bit Wine's and 32-bit Wine's Unix sides link (static
+# wasm builds: wine/deps64.sh, wine/deps32.sh), and the tools that build them.
+# wine/Makefile and the top-level Makefile include this file; deps64.sh,
+# wine-fon.sh and dist.sh read it. NAME_URL / NAME_SHA256: the tarball and its
+# sha256, checked on every fetch.
+
+FREETYPE_VERSION := 2.13.3
+FREETYPE_URL     := https://downloads.sourceforge.net/project/freetype/freetype2/2.13.3/freetype-2.13.3.tar.xz
+FREETYPE_SHA256  := 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289
+WAYLAND_VERSION  := 1.23.1
+WAYLAND_URL      := https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.23.1/downloads/wayland-1.23.1.tar.xz
+WAYLAND_SHA256   := 864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed
+LIBXML2_VERSION  := 2.12.9
+LIBXML2_URL      := https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.9.tar.xz
+LIBXML2_SHA256   := 59912db536ab56a3996489ea0299768c7bcffe57169f0235e7f962a91f483590
+XKBCOMMON_VERSION := 1.7.0
+XKBCOMMON_URL    := https://xkbcommon.org/download/libxkbcommon-1.7.0.tar.xz
+XKBCOMMON_SHA256 := 65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247
+# libxkbcommon builds with meson; this wheel runs from its directory (no install).
+MESON_VERSION    := 1.5.2
+MESON_URL        := https://files.pythonhosted.org/packages/py3/m/meson/meson-1.5.2-py3-none-any.whl
+MESON_SHA256     := 77706e2368a00d789c097632ccf4fc39251fba56d03e1e1b262559a3c7a08f5b
+
+# TLS (schannel's and crypt32's GnuTLS): GnuTLS with its included libtasn1
+# and libunistring over nettle with mini-gmp (no GMP), and Mozilla's CA
+# bundle as curl.se publishes it (sha256 as in its .sha256 file).
+NETTLE_VERSION   := 3.10.1
+NETTLE_URL       := https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
+NETTLE_SHA256    := b0fcdd7fc0cdea6e80dcf1dd85ba794af0d5b4a57e26397eee3bc193272d9132
+GNUTLS_VERSION   := 3.8.9
+GNUTLS_URL       := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.tar.xz
+GNUTLS_SHA256    := 69e113d802d1670c4d5ac1b99040b1f2d5c7c05daec5003813c049b5184820ed
+CACERT_URL       := https://curl.se/ca/cacert-2026-08-13.pem
+CACERT_SHA256    := f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9
+
+# FFmpeg, winegstreamer's media framework in 64-bit Wine's Unix side
+# (wine64-deps.sh: LGPL, decoders, demuxers and parsers only).
+FFMPEG_VERSION   := 8.1.1
+FFMPEG_URL       := https://ffmpeg.org/releases/ffmpeg-8.1.1.tar.xz
+FFMPEG_SHA256    := b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+
+# SDL2, winebus's game controllers in 64-bit Wine's Unix side
+# (wine64-deps.sh: its joystick, game controller and haptic parts only).
+SDL2_VERSION     := 2.32.10
+SDL2_URL         := https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+SDL2_SHA256      := 5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
+

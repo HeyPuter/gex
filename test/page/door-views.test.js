@@ -1,7 +1,7 @@
 // The door's views of a client's memory (gex.mjs `memoryViews`) cover all of
 // it, in a 64-bit memory past 4 GiB too: the word view's length was
 // `byteLength >>> 2`, which wraps there (4 GiB + 64 KiB gave 16384 words).
-import { memoryViews } from '../../shims/browser/js/gex.mjs';
+import { memoryViews } from '../../hosts/browser/js/gex.mjs';
 
 export const meta = { hosts: ['node'], arches: ['a64'], timeout: 60 };
 

@@ -1,0 +1,17 @@
+wisp-js, MercuryWorkshop's Wisp protocol client, vendored for
+page/runtime/src/net/wisp.mjs (the only module that imports it).
+
+Version:   0.4.1
+Package:   @mercuryworkshop/wisp-js
+Tarball:   https://registry.npmjs.org/@mercuryworkshop/wisp-js/-/wisp-js-0.4.1.tgz
+Integrity: sha512-104LwiXiuhti/e32gmv0Da0u0yuLFDHX8JawCzleTPWJ5t5qTX4EYi4E7/ucbjBPN9wwVPWHE5g5yGqzl/NzQA==
+Source:    https://github.com/MercuryWorkshop/wisp-js
+Licence:   AGPL-3.0 (LICENSE, the package's own)
+
+Files, from the package's src/, unchanged:
+  client/connection.mjs  src/client/connection.mjs
+  packet.mjs             src/packet.mjs
+  extensions.mjs         src/extensions.mjs
+  compat.mjs             src/compat_browser.mjs (what the package's "browser"
+                         field puts in place of src/compat.mjs)
+The server, the command line and the WebSocket polyfill are left out.

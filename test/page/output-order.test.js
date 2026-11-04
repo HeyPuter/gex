@@ -4,7 +4,7 @@
 // Worker and its output reaches the host as that Worker's messages, which
 // nothing orders against another Worker's, so the host has to be told a
 // process's output is delivered before its exit can be seen (`drain_output`,
-// shims/browser). Stressed: several copies at once, each forking many times,
+// hosts/browser). Stressed: several copies at once, each forking many times,
 // which is when the misorder showed (7 of 16 runs).
 import { guest, tail } from '../lib/guest.mjs';
 

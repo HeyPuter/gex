@@ -9,9 +9,9 @@
 // thread a key that met a kernel lock another helper held threw (Atomics.wait).
 // The test's own kernel calls run in a Worker too, on the slot a first guest
 // Worker would have.
-import { PageTty } from '../../shims/browser/js/tty.mjs';
-import { openedFiles } from '../../web/src/fs-opened.js';
-import { HELPER_STACKS, helperStackTop } from '../../shims/browser/js/lazy-fetch.mjs';
+import { PageTty } from '../../hosts/browser/js/tty.mjs';
+import { openedFiles } from '../../page/src/fs-opened.js';
+import { HELPER_STACKS, helperStackTop } from '../../hosts/browser/js/lazy-fetch.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], timeout: 240,
   single: "the page's helpers share the kernel's memory, which is the default build's" };
@@ -23,7 +23,7 @@ const KERNEL = '/gex/gex_kernel.x86.wasm';
 // input), in a Worker on a slot of its own (the one the host would give a
 // first guest Worker): on the page's thread a lock another holder had would
 // throw, which is the bug the terminal's Worker fixes.
-const driverSource = (lazy = new URL('../../shims/browser/js/lazy-fetch.mjs', import.meta.url).href, pagefs = new URL('../../shims/browser/js/page-fs.mjs', import.meta.url).href) => `import { kernelThread, lazyFetch, processMemories } from '${lazy}';
+const driverSource = (lazy = new URL('../../hosts/browser/js/lazy-fetch.mjs', import.meta.url).href, pagefs = new URL('../../hosts/browser/js/page-fs.mjs', import.meta.url).href) => `import { kernelThread, lazyFetch, processMemories } from '${lazy}';
 import { pageFs } from '${pagefs}';
 let k, P;
 const put = (s, at) => { const b = new TextEncoder().encode(s); P.set(b, at); return b.length; };

@@ -17,7 +17,7 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-/// 13: the registry's compatibility-profile commands (tools/gen_gl_compat.py,
+/// 13: the registry's compatibility-profile commands (scripts/gl/gen_gl_compat.py,
 /// opcodes from [`crate::compat_plans::COMPAT_BASE`]).
 pub const PROTOCOL_VERSION: u32 = 13;
 
@@ -354,7 +354,7 @@ pub mod op {
 
     /* Fixed function, which a compatibility profile has and the generated
      * GL 4.4 core set does not. These are hand-written rather than generated
-     * because tools/gen_gl44_manifest.py builds its list from glcorearb.h --
+     * because scripts/gl/gen_gl44_manifest.py builds its list from glcorearb.h --
      * the core-profile header, which by definition omits every one of them.
      *
      * The whole set exists to run programs written before shaders: glxgears

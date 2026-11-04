@@ -1,10 +1,10 @@
 // X programs through Xwayland: the clipboard both ways (the X window
 // manager's selection bridge) and a game's pointer grab (hidden cursor and
 // warps), which Xwayland turns into a locked pointer and relative motion.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
-import { Clipboard, PointerLock } from '../../web/runtime/src/input.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { Clipboard, PointerLock } from '../../page/runtime/src/input.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };

@@ -16,7 +16,7 @@
 
 /// Which memories the process's address space is imported as. The kernel's
 /// own is 0; a process's is appended to the import section after it, as two
-/// imports (`tools/add-memory.mjs`): 1, a 32-bit memory, and 2, a memory64
+/// imports (`hosts/kernel/add-memory.mjs`): 1, a 32-bit memory, and 2, a memory64
 /// A Worker gives its kernel instance its process's
 /// memory as the one of its type and an empty one (no pages) as the other:
 /// one kernel module serves both flavours, so a page whose processes differ

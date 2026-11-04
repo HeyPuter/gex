@@ -243,7 +243,7 @@ fn sample(format: u32, b: &[u8]) -> f32 {
 
 /// Convert whole frames of `pcm` (`channels` interleaved samples of
 /// `format`) to stereo `f32` into `out`, what the page's player plays
-/// (shims/kernel `audio.rs`); how many frames. Mono goes to both sides,
+/// (hosts/kernel `audio.rs`); how many frames. Mono goes to both sides,
 /// more than two channels keep the first two.
 pub fn to_stereo_f32(pcm: &[u8], format: u32, channels: u32, out: &mut Vec<[f32; 2]>) -> usize {
     let sb = sample_size(format);
@@ -261,7 +261,7 @@ pub fn to_stereo_f32(pcm: &[u8], format: u32, channels: u32, out: &mut Vec<[f32;
 
 /// Where what `/dev/dsp` accepts is also played, when the host has a
 /// player (the page's AudioWorklet, through the global kernel's ring:
-/// shims/kernel `audio.rs`): `(stream, bytes, format, rate, channels, ms)`,
+/// hosts/kernel `audio.rs`): `(stream, bytes, format, rate, channels, ms)`,
 /// `ms` the device's clock.
 /// Never blocks; the device keeps its own clock either way.
 pub type AudioOut = fn(u32, &[u8], u32, u32, u32, u32);
@@ -286,7 +286,7 @@ pub fn set_audio_pending(f: AudioPending) {
     let _ = AUDIO_PENDING.set(f);
 }
 
-/// Capture from the player (the page's loopback, shims/kernel `audio.rs`):
+/// Capture from the player (the page's loopback, hosts/kernel `audio.rs`):
 /// `(pos, buf, format, rate, channels)` -> bytes put in `buf` and the next
 /// position; `pos` `None` for a reader that has not read yet (it starts at
 /// the newest frame). `None` when there is no capture.
@@ -925,7 +925,7 @@ mod tests {
         assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
     }
 
-    /// The page's player as web/src/audio.js plays one stream at its own
+    /// The page's player as page/src/audio.js plays one stream at its own
     /// rate: it starts (and starts again after running dry) once 6 ms of
     /// frames are queued, or (`stalls`) once its writer has added none for
     /// 6 ms with two or more queued; then it reads a render quantum at a

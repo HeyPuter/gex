@@ -1,0 +1,979 @@
+// Run the browser runtime under Node: the same `gex.mjs` a page loads, with
+// Node supplying the file reads and a console. If this works, the browser path
+// works -- nothing below is Node-specific.
+//
+//   node hosts/browser/js/run-node.mjs [opts] <guest.wasm> <program.elf> [args...]
+//
+//     --file <guest>=<host>     bundle a host file into the guest's filesystem
+//     --dir <guest>=<host>      a whole directory tree: files under 64 KiB
+//                               bundled, larger ones lazy (as --lazy: read
+//                               as the guest reads them, as a page fetches
+//                               its rest bundle); GEX_DIR_EAGER=1 bundles
+//                               every file
+//     --extract <guest>=<host>  write a file back out when the program ends
+//     --lazy <guest>=<host>     a lazy file (the page's lazy.json files),
+//                               fetched as it is read: here read from the
+//                               host file, each fetch GEX_LAZY_DELAY_MS late
+//                               (default 0), a slow link's (lazy-fetch.mjs)
+//     --tar <host.tar>          a root filesystem tar (page/src/tar.js, as the
+//                               page unpacks one): files, modes, empty
+//                               directories, hard and symbolic links
+//     --busybox <host>          a wasm32 busybox as /bin/busybox, hard-linked
+//                               as /bin/<applet> and /usr/bin/<applet> for
+//                               toolchain/busybox/busybox.applets
+//     --argv0 <name>            what the guest sees as argv[0]
+//     --cwd <dir>               the directory the guest starts in
+//     --env <KEY=VALUE>         an environment variable (repeatable); none
+//                               leaves the shim's default environment
+//     --strace               narrate every syscall to stderr
+//     --providers            export providers from <web dir>/cgen (the
+//                            page's default), no units
+//     --cgen                 function-tier units from GEX_CGEN_CACHE (default
+//                            ~/.cache/gex/cgen), required for a Windows
+//                            program image; --cgen-prefer: used where found
+//     --no-jit               translate nothing at run time (an ejected
+//                            project's AOT-only run): a miss stops the run
+//     --aot                  an ejected project's run with translation (its
+//                            training run): everything else as --no-jit
+//
+// GEX_GL_CHANNEL=1: the guest has /dev/gex-gl, a ring nothing serves (no Mesa
+// under Node): enough to see the device, not to draw.
+//
+// GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
+// page/public/gex of this tree; an ejected project's runtime/web).
+
+import { accessSync, appendFileSync, closeSync, constants as fsc, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
+import { ProcessHost } from './host.mjs';
+import { enableSingle, FiberWorker, sched } from './single.mjs';
+import { spareMemories } from './lazy-fetch.mjs';
+import { pageHosts } from './page-host.mjs';
+import { envOptions } from './options.mjs';
+import { makeGlChannel } from './gl-bridge.mjs';
+
+/** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
+ *  a directory against this one. */
+function pageHostsFromEnv(v) {
+  if (!v) return undefined;
+  const map = {};
+  for (const item of v.split(',')) {
+    const at = item.indexOf('=');
+    if (at > 0) map[item.slice(0, at)] = item.slice(at + 1);
+  }
+  return pageHosts(map, pathToFileURL(`${process.cwd()}/`)) ?? undefined;
+}
+
+/** GEX_PROVIDER_DIRS as the shim takes it (`gex_provider_sources`). */
+function providerSources(dirs) {
+  if (!dirs) return undefined;
+  const out = [];
+  for (const d of dirs.split(':').filter(Boolean)) {
+    for (const f of readdirSync(d).filter((f) => f.endsWith('.c')).sort()) {
+      out.push(`${f.slice(0, -2)}\n${readFileSync(join(d, f), 'utf8')}`);
+    }
+  }
+  return out.join('\0') || undefined;
+}
+// GEX_SINGLE=1: the single-thread build -- every
+// process and thread a fiber on this thread, no SharedArrayBuffer, the shared
+// build's binaries on plain memories. Before anything is compiled.
+const SINGLE = !!process.env.GEX_SINGLE;
+if (SINGLE) {
+  enableSingle();
+  await import('./worker.mjs');
+}
+// `GEX_ARCH=x86` runs the x86-64 guest: the `.x86`-infixed shim and kernel
+// (see hosts/browser/build.sh), and `globalThis.GEX_ARCH` for the glue.
+const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
+if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
+// `GEX_MEM64=1` (with GEX_ARCH=x86 and GEX_SHARED=1): a 64-bit guest memory,
+// the `.m64` shim and seed built by `GEX_MEM64=1 hosts/browser/build.sh`.
+const MEM64 = !!process.env.GEX_MEM64;
+if (MEM64) globalThis.GEX_MEM64 = 1;
+const SHIM_INFIX = ARCH_INFIX + (MEM64 ? '.m64' : '');
+
+// The host runs on the main thread; give it the attach-trace flag too so
+// thread spawn/adopt timing is visible from the host side, not just the Worker.
+if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
+if (process.env.GEX_DENSE_DEBUG) globalThis.GEX_DENSE_DEBUG = 1;
+// GEX_TEST_MEMORIES=ADDR (a test-only switch; with GEX_MEMORIES=1 and
+// node --expose-gc): twice a second, after a collection, the 32-bit word at
+// ADDR in each memory `__gexMemories` holds, as a page leg reads a game's
+// frame counter; and at exit how many it still holds.
+if (process.env.GEX_TEST_MEMORIES) {
+  const at = Number(process.env.GEX_TEST_MEMORIES);
+  setInterval(() => {
+    globalThis.gc?.();
+    const all = globalThis.__gexMemories;
+    if (!all?.size) console.error('[test] memories: none');
+    for (const [pid, mem] of all ?? []) {
+      const v = mem.buffer.byteLength >= at + 4 ? new DataView(mem.buffer).getUint32(at, true) : -1;
+      console.error(`[test] memories: pid ${pid} word ${v}`);
+    }
+  }, 500).unref();
+  process.on('exit', () => console.error(`[test] memories at exit: ${globalThis.__gexMemories?.size ?? 0}`));
+}
+
+// Options come first and are named, so a guest argument that happens to
+// contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
+const files = {};
+// Lazy files (`--lazy`): [guest path, size, host path without its leading
+// slash] (the kernel puts the slash back: `k_fs_add_lazy`).
+const lazy = [];
+// Each bundled file's modification time, as the host has it (seconds).
+const mtimes = {};
+// The host files the bundle came from (`--file`, `--tar`, `--busybox`;
+// a `--dir`'s files by `mtimes`), for a snapshot's identity of it.
+const inputs = [];
+// Extended attributes from a `--tar`'s pax headers: path to { name: bytes }.
+const xattrs = {};
+let strace = false;
+let cwd = null;
+const extract = [];
+let argv0 = null;
+const env = [];
+// Hard links (guest path -> the bundled file it names) and modes.
+const hard = {};
+const modes = {};
+let cgenMode = 0;
+let providersRoot = false;
+let noJit = false;
+let aotRun = false;
+const dirs = [];
+// `--dir`'s files from this size up are lazy, unless GEX_DIR_EAGER=1.
+const DIR_LAZY_MIN = 64 << 10;
+const dirEager = process.env.GEX_DIR_EAGER === '1';
+// Symbolic links, path -> target text (`--tar`).
+const symlinks = {};
+const rest = [];
+{
+  const av = process.argv.slice(2);
+  let i = 0;
+  for (; i < av.length; i++) {
+    if (av[i] === '--file') {
+      const spec = av[++i] ?? '';
+      const eq = spec.indexOf('=');
+      if (eq <= 0) { console.error('--file wants <guest>=<host>'); process.exit(2); }
+      files[spec.slice(0, eq)] = readFileSync(spec.slice(eq + 1));
+      inputs.push(spec.slice(eq + 1));
+      mtimes[spec.slice(0, eq)] = Math.trunc(statSync(spec.slice(eq + 1)).mtimeMs / 1000);
+    } else if (av[i] === '--dir') {
+      // A whole directory tree, which is what a program that reads headers or
+      // data files needs and what a page would bundle up front.
+      const spec = av[++i] ?? '';
+      const eq = spec.indexOf('=');
+      if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
+      const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
+      const walk = (guest, host) => {
+        // Unreadable directories are ordinary in a rootfs (mode 0700, root),
+        // and one must not take the whole run down.
+        let names;
+        try {
+          names = readdirSync(host);
+        } catch {
+          return;
+        }
+        // Every directory: files bring their parents with them, but a Wine
+        // prefix's `Temp` and profile folders arrive empty, and an empty
+        // one's parents need not hold a file either (an ejected project's
+        // sparse prefix: `users/gex/AppData/Local/Temp` alone).
+        if (guest) {
+          dirs.push(guest);
+          // And its time, as a file's: a file manager lists folders by it.
+          try {
+            mtimes[guest] = Math.trunc(statSync(host).mtimeMs / 1000);
+          } catch {
+            // Its entries date it (the kernel's `date_parents`).
+          }
+        }
+        for (const name of names) {
+          const h = `${host}/${name}`, g = `${guest}/${name}`;
+          // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and
+          // `stat` follows links so it throws on them. Skipping matches what a
+          // guest sees: the link resolves to nothing there too.
+          let st;
+          try {
+            st = statSync(h);
+          } catch {
+            continue;
+          }
+          // A directory *symlink* is not descended into: Debian's
+          // `/usr/bin/X11 -> .` reads as a directory, so this walked into it
+          // forever until a too-long path blew up. The target is already
+          // walked under its real name.
+          if (st.isDirectory()) {
+            let link;
+            try {
+              link = lstatSync(h);
+            } catch {
+              continue;
+            }
+            // It arrives as the link it is instead (a Wine prefix's
+            // `dosdevices/c: -> ../drive_c`, which Wine opens by that name).
+            if (!link.isSymbolicLink()) walk(g, h);
+            else symlinks[g] = readlinkSync(h);
+          } else {
+            try {
+              // A large file is read only as far as the guest reads it: a
+              // test's Wine dist is a gigabyte, mostly DLLs no run loads,
+              // and reading it all up front was every page case's start.
+              if (st.size >= DIR_LAZY_MIN && !dirEager) {
+                accessSync(h, fsc.R_OK);
+                lazy.push([g, st.size, resolve(h).replace(/^\/+/, '')]);
+                process.env.GEX_NODE_LAZY = '1';
+              } else {
+                files[g] = readFileSync(h);
+              }
+              mtimes[g] = Math.trunc(st.mtimeMs / 1000);
+            } catch {
+              // Unreadable, or a name the host rejects. One file is not the
+              // run.
+            }
+          }
+        }
+      };
+      walk(guestRoot.replace(/\/$/, ''), hostRoot.replace(/\/$/, ''));
+      // Its lazy files skip GEX_LAZY_DELAY_MS (lazy-fetch.mjs `nodeFetch`).
+      if (!dirEager) {
+        const roots = (process.env.GEX_DIR_LAZY_ROOTS ?? '').split('\n').filter(Boolean);
+        process.env.GEX_DIR_LAZY_ROOTS = [...roots, resolve(hostRoot)].join('\n');
+      }
+    } else if (av[i] === '--lazy') {
+      const spec = av[++i] ?? '';
+      const eq = spec.indexOf('=');
+      if (eq <= 0) { console.error('--lazy wants <guest>=<host>'); process.exit(2); }
+      const host = resolve(spec.slice(eq + 1)).replace(/^\/+/, '');
+      lazy.push([spec.slice(0, eq), statSync('/' + host).size, host]);
+      process.env.GEX_NODE_LAZY = '1';
+    } else if (av[i] === '--extract') {
+      const spec = av[++i] ?? '';
+      const eq = spec.indexOf('=');
+      if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
+      extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
+    } else if (av[i] === '--tar') {
+      const { untar } = await import('../../../page/src/tar.js');
+      inputs.push(av[i + 1] ?? '');
+      const buf = readFileSync(av[++i] ?? '');
+      const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      Object.assign(files, tree.files);
+      Object.assign(modes, tree.modes ?? {});
+      Object.assign(xattrs, tree.xattrs ?? {});
+      Object.assign(hard, tree.hard ?? {});
+      Object.assign(symlinks, tree.links ?? {});
+      dirs.push(...(tree.dirs ?? []));
+    } else if (av[i] === '--busybox') {
+      const host = av[++i] ?? '';
+      files['/bin/busybox'] = readFileSync(host);
+      inputs.push(host);
+      modes['/bin/busybox'] = 0o755;
+      const list = readFileSync(new URL('../../../toolchain/busybox/busybox.applets', import.meta.url), 'utf8');
+      for (const name of list.split('\n').filter(Boolean)) {
+        for (const dir of ['/bin', '/usr/bin']) hard[`${dir}/${name}`] = '/bin/busybox';
+      }
+    } else if (av[i] === '--cwd') cwd = av[++i];
+    else if (av[i] === '--env') env.push(av[++i] ?? '');
+    else if (av[i] === '--strace') strace = true;
+    else if (av[i] === '--cgen') cgenMode = 2;
+    else if (av[i] === '--cgen-prefer') cgenMode = 1;
+    // the page's default: export providers from the dist's gex/cgen, no units
+    else if (av[i] === '--providers') { cgenMode = 8; providersRoot = true; }
+    else if (av[i] === '--no-jit') noJit = true;
+    else if (av[i] === '--aot') aotRun = true;
+    else if (av[i] === '--argv0') argv0 = av[++i];
+    else break;
+  }
+  rest.push(...av.slice(i));
+}
+
+const [guestPath, elfPath, ...guestArgs] = rest;
+if (!guestPath || !elfPath) {
+  console.error('usage: run-node.mjs [opts] <guest.wasm> <program.elf> [args...]');
+  process.exit(2);
+}
+
+// Everything on stdin up front -- the browser host cannot block for more
+// later. Nothing on a terminal, so an interactive run does not wait forever.
+function readStdin() {
+  try {
+    return process.stdin.isTTY ? null : readFileSync(0);
+  } catch {
+    return null;
+  }
+}
+
+// The same file the page fetches -- `hosts/browser/build.sh` installs it here,
+// so the harness tests what ships rather than a separately-built copy.
+//
+// `GEX_SHARED=1` picks the shared-memory pair instead: a memory import's
+// `shared` flag is part of its type, so the shim, seed, kernel and every
+// closure module must be the shared ones together. That is the configuration
+// the page ships and the one a fork breaks in.
+const SHARED = !!process.env.GEX_SHARED || SINGLE;
+const PUB = process.env.GEX_WEB_DIR
+  ? new URL(`file://${process.env.GEX_WEB_DIR.replace(/\/?$/, '/')}`)
+  : new URL('../../../page/public/gex/', import.meta.url);
+const shimWasm = readFileSync(
+  new URL(
+    SHARED ? `gex_browser${SHIM_INFIX}.shared.wasm` : `gex_browser${ARCH_INFIX}.wasm`,
+    PUB,
+  ),
+);
+
+// The global kernel: the process table, filesystem and pipes every process
+// shares, in a module every Worker instantiates against one shared memory.
+// Optional -- a single-process run needs none of it, but a program that forks
+// gets as far as the fork and no further without it.
+let kernel = null;
+try {
+  const path = new URL(
+    SHARED ? `gex_kernel${SHIM_INFIX}.wasm` : `gex_kernel${ARCH_INFIX}.plain.wasm`,
+    PUB,
+  );
+  kernel = {
+    module: await WebAssembly.compile(readFileSync(path)),
+    // Four gigabytes, all a wasm32 memory can be. The rootfs lives here (the
+    // filesystem belongs to the kernel), so this ceiling is the largest rootfs
+    // a run can have -- at one gigabyte a full Debian arm64 image did not
+    // fit. `maximum` reserves address space, not pages, so raising it is free.
+    // GEX_KERNEL_MAX_MIB (a test-only switch): a smaller
+    // ceiling, so the kernel's memory runs out the way an engine's does.
+    memory: new WebAssembly.Memory({ initial: 2048, maximum: process.env.GEX_KERNEL_MAX_MIB ? Math.max(2048, Math.min(65536, Number(process.env.GEX_KERNEL_MAX_MIB) * 16)) : 65536, shared: true }),
+    // Made once for every Worker (lazy-fetch.mjs `spareMemories`).
+    spare: spareMemories(),
+  };
+} catch {
+  // Not built. `hosts/kernel/build.sh` makes it; a run that never forks will
+  // not notice, and one that does will say so when it tries.
+}
+
+// Everything past here is the host -- `host.mjs`, the same file the page uses,
+// with a Node `Worker` in place of a Web one. Pid 1 runs in a Worker, not on
+// the main thread: `k_park` is `Atomics.wait`, and a guest parking on the main
+// thread would stop the loop that starts its children (`bash -c 'echo $(echo
+// hi)'` hung this way). No guest is on the thread the host runs on.
+const guestWasm = readFileSync(guestPath);
+const elf = readFileSync(elfPath);
+const args = [argv0 ?? elfPath, ...guestArgs];
+
+/// Read a `.pins` manifest into `{ path: { base, span } }`.
+///
+/// The same file `gexc run --pin` takes, and the same format the closure
+/// build writes: a hex base, a space, a guest path.
+function readPins() {
+  const path = process.env.GEX_PINS;
+  if (!path) return undefined;
+  const out = {};
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    // `base span path`: the span stops the placer handing out an address
+    // inside a pinned object.
+    const f = line.split(' ');
+    if (f.length < 3) continue;
+    const base = Number(f[0]);
+    const span = Number(f[1]);
+    if (!Number.isFinite(base) || base <= 0) continue;
+    out[f.slice(2).join(' ').trim()] = { base, span: Number.isFinite(span) ? span : 0 };
+  }
+  return out;
+}
+
+/// Every library module of a closure build, in build order (the order `gexc`
+/// allocated slots in; the modules themselves are independent).
+function readClosure() {
+  const stem = process.env.GEX_CLOSURE;
+  if (!stem) return undefined;
+  const dir = dirname(stem);
+  const base = basename(stem);
+  const names = readdirSync(dir)
+    // Not the image module itself: that is the guest, not a library.
+    .filter((n) => n.startsWith(base + '.') && n.endsWith('.wasm') && n !== base + '.wasm')
+    .sort();
+  return names.map((n) => readFileSync(join(dir, n)));
+}
+
+// With GEX_MEM64, the 32-bit memory's runtime too, for a process whose
+// program cannot run in a 64-bit one (host.mjs `#other`: a wasm32 module,
+// such as 64-bit Wine's wineserver, or a 32-bit ELF). Optional, as the kernel.
+let other = null;
+if (MEM64 && SHARED && kernel) {
+  try {
+    other = {
+      shim: readFileSync(new URL(`gex_browser${ARCH_INFIX}.shared.wasm`, PUB)),
+      guest: readFileSync(new URL(`seed${ARCH_INFIX}.shared.wasm`, PUB)),
+      // the one kernel module serves both flavours (gex-kmem)
+      kernel: kernel.module,
+    };
+  } catch {
+    // Not built: such a process says so when it starts.
+  }
+} else if (SHARED && !SINGLE && kernel && ARCH_INFIX) {
+  // Without it, the 64-bit memory's runtime, for a program an exec asks one
+  // for (GEX_MEM64=1 in the exec's environment, or the
+  // image's user.gex.mem64 record). Read only then.
+  other = async () => ({
+    shim: readFileSync(new URL(`gex_browser${ARCH_INFIX}.m64.shared.wasm`, PUB)),
+    guest: readFileSync(new URL(`seed${ARCH_INFIX}.m64.shared.wasm`, PUB)),
+    kernel: kernel.module,
+  });
+}
+
+// GEX_SNAP_OUT=DIR GEX_SNAP_AT=TEXT: once the guest's output has said TEXT,
+// a session snapshot (`ProcessHost.snapshot`) into DIR, after
+// GEX_SNAP_DELAY_MS (200); the run then ends (status 0), or goes on with
+// GEX_SNAP_RESUME=1. GEX_SNAP_IN=DIR: the run is DIR's snapshot, restored
+// (`ProcessHost.restore`), in place of the program. A refused snapshot ends
+// the run with status 3, as does asking a restored run for one (both set).
+const SNAP_OUT = process.env.GEX_SNAP_OUT, SNAP_AT = process.env.GEX_SNAP_AT, SNAP_IN = process.env.GEX_SNAP_IN;
+let snapSeen = '', snapTaken = false;
+function snapWatch(text) {
+  if (!SNAP_OUT || !SNAP_AT || snapTaken) return;
+  snapSeen = (snapSeen + text).slice(-4096);
+  if (!snapSeen.includes(SNAP_AT)) return;
+  snapTaken = true;
+  setTimeout(snapTake, Number(process.env.GEX_SNAP_DELAY_MS ?? 200));
+}
+async function snapTake() {
+  const resume = process.env.GEX_SNAP_RESUME === '1';
+  const r = await host.snapshot({ timeout: Number(process.env.GEX_SNAP_TIMEOUT_MS ?? 10000), resume, sources: await snapSourcesMake() });
+  if (r.refused) {
+    process.stderr.write(`[gex] snapshot refused after ${r.stopMs.toFixed(1)} ms: ${r.refused}\n`);
+    process.exit(3);
+  }
+  const t0 = performance.now();
+  mkdirSync(SNAP_OUT, { recursive: true });
+  let bytes = snapWrite(join(SNAP_OUT, 'kernel'), r.kernel);
+  writeFileSync(join(SNAP_OUT, 'kernel.refs.json'), JSON.stringify({ refs: r.kernel.refs, sources: r.kernel.sources }));
+  const byRef = r.kernel.refs.reduce((n, x) => n + x[1], 0);
+  for (const [pid, b] of r.memories) bytes += snapWrite(join(SNAP_OUT, `mem-${pid}`), b);
+  for (const [pid, b] of r.stores) { writeFileSync(join(SNAP_OUT, `store-${pid}.bin`), b); bytes += b.length; }
+  writeFileSync(join(SNAP_OUT, 'meta.json'), JSON.stringify(r.meta, (k, v) => (typeof v === 'bigint' ? `${v}n` : v)));
+  process.stderr.write(`[gex] snapshot: ${r.meta.threads.length} threads of ${r.memories.size} processes, `
+    + `stop ${r.stopMs.toFixed(1)} ms, copy ${r.copyMs.toFixed(1)} ms, write ${(performance.now() - t0).toFixed(1)} ms, ${(bytes / 1048576).toFixed(1)} MiB`
+    + ` (and ${(byRef / 1048576).toFixed(1)} MiB of the kernel's by reference)\n`);
+  if (!resume) process.exit(0);
+}
+// A memory as the snapshot holds it (its nonzero runs): NAME.bin the runs'
+// bytes one after another, NAME.map `{ length, runs: [[offset, length]] }`.
+// The bytes written.
+function snapWrite(name, m) {
+  const fd = openSync(`${name}.bin`, 'w');
+  let n = 0;
+  for (const [, bytes] of m.runs) { writeSync(fd, bytes); n += bytes.length; }
+  closeSync(fd);
+  writeFileSync(`${name}.map`, JSON.stringify({ length: m.length, runs: m.runs.map(([at, b]) => [at, b.length]) }));
+  return n;
+}
+function snapMem(name) {
+  const map = JSON.parse(readFileSync(`${name}.map`, 'utf8'));
+  // Run by run: a kernel's file passes what one read may take (2 GiB).
+  const fd = openSync(`${name}.bin`, 'r');
+  let off = 0;
+  const runs = map.runs.map(([at, len]) => {
+    const b = Buffer.allocUnsafe(len);
+    for (let got = 0; got < len;) got += readSync(fd, b, got, len - got, off + got);
+    off += len;
+    return [at, b];
+  });
+  closeSync(fd);
+  return { length: map.length, runs };
+}
+// What a snapshot's kernel pages may be by reference to (host.mjs
+// `snapRefs`): this run's bundled files (kind 0, by guest path) and its lazy
+// files (kind 1, by host path), under an identity of all of them made from
+// names, sizes and modification times (the host files the bundle came from,
+// each bundled file, each lazy one), never their bytes: it is made while
+// the session is stopped, and again before a restore.
+let snapSources = null;
+async function snapSourcesMake() {
+  if (snapSources) return snapSources;
+  const { createHash } = await import('node:crypto');
+  const h = createHash('sha256');
+  for (const p of inputs) {
+    let st = null;
+    try { st = statSync(p); } catch {}
+    h.update(`${resolve(p)}\0${st?.size ?? -1}\0${st?.mtimeMs ?? 0}\0`);
+  }
+  for (const p of Object.keys(files).sort()) h.update(`${p}\0${files[p].length}\0${mtimes[p] ?? 0}\0`);
+  for (const [g, size, host] of [...lazy].sort((x, y) => (x[0] < y[0] ? -1 : 1))) {
+    let mt = 0;
+    try { mt = statSync('/' + host).mtimeMs; } catch {}
+    h.update(`${g}\0${size}\0${host}\0${mt}\0`);
+  }
+  const id = h.digest('hex');
+  snapSources = {
+    id,
+    read(kind, name, off, len) {
+      if (kind === 0) {
+        const b = files[name];
+        return b && off + len <= b.length ? new Uint8Array(b.buffer, b.byteOffset + off, len) : null;
+      }
+      if (kind !== 1) return null;
+      const fd = openSync(name.startsWith('/') ? name : `/${name}`, 'r');
+      try {
+        const b = new Uint8Array(len);
+        return readSync(fd, b, 0, len, off) === len ? b : null;
+      } finally { closeSync(fd); }
+    },
+  };
+  return snapSources;
+}
+function snapRead(dir) {
+  const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'), (k, v) => (typeof v === 'string' && /^\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v));
+  const memories = new Map(), stores = new Map();
+  for (const f of readdirSync(dir)) {
+    const m = /^(mem|store)-(\d+)\.(bin|map)$/.exec(f);
+    if (!m) continue;
+    if (m[1] === 'mem' && m[3] === 'map') memories.set(Number(m[2]), snapMem(join(dir, `mem-${m[2]}`)));
+    if (m[1] === 'store') stores.set(Number(m[2]), readFileSync(join(dir, f)));
+  }
+  const kernel = snapMem(join(dir, 'kernel'));
+  try { Object.assign(kernel, JSON.parse(readFileSync(join(dir, 'kernel.refs.json'), 'utf8'))); } catch {}
+  return { kernel, memories, stores, meta };
+}
+
+const host = new ProcessHost({
+  makeWorker: SINGLE ? () => new FiberWorker() : () => new Worker(new URL('./worker.mjs', import.meta.url),
+    // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
+    // guest's time actually goes (which translated library functions, JS
+    // overhead, GC). Off by default -- it slows the run and writes a file each.
+    process.env.GEX_CPU_PROF
+      ? { execArgv: ['--cpu-prof', '--cpu-prof-dir', process.env.GEX_CPU_PROF, '--cpu-prof-interval', '2000'] }
+      // GEX_WORKER_STACK_MB=<n>: each Worker's stack, in MiB (Node's default
+      // is larger than a browser's), to see code that runs out of it here.
+      : (process.env.GEX_WORKER_STACK_MB ? { resourceLimits: { stackSizeMb: Number(process.env.GEX_WORKER_STACK_MB) } } : undefined)),
+  shim: shimWasm,
+  guest: guestWasm,
+  kernel,
+  other,
+  // Merged into every process's start message, because on a real machine
+  // every process gets the same of all of this.
+  extra: {
+    // Function-tier units (--cgen): where their files are, for every Worker.
+    cgen: cgenMode
+      ? { mode: cgenMode | (process.env.GEX_CGEN_UNGUARDED === '1' ? 4 : 0), root: providersRoot ? new URL('cgen', PUB).pathname : process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
+      : undefined,
+    // --no-jit: nothing is translated at run time, in any Worker.
+    jit: noJit ? false : undefined,
+    // --aot (implied by --no-jit): an ejected project's run, translation
+    // allowed or not (its training run).
+    aot: noJit || aotRun ? true : undefined,
+    // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
+    // deflate stream that a UTF-8 round trip would fill with U+FFFD.
+    rawOutput: true,
+    // The switches run-node.mjs takes from the environment, as the page from its
+    // URL (options.mjs).
+    ...envOptions(process.env, 'extra'),
+    // Which memory every process gets; must match the artefacts chosen above.
+    shared: SHARED,
+    // GEX_CLOSURE names the stem a closure build wrote; each
+    // `<stem>.NN.<name>.wasm` is one prebuilt library. In `extra` so a forked
+    // child gets it too: a child's own dispatch tables start empty, so it must
+    // instantiate the modules itself.
+    closure: readClosure(),
+    // GEX_NETWORK gives the guest a network of real TCP sockets. Inherited:
+    // apt fetches in a forked helper, so the one process needing a network was
+    // the only one without one when this was not carried.
+    network: !!(process.env.GEX_NETWORK || process.env.GEX_PAGE_HOSTS),
+    tcp: !!process.env.GEX_NETWORK,
+    // GEX_PAGE_HOSTS=name=DIR_OR_URL,...: hosts answered from those files
+    // (page-host.mjs), as a page's `pageHosts`; with no GEX_NETWORK, the
+    // guest reaches only these.
+    pageHosts: pageHostsFromEnv(process.env.GEX_PAGE_HOSTS),
+    // GEX_WL_STUB: run the shim's gex-wayland compositor with a headless present
+    // (no canvas), so a native-wayland guest connects and inits under node --
+    // for reproducing the browser-only native-wayland thread deadlock with node
+    // tooling. Every process gets it (gtk3-demo is a forked child of the shell).
+    wlStub: !!process.env.GEX_WL_STUB,
+    // GEX_WL_TRACE: narrate the wayland protocol (the wasm shim has no env, so
+    // the host flips the switch via gex_set_wl_trace in the worker).
+    wlTrace: process.env.GEX_WL_TRACE ? 1 : undefined,
+    // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
+    dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
+    mem64: MEM64,
+    // GEX_GL_CHANNEL=1: every process gets a GL ring, as a page with
+    // `gl: 'compositor'` gives them before its compositor starts Mesa: the
+    // guest has /dev/gex-gl, and nothing answers a batch sent into it.
+    glChannel: process.env.GEX_GL_CHANNEL === '1' ? makeGlChannel() : undefined,
+    // GEX_TEST_BREAK_STACK_GUARD=1: each Worker's shim stack guard broken at
+    // its start (a test-only switch).
+    testBreakStackGuard: process.env.GEX_TEST_BREAK_STACK_GUARD === '1' || undefined,
+    // GEX_TEST_UD2_ENTRY=1: 64-bit Wine's every system and Unix call by the
+    // fault hook's route, none by the direct entry (a test-only switch).
+    testUd2Entry: process.env.GEX_TEST_UD2_ENTRY === '1' || undefined,
+    inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
+    excTrace: !!process.env.GEX_EXC_TRACE,
+    // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
+    // 2 folded call targets, 4 successors).
+    discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
+    // Compiled translation units shared by every process, unless GEX_UNIT_CACHE=0.
+    unitCache: process.env.GEX_UNIT_CACHE === '0' ? undefined : 1,
+    // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
+    shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
+    // GEX_LOG=1: gex's debug output (log.mjs); Workers see the environment too.
+    log: process.env.GEX_LOG || undefined,
+    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
+    fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
+    // runs, saved under that name.
+    xcache: process.env.GEX_XCACHE || undefined,
+    // GEX_XCACHE_MIN=bytes: save when the store grew by this much (default 1 MiB).
+    xcacheMin: process.env.GEX_XCACHE_MIN ? Number(process.env.GEX_XCACHE_MIN) : undefined,
+    // GEX_XCACHE_DELAY_MS=ms: each save waits this long before it writes (tests: a slow disk).
+    xcacheDelay: process.env.GEX_XCACHE_DELAY_MS ? Number(process.env.GEX_XCACHE_DELAY_MS) : undefined,
+    fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
+    fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
+    // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).
+    providers: process.env.GEX_PROVIDERS === '0' ? 0 : undefined,
+    // GEX_ELF_UNITS=name,...: shared objects that get their function-tier
+    // unit from the cache at the bias they map at (the page's `?elfunits=`).
+    elfUnits: process.env.GEX_ELF_UNITS || undefined,
+    fillTime: !!process.env.GEX_FILL_TIME,
+    // GEX_PROVIDER_DIRS=dir[:dir...]: provider sources from outside gex, as
+    // natively (gex-cgen `add_sources`): every dir's *.c, named by stem.
+    providerSources: providerSources(process.env.GEX_PROVIDER_DIRS),
+    // GEX_STATEFUL=dll=file,...: stateful providers replacing Windows
+    // libraries, their modules under the unit cache (cgen.rs `set_stateful`).
+    stateful: process.env.GEX_STATEFUL || undefined,
+    debugExit: !!process.env.GEX_DEBUG_EXIT,
+    // Its own line per process exit (`onExit` below), not the host's.
+    ownExitLines: true,
+    // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
+    // dispatch misses, so a slow run can be told from a stuck one.
+    heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,
+    // GEX_PHASES=1: a stat's time by phase, from entry to return (gex_kernel::phase).
+    phases: process.env.GEX_PHASES ? (Number(process.env.GEX_PHASES) || 1) : undefined,
+    // GEX_RECOMPILE_OBJECTS statically recompiles each shared object once it
+    // proves hot -- the feature this project exists for. The value is a cap in
+    // KiB of mapped text; 8 MB is the largest that works (Mesa's rasteriser
+    // above it brings the run down inside ld.so).
+    recompileObjects: process.env.GEX_RECOMPILE_OBJECTS
+      ? Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192
+      : 0,
+    // GEX_LINK keeps the address space the guest's `ld.so` produced and hands
+    // it to the next process of the same program, relocations already applied.
+    link: Number(process.env.GEX_LINK || 0),
+    // GEX_TRACE is the syscall log, large enough to want a question already
+    // narrowed to a few seconds of guest time.
+    trace: !!process.env.GEX_TRACE,
+    // GEX_DL_CHECKED_CALLS=1: guard wasm32 modules' indirect calls (cgen/dylink.rs `checked`).
+    dlChecked: process.env.GEX_DL_CHECKED_CALLS === '1',
+    // GEX_JIT_DIAG: retire counts by page and call, and the watch on a page that keeps translating.
+    jitDiag: !!process.env.GEX_JIT_DIAG,
+    // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
+    traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+    watchMem: process.env.GEX_WATCH_MEM || undefined,
+    // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
+    // invisible until dereferenced, so this names the block that arrives with
+    // the bad value, not the one that dies on it.
+    checkSp: !!process.env.GEX_CHECK_SP,
+    // GEX_COHERENT_LOADS emits guest scalar loads/stores as atomic-when-aligned
+    // so shared reads stay coherent under true parallelism (V8 can't hoist a
+    // plain wasm load across a guest fence). Tests whether the GTK startup race
+    // is plain-load coherence at guest fences. Default off.
+    coherentLoads: !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
+    // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
+    // into the MAIN thread's stack (it would smash a canary the main thread only
+    // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
+    spGuard: !!process.env.GEX_SP_GUARD,
+    // TEST: GEX_DEBUG_PANIC=plain|nested|long makes the shim panic on purpose
+    // before the guest runs.
+    debugPanic: { plain: 1, nested: 2, long: 3 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
+    // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
+    // dumps the live registers (x30 = caller) and continues. Aimed at
+    // __stack_chk_fail to name the smashed function.
+    trapPc: process.env.GEX_TRAP_PC || 0,
+    // GEX_PREGROW: grow guest memory to a large floor up front so runtime
+    // memory.grow stops during startup -- probes the stale-bound-after-grow race.
+    pregrow: !!process.env.GEX_PREGROW,
+    // GEX_HOT dumps the guest's hottest back edges on exit -- the browser's
+    // answer to `--sample`, since a host profile is all `wasm-function[N]`.
+    hot: !!process.env.GEX_HOT,
+    // GEX_NO_INTRINSICS translates glibc's own memcpy/memcmp/memset instead of
+    // serving them, the only way to price the substitution.
+    noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
+    // GEX_INTRINSIC_MASK bisects which family corrupts memory: bit0=memcpy,
+    // bit1=memset, bit2=memcmp. e.g. 1 = memcpy only, 2 = memset only.
+    intrinsicMask: process.env.GEX_INTRINSIC_MASK
+      ? parseInt(process.env.GEX_INTRINSIC_MASK, 10) >>> 0
+      : undefined,
+    // GEX_FMA_COUNT: how many fused multiply-adds crossed out of the guest
+    // module. wasm has no FMA, so each is a call into the shim's.
+    fmaCount: !!process.env.GEX_FMA_COUNT,
+    // Anything the program leaves behind, read out by the Worker that owns its
+    // address space -- this thread has no view of it.
+    extract: extract.map(([guest]) => guest),
+  },
+  onOutput: (fd, text, pid, m) => {
+    snapWatch(m?.bytes ? Buffer.from(m.bytes).toString() : String(text));
+    // Through `process.stdout`, not `writeSync(1, ...)`: this runner is itself
+    // sometimes inside a Worker, whose fd 1 is the process's fd 1 -- writing it
+    // directly interleaved with the parent's output out of order.
+    const bytes = m?.bytes ? Buffer.from(m.bytes) : text;
+    const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
+    // Anything above 2 is a real descriptor and still goes to the fd.
+    if (s) s.write(bytes);
+    else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
+  },
+  onExit: (m, pid) => {
+    // A process that threw has no exit numbers to report (`#onExit`).
+    if (m.threw) return;
+    // GEX_DL_FILE=PATH: the discovery log (GEX_DISCOVER_SKIP=256), to PATH.PID.
+    if (process.env.GEX_DL_FILE && m.dl) appendFileSync(`${process.env.GEX_DL_FILE}.${pid}`, m.dl);
+    // How much of the run was translating vs. running translated code. Per
+    // process, because a program that forks pays it again.
+    if (process.env.GEX_TIME_JIT) {
+      process.stderr.write(
+        // `guestMillis` is the whole time inside the guest (load, install,
+        // run); `millis` is only the translator.
+        `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
+          // Why misses translated rather than being filled, and where: a
+          // Worker whose table lacks an install it should have shows here
+          // as nofill.
+          (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
+          (m.byObject ? ` [${m.byObject}]` : '') +
+          (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
+          (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +
+          // The page's runtime dispatch slots still unspent (a budget, and
+          // what an image loaded again at its base must not spend).
+          (m.slotsLeftK >= 0 ? `, slots left ${m.slotsLeftK}k` : '') +
+          (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
+            ` (${m.compileMs}ms compile${m.compiles !== undefined ? ` of ${m.compiles}` : ''}${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+          `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
+          // Where the shared-slot lookup went, to say why a forked and exec'd
+          // child lifts its parent's libraries again.
+          (m.reuse
+            ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}` +
+              ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}` +
+              (m.reuse[11] ? ` servedOtherMode=${m.reuse[11]}` : '') +
+              (m.reuse[12] || m.reuse[13] ? ` far=${m.reuse[12]} farSwitch=${m.reuse[13]} farInPlace=${m.reuse[14]}` : '')
+            : '') +
+          (m.byObject ? ` [${m.byObject}]` : '') +
+          (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB` +
+            (m.xlate[10] > 0 ? ` named=${m.xlate[10]}/${Math.round(m.xlate[11] / 1024)}KiB` : '') + ']' : '') +
+          '\n',
+      );
+    }
+    if (pid !== 1) {
+      if (process.env.GEX_DEBUG_EXIT) {
+        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
+        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}\n`);
+      }
+      return;
+    }
+    // GEX_TIME_GUEST prints how long the guest itself ran, not how long the
+    // process took: a third of the total is V8 compiling the module, which
+    // buries a codegen A/B. A/B scripts read this line.
+    if (process.env.GEX_TIME_GUEST) {
+      process.stderr.write(`[gex] guest ran in ${m.guestMillis}ms\n`);
+    }
+    // What this process's memory grew to; a run costs this times its process count.
+    if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB\n`);
+    }
+    if (process.env.GEX_HOT) {
+      // An empty answer is a question about the run, not a crash.
+      if (!m.hot?.length) {
+        process.stderr.write(
+          '[hot] nothing counted. The shim may predate `gex_set_hot`; rebuild it.\n',
+        );
+      }
+      for (const line of m.hot ?? []) process.stderr.write(`[hot] ${line}\n`);
+    }
+    if (process.env.GEX_FMA_COUNT && m.fmaCalls !== undefined) {
+      process.stderr.write(`[gex] fma calls: ${m.fmaCalls}\n`);
+    }
+    const got = new Map(m.extracted ?? []);
+    for (const [guest, hostPath] of extract) {
+      const bytes = got.get(guest);
+      if (bytes) writeFileSync(hostPath, Buffer.from(bytes));
+    }
+  },
+  onMessage: (m, pid) => {
+    if (m?.kind === 'audio') audioRing ??= m;
+    // Memory before the guest runs an instruction: whether the cost is placing
+    // the image or running it.
+    if (m?.kind === 'loaded' && pid === 1 && process.env.GEX_DEBUG_EXIT) {
+      process.stderr.write(`[gex] memory after load: ${m.memoryMib.toFixed(0)} MiB\n`);
+    }
+  },
+});
+
+// `/dev/dsp`'s rings in the global kernel (hosts/kernel/src/audio.rs,
+// layout 2), as the page plays them (page/src/audio.js). GEX_AUDIO_TAP=1
+// reports, at exit, what the newest quarter second of the slot written last
+// sounds like: its rate, generation, RMS and frequency (left channel, by
+// the spacing of its zero crossings), and how many slots were ever used.
+let audioRing = null;
+const AU_HDR = 32, AU_SW = 16, AU_OFF = (AU_HDR + 8 * AU_SW) * 4;
+function audioWords() {
+  return new Uint32Array(audioRing.memory.buffer, audioRing.at, AU_HDR + 8 * AU_SW);
+}
+function audioTap() {
+  if (!audioRing) { process.stderr.write('[audio] no ring\n'); return; }
+  const { memory, at } = audioRing;
+  const W = audioWords(), cap = W[3];
+  if (process.env.GEX_AUDIO_TAP === '2') process.stderr.write(`[audio] words ${Array.from(W.slice(0, 48)).join(' ')}\n`);
+  // The slot written last: the one with the newest write time.
+  let best = -1, used = 0;
+  for (let s = 0; s < W[2]; s++) {
+    const b = AU_HDR + s * AU_SW;
+    if (W[b + 3] || W[b + 2]) used++;
+    if (W[b + 2] && (best < 0 || ((W[b + 5] - W[AU_HDR + best * AU_SW + 5]) | 0) >= 0)) best = s;
+  }
+  if (best < 0) { process.stderr.write('[audio] nothing written\n'); return; }
+  const b = AU_HDR + best * AU_SW;
+  const w = W[b + 3], rate = W[b + 1], owner = W[b], gen = W[b + 2];
+  const n = Math.min(w, cap, Math.floor(rate / 4));
+  const f = new Float32Array(memory.buffer, at + AU_OFF + best * cap * 8, cap * 2);
+  let sq = 0, last = 0, prev = -1;
+  const gaps = [];
+  for (let i = w - n; i < w; i++) {
+    const l = f[((i >>> 0) % cap) * 2];
+    sq += l * l;
+    if (i > w - n && (l >= 0) !== (last >= 0)) {
+      if (prev >= 0) gaps.push(i - prev);
+      prev = i;
+    }
+    last = l;
+  }
+  // The frequency from the spacing of the crossings, those within a quarter
+  // of the median averaged: a writer that fell behind under load leaves a
+  // gap or a splice, a few odd spacings that would add crossings to a plain
+  // count.
+  const med = gaps.slice().sort((a, b) => a - b)[gaps.length >> 1];
+  const mid = gaps.filter((g) => Math.abs(g - med) <= med / 4);
+  const half = mid.length ? mid.reduce((a, b) => a + b, 0) / mid.length : 0;
+  const rms = n ? Math.sqrt(sq / n) : 0, hz = half ? rate / (2 * half) : 0;
+  process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)} slots ${used}\n`);
+}
+
+// GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that plays
+// every slot at SPEED times its rate (1: real time), publishing read
+// positions and a heartbeat as the worklet does, so the OSS device paces
+// its writers to it. It plays at a
+// context rate of GEX_AUDIO_RATE (48000), quanta of 128 frames, and with
+// GEX_AUDIO_LOOP=1 mixes the slots (nearest frame) into the capture ring,
+// as `?audioloop=1` does: the round trip (dsp-impulse).
+if (process.env.GEX_AUDIO_PLAYER) {
+  const speed = Number(process.env.GEX_AUDIO_PLAYER) || 1;
+  const ctxRate = Number(process.env.GEX_AUDIO_RATE) || 48000;
+  const loop = process.env.GEX_AUDIO_LOOP === '1';
+  let t = performance.now(), acc = 0;
+  const st = [];
+  setInterval(() => {
+    const now = performance.now(), dt = now - t;
+    t = now;
+    if (!audioRing) return;
+    const W = audioWords(), cap = W[3], ccap = W[8];
+    if (!W[5]) { Atomics.store(W, 5, ctxRate); Atomics.store(W, 9, 128); Atomics.store(W, 6, 10000); }
+    // Whole quanta of the context's rate, as the worklet runs.
+    acc += dt / 1000 * ctxRate * speed;
+    const q = Math.floor(acc / 128);
+    acc -= q * 128;
+    if (!q) return;
+    const k = q * 128;
+    const mix = loop ? new Float32Array(k * 2) : null;
+    for (let s = 0; s < W[2]; s++) {
+      const b = AU_HDR + s * AU_SW;
+      const w = Atomics.load(W, b + 3), g = Atomics.load(W, b + 2), rate = W[b + 1] || ctxRate;
+      st[s] ??= { gen: -1, ri: 0, fr: 0 };
+      const x = st[s];
+      if (g !== x.gen) { x.gen = g; x.ri = w; x.fr = 0; }
+      const f = loop ? new Float32Array(audioRing.memory.buffer, audioRing.at + AU_OFF + s * cap * 8, cap * 2) : null;
+      for (let i = 0; i < k && x.ri !== w; i++) {
+        if (mix) { mix[i * 2] += f[(x.ri % cap) * 2]; mix[i * 2 + 1] += f[(x.ri % cap) * 2 + 1]; }
+        x.fr += rate / ctxRate;
+        while (x.fr >= 1 && x.ri !== w) { x.fr -= 1; x.ri = (x.ri + 1) >>> 0; }
+      }
+      Atomics.store(W, b + 4, x.ri);
+    }
+    if (mix) {
+      const C = new Float32Array(audioRing.memory.buffer, audioRing.at + AU_OFF + W[2] * cap * 8, ccap * 2);
+      let cw = W[7];
+      for (let i = 0; i < k; i++) { C[(cw % ccap) * 2] = mix[i * 2]; C[(cw % ccap) * 2 + 1] = mix[i * 2 + 1]; cw = (cw + 1) >>> 0; }
+      Atomics.store(W, 7, cw);
+    }
+    Atomics.add(W, 4, 1);
+  }, 2).unref();
+}
+
+let status;
+// GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
+// process (every Worker) in `rss`, this isolate's wasm memories in
+// `arrayBuffers` -- to see what a run's footprint is made of.
+if (process.env.GEX_MEMSTATS) {
+  const every = Number(process.env.GEX_MEMSTATS) * 1000 || 10000;
+  const t0 = Date.now();
+  setInterval(() => {
+    const m = process.memoryUsage();
+    const mib = (n) => (n / 1048576).toFixed(0);
+    process.stderr.write(`[memstats] t=${((Date.now() - t0) / 1000).toFixed(0)}s rss=${mib(m.rss)}MiB heap=${mib(m.heapUsed)}MiB external=${mib(m.external)}MiB arrayBuffers=${mib(m.arrayBuffers)}MiB\n`);
+  }, every).unref();
+}
+try {
+  if (SNAP_IN) {
+    const t0 = performance.now();
+    const snap = snapRead(SNAP_IN);
+    process.stderr.write(`[gex] restore: read in ${(performance.now() - t0).toFixed(1)} ms\n`);
+    status = await host.restore(snap, {
+      sources: snap.kernel.refs?.length ? await snapSourcesMake() : null,
+      onRunning: (ms) => process.stderr.write(`[gex] restore: ${snap.meta.threads.length} threads running ${ms.toFixed(1)} ms after the read\n`),
+    });
+  } else
+  status = await host.start({
+    elf,
+    files,
+    args,
+    opts: {
+      strace,
+      lazy,
+      // GEX_STRACE_PID=N: narrate that one process (a forked child too; options.mjs).
+      ...envOptions(process.env, 'opts'),
+      mtimes,
+      xattrs,
+      // The debugging switches, in the run's own options as well as the boot
+      // message: `opts` is what a fork record carries to a child's Worker.
+      traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+      traceMisses: !!process.env.GEX_TRACE_MISSES,
+      dlChecked: process.env.GEX_DL_CHECKED_CALLS === '1',
+      jitDiag: !!process.env.GEX_JIT_DIAG,
+      checkSp: !!process.env.GEX_CHECK_SP,
+      watchMem: process.env.GEX_WATCH_MEM || undefined,
+      noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
+      intrinsicMask: process.env.GEX_INTRINSIC_MASK ? Number(process.env.GEX_INTRINSIC_MASK) : undefined,
+      // The suite compares this run against QEMU on the same machine, and QEMU
+      // reports the real user.
+      // GEX_UID=0 runs the guest as root (a rootfs's dpkg wants it).
+      uid: process.env.GEX_UID !== undefined ? Number(process.env.GEX_UID) : process.getuid?.(),
+      gid: process.env.GEX_UID !== undefined ? Number(process.env.GEX_UID) : process.getgid?.(),
+      stdin: readStdin(),
+      cwd,
+      env: env.length ? env : undefined,
+      dirs,
+      hard,
+      symlinks,
+      modes,
+      // GEX_PINS names a layout written by `gexc build --closure`. Every
+      // object in it is placed exactly where the build assumed, which is
+      // what makes a module built against those addresses correct -- and it
+      // goes into the *global* placement table too, so every process of the
+      // run agrees rather than only the first.
+      pins: readPins(),
+    },
+  });
+} catch (e) {
+  process.stderr.write(`gex: ${e?.message ?? e}\n`);
+  status = 1;
+  // `start` stops the Workers only when pid 1 exits; one that threw would
+  // otherwise keep node alive until the caller's timeout.
+  host.stop();
+}
+// `process.exitCode`, not `process.exit`: the guest's output goes through
+// `process.stdout`/`process.stderr` (async when a pipe), and `process.exit`
+// does not wait for them to drain. Setting the code lets node finish the writes.
+if (SINGLE && process.env.GEX_SINGLE_STATS) {
+  process.stderr.write(`[single] fibers ${FiberWorker.count}, sched ${JSON.stringify(sched.stats)}\n`);
+}
+if (process.env.GEX_AUDIO_TAP) audioTap();
+process.exitCode = status;

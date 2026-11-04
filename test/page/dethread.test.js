@@ -1,4 +1,4 @@
-// An exec from a second thread (Linux's de_thread, shims/browser/src/lib.rs
+// An exec from a second thread (Linux's de_thread, hosts/browser/src/lib.rs
 // `exec_waits`): fixtures/programs/exec-dethread.c execs from a new thread
 // while the first thread joins it, spins in translated code, blocks reading
 // a pipe, or waits on a futex, each 20 times (2 in the single-thread build,

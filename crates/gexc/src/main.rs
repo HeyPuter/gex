@@ -494,7 +494,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     }
     let path = path.context("expected a program to run")?;
     // `--host-env`: the guest starts with gexc's own environment (a gexcc
-    // program's host launcher passes it on: tools/gexcc/hoststub.c), then
+    // program's host launcher passes it on: toolchain/gexcc/hoststub.c), then
     // the `--env` settings over it.
     if host_env {
         let set: std::collections::HashSet<String> =

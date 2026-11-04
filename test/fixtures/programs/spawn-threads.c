@@ -2,7 +2,7 @@
  * CLONE_VM | CLONE_VFORK onto a stack of its own, the child applies its file
  * actions and attributes and execs, and only the calling thread waits. In the
  * page the child runs in the calling thread's Worker, in the parent's memory
- * (shims/browser/src/vfork.rs), so this checks what that must keep apart:
+ * (hosts/browser/src/vfork.rs), so this checks what that must keep apart:
  *   - the child's descriptors (its dup2 onto 1 is not the parent's 1);
  *   - its signal mask and dispositions (setsigmask, setsigdef);
  *   - its exit status and pid, which the parent's wait sees;

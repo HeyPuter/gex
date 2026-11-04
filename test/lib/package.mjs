@@ -1,5 +1,5 @@
 // `--package DIR` (run.mjs): the runtime's entry modules under
-// web/runtime/src and what web/runtime/build.sh names each in DIR.
+// page/runtime/src and what page/runtime/build.sh names each in DIR.
 export const PACKAGE_ENTRIES = {
   'index.js': 'index.mjs',
   'fs.js': 'fs.mjs',
@@ -13,7 +13,7 @@ export const PACKAGE_ENTRIES = {
 };
 
 /** The built module for import `source` from `importer` (paths), when it is
- *  one of the runtime's entries under `src` (web/runtime/src/): else null. */
+ *  one of the runtime's entries under `src` (page/runtime/src/): else null. */
 export function packaged(pkg, src, source, importer) {
   if (!importer || !source.startsWith('.')) return null;
   const abs = new URL(source, `file://${importer.split('?')[0]}`).pathname;

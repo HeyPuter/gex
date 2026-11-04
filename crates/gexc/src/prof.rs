@@ -8,7 +8,7 @@
 //! beside it (`<file>.maps`), so a run ended by a timeout still leaves a
 //! profile. Symbolise with `GEX_PERFMAP=1`'s /tmp/perf-<pid>.map for
 //! compiled wasm and the binaries' symbol tables for the rest
-//! (tools/prof-report.py).
+//! (scripts/prof-report.py).
 //!
 //! Each sample also records the thread it hit, and every thread with at
 //! least `GEX_PROF_MIN_PCT` (default 5) percent of the samples gets a

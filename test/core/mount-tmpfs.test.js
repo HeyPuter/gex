@@ -2,8 +2,8 @@
 // (x86-64 165 and 166, aarch64 40 and 39): a tmpfs over a directory, a file
 // in it, the mount listed, gone at the unmount, a second unmount EINVAL
 // (test/fixtures/programs/mount-tmpfs.c).
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox', 'native-progs'], timeout: 120 };
 

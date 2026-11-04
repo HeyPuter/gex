@@ -1,7 +1,7 @@
-// The eject library's start() (web/src/app.js) on the runtime API, a program
+// The eject library's start() (page/src/app.js) on the runtime API, a program
 // that ends: its standard output and error in `state.out` and onLog, and
 // its exit status from `exited` and onExit.
-import { start } from '../../web/src/app.js';
+import { start } from '../../page/src/app.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: '<div id="app" style="position:relative;width:320px;height:240px"></div>' };
 
@@ -18,7 +18,7 @@ export default async function (t) {
     onLog: (s) => { logged += s; },
     onExit: (st) => { exitSaid = st; },
     build: {
-      arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd: new URL('../eject-site/vendor/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href,
+      arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd: new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href,
       exe: '/bin/sh', argv: ['-c', 'echo to-stdout; echo to-stderr >&2; exit 5'], env: ['PATH=/bin'], cwd: '/',
       featuresOff: [], compositor: false, jitFallback: true, gl: false, switches,
     },

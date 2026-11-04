@@ -1,5 +1,5 @@
 // What a node-host test needs to run a guest program on the page runtime's
-// shim directly (shims/browser/js/run-node.mjs), below the runtime API: the
+// shim directly (hosts/browser/js/run-node.mjs), below the runtime API: the
 // program built, a seed, and a run. Each piece missing (gexc, the shim, a
 // compiler) is a skip.
 //
@@ -15,7 +15,7 @@ import { join, basename } from 'node:path';
 
 export const ROOT = join(import.meta.dirname, '..', '..');
 const PROGRAMS = join(import.meta.dirname, '..', 'fixtures', 'programs');
-const PUB = join(ROOT, 'web/public/gex');
+const PUB = join(ROOT, 'page/public/gex');
 
 const which = (cmd) => {
   try {
@@ -58,7 +58,7 @@ export function guest(t) {
     env: x86 ? { GEX_ARCH: 'x86' } : {},
     need,
     tool,
-    /** A file of the page's shims (`web/public/gex/NAME`, `{infix}` this
+    /** A file of the page's shims (`page/public/gex/NAME`, `{infix}` this
      *  arch's infix: '' or '.x86'), or a skip. */
     pub: (name) => need(join(PUB, name.replace('{infix}', infix))),
     /**
@@ -123,7 +123,7 @@ export function guest(t) {
       const argv = [
         ...(jspi && typeof WebAssembly.Suspending !== 'function' ? ['--experimental-wasm-jspi'] : []),
         ...(single ? ['--import', 'data:text/javascript,delete globalThis.SharedArrayBuffer'] : []),
-        join(ROOT, 'shims/browser/js/run-node.mjs'), ...flags,
+        join(ROOT, 'hosts/browser/js/run-node.mjs'), ...flags,
       ];
       if (single) env = { ...env, GEX_SINGLE: '1' };
       for (const [to, from] of Object.entries(files)) argv.push('--file', `${to}=${from}`);

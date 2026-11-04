@@ -14,7 +14,7 @@ prog-project/run.sh 7                   #    or with other arguments
 ```
 
 The code is this crate (the project model, the eject, the build, the run),
-`shims/native/src/aot.rs` (the runtime side: prebuilt modules and
+`hosts/native/src/aot.rs` (the runtime side: prebuilt modules and
 replacement calls) and `crates/gex-xlate/src/intrinsic.rs`
 (`Intrinsic::Replace`).
 
@@ -346,12 +346,12 @@ example, `user/index.html`, once and never again:
 
 Nothing about the page is special: any page that imports `app.mjs` and
 gives `start()` an element runs the program
-(`tests/eject/wine32-shell-min.html` is a hand-written one, with its own box,
+(`gexdev/tests/eject/wine32-shell-min.html` is a hand-written one, with its own box,
 arguments and `onExit`).
 
 **`start(options)`** resolves once the program runs, with
 `{ exited, kill(), resize(size), state, describe(), ready() }`. Its
-options, the handle and its errors are in `web/src/README.md`, beside the
+options, the handle and its errors are in `page/src/README.md`, beside the
 library's code. An unknown option or a wrong value is an error that names
 it, and so is an option for a piece the build left out
 (`start({ compositor: true })` on a `"compositor": false` build names
@@ -405,7 +405,7 @@ setting (`"compositor"`, say) fails the build and says where it goes.
 `"filesystem"` is required: where the guest's files are kept, `"memory"`
 (gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
 origin private file system, which keeps the whole root, a game's saves and
-the Wine prefix included, across loads; web/runtime README, "Persistence").
+the Wine prefix included, across loads; page/runtime README, "Persistence").
 A new project's file says `"memory"`; a build whose file says neither
 fails. The `"persist"` start option (one directory kept in IndexedDB) is
 gone and fails the build: what it saved is not read by an OPFS filesystem.
@@ -414,8 +414,8 @@ gone and fails the build: what it saved is not read by an OPFS filesystem.
 
 `gexc eject ... --web-shim gex_browser.wasm` vendors gex's browser runtime
 into `runtime/web/`: the shim you give it (built from the same source, for
-the same guest: `shims/browser`, `wasm32-unknown-unknown`, with
-`shims/browser/build.sh`'s link flags) and the `gex.mjs` this gexc was
+the same guest: `hosts/browser`, `wasm32-unknown-unknown`, with
+`hosts/browser/build.sh`'s link flags) and the `gex.mjs` this gexc was
 built with. `build.sh` then also writes `build/web/`:
 
 - the program translated for the browser's single-Worker shim (a plain,
@@ -434,7 +434,7 @@ node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
 node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
 
-`app.mjs`'s `start()` is the Linux program's (`web/src/README.md`, "A Linux
+`app.mjs`'s `start()` is the Linux program's (`page/src/README.md`, "A Linux
 program's build").
 
 The page needs cross-origin isolation (gex's runtime uses
@@ -471,7 +471,7 @@ why, rather than doing nothing.
 
 | Feature | What it is | Off |
 | --- | --- | --- |
-| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `web/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `page/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
 | `gl` | the guest's OpenGL: Mesa on WebGPU | the page ships no Mesa |
 | `multiprocess` | more than one guest process | not yet: a Wine program is several processes |
 | `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the translator is not a separate build |
@@ -490,16 +490,16 @@ keep, and a standalone site around the project's page:
 ```sh
 # 1. record: run the page to its window (headless Chromium); --boot-units-out
 #    also lists the images whose units it used shortly after the window
-node tools/eject/record-wine32.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
+node site/record-wine32.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
   --boot-units-out rec/boot-units.txt
 # 2. eject: the bundle, the units it used, the runtime, a build step
-gexc eject rec --out app-project --web-src web --unit-cache UNITS --features -compositor
+gexc eject rec --out app-project --web-src page --unit-cache UNITS --features -compositor
 # 3. build: the page with those features, the site's inputs in build/web
 app-project/build.sh
 # 4. the static site
-node web/eject-site.mjs app-project site --strip --prune --dedupe \
+node site/eject-site.mjs app-project site --strip --prune --dedupe \
   --pieces --boot-units rec/boot-units.txt
-node tests/eject/wine32-page.mjs site      # check: the site reaches the program's window
+node gexdev/tests/eject/wine32-page.mjs site      # check: the site reaches the program's window
 ```
 
 - **The recording** is how the page was started (exe, arguments,
@@ -513,13 +513,13 @@ node tests/eject/wine32-page.mjs site      # check: the site reaches the program
   the page, `user/index.html` (written once, yours). `page_source` names the
   gex checkout's `web/`: the library is built at build time, because the
   features decide what goes into it.
-- **The build** (`gexc eject build`) runs `web/build-eject-page.sh` with the
+- **The build** (`gexc eject build`) runs `site/build-eject-page.sh` with the
   features switched off, puts the project's runtime wasm in it, drops what a
   feature off ships (Mesa for `gl`), checks the bundler really left out what
   `compositor` off names, and writes `build/web/` (`page/`: the app library,
   `rootfs.tar`, `units/`, and the launch file with user/eject.json
   `"start"`).
-- **The site** (`web/eject-site.mjs`) is the project's page at `/`, the app
+- **The site** (`site/eject-site.mjs`) is the project's page at `/`, the app
   library as plain files, the bundle and the units as `FILE.zst` with a
   preload list, `pack.json` (their sizes and the build id) and the hosting
   files (`serve.mjs`, `_headers`). There is no service worker: the host
@@ -542,7 +542,7 @@ without it means `"whole"`) ships only those files in the site's bundle:
   recorder keeps the set as the session's `files_read`.
 - **Build:** `gexc eject build` puts that list in the launch file; a split
   without a read set fails the build and says so.
-- **Site:** `web/eject-site.mjs` keeps the read files (and the loader) in
+- **Site:** `site/eject-site.mjs` keeps the read files (and the loader) in
   `rootfs.tar` and makes every other file a lazy file: stored once by
   content as `project/build/web/lazy/SHA`, listed with its size and time in
   `lazy.json`. A guest that reads one gets it from the host in 1 MiB ranges,
@@ -606,7 +606,7 @@ fails the image is shipped whole, and the build says so.
 
 A unit holds every function of its image, and a run to the window calls a
 small fraction of them. The default (`"cold": "none"`) ships every unit
-whole, in one archive: `web/eject-site.mjs` tars every unit into
+whole, in one archive: `site/eject-site.mjs` tars every unit into
 `project/build/web/units.tar`, packed as one zstd file. The page decodes it
 once and compiles every module while the bundle downloads; nothing is
 fetched on a call.
@@ -628,7 +628,7 @@ is lifted in the page.
   functions go into cluster modules (`gex-split`), position-independent
   modules with the primary's imports that fill their own slots. The entry
   list does not change, so the runtime sees the same unit.
-- **Site.** `web/eject-site.mjs` packs each unit's clusters into `cold.bin`,
+- **Site.** `site/eject-site.mjs` packs each unit's clusters into `cold.bin`,
   one zstd frame per cluster, plus an index. On a cluster's first call the
   Worker fetches the frame with a synchronous Range request, decodes it,
   compiles it, shares the module with its siblings and instantiates it into

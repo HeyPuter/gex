@@ -1,8 +1,8 @@
 // CompositorWindows: the whole desktop in one canvas, drawn by the scene
 // compositor on WebGPU. Says so and passes where the browser has no WebGPU.
-import { System } from '../../web/runtime/src/index.js';
-import { MemoryFilesystem } from '../../web/runtime/src/fs.js';
-import { CompositorWindows } from '../../web/runtime/src/windows/compositor.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; }</style>
 <canvas id="out" width="800" height="600"></canvas>` };

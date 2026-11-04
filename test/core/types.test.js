@@ -1,4 +1,4 @@
-// The package's declarations (web/runtime/types/*.d.ts) against the modules
+// The package's declarations (page/runtime/types/*.d.ts) against the modules
 // they describe: every value a module exports is declared and every declared
 // one exported; every public method and accessor of each exported class is
 // declared, and every declared one is there; System's options are the ones
@@ -9,7 +9,7 @@ import { PACKAGE_ENTRIES } from '../lib/package.mjs';
 
 export const meta = { hosts: ['node'], images: [], timeout: 60 };
 
-const ROOT = new URL('../../web/runtime/', import.meta.url);
+const ROOT = new URL('../../page/runtime/', import.meta.url);
 
 /** `{ values, classes: { Name: { methods, fields } }, interfaces: { Name: [keys] } }`
  *  from a d.ts: what is declared at its top level, and each class's members. */

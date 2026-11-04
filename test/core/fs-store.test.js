@@ -2,8 +2,8 @@
 // far smaller than what a program writes, a MemoryFilesystem with a max, and
 // the abstract Filesystem a page's own store subclasses. One system per
 // page, so each is a load of its own (t.reload).
-import { System } from '../../web/runtime/src/index.js';
-import { Filesystem, MemoryFilesystem, OPFSFilesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { Filesystem, MemoryFilesystem, OPFSFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 
