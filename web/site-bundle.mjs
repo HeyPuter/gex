@@ -312,6 +312,13 @@ export function buildRest(lazy, store, { bin, work, frame: restFrame, zlev, orde
     }
   };
   const put = (b) => { cur.push(b); curLen += b.length; at += b.length; if (curLen >= restFrame) flush(false); };
+  // A file of half a frame or more has frames of its own: zeros (which
+  // cost a few bytes compressed) to the next frame before it and after it,
+  // so reading it fetches and decodes no other file's bytes, and reading a
+  // small file never decodes a big one's (the first controller took
+  // winegstreamer's frames with SDL's).
+  const alone = restFrame / 2;
+  const align = () => { const r = at % restFrame; if (r) put(Buffer.alloc(restFrame - r)); };
   const header = (name, size) => {
     const h = Buffer.alloc(512);
     h.write(name, 0, 100, 'utf8');
@@ -326,10 +333,14 @@ export function buildRest(lazy, store, { bin, work, frame: restFrame, zlev, orde
   };
   for (const [, size, hash] of order) {
     if (where.has(hash)) continue;
+    const big = size >= alone;
+    // (its header in the frame before: the file's own bytes start its frame)
+    if (big && (at + 512) % restFrame) { const r = (at + 512) % restFrame; put(Buffer.alloc((restFrame - r) % restFrame)); }
     put(header(hash, size));
     where.set(hash, at);
     put(readFileSync(join(store, hash)));
     if (size % 512) put(Buffer.alloc(512 - (size % 512)));
+    if (big) align();
   }
   put(Buffer.alloc(1024));
   const tarSize = at;

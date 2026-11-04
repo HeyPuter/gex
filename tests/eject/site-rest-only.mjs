@@ -65,6 +65,13 @@ try {
     const off = Number(rel.split('#')[1]);
     check(`${path.split('/').pop()}: its bytes at its offset`, tar.subarray(off, off + size).equals(path.endsWith('.so') ? side : side2), true);
   }
+  // A file of half a frame or more has frames of its own: the small
+  // one's frames are none of the big one's.
+  const frames = (rel, size) => { const off = Number(rel.split('#')[1]); return [Math.floor(off / idx.frame), Math.floor((off + size - 1) / idx.frame), off % idx.frame]; };
+  const [big, small] = [r.files.find((f) => f[0].endsWith('.so')), r.files.find((f) => !f[0].endsWith('.so'))];
+  const [b0, b1, bAt] = frames(big[2], big[1]), [s0, s1] = frames(small[2], small[1]);
+  check('a big file starts its frame', bAt, 0);
+  check('a small file shares no frame with a big one', s1 < b0 || s0 > b1, true);
   check('compressed', z.length < side.length, true);
 } finally {
   rmSync(root, { recursive: true, force: true });
