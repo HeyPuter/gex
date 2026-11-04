@@ -20,13 +20,19 @@ export function walk(dir, fn, base = dir) {
 }
 
 /** A .wasm's copy without its debug sections (in WORK/strip, by content), or
- *  SRC itself when `on` is false or it is no .wasm. */
-export function stripper(work, on) {
+ *  SRC itself when `on` is false or it is no .wasm. `names`: the name
+ *  section too, for gex's own runtime wasm (a release build ships none; user
+ *  10-30). Not for a bundle's files: gex finds a static program's entries in
+ *  its table by name (debdemo's stripnames keeps them for that). */
+export function stripper(work, on, names = false) {
+  const drop = names
+    ? '^(\\.debug_.*|name|producers|target_features|external_debug_info|sourceMappingURL)$'
+    : '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$';
   return (src) => {
     if (!on || !src.endsWith('.wasm')) return src;
-    const dst = join(work, 'strip', sha(readFileSync(src)));
+    const dst = join(work, names ? 'strip-names' : 'strip', sha(readFileSync(src)));
     mkdirSync(dirname(dst), { recursive: true });
-    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
+    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', drop, src, '-o', dst]);
     return dst;
   };
 }

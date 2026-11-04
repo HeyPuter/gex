@@ -378,6 +378,11 @@ function wine32Site() {
   mkdirSync(work, { recursive: true });
   const strip = flag('--strip');
   const stripped = stripper(work, strip);
+  // gex's runtime wasm (shim, kernel, seed) without names and DWARF in a
+  // release site whether or not --strip is given, as build-eject-page strips
+  // its own (a project's runtime copy replaces those); GEX_KEEP_NAMES=1 keeps
+  // them, for a debug site.
+  const runtimeStripped = stripper(work, !process.env.GEX_KEEP_NAMES, true);
   // The page as plain files: nothing between it and the server decodes, so
   // only what the page itself fetches and decodes (the bundle, the units:
   // app.js, pack.json) is packed. A host's own compression still applies.
@@ -388,7 +393,7 @@ function wine32Site() {
     // first asks for a 64-bit memory, through the page's pack (app.js
     // `fetchOther`).
     if (/^gex\/(gex_browser|gex_kernel|seed)[^/]*\.wasm$/.test(rel)) {
-      place(stripped(p), rel);
+      place(runtimeStripped(p), rel);
       return;
     }
     // Mesa (the page compositor's GL, app.js `mesaSource`): packed, and

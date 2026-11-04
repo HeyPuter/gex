@@ -245,6 +245,30 @@ fn provider_file(p: &gex_cgen::provider::Provider) -> String {
     format!("providers/{}-{f}.wasm", p.name)
 }
 
+/// A release page's runtime wasm without its names and DWARF, as
+/// build-eject-page.sh strips the copies it makes (user 10-30: every release
+/// build); `GEX_KEEP_NAMES=1` keeps them, for a debug page. Written to a new
+/// file and renamed over `path`, which may be a hard link to the project's
+/// runtime copy.
+fn strip_release(path: &Path) -> Result<()> {
+    if std::env::var_os("GEX_KEEP_NAMES").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("wasm.strip");
+    let st = std::process::Command::new("wasm-tools")
+        .args(["strip", "-d", "^name$", "-d", "^\\.debug_.*", "-d", "^external_debug_info$", "-d", "^sourceMappingURL$"])
+        .arg(path)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("running wasm-tools strip on {} (or GEX_KEEP_NAMES=1)", path.display()))?;
+    if !st.success() {
+        bail!("wasm-tools strip {} failed ({st})", path.display());
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
     if let Some(d) = to.parent() {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
@@ -1217,6 +1241,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         let to = page.join("gex").join(f);
         let _ = std::fs::remove_file(&to);
         link_or_copy(&dir.join("runtime/web/gex").join(f), &to)?;
+        strip_release(&to)?;
     }
     // GL kept, but the checkout has no Mesa built (ports/mesa/build.sh):
     // the page would answer the guest's first GL request with a device that
