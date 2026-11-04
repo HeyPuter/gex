@@ -202,6 +202,15 @@ impl Home {
         &self.procs
     }
 
+    /// Tell the process table what this process has used (`crate::usage`):
+    /// `cpu_ns` of processor time, its memory map's sizes now, and its start,
+    /// `age_ns` ago on the monotonic clock.
+    pub(crate) fn say_usage(&self, cpu_ns: u64, age_ns: u64) {
+        let (size, rss, _) = self.mm.lock().vm_counters();
+        let start = gex_kernel::syscalls::clock_ns(self.clock, 1).saturating_sub(age_ns);
+        self.procs.set_usage(self.pid, cpu_ns, rss, size, start);
+    }
+
     /// The socket name table, which locks itself.
     pub(crate) fn socket_names(&self) -> &gex_kernel::unix::SocketNames {
         &self.socket_names

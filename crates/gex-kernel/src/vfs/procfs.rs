@@ -66,6 +66,84 @@ pub trait ProcSource: Send + Sync {
     fn mount_changes(&self) -> (u64, u32) {
         (0, 0)
     }
+    /// What this process has used: `stat`'s times and sizes, `statm`.
+    fn usage(&self) -> Usage {
+        Usage::default()
+    }
+    /// The system's uptime, processor time and load, for `/proc/uptime`,
+    /// `/proc/stat` and `/proc/loadavg`; `None` where the kernel knows none.
+    fn system(&self) -> Option<System> {
+        None
+    }
+    /// The wall clock, seconds since the epoch (`/proc/stat`'s `btime`).
+    fn wall_secs(&self) -> u64 {
+        0
+    }
+}
+
+use crate::proc::Usage;
+
+/// The whole system as `/proc` shows it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct System {
+    /// The monotonic clock: time since boot.
+    pub uptime_ns: u64,
+    /// The processor time every process has used ([`crate::proc::ProcTable::cpu_total`]).
+    pub cpu_ns: u64,
+    /// Hundredths ([`crate::proc::ProcTable::loadavg`]).
+    pub load: [u32; 3],
+    /// The memory every process has mapped and accessible, summed.
+    pub rss: u64,
+    /// How many processes, and the newest pid.
+    pub procs: usize,
+    pub last_pid: i32,
+}
+
+/// `USER_HZ`: the clock ticks `/proc` counts processor time in.
+const TICK_NS: u64 = 10_000_000;
+
+/// `/proc/uptime`: seconds since boot, and the seconds the processors
+/// spent idle (all of them, so up to their count times the first): their
+/// time less what every process used.
+pub fn uptime_text(sys: &System, cpus: u64) -> String {
+    let idle = (sys.uptime_ns * cpus).saturating_sub(sys.cpu_ns);
+    let cs = |ns: u64| format!("{}.{:02}", ns / 1_000_000_000, ns % 1_000_000_000 / 10_000_000);
+    format!("{} {}\n", cs(sys.uptime_ns), cs(idle))
+}
+
+/// `/proc/stat`: the processors' time in ticks, all of it, then each's.
+/// Busy time is all user time (nothing tells a process's own work from the
+/// kernel's on its behalf), and is split evenly between the processors: the
+/// browser does not say which core ran a Worker. Idle is the rest of each
+/// one's time since boot. `btime` is the wall clock at boot.
+pub fn stat_text(sys: &System, cpus: u64, wall_s: u64) -> String {
+    let cpus = cpus.max(1);
+    let up = sys.uptime_ns / TICK_NS;
+    let busy = sys.cpu_ns / TICK_NS;
+    let mut s = format!("cpu  {busy} 0 0 {} 0 0 0 0 0 0\n", (up * cpus).saturating_sub(busy));
+    for i in 0..cpus {
+        let b = busy / cpus + u64::from(i < busy % cpus);
+        s.push_str(&format!("cpu{i} {b} 0 0 {} 0 0 0 0 0 0\n", up.saturating_sub(b)));
+    }
+    s.push_str(&format!(
+        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
+        wall_s.saturating_sub(sys.uptime_ns / 1_000_000_000),
+        sys.last_pid.max(1)
+    ));
+    s
+}
+
+/// `/proc/loadavg`. Of the running count, only the reader is known to be
+/// running: a parked Worker says nothing as it parks.
+pub fn loadavg_text(sys: &System) -> String {
+    let l = |h: u32| format!("{}.{:02}", h / 100, h % 100);
+    format!("{} {} {} 1/{} {}\n", l(sys.load[0]), l(sys.load[1]), l(sys.load[2]), sys.procs.max(1), sys.last_pid)
+}
+
+/// `/proc/<pid>/statm`, in pages: the size, what is resident, and nothing
+/// for the shared, text, library, data and dirty counts, which are not kept.
+pub fn statm_text(u: &Usage) -> String {
+    format!("{} {} 0 0 0 0 0\n", u.vsize / 4096, u.rss / 4096)
 }
 
 /// A mount point as Linux writes one in a mount table: space, tab, newline
@@ -114,8 +192,10 @@ pub fn mounts(table: &[(String, &'static str)]) -> String {
 /// is a process they skip (htop listed none) or a fatal error (`ps`: "fatal
 /// library error, reap"). `id` is the task's: the pid for a process, a
 /// thread's id in its `task/<tid>/stat`; `threads` counts the process's.
+/// The times, start and sizes are the process's `u`: all of its processor
+/// time counts as user time, a thread's as its process's.
 #[allow(clippy::too_many_arguments)]
-pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize) -> String {
+pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage) -> String {
     let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
     // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
@@ -124,21 +204,24 @@ pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i3
     // exit_signal processor rt_priority policy delayacct_blkio_ticks
     // guest_time cguest_time start_data end_data start_brk arg_start arg_end
     // env_start env_end exit_code
+    let (utime, cutime, start) = (u.cpu_ns / TICK_NS, u.child_cpu_ns / TICK_NS, u.start_ns / TICK_NS);
+    let (vsize, rss) = (u.vsize, u.rss / 4096);
     format!(
-        "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0 \
+        "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 {utime} 0 {cutime} 0 20 0 {threads} 0 {start} {vsize} {rss} \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
 /// `/proc/<pid>/status`, the fields programs look for: task `id` of process
 /// `tgid`, which has `threads`.
-pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8]) -> String {
+pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8], u: &Usage) -> String {
     let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
     let (uid, gid, caps) = status_ids(creds);
+    let (size, rss) = (u.vsize >> 10, u.rss >> 10);
     format!(
         "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
          PPid:\t{ppid}\nTracerPid:\t0\n{uid}{gid}FDSize:\t64\n\
-         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
+         Groups:\t\nVmSize:\t{size:8} kB\nVmRSS:\t{rss:8} kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n"
     )
 }
@@ -316,9 +399,9 @@ impl ProcFs {
         let state = if e.zombie { 'Z' } else { 'S' };
         let (id, threads) = (if tid != 0 { tid } else { e.pid }, e.tasks().len());
         Some(match rest {
-            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads).into_bytes(),
-            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds).into_bytes(),
-            "statm" => b"0 0 0 0 0 0 0\n".to_vec(),
+            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &e.usage).into_bytes(),
+            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &e.usage).into_bytes(),
+            "statm" => statm_text(&e.usage).into_bytes(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
             // Another process's memory and environment are not ours to show.
@@ -336,30 +419,47 @@ impl ProcFs {
             "self/environ" => s.environ(),
             "self/stat" => s.stat(id, self.tasks_of("self").len()).into_bytes(),
             "self/status" => s.status(id, self.tasks_of("self").len()).into_bytes(),
-            "self/statm" => b"0 0 0 0 0 0 0\n".to_vec(),
+            "self/statm" => statm_text(&s.usage()).into_bytes(),
             "self/mountinfo" => mountinfo(&s.mount_table()).into_bytes(),
             "self/mounts" | "mounts" => mounts(&s.mount_table()).into_bytes(),
             p if p.starts_with("self/fdinfo/") => s.fd_info(p["self/fdinfo/".len()..].parse().ok()?)?.into_bytes(),
-            "loadavg" => {
-                let n = s.others().len().max(1);
-                format!("0.00 0.00 0.00 1/{n} {}\n", s.pid()).into_bytes()
-            }
+            "loadavg" => match s.system() {
+                Some(sys) => loadavg_text(&sys).into_bytes(),
+                None => {
+                    let n = s.others().len().max(1);
+                    format!("0.00 0.00 0.00 1/{n} {}\n", s.pid()).into_bytes()
+                }
+            },
             "self/comm" => {
                 let exe = s.exe();
                 let name = exe.rsplit('/').next().unwrap_or("gex").to_string();
                 format!("{name}\n").into_bytes()
             }
-            "meminfo" => concat!(
-                "MemTotal:        4194304 kB\n",
-                "MemFree:         2097152 kB\n",
-                "MemAvailable:    3145728 kB\n",
-                "Buffers:               0 kB\n",
-                "Cached:                0 kB\n",
-                "SwapTotal:             0 kB\n",
-                "SwapFree:              0 kB\n",
-            )
-            .as_bytes()
-            .to_vec(),
+            "meminfo" => match s.system() {
+                // A fixed 4 GiB total: the browser does not say how much
+                // the machine has. In use: what the processes have mapped
+                // and accessible, summed.
+                Some(sys) => {
+                    let free = (4u64 << 30).saturating_sub(sys.rss) >> 10;
+                    format!(
+                        "MemTotal:        4194304 kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
+                         Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
+                         SwapFree:              0 kB\n"
+                    )
+                    .into_bytes()
+                }
+                None => concat!(
+                    "MemTotal:        4194304 kB\n",
+                    "MemFree:         2097152 kB\n",
+                    "MemAvailable:    3145728 kB\n",
+                    "Buffers:               0 kB\n",
+                    "Cached:                0 kB\n",
+                    "SwapTotal:             0 kB\n",
+                    "SwapFree:              0 kB\n",
+                )
+                .as_bytes()
+                .to_vec(),
+            },
             "cpuinfo" if gex_abi::X86 => crate::cpus::proc_cpuinfo(crate::x86::CPUINFO).into_bytes(),
             "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(
                 "processor\t: 0\n",
@@ -373,11 +473,17 @@ impl ProcFs {
             ))
             .into_bytes(),
             "version" => b"Linux version 6.1.0-gex (gex@puter) #1 SMP\n".to_vec(),
-            "uptime" => b"1000.00 1000.00\n".to_vec(),
-            // One cpu line per processor (`crate::cpus`), all idle, booted at a
-            // fixed time. Boehm's GC counts the cpu lines to size its markers,
-            // and glibc's get_nprocs falls back to them when there is no sysfs.
-            "stat" => crate::cpus::proc_stat().into_bytes(),
+            "uptime" => match s.system() {
+                Some(sys) => uptime_text(&sys, crate::cpus::count() as u64).into_bytes(),
+                None => b"1000.00 1000.00\n".to_vec(),
+            },
+            // One cpu line per processor (`crate::cpus`). Boehm's GC counts
+            // the cpu lines to size its markers, and glibc's get_nprocs falls
+            // back to them when there is no sysfs.
+            "stat" => match s.system() {
+                Some(sys) => stat_text(&sys, crate::cpus::count() as u64, s.wall_secs()).into_bytes(),
+                None => crate::cpus::proc_stat().into_bytes(),
+            },
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
@@ -603,10 +709,10 @@ mod tests {
             vec![(0, "/dev/tty".into()), (3, "/tmp/x".into())]
         }
         fn stat(&self, tid: i32, threads: usize) -> String {
-            stat_line(tid, "prog", 'R', 7, 42, 1, None, threads)
+            stat_line(tid, "prog", 'R', 7, 42, 1, None, threads, &Usage::default())
         }
         fn status(&self, tid: i32, threads: usize) -> String {
-            status_text(tid, 42, "prog", 'R', 7, threads, &[])
+            status_text(tid, 42, "prog", 'R', 7, threads, &[], &Usage::default())
         }
         fn task_owner(&self, id: i32) -> Option<i32> {
             self.others().into_iter().find(|e| e.tasks().contains(&id)).map(|e| e.pid)
@@ -621,6 +727,7 @@ mod tests {
                 info: info.to_vec(),
                 tids: tids.to_vec(),
                 creds: Vec::new(),
+                usage: Usage::default(),
             };
             vec![
                 e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]),
@@ -667,9 +774,35 @@ mod tests {
     fn this_process_keeps_its_own_view() {
         // Its own pid is `self`, served from its own state, not the table's.
         assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
-        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1).split_whitespace().count(), 52);
-        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1).split_whitespace().map(String::from).collect();
+        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default()).split_whitespace().count(), 52);
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1, &Usage::default()).split_whitespace().map(String::from).collect();
         assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
+    }
+
+    #[test]
+    fn the_times_and_sizes_are_the_processes_own() {
+        let u = Usage { cpu_ns: 2_340_000_000, child_cpu_ns: 50_000_000, rss: 8 << 20, vsize: 64 << 20, start_ns: 12_000_000_000 };
+        let f: Vec<String> = stat_line(9, "btop", 'R', 1, 9, 1, None, 2, &u).split_whitespace().map(String::from).collect();
+        assert_eq!(f.len(), 52);
+        // utime stime cutime cstime (14-17), starttime (22), vsize, rss (pages)
+        assert_eq!(&f[13..17], ["234", "0", "5", "0"]);
+        assert_eq!(&f[21..24], ["1200", "67108864", "2048"]);
+        assert_eq!(statm_text(&u), "16384 2048 0 0 0 0 0\n");
+        assert!(status_text(9, 9, "btop", 'R', 1, 2, &[], &u).contains("VmRSS:\t    8192 kB\n"));
+    }
+
+    #[test]
+    fn the_system_is_its_clock_and_its_processes_time() {
+        let sys = System { uptime_ns: 100_000_000_000, cpu_ns: 30_000_000_000, load: [125, 50, 3], rss: 1 << 30, procs: 12, last_pid: 77 };
+        // two processors for 100 s, 30 s of them busy
+        assert_eq!(uptime_text(&sys, 2), "100.00 170.00\n");
+        let st = stat_text(&sys, 2, 1_700_000_100);
+        let lines: Vec<&str> = st.lines().collect();
+        assert_eq!(lines[0], "cpu  3000 0 0 17000 0 0 0 0 0 0");
+        assert_eq!(lines[1], "cpu0 1500 0 0 8500 0 0 0 0 0 0");
+        assert_eq!(lines[2], "cpu1 1500 0 0 8500 0 0 0 0 0 0");
+        assert!(st.contains("btime 1700000000\n"), "{st}");
+        assert_eq!(loadavg_text(&sys), "1.25 0.50 0.03 1/12 77\n");
     }
 
     #[test]

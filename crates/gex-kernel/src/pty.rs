@@ -403,6 +403,18 @@ impl crate::vfs::FileHandle for RemotePty {
         true
     }
 
+    /// The slave in non-canonical mode with `VMIN` 0 and `VTIME` 0: btop's
+    /// input loop reads until a read gives 0, and parked on the second read of
+    /// every key instead, so it froze on the first key.
+    fn empty_read_returns(&self) -> bool {
+        if self.master {
+            return false;
+        }
+        let mut t = [0u8; 60];
+        (self.remote.get_termios)(self.id, &mut t);
+        crate::tty::polling_read(&t)
+    }
+
     /// Both ends of this pair live in the global kernel, and the other one is
     /// held by a program in another Worker -- a terminal emulator. Its write is
     /// what ends a wait here, and it wakes on its way out of the syscall.

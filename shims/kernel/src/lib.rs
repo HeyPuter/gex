@@ -2024,6 +2024,37 @@ pub extern "C" fn k_proc_snapshot(at: gex_kmem::PAddr, cap: u32) -> i32 {
     b.len() as i32
 }
 
+/// What a process has used, said by the process itself
+/// (`ProcTable::set_usage`).
+#[no_mangle]
+pub extern "C" fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64) {
+    procs().set_usage(pid, cpu_ns, rss, vsize, start_ns);
+}
+
+/// The processor time every process has used (`ProcTable::cpu_total`).
+#[no_mangle]
+pub extern "C" fn k_proc_cpu_total() -> u64 {
+    procs().cpu_total()
+}
+
+/// The processes' resident memory, summed (`ProcTable::memory`).
+#[no_mangle]
+pub extern "C" fn k_proc_rss_total() -> u64 {
+    procs().memory().0
+}
+
+/// How many processes (`ProcTable::memory`).
+#[no_mangle]
+pub extern "C" fn k_proc_count() -> i32 {
+    procs().memory().1 as i32
+}
+
+/// The load averages at `now_ns`, packed (`gex_kernel::proc::pack_load`).
+#[no_mangle]
+pub extern "C" fn k_proc_loadavg(now_ns: u64) -> u64 {
+    gex_kernel::proc::pack_load(procs().loadavg(now_ns))
+}
+
 // -- pipes -------------------------------------------------------------------
 //
 // A pipe crosses processes as a *number*: each file table holds an id and the

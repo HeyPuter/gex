@@ -50,6 +50,7 @@ mod fjit;
 mod waitq;
 mod sigs;
 mod vfork;
+mod usage;
 mod winspace;
 
 use std::sync::{Arc, Mutex};
@@ -493,6 +494,11 @@ extern "C" {
     fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64);
+    fn k_proc_cpu_total() -> u64;
+    fn k_proc_loadavg(now_ns: u64) -> u64;
+    fn k_proc_rss_total() -> u64;
+    fn k_proc_count() -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
     // other side copies across with `memory.copy`, which is the only way it
@@ -976,6 +982,21 @@ extern "C" fn r_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32) {
 extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_proc_snapshot(at, cap) }
 }
+extern "C" fn r_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64) {
+    unsafe { k_proc_set_usage(pid, cpu_ns, rss, vsize, start_ns) }
+}
+extern "C" fn r_cpu_total() -> u64 {
+    unsafe { k_proc_cpu_total() }
+}
+extern "C" fn r_loadavg(now_ns: u64) -> u64 {
+    unsafe { k_proc_loadavg(now_ns) }
+}
+extern "C" fn r_rss_total() -> u64 {
+    unsafe { k_proc_rss_total() }
+}
+extern "C" fn r_count() -> i32 {
+    unsafe { k_proc_count() }
+}
 extern "C" fn r_new_tid(pid: i32) -> i32 {
     unsafe { k_tid_new(pid) }
 }
@@ -997,6 +1018,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
     }
     // Every waitable object's queue lives in the global kernel, where a
     // waiter in another process can be on it. Before anything that makes one.
+    gex_kernel::proc::set_cpu_clock(usage::cpu_ns);
     gex_kernel::wait::set_hooks(gex_kernel::wait::Hooks {
         new: || unsafe { k_wq_new() },
         free: |id| unsafe { k_wq_free(id) },
@@ -1034,6 +1056,11 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             new_tid: r_new_tid,
             end_tid: r_end_tid,
             task_owner: r_task_owner,
+            set_usage: r_set_usage,
+            cpu_total: r_cpu_total,
+            loadavg: r_loadavg,
+            rss_total: r_rss_total,
+            count: r_count,
         },
     )))
 }
@@ -5952,6 +5979,7 @@ pub unsafe extern "C" fn gex_free(ptr: u32, len: u32) {
 /// return the entry point. Zero means the image could not be loaded.
 #[no_mangle]
 pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 {
+    usage::worker_start();
     // The ELF sits in the shim's own heap, above the guest's limit, so it is
     // reached through its own pointer rather than through the guest slice.
     let bytes = unsafe {
@@ -8182,6 +8210,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         gp_fault(ctx, pc as u64 & 0x00ff_ffff_ffff_ffff);
     }
     leave_guest();
+    usage::tick();
     let mut pc = pc;
     loop {
         gex_kernel::phase::begin();
@@ -10778,7 +10807,13 @@ fn paused() -> u8 {
 }
 
 fn set_paused_to(v: u8) {
-    PAUSED.with(|c| c.set(v));
+    let was = PAUSED.with(|c| c.replace(v));
+    // the Worker's processor time (`usage`): paused is parked
+    if was == 0 && v != 0 {
+        usage::park_begin();
+    } else if was != 0 && v == 0 {
+        usage::park_end();
+    }
 }
 
 /// Which thread of this process *this Worker* is running.
@@ -11165,6 +11200,7 @@ pub extern "C" fn gex_thread_taken() {}
 #[no_mangle]
 pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     phase(9);
+    usage::worker_start();
     // No kernel lock: the thread table and the signal states lock
     // themselves, and the binding is this Worker's own.
     let Some(home) = sigs::home() else { return 0 };
@@ -11339,6 +11375,7 @@ pub extern "C" fn gex_adopt_child(
     brk: i64,
 ) -> i64 {
     phase(1);
+    usage::fork_child();
     // The state this Worker started from is a *copy* of the parent's, and the
     // descriptors in it are the parent's: pipe and pty ends it still holds,
     // sockets it is still using. Every one of those handles closes its end in
@@ -20234,6 +20271,7 @@ pub extern "C" fn gex_abandon(code: i32) {
 /// waited for this process could otherwise print before this process's last
 /// output did.
 fn publish_exit(pid: i32, status: i32) {
+    usage::exiting();
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
     if let Some(home) = sigs::home() {

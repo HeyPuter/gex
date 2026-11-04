@@ -383,6 +383,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn is_tty(&self) -> bool {
         false
     }
+    /// Whether a blocking read with nothing to read returns 0 at once instead
+    /// of waiting: a terminal in non-canonical mode with `VMIN` and `VTIME`
+    /// both 0 (termios(3)'s "polling read"). A non-blocking descriptor still
+    /// gets `EAGAIN`, as on Linux.
+    fn empty_read_returns(&self) -> bool {
+        false
+    }
     /// Whether a read would return without waiting. Only streams that can be
     /// empty answer no; a file never waits. Asked *before* the read so an
     /// `O_NONBLOCK` descriptor still sees its own `EAGAIN`.

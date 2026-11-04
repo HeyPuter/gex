@@ -38,6 +38,8 @@ struct Live {
     envp: Vec<String>,
     /// Its ids and capabilities, read when `status` is.
     creds: Arc<crate::syscalls::Creds>,
+    /// The host's clock (`Kernel::clock`): uptime, and `btime`.
+    clock: crate::syscalls::ClockFn,
 }
 
 /// One process's `/proc` source: empty until the process is first
@@ -162,7 +164,26 @@ impl ProcSource for KernelProcSource {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, pgid, sid) = relations(&l);
         let tty = tty_of(l.ptys, sid);
-        crate::vfs::procfs::stat_line(tid, &comm(&l.exe), 'R', ppid, pgid, sid, tty, threads)
+        crate::vfs::procfs::stat_line(tid, &comm(&l.exe), 'R', ppid, pgid, sid, tty, threads, &usage(&l))
+    }
+    fn usage(&self) -> crate::proc::Usage {
+        self.0.get().map(|l| usage(&l)).unwrap_or_default()
+    }
+    fn system(&self) -> Option<crate::vfs::procfs::System> {
+        let l = self.0.get()?;
+        let uptime_ns = crate::syscalls::clock_ns(l.clock, 1);
+        let all = l.procs.entries();
+        Some(crate::vfs::procfs::System {
+            uptime_ns,
+            cpu_ns: l.procs.cpu_total(),
+            load: l.procs.loadavg(uptime_ns),
+            rss: all.iter().map(|e| e.usage.rss).sum(),
+            procs: all.len(),
+            last_pid: all.iter().map(|e| e.pid).max().unwrap_or(l.pid),
+        })
+    }
+    fn wall_secs(&self) -> u64 {
+        self.0.get().map_or(0, |l| crate::syscalls::clock_ns(l.clock, 0) / 1_000_000_000)
     }
     fn others(&self) -> Vec<crate::proc::ProcEntry> {
         self.0.get().map(|l| l.procs.entries()).unwrap_or_default()
@@ -196,6 +217,18 @@ impl ProcSource for KernelProcSource {
             ppid
         )
     }
+}
+
+/// What this process has used: its processor time and memory now, and the
+/// rest (its start, its children's time) as the process table has them.
+fn usage(l: &Live) -> crate::proc::Usage {
+    let mut u = l.procs.entries().into_iter().find(|e| e.pid == l.pid).map(|e| e.usage).unwrap_or_default();
+    if let Some(ns) = crate::proc::cpu_clock(false) {
+        u.cpu_ns = ns;
+    }
+    let (size, rss, _) = l.mm.lock().vm_counters();
+    (u.vsize, u.rss) = (size, rss);
+    u
 }
 
 /// Parent, group and session, as the process table has them now.
@@ -258,6 +291,7 @@ impl Kernel {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             creds: Arc::clone(&self.creds),
+            clock: self.clock,
         };
         if old.as_ref().is_none_or(|o| o.exe != live.exe || o.argv != live.argv || o.pid != live.pid) {
             let name = live.exe.rsplit('/').next().unwrap_or("gex");

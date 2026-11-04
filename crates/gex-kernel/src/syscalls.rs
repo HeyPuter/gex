@@ -1165,10 +1165,15 @@ pub fn clock_call(
         }
     };
     // Before the host has said when the process started (0): no time used.
-    let cpu = || {
+    // A host that measures processor time says it (`crate::proc::set_cpu_clock`).
+    let cpu_of = |thread: bool| {
+        if let Some(ns) = crate::proc::cpu_clock(thread) {
+            return ns as u128;
+        }
         let (s, n) = clock();
         if started == 0 { 0 } else { (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started) }
     };
+    let cpu = || cpu_of(false);
     let pair = |m: &mut GuestMem<'_>, at: u64, hi: u64, lo: u64, w32: bool| {
         if w32 {
             m.write_u32(at, hi as u32).and_then(|_| m.write_u32(at + 4, lo as u32))
@@ -1181,7 +1186,7 @@ pub fn clock_call(
             // As `sys_clock_gettime`, which a null buffer faults in.
             let (secs, nanos) = match clk {
                 2 | 3 => {
-                    let t = cpu();
+                    let t = cpu_of(clk == 3);
                     ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
                 }
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
@@ -1824,7 +1829,8 @@ impl FdIo<'_> {
             }
             nr::READV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                // (a terminal's polling read answers 0 instead: `polling_read`)
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 let (buf, len) = self.first_iovec(m, a)?;
@@ -1839,7 +1845,7 @@ impl FdIo<'_> {
             }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 Some(BlockOp::ReadStream {
@@ -1851,6 +1857,14 @@ impl FdIo<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Whether `fd` is a blocking descriptor of a terminal whose empty reads
+    /// return 0 ([`crate::vfs::FileHandle::empty_read_returns`]).
+    fn polling_read(&self, fd: u64) -> bool {
+        self.fds.get(fd as i32).is_ok_and(|f| {
+            f.flags() & crate::fs::oflags::O_NONBLOCK == 0 && f.handle.empty_read_returns()
+        })
     }
 
     /// The park for a `read`/`readv` or `write`/`writev` that returned
@@ -7516,7 +7530,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             // As the kernel's arms: nice 0, and a change taken and ignored.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
-            nr::SYSINFO => sysinfo(m, compat, a[0]),
+            nr::SYSINFO => sysinfo(m, compat, a[0], f.procs, f.futex.clock),
             nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
             _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
         }
@@ -7576,6 +7590,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.io.call(m, n, a) else { unreachable!("free_class admitted a call FdIo does not make") };
         // Lost the room or the bytes to another Worker since the check:
         // park, as the full call does.
+        // (a terminal's polling read: 0, as the full call answers)
+        let r = if r == Err(Errno::EAGAIN) && matches!(n, nr::READ | nr::READV) && f.io.polling_read(a[0]) { Ok(0) } else { r };
         if r == Err(Errno::EAGAIN) {
             if let Some(op) = f.io.eagain_park(m, n, a) {
                 return FreeOutcome::Blocking(op, None);
@@ -7615,7 +7631,10 @@ pub fn clock_nanos_at(clock: ClockFn, started: u128, clk: u64) -> u128 {
         secs as u128 * 1_000_000_000 + nanos as u128
     };
     match clk {
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => wall().saturating_sub(started),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+            Some(ns) => ns as u128,
+            None => wall().saturating_sub(started),
+        },
         c if is_monotonic_clock(c) => {
             let (secs, nanos) = monotonic_from(clock());
             secs as u128 * 1_000_000_000 + nanos as u128
@@ -10289,6 +10308,12 @@ impl Kernel {
         // returns that short count, which its callers loop on.
         // A blocking read can lose the same race to another reader of the
         // pipe (two readers of one pipe).
+        // A blocking read of a terminal in non-canonical mode with `VMIN` and
+        // `VTIME` 0 that found nothing: 0, at once (termios(3)), not a wait.
+        let outcome = match outcome {
+            Ok(Err(Errno::EAGAIN)) if matches!(n, nr::READ | nr::READV) && self.fd_io().polling_read(a[0]) => Ok(Ok(0)),
+            o => o,
+        };
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
@@ -12283,7 +12308,10 @@ impl Kernel {
         const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
         let (secs, nanos) = match clk {
             CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-                let t = self.cpu_nanos();
+                let t = match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+                    Some(ns) => ns as u128,
+                    None => self.cpu_nanos(),
+                };
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
             c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
@@ -12329,6 +12357,10 @@ impl Kernel {
     /// ask for here). `openssl speed` divides by it, so zero printed every
     /// throughput as `infk`.
     pub fn cpu_nanos(&mut self) -> u128 {
+        // a host that measures it (`crate::proc::set_cpu_clock`)
+        if let Some(ns) = crate::proc::cpu_clock(false) {
+            return ns as u128;
+        }
         let now = self.now_nanos();
         if self.started == 0 {
             self.started = now;
@@ -12362,7 +12394,7 @@ impl Kernel {
     }
 
     fn sys_sysinfo(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        sysinfo(m, self.compat, buf)
+        sysinfo(m, self.compat, buf, &self.procs, self.clock)
     }
 
     fn sys_process_vm(&mut self, m: &mut GuestMem<'_>, write: bool, a: [u64; 6]) -> SysResult {
@@ -12423,10 +12455,19 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
 const ST_VALID: u64 = 0x20;
 
 /// `sysinfo`: a constant machine (4 GiB, half free, one process).
-pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64, procs: &ProcTable, clock: ClockFn) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
     }
+    // As `/proc` has them (`vfs::procfs`): the monotonic clock's uptime, the
+    // process table's load averages (fixed point, 1 << 16 is 1.0), free
+    // memory a fixed 4 GiB less what the processes have resident, and their
+    // count.
+    let up_ns = clock_ns(clock, 1);
+    let loads = procs.loadavg(up_ns).map(|h| h as u64 * 65536 / 100);
+    let (rss, count) = procs.memory();
+    let free = (4u64 << 30).saturating_sub(rss);
+    let count = count.clamp(1, u16::MAX as usize) as u16;
     // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
     // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
     // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
@@ -12437,17 +12478,23 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     // 32-bit process overwrote the stack canary.
     if compat {
         m.zero(buf, 64)?;
-        m.write_u32(buf, 1000)?; // uptime
+        m.write_u32(buf, (up_ns / 1_000_000_000) as u32)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u32(buf + 4 + 4 * i as u64, *l as u32)?;
+        }
         m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
-        m.write_u32(buf + 20, 1 << 19)?; // freeram
-        m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+        m.write_u32(buf + 20, (free >> 12) as u32)?; // freeram
+        m.write(buf + 40, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 52, 4096)?; // mem_unit
     } else {
         m.zero(buf, 112)?;
-        m.write_u64(buf, 1000)?; // uptime
+        m.write_u64(buf, up_ns / 1_000_000_000)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u64(buf + 8 + 8 * i as u64, *l)?;
+        }
         m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
-        m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+        m.write_u64(buf + 40, free)?; // freeram
+        m.write(buf + 80, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 104, 1)?; // mem_unit
     }
     Ok(0)
