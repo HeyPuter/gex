@@ -14216,7 +14216,7 @@ fn finish_mine(signalled: bool) -> i32 {
             1
         }
         Done::Ends(code) => {
-            exit_here(code, None);
+            exit_here(code, Some(ctx_pc()));
             2
         }
     }
@@ -14463,7 +14463,7 @@ fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
                 Done::At(c, pc) => Pick::Resumed(Some((c, pc))),
                 Done::Ends(code) => {
                     drop(r);
-                    exit_here(code, None);
+                    exit_here(code, Some(ctx_pc()));
                     Pick::Resumed(None)
                 }
             };
@@ -14697,6 +14697,12 @@ fn dying_frames_i386() -> String {
 /// signal's default action, met by a thread delivering to itself, or a
 /// halted machine. With `killed_at`, the thread's pc, a signal's death is
 /// reported as a syscall's is ([`killed`]). The stop value (2).
+/// This Worker's thread's context pc, for a death report: where a parked
+/// call that a fatal signal ended was made.
+fn ctx_pc() -> u64 {
+    GuestMem::new(guest_bytes()).read_u64(my_ctx() + ctx::PC as u64).unwrap_or(0)
+}
+
 fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
     match killed_at {
         Some(at) if code < 0 => killed(-code, at),
@@ -16645,7 +16651,7 @@ fn safepoint(ctx: i32, pc: i64) {
             }
             // The process ends, which is the kernel's.
             gex_kernel::signal::Delivery::Terminate { signal, .. } => {
-                exit_here(-(signal as i32), None);
+                exit_here(-(signal as i32), Some(pc as u64));
                 trap();
             }
         }
