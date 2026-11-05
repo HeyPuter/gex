@@ -9110,6 +9110,19 @@ export class Gex {
     return this.#watchStub;
   }
 
+  /** The innermost call-out whose return the guest is at (`ctx`'s PC and
+   *  stack, by `#watchHit`'s rule), or -1. */
+  #returnedAt(ctx) {
+    const dv = new DataView(this.#memory.buffer);
+    const pc = dv.getBigUint64(ctx + CTX_PC, true);
+    const sp = dv.getBigUint64(ctx + this.#ctxSp(), true);
+    for (let k = this.#callouts.length - 1; k >= 0; k--) {
+      const c = this.#callouts[k];
+      if (returnsAt(c.ret, pc) && sp >= c.spWant && sp <= c.spWant + c.span) return k;
+    }
+    return -1;
+  }
+
   /** A dispatch reached a watched entry: the awaited return of a call-out
    *  (the innermost one waiting for it, as natively), or something else
    *  that shares the entry (another address of an x86 slot, a deeper frame
@@ -9425,6 +9438,18 @@ export class Gex {
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
           if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return leave(hit === ri ? 1 : 0); }
+          // A return the shim left at with no call-out of its own waiting
+          // there: one only this list has (native Wine's guest call, its
+          // return gex-kernel's NATIVE_RETURN_PAD), whose return has no
+          // translation to watch when nothing is translated at run time
+          // (AOT-only: the shim's miss at the pad leaves). The watch's
+          // rule (`#watchHit`) on where the guest is.
+          const at = this.#returnedAt(ctx);
+          if (at >= 0) {
+            this.#calloutSignal = at < me ? { kind: 'return', i: at } : null;
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: its return ${at} at the pad (no watch)`);
+            return leave(at === me ? 1 : 0);
+          }
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {

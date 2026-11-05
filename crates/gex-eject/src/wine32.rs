@@ -109,8 +109,11 @@ pub struct Wine32Summary {
 /// The provider modules (`providers/NAME-FINGERPRINT.wasm`, a unit cache's
 /// layout) that `units` (key, guest path) bind in `bundle`: each image's
 /// export providers that bind one of its exports, and the trampoline
-/// page's when any image is 32-bit.
-fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<String>> {
+/// page's when any image is 32-bit on 32-bit Wine. A 64-bit Wine page's
+/// trampoline page is the 64-bit one in every process, its WoW64 ones too
+/// (their 32-bit code reaches the system through wow64cpu.dll), which binds
+/// none of those providers.
+fn provider_files(bundle: &[u8], units: &[(String, String)], wine64: bool) -> Result<Vec<String>> {
     use gex_cgen::provider;
     let tar = crate::reach::Tar::parse(bundle)?;
     let file = provider_file;
@@ -133,7 +136,7 @@ fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<Strin
             }
         }
     }
-    if class32 {
+    if class32 && !wine64 {
         out.extend(provider::for_dll(provider::TRAMPOLINES_DLL, true).iter().filter(|p| !p.binds.is_empty()).map(file));
     }
     Ok(out.into_iter().collect())
@@ -355,7 +358,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     // The provider modules the units bind (as the page picks them, cgen.rs
     // `unit_key`), and the trampolines' for a 32-bit program: an AOT-only
     // page has no other code for them.
-    for file in provider_files(&bundle_bytes, &units)? {
+    for file in provider_files(&bundle_bytes, &units, wine64)? {
         let src = o.unit_cache.iter().map(|c| c.join(&file)).find(|p| p.is_file());
         // A 64-bit page runs without a provider it is not given (the image's
         // own code, translated): said, not refused.

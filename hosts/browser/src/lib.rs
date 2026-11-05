@@ -17090,9 +17090,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume_ctx(my_ctx());
         trap();
     }
-    // AOT-only: native Wine's return pad with no call-out waiting for it, a
-    // function body native Wine called directly returning there with its
-    // stack moved. The bodies leave, and the native caller goes on from the
+    // AOT-only: native Wine's return pad with no call-out of the shim's
+    // waiting for it: a function body native Wine called directly returning
+    // there with its stack moved, or a guest call native Wine made through
+    // JS's loop alone (gex.mjs `#returnedAt`: its return has no translation
+    // to watch). The bodies leave, and the native caller goes on from the
     // pad (gexrt's `run_until`), as after any body that leaves.
     if aot() && pc == gex_kernel::win::tramp::NATIVE_RETURN_PAD && !no_leave {
         miss_way(pc, 3);
