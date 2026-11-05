@@ -147,6 +147,9 @@ pub mod x87op {
     pub const MEM_I16: u64 = 3;
     pub const MEM_I32: u64 = 4;
     pub const MEM_I64: u64 = 5;
+    /// 18-digit packed BCD (`fbld`, `fbstp`): ten bytes, the sign in
+    /// bit 7 of the last.
+    pub const MEM_BCD: u64 = 6;
     /// `fisttp`: convert toward zero.
     pub const TRUNC: u64 = 1 << 19;
     /// `fucom`: only an SNaN raises IE.
@@ -1652,6 +1655,8 @@ impl<'a> Lifter<'a> {
             | Op::Fnstenv
             | Op::Frstor
             | Op::Fnsave
+            | Op::Fbld
+            | Op::Fbstp
             | Op::Ffree(_)
             | Op::Ffreep(_)
             | Op::Fcmovcc { .. } => self.x87(i),

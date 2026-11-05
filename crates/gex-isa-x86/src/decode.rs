@@ -1807,9 +1807,11 @@ impl<'a> Decoder<'a> {
                 (0xdf, 1) => Op::Fist { mem: I16, pop: true, truncate: true },
                 (0xdf, 2) => Op::Fist { mem: I16, pop: false, truncate: false },
                 (0xdf, 3) => Op::Fist { mem: I16, pop: true, truncate: false },
+                (0xdf, 4) => Op::Fbld,
                 (0xdf, 5) => Op::Fild(I64),
+                (0xdf, 6) => Op::Fbstp,
                 (0xdf, 7) => Op::Fist { mem: I64, pop: true, truncate: false },
-                // fbld / fbstp (packed BCD) and the reserved slots.
+                // The reserved slots.
                 _ => return Ok(self.unk()),
             };
             // The environment's image has a 16-bit form (14 bytes, 94 for

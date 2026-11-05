@@ -147,6 +147,7 @@ pub mod x87op {
     pub const MEM_I16: u64 = 3;
     pub const MEM_I32: u64 = 4;
     pub const MEM_I64: u64 = 5;
+    pub const MEM_BCD: u64 = 6;
     pub const TRUNC: u64 = 1 << 19;
     pub const QUIET: u64 = 1 << 20;
     pub const TO_EFLAGS: u64 = 1 << 21;
@@ -972,7 +973,7 @@ fn x87_mem(op: u64) -> Option<f80::Mem> {
         x87op::MEM_I16 => f80::Mem::I16,
         x87op::MEM_I32 => f80::Mem::I32,
         x87op::MEM_I64 => f80::Mem::I64,
-        _ => return None, // MEM_F80: the raw register format
+        _ => return None, // MEM_F80: the raw register format (MEM_BCD is served apart)
     })
 }
 
@@ -1073,6 +1074,27 @@ pub fn serve_x87(m: &mut GuestMem<'_>, ctx_addr: u64, op: u64) {
                 _ => F80::INDEFINITE,
             };
             x.set_st(0, r);
+        }
+        x87op::FLD if (op >> x87op::MEM_SHIFT) & 7 == x87op::MEM_BCD => {
+            let t = x.tmp();
+            let mut raw = [0u8; 10];
+            raw[..8].copy_from_slice(&t.sig.to_le_bytes());
+            raw[8..].copy_from_slice(&t.se.to_le_bytes());
+            let v = f80::load_bcd(&mut env, raw);
+            x.push(&mut env, v);
+        }
+        x87op::FST if (op >> x87op::MEM_SHIFT) & 7 == x87op::MEM_BCD => {
+            let raw = match x.operand(&mut env, 0) {
+                Some(v) => f80::store_bcd(&mut env, v),
+                None => {
+                    env.c1 = false;
+                    f80::BCD_INDEFINITE
+                }
+            };
+            x.set_tmp(F80 {
+                sig: u64::from_le_bytes(raw[..8].try_into().unwrap()),
+                se: u16::from_le_bytes([raw[8], raw[9]]),
+            });
         }
         x87op::FLD => {
             let v = match x87_mem(op) {
@@ -1276,6 +1298,27 @@ mod tests {
         assert_eq!(run(&[-12.0], x87op::FXTRACT).0, vec![-1.5, 3.0]);
         assert_eq!(run(&[0.0], x87op::FXTRACT).0, vec![0.0, f64::NEG_INFINITY]);
         assert_eq!(run(&[f64::MIN_POSITIVE / 4.0], x87op::FXTRACT).0, vec![1.0, -1024.0]);
+    }
+
+    #[test]
+    fn x87_packed_bcd_goes_through_the_operand_slot() {
+        let bcd = x87op::MEM_BCD << x87op::MEM_SHIFT;
+        // fbstp's conversion: -1234.5 rounds to even, to -1234.
+        let mut buf = vec![0u8; 0x4000];
+        stack(&mut buf, &[-1234.5]);
+        let mut m = GuestMem::new(&mut buf);
+        serve_x87(&mut m, CTX, x87op::FST | bcd);
+        let t = m.read(CTX + ctx::X87_TMP as u64, 10).unwrap().to_vec();
+        assert_eq!(t, [0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0x80]);
+        // fbld pushes it back.
+        serve_x87(&mut m, CTX, x87op::FLD | bcd);
+        let top = m.read_u32(CTX + ctx::X87_TOP as u64).unwrap() & 7;
+        let a = CTX + ctx::X87 as u64 + top as u64 * 16;
+        let v = crate::f80::F80 {
+            sig: m.read_u64(a).unwrap(),
+            se: u16::from_le_bytes(m.read(a + 8, 2).unwrap().try_into().unwrap()),
+        };
+        assert_eq!(crate::f80::to_f64(v), -1234.0);
     }
 
     #[test]

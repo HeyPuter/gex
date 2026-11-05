@@ -584,3 +584,63 @@ fn arith_through_f64_is_bit_exact() {
     // Each operation took the short path often enough to mean something.
     assert!(hits.iter().all(|&h| h > 2000), "hits {hits:?}");
 }
+
+/// `fbstp` and `fbld` natively: (the packed BCD, status word) and (st0,
+/// status word).
+fn n_bcd(a: F80, cw: u16) -> ([u8; 10], u16, F80, u16) {
+    let ab = a.to_bytes();
+    let mut bcd = [0u8; 10];
+    let mut back = [0u8; 10];
+    let (mut sw, mut sw2): (u16, u16) = (0, 0);
+    unsafe {
+        asm!(
+            "fninit", "fldcw word ptr [{cw}]",
+            "fld tbyte ptr [{a}]",
+            "fbstp tbyte ptr [{p}]",
+            "fnstsw word ptr [{sw}]",
+            "fnclex",
+            "fbld tbyte ptr [{p}]",
+            "fnstsw word ptr [{sw2}]",
+            "fstp tbyte ptr [{out}]", "fninit",
+            cw = in(reg) &cw, a = in(reg) ab.as_ptr(), p = in(reg) bcd.as_mut_ptr(),
+            out = in(reg) back.as_mut_ptr(), sw = in(reg) &mut sw, sw2 = in(reg) &mut sw2,
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    (bcd, sw, F80::from_bytes(back), sw2)
+}
+
+#[test]
+fn packed_bcd_matches_the_hardware() {
+    let mut rng = Rng(0xbcd);
+    let mut bad = 0;
+    for n in 0..200_000 {
+        let cw = rng.cw();
+        // Most operands near the 18-digit range, the rest anywhere.
+        let a = if n % 4 == 0 {
+            rng.f80()
+        } else {
+            let se = (rng.next() & 0x8000) as u16 | (0x3fff - 4 + rng.next() % 66) as u16;
+            F80 { sig: 1 << 63 | rng.next(), se }
+        };
+        let (want, wsw, wback, wsw2) = n_bcd(a, cw);
+        let mut env = Env::from_cw(cw);
+        let got = store_bcd(&mut env, a);
+        let gsw = sw_of(&env);
+        let mut env2 = Env::from_cw(cw);
+        let back = load_bcd(&mut env2, want);
+        let gsw2 = sw_of(&env2);
+        if got != want || gsw != wsw & SW_BITS || back != wback || gsw2 != wsw2 & SW_BITS {
+            bad += 1;
+            if bad < 12 {
+                eprintln!(
+                    "fbstp cw={cw:04x} a={a:x?}\n  want {want:02x?} sw {:04x}, back {wback:x?} sw {:04x}\n  got  {got:02x?} sw {gsw:04x}, back {back:x?} sw {gsw2:04x}",
+                    wsw & SW_BITS,
+                    wsw2 & SW_BITS
+                );
+            }
+        }
+    }
+    assert_eq!(bad, 0, "fbstp/fbld: {bad} mismatches");
+}

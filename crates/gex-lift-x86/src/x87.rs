@@ -355,6 +355,27 @@ impl<'a> Lifter<'a> {
                     }
                 }
             }
+            // Packed BCD, rare (Delphi's float formatting): the host
+            // converts, the ten bytes travel through `X87_TMP`, and the
+            // guest's own load or store stays here.
+            Op::Fbld | Op::Fbstp => {
+                let Operand::Mem(m) = i.op0() else { return self.illegal_x87() };
+                let (addr, off) = self.addr(&m);
+                let base = self.b.read(GuestReg::CtxAddr);
+                let k = self.k64(ctx::X87_TMP as u64);
+                let tmp = self.b.bin(BinOp::Add, Ty::I64, base, k);
+                let bcd = crate::x87op::MEM_BCD << crate::x87op::MEM_SHIFT;
+                if i.op == Op::Fbld {
+                    let v = self.ld_ext(addr, off);
+                    self.st_ext(tmp, 0, v);
+                    self.x87_host(crate::x87op::FLD | bcd);
+                } else {
+                    self.x87_host(crate::x87op::FST | bcd);
+                    let v = self.ld_ext(tmp, 0);
+                    self.st_ext(addr, off, v);
+                    self.pop_st();
+                }
+            }
             _ => return self.illegal_x87(),
         }
         Flow::Next

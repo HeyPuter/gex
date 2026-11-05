@@ -690,6 +690,10 @@ pub enum Op {
     Fnstenv,
     Frstor,
     Fnsave,
+    /// `fbld`: push an 18-digit packed BCD integer (10 bytes).
+    Fbld,
+    /// `fbstp`: store `st0` as packed BCD, rounded by RC, and pop.
+    Fbstp,
     Ffree(u8),
     Ffreep(u8),
     Fcmovcc { cond: Cond, i: u8 },

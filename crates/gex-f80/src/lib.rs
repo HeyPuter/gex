@@ -867,6 +867,49 @@ pub fn store(env: &mut Env, a: F80, m: Mem, trunc: bool) -> u64 {
     }
 }
 
+/// The packed BCD indefinite `fbstp` stores for a NaN, an infinity or an
+/// integer of more than 18 digits.
+pub const BCD_INDEFINITE: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+
+/// `fbld`: an 18-digit packed BCD integer (two digits a byte, least
+/// significant first; the sign in bit 7 of the tenth byte) to extended,
+/// exactly. Digits over 9 are undefined on the hardware; here they weigh
+/// what they say.
+pub fn load_bcd(env: &mut Env, raw: [u8; 10]) -> F80 {
+    let mut v: u64 = 0;
+    for &b in raw[..9].iter().rev() {
+        v = v * 100 + (b >> 4) as u64 * 10 + (b & 15) as u64;
+    }
+    let mut r = load(env, v, Mem::I64);
+    if raw[9] & 0x80 != 0 {
+        r.se |= 0x8000;
+    }
+    r
+}
+
+/// `fbstp`: `a` rounded to an integer by the control word, as packed BCD.
+/// A NaN, an infinity or more than 18 digits is invalid: IE, and the BCD
+/// indefinite. A zero keeps its sign.
+pub fn store_bcd(env: &mut Env, a: F80) -> [u8; 10] {
+    let v = store(env, a, Mem::I64, false) as i64;
+    let big = 999_999_999_999_999_999u64;
+    if env.flags & IE != 0 || v.unsigned_abs() > big {
+        env.flags = (env.flags & !PE) | IE;
+        env.c1 = false;
+        return BCD_INDEFINITE;
+    }
+    let mut m = v.unsigned_abs();
+    let mut out = [0u8; 10];
+    for b in out[..9].iter_mut() {
+        *b = (m % 10) as u8 | ((m / 10 % 10) as u8) << 4;
+        m /= 100;
+    }
+    if a.sign() {
+        out[9] = 0x80;
+    }
+    out
+}
+
 /// `f64` bits to extended, exactly (for callers computing in double).
 pub fn from_f64(v: f64) -> F80 {
     let mut env = Env::from_cw(0x37f);

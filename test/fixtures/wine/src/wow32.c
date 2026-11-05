@@ -26,6 +26,8 @@
  *             writes through each map reads back with glGetBufferSubData
  *             (the 64-bit GL driver's mappings, as wow64 hands them to
  *             32-bit code)
+ *   bcd       fbstp and fbld (packed BCD, as Delphi's float formatting
+ *             uses them): 1234567.5 rounds to even, and back
  *   sysarch   GetSystemInfo INTEL and GetNativeSystemInfo AMD64, as a
  *             32-bit program sees a 64-bit system
  *   sysbench N   N calls of NtQueryPerformanceCounter, then of
@@ -471,6 +473,18 @@ static int glmap_check(const char *what, unsigned seed, int n)
     return bad < 0;
 }
 
+static int case_bcd(void)
+{
+    static const unsigned char want[10] = { 0x68, 0x45, 0x23, 0x01, 0, 0, 0, 0, 0, 0x80 };
+    unsigned char bcd[10];
+    double in = -1234567.5, out = 0;
+
+    __asm__ volatile("fldl %2\n\tfbstp %0\n\tfbld %0\n\tfstpl %1" : "=m"(bcd), "=m"(out) : "m"(in));
+    CHECK(!memcmp(bcd, want, 10), "bcd fbstp %02x%02x%02x%02x..%02x", bcd[3], bcd[2], bcd[1], bcd[0], bcd[9]);
+    CHECK(out == -1234568.0, "bcd fbld %.1f", out);
+    return 0;
+}
+
 static int case_sysarch(void)
 {
     SYSTEM_INFO si, ni;
@@ -592,6 +606,7 @@ int main(int argc, char **argv)
     else if (!strcmp(c, "spawn64") && argc > 2) case_spawn64(argv[2]);
     else if (!strcmp(c, "glmap")) case_glmap();
     else if (!strcmp(c, "sysarch")) case_sysarch();
+    else if (!strcmp(c, "bcd")) case_bcd();
     else if (!strcmp(c, "child")) return 32;
     else { printf("FAIL unknown case %s\n", c); return 1; }
     if (fails) return 1;

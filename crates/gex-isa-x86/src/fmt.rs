@@ -495,6 +495,8 @@ pub fn mnemonic(i: &Inst) -> String {
         Fnstenv => "fnstenv".into(),
         Frstor => "frstor".into(),
         Fnsave => "fnsave".into(),
+        Fbld => "fbld".into(),
+        Fbstp => "fbstp".into(),
         Ffree(_) => "ffree".into(),
         Ffreep(_) => "ffreep".into(),
         Fcmovcc { cond, .. } => match cond.0 {
