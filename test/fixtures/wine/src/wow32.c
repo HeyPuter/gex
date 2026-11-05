@@ -26,6 +26,7 @@
  *             writes through each map reads back with glGetBufferSubData
  *             (the 64-bit GL driver's mappings, as wow64 hands them to
  *             32-bit code)
+ *   maskmov   maskmovdqu: the masked bytes only, to [edi]
  *   bcd       fbstp and fbld (packed BCD, as Delphi's float formatting
  *             uses them): 1234567.5 rounds to even, and back
  *   sysarch   GetSystemInfo INTEL and GetNativeSystemInfo AMD64, as a
@@ -473,6 +474,26 @@ static int glmap_check(const char *what, unsigned seed, int n)
     return bad < 0;
 }
 
+__attribute__((target("sse2"))) static int case_maskmov(void)
+{
+    static const unsigned char src[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    static const unsigned char mask[16] = { 0x80, 0, 0xff, 0x7f, 0, 0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90 };
+    unsigned char dst[24];
+    int k, bad = 0;
+
+    memset(dst, 0xee, sizeof(dst));
+    __asm__ volatile("movdqu (%0), %%xmm0\n\tmovdqu (%1), %%xmm1\n\tmaskmovdqu %%xmm1, %%xmm0"
+                     :: "r"(src), "r"(mask), "D"(dst + 4) : "xmm0", "xmm1", "memory");
+    for (k = 0; k < 24; k++)
+    {
+        int i = k - 4;
+        unsigned char want = i >= 0 && i < 16 && (mask[i] & 0x80) ? src[i] : 0xee;
+        if (dst[k] != want) bad++;
+    }
+    CHECK(!bad, "maskmov maskmovdqu %d wrong bytes", bad);
+    return 0;
+}
+
 static int case_bcd(void)
 {
     static const unsigned char want[10] = { 0x68, 0x45, 0x23, 0x01, 0, 0, 0, 0, 0, 0x80 };
@@ -607,6 +628,7 @@ int main(int argc, char **argv)
     else if (!strcmp(c, "glmap")) case_glmap();
     else if (!strcmp(c, "sysarch")) case_sysarch();
     else if (!strcmp(c, "bcd")) case_bcd();
+    else if (!strcmp(c, "maskmov")) case_maskmov();
     else if (!strcmp(c, "child")) return 32;
     else { printf("FAIL unknown case %s\n", c); return 1; }
     if (fails) return 1;

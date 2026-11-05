@@ -52,6 +52,8 @@ const CASES = [
   ['sysarch64', 'wow64c.exe', 'x64', ['sysarch']],
   ['sysarch32', 'wow32.exe', 'x86', ['sysarch']],
   ['bcd', 'wow32.exe', 'x86', ['bcd']],
+  ['maskmov32', 'wow32.exe', 'x86', ['maskmov']],
+  ['maskmov64', 'wow64c.exe', 'x64', ['maskmov']],
   ['x87conv32', 'x87conv.exe', 'x86', [], [], X87_WANT],
   ['x87conv64', 'x87conv.exe', 'x64', [], [], X87_WANT],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)

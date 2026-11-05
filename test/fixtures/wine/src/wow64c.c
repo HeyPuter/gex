@@ -7,6 +7,7 @@
  *                 IsWow64Process TRUE for it, and FALSE for this one
  *   xmmcb         xmm6-xmm15 (callee-saved) kept across SendMessage whose
  *                 window procedure, a user callback, changes them
+ *   maskmov       maskmovdqu: the masked bytes only, to [rdi]
  *   sysarch       GetSystemInfo and GetNativeSystemInfo both AMD64
  *   sysbench N    N calls of NtQueryPerformanceCounter, then of
  *                 NtQueryVirtualMemory: the 64-bit baseline of wow32's
@@ -90,6 +91,28 @@ static int case_xmmcb(void)
     return 0;
 }
 
+static int case_maskmov(void)
+{
+    static const unsigned char src[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    static const unsigned char mask[16] = { 0x80, 0, 0xff, 0x7f, 0, 0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90 };
+    unsigned char dst[24];
+    int k, bad = 0;
+
+    memset(dst, 0xee, sizeof(dst));
+    __asm__ volatile("movdqu (%0), %%xmm0\n\tmovdqu (%1), %%xmm1\n\tmaskmovdqu %%xmm1, %%xmm0"
+                     :: "r"(src), "r"(mask), "D"(dst + 4) : "xmm0", "xmm1", "memory");
+    for (k = 0; k < 24; k++)
+    {
+        int i = k - 4;
+        unsigned char want = i >= 0 && i < 16 && (mask[i] & 0x80) ? src[i] : 0xee;
+        if (dst[k] != want) bad++;
+    }
+    if (bad) { printf("FAIL maskmov maskmovdqu %d wrong bytes\n", bad); return 1; }
+    printf("ok   maskmov maskmovdqu\n");
+    printf("wow64c maskmov ok\n");
+    return 0;
+}
+
 static int case_sysarch(void)
 {
     SYSTEM_INFO si, ni;
@@ -118,6 +141,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "child")) return 64;
     if (argc > 1 && !strcmp(argv[1], "xmmcb")) return case_xmmcb();
     if (argc > 1 && !strcmp(argv[1], "sysarch")) return case_sysarch();
+    if (argc > 1 && !strcmp(argv[1], "maskmov")) return case_maskmov();
     if (argc > 1 && !strcmp(argv[1], "sysbench"))
     {
         LONG (WINAPI *qpc)(LARGE_INTEGER *, LARGE_INTEGER *) =

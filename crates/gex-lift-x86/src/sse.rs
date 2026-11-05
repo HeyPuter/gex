@@ -810,7 +810,21 @@ impl<'a> Lifter<'a> {
                 let r = self.shuffle(s, s, lane_shuffle(8, &[0, 0]));
                 self.wr_x(i.op0(), r);
             }
-            Op::Maskmov => return self.illegal(),
+            Op::Maskmov => {
+                // maskmovdqu: bytes of xmm1 whose mask byte (xmm2) has its
+                // top bit set, to [ds:(e/r)di]; read, merge and write the
+                // sixteen bytes, as maskmovq does its eight.
+                let v = self.rd_x(i.op0());
+                let m = self.rd_x(i.op1());
+                let z = self.zero_v();
+                let sel = self.vbin(VLaneBinOp::LtS, VLane::I8, m, z);
+                let mut at = gex_isa_x86::Mem::abs(0);
+                at.base = Some(RDI_REG);
+                let at = Operand::Mem(at);
+                let old = self.rd_x(at);
+                let r = self.b.def(Expr::VBitSelect { mask: sel, a: v, b: old });
+                self.wr_x(at, r);
+            }
 
             // -- float arithmetic -------------------------------------------------------
             Op::Addp => self.farith(i, VLaneBinOp::Add, FpBinOp::Add),
