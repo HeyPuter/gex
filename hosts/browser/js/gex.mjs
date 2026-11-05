@@ -1724,7 +1724,21 @@ export class Gex {
         }
         this.#inheritedEnds = [];
       }
-      const at = this.#shim.exports.gex_worker_init?.(); 
+      // The slot's span may be one another Worker took and grew the memory
+      // for (a `clone`'s `spans_ready`) since this instance was made, and the
+      // engine updates this Worker's bound only at its next interrupt: the
+      // thread-locals' first write would trap out of bounds (Wine's sync.exe,
+      // about one start in ten of `wine/backtoback`'s). Growing by nothing
+      // takes the memory's present length (worker.mjs does so again before
+      // the thread runs).
+      if (isShared(this.#memory.buffer)) {
+        try {
+          this.#memory.grow(0);
+        } catch {
+          this.#memory.grow(0n);
+        }
+      }
+      const at = this.#shim.exports.gex_worker_init?.();
       // A thread's slot was promised by its `clone`: claimed now, or lost.
       this.keepPromise();
       // No slot (every one held by a live instance, or no arena for its
