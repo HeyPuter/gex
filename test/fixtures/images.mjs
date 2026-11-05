@@ -3,7 +3,8 @@
 // ready, or the reason it cannot be (the tests that need it are skipped).
 //
 //   busybox  bb.tar.zst: BUSYBOX (a wasm32 busybox) and its applets, the probe
-//            programs (probe/*.c, built with GEXCC or gexcc), /etc/xattr with
+//            programs (probe/*.c, built with GEXCC or gexcc; rt-truncate and
+//            rt-sockpass include programs/ and native/wasm32/ sources), /etc/xattr with
 //            an extended attribute; and lazy.bin and lazy-program.bin, a lazy
 //            file's bytes (one test's each), and rt-side.so, a side module
 //            rt-dlstatic loads (a lazy file's). Kept
@@ -58,6 +59,7 @@ const PROBES = {
   'rt-wl': ['-lwayland-client', '-lffi'],
   'rt-joy': [],
   'rt-truncate': [],
+  'rt-sockpass': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
   // static, serving what rt-side.so imports (SIDES)
   'rt-dlstatic': ['-pthread', ...['malloc', 'snprintf', 'strlen', 'fprintf', 'stderr', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'sin', 'cos'].map((s) => `-Wl,--export=${s}`)],
@@ -81,9 +83,44 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
 
 export const images = {
+  // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
+  // gex-wasm targets (GEX_TEST_MESA_BUILD, default target/web-build: its
+  // mesa-mt and mesa-st, after ports/mesa/build.sh), mesa-cold/BUILD/whole
+  // (the module unsplit), split (the build's own split) and miss (every
+  // function kept but glReadPixels', ports/mesa/split.py --cold, left for a
+  // miss), each beside its glue marked split or not; and
+  // mesa-cold/gears.gexgltr, fixtures/gl's gles-gears trace.
+  async 'mesa-cold'(work) {
+    const top = process.env.GEX_TEST_MESA_BUILD || join(ROOT, 'target/web-build');
+    const out = join(work, 'mesa-cold');
+    rmSync(out, { recursive: true, force: true });
+    for (const v of ['mt', 'st']) {
+      const tgt = join(top, `mesa-${v}`, 'build/src/gallium/targets/gex-wasm');
+      for (const f of ['gex-wgpu-replay.wasm.orig', 'gex-wgpu-replay.js', 'split/gex-wgpu-replay.wasm']) {
+        if (!existsSync(join(tgt, f))) return `no ${f} in ${tgt} (ports/mesa/build.sh; GEX_TEST_MESA_BUILD)`;
+      }
+      const glue = readFileSync(join(tgt, 'gex-wgpu-replay.js'), 'utf8');
+      const marked = (split) => glue.replace(/(gexMesaColdSplit *= *["'])GEX_MESA_COLD_[A-Z]*/, `$1GEX_MESA_COLD_${split ? 'YES' : 'NO'}`);
+      const variant = (name, files, split) => {
+        const d = join(out, v, name);
+        mkdirSync(d, { recursive: true });
+        for (const [to, from] of Object.entries(files)) copyFileSync(from, join(d, to));
+        writeFileSync(join(d, 'gex-wgpu-replay.js'), marked(split));
+      };
+      const cold = join(tgt, 'split/gex-wgpu-replay.deferred.wasm');
+      variant('whole', { 'gex-wgpu-replay.wasm': join(tgt, 'gex-wgpu-replay.wasm.orig') }, false);
+      variant('split', { 'gex-wgpu-replay.wasm': join(tgt, 'split/gex-wgpu-replay.wasm'), ...(existsSync(cold) ? { 'gex-wgpu-replay.deferred.wasm': cold } : {}) }, existsSync(cold));
+      const r = spawnSync('python3', ['-I', join(ROOT, 'ports/mesa/split.py'), join(tgt, 'gex-wgpu-replay.wasm.orig'), '-', join(out, v, 'miss'), '--cold', '[Rr]ead[Pp]ixels'], { encoding: 'utf8' });
+      if (r.status !== 0) return `ports/mesa/split.py --cold: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' / ')}`;
+      writeFileSync(join(out, v, 'miss', 'gex-wgpu-replay.js'), marked(true));
+      writeFileSync(join(out, v, 'split.json'), JSON.stringify({ cold: existsSync(cold) }));
+    }
+    copyFileSync(join(HERE, 'gl/gles-gears-frames.gexgltr'), join(out, 'gears.gexgltr'));
+    return null;
+  },
   // A KDE site as debdemo's mksite makes it (GEX_TEST_KDE_SITE: kde.tar.zst,
   // lazy.json and its rest bundle), linked into the work directory as `kde`.
   async kde(work) {
@@ -161,6 +198,8 @@ export const images = {
     for (const name of [...Object.keys(PROBES), ...SIDES]) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
     // rt-truncate.c is programs/truncate-path.c.
     h.update(readFileSync(join(HERE, 'programs/truncate-path.c')));
+    // rt-sockpass.c is native/wasm32/sockpass.c.
+    h.update(readFileSync(join(HERE, 'native/wasm32/sockpass.c')));
     h.update(JSON.stringify(PROBES));
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
