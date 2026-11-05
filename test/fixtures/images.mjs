@@ -260,10 +260,7 @@ export const images = {
     const reg = join(ROOT, 'third_party/opengl-registry/api');
     if (!existsSync(reg)) return 'third_party/opengl-registry is not checked out';
     const probes = join(ROOT, 'guest/gl/probes');
-    // GEX_TEST_GL_PROBES: more probe sources (paths, `:` between), kept
-    // outside gex, built and checked as these are.
     const src = Object.fromEntries(readdirSync(probes).filter((f) => /^gl4\d-.*-probe\.c$/.test(f)).map((f) => [f.slice(0, -2), join(probes, f)]));
-    for (const p of (process.env.GEX_TEST_GL_PROBES ?? '').split(':').filter(Boolean)) src[p.replace(/^.*\//, '').replace(/\.c$/, '')] = p;
     const names = Object.keys(src).sort();
     const version = join(ROOT, 'test/fixtures/programs/gl-version.c');
     const musl = process.env.GEX_TOOLCHAIN || join(homedir(), '.cache/gex/toolchains/aarch64-linux-musl-cross');
