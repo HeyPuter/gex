@@ -7,6 +7,14 @@ REGEDIT4
 ;   every session, a process of its own beside the services, for menu
 ;   entries no page has. 32-bit Wine's dist has no winemenubuilder.exe, so
 ;   its sessions never ran one.
+; - MountMgr starts at boot again (wine32-session.reg makes it
+;   demand-start): 64-bit Wine has its Unix side, and without it the
+;   object namespace has no \??\X: drive links, so GetLogicalDrives is 0
+;   in every process. The .NET Framework 4.8 installer then finds no drive
+;   to extract to and exits with 0x80004005.
 
 [HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\RunServices]
 "winemenubuilder"=-
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\MountMgr]
+"Start"=dword:00000002

@@ -315,8 +315,8 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # either, so services.exe started a winedevice for each only to see
 # DriverEntry fail (c0000135), one after another, before wineboot let the
 # program start (a 64-bit Wine game 5 s sooner). MountMgr has one (its
-# DriverEntry succeeds), but stays demand-start: `net start mountmgr`
-# for a program that asks for volume names. On a copy, so the session changes without a new wineboot.
+# DriverEntry succeeds): demand-start in the 32-bit session, at boot again
+# in 64-bit Wine's (wine64-session.reg), whose programs list the drives. On a copy, so the session changes without a new wineboot.
 # And winedbg's crash dialog off (Wine's reg.exe, the native Wine): a crash
 # a debugger attaches to ends with its text report, not a dialog that waits
 # for a click.
