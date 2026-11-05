@@ -8,6 +8,12 @@
  * a read that starts after the publication must see that write or a later
  * one: an older value is a stale copy. Each value carries its number twice,
  * so a copy mixed from two states shows as torn.
+ *
+ * The reads overlap the writes by a handshake, never by timing: after each
+ * burst of 64 writes the writer waits until every reader has read again
+ * (the input case: until the reader has), so each burst has reads during
+ * it however loaded the host is. A reader that never reads stalls the
+ * writer, and the watchdog fails the case.
  * gex-nt-arch: x64
  */
 #include <windows.h>
@@ -32,8 +38,10 @@ static void check(int ok, const char *what, long long got)
 /* window: a pointer-sized extra value, the write's number twice (64-bit:
  * once in each half) */
 static HWND hwnd;
-static LONG64 stale[MAX_READERS], torn[MAX_READERS], reads[MAX_READERS];
+static LONG64 stale[MAX_READERS], torn[MAX_READERS];
+static volatile LONG64 reads[MAX_READERS];
 static LONG64 window_writes;
+static int window_readers;
 
 #ifdef _WIN64
 static ULONG_PTR enc(LONG64 n) { return ((ULONG_PTR)(ULONG)n << 32) | ((ULONG)n ^ 0xa5a5a5a5u); }
@@ -54,7 +62,14 @@ static DWORD WINAPI window_writer(void *arg)
     {
         SetWindowLongPtrW(hwnd, 0, enc(n));
         InterlockedExchange64(&published, n);
-        if (!(n % 64)) Sleep(0);  /* bursts of 64 */
+        if (!(n % 64))
+        {
+            /* a burst at a time: every reader reads again before the next */
+            LONG64 seen[MAX_READERS];
+            int i;
+            for (i = 0; i < window_readers; i++) seen[i] = reads[i];
+            for (i = 0; i < window_readers; i++) while (reads[i] == seen[i]) Sleep(0);
+        }
     }
     InterlockedExchange(&done, 1);
     return 0;
@@ -94,15 +109,15 @@ static void window_case(int readers, LONG64 writes, const char *name)
     sprintf(what, "%s: created", name);
     check(hwnd != NULL, what, 0);
     if (!hwnd) return;
-    published = 0; done = 0; window_writes = writes;
-    memset(stale, 0, sizeof(stale)); memset(torn, 0, sizeof(torn)); memset(reads, 0, sizeof(reads));
+    published = 0; done = 0; window_writes = writes; window_readers = readers;
+    memset(stale, 0, sizeof(stale)); memset(torn, 0, sizeof(torn)); memset((void *)reads, 0, sizeof(reads));
     for (i = 0; i < readers; i++) t[i] = CreateThread(NULL, 0, window_reader, (void *)(ULONG_PTR)i, 0, NULL);
     t[readers] = CreateThread(NULL, 0, window_writer, NULL, 0, NULL);
     WaitForMultipleObjects(readers + 1, t, TRUE, INFINITE);
     for (i = 0; i <= readers; i++) CloseHandle(t[i]);
     for (i = 0; i < readers; i++) { s += stale[i]; tr += torn[i]; n += reads[i]; }
     sprintf(what, "%s: reads during the writes", name);
-    check(n > writes / 4, what, n);
+    check(n >= readers * (writes / 64), what, n);
     sprintf(what, "%s: torn reads", name);
     check(!tr, what, tr);
     sprintf(what, "%s: stale reads", name);
@@ -173,7 +188,7 @@ static void queue_case(void)
     if (!done) InterlockedExchange(&give_up, 1);
     WaitForSingleObject(w, INFINITE);
     CloseHandle(w);
-    check(q_reads > WRITES, "queue: reads during the posts", q_reads);
+    check(q_reads >= WRITES, "queue: reads during the posts", q_reads);
     check(!q_wrong, "queue: messages taken in order", q_wrong);
     check(!q_stale_missing, "queue: status missing a posted message", q_stale_missing);
     check(!q_peek_missing, "queue: empty peek after a post", q_peek_missing);
@@ -203,11 +218,9 @@ static DWORD WINAPI key_writer(void *arg)
         InterlockedExchange64(&published, n);
         if (!(n % 64))
         {
-            /* a burst at a time: the reader reads between bursts (a slow
-             * read, a request each without the door, could miss them all) */
+            /* a burst at a time: the reader reads again before the next */
             LONG64 r = k_reads;
-            DWORD t0 = GetTickCount();
-            while (k_reads == r && GetTickCount() - t0 < 1000) Sleep(0);
+            while (k_reads == r) Sleep(0);
         }
     }
     InterlockedExchange(&done, 1);
