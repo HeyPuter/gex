@@ -359,6 +359,24 @@ pfs_make() {
 }
 log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
+# Each prefix names the builtins it was made for (.gex-builtins, "ARCH NAME"
+# lines): its Wine's, and those pfs_make adds (winegstreamer's halves, the
+# display driver). page-prefix.sh refuses a prefix whose list lacks a
+# builtin of the install it is used with: one made for another install (a
+# MEDIA=0 dist's beside a dist with winegstreamer) would boot without it
+# registered, since the template is stamped current and wineboot never
+# updates it. Written beside a cached prefix that predates the list too.
+builtins_list() { # PFX [NAME...]: N's lib/wine/*-windows names, and each NAME in each arch N has
+	local pfx=$1 a; shift
+	for a in x86_64 i386; do
+		[ -d "$N/lib/wine/$a-windows" ] || continue
+		{ ls "$N/lib/wine/$a-windows"; printf '%s\n' "$@"; } | grep -Ev '\.(a|so|wasm|wasmref|m64)$' | sort -u | sed "s/^/$a /"
+	done > "$pfx/.gex-builtins.tmp" && mv "$pfx/.gex-builtins.tmp" "$pfx/.gex-builtins"
+}
+[ -f "$C/pfx64-$PX/pfx/.gex-builtins" ] || builtins_list "$C/pfx64-$PX/pfx"
+# shellcheck disable=SC2046
+[ -f "$C/pfs64-$PX-$R/pfx/.gex-builtins" ] || builtins_list "$C/pfs64-$PX-$R/pfx" $([ -z "$GS" ] || echo winegstreamer.dll) $([ -z "$WD" ] || echo winewayland.drv)
+
 deps64_build() {
 	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" JOBS=$J nice -n 10 "$here/deps64.sh" "$PWD" "$C/dl"
 }

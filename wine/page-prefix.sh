@@ -15,6 +15,19 @@ here=$(cd "$(dirname "$0")" && pwd)
 src=$1 dist=$2 out=$3; shift 3
 [ -f "$src/system.reg" ] || { echo "$src has no registry: install it first (wineboot -u)" >&2; exit 2; }
 [ -f "$dist/share/wine/wine.inf" ] || { echo "$dist has no share/wine/wine.inf" >&2; exit 2; }
+# A prefix that names the builtins it was made for (dist.sh's .gex-builtins)
+# must have each of DIST's: one made for another install lacks them, and is
+# never updated in the page (stamped current below), so a DLL it never
+# installed or registered (winegstreamer's classes) fails only in a program.
+# The display driver aside: a 64-bit prefix has none (made without a
+# display), and Wine loads it from the install.
+if [ -f "$src/.gex-builtins" ]; then
+	lacks=$(for a in x86_64 i386; do
+		[ -d "$dist/lib/wine/$a-windows" ] || continue
+		ls "$dist/lib/wine/$a-windows" | grep -Ev '\.(a|so|wasm|wasmref|m64)$' | grep -vx winewayland.drv | sed "s/^/$a /"
+	done | sort -u | comm -23 - <(sort -u "$src/.gex-builtins"))
+	[ -z "$lacks" ] || { printf '%s was made for another Wine install than %s: it has no %s\n' "$src" "$dist" "$(echo "$lacks" | sed 's/^\([^ ]*\) \(.*\)/\2 (\1)/' | head -8 | paste -sd, - | sed 's/,/, /g')" >&2; exit 1; }
+fi
 rm -rf "$out"
 # Real files, without following dosdevices (z: is /): the page bundles the
 # tree, and a run writes its own copy. Links elsewhere (a staged prefix's
@@ -30,7 +43,7 @@ rm -rf "$out"
 # user's profile, a profile with no name, files a run left) is not.
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 user=${PAGE_USER:-gex}
-tar -C "$src" --exclude=./dosdevices --exclude=./drive_c/users -h --xattrs --xattrs-include='user.*' -cf - . |
+tar -C "$src" --exclude=./dosdevices --exclude=./drive_c/users --exclude=./.gex-builtins -h --xattrs --xattrs-include='user.*' -cf - . |
     tar -C "$out" --xattrs --xattrs-include='user.*' -xpf -
 # The install's user: the profile the registry names (ProfileList).
 built=$(sed -n 's/^"ProfileImagePath"="C:\\\\users\\\\\([^"\\]*\)"$/\1/p' "$src/system.reg" | head -1)
