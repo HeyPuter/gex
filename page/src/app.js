@@ -18,7 +18,7 @@
 // No URL parsing: the page's URL is the user's. gex's own test page
 // (nt.html, nt-page.js) maps its query onto these options.
 
-import { untar } from './tar.js';
+import { TarStream, untar } from './tar.js';
 import { SP_CODE } from '../../hosts/browser/js/mode.mjs';
 import { zstdLoader } from './zstd-loader.js';
 import { makeControl as lazyCacheControl, lazyVersion } from '../../hosts/browser/js/lazy-cache.mjs';
@@ -544,7 +544,20 @@ async function begin(opts, base, at, state, meter) {
     return out;
   })() : null;
   pieceBufs?.catch(() => {});
-  for (const url of b.tar) {
+  // One packed archive and no pieces (a KDE site's title bundle): unpacked
+  // and laid into the guest a part at a time as it downloads (`streamBundle`),
+  // the boot's other steps meanwhile; the program starts once it is all in,
+  // as before. `?streamtar=0`: fetched whole, then laid.
+  const exe = opts.exe ?? b.exe;
+  const z0 = b.tar.length === 1 && !pieceList && sw.streamtar !== '0' ? await packedEntry(at(b.tar[0]), fetcher) : null;
+  const streamed = z0 ? streamBundle(at(b.tar[0]), z0, fetcher, exe) : null;
+  if (streamed) {
+    streamed.done.then(() => {
+      mark(`fetched ${b.tar[0]} (${(z0.size / 1048576).toFixed(0)} MiB), unpacked as it came`);
+      meter.phase(meter.p.compile.done < meter.p.compile.total ? 'compile' : 'boot');
+    }, () => {});
+  }
+  for (const url of streamed ? [] : b.tar) {
     const tar = await fetchShared(at(url), fetcher);
     buffers.push(tar.buffer);
     mark(`fetched ${url} (${(tar.length / 1048576).toFixed(0)} MiB)`);
@@ -560,7 +573,7 @@ async function begin(opts, base, at, state, meter) {
     links: Object.assign(a.links ?? {}, t.links),
     mtimes: Object.assign(a.mtimes ?? {}, t.mtimes),
     xattrs: Object.assign(a.xattrs ?? {}, t.xattrs),
-  }));
+  }), { files: {}, dirs: [] });
   if (pieceBufs) {
     // The archive holds each such file empty (its mode, its time); its bytes
     // are a piece's, viewed, not copied.
@@ -605,9 +618,8 @@ async function begin(opts, base, at, state, meter) {
     for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
-  const exe = opts.exe ?? b.exe;
   // A copy, not a view: a view would keep the whole bundle alive.
-  const exeBytes = (files[exe] ?? files[hard[exe]])?.slice();
+  const exeBytes = streamed ? await streamed.exe : (files[exe] ?? files[hard[exe]])?.slice();
   if (!exeBytes) throw new Error(opts.exe ? `start({ exe: ${JSON.stringify(exe)} }): not a file in the bundle` : `the build's program, ${exe}, is not in its bundle`);
   const args = [exe, ...(opts.args ?? b.argv ?? [])];
   let env = mergeEnv(b.env, opts.env);
@@ -648,7 +660,7 @@ async function begin(opts, base, at, state, meter) {
   state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz && e !== pageTzName), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
-  if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
+  if (!streamed && meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
   const preModules = await preloading;
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
@@ -790,7 +802,7 @@ async function begin(opts, base, at, state, meter) {
   let desktop = null;
   let dropper = null;
   let settle;
-  meter.phase('boot');
+  if (!streamed) meter.phase('boot');
   meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
   // The guest's network: the page's (`network`, README "Network"), or a
@@ -825,6 +837,9 @@ async function begin(opts, base, at, state, meter) {
     // Wine's DOS attributes on the prefix (`tar --xattrs`), and the launch
     // file's (an ejected build's bundle keeps none itself).
     xattrs: b.xattrs ? { ...b.xattrs, ...tree.xattrs } : tree.xattrs,
+    // The bundle's parts as they are unpacked, laid over the above (which
+    // then holds only the lazy files' modes and times).
+    stream: streamed ? { parts: streamed.parts, has: streamed.has } : undefined,
     env,
     args,
     cwd,
@@ -1252,6 +1267,84 @@ function mesaSource(f, at) {
  * for the session, and the page lets go of this once the kernel has the
  * files (`onFilesLoaded`).
  */
+/** The most file bytes in one part of a bundle laid as it downloads. */
+const STREAM_PART_BYTES = 32 << 20;
+
+/**
+ * A packed archive (`url`, its pack entry `z`) unpacked as it downloads
+ * (tar.js `TarStream`), its parts handed out for the guest's files as they
+ * come (kfs.js `#layStream`): `parts`, an async iterable of `untar`'s
+ * parts, each up to STREAM_PART_BYTES of files (one each until `exe` is
+ * in, so the program's bytes come first); `exe`, the program's bytes (a
+ * copy; null if the archive has no such file); `has(path)`, whether a
+ * regular file of the archive has come; `done`, the download's end. A
+ * part's bytes are its own, so the decode keeps nothing once it is laid.
+ */
+function streamBundle(url, z, f, exe) {
+  const queue = [];
+  const have = new Set();
+  let wake = null;
+  let finished = false;
+  let failure = null;
+  let exeBytes = null;
+  let exeFound;
+  const exeSeen = new Promise((r) => { exeFound = r; });
+  let ts = new TarStream();
+  const put = (t) => {
+    if (!t.dirs.length && !Object.keys(t.files).length && !Object.keys(t.links).length && !Object.keys(t.hard).length
+      && !Object.keys(t.mtimes).length && !Object.keys(t.xattrs).length && !Object.keys(t.modes).length) return;
+    for (const p of Object.keys(t.files)) have.add(p);
+    if (!exeBytes && t.files[exe]) {
+      exeBytes = t.files[exe].slice();
+      exeFound(exeBytes);
+    }
+    queue.push(t);
+    const w = wake;
+    wake = null;
+    w?.();
+  };
+  const done = fetchPacked(url, z, false, f, {
+    sink: (piece) => {
+      ts.push(piece);
+      if (!exeBytes || ts.pending >= STREAM_PART_BYTES) put(ts.take());
+    },
+    // A cached copy that does not decode: unpacked again from the network,
+    // each part laid again over what it laid (the same files).
+    restart: () => { ts = new TarStream(); },
+  }).then(() => {
+    ts.end();
+    put(ts.take());
+    finished = true;
+  }, (e) => {
+    failure = e;
+  }).finally(() => {
+    if (!exeBytes) exeFound(null);
+    const w = wake;
+    wake = null;
+    w?.();
+  });
+  async function* parts() {
+    for (;;) {
+      if (queue.length) {
+        yield queue.shift();
+        continue;
+      }
+      if (failure) throw failure;
+      if (finished) return;
+      await new Promise((r) => { wake = r; });
+    }
+  }
+  return {
+    parts: parts(),
+    has: (p) => have.has(p),
+    exe: exeSeen.then((b) => {
+      if (!b && failure) throw failure;
+      return b;
+    }),
+    done: done.then(() => { if (failure) throw failure; }),
+  };
+}
+
 async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   const z = await packedEntry(url, f);
   if (z) return fetchPacked(url, z, shared, f, { priority });
@@ -1286,11 +1379,13 @@ async function fetchPacked(url, z, shared, f, opt = {}) {
     if (!e?.fromCache) throw e;
     await e.fromCache.cache.delete(e.fromCache.key).catch(() => {});
     console.warn(`[app] ${url}: the cached copy is bad (${e.message}); fetching it`);
+    // A `sink` has had part of the bad copy: it starts over.
+    opt.restart?.();
     return fetchPackedOnce(url, z, shared, f, { ...opt, noCache: true });
   }
 }
 
-async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into = null, progress = null, priority = 'auto', noCache = false } = {}) {
+async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into = null, progress = null, sink = null, priority = 'auto', noCache = false } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
@@ -1305,19 +1400,22 @@ async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into
   // decoder is given back when this is done (`zstdLoader`).
   const d = await f.zstd();
   try {
-    return await decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, bad });
+    return await decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, sink, bad });
   } finally {
     f.zstd.release?.();
   }
 }
 
-/** `fetchPackedOnce`'s decode, as the download arrives, into a buffer of `size`. */
-async function decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, bad }) {
-  const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
+/** `fetchPackedOnce`'s decode, as the download arrives, into a buffer of
+ *  `size`; or, with `sink`, each decoded piece handed to `sink(piece)` (a
+ *  view it must copy what it keeps of) and nothing kept here. */
+async function decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, sink, bad }) {
+  const out = sink ? null : new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
   const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
-    out.set(part, n);
+    if (sink) sink(part);
+    else out.set(part, n);
     n += part.length;
   };
   const z = d.stream();

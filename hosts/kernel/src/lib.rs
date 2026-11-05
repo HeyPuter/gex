@@ -3692,6 +3692,106 @@ pub extern "C" fn k_fs_add_lazy(path: gex_kmem::PAddr, path_len: u32, url: gex_k
     0
 }
 
+/// Many seeding calls in one (the page runtime's kfs.js `SeedRecords`): a
+/// bundle's lazy files, links, modes and times were one call each, 100,000
+/// for a desktop's image, and their round trips through the page's batch
+/// were half a second of its boot. Records, little-endian, one after the
+/// other; each path a byte length (u32) and its UTF-8:
+///   1 lazy file  mode u32 (u32::MAX: none), size u64, path, url
+///                ([`k_fs_add_lazy`], then [`k_fs_chmod`])
+///   2 symlink    target, path ([`k_fs_symlink`])
+///   3 time       seconds i64, path ([`k_fs_set_mtime`])
+///   4 mode       mode u32, path ([`k_fs_chmod`])
+/// Each does what its own call does, results unchecked as the page leaves
+/// those calls'. The records done, or -EINVAL at the first that does not
+/// parse.
+#[no_mangle]
+pub extern "C" fn k_fs_seed(at: gex_kmem::PAddr, len: u32) -> i32 {
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    struct R<'a>(&'a [u8], usize);
+    impl<'a> R<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let b = self.0.get(self.1..self.1.checked_add(n)?)?;
+            self.1 += n;
+            Some(b)
+        }
+        fn u32(&mut self) -> Option<u32> {
+            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+        }
+        fn u64(&mut self) -> Option<u64> {
+            Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+        fn text(&mut self) -> Option<String> {
+            let n = self.u32()? as usize;
+            Some(String::from_utf8_lossy(self.take(n)?).into_owned())
+        }
+        /// A path as [`path_of`] makes one: the relative form `TmpFs` keys on.
+        fn path(&mut self) -> Option<String> {
+            Some(self.text()?.trim_start_matches('/').to_string())
+        }
+    }
+    let chmod = |p: &str, mode: u32| {
+        if let Some((m, rel)) = pagefs::find(p) {
+            let _ = m.chmod(&rel, mode);
+        } else {
+            let _ = rootfs().chmod(p, mode);
+        }
+    };
+    let mut r = R(&buf, 0);
+    let mut n = 0i32;
+    while r.1 < buf.len() {
+        let Some(op) = r.take(1).map(|b| b[0]) else { return -22 };
+        let ok = match op {
+            1 => (|| {
+                let mode = r.u32()?;
+                let size = r.u64()?;
+                let p = r.path()?;
+                let u = r.path()?;
+                rootfs().add_lazy(&p, size, &format!("/{u}"));
+                if mode != u32::MAX {
+                    chmod(&p, mode);
+                }
+                Some(())
+            })(),
+            2 => (|| {
+                let target = r.text()?;
+                let p = r.path()?;
+                if let Some((m, rel)) = pagefs::find(&p) {
+                    let _ = m.symlink(&target, &rel);
+                } else {
+                    let _ = rootfs().symlink(&target, &p);
+                }
+                Some(())
+            })(),
+            3 => (|| {
+                let secs = r.u64()? as i64;
+                let p = r.path()?;
+                if let Some((m, rel)) = pagefs::find(&p) {
+                    let _ = m.set_mtime(&rel, secs);
+                } else {
+                    let _ = rootfs().set_mtime(&p, secs);
+                }
+                Some(())
+            })(),
+            4 => (|| {
+                let mode = r.u32()?;
+                let p = r.path()?;
+                chmod(&p, mode);
+                Some(())
+            })(),
+            _ => None,
+        };
+        if ok.is_none() {
+            return -22; // EINVAL
+        }
+        n += 1;
+    }
+    n
+}
+
 /// Whether the shared root is filled yet, so only the first Worker unpacks the
 /// rootfs.
 #[no_mangle]

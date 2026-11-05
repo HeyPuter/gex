@@ -31,6 +31,9 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  *   files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs
  *                       the bundle (tar.js `untar`'s parts, lazy files
  *                       `[path, size, url, head]`)
+ *   stream              the bundle as it is unpacked instead (app.js
+ *                       `streamBundle`): { parts, has(path) }, laid at boot
+ *                       part by part over the above; `elf` is a file of it
  *   env, cwd, uid       the program's; env empty is Debian's for root
  *   filesystem          required: 'memory' or start-options.js
  *                       `filesystemValue`'s { kind, ... }: the runtime's
@@ -56,7 +59,7 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  * pid 1.
  */
 export async function runPreset(term, {
-  elf, args, files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes, xattrs,
+  elf, args, files = {}, dirs = [], modes = {}, hard = {}, symlinks = {}, lazy = [], mtimes, xattrs, stream = null,
   env = [], cwd = '/', uid, tty = true, filesystem,
   wl = null, wlScale = 1, onDesktop = null, hostX = false,
   gl = null, glLazy = false, glSource = null, glBackend, d3d = false,
@@ -84,7 +87,7 @@ export async function runPreset(term, {
     }
     return false;
   };
-  const named = files[exe] !== undefined || hard[exe] !== undefined || viaLink(exe);
+  const named = !!stream || files[exe] !== undefined || hard[exe] !== undefined || viaLink(exe);
   if (!elf && !named) throw new Error(`runProgram: no ${exe} in the files`);
 
   const q = pageParams();
@@ -123,7 +126,7 @@ export async function runPreset(term, {
     image[exe] = elf;
     imageModes[exe] ??= 0o755;
   }
-  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs });
+  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs, ...(stream ? { stream: stream.parts } : {}) });
 
   let windows = null;
   if (wl && typeof wl.getContext === 'function') {
@@ -142,8 +145,10 @@ export async function runPreset(term, {
 
   // (the files are gone from `files` after the boot)
   const sdl = `${exe.replace(/\/[^/]*$/, '')}/libSDL2-2.0.so.0`;
-  const winePads = /\/wine$/.test(exe) && (files[sdl] !== undefined || lazy.some(([path]) => path === sdl));
+  const inBundle = (p) => files[p] !== undefined || !!stream?.has(p) || lazy.some(([path]) => path === p);
   await sys.boot();
+  // (after the boot: a streamed bundle's files are all in by then)
+  const winePads = /\/wine$/.test(exe) && inBundle(sdl);
   // The kernel has the files: nothing here views the bundle's bytes now.
   for (const k of Object.keys(image)) delete image[k];
   onFilesLoaded?.();

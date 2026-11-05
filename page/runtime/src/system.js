@@ -270,8 +270,16 @@ export class System extends EventTarget {
     return this.#booting;
   }
 
+  /** `?boottrace=1` (debug only, off by default): each step of the boot
+   *  and the time since the page's start, on the console. */
+  #mark(what) {
+    if (this.#opts.debug.boottrace) globalThis.__gexBootTrace = true;
+    if (this.#opts.debug.boottrace) console.warn(`[boot] ${what} (+${Math.round(performance.now())} ms)`);
+  }
+
   async #boot() {
     if (this.#state.phase !== 'new') throw new Error('this system has already booted');
+    this.#mark('boot');
     this.#state.phase = 'booting';
     if (!SINGLE && typeof SharedArrayBuffer !== 'function') {
       throw new Error(SP_CODE
@@ -301,6 +309,7 @@ export class System extends EventTarget {
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     if (this.#opts.files) globalThis.GEX_ASSET_FILES = this.#opts.files;
     await import('../../src/page-env.js');
+    this.#mark('page-env');
 
     // An architecture the page names (`arch`): the kernel, shim and seed load
     // while the files are got ready, not after the tree is read for one.
@@ -321,6 +330,7 @@ export class System extends EventTarget {
     // The filesystem's layers (fs.js).
     const opts = { layers: [] };
     for (const fn of this.#beforeBoot) await fn(opts);
+    this.#mark('layers');
 
     // The translated architecture, beside which wasm32 programs run: the
     // global kernel is built for one (its syscall ABI, struct layouts, signal
@@ -342,8 +352,10 @@ export class System extends EventTarget {
     }
     this.#arch = arch;
     globalThis.__gexTso = await rt.detectTso();
+    this.#mark('tso');
     const kernel = await (kernelEarly ?? rt.loadKernel());
     if (!kernel) throw new Error('the kernel would not load');
+    this.#mark('kernel loaded');
 
     // What the runtime says (the X server, Mesa), on the console.
     const term = { write: (d) => this.#say(String(d)), writeln: (t) => this.#say(`${t}\n`) };
@@ -351,9 +363,13 @@ export class System extends EventTarget {
     // compositor and its channel; MesaGl: the GL ring), before the processes'
     // host, which hands their channels to every Worker.
     const dev = { rt, kernel, term, say: (t) => this.#say(t), wlChannel: null, compositor: null, dom: false, glChannel: null };
-    for (const { fn } of this.#devices.sort((a, b) => a.stage - b.stage)) await fn(dev);
+    for (const { fn, stage } of this.#devices.sort((a, b) => a.stage - b.stage)) {
+      await fn(dev);
+      this.#mark(`device ${fn.name || 'at stage'} ${stage}`);
+    }
     const { compositor } = dev;
     const netChannel = await rt.openNet(this.#net);
+    this.#mark('network');
     // A lazy file in a rest bundle (`BUNDLE#OFFSET`: an ejected site's
     // lazy.json, site/eject-site.mjs) is read through zstd frames.
     this.#restBundle = opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
@@ -366,6 +382,7 @@ export class System extends EventTarget {
     // desktop's Workers ran the page out of them. Where it cannot run (no
     // shared memory, no Cache Storage), each Worker reads for itself.
     const lazyCache = await this.#lazyOwner(rt, kernel, opts.layers, stops);
+    this.#mark('lazy owner');
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
       // after boot reaches the programs already running, and each reaches
@@ -387,6 +404,7 @@ export class System extends EventTarget {
         for (const fn of this.#preset.onMessage) fn(m);
       },
     });
+    this.#mark('process host');
     this.#sys = {
       host, kernel, term, rt, compositor, wlChannel: dev.wlChannel, lazyCache,
       // Pid 1 is the kernel's: each process starts here, a child of it, from
@@ -414,6 +432,7 @@ export class System extends EventTarget {
   /** Boot's end, in either build: the init, if any, and what waited for
    *  the system to run. */
   async #begin() {
+    this.#mark('running');
     this.#state.phase = 'running';
     if (this.#init) {
       // Pid 1, before anything else runs. When it ends, so does the system,
@@ -530,6 +549,7 @@ export class System extends EventTarget {
     const k = started ?? await Kernel.start({
       module: s.kernel.module, memory: s.kernel.memory, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache: s.lazyCache ?? null,
     });
+    this.#mark('kernel started');
     this.#kernel = k;
     this.#files = new Files(k);
     this.#programs = new Programs(k, this.#files, {
@@ -541,7 +561,9 @@ export class System extends EventTarget {
     });
     // Where the files' contents go (fs.js), before any file is laid.
     await this.#store(s, k, fsi?.store?.());
+    this.#mark('store');
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
+    this.#mark('files laid');
     // What the store kept (gex_kernel::vfs::tmpfs::persist), over them.
     if (this.#stored) await this.#restore(k, fsi);
     // The steps below are not waited for one by one: the kernel's Worker
@@ -568,6 +590,7 @@ export class System extends EventTarget {
     ];
     const r = Object.fromEntries((await k.calls(list)).map((x, i) => [list[i].f, x.r >>> 0]));
     await Promise.all(steps);
+    this.#mark('kernel steps');
     s.host.useKernelStacks({
       area: r.k_stack_area, size: r.k_stack_size, count: r.k_stack_count,
       ...(k.has('k_snap_word') ? { snapWord: r.k_snap_word, wsAddr: r.k_ws_addr, wsCount: r.k_ws_count } : {}),

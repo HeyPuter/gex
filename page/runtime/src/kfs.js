@@ -26,7 +26,13 @@ async function batched(k, list, check) {
   let bytes = 0;
   const send = async () => {
     if (!part.length) return;
+    const t0 = performance.now();
     const res = await k.calls(part);
+    if (globalThis.__gexBootTrace) {
+      const kinds = {};
+      for (const c of part) kinds[c.f] = (kinds[c.f] ?? 0) + 1;
+      console.warn(`[boot] batch ${part.length} calls, ${(bytes / 1048576).toFixed(1)} MiB, ${(performance.now() - t0).toFixed(0)} ms: ${JSON.stringify(kinds)}`);
+    }
     if (check) res.forEach((r, i) => check(r.r, part[i]));
     part = [];
     bytes = 0;
@@ -38,6 +44,87 @@ async function batched(k, list, check) {
     bytes += n;
   }
   await send();
+}
+
+/** The most bytes of one `k_fs_seed` call's records. */
+const SEED_BYTES = 4 << 20;
+
+/** Seeding records for the kernel's `k_fs_seed` (its comment has the
+ *  format), pushed onto a call list as calls of at most SEED_BYTES each,
+ *  in order with the calls around them. Without that export (an older
+ *  kernel), each record is its own call, as before. */
+class SeedRecords {
+  #list;
+  #seed;
+  #buf = new Uint8Array(SEED_BYTES + 65536);
+  #view = new DataView(this.#buf.buffer);
+  #at = 0;
+
+  constructor(list, seed) {
+    this.#list = list;
+    this.#seed = seed;
+  }
+
+  #room(n) {
+    if (this.#at + n > SEED_BYTES) this.flush();
+    if (n > this.#buf.length) {
+      this.#buf = new Uint8Array(n);
+      this.#view = new DataView(this.#buf.buffer);
+    }
+  }
+
+  #u8(v) { this.#view.setUint8(this.#at, v); this.#at += 1; }
+  #u32(v) { this.#view.setUint32(this.#at, v >>> 0, true); this.#at += 4; }
+  #u64(v) { this.#view.setBigUint64(this.#at, BigInt.asUintN(64, BigInt(v)), true); this.#at += 8; }
+  #text(b) { this.#u32(b.length); this.#buf.set(b, this.#at); this.#at += b.length; }
+
+  lazy(p, url, size, mode) {
+    if (!this.#seed) {
+      this.#list.push({ f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
+      if (mode !== undefined) this.#list.push({ f: 'k_fs_chmod', a: [{ in: p }, mode] });
+      return;
+    }
+    const pb = enc.encode(p), ub = enc.encode(url);
+    this.#room(25 + pb.length + ub.length);
+    this.#u8(1); this.#u32(mode ?? 0xffffffff); this.#u64(size); this.#text(pb); this.#text(ub);
+  }
+
+  symlink(target, p) {
+    if (!this.#seed) return void this.#list.push({ f: 'k_fs_symlink', a: [{ in: target }, { in: p }] });
+    const tb = enc.encode(target), pb = enc.encode(p);
+    this.#room(9 + tb.length + pb.length);
+    this.#u8(2); this.#text(tb); this.#text(pb);
+  }
+
+  mtime(p, secs) {
+    if (!this.#seed) return void this.#list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(Math.trunc(secs))] });
+    const pb = enc.encode(p);
+    this.#room(13 + pb.length);
+    this.#u8(3); this.#u64(Math.trunc(secs)); this.#text(pb);
+  }
+
+  chmod(p, mode) {
+    if (!this.#seed) return void this.#list.push({ f: 'k_fs_chmod', a: [{ in: p }, mode] });
+    const pb = enc.encode(p);
+    this.#room(9 + pb.length);
+    this.#u8(4); this.#u32(mode); this.#text(pb);
+  }
+
+  /** The records so far, as one call on the list. */
+  flush() {
+    if (!this.#at) return;
+    this.#list.push({ f: 'k_fs_seed', a: [{ in: this.#buf.slice(0, this.#at) }] });
+    this.#at = 0;
+  }
+}
+
+/** A file's calls: its bytes in parts of at most PART, and its mode when
+ *  `modes` has one. */
+function fileCalls(list, p, data, modes) {
+  const d = typeof data === 'string' ? enc.encode(data) : data;
+  list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
+  for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
+  if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
 }
 
 export class Files {
@@ -236,49 +323,108 @@ export class Files {
    *  file wins over a lazy one unless it is that file's first `head` bytes),
    *  hard links, symbolic links, file times (seconds) and extended
    *  attributes. The count of files laid. */
-  async layImage({ files = {}, modes = {}, dirs = [], lazy = [], hard = {}, symlinks = {}, mtimes, xattrs }) {
-    const k = this.#k;
+  async layImage(l) {
+    if (l.stream) return this.#layStream(l);
+    const { files = {}, modes = {}, dirs = [] } = l;
     const list = [];
     for (const p of dirs) list.push({ f: 'k_fs_add_dir', a: [{ in: p }, 0o755] });
     let n = 0;
     for (const [p, data] of Object.entries(files)) {
-      const d = typeof data === 'string' ? enc.encode(data) : data;
-      list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
-      for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
-      if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+      fileCalls(list, p, data, modes);
       n++;
     }
+    return n + await this.#layRest(list, {
+      ...l, has: (p) => files[p] !== undefined, size: (p) => files[p].length, bytes: async (p) => files[p],
+    });
+  }
+
+  /** An image whose files arrive as they are unpacked (`stream`: an async
+   *  iterable of tar.js `untar` parts, in the archive's order), laid a part
+   *  at a time, each part's bytes free once laid; what needs every file in
+   *  first (lazy files, hard and symbolic links, times, the directories'
+   *  modes) after the last. `modes`, `mtimes` and `xattrs` beside it are the
+   *  lazy files' (the parts' own win, as one untarred tree's would). Nothing
+   *  runs in the guest until boot's layers are all in (system.js `#start`). */
+  async #layStream({ stream, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart }) {
+    const k = this.#k;
+    const sizes = new Map();
+    const dirs = [];
+    const modes = { ...lazyModes };
+    const symlinks = {};
+    const hard = {};
+    const mtimes = {};
+    const xattrs = { ...(baseXattrs ?? {}) };
+    let n = 0;
+    for await (const t of stream) {
+      const list = [];
+      for (const p of t.dirs) {
+        list.push({ f: 'k_fs_add_dir', a: [{ in: p }, 0o755] });
+        dirs.push(p);
+      }
+      for (const [p, data] of Object.entries(t.files)) {
+        fileCalls(list, p, data, t.modes);
+        sizes.set(p, data.length);
+        n++;
+      }
+      Object.assign(modes, t.modes);
+      Object.assign(symlinks, t.links);
+      Object.assign(hard, t.hard);
+      Object.assign(mtimes, t.mtimes);
+      Object.assign(xattrs, t.xattrs);
+      await batched(k, list, (r, c) => {
+        if (c.f === 'k_fs_add' && r < 0) throw errno(r, c.a[0].in);
+      });
+      onPart?.(t);
+    }
+    // Hard links whose target is a file of the image, as the page's own
+    // untarred tree keeps them (app.js).
+    for (const [p, target] of Object.entries(hard)) if (!sizes.has(target)) delete hard[p];
+    return n + await this.#layRest([], {
+      dirs, modes, lazy, hard, symlinks, mtimes: lazyMtimes ? { ...lazyMtimes, ...mtimes } : undefined, xattrs,
+      has: (p) => sizes.has(p), size: (p) => sizes.get(p),
+      // the bytes of a link the kernel would not make, from the copy laid
+      bytes: (p) => this.readFile(p),
+    });
+  }
+
+  /** An image's calls after its files' (`list`, sent with them): the
+   *  directories' modes, the lazy files, hard and symbolic links, times and
+   *  extended attributes. `has(p)`/`size(p)`: whether the image has file
+   *  `p` and its length; `bytes(p)` its contents. Resolves to the lazy files
+   *  laid. */
+  async #layRest(list, { dirs = [], modes = {}, lazy = [], hard = {}, symlinks = {}, mtimes, xattrs, has, size, bytes }) {
+    const k = this.#k;
+    let n = 0;
+    const seed = new SeedRecords(list, k.has('k_fs_seed'));
     // Directories' modes once their files are in (a read-only one keeps
     // its mode: Wine reports it read only).
-    for (const p of dirs) if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
-    for (const [p, size, url, head] of lazy) {
-      if (files[p] !== undefined && !(head && files[p].length === head)) continue;
-      list.push({ f: 'k_fs_add_lazy', a: [{ in: p }, { in: url }, BigInt(size)] });
-      if (modes[p] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[p]] });
+    for (const p of dirs) if (modes[p] !== undefined) seed.chmod(p, modes[p]);
+    for (const [p, sz, url, head] of lazy) {
+      if (has(p) && !(head && size(p) === head)) continue;
+      seed.lazy(p, url, sz, modes[p]);
       n++;
     }
+    seed.flush();
     // With no hard links, what follows goes in the same batch: a round trip
     // to the kernel's Worker fewer at every boot.
     const hasHard = Object.keys(hard).length > 0;
     if (hasHard) {
       await batched(k, list.splice(0), (r, c) => {
         if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+        if (c.f === 'k_fs_seed' && r < 0) throw errno(r, 'the image\'s seeding records');
       });
     }
     // Hard links after their targets: one inode with two names, as the host
     // had it; a copy where the kernel would not link.
     const copies = [];
     await batched(k, Object.entries(hard).map(([p, target]) => ({ f: 'k_fs_link', a: [{ in: target }, { in: p }], p, target })), (r, c) => {
-      if (r < 0 && files[c.target] !== undefined) copies.push(c);
+      if (r < 0 && has(c.target)) copies.push(c);
     });
-    for (const { p, target } of copies) {
-      const d = files[target];
-      list.push({ f: 'k_fs_add', a: [{ in: p }, { in: d.subarray(0, PART) }] });
-      for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_add_part', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
-    }
-    for (const [p, target] of Object.entries(hard)) if (modes[target] !== undefined) list.push({ f: 'k_fs_chmod', a: [{ in: p }, modes[target]] });
-    for (const [p, target] of Object.entries(symlinks)) list.push({ f: 'k_fs_symlink', a: [{ in: target }, { in: p }] });
-    for (const [p, secs] of Object.entries(mtimes ?? {})) list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(Math.trunc(secs))] });
+    for (const { p, target } of copies) fileCalls(list, p, await bytes(target), {});
+    for (const [p, target] of Object.entries(hard)) if (modes[target] !== undefined) seed.chmod(p, modes[target]);
+    for (const [p, target] of Object.entries(symlinks)) seed.symlink(target, p);
+    for (const [p, secs] of Object.entries(mtimes ?? {})) seed.mtime(p, secs);
+    seed.flush();
     for (const [p, attrs] of Object.entries(xattrs ?? {})) {
       for (const [name, value] of Object.entries(attrs)) {
         const v = value instanceof Uint8Array ? value : enc.encode(String(value));
@@ -287,6 +433,7 @@ export class Files {
     }
     await batched(k, list, (r, c) => {
       if ((c.f === 'k_fs_add' || (!hasHard && c.f === 'k_fs_add_lazy')) && r < 0) throw errno(r, c.a[0].in);
+      if (c.f === 'k_fs_seed' && r < 0) throw errno(r, 'the image\'s seeding records');
     });
     return n;
   }

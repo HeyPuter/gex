@@ -77,6 +77,77 @@ export function tarEntries(buf, visit) {
   }
 }
 
+/** An empty unpacked tree, as `untar` returns it. */
+function tree() {
+  return {
+    files: Object.create(null),
+    dirs: [],
+    links: Object.create(null),
+    hard: Object.create(null),
+    // Only the modes that differ from the default: a file's execute bit --
+    // which dpkg checks: "'sh' not found in PATH or not executable" for a
+    // `/bin/sh` that is plainly there -- and a directory's other than 0755.
+    // Keeps this to the few hundred binaries.
+    modes: Object.create(null),
+    // Each file's modification time (seconds), for a page that hands them on
+    // (nt-page's `mtimes=1`).
+    mtimes: Object.create(null),
+    // Extended attributes (`user.*`), path to { name: bytes }: what the pax
+    // headers carry, for `gex_set_xattr`.
+    xattrs: Object.create(null),
+  };
+}
+
+/** A guest path for an entry's name: absolute under `root`, without the
+ *  leading `./` tar adds; null for the archive's own top. */
+function entryPath(root, name) {
+  const p = name.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!p) return null;
+  return `${root}/${p}`.replace(/\/{2,}/g, '/');
+}
+
+/** One entry into tree `t`: its header at `hdr[off..]`, its bytes `body`
+ *  (a regular file's; kept, not copied). */
+function addEntry(t, root, { name, type, link, ext }, hdr, off, body) {
+  const keepXattrs = (p) => {
+    if (p && ext && ext.xattrs) t.xattrs[p] = ext.xattrs;
+  };
+  if (type === '5') {
+    const p = entryPath(root, name);
+    if (p) t.dirs.push(p);
+    // The archive's own top (`./`) names the directory it unpacks into,
+    // which exists already: only its time is taken.
+    else if (/^(\.\/?)?$/.test(name)) t.mtimes[root || '/'] = octal(hdr, off + 136, 12);
+    // its time too: a cache built over a directory (KDE's ksycoca) is
+    // stale when the directory looks newer
+    if (p) t.mtimes[p] = octal(hdr, off + 136, 12);
+    keepXattrs(p);
+    // A directory's mode, when it is not the VFS's 0755: a read-only one
+    // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and
+    // the Windows shell reads a folder's desktop.ini names only then.
+    const mode = octal(hdr, off + 100, 8) & 0o7777;
+    if (p && mode && mode !== 0o755) t.modes[p] = mode;
+  } else if (type === '2') {
+    const p = entryPath(root, name);
+    if (p) t.links[p] = link;
+  } else if (type === '1') {
+    // A hard link's target is relative to the root of the archive, not the
+    // link's directory (a symlink's is). Resolving it like a symlink would
+    // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
+    const p = entryPath(root, name);
+    if (p && link) t.hard[p] = `/${link.replace(/^\.\//, '')}`;
+  } else if (type === '0' || type === '\0' || type === '7') {
+    const p = entryPath(root, name);
+    if (p) {
+      t.files[p] = body;
+      const mode = octal(hdr, off + 100, 8) & 0o7777;
+      if (mode & 0o111) t.modes[p] = mode;
+      t.mtimes[p] = octal(hdr, off + 136, 12);
+      keepXattrs(p);
+    }
+  }
+}
+
 /**
  * Unpack a tar into `{ files, dirs, links, hard, modes }`.
  *
@@ -87,73 +158,148 @@ export function tarEntries(buf, visit) {
  */
 export function untar(buf, root = '') {
   const b = new Uint8Array(buf);
-  const files = Object.create(null);
-  const dirs = [];
-  const links = Object.create(null);
-  // Only the modes that differ from the default: a file's execute bit --
-  // which dpkg checks: "'sh' not found in PATH or not executable" for a
-  // `/bin/sh` that is plainly there -- and a directory's other than 0755.
-  // Keeps this to the few hundred binaries.
-  const modes = Object.create(null);
-  const hard = Object.create(null);
-  // Each file's modification time (seconds), for a page that hands them on
-  // (nt-page's `mtimes=1`).
-  const mtimes = Object.create(null);
-  // Extended attributes (`user.*`), path to { name: bytes }: what the pax
-  // headers carry, for `gex_set_xattr`.
-  const xattrs = Object.create(null);
+  const t = tree();
+  // A file's bytes are a view, not a copy. A 650 MB image copied file by
+  // file is 650 MB of page memory on top of the 650 MB just fetched, and the
+  // tab ran out before the first window appeared. The bytes are read once
+  // more when they are written into the guest's filesystem, and nothing
+  // mutates them in between.
+  tarEntries(b, (e) => addEntry(t, root, e, b, e.off, b.subarray(e.body, e.body + e.size)));
+  return t;
+}
 
-  const path = (name) => {
-    let p = name.replace(/^\.\//, '').replace(/\/+$/, '');
-    if (!p) return null;
-    return `${root}/${p}`.replace(/\/{2,}/g, '/');
-  };
+/**
+ * A tar unpacked as it arrives (`push` each decoded piece, in order; `end`
+ * once all are in), for a bundle laid into the guest while it downloads.
+ * Each regular file's bytes are copied once out of the pieces, into an
+ * array of their own, so a piece is free once pushed; `take()` hands over
+ * what has been unpacked since the last call, as `untar`'s parts. The
+ * archive's entries come out in its order, the same entries `untar` makes.
+ */
+export class TarStream {
+  #root;
+  #t = tree();
+  #hdr = new Uint8Array(BLOCK);
+  #hdrAt = 0;
+  // The entry whose body is coming: its header fields, the bytes so far.
+  #entry = null;
+  #body = null;
+  #bodyAt = 0;
+  #skip = 0;
+  #longName = null;
+  #longLink = null;
+  #pax = null;
+  #bytes = 0;
+  #files = 0;
+  #ended = false;
 
-  tarEntries(b, ({ name, type, size, body, off, link, ext }) => {
-    const keepXattrs = (p) => {
-      if (p && ext && ext.xattrs) xattrs[p] = ext.xattrs;
-    };
-    if (type === '5') {
-      const p = path(name);
-      if (p) dirs.push(p);
-      // The archive's own top (`./`) names the directory it unpacks into,
-      // which exists already: only its time is taken.
-      else if (/^(\.\/?)?$/.test(name)) mtimes[root || '/'] = octal(b, off + 136, 12);
-      // its time too: a cache built over a directory (KDE's ksycoca) is
-      // stale when the directory looks newer
-      if (p) mtimes[p] = octal(b, off + 136, 12);
-      keepXattrs(p);
-      // A directory's mode, when it is not the VFS's 0755: a read-only one
-      // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and
-      // the Windows shell reads a folder's desktop.ini names only then.
-      const mode = octal(b, off + 100, 8) & 0o7777;
-      if (p && mode && mode !== 0o755) modes[p] = mode;
-    } else if (type === '2') {
-      const p = path(name);
-      if (p) links[p] = link;
-    } else if (type === '1') {
-      // A hard link's target is relative to the root of the archive, not the
-      // link's directory (a symlink's is). Resolving it like a symlink would
-      // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
-      const p = path(name);
-      if (p && link) hard[p] = `/${link.replace(/^\.\//, '')}`;
-    } else if (type === '0' || type === '\0' || type === '7') {
-      const p = path(name);
-      if (p) {
-        // A view, not a copy. A 650 MB image copied file by file is 650 MB
-        // of page memory on top of the 650 MB just fetched, and the tab ran
-        // out before the first window appeared. The bytes are read once more
-        // when they are written into the guest's filesystem, and nothing
-        // mutates them in between.
-        files[p] = b.subarray(body, body + size);
-        const mode = octal(b, off + 100, 8) & 0o7777;
-        if (mode & 0o111) modes[p] = mode;
-        mtimes[p] = octal(b, off + 136, 12);
-        keepXattrs(p);
+  constructor(root = '') {
+    this.#root = root;
+  }
+
+  /** The files' bytes unpacked and not yet taken. */
+  get pending() { return this.#bytes; }
+
+  /** Regular files unpacked so far, in all. */
+  get files() { return this.#files; }
+
+  /** A decoded piece of the archive (a view the caller may reuse after). */
+  push(part) {
+    if (this.#ended) throw new Error('tar: a piece after the end');
+    let at = 0;
+    while (at < part.length) {
+      if (this.#skip) {
+        const n = Math.min(this.#skip, part.length - at);
+        this.#skip -= n;
+        at += n;
+        continue;
+      }
+      if (this.#body) {
+        const n = Math.min(this.#body.length - this.#bodyAt, part.length - at);
+        this.#body.set(part.subarray(at, at + n), this.#bodyAt);
+        this.#bodyAt += n;
+        at += n;
+        if (this.#bodyAt === this.#body.length) this.#bodyDone();
+        continue;
+      }
+      const n = Math.min(BLOCK - this.#hdrAt, part.length - at);
+      this.#hdr.set(part.subarray(at, at + n), this.#hdrAt);
+      this.#hdrAt += n;
+      at += n;
+      if (this.#hdrAt === BLOCK) {
+        this.#hdrAt = 0;
+        this.#header();
       }
     }
-  });
-  return { files, dirs, links, hard, modes, mtimes, xattrs };
+  }
+
+  /** The archive is all in: what is left over is an error. */
+  end() {
+    if (this.#body || this.#hdrAt) throw new Error('tar: the archive ends inside an entry');
+    this.#ended = true;
+  }
+
+  /** What was unpacked since the last `take`. */
+  take() {
+    const t = this.#t;
+    this.#t = tree();
+    this.#bytes = 0;
+    return t;
+  }
+
+  #header() {
+    const b = this.#hdr;
+    // Two zero blocks end the archive; one is enough to know we are done.
+    if (b[0] === 0) return;
+    const size = octal(b, 124, 12);
+    const type = String.fromCharCode(b[156] || 0x30);
+    const pad = Math.ceil(size / BLOCK) * BLOCK - size;
+    const e = { size, type, pad, hdr: b.slice() };
+    if (type === 'x' || type === 'K' || type === 'L' || type === 'g' || type === '0' || type === '\0' || type === '7') {
+      this.#entry = e;
+      this.#body = new Uint8Array(size);
+      this.#bodyAt = 0;
+      if (!size) this.#bodyDone();
+      return;
+    }
+    // No body to keep (directories, links, devices).
+    this.#entry = e;
+    this.#bodyDone(true);
+    this.#skip = size + pad;
+  }
+
+  #bodyDone(none = false) {
+    const e = this.#entry;
+    const body = none ? null : this.#body;
+    this.#entry = null;
+    this.#body = null;
+    if (!none) this.#skip = e.pad;
+    const { type } = e;
+    if (type === 'x') {
+      this.#pax = paxRecords(body);
+    } else if (type === 'K') {
+      this.#longLink = str(body, 0, body.length);
+    } else if (type === 'L') {
+      this.#longName = str(body, 0, body.length);
+    } else if (type !== 'g') {
+      const b = e.hdr;
+      let name = str(b, 0, 100);
+      const prefix = str(b, 345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+      if (this.#longName !== null) name = this.#longName;
+      let link = this.#longLink ?? str(b, 157, 100);
+      this.#longName = this.#longLink = null;
+      const ext = this.#pax;
+      this.#pax = null;
+      if (ext?.path !== undefined) name = ext.path;
+      if (ext?.linkpath !== undefined) link = ext.linkpath;
+      addEntry(this.#t, this.#root, { name, type, link, ext }, b, 0, body);
+      if (body) {
+        this.#bytes += body.length;
+        this.#files++;
+      }
+    }
+  }
 }
 
 /**
