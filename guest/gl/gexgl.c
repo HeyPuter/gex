@@ -80,6 +80,10 @@ struct header {
 };
 
 static int gl_fd = -1;
+/* The host context's state (context_create, host_realize, below). */
+static int host_context_made;
+static int host_deferred;
+static void host_realize(void);
 static struct header *ring;
 static uint8_t *cmds;   /* the command area, just past the header */
 static uint8_t *replies;
@@ -462,6 +466,8 @@ static void pv_divisor(unsigned index, unsigned divisor);
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
 static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
+    if (host_deferred && !host_context_made && opcode != GEXGL_CONTEXT_CREATE)
+        host_realize();
     if (!ring && ring_open() != 0) {
         return NULL;
     }
@@ -3085,6 +3091,16 @@ static unsigned egl_api = 0x30A0; /* EGL_OPENGL_ES_API */
 static int host_context_made;
 /* How many contexts the application believes it has. */
 static int egl_contexts_live;
+/* A context asked for whose host context is not made yet. The host's is made
+   (host_realize) at the first command that needs it -- a GL call, a surface,
+   a make-current with a drawable -- not at eglCreateContext: Wine's display
+   driver creates contexts, makes them current with no surface and reads their
+   strings while the first process starts, for every page visit, and the
+   host's first context is what starts the page's Mesa. */
+static int host_deferred;
+static void host_realize(void);
+/* The current draw surface (eglMakeCurrent, below). */
+static void *egl_current_draw;
 
 /* Defined below, next to the list it builds. */
 static const char *gexgl_extension_string(void);
@@ -3097,6 +3113,20 @@ const unsigned char *glGetString(unsigned name) {
        reports 3.30 -- and an application that believes it writes
        `#version 440` shaders that cannot compile. glxinfo prints it next to
        the real GL version, which is where the disagreement showed. */
+    /* A context no surface has been current with, whose host context is not
+       made: what a driver's probe reads (Wine's GPU list names the device from
+       these). Said without the host, and not kept: the first context that
+       draws asks the host as before. The version has no x.y.z after its last
+       space, so a probe that parses one leaves it unknown rather than wrong. */
+    if (!host_context_made && host_deferred && !egl_current_draw) {
+        switch (name) {
+        case 0x1F00u: return (const unsigned char *)"Mesa";
+        case 0x1F01u: return (const unsigned char *)"gex WebGPU";
+        case 0x1F02u: return (const unsigned char *)(egl_api == 0x30A2u ? "4.6 Mesa" : "OpenGL ES 3.2 Mesa");
+        case 0x1F03u: return (const unsigned char *)"";
+        default: host_realize(); break;
+        }
+    }
     if (name == 0x1F03u) { /* GL_EXTENSIONS */
         return (const unsigned char *)gexgl_extension_string();
     }
@@ -4036,8 +4066,16 @@ static void context_create(void) {
         if (host_context_made) egl_contexts_live++;
         return;
     }
-    host_context_made = 1;
+    /* Counted now, made at the first command that needs it (host_realize),
+       with the attributes of the last context asked for by then. */
     egl_contexts_live++;
+    host_deferred = 1;
+}
+
+static void host_realize(void) {
+    if (host_context_made || !host_deferred || !ring) return;
+    host_context_made = 1;
+    host_deferred = 0;
     shadow_context_made();
     uint32_t *p = begin(GEXGL_CONTEXT_CREATE, 4, 0);
     if (!p) return;
@@ -4564,6 +4602,8 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
     (void)dpy; (void)ctx;
     if (!host_context_made || egl_contexts_live > 1) {
         if (egl_contexts_live) egl_contexts_live--;
+        /* The last of them gone before any drew: the host never made one. */
+        if (!egl_contexts_live) host_deferred = 0;
         return EGL_TRUE;
     }
     egl_contexts_live = 0;
@@ -4588,7 +4628,9 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        counting every make-current as a new context kept the host context
        alive after its last eglDestroyContext (SDL's throwaway GLX context
        then stood in for the one it really wanted). */
-    if (ctx && !host_context_made) context_create();
+    if (ctx && !host_context_made && !host_deferred) context_create();
+    /* Drawing into a surface: the host's context is needed now. */
+    if (ctx && draw) host_realize();
     egl_current_display = ctx ? dpy : NULL;
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;
