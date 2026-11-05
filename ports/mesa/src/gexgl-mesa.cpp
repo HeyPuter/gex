@@ -482,6 +482,17 @@ uint32_t displayed = 0;
 /* Frames shown, by where they came from, across every client: the frame
  * report says which, since a D3D program's process may run GL as well. */
 uint32_t displayed_gl = 0, displayed_d3d = 0;
+
+/* One more frame shown. The first tells the page glue (gex-wgpu-split.js),
+ * which then fetches and compiles Mesa's cold part in the background: from
+ * here, not from a poll, which a workload reaching its first cold function
+ * soon after its first frame could beat. */
+void count_shown() {
+    if (displayed++ == 0)
+        MAIN_THREAD_ASYNC_EM_ASM({
+            if (typeof Module['gexColdFirstFrame'] === 'function') Module['gexColdFirstFrame']();
+        });
+}
 /* The frames a D3D window's last show left unshown: none, newest-first. */
 uint32_t d3d_behind = 0;
 GLuint default_vao = 0;
@@ -1527,7 +1538,7 @@ bool display_pending(const gex_surface& s) {
  * shown newest-first: the ones it presented in between are passed over, not
  * shown later one per page frame as though each were new. */
 void note_shown() {
-    ++displayed;
+    count_shown();
     if (sur->external) {
         sur->displayed = sur->produced;
         ++displayed_d3d;
@@ -1686,7 +1697,7 @@ void present_backend() {
 bool display_backend() {
     if (!sur || sur->displayed >= sur->produced) return false;
     ++sur->displayed;
-    ++displayed;
+    count_shown();
     return true;
 }
 

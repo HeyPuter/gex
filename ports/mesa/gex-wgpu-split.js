@@ -140,36 +140,34 @@ if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['instantiateWasm']) {
 
 if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['gexNoColdPrefetch'] &&
     !(typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD)) {
-  // Wait for the first presented frame, then fetch and compile in the
-  // background. Not in a pthread: the module's pool started each with this
-  // file, Mesa runs no code there, and every one of them fetched and
-  // compiled its own copy (four, on an mt build). A miss on a pthread would
-  // compile the cold part synchronously, which a Worker may do.
-  var gexColdPoll = setInterval(function () {
-    if (typeof _gex_gl_presented !== 'function' || typeof wasmBinaryFile !== 'string') return;
-    var presented = 0;
-    try { presented = _gex_gl_presented(); } catch (e) { return; }
-    if (!presented) return;
-    clearInterval(gexColdPoll);
-    if (gexMesaColdInstance) return;
-    var file = gexMesaColdFile();
-    var cache = gexMesaCold();
-    if (cache[file]) return;
-    cache[file] = 'pending';
-    var t0 = performance.now(), size = 0;
-    fetch(file).then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.arrayBuffer();
-    }).then(function (bytes) {
-      size = bytes.byteLength;
-      return WebAssembly.compile(bytes);
-    }).then(function (module) {
-      if (!(cache[file] instanceof WebAssembly.Module)) cache[file] = module;
-      console.warn('[gex-wgpu] cold part prefetched (' + size + ' bytes) in ' +
-                   (performance.now() - t0).toFixed(1) + ' ms');
-    }, function (e) {
-      if (cache[file] === 'pending') delete cache[file];
-      console.warn('[gex-wgpu] cold part prefetch failed: ' + e);
-    });
-  }, 1000);
+  // Fetch and compile in the background once the first frame is shown:
+  // gexgl-mesa.cpp calls this from that frame, and it queues the work behind
+  // it. Not in a pthread: the module's pool started each with this file, Mesa
+  // runs no code there, and every one of them fetched and compiled its own
+  // copy (four, on an mt build). A miss on a pthread would compile the cold
+  // part synchronously, which a Worker may do.
+  Module['gexColdFirstFrame'] = function () {
+    setTimeout(function () {
+      if (gexMesaColdInstance || typeof wasmBinaryFile !== 'string') return;
+      var file = gexMesaColdFile();
+      var cache = gexMesaCold();
+      if (cache[file]) return;
+      cache[file] = 'pending';
+      var t0 = performance.now(), size = 0;
+      fetch(file).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.arrayBuffer();
+      }).then(function (bytes) {
+        size = bytes.byteLength;
+        return WebAssembly.compile(bytes);
+      }).then(function (module) {
+        if (!(cache[file] instanceof WebAssembly.Module)) cache[file] = module;
+        console.warn('[gex-wgpu] cold part prefetched (' + size + ' bytes) in ' +
+                     (performance.now() - t0).toFixed(1) + ' ms');
+      }, function (e) {
+        if (cache[file] === 'pending') delete cache[file];
+        console.warn('[gex-wgpu] cold part prefetch failed: ' + e);
+      });
+    }, 0);
+  };
 }

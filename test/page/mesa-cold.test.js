@@ -61,7 +61,7 @@ function hasPresent(b) {
 
 /** The trace through `mesa` (its glue's URL): `{ digest, frames, rejects,
  *  validation, cold }`. */
-async function replay(t, mesa, { lazy = false, noprefetch = false, settle = async () => {} }) {
+async function replay(t, mesa, trail, { lazy = false, noprefetch = false, settle = async () => {} }) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('no WebGPU adapter');
   const optional = ['texture-compression-bc', 'depth32float-stencil8', 'rg11b10ufloat-renderable', 'depth-clip-control', 'float32-filterable', 'float32-blendable', 'clip-distances', 'dual-source-blending'];
@@ -97,11 +97,14 @@ async function replay(t, mesa, { lazy = false, noprefetch = false, settle = asyn
     if ((await submit(ptr, b.length, 0)) !== 0) rejects++;
     if (hasPresent(b)) {
       m._gex_gl_display();
-      if (++frames % 32 === 0) await device.queue.onSubmittedWorkDone();
+      trail.frames = ++frames;
+      if (frames % 32 === 0) await device.queue.onSubmittedWorkDone();
     }
   }
   await device.queue.onSubmittedWorkDone();
-  await settle();
+  await settle().catch((e) => {
+    throw new Error(`${e.message} (the cold part ${m.gexColdLoaded ? `loaded ${m.gexColdLoaded}` : 'not loaded'}; ${trail.seen.join(' | ') || 'nothing logged'})`);
+  });
   // READ_PIXELS of the default framebuffer, RGBA/UNSIGNED_BYTE.
   const cmd = new Uint8Array(44);
   const cv = new DataView(cmd.buffer);
@@ -126,14 +129,16 @@ export default async function (t) {
   const { cold: hasCold } = await (await fetch(t.work(`mesa-cold/${build}/split.json`))).json();
   // The glue's own lines about the cold part, as it logs them.
   const seen = [];
+  // Each line with the frame the replay was at.
+  const trail = { frames: 0, seen };
   for (const k of ['log', 'info', 'warn']) {
     const own = console[k].bind(console);
-    console[k] = (...a) => { const s = a.map(String).join(' '); if (s.includes('cold part')) seen.push(s); own(...a); };
+    console[k] = (...a) => { const s = a.map(String).join(' '); if (s.includes('cold part')) seen.push(`${s} (frame ${trail.frames})`); own(...a); };
   }
   let r;
   try {
     const settle = () => t.until(() => seen.some((l) => l.includes('cold part prefetched')), `${build} ${name}: the background prefetch`, 60000);
-    r = await t.timeout(replay(t, t.work(`mesa-cold/${build}/${dir}/gex-wgpu-replay.js`), { ...opts, ...(opts.prefetch ? { settle } : {}) }), 300000, `${build} ${name}`);
+    r = await t.timeout(replay(t, t.work(`mesa-cold/${build}/${dir}/gex-wgpu-replay.js`), trail, { ...opts, ...(opts.prefetch ? { settle } : {}) }), 300000, `${build} ${name}`);
   } catch (e) {
     t.check(`${build} ${name}: replays`, false, String(e?.stack || e));
   }
