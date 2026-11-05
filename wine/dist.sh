@@ -57,7 +57,7 @@
 #               (WINE64_NATIVE then names it)
 #   b32-K-B     with WINE64_WOW64=1, the wasm32 build tree of the i386 PE side
 #               (wine32/wine-build.sh wasm; B: that script, 32-bit Wine's
-#               sysroot and libraries)
+#               sysroot and libraries): WINE64_BUILD32, the sysroot WINE64_SYSROOT32
 #   pen32-K-N32 its native modules: WINE64_NATIVE_DLLS32 as the core, every
 #               other one of its own (stage-native64.sh --i386): WINE64_NATIVE32
 #   dist64-...-nN[-N32]-sX  the install with the native PE side in place
@@ -642,3 +642,6 @@ echo "WINE64_BUILD=$C/b64-$K-$S"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
 echo "WINE64_NATIVE=$NATIVE"
 [ -z "$NATIVE32" ] || echo "WINE64_NATIVE32=$NATIVE32"
+# (the i386 wasm32 tree and its sysroot, for a program linked into the i386
+# core as a builtin: test/wow64/ptval32)
+[ -z "$NATIVE32" ] || { echo "WINE64_BUILD32=$C/b32-$K-$B32K"; echo "WINE64_SYSROOT32=$SR32"; }

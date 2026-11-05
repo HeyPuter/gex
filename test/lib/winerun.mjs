@@ -595,6 +595,22 @@ export async function unitLegs(t, name, { want, args = [], build = {}, timeout =
   w.clean();
 }
 
+/** A binary PPM (P6) at `path`: `{ w, h, px }`, px its RGB bytes. */
+export function ppm(path) {
+  const data = readFileSync(path);
+  const fields = [];
+  let i = 0;
+  while (fields.length < 4) {
+    while (/\s/.test(String.fromCharCode(data[i]))) i++;
+    if (data[i] === 0x23) { i = data.indexOf(0x0a, i); continue; }
+    let j = i;
+    while (!/\s/.test(String.fromCharCode(data[j]))) j++;
+    fields.push(data.subarray(i, j).toString('latin1'));
+    i = j;
+  }
+  return { w: Number(fields[1]), h: Number(fields[2]), px: data.subarray(i + 1) };
+}
+
 /**
  * The frames gexc's compositor wrote (--wayland-out PREFIX: PREFIX-NNN.ppm,
  * binary P6) checked for a picture: one frame with at least `min` pixels of

@@ -1,10 +1,10 @@
 // The case sets 64-bit Wine's tests share, natively and on the page
 // (winerun.mjs's `nt`): each a function of a session `w` and `o`, the
 // options every case gets (`page`, `env`), and a `pre` for its names.
-import { writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Skip } from '../lib/t.js';
-import { ROOT } from '../lib/winerun.mjs';
+import { graphics, ppm, ROOT } from '../lib/winerun.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const allOk = /(ok [^\n]*\n)+0 failures/;
@@ -196,4 +196,88 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     return t.check(`${pre}xthr_dll: build`, false, String(e.message));
   }
   for (const n of ['xthr', 'xhoist']) await one(n, join(F, `${n}.c`), ['-O2'], { extra: [dll, `${dll}.wasm`] });
+}
+
+const WL = join(ROOT, 'test/fixtures/wine');
+
+/** The Wayland driver for a case under gexc's compositor: `userReg`, and a
+ *  `setup` that puts the driver's file in system32 when the prefix has none
+ *  (a 64-bit prefix is made without a display). `x64`: 64-bit Wine's. */
+function waylandLeg(w, x64) {
+  return {
+    userReg: `${graphics('wayland')}${x64 ? '\n[Software\\\\Wine\\\\X11 Driver]\n"EmulateModeset"="Y"\n' : ''}`,
+    setup: x64 ? (p) => {
+      const drv = join(p, 'drive_c/windows/system32/winewayland.drv');
+      if (!existsSync(drv)) copyFileSync(join(w.dist, 'lib/wine/x86_64-windows/winewayland.drv'), drv);
+    } : undefined,
+    wineEnv: x64 ? { WINEGEX_DOOR: '1', WINEDLLOVERRIDES: 'mscoree=;mshtml=' } : {},
+  };
+}
+
+/**
+ * Wheel input reaching a Win32 window through gexc's compositor and Wine's
+ * winewayland (wheel.c, wheel.wl): a mouse notch is WM_MOUSEWHEEL of -120,
+ * a trackpad's 40 small deltas add up to another -120, a horizontal notch
+ * is WM_MOUSEHWHEEL +120 (winewayland reads only axis_discrete /
+ * axis_value120, so the compositor must send wheel units). Again `slow`
+ * (wheel-slow.wl): the program's WH_MOUSE hook sleeps on every wheel
+ * message, and the sums must still come out, a burst of 20 moves still
+ * coalesce. `arch` the program's (x64, or x86 for a WoW64 process).
+ */
+export async function wheel(t, w, arch) {
+  const x64 = arch === 'x64';
+  for (const slow of [false, true]) {
+    const name = `wheel ${arch}${slow ? ' slow' : ''}`;
+    const r = await w.native(['C:\\wheel.exe', '300', ...(slow ? ['slow'] : [])], { files: { 'wheel.exe': w.prog('wheel.exe', arch) }, ...waylandLeg(w, x64),
+      wayland: { size: '640x480', out: 'null' }, env: { GEX_WL_INPUT: join(WL, slow ? 'wheel-slow.wl' : 'wheel.wl') }, timeout: 400000, name });
+    // the reason: the program's last sums, and what the compositor did with
+    // the scrolls (a short sum with none dropped was lost past it, in Wine)
+    const sums = [...r.out.matchAll(/^wheel: vertical.*$/gm)].pop()?.[0];
+    const why = sums ? `${sums}; compositor: ${(r.out.match(/\[gex\] input at .*Axis\(/g) ?? []).length} scrolls sent, ${(r.out.match(/scroll dropped/g) ?? []).length} dropped`
+      : `no result line (window ${/^wheel: window up/m.test(r.out) ? 'up' : 'never up'}, input clock ${r.out.includes("script's clock starts") ? 'started' : 'never started'})`;
+    t.check(`${name}: the sums came out`, /^wheel ok/m.test(r.out), `${why}; ${w.detail(r, 4)}`);
+  }
+}
+
+/**
+ * Wine windows under gex's compositor carry no frame of the compositor's
+ * (deco.c, deco.wl): every Wine toplevel is placed and unmanaged, at its
+ * Win32 position, and a drag on the popup's own caption moves it through
+ * Win32's move loop. The compositor's window list ([wl-place]) has P and O
+ * unmanaged at 100,100 and 500,100 and P at 300,250 after the drag; the
+ * program says P moved there; the buffers (dumped without a GPU) are P's own
+ * caption and body and O's Wine-drawn caption over its blue client; a popup
+ * centred by Win32 is listed centred, and at 20,600 after SetWindowPos.
+ */
+export async function deco(t, w, arch) {
+  const x64 = arch === 'x64';
+  const name = `deco ${arch}`;
+  const dir = join(w.work, `deco-${arch}-frames`);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const r = await w.native(['C:\\deco.exe', '300'], { files: { 'deco.exe': w.prog('deco.exe', arch) }, ...waylandLeg(w, x64),
+    wayland: { size: '1024x768', out: join(dir, 'f') }, env: { GEX_PPM_EVERY: '1', GEX_WL_INPUT: join(WL, 'deco.wl') }, timeout: 400000, name });
+  const wins = new Set();
+  for (const l of r.out.split('\n').filter((l) => l.includes('[wl-place]')))
+    for (const [, ww, h, x, y, u] of l.matchAll(/id=0x[0-9a-f]+ (\d+)x(\d+)\+(-?\d+)\+(-?\d+) layer=\d( unmanaged)?/g)) wins.add(`${ww}x${h}+${x}+${y}${u ? ' unmanaged' : ''}`);
+  const has = (g) => wins.has(`${g} unmanaged`);
+  t.check(`${name}: P listed unmanaged at 100,100`, has('300x200+100+100'), [...wins].join(', '));
+  t.check(`${name}: O listed unmanaged at 500,100`, has('300x200+500+100'));
+  t.check(`${name}: no managed (compositor-framed) window`, ![...wins].some((g) => !g.endsWith(' unmanaged')));
+  t.check(`${name}: P moved to 300,250 by its caption`, r.out.includes('moved P to 300,250'), w.detail(r, 4));
+  t.check(`${name}: P listed at 300,250 after the drag`, has('300x200+300+250'));
+  t.check(`${name}: C listed centred at 412,334 (Win32's position)`, has('200x100+412+334'));
+  t.check(`${name}: C listed at 20,600 after SetWindowPos`, has('200x100+20+600'));
+  const R = [255, 0, 0], Y = [255, 255, 0], B = [0, 0, 255];
+  let p = false, o = false;
+  for (const f of readdirSync(dir).filter((f) => f.endsWith('.ppm')).sort()) {
+    const img = ppm(join(dir, f));
+    if (img.w !== 300 || img.h !== 200) continue;
+    const at = (x, y) => [...img.px.subarray((y * img.w + x) * 3, (y * img.w + x) * 3 + 3)];
+    const eq = (a, b) => a.every((v, i) => v === b[i]);
+    if (eq(at(50, 10), Y) && eq(at(50, 150), R)) p = true;
+    if (eq(at(150, 150), B) && ![B, Y, R].some((c) => eq(at(150, 5), c))) o = true;
+  }
+  t.check(`${name}: P's buffer is its own caption (yellow) and body (red), nothing round them`, p);
+  t.check(`${name}: O's buffer is Wine's caption over its blue client`, o);
 }
