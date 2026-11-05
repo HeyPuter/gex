@@ -6,8 +6,10 @@
 // that runs its program in its own place (starter), 24 DLLs loaded and
 // unloaded with the peak RSS and dispatch slots they keep (dllcycle), the
 // ASIO host with its round trip, the translation cache across loads
-// (xcache) and a full prefix update (cases.mjs says what each checks).
-import { asio, CONSOLE, dllcycle, each, LOWNULL, NULLDRV, starter, xcache, allOk } from '../wine64/cases.mjs';
+// (xcache), a program to its exit with nothing translated at run time
+// (aot: the page's aot=1, units built from a first run) and a full prefix
+// update (cases.mjs says what each checks).
+import { aot, asio, CONSOLE, dllcycle, each, LOWNULL, NULLDRV, starter, xcache, allOk } from '../wine64/cases.mjs';
 import { wine64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], images: ['win-progs'], timeout: 5400 };
@@ -21,6 +23,7 @@ export default async function (t) {
   await dllcycle(t, w, o, pre, { rss: true });
   await asio(t, w, o, pre);
   await xcache(t, w, o, pre);
+  await aot(t, w, o, pre);
   await w.nt({ ...o, name: `${pre}prefupdate`, want: allOk, exe: 'prefupdate.exe', nullDriver: true, timeout: 1500000 });
   w.clean();
 }

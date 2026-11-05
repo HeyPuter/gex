@@ -2,7 +2,7 @@
 // (winerun.mjs's `nt`): each a function of a session `w` and `o`, the
 // options every case gets (`page`, `env`), and a `pre` for its names.
 import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { Skip } from '../lib/t.js';
 import { graphics, ppm, ROOT } from '../lib/winerun.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
@@ -146,6 +146,48 @@ export async function xcache(t, w, o, pre = '') {
   const restored = /restored [1-9][0-9]* modules/.exec(`${runs[1].out}\n${runs[1].err}`)?.[0];
   t.check(`${pre}xcache: the DLL's blocks lifted: ${b1} at ${at1?.toString(16)}, ${b2} at ${at2?.toString(16)} after the cache (${restored}), ${b3} at ${at3?.toString(16)}; want under 5% of the first, then at least half at another base`,
     b1 > 1000 && at2 === at1 && !!restored && b2 < b1 / 20 && at3 !== null && at3 !== at1 && b3 >= b1 / 2);
+}
+
+/**
+ * A 64-bit console program on the page with nothing translated at run time
+ * (the page's cgen=1&aot=1: run-node's --cgen-prefer --no-jit), to its
+ * exit. A first run with translation and an empty unit cache names the
+ * images it ran without a unit; each gets its unit (gexc cgen-image, in
+ * the page process's flavour), the trampolines' too when the run asked for
+ * them. The AOT-only run must then exit 3 with the program's line, and lose
+ * no guest call native Wine made through JS's loop alone: its return, at
+ * NATIVE_RETURN_PAD, has no translation to watch ("guest code returned out
+ * of a call-out"). Page only.
+ */
+export async function aot(t, w, o, pre = '') {
+  const exe = 'aotexit.exe', units = join(w.work, 'aot-units');
+  const flags = [...(o.page?.flags ?? []), '--cgen-prefer'];
+  const probe = await w.page([`C:\\${exe}`], { pfxFiles: { [exe]: w.prog(exe) }, prefix: w.pagePrefix(), cwd: '/pfx/drive_c', flags,
+    env: { ...o.env, GEX_LOG: 'info', GEX_CGEN_CACHE: units }, split: true, name: 'aot-probe', timeout: o.timeout ?? 900000 });
+  const said = `${probe.out}\n${probe.err}`;
+  if (!t.check(`${pre}aot: the run with translation exits 3`, probe.code === 3 && /^aotexit: ok 3$/m.test(probe.out), w.detail(probe))) return;
+  const images = new Map();
+  for (const [, p, b] of said.matchAll(/image (\S+) at base (0x[0-9a-f]+): no function-tier unit/g)) images.set(`${p} ${b}`, [p, b]);
+  const host = (p) => p.startsWith('/wine64/') ? join(w.dist, p.slice('/wine64'.length)) : basename(p).toLowerCase() === exe ? w.prog(exe)
+    : /^\/pfx\/(dosdevices\/c:|drive_c)\//.test(p) ? join(probe.pfx, 'drive_c', p.replace(/^\/pfx\/(dosdevices\/c:|drive_c)\//, '')) : null;
+  const flavour = (await w.gexcRun(['cgen-flavour', '--page', w.loader], { log: 'aot-flavour' })).trim().split(/\s+/).filter(Boolean);
+  const cgen = (args) => w.gexcRun(['cgen-image', ...args, ...flavour], { env: { GEX_CGEN_GUARD: '1', GEX_CGEN_CACHE: units }, log: 'aot-units' });
+  try {
+    if (said.includes('gex-pe: missing unit: [the trampolines]')) await cgen(['--nt-trampolines64']);
+    for (const [p, b] of images.values()) {
+      const f = host(p);
+      if (!f || !existsSync(f)) throw new Error(`no host file for ${p}`);
+      await cgen([f, '--pe-base', b, '--jobs', '8']);
+    }
+  } catch (e) {
+    t.check(`${pre}aot: the units`, false, String(e.message));
+    return;
+  }
+  const r = await w.nt({ ...o, page: { ...o.page, flags: [...flags, '--no-jit'] }, env: { ...o.env, GEX_CGEN_CACHE: units },
+    name: `${pre}aot`, code: 3, want: /aotexit: ok 3/, exe });
+  if (!r) return;
+  const lost = (`${r.out}\n${r.err}`.match(/returned out of a call-out/g) ?? []).length;
+  t.check(`${pre}aot: no call-out lost its return (${images.size} images given units)`, lost === 0, `${lost} lines of "guest code returned out of a call-out"`);
 }
 
 /**
