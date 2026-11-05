@@ -50,7 +50,11 @@ let runs = 0;
  *  and `input` (if given) on stdin: `{ code, out, timedOut }`, `code` as a
  *  shell gives it. `errFile`: stderr in a file of its own instead, `out`
  *  stdout alone and `err` stderr. */
-export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file, errFile, input } = {}) {
+/** `argv` with its output to `file` (stderr too, or to `errFile`): resolves
+ *  `{ code, out, err, timedOut }`. `until`: a RegExp; once the output
+ *  matches it the run is ended (SIGTERM), and `until` in the result is the
+ *  ms it took (null when it never matched). */
+export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file, errFile, input, until } = {}) {
   return new Promise((resolve) => {
     const fd = openSync(file, 'w');
     const efd = errFile ? openSync(errFile, 'w') : fd;
@@ -58,13 +62,19 @@ export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, fil
     closeSync(fd);
     if (errFile) closeSync(efd);
     if (input !== undefined) { p.stdin.on('error', () => {}); p.stdin.end(input); }
-    let timedOut = false;
+    let timedOut = false, matched = null;
+    const t0 = performance.now();
     const timer = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, timeout);
-    p.on('error', (e) => { clearTimeout(timer); resolve({ code: 127, out: String(e.message), timedOut }); });
+    const watch = until && setInterval(() => {
+      const text = readFileSync(file, 'utf8') + (errFile ? readFileSync(errFile, 'utf8') : '');
+      if (matched === null && until.test(text)) { matched = Math.round(performance.now() - t0); p.kill('SIGTERM'); }
+    }, 1000);
+    p.on('error', (e) => { clearTimeout(timer); if (watch) clearInterval(watch); resolve({ code: 127, out: String(e.message), timedOut }); });
     p.on('close', (code, signal) => {
       clearTimeout(timer);
+      if (watch) clearInterval(watch);
       const sig = { SIGABRT: 6, SIGKILL: 9, SIGSEGV: 11, SIGTERM: 15 }[signal];
-      resolve({ code: code ?? 128 + (sig ?? 0), out: readFileSync(file, 'utf8'), ...(errFile && { err: readFileSync(errFile, 'utf8') }), timedOut });
+      resolve({ code: code ?? 128 + (sig ?? 0), out: readFileSync(file, 'utf8'), ...(errFile && { err: readFileSync(errFile, 'utf8') }), timedOut, ...(until && { until: matched }) });
     });
   });
 }
@@ -258,7 +268,7 @@ export function wow64(t, { mono = false } = {}) {
 }
 
 /** 64-bit Wine for a 64-bit program; `door` its WINEGEX_DOOR (the LP64
- *  door call, as the page has it; 0: none). `native`: the install with the
+ *  door call, as the page has it; 0: none; null: not set). `native`: the install with the
  *  native PE core GEX_TEST_WINE64_NATIVE in place of its own (a skip
  *  without it). `mem64`: the memory64 flavour's install and prefix,
  *  GEX_TEST_WINE64_M64_DIST and _PREFIX. */
@@ -268,7 +278,7 @@ export function wine64(t, { door = 1, native = false, mem64 = false } = {}) {
   const distSrc = env[D] || t.skip(`${D}: a 64-bit Wine install (wine/dist.sh${mem64 ? ', WINE64_MEM64=1' : ''})`);
   const pfxSrc = env[P] || t.skip(`${P}: its prefix (wine/dist.sh's WINE64_PREFIX)`);
   const nativeSrc = native ? (env.GEX_TEST_WINE64_NATIVE || t.skip('GEX_TEST_WINE64_NATIVE: a native PE core (wine/dist.sh\'s WINE64_NATIVE)')) : null;
-  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, WINEGEX_DOOR: String(door) }, mount: '/wine64', mingwTriple: 'x86_64' });
+  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, ...(door !== null && { WINEGEX_DOOR: String(door) }) }, mount: '/wine64', mingwTriple: 'x86_64' });
 }
 
 function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, wineEnv: WENV, mount, mingwTriple }) {
@@ -364,7 +374,7 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
      * when gexc is not built. Resolves run's result plus `pfx`, the prefix
      * it used.
      */
-    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, setup, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native', split = false } = {}) {
+    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, setup, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native', split = false, until } = {}) {
       if (!existsSync(gexc)) t.skip(`${gexc} is not built`);
       const p = pfx(`${name}-pfx`, files, { userReg, from });
       await setup?.(p);
@@ -380,13 +390,14 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
       // Not the host's display: gexc --wayland sets WAYLAND_DISPLAY and
       // XDG_RUNTIME_DIR to its own compositor only when they are not given.
       const { WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, ...host } = base;
-      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
+      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, until, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
       return { ...r, pfx: p };
     },
     /**
      * Wine on the page's x86 shared shim with `args`: the install at
      * the session's mount, /wine32 or /wine64 (`dist`: another; `loader`: the host's loader, by default
-     * the install's), a copy of the prefix at /pfx with
+     * the install's; `rel` the loader's path in the install, LOADER by
+     * default), a copy of the prefix at /pfx with
      * `pfxFiles` in drive_c and `userReg` added to its user.reg (`setup`:
      * called with its path, then), an empty /t, `files` (`{ guest path: host path
      * }`), `dirs` more (`{ guest: host }`), `flags` run-node's own (before
@@ -398,7 +409,7 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
      * `errFile`); `rss` the run's peak RSS (KiB, node and its Workers) as
      * the result's `rss`. Resolves run's result plus `pfx`.
      */
-    async page(args, { files = {}, pfxFiles = {}, userReg, dirs = {}, flags = [], wineEnv = {}, env: more = {}, dist: d = dist, loader: ld, cwd = '/t', setup, timeout = 300000, name = 'page',
+    async page(args, { files = {}, pfxFiles = {}, userReg, dirs = {}, flags = [], wineEnv = {}, env: more = {}, dist: d = dist, loader: ld, rel = LOADER, cwd = '/t', setup, timeout = 300000, name = 'page',
       prefix: from = prefix, single = false, mem64 = false, split = false, rss = false } = {}) {
       const flavour = mem64 ? 'x86.m64.shared' : 'x86.shared';
       const seed = g.pub(`seed.${flavour}.wasm`);
@@ -420,7 +431,7 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
         ...Object.entries(dirs).flatMap(([to, from]) => ['--dir', `${to}=${from}`]),
         ...Object.entries(files).flatMap(([to, from]) => ['--file', `${to}=${from}`]),
         ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]),
-        '--cwd', cwd, '--argv0', `${mount}/${LOADER}`, ...flags, seed, ld ?? join(d, LOADER), ...args.map(String)];
+        '--cwd', cwd, '--argv0', `${mount}/${rel}`, ...flags, seed, ld ?? join(d, rel), ...args.map(String)];
       const r = await run(argv, { cwd: ROOT, env: { ...base, GEX_ARCH: 'x86', GEX_SHARED: '1', ...(single && { GEX_SINGLE: '1' }), ...(mem64 && { GEX_MEM64: '1' }), ...more },
         timeout, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
       return { ...r, pfx: p, ...(rss && existsSync(rssFile) && { rss: Number(readFileSync(rssFile, 'utf8')) }) };
