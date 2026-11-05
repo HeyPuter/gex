@@ -610,69 +610,127 @@ function bindSplit(text) {
   if (!i && !text.startsWith('V\t')) return [text, []];
   return [text.slice(0, i), text.slice(i + 2, text.endsWith('\n') ? -1 : undefined).split(',')];
 }
-/** A binding list's lines, parsed: `ops` to apply to a module's imports,
- *  each with the index of its number(s) in the list's `V`, its `late`
- *  calls, the table slots to fill after instantiation (`extra`, [number
- *  index, export]) and its thread-local block (`tls`). The single-thread
- *  build's processes all run in one realm and bind the same libraries over
- *  and over: there a module's lines are parsed once (`BIND_PLANS`, by the
- *  lines), up to `BIND_PLAN_BYTES` of them, and a late module is made once
- *  for the same slots (`LATE_MODS`, up to `LATE_MODS_MAX`). */
-const BIND_ASYNC = 0, BIND_GLOBAL = 1, BIND_EXPORT = 2, BIND_SLOT = 3, BIND_MISSING = 4;
+/** A binding list's lines, parsed: a plan of records of `PLAN_REC` numbers
+ *  each (`ops`: kind; module and name as offsets and lengths into the plan's
+ *  names, `names`, UTF-8; then the kind's own: the index of its number(s) in
+ *  the list's `V`, flags, a further name), in the lines' order. Kinds:
+ *  imports to bind (BIND_ASYNC .. BIND_MISSING), late calls (BIND_LATE), the
+ *  table slots to fill after instantiation (BIND_EXTRA) and the module's
+ *  thread-local block (BIND_TLS).
+ *
+ *  The lines are the same in every process binding a module alike, and a
+ *  boot binds the same few hundred shapes ten thousand times (KDE: 492 of
+ *  them, 22 MB, parsed 10351 times, 6.1 s of its Workers' time). So a plan
+ *  is made once for the page: its two arrays are on shared buffers, kept
+ *  by the shape's key (`plan:`, cgen/dylink.rs `gex_wasmprog_bind_key`) and
+ *  handed to Workers as compiled modules are; a Worker that has it reads
+ *  only the list's numbers. The single-thread build's processes all run in
+ *  one realm: there plans are kept by their lines (`BIND_PLANS`, up to
+ *  `BIND_PLAN_BYTES` of them), and a late module is made once for the same
+ *  slots (`LATE_MODS`, up to `LATE_MODS_MAX`). */
+const BIND_ASYNC = 0, BIND_GLOBAL = 1, BIND_EXPORT = 2, BIND_SLOT = 3, BIND_MISSING = 4, BIND_LATE = 5, BIND_EXTRA = 6, BIND_TLS = 7;
+const PLAN_REC = 10;
 const BIND_PLANS = new Map(), BIND_PLAN_BYTES = 64 << 20, LATE_MODS = new Map(), LATE_MODS_MAX = 4096;
 let bindPlanBytes = 0;
-/** Outside the single-thread build, the last list parsed: an install reads
- *  a module's list twice (its `X` lines before the compile, `#wasmprogBind`
- *  after), which parsed every list twice, ~60 ms of a fork child of Plasma's
- *  shell installing its 374 modules. */
-let lastShape = null, lastPlan = null;
+const planEncoder = new TextEncoder(), planDecoder = new TextDecoder();
+/** `n` bytes (a multiple of 4) for a plan: from a shared arena where the
+ *  page can share one (a typed array on it crosses `postMessage` by
+ *  reference), carved so that a plan costs no buffer of its own (one each
+ *  was most of a plan's making). [buffer, offset]. */
+const PLAN_ARENA = 4 << 20;
+let planArena = null, planArenaAt = 0;
+function planAlloc(n) {
+  const share = typeof SharedArrayBuffer === 'function' && globalThis.crossOriginIsolated !== false;
+  if (!share || n > PLAN_ARENA / 4) return [share ? new SharedArrayBuffer(n) : new ArrayBuffer(n), 0];
+  if (!planArena || planArenaAt + n > PLAN_ARENA) {
+    planArena = new SharedArrayBuffer(PLAN_ARENA);
+    planArenaAt = 0;
+  }
+  const at = planArenaAt;
+  planArenaAt += n;
+  return [planArena, at];
+}
+/** Whether `x` is a plan (`bindPlan`), as the page relays them. */
+const isPlan = (x) => x?.ops instanceof Int32Array && x.names instanceof Uint8Array;
+/** `shape`'s plan, and its names as a string: `{ plan, str }`. */
 function bindPlan(shape) {
   const shared = SP_CODE && single.on;
-  const had = shared ? BIND_PLANS.get(shape) : shape === lastShape ? lastPlan : undefined;
+  const had = shared ? BIND_PLANS.get(shape) : undefined;
   if (had) return had;
-  const plan = { ops: [], late: [], extra: [], tls: null };
+  const lines = shape.split('\n');
+  // records made here, copied to the plan's buffer once their count is known
+  const ops = new Int32Array(lines.length * PLAN_REC);
+  const parts = [];
+  let len = 0, n = 0;
+  const at = (str) => {
+    const o = len;
+    parts.push(str);
+    len += str.length;
+    return o;
+  };
+  const rec = (kind, m, name, a = 0, b = 0, c = 0, d = 0, e = 0) => {
+    ops[n] = kind; ops[n + 1] = at(m); ops[n + 2] = m.length; ops[n + 3] = at(name); ops[n + 4] = name.length;
+    ops[n + 5] = a; ops[n + 6] = b; ops[n + 7] = c; ops[n + 8] = d; ops[n + 9] = e;
+    n += PLAN_REC;
+  };
   let v = 0;
-  for (const line of shape.split('\n')) {
+  for (const line of lines) {
     if (!line) continue;
     const f = line.split('\t');
     switch (f[0]) {
       case 'S':
-        if (f[1] === 'env' && (f[2] === '__asyncify_state' || f[2] === '__asyncify_data')) plan.ops.push([BIND_ASYNC, 'env', f[2], f[2] === '__asyncify_state' ? 0 : 1]);
+        if (f[1] === 'env' && (f[2] === '__asyncify_state' || f[2] === '__asyncify_data')) rec(BIND_ASYNC, 'env', f[2], f[2] === '__asyncify_state' ? 0 : 1);
         break;
       case 'G':
-        plan.ops.push([BIND_GLOBAL, f[1], f[2], f[5] === '64', f[4] === '1', v++]);
+        rec(BIND_GLOBAL, f[1], f[2], f[5] === '64' ? 1 : 0, f[4] === '1' ? 1 : 0, v++);
         break;
       case 'E': {
         const mod = v++;
-        plan.ops.push([BIND_EXPORT, f[1], f[2], mod, f[4], f[5] === 's' ? v++ : f[5] && f[5] !== '-' ? f[5] : null]);
+        // a packed module's export: from its slot (a number) or a value
+        const [pk, pv] = f[5] === 's' ? [1, v++] : f[5] && f[5] !== '-' ? [2, Number(f[5].slice(1)) | 0] : [0, 0];
+        rec(BIND_EXPORT, f[1], f[2], mod, at(f[4]), f[4].length, pk, pv);
         break;
       }
       case 'L':
-        if (f[4]) plan.late.push([f[1], f[2], v++, f[4]]);
-        else plan.ops.push([BIND_SLOT, f[1], f[2], v++]);
+        if (f[4]) rec(BIND_LATE, f[1], f[2], v++, at(f[4]), f[4].length);
+        else rec(BIND_SLOT, f[1], f[2], v++);
         break;
-      case 'M':
-        plan.ops.push([BIND_MISSING, f[1], f[2], f.slice(3).join('\t')]);
+      case 'M': {
+        const msg = f.slice(3).join('\t');
+        rec(BIND_MISSING, f[1], f[2], 0, at(msg), msg.length);
         break;
+      }
       case 'X':
-        plan.extra.push([v++, f[2]]);
+        rec(BIND_EXTRA, '', f[2], v++);
         break;
       case 'T':
-        plan.tls = [Number(f[1]), Number(f[2])];
+        rec(BIND_TLS, '', '', Number(f[1]), Number(f[2]));
         break;
     }
   }
+  const str = parts.join('');
+  const bytes = planEncoder.encode(str);
+  const [ob, oo] = planAlloc(n * 4), [nb, no] = planAlloc((bytes.length + 3) & ~3);
+  const plan = { ops: new Int32Array(ob, oo, n), names: new Uint8Array(nb, no, bytes.length) };
+  plan.ops.set(ops.subarray(0, n));
+  plan.names.set(bytes);
+  const out = { plan, str };
   if (shared && bindPlanBytes + shape.length <= BIND_PLAN_BYTES) {
-    BIND_PLANS.set(shape, plan);
+    BIND_PLANS.set(shape, out);
     bindPlanBytes += shape.length;
   }
-  if (!shared) [lastShape, lastPlan] = [shape, plan];
-  return plan;
+  return out;
 }
-/** A binding list's `X` lines: [slot, export]. */
-function bindExtra(text) {
-  const [shape, vals] = typeof text === 'string' ? bindSplit(text) : text;
-  return bindPlan(shape).extra.map(([i, n]) => [Number(vals[i]), n]);
+/** A plan's names, as a string (`names` is shared: copied out first). */
+const planNames = (plan) => planDecoder.decode(plan.names.slice());
+/** A plan's `X` slots: [slot, export]. */
+function bindExtra({ plan, str, vals }) {
+  const out = [];
+  const o = plan.ops;
+  for (let i = 0; i < o.length; i += PLAN_REC) {
+    if (o[i] === BIND_EXTRA) out.push([Number(vals[o[i + 5]]), str.slice(o[i + 3], o[i + 3] + o[i + 4])]);
+  }
+  return out;
 }
 
 /** A wasm32 module's late-bound functions (`L` in a binding list, each
@@ -4822,7 +4880,7 @@ export class Gex {
   }
 
   addSharedModule(key, mod) {
-    if (typeof key === 'string' && mod instanceof WebAssembly.Module && !this.#sharedModules.has(key) && !this.#deadKeys.has(key)) {
+    if (typeof key === 'string' && (mod instanceof WebAssembly.Module || isPlan(mod)) && !this.#sharedModules.has(key) && !this.#deadKeys.has(key)) {
       this.#sharedModules.set(key, mod);
     }
   }
@@ -5187,8 +5245,7 @@ export class Gex {
     // read before its module is compiled: its exports are packed
     // (`packExports`, a separate module key) unless GEX_LOG=nodlpack.
     // Split once, here, for `#wasmprogBind` too.
-    const bindText = wasmprog ? this.#wasmprogBindRead(prov) : '';
-    const bindParts = wasmprog ? bindSplit(bindText) : null;
+    const bind = wasmprog ? this.#bindGet(prov) : null;
     let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
@@ -5206,7 +5263,7 @@ export class Gex {
           // is packed, and nowhere else (an install whose packed module the
           // page has, a fork's child or a thread, has no use for them; they
           // were 65 ms of a Plasma fork child's installs).
-          const xs = bindExtra(bindParts);
+          const xs = bind ? bindExtra(bind) : [];
           pbytes = packExports(raw, xs, base);
           if (logNamed('dlpack')) console.warn(`[dlpack] ${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: ${pbytes ? `${raw.length} -> ${pbytes.length} bytes, ${xs.length} slots` : 'not packed'} in ${(performance.now() - t0).toFixed(1)} ms`);
           if (pbytes) { pkey = `${pkey}:p`; packed = true; } else pbytes = raw;
@@ -5382,14 +5439,14 @@ export class Gex {
       });
     }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
-    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText, bindParts) : [];
+    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bind) : [];
     // One of Wine's PE modules with imports of the others (a DLL linked as
     // a module of its own, or the core calling into one): its binding list.
     const peMod = wasmdll && !wasmprog && !libprov;
     if (peMod) this.#wasmdllBind(prov, imports, st);
     // What a door instance needs to run this program again on its memory
     // (a wineserver: `#doorPublish`).
-    if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText, packed };
+    if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, prov, binds: bind?.text ?? null, packed };
     inst = new WebAssembly.Instance(mod, imports);
     if (peMod) {
       st.dyl.set(prov, inst);
@@ -6193,59 +6250,69 @@ export class Gex {
   /** Apply provider module `prov`'s binding list (cgen/dylink.rs's format)
    *  to `imports`; the table slots to fill with exports after
    *  instantiation, as [slot, name]. */
-  #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov), parts = null) {
-    this.#wasmprogBindText = text;
-    if (!text) return [];
-    const [shape, vals] = parts ?? bindSplit(text);
-    const plan = bindPlan(shape);
-    this.#wasmprogTls = plan.tls && [...plan.tls];
-    const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
-    for (const op of plan.ops) {
-      switch (op[0]) {
+  #wasmprogBind(prov, imports, st, bind) {
+    this.#wasmprogTls = null;
+    if (!bind) return [];
+    const { plan, str, vals } = bind;
+    const o = plan.ops;
+    const name = (at) => str.slice(o[at], o[at] + o[at + 1]);
+    const set = (m, n, v) => { (imports[m] ??= {})[n] = v; };
+    const extra = [];
+    let late = null;
+    for (let i = 0; i < o.length; i += PLAN_REC) {
+      switch (o[i]) {
         case BIND_ASYNC:
           this.#wasmprogAsync ??= [0, 1].map(() => new WebAssembly.Global({ value: 'i32', mutable: true }, 0));
-          set('env', op[2], this.#wasmprogAsync[op[3]]);
+          set('env', name(i + 3), this.#wasmprogAsync[o[i + 5]]);
           break;
         case BIND_GLOBAL: {
-          const [, m, name, wide, mutable, i] = op, v = vals[i];
-          const g = wide
+          const mutable = o[i + 6] === 1, v = vals[o[i + 7]];
+          const g = o[i + 5]
             ? new WebAssembly.Global({ value: 'i64', mutable }, BigInt(v))
             : new WebAssembly.Global({ value: 'i32', mutable }, Number(v) | 0);
           if (mutable) this.#wasmprogMuts.push(g);
-          set(m, name, g);
+          set(name(i + 1), name(i + 3), g);
           break;
         }
         case BIND_EXPORT: {
-          const [, m, name, mi, exp, packed] = op, mod = Number(vals[mi]);
+          const mod = Number(vals[o[i + 5]]), exp = name(i + 6);
           const from = st.dyl.get(mod);
           // a packed module's (`packExports`): from its slot or value
           let x = from?.exports[exp];
-          if (x === undefined && from && packed) {
-            x = typeof packed === 'string'
-              ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(packed.slice(1)) | 0)
-              : this.#slotFn(st, Number(vals[packed]));
+          if (x === undefined && from && o[i + 8]) {
+            x = o[i + 8] === 2
+              ? new WebAssembly.Global({ value: 'i32', mutable: false }, o[i + 9])
+              : this.#slotFn(st, Number(vals[o[i + 9]]));
           }
-          if (x === undefined) throw new Error(`wasm32 module ${prov}: ${m}.${name}: ${exp} of module ${mod} is not instantiated in this Worker`);
-          set(m, name, x);
+          if (x === undefined) throw new Error(`wasm32 module ${prov}: ${name(i + 1)}.${name(i + 3)}: ${exp} of module ${mod} is not instantiated in this Worker`);
+          set(name(i + 1), name(i + 3), x);
           break;
         }
         case BIND_SLOT: {
-          const slot = tIdx(this.#wide, Number(vals[op[3]])), t = st.ftab;
-          set(op[1], op[2], (...a) => t.get(slot)(...a));
+          const slot = tIdx(this.#wide, Number(vals[o[i + 5]])), t = st.ftab;
+          set(name(i + 1), name(i + 3), (...a) => t.get(slot)(...a));
           break;
         }
         case BIND_MISSING: {
-          const msg = op[3];
-          set(op[1], op[2], () => { throw new Error(msg); });
+          const msg = name(i + 6);
+          set(name(i + 1), name(i + 3), () => { throw new Error(msg); });
           break;
         }
+        case BIND_LATE:
+          (late ??= []).push([name(i + 1), name(i + 3), Number(vals[o[i + 5]]), name(i + 6)]);
+          break;
+        case BIND_EXTRA:
+          extra.push([Number(vals[o[i + 5]]), name(i + 3)]);
+          break;
+        case BIND_TLS:
+          this.#wasmprogTls = [o[i + 5], o[i + 6]];
+          break;
       }
     }
-    if (plan.late.length) {
+    if (late) {
       // In wasm, for a type the list gives: the call stays a wasm frame,
       // which the single-thread build's fiber can suspend through, as it
       // cannot through a JS one.
-      const late = plan.late.map(([m, name, i, sig]) => [m, name, Number(vals[i]), sig]);
       // Its bytes are a function of these slots and types alone, so it is
       // made once per key: in the single-thread build in this realm
       // (`LATE_MODS`), in the default build on the page (`late:`, relayed
@@ -6261,9 +6328,48 @@ export class Gex {
         }
       }
       const x = new WebAssembly.Instance(mod, { e: { t: st.ftab } }).exports;
-      plan.late.forEach(([m, name], i) => set(m, name, x[i]));
+      late.forEach(([m, n], k) => set(m, n, x[k]));
     }
-    return plan.extra.map(([i, n]) => [Number(vals[i]), n]);
+    return extra;
+  }
+
+  /** Provider module `prov`'s binding list, parsed (`bindPlan`): the page's
+   *  plan for its shape when the page has one (`plan:`), and then only its
+   *  numbers are read; else the list read whole, parsed, and its plan
+   *  offered to the page. `{ plan, str, vals, text }` (`str` the plan's
+   *  names, `text` the list when it was read), or null for none. */
+  #bindGet(prov) {
+    const e = this.#shim.exports;
+    const len = !(SP_CODE && single.on) && e.gex_wasmprog_bind_key ? e.gex_wasmprog_bind_key(prov, 0) >>> 0 : 0;
+    const key = len ? `plan:${len - 1}:${(e.gex_wasmprog_bind_key(prov, 2) >>> 0).toString(16)}:${(e.gex_wasmprog_bind_key(prov, 1) >>> 0).toString(16)}` : null;
+    const had = key ? this.#sharedModules.get(key) : null;
+    if (had && isPlan(had)) return { plan: had, str: planNames(had), vals: this.#bindVals(prov), text: null };
+    if (key) {
+      // only the shape's lines read: the numbers come from the shim
+      const { plan, str } = bindPlan(this.#wasmprogStrRead(e.gex_wasmprog_binds, prov, len - 1));
+      this.#sharedModules.set(key, plan);
+      this.#offerModule(key, plan, 0);
+      return { plan, str, vals: this.#bindVals(prov), text: null };
+    }
+    const text = this.#wasmprogBindRead(prov);
+    if (!text) return null;
+    const [shape, vals] = bindSplit(text);
+    return { ...bindPlan(shape), vals, text };
+  }
+
+  /** Provider module `prov`'s binding list's numbers (`V`), as the shim
+   *  keeps them: no text to split. */
+  #bindVals(prov) {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmprog_bind_vals(prov, 0, 0) >>> 0;
+    if (!n) return new Uint32Array(0);
+    const buf = e.gex_alloc(n) >>> 0;
+    try {
+      e.gex_wasmprog_bind_vals(prov, buf, n);
+      return new Uint32Array(this.#bytes().slice(buf, buf + n).buffer);
+    } finally {
+      e.gex_free?.(buf, n);
+    }
   }
 
   /** Wine's PE module `prov`'s binding list (cgen/wasmdll.rs, the format of
@@ -6438,12 +6544,18 @@ export class Gex {
 
   /** Provider module `prov`'s binding list, '' for none. */
   #wasmprogBindRead(prov) {
+    return this.#wasmprogStrRead(this.#shim.exports.gex_wasmprog_binds, prov);
+  }
+
+  /** A string the shim's `fn(prov, buf, cap)` puts (its length for a
+   *  `cap` of 0), or '' for none. */
+  #wasmprogStrRead(fn, prov, upto = Infinity) {
     const e = this.#shim.exports;
-    const n = e.gex_wasmprog_binds ? e.gex_wasmprog_binds(prov, 0, 0) >>> 0 : 0;
+    const n = fn ? Math.min(fn(prov, 0, 0) >>> 0, upto) : 0;
     if (!n) return '';
     const buf = e.gex_alloc(n) >>> 0;
     try {
-      e.gex_wasmprog_binds(prov, buf, n);
+      fn(prov, buf, n);
       return new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
     } finally {
       e.gex_free?.(buf, n);
@@ -7106,8 +7218,6 @@ export class Gex {
   #wasmprogInfo = null;
   /** Wine's PE modules' `L` thunk modules, by provider number (#wasmdllBind). */
   #wasmdllThunkMods = new Map();
-  /** The binding list `#wasmprogBind` read last (for `#wasmprogInfo`). */
-  #wasmprogBindText = '';
   /** The session's door server, and this Worker's instance on it. */
   #door = null;
   /** The session's door word (host.mjs `#doorWord`): the pid of the server
@@ -7141,7 +7251,7 @@ export class Gex {
       return;
     }
     const door = {
-      memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? '', packed: !!info.packed,
+      memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? this.#wasmprogBindRead(info.prov), packed: !!info.packed,
       area, kickId, pid: dv.getInt32(area + 112, true), id: `${Date.now()}:${area}`,
     };
     if (globalThis.GEX_DOOR_TRACE) console.error(`[gex-door] wineserver pid ${door.pid} published its door (area ${area})`);
@@ -10701,7 +10811,7 @@ export class Gex {
   #offerModule(key, mod, bytes) {
     // Units go to the page whatever their size: the host keeps them for every
     // process, and a Worker without one fetches its bytes as well.
-    if (!(bytes >= RELAY_MIN_BYTES) && !/^(wasm|cgen|cold|late):/.test(String(key))) {
+    if (!(bytes >= RELAY_MIN_BYTES) && !/^(wasm|cgen|cold|late|plan):/.test(String(key))) {
       this.#relaySkipped++;
       return;
     }

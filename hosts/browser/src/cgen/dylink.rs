@@ -144,7 +144,31 @@ impl Vals {
     }
 }
 /// Binding lists, by provider module number.
-static BINDS: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
+static BINDS: Mutex<Option<HashMap<u32, Binds>>> = Mutex::new(None);
+
+/// A binding list and its shape's key: the lines before its `V` line are
+/// the same in every process binding the module alike, and the page keeps
+/// what JS parsed of them by this key (gex.mjs `plan:`), so a Worker that
+/// finds it there reads only the `V` numbers ([`gex_wasmprog_bind_vals`]).
+struct Binds {
+    text: String,
+    /// The shape's length (where the `V` line starts) and its Fx hash.
+    shape: usize,
+    hash: u64,
+    /// The `V` numbers (all 32-bit), as JS takes them.
+    vals: Vec<u32>,
+}
+
+fn binds_put(number: u32, text: String) {
+    use std::hash::Hasher;
+    let shape = if text.starts_with("V\t") { 0 } else { text.rfind("\nV\t").map_or(text.len(), |i| i + 1) };
+    let mut h = gex_dylink::FxHasher::default();
+    h.write(&text.as_bytes()[..shape]);
+    let hash = h.finish();
+    let v = text[shape..].strip_prefix("V\t").unwrap_or("").trim_end_matches('\n');
+    let vals = if v.is_empty() { Vec::new() } else { v.split(',').map(|n| n.parse().unwrap_or(0)).collect() };
+    lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, Binds { text, shape, hash, vals });
+}
 thread_local! {
     /// The modules this thread's last `dlopen` loaded, in initialisation
     /// order, for JS to run their constructors once it has instantiated them.
@@ -376,7 +400,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             provs.len() as u32 - 1
         };
         p.module_of[i] = number;
-        lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
+        binds_put(number, text);
         let (wasm, shed) = bytes[i - from].take().unwrap_or_default();
         // the program's own bytes are from its image, a library's from its file
         let from_file = i != 0;
@@ -499,7 +523,7 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
         text.push_str(&format!("X\t\t{n}\n"));
     }
     vals.end(&mut text);
-    lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
+    binds_put(number, text);
     let slots = info.slots().0;
     dy(|d| *d = Some(DyProc {
         link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }], ..Default::default() },
@@ -673,7 +697,7 @@ fn adopt_inherited(p: &mut DyProc, mods: &str, inh: &str, wasm: &[u8], entry: u6
         }
         p.module_of[i] = m.number;
         p.slot_len[i] = m.slots;
-        lock(&BINDS).get_or_insert_with(HashMap::new).insert(m.number, m.binds.to_string());
+        binds_put(m.number, m.binds.to_string());
         // The program's bytes are its image's; a library's are read again
         // when a Worker asks, as once they have gone in the parent. One whose
         // parent still held them is read now.
@@ -727,7 +751,35 @@ pub extern "C" fn gex_wasmprog_ready() -> i32 {
 /// module without one, a static program).
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_binds(number: u32, buf: u32, cap: u32) -> u32 {
-    lock(&BINDS).as_ref().and_then(|b| b.get(&number)).map_or(0, |t| put_str(t, buf, cap))
+    lock(&BINDS).as_ref().and_then(|b| b.get(&number)).map_or(0, |t| put_str(&t.text, buf, cap))
+}
+
+/// Provider module `number`'s binding list's shape key ([`Binds`]): lane 0
+/// its length plus one (0: no list), 1 and 2 its hash's low and high words.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_bind_key(number: u32, lane: u32) -> u32 {
+    lock(&BINDS).as_ref().and_then(|b| b.get(&number)).map_or(0, |t| match lane {
+        0 => t.shape as u32 + 1,
+        1 => t.hash as u32,
+        _ => (t.hash >> 32) as u32,
+    })
+}
+
+/// Provider module `number`'s binding list's `V` numbers, little-endian
+/// 32-bit words at `buf` (up to `cap` bytes); their bytes. With them and its
+/// shape's plan (on the page: [`gex_wasmprog_bind_key`]) JS needs no text.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_bind_vals(number: u32, buf: u32, cap: u32) -> u32 {
+    lock(&BINDS).as_ref().and_then(|b| b.get(&number)).map_or(0, |t| {
+        let n = t.vals.len() * 4;
+        if buf != 0 && cap as usize >= n {
+            // a buffer from the shim's heap (put_str's)
+            for (o, v) in crate::shim_slice_mut(buf, n as u32).chunks_exact_mut(4).zip(&t.vals) {
+                o.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        n as u32
+    })
 }
 
 /// The process's link map as text, for a fork's child; 0 when the program
@@ -774,7 +826,7 @@ fn link_text(p: &DyProc) -> String {
     let mut s = String::new();
     for i in order {
         let number = p.module_of[i];
-        let (Some(b), Some(g)) = (binds.as_ref().and_then(|b| b.get(&number)), progs.iter().find(|g| g.number == number)) else { return t };
+        let (Some(b), Some(g)) = (binds.as_ref().and_then(|b| b.get(&number)).map(|b| &b.text), progs.iter().find(|g| g.number == number)) else { return t };
         let key = g.key.map_or("-".to_string(), |(a, c)| format!("{}:{}", a as i64, c as i64));
         let gone = g.gone.map_or("-".to_string(), |(a, m, c)| format!("{}:{m}:{}", a as i64, c as i64));
         let _ = writeln!(s, "P\t{i}\t{number}\t{}\t{}\t{}\t{key}\t{gone}\t{}", p.slot_len[i], g.lowered as u8, g.len, b.len());

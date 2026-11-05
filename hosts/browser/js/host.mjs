@@ -182,6 +182,10 @@ const PAGE_MODULE_BYTES = 1024 << 20;
 /** The most late-call modules (`late:`, gex.mjs `lateCalls`) the page keeps
  *  compiled for its Workers (`#lateModules`): each is a few hundred bytes. */
 const LATE_PAGE_MODULES = 4096;
+/** The most parsed binding-list plans (`plan:`, gex.mjs `bindPlan`) the
+ *  page keeps for its Workers (`#planModules`): a few KiB to 100 KiB each,
+ *  on shared buffers (KDE's boot makes 492, 22 MB of lines). */
+const PLAN_PAGE_MODULES = 4096;
 /** The most unit modules the page keeps compiled for its Workers (`#cgenModules`). */
 const UNIT_PAGE_MODULES = 4096;
 /** The most unit-cache files the page keeps for its Workers (`#unitFiles`). */
@@ -385,6 +389,11 @@ export class ProcessHost {
   // own yet). Apart from `#pageModules`, whose count they would take; the
   // oldest go past LATE_PAGE_MODULES.
   #lateModules = new Map();
+  // Parsed binding lists (`plan:` keys, gex.mjs `bindPlan`): a module's
+  // lines are the same in every process binding it alike, so the plan one
+  // Worker made is every Worker's. On shared buffers: handed out by
+  // reference. The oldest go past PLAN_PAGE_MODULES.
+  #planModules = new Map();
   // Units a Worker published and nobody has compiled yet: fetched and
   // compiled here, off the guest's threads (`prefetchUnit`), by key, with
   // the processes that asked for it meanwhile.
@@ -438,7 +447,7 @@ export class ProcessHost {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
     // And the page's translation units (empty unless `extra.unitCache`),
     // less those the Worker was given while it waited in the pool.
-    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries()];
+    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries(), ...this.#planModules.entries()];
     const had = w?.[POOLED];
     return [...own, ...(had ? page.filter(([k]) => !had.has(k)) : page)];
   }
@@ -448,7 +457,7 @@ export class ProcessHost {
    *  demo after a few commands; 2.5 ms to clone in, 1.1 ms more in transit
    *  and 0.7 ms to register, of every child's start). */
   #poolModules(w) {
-    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries()];
+    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries(), ...this.#planModules.entries()];
     w[POOLED] = new Set(entries.map(([k]) => k));
     if (entries.length) w.postMessage({ kind: 'pooledModules', entries });
   }
@@ -1789,6 +1798,19 @@ export class ProcessHost {
         if (this.#extra?.fillTime) this.#relayCensus();
         if (typeof m.key === 'string' && (m.key.startsWith('cgen:') || m.key.startsWith('cold:'))) {
           this.#cgenShare(m.key, m.mod, w, String(pid).split(':')[0]);
+          break;
+        }
+        if (typeof m.key === 'string' && m.key.startsWith('plan:')) {
+          if (!this.#planModules.has(m.key)) {
+            this.#planModules.set(m.key, m.mod);
+            this.#poolModule(m.key, m.mod);
+            while (this.#planModules.size > PLAN_PAGE_MODULES) this.#planModules.delete(this.#planModules.keys().next().value);
+            // and to the process's live Workers, which install the same
+            // modules (not into its module cache, whose count it would take)
+            for (const [key, other] of this.#workers) {
+              if (other !== w && String(key).split(':')[0] === proc) other.postMessage({ kind: 'sharedModule', key: m.key, mod: m.mod });
+            }
+          }
           break;
         }
         if (typeof m.key === 'string' && m.key.startsWith('late:') && !this.#lateModules.has(m.key)) {
