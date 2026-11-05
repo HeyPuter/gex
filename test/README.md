@@ -35,7 +35,7 @@ default on PATH; the `gexcc` group's programs run under it, its install's
 gexcc/dl-gobject), `GEX_TEST_INNER` (how many of gexcc/programs' programs run at
 once, default 4), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
-/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WOW64_DIST`, `GEX_TEST_WOW64_PREFIX` and `GEX_TEST_WOW64_MONO` (the `wow64` group: Native tests), `GEX_TEST_GEXCC_WIN`, `GEX_TEST_WINE64_TOOLS`, `GEX_TEST_WINE64_SRC` and `GEX_TEST_WINE64_BUILD` (the `wine64` group: Native tests), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
+/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WOW64_DIST`, `GEX_TEST_WOW64_PREFIX` and `GEX_TEST_WOW64_MONO` (the `wow64` group: Native tests), `GEX_TEST_GEXCC_WIN`, `GEX_TEST_WINE64_TOOLS`, `GEX_TEST_WINE64_SRC` and `GEX_TEST_WINE64_BUILD` (the `wine64` group: Native tests), `GEX_TEST_WINE64_NATIVE`, `GEX_TEST_WINE64_M64_DIST` and `GEX_TEST_WINE64_M64_PREFIX` (the `wine64-page` group), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
 
 The browser host is vite on page/ (cross-origin isolated, the runtime from
@@ -157,6 +157,15 @@ cases. `wine64/gexccwin` and `wine64/gl`'s d2dsize need GEX_TEST_GEXCC_WIN
 GEX_TEST_WINE64_SRC, GEX_TEST_WINE64_BUILD (wine/dist.sh's WINE64_TOOLS,
 WINE64_SRC and WINE64_BUILD) and GEX_WASM64_SYSROOT, `wine64/layout`
 GEX_TEST_WINE64_SRC.
+
+`wine64-page/*` runs them on the page (run-node.mjs with the x86 shared
+shim and seed, wine/page-prefix.sh's prefix): `mp` the default build,
+`sp` the single-thread one, `compact` and `pe` with the native PE core
+GEX_TEST_WINE64_NATIVE (wine/dist.sh's WINE64_NATIVE) in place of the
+install's (the compact space; the native modules' host-data views),
+`units` with function-tier units built from a first run, and `mem64` the
+memory64 flavour (GEX_TEST_WINE64_M64_DIST and _PREFIX, wine/dist.sh with
+WINE64_MEM64=1). wine64/cases.mjs holds the cases both groups share.
 `site/eject-page-files` builds an ejected page and checks it carries the
 page's runtime and X server.
 
