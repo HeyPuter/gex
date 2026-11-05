@@ -6,7 +6,7 @@
  * with 0. Its WM_CLASS is "rt-x11", "RtX11" and its _NET_WM_PID its pid,
  * as a toolkit's window's are.
  *
- *   rt-x11 TITLE [copy TEXT] [paste] [look] [where]
+ *   rt-x11 TITLE [copy TEXT] [paste] [look] [where] [at]
  *
  * With "copy TEXT" it owns the clipboard with TEXT once mapped ("copied",
  * and "sent" each time it is asked); with "paste", each button press asks
@@ -17,7 +17,9 @@
  * distance from the middle, warped back each time). With "where", each
  * ConfigureNotify of its window says "at X Y W H": where the window is on
  * the root (as the page placed it) and its size; and the root's, when the
- * output changes size, "root W H" (once at the start too). */
+ * output changes size, "root W H" (once at the start too). With "at", each
+ * press also says "press N at X Y" and each motion "motion X Y", in the
+ * window's own coordinates. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,12 +33,13 @@
 int main(int argc, char **argv) {
   const char *title = argc > 1 ? argv[1] : "rt-x11";
   const char *copy = NULL;
-  int paste = 0, look = 0, looking = 0, where = 0;
+  int paste = 0, look = 0, looking = 0, where = 0, at = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "copy") && i + 1 < argc) copy = argv[++i];
     else if (!strcmp(argv[i], "paste")) paste = 1;
     else if (!strcmp(argv[i], "look")) look = 1;
     else if (!strcmp(argv[i], "where")) where = 1;
+    else if (!strcmp(argv[i], "at")) at = 1;
   }
   Display *dpy = XOpenDisplay(NULL);
   if (!dpy) {
@@ -83,6 +86,7 @@ int main(int argc, char **argv) {
       printf("key %u\n", e.xkey.keycode);
     } else if (e.type == ButtonPress) {
       printf("button %u\n", e.xbutton.button);
+      if (at) printf("press %u at %d %d\n", e.xbutton.button, e.xbutton.x, e.xbutton.y);
       if (paste) XConvertSelection(dpy, clipboard, utf8, prop, w, e.xbutton.time);
       if (look && !looking) {
         looking = 1;
@@ -100,6 +104,8 @@ int main(int argc, char **argv) {
         XWarpPointer(dpy, None, w, 0, 0, 0, 0, 80, 40);
         printf("grabbed %d\n", g);
       }
+    } else if (e.type == MotionNotify && at && !looking) {
+      printf("motion %d %d\n", e.xmotion.x, e.xmotion.y);
     } else if (e.type == MotionNotify && looking) {
       int dx = e.xmotion.x - 80, dy = e.xmotion.y - 40;
       if (dx || dy) {

@@ -3,8 +3,9 @@
 // ready, or the reason it cannot be (the tests that need it are skipped).
 //
 //   busybox  bb.tar.zst: BUSYBOX (a wasm32 busybox) and its applets, the probe
-//            programs (probe/*.c, built with GEXCC or gexcc; rt-truncate and
-//            rt-sockpass include programs/ and native/wasm32/ sources), /etc/xattr with
+//            programs (probe/*.c, built with GEXCC or gexcc; rt-truncate,
+//            rt-repaint, rt-deadclient and rt-sockpass include programs/ and
+//            native/wasm32/ sources), /etc/xattr with
 //            an extended attribute; and lazy.bin and lazy-program.bin, a lazy
 //            file's bytes (one test's each), and rt-side.so, a side module
 //            rt-dlstatic loads (a lazy file's). Kept
@@ -60,6 +61,8 @@ const PROBES = {
   'rt-joy': [],
   'rt-truncate': [],
   'rt-sockpass': [],
+  'rt-repaint': [],
+  'rt-deadclient': [],
   'rt-x11': ['-lX11', '-lX11-xcb', '-lxcb-xfixes', '-lxcb', '-lXau', '-lXdmcp'],
   // static, serving what rt-side.so imports (SIDES)
   'rt-dlstatic': ['-pthread', ...['malloc', 'snprintf', 'strlen', 'fprintf', 'stderr', 'pthread_mutex_lock', 'pthread_mutex_unlock', 'sin', 'cos'].map((s) => `-Wl,--export=${s}`)],
@@ -200,6 +203,7 @@ export const images = {
     h.update(readFileSync(join(HERE, 'programs/truncate-path.c')));
     // rt-sockpass.c is native/wasm32/sockpass.c.
     h.update(readFileSync(join(HERE, 'native/wasm32/sockpass.c')));
+    for (const n of ['repaint', 'deadclient']) h.update(readFileSync(join(HERE, `programs/${n}.c`)));
     h.update(JSON.stringify(PROBES));
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
