@@ -127,6 +127,142 @@ pub struct Export {
     pub index: u32,
 }
 
+/// A module's exports by name: the names in one buffer, the exports in the
+/// section's order, and an open-addressed index of them by the name's hash.
+/// A map of a `String` each was a third of a library's parse at every load
+/// (Qt's and KDE's libraries export 8.4 MB of names, 225 thousand of them:
+/// one allocation and copy each, in every process).
+#[derive(Clone, Default)]
+pub struct Exports {
+    names: String,
+    /// (name start, name end, export)
+    ents: Vec<(u32, u32, Export)>,
+    /// `ents` indices, `u32::MAX` free; a power of two long, at most half full.
+    index: Vec<u32>,
+}
+
+impl Exports {
+    fn with_capacity(n: usize, name_bytes: usize) -> Exports {
+        Exports { names: String::with_capacity(name_bytes), ents: Vec::with_capacity(n), index: Vec::new() }
+    }
+
+    fn hash(name: &str) -> usize {
+        let mut h = FxHasher::default();
+        h.write(name.as_bytes());
+        h.finish() as usize
+    }
+
+    fn name(&self, i: usize) -> &str {
+        let (a, b, _) = self.ents[i];
+        &self.names[a as usize..b as usize]
+    }
+
+    /// Add `name` (last wins, as a map's insert): the index is made again
+    /// as it fills.
+    pub fn insert(&mut self, name: &str, e: Export) {
+        if let Some(i) = self.find(name) {
+            self.ents[i].2 = e;
+            return;
+        }
+        let a = self.names.len() as u32;
+        self.names.push_str(name);
+        self.ents.push((a, self.names.len() as u32, e));
+        if self.ents.len() * 2 > self.index.len() {
+            self.reindex((self.ents.len() * 2).next_power_of_two().max(16));
+        } else {
+            let i = self.ents.len() - 1;
+            self.place(i);
+        }
+    }
+
+    fn reindex(&mut self, size: usize) {
+        self.index.clear();
+        self.index.resize(size, u32::MAX);
+        for i in 0..self.ents.len() {
+            self.place(i);
+        }
+    }
+
+    fn place(&mut self, i: usize) {
+        let mask = self.index.len() - 1;
+        let mut at = Self::hash(self.name(i)) & mask;
+        while self.index[at] != u32::MAX {
+            at = (at + 1) & mask;
+        }
+        self.index[at] = i as u32;
+    }
+
+    fn find(&self, name: &str) -> Option<usize> {
+        if self.index.is_empty() {
+            return None;
+        }
+        let mask = self.index.len() - 1;
+        let mut at = Self::hash(name) & mask;
+        loop {
+            let i = self.index[at];
+            if i == u32::MAX {
+                return None;
+            }
+            if self.name(i as usize) == name {
+                return Some(i as usize);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Export> {
+        self.find(name).map(|i| &self.ents[i].2)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ents.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ents.is_empty()
+    }
+
+    /// (name, export), in the section's order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Export)> + '_ {
+        self.ents.iter().map(|(a, b, e)| (&self.names[*a as usize..*b as usize], e))
+    }
+}
+
+impl std::ops::Index<&str> for Exports {
+    type Output = Export;
+    fn index(&self, name: &str) -> &Export {
+        self.get(name).unwrap_or_else(|| panic!("no export {name}"))
+    }
+}
+
+impl<'a> IntoIterator for &'a Exports {
+    type Item = (&'a str, &'a Export);
+    type IntoIter = Box<dyn Iterator<Item = (&'a str, &'a Export)> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<(S, Export)> for Exports {
+    fn from_iter<I: IntoIterator<Item = (S, Export)>>(it: I) -> Exports {
+        let mut x = Exports::default();
+        for (n, e) in it {
+            x.insert(n.as_ref(), e);
+        }
+        x
+    }
+}
+
+impl std::fmt::Debug for Exports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 /// What the loader needs to know of a module.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
@@ -140,7 +276,7 @@ pub struct Info {
     /// Whether the module has a `dylink.0` section at all.
     pub dylink: bool,
     pub imports: Vec<Import>,
-    pub exports: HashMap<String, Export>,
+    pub exports: Exports,
     /// Exports flagged TLS in `dylink.0`.
     pub tls_exports: HashSet<String>,
     pub func_imports: u32,
@@ -157,8 +293,6 @@ pub struct Info {
     /// that calls through the table (`L` in a binding list); `None` for a
     /// type with any other value or a non-function type.
     pub sigs: Vec<Option<String>>,
-    /// The fork summary (`gex.forkreach`), if the module has one.
-    pub forkreach: Option<ForkReach>,
     /// [`Info::slots`], made once: the loader asks for it at every symbol it
     /// binds (a large C++ library binds tens of thousands).
     slots: std::sync::OnceLock<(u32, HashMap<u32, u32>)>,
@@ -210,6 +344,20 @@ impl ForkReach {
         s.into_bytes()
     }
 
+    /// `wasm`'s summary, if it has one. Only gexcc's link reads it (a
+    /// loader has no use for it: [`Info`] leaves it out, which was a third
+    /// of a library's parse, 7.6 MB of names across KDE's).
+    pub fn of(wasm: &[u8]) -> Result<Option<ForkReach>> {
+        for p in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::CustomSection(c) = p? {
+                if c.name() == FORKREACH_SECTION {
+                    return Ok(Some(ForkReach::decode(c.data())?));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn decode(data: &[u8]) -> Result<ForkReach> {
         let s = std::str::from_utf8(data).context("gex.forkreach: not UTF-8")?;
         let mut lines = s.lines();
@@ -242,7 +390,7 @@ impl Info {
     /// file (its code and data are nineteen twentieths of a Qt library).
     pub fn reads_section(id: u8, name: &[u8]) -> bool {
         match id {
-            0 => name == b"dylink.0" || name == FORKREACH_SECTION.as_bytes(),
+            0 => name == b"dylink.0",
             // types, imports, globals, exports, elements
             1 | 2 | 6 | 7 | 9 => true,
             _ => false,
@@ -307,9 +455,6 @@ impl Info {
                         }
                     }
                 }
-                Payload::CustomSection(c) if c.name() == FORKREACH_SECTION => {
-                    info.forkreach = Some(ForkReach::decode(c.data())?);
-                }
                 Payload::TypeSection(r) => {
                     for g in r {
                         for t in g?.into_types() {
@@ -363,18 +508,18 @@ impl Info {
                     }
                 }
                 Payload::ExportSection(s) => {
-                    info.exports.reserve(s.count() as usize);
+                    // (the section's bytes bound its names')
+                    let mut x = Exports::with_capacity(s.count() as usize, s.range().len());
                     for e in s {
                         let e = e?;
                         info.has_thunks |= e.name.starts_with(FPCAST_THUNK);
-                        info.exports.insert(
-                            e.name.to_string(),
-                            Export {
-                                kind: kind_of(e.kind),
-                                index: e.index,
-                            },
-                        );
+                        let a = x.names.len() as u32;
+                        x.names.push_str(e.name);
+                        x.ents.push((a, x.names.len() as u32, Export { kind: kind_of(e.kind), index: e.index }));
                     }
+                    // a module's export names are distinct (the format says so)
+                    x.reindex((x.ents.len() * 2).next_power_of_two().max(16));
+                    info.exports = x;
                 }
                 Payload::ElementSection(s) => {
                     for el in s {
@@ -424,7 +569,7 @@ impl Info {
             at.entry(f).or_insert(k as u32);
         }
         let mut len = self.table_size.max(self.elem.len() as u32);
-        let mut names: Vec<(&String, &Export)> =
+        let mut names: Vec<(&str, &Export)> =
             self.exports.iter().filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK)).collect();
         names.sort_by(|a, b| a.0.cmp(b.0));
         for (n, e) in names {
@@ -466,7 +611,7 @@ impl Info {
             .filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK))
             .filter_map(|(n, e)| {
                 let thunk = if self.has_thunks { format!("{FPCAST_THUNK}{n}") } else { String::new() };
-                let fill = if self.has_thunks && self.exports.contains_key(&thunk) { thunk } else { n.clone() };
+                let fill = if self.has_thunks && self.exports.contains_key(&thunk) { thunk } else { n.to_string() };
                 at.get(&e.index).filter(|&&s| s >= base).map(|&s| (s, fill))
             })
             .collect();
@@ -646,7 +791,7 @@ pub const FPCAST_THUNK: &str = "__fpcast$";
 pub fn fpcast_prep(wasm: &[u8]) -> Result<Vec<u8>> {
     use wasm_encoder::reencode::Reencode;
     let info = Info::parse(wasm)?;
-    let mut names: Vec<(&String, u32)> = info
+    let mut names: Vec<(&str, u32)> = info
         .exports
         .iter()
         .filter(|(n, e)| e.kind == Kind::Func && e.index >= info.func_imports && !n.starts_with(FPCAST_THUNK))
@@ -2098,6 +2243,23 @@ mod tests {
         m.section(&ds);
         m.section(&CustomSection { name: "producers".into(), data: b"\0".as_slice().into() });
         m.finish()
+    }
+
+    #[test]
+    fn exports_by_name() {
+        let names: Vec<String> = (0..5000).map(|i| format!("sym{i}")).collect();
+        let mut x: Exports = names.iter().enumerate().map(|(i, n)| (n.as_str(), Export { kind: Kind::Func, index: i as u32 })).collect();
+        assert_eq!(x.len(), 5000);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(x.get(n).map(|e| e.index), Some(i as u32));
+            assert_eq!(x[n.as_str()].index, i as u32);
+        }
+        assert!(!x.contains_key("sym5000") && x.get("").is_none());
+        // in the order added; an insert of a name there replaces its export
+        assert!(x.iter().map(|(n, _)| n).eq(names.iter().map(String::as_str)));
+        x.insert("sym7", Export { kind: Kind::Global, index: 1 });
+        assert_eq!((x.len(), x["sym7"].kind), (5000, Kind::Global));
+        assert!(Exports::default().get("a").is_none());
     }
 
     #[test]

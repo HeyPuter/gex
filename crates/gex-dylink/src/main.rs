@@ -68,7 +68,7 @@ fn main() -> Result<()> {
                 })
                 .collect();
             println!("GOT ({}): {}", got.len(), got.join(" "));
-            if let Some(f) = &i.forkreach {
+            if let Some(f) = ForkReach::of(&read(&a[2])?)? {
                 println!("forkreach: {} exports may fork", f.may_fork.len());
             }
         }
