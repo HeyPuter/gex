@@ -19,6 +19,7 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { TarStream, untar } from './tar.js';
+import { Sha256 } from './sha256.js';
 import { SP_CODE } from '../../hosts/browser/js/mode.mjs';
 import { zstdLoader } from './zstd-loader.js';
 import { makeControl as lazyCacheControl, lazyVersion } from '../../hosts/browser/js/lazy-cache.mjs';
@@ -1483,9 +1484,13 @@ async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into
  *  view it must copy what it keeps of) and nothing kept here. */
 async function decodeInto(url, u, got, d, res, { size, zsize, h, shared, f, into, progress, sink, bad }) {
   const out = sink ? null : new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
+  // A sink keeps nothing to hash at the end: its pieces are hashed as they
+  // pass (a bad cached copy found once it has all come, and laid again).
+  const sum = sink && h ? new Sha256() : null;
   let n = 0;
   const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
+    sum?.update(part);
     if (sink) sink(part);
     else out.set(part, n);
     n += part.length;
@@ -1517,9 +1522,10 @@ async function decodeInto(url, u, got, d, res, { size, zsize, h, shared, f, into
   if (at !== zsize) throw bad(`${u.href}: ${at} of ${zsize} bytes`);
   if (n !== size) throw bad(`${url}: decoded ${n} of ${size} bytes`);
   // pack.json's sizes, never the host's headers, say how much should come;
-  // and its hash (`h`, the content's), what (a sink keeps nothing to hash).
-  if (h && out && globalThis.crypto?.subtle) {
-    const v = new Uint8Array(await crypto.subtle.digest('SHA-256', out.buffer instanceof ArrayBuffer ? out.subarray(0, n) : out.slice(0, n)));
+  // and its hash (`h`, the content's), what.
+  if (h && (sum || globalThis.crypto?.subtle)) {
+    const v = sum ? sum.digest()
+      : new Uint8Array(await crypto.subtle.digest('SHA-256', out.buffer instanceof ArrayBuffer ? out.subarray(0, n) : out.slice(0, n)));
     const hex = Array.from(v.subarray(0, 8), (b) => b.toString(16).padStart(2, '0')).join('');
     if (hex !== h) throw bad(`${url}: its content's hash is ${hex}, not pack.json's ${h}`);
   }
