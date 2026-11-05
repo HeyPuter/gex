@@ -35,7 +35,8 @@
 #               beside it (WINE64_MEDIA=off, WINE64_PADS=off: not);
 #               WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
-#               that script and the 32-bit configure options it compiles with
+#               that script and the 32-bit configure options it compiles with;
+#               its objects in obj/ (test/page/snapshot relinks them): WINE64_SERVER
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
 #   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
@@ -640,6 +641,7 @@ echo "WINE64_TOOLS=$T"
 echo "WINE64_SRC=$W"
 echo "WINE64_BUILD=$C/b64-$K-$S"
 echo "WINE64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
+echo "WINE64_SERVER=$C/srv-$K-$V"
 echo "WINE64_NATIVE=$NATIVE"
 [ -z "$NATIVE32" ] || echo "WINE64_NATIVE32=$NATIVE32"
 # (the i386 wasm32 tree and its sysroot, for a program linked into the i386
