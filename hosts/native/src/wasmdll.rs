@@ -688,8 +688,18 @@ fn install_shared(
     // winecrt0's base of it (delay loads, unix calls, resources) and
     // GetModuleHandleEx's FROM_ADDRESS named whatever had landed at the old
     // one.
+    // Released is also another mapping at the old base since, not this
+    // DLL's: a program's own data there (Telegram's crypt32, loaded again
+    // after its first was freed, asked NtQueryVirtualMemory about the old
+    // base and its DllMain failed). Still the DLL's, its .wasmref is there.
     let old = wp.mapped.lock().unwrap_or_else(|e| e.into_inner()).get(&dll).copied();
-    let released = old.is_some_and(|o| o == base || state.with_kernel(|k| k.mem.lock().vma_at(o).is_none_or(|v| v.prot == 0)));
+    let still_there = |o: u64| {
+        let at = (o + sec.rva as u64) as usize;
+        memory.bytes().get(at..at + raw.len()).is_some_and(|b| b == &raw[..])
+    };
+    let released = old.is_some_and(|o| {
+        o == base || state.with_kernel(|k| k.mem.lock().vma_at(o).is_none_or(|v| v.prot == 0)) || !still_there(o)
+    });
     let first_mapping = {
         let mut m = wp.mapped.lock().unwrap_or_else(|e| e.into_inner());
         let first = !m.contains_key(&dll) || released;

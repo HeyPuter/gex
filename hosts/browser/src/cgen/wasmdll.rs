@@ -353,7 +353,16 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // before the modules' lock, which `forget_gone` takes apart from the
     // map's.
     let old = lock(&WINE_PE).mods.iter().filter(|w| w.ptr64 == pe.is64).find_map(|w| w.mapped.get(&dll).copied());
-    let released = old.is_some_and(|o| o == base || crate::sigs::proc_home().mm().lock().vma_at(o).is_none_or(|v| v.prot == 0));
+    // Released is also another mapping at the old base since, not this
+    // DLL's (a program's own data there): still the DLL's, its .wasmref is.
+    let still_there = |o: u64| {
+        let bytes = crate::guest_bytes();
+        let (at, from, n) = ((o + sec.rva as u64) as usize, (base + sec.rva as u64) as usize, sec.vsize as usize);
+        matches!((bytes.get(at..at + n), bytes.get(from..from + n)), (Some(a), Some(b)) if a == b)
+    };
+    let released = old.is_some_and(|o| {
+        o == base || crate::sigs::proc_home().mm().lock().vma_at(o).is_none_or(|v| v.prot == 0) || !still_there(o)
+    });
     let mut g = lock(&WINE_PE);
     let before = g.mods.len();
     // The module: installed once, at the first skeleton that names it. A
