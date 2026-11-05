@@ -1,7 +1,7 @@
 // The checks app.js's `start()` makes of its options before it fetches
 // anything: an unknown name (a typo would otherwise be ignored) or a value
 // of the wrong kind is an error that names it. No DOM, so Node can test it
-// (gexdev/web/test/check-start-options.mjs).
+// (test/page/start-options).
 
 /** Every option `start` reads (app.js lists what each is). */
 export const OPTIONS = [
