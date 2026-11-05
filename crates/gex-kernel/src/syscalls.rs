@@ -9689,6 +9689,10 @@ impl Kernel {
     /// program, and names the program's `.exe` there, so the attribute on
     /// the `.exe` applies to that program's process alone. That entry is
     /// removed too.
+    ///
+    /// Neither saying, the image itself may: an x86-64 one that cannot be
+    /// loaded anywhere but above the lowered memory's code space
+    /// ([`pe_needs_mem64`]) asks for a 64-bit memory.
     pub fn exec_flavour(&self, path: &str, envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
         let mut image = None;
@@ -9711,6 +9715,10 @@ impl Kernel {
                 b"0" | b"0\n" => Some(false),
                 _ => None,
             }
+        })
+        .or_else(|| {
+            let head = self.read_head(image.as_deref().unwrap_or(path), 4096)?;
+            pe_needs_mem64(&head).then_some(true)
         })
     }
 
@@ -17515,5 +17523,78 @@ mod tests {
         k.syscall(&mut m, 0);
         let arch = gex_abi::ARCH_NAME.as_bytes();
         assert_eq!(m.read(0x20000 + 65 * 4, arch.len()).unwrap(), arch);
+    }
+}
+
+/// The top of the code space of 64-bit Wine lowered to a wasm32 memory: its
+/// images, executable allocations and mappings go below it (Wine's
+/// virtual.c `w64_code_space_limit`).
+pub const W64_CODE_TOP: u64 = 0x7fff_0000;
+
+/// Whether the PE image whose headers start `head` is an x86-64 one that
+/// only a 64-bit memory can load: it has no relocations (stripped, or no
+/// relocation directory), so it goes at its preferred base alone, and that
+/// base puts it above [`W64_CODE_TOP`] (a linker's default x86-64 base,
+/// 0x140000000, is). Anything else, or headers that do not parse: false.
+pub fn pe_needs_mem64(head: &[u8]) -> bool {
+    let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u64_at = |o: usize| head.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let parse = || -> Option<bool> {
+        if head.get(..2)? != b"MZ" {
+            return None;
+        }
+        let nt = u32_at(0x3c)? as usize;
+        if head.get(nt..nt + 4)? != b"PE\0\0" || u16_at(nt + 4)? != 0x8664 {
+            return None;
+        }
+        let chars = u16_at(nt + 22)?;
+        let opt = nt + 24;
+        if u16_at(opt)? != 0x20b {
+            return None;
+        }
+        let (base, size) = (u64_at(opt + 24)?, u32_at(opt + 56)? as u64);
+        let dirs = u32_at(opt + 108)?;
+        let relocs = if dirs > 5 { u32_at(opt + 112 + 5 * 8 + 4)? } else { 0 };
+        let fixed = chars & 1 != 0 || relocs == 0;
+        Some(fixed && base.saturating_add(size) > W64_CODE_TOP)
+    };
+    parse().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod pe_mem64_tests {
+    use super::pe_needs_mem64;
+
+    /// A minimal PE32+ header: `base`, `chars`, the relocation directory's size.
+    fn pe(base: u64, chars: u16, relocs: u32, machine: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        b[0x96..0x98].copy_from_slice(&chars.to_le_bytes());
+        let opt = 0x98;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 24..opt + 32].copy_from_slice(&base.to_le_bytes());
+        b[opt + 56..opt + 60].copy_from_slice(&0x10000u32.to_le_bytes());
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        b[opt + 112 + 44..opt + 112 + 48].copy_from_slice(&relocs.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn fixed_high_base_needs_mem64() {
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664)));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664)));
+    }
+
+    #[test]
+    fn relocatable_or_low_does_not() {
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664)));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664)));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c)));
+        assert!(!pe_needs_mem64(b"MZ"));
+        assert!(!pe_needs_mem64(b"\x7fELF"));
     }
 }
