@@ -219,6 +219,30 @@ pub(crate) fn image_of(shared: &Arc<Mutex<JitShared>>, addr: u64) -> u64 {
     0
 }
 
+/// An ordinary PE image mapped at `[start, end)`: the bindings of Wine's PE
+/// modules there belong to a skeleton that was mapped there before and is
+/// gone (`ftab::on_retire` keeps providers on an unmap), so they go too.
+/// Kept, the new image's own code at a freed stub's address called the
+/// native export: DXSETUP frees advpack (an i386 skeleton), then dsetup.dll
+/// maps over it and its DllMain ran advpack's DelNodeA. Keyed on the remap,
+/// not on the bytes, so a hook's rewrite of a live skeleton's stub keeps its
+/// binding. Every arch and every Wine.
+pub(crate) fn take_back(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, start: u64, end: u64) {
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let installs: Vec<u32> = s.wine_pe.iter().chain(s.wine_pe_split.iter()).map(|wp| wp.install).collect();
+    if installs.is_empty() {
+        return;
+    }
+    let gone: Vec<u64> = s.ftab.map.range(start, end).filter(|(_, f)| installs.contains(&f.install)).map(|(a, _)| a).collect();
+    for &a in &gone {
+        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
+        s.ftab.map.retire(a);
+    }
+    if !gone.is_empty() && std::env::var_os("GEX_WINE32_TRACE").is_some() {
+        eprintln!("gex-wine32: {} bindings of Wine's PE modules at {start:#x}..{end:#x} taken back by an image mapped over them", gone.len());
+    }
+}
+
 impl WinePe {
     /// Whether this module's binding at `addr` outlived its skeleton: the
     /// bytes there are no longer the skeleton's stub or a stub's alias
@@ -227,7 +251,8 @@ impl WinePe {
     /// and the native export has nothing to do with it.
     /// A view unmapped and its addresses reused (an image view, freed, then
     /// `VirtualAlloc`'d for the program's own code) is that: kept, the
-    /// binding sent those calls to Wine's PE module. 64-bit Wine's module
+    /// binding sent those calls to Wine's PE module. ([`take_back`] covers a
+    /// PE image mapped there; this, code that lands without one.) 64-bit Wine's module
     /// only (32-bit Wine's skeletons keep their bindings beside a Detours
     /// hook), and only at guest addresses: the entry thunks are bound at
     /// table indices below the ICALL floor, where no stub is.

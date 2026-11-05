@@ -958,6 +958,33 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
     }
 }
 
+/// An ordinary PE image mapped at `[start, end)`: the bindings of Wine's PE
+/// modules there belong to a skeleton that was mapped there before and is
+/// gone, so they go too. Kept, the new image's own code at a freed stub's
+/// address called the native export: DXSETUP frees advpack (an i386
+/// skeleton), then dsetup.dll maps over it and its DllMain ran advpack's
+/// DelNodeA. Keyed on the remap, not on the bytes, so a hook's rewrite of
+/// a live skeleton's stub keeps its binding. Every arch and every Wine.
+pub(super) fn take_back(start: u64, end: u64) {
+    let installs = installs();
+    if installs.is_empty() {
+        return;
+    }
+    let memory = crate::guest_bytes();
+    let n = ftab(|m| {
+        let gone: Vec<u64> = m.range(start, end).filter(|(_, f)| installs.contains(&f.install)).map(|(a, _)| a).collect();
+        for &a in &gone {
+            m.retire(a);
+            gex_kernel::ftab::fcache_clear(memory, a);
+        }
+        gone.len()
+    });
+    lock(&SKELETON_CODE).retain(|&(lo, hi)| hi <= start || lo >= end);
+    if n > 0 {
+        crate::trace_line(&format!("gex: wine PE: {n} bindings at {start:#x}..{end:#x} taken back by an image mapped over them\n"));
+    }
+}
+
 /// Whether the binding of Wine's PE module at `pc` outlived its skeleton:
 /// the bytes there are no longer the skeleton's stub
 /// (`gex_kernel::win::skel`), so the code is the guest's and the native
@@ -1101,6 +1128,7 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
         let n = file.read_at(0, &mut head).unwrap_or(0) as usize;
         head.truncate(n);
         if let Some((size, false)) = pe_head(&head) {
+            take_back(base, base + size);
             crate::note_wine32_image(base, size, &path);
             super::wine32_defer_unread(&path, base, size, file);
             return -1;
@@ -1109,6 +1137,7 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     let Some(pe) = super::read_pe(&*file) else { return -1 };
     crate::note_wine32_image(base, pe.image_size as u64, &path);
     if !is_skeleton(&pe) {
+        take_back(base, base + pe.image_size as u64);
         // An i386 image (the program's, a game's DLL): its function-tier
         // unit, when units are on; -3 tells JS to serve it.
         return if super::wine32_mapped(&path, base, &pe) { -3 } else { -1 };

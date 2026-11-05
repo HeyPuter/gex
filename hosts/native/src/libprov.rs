@@ -605,6 +605,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             crate::ftab::catch_up(&mut caller)?;
             crate::wasmdll::apply_pending(&shared, &memory);
         } else {
+            crate::wasmdll::take_back(&shared, &memory, base, base + pe.image_size as u64);
             // An i386 image: its function-tier unit, if one was built.
             crate::pe_units::wine32_image(&mut caller, &path, base, pe)?;
         }
