@@ -617,9 +617,10 @@ pub struct Kernel {
     pub futexes: Arc<FutexTable>,
     /// Syscalls seen but not implemented, for ENOSYS telemetry.
     pub unimplemented: Vec<u64>,
-    /// Next free register-context slot. Slot 0 is the initial thread's.
-    /// Shared with the free path (`Free::slots`), which makes threads there.
-    pub next_ctx_slot: Arc<std::sync::atomic::AtomicU32>,
+    /// The register-context slots ([`CtxSlots`]). Slot 0 is the initial
+    /// thread's. Shared with the free path (`Free::slots`), which makes
+    /// threads there.
+    pub next_ctx_slot: Arc<CtxSlots>,
     /// Threads that have been created and not yet exited, including this one.
     /// Shared with the free path (`Free::live`), which ends a thread there.
     pub live_threads: Arc<std::sync::atomic::AtomicU32>,
@@ -5525,9 +5526,8 @@ pub struct Free<'a> {
     pub procs: &'a Arc<ProcTable>,
     /// The process's live thread count (`Kernel::live_threads`), for `exit`.
     pub live: &'a std::sync::atomic::AtomicU32,
-    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
-    /// `clone`.
-    pub slots: &'a std::sync::atomic::AtomicU32,
+    /// Its register-context slots (`Kernel::next_ctx_slot`), for `clone`.
+    pub slots: &'a CtxSlots,
     /// The terminal (`Kernel::tty`, the same one for the process's life),
     /// for `ioctl`.
     pub tty: &'a crate::tty::TtyRef,
@@ -6297,8 +6297,8 @@ pub struct ThreadMaker<'a> {
     pub procs: &'a ProcTable,
     pub pid: i32,
     pub compat: bool,
-    /// The next free register-context slot (`Kernel::next_ctx_slot`).
-    pub slots: &'a std::sync::atomic::AtomicU32,
+    /// The register-context slots (`Kernel::next_ctx_slot`).
+    pub slots: &'a CtxSlots,
     /// The live thread count (`Kernel::live_threads`).
     pub live: &'a std::sync::atomic::AtomicU32,
     pub thread_fs: &'a ThreadFs,
@@ -6307,6 +6307,81 @@ pub struct ThreadMaker<'a> {
     pub blocked: u64,
     /// The creator's fs_struct.
     pub fs: &'a Arc<FsCwd>,
+}
+
+/// A process's register-context slots, in the reserved region below the
+/// guest's own memory ([`ctx_addr`]): numbered upwards from `next`, and
+/// the slots of threads that have ended, which the host gives back once
+/// nothing of the thread runs ([`Self::give`]). Without that a process
+/// could make only as many threads in its whole life as there are slots.
+#[derive(Debug, Default)]
+pub struct CtxSlots {
+    next: std::sync::atomic::AtomicU32,
+    free: std::sync::Mutex<Vec<u32>>,
+}
+
+impl CtxSlots {
+    /// Slots from `next` up, none given back.
+    pub fn new(next: u32) -> Self {
+        Self { next: std::sync::atomic::AtomicU32::new(next), free: Default::default() }
+    }
+
+    /// A fork's child's: the same, its address space a copy.
+    pub fn fork(&self) -> Self {
+        Self { next: std::sync::atomic::AtomicU32::new(self.load()), free: std::sync::Mutex::new(self.free_list().clone()) }
+    }
+
+    fn free_list(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
+        self.free.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A slot for a new thread: the one given back last, else the next
+    /// number, or `None` when that would end past [`gex_abi::CTX_LIMIT`].
+    pub fn take(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if let Some(slot) = self.free_list().pop() {
+            return Some(slot);
+        }
+        // Claimed with one atomic add; one past the limit is never handed out.
+        let slot = self.next.fetch_add(1, Ordering::AcqRel);
+        if ctx_addr(slot) + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
+            self.next.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// The slot of the context at `ctx`, whose thread has ended and whose
+    /// host runs nothing of it any more, for the next thread.
+    pub fn give(&self, ctx: u64) {
+        let stride = (ctx::SIZE as u64 + 63) & !63;
+        let Some(off) = ctx.checked_sub(ctx_addr(0)) else { return };
+        let slot = (off / stride) as u32;
+        if off % stride == 0 && slot != 0 && slot < self.load() {
+            self.free_list().push(slot);
+        }
+    }
+
+    /// The next number a slot would take.
+    pub fn load(&self) -> u32 {
+        self.next.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Number from `next` up again, none given back: a new program's
+    /// (`execve`).
+    pub fn reset(&self, next: u32) {
+        let mut free = self.free_list();
+        free.clear();
+        self.next.store(next, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Number from `next` up at least, none at or below it given back:
+    /// a process running on a context there.
+    pub fn at_least(&self, next: u32) {
+        let mut free = self.free_list();
+        free.retain(|&s| s >= next);
+        self.next.fetch_max(next, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// What the host runs a process's threads on, when it has only so many (the
@@ -6361,14 +6436,10 @@ impl ThreadMaker<'_> {
         }
         // Contexts live in the reserved region below the guest's own memory;
         // running out of slots is a hard limit, not something to paper over.
-        // A slot is claimed with one atomic add; one past the limit is
-        // never handed out.
-        let slot = self.slots.fetch_add(1, Ordering::AcqRel);
-        let child = ctx_addr(slot);
-        if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
-            self.slots.fetch_sub(1, Ordering::AcqRel);
+        let Some(slot) = self.slots.take() else {
             return Err(Errno::EAGAIN);
-        }
+        };
+        let child = ctx_addr(slot);
         // Numbered with the processes (`ProcTable::new_tid`).
         let tid = self.procs.new_tid(self.pid);
         for off in (0..ctx::SIZE).step_by(8) {
@@ -9564,7 +9635,7 @@ impl Kernel {
             futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
-            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_ctx_slot: Arc::new(CtxSlots::new(1)),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             procs: Arc::new(ProcTable::new()),
             pipes: None,
@@ -9942,7 +10013,7 @@ impl Kernel {
             // Futexes live in the address space, and the child has its own.
             futexes: Arc::new(FutexTable::new()),
             unimplemented: Vec::new(),
-            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(self.next_ctx_slot.load(std::sync::atomic::Ordering::Acquire))),
+            next_ctx_slot: Arc::new(self.next_ctx_slot.fork()),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             // The table is the system's, not the process's.
             procs: Arc::clone(&self.procs),

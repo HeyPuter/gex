@@ -103,11 +103,7 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
         return Ok(g);
     }
     let tid = cx.data().thread.tid;
-    // Top down when only built-in providers are stateful, so the first call
-    // (a DllMain's malloc) does not move the DLLs mapped after it; an
-    // ejected project's sessions were recorded with it bottom-up.
-    let name = format!("[provider stack, thread {tid}]");
-    let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
+    let base = new_stack(cx.data_mut(), &format!("[provider stack, thread {tid}]"))?;
     let top = base + STACK - 16;
     if std::env::var_os("GEX_PROVIDER_STACKS").is_some() {
         eprintln!("gex: provider stack for thread {tid}: [{base:#x}, {:#x})", base + STACK);
@@ -134,14 +130,38 @@ pub(crate) fn stack64(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Resu
         return Ok(g);
     }
     let tid = cx.data().thread.tid;
-    let name = format!("[provider stack (lp64), thread {tid}]");
-    let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
+    let base = new_stack(cx.data_mut(), &format!("[provider stack (lp64), thread {tid}]"))?;
     let top = base + STACK - 16;
     let g = wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, wasmtime::Mutability::Var), Val::I64(top as i64))?;
     if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.provider_sp64 = Some(g.clone());
+        s.provider_stack64_lo = base;
     }
     Ok(g)
+}
+
+/// A provider stack for a thread starting: one an ended thread of this
+/// process left ([`free_stacks`]), or a new one. Top down when only
+/// built-in providers are stateful, so the first call (a DllMain's malloc)
+/// does not move the DLLs mapped after it; an ejected project's sessions
+/// were recorded with it bottom-up.
+fn new_stack(state: &mut HostState, name: &str) -> Result<u64> {
+    if let Some(base) = state.spawn.as_ref().and_then(|s| s.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).pop()) {
+        return Ok(base);
+    }
+    if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(state, STACK, name) } else { alloc(state, STACK, name) }
+}
+
+/// An ending thread's provider stacks, back to its process for the next
+/// threads. Kept mapped rather than unmapped: Wine has a view of each
+/// (`note_host_data`) that it never drops.
+pub(crate) fn free_stacks(state: &mut HostState) {
+    let Some(s) = state.jit.as_mut().and_then(|j| j.ftab.as_mut()) else { return };
+    let lo = [std::mem::take(&mut s.provider_stack_lo), std::mem::take(&mut s.provider_stack64_lo)];
+    (s.provider_sp, s.provider_sp64) = (None, None);
+    if let Some(spawn) = state.spawn.as_ref() {
+        spawn.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).extend(lo.into_iter().filter(|&b| b != 0));
+    }
 }
 
 /// Guest pages for a provider's own use.

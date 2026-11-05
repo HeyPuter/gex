@@ -11550,7 +11550,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // numbered from 1 reached N and drove two threads through one context (a
     // COM factory child of explorer: its fifth thread ran on the
     // main thread's registers).
-    kernel.next_ctx_slot.fetch_max(ctx_slots_below(ctx_addr), std::sync::atomic::Ordering::AcqRel);
+    kernel.next_ctx_slot.at_least(ctx_slots_below(ctx_addr));
     // The process's start, unless this is a vfork child's kernel: the
     // memory's other Workers are its parent's threads (vfork.rs).
     if vfork::pid_here().is_none() {
@@ -11990,7 +11990,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Clones above the context this program goes on, which is the exec'ing
     // thread's: not slot 0 after an exec from a second thread.
     let here = if ctx_addr_get() != 0 { ctx_addr_get() } else { h.kernel.ctx_addr };
-    h.kernel.next_ctx_slot.store(ctx_slots_below(here).max(1), std::sync::atomic::Ordering::Release);
+    h.kernel.next_ctx_slot.reset(ctx_slots_below(here).max(1));
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static

@@ -131,6 +131,8 @@ pub(crate) struct Store {
     pub provider_sp64: Option<wasmtime::Global>,
     /// The lowest address of that stack (`libprov::STACK` bytes).
     pub provider_stack_lo: u64,
+    /// The lowest address of [`Self::provider_sp64`]'s stack.
+    pub provider_stack64_lo: u64,
     /// This store's instance of each shared-library module (`dylink`), by
     /// module: what later modules' imports are bound to.
     pub dyl: HashMap<u32, wasmtime::Instance>,
@@ -293,7 +295,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     );
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, icall_limit, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, bridge_alt: None, enter_alt: None, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, provider_stack64_lo: 0, dyl: HashMap::new(), dl_tls: HashMap::new(), dl_tls_arena: (0, 0), dl_tls_chunks: Vec::new(), dl_seen: 0, dl_size: None, asyncify: None, icall_limit, replayed: 0 });
     Ok(())
 }
 

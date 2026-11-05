@@ -381,6 +381,10 @@ struct SpawnContext {
     /// thread-local data, by module, which its first thread keeps
     /// (`dylink::thread_tls` takes each as it instantiates the module).
     fork_dl_tls: Mutex<std::collections::HashMap<u32, u32>>,
+    /// Provider stacks of threads that have ended, still mapped, for the
+    /// next thread's (`libprov::stack`): a process that starts and ends
+    /// threads all its life uses no more of them than it ever ran at once.
+    provider_stacks: Mutex<Vec<u64>>,
 }
 
 /// Tier-1 counters for `GEX_WIN_STATS`: translations published, units
@@ -1128,7 +1132,7 @@ fn run_program_with(
             k.argv = opts.args.clone();
             k.envp = opts.env.clone();
             k.live_threads.store(1, std::sync::atomic::Ordering::Release);
-            k.next_ctx_slot.store(1, std::sync::atomic::Ordering::Release);
+            k.next_ctx_slot.reset(1);
             (k, ps)
         }
         None => (
@@ -1477,6 +1481,7 @@ fn run_program_with(
         limits: xlate.limits,
         prof_proc: prof_proc.clone(),
         fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
+        provider_stacks: Mutex::new(Vec::new()),
     });
     note_live_process(&spawn);
     store.data_mut().spawn = Some(Arc::clone(&spawn));
@@ -2815,6 +2820,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         limits: cx.limits,
         prof_proc: profile::fork_process(&cx.prof_proc),
         fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
+        // the parent's free ones are mapped in the child's copy too
+        provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     note_live_process(&child_cx);
     let status = {
@@ -3289,6 +3296,8 @@ fn exec_program(
 /// Run one spawned thread to its end. `Some` when its end is the process's
 /// (`exit_group`, a fatal signal), not just its own.
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
+    // Without the kernel lock at the end, which a process ending may hold.
+    let slots = Arc::clone(&cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).next_ctx_slot);
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -3365,6 +3374,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     if matches!(stopped, Stopped::Exited(_)) && store.data().thread_only && !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
         crate::dylink::free_thread_tls(store.data_mut());
+        crate::libprov::free_stacks(store.data_mut());
+        // nothing runs on its context any more
+        slots.give(thread.ctx_addr);
     }
     profile::harvest(&mut store)?;
     match stopped {

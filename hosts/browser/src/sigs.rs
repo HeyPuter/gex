@@ -73,9 +73,8 @@ pub(crate) struct Home {
     table: Arc<crate::Threads>,
     /// Its live thread count (`Kernel::live_threads`), for `exit`.
     live: Arc<std::sync::atomic::AtomicU32>,
-    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
-    /// `clone`.
-    slots: Arc<std::sync::atomic::AtomicU32>,
+    /// Its register-context slots (`Kernel::next_ctx_slot`), for `clone`.
+    slots: Arc<gex_kernel::syscalls::CtxSlots>,
     /// How it ended, decided once.
     exit: crate::ExitState,
     /// Its image, command line and environment as `/proc` shows them
