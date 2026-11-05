@@ -2,7 +2,7 @@
 // (badptr.c): the call fails with STATUS_ACCESS_VIOLATION and the caller
 // goes on. With bad-pointer guards on (GEX_NATIVE_TRY=1): the i386 program
 // natively and on the page, and the same program built for x86_64 natively.
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
 

@@ -11,7 +11,7 @@
 // unit; those are built (minutes: Wine's own DLLs) and, with the exe's, are
 // all an AOT-only run has.
 import { join } from 'node:path';
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 3600 };
 

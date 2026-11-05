@@ -35,7 +35,7 @@ default on PATH; the `gexcc` group's programs run under it, its install's
 gexcc/dl-gobject), `GEX_TEST_INNER` (how many of gexcc/programs' programs run at
 once, default 4), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
-/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WOW64_DIST`, `GEX_TEST_WOW64_PREFIX` and `GEX_TEST_WOW64_MONO` (the `wow64` group: Native tests), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
+/usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WOW64_DIST`, `GEX_TEST_WOW64_PREFIX` and `GEX_TEST_WOW64_MONO` (the `wow64` group: Native tests), `GEX_TEST_GEXCC_WIN`, `GEX_TEST_WINE64_TOOLS`, `GEX_TEST_WINE64_SRC` and `GEX_TEST_WINE64_BUILD` (the `wine64` group: Native tests), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
 
 The browser host is vite on page/ (cross-origin isolated, the runtime from
@@ -140,13 +140,23 @@ with a musl cross gcc (GEX_TOOLCHAIN, an aarch64-linux-musl-cross tree, and
 GEX_TOOLCHAIN_X86; default under ~/toolchains), runs them under gexc and,
 through lib/guest.mjs, on the page's shim (`native/*`: fixtures/native/NAME,
 the sources only; each test builds, runs and compares itself).
-lib/wow64.mjs runs 32-bit Windows programs (fixtures/wow64, built with
+lib/winerun.mjs runs 32-bit Windows programs (fixtures/wow64, built with
 i686-w64-mingw32-gcc) as WoW64 processes of 64-bit Wine, natively under
 x86 gexc and on the page's x86 shared shim (`wow64/*`, x86 only). It needs
 GEX_TEST_WOW64_DIST and GEX_TEST_WOW64_PREFIX (`WINE64_WOW64=1
 wine/dist.sh`'s WINE64_DIST and WINE64_PREFIX, the session prefix) and, for
 `wow64/dotnet`, GEX_TEST_WOW64_MONO (Wine Mono, both halves, unpacked); it
-prepares a copy of the install and prefix once per work directory.
+prepares a copy of the install and prefix once per work directory. Its
+wine64(t) runs 64-bit programs the same way on 64-bit Wine's default
+install (`wine64/*`: GEX_TEST_WINE64_DIST and GEX_TEST_WINE64_PREFIX, the
+`wine64` image's), the programs from fixtures/wine/src (the `win-progs`
+image) and fixtures/wine64: console, DLL, audio, native-core, shell, GUI
+(gexc's Wayland compositor, its frames checked) and GL (the host's GL)
+cases. `wine64/gexccwin` and `wine64/gl`'s d2dsize need GEX_TEST_GEXCC_WIN
+(a gexcc-win install), `wine64/dll` GEX_TEST_WINE64_TOOLS,
+GEX_TEST_WINE64_SRC, GEX_TEST_WINE64_BUILD (wine/dist.sh's WINE64_TOOLS,
+WINE64_SRC and WINE64_BUILD) and GEX_WASM64_SYSROOT, `wine64/layout`
+GEX_TEST_WINE64_SRC.
 `site/eject-page-files` builds an ejected page and checks it carries the
 page's runtime and X server.
 

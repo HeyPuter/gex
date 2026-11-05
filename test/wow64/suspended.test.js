@@ -3,7 +3,7 @@
 // its marker file while the parent waits, and must make it once resumed,
 // ROUNDS times, with the parent's pipe busy meanwhile. Natively (gexc run;
 // each round a native WoW64 child start) and on the page's shim.
-import { legs } from '../lib/wow64.mjs';
+import { legs } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 3300 };
 

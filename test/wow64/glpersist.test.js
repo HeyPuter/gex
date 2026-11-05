@@ -4,7 +4,7 @@
 // over.
 // Natively (gexc run --gl on its own Wayland compositor, no output), as a
 // WoW64 process of 64-bit Wine.
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 600 };
 

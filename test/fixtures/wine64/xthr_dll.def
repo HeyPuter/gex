@@ -1,0 +1,4 @@
+LIBRARY xthr_dll.dll
+EXPORTS
+  xthr_get
+  xthr_twice

@@ -5,7 +5,7 @@
 // The first run finds where the DLLs are mapped and their units are built
 // there. On the page's shim.
 import { join } from 'node:path';
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1800 };
 

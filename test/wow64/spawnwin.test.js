@@ -4,7 +4,7 @@
 // compositor of its own) and on the page's shim (with the shim's
 // compositor, GEX_WL_STUB), where a Windows process's child runs in place in
 // the cloning thread's Worker.
-import { graphics, legs } from '../lib/wow64.mjs';
+import { graphics, legs } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
 

@@ -10,7 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, rmSync, writeFileSync, chmodSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { LOADER, wow64 } from '../lib/wow64.mjs';
+import { LOADER, wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1800 };
 

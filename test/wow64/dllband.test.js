@@ -10,7 +10,7 @@
 // compact space only (the split space is 32-bit Wine's).
 import { mkdirSync, copyFileSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { FIXTURES, ROOT, run, wow64 } from '../lib/wow64.mjs';
+import { FIXTURES, ROOT, run, wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
 

@@ -7,7 +7,7 @@
 // start in the second; a run with the full tables is the control. Prints
 // "tables ok N" per run.
 import { join } from 'node:path';
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1800 };
 

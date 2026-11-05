@@ -12,7 +12,7 @@
 //                side, "native32": its native function's value refused).
 // On the page's shim (no process_vm_readv/writev) only vmpeer and vmpeer
 // quick, whose copies the target process makes itself.
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 2400 };
 

@@ -6,7 +6,7 @@
 // outer comparator, which calls GetCurrentThreadId and returns to the outer
 // qsort. Then the same on new threads. Natively (gexc run) and on the
 // page's shim, with the exe's unit and on tier-1.
-import { unitLegs } from '../lib/wow64.mjs';
+import { unitLegs } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1800 };
 

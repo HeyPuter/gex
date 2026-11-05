@@ -8,7 +8,7 @@
 // provider replaces (abs 7). Natively (gexc run) and on the page's shim.
 import { mkdirSync, writeFileSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { FIXTURES, ROOT, run, wow64 } from '../lib/wow64.mjs';
+import { FIXTURES, ROOT, run, wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 2400 };
 

@@ -1,6 +1,6 @@
 // An audio device through winmm, mmdevapi and wineoss.drv against
 // gex-kernel's /dev/dsp (audio.c). Natively and on the page.
-import { legs } from '../lib/wow64.mjs';
+import { legs } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
 

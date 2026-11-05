@@ -9,7 +9,7 @@
 // on the page's shim with the exe's unit, and on the page on tier-1. (The
 // 32-bit legs' GEX_STRAY_TRAP=1 leg has no WoW64 meaning: its qsort is guest
 // code, and no return goes to the pad.)
-import { unitLegs } from '../lib/wow64.mjs';
+import { unitLegs } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1800 };
 

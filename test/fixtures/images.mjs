@@ -42,10 +42,10 @@
 //            Needs gcc, the host's EGL and GL headers and libraries, and
 //            third_party/opengl-registry.
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { availableParallelism, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { UNIT_PROGS } from './wine/units.mjs';
 
@@ -354,6 +354,7 @@ export const images = {
     const dir = join(work, 'win-progs');
     rmSync(dir, { recursive: true, force: true });
     const failed = {};
+    const builds = [];
     for (const [arch, triple] of [['x64', 'x86_64'], ['x86', 'i686']]) {
       mkdirSync(join(dir, arch), { recursive: true });
       for (const f of names) {
@@ -395,15 +396,20 @@ export const images = {
           rmSync(join(work, 'win-progs-msvc'), { recursive: true, force: true });
           continue;
         }
-        for (const [name, flags] of variants.length ? variants : [[f.replace(/\.[a-z]+$/, ''), []]]) {
-          try {
-            execFileSync(cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), ...flags, '-o', join(dir, arch, `${name}.${dll ? 'dll' : 'exe'}`), join(src, f), ...libs], { stdio: ['ignore', 'ignore', 'pipe'] });
-          } catch (e) {
-            failed[`${arch}/${variants.length ? `${name}.c` : f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
-          }
-        }
+        for (const [name, flags] of variants.length ? variants : [[f.replace(/\.[a-z]+$/, ''), []]])
+          builds.push([cc[0], [...cc.slice(1), '-O2', '-s', '-Wl,--no-insert-timestamp', ...(dll ? ['-shared'] : []), ...flags, '-o', join(dir, arch, `${name}.${dll ? 'dll' : 'exe'}`), join(src, f), ...libs],
+            `${arch}/${variants.length ? `${name}.c` : f}`]);
       }
     }
+    // The compiles side by side, half the host's CPUs at a time.
+    const run1 = ([cmd, args, key]) => new Promise((resolve) => {
+      execFile(cmd, args, { maxBuffer: 1 << 26 }, (e, _out, err) => {
+        if (e) failed[key] = String(err || e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];
+        resolve();
+      });
+    });
+    const lanes = Math.max(1, availableParallelism() >> 1);
+    await Promise.all(Array.from({ length: lanes }, async () => { while (builds.length) await run1(builds.shift()); }));
     writeFileSync(join(work, 'win-progs.json'), JSON.stringify({ failed }, null, 1));
     execFileSync('tar', ['-cf', join(work, 'win-progs.tar'), '-C', dir, '.']);
     writeFileSync(keyFile, key);

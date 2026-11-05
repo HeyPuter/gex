@@ -1,8 +1,11 @@
-// What a node-host test needs to run a 32-bit Windows program as a WoW64
-// process of 64-bit Wine, natively under gexc and on the page's shim under
-// node (hosts/browser/js/run-node.mjs): a WINE64_WOW64=1 install
-// (GEX_TEST_WOW64_DIST, wine/dist.sh's WINE64_DIST) and its prefix
-// (GEX_TEST_WOW64_PREFIX), each a skip when not set.
+// What a node-host test needs to run a Windows program on 64-bit Wine,
+// natively under gexc and on the page's shim under node
+// (hosts/browser/js/run-node.mjs). Two installs, each a skip when not set:
+// - wow64(t): a 32-bit program as a WoW64 process, on a WINE64_WOW64=1
+//   install (GEX_TEST_WOW64_DIST, wine/dist.sh's WINE64_DIST) and its
+//   prefix (GEX_TEST_WOW64_PREFIX);
+// - wine64(t): a 64-bit program, on the default install
+//   (GEX_TEST_WINE64_DIST) and its prefix (GEX_TEST_WINE64_PREFIX).
 //
 //   const w = wow64(t);
 //   const exe = await w.mingw('rewind');              // fixtures/wow64/rewind.c
@@ -13,10 +16,11 @@
 // Neither the install nor the prefix is written. The run's copy of them,
 // made once per work directory: the install hard-linked (a WoW64 dist with
 // GEX_TEST_WOW64_MONO, Wine Mono's unpacked tree, as share/wine/mono), and
-// the prefix with system32's and syswow64's builtins Wine placeholders, so
-// the loader takes each builtin from the install, and services.exe waiting
-// 60 s for a service, not Wine's 10 (a translated 64-bit service takes 7-10
-// s on a busy host). Each leg copies that prefix again for itself.
+// the prefix with services.exe waiting 60 s for a service, not Wine's 10 (a
+// translated 64-bit service takes 7-10 s on a busy host); a WoW64 prefix's
+// system32 and syswow64 builtins also Wine placeholders, so the loader takes
+// each builtin from the install. Each leg copies that prefix again for
+// itself.
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -24,8 +28,9 @@ import {
   appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
   renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { guest, ROOT } from './guest.mjs';
+import { Skip } from './t.js';
 
 export { ROOT };
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'wow64');
@@ -36,17 +41,22 @@ const DEATH = /^\[gex\] pid \d+ killed by|^\[gex\] pid \d+: a vfork child|gex: (
 const WINE_FATAL = /^wine: |wineserver: |:err:(process|module|virtual|server|sync):/;
 /** Wine's environment for a WoW64 process (without WINEGEX_WOW64 the server takes no i386 process). */
 export const WINE_ENV = { WINEGEX_WOW64: '1', WINEDEBUG: 'err+all,fixme-all' };
+/** Wine's environment for a 64-bit process. */
+export const WINE64_ENV = { WINEDEBUG: 'err+all,fixme-all' };
 
 let runs = 0;
 
 /** `argv` with stdout and stderr in one file, in the order written (`2>&1`),
  *  and `input` (if given) on stdin: `{ code, out, timedOut }`, `code` as a
- *  shell gives it. */
-export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file, input } = {}) {
+ *  shell gives it. `errFile`: stderr in a file of its own instead, `out`
+ *  stdout alone and `err` stderr. */
+export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file, errFile, input } = {}) {
   return new Promise((resolve) => {
     const fd = openSync(file, 'w');
-    const p = spawn(argv[0], argv.slice(1), { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', fd, fd] });
+    const efd = errFile ? openSync(errFile, 'w') : fd;
+    const p = spawn(argv[0], argv.slice(1), { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', fd, efd] });
     closeSync(fd);
+    if (errFile) closeSync(efd);
     if (input !== undefined) { p.stdin.on('error', () => {}); p.stdin.end(input); }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, timeout);
@@ -54,7 +64,7 @@ export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, fil
     p.on('close', (code, signal) => {
       clearTimeout(timer);
       const sig = { SIGABRT: 6, SIGKILL: 9, SIGSEGV: 11, SIGTERM: 15 }[signal];
-      resolve({ code: code ?? 128 + (sig ?? 0), out: readFileSync(file, 'utf8'), timedOut });
+      resolve({ code: code ?? 128 + (sig ?? 0), out: readFileSync(file, 'utf8'), ...(errFile && { err: readFileSync(errFile, 'utf8') }), timedOut });
     });
   });
 }
@@ -182,9 +192,9 @@ function linkCopy(src, to) {
   }
 }
 
-function prepare(t, dist, prefix, mono) {
-  const key = createHash('sha256').update([dist, statSync(dist).mtimeMs, prefix, statSync(prefix).mtimeMs, mono ?? ''].join('\n')).digest('hex').slice(0, 16);
-  const top = join(t.workDir, 'wow64', key);
+function prepare(t, dist, prefix, mono, kind) {
+  const key = createHash('sha256').update([dist, statSync(dist).mtimeMs, prefix, statSync(prefix).mtimeMs, mono ?? '', kind].join('\n')).digest('hex').slice(0, 16);
+  const top = join(t.workDir, kind, key);
   if (existsSync(join(top, '.done'))) return top;
   const tmp = `${top}.tmp-${process.pid}`;
   rmSync(tmp, { recursive: true, force: true });
@@ -197,9 +207,11 @@ function prepare(t, dist, prefix, mono) {
     linkCopy(mono, m);
   }
   execFileSync('cp', ['-a', prefix, join(tmp, 'pfx')]);
-  const win = join(tmp, 'pfx/drive_c/windows');
-  placeholders(join(win, 'system32'), 'amd64', join(dist, 'lib/wine/x86_64-windows'));
-  placeholders(join(win, 'syswow64'), 'i386', join(dist, 'lib/wine/i386-windows'));
+  if (kind === 'wow64') {
+    const win = join(tmp, 'pfx/drive_c/windows');
+    placeholders(join(win, 'system32'), 'amd64', join(dist, 'lib/wine/x86_64-windows'));
+    placeholders(join(win, 'syswow64'), 'i386', join(dist, 'lib/wine/i386-windows'));
+  }
   appendFileSync(join(tmp, 'pfx/system.reg'), '\n[System\\\\ControlSet001\\\\Control] 1791289000\n"ServicesPipeTimeout"="60000"\n');
   writeFileSync(join(tmp, '.done'), '');
   try {
@@ -212,7 +224,6 @@ function prepare(t, dist, prefix, mono) {
 }
 
 export function wow64(t, { mono = false } = {}) {
-  const g = guest(t);
   const env = process.env;
   const distSrc = env.GEX_TEST_WOW64_DIST || t.skip('GEX_TEST_WOW64_DIST: a WINE64_WOW64=1 install (wine/dist.sh)');
   const pfxSrc = env.GEX_TEST_WOW64_PREFIX || t.skip('GEX_TEST_WOW64_PREFIX: its WoW64 prefix');
@@ -222,12 +233,26 @@ export function wow64(t, { mono = false } = {}) {
   if (!existsSync(join(pfxSrc, 'drive_c/windows/syswow64/winewayland.drv')))
     throw new Error(`${pfxSrc} has no syswow64/winewayland.drv: not wine/dist.sh's WINE64_PREFIX (pfs64-*), the session prefix`);
   const monoSrc = mono ? (env.GEX_TEST_WOW64_MONO || t.skip('GEX_TEST_WOW64_MONO: Wine Mono, both halves, unpacked')) : null;
+  return session(t, { kind: 'wow64', distSrc, pfxSrc, monoSrc, wineEnv: WINE_ENV, mount: '/wine32', mingwTriple: 'i686' });
+}
+
+/** 64-bit Wine for a 64-bit program; `door` its WINEGEX_DOOR (the LP64
+ *  door call, as the page has it; 0: none). */
+export function wine64(t, { door = 1 } = {}) {
+  const env = process.env;
+  const distSrc = env.GEX_TEST_WINE64_DIST || t.skip('GEX_TEST_WINE64_DIST: a 64-bit Wine install (wine/dist.sh)');
+  const pfxSrc = env.GEX_TEST_WINE64_PREFIX || t.skip('GEX_TEST_WINE64_PREFIX: its prefix (wine/dist.sh\'s WINE64_PREFIX)');
+  return session(t, { kind: 'wine64', distSrc, pfxSrc, wineEnv: { ...WINE64_ENV, WINEGEX_DOOR: String(door) }, mount: '/wine64', mingwTriple: 'x86_64' });
+}
+
+function session(t, { kind, distSrc, pfxSrc, monoSrc = null, wineEnv: WENV, mount, mingwTriple }) {
+  const g = guest(t);
+  const env = process.env;
   const gexc = env.GEXC_X86 || env.GEXC || join(ROOT, 'target/x86/release/gexc');
-  const mingw = g.tool('i686-w64-mingw32-gcc');
-  const top = prepare(t, distSrc, pfxSrc, monoSrc);
+  const top = prepare(t, distSrc, pfxSrc, monoSrc, kind);
   const dist = join(top, 'dist');
   const prefix = join(top, 'pfx');
-  const work = join(t.workDir, 'wow64-runs', `${process.pid}-${++runs}`);
+  const work = join(t.workDir, `${kind}-runs`, `${process.pid}-${++runs}`);
   rmSync(work, { recursive: true, force: true });
   mkdirSync(work, { recursive: true });
   const { NODE_CHANNEL_FD, NODE_CHANNEL_SERIALIZATION_MODE, ...base } = env;
@@ -246,18 +271,20 @@ export function wow64(t, { mono = false } = {}) {
     if (userReg) appendFileSync(join(p, 'user.reg'), userReg);
     return p;
   };
+  let loaderText, progsFailed;
   const w = {
     dist,
     prefix,
     work,
     gexc,
     loader: join(dist, LOADER),
-    /** fixtures/wow64/NAME.c (`src`: another source) built with
-     *  i686-w64-mingw32-gcc (-O1, `flags`, then `libs`; `x64`:
-     *  x86_64-w64-mingw32-gcc instead). */
+    /** fixtures/wow64/NAME.c (`src`: another source) built with MinGW gcc
+     *  for the session's arch (-O1, `flags`, then `libs`; `x64`:
+     *  x86_64-w64-mingw32-gcc in any session). */
     async mingw(name, { flags = [], libs = [], out = `${name}.exe`, x64 = false, src = join(FIXTURES, `${name}.c`) } = {}) {
       const exe = join(work, out);
-      const r = await run([x64 ? g.tool('x86_64-w64-mingw32-gcc') : mingw, '-O1', ...flags, '-o', exe, src, ...libs], { file: `${exe}.log` });
+      mkdirSync(join(exe, '..'), { recursive: true });
+      const r = await run([g.tool(`${x64 ? 'x86_64' : mingwTriple}-w64-mingw32-gcc`), '-O1', ...flags, '-o', exe, src, ...libs], { file: `${exe}.log` });
       if (r.code !== 0) throw new Error(`mingw ${name}: ${r.out.trim().split('\n').slice(-5).join(' / ')}`);
       return exe;
     },
@@ -304,12 +331,14 @@ export function wow64(t, { mono = false } = {}) {
      * (`prefix`: another to copy) with `files` in C:\ and `userReg` added
      * to its user.reg (`setup`: called with its path, then), from its
      * drive_c (or `cwd`). `wineEnv` on top of
-     * WINE_ENV (each a --env), `flags` gexc run's own (`wayland`: a
-     * compositor of its own, no output), `env` gexc's, `loader` another
-     * loader. A skip when gexc is not built. Resolves run's result plus
-     * `pfx`, the prefix it used.
+     * the session's Wine environment (each a --env), `flags` gexc run's
+     * own (`wayland`: a compositor of its own, no output; `{ size, out }`:
+     * its output's size, and its frames as PPMs at `out`-NNN.ppm), `env` gexc's, `loader` another
+     * loader, `split` stdout and stderr apart (run's `errFile`). A skip
+     * when gexc is not built. Resolves run's result plus `pfx`, the prefix
+     * it used.
      */
-    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, setup, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native' } = {}) {
+    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, setup, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native', split = false } = {}) {
       if (!existsSync(gexc)) t.skip(`${gexc} is not built`);
       const p = pfx(`${name}-pfx`, files, { userReg, from });
       await setup?.(p);
@@ -318,24 +347,24 @@ export function wow64(t, { mono = false } = {}) {
         rmSync(wl, { recursive: true, force: true });
         mkdirSync(wl);
         // (--wayland names the socket, in a directory of the run's own)
-        flags = [...flags, '--wayland', join(wl, 'wayland-0'), '--wayland-size', '640x480', '--wayland-out', 'null'];
+        flags = [...flags, '--wayland', join(wl, 'wayland-0'), '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
       }
-      const we = { WINEPREFIX: p, ...WINE_ENV, ...wineEnv };
+      const we = { WINEPREFIX: p, ...WENV, ...wineEnv };
       const argv = [gexc, 'run', ...flags, ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]), loader, ...args.map(String)];
       // Not the host's display: gexc --wayland sets WAYLAND_DISPLAY and
       // XDG_RUNTIME_DIR to its own compositor only when they are not given.
       const { WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, ...host } = base;
-      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, file: join(work, `${name}.log`) });
+      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
       return { ...r, pfx: p };
     },
     /**
      * Wine on the page's x86 shared shim with `args`: the install at
-     * /wine32 (`dist`: another; `loader`: the host's loader, by default
+     * the session's mount, /wine32 or /wine64 (`dist`: another; `loader`: the host's loader, by default
      * the install's), a copy of the prefix at /pfx with
      * `pfxFiles` in drive_c and `userReg` added to its user.reg (`setup`:
      * called with its path, then), an empty /t, `files` (`{ guest path: host path
      * }`), `dirs` more (`{ guest: host }`), `flags` run-node's own (before
-     * the seed), `wineEnv` on top of WINE_ENV, `env` node's, `cwd` the
+     * the seed), `wineEnv` on top of the session's Wine environment, `env` node's, `cwd` the
      * guest's (default /t). Resolves run's result plus `pfx`.
      */
     async page(args, { files = {}, pfxFiles = {}, userReg, dirs = {}, flags = [], wineEnv = {}, env: more = {}, dist: d = dist, loader: ld, cwd = '/t', setup, timeout = 300000, name = 'page' } = {}) {
@@ -346,19 +375,84 @@ export function wow64(t, { mono = false } = {}) {
       const tdir = join(work, `${name}-t`);
       rmSync(tdir, { recursive: true, force: true });
       mkdirSync(tdir);
-      const we = { WINEPREFIX: '/pfx', ...WINE_ENV, ...wineEnv };
+      const we = { WINEPREFIX: '/pfx', ...WENV, ...wineEnv };
       const argv = [process.execPath, '--max-old-space-size=8192', join(ROOT, 'hosts/browser/js/run-node.mjs'),
-        '--dir', `/wine32=${d}`, '--dir', `/pfx=${p}`, '--dir', `/t=${tdir}`,
+        '--dir', `${mount}=${d}`, '--dir', `/pfx=${p}`, '--dir', `/t=${tdir}`,
         ...Object.entries(dirs).flatMap(([to, from]) => ['--dir', `${to}=${from}`]),
         ...Object.entries(files).flatMap(([to, from]) => ['--file', `${to}=${from}`]),
         ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]),
-        '--cwd', cwd, '--argv0', `/wine32/${LOADER}`, ...flags, seed, ld ?? join(d, LOADER), ...args.map(String)];
+        '--cwd', cwd, '--argv0', `${mount}/${LOADER}`, ...flags, seed, ld ?? join(d, LOADER), ...args.map(String)];
       const r = await run(argv, { cwd: ROOT, env: { ...base, GEX_ARCH: 'x86', GEX_SHARED: '1', ...more }, timeout, file: join(work, `${name}.log`) });
       return { ...r, pfx: p };
     },
+    /** Whether the x86_64 side is the native PE core
+     *  (x86_64-windows/winepe.wasm), its DLLs skeletons. */
+    nativeCore: existsSync(join(dist, 'lib/wine/x86_64-windows/winepe.wasm')),
+    /** Whether the loader has `what` (a Unix library's name it was linked with). */
+    loaderHas(what) {
+      loaderText ??= readFileSync(w.loader).toString('latin1');
+      return loaderText.includes(what);
+    },
+    /** fixtures/wine/src's program `exe` for `arch` (the win-progs image);
+     *  a throw when it did not build. */
+    prog(exe, arch = 'x64') {
+      const dir = join(t.workDir, 'win-progs');
+      progsFailed ??= JSON.parse(readFileSync(join(t.workDir, 'win-progs.json'), 'utf8')).failed;
+      const why = progsFailed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.c')}`] ?? progsFailed[`${arch}/${exe.replace(/\.(exe|dll)$/, '.cpp')}`];
+      if (why) throw new Error(`${arch}/${exe} did not build: ${why}`);
+      return join(dir, arch, exe);
+    },
+    /** `src` built with the gexcc-win install GEX_TEST_GEXCC_WIN (a skip
+     *  without it) as `out` in the run's directory, beside its .wasm:
+     *  `args` the compiler's (g++ for a .cpp). */
+    async gexccWin(src, out, args = []) {
+      const cc = env.GEX_TEST_GEXCC_WIN || t.skip('GEX_TEST_GEXCC_WIN: a gexcc-win install (toolchain/gexcc/windows/install.sh)');
+      const exe = join(work, out);
+      mkdirSync(join(exe, '..'), { recursive: true });
+      const r = await run([join(cc, 'bin', `x86_64-w64-mingw32-${/\.cpp$/.test(src) ? 'g++' : 'gcc'}`), ...args, '-o', exe, src], { file: `${exe}.build` });
+      if (r.code !== 0) throw new Error(`gexcc-win ${basename(src)}: ${r.out.trim().split('\n').slice(-5).join(' / ')}`);
+      return exe;
+    },
+    /**
+     * A program case as 64-bit Wine's console tests have it: `exe` (a
+     * win-progs name, or a path) and `extra` files in C:\, run natively
+     * as C:\EXE with `args`; its exit must be `code` and its whole stdout
+     * (CRs out, the last newline off) match `want`. `nullDriver`: Wine's
+     * null display driver. `wayland`: the Wayland driver on a compositor
+     * of the run's own (`{ size, colors, min, last, skip }`: its frames
+     * checked by `frames`). `gl`: the host's GL. `wineEnv` the case's own.
+     * Checks it, and resolves the run.
+     */
+    async nt({ name, code = 0, want, exe, args = [], extra = [], nullDriver = false, wayland, gl = false, wineEnv = {}, timeout = 300000 }) {
+      let r;
+      try {
+        const src = exe.includes('/') ? exe : w.prog(exe);
+        const files = Object.fromEntries([src, ...extra].map((f) => [basename(f), f]));
+        let userReg = nullDriver ? graphics('null') : '';
+        if (wayland) userReg += `${graphics('wayland')}\n[Software\\\\Wine\\\\X11 Driver]\n"EmulateModeset"="Y"\n`;
+        const out = wayland?.colors ? join(work, name) : undefined;
+        // The prefix is made without a display (wine/dist.sh: wineboot with
+        // no Wayland libraries): the driver's file, as wineboot would
+        // install it.
+        const setup = wayland && ((p) => {
+          const drv = join(p, 'drive_c/windows/system32/winewayland.drv');
+          if (!existsSync(drv)) copyFileSync(join(dist, 'lib/wine/x86_64-windows/winewayland.drv'), drv);
+        });
+        r = await w.native([`C:\\${basename(src)}`, ...args], { files, userReg, setup, wineEnv, flags: gl ? ['--gl'] : [],
+          wayland: wayland && { size: wayland.size, out: out ?? 'null' }, env: { GEX_LOG: 'off' }, split: true, timeout, name });
+        r.stdout = r.out.replace(/\r/g, '').replace(/\n$/, '');
+        let why = r.code !== code ? `exit ${r.code} (want ${code})` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
+        if (!why && out) why = frames(out, wayland.colors, wayland) ?? '';
+        t.check(`${name}: exit ${code}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
+      } catch (e) {
+        if (e instanceof Skip) throw e;
+        t.check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));
+      }
+      return r;
+    },
     /** A run's last lines for a FAIL, without the host's. */
     detail: (r, n = 8) => {
-      const lines = r.out.split('\n');
+      const lines = (r.err === undefined ? r.out : `${r.out}\n${r.err}`).split('\n');
       // why a process died, when one did: the runtime's own death lines
       // first, else Wine's last fatal ones
       const dead = lines.filter((l) => DEATH.test(l)).slice(0, 2);
@@ -420,4 +514,55 @@ export async function unitLegs(t, name, { want, args = [], build = {}, timeout =
   const p1 = await page(tier1, 'page-t1');
   t.check(`page, tier-1: ${want.source}`, want.test(p1.out), w.detail(p1));
   w.clean();
+}
+
+/**
+ * The frames gexc's compositor wrote (--wayland-out PREFIX: PREFIX-NNN.ppm,
+ * binary P6) checked for a picture: one frame with at least `min` pixels of
+ * every colour of `colors` ('R,G,B', exact; 'R,G,B:N' wants N of it).
+ * `skip` ('WxH') leaves out the frames of that size (another surface's,
+ * such as a GL child's); `last` wants each of the last N frames to have
+ * them instead (a picture that has to stay). Null when it passes, else why.
+ */
+export function frames(prefix, colors, { min = 1000, skip, last = 0 } = {}) {
+  const want = colors.map((a) => {
+    const [c, n] = a.split(':');
+    return { c, rgb: Buffer.from(c.split(',').map(Number)), n: n ? Number(n) : min };
+  });
+  const dir = join(prefix, '..');
+  const ppm = (f) => {
+    const data = readFileSync(join(dir, f));
+    // magic, width, height, maxval; '#' comments
+    const fields = [];
+    let i = 0;
+    while (fields.length < 4) {
+      while (/\s/.test(String.fromCharCode(data[i]))) i++;
+      if (data[i] === 0x23) { i = data.indexOf(0x0a, i); continue; }
+      let j = i;
+      while (!/\s/.test(String.fromCharCode(data[j]))) j++;
+      fields.push(data.subarray(i, j).toString('latin1'));
+      i = j;
+    }
+    return { size: `${fields[1]}x${fields[2]}`, px: data.subarray(i + 1) };
+  };
+  // a colour's three bytes met across two pixels count too, which these
+  // distinct colours make rare enough not to matter
+  const count = (px, rgb) => { let n = 0; for (let i = px.indexOf(rgb); i >= 0; i = px.indexOf(rgb, i + 1)) n++; return n; };
+  let list = readdirSync(dir).filter((f) => f.startsWith(`${basename(prefix)}-`) && f.endsWith('.ppm')).sort().map((f) => ({ f, ...ppm(f) }));
+  if (skip) list = list.filter((x) => x.size !== skip);
+  if (last) {
+    const tail = list.slice(-last);
+    for (const x of tail) {
+      const got = want.map((c) => [c, count(x.px, c.rgb)]);
+      if (!got.every(([c, n]) => n >= c.n)) return `frame ${x.f} (of the last ${tail.length}) lacks a colour: ${got.map(([c, n]) => `${c.c}=${n}>=${c.n}`).join(' ')}`;
+    }
+    return tail.length === last ? null : `${list.length} frames, want at least ${last}`;
+  }
+  const best = new Map(want.map((c) => [c, 0]));
+  for (const x of list) {
+    const got = want.map((c) => [c, count(x.px, c.rgb)]);
+    for (const [c, n] of got) best.set(c, Math.max(best.get(c), n));
+    if (got.every(([c, n]) => n >= c.n)) return null;
+  }
+  return `no frame of ${list.length} has enough of each colour; best: ${[...best].map(([c, n]) => `${c.c}=${n}>=${c.n}`).join(' ')}`;
 }

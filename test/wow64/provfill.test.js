@@ -4,7 +4,7 @@
 // MiB provider stack, from the shim's heap above 2 GiB (cgen.rs
 // gex_provider_stack), not the full guest space ("no memory for a provider
 // stack"). On the page's shim, as a WoW64 process of 64-bit Wine.
-import { wow64 } from '../lib/wow64.mjs';
+import { wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 600 };
 

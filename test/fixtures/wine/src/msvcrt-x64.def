@@ -7,3 +7,4 @@ longjmp
 _CxxThrowException
 __CxxFrameHandler3
 __C_specific_handler
+strcmp

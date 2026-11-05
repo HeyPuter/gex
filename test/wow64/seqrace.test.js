@@ -4,7 +4,7 @@
 // (WINEGEX_DOOR=0), and on the page's shim, where every read is a server
 // request (2000 a case). Each prints "0 failures".
 import { join } from 'node:path';
-import { ROOT, wow64 } from '../lib/wow64.mjs';
+import { ROOT, wow64 } from '../lib/winerun.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 3000 };
 

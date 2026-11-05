@@ -1,3 +1,5 @@
 LIBRARY kernel32.dll
 EXPORTS
 RaiseException
+LoadLibraryA
+GetProcAddress
