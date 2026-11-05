@@ -2927,7 +2927,8 @@ pub extern "C" fn gex_dump_threads() {
 pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
     // The thread table, without the kernel lock.
     sigs::home().is_some_and(|home| {
-        home.table().iter().any(|(_, t)| t.ctx_addr() == ctx as u64 && matches!(t.run().waiting, Waiting::Exited))
+        // the newest thread on it: an ended one's slot is another's since
+        home.table().iter().filter(|(_, t)| t.ctx_addr() == ctx as u64).last().is_some_and(|(_, t)| matches!(t.run().waiting, Waiting::Exited))
     }) as i32
 }
 
@@ -5185,7 +5186,22 @@ pub extern "C" fn gex_worker_release() {
     if !CLAIMED.with(|c| c.replace(false)) {
         return;
     }
+    give_ctx_slot();
     slot_free(worker_id() as usize);
+}
+
+/// This Worker's thread's context slot back to its process, when the thread
+/// ended while the process goes on: nothing of it runs any more (the
+/// Worker parks for another thread, or ends).
+fn give_ctx_slot() {
+    let ctx = my_ctx();
+    let ended = MY_RUN.with(|c| c.borrow().as_ref().is_some_and(|t| matches!(t.run.lock().unwrap_or_else(|e| e.into_inner()).waiting, Waiting::Exited)));
+    if ctx == 0 || !ended || thread_gone() || exited() {
+        return;
+    }
+    if let Some(home) = sigs::home() {
+        home.give_ctx(ctx);
+    }
 }
 
 
@@ -11278,6 +11294,7 @@ pub extern "C" fn gex_thread_park() -> i32 {
     if why != 0 {
         return why;
     }
+    give_ctx_slot();
     waitq::leave();
     CURRENT.with(|c| c.set(0));
     MY_CTX.with(|c| c.set(0));

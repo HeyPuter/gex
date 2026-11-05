@@ -161,6 +161,11 @@ impl Home {
         self.pid
     }
 
+    /// The context slot of an ended thread back, for the next (`CtxSlots::give`).
+    pub(crate) fn give_ctx(&self, ctx: u64) {
+        self.slots.give(ctx);
+    }
+
     /// Its threads (`Host::threads`), which lock themselves.
     pub(crate) fn table(&self) -> &crate::Threads {
         &self.table
