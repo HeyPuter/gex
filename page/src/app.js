@@ -1367,6 +1367,8 @@ function streamBundle(url, z, f, exe, early = false) {
   };
   const done = fetchPacked(url, z, false, f, {
     sink: (piece) => {
+      // the index names every directory and link: theirs go unread
+      if (index) ts.skipLinks = true;
       ts.push(piece);
       if (!exeBytes || ts.pending >= (index ? EARLY_PART_BYTES : STREAM_PART_BYTES)) put(ts.take());
     },

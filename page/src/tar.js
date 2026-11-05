@@ -197,6 +197,12 @@ export class TarStream {
     this.#root = root;
   }
 
+  /** Directories and links passed over unread (their headers' names not
+   *  decoded): an archive with an index names them all already (app.js
+   *  `streamBundle`), and its tens of thousands of links were half of this
+   *  parser's time, at the archive's end, on the page's main thread. */
+  skipLinks = false;
+
   /** The files' bytes unpacked and not yet taken. */
   get pending() { return this.#bytes; }
 
@@ -254,6 +260,11 @@ export class TarStream {
     const size = octal(b, 124, 12);
     const type = String.fromCharCode(b[156] || 0x30);
     const pad = Math.ceil(size / BLOCK) * BLOCK - size;
+    if (this.skipLinks && (type === '1' || type === '2' || type === '5')) {
+      this.#longName = this.#longLink = this.#pax = null;
+      this.#skip = size + pad;
+      return;
+    }
     const e = { size, type, pad, hdr: b.slice() };
     if (type === 'x' || type === 'K' || type === 'L' || type === 'g' || type === '0' || type === '\0' || type === '7') {
       this.#entry = e;
