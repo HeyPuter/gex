@@ -22,6 +22,10 @@ const CASES = [
   ['spawn64', 'wow32.exe', 'x86', ['spawn64', 'C:\\wow64c.exe'], [['wow64c.exe', 'x64']]],
   ['spawn32', 'wow64c.exe', 'x64', ['spawn32', 'C:\\wow32.exe'], [['wow32.exe', 'x86']]],
   ['xmmcb', 'wow64c.exe', 'x64', ['xmmcb']],
+  // the processor architecture each side reports: AMD64 to 64-bit code,
+  // INTEL (system) and AMD64 (native) to 32-bit code
+  ['sysarch64', 'wow64c.exe', 'x64', ['sysarch']],
+  ['sysarch32', 'wow32.exe', 'x86', ['sysarch']],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)
   ['timerproc', 'timerproc.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
   // 32-bit OpenGL and Direct3D with no context ever current on the thread,

@@ -26,6 +26,8 @@
  *             writes through each map reads back with glGetBufferSubData
  *             (the 64-bit GL driver's mappings, as wow64 hands them to
  *             32-bit code)
+ *   sysarch   GetSystemInfo INTEL and GetNativeSystemInfo AMD64, as a
+ *             32-bit program sees a 64-bit system
  *   sysbench N   N calls of NtQueryPerformanceCounter, then of
  *             NtQueryVirtualMemory, system calls with no server request:
  *             wall time per call (a measurement, timed
@@ -469,6 +471,17 @@ static int glmap_check(const char *what, unsigned seed, int n)
     return bad < 0;
 }
 
+static int case_sysarch(void)
+{
+    SYSTEM_INFO si, ni;
+
+    GetSystemInfo(&si);
+    GetNativeSystemInfo(&ni);
+    CHECK(si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL, "sysarch GetSystemInfo %u", si.wProcessorArchitecture);
+    CHECK(ni.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64, "sysarch GetNativeSystemInfo %u", ni.wProcessorArchitecture);
+    return 0;
+}
+
 static int case_glmap(void)
 {
     enum { N = 1 << 18 };
@@ -578,6 +591,7 @@ int main(int argc, char **argv)
     else if (!strcmp(c, "cbnest")) case_cbnest(argc > 2 ? atoi(argv[2]) : 8);
     else if (!strcmp(c, "spawn64") && argc > 2) case_spawn64(argv[2]);
     else if (!strcmp(c, "glmap")) case_glmap();
+    else if (!strcmp(c, "sysarch")) case_sysarch();
     else if (!strcmp(c, "child")) return 32;
     else { printf("FAIL unknown case %s\n", c); return 1; }
     if (fails) return 1;

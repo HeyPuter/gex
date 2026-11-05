@@ -7,6 +7,7 @@
  *                 IsWow64Process TRUE for it, and FALSE for this one
  *   xmmcb         xmm6-xmm15 (callee-saved) kept across SendMessage whose
  *                 window procedure, a user callback, changes them
+ *   sysarch       GetSystemInfo and GetNativeSystemInfo both AMD64
  *   sysbench N    N calls of NtQueryPerformanceCounter, then of
  *                 NtQueryVirtualMemory: the 64-bit baseline of wow32's
  *                 sysbench (ns per call)
@@ -89,6 +90,22 @@ static int case_xmmcb(void)
     return 0;
 }
 
+static int case_sysarch(void)
+{
+    SYSTEM_INFO si, ni;
+
+    GetSystemInfo(&si);
+    GetNativeSystemInfo(&ni);
+    if (si.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64 || ni.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64)
+    {
+        printf("FAIL sysarch GetSystemInfo %u GetNativeSystemInfo %u\n", si.wProcessorArchitecture, ni.wProcessorArchitecture);
+        return 1;
+    }
+    printf("ok   sysarch GetSystemInfo and GetNativeSystemInfo AMD64\n");
+    printf("wow64c sysarch ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     STARTUPINFOA si = { sizeof(si) };
@@ -100,6 +117,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1 && !strcmp(argv[1], "child")) return 64;
     if (argc > 1 && !strcmp(argv[1], "xmmcb")) return case_xmmcb();
+    if (argc > 1 && !strcmp(argv[1], "sysarch")) return case_sysarch();
     if (argc > 1 && !strcmp(argv[1], "sysbench"))
     {
         LONG (WINAPI *qpc)(LARGE_INTEGER *, LARGE_INTEGER *) =
