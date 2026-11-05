@@ -2031,6 +2031,23 @@ pub extern "C" fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, 
     procs().set_usage(pid, cpu_ns, rss, vsize, start_ns);
 }
 
+/// Task `tid` has used `ns` more processor time (`ProcTable::add_task_cpu`).
+#[no_mangle]
+pub extern "C" fn k_proc_add_task_cpu(tid: i32, ns: u64) {
+    procs().add_task_cpu(tid, ns);
+}
+
+/// Task `tid`'s name, `len` bytes at `at` (`ProcTable::set_task_name`).
+#[no_mangle]
+pub extern "C" fn k_proc_set_task_name(tid: i32, at: gex_kmem::PAddr, len: u32) {
+    let len = len.min(15);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    procs().set_task_name(tid, &buf);
+}
+
 /// The processor time every process has used (`ProcTable::cpu_total`).
 #[no_mangle]
 pub extern "C" fn k_proc_cpu_total() -> u64 {

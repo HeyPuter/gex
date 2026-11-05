@@ -495,6 +495,8 @@ extern "C" {
     fn k_proc_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64);
+    fn k_proc_add_task_cpu(tid: i32, ns: u64);
+    fn k_proc_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_cpu_total() -> u64;
     fn k_proc_loadavg(now_ns: u64) -> u64;
     fn k_proc_rss_total() -> u64;
@@ -985,6 +987,12 @@ extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
 extern "C" fn r_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64) {
     unsafe { k_proc_set_usage(pid, cpu_ns, rss, vsize, start_ns) }
 }
+extern "C" fn r_add_task_cpu(tid: i32, ns: u64) {
+    unsafe { k_proc_add_task_cpu(tid, ns) }
+}
+extern "C" fn r_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_task_name(tid, at, len) }
+}
 extern "C" fn r_cpu_total() -> u64 {
     unsafe { k_proc_cpu_total() }
 }
@@ -1057,6 +1065,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             end_tid: r_end_tid,
             task_owner: r_task_owner,
             set_usage: r_set_usage,
+            add_task_cpu: r_add_task_cpu,
+            set_task_name: r_set_task_name,
             cpu_total: r_cpu_total,
             loadavg: r_loadavg,
             rss_total: r_rss_total,
@@ -10853,6 +10863,7 @@ pub(crate) fn bind_mine(h: &mut Host, i: usize) {
         MY_CTX.with(|c| c.set(ctx_addr));
         MY_TID.with(|c| c.set(tid));
         MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
+        usage::bind(tid);
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -11271,6 +11282,7 @@ pub extern "C" fn gex_thread_park() -> i32 {
     CURRENT.with(|c| c.set(0));
     MY_CTX.with(|c| c.set(0));
     MY_TID.with(|c| c.set(0));
+    usage::bind(0);
     MY_RUN.with(|c| *c.borrow_mut() = None);
     sigs::unbind();
     ctx_addr_set(0);
@@ -11356,6 +11368,7 @@ pub(crate) fn bind_free(i: usize) {
         MY_CTX.with(|c| c.set(t.ctx_addr()));
         MY_TID.with(|c| c.set(tid));
         MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
+        usage::bind(tid);
         sigs::bind_free(home, tid);
     }
 }

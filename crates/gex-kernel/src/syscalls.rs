@@ -6804,7 +6804,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
 
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
 /// both answer them here. `ctx_addr` is the calling thread's context.
-pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
+pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
     match n {
         nr::UNAME => uname(m, io.compat, a[0]),
         // The capability options ([`Creds`]): `PR_GET_KEEPCAPS` and
@@ -6812,8 +6812,28 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         // drop is not kept; `PR_CAPBSET_READ` of one past the last is
         // `EINVAL`, which libcap counts them by). Names, death signals,
         // dumpability and the rest: all things a process may set about
-        // itself that change nothing observable here.
+        // itself that change nothing observable here. A thread's name
+        // (`PR_SET_NAME`, `PR_GET_NAME`: what `pthread_setname_np` and
+        // `_getname_np` make) is the table's, for `/proc/<pid>/task/<tid>/comm`.
         nr::PRCTL => match a[0] {
+            15 => {
+                // at most 15 bytes, cut there when no NUL comes sooner
+                let name = match m.read_cstr(a[1], 16) {
+                    Err(Errno::ENAMETOOLONG) => m.read(a[1], 15)?.to_vec(),
+                    r => r?,
+                };
+                procs.set_task_name(tid, &name);
+                Ok(0)
+            }
+            16 => {
+                let e = procs.entries().into_iter().find(|e| e.pid == io.pid);
+                let name = e.map_or_else(|| "gex".to_string(), |e| e.task_comm(tid));
+                let mut out = [0u8; 16];
+                let b = name.as_bytes();
+                out[..b.len().min(15)].copy_from_slice(&b[..b.len().min(15)]);
+                m.write(a[1], &out)?;
+                Ok(0)
+            }
             7 => Ok(io.creds.keep_caps() as u64),
             8 if a[1] <= 1 => {
                 io.creds.set_keep_caps(a[1] == 1);
@@ -7449,7 +7469,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
+        quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a)
     } else if is_cred(n) {
         cred_call(f.creds, f.procs, f.pid, m, n, a)
     } else if is_mount(n) {
@@ -10764,7 +10784,7 @@ impl Kernel {
             }
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
-            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, m, self.ctx_addr, n, a),
+            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a),
 
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest

@@ -86,6 +86,10 @@ pub struct Remote {
     pub task_owner: extern "C" fn(id: i32) -> i32,
     /// See [`ProcTable::set_usage`].
     pub set_usage: extern "C" fn(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64),
+    /// See [`ProcTable::add_task_cpu`].
+    pub add_task_cpu: extern "C" fn(tid: i32, ns: u64),
+    /// See [`ProcTable::set_task_name`].
+    pub set_task_name: extern "C" fn(tid: i32, at: crate::PAddr, len: u32),
     /// See [`ProcTable::cpu_total`].
     pub cpu_total: extern "C" fn() -> u64,
     /// See [`ProcTable::loadavg`], the three packed by [`pack_load`].
@@ -111,6 +115,25 @@ pub struct Usage {
     pub vsize: u64,
     /// When it started, on the monotonic clock (nanoseconds since boot).
     pub start_ns: u64,
+}
+
+/// One task (thread) of a process as `/proc/<pid>/task/<tid>` has it: the
+/// processor time it has used, as its host said ([`ProcTable::add_task_cpu`]),
+/// and the name it gave itself (`prctl(PR_SET_NAME)`, which
+/// `pthread_setname_np` makes): NUL-padded, all NULs for none, when it goes
+/// by its process's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub cpu_ns: u64,
+    pub name: [u8; 16],
+}
+
+impl TaskUsage {
+    /// Its own name, if it gave itself one.
+    pub fn own_name(&self) -> Option<String> {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(15).min(15);
+        (end > 0).then(|| String::from_utf8_lossy(&self.name[..end]).into_owned())
+    }
 }
 
 /// The host's processor-time clock: this process's time (`thread` false) or
@@ -209,6 +232,8 @@ pub struct ProcEntry {
     pub creds: Vec<u8>,
     /// What it has used, as it last said.
     pub usage: Usage,
+    /// Each task's own time and name, in [`Self::tasks`]' order.
+    pub task_usage: Vec<TaskUsage>,
 }
 
 impl ProcEntry {
@@ -225,6 +250,14 @@ impl ProcEntry {
     pub fn tasks(&self) -> Vec<i32> {
         std::iter::once(self.pid).chain(self.tids.iter().copied()).collect()
     }
+    /// Task `tid`'s own time and name (none said: nothing yet).
+    pub fn task(&self, tid: i32) -> TaskUsage {
+        self.tasks().iter().position(|&t| t == tid).and_then(|i| self.task_usage.get(i)).copied().unwrap_or_default()
+    }
+    /// The name task `tid`'s `comm` and `stat` give: its own, or the process's.
+    pub fn task_comm(&self, tid: i32) -> String {
+        self.task(tid).own_name().unwrap_or_else(|| self.comm())
+    }
     /// `/proc/<pid>/cmdline`.
     pub fn cmdline(&self) -> &[u8] {
         match self.info.iter().position(|&b| b == b'\n') {
@@ -236,7 +269,9 @@ impl ProcEntry {
 
 /// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
 /// sid, zombie), the thread count and the info's length, the [`Usage`] as
-/// five `u64`s, the thread ids, the info, padded to four bytes.
+/// five `u64`s, the thread ids, each task's [`TaskUsage`] (its time, then its
+/// 16-byte name; the first thread's first), the info and the creds, padded
+/// to four bytes.
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
@@ -249,6 +284,11 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
         }
         for t in &e.tids {
             out.extend_from_slice(&t.to_le_bytes());
+        }
+        for i in 0..=e.tids.len() {
+            let u = e.task_usage.get(i).copied().unwrap_or_default();
+            out.extend_from_slice(&u.cpu_ns.to_le_bytes());
+            out.extend_from_slice(&u.name);
         }
         out.extend_from_slice(&e.info);
         out.extend_from_slice(&e.creds);
@@ -264,12 +304,20 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
     let long = |b: &[u8], i: usize| u64::from_le_bytes(b[32 + i * 8..40 + i * 8].try_into().unwrap());
     const HEAD: usize = 32 + 5 * 8;
+    const TASK: usize = 8 + 16;
     while b.len() >= HEAD {
         let (t, n, c) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize, word(b, 7).max(0) as usize);
-        let at = HEAD + 4 * t;
+        let tasks = HEAD + 4 * t;
+        let at = tasks + TASK * (t + 1);
         if b.len() < at + n + c {
             break;
         }
+        let task_usage = (0..=t)
+            .map(|i| {
+                let o = tasks + TASK * i;
+                TaskUsage { cpu_ns: u64::from_le_bytes(b[o..o + 8].try_into().unwrap()), name: b[o + 8..o + 24].try_into().unwrap() }
+            })
+            .collect();
         out.push(ProcEntry {
             pid: word(b, 0),
             ppid: word(b, 1),
@@ -280,6 +328,7 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
             info: b[at..at + n].to_vec(),
             creds: b[at + n..at + n + c].to_vec(),
             usage: Usage { cpu_ns: long(b, 0), child_cpu_ns: long(b, 1), rss: long(b, 2), vsize: long(b, 3), start_ns: long(b, 4) },
+            task_usage,
         });
         b = &b[(at + n + c + 3) & !3..];
     }
@@ -355,6 +404,10 @@ struct Table {
     procs: Vec<Proc>,
     /// Each live thread that is not its process's first, and its process.
     threads: std::collections::HashMap<i32, i32>,
+    /// Each task's own time and name, a process's first thread's under its
+    /// pid: the tasks that have said either ([`ProcTable::add_task_cpu`],
+    /// [`ProcTable::set_task_name`]).
+    tasks: std::collections::HashMap<i32, TaskUsage>,
     /// The processor time of every process no longer in the table.
     gone_cpu_ns: u64,
     load: Load,
@@ -368,6 +421,7 @@ impl Table {
         let mut owed = Vec::new();
         for p in std::mem::take(&mut self.procs) {
             if gone(&p) {
+                self.tasks.remove(&p.pid);
                 self.gone_cpu_ns += p.usage.cpu_ns;
                 owed.push((p.ppid, p.usage.cpu_ns + p.usage.child_cpu_ns));
             } else {
@@ -444,6 +498,7 @@ impl ProcTable {
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
+                tasks: std::collections::HashMap::new(),
                 procs: vec![Proc {
                     pid: INIT_PID,
                     ppid: 0,
@@ -552,7 +607,9 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.end_tid)(tid);
         }
-        self.lock().threads.remove(&tid);
+        let mut t = self.lock();
+        t.threads.remove(&tid);
+        t.tasks.remove(&tid);
     }
 
     /// The process task `id` is part of: `id` itself when it is a process
@@ -577,8 +634,14 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.set_info)(pid, info.as_ptr() as usize as crate::PAddr, info.len() as u32);
         }
-        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+        let mut t = self.lock();
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
             p.info = info.to_vec();
+        }
+        // a new image: the first thread goes by its name again, as an
+        // `execve` resets `comm` on Linux
+        if let Some(u) = t.tasks.get_mut(&pid) {
+            u.name = [0; 16];
         }
     }
 
@@ -623,7 +686,8 @@ impl ProcTable {
                 .map(|p| {
                     let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
                     tids.sort_unstable();
-                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage };
+                    let task_usage = std::iter::once(p.pid).chain(tids.iter().copied()).map(|id| t.tasks.get(&id).copied().unwrap_or_default()).collect();
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage, task_usage };
                     (e, Arc::clone(&p.child.status))
                 })
                 .collect()
@@ -687,7 +751,11 @@ impl ProcTable {
                 }
             }
             // Its threads went with it.
-            t.threads.retain(|_, p| *p != pid);
+            let gone: Vec<i32> = t.threads.iter().filter(|&(_, &p)| p == pid).map(|(&tid, _)| tid).collect();
+            for tid in gone {
+                t.threads.remove(&tid);
+                t.tasks.remove(&tid);
+            }
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
@@ -774,6 +842,35 @@ impl ProcTable {
             // the process's start, not an `execve`'s
             let start_ns = if p.usage.start_ns != 0 { p.usage.start_ns } else { start_ns };
             p.usage = Usage { cpu_ns, rss, vsize, start_ns, ..p.usage };
+        }
+    }
+
+    /// Task `tid` (a thread, or a process's first under its pid) has used
+    /// `ns` more processor time: said by its host as it goes, as
+    /// [`Self::set_usage`] is for the whole process. `/proc/<pid>/task/<tid>/stat`.
+    pub fn add_task_cpu(&self, tid: i32, ns: u64) {
+        if let Some(r) = self.remote {
+            return (r.add_task_cpu)(tid, ns);
+        }
+        let mut t = self.lock();
+        if t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid) {
+            t.tasks.entry(tid).or_default().cpu_ns += ns;
+        }
+    }
+
+    /// Task `tid` calls itself `name` (`prctl(PR_SET_NAME)`): at most 15
+    /// bytes, up to a NUL; empty goes back to the process's.
+    pub fn set_task_name(&self, tid: i32, name: &[u8]) {
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len()).min(15);
+        let name = &name[..end];
+        if let Some(r) = self.remote {
+            return (r.set_task_name)(tid, name.as_ptr() as usize as crate::PAddr, name.len() as u32);
+        }
+        let mut t = self.lock();
+        if t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid) {
+            let u = t.tasks.entry(tid).or_default();
+            u.name = [0; 16];
+            u.name[..end].copy_from_slice(name);
         }
     }
 
@@ -1391,6 +1488,36 @@ mod tests {
         assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().tids, vec![t1]);
         t.exit(a, 0);
         assert!(t.entries().iter().find(|e| e.pid == a).unwrap().zombie);
+    }
+
+    #[test]
+    fn each_task_has_its_own_time_and_name() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_info(a, b"prog\nprog\0");
+        let (x, y) = (t.new_tid(a), t.new_tid(a));
+        t.add_task_cpu(a, 5);
+        t.add_task_cpu(x, 300);
+        t.add_task_cpu(x, 100);
+        t.add_task_cpu(y, 700);
+        t.set_task_name(x, b"worker-x\0junk");
+        t.set_task_name(y, b"a name longer than fifteen");
+        // not a task: nothing
+        t.add_task_cpu(9999, 1);
+        let e = t.entries();
+        let mine = e.iter().find(|e| e.pid == a).unwrap();
+        assert_eq!((mine.task(a).cpu_ns, mine.task(x).cpu_ns, mine.task(y).cpu_ns), (5, 400, 700));
+        assert_eq!((mine.task_comm(a), mine.task_comm(x), mine.task_comm(y)), ("prog".into(), "worker-x".into(), "a name longer t".into()));
+        assert_eq!(decode_entries(&encode_entries(&e)), e);
+        // a thread's end takes its count; an exec resets the first's name
+        t.set_task_name(a, b"renamed");
+        assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().task_comm(a), "renamed");
+        t.end_tid(x);
+        t.set_info(a, b"next\nnext\0");
+        let mine = t.entries().into_iter().find(|e| e.pid == a).unwrap();
+        assert_eq!((mine.task_comm(a), mine.task(a).cpu_ns, mine.task(y).cpu_ns), ("next".into(), 5, 700));
+        let x2 = t.new_tid(a);
+        assert_eq!(t.entries().into_iter().find(|e| e.pid == a).unwrap().task(x2), TaskUsage::default());
     }
 
     #[test]

@@ -160,11 +160,19 @@ impl ProcSource for KernelProcSource {
         }
         Some(out)
     }
-    fn stat(&self, tid: i32, threads: usize) -> String {
+    fn stat(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, pgid, sid) = relations(&l);
         let tty = tty_of(l.ptys, sid);
-        crate::vfs::procfs::stat_line(tid, &comm(&l.exe), 'R', ppid, pgid, sid, tty, threads, &usage(&l))
+        let mut u = usage(&l);
+        let name = match task {
+            Some(t) => {
+                (u.cpu_ns, u.child_cpu_ns) = (t.cpu_ns, 0);
+                t.own_name().unwrap_or_else(|| comm(&l.exe))
+            }
+            None => comm(&l.exe),
+        };
+        crate::vfs::procfs::stat_line(tid, &name, 'R', ppid, pgid, sid, tty, threads, &u)
     }
     fn usage(&self) -> crate::proc::Usage {
         self.0.get().map(|l| usage(&l)).unwrap_or_default()
@@ -200,7 +208,7 @@ impl ProcSource for KernelProcSource {
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
-    fn status(&self, tid: i32, threads: usize) -> String {
+    fn status(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);
         // (no peak is kept: the peaks are the current sizes)
@@ -211,7 +219,7 @@ impl ProcSource for KernelProcSource {
             "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
              RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}",
-            l.exe.rsplit('/').next().unwrap_or("gex"),
+            task.and_then(|t| t.own_name()).unwrap_or_else(|| l.exe.rsplit('/').next().unwrap_or("gex").to_string()),
             l.pid,
             tid,
             ppid

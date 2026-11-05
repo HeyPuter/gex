@@ -36,10 +36,11 @@ pub trait ProcSource: Send + Sync {
         None
     }
     /// `stat` for task `tid` of this process (its pid for the process
-    /// itself), one of `threads`.
-    fn stat(&self, tid: i32, threads: usize) -> String;
+    /// itself), one of `threads`; `task`, the task's own time and name, for
+    /// `task/<tid>/stat` (`None`: the process's, `/proc/self/stat`).
+    fn stat(&self, tid: i32, threads: usize, task: Option<&TaskUsage>) -> String;
     /// `status` for task `tid`, as [`Self::stat`].
-    fn status(&self, tid: i32, threads: usize) -> String;
+    fn status(&self, tid: i32, threads: usize, task: Option<&TaskUsage>) -> String;
     /// Every process on the system, this one included, for `/proc/<pid>`
     /// and the listing of `/proc` (what `ps` and `htop` read). Empty where
     /// the kernel knows only this process.
@@ -81,7 +82,7 @@ pub trait ProcSource: Send + Sync {
     }
 }
 
-use crate::proc::Usage;
+use crate::proc::{TaskUsage, Usage};
 
 /// The whole system as `/proc` shows it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -395,12 +396,17 @@ impl ProcFs {
     }
 
     fn generate_other(&self, e: &crate::proc::ProcEntry, rest: &str, tid: i32) -> Option<Vec<u8>> {
-        let comm = e.comm();
         let state = if e.zombie { 'Z' } else { 'S' };
         let (id, threads) = (if tid != 0 { tid } else { e.pid }, e.tasks().len());
+        // a task's own name and time; the process's for `/proc/<pid>/…`
+        let (comm, usage) = if tid != 0 {
+            (e.task_comm(tid), Usage { cpu_ns: e.task(tid).cpu_ns, child_cpu_ns: 0, ..e.usage })
+        } else {
+            (e.comm(), e.usage)
+        };
         Some(match rest {
-            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &e.usage).into_bytes(),
-            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &e.usage).into_bytes(),
+            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &usage).into_bytes(),
+            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage).into_bytes(),
             "statm" => statm_text(&e.usage).into_bytes(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
@@ -413,12 +419,14 @@ impl ProcFs {
     fn generate(&self, path: &str, tid: i32) -> Option<Vec<u8>> {
         let s = &self.source;
         let id = if tid != 0 { tid } else { s.pid() };
+        // `task/<tid>/…`: the task's own time and name, as the table has them
+        let task = || (tid != 0).then(|| s.others().into_iter().find(|e| e.pid == s.pid()).map(|e| e.task(tid)).unwrap_or_default());
         Some(match path {
             "self/maps" => s.maps().into_bytes(),
             "self/cmdline" => s.cmdline(),
             "self/environ" => s.environ(),
-            "self/stat" => s.stat(id, self.tasks_of("self").len()).into_bytes(),
-            "self/status" => s.status(id, self.tasks_of("self").len()).into_bytes(),
+            "self/stat" => s.stat(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
+            "self/status" => s.status(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/statm" => statm_text(&s.usage()).into_bytes(),
             "self/mountinfo" => mountinfo(&s.mount_table()).into_bytes(),
             "self/mounts" | "mounts" => mounts(&s.mount_table()).into_bytes(),
@@ -431,6 +439,9 @@ impl ProcFs {
                 }
             },
             "self/comm" => {
+                if let Some(name) = task().and_then(|t| t.own_name()) {
+                    return Some(format!("{name}\n").into_bytes());
+                }
                 let exe = s.exe();
                 let name = exe.rsplit('/').next().unwrap_or("gex").to_string();
                 format!("{name}\n").into_bytes()
@@ -708,10 +719,10 @@ mod tests {
         fn fds(&self) -> Vec<(i32, String)> {
             vec![(0, "/dev/tty".into()), (3, "/tmp/x".into())]
         }
-        fn stat(&self, tid: i32, threads: usize) -> String {
+        fn stat(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
             stat_line(tid, "prog", 'R', 7, 42, 1, None, threads, &Usage::default())
         }
-        fn status(&self, tid: i32, threads: usize) -> String {
+        fn status(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
             status_text(tid, 42, "prog", 'R', 7, threads, &[], &Usage::default())
         }
         fn task_owner(&self, id: i32) -> Option<i32> {
@@ -728,12 +739,14 @@ mod tests {
                 tids: tids.to_vec(),
                 creds: Vec::new(),
                 usage: Usage::default(),
+                task_usage: Vec::new(),
             };
-            vec![
-                e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]),
-                e(7, 1, b"xterm\nxterm\0-e\0bash\0", &[8, 9]),
-                e(42, 7, b"prog\n", &[43]),
-            ]
+            let mut io = [0u8; 16];
+            io[..2].copy_from_slice(b"io");
+            let mut xterm = e(7, 1, b"xterm\nxterm\0-e\0bash\0", &[8, 9]);
+            xterm.usage.cpu_ns = 4_000_000_000;
+            xterm.task_usage = vec![TaskUsage::default(), TaskUsage { cpu_ns: 2_500_000_000, name: io }, TaskUsage { cpu_ns: 1_500_000_000, name: [0; 16] }];
+            vec![e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]), xterm, e(42, 7, b"prog\n", &[43])]
         }
     }
 
@@ -762,8 +775,9 @@ mod tests {
         assert_eq!(read(&f, "7/cmdline"), "xterm\0-e\0bash\0");
         assert_eq!(read(&f, "1/comm"), "bash\n");
         assert!(read(&f, "1/status").contains("PPid:\t0\n"));
-        // Its first thread's directory is the process's.
-        assert_eq!(read(&f, "7/task/7/stat"), stat);
+        // Its first thread's directory is the process's, with the first
+        // thread's own time.
+        assert_eq!(read(&f, "7/task/7/stat").replace(" 0 0 0 0 20 ", " 400 0 0 0 20 "), stat);
         let task: Vec<String> = f.open("7/task", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(task, [".", "..", "7", "8", "9"]);
         assert!(f.metadata("7").unwrap().file_type == FileType::Directory);
@@ -832,6 +846,25 @@ mod tests {
         assert!(read(&f, "43/status").contains("Pid:\t43\n"));
         assert!(read(&f, "self/status").contains("Threads:\t2\n"));
         assert_eq!(read(&f, "self/task/43/cmdline"), "/bin/prog\0arg\0");
+    }
+
+    #[test]
+    fn a_task_has_its_own_name_and_time() {
+        let f = fs();
+        let field = |s: &str, i: usize| s.split_whitespace().nth(i).unwrap().to_string();
+        // the process: all of its time, its name
+        let p = read(&f, "7/stat");
+        assert_eq!((field(&p, 1), field(&p, 13)), ("(xterm)".into(), "400".into()));
+        // a thread that named itself: its name and its time, in stat, comm
+        // and status, and under /proc/<tid> as well
+        let t = read(&f, "7/task/8/stat");
+        assert_eq!((field(&t, 0), field(&t, 1), field(&t, 13)), ("8".into(), "(io)".into(), "250".into()));
+        assert_eq!(read(&f, "7/task/8/comm"), "io\n");
+        assert!(read(&f, "8/status").starts_with("Name:\tio\n"));
+        // one that did not: the process's name, its own time
+        let t = read(&f, "7/task/9/stat");
+        assert_eq!((field(&t, 1), field(&t, 13)), ("(xterm)".into(), "150".into()));
+        assert_eq!(read(&f, "7/task/9/comm"), "xterm\n");
     }
 
     fn fs() -> ProcFs {

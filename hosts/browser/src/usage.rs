@@ -12,6 +12,12 @@
 //! `/proc/stat` read) as a Worker parks, once it has grown by a clock tick,
 //! every 50 ms of a stretch that does not park (at a system call: one that
 //! makes none is not seen until it does), and as the process exits.
+//!
+//! Each stretch is also the thread's that ran it (a Worker can run several
+//! of its process's threads in turn): added to the table's count for that
+//! task (`ProcTable::add_task_cpu`, `/proc/<pid>/task/<tid>/stat`) once a
+//! tick of it has gathered, when the Worker turns to another thread, and as
+//! the process exits.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,6 +45,45 @@ thread_local! {
     static BUSY_SINCE: Cell<u64> = const { Cell::new(0) };
     /// System calls since this Worker started, for [`tick`].
     static CALLS: Cell<u32> = const { Cell::new(0) };
+    /// The thread this Worker's stretches go to, and what of them the
+    /// table has not been told.
+    static TASK: Cell<(i32, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// `d` of this Worker's busy time is its thread's: told to the table once a
+/// tick has gathered (or now, `now`).
+fn to_task(d: u64, now: bool) {
+    let (tid, pending) = TASK.with(|c| c.get());
+    let pending = pending + d;
+    if tid > 0 && pending > 0 && (now || pending >= SAY_EVERY_NS) {
+        if let Some(home) = crate::sigs::home() {
+            home.procs().add_task_cpu(tid, pending);
+            TASK.with(|c| c.set((tid, 0)));
+            return;
+        }
+    }
+    TASK.with(|c| c.set((tid, pending)));
+}
+
+/// This Worker runs thread `tid` from now on: the stretch so far, and what
+/// the last thread had not said, are the last thread's.
+pub(crate) fn bind(tid: i32) {
+    let (was, _) = TASK.with(|c| c.get());
+    if was == tid {
+        return;
+    }
+    let since = BUSY_SINCE.with(|c| c.get());
+    if since != 0 {
+        let t = now();
+        BUSY_SINCE.with(|c| c.set(t));
+        let d = t.saturating_sub(since);
+        MINE_NS.with(|c| c.set(c.get() + d));
+        PROC_NS.fetch_add(d, Ordering::AcqRel);
+        to_task(d, true);
+    } else {
+        to_task(0, true);
+    }
+    TASK.with(|c| c.set((tid, 0)));
 }
 
 fn now() -> u64 {
@@ -56,6 +101,9 @@ pub(crate) fn worker_start() {
 /// A fork's child: a new process, which has used nothing yet, in a copy of
 /// its parent's memory.
 pub(crate) fn fork_child() {
+    // the child's first thread is a new task (its pid): the bind that names
+    // it starts its count
+    TASK.with(|c| c.set((0, 0)));
     PROC_NS.store(0, Ordering::Release);
     BASE_NS.store(0, Ordering::Release);
     BASE_READ.store(true, Ordering::Release);
@@ -72,6 +120,7 @@ pub(crate) fn park_begin() {
     }
     let d = now().saturating_sub(since);
     MINE_NS.with(|c| c.set(c.get() + d));
+    to_task(d, false);
     let total = PROC_NS.fetch_add(d, Ordering::AcqRel) + d;
     if total.saturating_sub(SAID_NS.load(Ordering::Acquire)) >= SAY_EVERY_NS {
         say(total);
@@ -111,6 +160,7 @@ pub(crate) fn tick() {
     BUSY_SINCE.with(|c| c.set(t));
     let d = t - since;
     MINE_NS.with(|c| c.set(c.get() + d));
+    to_task(d, false);
     let total = PROC_NS.fetch_add(d, Ordering::AcqRel) + d;
     if total.saturating_sub(SAID_NS.load(Ordering::Acquire)) >= SAY_EVERY_NS {
         say(total);
@@ -155,7 +205,9 @@ pub(crate) fn cpu_ns(thread: bool) -> u64 {
 
 /// The process exits: everything, said now, before its parent can collect it.
 pub(crate) fn exiting() {
-    let total = PROC_NS.load(Ordering::Acquire) + current_stretch();
+    let cur = current_stretch();
+    to_task(cur, true);
+    let total = PROC_NS.load(Ordering::Acquire) + cur;
     say(total);
 }
 

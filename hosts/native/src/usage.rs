@@ -6,7 +6,8 @@
 //! the process table (what another process's `/proc/<pid>/stat`,
 //! `/proc/stat` and a parent's `getrusage(RUSAGE_CHILDREN)` read): at a
 //! system call once 50 ms have passed since it last did, and as each of its
-//! threads ends.
+//! threads ends. Each thread says its own time the same way, to its task's
+//! count (`ProcTable::add_task_cpu`, `/proc/<pid>/task/<tid>/stat`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,6 +45,9 @@ static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1)
 
 struct Mine {
     pid: i32,
+    /// The guest thread, and this host thread's time when it last said it.
+    tid: i32,
+    task_said: u64,
     token: u64,
     procs: Arc<ProcTable>,
     mm: gex_kernel::mem::Mm,
@@ -89,13 +93,14 @@ impl Counting {
         leave();
         let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let start = gex_kernel::syscalls::clock_ns(k.clock, 1);
-        let running = Running { tid: host_tid(), base: thread_now() };
+        let base = thread_now();
+        let running = Running { tid: host_tid(), base };
         {
             let mut all = PROCS.lock().unwrap_or_else(|e| e.into_inner());
             let p = all.entry(k.pid).or_insert_with(|| Proc { start_ns: start, ..Proc::default() });
             p.live.insert(token, running);
         }
-        let mine = Mine { pid: k.pid, token, procs: Arc::clone(&k.procs), mm: k.mem.shared(), calls: 0, looked: Instant::now() };
+        let mine = Mine { pid: k.pid, tid: k.tid, task_said: base, token, procs: Arc::clone(&k.procs), mm: k.mem.shared(), calls: 0, looked: Instant::now() };
         MINE.with(|m| *m.borrow_mut() = Some(mine));
         Counting(())
     }
@@ -109,8 +114,9 @@ impl Drop for Counting {
 
 /// This thread's stretch ends: its time is the process's, said now.
 fn leave() {
-    let Some(mine) = MINE.with(|m| m.borrow_mut().take()) else { return };
+    let Some(mut mine) = MINE.with(|m| m.borrow_mut().take()) else { return };
     let now = thread_now();
+    say_task(&mut mine, now, 0);
     let total = {
         let mut all = PROCS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(p) = all.get_mut(&mine.pid) else { return };
@@ -158,12 +164,23 @@ pub(crate) fn tick() {
             return;
         }
         mine.looked = Instant::now();
+        say_task(mine, thread_now(), SAY_EVERY_NS);
         let t = total(mine.pid);
         let said = PROCS.lock().unwrap_or_else(|e| e.into_inner()).get(&mine.pid).map_or(0, |p| p.said);
         if t.saturating_sub(said) >= SAY_EVERY_NS {
             say(mine, t);
         }
     });
+}
+
+/// This thread's time since it last said it, said to its task once it is
+/// `at_least`.
+fn say_task(mine: &mut Mine, now: u64, at_least: u64) {
+    let d = now.saturating_sub(mine.task_said);
+    if d > 0 && d >= at_least {
+        mine.procs.add_task_cpu(mine.tid, d);
+        mine.task_said = now;
+    }
 }
 
 fn say(mine: &Mine, total: u64) {
