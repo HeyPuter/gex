@@ -9690,12 +9690,23 @@ impl Kernel {
     /// the `.exe` applies to that program's process alone. That entry is
     /// removed too.
     ///
-    /// Neither saying, the image itself may: an x86-64 one that cannot be
+    /// Neither saying, the image itself may (Wine's loader named on a DOS
+    /// path, its first argument, found through WINEPREFIX's dosdevices,
+    /// when no WINEGEX_IMAGE names it): an x86-64 one that cannot be
     /// loaded anywhere but above the lowered memory's code space
     /// ([`pe_needs_mem64`]) asks for a 64-bit memory.
-    pub fn exec_flavour(&self, path: &str, envp: &mut Vec<String>) -> Option<bool> {
+    pub fn exec_flavour(&self, path: &str, argv: &[String], envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
         let mut image = None;
+        // Wine's loader started on a program by hand (`wine C:\app.exe`,
+        // not by CreateProcess, so no WINEGEX_IMAGE): the program is its
+        // first argument, a DOS path, found through the prefix's dosdevices.
+        let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+        let dos = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\');
+        let by_hand = dos.and_then(|a| {
+            let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
+            Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))
+        });
         envp.retain(|e| {
             if let Some(v) = e.strip_prefix("GEX_MEM64=") {
                 flag = Some(v == "1");
@@ -9717,8 +9728,13 @@ impl Kernel {
             }
         })
         .or_else(|| {
-            let head = self.read_head(image.as_deref().unwrap_or(path), 4096)?;
-            pe_needs_mem64(&head).then_some(true)
+            let image = image.as_deref().or(by_hand.as_deref()).unwrap_or(path);
+            let head = self.read_head(image, 4096)?;
+            let beside = |name: &str| {
+                let dir = image.rsplit_once('/').map_or(".", |(d, _)| d);
+                self.vfs.metadata(&format!("{dir}/{name}")).is_ok()
+            };
+            pe_needs_mem64(&head, beside).then_some(true)
         })
     }
 
@@ -10277,7 +10293,7 @@ impl Kernel {
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, mut envp)) => {
-                    self.exec_mem64 = self.exec_flavour(&path, &mut envp);
+                    self.exec_mem64 = self.exec_flavour(&path, &argv, &mut envp);
                     self.map_io().flush_all_shared(m);
                     if self.trace {
                         eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());
@@ -17535,8 +17551,12 @@ pub const W64_CODE_TOP: u64 = 0x7fff_0000;
 /// only a 64-bit memory can load: it has no relocations (stripped, or no
 /// relocation directory), so it goes at its preferred base alone, and that
 /// base puts it above [`W64_CODE_TOP`] (a linker's default x86-64 base,
-/// 0x140000000, is). Anything else, or headers that do not parse: false.
-pub fn pe_needs_mem64(head: &[u8]) -> bool {
+/// 0x140000000, is). Or it is a Gecko program's (Firefox, Thunderbird:
+/// `beside` says its directory has mozglue.dll), whose JavaScript engine
+/// reserves 2 GiB of executable memory at start, more than the lowered
+/// memory's whole code space. Anything else, or headers that do not parse:
+/// false.
+pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
     let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let u64_at = |o: usize| head.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
@@ -17557,7 +17577,7 @@ pub fn pe_needs_mem64(head: &[u8]) -> bool {
         let dirs = u32_at(opt + 108)?;
         let relocs = if dirs > 5 { u32_at(opt + 112 + 5 * 8 + 4)? } else { 0 };
         let fixed = chars & 1 != 0 || relocs == 0;
-        Some(fixed && base.saturating_add(size) > W64_CODE_TOP)
+        Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || beside("mozglue.dll"))
     };
     parse().unwrap_or(false)
 }
@@ -17585,16 +17605,19 @@ mod pe_mem64_tests {
 
     #[test]
     fn fixed_high_base_needs_mem64() {
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664)));
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664)));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664), |_| false));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664), |_| false));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "mozglue.dll"));
     }
 
     #[test]
     fn relocatable_or_low_does_not() {
-        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664)));
-        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664)));
-        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c)));
-        assert!(!pe_needs_mem64(b"MZ"));
-        assert!(!pe_needs_mem64(b"\x7fELF"));
+        let none = |_: &str| false;
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), none));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664), none));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c), none));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "mozglue.dll"));
+        assert!(!pe_needs_mem64(b"MZ", none));
+        assert!(!pe_needs_mem64(b"\x7fELF", none));
     }
 }
