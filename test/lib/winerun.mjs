@@ -192,7 +192,19 @@ function linkCopy(src, to) {
   }
 }
 
+/** A throw when `prefix` is not one wine/dist.sh made for `dist`: a dist
+ *  with winegstreamer (its media, -wgf) has a prefix with it installed and
+ *  registered (wine/dist.sh's pfs64 for that dist), one without has none.
+ *  The pairing is dist.sh's (WINE64_DIST and WINE64_PREFIX from one run). */
+function paired(dist, prefix) {
+  const media = existsSync(join(dist, 'lib/wine/x86_64-windows/winegstreamer.dll'));
+  const has = existsSync(join(prefix, 'drive_c/windows/system32/winegstreamer.dll'));
+  if (media !== has)
+    throw new Error(`${prefix} is not ${dist}'s prefix: the install ${media ? 'has' : 'has no'} winegstreamer, the prefix ${has ? 'has' : 'has none'} (take WINE64_DIST and WINE64_PREFIX from one wine/dist.sh run)`);
+}
+
 function prepare(t, dist, prefix, mono, kind, native = null) {
+  paired(dist, prefix);
   const key = createHash('sha256').update([dist, statSync(dist).mtimeMs, prefix, statSync(prefix).mtimeMs, mono ?? '', kind, native ?? ''].join('\n')).digest('hex').slice(0, 16);
   const top = join(t.workDir, kind, key);
   if (existsSync(join(top, '.done'))) return top;
@@ -494,7 +506,8 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
             env: { GEX_LOG: 'off', ...more }, single: page.single, mem64: page.mem64, rss: page.rss, flags: page.flags, split: true, timeout, name })
           : await w.native([`C:\\${basename(src)}`, ...args], { files, userReg, setup, wineEnv, flags: gl ? ['--gl'] : [],
             wayland: wayland && { size: wayland.size, out: out ?? 'null' }, env: { GEX_LOG: 'off', ...more }, split: true, timeout, name });
-        r.stdout = r.out.replace(/\r/g, '').replace(/\n$/, '');
+        // (the runtime's own lines, which a GEX_LOG past `off` says on stdout, out)
+        r.stdout = r.out.replace(/\r/g, '').split('\n').filter((l) => !l.startsWith('[gex] ')).join('\n').replace(/\n$/, '');
         const oom = page ? (r.err.match(/mmap\(\) error Out of memory/g) ?? []).length : 0;
         let why = r.code !== code ? `exit ${r.code} (want ${code})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
         if (!why && out) why = frames(out, wayland.colors, wayland) ?? '';
