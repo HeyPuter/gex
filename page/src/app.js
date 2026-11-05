@@ -1416,23 +1416,29 @@ async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   if (z) return fetchPacked(url, z, shared, f, { priority });
   const { res, cached } = isPiece(url) ? await pieceFetch(url, f, { priority }) : { res: await fetch(url, { cache: 'no-cache', priority }), cached: false };
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
-  const total = Number(res.headers.get('content-length'));
-  if (!total) throw new Error(`${url}: no content-length`);
-  // Not packed: its size was not in the totals.
-  f.meter?.more(total);
-  const out = new Uint8Array(shared ? new SharedArrayBuffer(total) : new ArrayBuffer(total));
+  // Not packed, so no size of its own: sized by the bytes that come. A
+  // host's Content-Length is only the meter's hint (absent when it streams
+  // chunked, the compressed size when it compresses).
+  const hint = res.headers.get('content-encoding') ? 0 : Number(res.headers.get('content-length')) || 0;
+  if (hint) f.meter?.more(hint);
+  const chunks = [];
   const reader = res.body.getReader();
   let at = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    out.set(value, at);
+    chunks.push(value);
     at += value.length;
+    // past the hint (or with none): the meter's total grows by what came
+    const over = at - Math.max(hint, at - value.length);
+    if (over > 0) f.meter?.more(over);
     if (cached) f.meter?.cached(value.length);
     else f.meter?.bytes(value.length);
   }
   f.meter?.fileDone();
-  if (at !== total) throw new Error(`${url}: ${at} of ${total} bytes`);
+  const out = new Uint8Array(shared ? new SharedArrayBuffer(at) : new ArrayBuffer(at));
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
   return out;
 }
 
@@ -1466,7 +1472,7 @@ async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into
   // decoder is given back when this is done (`zstdLoader`).
   const d = await f.zstd();
   try {
-    return await decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, sink, bad });
+    return await decodeInto(url, u, got, d, res, { size, zsize, h, shared, f, into, progress, sink, bad });
   } finally {
     f.zstd.release?.();
   }
@@ -1475,7 +1481,7 @@ async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into
 /** `fetchPackedOnce`'s decode, as the download arrives, into a buffer of
  *  `size`; or, with `sink`, each decoded piece handed to `sink(piece)` (a
  *  view it must copy what it keeps of) and nothing kept here. */
-async function decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, progress, sink, bad }) {
+async function decodeInto(url, u, got, d, res, { size, zsize, h, shared, f, into, progress, sink, bad }) {
   const out = sink ? null : new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
   const emit = (part) => {
@@ -1510,6 +1516,13 @@ async function decodeInto(url, u, got, d, res, { size, zsize, shared, f, into, p
   f.meter?.fileDone();
   if (at !== zsize) throw bad(`${u.href}: ${at} of ${zsize} bytes`);
   if (n !== size) throw bad(`${url}: decoded ${n} of ${size} bytes`);
+  // pack.json's sizes, never the host's headers, say how much should come;
+  // and its hash (`h`, the content's), what (a sink keeps nothing to hash).
+  if (h && out && globalThis.crypto?.subtle) {
+    const v = new Uint8Array(await crypto.subtle.digest('SHA-256', out.buffer instanceof ArrayBuffer ? out.subarray(0, n) : out.slice(0, n)));
+    const hex = Array.from(v.subarray(0, 8), (b) => b.toString(16).padStart(2, '0')).join('');
+    if (hex !== h) throw bad(`${url}: its content's hash is ${hex}, not pack.json's ${h}`);
+  }
   return out;
 }
 
