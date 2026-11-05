@@ -13,7 +13,7 @@
 # wineboot and win32u read (wine.inf, nls, fonts, winmd).
 # Env: GEX_WASM_SYSROOT, GEX_WINE_PREFIX.
 set -eu
-here=$(cd "$(dirname "$0")" && pwd); T=$(cd "$here/.." && pwd)
+here=$(cd "$(dirname "$0")" && pwd)
 B=$(realpath "$1") F=$(realpath "$2") D=$(realpath -m "$3") P=$(realpath -m "$4")
 x86=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 CORE="ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll vcruntime140.dll msvcp140.dll concrt140.dll win32u.dll user32.dll gdi32.dll"
@@ -30,7 +30,7 @@ for m in $CORE $PROGRAMS; do
     { echo "wine32/stage: $m was not built (no $m.so in $B; see $B/make.log)" >&2; exit 1; }
 done
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/wine32-stage.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
-TMPDIR=$tmp "$T/stage-native.sh" "$B" "$F" "$P" $CORE $PROGRAMS
+TMPDIR=$tmp "$here/stage-native.sh" "$B" "$F" "$P" $CORE $PROGRAMS
 (cd "$P/drive_c/windows" && rm -rf system32 && mv syswow64 system32)
 # No links into the shared x86 prefix: wineboot writes system32 through them.
 find "$P" -type l -lname "$x86/*" -print0 | while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
