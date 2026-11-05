@@ -33,9 +33,12 @@ CC += ['-ffile-prefix-map=%s=%s' % m for m in _maps]
 
 args = sys.argv[1:]
 # Wine's PE-side code (-D_WIN32) gets the ICALL pass: its indirect calls may
-# reach guest code.
+# reach guest code. A sysroot without the pass is an error, not code built
+# without it: its raw indirect calls of a guest address trap at run time.
 plugin = os.path.join(sysroot, 'lib', 'GexIcall.so')
-if '-D_WIN32' in args and os.path.exists(plugin) and not os.environ.get('GEX_WASM_NO_ICALL'):
+if '-D_WIN32' in args and not os.environ.get('GEX_WASM_NO_ICALL'):
+    if not os.path.exists(plugin):
+        sys.exit('wcc: %s missing: GEX_WASM_SYSROOT=%s is not a built sysroot (toolchain/sysroot/build32.sh)' % (plugin, sysroot))
     CC += ['-fpass-plugin=' + plugin]
 # C++ on the PE side (Wine's libc++, icu) sees a Windows target, as wcc64's
 # does: Linux's predefined macros would send libc++'s headers to musl's.
