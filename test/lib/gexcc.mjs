@@ -98,15 +98,15 @@ export function gexcc(t) {
     exec: (argv, opts = {}) => run([join(bin, 'gexcc-exec'), ...argv], opts),
     /** A shared libc's directory, for LD_LIBRARY_PATH. */
     libdir: join(sysroot, 'lib'),
+    /** This test's work directories gone (at its end). */
+    clean: () => rmSync(top, { recursive: true, force: true }),
   };
   return c;
 }
 
-/** `fn(item)` over `items`, `width` at once (GEX_TEST_INNER, default 3:
- *  several programs time a child against a parent in hundreds of
- *  milliseconds, filelocks' holder among them, which more at once beside a
- *  run's other jobs makes late). */
-export async function pool(items, fn, width = Number(process.env.GEX_TEST_INNER) || 3) {
+/** `fn(item)` over `items`, `width` at once (GEX_TEST_INNER, default 4,
+ *  inside each of a run's --jobs). */
+export async function pool(items, fn, width = Number(process.env.GEX_TEST_INNER) || 4) {
   const out = new Array(items.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => {
@@ -124,22 +124,30 @@ export async function pool(items, fn, width = Number(process.env.GEX_TEST_INNER)
  * work directory is on: gex cannot read libraries from a tmpfs), gexcc on
  * PATH, GEX_ROOT this tree and GEX_ARCH this arch, plus `env`. Each of its
  * `ok ...` and `FAIL ...` lines is a check, and so is its exit status; a
- * `skip ...` line with exit 0 and nothing else is a skip.
+ * `skip ...` line with exit 0 and nothing else is a skip, and after a check
+ * a failed one (a leg not run). `need`: `ok` lines that must be there (the
+ * leg a script may skip, its browser runtime one).
  */
-export async function script(t, name, { env = {}, timeout = 1200000 } = {}) {
+export async function script(t, name, { env = {}, timeout = 1200000, need = [] } = {}) {
   const c = gexcc(t);
   const d = c.dir(name);
   const r = await c.run(['sh', join(FIXTURES, 'dl', `${name}.sh`), d], { cwd: d, timeout,
     env: { GEX_ROOT: ROOT, GEX_ARCH: t.arch === 'x86' ? 'x86' : 'aarch64', GEXC: c.gexc, ...env } });
   const lines = r.out.split('\n');
+  const oks = [];
   let checks = 0;
   for (const l of lines) {
     const m = /^(ok|FAIL)\s+(.*)$/.exec(l);
     if (m) {
       t.check(m[2] || name, m[1] === 'ok');
+      if (m[1] === 'ok') oks.push(l);
       checks++;
-    } else if (/^skip\b/.test(l) && r.code === 0 && !checks) t.skip(l.replace(/^skip:?\s*/, ''));
+    } else if (/^skip\b/.test(l)) {
+      if (r.code === 0 && !checks && !need.length) t.skip(l.replace(/^skip:?\s*/, ''));
+      t.check(l, false, 'a leg not run');
+    }
   }
+  for (const n of need) t.check(`${n}`, oks.some((l) => l.startsWith(n)), 'not printed');
   t.check(`${name}.sh exits 0`, r.code === 0, `exit ${r.code}${r.timedOut ? ' (timed out)' : ''}: ${lines.slice(-6).join(' / ')}`);
-  rmSync(d, { recursive: true, force: true });
+  c.clean();
 }

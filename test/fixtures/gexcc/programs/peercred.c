@@ -8,6 +8,8 @@
  *  2 listen/connect: the accepted end's peer is the connecting process, the
  *    connecting end's peer the listening one
  *  3 the length is 12, and a shorter buffer gets that much and no more
+ * The connecting child's line is the parent's to print (sent over the
+ * connection): two processes' lines on one stdout keep no order.
  * Natively and in the page (a pair or connection between processes there
  * is in the global kernel, which keeps each end's credentials). */
 #define _GNU_SOURCE
@@ -28,14 +30,21 @@ static int peer(int fd, struct ucred *c)
 	return (int)l;
 }
 
-static void check(const char *what, int fd, pid_t want)
+static int line(char *o, size_t n, const char *what, int fd, pid_t want)
 {
 	struct ucred c;
 	int l = peer(fd, &c);
-	printf("%s: len %d, pid %s, uid %s, gid %s\n", what, l,
-	       c.pid == want ? "the peer's" : "WRONG",
-	       c.uid == getuid() ? "ours" : "WRONG",
-	       c.gid == getgid() ? "ours" : "WRONG");
+	return snprintf(o, n, "%s: len %d, pid %s, uid %s, gid %s\n", what, l,
+	                c.pid == want ? "the peer's" : "WRONG",
+	                c.uid == getuid() ? "ours" : "WRONG",
+	                c.gid == getgid() ? "ours" : "WRONG");
+}
+
+static void check(const char *what, int fd, pid_t want)
+{
+	char o[128];
+	line(o, sizeof o, what, fd, want);
+	fputs(o, stdout);
 }
 
 int main(void)
@@ -73,15 +82,21 @@ int main(void)
 		int t = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (connect(t, (void *)&a, sizeof a) != 0)
 			_exit(2);
-		check("connecting end", t, me);
-		char x = 0;
-		write(t, &x, 1);
+		char o[128];
+		int n = line(o, sizeof o, "connecting end", t, me);
+		write(t, o, n);
+		char x;
 		read(t, &x, 1);
 		_exit(0);
 	}
 	int x = accept(s, NULL, NULL);
-	char b;
-	read(x, &b, 1);
+	char o[128], b = 0;
+	int n = 0, k;
+	while (n < (int)sizeof o - 1 && (k = read(x, o + n, sizeof o - 1 - n)) > 0 && o[n + k - 1] != '\n')
+		n += k;
+	if (k > 0)
+		n += k;
+	fwrite(o, 1, n, stdout);
 	check("accepted end", x, ch);
 	write(x, &b, 1);
 	int st;

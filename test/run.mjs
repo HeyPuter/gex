@@ -235,7 +235,13 @@ async function runNode(test, arch, say, timeout) {
         clearTimeout(timer);
         resolve(msg);
       });
-      child.on('exit', (code, sig) => { clearTimeout(timer); resolve({ exited: sig ?? code }); });
+      // 'exit' can come before the last messages: those are in once the
+      // channel has closed ('disconnect') too.
+      let exited = null;
+      let gone = false;
+      const end = () => { if (exited !== null && gone) { clearTimeout(timer); resolve({ exited }); } };
+      child.on('exit', (code, sig) => { exited = sig ?? code; end(); });
+      child.on('disconnect', () => { gone = true; end(); });
       child.send({ arch, phase, state, res, work: WORK, gpu, timed: o.timed });
     });
     child.kill('SIGKILL');

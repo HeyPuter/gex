@@ -79,6 +79,7 @@ export default async function (t) {
       t.check(`shared-${out}: builds`, false, e.message);
     }
   }
+  c.clean();
 }
 
 /** The first lines where `a` and `b` differ, for a FAIL's detail. */

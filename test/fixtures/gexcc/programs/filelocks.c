@@ -4,10 +4,16 @@
  *    F_GETLK names it (type, start, len, the parent's pid); beside it is
  *    free; the child holds none of its parent's locks (fork)
  *  2 F_SETLKW blocks until the holder unlocks, then takes it
+ * Nothing here depends on how fast a process runs: a child says over a pipe
+ * when it holds a lock or is about to wait, a holder keeps its lock until
+ * told, a waiter checks that the release was announced before its wait
+ * ended, a deadlock's two orders print the same, and a signal comes again
+ * until it lands in the wait.
  *  3 a partial unlock splits the lock: the hole is free, the rest held
  *  4 closing any descriptor of the file drops the process's record locks
  *  5 the holder's exit drops them
- *  6 F_SETLKW that would close a cycle of two waiters: EDEADLK
+ *  6 F_SETLKW that would close a cycle of two waiters: EDEADLK (for
+ *    whichever of the two waits second; the other then gets the lock)
  *  7 F_SETLKW ended by a signal (no SA_RESTART): EINTR
  *  8 OFD locks: the description's; F_OFD_GETLK says pid -1
  *  9 flock: a blocking LOCK_EX waits for the holder's LOCK_UN; LOCK_NB
@@ -20,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,6 +72,16 @@ static int open_f(void) {
         exit(2);
     }
     return fd;
+}
+
+/* A byte on `fd` already, without waiting: the announcement of a release. */
+static int ready(int fd) {
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    char c;
+    int n = read(fd, &c, 1);
+    fcntl(fd, F_SETFL, fl);
+    return n == 1;
 }
 
 /* Run `f` in a child; wait for it. */
@@ -118,27 +135,34 @@ int main(void) {
     printf("1 parent setlk write 0+10: %d\n", lk(fd, F_SETLK, F_WRLCK, 0, 10));
     child(c1);
 
-    /* 2: the child waits; the parent unlocks after it has started waiting. */
-    int pp[2];
-    if (pipe(pp) != 0)
+    /* 2: the child waits; the parent unlocks once it is about to wait, and
+       says so on `rel` first: the wait must not end before that. */
+    int pp[2], rel[2];
+    if (pipe(pp) != 0 || pipe(rel) != 0)
         return 2;
     fflush(stdout);
     pid_t w = fork();
     if (w == 0) {
         int cfd = open_f();
         close(pp[0]);
+        close(rel[1]);
+        write(pp[1], "w", 1);
         int r = lk(cfd, F_SETLKW, F_WRLCK, 0, 1);
         char b[64];
-        int n = snprintf(b, sizeof b, "2 child setlkw: %d\n", r);
+        int n = snprintf(b, sizeof b, "2 child setlkw: %d, after the unlock: %s\n", r, ready(rel[0]) ? "yes" : "no");
         write(pp[1], b, n);
         _exit(0);
     }
     close(pp[1]);
-    ms(300);
+    close(rel[0]);
+    char b[64];
+    read(pp[0], b, 1);
+    ms(50);
     printf("2 parent unlocks\n");
     fflush(stdout);
+    write(rel[1], "u", 1);
+    close(rel[1]);
     lk(fd, F_SETLK, F_UNLCK, 0, 0);
-    char b[64];
     int n = read(pp[0], b, sizeof b);
     if (n > 0)
         fwrite(b, 1, n, stdout);
@@ -158,16 +182,26 @@ int main(void) {
     child(c4);
 
     /* 5: the holder's exit */
+    if (pipe(pp) != 0 || pipe(rel) != 0)
+        return 2;
     fflush(stdout);
     pid_t h = fork();
     if (h == 0) {
         int cfd = open_f();
+        close(pp[0]);
+        close(rel[1]);
         lk(cfd, F_SETLK, F_WRLCK, 0, 0);
-        ms(200);
+        write(pp[1], "h", 1);
+        read(rel[0], b, 1);
         _exit(0);
     }
-    ms(100);
+    close(pp[1]);
+    close(rel[0]);
+    read(pp[0], b, 1);
     printf("5 while the child holds it: %d\n", lk(fd, F_SETLK, F_WRLCK, 0, 1));
+    write(rel[1], "x", 1);
+    close(rel[1]);
+    close(pp[0]);
     waitpid(h, 0, 0);
     printf("5 after it exits: %d\n", lk(fd, F_SETLK, F_WRLCK, 0, 1));
     lk(fd, F_SETLK, F_UNLCK, 0, 0);
@@ -191,16 +225,18 @@ int main(void) {
     }
     close(pp[1]);
     read(pp[0], b, 1);
-    ms(300);
+    /* Most often the child waits first and the parent's wait is the one
+       refused; if the child is late, its own wait is: the same pair. */
+    ms(50);
     int r = lk(fd, F_SETLKW, F_WRLCK, 1, 1);
-    printf("6 parent setlkw 1: %s\n", r == -EDEADLK ? "EDEADLK" : r == 0 ? "0" : "other");
-    fflush(stdout);
     lk(fd, F_SETLK, F_UNLCK, 0, 0);
-    n = read(pp[0], b, sizeof b);
-    if (n > 0)
-        fwrite(b, 1, n, stdout);
+    n = read(pp[0], b, sizeof b - 1);
     close(pp[0]);
     waitpid(d, 0, 0);
+    b[n > 0 ? n : 0] = 0;
+    const char *cr = strstr(b, ": ");
+    int rc = cr ? atoi(cr + 2) : 1;
+    printf("6 setlkw 1 and 0: %s\n", (r == -EDEADLK && rc == 0) || (r == 0 && rc == -EDEADLK) ? "one EDEADLK, the other 0" : "other");
 
     /* 7: EINTR */
     lk(fd, F_SETLK, F_WRLCK, 0, 1);
@@ -211,8 +247,11 @@ int main(void) {
         sa.sa_handler = on_alarm;
         sigaction(SIGALRM, &sa, 0);
         int cfd = open_f();
-        alarm(1);
+        struct itimerval it = {{0, 100000}, {0, 100000}};
+        setitimer(ITIMER_REAL, &it, 0);
         int r7 = lk(cfd, F_SETLKW, F_WRLCK, 0, 1);
+        struct itimerval off = {{0, 0}, {0, 0}};
+        setitimer(ITIMER_REAL, &off, 0);
         printf("7 child setlkw with an alarm: %s\n", r7 == -EINTR ? "EINTR" : "other");
         fflush(stdout);
         _exit(0);
@@ -231,24 +270,31 @@ int main(void) {
     /* 9: flock */
     int f1 = open_f();
     printf("9 parent flock ex: %d\n", flock(f1, LOCK_EX) == 0 ? 0 : -errno);
-    if (pipe(pp) != 0)
+    if (pipe(pp) != 0 || pipe(rel) != 0)
         return 2;
     fflush(stdout);
     pid_t g = fork();
     if (g == 0) {
         close(pp[0]);
+        close(rel[1]);
         int cfd = open_f();
         int nb = flock(cfd, LOCK_EX | LOCK_NB) == 0 ? 0 : errno;
+        write(pp[1], "n", 1);
         int bl = flock(cfd, LOCK_EX) == 0 ? 0 : -errno;
-        char c[64];
-        int k = snprintf(c, sizeof c, "9 child nb: %s, blocking: %d\n", nb == EWOULDBLOCK ? "EWOULDBLOCK" : "other", bl);
+        char c[96];
+        int k = snprintf(c, sizeof c, "9 child nb: %s, blocking: %d, after the unlock: %s\n", nb == EWOULDBLOCK ? "EWOULDBLOCK" : "other", bl,
+                         ready(rel[0]) ? "yes" : "no");
         write(pp[1], c, k);
         _exit(0);
     }
     close(pp[1]);
-    ms(300);
+    close(rel[0]);
+    read(pp[0], b, 1);
+    ms(50);
     printf("9 parent unlocks\n");
     fflush(stdout);
+    write(rel[1], "u", 1);
+    close(rel[1]);
     flock(f1, LOCK_UN);
     n = read(pp[0], b, sizeof b);
     if (n > 0)

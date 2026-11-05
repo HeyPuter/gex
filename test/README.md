@@ -33,7 +33,7 @@ Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
 default on PATH; the `gexcc` group's programs run under it, its install's
 `gexcc-exec` given this arch's gexc), `GEX_TEST_GLIB` (a wasm32 GLib install, for
 gexcc/dl-gobject), `GEX_TEST_INNER` (how many of gexcc/programs' programs run at
-once, default 3), `GEX_TEST_SLIM` (a directory with a Debian image,
+once, default 4), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
 /usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
