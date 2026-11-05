@@ -179,6 +179,9 @@ function imageExtent(child) {
  *  210 MiB, and a process exec'd again recompiles every one the page let go. */
 const PAGE_MODULES = 1024;
 const PAGE_MODULE_BYTES = 1024 << 20;
+/** The most late-call modules (`late:`, gex.mjs `lateCalls`) the page keeps
+ *  compiled for its Workers (`#lateModules`): each is a few hundred bytes. */
+const LATE_PAGE_MODULES = 4096;
 /** The most unit modules the page keeps compiled for its Workers (`#cgenModules`). */
 const UNIT_PAGE_MODULES = 4096;
 /** The most unit-cache files the page keeps for its Workers (`#unitFiles`). */
@@ -376,6 +379,12 @@ export class ProcessHost {
   // to the pool as it comes in and to each Worker that starts; the oldest
   // go past UNIT_PAGE_MODULES.
   #cgenModules = new Map();
+  // A wasm32 module's late-bound calls (`late:` keys, gex.mjs `lateCalls`):
+  // their bytes are a function of the key alone, so one compiled is every
+  // Worker's, a fork's child's above all (its process has no cache of its
+  // own yet). Apart from `#pageModules`, whose count they would take; the
+  // oldest go past LATE_PAGE_MODULES.
+  #lateModules = new Map();
   // Units a Worker published and nobody has compiled yet: fetched and
   // compiled here, off the guest's threads (`prefetchUnit`), by key, with
   // the processes that asked for it meanwhile.
@@ -429,7 +438,7 @@ export class ProcessHost {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
     // And the page's translation units (empty unless `extra.unitCache`),
     // less those the Worker was given while it waited in the pool.
-    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries()];
+    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries()];
     const had = w?.[POOLED];
     return [...own, ...(had ? page.filter(([k]) => !had.has(k)) : page)];
   }
@@ -439,7 +448,7 @@ export class ProcessHost {
    *  demo after a few commands; 2.5 ms to clone in, 1.1 ms more in transit
    *  and 0.7 ms to register, of every child's start). */
   #poolModules(w) {
-    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries()];
+    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries(), ...this.#cgenModules.entries(), ...this.#lateModules.entries()];
     w[POOLED] = new Set(entries.map(([k]) => k));
     if (entries.length) w.postMessage({ kind: 'pooledModules', entries });
   }
@@ -1781,6 +1790,11 @@ export class ProcessHost {
         if (typeof m.key === 'string' && (m.key.startsWith('cgen:') || m.key.startsWith('cold:'))) {
           this.#cgenShare(m.key, m.mod, w, String(pid).split(':')[0]);
           break;
+        }
+        if (typeof m.key === 'string' && m.key.startsWith('late:') && !this.#lateModules.has(m.key)) {
+          this.#lateModules.set(m.key, m.mod);
+          this.#poolModule(m.key, m.mod);
+          while (this.#lateModules.size > LATE_PAGE_MODULES) this.#lateModules.delete(this.#lateModules.keys().next().value);
         }
         if (typeof m.key === 'string' && m.key.startsWith('wasm:')) {
           this.#pageModules.delete(m.key);

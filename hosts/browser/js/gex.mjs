@@ -671,7 +671,7 @@ function bindPlan(shape) {
 }
 /** A binding list's `X` lines: [slot, export]. */
 function bindExtra(text) {
-  const [shape, vals] = bindSplit(text);
+  const [shape, vals] = typeof text === 'string' ? bindSplit(text) : text;
   return bindPlan(shape).extra.map(([i, n]) => [Number(vals[i]), n]);
 }
 
@@ -5186,9 +5186,9 @@ export class Gex {
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs),
     // read before its module is compiled: its exports are packed
     // (`packExports`, a separate module key) unless GEX_LOG=nodlpack.
+    // Split once, here, for `#wasmprogBind` too.
     const bindText = wasmprog ? this.#wasmprogBindRead(prov) : '';
-    const xs = [];
-    xs.push(...bindExtra(bindText));
+    const bindParts = wasmprog ? bindSplit(bindText) : null;
     let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
@@ -5202,6 +5202,11 @@ export class Gex {
         } else if (!this.#sharedModules.has(pkey)) {
           const raw = pcopy();
           const t0 = performance.now();
+          // The list's `X` slots, for packing only: made here, where a module
+          // is packed, and nowhere else (an install whose packed module the
+          // page has, a fork's child or a thread, has no use for them; they
+          // were 65 ms of a Plasma fork child's installs).
+          const xs = bindExtra(bindParts);
           pbytes = packExports(raw, xs, base);
           if (logNamed('dlpack')) console.warn(`[dlpack] ${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: ${pbytes ? `${raw.length} -> ${pbytes.length} bytes, ${xs.length} slots` : 'not packed'} in ${(performance.now() - t0).toFixed(1)} ms`);
           if (pbytes) { pkey = `${pkey}:p`; packed = true; } else pbytes = raw;
@@ -5377,7 +5382,7 @@ export class Gex {
       });
     }
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
-    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText) : [];
+    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st, bindText, bindParts) : [];
     // One of Wine's PE modules with imports of the others (a DLL linked as
     // a module of its own, or the core calling into one): its binding list.
     const peMod = wasmdll && !wasmprog && !libprov;
@@ -5976,6 +5981,24 @@ export class Gex {
 
   /** Replay the function table's log this Worker has not seen: installs,
    *  and retirements (back to `resolve`). */
+  /** Table slot `slot`'s function, for an import of a packed module's
+   *  export (`#wasmprogBind`): read once per catch-up (`#slotMemo`). A Plasma
+   *  fork child's installs read 52,922 such slots, 13,221 of them distinct. */
+  #slotFn(st, slot) {
+    const memo = this.#slotMemo;
+    let f = memo?.get(slot);
+    if (f === undefined) {
+      f = st.ftab.get(tIdx(this.#wide, slot));
+      memo?.set(slot, f);
+    }
+    return f;
+  }
+  /** The slots `#slotFn` read during the outermost catch-up running, and the
+   *  end of the highest install it replayed: an install below that end
+   *  (slots used again) or a slot's retirement drops what was read. */
+  #slotMemo = null;
+  #slotMemoEnd = 0;
+
   #cgenCatchUp() {
     const e = this.#shim.exports;
     if (!e.gex_ftab_log_len) return;
@@ -5998,6 +6021,12 @@ export class Gex {
     this.#cgenGrow();
     const timed = logNamed('unitstall');
     const t0 = timed ? performance.now() : 0, from = st.have;
+    const outer = !this.#slotMemo;
+    if (outer) {
+      this.#slotMemo = new Map();
+      this.#slotMemoEnd = 0;
+    }
+    try {
     while (st.have < len) {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
       const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
@@ -6007,6 +6036,9 @@ export class Gex {
         // A provider another Worker is publishing: its record follows its
         // install, and the next catch-up takes it from here.
         if (u >= 0x80000000 && u !== 0xffffffff && e.gex_cgen_pmod_ready && !e.gex_cgen_pmod_ready(u - 0x80000000)) break;
+        const ib = e.gex_ftab_install_base(v) >>> 0, iend = ib + (e.gex_ftab_install_len ? e.gex_ftab_install_len(v) >>> 0 : 0);
+        if (ib < this.#slotMemoEnd) this.#slotMemo.clear();
+        this.#slotMemoEnd = Math.max(this.#slotMemoEnd, iend);
         // Plain units deferred (`#cgenDefer`); providers and JIT modules now.
         if (u !== 0xffffffff) {
           if (u < 0x40000000 && !(SP_CODE && single.on) && e.gex_ftab_install_len) {
@@ -6030,10 +6062,14 @@ export class Gex {
       }
       else if (kind === 2) {
         st.ftab.set(tIdx(this.#wide, v), st.resolve);
+        this.#slotMemo.delete(v);
         if (this.#unitsDeferred.length) this.#unitRetired(v);
       }
       st.have++;
       e.gex_cgen_have(st.have);
+    }
+    } finally {
+      if (outer) this.#slotMemo = null;
     }
     this.#dlSize.value = size;
     if (st.have >= len) this.#raiseIcallLimit(size);
@@ -6157,10 +6193,10 @@ export class Gex {
   /** Apply provider module `prov`'s binding list (cgen/dylink.rs's format)
    *  to `imports`; the table slots to fill with exports after
    *  instantiation, as [slot, name]. */
-  #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov)) {
+  #wasmprogBind(prov, imports, st, text = this.#wasmprogBindRead(prov), parts = null) {
     this.#wasmprogBindText = text;
     if (!text) return [];
-    const [shape, vals] = bindSplit(text);
+    const [shape, vals] = parts ?? bindSplit(text);
     const plan = bindPlan(shape);
     this.#wasmprogTls = plan.tls && [...plan.tls];
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
@@ -6187,7 +6223,7 @@ export class Gex {
           if (x === undefined && from && packed) {
             x = typeof packed === 'string'
               ? new WebAssembly.Global({ value: 'i32', mutable: false }, Number(packed.slice(1)) | 0)
-              : st.ftab.get(tIdx(this.#wide, Number(vals[packed])));
+              : this.#slotFn(st, Number(vals[packed]));
           }
           if (x === undefined) throw new Error(`wasm32 module ${prov}: ${m}.${name}: ${exp} of module ${mod} is not instantiated in this Worker`);
           set(m, name, x);
@@ -6210,11 +6246,19 @@ export class Gex {
       // which the single-thread build's fiber can suspend through, as it
       // cannot through a JS one.
       const late = plan.late.map(([m, name, i, sig]) => [m, name, Number(vals[i]), sig]);
-      const shared = SP_CODE && single.on, key = shared && `${this.#wide ? 'w' : ''}${late.map((l) => `${l[2]}${l[3]}`).join()}`;
-      let mod = shared ? LATE_MODS.get(key) : undefined;
+      // Its bytes are a function of these slots and types alone, so it is
+      // made once per key: in the single-thread build in this realm
+      // (`LATE_MODS`), in the default build on the page (`late:`, relayed
+      // as a program's module is, so a fork's child or a thread has it).
+      const shared = SP_CODE && single.on, key = `${this.#wide ? 'w' : ''}${late.map((l) => `${l[2]}${l[3]}`).join()}`;
+      let mod = shared ? LATE_MODS.get(key) : this.#sharedModules.get(`late:${key}`);
       if (!mod) {
         mod = lateCalls(late, this.#wide);
         if (shared && LATE_MODS.size < LATE_MODS_MAX) LATE_MODS.set(key, mod);
+        else if (!shared) {
+          this.#sharedModules.set(`late:${key}`, mod);
+          this.#offerModule(`late:${key}`, mod, 0);
+        }
       }
       const x = new WebAssembly.Instance(mod, { e: { t: st.ftab } }).exports;
       plan.late.forEach(([m, name], i) => set(m, name, x[i]));
@@ -10657,7 +10701,7 @@ export class Gex {
   #offerModule(key, mod, bytes) {
     // Units go to the page whatever their size: the host keeps them for every
     // process, and a Worker without one fetches its bytes as well.
-    if (!(bytes >= RELAY_MIN_BYTES) && !/^(wasm|cgen|cold):/.test(String(key))) {
+    if (!(bytes >= RELAY_MIN_BYTES) && !/^(wasm|cgen|cold|late):/.test(String(key))) {
       this.#relaySkipped++;
       return;
     }
