@@ -609,19 +609,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gex-difffuzz"
-version = "0.0.1"
-dependencies = [
- "gex-ir",
- "gex-isa",
- "gex-lift",
-]
-
-[[package]]
-name = "gex-difffuzz-x86"
-version = "0.0.1"
-
-[[package]]
 name = "gex-dylink"
 version = "0.0.1"
 dependencies = [
