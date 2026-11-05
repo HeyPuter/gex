@@ -103,6 +103,22 @@ for k, s in enumerate(srcs):
         sys.exit(r)
     objs.append(o)
 
+def ld(cmd, name):
+    """wasm-ld CMD; a direct call whose type is not its callee's fails the
+    link. wasm-ld only warns ("function signature mismatch") and links the
+    call to a stub that traps: a Wine DLL declaring a function apart from
+    its definition (msvcp60's string destructors) traps on the first call."""
+    p = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    sys.stderr.write(p.stderr)
+    if p.returncode:
+        return p.returncode
+    if 'function signature mismatch' in p.stderr:
+        sys.stderr.write('%s: %s: a call through a declaration whose type is not the function\'s '
+                         '(wasm-ld links it to a trap); make the two agree\n' % (name, cmd[cmd.index('-o') + 1]))
+        return 1
+    return 0
+
+
 lib = sysroot + '/lib'
 common = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory',
           '--max-memory=4294967296', '-L' + lib]
@@ -110,7 +126,7 @@ if relocatable:
     # one relocatable object of the inputs (an archive's members only as
     # referenced): a DLL for pelink.py
     cmd = ['wasm-ld', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
-    sys.exit(subprocess.call(cmd))
+    sys.exit(ld(cmd, 'wcc'))
 
 def imports(path):
     """(module, name) of every function import of the module at path."""
@@ -205,7 +221,7 @@ def finish(path):
 if shared:
     cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags + \
         [lib + '/libclang_rt.builtins-wasm32.a']
-    r = subprocess.call(cmd)
+    r = ld(cmd, 'wcc')
     if r:
         sys.exit(r)
     finish(out)
@@ -220,7 +236,7 @@ wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
     libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a'] + \
     ([lib + '/libgex-snap.a'] if SNAPSHOT else [])
-r = subprocess.call(cmd)
+r = ld(cmd, 'wcc')
 if r:
     sys.exit(r)
 finish(wasm)

@@ -123,6 +123,22 @@ for k, s in enumerate(srcs):
         sys.exit(r)
     objs.append(o)
 
+def ld(cmd, name):
+    """wasm-ld CMD; a direct call whose type is not its callee's fails the
+    link. wasm-ld only warns ("function signature mismatch") and links the
+    call to a stub that traps: a Wine DLL declaring a function apart from
+    its definition (msvcp60's string destructors) traps on the first call."""
+    p = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    sys.stderr.write(p.stderr)
+    if p.returncode:
+        return p.returncode
+    if 'function signature mismatch' in p.stderr:
+        sys.stderr.write('%s: %s: a call through a declaration whose type is not the function\'s '
+                         '(wasm-ld links it to a trap); make the two agree\n' % (name, cmd[cmd.index('-o') + 1]))
+        return 1
+    return 0
+
+
 lib = sysroot + '/lib'
 opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
 feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
@@ -132,14 +148,14 @@ if relocatable:
     # one relocatable object of the inputs (an archive's members only as
     # referenced): a DLL for pelink.py, lowered with the whole PE module
     cmd = ['wasm-ld', '-mwasm64', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
-    sys.exit(subprocess.call(cmd))
+    sys.exit(ld(cmd, 'wcc64'))
 if shared:
     # a side module (a DLL's code behind its skeleton), lowered in place
     w64 = out + '.64.wasm'
     cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
            '--max-memory=' + ('17179869184' if mem64 else '4294967296'), '-L' + lib, '-shared', '--no-entry',
            '-o', w64] + objs + ld_in + ld_flags + [lib + '/libclang_rt.builtins-wasm64.a']
-    r = subprocess.call(cmd)
+    r = ld(cmd, 'wcc64')
     if r:
         sys.exit(r)
     r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + ['-O2', '-o', out])
@@ -153,7 +169,7 @@ snap_a = [lib + '/libgex-snap.a'] if SNAPSHOT else []
 cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
        '--max-memory=' + ('17179869184' if mem64 else '4294967296'), '-L' + lib, '-pie', '--no-entry', '-o', w64, lib + '/crt1.o'] + \
     objs + ld_in + ld_flags + [lib + '/libgex.a', '-lc', lib + '/libclang_rt.builtins-wasm64.a'] + snap_a
-r = subprocess.call(cmd)
+r = ld(cmd, 'wcc64')
 if r:
     sys.exit(r)
 # (the snapshot flavour's roots stay apart from the libc's start they
