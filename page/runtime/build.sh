@@ -148,7 +148,10 @@ export default {
             // Each Worker one file, with no imports: a page's bundler builds a
             // Worker as a classic script by default (vite's iife), which
             // cannot import a chunk.
-            rollupOptions: { output: { entryFileNames: '[name]-[hash].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]', codeSplitting: false } } },
+            // (In place of the page's own rolldownOptions, which vite takes
+            // before rollupOptions: with the page's, the Workers would go to
+            // assets/ under the page's names.)
+            rolldownOptions: { output: { entryFileNames: '[name]-[hash].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]', codeSplitting: false } } },
 };
 CFG
 (cd "$WEB" && node_modules/.bin/vite build --config "$CONFIG")
