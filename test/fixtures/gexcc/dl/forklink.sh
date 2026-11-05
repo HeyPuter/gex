@@ -7,7 +7,9 @@
 # same from the child's link, and execs. Forks while another thread dlopens
 # give children whose link is one moment's (taken under the fork's hold).
 # In the browser runtime (run-node), where GEX_LOG=forklink says the child
-# took the link, and natively (gexcc-exec).
+# took the link, and natively (gexcc-exec, the libraries beside the program:
+# its run path is their directory; libc.so from gexcc's sysroot, the host
+# having no wasm32-linux-musl directory of its own).
 #
 #   test/fixtures/gexcc/dl/forklink.sh DIR   (gexcc and node on PATH; GEX_ROOT: a gex
 #                                 checkout with page/public/gex built; DIR: where gex
@@ -37,7 +39,7 @@ done
 printf 'int old_fn(int x) { return x + 1000; }\n' > "$W/old.c"
 printf 'int k1(int);\nint new_fn(int x) { return k1(x) + 2000; }\n' > "$W/new.c"
 build -o "$W/libold.so" "$W/old.c"
-build -o "$W/libnew.so" "$W/new.c" -L"$W" -lk1
+build -o "$W/libnew.so" "$W/new.c" -L"$W" -lk1 -Wl,-rpath,"$W"
 files="$files --file $L/libold.so=$W/libold.so --file $L/libnew.so=$W/libnew.so"
 for i in $(seq 1 $R); do
     { for f in $(seq 1 1500); do printf 'int r%d_%d(int x) { return x + %d; }\n' $i $f $f; done
@@ -147,7 +149,7 @@ int main(int argc, char **argv) {
     return !ok;
 }
 X
-GEXCC_SHARED=1 gexcc -O1 -pthread -o "$W/m" "$W/m.c" -L"$W" $links || { echo "FAIL forklink: build"; exit 1; }
+GEXCC_SHARED=1 gexcc -O1 -pthread -o "$W/m" "$W/m.c" -L"$W" $links -Wl,-rpath,"$W" || { echo "FAIL forklink: build"; exit 1; }
 fail=0
 out=$(GEX_ARCH=$ARCH GEX_SHARED=1 GEX_LOG=forklink timeout "${TMO:-600}" node "$ROOT/hosts/browser/js/run-node.mjs" $files \
     --file "/t/m=$W/m" --cwd /t --argv0 /t/m "$SEED" "$W/m" 2>&1); s=$?
@@ -158,7 +160,7 @@ if [ "$(printf '%s\n' "$res" | tail -1)" = ok ] && [ $s = 0 ] && printf '%s\n' "
 else
     echo "FAIL forklink (browser runtime, exit $s, $took children took the link)"; printf '%s\n' "$out" | grep -v '^\[gex\] loaded' | tail -14; fail=1
 fi
-out=$(cd "$W" && LD_LIBRARY_PATH="$W" GEXCC_SLOTS=0 timeout "${TMO:-600}" gexcc-exec ./m 2>&1); s=$?
+out=$(cd "$W" && LD_LIBRARY_PATH="$(gexcc --print-sysroot)/lib:$W" GEXCC_SLOTS=0 timeout "${TMO:-600}" ./m 2>&1); s=$?
 res=$(printf '%s\n' "$out" | grep -v '^\[' | grep -v '^$')
 if [ "$(printf '%s\n' "$res" | tail -1)" = ok ] && [ $s = 0 ] && printf '%s\n' "$res" | grep -qx 'exec ok'; then
     echo "ok forklink (native)"
