@@ -140,6 +140,8 @@ const RECYCLE_COUNT = 4;
 /** How many spare thread Workers (`#startSpare`) the page keeps waiting at
  *  once; past it the oldest is let go. */
 const SPARE_MAX = 8;
+/** How long output waits for a write numbered before it (`#inOrder`). */
+const OUTPUT_GAP_MS = 200;
 /** How long a spare waits for its thread before it is let go. A process
  *  starts its threads in bursts, which find their spares within seconds;
  *  one that waits longer holds a whole thread's instantiation for a start
@@ -342,6 +344,49 @@ export class ProcessHost {
     const a = new Int32Array(new SharedArrayBuffer(4));
     this.#outputAcks.set(w, a);
     return a.buffer;
+  }
+  /// One counter for every Worker's output (`outputSeq` in worker.mjs): a
+  /// write takes the next number as it happens, and output is delivered in
+  /// that order. Two processes' writes to the page's stdout cross different
+  /// ports, which nothing orders: a child that printed and then wrote to a
+  /// socket could be overtaken by its parent, which read the socket and then
+  /// printed. A number taken whose output never comes (its Worker gone in
+  /// between) holds the rest for OUTPUT_GAP_MS at most.
+  #outputSeq = null;
+  #outputNext = 0;
+  #outputHeld = new Map();
+  #outputGap = null;
+  #outputSeqBuf() {
+    if ((SP_CODE && single.on) || typeof SharedArrayBuffer === 'undefined') return undefined;
+    this.#outputSeq ??= new Int32Array(new SharedArrayBuffer(4));
+    return this.#outputSeq.buffer;
+  }
+  /** `deliver` for output numbered `seq` (none: at once), once all before it are. */
+  #inOrder(seq, deliver) {
+    if (typeof seq !== 'number') {
+      deliver();
+      return;
+    }
+    this.#outputHeld.set(seq, deliver);
+    this.#outputFlush();
+  }
+  #outputFlush() {
+    for (let d; (d = this.#outputHeld.get(this.#outputNext));) {
+      this.#outputHeld.delete(this.#outputNext);
+      this.#outputNext = (this.#outputNext + 1) | 0;
+      d();
+    }
+    if (!this.#outputHeld.size || this.#outputGap) return;
+    this.#outputGap = setTimeout(() => {
+      this.#outputGap = null;
+      if (!this.#outputHeld.size) return;
+      // Past the numbers that never came: on from the first held one.
+      let first = null;
+      for (const s of this.#outputHeld.keys()) if (first === null || ((s - this.#outputNext) | 0) < ((first - this.#outputNext) | 0)) first = s;
+      if (((first - this.#outputNext) | 0) > 0) this.#outputNext = first;
+      this.#outputFlush();
+    }, OUTPUT_GAP_MS);
+    this.#outputGap.unref?.();
   }
   #onOutput; #onFork; #onExit; #readStdin; #onOther;
   #workers = new Map();
@@ -1620,6 +1665,7 @@ export class ProcessHost {
             closureCount: (closure ?? []).length,
             ...msg,
             outputAck: this.#outputAck(w),
+            outputSeq: this.#outputSeqBuf(),
             kernelStack: this.#stackFor(w, pid),
             // Compiled once here, not from bytes in every Worker.
             shim: rt.shim,
@@ -1706,13 +1752,15 @@ export class ProcessHost {
         this.#preattachOne();
         break;
       case 'output': {
-        this.#onOutput(m.fd, m.text, pid, m);
-        // Delivered: the Worker may now let its exit be seen.
-        const a = this.#outputAcks.get(w);
-        if (a) {
-          Atomics.add(a, 0, 1);
-          Atomics.notify(a, 0);
-        }
+        this.#inOrder(m.seq, () => {
+          this.#onOutput(m.fd, m.text, pid, m);
+          // Delivered: the Worker may now let its exit be seen.
+          const a = this.#outputAcks.get(w);
+          if (a) {
+            Atomics.add(a, 0, 1);
+            Atomics.notify(a, 0);
+          }
+        });
         break;
       }
       case 'droppedModules': {

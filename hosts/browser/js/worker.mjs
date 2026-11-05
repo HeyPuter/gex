@@ -491,6 +491,8 @@ async function handle(msg) {
   // says it has delivered (a shared counter it bumps per message).
   let outputSent = 0;
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
+  // The page's order of writes (host.mjs `#inOrder`): a number per write, taken as it happens.
+  const outputSeq = msg.outputSeq ? new Int32Array(msg.outputSeq) : null;
   // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
   const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
   // `closed` (an ejected page's units archive): the page fetched every unit
@@ -544,10 +546,11 @@ async function handle(msg) {
       // A page wants text; a command line wants the bytes: `gzip -c` writes a
       // deflate stream that a UTF-8 round trip would fill with U+FFFD.
       outputSent++;
+      const seq = outputSeq ? Atomics.add(outputSeq, 0, 1) : undefined;
       port.post(
         msg.rawOutput
-          ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag }
-          : { kind: 'output', fd, text: utf8(bytes.slice()), lflag: lastLflag },
+          ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag, seq }
+          : { kind: 'output', fd, text: utf8(bytes.slice()), lflag: lastLflag, seq },
       );
     }
     now() {
