@@ -31,18 +31,23 @@ export { ROOT };
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'wow64');
 /** The loader, in the install. */
 export const LOADER = 'lib/wine/x86_64-unix/wine';
+// A run's lines saying why a process died: the runtime's, and Wine's fatal ones.
+const DEATH = /^\[gex\] pid \d+ killed by|^\[gex\] pid \d+: a vfork child|gex: (process|thread) \S+ failed|panicked at|RuntimeError|RangeError/;
+const WINE_FATAL = /^wine: |wineserver: |:err:(process|module|virtual|server|sync):/;
 /** Wine's environment for a WoW64 process (without WINEGEX_WOW64 the server takes no i386 process). */
 export const WINE_ENV = { WINEGEX_WOW64: '1', WINEDEBUG: 'err+all,fixme-all' };
 
 let runs = 0;
 
-/** `argv` with stdout and stderr in one file, in the order written (`2>&1`):
- *  `{ code, out, timedOut }`, `code` as a shell gives it. */
-export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file } = {}) {
+/** `argv` with stdout and stderr in one file, in the order written (`2>&1`),
+ *  and `input` (if given) on stdin: `{ code, out, timedOut }`, `code` as a
+ *  shell gives it. */
+export function run(argv, { cwd = ROOT, env = process.env, timeout = 300000, file, input } = {}) {
   return new Promise((resolve) => {
     const fd = openSync(file, 'w');
-    const p = spawn(argv[0], argv.slice(1), { cwd, env, stdio: ['ignore', fd, fd] });
+    const p = spawn(argv[0], argv.slice(1), { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', fd, fd] });
     closeSync(fd);
+    if (input !== undefined) { p.stdin.on('error', () => {}); p.stdin.end(input); }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, timeout);
     p.on('error', (e) => { clearTimeout(timer); resolve({ code: 127, out: String(e.message), timedOut }); });
@@ -212,6 +217,10 @@ export function wow64(t, { mono = false } = {}) {
   const distSrc = env.GEX_TEST_WOW64_DIST || t.skip('GEX_TEST_WOW64_DIST: a WINE64_WOW64=1 install (wine/dist.sh)');
   const pfxSrc = env.GEX_TEST_WOW64_PREFIX || t.skip('GEX_TEST_WOW64_PREFIX: its WoW64 prefix');
   if (!existsSync(join(distSrc, 'lib/wine/i386-windows'))) t.skip(`${distSrc} has no lib/wine/i386-windows (WINE64_WOW64=1)`);
+  // wine/dist.sh's WINE64_PREFIX, the session prefix: the bare wineboot
+  // prefix beside it has no display driver, and no window opens
+  if (!existsSync(join(pfxSrc, 'drive_c/windows/syswow64/winewayland.drv')))
+    throw new Error(`${pfxSrc} has no syswow64/winewayland.drv: not wine/dist.sh's WINE64_PREFIX (pfs64-*), the session prefix`);
   const monoSrc = mono ? (env.GEX_TEST_WOW64_MONO || t.skip('GEX_TEST_WOW64_MONO: Wine Mono, both halves, unpacked')) : null;
   const gexc = env.GEXC_X86 || env.GEXC || join(ROOT, 'target/x86/release/gexc');
   const mingw = g.tool('i686-w64-mingw32-gcc');
@@ -243,15 +252,18 @@ export function wow64(t, { mono = false } = {}) {
     work,
     gexc,
     loader: join(dist, LOADER),
-    /** fixtures/wow64/NAME.c built with i686-w64-mingw32-gcc (-O1, `flags`,
-     *  then `libs`; `x64`: x86_64-w64-mingw32-gcc instead). */
-    async mingw(name, { flags = [], libs = [], out = `${name}.exe`, x64 = false } = {}) {
+    /** fixtures/wow64/NAME.c (`src`: another source) built with
+     *  i686-w64-mingw32-gcc (-O1, `flags`, then `libs`; `x64`:
+     *  x86_64-w64-mingw32-gcc instead). */
+    async mingw(name, { flags = [], libs = [], out = `${name}.exe`, x64 = false, src = join(FIXTURES, `${name}.c`) } = {}) {
       const exe = join(work, out);
-      const r = await run([x64 ? g.tool('x86_64-w64-mingw32-gcc') : mingw, '-O1', ...flags, '-o', exe, join(FIXTURES, `${name}.c`), ...libs], { file: `${exe}.log` });
+      const r = await run([x64 ? g.tool('x86_64-w64-mingw32-gcc') : mingw, '-O1', ...flags, '-o', exe, src, ...libs], { file: `${exe}.log` });
       if (r.code !== 0) throw new Error(`mingw ${name}: ${r.out.trim().split('\n').slice(-5).join(' / ')}`);
       return exe;
     },
     pfx,
+    /** A host tool's path (a skip without it). */
+    tool: g.tool,
     /** Whether the i386 side is native wasm32 (i386-windows/winepe.wasm), as
      *  32-bit Wine's is, not translated. */
     i386Native: existsSync(join(dist, 'lib/wine/i386-windows/winepe.wasm')),
@@ -290,20 +302,23 @@ export function wow64(t, { mono = false } = {}) {
     /**
      * Wine on gexc with `args` (after the loader): in a copy of the prefix
      * (`prefix`: another to copy) with `files` in C:\ and `userReg` added
-     * to its user.reg, from its drive_c (or `cwd`). `wineEnv` on top of
+     * to its user.reg (`setup`: called with its path, then), from its
+     * drive_c (or `cwd`). `wineEnv` on top of
      * WINE_ENV (each a --env), `flags` gexc run's own (`wayland`: a
      * compositor of its own, no output), `env` gexc's, `loader` another
      * loader. A skip when gexc is not built. Resolves run's result plus
      * `pfx`, the prefix it used.
      */
-    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native' } = {}) {
+    async native(args, { files = {}, wineEnv = {}, flags = [], env: more = {}, prefix: from = prefix, userReg, setup, wayland = false, loader = w.loader, cwd, timeout = 300000, name = 'native' } = {}) {
       if (!existsSync(gexc)) t.skip(`${gexc} is not built`);
       const p = pfx(`${name}-pfx`, files, { userReg, from });
+      await setup?.(p);
       if (wayland) {
         const wl = join(work, `${name}-wl`);
         rmSync(wl, { recursive: true, force: true });
         mkdirSync(wl);
-        flags = [...flags, '--wayland', wl, '--wayland-size', '640x480', '--wayland-out', 'null'];
+        // (--wayland names the socket, in a directory of the run's own)
+        flags = [...flags, '--wayland', join(wl, 'wayland-0'), '--wayland-size', '640x480', '--wayland-out', 'null'];
       }
       const we = { WINEPREFIX: p, ...WINE_ENV, ...wineEnv };
       const argv = [gexc, 'run', ...flags, ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]), loader, ...args.map(String)];
@@ -315,16 +330,19 @@ export function wow64(t, { mono = false } = {}) {
     },
     /**
      * Wine on the page's x86 shared shim with `args`: the install at
-     * /wine32 (`dist`: another), a copy of the prefix at /pfx with
-     * `pfxFiles` in drive_c and `userReg` added to its user.reg, an empty /t, `files` (`{ guest path: host path
+     * /wine32 (`dist`: another; `loader`: the host's loader, by default
+     * the install's), a copy of the prefix at /pfx with
+     * `pfxFiles` in drive_c and `userReg` added to its user.reg (`setup`:
+     * called with its path, then), an empty /t, `files` (`{ guest path: host path
      * }`), `dirs` more (`{ guest: host }`), `flags` run-node's own (before
      * the seed), `wineEnv` on top of WINE_ENV, `env` node's, `cwd` the
      * guest's (default /t). Resolves run's result plus `pfx`.
      */
-    async page(args, { files = {}, pfxFiles = {}, userReg, dirs = {}, flags = [], wineEnv = {}, env: more = {}, dist: d = dist, cwd = '/t', timeout = 300000, name = 'page' } = {}) {
+    async page(args, { files = {}, pfxFiles = {}, userReg, dirs = {}, flags = [], wineEnv = {}, env: more = {}, dist: d = dist, loader: ld, cwd = '/t', setup, timeout = 300000, name = 'page' } = {}) {
       const seed = g.pub('seed.x86.shared.wasm');
       g.pub('gex_browser.x86.shared.wasm');
       const p = pfx(`${name}-pfx`, pfxFiles, { userReg });
+      await setup?.(p);
       const tdir = join(work, `${name}-t`);
       rmSync(tdir, { recursive: true, force: true });
       mkdirSync(tdir);
@@ -334,12 +352,20 @@ export function wow64(t, { mono = false } = {}) {
         ...Object.entries(dirs).flatMap(([to, from]) => ['--dir', `${to}=${from}`]),
         ...Object.entries(files).flatMap(([to, from]) => ['--file', `${to}=${from}`]),
         ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]),
-        '--cwd', cwd, '--argv0', `/wine32/${LOADER}`, ...flags, seed, join(d, LOADER), ...args.map(String)];
+        '--cwd', cwd, '--argv0', `/wine32/${LOADER}`, ...flags, seed, ld ?? join(d, LOADER), ...args.map(String)];
       const r = await run(argv, { cwd: ROOT, env: { ...base, GEX_ARCH: 'x86', GEX_SHARED: '1', ...more }, timeout, file: join(work, `${name}.log`) });
       return { ...r, pfx: p };
     },
     /** A run's last lines for a FAIL, without the host's. */
-    detail: (r, n = 8) => `${r.timedOut ? 'timed out; ' : ''}exit ${r.code}: ${r.out.split('\n').filter((l) => l && !/^\[host\]|gex-console-error/.test(l)).slice(-n).join(' / ')}`,
+    detail: (r, n = 8) => {
+      const lines = r.out.split('\n');
+      // why a process died, when one did: the runtime's own death lines
+      // first, else Wine's last fatal ones
+      const dead = lines.filter((l) => DEATH.test(l)).slice(0, 2);
+      const why = (dead.length ? dead : lines.filter((l) => WINE_FATAL.test(l)).slice(-2)).map((l) => l.slice(0, 300));
+      return [`${r.timedOut ? 'timed out; ' : ''}exit ${r.code}`, ...why.map((l) => `why: ${l}`),
+        ...lines.filter((l) => l && !/^\[host\]|gex-console-error/.test(l)).slice(-n)].join(' / ');
+    },
     /** This test's runs gone (the shared install and prefix stay), unless a check failed. */
     clean() {
       if (failed) t.say(`runs kept: ${work}`);
@@ -369,5 +395,29 @@ export async function legs(t, name, { want, args = [], build = {}, native = {}, 
     const r = await w.page([`/t/${name}.exe`, ...args], { files: { [`/t/${name}.exe`]: exe }, ...page });
     t.check(`page: ${want.source}`, want.test(r.out), w.detail(r));
   }
+  w.clean();
+}
+
+/**
+ * The legs of a program with a unit: fixtures/wow64/NAME.c built, its unit
+ * (precompiled and guarded) in a cache with the provider modules and a
+ * cache of the provider modules alone; then natively with its unit, on the
+ * page with its unit (which must be the one that ran) and on the page on
+ * tier-1 (the cache without it), each with `args` and checked for `want`.
+ */
+export async function unitLegs(t, name, { want, args = [], build = {}, timeout = 300000 } = {}) {
+  const w = wow64(t);
+  const exe = await w.mingw(name, build);
+  const units = await w.unit(exe, await w.providers(join(w.work, 'units')));
+  const tier1 = await w.providers(join(w.work, 'units-t1'));
+  const n = await w.native([`C:\\${name}.exe`, ...args], { files: { [`${name}.exe`]: exe }, env: { GEX_CGEN_CACHE: units }, timeout });
+  t.check(`native: ${want.source}`, want.test(n.out), w.detail(n));
+  const page = (cache, leg) => w.page([`/t/${name}.exe`, ...args], { files: { [`/t/${name}.exe`]: exe }, flags: ['--cgen-prefer'],
+    env: { GEX_LOG: 'unit', GEX_CGEN_CACHE: cache }, timeout, name: leg });
+  const p = await page(units, 'page');
+  t.check('page: ran with its unit', new RegExp(`function tier for .*/${name}\\.exe`).test(p.out), w.detail(p));
+  t.check(`page: ${want.source}`, want.test(p.out), w.detail(p));
+  const p1 = await page(tier1, 'page-t1');
+  t.check(`page, tier-1: ${want.source}`, want.test(p1.out), w.detail(p1));
   w.clean();
 }

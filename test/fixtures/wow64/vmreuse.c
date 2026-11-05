@@ -4,7 +4,7 @@
  * soon another thread's with other code in it. The NT layer's free and its
  * retire of the old translations are separate kernel-lock sections; the
  * call must still return the value just written (docs/kernel-locking.md
- * §4.3, L12b). Prints "vmreuse ok N". */
+ * §4.3). Prints "vmreuse ok N". */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>

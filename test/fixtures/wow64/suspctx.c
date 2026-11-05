@@ -1,5 +1,5 @@
 /* Another thread's context, with its x87/SSE state, while the thread runs
- * guest code (H: 32-bit Wine's suspend path published only the integer, control and
+ * guest code (32-bit Wine's suspend path published only the integer, control and
  * segment registers, so the floating-point state came back as zeros). A
  * thread spins in a loop that touches no FP register, with xmm0-xmm7 and
  * MXCSR holding known values; another suspends it again and again and reads

@@ -1,6 +1,6 @@
 /* rewind() from ucrtbase on 32-bit Wine (test/wow64/rewind). ucrtbase's i386 rewind
  * export is rewind_preserve_stack, which the wasm32 build lacked: the call
- * trapped (Hades x86, 2026-10-16). The FILE must be ucrtbase's own, so every
+ * trapped (a game's x86 run). The FILE must be ucrtbase's own, so every
  * call goes through ucrtbase's exports. Writes a temporary file, reads to EOF,
  * rewinds, reads again. Prints "rewind ok". */
 #include <windows.h>
