@@ -3701,17 +3701,59 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     if NO_BLOCK.with(|b| b.get()) {
         return false;
     }
-    let mut secs = 0u32;
+    // Traced ([`k_fs_pending_trace`]): in 10 ms slices, each wait kept.
+    let traced = PENDING_TRACE.load(core::sync::atomic::Ordering::Relaxed);
+    let (slice, per_sec) = if traced { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
+    let start = traced.then(|| (rootfs().pending_path(ino), FILLED.load(core::sync::atomic::Ordering::Relaxed)));
+    let mut n = 0u32;
     while word.load(Acquire) == gex_kernel::vfs::tmpfs::PENDING {
         // SAFETY: the word is in this module's shared memory, and lives as
         // long as the file node the caller holds.
-        unsafe { core::arch::wasm32::memory_atomic_wait32(word as *const _ as *mut i32, gex_kernel::vfs::tmpfs::PENDING as i32, 1_000_000_000) };
-        secs += 1;
-        if secs == 30 {
+        unsafe { core::arch::wasm32::memory_atomic_wait32(word as *const _ as *mut i32, gex_kernel::vfs::tmpfs::PENDING as i32, slice) };
+        n += 1;
+        if n == 30 * per_sec {
             PENDING_LONG.store(ino, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    if let Some((path, at)) = start {
+        let path = path.unwrap_or_else(|| format!("inode {ino}"));
+        let line = format!("{}\t{}\t{}\n", n * (1000 / per_sec), at, path);
+        PENDING_WAITS.lock().unwrap_or_else(|e| e.into_inner()).push_str(&line);
+    }
     true
+}
+
+/// [`k_fs_pending_trace`] on.
+static PENDING_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Bytes [`k_fs_fill`] has laid: where in the bundle a wait began.
+static FILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The traced waits not yet read ([`k_fs_pending_waits`]).
+static PENDING_WAITS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Debug (`?boottrace=1`): every wait for a pending file kept, as a line
+/// `MS\tFILLED\tPATH` (FILLED: the bundle's bytes laid when it began), and
+/// a wait woken every 10 ms to time it.
+#[no_mangle]
+pub extern "C" fn k_fs_pending_trace(on: i32) -> i32 {
+    PENDING_TRACE.store(on != 0, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// The traced waits since the last call, into `at` (as many whole lines as
+/// fit in `cap`); their length.
+#[no_mangle]
+pub extern "C" fn k_fs_pending_waits(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let mut w = PENDING_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0;
+    for l in w.split_inclusive('\n') {
+        if n + l.len() > cap as usize {
+            break;
+        }
+        n += l.len();
+    }
+    unsafe { gex_kmem::push_checked(at, w.as_ptr(), n as u32) };
+    w.drain(..n);
+    n as i32
 }
 
 fn pending_wake(word: &core::sync::atomic::AtomicU32) {
@@ -3737,6 +3779,7 @@ pub extern "C" fn k_fs_fill(path: gex_kmem::PAddr, path_len: u32, offset: u64, a
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
+    FILLED.fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
     if rootfs().fill_pending(&p, offset, &buf) {
         return 0;
     }

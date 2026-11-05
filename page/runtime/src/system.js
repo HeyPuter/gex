@@ -280,13 +280,30 @@ export class System extends EventTarget {
    *  use has waited 30 s for, named. */
   #watchRest(k, rest) {
     let tick = null;
+    // Every wait for a file still to come, at the end: its ms, the bundle's
+    // bytes laid when it began, its path.
+    const waits = !!this.#opts.debug.boottrace && k.has('k_fs_pending_trace');
+    if (waits) k.r('k_fs_pending_trace', 1).catch(() => {});
+    const sayWaits = async () => {
+      if (!waits) return;
+      let all = '';
+      for (;;) {
+        const { r, out: [b] } = await k.call('k_fs_pending_waits', { out: 65536 }).catch(() => ({ r: 0, out: [] }));
+        if (r <= 0) break;
+        all += new TextDecoder().decode(b.subarray(0, r));
+      }
+      const rows = all.split('\n').filter(Boolean).map((l) => l.split('\t'));
+      const ms = rows.reduce((n, [w]) => n + Number(w), 0);
+      console.warn(`[boot] ${rows.length} waits for files still to come, ${ms} ms in all`);
+      for (const [w, at, p] of rows) console.warn(`[boot] wait ${w} ms at ${(Number(at) / 1048576).toFixed(1)} MiB laid: ${p}`);
+    };
     if (this.#opts.debug.boottrace && k.has('k_fs_pending_long')) {
       tick = setInterval(async () => {
         const { r, out: [b] } = await k.call('k_fs_pending_long', { out: 4096 }).catch(() => ({ r: 0, out: [] }));
         if (r > 0) console.warn(`[boot] waited 30 s for ${new TextDecoder().decode(b.subarray(0, r))}; ${await k.r('k_fs_pending_count').catch(() => '?')} files still to come`);
       }, 5000);
     }
-    rest.then(() => this.#mark('files laid'), (e) => {
+    rest.then(() => { this.#mark('files laid'); return sayWaits(); }, (e) => {
       if (this.#state.phase === 'stopped' || this.#state.phase === 'failed') return;
       console.error(`gex: the bundle failed while the system ran: ${e?.message ?? e}`);
       this.#state.phase = 'failed';
