@@ -371,19 +371,30 @@ export class ProcessHost {
     this.#outputFlush();
   }
   #outputFlush() {
+    let moved = false;
     for (let d; (d = this.#outputHeld.get(this.#outputNext));) {
       this.#outputHeld.delete(this.#outputNext);
       this.#outputNext = (this.#outputNext + 1) | 0;
       d();
+      moved = true;
+    }
+    // The wait is for the number now first missing: one that came starts it again.
+    if (moved && this.#outputGap) {
+      clearTimeout(this.#outputGap);
+      this.#outputGap = null;
     }
     if (!this.#outputHeld.size || this.#outputGap) return;
+    // Held output is what arrived within OUTPUT_GAP_MS of the gap: a Worker
+    // writing fast meanwhile is held no longer than that.
     this.#outputGap = setTimeout(() => {
       this.#outputGap = null;
       if (!this.#outputHeld.size) return;
       // Past the numbers that never came: on from the first held one.
       let first = null;
       for (const s of this.#outputHeld.keys()) if (first === null || ((s - this.#outputNext) | 0) < ((first - this.#outputNext) | 0)) first = s;
-      if (((first - this.#outputNext) | 0) > 0) this.#outputNext = first;
+      const lost = (first - this.#outputNext) | 0;
+      if (logNamed('output')) console.warn(`[output] writes ${this.#outputNext}..${(first - 1) | 0} never came in ${OUTPUT_GAP_MS} ms (${lost} lost); ${this.#outputHeld.size} held go on`);
+      if (lost > 0) this.#outputNext = first;
       this.#outputFlush();
     }, OUTPUT_GAP_MS);
     this.#outputGap.unref?.();
