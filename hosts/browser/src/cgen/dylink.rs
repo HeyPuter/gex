@@ -56,9 +56,70 @@ struct DyProc {
     /// How many of the modules the program started with: libc's registry
     /// gives those their thread-local blocks, gex the ones `dlopen` added.
     startup: usize,
+    /// Each module's table slots (`Info::slots`), kept for a fork's child,
+    /// which may not have parsed the module ([`DyProc::lazy`]).
+    slot_len: Vec<u32>,
+    /// libc's place in the link map and its `__gex_start` and
+    /// `__gex_thread_start` slots (past its table base).
+    entry_slots: Option<(usize, u32, u32)>,
+    /// A fork's child that took its parent's link ([`adopt_inherited`]):
+    /// every library's `Info` but the program's is a placeholder, parsed
+    /// from its file at the first `dlopen` or `dlsym` ([`DyProc::infos`]).
+    lazy: bool,
+}
+
+impl DyProc {
+    /// Every module's `Info`, parsed now if this is a fork's child that took
+    /// them on trust ([`DyProc::lazy`]): before anything looks a symbol up or
+    /// links another module in.
+    fn infos(&mut self) -> Result<(), String> {
+        if !self.lazy {
+            return Ok(());
+        }
+        for m in self.link.mods.iter_mut().skip(1) {
+            let b = read(&m.path).ok_or_else(|| format!("{}: gone since the fork", m.path))?;
+            m.info = Info::parse(&b).map_err(|e| format!("{}: {e:#}", m.path))?;
+        }
+        // (built from the placeholders' empty exports if anything had asked)
+        self.link.scope = Default::default();
+        self.lazy = false;
+        Ok(())
+    }
 }
 
 static DYPROC: Mutex<Option<DyProc>> = Mutex::new(None);
+
+thread_local! {
+    /// [`DYPROC`] held by this thread from its fork's hold until its memory
+    /// is copied ([`fork_hold`]): the link map the child gets is the one its
+    /// memory has, with no `dlopen` on another thread halfway between.
+    static FORK_HELD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, Option<DyProc>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `gex_fork_hold`, once the process's other threads are out of guest code:
+/// this thread takes the link map's lock until [`fork_release`] (one in a
+/// `dlopen` finishes it first).
+pub(super) fn fork_hold() {
+    let g = lock(&DYPROC);
+    FORK_HELD.with(|h| *h.borrow_mut() = Some(g));
+}
+
+/// The fork's memory is copied: the link map's lock goes.
+pub(super) fn fork_release() {
+    let g = FORK_HELD.with(|h| h.borrow_mut().take());
+    drop(g);
+}
+
+/// The link map, through the lock this thread holds for its fork if it
+/// does ([`fork_hold`]): taking it again would wait for itself.
+fn dy<R>(f: impl FnOnce(&mut Option<DyProc>) -> R) -> R {
+    let mut f = Some(f);
+    let held = FORK_HELD.with(|h| h.borrow_mut().as_mut().map(|g| (f.take().unwrap())(g)));
+    match held {
+        Some(r) => r,
+        None => (f.take().unwrap())(&mut lock(&DYPROC)),
+    }
+}
 
 /// A binding list's `#` columns, in order: its `V` line.
 #[derive(Default)]
@@ -191,6 +252,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
         m.memory_base = base as u32;
     }
     let order = p.link.init_order(from);
+    p.slot_len.resize(p.link.mods.len(), 0);
     if !keep {
         let mut next = ftab(|m| m.size());
         for &i in &order {
@@ -207,6 +269,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
     let mut bytes: Vec<Option<Bytes>> = bytes.into_iter().map(Some).collect();
     let mut done: HashSet<usize> = (0..from).collect();
     let mut libc_number = None;
+    let (mut lens, mut entry_slots) = (Vec::new(), None);
     for &i in &order {
         let binds = p.link.bind(i, &done).map_err(|e| format!("{e:#}"))?;
         done.insert(i);
@@ -219,6 +282,10 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             }
             _ => Vec::new(),
         };
+        lens.push((i, len));
+        if let [(_, s0), (_, s1)] = pairs[..] {
+            entry_slots = Some((i, s0, s1));
+        }
         let (regs, dirs, slots) = if pairs.is_empty() {
             (Vec::new(), Vec::new(), 0)
         } else {
@@ -310,6 +377,12 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
             CURRENT_BASE.store(m.table_base, Ordering::Relaxed);
         }
     }
+    for (i, len) in lens {
+        p.slot_len[i] = len;
+    }
+    if entry_slots.is_some() {
+        p.entry_slots = entry_slots;
+    }
     if std::env::var_os("GEX_WASM_TRACE").is_some() || crate::tracing() {
         for &i in &order {
             let m = &p.link.mods[i];
@@ -359,6 +432,9 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
         ldpath,
         origin,
         startup: usize::MAX,
+        slot_len: Vec::new(),
+        entry_slots: None,
+        lazy: false,
     };
     let mut bytes = vec![(wasm, None)];
     bytes.extend(find_needed(&mut p, 0)?);
@@ -367,7 +443,7 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
     let libc = libc.ok_or("no libc")?;
     let li = p.module_of.iter().position(|&n| n == libc).unwrap();
     *lock(&REGISTRY) = Some((order, li));
-    *lock(&DYPROC) = Some(p);
+    dy(|d| *d = Some(p));
     Ok(libc)
 }
 
@@ -404,19 +480,23 @@ pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base
     }
     vals.end(&mut text);
     lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
-    *lock(&DYPROC) = Some(DyProc {
+    let slots = info.slots().0;
+    dy(|d| *d = Some(DyProc {
         link: Link { mods: vec![Loaded { name: path.to_string(), path: path.to_string(), info, memory_base: mem_base, table_base: base }], ..Default::default() },
         module_of: vec![number],
         ldpath: Vec::new(),
         // (its directory: where `dlopen` finds a bare soname, `Link::dlopen_runpath`)
         origin: path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d }.to_string()).unwrap_or_else(|| ".".into()),
         startup: 1,
-    });
+        slot_len: vec![slots],
+        entry_slots: None,
+        lazy: false,
+    }));
 }
 
 /// `execve` (`wasmprog::on_exec`): the old program's link map goes with it.
 pub(super) fn on_exec() {
-    *lock(&DYPROC) = None;
+    dy(|d| *d = None);
     *lock(&BINDS) = None;
     DL_NEW.with(|d| d.borrow_mut().clear());
     *lock(&ADOPT) = None;
@@ -428,7 +508,7 @@ pub(super) fn on_exec() {
 pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32, String> {
     let text = lock(&ADOPT).take().ok_or("a fork's child of a program with shared libraries, without its link map")?;
     let _ = exe_path();
-    let mut lines = text.lines();
+    let mut lines = text.splitn(4, '\n');
     let origin = lines.next().and_then(|l| l.strip_prefix("origin\t")).ok_or("link map: no origin")?.to_string();
     let ldpath = lines
         .next()
@@ -443,9 +523,25 @@ pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32,
         .and_then(|l| l.strip_prefix("startup\t"))
         .and_then(|n| n.parse().ok())
         .ok_or("link map: no startup count")?;
-    let mut p = DyProc { link: Link::default(), module_of: Vec::new(), ldpath, origin, startup };
+    let rest = lines.next().unwrap_or("");
+    let mut p = DyProc { link: Link::default(), module_of: Vec::new(), ldpath, origin, startup, slot_len: Vec::new(), entry_slots: None, lazy: false };
+    // The modules' lines, then what the parent had made of them, if it said.
+    let (mods, inherited) = match rest.split_once("\ninherit\t") {
+        Some((m, i)) => (m, Some(i)),
+        None => (rest.strip_suffix('\n').unwrap_or(rest), None),
+    };
+    if let Some(inh) = inherited {
+        match adopt_inherited(&mut p, mods, inh, &wasm, entry, thread_entry) {
+            Ok(Some(libc)) => {
+                dy(|d| *d = Some(p));
+                return Ok(libc);
+            }
+            Ok(None) => p.link = Link::default(),
+            Err(e) => return Err(e),
+        }
+    }
     let mut bytes = Vec::new();
-    for (k, l) in lines.enumerate() {
+    for (k, l) in mods.lines().enumerate() {
         let f: Vec<&str> = l.splitn(4, '\t').collect();
         let [mb, tb, name, path] = f[..] else { return Err(format!("link map: bad line {l:?}")) };
         let b = if k == 0 { checked(wasm.clone()) } else { read(path).ok_or_else(|| format!("{path}: gone since the fork"))? };
@@ -456,8 +552,140 @@ pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32,
         bytes.push(if shed.is_some() { (Vec::new(), shed) } else { (b, None) });
     }
     let (_, libc) = publish(&mut p, 0, bytes, false, true, Some((entry, thread_entry)))?;
-    *lock(&DYPROC) = Some(p);
+    dy(|d| *d = Some(p));
     libc.ok_or_else(|| "no libc".into())
+}
+
+/// One module of a fork's parent, as [`gex_wasmprog_link`] says it: its
+/// provider module number, table slots, the program record's facts and
+/// its binding list.
+struct Inherited<'a> {
+    index: usize,
+    number: u32,
+    slots: u32,
+    lowered: bool,
+    len: u32,
+    key: Option<(u64, u64)>,
+    gone: Option<(u64, i64, u64)>,
+    binds: &'a str,
+}
+
+/// [`adopt`] from what the parent had made of its link map: its modules'
+/// binding lists and records, at its module numbers, so the child reads,
+/// parses and binds none of its libraries (266 of them, 248 MB, were 287 ms
+/// of every fork of Plasma's shell before its first instruction). Their
+/// `Info`s wait for a `dlopen` or `dlsym` ([`DyProc::infos`]). `Ok(None)`:
+/// this child cannot number them as the parent did (a provider of its own
+/// already there), and binds them itself.
+fn adopt_inherited(p: &mut DyProc, mods: &str, inh: &str, wasm: &[u8], entry: u64, thread_entry: u64) -> Result<Option<u32>, String> {
+    if CHECKED.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let bad = || "link map: bad inherited section".to_string();
+    let (head, mut rest) = inh.split_once('\n').ok_or_else(bad)?;
+    let h: Vec<&str> = head.split('\t').collect();
+    let [li, s0, s1] = h[..] else { return Err(bad()) };
+    let num = |s: &str| s.parse::<u64>().map_err(|_| format!("link map: bad number {s:?}"));
+    let entry_slots = (num(li)? as usize, num(s0)? as u32, num(s1)? as u32);
+    let pair = |s: &str| -> Result<Option<Vec<u64>>, String> {
+        if s == "-" {
+            return Ok(None);
+        }
+        s.split(':').map(|x| x.parse::<i64>().map(|v| v as u64).map_err(|_| bad())).collect::<Result<Vec<_>, _>>().map(Some)
+    };
+    let mut list = Vec::new();
+    while !rest.is_empty() {
+        let (line, after) = rest.split_once('\n').ok_or_else(bad)?;
+        let f: Vec<&str> = line.split('\t').collect();
+        let ["P", index, number, slots, lowered, len, key, gone, blen] = f[..] else { return Err(bad()) };
+        let blen = num(blen)? as usize;
+        let binds = after.get(..blen).ok_or_else(bad)?;
+        rest = &after[blen..];
+        list.push(Inherited {
+            index: num(index)? as usize,
+            number: num(number)? as u32,
+            slots: num(slots)? as u32,
+            lowered: lowered == "1",
+            len: num(len)? as u32,
+            key: pair(key)?.map(|v| (v[0], v[1])),
+            gone: pair(gone)?.map(|v| (v[0], v[1] as i64, v[2])),
+            binds,
+        });
+    }
+    // The parent's numbers, in order from where this child's next one is:
+    // its binding lists name modules by them.
+    let first = lock(&PROVIDERS).len() as u32;
+    if list.iter().enumerate().any(|(k, m)| m.number != first + k as u32) {
+        return Ok(None);
+    }
+    for (k, l) in mods.lines().enumerate() {
+        let f: Vec<&str> = l.splitn(4, '\t').collect();
+        let [mb, tb, name, path] = f[..] else { return Err(format!("link map: bad line {l:?}")) };
+        // the program's own, from its image (`gex_wasmprog_link` says
+        // whether it names libraries); the rest from their files when asked
+        let info = if k == 0 { Info::parse(wasm).map_err(|e| format!("{path}: {e:#}"))? } else { Info::default() };
+        p.link.mods.push(Loaded { name: name.to_string(), path: path.to_string(), info, memory_base: num(mb)? as u32, table_base: num(tb)? as u32 });
+    }
+    let n = p.link.mods.len();
+    if list.len() != n || list.iter().any(|m| m.index >= n) || entry_slots.0 >= n {
+        return Err(bad());
+    }
+    p.module_of = vec![u32::MAX; n];
+    p.slot_len = vec![0; n];
+    p.entry_slots = Some(entry_slots);
+    p.lazy = true;
+    let mut libc_number = None;
+    for m in &list {
+        let i = m.index;
+        let (path, table_base, memory_base) = (p.link.mods[i].path.clone(), p.link.mods[i].table_base, p.link.mods[i].memory_base);
+        let pairs = if i == entry_slots.0 { vec![(entry, entry_slots.1), (thread_entry, entry_slots.2)] } else { Vec::new() };
+        let (regs, dirs, slots) = if pairs.is_empty() {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            entry_bridges(&pairs.iter().map(|&(a, _)| a).collect::<Vec<_>>())
+        };
+        {
+            let mut provs = lock(&PROVIDERS);
+            if provs.len() as u32 != m.number {
+                return Err(format!("{}: provider module {} where the parent's was {}", path, provs.len(), m.number));
+            }
+            provs.push(ProviderModule { file: format!("wasmprog:{}", path), regs, dirs, slots, memory_base: memory_base as u64 });
+        }
+        p.module_of[i] = m.number;
+        p.slot_len[i] = m.slots;
+        lock(&BINDS).get_or_insert_with(HashMap::new).insert(m.number, m.binds.to_string());
+        // The program's bytes are its image's; a library's are read again
+        // when a Worker asks, as once they have gone in the parent. One whose
+        // parent still held them is read now.
+        let (wasm, key, gone) = if i == 0 {
+            (wasm.to_vec(), None, None)
+        } else if m.gone.is_some() {
+            (Vec::new(), m.key, m.gone)
+        } else {
+            let b = read(&path).ok_or_else(|| format!("{}: gone since the fork", path))?;
+            match super::wasmprog::shed(&path, &b) {
+                Some(s) => (Vec::new(), Some(s.key), Some(s.gone)),
+                None => (b, None, None),
+            }
+        };
+        let len = if wasm.is_empty() { m.len } else { wasm.len() as u32 };
+        lock(&PROGS).push(Prog { number: m.number, len, wasm, relocate: false, relocating: false, key, path: path.clone(), lowered: m.lowered, from_file: i != 0, gone });
+        let (_, ok) = ftab(|f| f.publish_at(table_base, m.slots.max(1), PROVIDER | m.number, Tier::Unit, &pairs));
+        if !ok {
+            return Err(format!("{}: table range {}+{} is taken", path, table_base, m.slots));
+        }
+        if i == entry_slots.0 {
+            libc_number = Some(m.number);
+            CURRENT_BASE.store(table_base, Ordering::Relaxed);
+        }
+    }
+    if std::env::var_os("GEX_WASM_TRACE").is_some() || crate::tracing() {
+        for m in &list {
+            let d = &p.link.mods[m.index];
+            crate::warn_line(&format!("gex: wasm32 module {}: data {:#x}, table {} (as its parent bound it)\n", d.path, d.memory_base, d.table_base));
+        }
+    }
+    libc_number.map(Some).ok_or_else(|| "no libc".into())
 }
 
 /// The program's modules are instantiated (JS, after catching up): fill
@@ -466,7 +694,7 @@ pub(super) fn adopt(wasm: Vec<u8>, entry: u64, thread_entry: u64) -> Result<u32,
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_ready() -> i32 {
     let Some((order, libc)) = lock(&REGISTRY).take() else { return 0 };
-    let r = lock(&DYPROC).as_ref().map(|p| p.link.write_registry(crate::guest_bytes(), &order, libc));
+    let r = dy(|d| d.as_ref().map(|p| p.link.write_registry(crate::guest_bytes(), &order, libc)));
     if let Some(Err(e)) = r {
         crate::warn_line(&format!("gex: wasm32 program: {e:#}\n"));
         crate::exit_process(127);
@@ -486,13 +714,55 @@ pub extern "C" fn gex_wasmprog_binds(number: u32, buf: u32, cap: u32) -> u32 {
 /// has no shared libraries.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_link(buf: u32, cap: u32) -> u32 {
-    let g = lock(&DYPROC);
-    let Some(p) = g.as_ref().filter(|p| !p.link.mods[0].info.needed.is_empty()) else { return 0 };
+    // Asked twice, its length and then its text: made once.
+    if buf != 0 {
+        if let Some(t) = LINK_TEXT.with(|l| l.borrow_mut().take()) {
+            return put_str(&t, buf, cap);
+        }
+    }
+    let Some(t) = dy(|d| d.as_ref().filter(|p| !p.link.mods[0].info.needed.is_empty()).map(link_text)) else { return 0 };
+    let n = put_str(&t, buf, cap);
+    if buf == 0 {
+        LINK_TEXT.with(|l| *l.borrow_mut() = Some(t));
+    }
+    n
+}
+
+thread_local! {
+    /// [`gex_wasmprog_link`]'s text between its two calls.
+    static LINK_TEXT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The link map as a fork's child takes it: where each module's data and
+/// table range are, then (`inherit`) libc's entry slots and, by provider
+/// module number, each module's table slots, program record and binding
+/// list, so the child binds nothing again ([`adopt_inherited`]).
+fn link_text(p: &DyProc) -> String {
+    use std::fmt::Write;
     let mut t = format!("origin\t{}\nldpath\t{}\nstartup\t{}\n", p.origin, p.ldpath.join(":"), p.startup);
     for m in &p.link.mods {
-        t.push_str(&format!("{}\t{}\t{}\t{}\n", m.memory_base, m.table_base, m.name, m.path));
+        let _ = writeln!(t, "{}\t{}\t{}\t{}", m.memory_base, m.table_base, m.name, m.path);
     }
-    put_str(&t, buf, cap)
+    let Some((li, s0, s1)) = p.entry_slots else { return t };
+    if p.slot_len.len() != p.link.mods.len() || p.module_of.len() != p.link.mods.len() {
+        return t;
+    }
+    let binds = lock(&BINDS);
+    let progs = lock(&PROGS);
+    let mut order: Vec<usize> = (0..p.link.mods.len()).collect();
+    order.sort_by_key(|&i| p.module_of[i]);
+    let mut s = String::new();
+    for i in order {
+        let number = p.module_of[i];
+        let (Some(b), Some(g)) = (binds.as_ref().and_then(|b| b.get(&number)), progs.iter().find(|g| g.number == number)) else { return t };
+        let key = g.key.map_or("-".to_string(), |(a, c)| format!("{}:{}", a as i64, c as i64));
+        let gone = g.gone.map_or("-".to_string(), |(a, m, c)| format!("{}:{m}:{}", a as i64, c as i64));
+        let _ = writeln!(s, "P\t{i}\t{number}\t{}\t{}\t{}\t{key}\t{gone}\t{}", p.slot_len[i], g.lowered as u8, g.len, b.len());
+        s.push_str(b);
+    }
+    let _ = writeln!(t, "inherit\t{li}\t{s0}\t{s1}");
+    t.push_str(&s);
+    t
 }
 
 /// A fork's child: its parent's link map ([`gex_wasmprog_link`]).
@@ -509,10 +779,14 @@ fn guest_str(ptr: u64) -> Option<String> {
 }
 
 fn dlopen(path: &str) -> Result<u32, String> {
-    let mut g = lock(&DYPROC);
+    dy(|g| dlopen_in(g, path))
+}
+
+fn dlopen_in(g: &mut Option<DyProc>, path: &str) -> Result<u32, String> {
     let Some(p) = g.as_mut() else {
         return Err(format!("{path}: dlopen in a static program (link it with GEXCC_SHARED=1)"));
     };
+    p.infos()?;
     if let Some(i) = p.link.loaded(path) {
         return Ok(HANDLE_BASE + i as u32 * 16);
     }
@@ -524,7 +798,7 @@ fn dlopen(path: &str) -> Result<u32, String> {
         return Err(format!("{found}: not a wasm shared library"));
     }
     // on failure the link map is as it was
-    let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o, startup: p.startup };
+    let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o, startup: p.startup, slot_len: p.slot_len.clone(), entry_slots: p.entry_slots, lazy: false };
     let from = q.link.mods.len();
     q.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
     let shed = super::wasmprog::shed(&q.link.mods[from].path, &b);
@@ -570,7 +844,14 @@ pub extern "C" fn gex_wasmprog_dl_new(k: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_dlsym(handle: u32, name: u64) -> u32 {
     let Some(name) = guest_str(name) else { return 0 };
-    lock(&DYPROC).as_ref().map_or(0, |p| p.link.dlsym(handle, &name))
+    dy(|g| {
+        let Some(p) = g.as_mut() else { return 0 };
+        if let Err(e) = p.infos() {
+            crate::warn_line(&format!("gex: dlsym {name}: {e}\n"));
+            return 0;
+        }
+        p.link.dlsym(handle, &name)
+    })
 }
 
 /// Guest pages for a Worker's thread-local blocks of `dlopen`ed modules
@@ -593,7 +874,15 @@ pub extern "C" fn gex_wasmprog_tls_free(at: u32, len: u32) {
 /// child, whose module numbers are its own), or -1.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_link_index(number: u32) -> i32 {
-    lock(&DYPROC).as_ref().and_then(|p| p.module_of.iter().position(|&n| n == number)).map_or(-1, |i| i as i32)
+    dy(|g| g.as_ref().and_then(|p| p.module_of.iter().position(|&n| n == number)).map_or(-1, |i| i as i32))
+}
+
+/// Whether this process is a fork's child whose libraries it took from its
+/// parent's link ([`adopt_inherited`]) and has not parsed since
+/// (`GEX_LOG=forklink`).
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_inherited() -> i32 {
+    dy(|g| g.as_ref().is_some_and(|p| p.lazy)) as i32
 }
 
 /// [`DL_GEN`], for a Worker to compare after a system call.

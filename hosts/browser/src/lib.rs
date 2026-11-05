@@ -10984,6 +10984,9 @@ pub extern "C" fn gex_fork_hold() {
         ));
     }
     HOLDING.with(|h| h.borrow_mut().extend(cells.into_iter().map(|(c, _)| c)));
+    // And the wasm32 link map, until the copy is taken: the child's is the
+    // one its memory has (a `dlopen` on another thread finishes first).
+    crate::cgen::fork_link_hold();
 }
 
 /// The memory for the fork is copied: the threads [`gex_fork_hold`] held go
@@ -10995,6 +10998,7 @@ pub extern "C" fn gex_fork_release() {
 
 fn fork_release() {
     use std::sync::atomic::Ordering::SeqCst;
+    crate::cgen::fork_link_release();
     HOLDING.with(|h| {
         for c in h.borrow_mut().drain(..) {
             c.hold.store(0, SeqCst);

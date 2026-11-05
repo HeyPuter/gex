@@ -40,6 +40,15 @@ mod wasmdll;
 pub(crate) use wasmdll::skeleton_code;
 pub(crate) mod wasmprog;
 mod dylink;
+
+/// `gex_fork_hold`'s and `gex_fork_release`'s part for wasm32 programs'
+/// shared libraries (`dylink::fork_hold`).
+pub(crate) fn fork_link_hold() {
+    dylink::fork_hold();
+}
+pub(crate) fn fork_link_release() {
+    dylink::fork_release();
+}
 pub(crate) use dylink::gex_wasmprog_dl_gen as dl_gen;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image

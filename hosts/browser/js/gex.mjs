@@ -621,9 +621,14 @@ function bindSplit(text) {
 const BIND_ASYNC = 0, BIND_GLOBAL = 1, BIND_EXPORT = 2, BIND_SLOT = 3, BIND_MISSING = 4;
 const BIND_PLANS = new Map(), BIND_PLAN_BYTES = 64 << 20, LATE_MODS = new Map(), LATE_MODS_MAX = 4096;
 let bindPlanBytes = 0;
+/** Outside the single-thread build, the last list parsed: an install reads
+ *  a module's list twice (its `X` lines before the compile, `#wasmprogBind`
+ *  after), which parsed every list twice, ~60 ms of a fork child of Plasma's
+ *  shell installing its 374 modules. */
+let lastShape = null, lastPlan = null;
 function bindPlan(shape) {
   const shared = SP_CODE && single.on;
-  const had = shared ? BIND_PLANS.get(shape) : undefined;
+  const had = shared ? BIND_PLANS.get(shape) : shape === lastShape ? lastPlan : undefined;
   if (had) return had;
   const plan = { ops: [], late: [], extra: [], tls: null };
   let v = 0;
@@ -661,6 +666,7 @@ function bindPlan(shape) {
     BIND_PLANS.set(shape, plan);
     bindPlanBytes += shape.length;
   }
+  if (!shared) [lastShape, lastPlan] = [shape, plan];
   return plan;
 }
 /** A binding list's `X` lines: [slot, export]. */
@@ -3984,7 +3990,7 @@ export class Gex {
       if (child.wasm32Link && e.gex_wasmprog_adopt_link) {
         // Before the link: adopting it may instantiate the modules.
         if (child.dlTls?.length) this.#dlTlsKept = new Map(child.dlTls);
-        const b = new TextEncoder().encode(child.wasm32Link);
+        const b = typeof child.wasm32Link === 'string' ? new TextEncoder().encode(child.wasm32Link) : child.wasm32Link;
         const p = e.gex_alloc(b.length) >>> 0;
         this.#bytes().set(b, p);
         e.gex_wasmprog_adopt_link(p, b.length);
@@ -4575,6 +4581,7 @@ export class Gex {
 
   async #startFork(pid) {
     const e = this.#shim.exports;
+    let wasm32Link = null;
     const child = {
       pid,
       pc: e.gex_fork_pc(),
@@ -4589,8 +4596,10 @@ export class Gex {
       // And where its module sits in the function table: the child's copy
       // of the data holds function pointers for that base.
       wasm32Base: e.gex_wasmprog_base?.() ?? 0,
-      // And its shared libraries: where each module's data and table range are.
-      wasm32Link: this.#wasmprogLink(),
+      // And its shared libraries: where each module's data and table range
+      // are, and how the parent bound them. Said with the memory's copy,
+      // below, under the link map's lock (`gex_fork_hold`).
+      wasm32Link: null,
       // And this thread's blocks for its `dlopen`ed modules' thread-local
       // data, which the child's copy of memory holds (`#dlTlsInit`).
       dlTls: this.#dlTlsFork(),
@@ -4613,6 +4622,7 @@ export class Gex {
         if (!(SP_CODE && single.on)) e.gex_fork_hold?.();
         let img;
         try {
+          wasm32Link = this.#wasmprogLink();
           img = this.#processImage();
         } finally {
           e.gex_fork_release?.();
@@ -4685,6 +4695,7 @@ export class Gex {
             )
           : null,
     };
+    child.wasm32Link = wasm32Link;
     child.forkCost = {
       buildMs: Math.round(this.#imageMs),
       bytes: this.#imageBytes,
@@ -6059,7 +6070,9 @@ export class Gex {
     }
   }
 
-  /** The process's wasm32 link map, for a fork's child (cgen/dylink.rs), or null. */
+  /** The process's wasm32 link map, for a fork's child (cgen/dylink.rs), or
+   *  null: its bytes, as the child's shim takes them (with every module's
+   *  binding list, megabytes for Plasma's shell: not made a string). */
   #wasmprogLink() {
     const e = this.#shim.exports;
     const n = (e.gex_wasmprog_link?.(0, 0) ?? 0) >>> 0;
@@ -6067,7 +6080,7 @@ export class Gex {
     const buf = e.gex_alloc(n) >>> 0;
     try {
       e.gex_wasmprog_link(buf, n);
-      return new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+      return this.#bytes().slice(buf, buf + n);
     } finally {
       e.gex_free?.(buf, n);
     }
@@ -7557,8 +7570,15 @@ export class Gex {
    *  child): published and installed here before the guest runs. */
   #wasmprogServe() {
     const e = this.#shim.exports;
+    const t0 = logNamed('forklink') ? performance.now() : 0;
     const n = e.gex_wasmprog_serve?.() ?? -1;
     if (n < 0) return;
+    // `GEX_LOG=forklink`: a fork's child took its parent's link (cgen/dylink.rs
+    // `adopt_inherited`), or bound its libraries again.
+    if (t0) {
+      const how = e.gex_wasmprog_inherited?.() ? "its parent's link" : 'its libraries bound here';
+      console.warn(`[forklink] pid ${e.gex_my_pid?.() ?? '?'}: served with ${how} in ${(performance.now() - t0).toFixed(1)} ms`);
+    }
     // Published, not yet installed here: the spare installs them meanwhile.
     this.#offerSpare((e.gex_ftab_log_len?.() >>> 0) - (this.#cgen?.have ?? 0));
     this.#cgenCatchUp();
