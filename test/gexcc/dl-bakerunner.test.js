@@ -1,0 +1,9 @@
+// Containers linked with GEXCC_BAKE_RUNNER empty, set, and unset: which
+// runner each names, and that each still runs.
+// The check is fixtures/gexcc/dl/bakerunner.sh.
+
+import { script } from '../lib/gexcc.mjs';
+
+export const meta = { hosts: ['node'], timeout: 1200 };
+
+export default (t) => script(t, 'bakerunner');

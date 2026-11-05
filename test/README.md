@@ -30,7 +30,10 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image), `GEXCC` (gexcc,
-default on PATH), `GEX_TEST_SLIM` (a directory with a Debian image,
+default on PATH; the `gexcc` group's programs run under it, its install's
+`gexcc-exec` given this arch's gexc), `GEX_TEST_GLIB` (a wasm32 GLib install, for
+gexcc/dl-gobject), `GEX_TEST_INNER` (how many of gexcc/programs' programs run at
+once, default 3), `GEX_TEST_SLIM` (a directory with a Debian image,
 `debian-slim.tar.zst`, and its apt repository, `repo/`), `CHROME` (default
 /usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec), `GEX_TEST_GL_PROBES` (the `gl-probes` image), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
@@ -124,6 +127,16 @@ A page or process runs one test, so each makes its own System.
 | `t.hits(name)` | How many times the page asked for work file `name` (browser). |
 | `t.logs(re, { levels })` | The lines the runtime logged this phase that match `re`: the page's and its Workers' console (browser), the process's output (node). With `levels` (browser), each line begins with its console level and a space (`warning ...`). |
 | `t.procStatus()` | Memory from /proc in KiB, `{ data, rss, hwm }` (VmData, VmRSS, VmHWM): this phase's process (node), or the page's renderer when it is the only renderer holding over 256 MiB (browser; null otherwise). `t.peakRss()` is its `hwm` (node: the process's maxRSS). |
+
+## Native tests
+
+Node-host tests may run programs natively as well as on the runtime:
+lib/gexcc.mjs builds with gexcc and the host's compiler and runs under this
+arch's gexc (`gexcc/programs`: fixtures/gexcc/programs, each against the host
+natively, under gexc and on the page's shim). A check written as a shell
+script is `script(t, NAME)`, fixtures/gexcc/dl/NAME.sh: each `ok`/`FAIL` line
+it prints is a check (`gexcc/dl-*`). `site/eject-page-files` builds an
+ejected page and checks it carries the page's runtime and X server.
 
 ## Images
 
