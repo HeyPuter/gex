@@ -165,7 +165,7 @@ dist() { # dist <mp|sp>
     f=$1
     out=$HERE/dist; [ "$f" = sp ] && out=$HERE/dist-sp
     stage=$CACHE/public-$f
-    say "web/${out##*/} ($f)"
+    say "page/${out##*/} ($f)"
     rm -rf "$stage" "$DEBUGDIR/$f"
     cp -al "$HERE/public" "$stage"
     # Only what this flavour's page loads (runtime.js: the shared shim, the
@@ -205,7 +205,7 @@ dist() { # dist <mp|sp>
         { tail -20 "$CACHE/vite-$f.log"; exit 1; }
     node "$HERE/build-inputs.mjs" stamp "$out" "page=$PAGE_KEY"
     rm -rf "$stage"
-    echo "  web/${out##*/}: $(du -sh "$out" | cut -f1)"
+    echo "  page/${out##*/}: $(du -sh "$out" | cut -f1)"
 }
 if [ "$DEBUG" = 0 ] && ! command -v wasm-tools >/dev/null 2>&1; then
     echo "need wasm-tools to strip the dists (cargo install wasm-tools), or pass --debug" >&2
