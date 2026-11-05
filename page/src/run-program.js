@@ -32,8 +32,10 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  *                       the bundle (tar.js `untar`'s parts, lazy files
  *                       `[path, size, url, head]`)
  *   stream              the bundle as it is unpacked instead (app.js
- *                       `streamBundle`): { parts, has(path) }, laid at boot
- *                       part by part over the above; `elf` is a file of it
+ *                       `streamBundle`): { parts, has(path), index }, laid at
+ *                       boot part by part over the above; `elf` is a file of
+ *                       it. With an index (a promise of its bytes or null),
+ *                       the program starts once that is laid
  *   env, cwd, uid       the program's; env empty is Debian's for root
  *   filesystem          required: 'memory' or start-options.js
  *                       `filesystemValue`'s { kind, ... }: the runtime's
@@ -126,7 +128,7 @@ export async function runPreset(term, {
     image[exe] = elf;
     imageModes[exe] ??= 0o755;
   }
-  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs, ...(stream ? { stream: stream.parts } : {}) });
+  fs[INTERNAL].addImage({ files: image, modes: imageModes, dirs, lazy, hard, symlinks, mtimes, xattrs, ...(stream ? { stream: stream.parts, streamIndex: stream.index ?? null } : {}) });
 
   let windows = null;
   if (wl && typeof wl.getContext === 'function') {

@@ -152,6 +152,62 @@ pub struct FileNode {
     /// descriptor that outlives every name. Modes are kept by name
     /// (`Inner::modes`) while it has one.
     gone_mode: core::sync::atomic::AtomicU32,
+    /// [`LAID`], [`PENDING`] (named by a bundle's index, its bytes still
+    /// coming: [`TmpFs::add_pending`]) or [`FAILED`] (they never will). A
+    /// use of the bytes waits on this word while it is [`PENDING`].
+    laid: core::sync::atomic::AtomicU32,
+    /// A pending file's size and the bytes come so far.
+    pend: Mutex<Option<Pend>>,
+}
+
+/// A file named by a bundle's index whose bytes have not all come.
+#[derive(Debug)]
+struct Pend {
+    size: u64,
+    buf: Vec<u8>,
+    got: u64,
+}
+
+/// [`FileNode::laid`]: an ordinary file.
+pub const LAID: u32 = 0;
+/// Its bytes are on their way in the bundle.
+pub const PENDING: u32 = 1;
+/// The bundle failed before its bytes came: every use is EIO.
+pub const FAILED: u32 = 2;
+
+/// How a use of a pending file's bytes waits: `(word, ino)` returns once
+/// the word is no longer [`PENDING`], or false at once when this thread may
+/// not block (the page's own kernel Worker, which lays the bytes). And how
+/// the bytes' arrival wakes the waiters.
+#[derive(Clone, Copy)]
+pub struct PendingHooks {
+    pub wait: fn(&core::sync::atomic::AtomicU32, u64) -> bool,
+    pub wake: fn(&core::sync::atomic::AtomicU32),
+}
+static PENDING_HOOKS: std::sync::OnceLock<PendingHooks> = std::sync::OnceLock::new();
+
+/// Set how pending files are waited for (the first call wins). Without
+/// hooks a wait yields until the word changes (native, the unit tests).
+pub fn set_pending_hooks(h: PendingHooks) {
+    let _ = PENDING_HOOKS.set(h);
+}
+
+fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
+    match PENDING_HOOKS.get() {
+        Some(h) => (h.wait)(word, ino),
+        None => {
+            while word.load(Ordering::Acquire) == PENDING {
+                std::thread::yield_now();
+            }
+            true
+        }
+    }
+}
+
+fn pending_wake(word: &core::sync::atomic::AtomicU32) {
+    if let Some(h) = PENDING_HOOKS.get() {
+        (h.wake)(word);
+    }
 }
 
 /// A file's contents go with its last name and descriptor: their room is
@@ -186,6 +242,26 @@ impl FileNode {
             written: core::sync::atomic::AtomicBool::new(false),
             changes: core::sync::atomic::AtomicU64::new(1),
             gone_mode: core::sync::atomic::AtomicU32::new(0o644),
+            laid: core::sync::atomic::AtomicU32::new(LAID),
+            pend: Mutex::new(None),
+        }
+    }
+    /// Its bytes here: at once for an ordinary file; for a pending one,
+    /// once they come (EIO if they never will, EAGAIN where this thread may
+    /// not wait). Before any use of the bytes.
+    fn ready(&self) -> Result<(), Errno> {
+        match self.laid.load(Ordering::Acquire) {
+            LAID => return Ok(()),
+            PENDING => {
+                if !pending_wait(&self.laid, self.ino) {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+            _ => {}
+        }
+        match self.laid.load(Ordering::Acquire) {
+            LAID => Ok(()),
+            _ => Err(Errno::EIO),
         }
     }
     /// The store's contents, made from `data` first when the file is to be
@@ -264,8 +340,13 @@ impl FileNode {
         *self.times.lock().unwrap()
     }
 
-    /// The size, lazy or not.
+    /// The size, lazy or not, pending or not.
     fn size(&self) -> u64 {
+        if self.laid.load(Ordering::Acquire) != LAID {
+            if let Some(p) = self.pend.lock().unwrap().as_ref() {
+                return p.size;
+            }
+        }
         if let Some(l) = self.lazy.lock().unwrap().as_ref() {
             return l.size;
         }
@@ -743,6 +824,9 @@ struct Shared {
     /// Files made from now on keep their contents in the block store once
     /// past what stays inline ([`TmpFs::use_store`]).
     store: core::sync::atomic::AtomicBool,
+    /// The files a bundle's index named, by path as it named them, until
+    /// the bundle ends ([`TmpFs::add_pending`], [`TmpFs::fill_pending`]).
+    pending: Mutex<std::collections::HashMap<String, Arc<FileNode>>>,
 }
 
 impl Shared {
@@ -951,7 +1035,7 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default() }),
+            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default(), pending: Default::default() }),
         }
     }
 
@@ -1007,6 +1091,103 @@ impl TmpFs {
         }
         data[start..end].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// A file a bundle's index names, before its bytes: `size` bytes, its
+    /// mode and time as the bundle has them. It is there at once for every
+    /// lookup, `stat` and listing; a use of its bytes (a read, a mapping, a
+    /// write, a truncation) waits until [`TmpFs::fill_pending`] has them all,
+    /// or is EIO once [`TmpFs::end_pending`] says they never will come. A
+    /// file of no bytes is an ordinary one.
+    pub fn add_pending(&self, path: &str, size: u64, mode: u32, mtime: i64) {
+        let path = path.trim_start_matches('/').to_string();
+        let f = {
+            let mut inner = self.inner.lock().unwrap();
+            Self::ensure_parents(&mut inner, &path);
+            let ino = inner.next_ino;
+            inner.next_ino += 1;
+            inner.set_ino(path.clone(), ino);
+            let f = Arc::new(FileNode::new(Vec::new(), ino, self.stored()));
+            f.mtime.store(mtime, Ordering::Relaxed);
+            if size > 0 {
+                *f.pend.lock().unwrap() = Some(Pend { size, buf: Vec::new(), got: 0 });
+                f.laid.store(PENDING, Ordering::Release);
+            }
+            inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
+            let _ = inner.chmod(&path, mode);
+            f
+        };
+        self.inner.pending.lock().unwrap().insert(path, f);
+    }
+
+    /// Bytes at `offset` of a file the index named ([`TmpFs::add_pending`]),
+    /// whatever its name is now: once all have come, it is an ordinary file
+    /// and its waiters go on. False when the index did not name `path` (the
+    /// caller lays it as a seeded file); true, doing nothing, when the file
+    /// is no longer waiting (truncated by the program meanwhile).
+    pub fn fill_pending(&self, path: &str, offset: u64, bytes: &[u8]) -> bool {
+        let path = path.trim_start_matches('/');
+        let Some(f) = self.inner.pending.lock().unwrap().get(path).cloned() else { return false };
+        let mut pend = f.pend.lock().unwrap();
+        let Some(p) = pend.as_mut() else { return true };
+        let end = (offset + bytes.len() as u64).min(p.size);
+        if offset < end {
+            if p.buf.len() < end as usize {
+                let was = p.buf.capacity();
+                if p.buf.capacity() == 0 {
+                    p.buf.reserve_exact(p.size as usize);
+                }
+                p.buf.resize(end as usize, 0);
+                note_capacity(was, p.buf.capacity());
+            }
+            p.buf[offset as usize..end as usize].copy_from_slice(&bytes[..(end - offset) as usize]);
+            p.got += end - offset;
+        }
+        if p.got >= p.size {
+            let p = pend.take().unwrap();
+            let mut data = f.data.lock().unwrap();
+            // the same bytes, accounted where they now are
+            let was = p.buf.capacity();
+            *data = p.buf;
+            debug_assert_eq!(was, data.capacity());
+            drop(data);
+            drop(pend);
+            f.laid.store(LAID, Ordering::Release);
+            pending_wake(&f.laid);
+        }
+        true
+    }
+
+    /// The bundle's end: every file the index named whose bytes have not
+    /// all come never will (a short archive, a failed fetch or decode).
+    /// Each is EIO to every use from now on, and those waiting wake with
+    /// it. Their count.
+    pub fn end_pending(&self) -> usize {
+        let all: Vec<_> = self.inner.pending.lock().unwrap().drain().map(|(_, f)| f).collect();
+        let mut n = 0;
+        for f in all {
+            let mut pend = f.pend.lock().unwrap();
+            // its size kept, for `stat`; the bytes come so far let go
+            if let Some(p) = pend.as_mut().filter(|_| f.laid.load(Ordering::Acquire) == PENDING) {
+                note_capacity(std::mem::take(&mut p.buf).capacity(), 0);
+                drop(pend);
+                f.laid.store(FAILED, Ordering::Release);
+                pending_wake(&f.laid);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// How many files the index named are still waiting for their bytes.
+    pub fn pending_count(&self) -> usize {
+        self.inner.pending.lock().unwrap().values().filter(|f| f.laid.load(Ordering::Acquire) == PENDING).count()
+    }
+
+    /// A pending file's path by its inode (the first named), for a report
+    /// of a long wait.
+    pub fn pending_path(&self, ino: u64) -> Option<String> {
+        self.inner.pending.lock().unwrap().iter().find(|(_, f)| f.ino == ino).map(|(p, _)| format!("/{p}"))
     }
 
     /// A file of `size` bytes whose contents are fetched from `url` as they
@@ -1335,6 +1516,7 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EISDIR);
         };
         file.mark_read();
+        file.ready()?;
         if let Some(l) = file.lazy.lock().unwrap().as_mut() {
             return l.read(offset, buf);
         }
@@ -1354,7 +1536,8 @@ impl FileHandle for TmpHandle {
 
     fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
         let file = self.file.as_ref()?;
-        if file.lazy.lock().unwrap().is_some() || file.pg.lock().unwrap().is_some() {
+        // (a pending file: by `read_at`, which waits)
+        if file.laid.load(Ordering::Acquire) != LAID || file.lazy.lock().unwrap().is_some() || file.pg.lock().unwrap().is_some() {
             return None;
         }
         file.mark_read();
@@ -1383,6 +1566,7 @@ impl FileHandle for TmpHandle {
         // The advice that fetches: a range wanted, an image mapped.
         if advice == super::FADV_WILLNEED || advice == super::FADV_GEX_IMAGE {
             file.mark_read();
+            file.ready()?;
         }
         match file.lazy.lock().unwrap().as_mut() {
             Some(l) => l.advise(offset, len, advice),
@@ -1394,6 +1578,7 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
         };
+        file.ready()?;
         file.materialize()?;
         // Held through the inline write too: a file that crosses the
         // threshold meanwhile moves only after this write.
@@ -1565,6 +1750,7 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EINVAL);
         };
+        file.ready()?;
         file.materialize()?;
         let mut pg = file.paged_for(len);
         if let Some(p) = pg.as_mut() {
@@ -1669,6 +1855,14 @@ impl TmpFs {
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
+                            // A pending file emptied: its bytes are not
+                            // wanted, and it waits no longer.
+                            if let Some(p) = f.pend.lock().unwrap().take() {
+                                note_capacity(p.buf.capacity(), 0);
+                                f.laid.store(LAID, Ordering::Release);
+                                pending_wake(&f.laid);
+                            }
+                            let _ = f.laid.compare_exchange(FAILED, LAID, Ordering::AcqRel, Ordering::Acquire);
                             if let Some(l) = f.lazy.lock().unwrap().take() {
                                 TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
                             }
@@ -2623,6 +2817,99 @@ mod lazy_tests {
         // WILLNEED: the range's chunks, no readahead
         h.advise(10 * LAZY_CHUNK + 5, 10, super::super::FADV_WILLNEED).unwrap();
         assert_eq!(*ASKED.lock().unwrap().last().unwrap(), (10 * LAZY_CHUNK, LAZY_CHUNK));
+    }
+
+    #[test]
+    fn a_pending_file_is_there_before_its_bytes() {
+        let fs = TmpFs::new();
+        fs.add_pending("/usr/lib/libx.so", 5, 0o755, 1234);
+        let m = fs.metadata("usr/lib/libx.so").unwrap();
+        assert_eq!((m.size, m.mode & 0o7777, m.mtime), (5, 0o755, 1234));
+        assert!(fs.metadata("usr/lib").unwrap().file_type == FileType::Directory);
+        let names: Vec<_> = fs.open("usr/lib", oflags::O_DIRECTORY, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "libx.so"));
+        // an open does not wait; its fstat answers from the index
+        let h = fs.open("usr/lib/libx.so", 0, 0).unwrap();
+        assert_eq!(h.metadata().unwrap().size, 5);
+        assert_eq!(fs.pending_count(), 1);
+        // no bytes: an ordinary file at once
+        fs.add_pending("/etc/empty", 0, 0o644, 0);
+        assert_eq!(read_all(&fs, "etc/empty"), b"");
+    }
+
+    #[test]
+    fn a_read_of_a_pending_file_waits_for_all_its_bytes() {
+        let fs = Arc::new(TmpFs::new());
+        fs.add_pending("/bin/prog", 6, 0o755, 0);
+        let h = fs.open("bin/prog", 0, 0).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut b = [0u8; 6];
+            let n = h.read_at(0, &mut b).unwrap();
+            (n, b)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(fs.fill_pending("/bin/prog", 0, b"abc"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!reader.is_finished(), "a read waits for the last part");
+        assert!(fs.fill_pending("/bin/prog", 3, b"def"));
+        assert_eq!(reader.join().unwrap(), (6, *b"abcdef"));
+        assert_eq!(fs.pending_count(), 0);
+        // seeded, not written by the program
+        assert!(fs.written().is_empty());
+        // a file the index did not name is the caller's to lay
+        assert!(!fs.fill_pending("/bin/other", 0, b"x"));
+    }
+
+    #[test]
+    fn a_bundle_that_ends_short_is_eio_never_enoent() {
+        let fs = Arc::new(TmpFs::new());
+        fs.add_pending("/usr/share/a", 4, 0o644, 0);
+        fs.add_pending("/usr/share/b", 4, 0o644, 0);
+        assert!(fs.fill_pending("/usr/share/a", 0, b"aaaa"));
+        assert!(fs.fill_pending("/usr/share/b", 0, b"bb"));
+        let h = fs.open("usr/share/b", 0, 0).unwrap();
+        let waiter = std::thread::spawn(move || h.read_at(0, &mut [0u8; 4]));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // the fetch or the decode failed, or the archive was short
+        assert_eq!(fs.end_pending(), 1);
+        assert_eq!(waiter.join().unwrap(), Err(Errno::EIO));
+        // still there: stat and open answer, the bytes are EIO
+        assert_eq!(fs.metadata("usr/share/b").unwrap().size, 4);
+        let h = fs.open("usr/share/b", 0, 0).unwrap();
+        assert_eq!(h.read_at(0, &mut [0u8; 4]), Err(Errno::EIO));
+        assert_eq!(h.write_at(0, b"x"), Err(Errno::EIO));
+        assert_eq!(read_all(&fs, "usr/share/a"), b"aaaa");
+        // a program replacing it may
+        let h = fs.open("usr/share/b", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap();
+        assert_eq!(h.write_at(0, b"new").unwrap(), 3);
+        assert_eq!(read_all(&fs, "usr/share/b"), b"new");
+    }
+
+    #[test]
+    fn a_pending_file_is_filled_by_its_inode_whatever_its_name() {
+        let fs = TmpFs::new();
+        fs.add_pending("/usr/lib/liby.so.1.2", 3, 0o644, 0);
+        fs.link("usr/lib/liby.so.1.2", "usr/lib/liby-hard.so").unwrap();
+        fs.rename("usr/lib/liby.so.1.2", "usr/lib/moved").unwrap();
+        assert!(fs.fill_pending("/usr/lib/liby.so.1.2", 0, b"xyz"));
+        assert_eq!(read_all(&fs, "usr/lib/moved"), b"xyz");
+        assert_eq!(read_all(&fs, "usr/lib/liby-hard.so"), b"xyz");
+        assert!(fs.metadata("usr/lib/liby.so.1.2").is_err());
+        // emptied by the program before its bytes came: they do not
+        // overwrite what it wrote
+        fs.add_pending("/etc/conf", 3, 0o644, 0);
+        let h = fs.open("etc/conf", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap();
+        h.write_at(0, b"mine").unwrap();
+        assert!(fs.fill_pending("/etc/conf", 0, b"old"));
+        assert_eq!(read_all(&fs, "etc/conf"), b"mine");
+    }
+
+    fn read_all(fs: &TmpFs, path: &str) -> Vec<u8> {
+        let h = fs.open(path, 0, 0).unwrap();
+        let mut b = vec![0u8; h.metadata().unwrap().size as usize];
+        let n = h.read_at(0, &mut b).unwrap() as usize;
+        b.truncate(n);
+        b
     }
 
     #[test]

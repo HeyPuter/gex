@@ -550,7 +550,12 @@ async function begin(opts, base, at, state, meter) {
   // as before. `?streamtar=0`: fetched whole, then laid.
   const exe = opts.exe ?? b.exe;
   const z0 = b.tar.length === 1 && !pieceList && sw.streamtar !== '0' ? await packedEntry(at(b.tar[0]), fetcher) : null;
-  const streamed = z0 ? streamBundle(at(b.tar[0]), z0, fetcher, exe) : null;
+  // An archive whose first entry is its index (`/.gex-index`): the guest
+  // starts once that is laid, and a use of a file waits for its bytes
+  // (kfs.js `#layEarly`). Not in the single-thread build, whose threads
+  // cannot wait; `?earlyinit=0`: once all of it is in, as before.
+  const early = sw.earlyinit !== '0' && !(SP_CODE && singleMode());
+  const streamed = z0 ? streamBundle(at(b.tar[0]), z0, fetcher, exe, early) : null;
   if (streamed) {
     streamed.done.then(() => {
       mark(`fetched ${b.tar[0]} (${(z0.size / 1048576).toFixed(0)} MiB), unpacked as it came`);
@@ -839,7 +844,7 @@ async function begin(opts, base, at, state, meter) {
     xattrs: b.xattrs ? { ...b.xattrs, ...tree.xattrs } : tree.xattrs,
     // The bundle's parts as they are unpacked, laid over the above (which
     // then holds only the lazy files' modes and times).
-    stream: streamed ? { parts: streamed.parts, has: streamed.has } : undefined,
+    stream: streamed ? { parts: streamed.parts, has: streamed.has, index: streamed.index } : undefined,
     env,
     args,
     cwd,
@@ -854,7 +859,15 @@ async function begin(opts, base, at, state, meter) {
     wlInput: desk ?? canvas,
     // The windows laid out in `desk` (bare-desktop.js, at `__gexCompositor`).
     onDesktop: desk ? (d) => { desktop = d; } : null,
-    onSystem: (s) => { sys = s; },
+    onSystem: (s) => {
+      sys = s;
+      // The bundle failed while the program ran (a fetch or decode error):
+      // its files that never came are EIO to the guest; the page says so.
+      s.system.addEventListener('failed', (e) => {
+        state.error = String(e.error?.stack ?? e.error);
+        meter.end('failed', state.error);
+      });
+    },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,
     // under the X session's own window manager (see hostx.js).
     hostX: !!b.hostx && opts.hostx !== false
@@ -1269,6 +1282,37 @@ function mesaSource(f, at) {
  */
 /** The most file bytes in one part of a bundle laid as it downloads. */
 const STREAM_PART_BYTES = 32 << 20;
+/** The same once the guest runs meanwhile (an archive with an index): a
+ *  file a program waits for is laid within a megabyte of its arrival. */
+const EARLY_PART_BYTES = 1 << 20;
+/** A bundle's index: its first entry (kde/bundles.py), the records of
+ *  kfs.js `#layEarly`. */
+const INDEX_PATH = '/.gex-index';
+
+/** The paths an index names (its records: hosts/kernel `k_fs_seed`). */
+function indexPaths(b) {
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const dec = new TextDecoder();
+  const out = new Set();
+  let at = 0;
+  const text = () => {
+    const n = v.getUint32(at, true);
+    const s = dec.decode(b.subarray(at + 4, at + 4 + n));
+    at += 4 + n;
+    return s;
+  };
+  while (at < b.length) {
+    const op = b[at++];
+    if (op === 5) { at += 20; out.add(text()); }
+    else if (op === 6) { at += 12; out.add(text()); }
+    else if (op === 2 || op === 7) { text(); out.add(text()); }
+    else if (op === 3) { at += 8; text(); }
+    else if (op === 4) { at += 4; text(); }
+    else throw new Error(`${INDEX_PATH}: record ${op} at ${at - 1}`);
+  }
+  for (const p of [...out]) if (!p.startsWith('/')) { out.delete(p); out.add(`/${p}`); }
+  return out;
+}
 
 /**
  * A packed archive (`url`, its pack entry `z`) unpacked as it downloads
@@ -1277,10 +1321,13 @@ const STREAM_PART_BYTES = 32 << 20;
  * parts, each up to STREAM_PART_BYTES of files (one each until `exe` is
  * in, so the program's bytes come first); `exe`, the program's bytes (a
  * copy; null if the archive has no such file); `has(path)`, whether a
- * regular file of the archive has come; `done`, the download's end. A
- * part's bytes are its own, so the decode keeps nothing once it is laid.
+ * regular file of the archive has come (or, with an index, is named by
+ * it); `done`, the download's end; with `early`, `index`, the archive's
+ * index (`INDEX_PATH`, its first entry) or null for none, once the first
+ * entry has come. A part's bytes are its own, so the decode keeps nothing
+ * once it is laid.
  */
-function streamBundle(url, z, f, exe) {
+function streamBundle(url, z, f, exe, early = false) {
   const queue = [];
   const have = new Set();
   let wake = null;
@@ -1289,8 +1336,23 @@ function streamBundle(url, z, f, exe) {
   let exeBytes = null;
   let exeFound;
   const exeSeen = new Promise((r) => { exeFound = r; });
+  let index = null, named = null, indexFound;
+  const indexSeen = new Promise((r) => { indexFound = r; });
   let ts = new TarStream();
   const put = (t) => {
+    const ix = t.files[INDEX_PATH];
+    if (ix) {
+      delete t.files[INDEX_PATH];
+      delete t.modes[INDEX_PATH];
+      delete t.mtimes[INDEX_PATH];
+      if (!index && early) {
+        index = ix.slice();
+        named = indexPaths(index);
+      }
+    }
+    // the first entry decides: an index or none
+    if (!index && (Object.keys(t.files).length || t.dirs.length)) indexFound(null);
+    else if (index) indexFound(index);
     if (!t.dirs.length && !Object.keys(t.files).length && !Object.keys(t.links).length && !Object.keys(t.hard).length
       && !Object.keys(t.mtimes).length && !Object.keys(t.xattrs).length && !Object.keys(t.modes).length) return;
     for (const p of Object.keys(t.files)) have.add(p);
@@ -1306,7 +1368,7 @@ function streamBundle(url, z, f, exe) {
   const done = fetchPacked(url, z, false, f, {
     sink: (piece) => {
       ts.push(piece);
-      if (!exeBytes || ts.pending >= STREAM_PART_BYTES) put(ts.take());
+      if (!exeBytes || ts.pending >= (index ? EARLY_PART_BYTES : STREAM_PART_BYTES)) put(ts.take());
     },
     // A cached copy that does not decode: unpacked again from the network,
     // each part laid again over what it laid (the same files).
@@ -1319,6 +1381,7 @@ function streamBundle(url, z, f, exe) {
     failure = e;
   }).finally(() => {
     if (!exeBytes) exeFound(null);
+    indexFound(index);
     const w = wake;
     wake = null;
     w?.();
@@ -1336,7 +1399,8 @@ function streamBundle(url, z, f, exe) {
   }
   return {
     parts: parts(),
-    has: (p) => have.has(p),
+    has: (p) => have.has(p) || !!named?.has(p),
+    index: early ? indexSeen : null,
     exe: exeSeen.then((b) => {
       if (!b && failure) throw failure;
       return b;

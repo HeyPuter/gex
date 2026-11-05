@@ -2853,6 +2853,7 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     static ROOT: OnceLock<std::sync::Arc<gex_kernel::vfs::TmpFs>> = OnceLock::new();
     ROOT.get_or_init(|| {
         gex_kernel::vfs::tmpfs::set_lazy_fetch(fetch_lazy);
+        gex_kernel::vfs::tmpfs::set_pending_hooks(gex_kernel::vfs::tmpfs::PendingHooks { wait: pending_wait, wake: pending_wake });
         // A process that ended holding directory renames off holds nothing.
         gex_kernel::vfs::set_owner_alive(|pid| procs().alive(pid));
         let fs = gex_kernel::vfs::TmpFs::new();
@@ -3685,6 +3686,95 @@ pub extern "C" fn k_fs_add(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::P
     0
 }
 
+std::thread_local! {
+    /// This instance's thread may not wait for a pending file ([`k_fs_noblock`]).
+    static NO_BLOCK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+/// A pending file's inode some use has waited on for 30 s ([`k_fs_pending_long`]).
+static PENDING_LONG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A use of a pending file's bytes waits on its word (a guest thread's
+/// Worker parks in `memory.atomic.wait32`), a second at a time. The page's
+/// kernel Worker lays the bytes, so it never waits: EAGAIN there.
+fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    if NO_BLOCK.with(|b| b.get()) {
+        return false;
+    }
+    let mut secs = 0u32;
+    while word.load(Acquire) == gex_kernel::vfs::tmpfs::PENDING {
+        // SAFETY: the word is in this module's shared memory, and lives as
+        // long as the file node the caller holds.
+        unsafe { core::arch::wasm32::memory_atomic_wait32(word as *const _ as *mut i32, gex_kernel::vfs::tmpfs::PENDING as i32, 1_000_000_000) };
+        secs += 1;
+        if secs == 30 {
+            PENDING_LONG.store(ino, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    true
+}
+
+fn pending_wake(word: &core::sync::atomic::AtomicU32) {
+    // SAFETY: as above.
+    unsafe { core::arch::wasm32::memory_atomic_notify(word as *const _ as *mut i32, u32::MAX) };
+}
+
+/// This instance's thread (the page's kernel Worker) never waits for a
+/// pending file: a use of one is EAGAIN there.
+#[no_mangle]
+pub extern "C" fn k_fs_noblock() -> i32 {
+    NO_BLOCK.with(|b| b.set(true));
+    0
+}
+
+/// Bytes at `offset` of a file of the bundle being laid: into the file its
+/// index named (`TmpFs::fill_pending`), else seeded at `path` as
+/// [`k_fs_add`] (offset 0) and [`k_fs_add_part`] do.
+#[no_mangle]
+pub extern "C" fn k_fs_fill(path: gex_kmem::PAddr, path_len: u32, offset: u64, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let p = path_of(path, path_len);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    if rootfs().fill_pending(&p, offset, &buf) {
+        return 0;
+    }
+    if offset == 0 {
+        rootfs().add_file(&p, buf);
+        return 0;
+    }
+    as_unit(rootfs().add_file_part(&p, offset, &buf))
+}
+
+/// The bundle's end (`failed` 0) or its failure (a fetch or decode error):
+/// every file its index named whose bytes did not all come is EIO from now
+/// on (`TmpFs::end_pending`). Their count.
+#[no_mangle]
+pub extern "C" fn k_fs_pending_end() -> i32 {
+    rootfs().end_pending() as i32
+}
+
+/// How many files the bundle's index named are still waiting for bytes.
+#[no_mangle]
+pub extern "C" fn k_fs_pending_count() -> i32 {
+    rootfs().pending_count() as i32
+}
+
+/// The path of a pending file something has waited on for 30 s, into
+/// `at` (its length; 0 for none, once per such wait).
+#[no_mangle]
+pub extern "C" fn k_fs_pending_long(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let ino = PENDING_LONG.swap(0, core::sync::atomic::Ordering::Relaxed);
+    if ino == 0 {
+        return 0;
+    }
+    let p = rootfs().pending_path(ino).unwrap_or_else(|| format!("inode {ino}"));
+    let n = p.len().min(cap as usize);
+    unsafe { gex_kmem::push_checked(at, p.as_ptr(), n as u32) };
+    n as i32
+}
+
 /// More of a file [`k_fs_add`] put in, `len` bytes at `offset`
 /// (`TmpFs::add_file_part`): a large file sent in parts. Seeding, not a write
 /// of the program's, so a persist snapshot does not take the file.
@@ -3719,6 +3809,11 @@ pub extern "C" fn k_fs_add_lazy(path: gex_kmem::PAddr, path_len: u32, url: gex_k
 ///   2 symlink    target, path ([`k_fs_symlink`])
 ///   3 time       seconds i64, path ([`k_fs_set_mtime`])
 ///   4 mode       mode u32, path ([`k_fs_chmod`])
+///   5 pending    mode u32, size u64, seconds i64, path: a file of the
+///                bundle being laid, its bytes to come (`TmpFs::add_pending`,
+///                [`k_fs_fill`]); a bundle's index
+///   6 directory  mode u32, seconds i64, path
+///   7 hard link  target, path ([`k_fs_link`])
 /// Each does what its own call does, results unchecked as the page leaves
 /// those calls'. The records done, or -EINVAL at the first that does not
 /// parse.
@@ -3797,6 +3892,32 @@ pub extern "C" fn k_fs_seed(at: gex_kmem::PAddr, len: u32) -> i32 {
                 let mode = r.u32()?;
                 let p = r.path()?;
                 chmod(&p, mode);
+                Some(())
+            })(),
+            5 => (|| {
+                let mode = r.u32()?;
+                let size = r.u64()?;
+                let secs = r.u64()? as i64;
+                let p = r.path()?;
+                rootfs().add_pending(&p, size, mode, secs);
+                Some(())
+            })(),
+            6 => (|| {
+                let mode = r.u32()?;
+                let secs = r.u64()? as i64;
+                let p = r.path()?;
+                if !p.is_empty() {
+                    rootfs().add_dir(&p);
+                }
+                chmod(&p, mode);
+                let _ = rootfs().set_mtime(&p, secs);
+                Some(())
+            })(),
+            7 => (|| {
+                let target = r.path()?;
+                let p = r.path()?;
+                let _ = rootfs().unlink(&p);
+                let _ = rootfs().link(&target, &p);
                 Some(())
             })(),
             _ => None,

@@ -108,6 +108,8 @@ const LAZY_CACHE = 'gex-runtime-lazy-v1';
 export class System extends EventTarget {
   #opts;
   #state = { phase: 'new', error: null, progress: null, console: '' };
+  /** The bundle failed while the system ran (`#watchRest`). */
+  #restFailed = false;
   #parts = new Map();
   #beforeBoot = [];
   #afterBoot = [];
@@ -268,6 +270,30 @@ export class System extends EventTarget {
       throw e;
     });
     return this.#booting;
+  }
+
+  /** The rest of a bundle laid while the guest runs: its end marked; its
+   *  failure (a fetch or decode error, a short archive) the system's: phase
+   *  'failed', `error` and a 'failed' event. Its programs go on, and the
+   *  files that never came are EIO to them (never ENOENT); what they wrote
+   *  still goes to the store at shutdown. Under `?boottrace=1`, a file some
+   *  use has waited 30 s for, named. */
+  #watchRest(k, rest) {
+    let tick = null;
+    if (this.#opts.debug.boottrace && k.has('k_fs_pending_long')) {
+      tick = setInterval(async () => {
+        const { r, out: [b] } = await k.call('k_fs_pending_long', { out: 4096 }).catch(() => ({ r: 0, out: [] }));
+        if (r > 0) console.warn(`[boot] waited 30 s for ${new TextDecoder().decode(b.subarray(0, r))}; ${await k.r('k_fs_pending_count').catch(() => '?')} files still to come`);
+      }, 5000);
+    }
+    rest.then(() => this.#mark('files laid'), (e) => {
+      if (this.#state.phase === 'stopped' || this.#state.phase === 'failed') return;
+      console.error(`gex: the bundle failed while the system ran: ${e?.message ?? e}`);
+      this.#state.phase = 'failed';
+      this.#state.error = String(e?.stack ?? e);
+      this.#restFailed = true;
+      this.dispatchEvent(Object.assign(new Event('failed'), { error: e }));
+    }).finally(() => clearInterval(tick));
   }
 
   /** `?boottrace=1` (debug only, off by default): each step of the boot
@@ -563,7 +589,15 @@ export class System extends EventTarget {
     await this.#store(s, k, fsi?.store?.());
     this.#mark('store');
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
-    this.#mark('files laid');
+    // A bundle laid while the guest runs (kfs.js `#layEarly`): its index is
+    // in, its files' bytes still coming.
+    const rest = this.#files.background;
+    if (rest) {
+      this.#mark('index laid');
+      this.#watchRest(k, rest);
+    } else {
+      this.#mark('files laid');
+    }
     // What the store kept (gex_kernel::vfs::tmpfs::persist), over them.
     if (this.#stored) await this.#restore(k, fsi);
     // The steps below are not waited for one by one: the kernel's Worker
@@ -980,7 +1014,7 @@ export class System extends EventTarget {
    *  do for a MemoryFilesystem. Rejects with the error (`code` EIO, ENOSPC)
    *  when the store could not take it. */
   async sync() {
-    if (this.#state.phase !== 'running') throw new Error(`sync: the system is ${this.#state.phase}, not running`);
+    if (this.#state.phase !== 'running' && !this.#restFailed) throw new Error(`sync: the system is ${this.#state.phase}, not running`);
     if (!this.#stored) return;
     const r = await this.#kernel.r('k_fs_sync_all');
     if (r < 0) throw errno(r, '/');
@@ -990,7 +1024,7 @@ export class System extends EventTarget {
   async shutdown() {
     if (this.#state.phase === 'stopped') return;
     // What was written goes to the store before the store goes.
-    if (this.#state.phase === 'running' && this.#stored) await this.sync().catch((e) => console.error(`[gex] shutdown: the filesystem's store could not take what was written: ${e.code ?? e.message}`));
+    if ((this.#state.phase === 'running' || this.#restFailed) && this.#stored) await this.sync().catch((e) => console.error(`[gex] shutdown: the filesystem's store could not take what was written: ${e.code ?? e.message}`));
     this.#state.phase = 'stopped';
     for (const p of this.#procs.values()) p[INTERNAL].exit({ code: 137, signal: 9, shutdown: true });
     this.#procs.clear();

@@ -52,6 +52,8 @@ const ops = {
     if (spec.lazyCache) setLazyCache(spec.lazyCache);
     rest = !!spec.restBundle;
     ({ k, mem } = await helperKernel(spec, 0, 32));
+    // It lays a streamed bundle's files: it never waits for one (EAGAIN).
+    k.k_fs_noblock?.();
     // Its exports' names: what this kernel build has.
     return { value: Object.keys(k).filter((n) => typeof k[n] === 'function') };
   },

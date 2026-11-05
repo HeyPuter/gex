@@ -133,6 +133,10 @@ export class Files {
     this.#k = k;
   }
 
+  /** A bundle still being laid while the guest runs (`#layEarly`): its
+   *  end, or its failure (every file it did not bring is EIO by then). */
+  background = null;
+
   /** `path` with its symlinks followed (the last too unless `last` is
    *  false), as the guest's own lookups follow them; `path` itself when the
    *  walk fails, for the call that follows to say why. */
@@ -345,8 +349,13 @@ export class Files {
    *  modes) after the last. `modes`, `mtimes` and `xattrs` beside it are the
    *  lazy files' (the parts' own win, as one untarred tree's would). Nothing
    *  runs in the guest until boot's layers are all in (system.js `#start`). */
-  async #layStream({ stream, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart }) {
+  async #layStream(l) {
+    const { stream, streamIndex, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart } = l;
     const k = this.#k;
+    if (streamIndex && k.has('k_fs_fill')) {
+      const index = await streamIndex;
+      if (index) return this.#layEarly(l, index);
+    }
     const sizes = new Map();
     const dirs = [];
     const modes = { ...lazyModes };
@@ -385,6 +394,57 @@ export class Files {
       // the bytes of a link the kernel would not make, from the copy laid
       bytes: (p) => this.readFile(p),
     });
+  }
+
+  /** A streamed image whose archive starts with its index (app.js
+   *  `streamBundle`, kde/bundles.py): every directory, link, mode and time
+   *  of the archive, and each file as pending (its size; hosts/kernel
+   *  `k_fs_seed`), laid at once with the lazy files, and the guest may start:
+   *  a use of a file's bytes waits until they come, a lookup or `stat` never
+   *  does. The files' bytes are laid as they arrive (`k_fs_fill`), in
+   *  `background`; at the archive's end, or its failure, what has not come
+   *  is EIO (`k_fs_pending_end`), never ENOENT. The count of files named. */
+  async #layEarly({ stream, modes: lazyModes = {}, mtimes: lazyMtimes, xattrs: baseXattrs, lazy = [], onPart }, index) {
+    const k = this.#k;
+    const r = await k.r('k_fs_seed', { in: index });
+    if (r < 0) throw errno(r, 'the bundle\'s index');
+    // The lazy files: the rest bundle's (a head the archive carries is laid
+    // over its pending copy at the end, as `#layStream` would).
+    const heads = lazy.filter((f) => f[3]);
+    const n = r + await this.#layRest([], {
+      modes: lazyModes, lazy: lazy.filter((f) => !f[3]), mtimes: lazyMtimes, xattrs: baseXattrs,
+      has: () => false, size: () => 0, bytes: null,
+    });
+    const run = async () => {
+      for await (const t of stream) {
+        const list = [];
+        for (const [p, data] of Object.entries(t.files)) {
+          const d = typeof data === 'string' ? enc.encode(data) : data;
+          list.push({ f: 'k_fs_fill', a: [{ in: p }, 0n, { in: d.subarray(0, PART) }] });
+          for (let off = PART; off < d.length; off += PART) list.push({ f: 'k_fs_fill', a: [{ in: p }, BigInt(off), { in: d.subarray(off, off + PART) }] });
+        }
+        for (const [p, attrs] of Object.entries(t.xattrs ?? {})) {
+          for (const [name, value] of Object.entries(attrs)) {
+            const v = value instanceof Uint8Array ? value : enc.encode(String(value));
+            list.push({ f: 'k_fs_xattr', a: [-1, { in: p }, XATTR_SET, { in: name }, { in: v }, 0] });
+          }
+        }
+        await batched(k, list, (r, c) => {
+          if (c.f === 'k_fs_fill' && r < 0) throw errno(r, c.a[0].in);
+        });
+        onPart?.(t);
+      }
+      const left = await k.r('k_fs_pending_end');
+      if (left > 0) throw new Error(`the bundle ended with ${left} of the files its index names missing`);
+      if (heads.length) await this.#layRest([], { modes: lazyModes, lazy: heads, has: () => true, size: (p) => heads.find((f) => f[0] === p)?.[3], bytes: null });
+    };
+    this.background = run().catch(async (e) => {
+      // the files that did not come: EIO to whoever waits, from now on
+      await k.r('k_fs_pending_end').catch(() => {});
+      throw e;
+    });
+    this.background.catch(() => {});
+    return n;
   }
 
   /** An image's calls after its files' (`list`, sent with them): the
