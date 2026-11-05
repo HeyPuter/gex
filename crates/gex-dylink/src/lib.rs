@@ -1501,6 +1501,19 @@ pub fn shim_import(m: &str, name: &str) -> bool {
 }
 
 impl Link {
+    /// Back to its first `n` modules (a dlopen that failed part way): the
+    /// scope index forgets what it had of the rest.
+    pub fn truncate(&mut self, n: usize) {
+        if n >= self.mods.len() {
+            return;
+        }
+        self.mods.truncate(n);
+        let mut x = self.scope.0.lock().unwrap_or_else(|e| e.into_inner());
+        if x.upto > n {
+            *x = ScopeIndex::default();
+        }
+    }
+
     /// Whether the program is a static one (it names no libraries): what a
     /// library it `dlopen`s imports, its libc's included, is the program's
     /// own exports (`-Wl,--export`), and no `libc.so` is loaded beside it.

@@ -797,17 +797,32 @@ fn dlopen_in(g: &mut Option<DyProc>, path: &str) -> Result<u32, String> {
     if !info.dylink {
         return Err(format!("{found}: not a wasm shared library"));
     }
-    // on failure the link map is as it was
-    let mut q = DyProc { link: p.link.clone(), module_of: p.module_of.clone(), ldpath: lp, origin: o, startup: p.startup, slot_len: p.slot_len.clone(), entry_slots: p.entry_slots, lazy: false };
-    let from = q.link.mods.len();
-    q.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
-    let shed = super::wasmprog::shed(&q.link.mods[from].path, &b);
-    let mut all = vec![if shed.is_some() { (Vec::new(), shed) } else { (b, None) }];
-    all.extend(find_needed(&mut q, from)?);
-    let (order, _) = publish(&mut q, from, all, true, false, None)?;
+    // On failure the link map is as it was: its new modules dropped again.
+    // (A copy of the whole map made for that, every library's Info with
+    // its exports, and a scope index built afresh for the copy, were most
+    // of Plasma's shell's dlopens: 1.8 s to copy, 0.7 s to drop and 1.3 s
+    // to index again across a boot's processes.)
+    let from = p.link.mods.len();
+    let (module_of, slot_len, entry_slots) = (p.module_of.len(), p.slot_len.len(), p.entry_slots);
+    p.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
+    let r = (|| {
+        let shed = super::wasmprog::shed(&p.link.mods[from].path, &b);
+        let mut all = vec![if shed.is_some() { (Vec::new(), shed) } else { (b, None) }];
+        all.extend(find_needed(p, from)?);
+        publish(p, from, all, true, false, None)
+    })();
+    let order = match r {
+        Ok((order, _)) => order,
+        Err(e) => {
+            p.link.truncate(from);
+            p.module_of.truncate(module_of);
+            p.slot_len.truncate(slot_len);
+            p.entry_slots = entry_slots;
+            return Err(e);
+        }
+    };
     DL_GEN.fetch_add(1, Ordering::Release);
-    DL_NEW.with(|d| *d.borrow_mut() = order.iter().map(|&i| q.module_of[i]).collect());
-    *p = q;
+    DL_NEW.with(|d| *d.borrow_mut() = order.iter().map(|&i| p.module_of[i]).collect());
     Ok(HANDLE_BASE + from as u32 * 16)
 }
 
