@@ -152,9 +152,12 @@ static BINDS: Mutex<Option<HashMap<u32, Binds>>> = Mutex::new(None);
 /// finds it there reads only the `V` numbers ([`gex_wasmprog_bind_vals`]).
 struct Binds {
     text: String,
-    /// The shape's length (where the `V` line starts) and its Fx hash.
+    /// The shape's length (where the `V` line starts) and two independent
+    /// hashes of it (Fx and FNV-1a), so that a key names one shape: the page
+    /// takes a plan by key alone.
     shape: usize,
     hash: u64,
+    hash2: u64,
     /// The `V` numbers (all 32-bit), as JS takes them.
     vals: Vec<u32>,
 }
@@ -165,9 +168,10 @@ fn binds_put(number: u32, text: String) {
     let mut h = gex_dylink::FxHasher::default();
     h.write(&text.as_bytes()[..shape]);
     let hash = h.finish();
+    let hash2 = text.as_bytes()[..shape].iter().fold(0xcbf2_9ce4_8422_2325u64, |a, &b| (a ^ b as u64).wrapping_mul(0x100_0000_01b3));
     let v = text[shape..].strip_prefix("V\t").unwrap_or("").trim_end_matches('\n');
     let vals = if v.is_empty() { Vec::new() } else { v.split(',').map(|n| n.parse().unwrap_or(0)).collect() };
-    lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, Binds { text, shape, hash, vals });
+    lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, Binds { text, shape, hash, hash2, vals });
 }
 thread_local! {
     /// The modules this thread's last `dlopen` loaded, in initialisation
@@ -755,13 +759,16 @@ pub extern "C" fn gex_wasmprog_binds(number: u32, buf: u32, cap: u32) -> u32 {
 }
 
 /// Provider module `number`'s binding list's shape key ([`Binds`]): lane 0
-/// its length plus one (0: no list), 1 and 2 its hash's low and high words.
+/// its length plus one (0: no list), 1 and 2 its Fx hash's low and high
+/// words, 3 and 4 its FNV-1a hash's.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_bind_key(number: u32, lane: u32) -> u32 {
     lock(&BINDS).as_ref().and_then(|b| b.get(&number)).map_or(0, |t| match lane {
         0 => t.shape as u32 + 1,
         1 => t.hash as u32,
-        _ => (t.hash >> 32) as u32,
+        2 => (t.hash >> 32) as u32,
+        3 => t.hash2 as u32,
+        _ => (t.hash2 >> 32) as u32,
     })
 }
 

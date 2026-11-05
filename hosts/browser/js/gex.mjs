@@ -6341,7 +6341,9 @@ export class Gex {
   #bindGet(prov) {
     const e = this.#shim.exports;
     const len = !(SP_CODE && single.on) && e.gex_wasmprog_bind_key ? e.gex_wasmprog_bind_key(prov, 0) >>> 0 : 0;
-    const key = len ? `plan:${len - 1}:${(e.gex_wasmprog_bind_key(prov, 2) >>> 0).toString(16)}:${(e.gex_wasmprog_bind_key(prov, 1) >>> 0).toString(16)}` : null;
+    // the shape's length and two independent 64-bit hashes of it
+    const w = (lane) => (e.gex_wasmprog_bind_key(prov, lane) >>> 0).toString(16);
+    const key = len ? `plan:${len - 1}:${w(2)}:${w(1)}:${w(4)}:${w(3)}` : null;
     const had = key ? this.#sharedModules.get(key) : null;
     if (had && isPlan(had)) return { plan: had, str: planNames(had), vals: this.#bindVals(prov), text: null };
     if (key) {
