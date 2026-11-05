@@ -228,7 +228,8 @@ async function getRange(url, lo, hi) {
 let store_ = null;
 // What a relative URL is relative to: the Worker's own URL, or, for one a
 // page started from a blob (its copy of this file), the URL it stands for.
-const here = () => globalThis.GEX_BASE ?? self.location.href;
+// (none in a realm without a location, a test's: absolute URLs only)
+const here = () => globalThis.GEX_BASE ?? self.location?.href;
 const frameKey = (url, b, k) => {
   const u = new URL(url, here());
   u.hash = '';
@@ -342,7 +343,8 @@ self.onmessage = async ({ data: m }) => {
   try {
     cache = await caches.open(m.cache);
     // A store that opens but cannot hold anything (some insecure origins).
-    const probe = new URL('/__gex-probe', here()).href;
+    const base = here();
+    const probe = base ? new URL('/__gex-probe', base).href : '/__gex-probe';
     await cache.put(probe, new Response('1'));
     await cache.delete(probe);
   } catch (e) {
