@@ -8,6 +8,31 @@ import { bootWine } from '../lib/wine.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 4800 };
 
+// x87conv.c's digests on the hardware (every conversion under all 16
+// precision and rounding modes, fbld and fbstp among them)
+const X87_DIGESTS = [
+  ['fstp m64', '15be51c3c46743ca'],
+  ['fstp m32', '01f2d10bff4f18a5'],
+  ['fstp m80', '8ac5f863c2bb09d0'],
+  ['fistp m16', '7e283010ef5ed5df'],
+  ['fistp m32', '1726425ce24446fa'],
+  ['fistp m64', '84e0dd0425f356d1'],
+  ['fisttp m16', 'bcb357664a27c82d'],
+  ['fisttp m32', '5742d4b8580fa5b3'],
+  ['fisttp m64', 'ce799954d1a9e474'],
+  ['fld m64', 'a34344f0530754d8'],
+  ['fld m32', 'b32e7a6fbff8b743'],
+  ['fild m16', 'e89afd776a2570bc'],
+  ['fild m32', 'c2236a313bb837e8'],
+  ['fild m64', '5159b85fbb56b35a'],
+  ['fld const', '058675d71874449d'],
+  ['stack faults', 'cba6f7d43db5b725'],
+  ['fbstp', '19b49b113215e0f0'],
+  ['fild fbstp', '628955cf60e8c1b0'],
+  ['fbld', 'ffa1cf42be60b3b1'],
+];
+const X87_WANT = new RegExp(X87_DIGESTS.map(([n, d]) => `^${n.replace(/ /g, ' +')} +\\d+ cases +${d}\\r?$`).join('\\n'), 'm');
+
 // [case, program, its arch, args, programs it starts, what it prints when it
 // passes (default "wowNN CASE ok"), the null driver (default yes)]
 const CASES = [
@@ -27,6 +52,8 @@ const CASES = [
   ['sysarch64', 'wow64c.exe', 'x64', ['sysarch']],
   ['sysarch32', 'wow32.exe', 'x86', ['sysarch']],
   ['bcd', 'wow32.exe', 'x86', ['bcd']],
+  ['x87conv32', 'x87conv.exe', 'x86', [], [], X87_WANT],
+  ['x87conv64', 'x87conv.exe', 'x64', [], [], X87_WANT],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)
   ['timerproc', 'timerproc.exe', 'x86', [], [], /^(ok [^\n]*\n)+0 failures\n?$/],
   // 32-bit OpenGL and Direct3D with no context ever current on the thread,
