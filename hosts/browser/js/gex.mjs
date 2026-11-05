@@ -274,6 +274,9 @@ const SPARE_MODULES = 20;
  *  apart once nothing has come for a while. */
 const SPARE_POLL_MS = 20;
 const SPARE_POLL_MAX_MS = 1000;
+/** How long a spare waits for a sibling's relay of a native module before
+ *  compiling it itself (`Gex#relayAwaited`). */
+const RELAY_WAIT_MS = 250;
 /** A test-only switch: the threshold itself, so a small program gets one. */
 const spareModules = () => Number(globalThis.GEX_TEST_SPARE_MODULES ?? globalThis.process?.env?.GEX_TEST_SPARE_MODULES ?? 0) || SPARE_MODULES;
 
@@ -4340,7 +4343,7 @@ export class Gex {
       const gen = this.#shim.exports.gex_exec_gen?.() ?? 0;
       this.#spareWait = true;
       await this.#catchUp();
-      this.#cgenCatchUp();
+      this.#cgenCatchUp(true);
       const said = logNamed('spare');
       if (said) console.warn(`[spare] pid ${this.#shim.exports.gex_my_pid?.() ?? '?'}: caught up with ${this.#cgen?.dyl.size ?? 0} modules, waiting`);
       // And what the process installs while it waits (its program's modules
@@ -4354,10 +4357,11 @@ export class Gex {
         const was = this.#cgen?.have ?? 0;
         // Not another program's: the host lets this spare go when it hears of it.
         const same = (this.#shim.exports.gex_exec_gen?.() ?? 0) === gen && !this.#shim.exports.gex_exited?.();
-        if (same && (this.#shim.exports.gex_ftab_log_len?.() >>> 0) > was) this.#cgenCatchUp();
+        if (same && (this.#shim.exports.gex_ftab_log_len?.() >>> 0) > was) this.#cgenCatchUp(true);
         const now = this.#cgen?.have ?? 0;
         if (now !== was && said) console.warn(`[spare] pid ${this.#shim.exports.gex_my_pid?.() ?? '?'}: caught up with ${this.#cgen?.dyl.size ?? 0} modules while waiting`);
-        delay = now !== was ? SPARE_POLL_MS : Math.min(2 * delay, SPARE_POLL_MAX_MS);
+        // Waiting on a sibling's module (`#relayWait`): looked at again soon.
+        delay = now !== was || this.#relayWait.size ? SPARE_POLL_MS : Math.min(2 * delay, SPARE_POLL_MAX_MS);
       }
       this.#spareWait = false;
       if (!go?.tid) {
@@ -5513,7 +5517,7 @@ export class Gex {
     // compile and its instantiation took.
     if (wasmdll && logNamed('wasmlib')) {
       const c = this.#fileModuleMs;
-      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'} w${Math.round(performance.timeOrigin) % 1e6}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'} w${Math.round(performance.timeOrigin) % 1e6}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}${this.#spareWait ? ' (spare)' : ''}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     }
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${bridges} bridges)`);
     return bridges;
@@ -6056,9 +6060,40 @@ export class Gex {
   #slotMemo = null;
   #slotMemoEnd = 0;
 
-  #cgenCatchUp() {
+  /** Native modules a spare's catch-up left for the sibling that compiled
+   *  them to relay (`#relayAwaited`): key -> when it was first left. */
+  #relayWait = new Map();
+  /** Whether a spare's catch-up (`#cgenCatchUp(true)`) leaves provider `prov`
+   *  for later: a native wasm32 module this Worker has no compiled module for,
+   *  which the Worker that published it compiled and is relaying (its record
+   *  follows its install) -- for at most RELAY_WAIT_MS, then compiled here. A
+   *  spare runs no thread, so nothing calls into what it has not installed,
+   *  and it turns its event loop while it waits, which the relay needs; a
+   *  running thread's Worker catches up at once, as before. */
+  #relayAwaited(prov) {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_pmod_wasm_key || !((e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0)) return false;
+    if (!e.gex_cgen_pmod_wasmprog?.(prov) && e.gex_cgen_pmod_libprov?.(prov)) return false;
+    const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
+    const key = `wasm:${e.gex_cgen_pmod_wasm_len(prov) >>> 0}:${lane(0)}:${lane(1)}`;
+    if (this.#sharedModules.has(key) || this.#sharedModules.has(`${key}:p`)) {
+      this.#relayWait.delete(key);
+      return false;
+    }
+    const now = performance.now(), since = this.#relayWait.get(key);
+    if (since === undefined) {
+      this.#relayWait.set(key, now);
+      return true;
+    }
+    if (now - since < RELAY_WAIT_MS) return true;
+    this.#relayWait.delete(key);
+    return false;
+  }
+
+  #cgenCatchUp(spare = false) {
     const e = this.#shim.exports;
     if (!e.gex_ftab_log_len) return;
+    if (!spare && this.#relayWait.size) this.#relayWait.clear();
     // before the log's length: every slot below it is published by then
     const size = e.gex_ftab_size() >>> 0;
     const len = e.gex_ftab_log_len() >>> 0;
@@ -6102,6 +6137,7 @@ export class Gex {
             this.#cgenDefer(u, e.gex_ftab_install_base(v) >>> 0, e.gex_ftab_install_len(v) >>> 0);
           }
           else if (u >= 0x80000000) {
+            if (spare && this.#relayAwaited(u - 0x80000000)) break;
             try {
               this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
             } catch (err) {
