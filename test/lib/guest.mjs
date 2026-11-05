@@ -113,14 +113,16 @@ export function guest(t) {
     /**
      * run-node.mjs on `seed` and `prog` with `args`: `files` (`{ guest path:
      * host path }`), `argv0`, `env` (on top of this one's), `timeout` (ms)
-     * and `flags` (run-node.mjs's own, before the seed). `single`: the
+     * and `flags` (run-node.mjs's own, before the seed); `cwd` (this tree by
+     * default) and `node` (node's own flags). `single`: the
      * single-thread build, as the page without SharedArrayBuffer runs it
      * (GEX_SINGLE=1, JSPI, no SharedArrayBuffer); `jspi` JSPI alone, where
      * this node has it only behind a flag. Resolves `{ code, signal,
      * stdout, stderr, all, guest }`, `guest` being `guestLines(stdout)`.
      */
-    run(seed, prog, args = [], { files = {}, argv0, env = {}, timeout = 120000, flags = [], single = false, merge = false, jspi = single } = {}) {
+    run(seed, prog, args = [], { files = {}, argv0, env = {}, timeout = 120000, flags = [], single = false, merge = false, jspi = single, cwd = ROOT, node = [] } = {}) {
       const argv = [
+        ...node,
         ...(jspi && typeof WebAssembly.Suspending !== 'function' ? ['--experimental-wasm-jspi'] : []),
         ...(single ? ['--import', 'data:text/javascript,delete globalThis.SharedArrayBuffer'] : []),
         join(ROOT, 'hosts/browser/js/run-node.mjs'), ...flags,
@@ -136,7 +138,7 @@ export function guest(t) {
         // `2>&1` keeps them (`all`; stdout and stderr then empty).
         const file = merge ? join(cache, `run-${process.pid}-${++runs}.out`) : null;
         const fd = file ? openSync(file, 'w') : null;
-        const p = spawn(process.execPath, argv, { cwd: ROOT, env: { ...base, ...g.env, ...env }, stdio: ['ignore', fd ?? 'pipe', fd ?? 'pipe'] });
+        const p = spawn(process.execPath, argv, { cwd, env: { ...base, ...g.env, ...env }, stdio: ['ignore', fd ?? 'pipe', fd ?? 'pipe'] });
         if (fd !== null) closeSync(fd);
         const out = [];
         const err = [];

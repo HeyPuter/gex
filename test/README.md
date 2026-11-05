@@ -135,8 +135,13 @@ lib/gexcc.mjs builds with gexcc and the host's compiler and runs under this
 arch's gexc (`gexcc/programs`: fixtures/gexcc/programs, each against the host
 natively, under gexc and on the page's shim). A check written as a shell
 script is `script(t, NAME)`, fixtures/gexcc/dl/NAME.sh: each `ok`/`FAIL` line
-it prints is a check (`gexcc/dl-*`). `site/eject-page-files` builds an
-ejected page and checks it carries the page's runtime and X server.
+it prints is a check (`gexcc/dl-*`). lib/native.mjs builds Linux programs
+with a musl cross gcc (GEX_TOOLCHAIN, an aarch64-linux-musl-cross tree, and
+GEX_TOOLCHAIN_X86; default under ~/toolchains), runs them under gexc and,
+through lib/guest.mjs, on the page's shim (`native/*`: fixtures/native/NAME,
+the sources only; each test builds, runs and compares itself).
+`site/eject-page-files` builds an ejected page and checks it carries the
+page's runtime and X server.
 
 ## Images
 
