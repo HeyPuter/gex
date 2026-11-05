@@ -52,7 +52,8 @@ file() { # PATH: the host file of a run's path, or nothing
       # C:\winlogon.exe to the dist's) is that path's file
       local q t; [ -n "$P" ] && q=$P/drive_c/${p#/pfx/dosdevices/c:/} || return 0
       if [ -L "$q" ] && t=$(readlink "$q") && [ "${t#/}" != "$t" ]; then file "$t"; else echo "$q"; fi ;;
-    /pfx/dosdevices/z:/*) echo "/${p#/pfx/dosdevices/z:/}" ;;
+    # the page's root (Z:): a page path, the program's directory /g among them
+    /pfx/dosdevices/z:/*) file "/${p#/pfx/dosdevices/z:/}" ;;
     /*) echo "$p" ;;
   esac
 }

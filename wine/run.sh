@@ -1,6 +1,7 @@
 #!/bin/bash
-# Run a Windows program on 32-bit Wine (Wine's own Unix side as wasm32 on gex) with the
-# dist and prefix `make -C wine` builds, natively under gexc.
+# Run a Windows program on Wine under gexc: a 64-bit Wine install (--dist,
+# wine64-dist.sh's) or 32-bit Wine (Wine's own Unix side as wasm32 on gex)
+# with the dist and prefix `make -C wine` builds.
 #
 #   wine/run.sh [options] EXE [ARGS...]
 #   wine/run.sh --page TREE [options] EXE [ARGS...]
@@ -24,11 +25,12 @@
 # WINE32_PAGE_DIR defaults to WINE32_CACHE/page; on a remote box it and the unit
 # cache must be under paths the runner maps.
 # With --dist a 64-bit Wine install (wine64-dist.sh's: lib/wine/x86_64-unix)
-# it runs that in the page instead, at /wine, on --prefix (required: its
-# WINE64_PREFIX, copied) with --null's driver or Wayland, and without doors;
-# a dist with lib/wine/i386-windows (WINE64_WOW64=1) runs 32-bit programs in
-# the 64-bit process (WoW64). No make then; units default to page-units
-# beside the dist. Only with --page.
+# it runs that, natively or in the page (at /wine), on --prefix (required:
+# its WINE64_PREFIX, copied) with --null's driver or Wayland, and without
+# doors; a dist with lib/wine/i386-windows (WINE64_WOW64=1) runs 32-bit
+# programs in the 64-bit process (WoW64). No make then; units default to
+# units (natively) or page-units (the page's) beside the dist. --native's
+# core goes over a linked copy of the dist, kept beside it (native-KEY).
 #
 # Options:
 #   --null             the null display driver (no compositor; tests)
@@ -105,12 +107,11 @@ target=prefix; [ $graphics = null ] && target=prefix-null
 # runs as it is, with its own prefix: no make.
 w64=""; [ -n "$dist" ] && [ -f "$dist/lib/wine/x86_64-unix/wine" ] && w64=1
 if [ -n "$w64" ]; then
-  [ -n "$page" ] || { echo "run.sh: a 64-bit Wine dist runs with --page only" >&2; exit 1; }
   [ -n "$prefix" ] || { echo "run.sh: a 64-bit Wine dist needs --prefix (its WINE64_PREFIX)" >&2; exit 1; }
   dist=$(realpath "$dist")
   WINE32_KEY=w64s-$({ echo "$dist $native"; find -L "$dist" ${native:+"$native"} -type f -printf '%T@ %s %p\n' | sort; } | sha256sum | cut -c1-12)
   WINE32_DIST=$dist
-  units=${units:-$(dirname "$dist")/page-units}
+  units=${units:-$(dirname "$dist")/$([ -n "$page" ] && echo page-units || echo units)}
 else
   [ -n "$make" ] && make -s -C "$WINE32" dist $target >&2
   eval "$(make -s -C "$WINE32" paths)"
@@ -156,7 +157,7 @@ if [ -n "$page" ]; then
   fi
   # The run tree, at one path per program, so the box's copy updates by difference.
   rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/page" "$rt/hosts/browser" "$rt/wine/page" "$rt/test/lib"
-  for d in page/nt.html page/vite.config.js page/package.json page/src wine/page/browser-harness.mjs test/lib/cdp.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
+  for d in page/nt.html page/vite.config.js page/package.json page/src page/runtime/src wine/page/browser-harness.mjs test/lib/cdp.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
     mkdir -p "$rt/$(dirname "$d")"; cp -al "$page/$d" "$rt/$(dirname "$d")/" 2>/dev/null || cp -a "$page/$d" "$rt/$(dirname "$d")/"
   done
   rm -rf "$rt/page/public/gex/nt"; mkdir -p "$rt/page/public/gex/nt"
@@ -209,13 +210,31 @@ if [ -n "$keep" ]; then
 else
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/wine32-run.XXXXXX"); pfx=$tmp/pfx; cp -a "$prefix" "$pfx"
 fi
+loader=$dist/lib/wine/i386-unix/wine
+if [ -n "$w64" ]; then
+  # the prefix's driver as --null asks (its prefix keeps one)
+  gd=wayland; [ $graphics = null ] && gd=null
+  [ "$(grep '^"Graphics"=' "$pfx/user.reg" | tail -1)" = "\"Graphics\"=\"$gd\"" ] ||
+  printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' $gd >> "$pfx/user.reg"
+  # the native core's files in place of the PE ones, on a linked copy
+  if [ -n "$native" ]; then
+    nd=$(dirname "$dist")/native-$WINE32_KEY
+    [ -f "$nd/.done" ] || {
+      rm -rf "$nd"; cp -rl "$dist" "$nd"
+      for f in "$native"/*; do rm -f "$nd/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$nd/lib/wine/x86_64-windows/"; done
+      touch "$nd/.done"; }
+    dist=$nd
+  fi
+  loader=$dist/lib/wine/x86_64-unix/wine
+  [ -d "$dist/lib/wine/i386-windows" ] && envs+=(--env WINEGEX_WOW64=1)
+fi
 win="Z:$(printf %s "$exe" | tr / '\\')"
 gl=(); [ $graphics = wayland ] && gl=(--gl)
 cd "$(dirname "$exe")"
 export GEX_WINE32_UNITS=${GEX_WINE32_UNITS:-all} GEX_CGEN_CACHE=$units
 [ -n "$build_units" ] && export GEX_WINE32_UNITS_BUILD=1
 cmd=("$gexc" run --env WINEPREFIX="$pfx" --env WINEDEBUG="$debug" "${envs[@]}" "${gl[@]}"
-  --wayland "$wl/wl" --wayland-size "$size" --wayland-out "$out" "$dist/lib/wine/i386-unix/wine" "$win" "$@")
+  --wayland "$wl/wl" --wayland-size "$size" --wayland-out "$out" "$loader" "$win" "$@")
 rc=0
 if [ -n "$tmo" ]; then timeout -k 10 "$tmo" "${cmd[@]}" || rc=$?; else "${cmd[@]}" || rc=$?; fi
 exit $rc
