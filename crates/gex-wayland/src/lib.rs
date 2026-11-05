@@ -54,8 +54,11 @@ pub trait Buffers {
     /// ever copies a frame on the way out. `map` stays for the host that has no
     /// such view (the native one, which composites from its own copy).
     ///
+    /// `size` is the pool's: a process that maps the descriptor more than
+    /// once has the pool where a mapping holds all of it.
+    ///
     /// 64 bits: a memory64 process's pool may sit above 4 GiB.
-    fn locate(&self, _fd: u32) -> Option<(u64, u64)> {
+    fn locate(&self, _fd: u32, _size: usize) -> Option<(u64, u64)> {
         None
     }
 }
@@ -1716,7 +1719,7 @@ impl Client {
                 // damaged rows straight out of the guest's memory. A host with
                 // no such view (the native one) says None, and gets a `Frame`
                 // with the pixels in it as before.
-                let placed = buffers.locate(spec.fd).and_then(|(base, len)| {
+                let placed = buffers.locate(spec.fd, spec.pool_size).and_then(|(base, len)| {
                     let off = u64::try_from(spec.offset).ok()?;
                     let need = u64::try_from(spec.stride)
                         .ok()?
@@ -3789,7 +3792,7 @@ mod tests {
         fn map(&self, _fd: u32, size: usize) -> Option<Vec<u8>> {
             Some(vec![0u8; size])
         }
-        fn locate(&self, _fd: u32) -> Option<(u64, u64)> {
+        fn locate(&self, _fd: u32, _size: usize) -> Option<(u64, u64)> {
             Some((self.0, self.1))
         }
     }

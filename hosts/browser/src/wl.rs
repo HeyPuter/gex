@@ -1158,13 +1158,14 @@ struct PoolView<'a, 'm> {
 }
 
 impl Buffers for PoolView<'_, '_> {
-    fn locate(&self, fd: u32) -> Option<(u64, u64)> {
+    fn locate(&self, fd: u32, size: usize) -> Option<(u64, u64)> {
         let file = self.fds.get(fd as usize)?.as_ref()?;
         // The client mapped its pool MAP_SHARED, so the mapping *is* the
         // pool: its address in guest memory is where the pixels are, live,
         // and the compositor reads them from there. This is why a frame is
-        // never copied on the way to the screen.
-        let map = self.maps.of(file)?;
+        // never copied on the way to the screen. Of the file's mappings, one
+        // that holds the whole pool (`pool_map`).
+        let map = self.maps.pool(file, size as u64)?;
         // Whole: a memory64 process's pool may sit above 4 GiB, and its low
         // half alone named the shim's heap (`push_record`'s two words).
         Some((map.start as u64, map.len as u64))
@@ -1174,7 +1175,7 @@ impl Buffers for PoolView<'_, '_> {
         let file = self.fds.get(fd as usize)?.as_ref()?;
         // Mapped shared, so the live pixels are in the guest's memory; the
         // file's own bytes are what was there before it drew.
-        let map = self.maps.of(file)?;
+        let map = self.maps.pool(file, size as u64)?;
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }

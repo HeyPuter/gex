@@ -192,7 +192,7 @@ struct Pools<'a> {
 }
 
 impl Buffers for Pools<'_> {
-    fn locate(&self, fd: u32) -> Option<(u64, u64)> {
+    fn locate(&self, fd: u32, _size: usize) -> Option<(u64, u64)> {
         let id = *self.fds.get(fd as usize)?;
         let mut out = [0u32; 2];
         let ok = unsafe { host_locate(id, out.as_mut_ptr() as u32) };

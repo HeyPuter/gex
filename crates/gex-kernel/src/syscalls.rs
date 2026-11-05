@@ -9101,6 +9101,47 @@ impl SharedMapView {
     pub fn of(&self, file: &Arc<OpenFile>) -> Option<SharedMap> {
         self.cur.read(crate::sync::me() as usize, |l| l.iter().find(|m| Arc::ptr_eq(&m.file, file)).cloned())
     }
+
+    /// The mapping that holds `file`'s first `len` bytes ([`pool_map`]).
+    pub fn pool(&self, file: &Arc<OpenFile>, len: u64) -> Option<SharedMap> {
+        self.cur.read(crate::sync::me() as usize, |l| pool_map(l.iter(), file, len).cloned())
+    }
+}
+
+/// Of the shared mappings `maps`, the one that holds `file`'s first `len`
+/// bytes: where a process that sent `file` to its compositor as a pool
+/// (`wl_shm.create_pool(fd, len)`, which is the file from offset 0) has the
+/// pool's pixels.
+///
+/// A program may map one file more than once, and at different lengths: Wine
+/// maps a 4 KiB view of the file that later backs a 3 MiB window buffer. The
+/// first mapping of the file in the list was then the 4 KiB one, too short
+/// for the buffer, which the compositor refused, and the window never showed.
+/// Which mapping came first depended on what the process had mapped before.
+///
+/// So any mapping of the file that holds the whole range will do, and the
+/// latest one is preferred, since a client maps its buffer just before
+/// sending it. A mapping of this description wins over a mapping of another
+/// `open` of the same file (the same pages, [`OpenFile::same_file`]), which
+/// is looked for only when this description has none. With none that holds
+/// the range, the longest from offset 0, so the caller can refuse it as too
+/// short.
+pub fn pool_map<'a>(
+    maps: impl Iterator<Item = &'a SharedMap> + Clone,
+    file: &Arc<OpenFile>,
+    len: u64,
+) -> Option<&'a SharedMap> {
+    let from0 = |m: &&SharedMap| m.offset == 0;
+    let holds = |m: &&SharedMap| m.len >= len;
+    let mine = maps.clone().filter(|m| Arc::ptr_eq(&m.file, file)).filter(from0);
+    if let Some(m) = mine.clone().filter(holds).last() {
+        return Some(m);
+    }
+    let same = maps.filter(|m| !Arc::ptr_eq(&m.file, file) && m.file.same_file(file)).filter(from0);
+    if let Some(m) = same.clone().filter(holds).last() {
+        return Some(m);
+    }
+    mine.chain(same).max_by_key(|m| m.len)
 }
 
 impl SharedMaps {
@@ -16230,6 +16271,26 @@ mod tests {
         assert!(view.of(&b).is_some());
         assert_eq!(held.len(), 2, "a reader's copy is whole");
         assert_eq!(maps.len(), 1);
+    }
+
+    /// A pool is where a mapping of its file holds all of it: a 4 KiB view
+    /// of the file mapped before the pool's 3 MiB one is not it (Wine maps
+    /// both, and the compositor took the first and refused the window's
+    /// buffer as longer than its pool).
+    #[test]
+    fn a_pool_is_the_mapping_that_holds_it() {
+        let file = |name: &str| OpenFile::new(Arc::new(crate::unix::MemFd::new(name)), name.into(), 0, true, true);
+        let a = file("pool");
+        let map = |start, len, offset| SharedMap { start, len, file: Arc::clone(&a), offset, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() };
+        let mut maps = SharedMaps::new();
+        let view = Arc::clone(maps.view());
+        maps.push(map(0xde56000, 0x1000, 0));
+        assert_eq!(view.pool(&a, 0x30_0000).map(|m| m.start), Some(0xde56000), "too short, but the only one: the caller refuses it");
+        maps.push(map(0x40000000, 0x30_0000, 0x1000));
+        maps.push(map(0x22890000, 0x30_0000, 0));
+        assert_eq!(view.pool(&a, 0x30_0000).map(|m| m.start), Some(0x22890000));
+        assert_eq!(view.pool(&a, 0x1000).map(|m| m.start), Some(0x22890000), "the latest that holds it");
+        assert!(view.pool(&file("other"), 0x1000).is_none());
     }
 
     /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class

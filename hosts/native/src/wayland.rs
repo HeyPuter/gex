@@ -1040,15 +1040,11 @@ impl Buffers for PoolView<'_, '_> {
         let file = self.fds.get(&fd)?;
         // The client mapped this shared, so the live pixels are in the guest's
         // memory; the file's own bytes are what was there before it drew (zero).
-        let map = self
-            .kernel
-            .mem
-            .lock()
-            .log
-            .shared_maps
-            .iter()
-            .find(|m| Arc::ptr_eq(&m.file, file))
-            .cloned()?;
+        // Its inode asked before the lock, as `mmap` asks it (file I/O).
+        let _ = file.ino();
+        let mm = self.kernel.mem.lock();
+        let map = gex_kernel::syscalls::pool_map(mm.log.shared_maps.iter(), file, size as u64).cloned()?;
+        drop(mm);
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }
