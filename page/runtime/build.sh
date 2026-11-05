@@ -392,27 +392,35 @@ fi
 # The declarations (types/), one beside each module.
 cp "$RT"/types/*.d.ts "$OUT/"
 
-# No file of the package names the machine it was built on: a path under
-# /home, /root or /tmp (an assertion's __FILE__, a build directory baked into
-# a string), or the sandbox's name, in any file, wasm included, fails the
-# build, naming the file and the string. The guest's own paths, which the
-# runtime and its programs use at run time, are allowed by name.
-node - "$OUT" <<'JS'
-const fs = require('fs'), path = require('path');
-const out = process.argv[2];
-const guest = [
-  /^\/tmp\/\.X11-unix(\/X0?)?$/, /^\/tmp\/wayland-0$/, /^\/tmp\/$/,
-  /^\/tmp\/mesa_%s_%d_XXXXXX\.log$/,       // Mesa's own debug log, in the guest's /tmp
-  /^\/tmp\/proc\/dev\/run\/var\/var\/tmp$/, // the kernel's mount points, one string after another
-  /^\/home\/web_user$/,                     // Emscripten's filesystem's home
-];
-const re = /(?:\/home\/|\/root\/|\/tmp\/)[^\0-\x20"'`(),;\\\x7f-\xff]*|[^\0-\x20"'`]*gex-sandbox[^\0-\x20"'`]*/g;
+# No file of the package names the machine it was built on: the builder's
+# home, this tree's absolute path (its target directories with it), a
+# CARGO_TARGET_DIR or TMPDIR of its own, or a /tmp/USER build directory,
+# in any file, wasm included, fails the build, naming the file and the
+# string. Only these: a scan of every absolute-looking string needs a list
+# of the guest's own paths, and a wasm's strings sit one after another with
+# no terminator, so what follows a guest path changes with every link.
+node - "$OUT" "$(dirname "$WEB")" <<'JS'
+const fs = require('fs'), os = require('os'), path = require('path');
+const [out, tree] = process.argv.slice(2);
+const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+const user = os.userInfo().username;
+const dirs = [os.homedir(), process.env.HOME, tree, real(tree), process.env.CARGO_TARGET_DIR,
+  ...[process.env.TMPDIR].filter((d) => d && !/^\/tmp\/?$/.test(d))]
+  .filter(Boolean).map((d) => d.replace(/\/+$/, '')).filter((d) => d.split('/').length > 2);
+// A directory as itself or with a path below it; /tmp/USER as the start of one (/tmp/USER-1004/...).
+const marks = [...new Set(dirs)].map((d) => new RegExp(`${d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![^/\0-\x20"'\`])`));
+marks.push(new RegExp(`/tmp/${user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
 let bad = 0;
 for (const f of fs.readdirSync(out).sort()) {
   const s = fs.readFileSync(path.join(out, f)).toString('latin1');
-  for (const m of new Set(Array.from(s.matchAll(re), (x) => x[0]))) {
-    if (!m.includes('gex-sandbox') && guest.some((g) => g.test(m))) continue;
-    console.error(`page/runtime/build.sh: ${f} names a build machine's path: ${m.slice(0, 160)}`);
+  const seen = new Set();
+  for (const m of marks) {
+    const at = s.search(m);
+    if (at >= 0) seen.add(s.slice(at, at + 160).match(/^[^\0-\x1f"'`]*/)[0]);
+  }
+  for (const p of seen) {
+    if ([...seen].some((q) => q !== p && q.endsWith(p))) continue; // one path, found by two of its directories
+    console.error(`page/runtime/build.sh: ${f} names a build machine's path: ${p}`);
     bad++;
   }
 }
