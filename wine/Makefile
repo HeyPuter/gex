@@ -128,7 +128,7 @@ $(GL_O): $(SYSROOT)/.done
 	mkdir -p $(dir $@)
 	$(NICE) $(WINE32)/wcc -O2 -c -o $@.tmp $(ROOT)/guest/gl/gexgl.c && mv $@.tmp $@
 
-$(DEPS)/.done: $(SYSROOT)/.done
+$(DEPS)/.done: $(SYSROOT)/.done | $(GL_O)
 	WINE32_GL_O=$(GL_O) $(NICE) $(WINE32)/deps32.sh $(DEPS) $(C)/dl > $(DEPS).log 2>&1 || { tail -5 $(DEPS).log; exit 1; }
 	touch $@
 

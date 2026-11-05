@@ -34,9 +34,12 @@
 #               and winebus in the loader, and winegstreamer.so (+ FFmpeg) and libSDL2-2.0.so.0
 #               beside it (WINE64_MEDIA=off, WINE64_PADS=off: not);
 #               WINE64_TLS=0 leaves GnuTLS out (S gets -notls)
-#   srv-K-V     the wasm32 wineserver (link-wineserver.sh over WINE32_BUILD); V:
-#               that script and the 32-bit configure options it compiles with;
-#               its objects in obj/ (test/page/snapshot relinks them): WINE64_SERVER
+#   s32-TP-SC   this Wine tree configured for wasm32, not made (build32.sh
+#               configure): the compile commands the server is built with;
+#               SC: the 32-bit sysroot and libraries, build32.sh and wcc
+#   srv-K-V     the wasm32 wineserver (link-wineserver.sh over s32-TP-SC); V:
+#               that script and SC; its objects in obj/ (test/page/snapshot
+#               relinks them): WINE64_SERVER
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
 #   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
@@ -74,11 +77,12 @@
 # Env: GEX_WASM64_SYSROOT (toolchain/sysroot/build64.sh); JOBS (default 16); the
 # libraries' tarballs are kept in CACHE/dl, taken from WINE32_DL_SEED and
 # 32-bit Wine's downloads (WINE32_CACHE, default ~/.cache/gex/wine32) when there.
-# The server is compiled with a configured 32-bit Wine build tree's commands:
-# WINE32_BUILD and GEX_WASM_SYSROOT, or, unset, wine's own (`make
-# paths`, under WINE32_CACHE), made first when missing (`make build`: the 32-bit Wine
-# sysroot, libraries and Wine tree, an hour or more the first time) --
-# checked before anything else is built. Needs x86_64-w64-mingw32-gcc. The
+# The server, a wasm32 program, is compiled with this tree's own wasm32
+# configure (s32 above), over the 32-bit sysroot and libraries: the caller's
+# GEX_WASM_SYSROOT and WINE32_DEPS, or, unset, wine's own (`make paths`,
+# under WINE32_CACHE), made first when missing (`make sysroot deps`) --
+# checked before anything else is built. WoW64's i386 side is built over
+# the same two. Needs x86_64-w64-mingw32-gcc. The
 # first run builds Wine twice (native and MinGW, then wasm64): about 40
 # minutes on 16 threads.
 set -eu
@@ -90,27 +94,26 @@ export TMPDIR=${TMPDIR:-$C/tmp}; mkdir -p "$TMPDIR"
 J=${JOBS:-16}
 [ -z "$(git -C "$W" status --porcelain --untracked-files=no)" ] || { echo "wine64-dist: $W has uncommitted changes" >&2; exit 1; }
 K=$(git -C "$W" rev-parse --short=12 HEAD)
-V=$(cat "$here/link-wineserver.sh" "$here/build32.sh" | sha256sum | cut -c1-6)
 pin=$(sed -n 's/^WINE64_COMMIT *:= *//p' "$here/wine.pins")
 [ "$(git -C "$W" rev-parse HEAD)" = "$pin" ] || echo "wine64-dist: $W is at $K, not wine.pins' $(printf %.12s "$pin")" >&2
 log() { echo "wine64-dist: $*" >&2; }
-# The server's prerequisite first, so a missing one fails now, not after
-# the Wine builds: a configured 32-bit Wine build tree and its sysroot.
-if [ ! -e "$C/srv-$K-$V/.done" ]; then
-	own=$(make -s -C "$here" paths) || { log "make -C wine paths failed"; exit 1; }
-	ownb=$(sed -n 's/^WINE32_BUILD=//p' <<< "$own")
-	if [ -z "${WINE32_BUILD:-}" ]; then
-		WINE32_BUILD=$ownb; GEX_WASM_SYSROOT=$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$own")
-	fi
-	if [ "$WINE32_BUILD" = "$ownb" ] && ! ls "$WINE32_BUILD"/.done-* >/dev/null 2>&1; then
-		log "no wine32 build tree at $WINE32_BUILD: making it (make -C wine build, log $C/wine32-build.log)"
-		nice -n 10 make -C "$here" build WINE32_JOBS="$J" > "$C/wine32-build.log" 2>&1 ||
-			{ log "the wine32 build tree failed: $C/wine32-build.log"; tail -5 "$C/wine32-build.log" >&2; exit 1; }
-	fi
-	[ -f "$WINE32_BUILD/Makefile" ] || { log "WINE32_BUILD=$WINE32_BUILD is no configured wine32 build tree (make -C wine build)"; exit 1; }
-	[ -d "${GEX_WASM_SYSROOT:-}" ] || { log "GEX_WASM_SYSROOT=${GEX_WASM_SYSROOT:-} is no wine32 sysroot (make -C wine paths)"; exit 1; }
-	export GEX_WASM_SYSROOT
+# The 32-bit prerequisites first, so a missing one fails now, not after the
+# Wine builds: the sysroot and the libraries (no 32-bit Wine tree, and
+# nothing of legacy32/ or its wine32.pins is read). The pins they are made
+# from: toolchain/pins' MUSL_COMMIT (the sysroot), and libs.pins' FREETYPE_*,
+# WAYLAND_*, XKBCOMMON_*, LIBXML2_*, MESON_*, NETTLE_*, GNUTLS_* and CACERT_*
+# (deps32.sh).
+p32=$(make -s -C "$here" paths) || { log "make -C wine paths failed"; exit 1; }
+SR32=${GEX_WASM_SYSROOT:-$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32")}
+DEPS32=${WINE32_DEPS:-$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")}
+if [ -z "${GEX_WASM_SYSROOT:-}${WINE32_DEPS:-}" ] && ! { [ -d "$SR32" ] && [ -e "$DEPS32/.done" ]; }; then
+	log "no 32-bit sysroot or libraries: making them (make -C wine sysroot deps, log $C/wine32-deps.log)"
+	nice -n 10 make -C "$here" sysroot deps WINE32_JOBS="$J" > "$C/wine32-deps.log" 2>&1 ||
+		{ log "the 32-bit sysroot or libraries failed: $C/wine32-deps.log"; tail -5 "$C/wine32-deps.log" >&2; exit 1; }
 fi
+[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit sysroot or libraries ($SR32, $DEPS32): make -C wine sysroot deps"; exit 1; }
+SC=$( { echo "$SR32 $DEPS32"; cat "$here"/build32.sh "$here"/wcc; } | sha256sum | cut -c1-10)
+V=$( { echo "$SC"; cat "$here/link-wineserver.sh"; } | sha256sum | cut -c1-6)
 # The tools, the PE DLLs and the prefix do not depend on the Unix side
 # (dlls/*/unix, server, loader): keyed by the rest of the tree, so a
 # Unix-side change rebuilds only the wasm64 tree and the server.
@@ -380,11 +383,14 @@ b64_build() {
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
+srv_conf() {
+	GEX_WASM_SYSROOT=$SR32 "$here/build32.sh" configure "$W" "$T" "$PWD" "$DEPS32"
+}
+log "wineserver's wasm32 configure ($TP, $SC)"; step s32-$TP-$SC srv_conf
 srv_link() {
-	# (a tree configured before wine32/wine-build.sh kept inotify has none)
-	grep -q '^#define HAVE_SYS_INOTIFY_H 1' "$WINE32_BUILD/include/config.h" ||
-		{ echo "wine64-dist: $WINE32_BUILD was configured without inotify (make -C wine build)"; return 1; }
-	"$here/link-wineserver.sh" "$WINE32_BUILD" "$W" "$PWD/obj" "$PWD"
+	grep -q '^#define HAVE_SYS_INOTIFY_H 1' "$C/s32-$TP-$SC/include/config.h" ||
+		{ echo "wine64-dist: s32-$TP-$SC was configured without inotify" >&2; return 1; }
+	GEX_WASM_SYSROOT=$SR32 "$here/link-wineserver.sh" "$C/s32-$TP-$SC" "$W" "$PWD/obj" "$PWD"
 }
 log "wineserver ($K, $V)"; step srv-$K-$V srv_link
 
@@ -522,10 +528,7 @@ NATIVE=$C/pen64-$K-$NK/native
 # of its own. The install's name gets -N32 too.
 N32=; NATIVE32=
 if [ "$WOW" != 0 ] && [ "$NPE" != 0 ] && [ "$M64" = 0 ]; then
-	p32=$(make -s -C "$here" paths) || { log "make -C wine paths failed"; exit 1; }
-	# the caller's 32-bit Wine (GEX_WASM_SYSROOT, WINE32_DEPS: its `make paths`) before ours
-	SR32=${GEX_WASM_SYSROOT:-$(sed -n 's/^GEX_WASM_SYSROOT=//p' <<< "$p32")}; DEPS32=${WINE32_DEPS:-$(sed -n 's/^WINE32_DEPS=//p' <<< "$p32")}
-	[ -d "$SR32" ] && [ -d "$DEPS32/install" ] || { log "no 32-bit Wine sysroot or libraries ($SR32, $DEPS32): make -C wine build"; exit 1; }
+	# (SR32, DEPS32: the 32-bit prerequisites above)
 	B32K=$( { echo "$SR32 $DEPS32${GS:+ winegstreamer}"; cat "$here"/build32.sh "$here"/wcc; } | sha256sum | cut -c1-10)
 	D32=${WINE64_NATIVE_DLLS32:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
 	N32=$( { echo "$B32K $D32 split all$W16$WICU$WGST$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)

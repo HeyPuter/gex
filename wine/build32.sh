@@ -10,6 +10,9 @@
 #       EGL from DEPS (wine32/deps.sh), then make. The loader and wineserver are
 #       linked from its objects afterwards (wine32/link-loader.sh,
 #       link-wineserver.sh).
+#   wine/build32.sh configure SRC TOOLS BUILD DEPS
+#       that tree configured only, not made: the compile commands the
+#       wineserver is built with (dist.sh, link-wineserver.sh).
 #
 # Both are incremental: configure only when there is no Makefile or the
 # options changed; make always (cheap when nothing changed).
@@ -40,7 +43,7 @@ tools)
   configure "$tools" "$src $o" "$src/configure" $o
   make -C "$tools" -j"$J" __tooldeps__ > "$tools/make.log" 2>&1 || { echo "wine32/wine-build: tools make failed ($tools/make.log)" >&2; exit 1; }
   ;;
-wasm)
+wasm|configure)
   src=$(realpath "$2") tools=$(realpath "$3") build=$(realpath -m "$4") deps=$(realpath "$5")
   : "${GEX_WASM_SYSROOT:?}"
   # dpnsvr and twain_32: i386 builtins configure enables for i386 alone
@@ -55,9 +58,14 @@ wasm)
     CC="$here/wcc" CXX="$here/wcc++" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$deps/host/wayland-scanner" \
     ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 ac_cv_lib_soname_EGL=libEGL.so.1 \
     ac_cv_lib_soname_gnutls=libgnutls.so.30
+  # configure: the tree only, for its compile commands (link-wineserver.sh)
+  [ "$1" = configure ] && exit 0
   # wrc and wmc read locale.nls from the tools tree, which __tooldeps__ does
   # not make: the source's.
-  mkdir -p "$tools/nls" && ln -sf "$src/nls/locale.nls" "$tools/nls/locale.nls"
+  # A copy, not a link: the tools tree outlives the source tree it was made
+  # from (keyed by its inputs, it serves later commits and other worktrees).
+  mkdir -p "$tools/nls" && { cmp -s "$src/nls/locale.nls" "$tools/nls/locale.nls" ||
+    { rm -f "$tools/nls/locale.nls" && cp "$src/nls/locale.nls" "$tools/nls/locale.nls"; }; }
   # -k: a few targets have no wasm32 meaning (they fail and are not used).
   TMPDIR=${TMPDIR:-/tmp} make -C "$build" -k -j"$J" > "$build/make.log" 2>&1 || true
   # What the dist needs: the loader's and the Unix libraries' objects, and
@@ -66,5 +74,5 @@ wasm)
     [ -e "$build/$f" ] || { echo "wine32/wine-build: $build/$f was not built ($build/make.log)" >&2; exit 1; }
   done
   ;;
-*) echo "usage: wine32/wine-build.sh tools|wasm ..." >&2; exit 2 ;;
+*) echo "usage: wine/build32.sh tools|wasm|configure ..." >&2; exit 2 ;;
 esac
