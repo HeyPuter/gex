@@ -13,8 +13,8 @@ PREFIX=$(realpath "$1")
 SRC=$(realpath "$2")
 B=$(realpath -m "${3:-$PREFIX/build/cxx-win}")
 [ -x "$PREFIX/bin/x86_64-w64-mingw32-g++" ] || { echo "build-cxx-win.sh: no $PREFIX/bin/x86_64-w64-mingw32-g++ (toolchain/gexcc/windows/install.sh PREFIX first)" >&2; exit 1; }
-. "$(dirname "$0")/../llvm-pin.sh"
-llvm_pin_check "$SRC"
+# (../llvm-pin.sh's check, run as from toolchain/gexcc, whose ../pins it reads)
+sh -c '. "$(dirname "$0")/llvm-pin.sh"; llvm_pin_check "$1"' "$(dirname "$0")/../build-cxx.sh" "$SRC"
 # (the build's own headers, not an installed copy)
 export GEXCC_WIN_CXX=/nonexistent
 rm -rf "$B"; mkdir -p "$B"
