@@ -236,6 +236,19 @@ fn kind_of(k: wasmparser::ExternalKind) -> Kind {
 }
 
 impl Info {
+    /// Whether [`Info::parse`] reads a section (by id, and a custom
+    /// section's name): a module of only these parses to the same `Info`.
+    /// A loader that has the module compiled already reads no more of the
+    /// file (its code and data are nineteen twentieths of a Qt library).
+    pub fn reads_section(id: u8, name: &[u8]) -> bool {
+        match id {
+            0 => name == b"dylink.0" || name == FORKREACH_SECTION.as_bytes(),
+            // types, imports, globals, exports, elements
+            1 | 2 | 6 | 7 | 9 => true,
+            _ => false,
+        }
+    }
+
     pub fn parse(wasm: &[u8]) -> Result<Info> {
         use wasmparser::{Payload, TypeRef};
         let mut info = Info::default();
@@ -1978,6 +1991,113 @@ mod tests {
         c.mods.truncate(3);
         assert_eq!(c.lookup("k", Kind::Func), None);
         assert_eq!(l.lookup("k", Kind::Func), Some(3));
+    }
+
+    /// `wasm` with only the sections [`Info::reads_section`] names, as the
+    /// browser host reads a library it has compiled (`read_wasm_parts`).
+    fn info_parts(wasm: &[u8]) -> Vec<u8> {
+        let mut out = wasm[..8].to_vec();
+        for p in wasmparser::Parser::new(0).parse_all(wasm) {
+            let p = p.unwrap();
+            let (id, body) = match &p {
+                wasmparser::Payload::CodeSectionStart { range, .. } => (10, range.clone()),
+                wasmparser::Payload::CustomSection(c) => (0, c.range()),
+                _ => match p.as_section() {
+                    Some((id, r)) => (id, r),
+                    None => continue,
+                },
+            };
+            // the section's id and length come before its body
+            let mut at = body.start - 1;
+            while wasm[at - 1] & 0x80 != 0 {
+                at -= 1;
+            }
+            let start = at - 1;
+            assert_eq!(wasm[start], id);
+            let name: &[u8] = if id == 0 { let n = wasm[body.start] as usize; &wasm[body.start + 1..body.start + 1 + n] } else { &[] };
+            if Info::reads_section(id, name) {
+                out.extend_from_slice(&wasm[start..body.end]);
+            }
+        }
+        out
+    }
+
+    /// A library's Info from its sections that `Info::parse` reads is the
+    /// one from the whole file. `GEX_DYLINK_PARTS_DIR` names a directory
+    /// of libraries to check too (a sysroot's lib).
+    #[test]
+    fn info_from_its_sections() {
+        let mut libs: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Ok(d) = std::env::var("GEX_DYLINK_PARTS_DIR") {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_file() {
+                    let b = std::fs::read(e.path()).unwrap();
+                    if b.starts_with(b"\0asm") {
+                        libs.push((e.path().display().to_string(), b));
+                    }
+                }
+            }
+            assert!(!libs.is_empty(), "{d}: no wasm modules");
+        }
+        libs.push(("made here".into(), made_library()));
+        for (name, b) in &libs {
+            let full = Info::parse(b).unwrap();
+            let cut = Info::parse(&info_parts(b)).unwrap();
+            assert_eq!(format!("{full:?}"), format!("{cut:?}"), "{name}");
+        }
+    }
+
+    /// A side module with code, data, a table, a TLS export and a dylink.0.
+    fn made_library() -> Vec<u8> {
+        use wasm_encoder::*;
+        let mut m = Module::new();
+        let mut d = Vec::new();
+        // WASM_DYLINK_MEM_INFO: mem size 16, align 2, table 1, align 0
+        d.extend_from_slice(&[1, 4, 16, 2, 1, 0]);
+        // WASM_DYLINK_NEEDED: libc.so
+        d.extend_from_slice(&[2, 9, 1, 7]);
+        d.extend_from_slice(b"libc.so");
+        m.section(&CustomSection { name: "dylink.0".into(), data: d.into() });
+        let mut t = TypeSection::new();
+        t.ty().function([ValType::I32], [ValType::I32]);
+        m.section(&t);
+        let mut i = ImportSection::new();
+        i.import("env", "memory", MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+        i.import("env", "__indirect_function_table", TableType { element_type: RefType::FUNCREF, minimum: 1, maximum: None, table64: false, shared: false });
+        i.import("env", "__memory_base", GlobalType { val_type: ValType::I32, mutable: false, shared: false });
+        i.import("env", "__table_base", GlobalType { val_type: ValType::I32, mutable: false, shared: false });
+        i.import("env", "puts", EntityType::Function(0));
+        m.section(&i);
+        let mut f = FunctionSection::new();
+        f.function(0);
+        f.function(0);
+        m.section(&f);
+        let mut g = GlobalSection::new();
+        g.global(GlobalType { val_type: ValType::I32, mutable: false, shared: false }, &ConstExpr::i32_const(8));
+        m.section(&g);
+        let mut e = ExportSection::new();
+        e.export("f", ExportKind::Func, 1);
+        e.export("g", ExportKind::Func, 2);
+        e.export("puts_again", ExportKind::Func, 0);
+        e.export("data", ExportKind::Global, 2);
+        m.section(&e);
+        let mut el = ElementSection::new();
+        el.active(Some(0), &ConstExpr::global_get(1), Elements::Functions(std::borrow::Cow::Borrowed(&[2])));
+        m.section(&el);
+        let mut c = CodeSection::new();
+        for _ in 0..2 {
+            let mut b = Function::new([]);
+            b.instruction(&Instruction::LocalGet(0));
+            b.instruction(&Instruction::End);
+            c.function(&b);
+        }
+        m.section(&c);
+        let mut ds = DataSection::new();
+        ds.active(0, &ConstExpr::global_get(0), b"hello\0".iter().copied());
+        m.section(&ds);
+        m.section(&CustomSection { name: "producers".into(), data: b"\0".as_slice().into() });
+        m.finish()
     }
 
     #[test]

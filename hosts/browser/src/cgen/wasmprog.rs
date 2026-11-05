@@ -500,6 +500,17 @@ pub(super) fn shed(path: &str, bytes: &[u8]) -> Option<Shed> {
     Some(Shed { len: bytes.len() as u32, key: file_key(path, bytes), gone: (ino, mtime, size) })
 }
 
+/// [`shed`] for a library whose bytes were not read: a process made its
+/// file's key already ([`known_key`]), so nothing here needs them. `None`
+/// for a file no process has hashed (it is read whole, and hashed then).
+pub(super) fn shed_known(path: &str) -> Option<Shed> {
+    let id = file_id(path)?;
+    let (_, ino, mtime, size) = id;
+    let len = u32::try_from(size).ok()?;
+    let key = known_key(&id, len)?;
+    Some(Shed { len, key, gone: (ino, mtime, size) })
+}
+
 /// The page holds wasm32 program module `number` compiled (JS, once the
 /// Worker that published it has instantiated it): a library's bytes go.
 /// They are most of a Qt program's heap (150 to 200 MiB for Plasma's), and

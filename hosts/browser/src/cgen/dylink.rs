@@ -77,7 +77,9 @@ impl DyProc {
             return Ok(());
         }
         for m in self.link.mods.iter_mut().skip(1) {
-            let b = read(&m.path).ok_or_else(|| format!("{}: gone since the fork", m.path))?;
+            // (its Info's sections only: the parent published its bytes)
+            let parts = if CHECKED.load(Ordering::Relaxed) { None } else { crate::sigs::proc_home().read_wasm_parts(&m.path, Info::reads_section) };
+            let b = parts.or_else(|| read(&m.path)).ok_or_else(|| format!("{}: gone since the fork", m.path))?;
             m.info = Info::parse(&b).map_err(|e| format!("{}: {e:#}", m.path))?;
         }
         // (built from the placeholders' empty exports if anything had asked)
@@ -177,6 +179,23 @@ pub(super) fn read(path: &str) -> Option<Vec<u8>> {
     crate::sigs::proc_home().read_file(path).map(checked)
 }
 
+/// A library's bytes for its `Info` only, when the page has its content key
+/// (a process hashed this file, `wasmprog::shed_known`): the sections
+/// `Info::parse` reads, and what stands for the rest, which the page
+/// compiled from or will read again. Otherwise the whole file ([`read`]).
+/// Plasma's processes each read 150 to 200 MiB of libraries to parse 10.
+fn read_lib(path: &str, skel: &std::cell::RefCell<HashMap<String, Shed>>) -> Option<Vec<u8>> {
+    if !CHECKED.load(Ordering::Relaxed) {
+        if let Some(s) = super::wasmprog::shed_known(path) {
+            if let Some(b) = crate::sigs::proc_home().read_wasm_parts(path, Info::reads_section) {
+                skel.borrow_mut().insert(path.to_string(), s);
+                return Some(b);
+            }
+        }
+    }
+    read(path)
+}
+
 /// `GEX_DL_CHECKED_CALLS` (the page's `dlchecked=1`): every wasm32 module
 /// of a program linked against shared libraries gets its indirect calls
 /// guarded (`gex_dylink::checked_calls`), so a function pointer from a
@@ -210,12 +229,13 @@ type Bytes = (Vec<u8>, Option<Shed>);
 fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Bytes>, String> {
     let (o, lp) = (p.origin.clone(), p.ldpath.clone());
     let mut sheds: HashMap<String, Shed> = HashMap::new();
+    let skel = std::cell::RefCell::new(HashMap::new());
     let libs = p
         .link
         .needed_of_shed(
             from,
-            |name, rp| gex_dylink::search(name, rp, &o, &lp, read),
-            |path, b| match super::wasmprog::shed(path, &b) {
+            |name, rp| gex_dylink::search(name, rp, &o, &lp, |path| read_lib(path, &skel)),
+            |path, b| match skel.borrow_mut().remove(path).or_else(|| super::wasmprog::shed(path, &b)) {
                 Some(s) => {
                     sheds.insert(path.to_string(), s);
                     Vec::new()
@@ -792,7 +812,8 @@ fn dlopen_in(g: &mut Option<DyProc>, path: &str) -> Result<u32, String> {
     }
     let (o, lp) = (p.origin.clone(), p.ldpath.clone());
     let rp = p.link.dlopen_runpath();
-    let (found, b) = gex_dylink::search(path, &rp, &o, &lp, read).map_err(|e| format!("{e:#}"))?;
+    let skel = std::cell::RefCell::new(HashMap::new());
+    let (found, b) = gex_dylink::search(path, &rp, &o, &lp, |path| read_lib(path, &skel)).map_err(|e| format!("{e:#}"))?;
     let info = Info::parse(&b).map_err(|_| format!("{found}: not a wasm shared library"))?;
     if !info.dylink {
         return Err(format!("{found}: not a wasm shared library"));
@@ -806,7 +827,7 @@ fn dlopen_in(g: &mut Option<DyProc>, path: &str) -> Result<u32, String> {
     let (module_of, slot_len, entry_slots) = (p.module_of.len(), p.slot_len.len(), p.entry_slots);
     p.link.mods.push(Loaded { name: path.to_string(), path: found, info, memory_base: 0, table_base: 0 });
     let r = (|| {
-        let shed = super::wasmprog::shed(&p.link.mods[from].path, &b);
+        let shed = skel.borrow_mut().remove(&p.link.mods[from].path).or_else(|| super::wasmprog::shed(&p.link.mods[from].path, &b));
         let mut all = vec![if shed.is_some() { (Vec::new(), shed) } else { (b, None) }];
         all.extend(find_needed(p, from)?);
         publish(p, from, all, true, false, None)

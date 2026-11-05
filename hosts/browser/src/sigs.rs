@@ -231,6 +231,68 @@ impl Home {
         Some(done)
     }
 
+    /// The wasm module at `path` with only the sections `keep` names (by id,
+    /// and a custom section's name): the header, then each kept section
+    /// whole, in the file's order. The rest is stepped over unread (a
+    /// library's code and data are most of its bytes). `None` if `path` is
+    /// not a wasm module or ends inside a section.
+    pub(crate) fn read_wasm_parts(&self, path: &str, keep: impl Fn(u8, &[u8]) -> bool) -> Option<Vec<u8>> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let at = |off: u64, out: &mut [u8]| -> Option<usize> {
+            let mut done = 0usize;
+            while done < out.len() {
+                let n = f.read_at(off + done as u64, &mut out[done..]).ok()? as usize;
+                if n == 0 {
+                    break;
+                }
+                done += n;
+            }
+            Some(done)
+        };
+        let mut out = vec![0u8; 8];
+        if at(0, &mut out)? != 8 || !out.starts_with(b"\0asm") {
+            return None;
+        }
+        let mut off = 8u64;
+        // A section's id, its length (5 bytes at most) and the start of a
+        // custom section's name.
+        let mut head = [0u8; 48];
+        loop {
+            let got = at(off, &mut head)?;
+            if got == 0 {
+                return Some(out);
+            }
+            let (mut len, mut shift, mut i) = (0u64, 0, 1);
+            loop {
+                let b = *head[..got].get(i)?;
+                len |= ((b & 0x7f) as u64) << shift;
+                i += 1;
+                if b < 0x80 {
+                    break;
+                }
+                shift += 7;
+                if shift > 28 {
+                    return None;
+                }
+            }
+            let body = &head[i..got];
+            // a custom section's name: its length, then its bytes
+            let name: &[u8] = match (head[0], body.first()) {
+                (0, Some(&n)) if n < 0x80 && body.len() > n as usize => &body[1..1 + n as usize],
+                _ => &[],
+            };
+            if keep(head[0], name) {
+                let from = out.len();
+                out.extend_from_slice(&head[..i]);
+                out.resize(from + i + len as usize, 0);
+                if at(off + i as u64, &mut out[from + i..])? != len as usize {
+                    return None;
+                }
+            }
+            off += i as u64 + len;
+        }
+    }
+
     /// The whole of `path` (at most 512 MiB), as [`Home::read_file_at`].
     pub(crate) fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let f = self.vfs.get().open(path, 0, 0).ok()?;
