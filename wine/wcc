@@ -7,7 +7,7 @@ function table, and wraps it in the ELF container gexc runs (wasm-elf.py);
 the module stays beside it as OUT.wasm. `-shared` links a PIC side module
 instead (a Unix library: .so), with no container.
 
-GEX_WASM_SYSROOT names the sysroot (build-sysroot.sh)."""
+GEX_WASM_SYSROOT names the sysroot (toolchain/sysroot/build32.sh)."""
 import os, subprocess, sys, tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
@@ -153,7 +153,7 @@ FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_threa
               '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
 
 
-# The snapshot flavour's sysroot (build-sysroot.sh GEX_SNAPSHOT=1, which
+# The snapshot flavour's sysroot (toolchain/sysroot/build32.sh GEX_SNAPSHOT=1, which
 # leaves this file in its lib/): asyncify also instruments what reaches
 # gex.syscall, and a session snapshot unwinds a thread at a call that can
 # block (libgex-snap/call.c). Only there: another sysroot's programs are
@@ -207,7 +207,7 @@ if shared:
         sys.exit(r)
     finish(out)
     sys.exit(0)
-# gex's support library (build-sysroot.sh, libgex/), before libc: its
+# gex's support library (toolchain/sysroot/build32.sh, libgex/), before libc: its
 # dlopen, __dlsym and vfork replace libc's; the setjmp runtime and the
 # signal frames are only there.
 libgex = [lib + '/libgex.a'] if os.path.exists(lib + '/libgex.a') else []

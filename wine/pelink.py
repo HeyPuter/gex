@@ -1396,7 +1396,7 @@ static void *gexw_ntdll_proc(const char *name)
                '--unresolved-symbols=import-dynamic', '-o', out, '-Map=' + out + '.map',
                f'@{rsp}'] + objs[g] + ([gexrt] if gexrt else [])
         # compiler-rt's builtins (__multi3 and the like), from the toolchain's
-        # sysroot (toolchain/sysroot/build32.sh, build-sysroot64.sh)
+        # sysroot (toolchain/sysroot/build32.sh, build64.sh)
         sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')
         if sysroot:
             cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if WINE64 else 'wasm32')))

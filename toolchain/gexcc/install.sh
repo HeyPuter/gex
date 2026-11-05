@@ -23,7 +23,7 @@ set -eu
 PREFIX=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
 ROOT=$(realpath "$HERE/../..")
-WW=$ROOT/wine
+SR=$ROOT/toolchain/sysroot
 MUSL=$(realpath "${2:-$ROOT/../musl-wasm}")
 TRIPLE=wasm32-unknown-linux-musl
 # gex's loader fills musl's registry of shared libraries (__gex_dsos): a
@@ -39,7 +39,7 @@ mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 # name their files)
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 SX="-fvisibility=default -ffile-prefix-map=$CRT=/compiler-rt/lib/builtins"
-build_sysroot() { GEX_WASM_EXTRA_CFLAGS="$SX" GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$1" "$MUSL"; }
+build_sysroot() { GEX_WASM_EXTRA_CFLAGS="$SX" GEX_WASM_LEGACY_EH=1 "$SR/build32.sh" "$1" "$MUSL"; }
 # GEXCC_CACHE=DIR: the sysroot, libc.so, libc++, busybox and GexPoll are kept there under a key
 # of everything they are built from (the files' contents, not their times),
 # so a rerun with nothing changed copies them (make gexcc sets it).
@@ -47,8 +47,8 @@ CK=${GEXCC_CACHE:-}
 treesum() { for p; do [ ! -e "$p" ] || find "$p" -name .git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 cat; done; }
 hash16() { { cat; clang --version; } | sha256sum | cut -c1-16; }
 if [ -n "$CK" ]; then
-  SK=$( { echo "$SX ${GEX_BINARYEN:-}"; treesum "$MUSL" "$CRT" "$WW/build-sysroot.sh" "$WW/flags.sh" \
-    "$WW/libgex" "$WW/libgex-snap" "$WW/icall"; } | hash16)
+  SK=$( { echo "$SX ${GEX_BINARYEN:-}"; treesum "$MUSL" "$CRT" "$SR/build32.sh" "$SR/flags.sh" \
+    "$SR/libgex" "$SR/libgex-snap" "$SR/icall"; } | hash16)
   if [ ! -f "$CK/sysroot-$SK/.done" ]; then
     rm -rf "$CK/sysroot-$SK.tmp" && mkdir -p "$CK"
     build_sysroot "$CK/sysroot-$SK.tmp"
@@ -61,7 +61,7 @@ else
 fi
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
-# the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,
+# the rest of the Linux UAPI headers (build32.sh copies linux/, asm/,
 # asm-generic/): architecture-neutral, from the host's linux-libc-dev
 for d in mtd sound video xen misc rdma; do
   [ -d "/usr/include/$d" ] && { rm -rf "$PREFIX/sysroot/include/$d"; cp -r "/usr/include/$d" "$PREFIX/sysroot/include/"; }
@@ -75,7 +75,7 @@ cp -r "$HERE/include" "$PREFIX/sysroot/include/gexcc"
 L=$PREFIX/lib/gexcc
 cp "$HERE/gexcc" "$PREFIX/bin/gexcc"
 cp "$HERE/elemfix.py" "$PREFIX/lib/gexcc/"
-cp "$WW/flags.sh" "$WW/wasm-elf.py" "$WW/forkreach.py" "$L/"
+cp "$SR/flags.sh" "$HERE/wasm-elf.py" "$HERE/forkreach.py" "$L/"
 # the container's host launcher: flat i386 code
 clang --target=i386-linux-gnu -Os -fPIE -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables \
   -fno-builtin -c "$HERE/hoststub.c" -o "$L/hoststub.o"
@@ -92,7 +92,7 @@ else
   [ -z "$PK" ] || { mkdir -p "$CK/poll-$PK" && cp "$L/GexPoll.so" "$CK/poll-$PK/GexPoll.so.tmp" && mv "$CK/poll-$PK/GexPoll.so.tmp" "$CK/poll-$PK/GexPoll.so"; }
 fi
 mkdir -p "$PREFIX/build/rt"
-. "$WW/flags.sh"
+. "$SR/flags.sh"
 # the runtime's sources by their names in gex, not this checkout's path
 RTMAP="-ffile-prefix-map=$HERE=/gex/toolchain/gexcc"
 clang $WASM_CFLAGS $RTMAP --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
@@ -317,7 +317,7 @@ EOF
 # seconds per command.
 # (libc++ and busybox are built with the driver, its headers and runtime over
 # that sysroot: their keys)
-[ -z "$CK" ] || TK=$( { echo "$SK"; treesum "$HERE/gexcc" "$HERE/include" "$HERE/rt" "$HERE/config.site" "$WW/flags.sh"; } | hash16)
+[ -z "$CK" ] || TK=$( { echo "$SK"; treesum "$HERE/gexcc" "$HERE/include" "$HERE/rt" "$HERE/config.site" "$SR/flags.sh"; } | hash16)
 [ -z "$CK" ] || [ -z "${BUSYBOX_TAR:-}" ] || BK=$( { echo "$TK"; cat "$BUSYBOX_TAR"; } | hash16)
 if [ -n "${BUSYBOX_TAR:-}" ] && [ -n "$CK" ] && [ -f "$CK/busybox-$BK/.done" ]; then
   cp "$CK/busybox-$BK/busybox" "$CK/busybox-$BK/busybox.applets" "$L/"

@@ -9,10 +9,10 @@
 # winegcc there leaves each DLL's relocatable object and export list),
 # WINE_SRC its source. OUTDIR gets winepe.wasm and the skeletons, to go in
 # place of a 64-bit Wine install's lib/wine/x86_64-windows DLLs; every DLL not named stays x86-64 code.
-# GEX_WASM64_SYSROOT must be set (build-sysroot64.sh).
+# GEX_WASM64_SYSROOT must be set (toolchain/sysroot/build64.sh).
 # --i386: WoW64's 32-bit side instead: WINE_BUILD a wasm32 build tree of the
 # same fork (wine32/wine-build.sh wasm), PE32 skeletons over wasm32 modules,
-# for lib/wine/i386-windows; GEX_WASM_SYSROOT must be set (build-sysroot.sh).
+# for lib/wine/i386-windows; GEX_WASM_SYSROOT must be set (toolchain/sysroot/build32.sh).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 i386=0; [ "${1:-}" != --i386 ] || { i386=1; shift; }

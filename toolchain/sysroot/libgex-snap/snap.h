@@ -1,4 +1,4 @@
-/* libgex, the snapshot flavour (build-sysroot.sh and build-sysroot64.sh
+/* libgex, the snapshot flavour (build32.sh and build64.sh
  * with GEX_SNAPSHOT=1, over the libc's GEX_SNAPSHOT hooks): threads stopped
  * for a session snapshot and started again from one.
  *

@@ -2,7 +2,7 @@
 """clang for 64-bit Wine's LP64 programs.
 
 Like wcc, for code with x86-64 Linux's LP64 layout: compiles for wasm64
-(flags64.sh) against GEX_WASM64_SYSROOT (build-sysroot64.sh), links a
+(flags64.sh) against GEX_WASM64_SYSROOT (toolchain/sysroot/build64.sh), links a
 position-independent wasm64 executable, lowers it to wasm32 with binaryen's
 --memory64-lowering (the one place an address becomes a memory index: every
 i64 address wrapped to i32 at its access), and wraps it in the ELF64 x86-64
@@ -15,7 +15,7 @@ OUT.wasm (OUT.64.wasm is the module before lowering).
 Wine's PE side (-D_WIN32) compiles with
 Windows x64's data model (the GexLLP64 plugin and its llp64.h,
 -mms-bitfields, -fshort-wchar) and the ICALL pass (GexIcall, its Win64
-mode), both from the sysroot's lib (build-sysroot64.sh). `-shared` links
+mode), both from the sysroot's lib (toolchain/sysroot/build64.sh). `-shared` links
 a position-independent side module (a DLL's code) and lowers it, `-r` one
 relocatable object of the inputs (pelink.py).
 
@@ -63,7 +63,7 @@ if '-D_WIN32' in args:
                '-DWINE_UNICODE_NATIVE', '-fno-c++-static-destructors']
     if not os.environ.get('GEX_WASM_NO_ICALL'):
         CC += ['-fpass-plugin=' + os.path.join(lib, 'GexIcall.so')]
-# The snapshot flavour's sysroot (build-sysroot64.sh GEX_SNAPSHOT=1, which
+# The snapshot flavour's sysroot (toolchain/sysroot/build64.sh GEX_SNAPSHOT=1, which
 # leaves lib/gex-snapshot): code takes the legacy exception instructions,
 # which asyncify can instrument (the program's link below, and pelink.py's
 # for the native PE core, translate them to the standard ones), and is

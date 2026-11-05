@@ -102,6 +102,34 @@ fi
 # directory compiled with other ones is cleaned below.
 export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
+# A build directory set up from files that are no longer there (its cross or
+# native file, or the source tree, at an old path, as after the tree's files
+# moved) cannot be reconfigured: it is set up afresh.
+if [ -f "$BUILD/build.ninja" ]; then
+    gone=$(python3 -I - "$BUILD" <<'PY'
+import ast, configparser, json, os, sys
+b = sys.argv[1]
+paths = []
+try:
+    paths.append(json.load(open(os.path.join(b, 'meson-info', 'meson-info.json')))['directories']['source'])
+except (OSError, ValueError, KeyError):
+    paths.append(os.path.join(b, 'meson-info', 'meson-info.json'))
+c = configparser.ConfigParser()
+c.read(os.path.join(b, 'meson-private', 'cmd_line.txt'))
+for k in ('cross_file', 'native_file'):
+    v = c.get('properties', k, fallback='[]')
+    try:
+        paths += ast.literal_eval(v)
+    except (ValueError, SyntaxError):
+        paths.append(v)
+print(' '.join(p for p in paths if not os.path.exists(p)))
+PY
+)
+    if [ -n "$gone" ]; then
+        echo "$BUILD was set up from files no longer there ($gone): setting it up again" >&2
+        rm -rf "${BUILD:?}"
+    fi
+fi
 if [ ! -f "$BUILD/build.ninja" ]; then
     mkdir -p "$OUT"
     meson setup "$BUILD" "$MESA" \

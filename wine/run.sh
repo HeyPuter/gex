@@ -19,7 +19,7 @@
 # TREE's web and hosts/browser/js) and the unit cache are synced to
 # the box; it runs until the program exits or --timeout (default 300 s), and
 # prints the program's output, "unitless:" lines and an "== wine32 page:" result
-# (page/page-run.mjs). With --build-units the unitless images' units are built
+# (wine/page/page-run.mjs). With --build-units the unitless images' units are built
 # afterwards (wine32/units.sh) for the next run: the page builds none itself.
 # WINE32_PAGE_DIR defaults to WINE32_CACHE/page; on a remote box it and the unit
 # cache must be under paths the runner maps.

@@ -29,10 +29,10 @@ CRT=${GEX_CRT_SRC:-}
 for c in "$HOME/emsdk" /usr/lib/emsdk; do
   [ -n "$CRT" ] || [ ! -d "$c/upstream/emscripten/system/lib/compiler-rt/lib/builtins" ] || CRT=$c/upstream/emscripten/system/lib/compiler-rt/lib/builtins
 done
-[ -n "$CRT" ] && [ -f "$CRT/udivti3.c" ] || { echo "build-sysroot64: no compiler-rt builtins sources (GEX_CRT_SRC)" >&2; exit 2; }
+[ -n "$CRT" ] && [ -f "$CRT/udivti3.c" ] || { echo "build64.sh: no compiler-rt builtins sources (GEX_CRT_SRC)" >&2; exit 2; }
 JOBS=${JOBS:-4}
 . "$HERE/flags64.sh"
-# GEX_SNAPSHOT=1: the snapshot flavour (as build-sysroot.sh's): the libc's
+# GEX_SNAPSHOT=1: the snapshot flavour (as build32.sh's): the libc's
 # GEX_SNAPSHOT hooks (the threads' runs) and libgex-snap/'s wasm64 roots;
 # wcc64 sees the lib/gex-snapshot it leaves and instruments what reaches
 # gex.syscall, so everything here takes the legacy exception instructions.

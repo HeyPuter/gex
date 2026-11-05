@@ -70,7 +70,7 @@
 # S those, gex's link tools, gex-gl's guest library and the OSSv4 header
 # (wine32/oss), N those, the PE
 # linker and the DLL list.
-# Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16); the
+# Env: GEX_WASM64_SYSROOT (toolchain/sysroot/build64.sh); JOBS (default 16); the
 # libraries' tarballs are kept in CACHE/dl, taken from WINE32_DL_SEED and
 # 32-bit Wine's downloads (WINE32_CACHE, default ~/.cache/gex/wine32) when there.
 # The server is compiled with a configured 32-bit Wine build tree's commands:

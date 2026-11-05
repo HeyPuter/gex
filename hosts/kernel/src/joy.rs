@@ -1,5 +1,5 @@
 //! The page's game controllers: a table the page writes from the Gamepad
-//! API (page/runtime/src/gamepad.js) and every process's `/dev/input/eventN`
+//! API (page/runtime/src/input.js) and every process's `/dev/input/eventN`
 //! reads (gex-kernel `vfs/evdev.rs`, which has the pad words' layout).
 //!
 //! The layout is written by JavaScript, so it is fixed (little-endian `u32`
