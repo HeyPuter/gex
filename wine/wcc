@@ -112,7 +112,11 @@ def ld(cmd, name):
     sys.stderr.write(p.stderr)
     if p.returncode:
         return p.returncode
-    if 'function signature mismatch' in p.stderr:
+    # A configure test links a function through autoconf's own `char f();`
+    # on purpose (it only asks whether the symbol exists), so its program
+    # is not judged.
+    out = os.path.basename(cmd[cmd.index('-o') + 1])
+    if 'function signature mismatch' in p.stderr and not out.startswith('conftest'):
         sys.stderr.write('%s: %s: a call through a declaration whose type is not the function\'s '
                          '(wasm-ld links it to a trap); make the two agree\n' % (name, cmd[cmd.index('-o') + 1]))
         return 1
