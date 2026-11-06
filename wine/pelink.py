@@ -396,6 +396,65 @@ def wasm_sig64(path):
     return {}
 
 
+def sig_params(sig):
+    """A gexw.sig64 signature's parameters as (kind, size) pairs."""
+    out, ps = [], sig.split(':', 1)[1] if ':' in sig else ''
+    i = 0
+    while i < len(ps) and ps[i] != '.':
+        k = ps[i]
+        i += 1
+        n = ''
+        while k in 'bs' and i < len(ps) and ps[i].isdigit():
+            n += ps[i]
+            i += 1
+        out.append((k, int(n or 0)))
+    return out
+
+
+def check_adapters(dlls):
+    """winebuild's adapters made without their callee's signature (an
+    export a DLL takes from another, its .adapters file: each parameter `v`
+    a value, `r` a struct by value through its slots' address) against the
+    defining DLL's gexw.sig64. A struct by value taken as a value passes it
+    as an address: unicows' COORDs to kernelbase's console functions were
+    read from addresses made of them. Such an export is to be the defining
+    DLL's, a forward in its .spec; a mismatch fails the link."""
+    sig64 = {}
+    def defs(mod, ro):
+        if mod not in sig64:
+            sig64[mod] = wasm_sig64(ro)
+        return sig64[mod]
+    bad = []
+    for mod, ro, ex, imports in dlls:
+        ad = ex[:-len('.exports')] + '.adapters'
+        if not ex.endswith('.exports') or not os.path.exists(ad):
+            continue
+        for line in open(ad):
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            name, link_name, mask = parts
+            mask = '' if mask == '-' else mask
+            owners = [d for d in dlls if d[0] != mod and link_name in defs(d[0], d[1])]
+            owners.sort(key=lambda d: d[0] not in imports)
+            if not owners:
+                continue
+            owner = owners[0][0]
+            for j, (k, n) in enumerate(sig_params(sig64[owner][link_name])):
+                if j >= len(mask) or mask[j] not in 'vr':
+                    continue
+                # (x86-64: one of 1, 2, 4 or 8 bytes in its slot, any other
+                # by reference, a pointer as the adapter passes it; i386:
+                # every one in its words)
+                byval = k == 'b' and (n in (1, 2, 4, 8) or not WINE64)
+                if byval != (mask[j] == 'r'):
+                    bad.append(f'{mod}!{name}: parameter {j} is {owner}\'s {k}{n or ""} ({sig64[owner][link_name]}), '
+                               f'its adapter takes it as {"a struct" if mask[j] == "r" else "a value"}')
+    if bad:
+        sys.exit('pelink: adapters that disagree with their callee (make each export a forward to the '
+                 'defining DLL in its .spec):\n  ' + '\n  '.join(bad))
+
+
 def dll_slots(path, mapfile, obj_dll):
     """Which DLL each of a linked module's table slots and data bytes is,
     for gex to find the module of an address (GetModuleHandleExW's
@@ -588,6 +647,7 @@ def link(dlls, out, gexrt, others=None):
             if len(parts) > 2 and parts[1] == 'forward' and f'{via}!{parts[0]}' in KEEP_EXPORTS:
                 forwards.setdefault(parts[0], {})[via] = parts[2]
 
+    check_adapters(dlls)
     sigs = {}  # dll -> {(name, 'defined'|'undefined'): sig}
     for mod, ro, ex, imports in dlls:
         listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', ro],

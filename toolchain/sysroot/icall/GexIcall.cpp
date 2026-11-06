@@ -47,7 +47,9 @@
 // records each defined function's signature with what the wasm types lose
 // (a byval struct's size, a struct return's size, pointer or integer) in
 // the custom section gexw.sig64, which winebuild's wasm64 adapters read
-// (sig64() below).
+// (sig64() below). On wasm32 too: winebuild's i386 adapters take a struct
+// by value of one word, which the .spec spells as an int, by reference from
+// it.
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
@@ -660,7 +662,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     Type *I32 = Type::getInt32Ty(C);
     // the pointer-sized integer a function pointer is compared as
     Type *IP = Wasm64 ? Type::getInt64Ty(C) : I32;
-    if (Wasm64) emitSigs(M);
+    emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
     // gexrt's setter of one variable: it returns and does not unwind (so a
