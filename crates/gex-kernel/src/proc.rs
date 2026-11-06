@@ -97,6 +97,8 @@ pub struct Remote {
     /// See [`ProcTable::memory`]: the bytes, and the count.
     pub rss_total: extern "C" fn() -> u64,
     pub count: extern "C" fn() -> i32,
+    /// See [`ProcTable::set_crash`].
+    pub set_crash: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
 }
 
 /// What a process has used, as it last said ([`ProcTable::set_usage`]):
@@ -379,6 +381,9 @@ struct Proc {
     host_child: bool,
     /// See [`ProcTable::set_usage`].
     usage: Usage,
+    /// How it crashed, as it said before it ended ([`ProcTable::set_crash`]):
+    /// empty when it has not.
+    crash: Vec<u8>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -397,6 +402,100 @@ pub struct PeerVm {
     pub mem: Arc<dyn PeerMem>,
 }
 
+/// `prctl` option gex adds: the calling process has crashed (`arg2` the
+/// note's address, `arg3` its length; [`ProcTable::set_crash`]).
+pub const PR_GEX_CRASH: u64 = 0x4745_0002;
+
+/// A note's first byte when it gives way to one the process gave itself
+/// ([`ProcTable::set_crash_unless_said`]).
+const UNLESS_SAID: u8 = 1;
+
+/// The most crashes kept for a reader that has not taken them.
+const CRASHES_KEPT: usize = 64;
+
+/// A process that crashed, as its exit reports it: one that said it had
+/// ([`ProcTable::set_crash`]) or that a signal which dumps core ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Crash {
+    pub pid: i32,
+    /// Its program's name (a Windows program's `.exe`).
+    pub name: String,
+    /// What happened, in a few words.
+    pub reason: String,
+    /// Its exit status: the program's own when it gave one (a Windows
+    /// exception code), else what a shell sees (128 plus the signal).
+    pub code: u32,
+    /// The signal that ended it, 0 for none.
+    pub signal: u32,
+}
+
+/// The signals whose default action dumps core: a program's crash.
+fn core_signal(sig: u32) -> bool {
+    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
+}
+
+/// Linux's name for signal `sig`.
+pub fn signal_name(sig: u32) -> &'static str {
+    match sig {
+        1 => "SIGHUP", 2 => "SIGINT", 3 => "SIGQUIT", 4 => "SIGILL", 5 => "SIGTRAP", 6 => "SIGABRT",
+        7 => "SIGBUS", 8 => "SIGFPE", 9 => "SIGKILL", 11 => "SIGSEGV", 13 => "SIGPIPE", 15 => "SIGTERM",
+        24 => "SIGXCPU", 25 => "SIGXFSZ", 31 => "SIGSYS",
+        _ => "a signal",
+    }
+}
+
+impl Crash {
+    /// Process `pid` (`/proc`'s `info`) ending with wait status `status`, its
+    /// own `note`: a crash, or not.
+    fn of(pid: i32, info: &[u8], note: Vec<u8>, status: i32) -> Option<Crash> {
+        let sig = (status & 0x7f) as u32;
+        let signaled = sig != 0 && sig != 0x7f;
+        if note.is_empty() && !(signaled && core_signal(sig)) {
+            return None;
+        }
+        let mut parts = note.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
+        let (name, reason, code) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next());
+        let own = || {
+            let end = info.iter().position(|&b| b == b'\n').unwrap_or(info.len());
+            String::from_utf8_lossy(&info[..end]).into_owned()
+        };
+        let code = code.and_then(|c| c.trim().parse::<u32>().ok()).unwrap_or(if signaled { 128 + sig } else { ((status >> 8) & 0xff) as u32 });
+        Some(Crash {
+            pid,
+            name: if name.is_empty() { own() } else { name },
+            reason: if !reason.is_empty() { reason } else if signaled { signal_name(sig).to_string() } else { "crashed".to_string() },
+            code,
+            signal: if signaled { sig } else { 0 },
+        })
+    }
+
+    /// As one line of JSON: `{"pid","name","reason","code","signal"}`.
+    pub fn json(&self) -> String {
+        fn q(s: &str) -> String {
+            let mut o = String::from('"');
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o.push('"');
+            o
+        }
+        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
+    }
+}
+
+/// A host's own report of each crash as it is recorded ([`set_crash_hook`]).
+static CRASH_HOOK: std::sync::OnceLock<fn(&Crash)> = std::sync::OnceLock::new();
+
+/// Have `f` hear of each crash the table records (a native host's line).
+pub fn set_crash_hook(f: fn(&Crash)) {
+    let _ = CRASH_HOOK.set(f);
+}
+
 struct Table {
     /// The next task id, a process's or a thread's: one numbering, as
     /// Linux's pids and tids are one, so an id names exactly one task.
@@ -411,9 +510,27 @@ struct Table {
     /// The processor time of every process no longer in the table.
     gone_cpu_ns: u64,
     load: Load,
+    /// The crashes not yet taken ([`ProcTable::take_crashes`]), oldest first.
+    crashes: std::collections::VecDeque<Crash>,
 }
 
 impl Table {
+    /// Process `pid`'s crash, if ending with `status` is one: heard by the
+    /// host's hook and kept for the reader. Whether it was.
+    fn record_crash(&mut self, pid: i32, status: i32) -> bool {
+        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), status)) else {
+            return false;
+        };
+        if let Some(f) = CRASH_HOOK.get() {
+            f(&c);
+        }
+        if self.crashes.len() >= CRASHES_KEPT {
+            self.crashes.pop_front();
+        }
+        self.crashes.push_back(c);
+        true
+    }
+
     /// Take the processes `gone` says out of the table, their processor
     /// time kept: in the total, and in their parent's children's time.
     fn forget(&mut self, gone: impl Fn(&Proc) -> bool) {
@@ -468,6 +585,9 @@ pub struct ProcTable {
     remote: Option<Remote>,
     /// Pid 1 is the kernel's own, with no program ([`ProcTable::set_virtual_init`]).
     virtual_init: AtomicBool,
+    /// Notified when a process crashes ([`ProcTable::crash_queue`]); made
+    /// when first asked for, once the host's queues are there.
+    crash_q: std::sync::OnceLock<crate::wait::Queue>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -495,6 +615,7 @@ impl ProcTable {
             halt_code: AtomicI32::new(0),
             remote: None,
             virtual_init: AtomicBool::new(false),
+            crash_q: std::sync::OnceLock::new(),
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
@@ -515,9 +636,11 @@ impl ProcTable {
                     vm: None,
                     host_child: false,
                     usage: Usage::default(),
+                    crash: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
+                crashes: std::collections::VecDeque::new(),
             }),
         }
     }
@@ -559,6 +682,7 @@ impl ProcTable {
             vm: None,
             host_child,
             usage: Usage::default(),
+            crash: Vec::new(),
         });
         pid
     }
@@ -657,6 +781,77 @@ impl ProcTable {
         }
     }
 
+    /// Process `pid` has crashed and is about to end, `note` saying how:
+    /// `NAME\0REASON`, and optionally `\0CODE` (a decimal status of the
+    /// program's own, such as Windows's exception code), its name (empty:
+    /// its own, as `/proc` has it) and what happened, for the report its exit
+    /// makes ([`Crash`]). A process that ends by a signal that would dump
+    /// core crashes without saying so; this gives the reason (where a host
+    /// knows more) or the crash (a Windows program, which ends with its
+    /// exception code as an exit status). The `prctl` gex adds,
+    /// [`PR_GEX_CRASH`], or the host's own.
+    pub fn set_crash(&self, pid: i32, note: &[u8]) {
+        let note = &note[..note.len().min(1024)];
+        if let Some(r) = self.remote {
+            return (r.set_crash)(pid, note.as_ptr() as usize as crate::PAddr, note.len() as u32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            match note.split_first() {
+                Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
+                Some((&UNLESS_SAID, _)) => {}
+                _ => p.crash = note.to_vec(),
+            }
+        }
+    }
+
+    /// The queue notified when a crash is recorded, for
+    /// [`ProcTable::take_crashes`]'s reader; 0 when the host has no queues.
+    pub fn crash_queue(&self) -> u32 {
+        self.crash_q.get_or_init(crate::wait::Queue::new).id()
+    }
+
+    /// The crashes recorded since the last call, oldest first.
+    pub fn take_crashes(&self) -> Vec<Crash> {
+        self.lock().crashes.drain(..).collect()
+    }
+
+    /// `note` for process `pid` as [`ProcTable::set_crash`], unless it has
+    /// said how it crashed itself: a host's account of what ended it, which
+    /// a program's own (a Windows program's exception) outranks. (Marked
+    /// for the table with a leading [`UNLESS_SAID`].)
+    pub fn set_crash_unless_said(&self, pid: i32, note: &[u8]) {
+        let mut v = Vec::with_capacity(note.len() + 1);
+        v.push(UNLESS_SAID);
+        v.extend_from_slice(note);
+        self.set_crash(pid, &v);
+    }
+
+    /// Process `pid` ends with wait status `status` and is not collected
+    /// here (the host's first process, whose end is the run's): its crash,
+    /// if it is one, reported as [`ProcTable::exit`] reports one.
+    pub fn report_end(&self, pid: i32, status: i32) {
+        if self.remote.is_some() {
+            return;
+        }
+        if self.lock().record_crash(pid, status) {
+            self.crash_notify();
+        }
+    }
+
+    fn crash_notify(&self) {
+        if let Some(q) = self.crash_q.get() {
+            crate::wait::notify(q.id());
+        }
+    }
+
+    /// Give back crashes taken and not delivered, ahead of the newer ones.
+    pub fn put_back_crashes(&self, back: Vec<Crash>) {
+        let mut t = self.lock();
+        for c in back.into_iter().rev() {
+            t.crashes.push_front(c);
+        }
+    }
+
     /// Every process in the table, for `/proc`'s listing.
     pub fn entries(&self) -> Vec<ProcEntry> {
         if let Some(r) = self.remote {
@@ -737,7 +932,22 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
+        self.end(pid, status, status);
+    }
+
+    /// [`ProcTable::exit`] for a table whose statuses are exit codes, or the
+    /// negated signal number for a death by one (the page kernel's), not
+    /// wait statuses.
+    pub fn exit_code(&self, pid: i32, code: i32) {
+        let word = if code < 0 { (-code) & 0x7f } else { (code & 0xff) << 8 };
+        self.end(pid, code, word);
+    }
+
+    /// `pid` ends with `status` kept for its parent; `word` is the same end
+    /// as a wait status, which says whether it is a crash.
+    fn end(&self, pid: i32, status: i32, word: i32) {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let mut crashed = false;
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
@@ -756,6 +966,7 @@ impl ProcTable {
                 t.threads.remove(&tid);
                 t.tasks.remove(&tid);
             }
+            crashed = t.record_crash(pid, word);
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
@@ -764,6 +975,9 @@ impl ProcTable {
                 None => return,
             }
         };
+        if crashed {
+            self.crash_notify();
+        }
         // Its children that had ended already and are given to a virtual
         // init: nobody will collect them, so they go now. (Each status is
         // read with the table let go, as in `entries`.)
@@ -1360,6 +1574,29 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crash_is_reported_once_with_what_the_process_said() {
+        let t = ProcTable::new();
+        let (a, b, c, d) = (t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID));
+        t.set_info(a, b"prog\nprog\0");
+        // a crash signal (SIGSEGV), with a host's account
+        t.set_crash_unless_said(a, b"\0SIGSEGV at 0x1234");
+        t.exit(a, 11);
+        // a Windows program's own account, which the host's does not replace
+        t.set_crash(b, b"app.exe\0page fault on read access to 00000000\03221225477");
+        t.set_crash_unless_said(b, b"\0gex could not run it on");
+        t.exit(b, 5 << 8);
+        // an ordinary exit, and SIGTERM: no crash
+        t.exit(c, 0);
+        t.exit(d, 15);
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11 });
+        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0 });
+        assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
+        assert!(t.take_crashes().is_empty());
+    }
 
     #[test]
     fn processor_time_outlives_the_process_and_goes_to_its_parent() {

@@ -508,6 +508,30 @@ impl Wayland {
     /// Move bytes in both directions for every client, and collect commits. The
     /// kernel locates a buffer's pixels through its shared mappings; guest
     /// memory is where they are.
+    /// Process `pid` has ended: its clients, which only it reads, are gone
+    /// with their windows.
+    pub fn forget_process(&self, pid: i32) {
+        let logged = self.inner.out.lock().unwrap().is_some();
+        let mut gone = Vec::new();
+        self.inner.sessions.lock().unwrap().retain(|s| {
+            let mine = s.owner == Some(pid);
+            if mine {
+                gone.push(s.id);
+            }
+            !mine
+        });
+        if gone.is_empty() {
+            return;
+        }
+        let mut screen = self.inner.screen.lock().unwrap();
+        for sid in gone {
+            screen.forget(sid);
+        }
+        if logged {
+            screen.list();
+        }
+    }
+
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
         PROCESS.with(|p| p.set(Some(kernel.pid)));
         // Scripted input waits for a client that can take it (a seat and a
@@ -657,7 +681,13 @@ impl Wayland {
             }
             let keep = !gone && s.client.failed.is_none();
             if !keep {
-                self.inner.screen.lock().unwrap().forget(s.id);
+                let logged = self.inner.out.lock().unwrap().is_some();
+                let mut screen = self.inner.screen.lock().unwrap();
+                screen.forget(s.id);
+                // Its windows' going is a change of the placement log too.
+                if logged {
+                    screen.list();
+                }
             }
             keep
         });

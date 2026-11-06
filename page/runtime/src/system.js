@@ -638,6 +638,8 @@ export class System extends EventTarget {
     // /dev/gex-host.
     step(k.r('k_host_calls_serve'));
     step(this.#programs.start({ init: !!this.#init }));
+    // Each process that crashes, to the page (`crash` events).
+    if (k.has('k_crash_queue')) step(this.#watchCrashes(k));
     const opt = (f, ...a) => (k.has(f) ? [{ f, a }] : []);
     const list = [
       { f: 'k_stack_area' }, { f: 'k_stack_size' }, { f: 'k_stack_count' },
@@ -674,6 +676,35 @@ export class System extends EventTarget {
     new Uint8Array(s.kernel.memory.buffer).set(bytes, at);
     const n = await k.r('k_store_restore');
     this.#say(`xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB, restored ${n} modules\n`);
+  }
+
+  /** Every crash the kernel records (gex_kernel::proc::Crash: a program
+   *  that a crash signal ended, or one that said it crashed, as Wine does
+   *  for a Windows program's unhandled exception), as a `crash` event:
+   *  `{ pid, name, reason, code, signal }`. */
+  async #watchCrashes(k) {
+    const queue = (await k.r('k_crash_queue')) >>> 0;
+    if (!queue) return;
+    await k.watch(queue);
+    const dec = new TextDecoder();
+    (async () => {
+      for (;;) {
+        const seq = k.seq();
+        const { r, out } = await k.call('k_crash_take', { out: 16384 }).catch(() => ({ r: -1 }));
+        if (r < 0) return;
+        if (r === 0) {
+          await k.changed(seq);
+          continue;
+        }
+        for (const line of dec.decode(out[0].subarray(0, r)).split('\n')) {
+          if (!line) continue;
+          let c;
+          try { c = JSON.parse(line); } catch { continue; }
+          this.#say(`[gex] pid ${c.pid}${c.name ? ` (${c.name})` : ''} crashed: ${c.reason}\n`);
+          this.dispatchEvent(Object.assign(new Event('crash'), c));
+        }
+      }
+    })();
   }
 
   #exit(m) {

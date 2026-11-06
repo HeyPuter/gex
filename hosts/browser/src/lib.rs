@@ -492,6 +492,7 @@ extern "C" {
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
     fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_set_crash(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32);
     fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64);
@@ -978,6 +979,9 @@ extern "C" fn r_halt_code() -> i32 {
 extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
     unsafe { k_proc_set_info(pid, at, len) }
 }
+extern "C" fn r_set_crash(pid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_crash(pid, at, len) }
+}
 extern "C" fn r_set_creds(pid: i32, at: gex_kernel::PAddr, len: u32) {
     unsafe { k_proc_set_creds(pid, at, len) }
 }
@@ -1070,6 +1074,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             cpu_total: r_cpu_total,
             loadavg: r_loadavg,
             rss_total: r_rss_total,
+            set_crash: r_set_crash,
             count: r_count,
         },
     )))
@@ -20389,6 +20394,8 @@ pub extern "C" fn gex_abandon(code: i32) {
         }
     }
     release_wakes();
+    // A crash: the program's, as it sees it (gex could not run it on).
+    home.procs().set_crash_unless_said(pid, b"\0gex could not run it on");
     publish_exit(pid, code);
 }
 
@@ -20499,6 +20506,9 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
             0
         }
     };
+    if let Some(home) = sigs::home() {
+        home.procs().set_crash_unless_said(pid, b"\0gex could not run it on");
+    }
     publish_exit(pid, status);
     warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"

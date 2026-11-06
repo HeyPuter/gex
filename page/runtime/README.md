@@ -215,7 +215,7 @@ processes and memory.
 | `run(argv, opts)` | `spawn`, then `{ code, signal, stdout, stderr }` once it ends. `input` is written to its stdin; `encoding` (default `'utf-8'`, `null` for bytes). It reads both outputs as they come, so a program never waits on it. The output is what was written before the program ended: a daemon it started that still holds its pipes (a persistent server) does not keep `run` waiting. |
 | `init` | The init's `Process`, or null without one. |
 | `state` | `{ phase, error, console, init }`; phase is `new`, `booting`, `running`, `stopped` or `failed`. |
-| Events | On the system itself (`sys.addEventListener`): `running` when it boots, `stopped` when it ends, `console` (`text`) for what the runtime says. |
+| Events | On the system itself (`sys.addEventListener`): `running` when it boots, `stopped` when it ends, `console` (`text`) for what the runtime says, `crash` (`pid`, `name`, `reason`, `code`, `signal`) when a program crashes, any program of the system's: one a crash signal ends (`SIGSEGV`, `SIGILL`, `SIGABRT`, ...: `signal` its number, `code` 128 plus it), or a Windows program that Wine ends for an exception nothing handled (`name` its `.exe`, `reason` the exception, `code` its code, such as `0xc0000005`, `signal` 0). The program has ended by then: its windows are gone. |
 | `describe()` | `{ phase, arch, processes, pids, threads, memory }`. |
 | `sync()` | What the programs wrote made durable in the filesystem's store, as `sync(2)` (nothing to do for a `MemoryFilesystem`). Rejects with the store's error (`code` `EIO`, `ENOSPC`). |
 | `shutdown()` | Ends every program and the kernel, after a `sync()`. |

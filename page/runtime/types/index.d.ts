@@ -72,6 +72,21 @@ export interface SystemState {
   init?: { code: number; signal: string | null } | { error: string };
 }
 
+/** A program that crashed (System's `crash` event): one a crash signal
+ *  ended, or a Windows program Wine ended for an unhandled exception. It
+ *  has ended by the time the event comes. */
+export interface CrashEvent extends Event {
+  readonly pid: number;
+  /** Its program's name (a Windows program's `.exe`). */
+  readonly name: string;
+  /** What happened, in a few words ("page fault on read access to 00000000 at address 004017DD", "SIGSEGV"). */
+  readonly reason: string;
+  /** Its exit status: a Windows exception's code (0xc0000005), else 128 plus the signal. */
+  readonly code: number;
+  /** The signal that ended it, 0 for none. */
+  readonly signal: number;
+}
+
 export interface HostCalls {
   /** `fn(value)` for a guest's call NAME on /dev/gex-host; returns a function that unregisters it. */
   register(name: string, fn: (value: unknown) => unknown): () => void;

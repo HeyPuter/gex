@@ -793,6 +793,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
+    gex_kernel::proc::set_crash_hook(crash_line);
     run_program_with(program, opts, xlate, None)
 }
 
@@ -1530,7 +1531,14 @@ fn run_program_with(
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
             k.fds.close_all();
-            return Err(e);
+            // The program's crash, not gexc's: it ends as one that a
+            // signal ended (gex's own failures are SIGSEGV), and its crash
+            // is reported.
+            let pid = k.pid;
+            drop(k);
+            let exit = Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail: format!("{e:#}"), internal: true };
+            report_first_end(&spawn, pid, &exit);
+            return Ok((exit, Stats::default()));
         }
     };
     profile::harvest(&mut store)?;
@@ -1565,6 +1573,10 @@ fn run_program_with(
     // Another thread may have ended the process (this one then only saw
     // `stopping`).
     let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
+    {
+        let pid = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+        report_first_end(&spawn, pid, &exit);
+    }
 
     // The process is over. Every other thread must stop before the stores and
     // memory go away: set the stopping flag and wake anyone parked on a futex,
@@ -2844,15 +2856,22 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // (the parent's copy) with it, while the new program runs.
             let cleanup = Arc::downgrade(&child_cx);
             let kernel = Arc::clone(&child_cx.kernel);
+            let compositor = child_cx.wayland.clone();
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
                 Ok(exit) => {
                     say_killed(pid, &exit);
+                    if let Some(note) = crash_note(&exit) {
+                        procs.set_crash_unless_said(pid, &note);
+                    }
                     (exit.code(), exit.wait_status())
                 }
                 Err(e) => {
-                    eprintln!("gexc: child {pid} failed: {e:#}");
+                    // gex could not go on with it: a crash of the program's,
+                    // as the program sees it (a Wasm exception no frame of its
+                    // caught, a trap gex has no signal for).
+                    procs.set_crash_unless_said(pid, format!("\0gex could not run it on: {e:#}").as_bytes());
                     // A process that dies takes its threads and descriptors
                     // with it: otherwise its threads park in a futex nobody
                     // wakes and its pipes never reach EOF for their readers.
@@ -2867,6 +2886,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     (127, 127 << 8)
                 }
             };
+            // Its windows: only their process reads its clients, so a client
+            // of one that ended (a crash most of all) would stay on screen.
+            if let Some(w) = &compositor {
+                w.forget_process(pid);
+            }
             // Its record locks, however it ended (a descriptor table the
             // process drops closes nothing), and whoever waits for them.
             kernel.lock().unwrap_or_else(|e| e.into_inner()).file_locks.release_pid(pid, None);
@@ -2904,6 +2928,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
 /// so a SIGKILL is another process's doing and is said.
 fn say_killed(pid: i32, exit: &Exit) {
     let Exit::Signal { signal, pc, detail, internal } = exit else { return };
+    // A crash is said by the process table's report of it (`crash_line`),
+    // gex's own failure too.
+    if *internal || crash_signal(*signal) {
+        return;
+    }
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let all = *ALL.get_or_init(|| std::env::var("GEX_LOG_CHILD_SIGNALS").is_ok_and(|v| v == "1"));
     // SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGSYS.
@@ -2913,6 +2942,47 @@ fn say_killed(pid: i32, exit: &Exit) {
     let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
     let whose = if *internal { " (gex cannot run it)" } else { "" };
     eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{whose}{detail}");
+}
+
+/// The signals a crash ends a program with (those that dump core).
+fn crash_signal(sig: i32) -> bool {
+    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
+}
+
+/// What gex knows of a crash that ended a process (`exit`), as a note for
+/// the process table (`ProcTable::set_crash`): the signal, where, and the
+/// trap's account. None for an exit that is no crash.
+fn crash_note(exit: &Exit) -> Option<Vec<u8>> {
+    let Exit::Signal { signal, pc, detail, internal } = exit else { return None };
+    if !internal && !crash_signal(*signal) {
+        return None;
+    }
+    let at = if *pc != 0 { format!(" at {pc:#x}") } else { String::new() };
+    let why = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
+    if *internal {
+        return Some(format!("\0gex could not run it on{at}{why}").into_bytes());
+    }
+    let sig = gex_kernel::proc::signal_name(*signal as u32);
+    Some(format!("\0{sig}{at}{why}").into_bytes())
+}
+
+/// The run's first process (pid 1, whose end is gexc's) ends with `exit`:
+/// nothing collects it, so its crash, if it is one, is reported here.
+fn report_first_end(spawn: &SpawnContext, pid: i32, exit: &Exit) {
+    if pid != gex_kernel::INIT_PID {
+        return;
+    }
+    let procs = Arc::clone(&spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).procs);
+    if let Some(note) = crash_note(exit) {
+        procs.set_crash_unless_said(pid, &note);
+    }
+    procs.report_end(pid, exit.wait_status());
+}
+
+/// A crash's one line on the host's console.
+fn crash_line(c: &gex_kernel::proc::Crash) {
+    let name = if c.name.is_empty() { String::new() } else { format!(" ({})", c.name) };
+    eprintln!("[gex] pid {}{name} crashed: {}", c.pid, c.reason);
 }
 
 /// Run a child process to completion in this host thread.

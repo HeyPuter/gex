@@ -332,6 +332,10 @@ pfs_make() {
 	cp -a "$C/pfx64-$PX/pfx" pfx
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
+	if [ "$WOW" != 0 ]; then
+		printf '[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug]\n"Debugger"=-\n' > aedebug32.reg
+		python3 "$here/reg-apply.py" pfx/system.reg aedebug32.reg && rm -f aedebug32.reg || return 1
+	fi
 	if [ "$PADS" = 0 ]; then python3 "$here/reg-apply.py" pfx/system.reg "$here/session.reg" "$here/wine64-session.reg"
 	else
 		# winebus's root device kept, its driver started on demand only

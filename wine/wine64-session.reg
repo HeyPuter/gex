@@ -18,3 +18,10 @@ REGEDIT4
 
 [HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\MountMgr]
 "Start"=dword:00000002
+
+; No debugger at a crash (AeDebug's Debugger, winedbg --auto, gone): on gex
+; the program ends at once and gex reports it (kernelbase's report_crash);
+; winedbg's report took seconds, its dialog kept the windows up. WoW64's
+; 32-bit view the same (dist.sh's pfs_make, where there is one).
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\AeDebug]
+"Debugger"=-

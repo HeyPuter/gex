@@ -1738,7 +1738,7 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
-    procs().exit(pid, status);
+    procs().exit_code(pid, status);
 }
 
 /// Collect a finished child of `ppid`. Zero if none is ready. `want` is a
@@ -2009,6 +2009,45 @@ pub extern "C" fn k_proc_set_info(pid: i32, at: gex_kmem::PAddr, len: u32) {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     procs().set_info(pid, &buf);
+}
+
+/// Process `pid` has crashed, and how (`ProcTable::set_crash`).
+#[no_mangle]
+pub extern "C" fn k_proc_set_crash(pid: i32, at: gex_kmem::PAddr, len: u32) {
+    let len = len.min(1024);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    procs().set_crash(pid, &buf);
+}
+
+/// The queue a crash notifies (the page's reader of `k_crash_take`).
+#[no_mangle]
+pub extern "C" fn k_crash_queue() -> u32 {
+    procs().crash_queue()
+}
+
+/// The crashes recorded since the last take, one JSON object a line
+/// (`gex_kernel::proc::Crash::json`), into up to `len` bytes at `at`: the
+/// bytes written, 0 for none. What does not fit stays for the next.
+#[no_mangle]
+pub extern "C" fn k_crash_take(at: gex_kmem::PAddr, len: u32) -> i32 {
+    let mut out = String::new();
+    let mut back = Vec::new();
+    for c in procs().take_crashes() {
+        let line = c.json() + "\n";
+        if out.len() + line.len() > len as usize {
+            back.push(c);
+        } else {
+            out += &line;
+        }
+    }
+    procs().put_back_crashes(back);
+    if !out.is_empty() {
+        unsafe { gex_kmem::push_checked(at, out.as_ptr(), out.len() as u32) };
+    }
+    out.len() as i32
 }
 
 /// Every process, encoded (`gex_kernel::proc::encode_entries`), into up to

@@ -6913,6 +6913,13 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             8 => Err(Errno::EINVAL),
             23 if a[1] <= 40 => Ok(1),
             23 => Err(Errno::EINVAL),
+            // gex's own: the process has crashed, and says how (the report
+            // its exit makes, `ProcTable::set_crash`).
+            crate::proc::PR_GEX_CRASH => {
+                let note = m.read(a[1], (a[2] as usize).min(1024))?.to_vec();
+                procs.set_crash(io.pid, &note);
+                Ok(0)
+            }
             _ => Ok(0),
         },
         // Everything written made durable: the block store's dirty blocks

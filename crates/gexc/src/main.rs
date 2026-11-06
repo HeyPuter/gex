@@ -817,8 +817,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     Ok(report_exit(&exit, ra.opts.verbose))
 }
 
-/// The exit status a shell sees for a guest's exit, with a message when gex
-/// itself failed.
+/// The exit status a shell sees for a guest's exit.
 fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
     match exit {
         Exit::Status(c) => ExitCode::from((*c & 0xff) as u8),
@@ -828,14 +827,11 @@ fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
             detail,
             internal,
         } => {
-            // An ordinary signal says nothing itself, as on Linux. Only a gex
-            // limitation is worth a message.
-            if *internal {
-                // Not a guest crash: gex delivers its own failures as SIGSEGV
-                // (the only way to stop a running guest), so say which side
-                // failed rather than let it read as "terminated by signal 11".
-                eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
-            } else if verbose {
+            // An ordinary signal says nothing itself, as on Linux, and a
+            // crash is said by its report (gex_native's `crash_line`). So is
+            // gex's own failure (delivered as SIGSEGV, the only way to stop
+            // a running guest): as gex could not run it on.
+            if !*internal && verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
             ExitCode::from((exit.code() & 0xff) as u8)
