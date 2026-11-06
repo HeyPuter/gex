@@ -396,6 +396,12 @@ tab killed in the middle of one, a damaged store), it boots the one before
 and says so on the console. A file's bytes are not journalled: after such
 a boot, a file reads what was last written into the blocks it had.
 
+One page holds an `OPFSFilesystem`'s store at a time: a Web Lock named for
+it, taken at boot and let go at `shutdown()` or when the page is left. A
+system booted on a store another tab of the site holds fails at once with
+`EBUSY`. (The eject library's `start()` asks first, and lets the page
+offer to run without keeping files: its `onStoreBusy` option.)
+
 ```js
 import { System } from '@gex/runtime';
 import { OPFSFilesystem } from '@gex/runtime/fs';

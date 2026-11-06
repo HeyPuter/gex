@@ -57,6 +57,7 @@ Every option is optional. A default comes from the build
 | `onLog(text)` | the program's terminal output |
 | `onExit(status)` | called when it exits |
 | `onProgress(p)` | the start-up's progress, for a loading screen (`crates/gex-eject/README.md`, "The loading screen") |
+| `onStoreBusy({ name, signal })` | an OPFS `filesystem` open in another tab of the site (one page holds a store at a time): return `'memory'` to run without keeping files, or anything else to wait; start-up goes on by itself once the other tab closes, and `signal` is aborted. Without it a busy store fails the start (`EBUSY`) |
 | `baseUrl` | where `app.mjs`'s files are; default beside `app.mjs` |
 | `launch` | the build's launch file, relative to `baseUrl` |
 

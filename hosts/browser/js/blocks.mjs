@@ -43,8 +43,67 @@ export async function blocksOpen(name) {
   return true;
 }
 
+// The stores this page holds (`claimStore`): name -> { n, held, release },
+// or the promise of one while its lock is asked for.
+const claims = new Map();
+
+/** Hold the store `name` for this page: a Web Lock named for it, held until
+ *  every claim is released (or the page goes away), so that two pages of
+ *  one origin never open one store (the second one's sync access handle
+ *  would fail). Claims in one page share the lock. `wait`: until another
+ *  page lets it go (`signal` stops the wait, rejecting with its reason);
+ *  otherwise null at once if another page holds it. A browser without Web
+ *  Locks: a claim that holds nothing (the handle is then the only guard). */
+export async function claimStore(name, { wait = false, signal } = {}) {
+  const locks = globalThis.navigator?.locks;
+  let c = claims.get(name);
+  if (c instanceof Promise) c = await c.catch(() => null);
+  if (!c || !claims.has(name)) {
+    if (!locks) {
+      c = { n: 0, release() {} };
+    } else {
+      const asked = new Promise((granted, failed) => {
+        let release;
+        const held = new Promise((r) => { release = r; });
+        locks.request(`gex-fs-${name}`, wait ? { signal } : { ifAvailable: true }, (lock) => {
+          granted(lock ? { n: 0, release } : null);
+          return lock ? held : undefined;
+        }).catch(failed);
+      });
+      claims.set(name, asked);
+      try {
+        c = await asked;
+      } catch (e) {
+        if (claims.get(name) === asked) claims.delete(name);
+        throw e;
+      }
+      if (!c) {
+        if (claims.get(name) === asked) claims.delete(name);
+        return null;
+      }
+    }
+    claims.set(name, c);
+  }
+  c.n++;
+  let done = false;
+  return {
+    release() {
+      if (done) return;
+      done = true;
+      if (--c.n === 0 && claims.get(name) === c) {
+        claims.delete(name);
+        c.release();
+      }
+    },
+  };
+}
+
+/** A store held by another page: its error (code EBUSY). */
+export const storeBusy = (name) => Object.assign(new Error(`OPFSFilesystem: the store ${name} is open in another tab or window of this site; close it, or keep the files in a MemoryFilesystem`), { code: 'EBUSY' });
+
 /** A sync access handle on `fh`; a store Worker of a system just stopped
- *  may still hold it a moment after it was terminated. */
+ *  (or of a page just closed) may still hold it a moment after it was
+ *  terminated, so a busy handle is tried again for 10 s. */
 export async function openHandle(fh) {
   for (let i = 0; ; i++) {
     try {

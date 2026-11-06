@@ -22,7 +22,7 @@ import { Files } from './kfs.js';
 import { Programs } from './programs.js';
 import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../hosts/browser/js/mode.mjs';
-import { serveSlots } from '../../../hosts/browser/js/blocks.mjs';
+import { serveSlots, claimStore, storeBusy } from '../../../hosts/browser/js/blocks.mjs';
 
 /** Whether this system is the single-thread build's (@gex/runtime-single:
  *  the kernel and every process in one Worker, kernel-single-worker.js): a
@@ -128,6 +128,10 @@ export class System extends EventTarget {
   #restBundle = false;
   /** The filesystem keeps its contents in a store (fs.js): sync has work. */
   #stored = false;
+  /** This system's claim on its OPFS store, and the store Worker holding
+   *  its handle (the default build). */
+  #claim = null;
+  #storeWorker = null;
   #nextHandle = 1;
   #booting = null;
   #arch = null;
@@ -871,6 +875,14 @@ export class System extends EventTarget {
     return p;
   }
 
+  /** The store's handle and lock given up: the page is going away. */
+  #letStoreGo() {
+    this.#storeWorker?.terminate();
+    this.#storeWorker = null;
+    this.#claim?.release();
+    this.#claim = null;
+  }
+
   /** The root the store kept laid over the sources'. A generation that
    *  failed its checks is said, and the one before it is booted; a store
    *  that holds nothing whole boots the sources alone. */
@@ -901,6 +913,15 @@ export class System extends EventTarget {
       return;
     }
     const check = !!this.#opts.debug.blockscheck;
+    if (st.kind !== 'page') {
+      // One page per store: a second tab of the site is told so (EBUSY), at
+      // once, not after the handle's retries (the page's start() asks
+      // first, and may have offered a MemoryFilesystem instead).
+      const claim = await claimStore(st.name);
+      if (!claim) throw storeBusy(st.name);
+      this.#sys.onStop(() => claim.release());
+      this.#claim = claim;
+    }
     const ctl = await k.r('k_blocks_config', 0, 0, 0, 0);
     if (st.kind === 'page') {
       // A page's own store (a Filesystem subclass), asked from here through
@@ -932,6 +953,7 @@ export class System extends EventTarget {
         throw new Error(`OPFSFilesystem: the store ${st.name} would not open: ${ready.why}`);
       }
       this.#sys.onStop(() => w.terminate());
+      this.#storeWorker = w;
     }
     await k.r('k_blocks_config', st.block, st.cache, st.inline, check ? 1 : 0);
     this.#stored = true;
@@ -953,7 +975,13 @@ export class System extends EventTarget {
     }, every);
     // A page going away writes what it can first.
     const hide = () => { if (document.visibilityState === 'hidden') this.sync().catch(() => {}); };
-    const leave = () => this.sync().catch(() => {});
+    // A page left for good (not kept in the back/forward cache) lets the
+    // store go once that is done, so the next load of the site (a reload)
+    // opens it without waiting on this one's teardown.
+    const leave = (e) => {
+      const done = this.sync().catch(() => {});
+      if (!e?.persisted) done.finally(() => this.#letStoreGo());
+    };
     if (typeof document === 'object') {
       document.addEventListener('visibilitychange', hide);
       addEventListener('pagehide', leave);

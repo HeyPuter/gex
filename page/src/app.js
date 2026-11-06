@@ -30,6 +30,7 @@ import { noRegSave } from './wine-env.js';
 import { logOn } from '../../hosts/browser/js/log.mjs';
 import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../hosts/browser/js/page-host.mjs';
+import { claimStore, storeBusy } from '../../hosts/browser/js/blocks.mjs';
 import { checkOptions, filesystemValue, sizeValue, showValue } from './start-options.js';
 import { posixTz } from './posix-tz.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
@@ -102,6 +103,15 @@ const PIECES = {
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
  *   onLog(text)     the program's terminal output
  *   onExit(status)  called when it exits
+ *   onStoreBusy({ name, signal })
+ *              the OPFS store is open in another tab or window of the site
+ *              (one page holds a store at a time): the page offers its user
+ *              the choice, and returns (or resolves to) 'memory' to run
+ *              without keeping files (a MemoryFilesystem), or anything else
+ *              to wait for the other page to close. Start-up goes on by
+ *              itself once the store is free, and `signal` is then aborted
+ *              (the page takes its question down). Without it, a busy store
+ *              fails the start (EBUSY).
  *   onProgress(p)   the start-up's progress, for a loading screen: called
  *              when it moves (a few times a second at most while bytes
  *              arrive; at once on a phase change, when a file is whole and
@@ -120,9 +130,13 @@ export async function start(opts = {}) {
   // The guest Worker's modules: fetched, or from the page's cache (worker-graph.js).
   state.workerGraph = workerGraphBytes;
   const meter = progressMeter(state, opts.onProgress);
+  // What the run holds of the page's (its store's claim), let go when it
+  // ends or fails to start.
+  const lets = [];
   try {
-    return await begin(opts, base, at, state, meter);
+    return await begin(opts, base, at, state, meter, lets);
   } catch (e) {
+    for (const f of lets) f();
     state.error = String(e?.stack ?? e);
     state.phase = 'failed';
     meter.end('failed', state.error);
@@ -348,7 +362,31 @@ function progressMeter(state, onProgress) {
   };
 }
 
-async function begin(opts, base, at, state, meter) {
+/** The claim on `where`'s OPFS store (null for any other filesystem), or
+ *  'memory' when another page holds it and `onBusy` chose to keep no files. */
+async function claimFor(where, onBusy) {
+  if (where.kind !== 'opfs') return null;
+  const now = await claimStore(where.name);
+  if (now) return now;
+  if (!onBusy) throw storeBusy(where.name);
+  const told = new AbortController(), asking = new AbortController();
+  const freed = claimStore(where.name, { wait: true, signal: asking.signal });
+  freed.catch(() => {});
+  try {
+    const choice = Promise.resolve(onBusy({ name: where.name, signal: told.signal }));
+    const got = await Promise.race([freed, choice.then((c) => (c === 'memory' ? 'memory' : freed))]);
+    if (got === 'memory') {
+      asking.abort();
+      freed.then((c) => c.release(), () => {});
+      return 'memory';
+    }
+    return got;
+  } finally {
+    told.abort();
+  }
+}
+
+async function begin(opts, base, at, state, meter, lets) {
   // Start-up's steps, as debug output (`?log=1`). `always`: the fill's end and
   // its late units, which are said by default (gexdev/tests/eject/wine32-page.mjs reads them).
   const mark = (what, always = false) => {
@@ -361,9 +399,22 @@ async function begin(opts, base, at, state, meter) {
   const b = opts.build ?? fromLaunch(await fetchJson(at(opts.launch ?? 'project/build/web/nt.json'), 'the build\'s launch file'), at);
   // Where the guest's files are kept: the page's choice, or the build's
   // (user/eject.json "start"). There is no default.
-  const filesystem = opts.filesystem ?? b.filesystem;
+  let filesystem = opts.filesystem ?? b.filesystem;
   if (!filesystem) throw new Error("start(): choose where the guest's files are kept: filesystem: 'memory' or { kind: 'opfs', name } (here, or the build's user/eject.json \"start\")");
   if (!filesystemValue(filesystem)) throw new Error(`start(): the build's filesystem ${JSON.stringify(filesystem)} is not 'memory', { kind: 'memory', max } or { kind: 'opfs', name, cache }`);
+
+  // An OPFS store is held by one page at a time (a Web Lock named for it,
+  // blocks.mjs `claimStore`), from here until the run ends or the page goes
+  // away. Held by another tab: the page's choice (`onStoreBusy`).
+  const storeClaim = await claimFor(filesystemValue(filesystem), opts.onStoreBusy);
+  if (storeClaim === 'memory') {
+    filesystem = 'memory';
+    console.warn(`[app] the store ${filesystemValue(opts.filesystem ?? b.filesystem).name} is open in another tab: this one keeps no files`);
+  } else if (storeClaim) {
+    const leave = (e) => { if (!e.persisted) storeClaim.release(); };
+    addEventListener('pagehide', leave);
+    lets.push(() => { removeEventListener('pagehide', leave); storeClaim.release(); });
+  }
 
   // What the build left out cannot be asked for.
   const has = {
@@ -890,7 +941,7 @@ async function begin(opts, base, at, state, meter) {
       mark('bundle released');
     },
   });
-  const exited = Promise.race([run.then(({ status }) => status), killed]).then((status) => {
+  const exited = Promise.race([run.then(({ status }) => status), killed]).finally(() => { for (const f of lets) f(); }).then((status) => {
     state.status = status;
     state.phase = 'done';
     meter.end('exited');

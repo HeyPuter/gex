@@ -406,6 +406,8 @@ setting (`"compositor"`, say) fails the build and says where it goes.
 (gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
 origin private file system, which keeps the whole root, a game's saves and
 the Wine prefix included, across loads; page/runtime README, "Persistence").
+One page holds a store at a time: a second tab of the site gets the
+page's `onStoreBusy` choice, or fails with EBUSY without one.
 A new project's file says `"memory"`; a build whose file says neither
 fails. The `"persist"` start option (one directory kept in IndexedDB) is
 gone and fails the build: what it saved is not read by an OPFS filesystem.
