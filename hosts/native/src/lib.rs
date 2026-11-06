@@ -6179,9 +6179,9 @@ pub(crate) enum CalloutSignal {
 }
 
 /// Call-outs nested deeper than this leave instead: each holds a host frame
-/// and a nested wasm call. Native Wine's guest calls, which cannot leave,
-/// nest as deep as the guest thread's stack and the host's have room for
-/// (`native_call_spent`).
+/// and a nested wasm call. Native Wine's guest calls and WoW64's stops,
+/// which cannot leave, nest as deep as the guest thread's stack and the
+/// host's have room for (`native_call_spent`).
 const CALLOUT_MAX_DEPTH: usize = 32;
 
 thread_local! {
@@ -6195,8 +6195,9 @@ thread_local! {
 /// three quarters of the wasm stack since the thread's outermost call-out
 /// (each level holds its native Wine frames and the host's, a few KiB; the
 /// rest is room for what ran below that call-out, short of wasmtime's own
-/// overflow, which would end gexc).
-fn native_call_spent(caller: &Caller<'_, HostState>, ctx_addr: u64, sp: u64) -> Option<&'static str> {
+/// overflow, which would end gexc). `sp` is `None` for a WoW64 stop, which
+/// names no guest stack pointer: only the host's stack is asked about.
+fn native_call_spent(caller: &Caller<'_, HostState>, ctx_addr: u64, sp: Option<u64>) -> Option<&'static str> {
     let here = 0u8;
     let host = std::hint::black_box(&here) as *const u8 as usize;
     if caller.data().callouts.is_empty() {
@@ -6204,6 +6205,7 @@ fn native_call_spent(caller: &Caller<'_, HostState>, ctx_addr: u64, sp: u64) -> 
     } else if CALLOUT_HOST_SP0.with(|s| s.get()).saturating_sub(host) > wasm_stack_bytes() / 4 * 3 {
         return Some("the host's stack");
     }
+    let sp = sp?;
     if !gex_abi::X86 {
         return None;
     }
@@ -6834,14 +6836,20 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
 fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64, need: u32) -> Result<i32> {
     // Native Wine's guest call (its return pad) cannot be left: its C caller
     // would never run again and the guest's return to the pad find no
-    // call-out. Those nest as deep as the program's callbacks do.
+    // call-out. Those nest as deep as the program's callbacks do. Nor can a
+    // WoW64 stop's (wow64cpu's run of the 32-bit code, one for each user
+    // callback into it: a window procedure sending a message whose
+    // procedure sends one ... nests four call-outs a message, and a modal
+    // loop in a window procedure every message it dispatches): left, its C
+    // caller throws, past the frames of every callback still open.
     let pad = ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD;
-    if let Some(what) = pad.then(|| native_call_spent(caller, ctx_i as u32 as u64, sp_want)).flatten() {
+    let stop = gex_kernel::win::tramp::any_stack(ret);
+    if let Some(what) = (pad || stop).then(|| native_call_spent(caller, ctx_i as u32 as u64, pad.then_some(sp_want))).flatten() {
         eprintln!("gex: native Wine's guest calls nest deeper than {what} has room for: the process ends (stack overflow)");
         caller.data_mut().exit = Some(Exit::Status(0xfd));
         return Err(StopExecution.into());
     }
-    if (!pad && caller.data().callouts.len() >= CALLOUT_MAX_DEPTH) || caller.data().jit.is_none() {
+    if (!pad && !stop && caller.data().callouts.len() >= CALLOUT_MAX_DEPTH) || caller.data().jit.is_none() {
         if crate::stall::on() {
             crate::stall::callout(target, ret | 1 << 63, true);
         }
