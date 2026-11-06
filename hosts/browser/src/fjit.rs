@@ -308,7 +308,7 @@ fn mid_function(addr: u64) -> bool {
     let obj = match cached {
         Some(o) => o,
         None => {
-            let bytes = home.read_file(&path).unwrap_or_default();
+            let bytes = home.read_elf(&path).unwrap_or_default();
             // Not the PLT's: one FDE covers all of `.plt`, whose stubs are
             // each an entry (left to the fallback, they died).
             let plt: Vec<(u64, u64)> = gex_xlate::ehframe::sections(&bytes)
@@ -382,7 +382,7 @@ fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
         if lock(&SEEDED).iter().any(|(p, lo, hi)| *p == path && start >= *lo && start < *hi) {
             continue;
         }
-        let bytes = home.read_file(&path).unwrap_or_default();
+        let bytes = home.read_elf(&path).unwrap_or_default();
         let lds = loads(&bytes);
         // The vma's file offset gives its vaddr in the file, hence the bias.
         let Some(bias) = lds.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| start.wrapping_sub(v + (off - o))) else {

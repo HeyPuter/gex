@@ -783,6 +783,36 @@ fn wine32_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at
     })
 }
 
+/// Where a PE file's image ends: its headers, the furthest section's raw
+/// data, and the COFF symbol table with its strings (MinGW's long section
+/// names). None when the headers do not say (read the whole file then).
+fn pe_extent(f: &dyn gex_kernel::vfs::FileHandle) -> Option<usize> {
+    let mut h = vec![0u8; 0x10000];
+    let n = f.read_at(0, &mut h).ok()? as usize;
+    let h = &h[..n];
+    let u16_at = |o: usize| h.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |o: usize| h.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let nt = u32_at(0x3c)?;
+    if h.get(nt..nt + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let coff = nt + 4;
+    let (sections, symtab, nsyms, opt) = (u16_at(coff + 2)?, u32_at(coff + 8)?, u32_at(coff + 12)?, u16_at(coff + 16)?);
+    let table = coff + 20 + opt;
+    let mut end = u32_at(coff + 20 + 60).unwrap_or(0).max(table + 40 * sections);
+    for i in 0..sections {
+        let s = table + 40 * i;
+        end = end.max(u32_at(s + 20)?.checked_add(u32_at(s + 16)?)?);
+    }
+    if symtab != 0 {
+        let strings = symtab.checked_add(nsyms.checked_mul(18)?)?;
+        let mut len = [0u8; 4];
+        let got = f.read_at(strings as u64, &mut len).ok()? as usize;
+        end = end.max(strings + if got == 4 { u32::from_le_bytes(len) as usize } else { 0 });
+    }
+    Some(end)
+}
+
 /// A tier-1 miss at `pc`: if it is inside an image [`wine32_mapped`] deferred,
 /// place that image's unit now (an image whose code still differs stays on
 /// tier-1). Returns whether a unit now waits for JavaScript.
@@ -820,9 +850,13 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
     wanted_any()
 }
 
-/// A whole file, parsed as a PE image.
+/// A file parsed as a PE image: its headers, sections and COFF symbols, not
+/// what follows them. An installer's payload sits after its image (a hundred
+/// megabytes and more) and nothing here reads it, while this heap never
+/// gives a span back: read whole, it took that much address space for the
+/// process's life. The certificate table goes with it (never mapped).
 pub(crate) fn read_pe(f: &dyn gex_kernel::vfs::FileHandle) -> Option<gex_ld::pe::PeImage> {
-    let size = f.metadata().ok()?.size as usize;
+    let size = (f.metadata().ok()?.size as usize).min(pe_extent(f).unwrap_or(usize::MAX));
     let mut b = vec![0u8; size];
     let mut at = 0;
     while at < size {

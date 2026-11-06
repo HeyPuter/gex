@@ -297,10 +297,29 @@ impl Home {
         }
     }
 
+    /// The whole of `path` when it is an ELF object, for the scans that parse
+    /// one (its symbols, `.eh_frame`, segments); None for anything else,
+    /// read no further than its magic. An executable mapping of a Windows
+    /// program is a PE image, often with a payload of a hundred megabytes
+    /// after it (an installer's): read whole into this heap, which never
+    /// gives a span back, it took that much address space for the
+    /// process's life, once per scan.
+    pub(crate) fn read_elf(&self, path: &str) -> Option<Vec<u8>> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut magic = [0u8; 4];
+        if f.read_at(0, &mut magic).ok()? != 4 || magic != *b"\x7fELF" {
+            return None;
+        }
+        drop(f);
+        self.read_file(path)
+    }
+
     /// The whole of `path` (at most 512 MiB), as [`Home::read_file_at`].
     pub(crate) fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let f = self.vfs.get().open(path, 0, 0).ok()?;
-        let mut out = Vec::new();
+        // Its size first, so the buffer is one allocation, not a doubling
+        // series of them (each a span of the heap at these sizes).
+        let mut out = Vec::with_capacity(f.metadata().map(|m| (m.size as usize).min(512 << 20)).unwrap_or(0));
         let mut buf = vec![0u8; 65536];
         loop {
             let n = f.read_at(out.len() as u64, &mut buf).ok()? as usize;

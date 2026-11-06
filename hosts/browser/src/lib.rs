@@ -19726,7 +19726,7 @@ fn executable_object_at(a: u64) -> Option<String> {
 /// chosen implementation is written into the GOT at startup, so the address is
 /// read from the slot the linker wrote in live memory, after it has run.
 fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>, bool) {
-    let Some(bytes) = sigs::proc_home().read_file(path) else {
+    let Some(bytes) = sigs::proc_home().read_elf(path) else {
         return (Vec::new(), false);
     };
     let Ok(image) = gex_ld::elf::load(&bytes, 0) else {
@@ -19773,7 +19773,7 @@ fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>,
 
 fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
     // Through the process's published namespace, not the kernel.
-    let Some(bytes) = sigs::proc_home().read_file(&map.path) else {
+    let Some(bytes) = sigs::proc_home().read_elf(&map.path) else {
         return Vec::new();
     };
     let Ok(image) = gex_ld::elf::load(&bytes, 0) else {
