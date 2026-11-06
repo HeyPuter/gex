@@ -7,7 +7,7 @@
 export const OPTIONS = [
   'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'filesystem', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
-  'glLazy', 'background', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'onStoreBusy', 'ready',
+  'glLazy', 'background', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'onStoreBusy', 'onCrash', 'ready',
 ];
 
 /** The option of `names` one edit or a case away from `k`, if any. */
@@ -61,7 +61,7 @@ export function checkOptions(opts) {
   }
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
   if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
-  for (const k of ['onLog', 'onExit', 'onProgress', 'onStoreBusy']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');
+  for (const k of ['onLog', 'onExit', 'onProgress', 'onStoreBusy', 'onCrash']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');
   for (const k of ['debug', 'pageHosts']) if (given(k) && typeof opts[k] !== 'object') bad(k, 'an object, {name: value}');
 }
 

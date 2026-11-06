@@ -109,6 +109,9 @@ const PIECES = {
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
  *   onLog(text)     the program's terminal output
  *   onExit(status)  called when it exits
+ *   onCrash({ pid, name, reason, code, signal })
+ *              a program of the run crashed (the System's `crash` event,
+ *              page/runtime README): it has ended and its windows are gone
  *   onStoreBusy({ name, signal })
  *              the OPFS store is open in another tab or window of the site
  *              (one page holds a store at a time): the page offers its user
@@ -937,6 +940,9 @@ async function begin(opts, base, at, state, meter, lets) {
         state.error = String(e.error?.stack ?? e.error);
         meter.end('failed', state.error);
       });
+      if (opts.onCrash) {
+        s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
+      }
     },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,
     // under the X session's own window manager (see hostx.js).

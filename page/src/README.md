@@ -57,6 +57,7 @@ Every option is optional. A default comes from the build
 | `ready` | `'frame'` (default): the start-up is over at the first frame. `'manual'`: when the page calls `ready()` |
 | `onLog(text)` | the program's terminal output |
 | `onExit(status)` | called when it exits |
+| `onCrash({ pid, name, reason, code, signal })` | a program of the run crashed: any of them, not only the first (the System's `crash` event, `page/runtime/README.md`). It has ended and its windows are gone by then; the page says so its own way |
 | `onProgress(p)` | the start-up's progress, for a loading screen (`crates/gex-eject/README.md`, "The loading screen") |
 | `onStoreBusy({ name, signal })` | an OPFS `filesystem` open in another tab of the site (one page holds a store at a time): return `'memory'` to run without keeping files, or anything else to wait; start-up goes on by itself once the other tab closes, and `signal` is aborted. Without it a busy store fails the start (`EBUSY`) |
 | `baseUrl` | where `app.mjs`'s files are; default beside `app.mjs` |

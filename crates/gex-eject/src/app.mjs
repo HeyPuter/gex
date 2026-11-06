@@ -16,7 +16,7 @@ const ABSENT = { compositor: 'a desktop', gl: 'OpenGL', hostx: 'an X server', me
 // What this library reads, and what a 32-bit Wine page's start() also takes:
 // those are accepted and do nothing here (one page can start either kind).
 const OPTIONS = ['container', 'args', 'env', 'cwd', 'onLog', 'onExit', 'onProgress', 'strace', 'translation', 'baseUrl', ...Object.keys(ABSENT)];
-const WINE_ONLY = ['canvas', 'size', 'exe', 'uid', 'mtimes', 'network', 'wisp', 'pageHosts', 'trapstack', 'debug', 'glLazy', 'launch', 'build', 'ready'];
+const WINE_ONLY = ['canvas', 'size', 'exe', 'uid', 'mtimes', 'network', 'wisp', 'pageHosts', 'trapstack', 'debug', 'glLazy', 'launch', 'build', 'ready', 'onCrash'];
 
 /** The option of `names` one edit or a case away (as page/src/start-options.js) from `k`, if any. */
 function nearName(k, names) {
