@@ -8,7 +8,7 @@ the module stays beside it as OUT.wasm. `-shared` links a PIC side module
 instead (a Unix library: .so), with no container.
 
 GEX_WASM_SYSROOT names the sysroot (toolchain/sysroot/build32.sh)."""
-import os, subprocess, sys, tempfile
+import os, re, subprocess, sys, tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
 flags = {}
@@ -115,8 +115,11 @@ def ld(cmd, name):
     # A configure test links a function through autoconf's own `char f();`
     # on purpose (it only asks whether the symbol exists), so its program
     # is not judged.
+    # The C runtime calls main or wmain with every argument it has; a
+    # program's own main may take fewer, as C allows.
     out = os.path.basename(cmd[cmd.index('-o') + 1])
-    if 'function signature mismatch' in p.stderr and not out.startswith('conftest'):
+    bad = [m for m in re.findall(r'function signature mismatch: (\S+)', p.stderr) if m not in ('main', 'wmain')]
+    if bad and not out.startswith('conftest'):
         sys.stderr.write('%s: %s: a call through a declaration whose type is not the function\'s '
                          '(wasm-ld links it to a trap); make the two agree\n' % (name, cmd[cmd.index('-o') + 1]))
         return 1
