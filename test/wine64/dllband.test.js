@@ -8,9 +8,10 @@
 // base) whose own base the program holds, relocated to its pin. Natively
 // (no cgen) and on the page's shim, without the door; in neither may a
 // driver fail to load. Also that the prefix carries 32-bit Wine's session
-// (wine/dist.sh applies wine32-session.reg): MountMgr and the Event Log on
-// demand, no root bus devices (winebus's root device on demand, where the
-// install has game controllers).
+// and 64-bit Wine's after it (wine/dist.sh applies session.reg, then
+// wine64-session.reg): the Event Log on demand, no root bus devices
+// (winebus's root device on demand, where the install has game
+// controllers), and MountMgr at boot (64-bit Wine's own: its drive links).
 import { copyFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT, run, wine64 } from '../lib/winerun.mjs';
@@ -20,12 +21,12 @@ export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 const BASES = join(ROOT, 'wine/dll-bases.py');
 const F = join(ROOT, 'test/fixtures/wine64');
 
-/** Why `systemReg` is not 32-bit Wine's session, or ''. */
+/** Why `systemReg` is not 32-bit Wine's session with 64-bit Wine's after it, or ''. */
 function session(systemReg) {
   const t = `${readFileSync(systemReg, 'utf8')}\n\n`;
   const key = (svc) => new RegExp(`^\\[System\\\\\\\\ControlSet001\\\\\\\\Services\\\\\\\\${svc}\\] .*?\\n\\n`, 'msi').exec(t)?.[0] ?? '';
   const start = (svc) => { const m = /^"Start"=dword:([0-9a-f]{8})$/m.exec(key(svc)); return m && parseInt(m[1], 16); };
-  const bad = ['MountMgr', 'Eventlog'].filter((s) => start(s) !== 3).map((s) => `${s} Start=${start(s)}`);
+  const bad = [['Eventlog', 3], ['MountMgr', 2]].filter(([s, n]) => start(s) !== n).map(([s]) => `${s} Start=${start(s)}`);
   const demand = (svc) => /^"DemandStart"=dword:00000001$/m.test(key(svc));
   for (const d of ['WINEBUS', 'WINEUSB', 'WINEBTH'])
     if (!(d === 'WINEBUS' && demand('winebus')) && new RegExp(`^\\[System\\\\\\\\ControlSet001\\\\\\\\Enum\\\\\\\\ROOT\\\\\\\\WINE\\\\\\\\${d}\\]`, 'mi').test(t)) bad.push(d);
@@ -35,7 +36,7 @@ function session(systemReg) {
 export default async function (t) {
   const w = wine64(t, { door: 0 });
   const why = session(join(w.prefix, 'system.reg'));
-  t.check('the prefix carries 32-bit Wine\'s session', !why, `${why} (wine/dist.sh's WINE64_PREFIX)`);
+  t.check('the prefix carries 32-bit Wine\'s session and 64-bit Wine\'s', !why, `${why} (wine/dist.sh's WINE64_PREFIX)`);
   const exe = await w.mingw('dllband', { src: join(F, 'dllband.c'), flags: ['-Wall'] });
   const src = (name, body) => { const f = join(w.work, `${name}.c`); writeFileSync(f, body); return f; };
   // (relocatable, as a DLL that can be pinned must be)
