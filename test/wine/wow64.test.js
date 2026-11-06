@@ -54,6 +54,9 @@ const CASES = [
   ['bcd', 'wow32.exe', 'x86', ['bcd']],
   ['maskmov32', 'wow32.exe', 'x86', ['maskmov']],
   ['maskmov64', 'wow64c.exe', 'x64', ['maskmov']],
+  // a prefix update's fake explorer.exe, and a console app in a new console
+  ['fakedll', 'wow64c.exe', 'x64', ['fakedll']],
+  ['newconsole', 'wow64c.exe', 'x64', ['newconsole']],
   ['x87conv32', 'x87conv.exe', 'x86', [], [], X87_WANT],
   ['x87conv64', 'x87conv.exe', 'x64', [], [], X87_WANT],
   // a timer procedure of 32-bit Wine's own (comctl32's list view)

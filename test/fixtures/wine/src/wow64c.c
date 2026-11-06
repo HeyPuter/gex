@@ -15,6 +15,7 @@
  *
  * Prints "ok   ..." lines and "wow64c CASE ok", or "FAIL ..." and exits 1. */
 #include <windows.h>
+#include <setupapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -129,6 +130,92 @@ static int case_sysarch(void)
     return 0;
 }
 
+/* setupapi's fake DLLs, as wineboot's prefix update installs them: a
+ * WineFakeDlls entry for explorer.exe must leave a file behind (a setupapi
+ * that cannot find the DLL in its own arch's directory deletes it instead) */
+static int case_fakedll(void)
+{
+    void *(WINAPI *open_inf)(const char *, const char *, DWORD, UINT *);
+    BOOL (WINAPI *install)(HWND, void *, const char *, UINT, HKEY, const char *, UINT, void *, void *, HDEVINFO, void *);
+    void (WINAPI *close_inf)(void *);
+    HMODULE setupapi = LoadLibraryA("setupapi.dll");
+    char dir[MAX_PATH], inf[MAX_PATH], dll[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    void *h;
+    HANDLE f;
+    DWORD n;
+    BOOL ok;
+    static const char text[] =
+        "[Version]\r\nSignature=\"$Chicago$\"\r\n"
+        "[DefaultInstall]\r\nWineFakeDlls=Fake\r\n"
+        "[Fake]\r\n11,gexfake,explorer.exe\r\n";
+
+    open_inf = (void *)GetProcAddress(setupapi, "SetupOpenInfFileA");
+    install = (void *)GetProcAddress(setupapi, "SetupInstallFromInfSectionA");
+    close_inf = (void *)GetProcAddress(setupapi, "SetupCloseInfFile");
+    if (!open_inf || !install || !close_inf) { printf("FAIL fakedll no setupapi\n"); return 1; }
+    GetTempPathA(sizeof(dir), dir);
+    sprintf(inf, "%sgexfake.inf", dir);
+    f = CreateFileA(inf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    WriteFile(f, text, sizeof(text) - 1, &n, NULL);
+    CloseHandle(f);
+    GetSystemDirectoryA(dir, sizeof(dir));
+    sprintf(dll, "%s\\gexfake\\explorer.exe", dir);
+    if ((h = open_inf(inf, NULL, INF_STYLE_WIN4, NULL)) == INVALID_HANDLE_VALUE) { printf("FAIL fakedll SetupOpenInfFile %lu\n", GetLastError()); return 1; }
+    ok = install(NULL, h, "DefaultInstall", SPINST_ALL, NULL, NULL, 0, NULL, NULL, NULL, NULL);
+    close_inf(h);
+    DeleteFileA(inf);
+    if (!ok) { printf("FAIL fakedll SetupInstallFromInfSection %lu\n", GetLastError()); return 1; }
+    if (!GetFileAttributesExA(dll, GetFileExInfoStandard, &fa) || !fa.nFileSizeLow)
+    {
+        printf("FAIL fakedll %s missing after install (%lu)\n", dll, GetLastError());
+        return 1;
+    }
+    printf("ok   fakedll %s, %lu bytes\n", dll, fa.nFileSizeLow);
+    DeleteFileA(dll);
+    dll[strlen(dll) - strlen("\\explorer.exe")] = 0;
+    RemoveDirectoryA(dll);
+    printf("wow64c fakedll ok\n");
+    return 0;
+}
+
+/* a child in a console of its own (CREATE_NEW_CONSOLE): its conhost has to
+ * come up, so the child's console calls work */
+static int case_newconsole(void)
+{
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    char cmd[MAX_PATH + 16];
+    char self[MAX_PATH];
+    DWORD code = 99;
+
+    GetModuleFileNameA(NULL, self, sizeof(self));
+    sprintf(cmd, "\"%s\" conchild", self);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi))
+    {
+        printf("FAIL newconsole CreateProcess %lu\n", GetLastError());
+        return 1;
+    }
+    if (WaitForSingleObject(pi.hProcess, 120000)) { printf("FAIL newconsole child hangs\n"); TerminateProcess(pi.hProcess, 1); return 1; }
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (code) { printf("FAIL newconsole child: %s\n", code == 2 ? "no CONOUT$" : code == 3 ? "GetConsoleScreenBufferInfo failed" : "exit code"); return 1; }
+    printf("ok   newconsole GetConsoleScreenBufferInfo in the new console\n");
+    printf("wow64c newconsole ok\n");
+    return 0;
+}
+
+static int conchild(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+
+    if (out == INVALID_HANDLE_VALUE) return 2;
+    if (!GetConsoleScreenBufferInfo(out, &info) || !info.dwSize.X || !info.dwSize.Y) return 3;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     STARTUPINFOA si = { sizeof(si) };
@@ -141,6 +228,9 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "child")) return 64;
     if (argc > 1 && !strcmp(argv[1], "xmmcb")) return case_xmmcb();
     if (argc > 1 && !strcmp(argv[1], "sysarch")) return case_sysarch();
+    if (argc > 1 && !strcmp(argv[1], "fakedll")) return case_fakedll();
+    if (argc > 1 && !strcmp(argv[1], "newconsole")) return case_newconsole();
+    if (argc > 1 && !strcmp(argv[1], "conchild")) return conchild();
     if (argc > 1 && !strcmp(argv[1], "maskmov")) return case_maskmov();
     if (argc > 1 && !strcmp(argv[1], "sysbench"))
     {
