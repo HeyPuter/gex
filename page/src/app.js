@@ -96,8 +96,12 @@ const PIECES = {
  *              compositor: false draws windows straight into the page.
  *              hostx: 'rootful' is one fullscreen X screen under the session's
  *              own window manager.
- *   background the desktop's colour behind the windows, '#rrggbb' (the scene
- *              compositor's; default its dark grey)
+ *   background the desktop behind the windows (the scene compositor's): its colour,
+ *              '#rrggbb' (default its dark grey), or {color, image, anchor}: a colour
+ *              and an image (a URL, relative to the page, or a Blob) drawn over it,
+ *              scaled to cover the desktop, with its `anchor` edge ('top', 'center',
+ *              the default, or 'bottom') always showing. The colour shows until the
+ *              image is decoded; the image is fetched at start, beside the bundle.
  *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
@@ -448,7 +452,18 @@ async function begin(opts, base, at, state, meter, lets) {
     if (typeof opts.strace === 'number') sw.stracepid = String(opts.strace);
   }
   if (opts.trapstack) sw.trapstack = '1';
-  if (opts.background) sw.desktopbg = opts.background.slice(1);
+  const bgColor = typeof opts.background === 'string' ? opts.background : opts.background?.color;
+  if (bgColor) sw.desktopbg = bgColor.slice(1);
+  const bgImage = typeof opts.background === 'object' ? opts.background?.image : null;
+  globalThis.GEX_WALLPAPER = bgImage ? (async () => {
+    try {
+      const blob = bgImage instanceof Blob ? bgImage : await (await fetch(new URL(bgImage, location.href))).blob();
+      return { bitmap: await createImageBitmap(blob), anchor: opts.background.anchor ?? 'center' };
+    } catch (e) {
+      console.warn('gex: the background image did not load:', e);
+      return null;
+    }
+  })() : null;
   for (const [k, v] of Object.entries(opts.debug ?? {})) {
     if (v === null || v === undefined || v === false) delete sw[k];
     else sw[k] = v === true ? '1' : String(v);

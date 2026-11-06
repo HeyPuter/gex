@@ -557,6 +557,32 @@ class Compositor {
 
   #canvas;
 
+  /* start()'s background image: a texture, drawn first, covering the output
+   * and anchored at `anchor` (top, center, bottom: the edge that always
+   * shows). The desktop's colour shows until it is set. */
+  #wallpaper = null;
+
+  setWallpaper(bitmap, anchor) {
+    const tex = gpuTexture(this.#device, bitmap.width, bitmap.height);
+    this.#device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: tex }, [bitmap.width, bitmap.height]);
+    bitmap.close?.();
+    this.#wallpaper?.tex.destroy();
+    this.#wallpaper = { tex, anchor: anchor || 'center' };
+    this.#lastSig = null;
+    this.touch();
+  }
+
+  #drawWallpaper() {
+    const wp = this.#wallpaper;
+    if (!wp) return;
+    const { tex, anchor } = wp;
+    const W = this.#outW, H = this.#outH;
+    const k = Math.max(W / tex.width, H / tex.height);
+    const su = W / k / tex.width, sv = H / k / tex.height;
+    const v0 = anchor === 'top' ? 0 : anchor === 'bottom' ? 1 - sv : (1 - sv) / 2;
+    this.#painter.textured(0, 0, W, H, tex, { opaque: 1, uv: [(1 - su) / 2, v0, su, sv] });
+  }
+
   resize(w, h) {
     this.#outW = Math.max(1, w | 0);
     this.#outH = Math.max(1, h | 0);
@@ -1506,6 +1532,7 @@ class Compositor {
       this.#lastSig = null;
       return;
     }
+    this.#drawWallpaper();
     // Windows bottom to top, each with its popups and subsurfaces above it.
     // Placed windows -- a Win32 desktop, an X menu -- are in the same stack,
     // where their clients put them.
@@ -2178,6 +2205,9 @@ async function serveGlRing() {
   serveGl(glDevice, glChannel);
 }
 
+/* The background image, when it is decoded before the compositor is up. */
+let wallpaper = null;
+
 const onMessage = ({ data: m }) => {
   comp?.touch();
   try {
@@ -2191,11 +2221,15 @@ const onMessage = ({ data: m }) => {
       requestGexDevice().then((gpu) => {
         comp = new Compositor(canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
         comp.setDirect(m.direct);
+        if (wallpaper) comp.setWallpaper(wallpaper.bitmap, wallpaper.anchor);
         running = true;
         requestAnimationFrame(loop);
         if (m.drawOnPublish !== false && !globalThis.GEX_NO_PUBDRAW) onPublishes(m.channel);
         post({ kind: 'ready' });
       }).catch((e) => post({ kind: 'error', error: e?.stack || String(e) }));
+    } else if (m.kind === 'wallpaper') {
+      if (comp) comp.setWallpaper(m.bitmap, m.anchor);
+      else wallpaper = m;
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its

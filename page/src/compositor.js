@@ -158,6 +158,10 @@ export class Compositor {
         channel, stats: this.#stats, present, direct, glLimits, desktop },
       [offscreen],
     );
+    // start()'s background image (app.js decodes it): drawn once it is here.
+    globalThis.GEX_WALLPAPER?.then((wp) => {
+      if (wp) worker.postMessage({ kind: 'wallpaper', bitmap: wp.bitmap, anchor: wp.anchor }, [wp.bitmap]);
+    });
     await ready;
     this.#listen(inputTarget);
   }

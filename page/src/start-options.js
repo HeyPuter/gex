@@ -51,7 +51,14 @@ export function checkOptions(opts) {
   if (given('strace') && typeof opts.strace !== 'boolean' && !Number.isInteger(opts.strace)) bad('strace', 'true (every process) or a pid');
   if (given('wisp') && !/^wss?:\/\//.test(String(opts.wisp))) bad('wisp', 'a Wisp proxy\'s URL, ws://... or wss://...');
   if (given('network') && typeof opts.network?.connect !== 'function') bad('network', 'an object with connect(host, port)');
-  if (given('background') && !/^#[0-9a-fA-F]{6}$/.test(String(opts.background))) bad('background', "a colour, '#rrggbb'");
+  if (given('background')) {
+    const bg = opts.background, colour = (c) => /^#[0-9a-fA-F]{6}$/.test(String(c));
+    const ok = typeof bg === 'string' ? colour(bg)
+      : bg && typeof bg === 'object' && (bg.color === undefined || colour(bg.color))
+        && (bg.image === undefined || typeof bg.image === 'string' || bg.image instanceof Blob)
+        && (bg.anchor === undefined || ['top', 'center', 'bottom'].includes(bg.anchor));
+    if (!ok) bad('background', "a colour, '#rrggbb', or {color: '#rrggbb', image: URL or Blob, anchor: 'top'|'center'|'bottom'}");
+  }
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
   if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
   for (const k of ['onLog', 'onExit', 'onProgress', 'onStoreBusy']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');

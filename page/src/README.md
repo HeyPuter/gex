@@ -53,7 +53,7 @@ Every option is optional. A default comes from the build
 | `debug` | other runtime switches, `{name: value}`, as gex's test page's `?name=value` |
 | `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out). `compositor: false` draws windows straight into the page. `hostx: 'rootful'` is one fullscreen X screen |
 | `glLazy` | start Mesa at the first GL request, not at boot |
-| `background` | the desktop's colour behind the windows, `'#rrggbb'` (default the compositor's dark grey) |
+| `background` | the desktop behind the windows: a colour, `'#rrggbb'` (default the compositor's dark grey), or `{color, image, anchor}`: an image (URL or Blob) over the colour, scaled to cover, its `anchor` edge (`'top'`, `'center'`, `'bottom'`) always showing; the colour shows until the image is decoded |
 | `ready` | `'frame'` (default): the start-up is over at the first frame. `'manual'`: when the page calls `ready()` |
 | `onLog(text)` | the program's terminal output |
 | `onExit(status)` | called when it exits |
