@@ -24,14 +24,20 @@ pub fn decode_in(mode: Mode, bytes: &[u8], pc: u64) -> Inst {
         op16: false,
         // In compatibility mode every address is 32 bits wide; the flag is
         // what makes the lifter wrap the arithmetic, so it is on from the
-        // start there and 0x67 (16-bit addressing) is refused.
+        // start there and 0x67 (16-bit addressing) is taken only for an
+        // absolute disp16 (see `addr16`).
         addr32: mode == Mode::Compat,
+        addr16: false,
+        addr16_used: false,
         seg: None,
         rep: Rep::None,
         lock: false,
         mand: Mand::None,
     };
     match d.run() {
+        // 16-bit addressing that is not an absolute disp16 (a register base,
+        // a string instruction's si/di, loop's cx): refused
+        Ok(_) if d.addr16 && !d.addr16_used => unknown(1),
         Ok(mut inst) => {
             inst.len = d.pos.min(MAX_INST_BYTES) as u8;
             // RIP-relative displacements are relative to the end of the
@@ -85,6 +91,12 @@ struct Decoder<'a> {
     has_rex: bool,
     op16: bool,
     addr32: bool,
+    /// 0x67 in 32-bit code: 16-bit addressing. Only the register-free form,
+    /// `[disp16]`, is decoded (C++Builder's and Delphi's `mov reg, fs:[0x2c]`,
+    /// the TLS array): its address needs no 16-bit wrap.
+    addr16: bool,
+    /// An operand took the 16-bit form.
+    addr16_used: bool,
     seg: Option<Seg>,
     rep: Rep,
     lock: bool,
@@ -251,6 +263,20 @@ impl<'a> Decoder<'a> {
             },
             addr32: self.addr32,
         };
+        if self.addr16 && md != 3 {
+            if md != 0 || rm3 != 6 {
+                return Err(());
+            }
+            mem.disp = self.u16()? as i64;
+            self.addr16_used = true;
+            return Ok(ModRm {
+                reg,
+                is_reg: false,
+                rm: 0,
+                mem,
+                raw,
+            });
+        }
         if md == 3 {
             return Ok(ModRm {
                 reg,
@@ -400,8 +426,8 @@ impl<'a> Decoder<'a> {
                         if matches!(self.peek(), Some(0xe8 | 0xe9)) {
                             continue;
                         }
-                        // 16-bit addressing: nothing gex runs uses it.
-                        return Err(());
+                        self.addr16 = true;
+                        continue;
                     }
                     self.addr32 = true;
                 }
@@ -637,7 +663,14 @@ impl<'a> Decoder<'a> {
             0xa0..=0xa3 => {
                 // mov al/eax <-> moffs64: a full 64-bit absolute address.
                 let w = if op & 1 == 0 { Width::B } else { self.wv() };
-                let addr = if self.addr32 { self.i32()? & 0xffff_ffff } else { self.u64()? };
+                let addr = if self.addr16 {
+                    self.addr16_used = true;
+                    self.u16()? as i64
+                } else if self.addr32 {
+                    self.i32()? & 0xffff_ffff
+                } else {
+                    self.u64()?
+                };
                 let mut mem = Mem::abs(addr);
                 // A 32-bit moffs with a segment is `seg_base + disp32` wrapped
                 // at 32 bits: TLS lives *below* %gs on i386, so the offset is
@@ -2014,6 +2047,26 @@ mod tests {
         assert_eq!(c(&[0xca, 0x08, 0x00]).op0(), Operand::Imm(8));
         assert_eq!((l(&[0x48, 0xcf]).op, l(&[0x48, 0xcf]).width), (Op::Iret, Width::Q));
         assert_eq!(c(&[0xcf]).width, Width::D);
+    }
+
+    #[test]
+    fn addr16_absolute_only() {
+        let c = |b: &[u8]| decode_in(Mode::Compat, b, 0x1000);
+        // mov edx, fs:[0x2c] with 16-bit addressing (C++Builder's TLS array)
+        let i = c(&[0x64, 0x67, 0x8b, 0x16, 0x2c, 0x00]);
+        assert_eq!((i.op, i.len, i.width), (Op::Mov, 6, Width::D));
+        assert!(matches!(i.op1(), Operand::Mem(m) if m.disp == 0x2c && m.base.is_none() && m.index.is_none() && m.seg == Some(Seg::Fs)));
+        // mov eax, fs:[0x18] through moffs16
+        let i = c(&[0x64, 0x67, 0xa1, 0x18, 0x00]);
+        assert_eq!((i.op, i.len), (Op::Mov, 5));
+        assert!(matches!(i.op1(), Operand::Mem(m) if m.disp == 0x18 && m.seg == Some(Seg::Fs)));
+        // a register base ([bx+si]), a string instruction's si/di, a register
+        // operand: refused
+        assert_eq!(c(&[0x67, 0x8b, 0x00]).op, Op::Unknown);
+        assert_eq!(c(&[0x67, 0xa4]).op, Op::Unknown);
+        assert_eq!(c(&[0x67, 0x89, 0xc0]).op, Op::Unknown);
+        // the 32-bit form is unchanged
+        assert_eq!(c(&[0x64, 0x8b, 0x15, 0x2c, 0x00, 0x00, 0x00]).len, 7);
     }
 
     #[test]
