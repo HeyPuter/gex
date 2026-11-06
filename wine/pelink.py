@@ -873,6 +873,7 @@ def link(dlls, out, gexrt, others=None):
     # imports: rpcrt4 brought combase, ole32, user32, gdi32, win32u and
     # coml2 into every process that loads it (sc, services, winedevice).
     delay_targets = {}
+    delay_marks = {}  # group -> (the DLLs marked delayed, the DLLs its delay thunks load)
 
     def fwd_first(mod, imports, name):
         """`name` is the module's through a forwarding DLL it imports ahead
@@ -1057,7 +1058,8 @@ def link(dlls, out, gexrt, others=None):
       if gthunks:
           ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
           src = os.path.join(tmp, f'forwards{g}.c')
-          delayed = sorted({t[4] for t in gthunks if t[4]})
+          loads = {t[0]: delay_loads(t[4], t[2], static_closure) for t in gthunks if t[4]}
+          delayed = sorted({d for ds in loads.values() for d in ds})
           with open(src, 'w') as f:
               if delayed:
                   # A delay import's first call: the DLL loaded (and attached)
@@ -1075,6 +1077,7 @@ def link(dlls, out, gexrt, others=None):
                   # each DLL only these thunks reach, marked for gex (wasmdll):
                   # its module is not installed ahead of this one
                   marked = sorted((set(delayed) | {d for d in delay_targets.get(g, ()) if grp(d) != g}) - direct_refs.get(g, set()))
+                  delay_marks[g] = (set(marked), set(delayed) | {c for d in delayed for c in static_closure(d)})
                   for k, d in enumerate(marked):
                       f.write(f'__attribute__((export_name("gexw-delay!{d}"))) void dm{k}(void) {{}}\n')
                   f.write('static __attribute__((noinline)) void dl_load(int i, const char *name)\n{\n'
@@ -1096,8 +1099,8 @@ def link(dlls, out, gexrt, others=None):
                   else:
                       body = f'return ({ctype[hr]}){call};'
                   if delay:
-                      i = delayed.index(delay)
-                      body = (f'if (!__atomic_load_n(&dl[{i}], __ATOMIC_ACQUIRE)) dl_load({i}, "{delay}"); ' + body)
+                      body = ''.join(f'if (!__atomic_load_n(&dl[{delayed.index(d)}], __ATOMIC_ACQUIRE)) dl_load({delayed.index(d)}, "{d}"); '
+                                     for d in loads[alias]) + body
                   f.write(f'{ctype[hr]} f{k}({params}) {{ {body} }}\n')
           obj = os.path.join(tmp, f'forwards{g}.o')
           subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
@@ -1606,6 +1609,36 @@ static void *gexw_ntdll_proc(const char *name)
             emit(g, os.path.join(os.path.dirname(out), g), None)
     if SPLIT:
         check_imports(out, [os.path.join(os.path.dirname(out), g) for g in objs if g])
+    check_delay_imports({g: os.path.join(os.path.dirname(out), g) if g else out for g in objs}, delay_marks)
+
+
+def delay_loads(delay, target, static_closure):
+    """The DLLs a delay thunk loads before its call: the delay import, and
+    the DLL the call reaches when the delay import only forwards it there
+    and does not bring it in itself (msvcrt's RtlGenRandom: advapi32's
+    SystemFunction036 is cryptbase's, which advapi32 does not import;
+    Windows loads it when it resolves the forward)."""
+    dll = target.split('!', 1)[0]
+    return [delay] + ([dll] if dll != delay and dll not in static_closure(delay) else [])
+
+
+def check_delay_imports(modules, marks):
+    """A DLL marked delayed is not installed ahead of the module importing
+    it, so each of its functions the module imports must be one a delay
+    thunk calls after loading it. Any other reaches an empty slot at its
+    first call: the link fails here instead."""
+    bad = []
+    for g, path in modules.items():
+        marked, loaded = marks.get(g, (set(), set()))
+        imported = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', path], capture_output=True, text=True).stdout
+        gaps = sorted({n for n in re.findall(r'<- env\.(\S+)', imported)
+                       if '!' in n and n.split('!', 1)[0] in marked - loaded})
+        if gaps:
+            # (not "NAME.wasm: ...", which wine/dist.sh reads as a --split
+            # module to leave out)
+            bad.append(f'in {os.path.basename(path)}, {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))
+    if bad:
+        sys.exit('pelink: functions of delayed DLLs that no delay thunk loads first:\n  ' + '\n  '.join(bad))
 
 
 # What a module may import beside the others' exports: the memory, table and

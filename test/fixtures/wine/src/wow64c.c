@@ -9,11 +9,15 @@
  *                 window procedure, a user callback, changes them
  *   maskmov       maskmovdqu: the masked bytes only, to [rdi]
  *   sysarch       GetSystemInfo and GetNativeSystemInfo both AMD64
+ *   genrandom     rand_s and advapi32's SystemFunction036 (RtlGenRandom)
+ *                 in a process cryptbase is not loaded in: both reach
+ *                 cryptbase's, which advapi32 only forwards to
  *   sysbench N    N calls of NtQueryPerformanceCounter, then of
  *                 NtQueryVirtualMemory: the 64-bit baseline of wow32's
  *                 sysbench (ns per call)
  *
  * Prints "ok   ..." lines and "wow64c CASE ok", or "FAIL ..." and exits 1. */
+#define _CRT_RAND_S
 #include <windows.h>
 #include <setupapi.h>
 #include <stdio.h>
@@ -216,6 +220,35 @@ static int conchild(void)
     return 0;
 }
 
+static int case_genrandom(void)
+{
+    BOOLEAN (WINAPI *gen)(void *, ULONG);
+    unsigned char buf[16] = { 0 }, zero[16] = { 0 };
+    unsigned int r = 0;
+
+    if (GetModuleHandleA("cryptbase.dll"))
+    {
+        printf("FAIL genrandom cryptbase.dll already loaded at start\n");
+        return 1;
+    }
+    /* the C runtime's call: its delay import of advapi32, whose export is cryptbase's */
+    if (rand_s(&r))
+    {
+        printf("FAIL genrandom rand_s failed\n");
+        return 1;
+    }
+    printf("ok   genrandom rand_s\n");
+    gen = (void *)GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036");
+    if (!gen || !gen(buf, sizeof(buf)) || !memcmp(buf, zero, sizeof(buf)))
+    {
+        printf("FAIL genrandom advapi32 SystemFunction036 %p\n", gen);
+        return 1;
+    }
+    printf("ok   genrandom advapi32 SystemFunction036, cryptbase %s\n", GetModuleHandleA("cryptbase.dll") ? "loaded" : "not loaded");
+    printf("wow64c genrandom ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     STARTUPINFOA si = { sizeof(si) };
@@ -231,6 +264,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "fakedll")) return case_fakedll();
     if (argc > 1 && !strcmp(argv[1], "newconsole")) return case_newconsole();
     if (argc > 1 && !strcmp(argv[1], "conchild")) return conchild();
+    if (argc > 1 && !strcmp(argv[1], "genrandom")) return case_genrandom();
     if (argc > 1 && !strcmp(argv[1], "maskmov")) return case_maskmov();
     if (argc > 1 && !strcmp(argv[1], "sysbench"))
     {
