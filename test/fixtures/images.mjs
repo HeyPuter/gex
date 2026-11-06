@@ -27,7 +27,7 @@
 //            /pfx; files over 64 KiB are lazy, served from wine64/ in the
 //            work directory (fixtures/wine/pack.py).
 //   wine64-units  wine64-units/: function-tier units (a unit cache, `gexc
-//            cgen-image`'s) for the programs in wine/units.mjs and Wine's core DLLs at the bases a
+//            cgen-image`'s) for the programs in wine/units.mjs and Wine's core DLLs (when translated, not a native PE core's) at the bases a
 //            run of them names (fixtures/wine/unit-bases.mjs), and the NT
 //            trampolines. Built with GEX_TEST_GEXC (default target/x86's
 //            gexc); a few minutes.
@@ -522,7 +522,9 @@ export const images = {
     }
     const tramp = /gex-pe: missing unit: \[the trampolines\].* gexc cgen-image (--nt-trampolines64(?: --[a-z0-9-]+(?: \d+)?)*)$/m.exec(said);
     if (tramp) builds.add(JSON.stringify(tramp[1].split(' ')));
-    if (![...builds].some((b) => b.includes('ntdll.dll'))) return 'the run named no base for ntdll.dll';
+    // Wine's core DLLs only where the dist translates them: a native PE
+    // core (wine/dist.sh's default) runs them as wasm and names none.
+    if (!UNIT_PROGS.every((e) => [...builds].some((b) => b.includes(`/${e}"`)))) return `the run named no base for each of ${UNIT_PROGS.join(', ')}`;
     for (const b of builds) {
       try {
         execFileSync('nice', [gexc, 'cgen-image', ...JSON.parse(b)], { env: { ...process.env, GEX_CGEN_CACHE: dir, ...(guard ? { GEX_CGEN_GUARD: '1' } : {}) }, stdio: ['ignore', 'ignore', 'pipe'] });

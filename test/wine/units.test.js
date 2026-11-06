@@ -1,7 +1,8 @@
 // Function-tier units served to the System (`new System({ units })`): the
 // `wine64-units` image's, built for the test programs and Wine's core DLLs at
-// the bases they load at. The programs run right with them, and the runtime
-// names none of those images as lacking a unit: each was used.
+// the bases they load at (the core's only where the dist translates it; a
+// native PE core runs it as wasm). The programs run right with them, and the
+// runtime names none of those images as lacking a unit: each was used.
 import { bootWine } from '../lib/wine.mjs';
 import { UNIT_PROGS } from '../fixtures/wine/units.mjs';
 
