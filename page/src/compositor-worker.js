@@ -1914,7 +1914,7 @@ class Compositor {
       const px = r?.px ?? new Uint8Array(0);
       // Above the desktop's own colour, so the background does not count as
       // something drawn.
-      const floor = Math.round(COL.desktop[2] * 255) + 12;
+      const floor = Math.round(Math.max(...COL.desktop.slice(0, 3)) * 255) + 12;
       for (let i = 0; i < px.length; i += 16) {
         const v = Math.max(px[i], px[i + 1], px[i + 2]);
         if (v > floor) lit++;
@@ -2185,6 +2185,7 @@ const onMessage = ({ data: m }) => {
       presentOverride = m.present ?? null;
       canvas = m.canvas;
       setUiScale(m.scale || 1);
+      if (m.desktop) COL.desktop = [...m.desktop, 1];
       // The compositor draws with WebGPU on the device Mesa will use.
       if (m.glLimits != null) globalThis.GEX_GL_LIMITS = m.glLimits;
       requestGexDevice().then((gpu) => {

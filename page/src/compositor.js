@@ -150,9 +150,12 @@ export class Compositor {
     // (the default), which decide the GL version Mesa's context earns
     // (gpu-device.js).
     const glLimits = pq?.has('gllimits') ? Number(pq.get('gllimits')) || 0 : null;
+    // start()'s `background`: the desktop's colour, rrggbb.
+    const bg = /^[0-9a-fA-F]{6}$/.test(pq?.get('desktopbg') ?? '') ? pq.get('desktopbg') : null;
+    const desktop = bg ? [0, 2, 4].map((i) => parseInt(bg.slice(i, i + 2), 16) / 255) : null;
     worker.postMessage(
       { kind: 'init', canvas: offscreen, width: canvas.width, height: canvas.height, scale,
-        channel, stats: this.#stats, present, direct, glLimits },
+        channel, stats: this.#stats, present, direct, glLimits, desktop },
       [offscreen],
     );
     await ready;

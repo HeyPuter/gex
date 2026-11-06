@@ -7,7 +7,7 @@
 export const OPTIONS = [
   'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'filesystem', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
-  'glLazy', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'onStoreBusy', 'ready',
+  'glLazy', 'background', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'onStoreBusy', 'ready',
 ];
 
 /** The option of `names` one edit or a case away from `k`, if any. */
@@ -51,6 +51,7 @@ export function checkOptions(opts) {
   if (given('strace') && typeof opts.strace !== 'boolean' && !Number.isInteger(opts.strace)) bad('strace', 'true (every process) or a pid');
   if (given('wisp') && !/^wss?:\/\//.test(String(opts.wisp))) bad('wisp', 'a Wisp proxy\'s URL, ws://... or wss://...');
   if (given('network') && typeof opts.network?.connect !== 'function') bad('network', 'an object with connect(host, port)');
+  if (given('background') && !/^#[0-9a-fA-F]{6}$/.test(String(opts.background))) bad('background', "a colour, '#rrggbb'");
   if (given('hostx') && ![true, false, 'rootful'].includes(opts.hostx)) bad('hostx', "true, false or 'rootful'");
   if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
   for (const k of ['onLog', 'onExit', 'onProgress', 'onStoreBusy']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');

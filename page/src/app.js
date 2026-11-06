@@ -96,6 +96,8 @@ const PIECES = {
  *              compositor: false draws windows straight into the page.
  *              hostx: 'rootful' is one fullscreen X screen under the session's
  *              own window manager.
+ *   background the desktop's colour behind the windows, '#rrggbb' (the scene
+ *              compositor's; default its dark grey)
  *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
@@ -446,6 +448,7 @@ async function begin(opts, base, at, state, meter, lets) {
     if (typeof opts.strace === 'number') sw.stracepid = String(opts.strace);
   }
   if (opts.trapstack) sw.trapstack = '1';
+  if (opts.background) sw.desktopbg = opts.background.slice(1);
   for (const [k, v] of Object.entries(opts.debug ?? {})) {
     if (v === null || v === undefined || v === false) delete sw[k];
     else sw[k] = v === true ? '1' : String(v);
