@@ -2920,28 +2920,24 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     Ok(())
 }
 
-/// A child ended by a crash signal says so, once, as a shell would: one no
-/// crash handler catches otherwise leaves only its absence. A gex limitation
-/// delivered as a signal is said whatever the signal. The rest (a pipeline's
-/// SIGPIPE, the SIGTERM a session ends its processes with) only under
-/// `GEX_LOG_CHILD_SIGNALS=1`. gex itself never ends a process with SIGKILL,
-/// so a SIGKILL is another process's doing and is said.
+/// A child a signal ended says so, once, as a shell would. A crash (a signal
+/// that dumps core) and gex's own failure are said by the process table's
+/// report of it (`crash_line`), not here. Of the rest, a SIGKILL is said:
+/// gex itself never ends a process with one, so it is another process's
+/// doing. The others (a pipeline's SIGPIPE, the SIGTERM a session ends its
+/// processes with) only under `GEX_LOG_CHILD_SIGNALS=1`.
 fn say_killed(pid: i32, exit: &Exit) {
     let Exit::Signal { signal, pc, detail, internal } = exit else { return };
-    // A crash is said by the process table's report of it (`crash_line`),
-    // gex's own failure too.
     if *internal || crash_signal(*signal) {
         return;
     }
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let all = *ALL.get_or_init(|| std::env::var("GEX_LOG_CHILD_SIGNALS").is_ok_and(|v| v == "1"));
-    // SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGSYS.
-    if !internal && !all && !matches!(signal, 4 | 5 | 6 | 7 | 8 | 9 | 11 | 31) {
+    if !all && *signal != 9 {
         return;
     }
     let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
-    let whose = if *internal { " (gex cannot run it)" } else { "" };
-    eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{whose}{detail}");
+    eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{detail}");
 }
 
 /// The signals a crash ends a program with (those that dump core).
