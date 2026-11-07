@@ -17561,8 +17561,11 @@ pub const W64_CODE_TOP: u64 = 0x7fff_0000;
 /// 0x140000000, is). Or it is a Gecko program's (Firefox, Thunderbird:
 /// `beside` says its directory has mozglue.dll), whose JavaScript engine
 /// reserves 2 GiB of executable memory at start, more than the lowered
-/// memory's whole code space. Anything else, or headers that do not parse:
-/// false.
+/// memory's whole code space. Or it is a Java launcher's (java.exe and
+/// its kin: jvm.dll in its directory's `server` or `client`, or beside
+/// it), whose VM reserves its heap, a 1 GiB compressed class space and its
+/// code cache at start, more than the lowered memory has. Anything else,
+/// or headers that do not parse: false.
 pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
     let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -17584,7 +17587,9 @@ pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
         let dirs = u32_at(opt + 108)?;
         let relocs = if dirs > 5 { u32_at(opt + 112 + 5 * 8 + 4)? } else { 0 };
         let fixed = chars & 1 != 0 || relocs == 0;
-        Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || beside("mozglue.dll"))
+        let gecko = beside("mozglue.dll");
+        let java = ["server/jvm.dll", "client/jvm.dll", "jvm.dll"].into_iter().any(&beside);
+        Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || gecko || java)
     };
     parse().unwrap_or(false)
 }
@@ -17615,6 +17620,9 @@ mod pe_mem64_tests {
         assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664), |_| false));
         assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664), |_| false));
         assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "mozglue.dll"));
+        // A Java launcher: the VM in bin\server\ (a JDK's or a JRE's), or beside it.
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "server/jvm.dll"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "jvm.dll"));
     }
 
     #[test]
@@ -17624,6 +17632,7 @@ mod pe_mem64_tests {
         assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664), none));
         assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c), none));
         assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "mozglue.dll"));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "server/jvm.dll"));
         assert!(!pe_needs_mem64(b"MZ", none));
         assert!(!pe_needs_mem64(b"\x7fELF", none));
     }
