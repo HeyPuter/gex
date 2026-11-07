@@ -6,7 +6,8 @@
 // module from before the marker. Cases: Wine's loader, then the i386 PE
 // module (i386-windows/winepe.wasm), each in a hard-linked copy of the
 // install, running syswow64's cmd.exe (so that the 32-bit PE module loads).
-// Each must end with the refusal line, exit 127, and no trap.
+// Each must end with the refusal line, exit 127, and no trap; a refusal is
+// gex declining to run the program, not its crash, so no crash is reported.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, rmSync, writeFileSync, chmodSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -33,8 +34,9 @@ export default async function (t) {
     chmodSync(join(d, rel), 0o755);
     return d;
   };
-  const check = (leg, r, what) => t.check(`${leg}: refused, exit 127`,
-    new RegExp(`${what} .*built for gex's native ABI 1, this gex's is`).test(r.out) && !/signature mismatch/i.test(r.out) && r.code === 127,
+  const check = (leg, r, what) => t.check(`${leg}: refused, exit 127, no crash`,
+    new RegExp(`${what} .*built for gex's native ABI 1, this gex's is`).test(r.out) && !/signature mismatch/i.test(r.out) && r.code === 127
+      && !/\] pid \d+ .*crashed:/.test(r.out),
     w.detail(r));
   const pe = 'lib/wine/i386-windows/winepe.wasm';
   for (const [name, d, what, ld] of [

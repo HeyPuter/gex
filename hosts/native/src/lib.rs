@@ -1531,9 +1531,14 @@ fn run_program_with(
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
             k.fds.close_all();
-            // The program's crash, not gexc's: it ends as one that a
-            // signal ended (gex's own failures are SIGSEGV), and its crash
-            // is reported.
+            // A trap or a Wasm exception is the program's crash, not
+            // gexc's: it ends as one that a signal ended (SIGSEGV), and its
+            // crash is reported. Anything else is gex declining or failing
+            // to run it (an ABI refusal's 127), with its own message and
+            // status.
+            if !program_failed(&e) {
+                return Err(e);
+            }
             let pid = k.pid;
             drop(k);
             let exit = Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail: format!("{e:#}"), internal: true };
@@ -2870,8 +2875,13 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 Err(e) => {
                     // gex could not go on with it: a crash of the program's,
                     // as the program sees it (a Wasm exception no frame of its
-                    // caught, a trap gex has no signal for).
-                    procs.set_crash_unless_said(pid, format!("\0gex could not run it on: {e:#}").as_bytes());
+                    // caught, a trap gex has no signal for). Anything else
+                    // (an ABI refusal) is said as gex's own and is no crash.
+                    if program_failed(&e) {
+                        procs.set_crash_unless_said(pid, format!("\0gex could not run it on: {e:#}").as_bytes());
+                    } else {
+                        eprintln!("gexc: child {pid} failed: {e:#}");
+                    }
                     // A process that dies takes its threads and descriptors
                     // with it: otherwise its threads park in a futex nobody
                     // wakes and its pipes never reach EOF for their readers.
@@ -2938,6 +2948,13 @@ fn say_killed(pid: i32, exit: &Exit) {
     }
     let detail = if detail.is_empty() || detail.starts_with("killed by signal") { String::new() } else { format!(": {detail}") };
     eprintln!("[gex] pid {pid} killed by signal {signal} at pc {pc:#x}{detail}");
+}
+
+/// Whether `e`, which ended a process's run, is the program's failure: a
+/// trap, or a Wasm exception no frame of its caught. Not gex declining to
+/// run it (an ABI refusal) or failing itself.
+fn program_failed(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<GuestTrap>() || c.is::<wasmtime::Trap>() || c.is::<wasmtime::ThrownException>())
 }
 
 /// The signals a crash ends a program with (those that dump core).
@@ -7572,10 +7589,23 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         };
         // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
         let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
-        return anyhow!("{detail} (pc≈0x{pc:x}){bt}");
+        return anyhow::Error::new(GuestTrap(format!("{detail} (pc≈0x{pc:x}){bt}")));
     }
     e
 }
+
+/// A trap in the program's code, as [`classify_trap`] words it: the
+/// program's failure ([`program_failed`]), not gex's.
+#[derive(Debug)]
+struct GuestTrap(String);
+
+impl std::fmt::Display for GuestTrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GuestTrap {}
 
 /// Record a taken resume's cause (set with `resume_at`) and target, under
 /// GEX_WIN_STATS; `taker` names the loop that took it when no cause was set.
