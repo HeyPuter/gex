@@ -6,6 +6,8 @@
 //   program whose manifest names comctl32 6, and without it (comctl32 5);
 // - drives: the prefix's drives listed with no services started
 //   (WINEGEX_NO_WINEBOOT=1, the page's boot);
+// - scmstart: in that session the first OpenSCManager starts services.exe
+//   and succeeds;
 // - workarea: a work area one process sets is another's, and its maximised
 //   window stops there;
 // - hooktest: inline hooks of user32 and kernelbase exports (a 14-byte
@@ -35,6 +37,7 @@ export default async function (t) {
     await w.nt({ name: 'props5', want: allOk, exe: exe5, nullDriver: true, wineEnv: { USER: 'gex' } });
   }
   await w.nt({ name: 'drives', want: allOk, exe: 'drives.exe', wineEnv: { WINEGEX_NO_WINEBOOT: '1', USER: 'gex' } });
+  await w.nt({ name: 'scmstart', want: allOk, exe: 'scmstart.exe', wineEnv: { WINEGEX_NO_WINEBOOT: '1' } });
   await w.nt({ name: 'workarea', want: allOk, exe: 'workarea.exe', nullDriver: true });
   await w.nt({ name: 'hooktest', exe: 'hooktest.exe', nullDriver: true,
     want: /(hooktest: [^\n]*\n)*hooktest abs14 user32 ok\nhooktest abs14 kernelbase ok\nhooktest rel5 user32 ok\nhooktest rel5 kernelbase ok\nhooktest: 0 failures/ });
