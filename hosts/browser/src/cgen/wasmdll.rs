@@ -1143,13 +1143,13 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
             return -1;
         }
     }
-    let Some(pe) = super::read_pe(&*file) else { return -1 };
+    let Some((pe, lean)) = super::read_pe(&file) else { return -1 };
     crate::note_wine32_image(base, pe.image_size as u64, &path);
     if !is_skeleton(&pe) {
         take_back(base, base + pe.image_size as u64);
         // An i386 image (the program's, a game's DLL): its function-tier
         // unit, when units are on; -3 tells JS to serve it.
-        return if super::wine32_mapped(&path, base, &pe) { -3 } else { -1 };
+        return if super::wine32_mapped(&path, base, &pe, lean) { -3 } else { -1 };
     }
     match publish(&path, base, &pe) {
         Ok(n) => {

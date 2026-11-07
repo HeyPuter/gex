@@ -14,18 +14,40 @@ use gex_ld::Image;
 /// An image's identity: its placement, entry, class and every segment's
 /// address, permissions and bytes as loaded (relocated at its base).
 pub fn image_identity(image: &Image) -> String {
-    let mut h = sha256::Sha256::new();
-    h.update(b"gex-image-1");
-    h.update(&image.bias.to_le_bytes());
-    h.update(&image.entry.to_le_bytes());
-    h.update(&[image.class32 as u8]);
+    let mut h = IdentityHasher::new(image.bias, image.entry, image.class32);
     for seg in &image.segments {
-        h.update(&seg.vaddr.to_le_bytes());
-        h.update(&[seg.executable as u8]);
-        h.update(&(seg.bytes.len() as u64).to_le_bytes());
-        h.update(&seg.bytes);
+        h.segment(seg.vaddr, seg.executable, seg.bytes.len() as u64);
+        h.bytes(&seg.bytes);
     }
-    format!("image:{}", sha256::hex(&h.finish()))
+    h.finish()
+}
+
+/// [`image_identity`] a piece at a time, for a host that has an image's
+/// segments without holding all of their bytes at once (a section read from
+/// its file as it is hashed): each segment's head, then exactly that many
+/// bytes, in the image's segment order.
+pub struct IdentityHasher(sha256::Sha256);
+
+impl IdentityHasher {
+    pub fn new(bias: u64, entry: u64, class32: bool) -> IdentityHasher {
+        let mut h = sha256::Sha256::new();
+        h.update(b"gex-image-1");
+        h.update(&bias.to_le_bytes());
+        h.update(&entry.to_le_bytes());
+        h.update(&[class32 as u8]);
+        IdentityHasher(h)
+    }
+    pub fn segment(&mut self, vaddr: u64, executable: bool, len: u64) {
+        self.0.update(&vaddr.to_le_bytes());
+        self.0.update(&[executable as u8]);
+        self.0.update(&len.to_le_bytes());
+    }
+    pub fn bytes(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    pub fn finish(self) -> String {
+        format!("image:{}", sha256::hex(&self.0.finish()))
+    }
 }
 
 /// The identity of an image's function-tier recovery: the sources that decide
@@ -40,6 +62,11 @@ pub fn image_identity(image: &Image) -> String {
 /// Wine's boot. x86 adds nothing, so its keys, and
 /// every cache built with them, stay as they were.
 pub fn recovery_key(image: &Image, recovery_inputs: &str) -> String {
+    recovery_key_of(&image_identity(image), recovery_inputs)
+}
+
+/// [`recovery_key`] of an image whose [`image_identity`] is `identity`.
+pub fn recovery_key_of(identity: &str, recovery_inputs: &str) -> String {
     let mut h = sha256::Sha256::new();
     h.update(b"gex-cgen-recovery 1");
     h.update(recovery_inputs.as_bytes());
@@ -47,7 +74,7 @@ pub fn recovery_key(image: &Image, recovery_inputs: &str) -> String {
         h.update(b":");
         h.update(gex_abi::ARCH_NAME.as_bytes());
     }
-    h.update(image_identity(image).as_bytes());
+    h.update(identity.as_bytes());
     sha256::hex(&h.finish())
 }
 
@@ -56,11 +83,16 @@ pub fn recovery_key(image: &Image, recovery_inputs: &str) -> String {
 /// was built from (gex-cgen's `image::image_key` passes its constants). The
 /// unit lives in the directory of this name under the cgen cache.
 pub fn unit_key(image: &Image, format: &str, unit_inputs: &str, unit_abi_version: u32, recovery_inputs: &str) -> String {
+    unit_key_of(&image_identity(image), format, unit_inputs, unit_abi_version, recovery_inputs)
+}
+
+/// [`unit_key`] of an image whose [`image_identity`] is `identity`.
+pub fn unit_key_of(identity: &str, format: &str, unit_inputs: &str, unit_abi_version: u32, recovery_inputs: &str) -> String {
     let mut h = sha256::Sha256::new();
     h.update(format.as_bytes());
     h.update(unit_inputs.as_bytes());
     h.update(&unit_abi_version.to_le_bytes());
-    h.update(recovery_key(image, recovery_inputs).as_bytes());
+    h.update(recovery_key_of(identity, recovery_inputs).as_bytes());
     sha256::hex(&h.finish())
 }
 

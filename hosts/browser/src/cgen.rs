@@ -657,20 +657,29 @@ pub(crate) fn drain() -> bool {
 /// code is not yet its bytes (Wine relocates a moved image after mapping it)
 /// waits for its first miss ([`wine32_miss`]), as natively. Returns whether a
 /// unit now waits for JavaScript.
-pub(crate) fn wine32_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
+pub(crate) fn wine32_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage, lean: Option<Arc<Lean>>) -> bool {
     if !on() {
         return false;
     }
     wine32_trampolines(!pe.is64 && !other_mode_pe(pe));
-    let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
+    let Some(image) = pe_input(pe, base, lean.as_deref()) else { return false };
     if !wine32_matches(&image, base, pe, true) {
-        wine32_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())), at_ns: crate::host_now_ns() });
+        wine32_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone()), lean), at_ns: crate::host_now_ns() });
         return false;
     }
     wine32_forget(base, pe.image_size as u64);
     PLACING_AT.with(|c| c.set(crate::host_now_ns()));
+    PLACING_LEAN.with(|c| *c.borrow_mut() = lean);
     place(&image, path, base, true, Some(pe));
     wanted_any()
+}
+
+/// `gex_xlate::func::pe_input`'s image, of a PE [`read_pe`] read whole or lean.
+fn pe_input(pe: &gex_ld::pe::PeImage, base: u64, lean: Option<&Lean>) -> Option<gex_ld::Image> {
+    match lean {
+        Some(l) => l.input(pe, base),
+        None => gex_xlate::func::pe_input(pe, base).ok().map(|r| r.0),
+    }
 }
 
 /// Whether an image Wine's loader mapped at `base` can wait for its first
@@ -695,7 +704,7 @@ pub(crate) fn wine32_defer_unread(path: &str, base: u64, size: u64, file: Arc<dy
 /// Where a deferred image's PE comes from: parsed at its mapping (its code
 /// was not yet its bytes), or its file, read at the first miss.
 enum Src {
-    Pe(Arc<gex_ld::pe::PeImage>),
+    Pe(Arc<gex_ld::pe::PeImage>, Option<Arc<Lean>>),
     File(Arc<dyn gex_kernel::vfs::FileHandle>),
 }
 
@@ -829,10 +838,10 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
         }
         p
     };
-    let pe = match d.src {
-        Src::Pe(pe) => pe,
-        Src::File(f) => match read_pe(&*f) {
-            Some(pe) => Arc::new(pe),
+    let (pe, lean) = match d.src {
+        Src::Pe(pe, lean) => (pe, lean),
+        Src::File(f) => match read_pe(&f) {
+            Some((pe, lean)) => (Arc::new(pe), lean),
             None => {
                 crate::warn_line(&format!("gex-wine32: {} at {:#x}: reading the image at its first miss failed; tier-1\n", d.path, d.base));
                 return false;
@@ -840,12 +849,13 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
         },
     };
     wine32_trampolines(!pe.is64 && !other_mode_pe(&pe));
-    let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
+    let Some(image) = pe_input(&pe, d.base, lean.as_deref()) else { return false };
     if !wine32_matches(&image, d.base, &pe, false) {
         crate::warn_line(&format!("gex-wine32: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
         return false;
     }
     PLACING_AT.with(|c| c.set(d.at_ns));
+    PLACING_LEAN.with(|c| *c.borrow_mut() = lean);
     place(&image, &d.path, d.base, true, Some(&pe));
     wanted_any()
 }
@@ -855,18 +865,279 @@ pub(crate) fn wine32_miss(pc: u64) -> bool {
 /// megabytes and more) and nothing here reads it, while this heap never
 /// gives a span back: read whole, it took that much address space for the
 /// process's life. The certificate table goes with it (never mapped).
-pub(crate) fn read_pe(f: &dyn gex_kernel::vfs::FileHandle) -> Option<gex_ld::pe::PeImage> {
-    let size = (f.metadata().ok()?.size as usize).min(pe_extent(f).unwrap_or(usize::MAX));
+///
+/// A payload inside the image, in a resource section (Chrome's installer
+/// carries its 157 MiB that way), is left out too ([`Lean`]): parsed,
+/// mapped for the translator and cut into segments, it was four copies of
+/// itself at once, each a span of its own.
+pub(crate) fn read_pe(f: &Arc<dyn gex_kernel::vfs::FileHandle>) -> Option<(gex_ld::pe::PeImage, Option<Arc<Lean>>)> {
+    if let Some((pe, lean)) = read_lean(f) {
+        return Some((pe, Some(Arc::new(lean))));
+    }
+    let size = (f.metadata().ok()?.size as usize).min(pe_extent(&**f).unwrap_or(usize::MAX));
     let mut b = vec![0u8; size];
+    let at = read_full(&**f, 0, &mut b);
+    b.truncate(at);
+    gex_ld::pe::parse(&b).ok().map(|pe| (pe, None))
+}
+
+/// Bytes of `f` from `off` into `buf`, as many as there are.
+fn read_full(f: &dyn gex_kernel::vfs::FileHandle, off: u64, buf: &mut [u8]) -> usize {
     let mut at = 0;
-    while at < size {
-        match f.read_at(at as u64, &mut b[at..]) {
+    while at < buf.len() {
+        match f.read_at(off + at as u64, &mut buf[at..]) {
             Ok(0) | Err(_) => break,
             Ok(n) => at += n as usize,
         }
     }
-    b.truncate(at);
-    gex_ld::pe::parse(&b).ok()
+    at
+}
+
+/// A section this big that holds nothing but resources is not read.
+const BULK: u32 = 8 << 20;
+
+/// What [`read_pe`] left out of an image: a non-executable section of
+/// [`BULK`] or more raw bytes that no data directory but the resources' points
+/// into. It reads the image without it: the sections after it (only data:
+/// its base relocations) moved down to where it began, SizeOfImage cut to
+/// match. The translator needs none of it (no relocation, import slot or
+/// code is in or after it), but the image's identity, which names its unit,
+/// covers every segment as the file has it: [`Lean::identity`] hashes those
+/// from the file a piece at a time.
+pub(crate) struct Lean {
+    /// SizeOfImage of the image as read; the PE keeps the file's.
+    size: u32,
+    real_size: u32,
+    section_align: u32,
+    headers: usize,
+    opt: usize,
+    is64: bool,
+    /// The file's mapped sections in RVA order: RVA, bytes mapped, executable,
+    /// and where their bytes are.
+    secs: Vec<(u32, u32, bool, Part)>,
+    file: Arc<dyn gex_kernel::vfs::FileHandle>,
+}
+
+enum Part {
+    /// In the image as read, at this RVA.
+    Read(u32),
+    /// Only in the file: this many bytes from this offset, zeros after.
+    File(u64, u64),
+}
+
+fn read_lean(f: &Arc<dyn gex_kernel::vfs::FileHandle>) -> Option<(gex_ld::pe::PeImage, Lean)> {
+    let mut h = vec![0u8; 0x10000];
+    let n = read_full(&**f, 0, &mut h);
+    h.truncate(n);
+    let u16_at = |o: usize| h.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |o: usize| h.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let nt = u32_at(0x3c)? as usize;
+    if h.get(nt..nt + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let coff = nt + 4;
+    let (nsec, symtab, nsyms, optsz) = (u16_at(coff + 2)?, u32_at(coff + 8)?, u32_at(coff + 12)?, u16_at(coff + 16)?);
+    let opt = coff + 20;
+    let is64 = match u16_at(opt)? {
+        0x10b => false,
+        0x20b => true,
+        _ => return None,
+    };
+    let (sa, fa, real_size, headers) = (u32_at(opt + 32)?, u32_at(opt + 36)?.max(1), u32_at(opt + 56)?, u32_at(opt + 60)? as usize);
+    let (nrva_at, dd) = if is64 { (opt + 108, opt + 112) } else { (opt + 92, opt + 96) };
+    let nrva = (u32_at(nrva_at)? as usize).min(16);
+    let table = opt + optsz;
+    // One mapping per section (an alignment below a page is one mapping of
+    // everything), and the section table inside the headers.
+    if sa < 4096 || headers > h.len() || table + 40 * nsec > headers {
+        return None;
+    }
+    let dirs: Vec<(u32, u32)> = (0..nrva).map(|i| Some((u32_at(dd + 8 * i)?, u32_at(dd + 8 * i + 4)?))).collect::<Option<_>>()?;
+    // A mixed-mode image's CLR side is rewritten in its mapping.
+    if dirs.get(14).is_some_and(|d| d.1 != 0) {
+        return None;
+    }
+    struct S {
+        at: usize,
+        rva: u32,
+        mapped: u32,
+        raw: u32,
+        off: u32,
+        exec: bool,
+    }
+    let secs: Vec<S> = (0..nsec)
+        .map(|i| {
+            let at = table + 40 * i;
+            let (vsize, rva, raw, off, ch) = (u32_at(at + 8)?, u32_at(at + 12)?, u32_at(at + 16)?, u32_at(at + 20)?, u32_at(at + 36)?);
+            Some(S { at, rva, mapped: if vsize == 0 { raw } else { vsize }, raw, off, exec: ch & 0x2000_0020 != 0 })
+        })
+        .collect::<Option<_>>()?;
+    let holds = |s: &S, rva: u32| rva >= s.rva && (rva as u64) < s.rva as u64 + s.mapped as u64;
+    let bulk = |s: &S| {
+        !s.exec && s.raw >= BULK && dirs.iter().enumerate().all(|(i, d)| i == 2 || i == 4 || d.1 == 0 || !holds(s, d.0))
+    };
+    let first = secs.iter().filter(|s| bulk(s)).map(|s| s.rva).min()?;
+    if secs.iter().any(|s| s.rva > first && !bulk(s) && s.exec) {
+        return None;
+    }
+    let align = |v: u64| v.div_ceil(sa as u64) * sa as u64;
+    let mut order: Vec<usize> = (0..secs.len()).collect();
+    order.sort_by_key(|&i| secs[i].rva);
+    let mut moved = std::collections::HashMap::new();
+    let mut cursor = first as u64;
+    for &i in order.iter().filter(|&&i| secs[i].rva > first && !bulk(&secs[i])) {
+        moved.insert(i, cursor as u32);
+        cursor = align(cursor + secs[i].mapped as u64);
+    }
+    let size = u32::try_from(cursor).ok()?;
+    let rva_as_read = |i: usize| moved.get(&i).copied().unwrap_or(secs[i].rva);
+
+    // The image as read: the headers, then each kept section's raw bytes
+    // packed after them, then the COFF symbols.
+    let mut out = h[..headers].to_vec();
+    let mut entries = Vec::new();
+    for (i, s) in secs.iter().enumerate().filter(|(_, s)| !bulk(s)) {
+        let mut e = h[s.at..s.at + 40].to_vec();
+        e[12..16].copy_from_slice(&rva_as_read(i).to_le_bytes());
+        if s.raw != 0 {
+            out.resize((out.len() as u64).div_ceil(fa as u64) as usize * fa as usize, 0);
+            e[20..24].copy_from_slice(&u32::try_from(out.len()).ok()?.to_le_bytes());
+            let at = out.len();
+            out.resize(at + s.raw as usize, 0);
+            if read_full(&**f, s.off as u64, &mut out[at..]) != s.raw as usize {
+                return None;
+            }
+        }
+        entries.extend(e);
+    }
+    out[table..table + 40 * nsec].fill(0);
+    out[table..table + entries.len()].copy_from_slice(&entries);
+    out[coff + 2..coff + 4].copy_from_slice(&((entries.len() / 40) as u16).to_le_bytes());
+    let (mut sym_at, mut sym_n) = (0u32, 0u32);
+    if symtab != 0 && nsyms != 0 {
+        let strings = symtab as u64 + nsyms as u64 * 18;
+        let mut len = [0u8; 4];
+        let len = if read_full(&**f, strings, &mut len) == 4 { u32::from_le_bytes(len) as u64 } else { 0 };
+        let at = out.len();
+        let total = (strings - symtab as u64 + len) as usize;
+        out.resize(at + total, 0);
+        if read_full(&**f, symtab as u64, &mut out[at..]) != total {
+            return None;
+        }
+        (sym_at, sym_n) = (u32::try_from(at).ok()?, nsyms);
+    }
+    out[coff + 8..coff + 12].copy_from_slice(&sym_at.to_le_bytes());
+    out[coff + 12..coff + 16].copy_from_slice(&sym_n.to_le_bytes());
+    out[opt + 56..opt + 60].copy_from_slice(&size.to_le_bytes());
+    for (i, &(rva, len)) in dirs.iter().enumerate() {
+        let d = if len == 0 {
+            (rva, len)
+        } else if i == 4 || secs.iter().any(|s| bulk(s) && holds(s, rva)) {
+            // The certificates (by file offset), and resources not read.
+            (0, 0)
+        } else if let Some((&m, &to)) = moved.iter().find(|(&m, _)| holds(&secs[m], rva)) {
+            (rva - secs[m].rva + to, len)
+        } else {
+            (rva, len)
+        };
+        out[dd + 8 * i..dd + 8 * i + 4].copy_from_slice(&d.0.to_le_bytes());
+        out[dd + 8 * i + 4..dd + 8 * i + 8].copy_from_slice(&d.1.to_le_bytes());
+    }
+    let mut pe = gex_ld::pe::parse(&out).ok()?;
+    // Nothing the translator reads may be in or after what was left out.
+    let before = |rva: u32| rva < first;
+    if !pe.relocs.iter().all(|r| before(r.rva))
+        || !pe.imports.iter().flat_map(|d| d.symbols.iter()).all(|s| before(s.iat_rva))
+        || !pe.delay_imports.iter().flat_map(|d| d.symbols.iter()).all(|s| before(s.iat_rva))
+    {
+        return None;
+    }
+    pe.image_size = real_size;
+    let parts = order
+        .iter()
+        .filter(|&&i| secs[i].mapped != 0)
+        .map(|&i| {
+            let s = &secs[i];
+            let part = if bulk(s) { Part::File(s.off as u64, (s.raw as u64).min(align(s.mapped as u64))) } else { Part::Read(rva_as_read(i)) };
+            (s.rva, s.mapped, s.exec, part)
+        })
+        .collect();
+    Some((pe, Lean { size, real_size, section_align: sa, headers, opt, is64, secs: parts, file: Arc::clone(f) }))
+}
+
+impl Lean {
+    /// `pe` (as [`read_pe`] read it) for the translator at `base`.
+    pub(crate) fn input(&self, pe: &gex_ld::pe::PeImage, base: u64) -> Option<gex_ld::Image> {
+        let mut small = pe.clone();
+        small.image_size = self.size;
+        gex_xlate::func::pe_input(&small, base).ok().map(|r| r.0)
+    }
+
+    /// `gex_key::image_identity` of the image the file maps at `base`, from
+    /// `image` (what [`Lean::input`] made of it) and the file: the segments
+    /// `gex_ld::pe::PeImage::segments` would cut from it read whole.
+    fn identity(&self, image: &gex_ld::Image, base: u64) -> Option<String> {
+        let trim = |b: &[u8]| b.iter().rposition(|&x| x != 0).map_or(0, |p| p + 1);
+        let mut h = gex_key::IdentityHasher::new(image.bias, image.entry, image.class32);
+        // The headers as mapped: the file's, ImageBase made `base`.
+        let mut hd = vec![0u8; self.headers];
+        if read_full(&*self.file, 0, &mut hd) != self.headers {
+            return None;
+        }
+        if self.is64 {
+            hd[self.opt + 24..self.opt + 32].copy_from_slice(&base.to_le_bytes());
+        } else {
+            hd[self.opt + 28..self.opt + 32].copy_from_slice(&(base as u32).to_le_bytes());
+        }
+        let n = trim(&hd);
+        h.segment(base, false, n as u64);
+        h.bytes(&hd[..n]);
+        let sa = self.section_align as u64;
+        for (rva, mapped, exec, part) in &self.secs {
+            let end = ((*rva as u64 + *mapped as u64).div_ceil(sa) * sa).min(self.real_size as u64);
+            let want = end.saturating_sub(*rva as u64);
+            match part {
+                Part::Read(at) => {
+                    let seg = image.segments.iter().find(|s| s.vaddr == base + *at as u64)?;
+                    let b = &seg.bytes[..seg.bytes.len().min(want as usize)];
+                    let n = trim(b);
+                    h.segment(base + *rva as u64, *exec, n as u64);
+                    h.bytes(&b[..n]);
+                }
+                Part::File(off, len) => {
+                    const STEP: u64 = 1 << 20;
+                    let mut buf = vec![0u8; STEP as usize];
+                    // Its last byte that is not zero, then everything up to it.
+                    let mut n = (*len).min(want);
+                    while n > 0 {
+                        let from = n.saturating_sub(STEP);
+                        let b = &mut buf[..(n - from) as usize];
+                        if read_full(&*self.file, off + from, b) != b.len() {
+                            return None;
+                        }
+                        match b.iter().rposition(|&x| x != 0) {
+                            Some(p) => {
+                                n = from + p as u64 + 1;
+                                break;
+                            }
+                            None => n = from,
+                        }
+                    }
+                    h.segment(base + *rva as u64, *exec, n);
+                    let mut at = 0;
+                    while at < n {
+                        let b = &mut buf[..(n - at).min(STEP) as usize];
+                        if read_full(&*self.file, off + at, b) != b.len() {
+                            return None;
+                        }
+                        h.bytes(b);
+                        at += b.len() as u64;
+                    }
+                }
+            }
+        }
+        Some(h.finish())
+    }
 }
 
 /// Want the unit for `image`, mapped at `base`: its key, and the check that
@@ -900,7 +1171,12 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let known = known(base, path);
+    // An image read lean has its identity from its file.
+    let lean = PLACING_LEAN.with(|c| c.borrow_mut().take());
+    let known = known(base, path).or_else(|| {
+        let id = lean?.identity(image, base)?;
+        Some((gex_cgen::image::image_key_of(&id), id.trim_start_matches("image:").to_string()))
+    });
     let (key, mut providers) = unit_key(image, pe, base, known.as_ref().map(|k| k.0.clone()));
     // The trampoline page's providers (gex-cgen/providers/nt_unixcall.c),
     // bound at its entries after its unit, as an image's at its exports.
@@ -974,6 +1250,8 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
 thread_local! {
     /// The mapping time of the image `drain` is placing (0: none).
     static PLACING_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// What [`read_pe`] left out of the image being placed, if anything.
+    static PLACING_LEAN: std::cell::RefCell<Option<Arc<Lean>>> = const { std::cell::RefCell::new(None) };
 }
 /// Each placed image's unit, its mapping time and when it was wanted
 /// (unit, `host_now_ns` twice).

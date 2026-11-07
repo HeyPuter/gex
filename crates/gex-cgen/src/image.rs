@@ -60,6 +60,11 @@ pub fn image_key(image: &gex_ld::Image) -> String {
     gex_key::unit_key(image, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
 }
 
+/// [`image_key`] of an image whose `gex_key::image_identity` is `identity`.
+pub fn image_key_of(identity: &str) -> String {
+    gex_key::unit_key_of(identity, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
+}
+
 /// Everything [`image_key`] takes besides the image (the format, the unit
 /// and recovery inputs, the flavour), hashed, and the export providers'
 /// fingerprints, which an image with providers adds to its key (`-p...`):
