@@ -947,7 +947,7 @@ impl ProcTable {
     /// as a wait status, which says whether it is a crash.
     fn end(&self, pid: i32, status: i32, word: i32) {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
-        let mut crashed = false;
+        let crashed;
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
