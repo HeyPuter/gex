@@ -1025,9 +1025,16 @@ const DISPATCH_DIR = 0x00100000;
 const NATIVE_FN_TOP = 0x00300000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 // An M64 memory's dense directory, one word per page of all 16 GiB, and its
-// patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END).
-const DISPATCH_DIR64 = 2 ** 32;
-const HIGH_TABLES_END = DISPATCH_DIR64 + 17 * 2 ** 20;
+// patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END), as the
+// shim names them (`gex_m64_tables`, MiB), read at its first instantiation.
+let DISPATCH_DIR64 = 0;
+let HIGH_TABLES_END = 0;
+const noteM64Tables = (e) => {
+  const t = e.gex_m64_tables?.();
+  if (t === undefined || DISPATCH_DIR64) return;
+  DISPATCH_DIR64 = (t & 0xffff) * 2 ** 20;
+  HIGH_TABLES_END = (t >>> 16) * 2 ** 20;
+};
 const dispatchDir = (w) => (w ? DISPATCH_DIR64 : DISPATCH_DIR);
 const dispatchPages = (w) => (w ? LIMIT64_BYTES / 4096 : 0x80000);
 const PAGES = GUEST_BYTES / 65536;
@@ -2514,6 +2521,7 @@ export class Gex {
       gex_env: this.#hostImports(),
       gex_k: this.#kernelImports(shimMod),
     });
+    noteM64Tables(this.#shim.exports);
     this.#u8 = null;
     // First, before any call into the shim: `gex_worker_init` gives this Worker
     // its thread-local block, and until it runs `__tls_base` is zero, so a shim
@@ -3108,6 +3116,7 @@ export class Gex {
       gex_k: this.#kernelImports(shimMod),
     });
     this.#shimInstantiateMs = performance.now() - tShimI;
+    noteM64Tables(this.#shim.exports);
     _at('shim instantiated');
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own

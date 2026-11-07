@@ -3294,6 +3294,12 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // to cover it (V8 commits lazily), but the low arena's cursor -- which
     // this module's heap also takes from, and whose addresses cross to JS as
     // u32 -- stays below 4 GiB.
+    // Below the tables, from 4 GiB (claimed whole as the guest's, see
+    // `memmap::claim_fixed`; the memory is that long from the start, so
+    // this only checks).
+    if gex_abi::mem64() && start >= gex_abi::IMAGE_ZONE64 && end <= gex_abi::DISPATCH_DIR64 {
+        return grow_memory_to(end).then_some(start);
+    }
     if end > gex_abi::HIGH_ARENA_BASE && gex_abi::mem64() {
         if !grow_memory_to(end) {
             return None;
@@ -10468,17 +10474,27 @@ pub(crate) fn wine64_unix_call_entry() -> u64 {
 }
 
 /// The default top of a 64-bit Wine process's space in a 64-bit memory: no
-/// mapping ends above it. Wine places images and stacks top down from the
-/// top (`gex.space_top`, else its probe at powers of two), and the memory is
-/// as long as its highest mapping, so the top, not [`gex_abi::LIMIT64`], is
-/// the memory's length from the process's start. The high arena's data lies
-/// below it.
-const WINE64_TOP_M64: u64 = 8 << 30;
-const _: () = assert!(WINE64_TOP_M64.is_power_of_two() && WINE64_TOP_M64 > gex_abi::HIGH_ARENA_BASE && WINE64_TOP_M64 <= gex_abi::LIMIT64);
+/// Windows mapping ends above it. Wine places images and stacks top down
+/// from the top (`gex.space_top`, else its probe at powers of two), and the
+/// memory is as long as its highest mapping, so the top is the memory's
+/// length from the process's start -- and on Windows hosts its commit
+/// charge too: V8 grows a wasm memory with `SetPermissions(kReadWrite)`
+/// (backing-store.cc `GrowWasmMemoryInPlace`), which is `VirtualAlloc
+/// (MEM_COMMIT)` there (platform-win32.cc), so every byte up to the
+/// highest mapping is charged, touched or not. The default is therefore
+/// the M64 tables' start, [`gex_abi::DISPATCH_DIR64`], and the memory starts
+/// 8 GiB and 17 MiB long. Wine's anonymous memory is the kernel's, so it
+/// must lie below the top too: the high arena is `[4 GiB, top)`, filled
+/// from the top down (`MemoryMap::find_high`), so that images at their own
+/// low bases there (Free Pascal's 0x100000000, 0x140000000, 0x180000000)
+/// are reached last. `GEX_W64_TOP` may raise the top as far as
+/// [`gex_abi::LIMIT64`]: the arena then reaches past the tables, and the
+/// memory is that long from the start.
+const WINE64_TOP_M64: u64 = gex_abi::DISPATCH_DIR64;
+const _: () = assert!(WINE64_TOP_M64.is_power_of_two() && WINE64_TOP_M64 <= gex_abi::DISPATCH_DIR64 && gex_abi::IMAGE_ZONE64 < WINE64_TOP_M64);
 
-/// The lowest top `GEX_W64_TOP` may ask for: the high arena keeps at least
-/// 512 MiB.
-const WINE64_TOP_M64_MIN: u64 = (gex_abi::HIGH_ARENA_BASE + (512 << 20) + 0xffff) & !0xffff;
+/// The lowest top `GEX_W64_TOP` may ask for: 512 MiB of space above 4 GiB.
+const WINE64_TOP_M64_MIN: u64 = (1 << 32) + (512 << 20);
 
 /// This process's top in a 64-bit memory, set at its program's load
 /// ([`wine64_reserve_pe_data`]): [`WINE64_TOP_M64`], or `GEX_W64_TOP` from
@@ -10525,6 +10541,15 @@ pub(crate) fn wine64_top_m64() -> u64 {
 /// `gex.space_top()`: this process's top in 64 KiB units, which 64-bit
 /// Wine's ntdll takes as the end of its space instead of probing; 0 in a
 /// 32-bit memory.
+/// `[gex_abi::DISPATCH_DIR64, gex_abi::HIGH_TABLES_END)` in MiB (the low
+/// half the start, the high half the end), for the page's host, which
+/// reads an M64 memory's directory and copies its tables on a fork.
+#[no_mangle]
+pub extern "C" fn gex_m64_tables() -> u32 {
+    const _: () = assert!(gex_abi::HIGH_TABLES_END >> 20 <= 0xffff && gex_abi::DISPATCH_DIR64 % (1 << 20) == 0 && gex_abi::HIGH_TABLES_END % (1 << 20) == 0);
+    ((gex_abi::HIGH_TABLES_END >> 20) << 16 | gex_abi::DISPATCH_DIR64 >> 20) as u32
+}
+
 #[no_mangle]
 pub extern "C" fn gex_space_top() -> u32 {
     if gex_abi::mem64() { (wine64_top_m64() >> 16) as u32 } else { 0 }
@@ -10554,14 +10579,21 @@ pub(crate) fn wine64_pe_data() -> (u64, u64) {
 
 /// Reserve [`wine64_pe_data`] (no access until the core's data is placed in
 /// it) and, in a 32-bit memory with the split, keep mmap below it; in a
-/// 64-bit memory, end the process's space at its top ([`wine64_top_m64`],
-/// taken here from its environment).
+/// 64-bit memory, take the process's top ([`wine64_top_m64`]) from its
+/// environment and give it the high arena, `[4 GiB, top)` (see
+/// [`WINE64_TOP_M64`]).
 pub(crate) fn wine64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     use gex_kernel::mem::{flags, prot};
     if gex_abi::mem64() {
         let top = wine64_top_from_env(&crate::sigs::proc_home().envp());
         WINE64_TOP.store(top, std::sync::atomic::Ordering::Relaxed);
-        mem.set_high_arena(gex_abi::HIGH_ARENA_BASE, top);
+        mem.set_high_arena_down(gex_abi::IMAGE_ZONE64, top);
+        gex_kernel::mem::set_high_arena_full_hook(|lo, hi, len| {
+            warn_line(&format!(
+                "gex: wine64: the memory64 data arena {lo:#x}..{hi:#x} is full ({len:#x} bytes asked for): data goes below 4 GiB now, \
+                 and an image whose base it took relocates, or fails to load if it has no relocations (GEX_W64_TOP raises the top, the arena with it)\n"
+            ));
+        });
     }
     let (lo, hi) = wine64_pe_data();
     if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {

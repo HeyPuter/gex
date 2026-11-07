@@ -132,10 +132,22 @@ pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 /// An M64 process's dense per-page tables: its dispatch
 /// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
 /// anywhere in the memory (a W^X JIT's high pages made executable), and its
-/// [`PATCHED_PAGES`] bits after it. At the bottom of the high region, below
-/// the arena. An M32 process uses the low region's directory instead; see
-/// [`dispatch_dir`].
-pub const DISPATCH_DIR64: u64 = 1 << 32;
+/// [`PATCHED_PAGES`] bits after it. At 8 GiB, so that `[4 GiB, 8 GiB)`
+/// holds nothing of gex's when a process starts (the high arena's data
+/// comes later, and in 64-bit Wine from the top down), and a Windows
+/// image keeps the base it was linked at there -- Free Pascal's x86-64
+/// exe at 0x100000000 (no relocations: at 4 GiB, where these tables were,
+/// such an exe could not start), MSVC's and MinGW's at 0x140000000, a
+/// DLL's at 0x180000000. An M32 process uses the low region's directory
+/// instead; see [`dispatch_dir`].
+pub const DISPATCH_DIR64: u64 = 8 << 30;
+
+/// The bottom of an M64 memory's high arena: the guest's data above
+/// everything a wasm32 process has, filled bottom-up to [`LIMIT64`] around
+/// the M64 tables, and in 64-bit Wine top-down from its top
+/// ([`DISPATCH_DIR64`] by default), so that its images at their own low
+/// bases (0x100000000, 0x140000000) are reached by the data last.
+pub const IMAGE_ZONE64: u64 = 1 << 32;
 
 /// Pages [`DISPATCH_DIR64`] covers: all of [`LIMIT64`].
 pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
@@ -146,10 +158,8 @@ pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
 /// End of the M64 tables, rounded to 1 MiB.
 pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
 
-/// The bottom of an M64 process's high arena: non-executable data (Linux
-/// `mmap` without `PROT_EXEC`, NT allocations without an executable
-/// protection) goes here, above everything a wasm32 process has and above
-/// the M64 tables.
+/// The bottom of the part of an M64 process's high arena ([`IMAGE_ZONE64`])
+/// above the M64 tables: what the memory grows over as that part is used.
 pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
 
 /// The dispatch directory of this process's memory flavour: the low region's
@@ -1384,8 +1394,9 @@ mod tests {
         assert!(INTERP_BASE < STACK_TOP);
         assert!(STACK_TOP <= MMAP_BOTTOM);
         assert!(MMAP_TOP <= GUEST_LIMIT);
-        // The M64 tables sit above every M32 address, below the arena.
-        assert!(DISPATCH_DIR64 >= GUEST_LIMIT);
+        // The M64 tables sit above every M32 address and the image zone
+        // `[4 GiB, 8 GiB)`, below the arena.
+        assert!(DISPATCH_DIR64 >= GUEST_LIMIT && DISPATCH_DIR64 >= 8 << 30);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
         assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);

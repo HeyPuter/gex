@@ -389,11 +389,14 @@ pub struct MemoryMap {
     /// reformatting on every read (measured half of an X server's time in
     /// `core::fmt` before this).
     generation: u64,
-    /// An M64 process's high arena, `[HIGH_ARENA_BASE, LIMIT64)`:
-    /// non-executable mappings without a fixed address go
-    /// there. `None` for every M32 process, whose map behaves exactly as it
-    /// always has.
+    /// An M64 process's high arena, `[IMAGE_ZONE64, LIMIT64)` less the M64
+    /// tables (64-bit
+    /// Wine's: [`Self::set_high_arena_down`]): non-executable mappings
+    /// without a fixed address go there. `None` for every M32 process, whose
+    /// map behaves exactly as it always has.
     high: Option<(u64, u64)>,
+    /// The high arena is filled from its top down, not bottom-up.
+    high_down: bool,
     /// Whether running out of address space here is noted in
     /// [`ADDRESS_SPACE_SHORT`]: the map of the program a run started with
     /// and its forks, not of another image one of them execs (a new map).
@@ -564,6 +567,24 @@ const BAND_ALIGN: u64 = 64 << 10;
 /// not place in an M32 memory: 0 if none ran short.
 pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A host's line for an M64 high arena that is full ([`MemoryMap::find_high`]).
+static HIGH_ARENA_FULL_HOOK: std::sync::OnceLock<fn(u64, u64, u64)> = std::sync::OnceLock::new();
+
+/// Have `f(lo, hi, len)` hear, once per process, that the high arena
+/// `[lo, hi)` had no room for `len` bytes.
+pub fn set_high_arena_full_hook(f: fn(u64, u64, u64)) {
+    let _ = HIGH_ARENA_FULL_HOOK.set(f);
+}
+
+fn arena_full(lo: u64, hi: u64, len: u64) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(f) = HIGH_ARENA_FULL_HOOK.get() {
+            f(lo, hi, len);
+        }
+    }
+}
+
 /// Note that a learning M32 process ran out of address space asking for
 /// `len` bytes.
 pub fn note_address_space_short(len: u64) {
@@ -612,7 +633,8 @@ impl MemoryMap {
             back: None,
             // Every process of a host with a 64-bit guest memory has the
             // high arena.
-            high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+            high: gex_abi::mem64().then_some((gex_abi::IMAGE_ZONE64, gex_abi::LIMIT64)),
+            high_down: false,
             learns: false,
             clean: Vec::new(),
             fresh: None,
@@ -706,9 +728,21 @@ impl MemoryMap {
         &self.clean
     }
 
-    /// Give this process a 64-bit memory's high arena.
+    /// Give this process a 64-bit memory's high arena, filled bottom-up:
+    /// the browser grows the memory to the highest address used, so low and
+    /// dense is cheap.
     pub fn set_high_arena(&mut self, lo: u64, hi: u64) {
         self.high = Some((lo, hi));
+        self.high_down = false;
+    }
+
+    /// As [`Self::set_high_arena`], filled from the top down: 64-bit Wine's,
+    /// `[4 GiB, top)`, in a memory already as long as its top, where
+    /// executables sit at their own low bases (0x100000000, 0x140000000), so
+    /// data reaches them last.
+    pub fn set_high_arena_down(&mut self, lo: u64, hi: u64) {
+        self.high = Some((lo, hi));
+        self.high_down = true;
     }
 
     /// The highest address a mapping may end at, exclusive.
@@ -716,20 +750,50 @@ impl MemoryMap {
         self.high.map_or(GUEST_LIMIT, |(_, hi)| hi)
     }
 
-    /// First fit, bottom-up, in the high arena: the browser grows memory to
-    /// the highest address used, so low and dense is cheap.
+    /// First fit in the high arena, bottom-up or top-down
+    /// ([`Self::set_high_arena_down`]), never over the M64 tables. Full, it
+    /// says so once ([`set_high_arena_full_hook`]): data then goes below
+    /// 4 GiB, and an image whose base the data has taken relocates (or, with
+    /// no relocations, fails to load), as on Windows.
     fn find_high(&self, len: u64) -> Option<u64> {
         let (lo, hi) = self.high?;
-        let mut candidate = lo;
-        loop {
-            if candidate + len > hi {
-                return None;
+        let tables = |a: u64| gex_abi::mem64() && a < gex_abi::HIGH_TABLES_END && a + len > gex_abi::DISPATCH_DIR64;
+        let found = if self.high_down {
+            let mut candidate = hi;
+            loop {
+                if candidate < lo + len {
+                    break None;
+                }
+                let start = page_align_down(candidate - len);
+                if tables(start) {
+                    candidate = gex_abi::DISPATCH_DIR64;
+                    continue;
+                }
+                match self.vmas.iter().filter(|v| v.start < start + len && v.end > start).map(|v| v.start).min() {
+                    Some(below) => candidate = below,
+                    None => break Some(start),
+                }
             }
-            match self.vmas.iter().filter(|v| v.start < candidate + len && v.end > candidate).map(|v| v.end).max() {
-                Some(end) => candidate = page_align_up(end),
-                None => return Some(candidate),
+        } else {
+            let mut candidate = lo;
+            loop {
+                if candidate + len > hi {
+                    break None;
+                }
+                if tables(candidate) {
+                    candidate = gex_abi::HIGH_TABLES_END;
+                    continue;
+                }
+                match self.vmas.iter().filter(|v| v.start < candidate + len && v.end > candidate).map(|v| v.end).max() {
+                    Some(end) => candidate = page_align_up(end),
+                    None => break Some(candidate),
+                }
             }
+        };
+        if found.is_none() {
+            arena_full(lo, hi, len);
         }
+        found
     }
 
     /// How many times the map has changed. Two equal readings mean the VMA
@@ -902,8 +966,9 @@ impl MemoryMap {
             return Ok(());
         }
         // In an M64 memory's high arena (a fixed mapping or a hint there,
-        // code or data): backed as the arena's own mappings are, the memory
-        // grown over it, and never the low arena's cursor.
+        // an image at its base, code or data): backed as the arena's own
+        // mappings are, the memory grown over it, and never the low arena's
+        // cursor.
         if let (Some((lo, hi)), Some(back)) = (self.high, self.back) {
             if start >= lo && end <= hi {
                 back(start, end).ok_or(Errno::ENOMEM)?;
@@ -2545,21 +2610,27 @@ mod tests {
     #[test]
     fn a_64_bit_memory_puts_data_in_the_high_arena() {
         let mut m = MemoryMap::new(0x40_0000);
-        m.set_high_arena(gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64);
-        // A runtime's reservations: 512 MiB - 4 KiB with no access, twenty of them.
-        let mut last = 0;
-        for _ in 0..20 {
+        m.set_high_arena_down(gex_abi::IMAGE_ZONE64, gex_abi::DISPATCH_DIR64);
+        // A runtime's reservations: 512 MiB - 4 KiB with no access, seven of
+        // them, top-down (the arena is the 4 GiB below the tables).
+        let mut last = u64::MAX;
+        for _ in 0..7 {
             let a = m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").unwrap();
-            assert!(a >= gex_abi::HIGH_ARENA_BASE && a + 0x1fff_f000 <= gex_abi::LIMIT64);
-            assert!(a > last);
+            assert!(a >= gex_abi::IMAGE_ZONE64 && a + 0x1fff_f000 <= gex_abi::DISPATCH_DIR64);
+            assert!(a < last);
             last = a;
         }
         let code = m.mmap(0, 0x10000, prot::READ | prot::WRITE | prot::EXEC, 0, "jit").unwrap();
         assert!(code < MMAP_TOP);
         assert!(m.protect(last, 0x1000, prot::READ | prot::WRITE).is_ok());
         assert!(m.protect(last, 0x1000, prot::READ | prot::EXEC).is_ok());
-        // A hint or a fixed address up to the 64-bit limit is honoured.
-        let fixed = 10u64 << 30;
+        // A plain high arena (any other M64 process's) is filled bottom-up,
+        // so the memory grows only as far as it is used.
+        let mut up = MemoryMap::new(0x40_0000);
+        up.set_high_arena(gex_abi::IMAGE_ZONE64, gex_abi::LIMIT64);
+        assert_eq!(up.mmap(0, 0x1_0000, prot::READ | prot::WRITE, 0, "d"), Ok(gex_abi::IMAGE_ZONE64));
+        // A hint or a fixed address in the arena is honoured.
+        let fixed = gex_abi::IMAGE_ZONE64 + 0x10_0000;
         assert_eq!(m.mmap(fixed, 0x1000, prot::READ, flags::FIXED, "f"), Ok(fixed));
         // A file mapping stays low whatever its protection (ld.so reserves a
         // library read-only, then maps its text inside), and so does a
@@ -2568,8 +2639,8 @@ mod tests {
         assert!(lib < MMAP_TOP);
         let res = m.mmap_low(0, 0x40_0000, prot::NONE, 0, "").unwrap();
         assert!(res < MMAP_TOP);
-        // ... and takes executable pages above 4 GiB in either form.
-        assert_eq!(m.mmap(11u64 << 30, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Ok(11u64 << 30));
+        // ... and takes executable pages in the arena in either form.
+        assert_eq!(m.mmap(fixed + 0x10_0000, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Ok(fixed + 0x10_0000));
     }
 
     /// In the browser (a map whose host grows the memory on demand), a fixed
@@ -2586,10 +2657,40 @@ mod tests {
         }
         let mut m = MemoryMap::new(0x40_0000);
         m.grows_on_demand(take, back);
-        m.set_high_arena(gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64);
-        let at = 11u64 << 30;
+        m.set_high_arena_down(gex_abi::IMAGE_ZONE64, gex_abi::DISPATCH_DIR64);
+        let at = 6u64 << 30;
         assert_eq!(m.mmap(at, 0x1000, prot::READ | prot::WRITE | prot::EXEC, flags::FIXED_NOREPLACE, "jit"), Ok(at));
         assert!(BACKED.load(std::sync::atomic::Ordering::SeqCst) >= at + 0x1000);
+        // An exe at Free Pascal's base is placed there by address, and data
+        // without one fills the arena from the top, never over it.
+        let exe = gex_abi::IMAGE_ZONE64;
+        assert_eq!(m.mmap(exe, 0x10000, prot::READ, flags::FIXED_NOREPLACE, "exe"), Ok(exe));
+        assert!(BACKED.load(std::sync::atomic::Ordering::SeqCst) >= exe + 0x10000);
+        let data = m.mmap(0, 0x10000, prot::READ | prot::WRITE, 0, "data").unwrap();
+        assert_eq!(data, gex_abi::DISPATCH_DIR64 - 0x10000);
+    }
+
+    /// A full M64 arena says so once and places data below 4 GiB, never
+    /// over an image in it.
+    #[test]
+    fn a_full_high_arena_says_so_and_spares_its_images() {
+        static FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn full(_lo: u64, _hi: u64, len: u64) {
+            FULL.store(len, std::sync::atomic::Ordering::SeqCst);
+        }
+        set_high_arena_full_hook(full);
+        let mut m = MemoryMap::new(0x40_0000);
+        let (lo, hi) = (gex_abi::IMAGE_ZONE64, gex_abi::IMAGE_ZONE64 + 0x40_0000);
+        m.set_high_arena_down(lo, hi);
+        assert_eq!(m.mmap(lo, 0x10000, prot::READ, flags::FIXED_NOREPLACE, "exe"), Ok(lo));
+        while let Ok(a) = m.mmap(0, 0x10000, prot::READ | prot::WRITE, 0, "data") {
+            if a < lo {
+                break;
+            }
+            assert!(a >= lo + 0x10000 && a + 0x10000 <= hi);
+        }
+        assert_eq!(FULL.load(std::sync::atomic::Ordering::SeqCst), 0x10000);
+        assert_eq!(m.mmap(lo, 0x10000, prot::READ, flags::FIXED_NOREPLACE, "exe2"), Err(Errno::EEXIST));
     }
 
     /// An M32 map is unchanged, and running out of address space is recorded
