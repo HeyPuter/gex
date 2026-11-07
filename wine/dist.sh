@@ -42,8 +42,10 @@
 #               relinks them): WINE64_SERVER
 #   fon-F       Wine's raster fonts (wine-fon.sh: sfnt2fon over a native
 #               FreeType); F: fonts/, tools/sfnt2fon, the script and FreeType's pin
-#   dist64-K-S-fF-sV-twin  with WINE64_TWIN=1, that install plus the memory64
+#   dist64-K-S-fF-sV-twinM  with WINE64_TWIN=1, that install plus the memory64
 #               loader as x86_64-unix/wine.m64 (the WINE64_MEM64=1 build's)
+#               and that build's modules in x86_64-windows, each as
+#               NAME.wasm.m64 (M: its core's key)
 #   dist64-K-S-fF-sV  the install: x86_64-unix/{wine,wineserver,winegstreamer.so,libSDL2-2.0.so.0 and their gex-rest-only}, x86_64-windows,
 #               (with WINE64_WOW64=1 i386-windows and its winewayland.drv:
 #               the name gets -wwl; less Win16 and VxD: -no16; less icu: -noicu; ICU data cut to WINE_ICU_LOCALES: -icuL; winegstreamer over FFmpeg: -wgf, less it: -nogst; game controllers: -sdl)
@@ -641,14 +643,20 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	MO=$(WINE64_TWIN=0 WINE64_MEM64=1 WINE64_M64_NATIVE=1 "$0" "$W" "$C") || { log "the memory64 build for the twin failed"; exit 1; }
 	MD=$(sed -n 's/^WINE64_DIST=//p' <<< "$MO"); MN=$(sed -n 's/^WINE64_NATIVE=//p' <<< "$MO")
 	[ -n "$MD" ] && [ -f "$MN/winepe.wasm" ] || { log "the memory64 build for the twin made no loader or PE core"; exit 1; }
+	MK=${MN%/native}; MK=${MK##*-}
 	twin_make() {
 		cp -a "$DIST/." .
 		rm -f .done
 		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
+		# the memory64 build's modules, which a process with a 64-bit memory
+		# loads in its own modules' place: the install runs the twin as it is
+		local m
+		for m in "$MN"/*.wasm; do cp -p "$m" "lib/wine/x86_64-windows/${m##*/}.m64"; done
 	}
-	# (named after the install it copies: a twin of another install is another twin)
-	log "twin install ($K, $S, $F, $V)"; step "${DIST##*/}-twin" twin_make
-	DIST=$DIST-twin
+	# (named after the install it copies and the memory64 build: a twin of
+	# another install, or of another memory64 build, is another twin)
+	log "twin install ($K, $S, $F, $V, $MK)"; step "${DIST##*/}-twin$MK" twin_make
+	DIST=$DIST-twin$MK
 	twin_native() {
 		cp -a "$NATIVE/." .
 		rm -f .done
@@ -656,7 +664,6 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 		local m
 		for m in "$MN"/*.wasm; do cp -p "$m" "${m##*/}.m64"; done
 	}
-	MK=${MN%/native}; MK=${MK##*-}
 	log "twin native PE core ($K, $NK, $MK)"; step pen64-$K-$NK-twin$MK twin_native
 	NATIVE=$C/pen64-$K-$NK-twin$MK
 fi
