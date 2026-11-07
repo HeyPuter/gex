@@ -22,6 +22,7 @@ export const CONSOLE = [
   { name: 'exitproc', code: 33, want: /worker exiting\natexit ran/, exe: 'exitproc.exe' },
   { name: 'seh', code: 77, want: /(ok [^\n]*\n)+top-level filter saw e00000ff\n0 failures/, exe: 'seh.exe' },
   { name: 'seh-traps', want: allOk, exe: 'seh.exe', args: ['traps'] },
+  { name: 'seh-localunwind', want: allOk, exe: 'seh.exe', args: ['localunwind'] },
 ];
 
 /** A locked write through a null pointer's field: an access violation for

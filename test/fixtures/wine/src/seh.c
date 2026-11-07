@@ -4,6 +4,9 @@
  * unhandled exception reaching the top-level filter.
  * `seh.exe traps`: divide errors and `hlt` instead (EXCEPTION_INT_DIVIDE_BY_ZERO,
  * EXCEPTION_INT_OVERFLOW, EXCEPTION_PRIV_INSTRUCTION), then exits.
+ * `seh.exe localunwind` (x86-64): Free Pascal's local unwind, a
+ * RtlUnwindEx to a label in the caller with a CONTEXT whose tail runs over
+ * the helper's saved rbp and return address, then exits.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
@@ -149,6 +152,68 @@ __attribute__((noinline)) static int raise_keeps_control_words(int pad) {
     return (cw_after & ~0x40) == 0x0c3f && mxcsr_after == 0x7f80;
 }
 
+#ifdef __x86_64__
+/* As Free Pascal's _FPC_local_unwind and a caller that leaves a
+ * try..finally by jumping out: local_unwind(frame, target) calls
+ * RtlUnwindEx(frame, target, NULL, 0, ctx, NULL) with ctx 0x470 bytes
+ * below its frame pointer (a CONTEXT is 0x4d0), so the record's tail
+ * holds its saved rbp and return address. RtlCaptureContext writes
+ * nothing past the record's FltSave, as on Windows, and the unwind reads
+ * them back: the target runs with the caller's rbp. Returns 0x1234. */
+int local_unwind_caller(void);
+__asm__(
+    ".text\n"
+    ".globl local_unwind_helper\n"
+    ".def local_unwind_helper; .scl 2; .type 32; .endef\n"
+    ".seh_proc local_unwind_helper\n"
+    "local_unwind_helper:\n"
+    "  pushq %rbp\n"
+    "  .seh_pushreg %rbp\n"
+    "  movq %rsp, %rbp\n"
+    "  leaq -0x4a0(%rsp), %rsp\n"
+    "  .seh_stackalloc 0x4a0\n"
+    "  .seh_endprologue\n"
+    "  movq $0, 0x28(%rsp)\n"
+    "  leaq -0x470(%rbp), %rax\n"
+    "  movq %rax, 0x20(%rsp)\n"
+    "  xorq %r9, %r9\n"
+    "  xorq %r8, %r8\n"
+    "  callq *__imp_RtlUnwindEx(%rip)\n"
+    "  nop\n"
+    "  leaq (%rbp), %rsp\n"
+    "  popq %rbp\n"
+    "  retq\n"
+    ".seh_endproc\n"
+    ".globl local_unwind_caller\n"
+    ".def local_unwind_caller; .scl 2; .type 32; .endef\n"
+    ".seh_proc local_unwind_caller\n"
+    "local_unwind_caller:\n"
+    "  pushq %rbp\n"
+    "  .seh_pushreg %rbp\n"
+    "  movq %rsp, %rbp\n"
+    "  leaq -0x40(%rsp), %rsp\n"
+    "  .seh_stackalloc 0x40\n"
+    "  .seh_endprologue\n"
+    "  movl $0x1234, -0x8(%rbp)\n"
+    "  movq %rsp, %rcx\n"
+    "  leaq 1f(%rip), %rdx\n"
+    "  callq local_unwind_helper\n"
+    "  movl $1, -0x8(%rbp)\n"
+    "1:\n"
+    "  movl -0x8(%rbp), %eax\n"
+    "  leaq (%rbp), %rsp\n"
+    "  popq %rbp\n"
+    "  retq\n"
+    ".seh_endproc\n");
+
+static int local_unwind(void) {
+    CHECK("local unwind: the target runs in its frame", local_unwind_caller() == 0x1234);
+    printf("%d failures\n", failures);
+    fflush(stdout);
+    return failures != 0;
+}
+#endif
+
 static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
     printf("top-level filter saw %08lx\n", e->ExceptionRecord->ExceptionCode);
     printf("%d failures\n", failures);
@@ -160,6 +225,7 @@ static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "traps")) return traps();
 #ifdef __x86_64__
+    if (argc > 1 && !strcmp(argv[1], "localunwind")) return local_unwind();
     int caught = 0;
     __try { RaiseException(0xe0000001, 0, 0, 0); } __except (GetExceptionCode() == 0xe0000001) { caught = 1; }
     CHECK("__try/__except", caught);

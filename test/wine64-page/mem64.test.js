@@ -12,7 +12,7 @@ const pick = (n) => CONSOLE.find((c) => c.name === n);
 
 export default async function (t) {
   const w = wine64(t, { door: 1, mem64: true });
-  await each(w, [pick('hello_args'), pick('crtmem'), pick('tls'), pick('seh'), { name: 'highdata', want: allOk, exe: 'highdata.exe', args: ['mem64'] },
+  await each(w, [pick('hello_args'), pick('crtmem'), pick('tls'), pick('seh'), pick('seh-localunwind'), { name: 'highdata', want: allOk, exe: 'highdata.exe', args: ['mem64'] },
     { name: 'fpcbase', want: allOk, exe: 'fpcbase.exe' }],
     { page: { mem64: true }, timeout: 1800000 }, 'page mem64: ');
   w.clean();
