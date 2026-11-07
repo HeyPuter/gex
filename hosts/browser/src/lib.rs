@@ -917,15 +917,9 @@ fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
-    let line = format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n");
-    // SIGINT, SIGKILL and SIGTERM to another process are a parent ending a
-    // child on purpose (apt stops each of its methods with SIGINT): noted,
-    // not warned. A hangup stays a warning; that is a session coming apart.
-    if matches!(signo, 2 | 9 | 15) && caller != target {
-        trace_line(&line);
-    } else {
-        warn_line(&line);
-    }
+    // On the debug console: sending a signal is ordinary, and the line is
+    // for when a session is coming apart.
+    trace_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
 }
 
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
@@ -16746,10 +16740,10 @@ fn safepoint(ctx: i32, pc: i64) {
         // it: the frame records where to return, and a branch stores no pc.
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc as u64);
         let d = sigs::deliver(&mut gm, ctx_addr);
-        // Which signals a process actually takes, capped. A signal that
-        // should never have been sent looks like a program misbehaving:
-        // xterm tearing down a live session, a shell exiting for no reason.
-        // Where it came from is in `k_last_kill`.
+        // Which signals a process actually takes, capped, on the debug
+        // console. A signal that should never have been sent looks like a
+        // program misbehaving: xterm tearing down a live session, a shell
+        // exiting for no reason. Where it came from is in `k_last_kill`.
         if !matches!(d, gex_kernel::signal::Delivery::None) {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SAID: AtomicU32 = AtomicU32::new(0);
@@ -16765,7 +16759,7 @@ fn safepoint(ctx: i32, pc: i64) {
                 } else {
                     String::new()
                 };
-                warn_line(&format!("[sig] pid {} takes a signal{last}\n", my_pid()));
+                trace_line(&format!("[sig] pid {} takes a signal{last}\n", my_pid()));
             }
         }
         match d {
