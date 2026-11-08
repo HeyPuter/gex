@@ -338,6 +338,17 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
     }
 }
 
+/// A write of a loaded module's data (its data as before its first load, its
+/// image base, ntdll's variables): through GuestMem, as `publish`'s reads
+/// are, since a raw write through `guest_bytes` is as open to the folding
+/// that made its compare unequal; and said if it fails, since a write
+/// skipped quietly leaves the DLL running on stale data.
+fn put(dll: &str, at: u64, bytes: &[u8]) {
+    if GuestMem::new(crate::guest_bytes()).write(at, bytes).is_err() {
+        crate::warn_line(&format!("gex-pe: {dll}: its data at {at:#x} ({} bytes) is outside memory, not written\n", bytes.len()));
+    }
+}
+
 fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, String> {
     let sec = pe.sections.iter().find(|s| s.name == ".wasmref").ok_or("no .wasmref")?;
     let (module_name, dll, data_list) = wasmref(&crate::guest_bytes()[..], base, sec)?;
@@ -462,8 +473,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                 let bytes = p.bytes.clone().unwrap_or_else(|| vec![0; p.len as usize]);
                 if !wp.installed {
                     wp.pending.push((p.at, bytes));
-                } else if let Some(dst) = crate::guest_bytes().get_mut(p.at as usize..(p.at + p.len) as usize) {
-                    dst.copy_from_slice(&bytes);
+                } else {
+                    put(&dll, p.at, &bytes);
                 }
             }
         }
@@ -480,8 +491,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
         if !wp.installed {
             wp.pending.push((at, bytes));
-        } else if let Some(dst) = crate::guest_bytes().get_mut(at as usize..at as usize + bytes.len()) {
-            dst.copy_from_slice(&bytes);
+        } else {
+            put(&dll, at, &bytes);
         }
     }
     // (64-bit Wine's ntdll has Wine's own Unix side, which sets them: these are
@@ -492,8 +503,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
                 let at = wp.data + *off as u64;
                 if !wp.installed {
                     wp.pending.push((at, bytes));
-                } else if let Some(dst) = crate::guest_bytes().get_mut(at as usize..at as usize + bytes.len()) {
-                    dst.copy_from_slice(&bytes);
+                } else {
+                    put(&dll, at, &bytes);
                 }
             }
         }
