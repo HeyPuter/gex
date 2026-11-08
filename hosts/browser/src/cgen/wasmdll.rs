@@ -355,11 +355,15 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     let old = lock(&WINE_PE).mods.iter().filter(|w| w.ptr64 == pe.is64).find_map(|w| w.mapped.get(&dll).copied());
     // Released is also another mapping at the old base since, not this
     // DLL's (a program's own data there): still the DLL's, its .wasmref is.
-    let still_there = |o: u64| {
-        let bytes = crate::guest_bytes();
-        let (at, from, n) = ((o + sec.rva as u64) as usize, (base + sec.rva as u64) as usize, sec.vsize as usize);
-        matches!((bytes.get(at..at + n), bytes.get(from..from + n)), (Some(a), Some(b)) if a == b)
-    };
+    // Read through GuestMem, its .wasmref against this mapping's: two
+    // slices of `guest_bytes` compared directly were folded to unequal (a
+    // pointer made from an integer, whose bounds LLVM folds at some call
+    // sites, GuestMem::view), so a DLL loaded again by another path (a
+    // program's own copy of ucrtbase.dll) took the live first mapping for
+    // released and set the module's data back to before its first load:
+    // ucrtbase's heap handle went to NULL under every later calloc.
+    let raw = GuestMem::new(crate::guest_bytes()).read(base + sec.rva as u64, sec.vsize as usize).map(<[u8]>::to_vec).map_err(|_| ".wasmref outside memory")?;
+    let still_there = |o: u64| GuestMem::new(crate::guest_bytes()).read(o + sec.rva as u64, raw.len()).is_ok_and(|b| b == &raw[..]);
     let released = old.is_some_and(|o| {
         o == base || crate::sigs::proc_home().mm().lock().vma_at(o).is_none_or(|v| v.prot == 0) || !still_there(o)
     });
