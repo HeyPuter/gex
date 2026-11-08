@@ -9756,7 +9756,9 @@ impl Kernel {
                 let dir = image.rsplit_once('/').map_or(".", |(d, _)| d);
                 self.vfs.metadata(&format!("{dir}/{name}")).is_ok()
             };
-            pe_needs_mem64(&head, beside).then_some(true)
+            let file = image.rsplit('/').next().unwrap_or(image);
+            let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+            pe_needs_mem64(&head, stem, beside).then_some(true)
         })
     }
 
@@ -17610,9 +17612,14 @@ pub fn gecko_without_sandbox(envp: &mut Vec<String>) {
 /// memory's whole code space. Or it is a Java launcher's (java.exe and
 /// its kin: jvm.dll in its directory's `server` or `client`, or beside
 /// it), whose VM reserves its heap, a 1 GiB compressed class space and its
-/// code cache at start, more than the lowered memory has. Anything else,
-/// or headers that do not parse: false.
-pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
+/// code cache at start, more than the lowered memory has. Or it is a .NET
+/// program's (coreclr.dll beside it, a self-contained one; its
+/// `<stem>.runtimeconfig.json` beside it, one that runs on an installed
+/// runtime; or the `dotnet` launcher, `host/fxr` beside it), whose runtime
+/// reserves 2 GiB for its code near coreclr.dll, more than the lowered
+/// memory's code space has room for. `stem` is the image's file name
+/// without its extension. Anything else, or headers that do not parse: false.
+pub fn pe_needs_mem64(head: &[u8], stem: &str, beside: impl Fn(&str) -> bool) -> bool {
     let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let u64_at = |o: usize| head.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
@@ -17635,7 +17642,8 @@ pub fn pe_needs_mem64(head: &[u8], beside: impl Fn(&str) -> bool) -> bool {
         let fixed = chars & 1 != 0 || relocs == 0;
         let gecko = pe_is_gecko(head, &beside);
         let java = ["server/jvm.dll", "client/jvm.dll", "jvm.dll"].into_iter().any(&beside);
-        Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || gecko || java)
+        let dotnet = beside("coreclr.dll") || beside(&format!("{stem}.runtimeconfig.json")) || beside("host/fxr");
+        Some((fixed && base.saturating_add(size) > W64_CODE_TOP) || gecko || java || dotnet)
     };
     parse().unwrap_or(false)
 }
@@ -17663,12 +17671,16 @@ mod pe_mem64_tests {
 
     #[test]
     fn fixed_high_base_needs_mem64() {
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664), |_| false));
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664), |_| false));
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "mozglue.dll"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664), "app", |_| false));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664), "app", |_| false));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "mozglue.dll"));
         // A Java launcher: the VM in bin\server\ (a JDK's or a JRE's), or beside it.
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "server/jvm.dll"));
-        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), |n| n == "jvm.dll"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "server/jvm.dll"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "jvm.dll"));
+        // A .NET program: self-contained, on an installed runtime, or the launcher.
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "coreclr.dll"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "app.runtimeconfig.json"));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "dotnet", |n| n == "host/fxr"));
     }
 
     #[test]
@@ -17690,12 +17702,14 @@ mod pe_mem64_tests {
     #[test]
     fn relocatable_or_low_does_not() {
         let none = |_: &str| false;
-        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), none));
-        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664), none));
-        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c), none));
-        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "mozglue.dll"));
-        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), |n| n == "server/jvm.dll"));
-        assert!(!pe_needs_mem64(b"MZ", none));
-        assert!(!pe_needs_mem64(b"\x7fELF", none));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", none));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664), "app", none));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c), "app", none));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), "app", |n| n == "mozglue.dll"));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), "app", |n| n == "server/jvm.dll"));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664), "app", |n| n == "other.runtimeconfig.json"));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x22, 0x200, 0x14c), "app", |n| n == "coreclr.dll"));
+        assert!(!pe_needs_mem64(b"MZ", "app", none));
+        assert!(!pe_needs_mem64(b"\x7fELF", "app", none));
     }
 }
