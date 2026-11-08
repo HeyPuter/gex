@@ -43,7 +43,7 @@ rm -rf "$out"
 # user's profile, a profile with no name, files a run left) is not.
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 user=${PAGE_USER:-gex}
-tar -C "$src" --exclude=./dosdevices --exclude=./drive_c/users --exclude=./.gex-builtins -h --xattrs --xattrs-include='user.*' -cf - . |
+tar -C "$src" --exclude=./dosdevices --exclude=./drive_c/users --exclude=./.gex-builtins --exclude=./.gex-dists -h --xattrs --xattrs-include='user.*' -cf - . |
     tar -C "$out" --xattrs --xattrs-include='user.*' -xpf -
 # The install's user: the profile the registry names (ProfileList).
 built=$(sed -n 's/^"ProfileImagePath"="C:\\\\users\\\\\([^"\\]*\)"$/\1/p' "$src/system.reg" | head -1)

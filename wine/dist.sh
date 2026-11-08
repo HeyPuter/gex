@@ -22,7 +22,8 @@
 #   wgs-P       winegstreamer's PE halves, likewise (WINE64_MEDIA=lazy, the default)
 #   pfx64-P-gex a win64 prefix (wineboot -i, native, no display, as user gex)
 #   pfs64-P-gex-R it with 32-bit Wine's session applied (wine32-session.reg; R: that and
-#               reg-apply.py): WINE64_PREFIX
+#               reg-apply.py): WINE64_PREFIX; each keeps the keys of the
+#               installs it is printed with (.gex-dists, wine/prefix-key.sh)
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (wine64-deps.sh:
 #               FreeType, libwayland, libxml2, xkbcommon, EGL headers;
 #               GnuTLS over nettle and Mozilla's CA bundle, as 32-bit Wine's;
@@ -307,9 +308,15 @@ pfx_make() {
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
 	rm -rf home
 	grep -q '^#arch=win64' pfx/system.reg
+	: > pfx/.gex-dists
 }
+# Each prefix keeps the keys of the installs it was made for (.gex-dists,
+# prefix-key.sh's): those this script prints it with. One without the file
+# predates the keys, so it is made again, never taken as it is.
+fresh() { [ -f "$C/$1/pfx/.gex-dists" ] || rm -f "$C/$1/.done"; }
 # -gex: made as user gex (before, as the build machine's user).
 PX=$P-gex
+fresh pfx64-$PX
 log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 
 # The session 32-bit Wine's prefixes have (wine32-session.reg):
@@ -362,7 +369,9 @@ pfs_make() {
 	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
 	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
 	[ -z "$GS" ] || [ "$(grep -c 'winegstreamer.dll"$' pfx/system.reg)" -ge 10 ] || { echo "winegstreamer was not registered"; return 1; }
+	: > pfx/.gex-dists
 }
+fresh pfs64-$PX-$R
 log "win64 prefix's session ($PX, $R)"; step pfs64-$PX-$R pfs_make
 
 # Each prefix names the builtins it was made for (.gex-builtins, "ARCH NAME"
@@ -580,6 +589,7 @@ if [ "$M64" != 0 ]; then
 	if [ "${WINE64_M64_NATIVE:-0}" != 0 ]; then
 		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 	fi
+	"$here/prefix-key.sh" --add "$C/pfx64-$PX/pfx" "$DIST" || exit 1
 	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
 	echo "WINE64_BUILD=$C/b64-$K-$S"
 	[ "${WINE64_M64_NATIVE:-0}" = 0 ] || echo "WINE64_NATIVE=$NATIVE"
@@ -639,6 +649,7 @@ fi
 # default's, as winepe.wasm.m64, which a process with a 64-bit memory loads
 # in its place (one set of skeletons: the same DLLs and exports).
 # Off by default: the default install and its downloads do not grow.
+BASE=$DIST
 if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	MO=$(WINE64_TWIN=0 WINE64_MEM64=1 WINE64_M64_NATIVE=1 "$0" "$W" "$C") || { log "the memory64 build for the twin failed"; exit 1; }
 	MD=$(sed -n 's/^WINE64_DIST=//p' <<< "$MO"); MN=$(sed -n 's/^WINE64_NATIVE=//p' <<< "$MO")
@@ -667,6 +678,7 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	log "twin native PE core ($K, $NK, $MK)"; step pen64-$K-$NK-twin$MK twin_native
 	NATIVE=$C/pen64-$K-$NK-twin$MK
 fi
+for d in "$BASE" "$DIST"; do "$here/prefix-key.sh" --add "$C/pfs64-$PX-$R/pfx" "$d" || exit 1; done
 echo "WINE64_DIST=$DIST"
 echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"
 echo "WINE64_TOOLS=$T"
