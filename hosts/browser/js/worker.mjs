@@ -79,6 +79,7 @@ async function forkBulkIn(child) {
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
+import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
 import { setLazyCache } from './lazy-cache.mjs';
 import { pageFs, setPageFs } from './page-fs.mjs';
@@ -528,11 +529,9 @@ async function handle(msg) {
   if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
     try {
       const t0 = logNamed('unitstall') ? performance.now() : -1;
-      const { ZSTDDecoder } = await import(msg.cgen.zstd);
-      zstd = new ZSTDDecoder();
       // compiled now, instantiated at its first decode: a Worker that never
-      // decodes (most threads) makes no memory for it
-      await zstd.prepare();
+      // decodes (most threads) makes no memory for it (zstd-late.mjs)
+      zstd = await lateZstd(import(msg.cgen.zstd), new URL('./zstddec.wasm', new URL(msg.cgen.zstd, globalThis.location?.href)).href);
       if (t0 >= 0) console.warn(`[unitzstd] decoder ready in ${(performance.now() - t0).toFixed(1)} ms`);
     } catch (err) {
       console.error(`[gex] no zstd decoder for units (${msg.cgen.zstd}): ${err?.message ?? err}`);

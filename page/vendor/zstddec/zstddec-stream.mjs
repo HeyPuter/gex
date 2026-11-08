@@ -14,7 +14,6 @@ size_t pos;
 } ZSTD_outBuffer;
 */
 let init;
-let compiled;
 let instance;
 let heap;
 let heapView;
@@ -38,24 +37,6 @@ var ZSTDDecoder = class {
 		}).then((arrayBuffer) => WebAssembly.instantiate(arrayBuffer, IMPORT_OBJECT)).then(this._init);
 		return init;
 	}
-	/** gex: compile the module and no more: its instance, and the memory it
-	 *  makes (an engine address-space reservation, however small), come at
-	 *  the first decode, made there synchronously. A Worker that may decode
-	 *  but mostly doesn't (a thread) holds no memory of its own for it. */
-	prepare() {
-		if (init || compiled) return init ?? Promise.resolve();
-		const url = new URL("./zstddec.wasm", import.meta.url);
-		const bytes = typeof process !== "undefined" && url.protocol === "file:" ? import("node:fs/promises").then((fs) => fs.readFile(url)) : fetch(url).then((response) => {
-			if (!response.ok) throw new Error(`${url}: ${response.status}`);
-			return response.arrayBuffer();
-		});
-		return bytes.then((b) => WebAssembly.compile(b)).then((m) => { compiled = m; });
-	}
-	_now() {
-		if (instance) return;
-		if (!compiled) throw new Error("ZSTDDecoder: Await .init() before decoding.");
-		this._init({ instance: new WebAssembly.Instance(compiled, IMPORT_OBJECT) });
-	}
 	/** gex: let the instance and its memory go (a wasm memory never shrinks); the next
 	 *  init() makes a new one. Every stream must have ended. */
 	dispose() {
@@ -66,7 +47,7 @@ var ZSTDDecoder = class {
 		IMPORT_OBJECT.env.emscripten_notify_memory_growth(0);
 	}
 	decode(array, uncompressedSize = 0) {
-		if (!instance) this._now();
+		if (!instance) throw new Error("ZSTDDecoder: Await .init() before decoding.");
 		const compressedSize = array.byteLength;
 		const compressedPtr = instance.exports.malloc(compressedSize);
 		heap.set(array, compressedPtr);
@@ -97,7 +78,7 @@ var ZSTDDecoder = class {
 	 *  buffer, good until the next call);
 	 *  `end()` frees it and throws if the stream is incomplete. */
 	stream() {
-		if (!instance) this._now();
+		if (!instance) throw new Error("ZSTDDecoder: Await .init() before decoding.");
 		const buffOutSize = instance.exports.ZSTD_DStreamOutSize();
 		const buffOut = instance.exports.malloc(buffOutSize);
 		const dctxPtr = instance.exports.ZSTD_createDCtx();
@@ -136,7 +117,7 @@ var ZSTDDecoder = class {
 		};
 	}
 	*decodeStreaming(arrays) {
-		if (!instance) this._now();
+		if (!instance) throw new Error("ZSTDDecoder: Await .init() before decoding.");
 		const buffInSize = instance.exports.ZSTD_DStreamInSize();
 		const buffIn = instance.exports.malloc(buffInSize);
 		const buffOutSize = instance.exports.ZSTD_DStreamOutSize();

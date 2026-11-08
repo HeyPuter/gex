@@ -5,6 +5,7 @@
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
 import { logNamed } from './log.mjs';
+import { lateZstd } from './zstd-late.mjs';
 import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
@@ -92,11 +93,11 @@ let zstdLoad = null;
  *  owner reads it for every Worker (lazy-cache.mjs): a decoder is an engine
  *  memory reservation, and one in each of a desktop's Workers ran the page
  *  out of them. Compiled here; its instance (and memory) only at a first
- *  decode. */
+ *  decode (zstd-late.mjs). */
 export function lazyReady() {
   if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
-  zstdLoad ??= import('../../../page/vendor/zstddec/zstddec-stream.mjs')
-    .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.prepare(); zstd = d; })
+  zstdLoad ??= lateZstd(import('../../../page/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../page/vendor/zstddec/zstddec.wasm', import.meta.url).href)
+    .then((d) => { zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
   return zstdLoad;
 }
