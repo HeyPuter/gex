@@ -176,7 +176,7 @@ fn unbind_overlapped(caller: &mut Caller<'_, HostState>, m: &gex_kernel::CodeMap
     let Some(memory) = caller.data().memory.clone() else { return };
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for a in gone {
-        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
+        gex_kernel::ftab::fcache_clear(&mut gex_kernel::GuestMem::new(memory.bytes()), a);
         sh.ftab.map.retire(a);
     }
 }

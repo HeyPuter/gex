@@ -15,7 +15,6 @@
 //! Off unless the page asks (`gex_set_fjit`). Natively the translation can
 //! run on worker threads (`GEX_FJIT_BACKGROUND`); here it is always inline.
 
-use gex_kernel::GuestMem;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -227,8 +226,8 @@ fn is_tier1_only(addr: u64) -> bool {
 
 /// Whether the JIT function of install `install` still matches its pages.
 pub(crate) fn current(install: u32) -> bool {
-    let mem = crate::guest_bytes();
-    let word = |off: u64| mem.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mem = crate::guest();
+    let word = |off: u64| mem.read_u32(off).unwrap_or(0);
     lock(&CHECKS)
         .as_ref()
         .and_then(|c| c.get(&install))
@@ -244,7 +243,7 @@ fn page_gen(key: u64, fresh: &mut Vec<(u64, u32)>) -> (u64, u32) {
     if at == u64::MAX {
         return (gex_abi::page_gen() + 4 * gex_abi::key_page(key).0, u32::MAX);
     }
-    let have = GuestMem::new(crate::guest_bytes()).read_u32(at).unwrap_or(0);
+    let have = crate::guest().read_u32(at).unwrap_or(0);
     if have != 0 {
         return (at, have);
     }
@@ -416,14 +415,16 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     r
 }
 
-/// The guest memory as far as it exists now: `guest_bytes` spans the whole
-/// address space, and recovery reads the slots of `call [addr]` and `jmp
+/// The guest memory as far as it exists now: the translator's view
+/// (`guest_whole`) spans the whole address space, and recovery reads the slots of `call [addr]` and `jmp
 /// [addr]` straight from it. A slot past the memory's end (Wine's system
 /// call stubs' `call [0x7ffe1000]`, in a process whose memory stops below
 /// the shared user data) is then out of bounds: a trap in the shim, which
 /// the thread took for a fault at its last PC.
 fn mem_now() -> &'static [u8] {
-    let mem = crate::guest_bytes();
+    // SAFETY: the translator's whole-memory view (`guest_whole`), cut to
+    // what exists.
+    let mem = unsafe { crate::guest_whole() };
     &mem[..(crate::warch::memory_size(0) as usize).saturating_mul(65536).min(mem.len())]
 }
 
@@ -521,7 +522,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     // reconcile covers the faulting page, not the others.
     let declined = |fresh: Vec<(u64, u32)>| {
         DECLINED.fetch_add(1, Ordering::Relaxed);
-        let mut gm = GuestMem::new(crate::guest_bytes());
+        let mut gm = crate::guest();
         for (key, b) in fresh {
             let at = crate::dir_word(key);
             if at != u64::MAX && gm.read_u32(at).unwrap_or(0) == 0 {
@@ -565,9 +566,9 @@ fn translate_root(addr: u64) -> Option<u32> {
     lock(&CHECKS).get_or_insert_with(Default::default).insert(install, checks.into_inner());
     let entries: Vec<u64> = funcs.iter().copied().filter(|&a| a != 0).collect();
     {
-        let mem = crate::guest_bytes();
+        let mut mem = crate::guest();
         for &a in &entries {
-            gex_kernel::ftab::fcache_clear(mem, a);
+            gex_kernel::ftab::fcache_clear(&mut mem, a);
         }
     }
     let (regs, mut dirs, slots) = crate::cgen::bridges_mode(&entries, alt);
@@ -638,7 +639,7 @@ static LIBS: Mutex<Vec<Rule>> = Mutex::new(Vec::new());
 #[no_mangle]
 pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
     // The string is in the shim's heap (`gex_alloc`), above the guest's
-    // slice (`GUEST_LIMIT`): read it directly, not through `guest_bytes`.
+    // range (`GUEST_LIMIT`): read it directly, not through `guest()`.
     // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
     let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
     let mut v = lock(&LIBS);
@@ -716,9 +717,7 @@ pub(crate) fn watch_check(pc: u64, at: &str) {
     if a + 8 > crate::warch::memory_size(0) as u64 * 65536 {
         return;
     }
-    let mem = crate::guest_bytes();
-    let Some(b) = mem.get(a as usize..a as usize + 8) else { return };
-    let v = u64::from_le_bytes(b.try_into().unwrap());
+    let Ok(v) = crate::guest().read_u64(a) else { return };
     let last = WATCH_LAST.swap(v, Ordering::Relaxed);
     if last != v && WATCH_SAID.fetch_add(1, Ordering::Relaxed) < 64 {
         let (thread, whose, vwhose) = (crate::cur(), crate::object_off_at(pc), crate::object_off_at(v));

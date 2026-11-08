@@ -85,6 +85,14 @@ pub fn masked_page_hash(memory: &[u8], page: u64, page_size: u64, slots: &[(u64,
     let lo = page * page_size;
     let hi = lo + page_size;
     let range = memory.get(lo as usize..(hi as usize).min(memory.len())).unwrap_or(&[]);
+    masked_hash(range, page, page_size, slots)
+}
+
+/// [`masked_page_hash`] of the page's bytes `range` (what of it the memory
+/// has), read by the caller.
+pub fn masked_hash(range: &[u8], page: u64, page_size: u64, slots: &[(u64, u64)]) -> u64 {
+    let lo = page * page_size;
+    let hi = lo + page_size;
     let first = slots.partition_point(|r| r.1 <= lo);
     let hits = &slots[first..slots[first..].partition_point(|r| r.0 < hi) + first];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

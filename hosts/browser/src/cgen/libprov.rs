@@ -183,7 +183,7 @@ fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     let len = (size + 0xfff) & !0xfff;
     // Zeroed, as a guest's anonymous mapping is: a Windows space places by
     // first fit, so the range may be one Wine's own mappings used.
-    let mut gm = GuestMem::new(crate::guest_bytes());
+    let mut gm = crate::guest();
     let mm = crate::sigs::proc_home().mm();
     let at = mm.mmap_anon(&mut gm, 0, len, prot, 0, true, name).map_err(|e| format!("mapping {name}: errno {}", e.0))?;
     if prot & gex_kernel::mem::prot::WRITE != 0 {
@@ -292,7 +292,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
         let name = format!("[provider {wasm_path} code]");
         let at = match inherited(&name) {
             Some(a) => {
-                let gm = GuestMem::new(crate::guest_bytes());
+                let gm = crate::guest();
                 if gm.read_u32(a + BASE_AT).ok() == Some(BASE_MAGIC) {
                     want_base = gm.read_u32(a + BASE_AT + 4).ok();
                 }
@@ -396,14 +396,14 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
     });
     if l.code != 0 {
         let base = ftab(|t| t.install(l.install).base);
-        let mut gm = GuestMem::new(crate::guest_bytes());
+        let mut gm = crate::guest();
         let _ = gm.write_u32(l.code + BASE_AT, BASE_MAGIC);
         let _ = gm.write_u32(l.code + BASE_AT + 4, base);
     }
     let addrs: Vec<u64> = l.pairs.iter().map(|&(a, _)| a).collect();
-    let mem = crate::guest_bytes();
+    let mut mem = crate::guest();
     for &a in &addrs {
-        gex_kernel::ftab::fcache_clear(mem, a);
+        gex_kernel::ftab::fcache_clear(&mut mem, a);
     }
     let (regs, dirs, slots) = bridges(&addrs);
     lock(&PROVIDERS).push(ProviderModule { file: format!("libprov:{}", l.path), regs, dirs, slots, memory_base: l.data as u32 as u64 });
@@ -430,7 +430,7 @@ pub extern "C" fn gex_libprov_installed(number: u32) {
         let Some(&off) = exports.get("__gexa_entries") else { return };
         (l.install, l.data, off, l.path.clone())
     };
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let at = data + off as u64;
     let (start, stop) = (gm.read_u64(at).unwrap_or(0), gm.read_u64(at + 8).unwrap_or(0));
     if start == 0 || stop <= start {
@@ -594,7 +594,7 @@ pub extern "C" fn gex_libprov_guest_call(delta: i32) {
 
 fn prov_check(delta: i32) {
     let ctx = crate::my_ctx();
-    let gm = crate::GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let reg = |o: usize| gm.read_u64(ctx + o as u64).unwrap_or(0);
     let sp = reg(gex_abi::ctx::x(4));
     if delta > 0 {

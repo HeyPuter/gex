@@ -6,12 +6,14 @@
 //! futex: `FUTEX_LOCK_PI` sets the waiters bit on a word the owner may be
 //! releasing in user space at the same moment) needs a real atomic, not a
 //! read and a write. gex-kernel forbids unsafe code; this crate is the one
-//! place that views a guest word as an atomic.
+//! place that views a guest word as an atomic, and the guest memory itself
+//! as a pointer and a length ([`mem::Span`]).
 //!
 //! Every function takes the guest memory as the kernel sees it (a byte
 //! slice) and an offset, and fails (`None`) for an offset that is out of
 //! range or not 4-aligned, as the futex syscalls require.
 
+pub mod mem;
 pub mod rcu;
 pub mod threads;
 

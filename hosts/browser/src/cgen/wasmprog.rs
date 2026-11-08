@@ -229,9 +229,8 @@ fn wine64_native_ntdll(exe: &str) -> bool {
 }
 
 fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, String> {
-    let mem = crate::guest_bytes();
-    let at = entry.wrapping_sub(0x40) as usize;
-    let h = mem.get(at..at + 36).ok_or("header outside memory")?;
+    let mem = crate::guest();
+    let h = mem.read(entry.wrapping_sub(0x40), 36).map_err(|_| "header outside memory")?;
     if &h[..8] != MAGIC {
         return Err("no GEXWASM header".into());
     }
@@ -246,21 +245,17 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // above KUSER_SHARED_DATA unless asked for there -- and gets the NT
     // trampoline page native Wine's gexrt sends the guest to. Once per fresh
     // image: a fork's child has its parent's.
-    let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
+    let flags = mem.read_u32(entry.wrapping_sub(0x40) + 36).unwrap_or(0);
     GUEST_X86_64.store(flags & FLAG_GUEST_X86_64 != 0, Ordering::Relaxed);
     if flags & FLAG_LINUX_SPACE != 0 && relocate {
         use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
         let page = gex_kernel::win::trampoline_page();
-        if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
-            dst.copy_from_slice(&page);
-        }
+        let _ = crate::guest().write(TRAMPOLINES, &page);
         crate::sigs::proc_home().mm().lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
     } else if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
         use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
         let page = gex_kernel::win::trampoline_page();
-        if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
-            dst.copy_from_slice(&page);
-        }
+        let _ = crate::guest().write(TRAMPOLINES, &page);
         // 32-bit Wine's compact address space (`winspace::wine32_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
@@ -301,7 +296,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
             mm.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
         }
     }
-    let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
+    let wasm = mem.read(wasm_at, wasm_len as usize).map_err(|_| "module outside memory")?.to_vec();
     // Wine's loader: refused when its inline probe reads another layout. Every
     // 32-bit guest program is Wine's loader; a 64-bit one is when it is bound
     // to the probe layout (abi_bound: its gex.abi section, or its gex.call_out
@@ -409,8 +404,9 @@ pub(super) fn exe_path() -> String {
 /// The bridges for a program's entries (`__gex_start`, `__gex_thread_start`,
 /// whichever module defines them), their pages in the directory.
 pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    let mut mem = crate::guest();
     for &a in addrs {
-        gex_kernel::ftab::fcache_clear(crate::guest_bytes(), a);
+        gex_kernel::ftab::fcache_clear(&mut mem, a);
     }
     let (regs, mut dirs, slots) = bridges(addrs);
     // Every entry's page in the directory, not only the pages numbered now: a

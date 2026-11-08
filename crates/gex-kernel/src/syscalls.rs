@@ -8006,10 +8006,10 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // of the count and its store (`FutexTable::pi_lock`).
             let mut pi = cx.table.pi_lock();
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & futex::pi::TID_MASK {
                     0 => {
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, tid | (v & futex::pi::WAITERS))
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, tid | (v & futex::pi::WAITERS))
                             .ok_or(Errno::EFAULT)?
                             .is_ok()
                         {
@@ -8020,7 +8020,7 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
                     // A compare-and-swap even when the bit is already on:
                     // it checks the word is still the one just read.
                     _ => {
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, v | futex::pi::WAITERS)
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, v | futex::pi::WAITERS)
                             .ok_or(Errno::EFAULT)?
                             .is_ok()
                         {
@@ -8045,11 +8045,11 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             let pi = cx.table.pi_lock();
             let rest = if pi.waiters(uaddr) { futex::pi::WAITERS } else { 0 };
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 if v & futex::pi::TID_MASK != tid {
                     return Err(Errno::EPERM);
                 }
-                if gex_atomic::cas_u32(m.bytes, uaddr, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
+                if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
                     break;
                 }
             }
@@ -8060,11 +8060,11 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
         futex::op::TRYLOCK_PI => {
             let tid = cx.tid;
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & futex::pi::TID_MASK {
                     0 => {
                         let new = tid | (v & futex::pi::WAITERS);
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, new).ok_or(Errno::EFAULT)?.is_ok() {
                             return Ok(0);
                         }
                     }
@@ -13039,7 +13039,7 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000;
 /// length past the end with a short file still reads; a `buf` outside the
 /// memory keeps its length and faults).
 fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
-    let room = (m.bytes.len() as u64).saturating_sub(buf);
+    let room = (m.len() as u64).saturating_sub(buf);
     (if room == 0 { len.min(MAX_RW_COUNT) } else { len.min(MAX_RW_COUNT).min(room) }) as usize
 }
 

@@ -123,13 +123,13 @@ struct DataSnap {
 /// A DLL's data (its `gexw.dllslots` data ranges, past the module's data
 /// at `data`) in 4 KiB pieces, the zero ones not kept (as natively).
 fn snap_data(data: u64, ranges: &[DllRange], dll: &str) -> Vec<DataSnap> {
-    let memory = crate::guest_bytes();
+    let memory = crate::guest();
     let mut out = Vec::new();
     for r in ranges.iter().filter(|r| !r.func && r.dll == dll) {
         let mut a = data + r.lo;
         while a < data + r.hi {
             let len = (data + r.hi - a).min(4096);
-            let Some(b) = memory.get(a as usize..(a + len) as usize) else { break };
+            let Ok(b) = memory.read(a, len as usize) else { break };
             out.push(DataSnap { at: a, len, bytes: b.iter().any(|&x| x != 0).then(|| b.to_vec()) });
             a += len;
         }
@@ -339,19 +339,17 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
 }
 
 /// A write of a loaded module's data (its data as before its first load, its
-/// image base, ntdll's variables): through GuestMem, as `publish`'s reads
-/// are, since a raw write through `guest_bytes` is as open to the folding
-/// that made its compare unequal; and said if it fails, since a write
-/// skipped quietly leaves the DLL running on stale data.
+/// image base, ntdll's variables): through GuestMem, and said if it fails,
+/// since a write skipped quietly leaves the DLL running on stale data.
 fn put(dll: &str, at: u64, bytes: &[u8]) {
-    if GuestMem::new(crate::guest_bytes()).write(at, bytes).is_err() {
+    if crate::guest().write(at, bytes).is_err() {
         crate::warn_line(&format!("gex-pe: {dll}: its data at {at:#x} ({} bytes) is outside memory, not written\n", bytes.len()));
     }
 }
 
 fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, String> {
     let sec = pe.sections.iter().find(|s| s.name == ".wasmref").ok_or("no .wasmref")?;
-    let (module_name, dll, data_list) = wasmref(&crate::guest_bytes()[..], base, sec)?;
+    let (module_name, dll, data_list) = wasmref(&crate::guest(), base, sec)?;
     // beside the image's file itself: a prefix's system32 and syswow64 name
     // the dist's skeletons by links (soju's bundles)
     let real = crate::sigs::proc_home().ns().canonical(path);
@@ -366,15 +364,14 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     let old = lock(&WINE_PE).mods.iter().filter(|w| w.ptr64 == pe.is64).find_map(|w| w.mapped.get(&dll).copied());
     // Released is also another mapping at the old base since, not this
     // DLL's (a program's own data there): still the DLL's, its .wasmref is.
-    // Read through GuestMem, its .wasmref against this mapping's: two
-    // slices of `guest_bytes` compared directly were folded to unequal (a
-    // pointer made from an integer, whose bounds LLVM folds at some call
-    // sites, GuestMem::view), so a DLL loaded again by another path (a
-    // program's own copy of ucrtbase.dll) took the live first mapping for
-    // released and set the module's data back to before its first load:
-    // ucrtbase's heap handle went to NULL under every later calloc.
-    let raw = GuestMem::new(crate::guest_bytes()).read(base + sec.rva as u64, sec.vsize as usize).map(<[u8]>::to_vec).map_err(|_| ".wasmref outside memory")?;
-    let still_there = |o: u64| GuestMem::new(crate::guest_bytes()).read(o + sec.rva as u64, raw.len()).is_ok_and(|b| b == &raw[..]);
+    // Its .wasmref against this mapping's, both read through GuestMem: a
+    // compare taken wrongly unequal here makes a DLL loaded again by
+    // another path (a program's own copy of ucrtbase.dll) take the live
+    // first mapping for released and set the module's data back to before
+    // its first load: ucrtbase's heap handle went to NULL under every
+    // later calloc.
+    let raw = crate::guest().read(base + sec.rva as u64, sec.vsize as usize).map(<[u8]>::to_vec).map_err(|_| ".wasmref outside memory")?;
+    let still_there = |o: u64| crate::guest().read(o + sec.rva as u64, raw.len()).is_ok_and(|b| b == &raw[..]);
     let released = old.is_some_and(|o| {
         o == base || crate::sigs::proc_home().mm().lock().vma_at(o).is_none_or(|v| v.prot == 0) || !still_there(o)
     });
@@ -445,7 +442,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     // module's data (32-bit RVAs wrap to any address).
     let edir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
     if edir != 0 && !data_list.is_empty() {
-        let mut gm = GuestMem::new(crate::guest_bytes());
+        let mut gm = crate::guest();
         let functions = gm.read_u32(base + edir as u64 + 28).map_err(|_| "export directory outside memory")? as u64;
         for (i, link) in &data_list {
             let Some(off) = wp.data_exports.get(&format!("{dll}!{link}")) else {
@@ -969,11 +966,11 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
         )
     };
     if !dead.is_empty() {
-        let memory = crate::guest_bytes();
+        let mut memory = crate::guest();
         ftab(|m| {
             for &a in &dead {
                 m.retire(a);
-                gex_kernel::ftab::fcache_clear(memory, a);
+                gex_kernel::ftab::fcache_clear(&mut memory, a);
             }
         });
     }
@@ -994,12 +991,12 @@ pub(super) fn take_back(start: u64, end: u64) {
     if installs.is_empty() {
         return;
     }
-    let memory = crate::guest_bytes();
+    let mut memory = crate::guest();
     let n = ftab(|m| {
         let gone: Vec<u64> = m.range(start, end).filter(|(_, f)| installs.contains(&f.install)).map(|(a, _)| a).collect();
         for &a in &gone {
             m.retire(a);
-            gex_kernel::ftab::fcache_clear(memory, a);
+            gex_kernel::ftab::fcache_clear(&mut memory, a);
         }
         gone.len()
     });
@@ -1031,10 +1028,10 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
         return false;
     }
     use gex_kernel::win::skel;
-    let bytes: &[u8] = crate::guest_bytes();
-    let stub = |a: u64| skel::intact(bytes, a);
+    let bytes = crate::guest();
+    let stub = |a: u64| skel::intact(&bytes, a);
     // Unreadable or the stub still there: a live skeleton.
-    if crate::GuestMem::new(crate::guest_bytes()).read_u32(pc).is_err() || stub(pc) {
+    if crate::guest().read_u32(pc).is_err() || stub(pc) {
         return false;
     }
     let (lo, hi) = {
@@ -1044,13 +1041,13 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
             None => (pc & !0xfff, (pc & !0xfff) + 0x1000),
         }
     };
-    let memory = crate::guest_bytes();
+    let mut memory = crate::guest();
     let gone: Vec<u64> = ftab(|m| m.range(lo, hi).filter(|(a, f)| installs.contains(&f.install) && !stub(*a)).map(|(a, _)| a).collect());
     ftab(|m| {
         for &a in &gone {
-            bind_alias_of(m, bytes, a);
+            bind_alias_of(m, &bytes, a);
             m.retire(a);
-            gex_kernel::ftab::fcache_clear(memory, a);
+            gex_kernel::ftab::fcache_clear(&mut memory, a);
         }
     });
     crate::trace_line(&format!("gex: {} native bindings in {lo:#x}..{hi:#x} outlived their skeleton; forgotten\n", gone.len()));
@@ -1059,7 +1056,7 @@ pub(crate) fn binding_is_stale(pc: u64) -> bool {
 
 /// Bind the native export at `stub`'s alias too (`gex_kernel::win::skel`),
 /// when it is still the alias and nothing is bound there.
-fn bind_alias_of(m: &mut gex_kernel::ftab::FuncMap, bytes: &[u8], stub: u64) -> bool {
+fn bind_alias_of(m: &mut gex_kernel::ftab::FuncMap, bytes: &GuestMem<'_>, stub: u64) -> bool {
     let alias = stub + gex_kernel::win::skel::ALIAS;
     if !gex_kernel::win::skel::alias(bytes, alias) || m.get(alias).is_some() {
         return false;
@@ -1078,12 +1075,12 @@ pub(crate) fn bind_alias(pc: u64) -> bool {
     if pc % 16 != skel::ALIAS || !in_skeleton(pc) {
         return false;
     }
-    let bytes: &[u8] = crate::guest_bytes();
-    if !skel::alias(bytes, pc) {
+    let bytes = crate::guest();
+    if !skel::alias(&bytes, pc) {
         return false;
     }
     let installs = installs();
-    ftab(|m| m.get(pc - skel::ALIAS).is_some_and(|f| installs.contains(&f.install)) && bind_alias_of(m, bytes, pc - skel::ALIAS))
+    ftab(|m| m.get(pc - skel::ALIAS).is_some_and(|f| installs.contains(&f.install)) && bind_alias_of(m, &bytes, pc - skel::ALIAS))
 }
 
 /// The function-table installs of Wine's PE modules.
@@ -1211,16 +1208,14 @@ fn alloc_pe_data_window(low: &mut u64, size: u64, name: &str) -> Result<u64, Str
         mm.note_host_data(a, a + len);
         a
     };
-    if let Some(b) = crate::guest_bytes().get_mut(a as usize..(a + len) as usize) {
-        b.fill(0);
-    }
+    let _ = crate::guest().zero(a, len as usize);
     Ok(a)
 }
 
 fn clear(addrs: &[u64]) {
-    let mem = crate::guest_bytes();
+    let mut mem = crate::guest();
     for &a in addrs {
-        gex_kernel::ftab::fcache_clear(mem, a);
+        gex_kernel::ftab::fcache_clear(&mut mem, a);
     }
 }
 
@@ -1302,17 +1297,15 @@ pub extern "C" fn gex_wasmdll_installed() {
 }
 
 fn installed_one(install: u32, data: u64, entries: Option<(u32, Option<u32>)>, pending: Vec<(u64, Vec<u8>)>, w: u64) {
-    let mem = crate::guest_bytes();
+    let mut mem = crate::guest();
     for (at, bytes) in pending {
-        if let Some(dst) = mem.get_mut(at as usize..at as usize + bytes.len()) {
-            dst.copy_from_slice(&bytes);
-        }
+        let _ = mem.write(at, &bytes);
     }
     let Some((off, decl)) = entries else { return };
     // The ICALL pass's {function, thunk} pairs (table indices): each thunk
     // at its function's index as a guest address (as the native
     // `bind_entry_thunks`).
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let base = ftab(|m| m.install(install).base);
     let read = |off: u32| -> Vec<(u64, u32)> {
         let at = data + off as u64;
@@ -1497,9 +1490,8 @@ pub extern "C" fn gex_wasmdll_bind_done(i: u32) {
 
 /// The skeleton's `.wasmref`: `GEXWREF1 module\0 dll\0 u32 count { u32
 /// index, name\0 }` (winebuild `--wasm-shared`).
-fn wasmref(mem: &[u8], base: u64, sec: &gex_ld::pe::Section) -> Result<(String, String, Vec<(u32, String)>), String> {
-    let at = (base + sec.rva as u64) as usize;
-    let raw = mem.get(at..at + sec.vsize as usize).ok_or(".wasmref outside memory")?;
+fn wasmref(mem: &GuestMem<'_>, base: u64, sec: &gex_ld::pe::Section) -> Result<(String, String, Vec<(u32, String)>), String> {
+    let raw = mem.read(base + sec.rva as u64, sec.vsize as usize).map_err(|_| ".wasmref outside memory")?;
     if raw.get(..8) != Some(&b"GEXWREF1"[..]) {
         return Err(".wasmref is not GEXWREF1".into());
     }
@@ -1602,8 +1594,8 @@ pub(super) fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, Stri
 /// by it), or 0 when the module is not installed or has no such function.
 #[no_mangle]
 pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
-    let mem = crate::guest_bytes();
-    let Some(b) = mem.get(ptr as usize..(ptr as usize).saturating_add(len as usize)) else { return 0 };
+    let mem = crate::guest();
+    let Ok(b) = mem.read(ptr as u64, len as usize) else { return 0 };
     let name = String::from_utf8_lossy(b).into_owned();
     let g = lock(&WINE_PE);
     // (of the process's own mode: the caller is a Unix side's)

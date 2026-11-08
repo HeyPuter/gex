@@ -80,44 +80,43 @@ pub use proclive::{KernelProcSource, ProcCell};
 /// Guest virtual address equals byte offset, so the kernel needs
 /// no translation layer — just bounds checks, which are also the syscall
 /// ABI's `EFAULT` checks.
+///
+/// Held as a [`gex_atomic::mem::Span`], never as a slice of the whole: in
+/// the browser the memory starts at address 0, where a Rust reference may
+/// not point, and every accessor makes a slice of only the range it was
+/// asked for (see the span's module).
 pub struct GuestMem<'a> {
-    pub bytes: &'a mut [u8],
+    span: gex_atomic::mem::Span<'a>,
 }
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { bytes }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes) }
     }
 
-    /// The backing bytes, hidden from the optimiser on wasm.
-    ///
-    /// In the browser this slice spans the guest's whole address space via a
-    /// pointer made from an integer. LLVM sees no provenance, assumes size zero,
-    /// and folds the bounds checks below to "always out of range" at some call
-    /// sites but not others. A barrier at each use leaves it nothing to fold;
-    /// native hosts get a real slice and need none of this.
+    /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
+    /// its memory).
+    pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
+        GuestMem { span }
+    }
+
+    /// The memory as one slice, where it is one (a native host's, a
+    /// buffer); `None` for the browser's.
+    pub fn as_slice_mut(&mut self) -> Option<&mut [u8]> {
+        self.span.as_slice_mut()
+    }
+
+    /// `r`, checked by [`Self::range`], as a slice: `EFAULT` at address 0
+    /// of the browser's memory, which no slice may start at (as for an
+    /// unmapped zero page).
     #[inline(always)]
-    fn view(&self) -> &[u8] {
-        #[cfg(target_family = "wasm")]
-        {
-            std::hint::black_box(&*self.bytes)
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.bytes
-        }
+    fn slice(&self, r: std::ops::Range<usize>) -> Result<&[u8], Errno> {
+        self.span.get(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
     #[inline(always)]
-    fn view_mut(&mut self) -> &mut [u8] {
-        #[cfg(target_family = "wasm")]
-        {
-            std::hint::black_box(&mut *self.bytes)
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.bytes
-        }
+    fn slice_mut(&mut self, r: std::ops::Range<usize>) -> Result<&mut [u8], Errno> {
+        self.span.get_mut(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
@@ -129,13 +128,23 @@ impl<'a> GuestMem<'a> {
         Ok(start..end)
     }
 
+    /// How far the memory may be addressed: the length it was made with,
+    /// whatever of it exists ([`Self::limit`] is what does).
+    pub fn len(&self) -> usize {
+        self.span.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.span.is_empty()
+    }
+
     /// The last address this memory really has, read live.
     ///
-    /// Not `view().len()`: in the browser the view spans the whole 2 GiB a
-    /// guest pointer may name, while the memory starts smaller and grows as the
-    /// guest maps, so a check against the view passed for unbacked addresses and
-    /// the access trapped. Live because it moves during a syscall -- an `mmap`
-    /// grows the memory then zeroes what it just mapped.
+    /// Not the length it was made with: in the browser that spans the whole
+    /// 2 GiB a guest pointer may name, while the memory starts smaller and
+    /// grows as the guest maps, so a check against it passed for unbacked
+    /// addresses and the access trapped. Live because it moves during a
+    /// syscall -- an `mmap` grows the memory then zeroes what it just mapped.
     #[inline(always)]
     fn limit(&self) -> usize {
         #[cfg(target_family = "wasm")]
@@ -145,17 +154,27 @@ impl<'a> GuestMem<'a> {
             #[cfg(target_arch = "wasm64")]
             let pages = core::arch::wasm64::memory_size(0);
             let live = (pages as u64) << 16;
-            (live as usize).min(self.view().len())
+            (live as usize).min(self.span.len())
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            self.view().len()
+            self.span.len()
         }
+    }
+
+    /// The 4 bytes at `addr` for an atomic access ([`gex_atomic`]'s, at
+    /// offset 0 of them): `None` outside memory.
+    pub fn word_mut(&mut self, addr: u64) -> Option<&mut [u8]> {
+        if addr % 4 != 0 {
+            return None;
+        }
+        let r = self.range(addr, 4).ok()?;
+        self.slice_mut(r).ok()
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
         let r = self.range(addr, len)?;
-        Ok(&self.view()[r])
+        self.slice(r)
     }
 
     /// A writable slice of guest memory, for a caller that fills it itself.
@@ -165,12 +184,12 @@ impl<'a> GuestMem<'a> {
     /// claim 117 arena spans (1,872 MiB). See task 140.
     pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
         let r = self.range(addr, len)?;
-        Ok(&mut self.view_mut()[r])
+        self.slice_mut(r)
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
         let r = self.range(addr, data.len())?;
-        self.view_mut()[r].copy_from_slice(data);
+        self.slice_mut(r)?.copy_from_slice(data);
         Ok(())
     }
 
@@ -178,7 +197,7 @@ impl<'a> GuestMem<'a> {
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero", len);
         let r = self.range(addr, len)?;
-        self.view_mut()[r].fill(0);
+        self.slice_mut(r)?.fill(0);
         Ok(())
     }
 
@@ -190,7 +209,9 @@ impl<'a> GuestMem<'a> {
         big_op("copy_within", len);
         let s = self.range(src, len)?;
         let d = self.range(dst, len)?;
-        self.view_mut().copy_within(s, d.start);
+        if !self.span.copy_within(s.start, d.start, len) {
+            return Err(Errno::EFAULT);
+        }
         Ok(())
     }
 
@@ -203,7 +224,7 @@ impl<'a> GuestMem<'a> {
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
-        zero_dirty_bytes(&mut self.view_mut()[r]);
+        zero_dirty_bytes(self.slice_mut(r)?);
         Ok(())
     }
 
@@ -248,7 +269,7 @@ impl<'a> GuestMem<'a> {
             return Err(Errno::EFAULT);
         }
         let end = (start + buf.len()).min(limit);
-        let slice = &self.view()[start..end];
+        let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => {
                 buf[..n].copy_from_slice(&slice[..n]);
@@ -269,7 +290,7 @@ impl<'a> GuestMem<'a> {
         // of the stack is within a page of memory's end, and scanning `max`
         // bytes ran off into pages never mapped.
         let end = (start + max).min(limit);
-        let slice = &self.view()[start..end];
+        let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),
             None => Err(Errno::ENAMETOOLONG),

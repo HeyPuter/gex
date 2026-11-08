@@ -217,7 +217,7 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     }
     let [pc, ctx_addr, sp, tls, brk] = CLAIMED_FORK.with(|c| c.get());
     let ctx = {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         gm.read(ctx_addr, ctx::SIZE).map(<[u8]>::to_vec).unwrap_or_default()
     };
     // The parent's constants and a copy of its map, from what it publishes
@@ -293,7 +293,7 @@ pub(crate) fn check(nr: u64, a0: u64) {
     const SPAWN: u64 = 0x100 | 0x4000; // CLONE_VM | CLONE_VFORK
     let flags = match nr {
         CLONE => a0,
-        CLONE3 => GuestMem::new(guest_bytes()).read_u64(a0).unwrap_or(0),
+        CLONE3 => guest().read_u64(a0).unwrap_or(0),
         _ => 0,
     };
     // A spawn shares the map; a fork (no CLONE_VM) copies it, and its
@@ -688,7 +688,7 @@ pub extern "C" fn gex_vfork_end() -> i64 {
     EXITED.with(|c| c.set(outer.as_ref().is_some_and(|f| f.exited)));
     WHY.with(|c| c.set(outer.as_ref().map_or(0, |f| f.why)));
     if !ctx.is_empty() {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let _ = gm.write(ctx_addr, &ctx);
     }
     CURRENT.with(|c| c.set(cur));

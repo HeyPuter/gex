@@ -38,7 +38,7 @@ pub(crate) fn note(nr: u64, ctx: u64, sp_index: u8) {
     if n % EVERY != 0 {
         return;
     }
-    let gm = gex_kernel::GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let Ok(sp) = gm.read_u64(ctx + gex_abi::ctx::x(sp_index) as u64) else { return };
     let mut g = MAPS.lock().unwrap_or_else(|e| e.into_inner());
     // The maps again every 4096 samples (a new image is caught soon enough).

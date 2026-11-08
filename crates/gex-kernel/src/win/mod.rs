@@ -264,13 +264,31 @@ pub mod skel {
     /// The alias's offset from its stub.
     pub const ALIAS: u64 = 14;
 
-    fn at<const N: usize>(m: &[u8], a: u64) -> Option<[u8; N]> {
-        let a = usize::try_from(a).ok()?;
-        m.get(a..a.checked_add(N)?)?.try_into().ok()
+    /// Memory a skeleton is read from: a slice addressed from 0 (a native
+    /// host's memory, a test's), or the guest's [`crate::GuestMem`].
+    pub trait Bytes {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]>;
+    }
+
+    impl Bytes for [u8] {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]> {
+            let a = usize::try_from(a).ok()?;
+            self.get(a..a.checked_add(n)?)
+        }
+    }
+
+    impl Bytes for crate::GuestMem<'_> {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]> {
+            self.read(a, n).ok()
+        }
+    }
+
+    fn at<const N: usize>(m: &(impl Bytes + ?Sized), a: u64) -> Option<[u8; N]> {
+        m.bytes_at(a, N)?.try_into().ok()
     }
 
     /// Whether the bytes at `a` are still an export's stub.
-    pub fn stub(m: &[u8], a: u64) -> bool {
+    pub fn stub(m: &(impl Bytes + ?Sized), a: u64) -> bool {
         match at::<4>(m, a) {
             Some([0x0f, 0x0b, 0x0f, 0x0b]) => true,
             Some([0xff, 0x25, 0, 0]) => at::<2>(m, a + 4) == Some([0, 0]) && alias_target(m, a) == Some(a + ALIAS),
@@ -280,7 +298,7 @@ pub mod skel {
 
     /// The address the 64-bit stub at `a` jumps to (its alias, unless the
     /// operand was rewritten).
-    pub fn alias_target(m: &[u8], a: u64) -> Option<u64> {
+    pub fn alias_target(m: &(impl Bytes + ?Sized), a: u64) -> Option<u64> {
         at::<8>(m, a + 6).map(u64::from_le_bytes)
     }
 
@@ -288,12 +306,12 @@ pub mod skel {
     /// bytes into a 16-byte stub. Not by the stub's operand: a 14-byte hook
     /// (`jmp [rip+0]` and the detour's address) rewrote it, and the hook's
     /// trampoline, which copied the original 14 bytes, still lands here.
-    pub fn alias(m: &[u8], a: u64) -> bool {
+    pub fn alias(m: &(impl Bytes + ?Sized), a: u64) -> bool {
         a % 16 == ALIAS && at::<2>(m, a) == Some([0xcc, 0xcc])
     }
 
     /// Whether the bytes at `a` are still the skeleton's: a stub or an alias.
-    pub fn intact(m: &[u8], a: u64) -> bool {
+    pub fn intact(m: &(impl Bytes + ?Sized), a: u64) -> bool {
         stub(m, a) || alias(m, a)
     }
 
@@ -314,18 +332,18 @@ pub mod skel {
             m[0..4].copy_from_slice(&[0x0f, 0x0b, 0x0f, 0x0b]);
             stub64(&mut m, 16);
             stub64(&mut m, 32);
-            assert!(stub(&m, 0) && intact(&m, 0));
-            assert!(stub(&m, 16) && !alias(&m, 16));
-            assert!(alias(&m, 30) && !stub(&m, 30) && intact(&m, 30));
-            assert_eq!(alias_target(&m, 32), Some(46));
+            assert!(stub(&m[..], 0) && intact(&m[..], 0));
+            assert!(stub(&m[..], 16) && !alias(&m[..], 16));
+            assert!(alias(&m[..], 30) && !stub(&m[..], 30) && intact(&m[..], 30));
+            assert_eq!(alias_target(&m[..], 32), Some(46));
             // a 5-byte hook at 16: the stub is gone, its operand and alias stay
             m[16..21].copy_from_slice(&[0xe9, 1, 2, 3, 4]);
-            assert!(!intact(&m, 16) && alias(&m, 30) && alias_target(&m, 16) == Some(30));
+            assert!(!intact(&m[..], 16) && alias(&m[..], 30) && alias_target(&m[..], 16) == Some(30));
             // a 14-byte one at 32 over the operand: the stub is gone, its alias stays
             m[32..38].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
             m[38..46].copy_from_slice(&0x1234u64.to_le_bytes());
-            assert!(!stub(&m, 32) && !intact(&m, 32) && alias(&m, 46) && intact(&m, 46));
-            assert!(!intact(&m, 60) && !intact(&m, 1000));
+            assert!(!stub(&m[..], 32) && !intact(&m[..], 32) && alias(&m[..], 46) && intact(&m[..], 46));
+            assert!(!intact(&m[..], 60) && !intact(&m[..], 1000));
         }
     }
 }

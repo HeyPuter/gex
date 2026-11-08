@@ -426,7 +426,7 @@ fn ftab_safe_len() -> u32 {
 /// Write `addr → idx` into the probe cache if every running Worker's table
 /// holds `idx`; otherwise leave the slot to resolve (clearing it if it named
 /// `addr`).
-fn fcache_publish(mem: &mut [u8], addr: u64, idx: u32) {
+fn fcache_publish(mem: &mut gex_kernel::GuestMem<'_>, addr: u64, idx: u32) {
     if idx < ftab_safe_len() {
         gex_kernel::ftab::fcache_write(mem, addr, idx);
     } else {
@@ -609,9 +609,10 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
 }
 
 /// A hash of guest page `page` as it is now (the native host's `page_hash`).
-fn page_hash(memory: &[u8], page: u64) -> u64 {
+fn page_hash(memory: &gex_kernel::GuestMem<'_>, page: u64) -> u64 {
     let slots = lock(&IMPORT_SLOTS);
-    gex_xlate::masked_page_hash(memory, page, gex_abi::DISPATCH_PAGE, &slots)
+    let range = memory.read(page * gex_abi::DISPATCH_PAGE, gex_abi::DISPATCH_PAGE as usize).unwrap_or(&[]);
+    gex_xlate::masked_hash(range, page, gex_abi::DISPATCH_PAGE, &slots)
 }
 
 /// The import slots of every PE image placed (absolute, sorted): bytes the
@@ -782,13 +783,12 @@ fn wine32_trampolines(class32: bool) {
 /// it, which retires the page and the unit's functions on it) the unit must
 /// wait for the image's first miss.
 fn wine32_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at_map: bool) -> bool {
-    let memory = crate::guest_bytes();
+    let memory = crate::guest();
     let mask = if at_map { None } else { Some(pe) };
     image.segments.iter().filter(|s| s.executable).all(|seg| {
-        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
         memory
-            .get(lo..lo + n)
-            .is_some_and(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, mask).is_none())
+            .read(seg.vaddr, seg.bytes.len())
+            .is_ok_and(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, mask).is_none())
     })
 }
 
@@ -1145,7 +1145,7 @@ impl Lean {
 /// as natively: a unit over different code is wrong code). `optional`: a
 /// missing unit is fine even under `--cgen` (Wine's DLLs, the trampolines).
 fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Option<&gex_ld::pe::PeImage>) {
-    let memory = crate::guest_bytes();
+    let memory = crate::guest();
     let mut pages = Vec::new();
     // A native wasm32 Wine DLL's skeleton has no x86 code (no unit is ever
     // built for it: its `ud2` stubs are bound to Wine's PE module).
@@ -1154,13 +1154,13 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         note_import_slots(base, pe);
     }
     for seg in image.segments.iter().filter(|s| s.executable && !skeleton) {
-        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
-        let live = memory.get(lo..lo + n);
-        if let Some(i) = live.and_then(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, pe)) {
+        let n = seg.bytes.len();
+        let live = memory.read(seg.vaddr, n).ok();
+        if let Some((i, live)) = live.and_then(|live| Some((gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, pe)?, live))) {
             crate::warn_line(&format!(
                 "gex-cgen: {path}: the mapped code at {:#x} differs from the image (guest {:#04x}, image {:#04x}); refusing its unit\n",
                 seg.vaddr + i as u64,
-                memory[lo + i],
+                live[i],
                 seg.bytes[i]
             ));
             crate::end_process(0xc000_0005);
@@ -1168,7 +1168,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         let first = seg.vaddr / gex_abi::DISPATCH_PAGE;
         let last = (seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
         for page in first..=last {
-            pages.push((page, page_hash(memory, page)));
+            pages.push((page, page_hash(&memory, page)));
         }
     }
     // An image read lean has its identity from its file.
@@ -1566,9 +1566,9 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
     {
-        let mem = crate::guest_bytes();
+        let mut mem = crate::guest();
         for &a in &addrs {
-            gex_kernel::ftab::fcache_clear(mem, a);
+            gex_kernel::ftab::fcache_clear(&mut mem, a);
         }
     }
     let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
@@ -1584,11 +1584,10 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
         x.slots = nslots;
         let mut pages = lock(&UNIT_PAGES);
         let map = pages.get_or_insert_with(Default::default);
-        let mem = crate::guest_bytes();
+        let mut mem = crate::guest();
         for &(page, hash) in &x.pages {
             map.insert(page, hash);
-            let off = (gex_abi::patched_pages() + page / 8) as usize;
-            if let Some(b) = mem.get_mut(off) {
+            if let Ok([b]) = mem.read_mut(gex_abi::patched_pages() + page / 8, 1) {
                 *b &= !(1 << (page % 8));
             }
         }
@@ -1841,9 +1840,9 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
     ftab(|m| m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs));
     let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
     {
-        let mem = crate::guest_bytes();
+        let mut mem = crate::guest();
         for &a in &addrs {
-            gex_kernel::ftab::fcache_clear(mem, a);
+            gex_kernel::ftab::fcache_clear(&mut mem, a);
         }
     }
     let alt = lock(&UNITS).get(u as usize).is_some_and(|x| x.alt);
@@ -1942,7 +1941,7 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     // (32-bit Wine: Wine's PE module's data in the grandchild of a process that had
     // it at the same address, whose stale bss cached another process's
     // function-table indices).
-    let mut gm = GuestMem::new(crate::guest_bytes());
+    let mut gm = crate::guest();
     for (a, b) in dirty {
         gm.zero_dirty(a, (b - a) as usize).map_err(|e| format!("zeroing {name}: errno {}", e.0))?;
     }
@@ -1969,10 +1968,9 @@ fn builtin_data(file: &str, wasm: &[u8]) -> Result<u32, String> {
 #[no_mangle]
 pub extern "C" fn gex_host_data(from: u32, out: u32, max: u32) -> u32 {
     let ranges = crate::sigs::proc_home().mm().lock().host_data().to_vec();
-    let b = crate::guest_bytes();
+    let mut b = crate::guest();
     for (i, &(lo, hi)) in ranges.iter().skip(from as usize).take(max as usize).enumerate() {
-        let at = out as usize + i * 8;
-        let Some(dst) = b.get_mut(at..at + 8) else { break };
+        let Ok(dst) = b.read_mut(out as u64 + i as u64 * 8, 8) else { break };
         dst[..4].copy_from_slice(&(lo as u32).to_le_bytes());
         dst[4..].copy_from_slice(&(hi.min(0xffff_ffff) as u32).to_le_bytes());
     }
@@ -2216,7 +2214,7 @@ pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
 
 pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
     crate::with_jit_only(|j| {
-        let mut gm = GuestMem::new(crate::guest_bytes());
+        let mut gm = crate::guest();
         for (page, base) in dirs {
             if j.page_table.lookup(page) == Some(base) {
                 // The table high-water a sibling Worker's out-of-bounds
@@ -2414,14 +2412,14 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     if addr == STRAY_PC {
         return gex_abi::ftab::FALLBACK as i32;
     }
-    let mem = crate::guest_bytes();
+    let mut mem = crate::guest();
     let hit = ftab(|m| {
         let f = m.get(addr)?;
         let stale = if m.install(f.install).tier == Tier::Jit {
             !crate::fjit::current(f.install)
         } else {
             let page = addr / gex_abi::DISPATCH_PAGE;
-            let patched = mem.get((gex_abi::patched_pages() + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
+            let patched = mem.read(gex_abi::patched_pages() + page / 8, 1).is_ok_and(|b| b[0] & (1 << (page % 8)) != 0);
             // A provider serves the export whatever its bytes became: a game's
             // mod sandbox may rewrite a DLL's entry points, which the Lua provider
             // replaces (as natively, ftab.rs `current`).
@@ -2443,7 +2441,7 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         if stats && f.idx >= ftab_safe_len() {
             fcache_why(W_REFUSED);
         }
-        fcache_publish(mem, addr, f.idx);
+        fcache_publish(&mut mem, addr, f.idx);
         Some(f.idx)
     });
     // An ejected project's training run (`run.mjs --record-entries`): an
@@ -2467,7 +2465,7 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         }
     }
     if !served {
-        fcache_publish(mem, addr, idx);
+        fcache_publish(&mut mem, addr, idx);
     }
     idx as i32
 }
@@ -2521,9 +2519,7 @@ fn fcache_stat(addr: u64) {
         }
         m.1 += (addr >> 32 != 0) as u64;
         {
-            let mem = crate::guest_bytes();
-            let at = gex_abi::fcache_entry(addr) as usize;
-            let e = mem.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+            let e = crate::guest().read_u64(gex_abi::fcache_entry(addr)).unwrap_or(0);
             let other = e >> gex_abi::FCACHE_TAG_BITS != gex_abi::ftab::RESOLVE as u64 && e & gex_abi::FCACHE_TAG_MASK != addr & gex_abi::FCACHE_TAG_MASK;
             fcache_why(if other { W_COLLISION } else { W_EMPTY });
         }
@@ -2564,7 +2560,7 @@ fn fcache_stat(addr: u64) {
 #[no_mangle]
 pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64) -> i32 {
     LEAVES.fetch_add(1, Ordering::Relaxed);
-    let mut gm = GuestMem::new(crate::guest_bytes());
+    let mut gm = crate::guest();
     let c = ctx as u32 as u64;
     let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
     let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
@@ -2711,7 +2707,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
     {
-        let after = GuestMem::new(crate::guest_bytes()).read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+        let after = crate::guest().read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
         CALLOUT_RING.with(|x| {
             let mut x = x.borrow_mut();
             if x.len() >= 24 {
@@ -2723,7 +2719,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if r == gex_abi::ftab::RET_LEFT {
         CALLOUT_LEFT.fetch_add(1, Ordering::Relaxed);
         if libprov::provider_return(ret as u64) {
-            let pc = GuestMem::new(crate::guest_bytes()).read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
+            let pc = crate::guest().read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
             crate::warn_line(&format!("[gex] a provider's guest call-out to {t:#x} was left (the guest is at {pc:#x})\n"));
         }
     }
@@ -3000,7 +2996,7 @@ pub(crate) fn sp_index() -> u8 {
 /// nested loop ends that call-out). An untranslated return address is
 /// caught here; a translated one by the watched table entry (JS).
 pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
-    let sp = GuestMem::new(crate::guest_bytes()).read_u64(ctx + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    let sp = crate::guest().read_u64(ctx + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
     // Only a call-out with no NT callback begun inside it (as `#watchHit`).
     let cb = CB_DEPTH.with(|d| d.get());
     let hit = CALLOUTS.with(|c| {
@@ -3088,7 +3084,7 @@ thread_local! {
 /// Keep the guest's registers at a stray return to the pad (thread
 /// context `ctx`).
 fn stray_keep(ctx: u64) {
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let mut v: Vec<u64> = (0..STRAY_WORDS as u64).map(|i| gm.read_u64(ctx + 8 * i).unwrap_or(0)).collect();
     v.push(gm.read_u64(ctx + gex_abi::ctx::NZCV as u64).unwrap_or(0));
     STRAY.with(|s| *s.borrow_mut() = Some(v));
@@ -3116,7 +3112,7 @@ pub extern "C" fn gex_callout_stray(take: i32) -> i32 {
 fn stray_restore(ctx: u64) -> bool {
     // (One thread per Worker: the context it was kept from is this one.)
     let Some(v) = STRAY.with(|s| s.borrow_mut().take()) else { return false };
-    let mut gm = GuestMem::new(crate::guest_bytes());
+    let mut gm = crate::guest();
     for (i, w) in v[..STRAY_WORDS].iter().enumerate() {
         let _ = gm.write_u64(ctx + 8 * i as u64, *w);
     }
@@ -3184,7 +3180,7 @@ fn dispatch_ref(pc: u64, alt: bool) -> i64 {
     if at == u64::MAX {
         return -1;
     }
-    let entry = GuestMem::new(crate::guest_bytes()).read_u32(at).unwrap_or(0);
+    let entry = crate::guest().read_u32(at).unwrap_or(0);
     if entry == 0 {
         return -1;
     }
@@ -3447,13 +3443,13 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     // the cache; the body found its page patched and left through the same
     // slot, to itself, forever: explorer's uxtheme.dll, unloaded and loaded
     // again at its base, hung its DllMain with the loader lock held.
-    let memory = crate::guest_bytes();
+    let mut memory = crate::guest();
     let keep = TEST_KEEP_PROBE.load(Ordering::Relaxed);
     ftab(|m| {
         for &(start, end) in ranges {
             for (a, _) in m.range(start, end).collect::<Vec<_>>() {
                 if !keep {
-                    gex_kernel::ftab::fcache_clear(memory, a);
+                    gex_kernel::ftab::fcache_clear(&mut memory, a);
                 }
             }
         }
@@ -3484,11 +3480,11 @@ pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
     on_retire_pages(old_code, old_code);
     let mut dead = libprov::numbers();
     dead.extend(wasmprog::numbers());
-    let memory = crate::guest_bytes();
+    let mut memory = crate::guest();
     ftab(|m| {
         for &(start, end) in old_code {
             for (a, _) in m.retire_range(start, end) {
-                gex_kernel::ftab::fcache_clear(memory, a);
+                gex_kernel::ftab::fcache_clear(&mut memory, a);
             }
         }
         for n in dead {
@@ -3503,15 +3499,14 @@ pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
 fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };
-    let memory = crate::guest_bytes();
+    let mut memory = crate::guest();
     for &(start, end) in ranges {
         for page in start / gex_abi::DISPATCH_PAGE..end.div_ceil(gex_abi::DISPATCH_PAGE) {
             let Some(&built) = pages.get(&page) else { continue };
             let at = page * gex_abi::DISPATCH_PAGE;
             let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
-            if unmapped || page_hash(memory, page) != built {
-                let off = (gex_abi::patched_pages() + page / 8) as usize;
-                if let Some(b) = memory.get_mut(off) {
+            if unmapped || page_hash(&memory, page) != built {
+                if let Ok([b]) = memory.read_mut(gex_abi::patched_pages() + page / 8, 1) {
                     *b |= 1 << (page % 8);
                 }
             }
@@ -3595,7 +3590,7 @@ fn wine64_entry(gm: &GuestMem, c: u64, t: u64, ret: u64) -> Option<i32> {
     }
     crate::set_resume_none();
     crate::set_resume_ctx_none();
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
     let back = gm.read_u64(sp_at).unwrap_or(0);
     Some(if pc == ret && back == sp + 8 { gex_abi::ftab::RET_PREDICTED } else { gex_abi::ftab::RET_LEFT })
@@ -3631,7 +3626,7 @@ pub extern "C" fn gex_snap_entry_tail(c: i32) -> i32 {
 /// could not. A call that left another thread's context to resume with
 /// traps out ([`wine64_entry`]), the way the fault hook's return would leave.
 pub(crate) fn wine64_entry_illegal(c: u64, pc: u64) -> bool {
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     let Ok(sp) = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64) else { return false };
     let Ok(ret) = gm.read_u64(sp) else { return false };
     wine64_entry(&gm, c, pc, ret).is_some()
@@ -3733,7 +3728,7 @@ pub(crate) fn fault_in_place(c: u64, code: u32, addr: u64, kind: u32) -> bool {
 /// the hook's work is done on the 64-bit one, a little below R14
 /// ([`WOW64_DISPATCH_ROOM`]), as `gex.mjs` `#hookStack` puts it.
 fn hook_sp(c: u64) -> Option<u64> {
-    let gm = GuestMem::new(crate::guest_bytes());
+    let gm = crate::guest();
     if crate::thread_alt() {
         return gm.read_u64(c + gex_abi::ctx::x(14) as u64).ok().map(|r14| (r14 & 0xffff_ffff).saturating_sub(WOW64_DISPATCH_ROOM));
     }
@@ -3838,7 +3833,7 @@ pub extern "C" fn gex_handler_lost(ctx_addr: u32, jmp: u32) -> u32 {
         return 0;
     }
     let c = ctx_addr as u64;
-    let mut gm = GuestMem::new(crate::guest_bytes());
+    let mut gm = crate::guest();
     let teb = gm.read_u64(c + gex_abi::ctx::FS_BASE as u64).unwrap_or(0) & 0xffff_ffff;
     let frame = jmp as u64 - 16;
     let (Ok(head), Ok(prev), Ok(code)) = (gm.read_u32(teb), gm.read_u32(frame), gm.read_u32(jmp as u64 + 64)) else { return 0 };

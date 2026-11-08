@@ -383,7 +383,7 @@ pub fn pump_if_wanted() {
     }
     let device = COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(w) = device.filter(|w| w.needs_pump()) {
-        let gm = GuestMem::new(crate::guest_bytes());
+        let gm = crate::guest();
         w.pump(&gm);
     }
 }

@@ -138,7 +138,7 @@ pub(crate) fn submit_pending(ctx_addr: u64) {
     } else {
         return;
     };
-    let mut m = GuestMem::new(crate::guest_bytes());
+    let mut m = crate::guest();
     let _ = m.write_u64(ctx_addr + gex_abi::ctx::x(0) as u64, rax as u64);
 }
 

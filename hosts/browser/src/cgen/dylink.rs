@@ -742,7 +742,7 @@ fn adopt_inherited(p: &mut DyProc, mods: &str, inh: &str, wasm: &[u8], entry: u6
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_ready() -> i32 {
     let Some((order, libc)) = lock(&REGISTRY).take() else { return 0 };
-    let r = dy(|d| d.as_ref().map(|p| p.link.write_registry(crate::guest_bytes(), &order, libc)));
+    let r = dy(|d| d.as_ref().map(|p| write_registry(&p.link, &order, libc)));
     if let Some(Err(e)) = r {
         crate::warn_line(&format!("gex: wasm32 program: {e:#}\n"));
         crate::exit_process(127);
@@ -851,10 +851,18 @@ pub extern "C" fn gex_wasmprog_adopt_link(ptr: u32, len: u32) {
     *lock(&ADOPT) = Some(String::from_utf8_lossy(&b).into_owned());
 }
 
+/// libc's `__gex_dsos` in guest memory, filled ([`gex_dylink::Link::write_registry`]).
+fn write_registry(link: &gex_dylink::Link, order: &[usize], libc: usize) -> gex_dylink::Result<()> {
+    let mut mem = crate::guest();
+    let at = link.dsos_at(libc)? as u64;
+    let n = mem.read(at, 12).ok().and_then(gex_dylink::Link::dsos_len).unwrap_or(0);
+    let dsos = mem.read_mut(at, n).unwrap_or(&mut []);
+    link.write_registry(dsos, order, libc)
+}
+
 fn guest_str(ptr: u64) -> Option<String> {
-    let s = crate::guest_bytes().get(ptr as usize..)?;
-    let n = s.iter().position(|&c| c == 0)?;
-    Some(String::from_utf8_lossy(&s[..n]).into_owned())
+    let s = crate::guest().read_cstr(ptr, 1 << 20).ok()?;
+    Some(String::from_utf8_lossy(&s).into_owned())
 }
 
 fn dlopen(path: &str) -> Result<u32, String> {
@@ -919,7 +927,7 @@ pub extern "C" fn gex_wasmprog_dlopen(path: u64, err: u64, errlen: u32) -> u32 {
         Ok(h) => h,
         Err(msg) => {
             let n = msg.len().min(errlen.saturating_sub(1) as usize);
-            if let Some(d) = crate::guest_bytes().get_mut(err as usize..err as usize + n + 1) {
+            if let Ok(d) = crate::guest().read_mut(err as u64, n + 1) {
                 d[..n].copy_from_slice(&msg.as_bytes()[..n]);
                 d[n] = 0;
             }

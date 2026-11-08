@@ -4211,25 +4211,37 @@ const WINE32_SPLIT_TOP: u64 = 0x7fff_0000;
 #[cfg(target_arch = "wasm64")]
 const GUEST_LIMIT: u64 = gex_abi::LIMIT64;
 
-/// The guest's memory, as a slice.
+/// The guest's memory: this module's own from address 0, below
+/// [`GUEST_LIMIT`]. Every access makes a slice of only the range it names
+/// (`GuestMem`, over a `gex_atomic::mem::Span`), never one of the whole
+/// from address 0.
+fn guest() -> GuestMem<'static> {
+    // SAFETY: address zero is an ordinary linear-memory location where the
+    // guest's address space starts; this module's data sits above
+    // `STACK_TOP` where the guest never maps; GuestMem reads what exists
+    // (`memory.size`) live on every access.
+    GuestMem::of_span(unsafe { gex_atomic::mem::Span::from_address_zero(GUEST_LIMIT as usize) })
+}
+
+/// The whole guest memory as one slice, from address 0, for the
+/// translator's API, which takes guest memory that way and nothing else.
+/// Its users: `gex_xlate::translate_runtime` (`dispatch_miss`),
+/// `gex_xlate::translate_object` (`recompile_object`) and the
+/// function tier's recovery reads (`fjit::mem_now`). Anything that reads or
+/// writes a range it names goes through [`guest`].
 ///
-/// This module's memory *is* the guest's, so the address space below
-/// [`GUEST_LIMIT`] is addressable directly.
+/// # Safety
+/// A reference from address 0 is not one Rust allows (a null slice), and a
+/// fresh `&mut` of all of it on every call aliases every other: LLVM may
+/// fold what it is told about it (a bounds check to "always out of range",
+/// two equal ranges to unequal), so a caller compares or bounds-checks
+/// nothing through it it cannot get from [`guest`] instead. The pointer and
+/// length go through `black_box`, which has kept the translator's use of
+/// it from folding so far.
 #[allow(clippy::mut_from_ref)]
 #[inline(never)]
-fn guest_bytes() -> &'static mut [u8] {
-    // The *pointer* (not just its address) goes through `black_box`: otherwise
-    // LLVM sees a constant-zero pointer aliasing nothing and deletes stores
-    // through it, or folds bounds checks to always-out-of-range -- miscompiles
-    // that returned EFAULT from the kernel path but succeeded from a small fn.
-    //
-    // SAFETY: address zero is an ordinary linear-memory location where the
-    // guest's address space starts; this module's data sits above `STACK_TOP`
-    // where the guest never maps; the memory is imported and never grows.
+unsafe fn guest_whole() -> &'static mut [u8] {
     let p: *mut u8 = std::hint::black_box(std::ptr::with_exposed_provenance_mut::<u8>(0));
-    // Length hidden for the same reason. It spans the whole nameable address
-    // space; what exists is smaller and moves, so `GuestMem` reads
-    // `memory.size` live on every access. See `GuestMem::limit`.
     let len = std::hint::black_box(GUEST_LIMIT as usize);
     unsafe { std::slice::from_raw_parts_mut(p, len) }
 }
@@ -6147,13 +6159,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // host can actually see.
     install_console(&mut kernel);
 
-    let data = guest_bytes();
+    let mut data = guest();
     for (seg, from) in program.placements() {
-        let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         // Only what is not zero already: a segment's bss over memory nothing
         // touched would otherwise be committed, zeroes and all.
-        gex_kernel::zero_dirty_bytes(&mut data[a..b]);
-        data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        data.zero_dirty(seg.vaddr, seg.mem_size as usize).expect("an image segment outside memory");
+        data.write(seg.vaddr, &seg.bytes).expect("an image segment outside memory");
         let mut p = 0;
         if seg.readable {
             p |= gex_kernel::mem::prot::READ;
@@ -6263,8 +6274,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             entry_hook: hook,
         },
     );
-    let start = layout.low as usize;
-    data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
+    data.write(layout.low, &layout.bytes).expect("the new stack outside memory");
     kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,
@@ -6275,18 +6285,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let c = gex_abi::ctx_addr(0) as usize;
     // Registers first, then the stack pointer: on x86-64 `SP` is one of them.
     for i in 0..31u8 {
-        write_u64(data, c + ctx::x(i), 0);
+        write_u64(&mut data, c + ctx::x(i), 0);
     }
     // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
-    write_u64(data, c + ctx::sp_slot(program.compat()), layout.sp);
-    write_u64(data, c + ctx::PC, program.entry());
-    data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
-        .copy_from_slice(&1024i32.to_le_bytes());
+    write_u64(&mut data, c + ctx::sp_slot(program.compat()), layout.sp);
+    write_u64(&mut data, c + ctx::PC, program.entry());
+    data.write((c + ctx::SAFEPOINT_COUNTER) as u64, &1024i32.to_le_bytes()).expect("a thread's context outside memory");
     // The x87 control word and MXCSR at their power-on defaults. (`MXCSR` is
     // A64's `FPCR` slot, which starts at zero.)
     if gex_abi::X86 {
-        data[c + ctx::X87_CW..c + ctx::X87_CW + 4].copy_from_slice(&0x37fu32.to_le_bytes());
-        data[c + ctx::MXCSR..c + ctx::MXCSR + 4].copy_from_slice(&0x1f80u32.to_le_bytes());
+        data.write((c + ctx::X87_CW) as u64, &0x37fu32.to_le_bytes()).expect("a thread's context outside memory");
+        data.write((c + ctx::MXCSR) as u64, &0x1f80u32.to_le_bytes()).expect("a thread's context outside memory");
     }
     if hook != 0 {
         snap_arm(&mut kernel, snap_key_1, &program.exe, program.interp_base());
@@ -6795,7 +6804,7 @@ static mut IDENTITY: (u32, u32) = (1000, 1000);
 
 /// Bytes JS wrote into the shim's own region, which is above the guest's
 /// limit and so is reached through a pointer rather than through
-/// [`guest_bytes`].
+/// [`guest`].
 fn shim_slice(p: u32, n: u32) -> &'static [u8] {
     unsafe {
         std::slice::from_raw_parts(
@@ -7121,7 +7130,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
         // program (every closure root is an image at `PIE_BASE`, so the
         // question is which, not whether).
         let ours = image_is_ours(px, idx as usize);
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         for (page, base) in &meta.dir_entries {
             if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE && !ours {
                 continue;
@@ -7308,7 +7317,7 @@ pub extern "C" fn gex_claim_page(page: u64) -> u32 {
         _ => return 0,
     };
     // The directory word as an atomic in the shared linear memory. The guest
-    // address space starts at linear address 0 (see `guest_bytes`), so the
+    // address space starts at linear address 0 (see `guest`), so the
     // guest address is the native address; `with_exposed_provenance` keeps LLVM
     // from folding it to a null-derived pointer.
     let addr = (gex_abi::dispatch_dir() + page * 4) as usize;
@@ -7370,7 +7379,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
         // check there, and branches to it from inside its own module do so
         // for good. The first few per process, with who did it.
         static REBASED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let had = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
+        let had = guest().read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
         if had != 0 && had != entry && REBASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             warn_line(&format!(
                 "[gex] pid {} page {:#x} re-based {had:#x} -> {entry:#x} by {who}\n",
@@ -7383,7 +7392,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     if want < 0 || want as u64 != page {
         return;
     }
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let had = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
     if had != entry {
         // With the pid, to tell one process renumbering from several numbering
@@ -7406,7 +7415,7 @@ pub extern "C" fn gex_watch_dir_marker() {}
 /// says rather than where the build guessed.
 #[no_mangle]
 pub extern "C" fn gex_page_base(page: u32) -> u32 {
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     gm.read_u32(gex_abi::dispatch_dir() + page as u64 * 4)
         .unwrap_or(0)
         & gex_abi::DISPATCH_SLOT_MASK
@@ -7455,7 +7464,7 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
     let idx = LAZY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The JIT lock alone: the page table and `LAZY_OWNER` are its.
     with_jit_only(|j| {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         // TEST(gex_test_fork_rebase): the module's pages as a parent that
         // moved them after translating them leaves them: each at a new base,
         // nothing in its slots yet.
@@ -7530,10 +7539,9 @@ pub extern "C" fn gex_lazy_owner(page: u64) -> i32 {
 pub extern "C" fn gex_reset_directory() -> u32 {
     phase(6);
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
-    let data = guest_bytes();
+    let mut gm = guest();
     let (from, to) = gex_abi::dispatch_dir_range();
-    gex_kernel::zero_dirty_bytes(&mut data[from as usize..to as usize]);
-    let mut gm = GuestMem::new(guest_bytes());
+    gm.zero_dirty(from, (to - from) as usize).expect("the dispatch directory outside memory");
     let mut n = 0u32;
     for (page, base) in &meta.dir_entries {
         dir_note(*page, *base, "restore-dirs");
@@ -7982,7 +7990,7 @@ pub extern "C" fn gex_wake() -> i32 {
                         let gen_now = if unsafe { k_present() } != 0 {
                             unsafe { k_futex_gen(a) }
                         } else { 0 };
-                        let word = GuestMem::new(guest_bytes()).read_u32(a).unwrap_or(0);
+                        let word = guest().read_u32(a).unwrap_or(0);
                         out.push_str(&format!(
                             "[ftx a={a:#x} gen={wake_gen}/{gen_now} word={word:#x}/slept={val:#x} woken={}]",
                             parked.woken()
@@ -8237,7 +8245,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // `PROVIDER_SYSCALL` and are no such instruction.
     if gex_abi::X86
         && pc as u64 & PROVIDER_SYSCALL == 0
-        && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))
+        && cs_alt(guest().read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))
     {
         gp_fault(ctx, pc as u64 & 0x00ff_ffff_ffff_ffff);
     }
@@ -8465,7 +8473,7 @@ fn native_left(ctx: i32, pc: i64) {
         return;
     }
     let ctx_addr = ctx as u32 as u64;
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     if gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32 != gex_kernel::win::nr::NATIVE_LEFT {
         return;
     }
@@ -8500,7 +8508,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     } else {
         let hook = cgen::guest_unix_call_hook();
         if hook != 0 {
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let eax = gm.read_u64(ctx as u32 as u64 + ctx::x(0) as u64).unwrap_or(0) as u32;
             if eax == gex_kernel::win::nr::UNIX_CALL {
                 // SAFETY: a host import taking scalars; no lock is held.
@@ -8521,7 +8529,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // ever without this.
         if WASM32.load(std::sync::atomic::Ordering::Acquire) && sigs::ready() {
             let at = ctx as u32 as u64;
-            let mut gm = GuestMem::new(guest_bytes());
+            let mut gm = guest();
             if let gex_kernel::signal::Delivery::Terminate { signal, .. } = sigs::deliver(&mut gm, at) {
                 let pc_at = gm.read_u64(at + ctx::PC as u64).unwrap_or(0);
                 if exit_here(-(signal as i32), Some(pc_at)) != 0 {
@@ -8547,7 +8555,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1;
     let base = ctx as u32 as u64;
     let (regs, slot_nr) = {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let regs = gex_kernel::syscalls::call_regs(&gm, base, compat);
         // The number slot itself, which `LAST_SYSCALL` and the stub entry's
         // check read raw: an i386-ABI process's number is in `x(0)`.
@@ -8586,7 +8594,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         vfork::check(this_nr, regs.a[0]);
     }
     if tracing() {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let base = my_ctx();
         // The number and arguments as the call was read above, where its
         // ABI puts them (an i386-ABI process's, and so an AArch64 build's
@@ -8737,7 +8745,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         check_host_magic_in(h, "a syscall");
         set_my_pid(h.kernel.pid);
         report_new_pins_in(h);
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let kstate = h.threads[cur()].kstate();
         if ctx as u32 as u64 != kstate.ctx_addr {
             warn_line(&format!(
@@ -9115,7 +9123,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
             // interpreter is missing does (`ENOENT`), not in a Worker that
             // never starts.
             SyscallOutcome::Exec { ref path, .. } if vfork::exec_unrunnable(h, path) => {
-                let mut gm = GuestMem::new(guest_bytes());
+                let mut gm = guest();
                 let ctx_addr = h.threads[cur()].ctx_addr();
                 let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, Errno::ENOENT.as_return());
                 0
@@ -9172,7 +9180,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     // The kernel checked the path before saying `Exec`, so a
                     // failure here is the loader's: not an ELF, or one this
                     // cannot place. `ENOEXEC` is what the guest expects.
-                    let mut gm = GuestMem::new(guest_bytes());
+                    let mut gm = guest();
                     let ctx_addr = h.threads[cur()].ctx_addr();
                     let _ = gex_kernel::syscalls::set_result(
                         &mut gm,
@@ -9274,14 +9282,14 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // call (a call that never returns is the one worth seeing); this fills in
     // the answer for the ones that do.
     if unsafe { HEARTBEAT } != 0 {
-        let x0 = GuestMem::new(guest_bytes()).read_u64(my_ctx() + ctx::x(0) as u64).unwrap_or(0);
+        let x0 = guest().read_u64(my_ctx() + ctx::x(0) as u64).unwrap_or(0);
         unsafe {
             let last = (SYSLOG_AT + SYSLOG_N - 1) % SYSLOG_N;
             SYSLOG[last].3 = x0;
         }
     }
     if tracing() {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let (i, ctx_addr) = (cur(), my_ctx());
         let x0 = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         // For a `select`, split the count: the total hides whether the ready
@@ -9457,7 +9465,7 @@ fn clock_syscall(ctx: i32) -> bool {
     if abi == 0 || exited() {
         return false;
     }
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let started = CLOCK_STARTED.load(Acquire) as u128;
     let at = ctx as u32 as u64;
     // The census's number, read before the call: x86-64's number slot is
@@ -11014,15 +11022,13 @@ pub extern "C" fn gex_fork_hold() {
     let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {
         h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| (t.state_arc(), t.ctx_addr())).collect()
     });
-    let mem = guest_bytes();
+    let mut mem = guest();
     for (c, at) in &cells {
         c.hold.store(1, SeqCst);
         // Run the counter out. A store of the thread's own countdown racing
         // this one puts it back at most `SAFEPOINT_INTERVAL` back-edges away.
-        let at = (*at as usize).wrapping_add(ctx::SAFEPOINT_COUNTER);
-        if let Some(w) = mem.get_mut(at..at + 4) {
-            // SAFETY: an aligned word of the guest's context, in linear memory.
-            unsafe { (*(w.as_mut_ptr() as *const std::sync::atomic::AtomicI32)).store(0, SeqCst) };
+        if let Some(w) = mem.word_mut(at.wrapping_add(ctx::SAFEPOINT_COUNTER as u64)) {
+            gex_atomic::store_u32(w, 0, 0);
         }
     }
     let stopped = |c: &ThreadCell| c.out.load(SeqCst) || c.held.load(SeqCst) || c.halted.load(SeqCst);
@@ -11126,7 +11132,7 @@ pub(crate) fn thread_staged() -> bool {
 fn thread_made(tid: i32, ctx_addr: u64, syscall_pc: u64) -> i32 {
     // The kernel has already written the child's context; it starts at the
     // pc that context carries.
-    let start = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    let start = guest().read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
     // A Worker of its own. Always: a thread is a Worker here.
     //
     // The table entry is still this process's -- `join`, the futexes and
@@ -11378,10 +11384,10 @@ pub extern "C" fn gex_snap_thread(tid: i32, pc: i64, sp: i64) -> i64 {
     }
     CURRENT.with(|c| c.set(i));
     bind_free(i);
-    let c = my_ctx() as usize;
-    let data = guest_bytes();
-    write_u64(data, c + ctx::sp_slot(true), sp as u64);
-    write_u64(data, c + ctx::PC, pc as u64);
+    let c = my_ctx();
+    let mut data = guest();
+    data.write_u64(c + ctx::sp_slot(true) as u64, sp as u64).expect("the thread's context outside memory");
+    data.write_u64(c + ctx::PC as u64, pc as u64).expect("the thread's context outside memory");
     pc
 }
 
@@ -11463,7 +11469,7 @@ pub extern "C" fn gex_adopt_child(
     // The slot maps the copied low region names are the parent's.
     dense::child();
     // So is the probe cache, which names the parent's table indices.
-    gex_kernel::ftab::fcache_reset(guest_bytes());
+    gex_kernel::ftab::fcache_reset(&mut guest());
     cgen::ftab_registry_reset();
     // Built from the module's `gex.meta`, as `gex_load` does: an empty
     // table would report "nothing to translate" almost at once, since `fork`
@@ -11543,7 +11549,7 @@ fn ctx_slots_below(ctx: u64) -> u32 {
 fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> Host {
     let ctx_addr = ctx_addr as u64;
     {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         // What `fork` returns in the child.
         let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if sp != 0 {
@@ -11878,7 +11884,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // program starts in its own mode.
     ALT_DIR.store(0, std::sync::atomic::Ordering::Release);
     if gex_abi::X86 {
-        let _ = GuestMem::new(guest_bytes()).write_u32(my_ctx() + ctx::CS as u64, 0);
+        let _ = guest().write_u32(my_ctx() + ctx::CS as u64, 0);
     }
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
@@ -11978,10 +11984,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     cgen::on_exec(&reused);
     fjit::on_retire(&reused);
     {
-        // The live memory size, not `guest_bytes().len()` (which is the whole
-        // 4 GiB nameable range): the fill must stay inside what actually exists.
+        // The live memory size, not the whole nameable range: the fill must
+        // stay inside what actually exists.
         let live = warch::memory_size(0) as usize * 65536;
-        let data = guest_bytes();
+        let mut data = guest();
         for (start, end) in old {
             // Only the fixed low layout is reused at the same address by the next
             // program -- its image at `PIE_BASE`, `ld.so` at `INTERP_BASE`, the
@@ -12004,12 +12010,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
                 // and never touched reads as zero already, and filling it
                 // would commit all of it (a demo's Wine processes
                 // carried ~80 MiB each of exactly that).
-                gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+                let _ = data.zero_dirty(a as u64, b - a);
             }
         }
     }
     // The probe cache names the old program's table indices.
-    gex_kernel::ftab::fcache_reset(guest_bytes());
+    gex_kernel::ftab::fcache_reset(&mut guest());
     cgen::ftab_registry_reset();
     // (an exec of `/proc/self/exe` runs the program it links to, and that
     // is what the new image's link says too)
@@ -12041,20 +12047,17 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let here = if ctx_addr_get() != 0 { ctx_addr_get() } else { h.kernel.ctx_addr };
     h.kernel.next_ctx_slot.reset(ctx_slots_below(here).max(1));
 
-    let data = guest_bytes();
+    let mut data = guest();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
     for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
-        let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         let len = len as usize;
-        if b > data.len() || a + len > data.len() {
+        if !fresh && data.zero_dirty(seg.vaddr, seg.mem_size as usize).is_err() {
             return 0;
         }
-        if !fresh {
-            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
-        }
         // From the file into place: the one copy.
-        if h.kernel.read_file_at(from.unwrap_or(path), off, &mut data[a..a + len]) != Some(len) {
+        let Ok(dst) = data.read_mut(seg.vaddr, len) else { return 0 };
+        if h.kernel.read_file_at(from.unwrap_or(path), off, dst) != Some(len) {
             return 0;
         }
         let mut prot = 0;
@@ -12084,11 +12087,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A wasm32 program is published before it runs: its magic, read where
     // it now is.
     cgen::wasmprog::stage_entry(program.as_ref().map(|p| p.exe.entry).filter(|&entry| {
-        let at = entry.wrapping_sub(0x40) as usize;
-        data.get(at..at + 8) == Some(&cgen::wasmprog::MAGIC[..])
-            && program.iter().flat_map(|p| p.exe.segments.iter()).any(|s| {
-                (at as u64) >= s.vaddr && (at as u64) + 8 <= s.vaddr + s.mem_size
-            })
+        let at = entry.wrapping_sub(0x40);
+        data.read(at, 8).is_ok_and(|m| m == &cgen::wasmprog::MAGIC[..])
+            && program.iter().flat_map(|p| p.exe.segments.iter()).any(|s| at >= s.vaddr && at + 8 <= s.vaddr + s.mem_size)
     }));
     // The recorded address space, when there is one. It replaces the map
     // this function just built, because the map is part of what was
@@ -12159,10 +12160,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // (A fresh memory's is zero: scanning its 8 MiB to find that out was
     // half a millisecond of every posix_spawn child's exec.)
     if !fresh {
-        gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
+        data.zero_dirty(stack_lo as u64, gex_abi::STACK_TOP as usize - stack_lo).expect("the new stack outside memory");
     }
-    let start = layout.low as usize;
-    data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
+    data.write(layout.low, &layout.bytes).expect("the new stack outside memory");
     h.kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,
@@ -12177,7 +12177,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         warn_line(&format!("[gex] pid {} dir cleared by exec\n", my_pid()));
     }
     let (from, to) = gex_abi::dispatch_dir_range();
-    gex_kernel::zero_dirty_bytes(&mut data[from as usize..to as usize]);
+    data.zero_dirty(from, (to - from) as usize).expect("the dispatch directory outside memory");
     // And forget which spans were asked for: `FILL_ASKED` avoids re-asking a
     // span, which is only safe while the fill's answer is reachable -- and
     // clearing the directory above made it unreachable, so a stale mark would
@@ -12256,9 +12256,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             kept += 1;
             h.jit.page_table.assign(*page, *base);
             let at = (gex_abi::dispatch_dir() + page * 4) as usize;
-            if at + 4 <= data.len() {
-                data[at..at + 4].copy_from_slice(&base.to_le_bytes());
-            }
+            let _ = data.write(at as u64, &base.to_le_bytes());
         }
         trace_line(&format!(
             "[gex] exec: {} closure pages kept of {}, {} slots\n",
@@ -12300,25 +12298,24 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // the TLS block the linker allocated).
     for i in 0..31u8 {
         let v = restored.as_ref().map(|l| l.x[i as usize]).unwrap_or(0);
-        write_u64(data, c + ctx::x(i), v);
+        write_u64(&mut data, c + ctx::x(i), v);
     }
     if let Some(l) = &restored {
-        write_u64(data, c + ctx::TPIDR, l.tpidr);
+        write_u64(&mut data, c + ctx::TPIDR, l.tpidr);
     }
     // `sp` is the stack just built, not the recorded one: the two are the
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
     let compat = program.as_ref().is_some_and(|p| p.compat());
-    write_u64(data, c + ctx::sp_slot(compat), layout.sp);
+    write_u64(&mut data, c + ctx::sp_slot(compat), layout.sp);
     let entry = match (&program, &restored) {
         (Some(p), _) => p.entry(),
         (None, Some(l)) => l.entry,
         (None, None) => return 0,
     };
-    write_u64(data, c + ctx::PC, entry);
-    write_u64(data, c + ctx::MON_SIZE, 0);
-    data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
-        .copy_from_slice(&1024i32.to_le_bytes());
+    write_u64(&mut data, c + ctx::PC, entry);
+    write_u64(&mut data, c + ctx::MON_SIZE, 0);
+    data.write((c + ctx::SAFEPOINT_COUNTER) as u64, &1024i32.to_le_bytes()).expect("a thread's context outside memory");
     // Every other thread goes with the old program (Linux's de_thread): its
     // Worker, parked or running, sees `gone` and ends, without the process.
     let me = cur();
@@ -12649,9 +12646,7 @@ fn snap_key(path: &str, envp: &[String]) -> u64 {
 fn snap_arm(kernel: &mut Kernel, key: u64, exe: &gex_ld::Image, interp_base: u64) {
     *SNAP_FACTS.0.borrow_mut() = (exe.phdr_vaddr, exe.phentsize, exe.phnum, interp_base);
     let entry = exe.entry;
-    let data = guest_bytes();
-    let at = SNAP_STUB as usize;
-    data[at..at + SNAP_STUB_CODE.len()].copy_from_slice(SNAP_STUB_CODE);
+    guest().write(SNAP_STUB, SNAP_STUB_CODE).expect("the snapshot stub outside memory");
     kernel.mem.lock().insert_loaded(
         SNAP_STUB,
         SNAP_STUB + 4096,
@@ -12720,7 +12715,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     }
     out.extend_from_slice(&h.kernel.mem.lock().brk_current().to_le_bytes());
     {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         for i in 0..31u8 {
             let v = gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
             out.extend_from_slice(&v.to_le_bytes());
@@ -12759,7 +12754,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
         })
         .collect();
     out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
-    let data = guest_bytes();
+    let data = guest();
     for (start, end, prot, name, code, origin) in regions {
         out.extend_from_slice(&start.to_le_bytes());
         out.extend_from_slice(&end.to_le_bytes());
@@ -12785,7 +12780,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 // carrying only non-zero pages is a fraction of the size.
                 out.extend_from_slice(&0u32.to_le_bytes());
                 let (a, b) = (start as usize, (end as usize).min(data.len()));
-                let bytes: &[u8] = if a < b { &data[a..b] } else { &[] };
+                let bytes: &[u8] = if a < b { data.read(a as u64, b - a).unwrap_or(&[]) } else { &[] };
                 let pages = bytes.len().div_ceil(4096);
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 let bitmap_at = out.len();
@@ -12874,14 +12869,14 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             ms_read += now_ns() - began;
             n_read += end - start;
             let bytes = &files.iter().find(|(k, _)| *k == path)?.1;
-            let data = guest_bytes();
+            let mut data = guest();
             let (a, b) = (start as usize, (end as usize).min(data.len()));
             if a >= b {
                 return None;
             }
-            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+            data.zero_dirty(a as u64, b - a).ok()?;
             let take = (b - a).min(bytes.len().saturating_sub(off as usize));
-            data[a..a + take].copy_from_slice(&bytes[off as usize..off as usize + take]);
+            data.write(a as u64, &bytes[off as usize..off as usize + take]).ok()?;
             h.kernel.mem.lock().insert_from(start, end, prot, &name, Some((path, off)));
         } else {
             let len = snap_read_u32(raw, &mut p)? as usize;
@@ -12889,7 +12884,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             let began = now_ns();
             let bitmap = raw.get(p..p + pages.div_ceil(8))?.to_vec();
             p += pages.div_ceil(8);
-            let data = guest_bytes();
+            let mut data = guest();
             let (a, b) = (start as usize, (end as usize).min(data.len()));
             if a >= b {
                 return None;
@@ -12899,7 +12894,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             // `execve` runs in the Worker that had the previous program. Only
             // the pages that hold anything, though: a large reservation
             // restored with a fill came back fully resident.
-            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+            data.zero_dirty(a as u64, b - a).ok()?;
             for q in 0..pages {
                 if bitmap[q / 8] & (1 << (q % 8)) == 0 {
                     continue;
@@ -12910,7 +12905,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
                 p += hi - lo;
                 let (da, db) = (a + lo, (a + hi).min(b));
                 if da < db {
-                    data[da..db].copy_from_slice(&payload[..db - da]);
+                    data.write(da as u64, &payload[..db - da]).ok()?;
                 }
             }
             h.kernel.mem.lock().adopt(start, end, prot, &name, code);
@@ -13644,7 +13639,7 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                 || (unsafe { k_present() } != 0
                     && unsafe { k_futex_gen(parked.addr()) } != *wake_gen)
                 || (unsafe { k_present() } == 0
-                    && GuestMem::new(guest_bytes())
+                    && guest()
                         .read_u32(parked.addr())
                         .map(|w| w != *val)
                         .unwrap_or(false))
@@ -13717,7 +13712,7 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         Waiting::Pi { addr, gen, deadline } => {
             deadline.is_some_and(|d| now >= d)
                 || (unsafe { k_present() } != 0 && unsafe { k_futex_gen(*addr) } != *gen)
-                || gex_atomic::load_u32(guest_bytes(), *addr)
+                || guest().word_mut(*addr).and_then(|w| gex_atomic::load_u32(w, 0))
                     .is_some_and(|v| v & gex_kernel::futex::pi::TID_MASK == 0)
         }
         Waiting::Exited => false,
@@ -13753,7 +13748,7 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
             // The LIVE pc from the context, not `r.pc` (updated only on a
             // block): a spinning `runnable` thread's real pc is here.
             if matches!(r.waiting, Waiting::Runnable) {
-                let gm = GuestMem::new(guest_bytes());
+                let gm = guest();
                 let live = gm.read_u64(t.ctx_addr() + ctx::PC as u64).unwrap_or(0);
                 // Also the file offset within the object, so `addr2line` can name
                 // the exact function a runnable-but-frozen thread is stuck in.
@@ -13857,7 +13852,7 @@ fn report_idle(why: u8) {
                 // worker" whose Worker is stalled in JS shows its real position
                 // here, where r.pc is still the entry. Names the block a stranded
                 // nested-clone thread died on (native-wayland gtk stall).
-                let cpc = GuestMem::new(guest_bytes())
+                let cpc = guest()
                     .read_u64(t.ctx_addr() + ctx::PC as u64)
                     .unwrap_or(0);
                 if cpc != r.pc {
@@ -13873,7 +13868,7 @@ fn report_idle(why: u8) {
                 if let Waiting::Futex { parked, val, wake_gen, .. } = &r.waiting {
                     let a = parked.addr();
                     let gen_now = if unsafe { k_present() } != 0 { unsafe { k_futex_gen(a) } } else { 0 };
-                    let word = GuestMem::new(guest_bytes()).read_u32(a).unwrap_or(0);
+                    let word = guest().read_u32(a).unwrap_or(0);
                     out.push_str(&format!(
                         "[ftx a={a:#x} gen={wake_gen}/{gen_now} word={word:#x}/slept={val:#x} woken={}]",
                         parked.woken()
@@ -14205,7 +14200,7 @@ fn report_deadlock() {
     // kernel's.
     let who = sigs::home().map(|home| {
         let mut s = String::new();
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         for (i, t) in home.table().iter() {
             let r = t.run();
             if let Waiting::Futex { parked, .. } = &r.waiting {
@@ -14341,7 +14336,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
     use gex_kernel::signal::Delivery;
     use gex_kernel::syscalls::{nr, FreeOutcome};
     let ctx_addr = ctx as u32 as u64;
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     // The dynamic linker's jump to gex's stub entry, at a process's start
     // (`SNAP_SYSCALL`): what it built is kept as an exec's image is made,
     // under the exec lock.
@@ -14744,7 +14739,7 @@ fn dying_frames() -> String {
         return String::new();
     }
     let ctx_addr = ctx_addr_get();
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let reg = |i: u8| gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
     let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
     let mut out = format!(
@@ -14797,7 +14792,7 @@ fn dying_frames() -> String {
 /// read as zeros, which looked like a frame wiped to nothing.
 fn dying_frames_i386() -> String {
     let ctx_addr = ctx_addr_get();
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let reg = |i: u8| gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0) & 0xffff_ffff;
     let (esp, ebp) = (reg(4), reg(5));
     let eip = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
@@ -14836,7 +14831,7 @@ fn dying_frames_i386() -> String {
 /// This Worker's thread's context pc, for a death report: where a parked
 /// call that a fatal signal ended was made.
 fn ctx_pc() -> u64 {
-    GuestMem::new(guest_bytes()).read_u64(my_ctx() + ctx::PC as u64).unwrap_or(0)
+    guest().read_u64(my_ctx() + ctx::PC as u64).unwrap_or(0)
 }
 
 fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
@@ -14868,7 +14863,7 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     if tracing() {
         trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={}\n", op.is_some()));
     }
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     // What other processes wrote back while the call waited
     // (`Kernel::finish_blocking`, as the native host's).
     sigs::catch_up_shared(&mut gm);
@@ -15005,10 +15000,10 @@ fn finish_parked(
         gex_kernel::BlockOp::FutexLockPi { uaddr, tid, .. } => {
             use gex_kernel::futex::pi;
             loop {
-                let v = gex_atomic::load_u32(gm.bytes, *uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(gm.word_mut(*uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & pi::TID_MASK {
                     0 => {
-                        if gex_atomic::cas_u32(gm.bytes, *uaddr, v, *tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                        if gex_atomic::cas_u32(gm.word_mut(*uaddr).ok_or(Errno::EFAULT)?, 0, v, *tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
                             return Ok(0);
                         }
                         continue;
@@ -15017,7 +15012,7 @@ fn finish_parked(
                     _ => {}
                 }
                 let want = v | pi::WAITERS;
-                if v != want && gex_atomic::cas_u32(gm.bytes, *uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                if v != want && gex_atomic::cas_u32(gm.word_mut(*uaddr).ok_or(Errno::EFAULT)?, 0, v, want).ok_or(Errno::EFAULT)?.is_err() {
                     continue;
                 }
                 return Err(PI_RETRY);
@@ -15355,7 +15350,7 @@ pub extern "C" fn gex_last_target() -> i64 {
     if at == 0 {
         return 0;
     }
-    GuestMem::new(guest_bytes())
+    guest()
         .read_u64(at + ctx::LAST_TARGET as u64)
         .unwrap_or(0) as i64
 }
@@ -15456,8 +15451,9 @@ pub extern "C" fn gex_exit_code() -> i32 {
     exit_status().unwrap_or(0)
 }
 
-fn write_u64(data: &mut [u8], off: usize, v: u64) {
-    data[off..off + 8].copy_from_slice(&v.to_le_bytes());
+/// A register of a thread's context, which is always in memory.
+fn write_u64(data: &mut GuestMem<'_>, off: usize, v: u64) {
+    data.write_u64(off as u64, v).expect("a thread's context outside memory");
 }
 
 /// Fused multiply-add, which wasm cannot express. Rust's `mul_add` is the
@@ -15514,7 +15510,7 @@ pub extern "C" fn gex_x87(ctx: i32, op: i32, a_sig: i64, a_se: i32, b_sig: i64, 
         }
         _ => panic!("x87 import: unknown operation {op:#x}"),
     };
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let base = ctx as u32 as u64 + ctx::X87_TMP as u64;
     let _ = gm.write_u32(base + 8, se);
     let _ = gm.write_u32(base + 12, sw);
@@ -15555,7 +15551,7 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
         return false;
     }
     // No lock: the context is this Worker's thread's own (`my_ctx`).
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
     if resumable && cgen::fault_in_place(c, code, addr, 0) {
@@ -15673,7 +15669,7 @@ pub extern "C" fn gex_set_compat(on: i32) {
 /// put it) to `esp` (`ctx::sp_slot`), which on an AArch64 build is another
 /// slot: its context at `c`, its own.
 pub(crate) fn compat_stack(c: u64) {
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
     if sp != 0 {
         let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
@@ -15703,7 +15699,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     }
     if raw == gex_abi::imports::BRK_TRACE {
         let line = (|| {
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let c = my_ctx();
             let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
             if gex_abi::X86 {
@@ -15761,7 +15757,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         {
             let (line, unusual) = (|| {
                 let Some(home) = sigs::home() else { return Default::default() };
-                let gm = GuestMem::new(guest_bytes());
+                let gm = guest();
                 let c = my_ctx();
                 let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
                 let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
@@ -15829,7 +15825,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     if raw == gex_abi::imports::BRK_BAD_SP {
         let line = (|| {
             let Some(home) = sigs::home() else { return Default::default() };
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let c = my_ctx();
             let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
             let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
@@ -15860,7 +15856,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // and which caller -- otherwise "breakpoint at pc" names only glibc's abort.
     let line = (|| {
         let Some(home) = sigs::home() else { return Default::default() };
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let c = my_ctx();
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
@@ -15923,13 +15919,13 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.
     if reg == gex_kernel::x86::SYSREG_CPUID {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, val as u64);
     }
     // An x87 transcendental or remainder, computed on the register stack in
     // the context.
     if reg == gex_kernel::x86::SYSREG_X87 {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, val as u64);
     }
     // A far transfer: the selector checked, the thread's mode set; any
@@ -15938,7 +15934,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     // mode's: JavaScript's loop goes on at the target through a module of
     // the new mode's (`gex.mjs` `#enter`).
     if gex_abi::X86 && (reg == gex_kernel::x86::SYSREG_FAR || reg == gex_kernel::x86::SYSREG_FAR_IN_PLACE) {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let cs_at = ctx as u32 as u64 + ctx::CS as u64;
         let before = gm.read_u32(cs_at).unwrap_or(0);
         if let Err(sel) = gex_kernel::x86::serve_far(&mut gm, ctx as u32 as u64, val as u64) {
@@ -15963,7 +15959,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         if (val as u64) < gex_abi::GUEST_FLOOR {
             low_access("a cmpxchg16b", val as u64, ctx, pc as u64);
         }
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, val as u64);
     }
 }
@@ -16027,7 +16023,7 @@ fn far_switch(ctx: i32) -> i32 {
 /// it; `None` when that mode's directory has no entry for its page.
 fn mode_entry(c: u64, pc: u64) -> Option<i32> {
     let alt = thread_alt();
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let alt_dir = ALT_DIR.load(std::sync::atomic::Ordering::Acquire);
     let entry = gex_abi::dir_entry_addr(gex_abi::page_key(pc, alt), alt_dir).and_then(|a| gm.read_u32(a).ok()).unwrap_or(0);
     if entry == 0 {
@@ -16064,7 +16060,7 @@ pub extern "C" fn gex_alt_dir() -> u64 {
 /// `enter` JavaScript's loops go in by (`gex.mjs` `#enterOf`).
 #[no_mangle]
 pub extern "C" fn gex_ctx_alt(ctx: i32) -> i32 {
-    (gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))) as i32
+    (gex_abi::X86 && cs_alt(guest().read_u32(ctx as u32 as u64 + ctx::CS as u64).unwrap_or(0))) as i32
 }
 
 /// The pointer of the stack the thread at `ctx` makes and takes call-outs
@@ -16073,7 +16069,7 @@ pub extern "C" fn gex_ctx_alt(ctx: i32) -> i32 {
 /// (`gex_kernel::x86::wow64_live_sp`; `gex.mjs` `#liveSp`).
 #[no_mangle]
 pub extern "C" fn gex_live_sp(ctx: i32) -> i64 {
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let c = ctx as u32 as u64;
     if !gex_abi::X86 {
         return gm.read_u64(c + ctx::x(cgen::sp_index()) as u64).unwrap_or(0) as i64;
@@ -16091,7 +16087,7 @@ pub extern "C" fn gex_callout_live_sp(ctx: i32, callout_alt: i32) -> i64 {
     if !gex_abi::X86 || callout_alt == 0 {
         return gex_live_sp(ctx);
     }
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let c = ctx as u32 as u64;
     let alt = cs_alt(gm.read_u32(c + ctx::CS as u64).unwrap_or(0));
     let wow64 = ALT_DIR.load(std::sync::atomic::Ordering::Acquire) != 0;
@@ -16101,7 +16097,7 @@ pub extern "C" fn gex_callout_live_sp(ctx: i32, callout_alt: i32) -> i64 {
 /// Whether this thread runs code in the mode its process's own class is
 /// not (`ctx::CS`): a WoW64 process's 32-bit code.
 pub(crate) fn thread_alt() -> bool {
-    gex_abi::X86 && cs_alt(GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0))
+    gex_abi::X86 && cs_alt(guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0))
 }
 
 thread_local! {
@@ -16140,7 +16136,7 @@ fn ensure_alt_dir(px: &Px<'_>) -> u64 {
     }
     let len = (gex_abi::alt_dir_bytes() + 0xffff) & !0xffff;
     let name = "[gex other-mode dispatch]";
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let mut at = (0x1_0000_0000u64.saturating_sub(len + 0x10_0000)) & !0xffff;
     let mut got = None;
     while at >= 0x8000_0000 && got.is_none() {
@@ -16166,7 +16162,7 @@ fn far_fault(sel: u16, ctx: i32, pc: u64) -> ! {
 fn gp_fault(ctx: i32, pc: u64) -> ! {
     let c = ctx as u32 as u64;
     if cgen::fault_hook() != 0 {
-        let _ = GuestMem::new(guest_bytes()).write_u64(c + ctx::PC as u64, pc);
+        let _ = guest().write_u64(c + ctx::PC as u64, pc);
         cgen::fault_stage(0xc000_0005, 0, 0);
         set_resume(pc);
         set_resume_ctx(c);
@@ -16182,7 +16178,7 @@ fn gp_fault(ctx: i32, pc: u64) -> ! {
 /// violation (a write, at `addr`, from the block's start `pc`) for the
 /// process's fault hook (Wine), SIGSEGV without one. Does not return.
 fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let c = ctx as u32 as u64;
     let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
     warn_line(&format!(
@@ -16225,7 +16221,7 @@ thread_local!(static STALE_INFO: std::cell::RefCell<String> = Default::default()
 fn heal_dirs(start: u64) {
     let first = gex_abi::dispatch_page(start);
     let healed: Vec<(u64, u32, u32)> = with_jit_only(|j| {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let mut out = Vec::new();
         // Both modes' keys of the two pages.
         for page in [first, first + 1, first | gex_abi::ALT_PAGE, (first + 1) | gex_abi::ALT_PAGE] {
@@ -16266,7 +16262,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
     }
     if op == gex_abi::cache_op::SPLIT_LOCK {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let c = _ctx as u32 as u64;
         let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
         warn_line(&format!(
@@ -16361,7 +16357,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             }
             if jit_diag() {
                 let pg = gex_abi::dispatch_page(start);
-                let gm = GuestMem::new(guest_bytes());
+                let gm = guest();
                 let dir = |p: u64| gm.read_u32(gex_abi::dispatch_dir() + p * 4).unwrap_or(u32::MAX);
                 let info = format!(
                     "dense index {:#x}, stale range {:?}, provider {:x?}, repeat {repeat}, page {pg:#x} dir {:#x} table {:x?}, next dir {:#x} table {:x?}",
@@ -16543,7 +16539,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 return;
             }
             let home = if jit_diag() { sigs::home() } else { None };
-            let mut gm = GuestMem::new(guest_bytes());
+            let mut gm = guest();
             for (k, gone) in [(page, own), (key, alt)] {
                 if !gone {
                     continue;
@@ -16580,11 +16576,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         return;
     }
     let block = gex_abi::DCZID_BLOCK_BYTES as usize;
-    let start = (addr as u64 & !(gex_abi::DCZID_BLOCK_BYTES - 1)) as usize;
-    let mem = guest_bytes();
-    if let Some(dst) = mem.get_mut(start..start + block) {
-        dst.fill(0);
-    }
+    let start = addr as u64 & !(gex_abi::DCZID_BLOCK_BYTES - 1);
+    let _ = guest().zero(start, block);
 }
 /// A poll on a loop back-edge: the point where the guest's registers are
 /// flushed to its context and the pc is the branch target, so the stack can be
@@ -16609,7 +16602,7 @@ fn safepoint(ctx: i32, pc: i64) {
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.
     {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let _ = gm.write_u32(
             ctx as u32 as u64 + ctx::SAFEPOINT_COUNTER as u64,
             SAFEPOINT_INTERVAL,
@@ -16623,7 +16616,7 @@ fn safepoint(ctx: i32, pc: i64) {
     if SP_GUARD.load(std::sync::atomic::Ordering::Relaxed) {
         let ctxa = ctx as u32 as u64;
         if ctxa != gex_abi::ctx_addr(0) {
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let sp = gm.read_u64(ctxa + ctx::SP as u64).unwrap_or(0);
             let main_lo = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
             if sp >= main_lo && sp < gex_abi::STACK_TOP {
@@ -16736,7 +16729,7 @@ fn safepoint(ctx: i32, pc: i64) {
     // looked.
     if SAFEPOINT_SIGNALS && sigs::ready() {
         let ctx_addr = ctx as u32 as u64;
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         // The context pc must be exact before a handler frame is built on
         // it: the frame records where to return, and a branch stores no pc.
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc as u64);
@@ -16773,7 +16766,7 @@ fn safepoint(ctx: i32, pc: i64) {
                 // host before the thread goes on; the guest goes on where its
                 // sigreturn put the context.
                 let target = match cgen::signal_hook(ctx_addr, pc as u64) {
-                    cgen::SignalHooked::Ran => GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(target),
+                    cgen::SignalHooked::Ran => guest().read_u64(ctx_addr + ctx::PC as u64).unwrap_or(target),
                     cgen::SignalHooked::Staged | cgen::SignalHooked::No => target,
                 };
                 if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
@@ -16844,7 +16837,7 @@ fn remiss(pc: u64) {
         }
         let page = pc / gex_abi::DISPATCH_PAGE;
         pwatch_arm(page);
-        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
+        let dir = guest().read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
         Some(format!(
             "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {} ({} times), {} translations so far\n",
             j.page_table.lookup(page),
@@ -16904,7 +16897,7 @@ fn pwatch_say(page: u64, what: impl FnOnce() -> String) {
     if PWATCH_LEFT.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
         return;
     }
-    let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
+    let dir = guest().read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
     warn_line(&format!("gex: watch page {page:#x} pid {} worker {}: {} (dir {dir:#x})\n", my_pid(), jit_me(), what()));
 }
 
@@ -16991,7 +16984,7 @@ fn livelock_note(pc: u64) {
     };
     let mut pages = Vec::new();
     for page in [gex_abi::dispatch_page(pc), gex_abi::dispatch_page(pc) + 1] {
-        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
+        let dir = guest().read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
         let (pt, retired) = with_jit_only(|j| (j.page_table.lookup(page), j.retired_pages.contains(&page)));
         pages.push(format!("page {page:#x}: directory {dir:#x}, page table {pt:x?}, retired {retired}"));
     }
@@ -17037,7 +17030,7 @@ fn watch_mem(where_: &str) {
     if addr == 0 {
         return;
     }
-    let now = GuestMem::new(guest_bytes()).read_u64(addr).unwrap_or(u64::MAX - 1);
+    let now = guest().read_u64(addr).unwrap_or(u64::MAX - 1);
     let last = WATCH_LAST.swap(now, std::sync::atomic::Ordering::Relaxed);
     if now != last {
         warn_line(&format!(
@@ -17265,7 +17258,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // so the handler's `ret` arrives here -- the whole mechanism.
     // No kernel lock: the thread's signal state and run state are its own.
     if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let ctx_addr = my_ctx();
         match sigs::sigreturn(&mut gm, ctx_addr) {
             Ok(target) => {
@@ -17298,7 +17291,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // lpk.dll, and expects the exception to be caught) ended the thread.
     if wild && cgen::fault_hook() != 0 {
         (|| {
-            let mut gm = GuestMem::new(guest_bytes());
+            let mut gm = guest();
             let c = my_ctx();
             let _ = gm.write_u64(c + ctx::PC as u64, pc);
             cgen::fault_stage(0xc000_0005, pc, 8);
@@ -17310,7 +17303,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if wild {
         (|| {
             let Some(home) = sigs::home() else { return Default::default() };
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let c = my_ctx();
             let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
             let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
@@ -17437,7 +17430,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // the guest stack, not only this one: name the likely ones
             // (stack words just after a call instruction in an image) so a
             // single run lists what user/web-entries.txt needs.
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let sp = gm.read_u64(my_ctx() + ctx::SP as u64).unwrap_or(0);
             let mut cands = Vec::new();
             for i in 0..4096u64 {
@@ -17948,7 +17941,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // freshly allocated pages get an entry from the unit, and
                         // this page already has a base, so without writing it here
                         // the branch misses again next instruction.
-                        let mut gm = GuestMem::new(guest_bytes());
+                        let mut gm = guest();
                         dir_note(page, base, "miss-shared-slot");
                         let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
                         // Published here, so a module with blocks on it is
@@ -18005,10 +17998,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // (`cgen::provider_serves`), its bytes may be a `ud2` stub; in the other
     // mode, a function of that mode bound there (`cgen::alt_serves`).
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
-    let cs = if gex_abi::X86 { GuestMem::new(guest_bytes()).read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
+    let cs = if gex_abi::X86 { guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
     let (mut unit, stats) = gex_xlate::translate_runtime(
-            guest_bytes(),
+            // SAFETY: the translator takes the whole memory (`guest_whole`).
+            unsafe { guest_whole() },
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&gex_abi::addr_key(a, alt)) || if alt { crate::cgen::alt_serves(a) } else { crate::cgen::provider_serves(a) },
@@ -18210,7 +18204,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // with entry 0) failed its page check until `heal_dirs` wrote it.
         let mut dirs = unit.dir_entries.clone();
         {
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             for &(p, b) in &unit.covered {
                 if gex_abi::key_page(p).0 < gex_abi::dispatch_max_pages()
                     && gm.read_u32(dir_word(p)).unwrap_or(1) == 0
@@ -18227,7 +18221,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // lives in, for the faulting page only (minimal, to keep the shared
         // dispatch path load-bearing for apt/closures). Only when it differs.
         if let Some(base) = fault_base {
-            let mut gm = GuestMem::new(guest_bytes());
+            let mut gm = guest();
             let at = dir_word(page);
             if gm.read_u32(at).unwrap_or(0) != base {
                 dir_note(page, base, "miss-reconcile-covered");
@@ -18323,7 +18317,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         (|| {
             let Some(home) = sigs::home() else { return Default::default() };
-            let gm = GuestMem::new(guest_bytes());
+            let gm = guest();
             let c = my_ctx();
             let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
             trace_line(&format!(
@@ -18358,7 +18352,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// running and its parent waiting.
 fn branch_fault(pc: u64) {
     let c = my_ctx();
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     match sigs::fault(&mut gm, c, 11, pc, pc) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
@@ -18437,7 +18431,7 @@ fn kuser_unfolded(arg: i64, resumable: bool) {
                 wine32_image_off_at(pc)
             ));
         }
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         let c = my_ctx();
         let _ = gm.write_u64(c + ctx::PC as u64, pc);
         if resumable && cgen::fault_hook() != 0 && cgen::fault_in_place(c, 0xc000_0005, addr, 0) {
@@ -18500,7 +18494,7 @@ pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
         0 => ctx_addr as u64,
         m => m,
     };
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let Ok(pc) = gm.read_u64(c + ctx::PC as u64) else { return 0 };
     if cgen::fault_hook() != 0 {
         if signo != 11 {
@@ -19165,7 +19159,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
                 Some(base) => {
                     j.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
-                    let mut gm = GuestMem::new(guest_bytes());
+                    let mut gm = guest();
                     let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
                 }
                 None => missing += 1,
@@ -19228,7 +19222,8 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // left it, so the last one's is the result, and with none the table is as
     // it went in.
     let (modules, stats) = gex_xlate::translate_object(
-        guest_bytes(),
+        // SAFETY: the translator takes the whole memory (`guest_whole`).
+        unsafe { guest_whole() },
         map.start,
         map.end,
         &seeds,
@@ -19546,7 +19541,7 @@ pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
 /// read them (an x86 process's too: its number is not in `x(8)`).
 fn note_process_syscall(n: u64, a: &[u64; 6], pc: i64) {
     use gex_kernel::syscalls::{clone_flags, nr};
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let g = |i: usize| a[i];
     // How much of a process is its dynamic linker: `ld.so` links in translated
     // code once per process, recomputing an answer a closure pins at build
@@ -19766,7 +19761,7 @@ fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>,
     // image is parsed at its own addresses and mapped at others.
     let bias = start.wrapping_sub(text.vaddr & !0xfff);
     let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
-    let gm = GuestMem::new(guest_bytes());
+    let gm = guest();
     let mut out = Vec::new();
     let mut pending = false;
     for s in &image.symbols {
@@ -19860,12 +19855,12 @@ pub extern "C" fn gex_current_pc() -> i64 {
     // See `CTX_ADDR`.
     let at = ctx_addr_get();
     if at != 0 {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
     }
     match my_ctx() {
         0 => 0,
-        at => GuestMem::new(guest_bytes()).read_u64(at + ctx::PC as u64).unwrap_or(0) as i64,
+        at => guest().read_u64(at + ctx::PC as u64).unwrap_or(0) as i64,
     }
 }
 
@@ -19875,7 +19870,7 @@ pub extern "C" fn gex_current_pc() -> i64 {
 #[no_mangle]
 pub extern "C" fn gex_current_lr() -> i64 {
     let read = |at: u64| {
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         gm.read_u64(at + 30 * 8).unwrap_or(0) as i64
     };
     let at = ctx_addr_get();
@@ -20174,7 +20169,7 @@ pub extern "C" fn gex_jit_installed() {
         if let Some(d) = &done.dense {
             dense::publish(d);
         }
-        let mut gm = GuestMem::new(guest_bytes());
+        let mut gm = guest();
         for (page, base) in done.dirs {
             // A page has ONE base per process. A served module built elsewhere
             // names its own bases; where this process already numbered the page
@@ -20280,7 +20275,7 @@ pub extern "C" fn gex_dump_state() {
     }
     (|| {
         let Some(home) = sigs::home() else { return Default::default() };
-        let gm = GuestMem::new(guest_bytes());
+        let gm = guest();
         let c = my_ctx();
         let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);

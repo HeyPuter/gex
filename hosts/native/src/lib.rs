@@ -1945,14 +1945,14 @@ fn perform_block(
             use gex_kernel::futex::pi;
             let start = std::time::Instant::now();
             loop {
-                let mem = GuestMem::new(&mut *data);
-                let v = gex_atomic::load_u32(mem.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let mut mem = GuestMem::new(&mut *data);
+                let v = gex_atomic::load_u32(mem.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & pi::TID_MASK {
                     // Free: take it. The waiters bit stays (set) because
                     // others may still sleep on it, so the next unlock goes
                     // through the kernel and wakes one.
                     0 => {
-                        if gex_atomic::cas_u32(mem.bytes, uaddr, v, tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                        if gex_atomic::cas_u32(mem.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
                             return Ok(0);
                         }
                         continue;
@@ -1961,7 +1961,7 @@ fn perform_block(
                     _ => {}
                 }
                 let want = v | pi::WAITERS;
-                if v != want && gex_atomic::cas_u32(mem.bytes, uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                if v != want && gex_atomic::cas_u32(mem.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, want).ok_or(Errno::EFAULT)?.is_err() {
                     continue;
                 }
                 let left = match deadline {
@@ -3805,11 +3805,9 @@ fn watch_check(gm: &GuestMem<'_>, pc: u64, tid: i32) {
     let Some((addr, len, before)) = w.as_mut() else {
         return;
     };
-    let (start, end) = (*addr as usize, *addr as usize + *len);
-    if end > gm.bytes.len() {
+    let Ok(now) = gm.read(*addr, *len) else {
         return;
-    }
-    let now = &gm.bytes[start..end];
+    };
     if now == before.as_slice() {
         return;
     }
@@ -3848,10 +3846,9 @@ fn watch_arm(gm: &GuestMem<'_>, slot: &mut Option<(u64, usize, Vec<u8>)>) {
         WATCH_ON.store(false, std::sync::atomic::Ordering::Relaxed);
         return;
     };
-    if addr as usize + len > gm.bytes.len() {
+    let Ok(bytes) = gm.read(addr, len).map(<[u8]>::to_vec) else {
         return;
-    }
-    let bytes = gm.bytes[addr as usize..addr as usize + len].to_vec();
+    };
     eprintln!("gex: watching {addr:#x}+{len:#x}, now {}", hex_bytes(&bytes));
     *slot = Some((addr, len, bytes));
 }
@@ -5540,10 +5537,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             watch_check(&gm, pc as u64, state.thread.tid);
             let _ = gm.write_u64(ctx_addr + gex_abi::ctx::PC as u64, pc as u64);
             // Rearm before delivering, so a handler that loops still polls.
-            let counter = ctx_addr as usize + gex_abi::ctx::SAFEPOINT_COUNTER;
-            if counter + 4 <= gm.bytes.len() {
-                gm.bytes[counter..counter + 4].copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
-            }
+            let _ = gm.write(ctx_addr + gex_abi::ctx::SAFEPOINT_COUNTER as u64, &SAFEPOINT_INTERVAL.to_le_bytes());
             // The process may have ended in another thread while this one was
             // running. A safepoint is the only place it is safe to notice.
             if state

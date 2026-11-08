@@ -1998,26 +1998,38 @@ impl Link {
         0
     }
 
-    /// Fill libc's `__gex_dsos` (musl's gex_dso.h) in `mem`, the process's
-    /// memory: every module but libc (index `libc`), in init order
-    /// `order`, with its TLS image and functions (table indices), libc's
-    /// own constructors at the head; the program's constructors are
-    /// crt1's to run.
-    pub fn write_registry(&self, mem: &mut [u8], order: &[usize], libc: usize) -> Result<()> {
+    /// Where libc's `__gex_dsos` (musl's gex_dso.h) is in the process's
+    /// memory, libc being module `libc`.
+    pub fn dsos_at(&self, libc: usize) -> Result<usize> {
         let lc = &self.mods[libc];
         let Some(off) = lc.info.data_offset("__gex_dsos") else {
             bail!("{}: no __gex_dsos (a libc.so older than gex's loader)", lc.path);
         };
-        let at = (lc.memory_base + off) as usize;
+        Ok((lc.memory_base + off) as usize)
+    }
+
+    /// How many bytes `__gex_dsos` takes, from its first 12 (`head`).
+    pub fn dsos_len(head: &[u8]) -> Option<usize> {
+        Some(12 + u32::from_le_bytes(head.get(8..12)?.try_into().ok()?) as usize * 24)
+    }
+
+    /// Fill libc's `__gex_dsos` (musl's gex_dso.h), `dsos` being its bytes
+    /// in the process's memory (at [`Self::dsos_at`], [`Self::dsos_len`]
+    /// long): every module but libc (index `libc`), in init order `order`,
+    /// with its TLS image and functions (table indices), libc's own
+    /// constructors at the head; the program's constructors are crt1's to
+    /// run.
+    pub fn write_registry(&self, dsos: &mut [u8], order: &[usize], libc: usize) -> Result<()> {
+        let lc = &self.mods[libc];
         let rd = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
-        if mem.len() < at + 12 {
+        if dsos.len() < 12 {
             bail!("{}: __gex_dsos outside memory", lc.path);
         }
-        let (version, max) = (rd(mem, at), rd(mem, at + 8));
+        let (version, max) = (rd(dsos, 0), rd(dsos, 8));
         if version != 1 {
             bail!("{}: __gex_dsos version {version} (want 1)", lc.path);
         }
-        if mem.len() < at + 12 + max as usize * 24 {
+        if dsos.len() < 12 + max as usize * 24 {
             bail!("{}: __gex_dsos outside memory", lc.path);
         }
         let mut entries: Vec<[u32; 6]> = Vec::new();
@@ -2051,11 +2063,11 @@ impl Link {
         }
         for (k, w) in entries.iter().enumerate() {
             for (j, x) in w.iter().enumerate() {
-                let a = at + 12 + k * 24 + j * 4;
-                mem[a..a + 4].copy_from_slice(&x.to_le_bytes());
+                let a = 12 + k * 24 + j * 4;
+                dsos[a..a + 4].copy_from_slice(&x.to_le_bytes());
             }
         }
-        mem[at + 4..at + 8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        dsos[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
         Ok(())
     }
 }

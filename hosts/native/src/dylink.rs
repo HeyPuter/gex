@@ -260,7 +260,7 @@ pub(crate) fn install_program(
     {
         let data = memory.bytes();
         for a in [entry, thread_entry] {
-            gex_kernel::ftab::fcache_clear(data, a);
+            gex_kernel::ftab::fcache_clear(&mut GuestMem::new(data), a);
         }
     }
     crate::ftab::publish_bridges(&shared, &[entry, thread_entry], &[])?;
@@ -514,7 +514,11 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
 
 /// libc's `__gex_dsos` (gex-dylink's `Link::write_registry`).
 fn write_registry(memory: &gex_mem::GuestMemory, link: &Link, order: &[usize], libc: usize) -> Result<()> {
-    link.write_registry(memory.bytes(), order, libc)
+    let mem = memory.bytes();
+    let at = link.dsos_at(libc)?;
+    let dsos = mem.get_mut(at..).unwrap_or(&mut []);
+    let n = gex_dylink::Link::dsos_len(dsos).unwrap_or(0).min(dsos.len());
+    link.write_registry(&mut dsos[..n], order, libc)
 }
 
 /// Define module `module`'s imports per its [`Binds`] in `l`.

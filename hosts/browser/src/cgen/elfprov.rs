@@ -225,9 +225,9 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
         }
         !b.addrs.is_empty()
     });
-    let mem = crate::guest_bytes();
+    let mut mem = crate::guest();
     for a in gone {
-        gex_kernel::ftab::fcache_clear(mem, a);
+        gex_kernel::ftab::fcache_clear(&mut mem, a);
         super::ftab(|t| t.retire(a));
     }
 }

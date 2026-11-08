@@ -235,7 +235,7 @@ pub(crate) fn take_back(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestM
     }
     let gone: Vec<u64> = s.ftab.map.range(start, end).filter(|(_, f)| installs.contains(&f.install)).map(|(a, _)| a).collect();
     for &a in &gone {
-        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
+        gex_kernel::ftab::fcache_clear(&mut GuestMem::new(memory.bytes()), a);
         s.ftab.map.retire(a);
     }
     if !gone.is_empty() && std::env::var_os("GEX_WINE32_TRACE").is_some() {

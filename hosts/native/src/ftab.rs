@@ -558,7 +558,7 @@ pub(crate) fn bind_pairs(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemo
     sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.bind(install, pairs);
     let data = memory.bytes();
     for &a in &entries {
-        gex_kernel::ftab::fcache_clear(data, a);
+        gex_kernel::ftab::fcache_clear(&mut GuestMem::new(data), a);
     }
     publish_bridges(sh, &entries, &[])
 }
@@ -640,7 +640,7 @@ fn publish_pairs_at(
     // looks again.
     let data = memory.bytes();
     for &a in &entries {
-        gex_kernel::ftab::fcache_clear(data, a);
+        gex_kernel::ftab::fcache_clear(&mut GuestMem::new(data), a);
     }
     publish_bridges(sh, &entries, &checks)?;
     Ok(Some(n))
@@ -813,11 +813,11 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
                     let rsp = rd(ctx_addr + gex_abi::ctx::X + 4 * 8);
                     let ret = rd(rsp as usize);
                     eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) ret {ret:#x} holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
-                    gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
+                    gex_kernel::ftab::fcache_write(&mut gex_kernel::GuestMem::new(memory.bytes()), addr, f.idx);
                     return Ok(f.idx as i32);
                 }
                 drop(s);
-                gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
+                gex_kernel::ftab::fcache_write(&mut gex_kernel::GuestMem::new(memory.bytes()), addr, f.idx);
                 return Ok(f.idx as i32);
             }
             stats::STALE.fetch_add(1, Relaxed);
@@ -827,7 +827,7 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
             s.ftab.map.retire(addr);
             s.ftab.queued.remove(&addr);
             drop(s);
-            gex_kernel::ftab::fcache_clear(memory.bytes(), addr);
+            gex_kernel::ftab::fcache_clear(&mut GuestMem::new(memory.bytes()), addr);
             catch_up(&mut *caller)?;
         }
     }
@@ -836,7 +836,7 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
         // this address's cache entry, so the next call finds the function.
         // The cache entry first: a publication racing ahead clears it.
         stats::FALLBACKS.fetch_add(1, Relaxed);
-        gex_kernel::ftab::fcache_write(memory.bytes(), addr, gex_abi::ftab::FALLBACK);
+        gex_kernel::ftab::fcache_write(&mut gex_kernel::GuestMem::new(memory.bytes()), addr, gex_abi::ftab::FALLBACK);
         let fresh = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.queued.insert(addr);
         if fresh {
             if let Some(j) = job(caller, &sh, &memory, addr) {
@@ -845,11 +845,11 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
         }
         return Ok(gex_abi::ftab::FALLBACK as i32);
     } else if let Some(idx) = translate(caller, &sh, &memory, addr)? {
-        gex_kernel::ftab::fcache_write(memory.bytes(), addr, idx);
+        gex_kernel::ftab::fcache_write(&mut gex_kernel::GuestMem::new(memory.bytes()), addr, idx);
         return Ok(idx as i32);
     }
     stats::FALLBACKS.fetch_add(1, Relaxed);
-    gex_kernel::ftab::fcache_write(memory.bytes(), addr, gex_abi::ftab::FALLBACK);
+    gex_kernel::ftab::fcache_write(&mut gex_kernel::GuestMem::new(memory.bytes()), addr, gex_abi::ftab::FALLBACK);
     Ok(gex_abi::ftab::FALLBACK as i32)
 }
 
@@ -1311,7 +1311,7 @@ pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u
         for (a, f) in hit {
             // Every entry's probe cache slot, the units' included: a cached
             // unit entry would outlive its retirement below.
-            gex_kernel::ftab::fcache_clear(memory, a);
+            gex_kernel::ftab::fcache_clear(&mut GuestMem::new(memory), a);
             let install = sh.ftab.map.install(f.install);
             let unit_gone = install.tier == Tier::Unit && !sh.ftab.providers.contains(&f.install) && is_gone(a);
             if install.tier != Tier::Unit || unit_gone {

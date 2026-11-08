@@ -596,10 +596,8 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
 }
 
 fn read_cstr(gm: &gex_kernel::GuestMem<'_>, ptr: u64) -> Option<String> {
-    let start = ptr as usize;
-    let bytes = gm.bytes.get(start..)?;
-    let end = bytes.iter().take(4096).position(|&b| b == 0)?;
-    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    let bytes = gm.read_cstr(ptr, 4096).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Write the profile and the manifest.
