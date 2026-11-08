@@ -7,7 +7,10 @@ import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { setTabMemoriesMax, tabMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
 
-export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
+export const meta = {
+  hosts: ['browser', 'node'], images: ['busybox'], timeout: 180,
+  single: 'every process runs in the one kernel Worker there, whose memories the page does not count',
+};
 
 export default async function (t) {
   const { check, timeout } = t;

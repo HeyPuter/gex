@@ -223,21 +223,24 @@ export function spareMemories(shared = true) {
   // the tab's count of them (`wasmMemory`): live, the most at once, and a
   // test's cap (`setTabMemoriesMax`)
   const count = new Int32Array(typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(12) : new ArrayBuffer(12));
-  pageCount ??= count;
+  globalThis[PAGE_COUNT] ??= count;
   const spare = { count };
   spare.m32 = wasmMemory({ initial: 0, maximum: 0, shared }, 'the spare 32-bit memory', spare);
   spare.m64 = wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'the spare memory64', spare);
   return spare;
 }
 
-// The first kernel spec's count, for this realm's memories made without one.
-let pageCount = null;
+// The first kernel spec's count, for this realm's memories made without one:
+// on the realm, not in this module, as a built package has its own copy of
+// this module beside the one a page or a test imports.
+const PAGE_COUNT = Symbol.for('gex.tabMemories');
+const pageCount = () => globalThis[PAGE_COUNT] ?? null;
 
 /** The tab's wasm memories as `wasmMemory` counted them, `{ live, peak }`
  *  (the kernel spec `spare`'s count, or this realm's first), or null.
  *  `peak` from `reset` on, when given. */
 export function tabMemories(spare = null, { reset = false } = {}) {
-  const c = spare?.count ?? pageCount;
+  const c = spare?.count ?? pageCount();
   if (!c) return null;
   if (reset) Atomics.store(c, 1, Atomics.load(c, 0));
   return { live: Atomics.load(c, 0), peak: Atomics.load(c, 1) };
@@ -247,7 +250,7 @@ export function tabMemories(spare = null, { reset = false } = {}) {
  *  on, every Worker of it, as a browser whose address space ran out (Node
  *  has no such limit). */
 export function setTabMemoriesMax(n, spare = null) {
-  const c = spare?.count ?? pageCount;
+  const c = spare?.count ?? pageCount();
   if (c) Atomics.store(c, 2, n | 0);
 }
 
@@ -264,7 +267,7 @@ export function wasmMemory(desc, what, spare = null) {
   let m;
   try {
     // a test's cap (`setTabMemoriesMax`)
-    const c = spare?.count ?? pageCount;
+    const c = spare?.count ?? pageCount();
     if (c && Atomics.load(c, 2) > 0 && Atomics.load(c, 0) >= Atomics.load(c, 2)) throw new RangeError('WebAssembly.Memory(): could not allocate memory');
     m = new WebAssembly.Memory(desc);
   } catch (e) {
@@ -273,7 +276,7 @@ export function wasmMemory(desc, what, spare = null) {
     throw new Error(`the tab can hold no more process memories (${what}${n ? `; it holds ${n.live}` : ''}: ` +
       'a browser reserves about 8 GiB of address space for each, and a tab has about 1 TiB)', { cause: e });
   }
-  const c = spare?.count ?? pageCount;
+  const c = spare?.count ?? pageCount();
   if (c) {
     const live = Atomics.add(c, 0, 1) + 1;
     for (let p = Atomics.load(c, 1); p < live && Atomics.compareExchange(c, 1, p, live) !== p; p = Atomics.load(c, 1));
@@ -284,7 +287,7 @@ export function wasmMemory(desc, what, spare = null) {
 
 /** A memory `wasmMemory` counted is let go (`what`, for the log line). */
 export function wasmMemoryGone(what, spare = null) {
-  const c = spare?.count ?? pageCount;
+  const c = spare?.count ?? pageCount();
   if (!c) return;
   const live = Atomics.sub(c, 0, 1) - 1;
   if (logNamed('mem')) console.warn(`[mem] tab memories: ${live} live: -1 ${what}`);
