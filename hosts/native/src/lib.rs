@@ -5740,19 +5740,12 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .map(|v| (v.start, v.end))
             .collect()
     });
-    // Writable-and-executable ranges (a JIT's), whose blocks guard their own
-    // bytes (x86-64; A64 announces its code writes with `ic ivau`). See
-    // `Block::guard`.
+    // Writable-and-executable ranges (a JIT's), and code written through
+    // another view, whose blocks guard their own bytes (x86-64; A64
+    // announces its code writes with `ic ivau`). See `Block::guard`,
+    // `MemoryMap::volatile_code`.
     if gex_abi::X86 {
-    let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
-        k.mem
-            .lock()
-            .vmas()
-            .iter()
-            .filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0)
-            .map(|v| (v.start, v.end))
-            .collect()
-    });
+    let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| k.mem.lock().volatile_code());
     gex_xlate::set_volatile_ranges(volatile);
     }
     let (translated_module, stats) = gex_emit::with_module_id_global(|| {

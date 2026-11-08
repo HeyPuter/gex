@@ -17953,22 +17953,12 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         let started = now_ns();
         // x86-64: what the page table's identity hooks answer from, as of now,
-        // and which pages are a JIT's (writable and executable), so their
-        // blocks carry a self-modifying-code guard. See `Block::guard`.
+        // and which pages are a JIT's (writable and executable, or written
+        // through another view), so their blocks carry a self-modifying-code
+        // guard. See `Block::guard`, `MemoryMap::volatile_code`.
         if gex_abi::X86 {
         refresh_ident_snapshot(px);
-        gex_xlate::set_volatile_ranges(
-            px.mm
-                .lock()
-                .vmas()
-                .iter()
-                .filter(|v| {
-                    v.prot & gex_kernel::mem::prot::EXEC != 0
-                        && v.prot & gex_kernel::mem::prot::WRITE != 0
-                })
-                .map(|v| (v.start, v.end))
-                .collect(),
-        );
+        gex_xlate::set_volatile_ranges(px.mm.lock().volatile_code());
         }
         phase(11);
         // The page table moves out and back: cloning it (a BTreeMap of every

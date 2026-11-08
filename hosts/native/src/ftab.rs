@@ -959,7 +959,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
             // A library a stateful provider replaced is not code to translate (`libprov::replaced`).
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && !crate::libprov::replaced(v.start, v.end)).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
-            v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
+            mm.volatile_code(),
         )
     });
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {

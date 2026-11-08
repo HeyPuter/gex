@@ -814,6 +814,33 @@ impl MemoryMap {
         &self.vmas
     }
 
+    /// Where code can change with nothing to say so, so that x86-64 blocks
+    /// translated there carry a guard of their bytes (`Block::guard`):
+    /// executable mappings that are writable (a JIT's), and the executable
+    /// parts of shared mappings of a file open for writing. Those are
+    /// written through another view: Wine gives a section's second view the
+    /// first one's address (a wasm memory cannot show one page at two), so
+    /// a JIT's read+write view of its read+execute code is the same pages,
+    /// and its writes there come with no `mprotect` to retire what was
+    /// translated (.NET's W^X).
+    pub fn volatile_code(&self) -> Vec<(u64, u64)> {
+        let shared: Vec<(u64, u64)> = self.log.shared_maps.iter().filter(|s| s.file.writable).map(|s| (s.start, s.start + s.len)).collect();
+        let mut out = Vec::new();
+        for v in self.vmas.iter().filter(|v| v.prot & prot::EXEC != 0) {
+            if v.prot & prot::WRITE != 0 {
+                out.push((v.start, v.end));
+                continue;
+            }
+            for &(a, b) in &shared {
+                let (lo, hi) = (a.max(v.start), b.min(v.end));
+                if lo < hi {
+                    out.push((lo, hi));
+                }
+            }
+        }
+        out
+    }
+
     /// The map as readers that do not own it see it ([`MapView`]): the same
     /// view for the map's whole life, republished as it changes.
     pub fn view(&self) -> &std::sync::Arc<MapView> {

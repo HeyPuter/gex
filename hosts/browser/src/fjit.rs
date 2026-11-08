@@ -445,7 +445,7 @@ fn translate_root(addr: u64) -> Option<u32> {
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
-            v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
+            mm.volatile_code(),
         )
     };
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
