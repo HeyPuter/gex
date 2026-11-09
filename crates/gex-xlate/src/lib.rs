@@ -1026,6 +1026,7 @@ pub fn translate_object(
         known,
         limits,
         max_blocks,
+        usize::MAX,
         intrinsics,
     );
     stage("discovered", blocks.len());
@@ -1294,7 +1295,7 @@ fn translate_seeded(
     let mut page_table = page_table;
     page_table.set_alt(other_mode());
     let (mut blocks, mut stats) = discover(
-        memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
+        memory, entry, seeds, executable, known, limits, max_blocks, MISS_CODE_BUDGET, intrinsics,
     );
     // A dispatch slot spans more bytes than an instruction (x86-64): every
     // block already translated that shares a slot with one of these has to be
@@ -1354,6 +1355,14 @@ pub fn set_discover_skip(bits: u32) {
 /// Separate from encoding because one object's blocks may not fit in one
 /// module -- see [`emit_modules`].
 #[allow(clippy::too_many_arguments)]
+/// The most guest code (bytes) one runtime miss lifts (`translate_runtime`;
+/// a whole-image translation has none), whatever `max_blocks` allows: blocks end at `BlockLimits::max_insts` and fall through, so a run of
+/// straight-line bytes -- a packed image's unpacking target, still zeros when
+/// its stub jumps there -- was `max_blocks` full blocks in one module (an
+/// AutoHotkey installer's first miss: a 68 MiB buffer and an arena out of
+/// room). Ordinary code is far under it: 2048 blocks of a few instructions.
+pub const MISS_CODE_BUDGET: usize = 128 << 10;
+
 fn discover(
     memory: &[u8],
     entry: u64,
@@ -1362,6 +1371,7 @@ fn discover(
     known: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
     max_blocks: usize,
+    code_budget: usize,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (Vec<Block>, Stats) {
     let mut stats = Stats::default();
@@ -1389,7 +1399,11 @@ fn discover(
     // start-up lifts never run, and the deeper the level the fewer run.
     let max_depth = (DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed) >> 16) & 0xff;
     let compat = arch::compat();
-    while !frontier.is_empty() && stats.blocks < max_blocks && (max_depth == 0 || u32::from(depth) <= max_depth) {
+    while !frontier.is_empty()
+        && stats.blocks < max_blocks
+        && stats.instructions * INST_ALIGN as usize <= code_budget
+        && (max_depth == 0 || u32::from(depth) <= max_depth)
+    {
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
@@ -1742,6 +1756,32 @@ mod tests {
         assert_ne!(c.wasm, d.wasm);
     }
 
+    /// A long run of straight-line code (what a packed image's stub jumps
+    /// into) lifts no more than the budget in one miss, not `max_blocks` full
+    /// blocks; the next miss carries on.
+    #[test]
+    fn one_miss_lifts_at_most_its_code_budget() {
+        let (base, len) = (0x10000usize, 4 << 20);
+        let mut mem = vec![0u8; base + len];
+        for w in mem[base..].chunks_mut(4) {
+            w.copy_from_slice(&0xd503_201fu32.to_le_bytes()); // nop
+        }
+        let (_, stats) = translate_runtime(
+            &mem,
+            base as u64,
+            &|a| a >= base as u64 && a < (base + len) as u64,
+            &|_| false,
+            PageTable::new(),
+            BlockLimits::default(),
+            2048,
+            true,
+            &Default::default(),
+        );
+        let bytes = stats.instructions * 4;
+        assert!(bytes > 0 && bytes <= super::MISS_CODE_BUDGET + BlockLimits::default().max_insts * 4, "{bytes} bytes lifted");
+        assert!(stats.blocks < 2048);
+    }
+
     #[test]
     fn cgen_refuses_profiling() {
         assert!(super::cgen_conflict(true, true).is_some());
@@ -1836,6 +1876,7 @@ mod tests {
             &|x| x >= base && x < base + span,
             &|_| false,
             BlockLimits::default(),
+            usize::MAX,
             usize::MAX,
             &HashMap::new(),
         );
