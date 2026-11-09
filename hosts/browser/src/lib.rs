@@ -11740,7 +11740,7 @@ thread_local! {
 /// claimed, so nothing of it is torn down or published -- the process goes
 /// on, its descriptors and signal state carried, in the Worker the host
 /// starts with the other flavour's runtime (host.mjs `execAway`).
-fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
+pub(crate) fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
     let ctx = h.threads[cur()].ctx_addr() as u32;
     vfork::stage_exec_parts(h, path, argv, envp);
     EXEC_AWAY.with(|c| c.set(Some((h.kernel.pid, ctx))));

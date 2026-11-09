@@ -713,6 +713,19 @@ pub extern "C" fn gex_vfork_end() -> i64 {
     resume as i64
 }
 
+/// Whether the next [`gex_adopted_exec`] is a program the page itself
+/// started (host.mjs `spawnExec`), not a vfork child's exec
+/// (`gex_page_program`).
+static PAGE_PROGRAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next adopted exec is a program the page started: no `execve` named
+/// it, so the kernel has not yet chosen its memory flavour nor settled its
+/// environment, which an `execve` does (`Kernel::exec_flavour`).
+#[no_mangle]
+pub extern "C" fn gex_page_program() {
+    PAGE_PROGRAM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Run an exec a vfork child staged (`stage_exec`), in the fresh Worker the
 /// host started for it, whose kernel `gex_adopt_child` has built and whose
 /// descriptors and signal state are adopted. The entry, or 0 when the
@@ -730,7 +743,8 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
         parts.take(n).collect()
     };
     let argv = list(&mut parts);
-    let envp = list(&mut parts);
+    let mut envp = list(&mut parts);
+    let page_program = PAGE_PROGRAM.swap(false, std::sync::atomic::Ordering::Relaxed);
     // This Worker's memory is new (host.mjs gives an exec child no recycled
     // one), so the exec need not clear what no program wrote.
     EXEC_FRESH.with(|c| c.set(true));
@@ -746,6 +760,31 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
                 exit_process(127);
                 return 0;
             }
+        };
+        // A program the page started: its flavour and environment as an
+        // `execve` of it would have them (`Kernel::exec_flavour`: a
+        // GEX_MEM64 entry or the image's record honoured and taken out, an
+        // image only a 64-bit memory can load given one), the memory64
+        // twin of its loader when that is what it runs in (`exec_route`),
+        // and a Worker of that flavour when this one is not
+        // (`exec_away`). Without this a program the page started ran in
+        // the page's flavour whatever it needed, unless its Wine loader
+        // happened to exec itself again (starting the server).
+        let path = if page_program {
+            h.kernel.exec_mem64 = h.kernel.exec_flavour(&path, &argv, &mut envp);
+            let path = exec_route(h, &path).unwrap_or(path);
+            if exec_unrunnable(h, &path) {
+                warn_line(&format!("gex: {path}: its memory flavour's runtime could not be had\n"));
+                exit_process(127);
+                return 0;
+            }
+            if exec_elsewhere(h, &path) {
+                crate::exec_away(h, &path, &argv, &envp);
+                return 0;
+            }
+            path
+        } else {
+            path
         };
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {

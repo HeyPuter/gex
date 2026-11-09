@@ -863,6 +863,8 @@ export class ProcessHost {
       pc: 0n, sp: 0n, tls: 0n, compat: 0, wasm32: 0n, brk: 0n, windowsSpace: 0,
       image: [], vmaBlob: null, slots: 0, pages: null, shared: null, modules: [],
       opts, exec, wasmImage, fds, cwd, state: new Uint8Array(0), exe: null,
+      // (no execve named it: the shim's `gex_page_program`)
+      page: true,
     };
     return this.#spawn(pid, { kind: 'adopt', child });
   }

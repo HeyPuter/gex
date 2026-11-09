@@ -3859,6 +3859,9 @@ export class Gex {
     await this.#installClosure();
     // The single-thread build: the exec reads the program's files through
     // the kernel, which may wait, so it runs on a stack that can suspend.
+    // A program the page started (host.mjs `spawnExec`): the shim settles its
+    // memory flavour and environment as an execve would.
+    if (child.page) e.gex_page_program?.();
     if (SP_CODE && single.on) return this.#putBytesP(child.exec, e.gex_adopted_exec);
     return this.#putBytes(child.exec, e.gex_adopted_exec);
   }
