@@ -6,7 +6,8 @@
 // version, cost what they cost for the same program with a small resource
 // section, natively and on the page. The cut file ends nothing: not the
 // program (it says "done"), nor the wineserver (the image mapping it made of
-// the file, whose version resource could not be read, is closed cleanly).
+// the file, whose version resource could not be read, is closed cleanly,
+// however many times it is made).
 import { join } from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -74,9 +75,12 @@ export default async function (t) {
   files['cut.exe'] = join(dir, 'cut.exe');
 
   for (const where of ['native', 'page']) {
+    // the cut file's version read again and again: each read maps the image
+    // and closes it, which freed the unreadable version twice
+    const args = (exe) => ['C:\\rsrcread.exe', `C:\\${exe}`, ...(exe === 'cut.exe' ? ['32'] : [])];
     const read = (exe) => where === 'native'
-      ? w.native(['C:\\rsrcread.exe', `C:\\${exe}`], { files, name: `n-${exe}`, timeout: 600000 })
-      : w.page(['C:\\rsrcread.exe', `C:\\${exe}`], { pfxFiles: files, prefix: w.pagePrefix(), cwd: '/pfx/drive_c', name: `p-${exe}`, timeout: 600000 });
+      ? w.native(args(exe), { files, name: `n-${exe}`, timeout: 600000 })
+      : w.page(args(exe), { pfxFiles: files, prefix: w.pagePrefix(), cwd: '/pfx/drive_c', name: `p-${exe}`, timeout: 600000 });
     const r = {};
     for (const exe of ['small.exe', 'big.exe', 'cut.exe']) {
       r[exe] = await read(exe);

@@ -3,10 +3,14 @@
  * resource. The icons are read twice, the second time timed as "icons":
  * the first read also pays the first icon's making (seconds on gex, and
  * varying) and the file's first read (a page reads a file's bytes in as
- * they are first asked for). Says "done" at the end. */
+ * they are first asked for). argv[2], a count: the version's size read
+ * that many times more, each an image mapping of the file made and closed
+ * (one whose version cannot be read must leave the wineserver whole). Says
+ * "done" at the end. */
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 int main(int argc, char **argv)
 {
@@ -32,6 +36,7 @@ int main(int argc, char **argv)
     t = GetTickCount();
     n = GetFileVersionInfoSizeA(f, &h);
     printf("version size %lu: %lu ms\n", n, GetTickCount() - t);
+    for (int i = argc > 2 ? atoi(argv[2]) : 0; i > 0; i--) GetFileVersionInfoSizeA(f, &h);
     if (n && (buf = malloc(n)))
     {
         t = GetTickCount();
