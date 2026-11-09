@@ -26,8 +26,10 @@ wcc64 does a DLL's own side module. A tree configured with CC="wcc64
 -mgex-memory64" (wine64-dist.sh WINE64_MEM64=1), or --memory64 after --wasm64:
 the memory64 flavour, for a process with a 64-bit memory, compiled the
 same way, linked for a 16 GiB memory and not lowered."""
+import atexit
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +54,7 @@ BUILD = None  # the Wine build tree (pelink's main)
 WINE64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
 M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
+STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as paths (pelink's main)
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 
 
@@ -294,6 +297,12 @@ def main():
             if only and mod not in only and not KEEP_EXPORTS:
                 continue
             imports = [i.lstrip('-') for i in makefile_var(mk, 'IMPORTS') + makefile_var(mk, 'DELAYIMPORTS')]
+            # (an IMPORTS entry may be a static library instead, uuid: the
+            # tree's libs/uuid/libuuid.a, whose objects a spec's `extern`
+            # can export)
+            STATIC[mod] = [a for i in makefile_var(mk, 'IMPORTS')
+                           for a in [os.path.join(build, t, i.lstrip('-'), f'lib{i.lstrip("-")}.a') for t in ('libs', 'dlls')]
+                           if os.path.exists(a)]
             imports = [modname(i) for i in imports]
             if not only or mod in only:
                 dlls.append((mod, ro, ex, imports))
@@ -618,6 +627,51 @@ def name_imports(path):
     open(path, 'wb').write(out)
 
 
+def with_static_exports(dlls):
+    """`dlls` with each DLL's object holding the exports its own code does
+    not define but a static library it imports does: a spec's `extern
+    IID_IRichEditOle`, the data that libuuid.a's object defines (msftedit).
+    A DLL's object is its own code alone, so the static library's members
+    came in only at the module's link, under their C names, never
+    DLL!name, and the export was missing. The members defining them are
+    linked into the DLL's object (`wasm-ld -r`), as the C runtime's are
+    into the core's, so pesym.py makes them the DLL's exports and the rest
+    of each member local to it."""
+    out = []
+    for mod, ro, ex, imports in dlls:
+        libs = STATIC.get(mod, [])
+        names = [l.split()[0] for l in open(ex) if l.split() and 'forward' not in l.split()[1:2]] if libs else []
+        defined = set(subprocess.run(['llvm-nm', '--defined-only', '--format=just-symbols', ro],
+                                     capture_output=True, text=True).stdout.split()) if names else set()
+        want = [n for n in names if n not in defined and not n.startswith('__gexw_')]
+        members = []  # (library, member)
+        for lib in libs if want else ():
+            listing = subprocess.run(['llvm-nm', '--defined-only', '--print-file-name', lib],
+                                     capture_output=True, text=True).stdout
+            # (`libuuid.a:uuid.o: 00005050 D IID_IRichEditOle`)
+            at = {l.split()[-1]: l.split()[0].split(':')[-2] for l in listing.splitlines()
+                  if len(l.split()) >= 3 and l.split()[-2] in 'TDRB'}
+            for n in [n for n in want if n in at]:
+                if (lib, at[n]) not in members:
+                    members.append((lib, at[n]))
+                want.remove(n)
+        if not members:
+            out.append((mod, ro, ex, imports))
+            continue
+        d = tempfile.mkdtemp(prefix='pelink-static-')
+        atexit.register(shutil.rmtree, d, True)
+        objs = []
+        for k, (lib, m) in enumerate(members):
+            sub = os.path.join(d, str(k))
+            os.mkdir(sub)
+            subprocess.check_call(['llvm-ar', 'x', '--output', sub, lib, m])
+            objs.append(os.path.join(sub, m))
+        merged = os.path.join(d, mod + '.r.o')
+        subprocess.check_call(['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['-r', '-o', merged, ro] + objs)
+        out.append((mod, merged, ex, imports))
+    return out
+
+
 def link(dlls, out, gexrt, others=None):
 
     exporters = {}  # link name -> [dll, ...]
@@ -647,6 +701,7 @@ def link(dlls, out, gexrt, others=None):
             if len(parts) > 2 and parts[1] == 'forward' and f'{via}!{parts[0]}' in KEEP_EXPORTS:
                 forwards.setdefault(parts[0], {})[via] = parts[2]
 
+    dlls = with_static_exports(dlls)
     check_adapters(dlls)
     sigs = {}  # dll -> {(name, 'defined'|'undefined'): sig}
     for mod, ro, ex, imports in dlls:
