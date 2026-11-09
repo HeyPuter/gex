@@ -10550,6 +10550,18 @@ pub extern "C" fn gex_space_top() -> u32 {
     if gex_abi::mem64() { (wine64_top_m64() >> 16) as u32 } else { 0 }
 }
 
+/// Where this module's own space below 4 GiB starts, in 64 KiB units, for a
+/// 64-bit Wine in a 64-bit memory: the shim's heap climbs from 2 GiB once
+/// the Windows space is taken (`winspace::host_floor`), and no Windows
+/// view lies above it, so Wine reports `[it, 4 GiB)` as reserved rather
+/// than free (VirtualQuery, GlobalMemoryStatusEx's available virtual
+/// memory). 0 when there is no such space (a 32-bit memory).
+#[no_mangle]
+pub extern "C" fn gex_host_space() -> u32 {
+    let lo = winspace::host_floor();
+    if gex_abi::mem64() && lo < gex_abi::IMAGE_ZONE64 { (lo >> 16) as u32 } else { 0 }
+}
+
 /// In the compact space (`winspace::wine64_compact`) the window is the top
 /// of the island Wine's images are kept in (`winspace::island`), above
 /// every image Wine places there and within 4 GiB of them, so that it does

@@ -7219,6 +7219,8 @@ export class Gex {
       // The end of 64-bit Wine's space in a 64-bit memory, in 64 KiB units
       // (shim `gex_space_top`): ntdll's top instead of its probe; 0 to probe.
       space_top: () => (e.gex_space_top?.() ?? 0) | 0,
+      // (shim `gex_host_space`): where its own space below 4 GiB starts, which Wine reports reserved
+      host_space: () => (e.gex_host_space?.() ?? 0) | 0,
       // The session mapping, a block of the server's memory (area +128,
       // +132), copied from directly by win32u: the
       // bytes copied, or -1 with no door session; the session's
