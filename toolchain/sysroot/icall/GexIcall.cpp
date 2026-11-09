@@ -656,12 +656,50 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return pairs.size() + decl_pairs.size();
   }
 
+  // Narrow integers (BYTE, BOOLEAN, CHAR, WCHAR, WORD, SHORT) where PE code meets this module's. Windows'
+  // conventions leave the upper bits of a narrow argument or result undefined (MSVC passes a BYTE as `mov cl,
+  // [mem]`); wasm's C ABI has the caller extend them and the callee rely on it. So no function defined here
+  // relies on its caller's extension: its narrow parameters lose zeroext/signext, and codegen extends them on
+  // entry instead. No indirect call (one that may reach guest code) relies on the callee's either: the call's
+  // narrow result loses its attribute and is extended after the call. Callers still extend what they pass and
+  // functions what they return, so a module built without this pass sees nothing change. A function with a
+  // musttail call keeps its parameters' attributes (the call must match them).
+  unsigned narrowInts(Module &M) {
+    unsigned n = 0;
+    auto narrow = [](Type *T) { return T->isIntegerTy() && T->getIntegerBitWidth() < 32; };
+    for (Function &F : M) {
+      if (F.isDeclaration()) continue;
+      bool musttail = false;
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB) continue;
+          if (auto *CI = dyn_cast<CallInst>(CB); CI && CI->isMustTailCall()) musttail = true;
+          if (CB->getCalledFunction() || CB->isInlineAsm() || !narrow(CB->getType())) continue;
+          if (CB->hasRetAttr(Attribute::ZExt) || CB->hasRetAttr(Attribute::SExt)) {
+            CB->removeRetAttr(Attribute::ZExt);
+            CB->removeRetAttr(Attribute::SExt);
+            n++;
+          }
+        }
+      if (musttail) continue;
+      for (Argument &A : F.args())
+        if (narrow(A.getType()) && (A.hasAttribute(Attribute::ZExt) || A.hasAttribute(Attribute::SExt))) {
+          A.removeAttr(Attribute::ZExt);
+          A.removeAttr(Attribute::SExt);
+          n++;
+        }
+    }
+    return n;
+  }
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     LLVMContext &C = M.getContext();
     Wasm64 = Triple(M.getTargetTriple()).getArch() == Triple::wasm64;
     Type *I32 = Type::getInt32Ty(C);
     // the pointer-sized integer a function pointer is compared as
     Type *IP = Wasm64 ? Type::getInt64Ty(C) : I32;
+    unsigned narrowed = narrowInts(M);
     emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
@@ -733,8 +771,8 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     }
     if (getenv("GEXW_ICALL_STATS"))
       errs() << "gex icall: " << M.getName() << ": " << done << " sites, " << varargs << " variadic left alone, "
-             << thunks << " entry thunks\n";
-    return done || thunks ? PreservedAnalyses::none() : PreservedAnalyses::all();
+             << thunks << " entry thunks, " << narrowed << " narrow integers extended here\n";
+    return done || thunks || narrowed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 
