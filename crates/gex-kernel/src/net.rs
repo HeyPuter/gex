@@ -878,20 +878,28 @@ impl Socket {
                 .ok_or(Errno::EINVAL);
         }
         let remote_listener = *self.remote_listener.lock().unwrap();
-        let (t, from): (Arc<dyn Transport>, u16) = match (remote_listener, self.remote) {
+        let (t, from): (Arc<dyn Transport>, (u32, u16)) = match (remote_listener, self.remote) {
             (Some(id), Some(r)) => match (r.accept)(id) {
-                // The far end's port is the other process's to know.
-                n if n >= 0 => (Arc::new(RemoteEnd { id: n, remote: r, reset: Default::default() }), 0),
+                // Where the far end connected from, as its `connect` said.
+                n if n >= 0 => {
+                    let mut b = [0u8; 8];
+                    let from = if (r.peer_addr)(n, b.as_mut_ptr() as crate::PAddr) == 0 {
+                        (u32::from_le_bytes(b[..4].try_into().unwrap()), u32::from_le_bytes(b[4..].try_into().unwrap()) as u16)
+                    } else {
+                        (0x7f00_0001, 0)
+                    };
+                    (Arc::new(RemoteEnd { id: n, remote: r, reset: Default::default() }), from)
+                }
                 n => return Err(Errno(-n)),
             },
             _ => match &mut *self.backlog.lock().unwrap() {
-                Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
+                Some(q) => q.pop_front().map(|(t, p)| (t, (0x7f00_0001, p))).ok_or(Errno::EAGAIN)?,
                 None => return Err(Errno::EINVAL),
             },
         };
         let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports), self.remote);
         *s.transport.lock().unwrap() = Some(t);
-        *s.peer.lock().unwrap() = Some((0x7f00_0001, from));
+        *s.peer.lock().unwrap() = Some(from);
         *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
         let s = Arc::new(s);
         s.set_self();
@@ -1014,10 +1022,14 @@ impl Socket {
         if self.kind == Kind::Tcp && is_local(addr) {
             if let Some(r) = self.remote {
                 let n = tcp_name(port);
-                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
+                // This end's address goes with the connection: the accepted
+                // end's peer is this end (libcurl's loopback socketpair
+                // compares the two).
+                let from = self.ports.ephemeral();
+                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0, 0x7f00_0001, from as u32);
                 if id >= 0 {
                     *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
-                    *self.local.lock().unwrap() = Some((0x7f00_0001, self.ports.ephemeral()));
+                    *self.local.lock().unwrap() = Some((0x7f00_0001, from));
                     *self.transport.lock().unwrap() = Some(Arc::new(RemoteEnd { id, remote: r, reset: Default::default() }));
                     return Ok(());
                 }
@@ -1147,7 +1159,7 @@ impl Socket {
             return Some(id);
         }
         let n = udp_name(port);
-        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0);
+        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32, 0, 0, 0, 0, 0);
         (id >= 0).then(|| {
             u.outbound.insert(port, id);
             id
