@@ -861,6 +861,22 @@ impl PeImage {
         Ok(&self.data[off..off + n as usize])
     }
 
+    /// `n` bytes at an RVA inside the image, where any not backed by file
+    /// data (a section's virtual tail past its raw data) read as the zeros
+    /// the loader maps there. A packed image's exception directory lies in
+    /// such memory: its unpacker writes the table at run time.
+    fn bytes_or_zeros(&self, rva: u32, n: u32) -> Result<std::borrow::Cow<'_, [u8]>> {
+        if let Ok(b) = self.bytes_at(rva, n) {
+            return Ok(std::borrow::Cow::Borrowed(b));
+        }
+        if !self.in_image(rva, n) {
+            return Err(PeError::malformed(format!("RVA {rva:#x}+{n:#x} is outside the image")));
+        }
+        Ok(std::borrow::Cow::Owned(
+            (rva..rva + n).map(|r| self.rva_to_offset(r).map_or(0, |o| self.data[o])).collect(),
+        ))
+    }
+
     /// A read at an RVA that may lie in zero-filled memory (uninitialised
     /// data), which reads as zero.
     fn u32_at(&self, rva: u32) -> Result<u32> {
@@ -1310,7 +1326,9 @@ impl PeImage {
                 if size % 12 != 0 {
                     return Err(PeError::malformed("AMD64 exception directory size is not a multiple of 12"));
                 }
-                let b = self.bytes_at(rva, size)?;
+                // (an all-zero entry, as the zeros of an unbacked table are, is
+                // no function)
+                let b = self.bytes_or_zeros(rva, size)?;
                 for c in b.chunks(12) {
                     let w = |k: usize| u32::from_le_bytes(c[k..k + 4].try_into().unwrap());
                     let (begin, end, unwind) = (w(0), w(4), w(8));
@@ -1327,10 +1345,13 @@ impl PeImage {
                 if size % 8 != 0 {
                     return Err(PeError::malformed("ARM64 exception directory size is not a multiple of 8"));
                 }
-                let b = self.bytes_at(rva, size)?;
+                let b = self.bytes_or_zeros(rva, size)?;
                 for c in b.chunks(8) {
                     let begin = u32::from_le_bytes(c[0..4].try_into().unwrap());
                     let word = u32::from_le_bytes(c[4..8].try_into().unwrap());
+                    if begin == 0 && word == 0 {
+                        continue;
+                    }
                     let end = if word & 3 != 0 { begin + ((word >> 2) & 0x7ff) * 4 } else { 0 };
                     out.push(RuntimeFunction { begin_rva: begin, end_rva: end, unwind: word, unwind_flags: None });
                 }

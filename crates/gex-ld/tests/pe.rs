@@ -542,3 +542,31 @@ fn no_reloc_directory_moves_only_when_dynamic_base() {
     assert_eq!(e.kind, PeErrorKind::Layout);
     assert!(e.to_string().contains("not linked /DYNAMICBASE"), "{e}");
 }
+
+/// A packed image's exception directory lies in memory its unpacker fills
+/// (UPX's first section: no raw data, all virtual): the loader maps zeros
+/// there, so the table parses as empty rather than failing the image.
+#[test]
+fn an_exception_directory_in_unbacked_memory_parses_as_empty() {
+    let mut b = std::fs::read(fixture("x64/uses.exe")).unwrap();
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as usize;
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let nt = u32_at(&b, 0x3c) as usize;
+    let (nsec, opt) = (u16_at(&b, nt + 6), u16_at(&b, nt + 20));
+    let pdata_rva = u32_at(&b, nt + 24 + 112 + 3 * 8);
+    assert!(pdata_rva != 0, "the fixture has an exception directory");
+    // The section holding it keeps its virtual size and loses its raw data.
+    let table = nt + 24 + opt;
+    let s = (0..nsec)
+        .map(|i| table + 40 * i)
+        .find(|&s| {
+            let (vs, va) = (u32_at(&b, s + 8), u32_at(&b, s + 12));
+            pdata_rva >= va && pdata_rva < va + vs
+        })
+        .unwrap();
+    b[s + 16..s + 20].copy_from_slice(&0u32.to_le_bytes());
+    let pe = pe::parse(&b).unwrap();
+    assert!(pe.pdata.is_empty());
+    // As the file has it, the table is there.
+    assert!(!pe::parse(&std::fs::read(fixture("x64/uses.exe")).unwrap()).unwrap().pdata.is_empty());
+}
