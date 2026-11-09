@@ -236,6 +236,12 @@ pub struct UnixSocket {
     /// (`SO_PEERCRED`): None for a peer this kernel did not see made (a
     /// host's end).
     peer_cred: Mutex<Option<Cred>>,
+    /// The IPv4 address and port the connecting process gave for this end
+    /// (a page's loopback TCP connection, made through a name here): what
+    /// the accepted end's `getpeername` reports.
+    addr: Mutex<Option<(u32, u16)>>,
+    /// The far end's `addr`, taken when the two were joined.
+    peer_addr: Mutex<Option<(u32, u16)>>,
     /// Its last descriptor has closed ([`Self::release`]).
     gone: AtomicBool,
     /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
@@ -261,6 +267,8 @@ impl UnixSocket {
             queue: crate::wait::Queue::new(),
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
+            addr: Mutex::new(None),
+            peer_addr: Mutex::new(None),
             gone: AtomicBool::new(false),
             passcred: AtomicBool::new(false),
         }
@@ -284,6 +292,17 @@ impl UnixSocket {
     /// The far end's credentials (`SO_PEERCRED`), when they are known.
     pub fn peer_cred(&self) -> Option<Cred> {
         *self.peer_cred.lock().unwrap()
+    }
+
+    /// Record the IPv4 address and port this end connects from (before its
+    /// `connect`), for the accepted end's `peer_addr`.
+    pub fn set_addr(&self, addr: (u32, u16)) {
+        *self.addr.lock().unwrap() = Some(addr);
+    }
+
+    /// The far end's IPv4 address and port, when its process gave one.
+    pub fn peer_addr(&self) -> Option<(u32, u16)> {
+        *self.peer_addr.lock().unwrap()
     }
 
     /// Both ends of a `socketpair` made by `cred`: each end's peer is that
@@ -466,6 +485,7 @@ impl UnixSocket {
             *theirs.cred.lock().unwrap() = server;
             *theirs.peer_cred.lock().unwrap() = client;
             *self.peer_cred.lock().unwrap() = server;
+            *theirs.peer_addr.lock().unwrap() = *self.addr.lock().unwrap();
             backlog.lock().unwrap().push_back(theirs);
         }
         // A connection is waiting for `accept`.
@@ -1827,12 +1847,19 @@ pub struct Remote {
     /// or a negated errno.
     pub bind: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
     /// Connect to a name, as `pid`, `uid` and `gid` (what the server's
-    /// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
-    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// `SO_PEERCRED` reports), from IPv4 address `addr` and port `port` (a
+    /// loopback TCP connection's own end, what the accepted end's
+    /// `peer_addr` reports; both 0 for none). Returns this end's id, or a
+    /// negated errno.
+    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32,
     /// The far end's `struct ucred` as it was when the two were joined:
     /// pid, uid and gid as three little-endian words at `out`. Zero, or a
     /// negated errno (`ENOTCONN`: no peer, or none known).
     pub peer_cred: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
+    /// The far end's IPv4 address and port as its `connect` gave them: two
+    /// little-endian words at `out`. Zero, or a negated errno (`ENOTCONN`:
+    /// none given).
+    pub peer_addr: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
     /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
     pub accept: extern "C" fn(listener: i32) -> i32,
     pub pending: extern "C" fn(listener: i32) -> i32,

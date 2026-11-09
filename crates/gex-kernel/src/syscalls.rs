@@ -5119,7 +5119,7 @@ impl NetIo<'_> {
         // local path is still tried when the kernel does not know the name.
         if let Some(r) = self.unix_remote {
             let me = io.cred();
-            let id = (r.connect)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid);
+            let id = (r.connect)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid, 0, 0);
             if id >= 0 {
                 let flags = io.fds.get(fd)?.flags();
                 let cloexec = io.fds.cloexec(fd).unwrap_or(false);

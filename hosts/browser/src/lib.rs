@@ -694,10 +694,12 @@ extern "C" {
     // and with a Worker per process those are two memories -- so the name has
     // to be somewhere neither of them owns.
     // With the caller's pid, uid and gid: what the far end's SO_PEERCRED
-    // reports (`k_sock_peer_cred`).
+    // reports (`k_sock_peer_cred`); `connect` also with the IPv4 address and
+    // port a loopback TCP end connects from (`k_sock_peer_addr`, 0 for none).
     fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
-    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32;
+    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32;
     fn k_sock_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32;
+    fn k_sock_peer_addr(id: i32, out: gex_kernel::PAddr) -> i32;
     fn k_sock_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32);
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
@@ -1676,11 +1678,14 @@ extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32
 extern "C" fn rs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) {
     unsafe { k_sock_rename(from, from_len, to, to_len) }
 }
-extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    unsafe { k_sock_connect(path, path_len, pid, uid, gid) }
+extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
+    unsafe { k_sock_connect(path, path_len, pid, uid, gid, addr, port) }
 }
 extern "C" fn rs_peer_cred(id: i32, out: gex_kernel::PAddr) -> i32 {
     unsafe { k_sock_peer_cred(id, out) }
+}
+extern "C" fn rs_peer_addr(id: i32, out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_peer_addr(id, out) }
 }
 extern "C" fn rs_accept(listener: i32) -> i32 {
     unsafe { k_sock_accept(listener) }
@@ -1841,6 +1846,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         bind: rs_bind,
         connect: rs_connect,
         peer_cred: rs_peer_cred,
+        peer_addr: rs_peer_addr,
         accept: rs_accept,
         pending: rs_pending,
         read: rs_read,
