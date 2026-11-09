@@ -3859,6 +3859,9 @@ export class Gex {
     await this.#installClosure();
     // The single-thread build: the exec reads the program's files through
     // the kernel, which may wait, so it runs on a stack that can suspend.
+    // A program the page started (host.mjs `spawnExec`): the shim settles its
+    // memory flavour and environment as an execve would.
+    if (child.page) e.gex_page_program?.();
     if (SP_CODE && single.on) return this.#putBytesP(child.exec, e.gex_adopted_exec);
     return this.#putBytes(child.exec, e.gex_adopted_exec);
   }
@@ -7219,6 +7222,8 @@ export class Gex {
       // The end of 64-bit Wine's space in a 64-bit memory, in 64 KiB units
       // (shim `gex_space_top`): ntdll's top instead of its probe; 0 to probe.
       space_top: () => (e.gex_space_top?.() ?? 0) | 0,
+      // (shim `gex_host_space`): where its own space below 4 GiB starts, which Wine reports reserved
+      host_space: () => (e.gex_host_space?.() ?? 0) | 0,
       // The session mapping, a block of the server's memory (area +128,
       // +132), copied from directly by win32u: the
       // bytes copied, or -1 with no door session; the session's

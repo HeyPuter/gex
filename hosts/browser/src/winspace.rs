@@ -32,6 +32,11 @@ mod stub {
         0
     }
 
+    /// As the shared build's; no Windows space here.
+    pub(crate) fn host_floor() -> u64 {
+        arena_ceiling()
+    }
+
     pub(crate) fn wine32_windows_space() -> u64 {
         0
     }
@@ -324,6 +329,14 @@ mod imp {
 
     pub(crate) fn windows_space() -> u64 {
         WINDOWS_LO.load(Ordering::Relaxed)
+    }
+
+    /// Where the shim's own space starts above the guest's: [`NT_HEAP_BASE`]
+    /// once a Windows space is taken (the split: the heap climbs from there,
+    /// and the arena's ceiling is raised to the memory's end), else the
+    /// arena's ceiling.
+    pub(crate) fn host_floor() -> u64 {
+        if windows_space() != 0 { NT_HEAP_BASE } else { arena_ceiling() }
     }
 
     /// A forked child's half of the parent's split, before the child's heap

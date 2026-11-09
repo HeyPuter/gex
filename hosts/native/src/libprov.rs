@@ -554,6 +554,8 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "exec_fresh", || {})?;
     // The end of 64-bit Wine's space in 64 KiB units: 0, Wine probes.
     linker.func_wrap(IMPORT_MODULE, "space_top", || -> i32 { 0 })?;
+    // (natively the module's own data is not in the guest's memory)
+    linker.func_wrap(IMPORT_MODULE, "host_space", || -> i32 { 0 })?;
     linker.func_wrap(IMPORT_MODULE, "session_copy", |mut caller: Caller<'_, HostState>, dst: i32, off: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::session_copy(&mut caller, dst as u32, off as u32, size as u32))
     })?;
