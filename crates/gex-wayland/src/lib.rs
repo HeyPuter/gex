@@ -1385,8 +1385,11 @@ impl Client {
                 self.objects.insert(id, Object::Surface);
                 let mut state = SurfaceState::default();
                 // A client that already said this surface is drawn on the host
-                // said so before the request that creates it arrived.
-                state.external = self.external_pending.get(&id).copied();
+                // said so before the request that creates it arrived. The word
+                // is for this one creation: ids are reused, and a later surface
+                // with this id (a dialog after a GL probe window) is not drawn
+                // on the host unless the client says so again.
+                state.external = self.external_pending.remove(&id);
                 self.surfaces.insert(id, state);
                 if state_is_external(&self.surfaces, id) {
                     self.dirty = true;
@@ -3982,6 +3985,30 @@ mod tests {
         c.receive(&Writer::new(surface, 1).object(0).int(0).int(0).finish(), &[], &pool);
         c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
         assert!(c.scene().is_empty(), "an unmapped window stayed on screen");
+    }
+
+    #[test]
+    fn a_host_drawn_mark_is_for_one_surface_not_its_id() {
+        let pool = no_pool();
+        let mut c = Client::new();
+        c.receive(&Writer::new(1, 1).new_id(2).finish(), &[], &pool);
+        c.receive(&Writer::new(2, 0).uint(1).string("wl_compositor").uint(4).new_id(3).finish(), &[], &pool);
+        // The GL device's word can beat the create_surface it is about.
+        c.attach_external(6, 133, 1);
+        c.receive(&Writer::new(3, 0).new_id(6).finish(), &[], &pool);
+        assert!(state_is_external(&c.surfaces, 6), "the mark that came first was lost");
+        // A GL probe window goes away; a dialog's surface gets its id again.
+        c.receive(&Writer::new(6, 0).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(6).finish(), &[], &pool);
+        assert!(!state_is_external(&c.surfaces, 6), "a new surface took an old one's host frames by its id");
+        // Marked after its creation and unmarked when its EGL surface goes
+        // (eglDestroySurface): the next surface with the id is the client's.
+        c.attach_external(6, 133, 1);
+        assert!(state_is_external(&c.surfaces, 6));
+        c.attach_external(6, 0, 0);
+        c.receive(&Writer::new(6, 0).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(6).finish(), &[], &pool);
+        assert!(!state_is_external(&c.surfaces, 6), "an unmarked id came back marked");
     }
 
     #[test]
