@@ -17,7 +17,7 @@ export default async function (t) {
     for (const c of CASES) {
       const r = await w.nt({ ...c, name: `${c.name} door=${door}` });
       if (c.name === 'highdata' && r)
-        t.check(`highdata door=${door}: Wine says why it refused the protection`, /made executable above gex's code space/.test(r.err), w.detail(r, 3));
+        t.check(`highdata door=${door}: Wine says why it refused the protection`, /memory made executable \S+ outside gex's code space/.test(r.err), w.detail(r, 3));
     }
     w.clean();
   }
