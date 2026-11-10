@@ -336,6 +336,11 @@ export class Compositor {
     if (memory || kernel) this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
   }
 
+  /** A rootful X server's buffers for the GL frames of its windows (xgl.js). */
+  addXGl(ctl, pix) {
+    this.#worker.postMessage({ kind: 'x-gl', ctl, pix });
+  }
+
   /** A guest's new pixel buffer (wl-bridge.mjs `WlProxy`). */
   addPixels(token, id, buffer, replaces) {
     this.#worker.postMessage({ kind: 'pixels', token, id, buffer, replaces });

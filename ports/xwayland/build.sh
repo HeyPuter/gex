@@ -289,7 +289,7 @@ WANT_WL="${WAYLAND_TAG:-$(env -u PKG_CONFIG_LIBDIR pkg-config --modversion wayla
     git fetch --depth 1 origin tag "$WANT_WL" >/dev/null 2>&1
     git checkout -f -q "$WANT_WL"
 })
-cp "$HERE/gexos.c" "$SRC/xserver/hw/xwayland/"
+cp "$HERE/gexos.c" "$HERE/gexgl.c" "$SRC/xserver/hw/xwayland/"
 python3 "$HERE/patch.py" sources "$SRC/wayland" "$SRC/xserver"
 
 say "zlib"

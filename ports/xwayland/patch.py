@@ -366,9 +366,16 @@ def patch_meson(src):
     p = f'{src}/hw/xwayland/meson.build'
     s = open(p).read()
     if 'gexos.c' in s:
+        # A tree patched before gexgl.c was part of it.
+        if 'gexgl.c' not in s:
+            s = s.replace("""    'gexos.c',""", """    'gexos.c',
+    'gexgl.c',""", 1)
+            open(p, 'w').write(s)
+            print('  xwayland/meson.build: gexgl.c is part of the server')
         return
     s = s.replace("""    '../../mi/miinitext.c',""",
                   """    'gexos.c',
+    'gexgl.c',
     '../../mi/miinitext.c',""", 1)
     assert 'gexos.c' in s, 'xwayland/meson.build: the source list did not match'
 
@@ -389,7 +396,7 @@ def patch_meson(src):
     link_args: [ '-sPTHREAD_POOL_SIZE=0' ],""", 1)
     assert 'PTHREAD_POOL_SIZE=0' in s, 'xwayland/meson.build: the executable did not match'
     open(p, 'w').write(s)
-    print('  xwayland/meson.build: gexos.c is part of the server, and no thread pool')
+    print('  xwayland/meson.build: gexos.c and gexgl.c are part of the server, and no thread pool')
 
 
 def main():

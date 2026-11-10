@@ -28,6 +28,7 @@
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../hosts/browser/js/wl-bridge.mjs';
 import { isZstd, unzstd } from './zfetch.js';
+import { xglBuffers, xglServer } from './xgl.js';
 import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
 import { blockIo } from '../../hosts/browser/js/blocks.mjs';
 import { pageFs } from '../../hosts/browser/js/page-fs.mjs';
@@ -92,6 +93,11 @@ export async function moduleBytes(url) {
   const { readFile } = await import('node:fs/promises');
   const { fileURLToPath } = await import('node:url');
   return (await readFile(url.startsWith('file:') ? fileURLToPath(url) : url)).buffer;
+}
+
+/** gexgl.c's names for xgl.js's server half. */
+function xglHooks(s) {
+  return { xglWatch: s.watch, xglViewable: s.viewable, xglTake: s.take, xglDone: s.done };
 }
 
 /**
@@ -299,6 +305,16 @@ export class HostX {
 
     // -- the transport the server will use ---------------------------------
     this.#x.gexos = this.#gexos();
+
+    // Rootful, a GL client's frames go into its window's own pixels (xgl.js):
+    // the buffers they come through, for the compositor.
+    if (msg.rootful) {
+      const b = xglBuffers();
+      if (b) {
+        Object.assign(this.#x.gexos, xglHooks(xglServer(b, this.#x, () => this.#proxy.block)));
+        this.emit({ kind: 'x-gl', ...b });
+      }
+    }
 
     const argv = this.#argv(msg);
     this.log(`[hostx] Xwayland ${argv.join(' ')}`);
