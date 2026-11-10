@@ -103,6 +103,13 @@ for h in $(grep -l __i386__ "$SR"/asm/*.h); do
 done
 
 cd "$OUT/crt-build"
+# objects of other flags are built again (a build directory copied from one
+# made without gexcc's -fvisibility=default kept its hidden builtins, and
+# libc.so then exported none of them)
+if [ "$(cat .gex-flags 2>/dev/null)" != "$CRT $WASM_CFLAGS" ]; then
+  rm -f ./*.o
+  printf '%s' "$CRT $WASM_CFLAGS" > .gex-flags
+fi
 objs=
 for f in "$CRT"/*.c; do
   b=$(basename "$f" .c)

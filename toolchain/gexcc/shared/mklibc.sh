@@ -37,4 +37,11 @@ printf '__gex_start_c\n' > "$W/undef.txt"
 GEXCC_SHARED=1 GEXCC_POLL=0 "$PREFIX/bin/gexcc" -shared -nostdlib -o "$L/libc.so" \
   -Wl,-soname,libc.so -Wl,--export=__gex_fork_run -Wl,--allow-undefined-file="$W/undef.txt" \
   "$W"/lc/* "$W"/gx/*.o "$L/libclang_rt.builtins-wasm32.a"
+# the builtins libc's own code takes (128-bit integers, long double) are
+# every library's: one built without -fvisibility=default hides them, and a
+# library that imports them from libc fails to load
+for s in __multi3 __addtf3 __trunctfdf2; do
+  llvm-nm --extern-only --defined-only "$L/libc.so" | grep -q " $s\$" ||
+    { echo "mklibc.sh: libc.so does not export $s (compiler-rt's builtins built hidden: $L/libclang_rt.builtins-wasm32.a)" >&2; exit 1; }
+done
 echo "libc.so: $(wc -c < "$L/libc.so") bytes"
