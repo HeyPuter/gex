@@ -301,6 +301,11 @@ impl Kernel {
             creds: Arc::clone(&self.creds),
             clock: self.clock,
         };
+        // A program's publication (an exec arms its own, as it chooses the
+        // new program's memory: `Kernel::exec_flavour`).
+        if old.as_ref().is_none_or(|o| o.pid != live.pid || o.exe != live.exe) {
+            self.outgrow_arm(&self.exe_path, false);
+        }
         if old.as_ref().is_none_or(|o| o.exe != live.exe || o.argv != live.argv || o.pid != live.pid) {
             let name = live.exe.rsplit('/').next().unwrap_or("gex");
             let mut info = name.as_bytes().to_vec();

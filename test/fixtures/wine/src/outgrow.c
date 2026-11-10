@@ -1,0 +1,63 @@
+/* outgrow: the Windows guest of test/wow64/outgrow. Reserves 3.5 GiB in
+ * one block (VirtualAlloc, no address), which the lowered memory has no
+ * room for and a 64-bit one has.
+ *
+ *   outgrow crash      no room: says "outgrow short", then raises an
+ *                      access violation no handler takes (gex maps no
+ *                      guard at address 0 unless asked to)
+ *   outgrow fallback   no room: reserves 64 MiB instead and exits 0
+ *   outgrow twice M    runs `outgrow M` twice, one after the other
+ *                      (CreateProcess each), and says how each ended
+ *
+ * Each run says "outgrow big high" when it got the 3.5 GiB above 4 GiB.
+ * gex-nt-arch: x64
+ */
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+#define BIG ((SIZE_T)7 << 29)
+
+static void once(const char *mode) {
+    char me[MAX_PATH], cmd[MAX_PATH + 32];
+    STARTUPINFOA si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    DWORD code = 0;
+
+    fflush(stdout);
+    GetModuleFileNameA(NULL, me, sizeof me);
+    snprintf(cmd, sizeof cmd, "\"%s\" %s", me, mode);
+    if (!CreateProcessA(me, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        printf("outgrow child not started: %lu\n", GetLastError());
+        return;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    printf("outgrow child exit %08lx\n", code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+}
+
+int main(int argc, char **argv) {
+    const char *mode = argc > 1 ? argv[1] : "crash";
+    void *p;
+
+    if (argc > 2 && !strcmp(argv[1], "twice")) {
+        once(argv[2]);
+        once(argv[2]);
+        return 0;
+    }
+    p = VirtualAlloc(NULL, BIG, MEM_RESERVE, PAGE_NOACCESS);
+    if (p) {
+        printf("outgrow big %s\n", (ULONG_PTR)p >= ((ULONG_PTR)1 << 32) ? "high" : "low");
+        return 0;
+    }
+    if (!strcmp(mode, "crash")) {
+        printf("outgrow short\n");
+        fflush(stdout);
+        RaiseException(EXCEPTION_ACCESS_VIOLATION, EXCEPTION_NONCONTINUABLE, 0, NULL);
+    }
+    p = VirtualAlloc(NULL, 64 << 20, MEM_RESERVE, PAGE_NOACCESS);
+    printf("outgrow fallback %s\n", p ? "ok" : "failed");
+    return 0;
+}

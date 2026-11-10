@@ -359,32 +359,6 @@ pub fn mem64_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("mem64"))
 }
 
-fn mem64_record(image: &[u8]) -> Option<PathBuf> {
-    let mut h = sha256::Sha256::new();
-    h.update(image);
-    Some(mem64_dir()?.join(sha256::hex(&h.finish())))
-}
-
-/// Whether an earlier run of `image` ran out of a wasm32 memory's address
-/// space, so this one should start with a 64-bit memory.
-pub fn mem64_recorded(image: &[u8]) -> bool {
-    mem64_record(image).and_then(|p| std::fs::read(p).ok()).is_some_and(|b| b.starts_with(MEM64_RECORD_V))
-}
-
-/// The first line of a record: one an earlier gex wrote without it may have
-/// been learned from another image the run exec'd, and is not taken.
-const MEM64_RECORD_V: &[u8] = b"v 2\n";
-
-/// Record that `image` (at `path`, for the record's reader) ran out of
-/// address space asking for `short` bytes. Returns where it was written.
-pub fn record_mem64(image: &[u8], path: &str, short: u64) -> Option<PathBuf> {
-    let p = mem64_record(image)?;
-    std::fs::create_dir_all(p.parent()?).ok()?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    std::fs::write(&p, format!("v 2\nimage {path}\nshort {short}\nwhen {now}\n")).ok()?;
-    Some(p)
-}
-
 /// Where entry-point profiles live.
 pub fn profile_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("profiles"))

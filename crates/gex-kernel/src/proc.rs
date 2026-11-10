@@ -384,6 +384,8 @@ struct Proc {
     /// How it crashed, as it said before it ended ([`ProcTable::set_crash`]):
     /// empty when it has not.
     crash: Vec<u8>,
+    /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
+    crash_more: Vec<u8>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -406,9 +408,19 @@ pub struct PeerVm {
 /// note's address, `arg3` its length; [`ProcTable::set_crash`]).
 pub const PR_GEX_CRASH: u64 = 0x4745_0002;
 
+/// `prctl` option gex adds: a reservation of `arg2` bytes with no address
+/// could not be placed in the calling process's lowered memory (64-bit
+/// Wine's `map_view`, which looks for room itself and never asks the
+/// kernel for a mapping it has no gap for). `Kernel::note_short`.
+pub const PR_GEX_SHORT: u64 = 0x4745_0003;
+
 /// A note's first byte when it gives way to one the process gave itself
 /// ([`ProcTable::set_crash_unless_said`]).
 const UNLESS_SAID: u8 = 1;
+
+/// A note's first byte when the rest is one more line for its crash's
+/// reason ([`ProcTable::add_crash_line`]).
+const ADD_LINE: u8 = 2;
 
 /// The most crashes kept for a reader that has not taken them.
 const CRASHES_KEPT: usize = 64;
@@ -447,12 +459,15 @@ pub fn signal_name(sig: u32) -> &'static str {
 impl Crash {
     /// Process `pid` (`/proc`'s `info`) ending with wait status `status`, its
     /// own `note`: a crash, or not.
-    fn of(pid: i32, info: &[u8], note: Vec<u8>, status: i32) -> Option<Crash> {
+    /// `more`: a line gex adds to the reason ([`ProcTable::add_crash_line`]),
+    /// which makes an end that is no crash otherwise (a nonzero exit) one.
+    fn of(pid: i32, info: &[u8], note: Vec<u8>, more: Vec<u8>, status: i32) -> Option<Crash> {
         let sig = (status & 0x7f) as u32;
         let signaled = sig != 0 && sig != 0x7f;
-        if note.is_empty() && !(signaled && core_signal(sig)) {
+        if note.is_empty() && more.is_empty() && !(signaled && core_signal(sig)) {
             return None;
         }
+        let exited = (!signaled && note.is_empty()).then(|| format!("exited with code {}", (status >> 8) & 0xff));
         let mut parts = note.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
         let (name, reason, code) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next());
         let own = || {
@@ -463,7 +478,10 @@ impl Crash {
         Some(Crash {
             pid,
             name: if name.is_empty() { own() } else { name },
-            reason: if !reason.is_empty() { reason } else if signaled { signal_name(sig).to_string() } else { "crashed".to_string() },
+            reason: {
+                let r = if !reason.is_empty() { reason } else if signaled { signal_name(sig).to_string() } else { exited.unwrap_or_else(|| "crashed".to_string()) };
+                if more.is_empty() { r } else { format!("{r}; {}", String::from_utf8_lossy(&more)) }
+            },
             code,
             signal: if signaled { sig } else { 0 },
         })
@@ -518,7 +536,7 @@ impl Table {
     /// Process `pid`'s crash, if ending with `status` is one: heard by the
     /// host's hook and kept for the reader. Whether it was.
     fn record_crash(&mut self, pid: i32, status: i32) -> bool {
-        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), status)) else {
+        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)) else {
             return false;
         };
         if let Some(f) = CRASH_HOOK.get() {
@@ -637,6 +655,7 @@ impl ProcTable {
                     host_child: false,
                     usage: Usage::default(),
                     crash: Vec::new(),
+                    crash_more: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
@@ -683,6 +702,7 @@ impl ProcTable {
             host_child,
             usage: Usage::default(),
             crash: Vec::new(),
+            crash_more: Vec::new(),
         });
         pid
     }
@@ -799,6 +819,7 @@ impl ProcTable {
             match note.split_first() {
                 Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
                 Some((&UNLESS_SAID, _)) => {}
+                Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
                 _ => p.crash = note.to_vec(),
             }
         }
@@ -813,6 +834,16 @@ impl ProcTable {
     /// The crashes recorded since the last call, oldest first.
     pub fn take_crashes(&self) -> Vec<Crash> {
         self.lock().crashes.drain(..).collect()
+    }
+
+    /// One more line for the reason process `pid`'s crash gives, which
+    /// makes its end a crash if it would not be one (a nonzero exit): what
+    /// gex knows of why it ended (`outgrow_ending`).
+    pub fn add_crash_line(&self, pid: i32, line: &str) {
+        let mut v = Vec::with_capacity(line.len() + 1);
+        v.push(ADD_LINE);
+        v.extend_from_slice(line.as_bytes());
+        self.set_crash(pid, &v);
     }
 
     /// `note` for process `pid` as [`ProcTable::set_crash`], unless it has
@@ -1596,6 +1627,29 @@ mod tests {
         assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0 });
         assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
         assert!(t.take_crashes().is_empty());
+    }
+
+    #[test]
+    fn a_line_gex_adds_ends_the_crash_reason() {
+        let t = ProcTable::new();
+        let (a, b, c) = (t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID));
+        t.set_info(a, b"prog\nprog\0");
+        // the host's account and gex's line, in either order
+        t.add_crash_line(a, "needs more");
+        t.set_crash_unless_said(a, b"\0SIGABRT at 0x10");
+        t.exit(a, 6);
+        // a Windows program's own account keeps it too
+        t.set_crash(b, b"app.exe\0page fault on read access to 00000000\03221225477");
+        t.add_crash_line(b, "needs more");
+        t.exit(b, 5 << 8);
+        // a nonzero exit that said nothing else is a crash only with the line
+        t.add_crash_line(c, "needs more");
+        t.exit(c, 1 << 8);
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].reason, "SIGABRT at 0x10; needs more");
+        assert_eq!(got[1].reason, "page fault on read access to 00000000; needs more");
+        assert_eq!(got[2].reason, "exited with code 1; needs more");
     }
 
     #[test]

@@ -425,6 +425,13 @@ fn page_flavours() -> i32 {
     }
 }
 
+/// Whether this page runs programs in a 64-bit memory: its own is one, or
+/// it runs the other flavour as well.
+pub(crate) fn page_runs_mem64() -> bool {
+    let page = page_flavours();
+    page & 1 != 0 || page & 2 != 0
+}
+
 /// Bit 0: the page's memory is a 64-bit one; bit 1: it runs the other
 /// flavour as well ([`exec_target`]). Set in every Worker before the guest
 /// runs.
